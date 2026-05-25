@@ -2,6 +2,10 @@
 
 Three supported install paths, ordered from easiest to most flexible.
 
+**Supported PostgreSQL version:** 18. (PG17 backport is tracked but not
+shipped — `EXPLAIN (SEMANTIC ON)` and parts of the GROUP BY rewriter use
+PG18-only APIs.)
+
 ## 1. Pre-built Docker image (recommended for getting started)
 
 ```bash
@@ -77,12 +81,6 @@ cargo pgrx install --release --pg-config $(which pg_config)
 cargo build --release --locked --manifest-path crates/rvbbit_duck/Cargo.toml
 sudo cp crates/rvbbit_duck/target/release/rvbbit-duck /usr/local/bin/
 ```
-
-To target a different PG major version, add the matching feature to
-`crates/pg_rvbbit/Cargo.toml` (e.g. `pg17 = ["pgrx/pg17"]`) and pass
-`--features pg17 --no-default-features` to `cargo pgrx install`. Hooks
-and the TAM alias are stable across PG14+; the lock to PG18 is only the
-default feature.
 
 ## Runtime characteristics
 
