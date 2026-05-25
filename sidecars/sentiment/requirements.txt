@@ -1,0 +1,8 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+# transformers + torch are the heavy bits. The Dockerfile installs torch
+# from PyTorch's CPU wheel index — switch the index in the Dockerfile if
+# you want GPU support.
+transformers==4.46.3
+torch==2.5.1

@@ -1,0 +1,212 @@
+COMPOSE := docker compose -f docker/docker-compose.yml
+COMPOSE_SIDECARS := docker compose -f docker/docker-compose.yml -f docker/docker-compose.sidecars.yml
+
+.PHONY: help build up down logs psql-heap psql-rvbbit bench-shell info clean \
+        reload-extension e2e-realworld e2e-realworld-fresh e2e-realworld-live \
+        e2e-realworld-warren \
+        gpu-up gpu-down register-specialists restore-local-embed gpu-status \
+        bigfoot-kg-demo capabilities-list capability-render capability-catalog \
+        capability-scaffold capability-install capability-deploy warren-agent warren-once
+
+RVBBIT_DSN ?= postgresql://postgres:rvbbit@localhost:55433/bench
+WARREN_NODE ?= local-warren
+WARREN_WORK_DIR ?= .rvbbit/warren
+WARREN_LABELS ?= {"capability":true,"docker":true,"gpu":false}
+WARREN_CAPACITY ?= {}
+WARREN_DOCKER_NETWORK ?= docker_default
+WARREN_METRICS_MS ?= 10000
+
+help:
+	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
+		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+
+build:           ## Build the rvbbit + bench images
+	$(COMPOSE) build
+
+up:              ## Start heap baseline + rvbbit + bench (builds if needed)
+	$(COMPOSE) up -d --build
+
+down:            ## Stop everything (keeps volumes)
+	$(COMPOSE) down
+
+nuke:            ## Stop and delete volumes (wipes both databases)
+	$(COMPOSE) down -v
+
+logs:            ## Tail logs from all services
+	$(COMPOSE) logs -f
+
+logs-rvbbit:     ## Tail rvbbit container logs only
+	$(COMPOSE) logs -f pg-rvbbit
+
+psql-heap:       ## psql into the heap baseline
+	$(COMPOSE) exec pg-heap psql -U postgres -d bench
+
+psql-rvbbit:     ## psql into the rvbbit instance
+	$(COMPOSE) exec pg-rvbbit psql -U postgres -d bench
+
+bench-shell:     ## Shell in the bench container
+	$(COMPOSE) exec bench bash
+
+info:            ## Print versions from both servers via the bench runner
+	$(COMPOSE) exec bench python run.py info
+
+smoke:           ## Phase 1a smoke test: CREATE / INSERT / SELECT via rvbbit AM
+	$(COMPOSE) exec bench python run.py smoke
+
+load-llm:        ## Load N rows of LLM-shaped synthetic data (defaults to 100k)
+	$(COMPOSE) exec bench python run.py load llm --rows $${ROWS:-100000}
+
+compact-llm:     ## Run rvbbit.compact() on the loaded llm_events table
+	$(COMPOSE) exec bench python run.py compact
+
+query-llm:       ## Pair-wise compare heap vs rvbbit on the LLM query set
+	$(COMPOSE) exec bench python run.py query llm
+
+test:            ## Run E2E tests (skips live-LLM ones; cheap & deterministic)
+	$(COMPOSE) exec bench pytest /tests -x
+
+test-live:       ## Run E2E tests INCLUDING live LLM calls (costs $$)
+	$(COMPOSE) exec -e RUN_LLM_TESTS=1 bench pytest /tests
+
+e2e-realworld:   ## Run the real-world acceptance harness (deterministic/default)
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed
+	$(MAKE) --no-print-directory reload-extension
+	$(COMPOSE) exec -T bench python /bench/e2e_realworld.py
+
+e2e-realworld-fresh: ## Destructive fresh acceptance run (deletes Docker volumes)
+	$(COMPOSE_SIDECARS) down -v
+	$(MAKE) --no-print-directory e2e-realworld
+
+e2e-realworld-live: ## Run acceptance harness with live provider calls enabled
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed
+	$(MAKE) --no-print-directory reload-extension
+	$(COMPOSE) exec -T -e RVBBIT_E2E_LIVE_LLM=1 bench python /bench/e2e_realworld.py
+
+e2e-realworld-warren: ## Run real Warren deploy/probe/operator acceptance smoke
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed
+	$(MAKE) --no-print-directory reload-extension
+	@JOB_NAME=e2e-warren-smoke-$$(date +%Y%m%d%H%M%S); \
+	  echo "queueing $$JOB_NAME"; \
+	  capabilities/tools/rvbbit-capability deploy capabilities/manifests/smoke/warren-echo.yaml \
+	    --dsn '$(RVBBIT_DSN)' \
+	    --target '{"capability":true,"docker":true,"gpu":false}' \
+	    --job-name "$$JOB_NAME"; \
+	  cargo run -p warren-agent -- \
+	    --dsn '$(RVBBIT_DSN)' \
+	    --node 'e2e-warren-local' \
+	    --work-dir '.rvbbit/warren-e2e' \
+	    --docker-network '$(WARREN_DOCKER_NETWORK)' \
+	    --labels '{"capability":true,"docker":true,"gpu":false}' \
+	    --capacity '{"e2e":true}' \
+	    --metrics-ms 1000 \
+	    --once
+	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench -P pager=off -v ON_ERROR_STOP=1 \
+	  < docker/sql/e2e-warren-verify.sql
+
+reload-extension: ## Non-destructive extension reload/update; preserves KG/cache/router data
+	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 \
+	  -c "CREATE EXTENSION IF NOT EXISTS pg_rvbbit;" \
+	  -c "ALTER EXTENSION pg_rvbbit UPDATE;"
+
+bigfoot-load:    ## Load BFRO sightings CSV into rvbbit
+	$(COMPOSE) exec bench python /bench/bigfoot_bench.py load
+
+bigfoot-bench:   ## Benchmark the user-style semantic query (LIMIT=N to size; default 20)
+	$(COMPOSE) exec -e LIMIT=$${LIMIT:-20} bench python /bench/bigfoot_bench.py run
+
+# ---- GPU specialist sidecars ---------------------------------------------
+#
+# These are the "real model" backends — BGE-M3 embeddings, BGE reranker
+# (via Gradio), GLiNER (extract). They're profile-gated so a plain
+# `make up` won't pull them in. First boot downloads ~5-7GB of weights.
+
+gpu-up:          ## Start the GPU sidecars (embed / rerank / extract) + main stack
+	$(COMPOSE_SIDECARS) --profile models up -d --build
+
+gpu-down:        ## Stop the GPU sidecars (keeps the HF cache volume)
+	$(COMPOSE_SIDECARS) --profile models down
+
+gpu-status:      ## Show health of the GPU sidecars
+	@$(COMPOSE_SIDECARS) ps embed rerank extract 2>/dev/null || true
+	@echo "--- /health ---"
+	@for svc in embed:8091 rerank:8093/config extract:8094; do \
+	  printf "%-10s " $${svc%%:*}; \
+	  port=$$(echo $${svc#*:} | cut -d/ -f1); \
+	  curl -sS --max-time 2 http://localhost:$${port}/health 2>&1 || echo "down"; \
+	done
+
+register-specialists:  ## Register GPU specialists in rvbbit AND wire operators to use them (idempotent; replaces embed)
+	$(COMPOSE_SIDECARS) exec -T pg-rvbbit psql -U postgres -d bench \
+	  -v ON_ERROR_STOP=1 \
+	  < docker/sql/register-gpu-specialists.sql
+	@$(MAKE) --no-print-directory wire-specialists
+
+restore-local-embed:  ## Restore the default local CPU embed backend after GPU demos/tests
+	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench \
+	  -v ON_ERROR_STOP=1 \
+	  < docker/sql/register-local-embed.sql
+
+wire-specialists:  ## (Re)wire the LLM operators to route through the GPU specialists
+	$(COMPOSE_SIDECARS) exec -T pg-rvbbit psql -U postgres -d bench \
+	  -v ON_ERROR_STOP=1 \
+	  < docker/sql/wire-operators-to-specialists.sql
+
+bigfoot-demo:    ## Run the bigfoot demo (self-registers + wires specialists; only needs `make gpu-up` + `make bigfoot-load` first)
+	cat docker/sql/register-gpu-specialists.sql \
+	    docker/sql/wire-operators-to-specialists.sql \
+	    docker/sql/bigfoot-demo.sql \
+	  | $(COMPOSE_SIDECARS) exec -T pg-rvbbit psql -U postgres -d bench -P pager=off -v ON_ERROR_STOP=1
+
+bigfoot-kg-demo: ## Build/query a deterministic KG over BFRO observations (no GPU/LLM calls; needs `make bigfoot-load`)
+	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench \
+	  -P pager=off -v ON_ERROR_STOP=1 \
+	  < docker/sql/bigfoot-kg-demo.sql
+
+capabilities-list: ## List curated Rvbbit backend/operator capability manifests
+	capabilities/tools/rvbbit-capability list
+
+capability-render: ## Render a capability manifest (MANIFEST=capabilities/manifests/...)
+	@test -n "$${MANIFEST:-}" || (echo "set MANIFEST=capabilities/manifests/..." >&2; exit 2)
+	capabilities/tools/rvbbit-capability render "$${MANIFEST}"
+
+capability-catalog: ## Rebuild capabilities/catalog.json for UI browsing
+	capabilities/tools/rvbbit-capability catalog build --output capabilities/catalog.json
+
+capability-scaffold: ## Scaffold a capability (MANIFEST=... OUT=.rvbbit/capabilities/name)
+	@test -n "$${MANIFEST:-}" || (echo "set MANIFEST=capabilities/manifests/..." >&2; exit 2)
+	capabilities/tools/rvbbit-capability scaffold "$${MANIFEST}" "$${OUT:-.rvbbit/capabilities/$$(basename "$${MANIFEST%.*}")}" --force
+
+capability-install: ## Scaffold/run/register a capability (MANIFEST=..., optional GPU=1, RVBBIT_DSN=...)
+	@test -n "$${MANIFEST:-}" || (echo "set MANIFEST=capabilities/manifests/..." >&2; exit 2)
+	capabilities/tools/rvbbit-capability install "$${MANIFEST}" --force $${GPU:+--gpu}
+
+capability-deploy: ## Queue a capability for Warren (MANIFEST=..., optional TARGET='{"gpu":true}')
+	@test -n "$(MANIFEST)" || (echo "set MANIFEST=capabilities/manifests/..." >&2; exit 2)
+	capabilities/tools/rvbbit-capability deploy "$(MANIFEST)" \
+	  --dsn '$(RVBBIT_DSN)' \
+	  --target '$(if $(TARGET),$(TARGET),{})' \
+	  $(if $(JOB_NAME),--job-name '$(JOB_NAME)',)
+
+warren-agent: ## Run a local Warren deployment agent
+	cargo run -p warren-agent -- \
+	  --dsn '$(RVBBIT_DSN)' \
+	  --node '$(WARREN_NODE)' \
+	  --work-dir '$(WARREN_WORK_DIR)' \
+	  --docker-network '$(WARREN_DOCKER_NETWORK)' \
+	  --labels '$(WARREN_LABELS)' \
+	  --capacity '$(WARREN_CAPACITY)' \
+	  --metrics-ms '$(WARREN_METRICS_MS)'
+
+warren-once: ## Claim at most one Warren job, useful for smoke/debug
+	cargo run -p warren-agent -- \
+	  --dsn '$(RVBBIT_DSN)' \
+	  --node '$(WARREN_NODE)' \
+	  --work-dir '$(WARREN_WORK_DIR)' \
+	  --docker-network '$(WARREN_DOCKER_NETWORK)' \
+	  --labels '$(WARREN_LABELS)' \
+	  --capacity '$(WARREN_CAPACITY)' \
+	  --metrics-ms '$(WARREN_METRICS_MS)' \
+	  --once
+
+clean:           ## Remove built artifacts
+	cargo clean

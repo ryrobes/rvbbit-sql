@@ -1,0 +1,115 @@
+# Cross-database benchmark competitors.
+# Brought up alongside the main stack:
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/docker-compose.competitors.yml \
+#                  --profile bench up -d
+#
+# Profile-gated (`bench`) so a plain `up` doesn't drag these heavy
+# images in. Each system gets its own port + container name. All
+# share the same `bench-data` volume so the loaders can read parquet
+# from /data without re-downloading per system.
+
+services:
+  # Add /data to the bench container so the downloader writes where the
+  # competitor containers (each mounting the same dir at /data) can read it.
+  bench:
+    volumes:
+      - ../bench/columnar_comparison/data:/data
+
+  pg-baseline:
+    image: postgres:18
+    container_name: bench-pg-baseline
+    profiles: ["bench"]
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    ports:
+      - "5440:5432"
+    volumes:
+      - ../bench/columnar_comparison/data:/data:ro
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - work_mem=128MB
+      - -c
+      - max_parallel_workers_per_gather=4
+
+  citus:
+    image: citusdata/citus:13.0
+    container_name: bench-citus
+    profiles: ["bench"]
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    ports:
+      - "5441:5432"
+    volumes:
+      - ../bench/columnar_comparison/data:/data:ro
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - work_mem=128MB
+
+  hydra:
+    image: ghcr.io/hydradatabase/hydra:latest
+    container_name: bench-hydra
+    profiles: ["bench"]
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    ports:
+      - "5442:5432"
+    volumes:
+      - ../bench/columnar_comparison/data:/data:ro
+
+  alloydb-omni:
+    image: google/alloydbomni:latest
+    container_name: bench-alloydb
+    profiles: ["bench"]
+    environment:
+      POSTGRES_PASSWORD: bench
+    ports:
+      - "5443:5432"
+    # google_columnar_engine.enabled is POSTMASTER scope — only takes
+    # effect via a real restart, not pg_reload_conf. Append the GUCs
+    # via -c flags so they're set at startup. Without these AlloyDB
+    # runs heap-only and the bench numbers misrepresent it.
+    # shm_size: the columnar engine + shared_buffers want sizable
+    # SHM. Docker defaults to 64MB which causes "could not resize
+    # shared memory segment" on table refresh.
+    command:
+      - postgres
+      - -c
+      - google_columnar_engine.enabled=on
+      - -c
+      - google_columnar_engine.memory_size_in_mb=4096
+      - -c
+      - shared_buffers=2GB
+    shm_size: 6gb
+    volumes:
+      - ../bench/columnar_comparison/data:/data:ro
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.10
+    container_name: bench-clickhouse
+    profiles: ["bench"]
+    ports:
+      - "8123:8123"   # HTTP
+      - "9100:9000"   # native client (avoid colliding with pgrx 9000)
+    volumes:
+      # ClickHouse blocks file() reads outside user_files_path; mount our
+      # data there. The loader uses file('data/yellow*.parquet') with
+      # paths relative to user_files_path.
+      - ../bench/columnar_comparison/data:/var/lib/clickhouse/user_files/data:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # DuckDB is embedded — we run it inside the bench container.
+  # It doesn't need its own service; included here only as
+  # documentation that we're testing it.

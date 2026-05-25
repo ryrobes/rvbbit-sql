@@ -1,0 +1,22 @@
+[package]
+name = "rvbbit_duck"
+version = "0.30.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Rvbbit contributors"]
+
+[workspace]
+
+[[bin]]
+name = "rvbbit-duck"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+datafusion = "53.1.0"
+duckdb = { version = "1.10502.0", features = ["parquet"] }
+parquet = "58.3.0"
+postgres = "0.19"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }

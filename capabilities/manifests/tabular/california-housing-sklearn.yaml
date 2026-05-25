@@ -1,0 +1,38 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: california_housing_sklearn
+title: California Housing Regressor
+description: Scikit-learn tabular regression example that predicts median house value from California housing row features.
+license: unknown
+tags: [tabular, regression, prediction, row, sklearn, real-estate, demo]
+source:
+  provider: huggingface
+  model: B4S/california-housing-predictor
+  url: https://huggingface.co/B4S/california-housing-predictor
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: tabular_regression
+  device: cpu
+  env:
+    RVBBIT_CAPABILITY_EAGER: "0"
+    RVBBIT_TABULAR_MODEL_FILE: model.joblib
+    RVBBIT_TABULAR_CONFIG_FILE: config.json
+backend:
+  name: predict_california_housing_sklearn
+  transport: rvbbit
+  batch_size: 256
+  max_concurrent: 2
+  timeout_ms: 120000
+  description: Scikit-learn California housing regression demo model.
+operators:
+  - name: predict_house_value
+    description: Predict median house value from a JSONB row of California housing features.
+    arg_names: [row]
+    arg_types: [jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      row: "{{ inputs.row }}"
+smoke:
+  inputs:
+    - row: '{"MedInc":8.3252,"HouseAge":41.0,"AveRooms":6.984127,"AveBedrms":1.02381,"Population":322.0,"AveOccup":2.555556,"Latitude":37.88,"Longitude":-122.23}'

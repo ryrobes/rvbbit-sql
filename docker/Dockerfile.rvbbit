@@ -1,0 +1,83 @@
+# Build stage: install Rust, cargo-pgrx, and compile the extension
+# against system PG18 headers from the postgres:18 image.
+FROM postgres:18 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        curl \
+        git \
+        libclang-dev \
+        libssl-dev \
+        pkg-config \
+        postgresql-server-dev-18 \
+        zstd libzstd-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain (stable). Pinned to keep CI reproducible; bump as needed.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain 1.95.0 --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# cargo-pgrx must match the pgrx crate version (=0.18.0).
+RUN cargo install --locked cargo-pgrx --version 0.18.0
+
+# Tell pgrx to use the system PG18 rather than building its own copy.
+RUN cargo pgrx init --pg18 $(which pg_config)
+
+WORKDIR /build
+# Copy in dependency manifests first so the heavy crate-graph download/compile
+# is cached separately from source changes.
+COPY Cargo.toml Cargo.lock* rust-toolchain.toml ./
+COPY crates/pg_rvbbit/Cargo.toml crates/pg_rvbbit/Cargo.toml
+COPY crates/pg_rvbbit/pg_rvbbit.control crates/pg_rvbbit/
+COPY crates/rvbbit_storage/Cargo.toml crates/rvbbit_storage/Cargo.toml
+COPY warren/agent/Cargo.toml warren/agent/Cargo.toml
+# Stub src/ files so the workspace resolves before we drop in real sources.
+RUN mkdir -p crates/pg_rvbbit/src crates/rvbbit_storage/src warren/agent/src \
+    && echo 'fn _stub() {}' > crates/rvbbit_storage/src/lib.rs \
+    && echo 'use pgrx::prelude::*; ::pgrx::pg_module_magic!();' > crates/pg_rvbbit/src/lib.rs \
+    && echo 'fn main() {}' > warren/agent/src/main.rs \
+    && cargo fetch
+
+# Now the real sources.
+COPY crates/ crates/
+
+# Build and install into the system PG extension dir. The target/ cache
+# mount persists the compiled crate graph across rebuilds, so iterating on
+# extension source only recompiles the changed crates (minutes -> seconds).
+RUN --mount=type=cache,target=/build/target \
+    cargo pgrx install --release --pg-config $(which pg_config)
+
+# Backend Duck routing uses a small native Rust sidecar from inside the
+# PostgreSQL container. It is guarded by the router and optional at runtime,
+# but installing it here makes normal Rvbbit backends capable by default.
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/build/crates/rvbbit_duck/target \
+    cargo build --release --locked --manifest-path crates/rvbbit_duck/Cargo.toml \
+    && cp crates/rvbbit_duck/target/release/rvbbit-duck /build/rvbbit-duck
+
+# Runtime stage: clean PG18 image with the extension files dropped in.
+FROM postgres:18
+
+# zstd runtime (compression library used by parquet writes)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libzstd1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/share/postgresql/18/extension/pg_rvbbit* \
+        /usr/share/postgresql/18/extension/
+COPY --from=builder /usr/lib/postgresql/18/lib/pg_rvbbit* \
+        /usr/lib/postgresql/18/lib/
+COPY --from=builder /build/rvbbit-duck /usr/local/bin/rvbbit-duck
+
+# Pre-load extension on first boot.
+COPY docker/init/ /docker-entrypoint-initdb.d/
+
+# Tell PG to preload our shared lib so background workers / TAM hooks can
+# register at startup. Phase 0 doesn't strictly need this but it's harmless
+# and we'll need it from Phase 1 on.
+RUN echo "shared_preload_libraries = 'pg_rvbbit'" \
+        >> /usr/share/postgresql/postgresql.conf.sample

@@ -1,0 +1,214 @@
+# Opt-in sidecar containers. Bring up alongside the main stack with:
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/docker-compose.sidecars.yml up -d echo
+#
+# Each sidecar lives in sidecars/<name>/ as its own self-contained
+# image — no shared base, no model registry, no orchestration magic.
+# Adding a sidecar = adding a service block here + a sidecars/<name>/
+# directory with Dockerfile, main.py, requirements.txt.
+
+services:
+  # Tiny deterministic sidecar — no model. Used by tests + as a copy-paste
+  # template for users authoring their own rvbbit-transport specialists.
+  echo:
+    build:
+      context: ../sidecars/echo
+    container_name: rvbbit-echo
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  # Real Gradio app for the gradio transport. Same upper/reverse contract
+  # as `echo` but exposed through gr.Interface + the sync /api/predict
+  # endpoint. Mirrors what an HF Space would offer.
+  echo-gradio:
+    build:
+      context: ../sidecars/echo-gradio
+    container_name: rvbbit-echo-gradio
+    ports:
+      - "8082:7860"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7860/config').read()"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  # GPU-friendly sentence embeddings — BAAI/bge-m3 by default (1024-dim
+  # multilingual, ~2GB FP16). Set EMBED_MODEL=BAAI/bge-small-en-v1.5 if
+  # you want the older CPU-sized 384-dim model. The container will fall
+  # back to CPU automatically if no GPU is mapped in.
+  #
+  # Uses the NATIVE rvbbit transport (POST /predict {inputs:[...]}).
+  # Pair with the `rerank` sidecar below to see Gradio + native running
+  # side-by-side.
+  embed:
+    build:
+      context: ../sidecars/embed
+    container_name: rvbbit-embed
+    profiles: ["models"]
+    ports:
+      - "8091:8080"
+    environment:
+      EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-m3}
+      EMBED_EAGER: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    # First-call model load can take ~30s for bge-m3 on first download
+    # (~2GB). Give the healthcheck plenty of slack.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+
+  # GPU reranker — BAAI/bge-reranker-v2-m3 cross-encoder, exposed via
+  # GRADIO. Powers rvbbit.score / rvbbit.about + the criterion mode of
+  # rvbbit.outliers. Mounted at / so the Gradio queue + /api/predict
+  # endpoint behave like a real HF Space.
+  rerank:
+    build:
+      context: ../sidecars/rerank
+    container_name: rvbbit-rerank
+    profiles: ["models"]
+    ports:
+      - "8093:7860"
+    environment:
+      RERANK_MODEL: ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+      RERANK_EAGER: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7860/config').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+
+  # GPU NLI — deberta-v3-large-zeroshot-v2.0. ONE container, THREE
+  # rvbbit specialists pointed at three endpoints:
+  #   /classify    -- zero-shot label argmax (sentiment, classify)
+  #   /entails     -- premise-entails-hypothesis  (supports, implies)
+  #   /contradicts -- premise-contradicts-hypothesis  (contradicts)
+  # Replaces five separate LLM round-trips with one local forward pass.
+  nli:
+    build:
+      context: ../sidecars/nli
+    container_name: rvbbit-nli
+    profiles: ["models"]
+    ports:
+      - "8095:8080"
+    environment:
+      NLI_MODEL: ${NLI_MODEL:-MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli}
+      NLI_EAGER: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 180s
+
+  # GPU GLiNER — zero-shot NER with arbitrary descriptive labels.
+  # Powers rvbbit.extract. Native rvbbit transport (batched).
+  extract:
+    build:
+      context: ../sidecars/extract
+    container_name: rvbbit-extract
+    profiles: ["models"]
+    ports:
+      - "8094:8080"
+    environment:
+      EXTRACT_MODEL: ${EXTRACT_MODEL:-urchade/gliner_medium-v2.1}
+      EXTRACT_EAGER: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+
+  # Sentiment classifier — DistilBERT SST-2. Lazy model load on first
+  # request (~268MB). Profile-gated so a plain `up` doesn't try to
+  # build the heavy image when you just want the echo sidecars.
+  sentiment:
+    build:
+      context: ../sidecars/sentiment
+    container_name: rvbbit-sentiment
+    profiles: ["models"]
+    ports:
+      - "8090:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  # Zero-shot classifier — cross-encoder NLI. ~280MB, lazy. Profile-gated.
+  classify:
+    build:
+      context: ../sidecars/classify
+    container_name: rvbbit-classify
+    profiles: ["models"]
+    ports:
+      - "8092:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  # OpenAI-shaped /v1/embeddings mock — deterministic vectors, no model.
+  # Use this URL when developing; swap to http://ollama:11434/v1/embeddings
+  # (or another OpenAI-compatible target) when you want real embeddings.
+  echo-openai-embed:
+    build:
+      context: ../sidecars/echo-openai-embed
+    container_name: rvbbit-echo-openai-embed
+    ports:
+      - "8083:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+# Shared HuggingFace cache so the heavy model weights only download once
+# and survive container rebuilds.
+volumes:
+  hf_cache:

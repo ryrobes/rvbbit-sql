@@ -1,0 +1,474 @@
+
+[1;36m== configuration[0m
+   limit       : 100000
+   systems     : rvbbit,hydra,citus,alloydb
+   repeats     : 3
+   timeout/q   : 300s
+   report file : bench/clickbench/results/clickbench_100000_20260523T060827Z.txt
+
+[1;36m== hits.parquet present: 14G[0m
+
+[1;36m== starting competitor containers (profile=bench)[0m
+
+[1;36m== resetting pg_rvbbit extension (drops prior 'hits' table)[0m
+DROP EXTENSION
+SET
+DROP SCHEMA
+CREATE SCHEMA
+CREATE EXTENSION
+
+[1;36m== loading Rvbbit route profile[0m
+{
+  "action": "imported",
+  "active": true,
+  "profile": "bench-combined",
+  "stored_entries": 140,
+  "stored_points": 260
+}
+
+[1;36m== loading 100000 rows into [rvbbit,hydra,citus,alloydb][0m
+
+>>> loading rvbbit (limit=100000) ...
+
+>>> loading hydra (limit=100000) ...
+
+>>> loading citus (limit=100000) ...
+
+>>> loading alloydb (limit=100000) ...
+
+
+=== ClickBench load summary ===
+system                   rows  load+post (s)   wall (s)         size   status
+------------------------------------------------------------------------------------------
+rvbbit                100,000           12.9       13.1     100.5 MB   ok
+hydra                 100,000            5.5        5.6       8.0 MB   ok
+citus                 100,000            5.5        5.7       8.0 MB   ok
+alloydb               100,000            6.0        6.2      77.0 MB   ok
+
+[1;36m== running queries[0m
+
+=== ClickBench query bench (3 runs, median, 300s timeout) ===
+systems: ['rvbbit', 'hydra', 'citus', 'alloydb']
+
+-> Q0: count(*)
+     rvbbit              791µs    (wall 0.0s)
+     hydra                 2ms    (wall 0.0s)
+     citus                 3ms    (wall 0.0s)
+     alloydb             659µs    (wall 0.0s)
+
+-> Q1: count(*) with filter
+     rvbbit                5ms    (wall 0.0s)
+     hydra                 2ms    (wall 0.0s)
+     citus                 3ms    (wall 0.0s)
+     alloydb             175µs    (wall 0.0s)
+
+-> Q2: sum/count/avg over big table
+     rvbbit                6ms    (wall 0.1s)
+     hydra                 4ms    (wall 0.0s)
+     citus                 6ms    (wall 0.0s)
+     alloydb             944µs    (wall 0.0s)
+
+-> Q3: avg(UserID)
+     rvbbit                5ms    (wall 0.0s)
+     hydra                 4ms    (wall 0.0s)
+     citus                 4ms    (wall 0.0s)
+     alloydb             820µs    (wall 0.0s)
+
+-> Q4: count distinct UserID
+     rvbbit                7ms    (wall 0.1s)
+     hydra                 9ms    (wall 0.0s)
+     citus                 9ms    (wall 0.0s)
+     alloydb              13ms    (wall 0.0s)
+
+-> Q5: count distinct SearchPhrase
+     rvbbit                7ms    (wall 0.1s)
+     hydra                30ms    (wall 0.1s)
+     citus                24ms    (wall 0.1s)
+     alloydb              19ms    (wall 0.1s)
+
+-> Q6: min/max EventDate
+     rvbbit                1ms    (wall 0.0s)
+     hydra                 3ms    (wall 0.0s)
+     citus                 5ms    (wall 0.0s)
+     alloydb             760µs    (wall 0.0s)
+
+-> Q7: AdvEngineID group + filter
+     rvbbit                5ms    (wall 0.0s)
+     hydra                 2ms    (wall 0.0s)
+     citus                 3ms    (wall 0.0s)
+     alloydb             274µs    (wall 0.0s)
+
+-> Q8: RegionID top 10 unique users
+     rvbbit               10ms    (wall 0.1s)
+     hydra                25ms    (wall 0.1s)
+     citus                22ms    (wall 0.1s)
+     alloydb              27ms    (wall 0.1s)
+
+-> Q9: RegionID rollup
+     rvbbit               11ms    (wall 0.1s)
+     hydra                29ms    (wall 0.1s)
+     citus                29ms    (wall 0.1s)
+     alloydb              31ms    (wall 0.1s)
+
+-> Q10: MobilePhoneModel filter+groupby
+     rvbbit                7ms    (wall 0.1s)
+     hydra                 5ms    (wall 0.0s)
+     citus                 6ms    (wall 0.0s)
+     alloydb               1ms    (wall 0.0s)
+
+-> Q11: MobilePhone+Model groupby
+     rvbbit                7ms    (wall 0.1s)
+     hydra                 6ms    (wall 0.0s)
+     citus                 6ms    (wall 0.0s)
+     alloydb               1ms    (wall 0.0s)
+
+-> Q12: SearchPhrase top 10 count
+     rvbbit                7ms    (wall 0.1s)
+     hydra                 7ms    (wall 0.0s)
+     citus                 8ms    (wall 0.0s)
+     alloydb               2ms    (wall 0.0s)
+
+-> Q13: SearchPhrase top 10 unique users
+     rvbbit                9ms    (wall 0.1s)
+     hydra                23ms    (wall 0.1s)
+     citus                23ms    (wall 0.1s)
+     alloydb               9ms    (wall 0.0s)
+
+-> Q14: SearchEngineID+Phrase top 10
+     rvbbit                8ms    (wall 0.1s)
+     hydra                 8ms    (wall 0.0s)
+     citus                 8ms    (wall 0.0s)
+     alloydb               2ms    (wall 0.0s)
+
+-> Q15: UserID top 10
+     rvbbit                6ms    (wall 0.0s)
+     hydra                11ms    (wall 0.0s)
+     citus                10ms    (wall 0.0s)
+     alloydb               3ms    (wall 0.0s)
+
+-> Q16: UserID+SearchPhrase ordered top 10
+     rvbbit                8ms    (wall 0.1s)
+     hydra                16ms    (wall 0.1s)
+     citus                16ms    (wall 0.1s)
+     alloydb               5ms    (wall 0.0s)
+
+-> Q17: UserID+SearchPhrase any 10
+     rvbbit                4ms    (wall 0.0s)
+     hydra                14ms    (wall 0.0s)
+     citus                15ms    (wall 0.1s)
+     alloydb               5ms    (wall 0.0s)
+
+-> Q18: UserID+minute+SearchPhrase groupby
+     rvbbit               12ms    (wall 0.1s)
+     hydra                39ms    (wall 0.1s)
+     citus                36ms    (wall 0.1s)
+     alloydb              40ms    (wall 0.1s)
+
+-> Q19: UserID point lookup
+     rvbbit                5ms    (wall 0.0s)
+     hydra               791µs    (wall 0.0s)
+     citus               977µs    (wall 0.0s)
+     alloydb             170µs    (wall 0.0s)
+
+-> Q20: LIKE URL %google%
+     rvbbit                9ms    (wall 0.1s)
+     hydra                14ms    (wall 0.0s)
+     citus                16ms    (wall 0.1s)
+     alloydb               2ms    (wall 0.0s)
+
+-> Q21: LIKE URL + SearchPhrase top 10
+     rvbbit                3ms    (wall 0.0s)
+     hydra                15ms    (wall 0.1s)
+     citus                17ms    (wall 0.1s)
+     alloydb               2ms    (wall 0.0s)
+
+-> Q22: LIKE Title + URL NOT LIKE rollup
+     rvbbit                3ms    (wall 0.0s)
+     hydra                49ms    (wall 0.2s)
+     citus                56ms    (wall 0.2s)
+     alloydb               8ms    (wall 0.0s)
+
+-> Q23: SELECT * filter LIKE
+     rvbbit               10ms    (wall 0.0s)
+     hydra               130ms    (wall 0.4s)
+     citus               115ms    (wall 0.4s)
+     alloydb               2ms    (wall 0.0s)
+
+-> Q24: SearchPhrase order by EventTime
+     rvbbit                4ms    (wall 0.0s)
+     hydra                 7ms    (wall 0.0s)
+     citus                 7ms    (wall 0.0s)
+     alloydb             761µs    (wall 0.0s)
+
+-> Q25: SearchPhrase order by SearchPhrase
+     rvbbit                3ms    (wall 0.0s)
+     hydra                 6ms    (wall 0.0s)
+     citus                 5ms    (wall 0.0s)
+     alloydb               2ms    (wall 0.0s)
+
+-> Q26: SearchPhrase order EventTime+Phrase
+     rvbbit                4ms    (wall 0.0s)
+     hydra                 7ms    (wall 0.0s)
+     citus                 7ms    (wall 0.0s)
+     alloydb             740µs    (wall 0.0s)
+
+-> Q27: CounterID avg URL length
+     rvbbit               13ms    (wall 0.1s)
+     hydra                24ms    (wall 0.1s)
+     citus                26ms    (wall 0.1s)
+     alloydb              11ms    (wall 0.0s)
+
+-> Q28: regex_replace Referer
+     rvbbit               13ms    (wall 0.1s)
+     hydra               452ms    (wall 1.4s)
+     citus               376ms    (wall 1.1s)
+     alloydb             447ms    (wall 1.3s)
+
+-> Q29: 90 sum exprs (wide tlist)
+     rvbbit                1ms    (wall 0.0s)
+     hydra                79ms    (wall 0.2s)
+     citus                74ms    (wall 0.2s)
+     alloydb              18ms    (wall 0.1s)
+
+-> Q30: SearchEngineID+ClientIP rollup
+     rvbbit                9ms    (wall 0.1s)
+     hydra                11ms    (wall 0.0s)
+     citus                11ms    (wall 0.0s)
+     alloydb               3ms    (wall 0.0s)
+
+-> Q31: WatchID+ClientIP rollup (filtered)
+     rvbbit               10ms    (wall 0.1s)
+     hydra                14ms    (wall 0.1s)
+     citus                14ms    (wall 0.1s)
+     alloydb               8ms    (wall 0.0s)
+
+-> Q32: WatchID+ClientIP rollup (full)
+     rvbbit               10ms    (wall 0.1s)
+     hydra                63ms    (wall 0.2s)
+     citus                60ms    (wall 0.2s)
+     alloydb              66ms    (wall 0.2s)
+
+-> Q33: URL top 10
+     rvbbit               11ms    (wall 0.1s)
+     hydra                24ms    (wall 0.1s)
+     citus                27ms    (wall 0.1s)
+     alloydb              11ms    (wall 0.0s)
+
+-> Q34: literal 1 + URL top 10
+     rvbbit               17ms    (wall 0.1s)
+     hydra                28ms    (wall 0.1s)
+     citus                29ms    (wall 0.1s)
+     alloydb              13ms    (wall 0.0s)
+
+-> Q35: ClientIP+N rollups
+     rvbbit                2ms    (wall 0.0s)
+     hydra                16ms    (wall 0.1s)
+     citus                15ms    (wall 0.1s)
+     alloydb              25ms    (wall 0.1s)
+
+-> Q36: selective filter date range
+     rvbbit                6ms    (wall 0.0s)
+     hydra               781µs    (wall 0.0s)
+     citus               501µs    (wall 0.0s)
+     alloydb             188µs    (wall 0.0s)
+
+-> Q37: Title selective filter
+     rvbbit                6ms    (wall 0.1s)
+     hydra               847µs    (wall 0.0s)
+     citus               541µs    (wall 0.0s)
+     alloydb             233µs    (wall 0.0s)
+
+-> Q38: URL link clicks offset 1000
+     rvbbit                5ms    (wall 0.0s)
+     hydra               865µs    (wall 0.0s)
+     citus               474µs    (wall 0.0s)
+     alloydb             218µs    (wall 0.0s)
+
+-> Q39: Src/Dst rollup
+     rvbbit                6ms    (wall 0.1s)
+     hydra               778µs    (wall 0.0s)
+     citus               472µs    (wall 0.0s)
+     alloydb               9ms    (wall 0.0s)
+
+-> Q40: URLHash+EventDate IN filter
+     rvbbit                6ms    (wall 0.1s)
+     hydra               748µs    (wall 0.0s)
+     citus               619µs    (wall 0.0s)
+     alloydb             207µs    (wall 0.0s)
+
+-> Q41: WindowClientWidth+Height filter
+     rvbbit                6ms    (wall 0.1s)
+     hydra               794µs    (wall 0.0s)
+     citus               548µs    (wall 0.0s)
+     alloydb             229µs    (wall 0.0s)
+
+-> Q42: DATE_TRUNC minute groupby
+     rvbbit                6ms    (wall 0.1s)
+     hydra               753µs    (wall 0.0s)
+     citus               782µs    (wall 0.0s)
+     alloydb             284µs    (wall 0.0s)
+
+
+=== markdown summary ===
+
+| Query | rvbbit | hydra | citus | alloydb |
+|---|---|---|---|---|
+| Q0 | 791µs | 2ms | 3ms | 659µs |
+| Q1 | 5ms | 2ms | 3ms | 175µs |
+| Q2 | 6ms | 4ms | 6ms | 944µs |
+| Q3 | 5ms | 4ms | 4ms | 820µs |
+| Q4 | 7ms | 9ms | 9ms | 13ms |
+| Q5 | 7ms | 30ms | 24ms | 19ms |
+| Q6 | 1ms | 3ms | 5ms | 760µs |
+| Q7 | 5ms | 2ms | 3ms | 274µs |
+| Q8 | 10ms | 25ms | 22ms | 27ms |
+| Q9 | 11ms | 29ms | 29ms | 31ms |
+| Q10 | 7ms | 5ms | 6ms | 1ms |
+| Q11 | 7ms | 6ms | 6ms | 1ms |
+| Q12 | 7ms | 7ms | 8ms | 2ms |
+| Q13 | 9ms | 23ms | 23ms | 9ms |
+| Q14 | 8ms | 8ms | 8ms | 2ms |
+| Q15 | 6ms | 11ms | 10ms | 3ms |
+| Q16 | 8ms | 16ms | 16ms | 5ms |
+| Q17 | 4ms | 14ms | 15ms | 5ms |
+| Q18 | 12ms | 39ms | 36ms | 40ms |
+| Q19 | 5ms | 791µs | 977µs | 170µs |
+| Q20 | 9ms | 14ms | 16ms | 2ms |
+| Q21 | 3ms | 15ms | 17ms | 2ms |
+| Q22 | 3ms | 49ms | 56ms | 8ms |
+| Q23 | 10ms | 130ms | 115ms | 2ms |
+| Q24 | 4ms | 7ms | 7ms | 761µs |
+| Q25 | 3ms | 6ms | 5ms | 2ms |
+| Q26 | 4ms | 7ms | 7ms | 740µs |
+| Q27 | 13ms | 24ms | 26ms | 11ms |
+| Q28 | 13ms | 452ms | 376ms | 447ms |
+| Q29 | 1ms | 79ms | 74ms | 18ms |
+| Q30 | 9ms | 11ms | 11ms | 3ms |
+| Q31 | 10ms | 14ms | 14ms | 8ms |
+| Q32 | 10ms | 63ms | 60ms | 66ms |
+| Q33 | 11ms | 24ms | 27ms | 11ms |
+| Q34 | 17ms | 28ms | 29ms | 13ms |
+| Q35 | 2ms | 16ms | 15ms | 25ms |
+| Q36 | 6ms | 781µs | 501µs | 188µs |
+| Q37 | 6ms | 847µs | 541µs | 233µs |
+| Q38 | 5ms | 865µs | 474µs | 218µs |
+| Q39 | 6ms | 778µs | 472µs | 9ms |
+| Q40 | 6ms | 748µs | 619µs | 207µs |
+| Q41 | 6ms | 794µs | 548µs | 229µs |
+| Q42 | 6ms | 753µs | 782µs | 284µs |
+
+results JSON: /bench/clickbench/results/last_run.json
+
+[1;36m== formatting report[0m
+
+[1m=== ClickBench results — 3 runs, median ===[0m
+[2m   systems: rvbbit, hydra, citus, alloydb[0m
+[2m   queries: 43  (best per-row in green, FAIL in red)[0m
+
+╭─────────┬─────────────────────────────────────┬──────────┬─────────┬─────────┬───────────╮
+│   Query │                         Description │   rvbbit │   hydra │   citus │   alloydb │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│      [1mQ0[0m │                            [2mcount(*)[0m │    791µs │     2ms │     3ms │     [1;32m659µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│      [1mQ1[0m │                [2mcount(*) with filter[0m │      5ms │     2ms │     3ms │     [1;32m175µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│      [1mQ2[0m │        [2msum/count/avg over big table[0m │      6ms │     4ms │     6ms │     [1;32m944µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│      [1mQ3[0m │                         [2mavg(UserID)[0m │      5ms │     4ms │     4ms │     [1;32m820µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│      [1mQ4[0m │               [2mcount distinct UserID[0m │      [1;32m7ms[0m │     9ms │     9ms │      13ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│      [1mQ5[0m │         [2mcount distinct SearchPhrase[0m │      [1;32m7ms[0m │    30ms │    24ms │      19ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│      [1mQ6[0m │                   [2mmin/max EventDate[0m │      1ms │     3ms │     5ms │     [1;32m760µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│      [1mQ7[0m │          [2mAdvEngineID group + filter[0m │      5ms │     2ms │     3ms │     [1;32m274µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│      [1mQ8[0m │        [2mRegionID top 10 unique users[0m │     [1;32m10ms[0m │    25ms │    22ms │      27ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│      [1mQ9[0m │                     [2mRegionID rollup[0m │     [1;32m11ms[0m │    29ms │    29ms │      31ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ10[0m │     [2mMobilePhoneModel filter+groupby[0m │      7ms │     5ms │     6ms │       [1;32m1ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ11[0m │           [2mMobilePhone+Model groupby[0m │      7ms │     6ms │     6ms │       [1;32m1ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ12[0m │           [2mSearchPhrase top 10 count[0m │      7ms │     7ms │     8ms │       [1;32m2ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ13[0m │    [2mSearchPhrase top 10 unique users[0m │      [1;32m9ms[0m │    23ms │    23ms │       9ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ14[0m │        [2mSearchEngineID+Phrase top 10[0m │      8ms │     8ms │     8ms │       [1;32m2ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ15[0m │                       [2mUserID top 10[0m │      6ms │    11ms │    10ms │       [1;32m3ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ16[0m │  [2mUserID+SearchPhrase ordered top 10[0m │      8ms │    16ms │    16ms │       [1;32m5ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ17[0m │          [2mUserID+SearchPhrase any 10[0m │      [1;32m4ms[0m │    14ms │    15ms │       5ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ18[0m │  [2mUserID+minute+SearchPhrase groupby[0m │     [1;32m12ms[0m │    39ms │    36ms │      40ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ19[0m │                 [2mUserID point lookup[0m │      5ms │   791µs │   977µs │     [1;32m170µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ20[0m │                   [2mLIKE URL %google%[0m │      9ms │    14ms │    16ms │       [1;32m2ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ21[0m │      [2mLIKE URL + SearchPhrase top 10[0m │      3ms │    15ms │    17ms │       [1;32m2ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ22[0m │    [2mLIKE Title + URL NOT LIKE rollup[0m │      [1;32m3ms[0m │    49ms │    56ms │       8ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ23[0m │                [2mSELECT * filter LIKE[0m │     10ms │   130ms │   115ms │       [1;32m2ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ24[0m │     [2mSearchPhrase order by EventTime[0m │      4ms │     7ms │     7ms │     [1;32m761µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ25[0m │  [2mSearchPhrase order by SearchPhrase[0m │      3ms │     6ms │     5ms │       [1;32m2ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ26[0m │ [2mSearchPhrase order EventTime+Phrase[0m │      4ms │     7ms │     7ms │     [1;32m740µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ27[0m │            [2mCounterID avg URL length[0m │     13ms │    24ms │    26ms │      [1;32m11ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ28[0m │               [2mregex_replace Referer[0m │     [1;32m13ms[0m │   452ms │   376ms │     447ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ29[0m │           [2m90 sum exprs (wide tlist)[0m │      [1;32m1ms[0m │    79ms │    74ms │      18ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ30[0m │      [2mSearchEngineID+ClientIP rollup[0m │      9ms │    11ms │    11ms │       [1;32m3ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ31[0m │  [2mWatchID+ClientIP rollup (filtered)[0m │     10ms │    14ms │    14ms │       [1;32m8ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ32[0m │      [2mWatchID+ClientIP rollup (full)[0m │     [1;32m10ms[0m │    63ms │    60ms │      66ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ33[0m │                          [2mURL top 10[0m │     [1;32m11ms[0m │    24ms │    27ms │      11ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ34[0m │              [2mliteral 1 + URL top 10[0m │     17ms │    28ms │    29ms │      [1;32m13ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ35[0m │                  [2mClientIP+N rollups[0m │      [1;32m2ms[0m │    16ms │    15ms │      25ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ36[0m │         [2mselective filter date range[0m │      6ms │   781µs │   501µs │     [1;32m188µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ37[0m │              [2mTitle selective filter[0m │      6ms │   847µs │   541µs │     [1;32m233µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ38[0m │         [2mURL link clicks offset 1000[0m │      5ms │   865µs │   474µs │     [1;32m218µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ39[0m │                      [2mSrc/Dst rollup[0m │      6ms │   778µs │   [1;32m472µs[0m │       9ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ40[0m │         [2mURLHash+EventDate IN filter[0m │      6ms │   748µs │   619µs │     [1;32m207µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ41[0m │     [2mWindowClientWidth+Height filter[0m │      6ms │   794µs │   548µs │     [1;32m229µs[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│     [1mQ42[0m │           [2mDATE_TRUNC minute groupby[0m │      6ms │   753µs │   782µs │     [1;32m284µs[0m │
+╰─────────┴─────────────────────────────────────┴──────────┴─────────┴─────────┴───────────╯
+
+[1m=== summary ===[0m
+
+╭────────────────────┬──────────┬─────────┬─────────┬───────────╮
+│             Metric │   rvbbit │   hydra │   citus │   alloydb │
+├────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│       [1mgeomean (ms)[0m │      6ms │     8ms │     8ms │       3ms │
+├────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│ [1msum of medians (s)[0m │     0.3s │    1.2s │    1.1s │      0.8s │
+├────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│ [1mwins (best of row)[0m │       13 │       0 │       1 │        [1;32m29[0m │
+├────────────────────┼──────────┼─────────┼─────────┼───────────┤
+│           [1mfailures[0m │        0 │       0 │       0 │         0 │
+╰────────────────────┴──────────┴─────────┴─────────┴───────────╯
+
+
+[1;36m== report saved to bench/clickbench/results/clickbench_100000_20260523T060827Z.txt[0m
+raw JSON at bench/clickbench/results/last_run.json

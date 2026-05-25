@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Offline ClickBench runner — single entry point.
+#
+# Brings up every competitor container, downloads hits.parquet if
+# missing, loads each system at the requested scale, runs all 43
+# queries, and prints a colored grid.
+#
+# Usage:
+#   ./bench/clickbench/run_offline.sh                       # default: 10M rows, all systems
+#   BENCH_LIMIT=100000000 ./bench/clickbench/run_offline.sh # full 100M
+#   BENCH_SYSTEMS=rvbbit,duckdb,clickhouse \                # subset
+#     ./bench/clickbench/run_offline.sh
+#   BENCH_QUERIES=Q0,Q1,Q7 ./bench/clickbench/run_offline.sh # subset
+#   SKIP_LOAD=1 ./bench/clickbench/run_offline.sh           # reuse existing data
+#   SKIP_DOWNLOAD=1 ./bench/clickbench/run_offline.sh       # assume parquet exists
+#   RVBBIT_RESET_EXTENSION=1 ./bench/clickbench/run_offline.sh
+#                                                            # destructive reset of rvbbit system/catalog data
+#   RVBBIT_LOAD_ROUTE_PROFILE=1 ./bench/clickbench/run_offline.sh
+#                                                            # import bench/rvbbit_route_profile.json
+#   BENCH_SYSTEMS=rvbbit,rvbbit_native,rvbbit_duck_forced ./bench/clickbench/run_offline.sh
+#   RVBBIT_DUCK_HOT_VALIDATE=1 BENCH_SYSTEMS=rvbbit,rvbbit_native ./bench/clickbench/run_offline.sh
+#
+# Flags:
+#   --reset-rvbbit-extension  same as RVBBIT_RESET_EXTENSION=1
+#   --load-route-profile      same as RVBBIT_LOAD_ROUTE_PROFILE=1
+#   --skip-load               same as SKIP_LOAD=1
+#   --skip-download           same as SKIP_DOWNLOAD=1
+#
+# Run from the repo root (./rvbbit/).
+
+set -euo pipefail
+
+# ---- Resolve paths ----------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${REPO_ROOT}"
+
+COMPOSE="docker compose -f docker/docker-compose.yml -f docker/docker-compose.competitors.yml"
+DATA_DIR="bench/columnar_comparison/data"
+HITS_URL="https://datasets.clickhouse.com/hits_compatible/hits.parquet"
+HITS="${DATA_DIR}/hits.parquet"
+
+LIMIT="${BENCH_LIMIT:-10000000}"
+SYSTEMS="${BENCH_SYSTEMS:-rvbbit,duckdb,clickhouse,pg_baseline,citus,hydra,alloydb}"
+QUERIES_ENV=()
+[ -n "${BENCH_QUERIES:-}" ] && QUERIES_ENV=(-e "BENCH_QUERIES=${BENCH_QUERIES}")
+DUCK_HOT_ENV=()
+[ -n "${RVBBIT_DUCK_HOT_DEBUG:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_DUCK_HOT_DEBUG=${RVBBIT_DUCK_HOT_DEBUG}")
+[ -n "${RVBBIT_DUCK_HOT_VALIDATE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_DUCK_HOT_VALIDATE=${RVBBIT_DUCK_HOT_VALIDATE}")
+[ -n "${RVBBIT_DUCK_HOT_MODE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_DUCK_HOT_MODE=${RVBBIT_DUCK_HOT_MODE}")
+[ -n "${RVBBIT_ROUTE_PROFILE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_PROFILE=${RVBBIT_ROUTE_PROFILE}")
+[ -n "${RVBBIT_ROUTE_TRACE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_TRACE=${RVBBIT_ROUTE_TRACE}")
+[ -n "${RVBBIT_ROUTE_LOG:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_LOG=${RVBBIT_ROUTE_LOG}")
+[ -n "${RVBBIT_ROUTE_PROFILE_MIN_CONFIDENCE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_PROFILE_MIN_CONFIDENCE=${RVBBIT_ROUTE_PROFILE_MIN_CONFIDENCE}")
+[ -n "${RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE=${RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE}")
+[ -n "${RVBBIT_ROUTE_DUCK_VECTOR:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DUCK_VECTOR=${RVBBIT_ROUTE_DUCK_VECTOR}")
+[ -n "${RVBBIT_ROUTE_DUCK_HIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DUCK_HIVE=${RVBBIT_ROUTE_DUCK_HIVE}")
+[ -n "${RVBBIT_ROUTE_DATAFUSION_VECTOR:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_VECTOR=${RVBBIT_ROUTE_DATAFUSION_VECTOR}")
+[ -n "${RVBBIT_ROUTE_DATAFUSION_HIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_HIVE=${RVBBIT_ROUTE_DATAFUSION_HIVE}")
+[ -n "${RVBBIT_ROUTE_HIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_HIVE=${RVBBIT_ROUTE_HIVE}")
+[ -n "${RVBBIT_ROUTE_PG_ROWSTORE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_PG_ROWSTORE=${RVBBIT_ROUTE_PG_ROWSTORE}")
+[ -n "${RVBBIT_ROUTE_RVBBIT_NATIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_RVBBIT_NATIVE=${RVBBIT_ROUTE_RVBBIT_NATIVE}")
+[ -n "${RVBBIT_NATIVE_ROUTER:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_NATIVE_ROUTER=${RVBBIT_NATIVE_ROUTER}")
+[ -n "${RVBBIT_ROUTE_OBSERVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_OBSERVE=${RVBBIT_ROUTE_OBSERVE}")
+[ -n "${RVBBIT_ROUTE_EXPLORE_PCT:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_EXPLORE_PCT=${RVBBIT_ROUTE_EXPLORE_PCT}")
+[ -n "${RVBBIT_HIVE_LAYOUT:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_HIVE_LAYOUT=${RVBBIT_HIVE_LAYOUT}")
+LOAD_ENV=()
+[ -n "${RVBBIT_COMPACT_KEEP_HEAP:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_KEEP_HEAP=${RVBBIT_COMPACT_KEEP_HEAP}")
+[ -n "${RVBBIT_COMPACT_VARIANTS_SYNC:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_VARIANTS_SYNC=${RVBBIT_COMPACT_VARIANTS_SYNC}")
+[ -n "${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD:-}" ] && LOAD_ENV+=(-e "RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD}")
+if [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]]; then
+    LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_LAYOUT=${RVBBIT_COMPACT_HIVE_LAYOUT:-on}")
+elif [ -n "${RVBBIT_COMPACT_HIVE_LAYOUT:-}" ]; then
+    LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_LAYOUT=${RVBBIT_COMPACT_HIVE_LAYOUT}")
+fi
+[ -n "${RVBBIT_COMPACT_HIVE_KEYS:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_KEYS=${RVBBIT_COMPACT_HIVE_KEYS}")
+[ -n "${RVBBIT_COMPACT_HIVE_VARIANTS:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_VARIANTS=${RVBBIT_COMPACT_HIVE_VARIANTS}")
+[ -n "${RVBBIT_COMPACT_HIVE_MIN_DISTINCT:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_MIN_DISTINCT=${RVBBIT_COMPACT_HIVE_MIN_DISTINCT}")
+[ -n "${RVBBIT_COMPACT_HIVE_MAX_DISTINCT:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_MAX_DISTINCT=${RVBBIT_COMPACT_HIVE_MAX_DISTINCT}")
+REPEATS="${BENCH_REPEATS:-3}"
+TIMEOUT_S="${BENCH_TIMEOUT:-300}"
+RVBBIT_RESET_EXTENSION="${RVBBIT_RESET_EXTENSION:-${RESET_RVBBIT_EXTENSION:-}}"
+RVBBIT_LOAD_ROUTE_PROFILE="${RVBBIT_LOAD_ROUTE_PROFILE:-}"
+
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+REPORT_FILE="bench/clickbench/results/clickbench_${LIMIT}_${STAMP}.txt"
+
+# ---- Helpers ---------------------------------------------------------------
+say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+warn() { printf '\033[1;33m!! %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[1;31mXX %s\033[0m\n' "$*" >&2; exit 1; }
+env_on() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+usage() {
+    awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "$0"
+}
+
+for arg in "$@"; do
+    case "${arg}" in
+        --reset-rvbbit-extension|--clear-rvbbit-system-data)
+            RVBBIT_RESET_EXTENSION=1
+            ;;
+        --load-route-profile)
+            RVBBIT_LOAD_ROUTE_PROFILE=1
+            ;;
+        --skip-load)
+            export SKIP_LOAD=1
+            ;;
+        --skip-download)
+            export SKIP_DOWNLOAD=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: ${arg}"
+            ;;
+    esac
+done
+
+# ---- 0. Sanity --------------------------------------------------------------
+command -v docker >/dev/null || die "docker not found in PATH"
+[ -f "docker/docker-compose.yml" ] || die "expected to run from repo root (no docker/docker-compose.yml here)"
+
+say "configuration"
+echo "   limit       : ${LIMIT}"
+echo "   systems     : ${SYSTEMS}"
+echo "   repeats     : ${REPEATS}"
+echo "   timeout/q   : ${TIMEOUT_S}s"
+echo "   report file : ${REPORT_FILE}"
+echo "   rvbbit reset: $(env_on "${RVBBIT_RESET_EXTENSION}" && echo destructive || echo preserve-system-data)"
+echo "   route import: $(env_on "${RVBBIT_LOAD_ROUTE_PROFILE}" && echo yes || echo no)"
+
+# ---- 1. Download hits.parquet ----------------------------------------------
+if [ -z "${SKIP_DOWNLOAD:-}" ] && [ ! -f "${HITS}" ]; then
+    say "downloading hits.parquet (~14 GB) — this is the slow part"
+    mkdir -p "${DATA_DIR}"
+    curl -L --fail --progress-bar -o "${HITS}.part" "${HITS_URL}"
+    mv "${HITS}.part" "${HITS}"
+fi
+[ -f "${HITS}" ] || die "hits.parquet missing at ${HITS} (re-run without SKIP_DOWNLOAD)"
+
+HITS_SIZE="$(du -h "${HITS}" | awk '{print $1}')"
+say "hits.parquet present: ${HITS_SIZE}"
+
+# ---- 2. Bring up containers ------------------------------------------------
+say "starting competitor containers (profile=bench)"
+${COMPOSE} --profile bench up -d
+sleep 5
+
+# ---- 3. Prepare rvbbit extension ------------------------------------------
+RVBBIT_SELECTED=0
+if [[ ",${SYSTEMS}," == *",rvbbit,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hot,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_auto,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",pg_heap,"* ]]; then
+    RVBBIT_SELECTED=1
+fi
+
+if [ "${RVBBIT_SELECTED}" = "1" ]; then
+    if env_on "${RVBBIT_RESET_EXTENSION}"; then
+        say "resetting pg_rvbbit extension (DESTRUCTIVE: drops rvbbit system/catalog data)"
+        ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 <<'SQL'
+DROP EXTENSION IF EXISTS pg_rvbbit CASCADE;
+-- pg_rvbbit is preloaded, so hooks remain active in this backend after
+-- DROP EXTENSION. Keep routing disabled while replacing the extension schema.
+SET rvbbit.duck_backend = off;
+DROP SCHEMA IF EXISTS rvbbit CASCADE;
+CREATE SCHEMA rvbbit;
+CREATE EXTENSION pg_rvbbit;
+SQL
+    else
+        say "ensuring pg_rvbbit extension (preserves rvbbit system/catalog data)"
+        ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 <<'SQL'
+CREATE EXTENSION IF NOT EXISTS pg_rvbbit;
+ALTER EXTENSION pg_rvbbit UPDATE;
+SQL
+    fi
+
+    if env_on "${RVBBIT_LOAD_ROUTE_PROFILE}" && [ -f "bench/rvbbit_route_profile.json" ]; then
+        say "loading Rvbbit route profile"
+        ${COMPOSE} exec -T bench python /bench/rvbbit_route_load_profile.py \
+            --profile /bench/rvbbit_route_profile.json \
+            --name bench-combined
+    fi
+fi
+
+# ---- 4. Load --------------------------------------------------------------
+if [ -z "${SKIP_LOAD:-}" ]; then
+    say "loading ${LIMIT} rows into [${SYSTEMS}]"
+    ${COMPOSE} exec -T \
+        -e "BENCH_LIMIT=${LIMIT}" -e "BENCH_SYSTEMS=${SYSTEMS}" "${LOAD_ENV[@]}" \
+        bench python /bench/clickbench/load_all.py
+else
+    say "skipping load (SKIP_LOAD set)"
+fi
+
+# ---- 5. Run queries -------------------------------------------------------
+say "running queries"
+${COMPOSE} exec -T \
+    -e "BENCH_SYSTEMS=${SYSTEMS}" -e "BENCH_REPEATS=${REPEATS}" \
+    -e "BENCH_TIMEOUT=${TIMEOUT_S}" "${QUERIES_ENV[@]}" "${DUCK_HOT_ENV[@]}" \
+    bench python /bench/clickbench/run_queries.py
+
+# ---- 6. Pretty-print + save ----------------------------------------------
+say "formatting report"
+mkdir -p "$(dirname "${REPORT_FILE}")"
+
+# Save uncolored to file (NO_COLOR) and print colored to console
+${COMPOSE} exec -T -e NO_COLOR=1 bench \
+    python /bench/clickbench/format_report.py \
+    > "${REPORT_FILE}"
+
+${COMPOSE} exec -T -e FORCE_COLOR=1 bench \
+    python /bench/clickbench/format_report.py
+
+say "report saved to ${REPORT_FILE}"
+echo "raw JSON at bench/clickbench/results/last_run.json"

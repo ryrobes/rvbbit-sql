@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rvbbit.dev/schemas/capability.schema.json",
+  "title": "Rvbbit Capability Manifest",
+  "type": "object",
+  "required": ["api_version", "kind", "name", "backend"],
+  "additionalProperties": false,
+  "properties": {
+    "api_version": {
+      "type": "string",
+      "const": "rvbbit.capability/v1"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["hf_backend"]
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_\\-]*$"
+    },
+    "title": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "license": {
+      "type": "string"
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "source": {
+      "type": "object",
+      "required": ["provider", "model"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "const": "huggingface" },
+        "model": { "type": "string" },
+        "revision": { "type": "string" },
+        "url": { "type": "string" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "template": { "type": "string", "default": "hf-rvbbit-fastapi" },
+        "handler": {
+          "type": "string",
+          "enum": [
+            "embedding",
+            "sequence_classification",
+            "zero_shot_classification",
+            "gliner",
+            "tabular_classification",
+            "tabular_regression",
+            "custom"
+          ]
+        },
+        "device": { "type": "string", "enum": ["auto", "cpu", "cuda"] },
+        "base_image": { "type": "string" },
+        "extra_requirements": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "endpoint": { "type": "string" },
+        "transport": { "type": "string", "default": "rvbbit" },
+        "batch_size": { "type": "integer", "minimum": 1, "default": 32 },
+        "max_concurrent": { "type": "integer", "minimum": 1, "default": 4 },
+        "timeout_ms": { "type": "integer", "minimum": 100, "default": 60000 },
+        "auth_env": { "type": ["string", "null"] },
+        "opts": { "type": "object" },
+        "description": { "type": "string" }
+      }
+    },
+    "operators": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "arg_names", "return_type"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+          "description": { "type": "string" },
+          "arg_names": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1
+          },
+          "arg_types": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1
+          },
+          "return_type": {
+            "type": "string",
+            "enum": ["bool", "text", "float8", "jsonb"]
+          },
+          "parser": {
+            "type": "string",
+            "enum": ["yes_no", "score_0_1", "raw_text", "strip", "json"]
+          },
+          "shape": {
+            "type": "string",
+            "enum": ["scalar", "aggregate", "dimension"],
+            "default": "scalar"
+          },
+          "inputs": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "steps": {
+            "type": "array",
+            "items": { "type": "object" }
+          },
+          "tests": {
+            "type": "array",
+            "items": { "type": "object" }
+          }
+        }
+      }
+    },
+    "smoke": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "sql": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

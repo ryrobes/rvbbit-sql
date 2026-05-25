@@ -1,0 +1,45 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: toxic_bert
+title: Toxicity Classifier
+description: Multi-label toxicity classifier for moderation, support triage, and data quality workflows.
+license: apache-2.0
+tags: [classify, toxicity, moderation, multilabel, tabular, row]
+source:
+  provider: huggingface
+  model: unitary/toxic-bert
+  url: https://huggingface.co/unitary/toxic-bert
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+  env:
+    RVBBIT_SEQUENCE_MODE: sigmoid
+backend:
+  name: classify_toxic_bert
+  transport: rvbbit
+  batch_size: 32
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: Multi-label toxic-bert classifier.
+operators:
+  - name: classify_toxicity
+    description: Return toxicity category scores for text.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+  - name: classify_row_toxicity
+    description: Return toxicity category scores for a JSONB row.
+    arg_names: [row]
+    arg_types: [jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.row }}"
+smoke:
+  inputs:
+    - text: you are awful and nobody wants you here
+      row: '{"comment":"you are awful","channel":"support_chat"}'

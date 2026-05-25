@@ -1,0 +1,474 @@
+
+[1;36m== configuration[0m
+   limit       : 100000
+   systems     : rvbbit,hydra,citus,pg_baseline
+   repeats     : 3
+   timeout/q   : 300s
+   report file : bench/clickbench/results/clickbench_100000_20260523T055853Z.txt
+
+[1;36m== hits.parquet present: 14G[0m
+
+[1;36m== starting competitor containers (profile=bench)[0m
+
+[1;36m== resetting pg_rvbbit extension (drops prior 'hits' table)[0m
+DROP EXTENSION
+SET
+DROP SCHEMA
+CREATE SCHEMA
+CREATE EXTENSION
+
+[1;36m== loading Rvbbit route profile[0m
+{
+  "action": "imported",
+  "active": true,
+  "profile": "bench-combined",
+  "stored_entries": 140,
+  "stored_points": 260
+}
+
+[1;36m== loading 100000 rows into [rvbbit,hydra,citus,pg_baseline][0m
+
+>>> loading rvbbit (limit=100000) ...
+
+>>> loading hydra (limit=100000) ...
+
+>>> loading citus (limit=100000) ...
+
+>>> loading pg_baseline (limit=100000) ...
+
+
+=== ClickBench load summary ===
+system                   rows  load+post (s)   wall (s)         size   status
+------------------------------------------------------------------------------------------
+rvbbit                100,000           13.5       13.8     100.5 MB   ok
+hydra                 100,000            9.1        9.2       8.0 MB   ok
+citus                 100,000           12.8       13.1       8.0 MB   ok
+pg_baseline           100,000            6.1        6.3      78.1 MB   ok
+
+[1;36m== running queries[0m
+
+=== ClickBench query bench (3 runs, median, 300s timeout) ===
+systems: ['rvbbit', 'hydra', 'citus', 'pg_baseline']
+
+-> Q0: count(*)
+     rvbbit              799µs    (wall 0.0s)
+     hydra                 2ms    (wall 0.0s)
+     citus                 4ms    (wall 0.0s)
+     pg_baseline           6ms    (wall 0.0s)
+
+-> Q1: count(*) with filter
+     rvbbit                5ms    (wall 0.0s)
+     hydra                 1ms    (wall 0.0s)
+     citus                 3ms    (wall 0.0s)
+     pg_baseline          21ms    (wall 0.1s)
+
+-> Q2: sum/count/avg over big table
+     rvbbit                8ms    (wall 0.1s)
+     hydra                 4ms    (wall 0.0s)
+     citus                 6ms    (wall 0.0s)
+     pg_baseline           9ms    (wall 0.0s)
+
+-> Q3: avg(UserID)
+     rvbbit                5ms    (wall 0.0s)
+     hydra                 3ms    (wall 0.0s)
+     citus                 5ms    (wall 0.0s)
+     pg_baseline          14ms    (wall 0.0s)
+
+-> Q4: count distinct UserID
+     rvbbit                6ms    (wall 0.1s)
+     hydra                 9ms    (wall 0.0s)
+     citus                 9ms    (wall 0.0s)
+     pg_baseline          19ms    (wall 0.1s)
+
+-> Q5: count distinct SearchPhrase
+     rvbbit                7ms    (wall 0.1s)
+     hydra                31ms    (wall 0.1s)
+     citus                26ms    (wall 0.1s)
+     pg_baseline          41ms    (wall 0.1s)
+
+-> Q6: min/max EventDate
+     rvbbit                1ms    (wall 0.0s)
+     hydra                 3ms    (wall 0.0s)
+     citus                 5ms    (wall 0.0s)
+     pg_baseline          15ms    (wall 0.0s)
+
+-> Q7: AdvEngineID group + filter
+     rvbbit                6ms    (wall 0.0s)
+     hydra                 2ms    (wall 0.0s)
+     citus                 3ms    (wall 0.0s)
+     pg_baseline          21ms    (wall 0.1s)
+
+-> Q8: RegionID top 10 unique users
+     rvbbit                9ms    (wall 0.1s)
+     hydra                25ms    (wall 0.1s)
+     citus                22ms    (wall 0.1s)
+     pg_baseline          34ms    (wall 0.1s)
+
+-> Q9: RegionID rollup
+     rvbbit               12ms    (wall 0.1s)
+     hydra                30ms    (wall 0.1s)
+     citus                26ms    (wall 0.1s)
+     pg_baseline          43ms    (wall 0.1s)
+
+-> Q10: MobilePhoneModel filter+groupby
+     rvbbit                7ms    (wall 0.1s)
+     hydra                 5ms    (wall 0.0s)
+     citus                 6ms    (wall 0.0s)
+     pg_baseline          20ms    (wall 0.1s)
+
+-> Q11: MobilePhone+Model groupby
+     rvbbit                7ms    (wall 0.1s)
+     hydra                 6ms    (wall 0.0s)
+     citus                 6ms    (wall 0.0s)
+     pg_baseline          21ms    (wall 0.1s)
+
+-> Q12: SearchPhrase top 10 count
+     rvbbit                7ms    (wall 0.1s)
+     hydra                 7ms    (wall 0.0s)
+     citus                 7ms    (wall 0.0s)
+     pg_baseline          23ms    (wall 0.1s)
+
+-> Q13: SearchPhrase top 10 unique users
+     rvbbit                9ms    (wall 0.1s)
+     hydra                24ms    (wall 0.1s)
+     citus                24ms    (wall 0.1s)
+     pg_baseline          40ms    (wall 0.1s)
+
+-> Q14: SearchEngineID+Phrase top 10
+     rvbbit                8ms    (wall 0.1s)
+     hydra                 8ms    (wall 0.0s)
+     citus                 8ms    (wall 0.0s)
+     pg_baseline          25ms    (wall 0.1s)
+
+-> Q15: UserID top 10
+     rvbbit                7ms    (wall 0.1s)
+     hydra                11ms    (wall 0.0s)
+     citus                10ms    (wall 0.0s)
+     pg_baseline          24ms    (wall 0.1s)
+
+-> Q16: UserID+SearchPhrase ordered top 10
+     rvbbit                9ms    (wall 0.1s)
+     hydra                16ms    (wall 0.1s)
+     citus                17ms    (wall 0.1s)
+     pg_baseline          33ms    (wall 0.1s)
+
+-> Q17: UserID+SearchPhrase any 10
+     rvbbit                4ms    (wall 0.0s)
+     hydra                14ms    (wall 0.0s)
+     citus                15ms    (wall 0.1s)
+     pg_baseline          31ms    (wall 0.1s)
+
+-> Q18: UserID+minute+SearchPhrase groupby
+     rvbbit               11ms    (wall 0.1s)
+     hydra                39ms    (wall 0.1s)
+     citus                37ms    (wall 0.1s)
+     pg_baseline          53ms    (wall 0.2s)
+
+-> Q19: UserID point lookup
+     rvbbit                5ms    (wall 0.0s)
+     hydra               844µs    (wall 0.0s)
+     citus                 1ms    (wall 0.0s)
+     pg_baseline          13ms    (wall 0.0s)
+
+-> Q20: LIKE URL %google%
+     rvbbit               10ms    (wall 0.1s)
+     hydra                14ms    (wall 0.1s)
+     citus                16ms    (wall 0.1s)
+     pg_baseline          23ms    (wall 0.1s)
+
+-> Q21: LIKE URL + SearchPhrase top 10
+     rvbbit                3ms    (wall 0.0s)
+     hydra                15ms    (wall 0.1s)
+     citus                17ms    (wall 0.1s)
+     pg_baseline          11ms    (wall 0.0s)
+
+-> Q22: LIKE Title + URL NOT LIKE rollup
+     rvbbit                3ms    (wall 0.0s)
+     hydra                49ms    (wall 0.2s)
+     citus                55ms    (wall 0.2s)
+     pg_baseline          17ms    (wall 0.1s)
+
+-> Q23: SELECT * filter LIKE
+     rvbbit                9ms    (wall 0.0s)
+     hydra               159ms    (wall 0.5s)
+     citus               174ms    (wall 0.6s)
+     pg_baseline          23ms    (wall 0.1s)
+
+-> Q24: SearchPhrase order by EventTime
+     rvbbit                4ms    (wall 0.0s)
+     hydra                 7ms    (wall 0.0s)
+     citus                 7ms    (wall 0.0s)
+     pg_baseline          23ms    (wall 0.1s)
+
+-> Q25: SearchPhrase order by SearchPhrase
+     rvbbit                3ms    (wall 0.0s)
+     hydra                 6ms    (wall 0.0s)
+     citus                 6ms    (wall 0.0s)
+     pg_baseline          24ms    (wall 0.1s)
+
+-> Q26: SearchPhrase order EventTime+Phrase
+     rvbbit                5ms    (wall 0.0s)
+     hydra                 8ms    (wall 0.0s)
+     citus                 8ms    (wall 0.0s)
+     pg_baseline          25ms    (wall 0.1s)
+
+-> Q27: CounterID avg URL length
+     rvbbit               13ms    (wall 0.1s)
+     hydra                26ms    (wall 0.1s)
+     citus                27ms    (wall 0.1s)
+     pg_baseline          13ms    (wall 0.0s)
+
+-> Q28: regex_replace Referer
+     rvbbit               15ms    (wall 0.1s)
+     hydra               462ms    (wall 1.4s)
+     citus               402ms    (wall 1.3s)
+     pg_baseline         408ms    (wall 1.2s)
+
+-> Q29: 90 sum exprs (wide tlist)
+     rvbbit                1ms    (wall 0.0s)
+     hydra                79ms    (wall 0.2s)
+     citus                74ms    (wall 0.2s)
+     pg_baseline          27ms    (wall 0.1s)
+
+-> Q30: SearchEngineID+ClientIP rollup
+     rvbbit                9ms    (wall 0.1s)
+     hydra                11ms    (wall 0.0s)
+     citus                11ms    (wall 0.0s)
+     pg_baseline          24ms    (wall 0.1s)
+
+-> Q31: WatchID+ClientIP rollup (filtered)
+     rvbbit                9ms    (wall 0.1s)
+     hydra                15ms    (wall 0.1s)
+     citus                15ms    (wall 0.1s)
+     pg_baseline          27ms    (wall 0.1s)
+
+-> Q32: WatchID+ClientIP rollup (full)
+     rvbbit               11ms    (wall 0.1s)
+     hydra                69ms    (wall 0.2s)
+     citus                64ms    (wall 0.2s)
+     pg_baseline          81ms    (wall 0.2s)
+
+-> Q33: URL top 10
+     rvbbit               10ms    (wall 0.1s)
+     hydra                26ms    (wall 0.1s)
+     citus                26ms    (wall 0.1s)
+     pg_baseline          30ms    (wall 0.1s)
+
+-> Q34: literal 1 + URL top 10
+     rvbbit               16ms    (wall 0.1s)
+     hydra                27ms    (wall 0.1s)
+     citus                24ms    (wall 0.1s)
+     pg_baseline          31ms    (wall 0.1s)
+
+-> Q35: ClientIP+N rollups
+     rvbbit                2ms    (wall 0.0s)
+     hydra                16ms    (wall 0.1s)
+     citus                15ms    (wall 0.1s)
+     pg_baseline          28ms    (wall 0.1s)
+
+-> Q36: selective filter date range
+     rvbbit                6ms    (wall 0.1s)
+     hydra               943µs    (wall 0.0s)
+     citus               550µs    (wall 0.0s)
+     pg_baseline          10ms    (wall 0.0s)
+
+-> Q37: Title selective filter
+     rvbbit                6ms    (wall 0.1s)
+     hydra                 1ms    (wall 0.0s)
+     citus               641µs    (wall 0.0s)
+     pg_baseline          10ms    (wall 0.0s)
+
+-> Q38: URL link clicks offset 1000
+     rvbbit                6ms    (wall 0.0s)
+     hydra               943µs    (wall 0.0s)
+     citus               538µs    (wall 0.0s)
+     pg_baseline          10ms    (wall 0.0s)
+
+-> Q39: Src/Dst rollup
+     rvbbit                6ms    (wall 0.1s)
+     hydra               865µs    (wall 0.0s)
+     citus               522µs    (wall 0.0s)
+     pg_baseline           8ms    (wall 0.0s)
+
+-> Q40: URLHash+EventDate IN filter
+     rvbbit                6ms    (wall 0.1s)
+     hydra               864µs    (wall 0.0s)
+     citus               548µs    (wall 0.0s)
+     pg_baseline          12ms    (wall 0.0s)
+
+-> Q41: WindowClientWidth+Height filter
+     rvbbit                7ms    (wall 0.1s)
+     hydra               888µs    (wall 0.0s)
+     citus               951µs    (wall 0.0s)
+     pg_baseline          13ms    (wall 0.0s)
+
+-> Q42: DATE_TRUNC minute groupby
+     rvbbit                6ms    (wall 0.1s)
+     hydra               911µs    (wall 0.0s)
+     citus               514µs    (wall 0.0s)
+     pg_baseline          10ms    (wall 0.0s)
+
+
+=== markdown summary ===
+
+| Query | rvbbit | hydra | citus | pg_baseline |
+|---|---|---|---|---|
+| Q0 | 799µs | 2ms | 4ms | 6ms |
+| Q1 | 5ms | 1ms | 3ms | 21ms |
+| Q2 | 8ms | 4ms | 6ms | 9ms |
+| Q3 | 5ms | 3ms | 5ms | 14ms |
+| Q4 | 6ms | 9ms | 9ms | 19ms |
+| Q5 | 7ms | 31ms | 26ms | 41ms |
+| Q6 | 1ms | 3ms | 5ms | 15ms |
+| Q7 | 6ms | 2ms | 3ms | 21ms |
+| Q8 | 9ms | 25ms | 22ms | 34ms |
+| Q9 | 12ms | 30ms | 26ms | 43ms |
+| Q10 | 7ms | 5ms | 6ms | 20ms |
+| Q11 | 7ms | 6ms | 6ms | 21ms |
+| Q12 | 7ms | 7ms | 7ms | 23ms |
+| Q13 | 9ms | 24ms | 24ms | 40ms |
+| Q14 | 8ms | 8ms | 8ms | 25ms |
+| Q15 | 7ms | 11ms | 10ms | 24ms |
+| Q16 | 9ms | 16ms | 17ms | 33ms |
+| Q17 | 4ms | 14ms | 15ms | 31ms |
+| Q18 | 11ms | 39ms | 37ms | 53ms |
+| Q19 | 5ms | 844µs | 1ms | 13ms |
+| Q20 | 10ms | 14ms | 16ms | 23ms |
+| Q21 | 3ms | 15ms | 17ms | 11ms |
+| Q22 | 3ms | 49ms | 55ms | 17ms |
+| Q23 | 9ms | 159ms | 174ms | 23ms |
+| Q24 | 4ms | 7ms | 7ms | 23ms |
+| Q25 | 3ms | 6ms | 6ms | 24ms |
+| Q26 | 5ms | 8ms | 8ms | 25ms |
+| Q27 | 13ms | 26ms | 27ms | 13ms |
+| Q28 | 15ms | 462ms | 402ms | 408ms |
+| Q29 | 1ms | 79ms | 74ms | 27ms |
+| Q30 | 9ms | 11ms | 11ms | 24ms |
+| Q31 | 9ms | 15ms | 15ms | 27ms |
+| Q32 | 11ms | 69ms | 64ms | 81ms |
+| Q33 | 10ms | 26ms | 26ms | 30ms |
+| Q34 | 16ms | 27ms | 24ms | 31ms |
+| Q35 | 2ms | 16ms | 15ms | 28ms |
+| Q36 | 6ms | 943µs | 550µs | 10ms |
+| Q37 | 6ms | 1ms | 641µs | 10ms |
+| Q38 | 6ms | 943µs | 538µs | 10ms |
+| Q39 | 6ms | 865µs | 522µs | 8ms |
+| Q40 | 6ms | 864µs | 548µs | 12ms |
+| Q41 | 7ms | 888µs | 951µs | 13ms |
+| Q42 | 6ms | 911µs | 514µs | 10ms |
+
+results JSON: /bench/clickbench/results/last_run.json
+
+[1;36m== formatting report[0m
+
+[1m=== ClickBench results — 3 runs, median ===[0m
+[2m   systems: rvbbit, hydra, citus, pg_baseline[0m
+[2m   queries: 43  (best per-row in green, FAIL in red)[0m
+
+╭─────────┬─────────────────────────────────────┬──────────┬─────────┬─────────┬───────────────╮
+│   Query │                         Description │   rvbbit │   hydra │   citus │   pg_baseline │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│      [1mQ0[0m │                            [2mcount(*)[0m │    [1;32m799µs[0m │     2ms │     4ms │           6ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│      [1mQ1[0m │                [2mcount(*) with filter[0m │      5ms │     [1;32m1ms[0m │     3ms │          21ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│      [1mQ2[0m │        [2msum/count/avg over big table[0m │      8ms │     [1;32m4ms[0m │     6ms │           9ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│      [1mQ3[0m │                         [2mavg(UserID)[0m │      5ms │     [1;32m3ms[0m │     5ms │          14ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│      [1mQ4[0m │               [2mcount distinct UserID[0m │      [1;32m6ms[0m │     9ms │     9ms │          19ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│      [1mQ5[0m │         [2mcount distinct SearchPhrase[0m │      [1;32m7ms[0m │    31ms │    26ms │          41ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│      [1mQ6[0m │                   [2mmin/max EventDate[0m │      [1;32m1ms[0m │     3ms │     5ms │          15ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│      [1mQ7[0m │          [2mAdvEngineID group + filter[0m │      6ms │     [1;32m2ms[0m │     3ms │          21ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│      [1mQ8[0m │        [2mRegionID top 10 unique users[0m │      [1;32m9ms[0m │    25ms │    22ms │          34ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│      [1mQ9[0m │                     [2mRegionID rollup[0m │     [1;32m12ms[0m │    30ms │    26ms │          43ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ10[0m │     [2mMobilePhoneModel filter+groupby[0m │      7ms │     [1;32m5ms[0m │     6ms │          20ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ11[0m │           [2mMobilePhone+Model groupby[0m │      7ms │     [1;32m6ms[0m │     6ms │          21ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ12[0m │           [2mSearchPhrase top 10 count[0m │      7ms │     [1;32m7ms[0m │     7ms │          23ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ13[0m │    [2mSearchPhrase top 10 unique users[0m │      [1;32m9ms[0m │    24ms │    24ms │          40ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ14[0m │        [2mSearchEngineID+Phrase top 10[0m │      8ms │     [1;32m8ms[0m │     8ms │          25ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ15[0m │                       [2mUserID top 10[0m │      [1;32m7ms[0m │    11ms │    10ms │          24ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ16[0m │  [2mUserID+SearchPhrase ordered top 10[0m │      [1;32m9ms[0m │    16ms │    17ms │          33ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ17[0m │          [2mUserID+SearchPhrase any 10[0m │      [1;32m4ms[0m │    14ms │    15ms │          31ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ18[0m │  [2mUserID+minute+SearchPhrase groupby[0m │     [1;32m11ms[0m │    39ms │    37ms │          53ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ19[0m │                 [2mUserID point lookup[0m │      5ms │   [1;32m844µs[0m │     1ms │          13ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ20[0m │                   [2mLIKE URL %google%[0m │     [1;32m10ms[0m │    14ms │    16ms │          23ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ21[0m │      [2mLIKE URL + SearchPhrase top 10[0m │      [1;32m3ms[0m │    15ms │    17ms │          11ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ22[0m │    [2mLIKE Title + URL NOT LIKE rollup[0m │      [1;32m3ms[0m │    49ms │    55ms │          17ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ23[0m │                [2mSELECT * filter LIKE[0m │      [1;32m9ms[0m │   159ms │   174ms │          23ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ24[0m │     [2mSearchPhrase order by EventTime[0m │      [1;32m4ms[0m │     7ms │     7ms │          23ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ25[0m │  [2mSearchPhrase order by SearchPhrase[0m │      [1;32m3ms[0m │     6ms │     6ms │          24ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ26[0m │ [2mSearchPhrase order EventTime+Phrase[0m │      [1;32m5ms[0m │     8ms │     8ms │          25ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ27[0m │            [2mCounterID avg URL length[0m │     13ms │    26ms │    27ms │          [1;32m13ms[0m │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ28[0m │               [2mregex_replace Referer[0m │     [1;32m15ms[0m │   462ms │   402ms │         408ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ29[0m │           [2m90 sum exprs (wide tlist)[0m │      [1;32m1ms[0m │    79ms │    74ms │          27ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ30[0m │      [2mSearchEngineID+ClientIP rollup[0m │      [1;32m9ms[0m │    11ms │    11ms │          24ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ31[0m │  [2mWatchID+ClientIP rollup (filtered)[0m │      [1;32m9ms[0m │    15ms │    15ms │          27ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ32[0m │      [2mWatchID+ClientIP rollup (full)[0m │     [1;32m11ms[0m │    69ms │    64ms │          81ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ33[0m │                          [2mURL top 10[0m │     [1;32m10ms[0m │    26ms │    26ms │          30ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ34[0m │              [2mliteral 1 + URL top 10[0m │     [1;32m16ms[0m │    27ms │    24ms │          31ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ35[0m │                  [2mClientIP+N rollups[0m │      [1;32m2ms[0m │    16ms │    15ms │          28ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ36[0m │         [2mselective filter date range[0m │      6ms │   943µs │   [1;32m550µs[0m │          10ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ37[0m │              [2mTitle selective filter[0m │      6ms │     1ms │   [1;32m641µs[0m │          10ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ38[0m │         [2mURL link clicks offset 1000[0m │      6ms │   943µs │   [1;32m538µs[0m │          10ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ39[0m │                      [2mSrc/Dst rollup[0m │      6ms │   865µs │   [1;32m522µs[0m │           8ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ40[0m │         [2mURLHash+EventDate IN filter[0m │      6ms │   864µs │   [1;32m548µs[0m │          12ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ41[0m │     [2mWindowClientWidth+Height filter[0m │      7ms │   [1;32m888µs[0m │   951µs │          13ms │
+├─────────┼─────────────────────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│     [1mQ42[0m │           [2mDATE_TRUNC minute groupby[0m │      6ms │   911µs │   [1;32m514µs[0m │          10ms │
+╰─────────┴─────────────────────────────────────┴──────────┴─────────┴─────────┴───────────────╯
+
+[1m=== summary ===[0m
+
+╭────────────────────┬──────────┬─────────┬─────────┬───────────────╮
+│             Metric │   rvbbit │   hydra │   citus │   pg_baseline │
+├────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│       [1mgeomean (ms)[0m │      6ms │     8ms │     8ms │          22ms │
+├────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│ [1msum of medians (s)[0m │     0.3s │    1.2s │    1.2s │          1.4s │
+├────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│ [1mwins (best of row)[0m │       [1;32m26[0m │      10 │       6 │             1 │
+├────────────────────┼──────────┼─────────┼─────────┼───────────────┤
+│           [1mfailures[0m │        0 │       0 │       0 │             0 │
+╰────────────────────┴──────────┴─────────┴─────────┴───────────────╯
+
+
+[1;36m== report saved to bench/clickbench/results/clickbench_100000_20260523T055853Z.txt[0m
+raw JSON at bench/clickbench/results/last_run.json

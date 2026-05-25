@@ -1,0 +1,43 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: twitter_roberta_sentiment
+title: RoBERTa Sentiment Classifier
+description: Practical positive/neutral/negative sentiment classifier for reviews, tickets, social text, and notes.
+license: cc-by-4.0
+tags: [classify, sentiment, text, tabular, row]
+source:
+  provider: huggingface
+  model: cardiffnlp/twitter-roberta-base-sentiment-latest
+  url: https://huggingface.co/cardiffnlp/twitter-roberta-base-sentiment-latest
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+backend:
+  name: classify_twitter_roberta_sentiment
+  transport: rvbbit
+  batch_size: 64
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: RoBERTa sentiment classifier.
+operators:
+  - name: classify_sentiment
+    description: Classify text as negative, neutral, or positive.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+  - name: classify_row_sentiment
+    description: Classify the sentiment of a JSONB row serialized as text.
+    arg_names: [row]
+    arg_types: [jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.row }}"
+smoke:
+  inputs:
+    - text: the setup was simple and the dashboard is fantastic
+      row: '{"review":"dashboard is fantastic","stars":5,"plan":"pro"}'

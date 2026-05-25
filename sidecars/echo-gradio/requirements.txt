@@ -1,0 +1,4 @@
+gradio==4.44.1
+huggingface_hub==0.25.2
+fastapi==0.115.5
+uvicorn[standard]==0.32.1

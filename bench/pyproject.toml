@@ -1,0 +1,19 @@
+[project]
+name = "rvbbit-bench"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "pyarrow>=18",
+    "click",
+    "tabulate",
+    "numpy",
+]
+
+[tool.pyright]
+include = ["."]
+extraPaths = ["."]
+typeCheckingMode = "basic"
+
+[tool.ruff]
+line-length = 100

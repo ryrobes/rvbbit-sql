@@ -1,0 +1,36 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: e5_small_v2
+title: E5 Small Embeddings
+description: Small, fast E5 embeddings useful for CPU-friendly retrieval experiments and lightweight semantic joins.
+license: mit
+tags: [embedding, retrieval, cpu-friendly, semantic-join]
+source:
+  provider: huggingface
+  model: intfloat/e5-small-v2
+  url: https://huggingface.co/intfloat/e5-small-v2
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: embedding
+  device: auto
+backend:
+  name: embed_e5_small
+  transport: rvbbit
+  batch_size: 128
+  max_concurrent: 2
+  timeout_ms: 120000
+  description: intfloat/e5-small-v2 sentence embeddings.
+operators:
+  - name: embed_e5_small
+    description: Return an E5-small embedding as JSON. For best retrieval quality, prefix inputs with `query:` or `passage:`.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+smoke:
+  inputs:
+    - text: "query: refund request from angry customer"
+  sql:
+    - "SELECT jsonb_array_length(rvbbit.embed_e5_small('query: hello world'));"

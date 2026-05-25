@@ -1,0 +1,46 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: ms_marco_minilm_l6_v2
+title: MS MARCO MiniLM Reranker
+description: Lightweight cross-encoder reranker for query/document scoring and ranking table rows by relevance.
+license: apache-2.0
+tags: [rerank, retrieval, relevance, row, cpu-friendly]
+source:
+  provider: huggingface
+  model: cross-encoder/ms-marco-MiniLM-L6-v2
+  url: https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+backend:
+  name: rerank_ms_marco_minilm
+  transport: rvbbit
+  batch_size: 32
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: MS MARCO MiniLM cross-encoder relevance scorer.
+operators:
+  - name: rerank_ms_marco_score
+    description: Score how relevant text is to a query using a lightweight MS MARCO MiniLM cross-encoder.
+    arg_names: [query, text]
+    arg_types: [text, text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      query: "{{ inputs.query }}"
+      text: "{{ inputs.text }}"
+  - name: rerank_ms_marco_row
+    description: Score how relevant a JSONB row is to a query using a lightweight MS MARCO MiniLM cross-encoder.
+    arg_names: [query, row]
+    arg_types: [text, jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      query: "{{ inputs.query }}"
+      text: "{{ inputs.row }}"
+smoke:
+  inputs:
+    - query: billing refund
+      text: customer was charged twice and asks for their money back
+      row: '{"ticket":"charged twice","requested_action":"refund","priority":"high"}'

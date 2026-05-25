@@ -1,0 +1,37 @@
+[package]
+name = "pg_rvbbit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18"]
+pg_test = []
+
+[dependencies]
+pgrx = { workspace = true }
+rvbbit_storage = { path = "../rvbbit_storage" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonwebtoken = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["zstd"] }
+reqwest = { workspace = true }
+blake3 = { workspace = true }
+sha2 = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+postgres = { workspace = true }
+lru = { workspace = true }
+tiktoken-rs = { workspace = true }
+roaring = { workspace = true }
+fastembed = { workspace = true }
+
+[dev-dependencies]
+pgrx-tests = { workspace = true }

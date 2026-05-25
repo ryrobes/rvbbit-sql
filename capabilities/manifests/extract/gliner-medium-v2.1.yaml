@@ -1,0 +1,66 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: gliner_medium_v2_1
+title: GLiNER Medium v2.1 Extraction
+description: Zero-shot entity extraction over arbitrary user-provided labels.
+license: apache-2.0
+tags: [extract, ner, zero-shot, entities, pii, business, row]
+source:
+  provider: huggingface
+  model: urchade/gliner_medium-v2.1
+  url: https://huggingface.co/urchade/gliner_medium-v2.1
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: gliner
+  device: auto
+  extra_requirements:
+    - gliner==0.2.16
+backend:
+  name: extract_gliner
+  transport: rvbbit
+  batch_size: 16
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: GLiNER medium zero-shot entity extraction.
+operators:
+  - name: extract_entities
+    description: Extract entities from text using GLiNER with comma-separated labels.
+    arg_names: [text, labels]
+    arg_types: [text, text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+      labels: "{{ inputs.labels }}"
+  - name: extract_pii
+    description: Extract likely PII spans from text using a fixed label set.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+      labels: person, email, phone number, address, credit card, bank account, ssn, date of birth, username, password
+  - name: extract_business_entities
+    description: Extract business-oriented entities from notes, tickets, contracts, and CRM records.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+      labels: person, organization, product, location, money, date, contract, account, issue, competitor
+  - name: extract_row_entities
+    description: Extract caller-selected entity labels from a JSONB row serialized as text.
+    arg_names: [row, labels]
+    arg_types: [jsonb, text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.row }}"
+      labels: "{{ inputs.labels }}"
+smoke:
+  inputs:
+    - text: A witness saw a large figure near Mount Hood outside Portland.
+      labels: person, location, animal, organization
+      row: '{"note":"A witness saw a large figure near Mount Hood outside Portland.","county":"Clackamas"}'

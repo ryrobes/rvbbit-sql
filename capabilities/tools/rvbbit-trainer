@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""Train SQL-backed tabular models and register them as Rvbbit capabilities.
+
+This is the first production-shaped trainer worker. It deliberately keeps
+training outside the Postgres backend:
+
+1. claim a queued `rvbbit.ml_training_runs` row,
+2. execute its `source_sql`,
+3. fit a small sklearn tabular model,
+4. scaffold a capability sidecar containing `model.joblib` + `config.json`,
+5. optionally start the sidecar with Docker Compose,
+6. call `rvbbit.complete_model_training(...)`.
+
+The generated serving path is the same capability/operator path used by curated
+model packs, so trained models and installed model-zoo packs share one runtime
+surface.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CAPABILITY_TOOL = ROOT / "tools" / "rvbbit-capability"
+DEFAULT_DSN = os.environ.get(
+    "RVBBIT_DSN",
+    "postgresql://postgres:rvbbit@localhost:55433/bench",
+)
+
+CLASSIFICATION_TASKS = {"classification", "classifier", "tabular_classification"}
+REGRESSION_TASKS = {"regression", "regressor", "tabular_regression"}
+
+
+@dataclass
+class ClaimedRun:
+    run_id: str
+    model_name: str
+    task: str
+    source_sql: str
+    target_column: str | None
+    feature_schema: list[dict[str, Any]]
+    training_opts: dict[str, Any]
+
+
+@dataclass
+class TrainResult:
+    output_dir: Path
+    manifest: dict[str, Any]
+    metrics: dict[str, Any]
+    artifact_uri: str
+    artifact_format: str
+    backend_name: str
+    backend_endpoint: str
+    operator_name: str
+
+
+def slugify(value: str, prefix: str = "model") -> str:
+    slug = re.sub(r"[^a-z0-9_]+", "_", value.lower()).strip("_")
+    slug = re.sub(r"_+", "_", slug)
+    if not slug:
+        slug = f"{prefix}_{hashlib.sha1(value.encode()).hexdigest()[:8]}"
+    if not re.match(r"^[a-z_]", slug):
+        slug = f"{prefix}_{slug}"
+    return slug
+
+
+def docker_port_for_model(model_name: str, base: int) -> int:
+    digest = int(hashlib.sha1(model_name.encode()).hexdigest()[:8], 16)
+    return base + (digest % 1000)
+
+
+def normalize_json(value: Any, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return fallback
+    return value
+
+
+def normalize_task(task: str) -> str:
+    t = (task or "classification").strip().lower()
+    if t in CLASSIFICATION_TASKS:
+        return "classification"
+    if t in REGRESSION_TASKS:
+        return "regression"
+    raise ValueError(
+        f"unsupported trainer task {task!r}; supported: classification, regression"
+    )
+
+
+def handler_for_task(task: str) -> str:
+    return "tabular_classification" if normalize_task(task) == "classification" else "tabular_regression"
+
+
+def read_sql_frame(dsn: str, source_sql: str):
+    import pandas as pd
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(source_sql)
+            if cur.description is None:
+                raise ValueError("source_sql must be a SELECT-like query that returns rows")
+            columns = [col.name for col in cur.description]
+            rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=columns)
+
+
+def claim_run(dsn: str, worker_id: str) -> ClaimedRun | None:
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT run_id::text, model_name, task, source_sql, target_column,
+                       feature_schema, training_opts
+                FROM rvbbit.claim_model_training_run(%s)
+                """,
+                (worker_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return ClaimedRun(
+        run_id=row[0],
+        model_name=row[1],
+        task=row[2],
+        source_sql=row[3],
+        target_column=row[4],
+        feature_schema=normalize_json(row[5], []),
+        training_opts=normalize_json(row[6], {}),
+    )
+
+
+def fetch_run(dsn: str, run_id: str) -> ClaimedRun:
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE rvbbit.ml_training_runs
+                SET status = 'running',
+                    started_at = COALESCE(started_at, clock_timestamp())
+                WHERE run_id = %s
+                  AND status IN ('queued', 'running')
+                RETURNING run_id::text, model_name, task, source_sql,
+                          target_column, feature_schema, training_opts
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(f"training run {run_id} not found or not runnable")
+    return ClaimedRun(
+        run_id=row[0],
+        model_name=row[1],
+        task=row[2],
+        source_sql=row[3],
+        target_column=row[4],
+        feature_schema=normalize_json(row[5], []),
+        training_opts=normalize_json(row[6], {}),
+    )
+
+
+def schema_feature_names(feature_schema: list[dict[str, Any]]) -> list[str]:
+    names = []
+    for item in feature_schema:
+        if isinstance(item, dict) and item.get("name"):
+            names.append(str(item["name"]))
+    return names
+
+
+def schema_type_map(feature_schema: list[dict[str, Any]]) -> dict[str, str]:
+    out = {}
+    for item in feature_schema:
+        if isinstance(item, dict) and item.get("name"):
+            typ = item.get("type") or item.get("sql_type") or item.get("dtype") or ""
+            out[str(item["name"])] = str(typ).lower()
+    return out
+
+
+def infer_feature_schema(frame, feature_names: list[str]) -> list[dict[str, Any]]:
+    schema = []
+    for name in feature_names:
+        dtype = str(frame[name].dtype)
+        if dtype.startswith("int"):
+            sql_type = "bigint"
+        elif dtype.startswith("float"):
+            sql_type = "float8"
+        elif dtype == "bool":
+            sql_type = "boolean"
+        else:
+            sql_type = "text"
+        schema.append({"name": name, "type": sql_type, "dtype": dtype})
+    return schema
+
+
+def split_feature_columns(frame, feature_schema: list[dict[str, Any]], features: list[str]) -> tuple[list[str], list[str]]:
+    type_map = schema_type_map(feature_schema)
+    numeric = []
+    categorical = []
+    for name in features:
+        declared = type_map.get(name, "")
+        dtype = str(frame[name].dtype)
+        if declared in {"text", "varchar", "char", "bpchar", "jsonb", "json"}:
+            categorical.append(name)
+        elif declared in {"boolean", "bool"}:
+            categorical.append(name)
+        elif dtype == "object" or dtype.startswith("string") or dtype == "category" or dtype == "bool":
+            categorical.append(name)
+        else:
+            numeric.append(name)
+    return numeric, categorical
+
+
+def choose_estimator(task: str, opts: dict[str, Any]):
+    estimator = str(opts.get("estimator") or opts.get("algorithm") or "random_forest").lower()
+    random_state = int(opts.get("random_state", 42))
+    n_estimators = int(opts.get("n_estimators", 200))
+
+    if normalize_task(task) == "classification":
+        if estimator in {"extra_trees", "extratrees"}:
+            from sklearn.ensemble import ExtraTreesClassifier
+
+            return ExtraTreesClassifier(
+                n_estimators=n_estimators,
+                random_state=random_state,
+                n_jobs=-1,
+                class_weight=opts.get("class_weight"),
+            )
+        if estimator in {"logistic", "logistic_regression"}:
+            from sklearn.linear_model import LogisticRegression
+
+            return LogisticRegression(max_iter=int(opts.get("max_iter", 1000)))
+        from sklearn.ensemble import RandomForestClassifier
+
+        return RandomForestClassifier(
+            n_estimators=n_estimators,
+            random_state=random_state,
+            n_jobs=-1,
+            class_weight=opts.get("class_weight"),
+        )
+
+    if estimator in {"extra_trees", "extratrees"}:
+        from sklearn.ensemble import ExtraTreesRegressor
+
+        return ExtraTreesRegressor(
+            n_estimators=n_estimators,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+    if estimator in {"ridge", "ridge_regression"}:
+        from sklearn.linear_model import Ridge
+
+        return Ridge()
+    from sklearn.ensemble import RandomForestRegressor
+
+    return RandomForestRegressor(
+        n_estimators=n_estimators,
+        random_state=random_state,
+        n_jobs=-1,
+    )
+
+
+def can_stratify(y, test_size: float) -> bool:
+    counts = y.value_counts(dropna=False)
+    if len(counts) < 2:
+        return False
+    n_test = max(1, int(round(len(y) * test_size)))
+    return counts.min() >= 2 and n_test >= len(counts)
+
+
+def fit_model(frame, run: ClaimedRun) -> tuple[Any, dict[str, Any], list[str], list[dict[str, Any]]]:
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import (
+        accuracy_score,
+        balanced_accuracy_score,
+        f1_score,
+        mean_absolute_error,
+        mean_squared_error,
+        r2_score,
+    )
+    from sklearn.model_selection import train_test_split
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+    task = normalize_task(run.task)
+    opts = run.training_opts or {}
+    target = run.target_column
+    if not target:
+        raise ValueError("target_column is required for the current tabular trainer")
+    if target not in frame.columns:
+        raise ValueError(f"target column {target!r} not found in source_sql output")
+
+    feature_names = schema_feature_names(run.feature_schema)
+    if not feature_names:
+        feature_names = [col for col in frame.columns if col != target]
+    missing = [col for col in feature_names if col not in frame.columns]
+    if missing:
+        raise ValueError(f"feature columns missing from source_sql output: {missing}")
+    if not feature_names:
+        raise ValueError("no feature columns available")
+
+    feature_schema = run.feature_schema or infer_feature_schema(frame, feature_names)
+    work = frame[feature_names + [target]].dropna(subset=[target]).copy()
+    if work.empty:
+        raise ValueError("no rows remain after dropping NULL targets")
+
+    X = work[feature_names]
+    y = work[target]
+    numeric_cols, categorical_cols = split_feature_columns(work, feature_schema, feature_names)
+
+    transformers = []
+    if numeric_cols:
+        transformers.append(
+            (
+                "num",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scale", StandardScaler()),
+                    ]
+                ),
+                numeric_cols,
+            )
+        )
+    if categorical_cols:
+        transformers.append(
+            (
+                "cat",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+                    ]
+                ),
+                categorical_cols,
+            )
+        )
+    if not transformers:
+        raise ValueError("no trainable feature columns found")
+
+    pipeline = Pipeline(
+        [
+            ("preprocess", ColumnTransformer(transformers=transformers)),
+            ("model", choose_estimator(task, opts)),
+        ]
+    )
+
+    metrics: dict[str, Any] = {
+        "task": task,
+        "n_rows": int(len(work)),
+        "n_features": int(len(feature_names)),
+        "features": feature_names,
+        "target_column": target,
+        "numeric_features": numeric_cols,
+        "categorical_features": categorical_cols,
+        "estimator": pipeline.named_steps["model"].__class__.__name__,
+    }
+
+    test_size = float(opts.get("test_size", 0.2))
+    do_holdout = len(work) >= int(opts.get("min_holdout_rows", 20)) and 0.0 < test_size < 0.5
+    if do_holdout:
+        stratify = y if task == "classification" and can_stratify(y, test_size) else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=test_size,
+            random_state=int(opts.get("random_state", 42)),
+            stratify=stratify,
+        )
+        pipeline.fit(X_train, y_train)
+        pred = pipeline.predict(X_test)
+        metrics["train_rows"] = int(len(X_train))
+        metrics["test_rows"] = int(len(X_test))
+        if task == "classification":
+            metrics["accuracy"] = float(accuracy_score(y_test, pred))
+            metrics["balanced_accuracy"] = float(balanced_accuracy_score(y_test, pred))
+            metrics["f1_macro"] = float(f1_score(y_test, pred, average="macro", zero_division=0))
+        else:
+            mse = float(mean_squared_error(y_test, pred))
+            metrics["mae"] = float(mean_absolute_error(y_test, pred))
+            metrics["rmse"] = mse ** 0.5
+            metrics["r2"] = float(r2_score(y_test, pred))
+
+    pipeline.fit(X, y)
+    if task == "classification":
+        labels = [str(value) for value in sorted(set(y.astype(str)))]
+        metrics["class_labels"] = labels
+        metrics["n_classes"] = len(labels)
+    return pipeline, metrics, feature_names, feature_schema
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def manifest_for_model(
+    run: ClaimedRun,
+    feature_names: list[str],
+    feature_schema: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    safe_model = slugify(run.model_name)
+    service_name = f"trained_{safe_model}"
+    backend_name = args.backend_name or f"{service_name}_backend"
+    operator_name = args.operator_name or f"predict_{safe_model}"
+    endpoint = args.endpoint_url or f"http://{service_name.replace('_', '-')}:8080/predict"
+    handler = handler_for_task(run.task)
+    title = f"Trained {run.model_name}"
+
+    sample_row = {name: None for name in feature_names}
+    if args.sample_json:
+        sample_row = json.loads(args.sample_json)
+
+    return {
+        "api_version": "rvbbit.capability/v1",
+        "kind": "hf_backend",
+        "name": service_name,
+        "title": title,
+        "description": f"SQL-trained Rvbbit {normalize_task(run.task)} model.",
+        "license": "user-provided",
+        "tags": ["trained", "tabular", normalize_task(run.task), "sql"],
+        "source": {
+            "provider": "rvbbit-trained",
+            "model": run.model_name,
+            "revision": run.run_id,
+        },
+        "runtime": {
+            "template": "hf-rvbbit-fastapi",
+            "handler": handler,
+            "device": "cpu",
+            "base_image": args.base_image,
+            "env": {
+                "RVBBIT_CAPABILITY_EAGER": "0",
+                "RVBBIT_TABULAR_MODEL_FILE": "model.joblib",
+                "RVBBIT_TABULAR_CONFIG_FILE": "config.json",
+            },
+        },
+        "backend": {
+            "name": backend_name,
+            "endpoint": endpoint,
+            "transport": "rvbbit",
+            "batch_size": int(args.batch_size),
+            "max_concurrent": int(args.max_concurrent),
+            "timeout_ms": int(args.timeout_ms),
+            "description": f"Serving backend for trained model {run.model_name}.",
+        },
+        "operators": [
+            {
+                "name": operator_name,
+                "description": f"Predict with trained model {run.model_name}.",
+                "arg_names": ["row"],
+                "arg_types": ["jsonb"],
+                "return_type": "jsonb",
+                "parser": "json",
+                "inputs": {"row": "{{ inputs.row }}"},
+            }
+        ],
+        "smoke": {"inputs": [{"row": json.dumps(sample_row, sort_keys=True)}]},
+        "rvbbit_training": {
+            "run_id": run.run_id,
+            "model_name": run.model_name,
+            "task": normalize_task(run.task),
+            "target_column": run.target_column,
+            "feature_schema": feature_schema,
+            "metrics": metrics,
+        },
+    }
+
+
+def scaffold_sidecar(out_dir: Path, manifest: dict[str, Any], force: bool) -> None:
+    if out_dir.exists():
+        if force:
+            shutil.rmtree(out_dir)
+        elif any(out_dir.iterdir()):
+            raise RuntimeError(f"{out_dir} exists and is not empty; pass --force")
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    manifest_tmp = out_dir.parent / f".{manifest['name']}.manifest.json"
+    write_json(manifest_tmp, manifest)
+    try:
+        subprocess.run(
+            [sys.executable, str(CAPABILITY_TOOL), "scaffold", str(manifest_tmp), str(out_dir), "--force"],
+            check=True,
+        )
+    finally:
+        try:
+            manifest_tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def start_sidecar(out_dir: Path, port: int, network: str, wait_seconds: int) -> None:
+    env = os.environ.copy()
+    env["RVBBIT_CAPABILITY_PORT"] = str(port)
+    env["RVBBIT_DOCKER_NETWORK"] = network
+    subprocess.run(["docker", "compose", "up", "-d", "--build"], cwd=out_dir, env=env, check=True)
+    deadline = time.time() + wait_seconds
+    url = f"http://127.0.0.1:{port}/health"
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:
+                if response.status < 500:
+                    return
+        except Exception as exc:
+            last_error = exc
+        time.sleep(1)
+    raise RuntimeError(f"sidecar did not become healthy at {url}: {last_error}")
+
+
+def train_and_scaffold(run: ClaimedRun, args: argparse.Namespace) -> TrainResult:
+    import joblib
+
+    safe_model = slugify(run.model_name)
+    out_dir = Path(args.output_root).expanduser().resolve() / safe_model
+    frame = read_sql_frame(args.dsn, run.source_sql)
+    model, metrics, feature_names, feature_schema = fit_model(frame, run)
+    manifest = manifest_for_model(run, feature_names, feature_schema, metrics, args)
+    scaffold_sidecar(out_dir, manifest, args.force)
+
+    joblib.dump(model, out_dir / "model.joblib")
+    write_json(
+        out_dir / "config.json",
+        {
+            "features": feature_names,
+            "feature_schema": feature_schema,
+            "target_column": run.target_column,
+            "task": normalize_task(run.task),
+            "metrics": metrics,
+        },
+    )
+    write_json(out_dir / "training_metrics.json", metrics)
+
+    backend = manifest["backend"]
+    operator = manifest["operators"][0]
+    return TrainResult(
+        output_dir=out_dir,
+        manifest=manifest,
+        metrics=metrics,
+        artifact_uri=f"file://{out_dir / 'model.joblib'}",
+        artifact_format="joblib",
+        backend_name=backend["name"],
+        backend_endpoint=backend["endpoint"],
+        operator_name=operator["name"],
+    )
+
+
+def complete_run(dsn: str, run: ClaimedRun, result: TrainResult, args: argparse.Namespace) -> None:
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rvbbit.complete_model_training(
+                  run_id => %s,
+                  backend_name => %s,
+                  backend_endpoint => %s,
+                  backend_transport => 'rvbbit',
+                  artifact_uri => %s,
+                  artifact_format => %s,
+                  metrics => %s,
+                  install_manifest => %s,
+                  backend_opts => '{}'::jsonb,
+                  backend_batch_size => %s,
+                  backend_max_concur => %s,
+                  backend_timeout_ms => %s,
+                  create_sql_operator => true,
+                  operator_name => %s,
+                  operator_arg_name => 'row',
+                  operator_arg_type => 'jsonb',
+                  backend_input_key => 'row',
+                  operator_return_type => 'jsonb',
+                  operator_parser => 'json'
+                )
+                """,
+                (
+                    run.run_id,
+                    result.backend_name,
+                    result.backend_endpoint,
+                    result.artifact_uri,
+                    result.artifact_format,
+                    Jsonb(result.metrics),
+                    Jsonb(result.manifest),
+                    int(args.batch_size),
+                    int(args.max_concurrent),
+                    int(args.timeout_ms),
+                    result.operator_name,
+                ),
+            )
+
+
+def fail_run(dsn: str, run_id: str, error: str) -> None:
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT rvbbit.fail_model_training(%s, %s, %s)",
+                (run_id, error, Jsonb({"trainer": "rvbbit-trainer"})),
+            )
+
+
+def process_run(run: ClaimedRun, args: argparse.Namespace) -> TrainResult:
+    result = train_and_scaffold(run, args)
+    if args.start_sidecar:
+        port = int(args.port or docker_port_for_model(run.model_name, int(args.port_base)))
+        start_sidecar(result.output_dir, port, args.docker_network, int(args.wait_seconds))
+    if not args.no_complete:
+        complete_run(args.dsn, run, result, args)
+    return result
+
+
+def add_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--dsn", default=DEFAULT_DSN, help="Postgres DSN")
+    parser.add_argument(
+        "--output-root",
+        default=os.environ.get("RVBBIT_TRAINED_MODEL_DIR", ".rvbbit/trained-models"),
+        help="Directory for generated trained-model capability projects",
+    )
+    parser.add_argument("--force", action="store_true", help="Replace an existing output directory")
+    parser.add_argument("--start-sidecar", action="store_true", help="Build/start generated sidecar with Docker Compose")
+    parser.add_argument("--docker-network", default=os.environ.get("RVBBIT_DOCKER_NETWORK", "docker_default"))
+    parser.add_argument("--port", type=int, help="Host port for generated sidecar when --start-sidecar is set")
+    parser.add_argument("--port-base", type=int, default=int(os.environ.get("RVBBIT_TRAINER_PORT_BASE", "8200")))
+    parser.add_argument("--wait-seconds", type=int, default=120)
+    parser.add_argument("--base-image", default="python:3.11-slim")
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--max-concurrent", type=int, default=2)
+    parser.add_argument("--timeout-ms", type=int, default=120000)
+    parser.add_argument("--backend-name")
+    parser.add_argument("--operator-name")
+    parser.add_argument("--endpoint-url", help="Override backend endpoint registered in Rvbbit")
+    parser.add_argument("--sample-json", help="Optional sample row JSON for generated smoke.sql")
+    parser.add_argument("--no-complete", action="store_true", help="Train/scaffold but do not call complete_model_training")
+
+
+def cmd_run_once(args: argparse.Namespace) -> int:
+    run = claim_run(args.dsn, args.worker_id)
+    if run is None:
+        print("no queued training runs")
+        return 2
+    try:
+        result = process_run(run, args)
+    except Exception as exc:
+        fail_run(args.dsn, run.run_id, str(exc))
+        raise
+    print(
+        json.dumps(
+            {
+                "run_id": run.run_id,
+                "model_name": run.model_name,
+                "output_dir": str(result.output_dir),
+                "backend_name": result.backend_name,
+                "operator_name": result.operator_name,
+                "metrics": result.metrics,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_train_run(args: argparse.Namespace) -> int:
+    run = fetch_run(args.dsn, args.run_id)
+    try:
+        result = process_run(run, args)
+    except Exception as exc:
+        fail_run(args.dsn, run.run_id, str(exc))
+        raise
+    print(json.dumps({"run_id": run.run_id, "output_dir": str(result.output_dir), "metrics": result.metrics}, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_train_query(args: argparse.Namespace) -> int:
+    run = ClaimedRun(
+        run_id=args.run_id or f"manual-{int(time.time())}",
+        model_name=args.model_name,
+        task=args.task,
+        source_sql=args.source_sql,
+        target_column=args.target_column,
+        feature_schema=json.loads(args.feature_schema) if args.feature_schema else [],
+        training_opts=json.loads(args.training_opts) if args.training_opts else {},
+    )
+    result = process_run(run, args)
+    print(json.dumps({"output_dir": str(result.output_dir), "metrics": result.metrics}, indent=2, sort_keys=True))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="rvbbit-trainer")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_once = sub.add_parser("run-once", help="claim and process one queued training run")
+    add_common_args(p_once)
+    p_once.add_argument("--worker-id", default=os.environ.get("RVBBIT_TRAINER_WORKER", "rvbbit-trainer"))
+    p_once.set_defaults(func=cmd_run_once)
+
+    p_run = sub.add_parser("train-run", help="process a specific training run id")
+    add_common_args(p_run)
+    p_run.add_argument("run_id")
+    p_run.set_defaults(func=cmd_train_run)
+
+    p_query = sub.add_parser("train-query", help="train directly from SQL without claiming a queued run")
+    add_common_args(p_query)
+    p_query.add_argument("--model-name", required=True)
+    p_query.add_argument("--source-sql", required=True)
+    p_query.add_argument("--target-column", required=True)
+    p_query.add_argument("--task", default="classification")
+    p_query.add_argument("--feature-schema", help="JSON feature schema array")
+    p_query.add_argument("--training-opts", help="JSON training opts")
+    p_query.add_argument("--run-id")
+    p_query.set_defaults(func=cmd_train_query)
+
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

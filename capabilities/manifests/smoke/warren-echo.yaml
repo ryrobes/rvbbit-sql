@@ -1,0 +1,36 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: warren_smoke_echo
+title: Warren Smoke Echo
+description: Deterministic no-model sidecar for validating Warren deployment, backend registration, probing, and operator wiring.
+license: apache-2.0
+tags: [smoke, warren, deterministic, no-model, cpu]
+source:
+  provider: builtin
+  model: rvbbit/warren-smoke-echo
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: echo
+  device: cpu
+  base_image: python:3.12-slim
+backend:
+  name: warren_smoke_echo
+  transport: rvbbit
+  batch_size: 256
+  max_concurrent: 8
+  timeout_ms: 10000
+  description: Deterministic echo backend for Warren smoke tests.
+operators:
+  - name: warren_smoke_echo
+    description: Echo text through a Warren-managed sidecar.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+smoke:
+  inputs:
+    - text: warren smoke test
+  sql:
+    - "SELECT rvbbit.warren_smoke_echo('warren smoke test')->>'echo' AS echo;"

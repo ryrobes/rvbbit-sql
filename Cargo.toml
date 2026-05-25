@@ -1,0 +1,48 @@
+[workspace]
+members = ["crates/pg_rvbbit", "crates/rvbbit_storage", "warren/agent"]
+resolver = "2"
+
+[workspace.package]
+version = "0.56.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Rvbbit contributors"]
+
+[workspace.dependencies]
+pgrx = "=0.18.0"
+pgrx-tests = "=0.18.0"
+arrow = "55"
+parquet = "55"
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jsonwebtoken = "9"
+zstd = "0.13"
+# Semantic operator runtime (R5+): sync HTTP, content hashing.
+# reqwest::blocking avoids the tokio runtime; matches pgrx's backend model.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+blake3 = "1"
+sha2 = "0.10"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+postgres = "0.19"
+lru = "0.16"
+# Tiered model layer (RYR-289). tiktoken-rs is OpenAI's BPE in pure Rust —
+# bundled encodings (cl100k_base, o200k_base, p50k_base, r50k_base) so
+# token counts are deterministic without network or model files.
+tiktoken-rs = "0.7"
+# Semantic predicate bitmap cache (RYR-288). Pure-Rust roaring bitmaps;
+# compresses well for both sparse and dense match sets within a parquet
+# row group. Serialized as bytea into rvbbit.semantic_bitmaps.
+roaring = "0.10"
+# Lightweight base64 for HLL state inside column stats jsonb.
+base64 = "0.22"
+# Local CPU embedding transport. Keep image/CUDA features off here; Rvbbit
+# only needs text embeddings for the built-in `embed` backend.
+fastembed = { version = "5.13.4", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1

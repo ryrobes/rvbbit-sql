@@ -1,0 +1,46 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: deberta_v3_base_zero_shot
+title: DeBERTa v3 Base Zero-Shot Classifier
+description: Smaller NLI zero-shot classifier for classifying text or JSONB rows into caller-provided labels.
+license: mit
+tags: [classify, zero-shot, nli, row, cpu-friendly]
+source:
+  provider: huggingface
+  model: MoritzLaurer/deberta-v3-base-zeroshot-v2.0
+  url: https://huggingface.co/MoritzLaurer/deberta-v3-base-zeroshot-v2.0
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: zero_shot_classification
+  device: auto
+backend:
+  name: classify_deberta_base_zero_shot
+  transport: rvbbit
+  batch_size: 24
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: DeBERTa v3 base NLI zero-shot classifier.
+operators:
+  - name: classify_zero_shot_base
+    description: Classify text into comma-separated categories using a smaller DeBERTa v3 zero-shot model.
+    arg_names: [text, categories]
+    arg_types: [text, text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+      labels: "{{ inputs.categories }}"
+  - name: classify_row_zero_shot_base
+    description: Classify a JSONB row into comma-separated categories using a smaller DeBERTa v3 zero-shot model.
+    arg_names: [row, categories]
+    arg_types: [jsonb, text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.row }}"
+      labels: "{{ inputs.categories }}"
+smoke:
+  inputs:
+    - text: account was locked after too many login attempts
+      row: '{"event":"login_failed","count":12,"country":"unknown","status":"locked"}'
+      categories: auth, billing, support, fraud, product

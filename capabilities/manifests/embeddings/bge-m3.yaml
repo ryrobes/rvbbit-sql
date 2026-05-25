@@ -1,0 +1,36 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: bge_m3
+title: BGE-M3 Embeddings
+description: High-quality multilingual BGE-M3 sentence embeddings for retrieval and semantic search.
+license: mit
+tags: [embedding, retrieval, multilingual, gpu]
+source:
+  provider: huggingface
+  model: BAAI/bge-m3
+  url: https://huggingface.co/BAAI/bge-m3
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: embedding
+  device: auto
+backend:
+  name: embed_bge_m3
+  transport: rvbbit
+  batch_size: 64
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: BAAI/bge-m3 multilingual sentence embeddings.
+operators:
+  - name: embed_bge_m3
+    description: Return a BGE-M3 embedding as JSON for exploratory use. Register this backend as `embed` if you want the built-in embedding SQL to use it.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+smoke:
+  inputs:
+    - text: suspicious movement near a wooded creek
+  sql:
+    - "SELECT jsonb_array_length(rvbbit.embed_bge_m3('hello world'));"

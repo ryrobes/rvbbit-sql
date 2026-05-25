@@ -1,0 +1,38 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: wine_quality_sklearn
+title: Wine Quality Classifier
+description: Scikit-learn tabular classification example that predicts red wine quality classes from numeric row features.
+license: unknown
+tags: [tabular, classify, prediction, row, sklearn, demo]
+source:
+  provider: huggingface
+  model: julien-c/wine-quality
+  url: https://huggingface.co/julien-c/wine-quality
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: tabular_classification
+  device: cpu
+  env:
+    RVBBIT_CAPABILITY_EAGER: "0"
+    RVBBIT_TABULAR_MODEL_FILE: sklearn_model.joblib
+    RVBBIT_TABULAR_FEATURES: '["fixed acidity","volatile acidity","citric acid","residual sugar","chlorides","free sulfur dioxide","total sulfur dioxide","density","pH","sulphates","alcohol"]'
+backend:
+  name: predict_wine_quality_sklearn
+  transport: rvbbit
+  batch_size: 256
+  max_concurrent: 2
+  timeout_ms: 120000
+  description: Scikit-learn wine quality classification demo model.
+operators:
+  - name: predict_wine_quality
+    description: Predict wine quality class from a JSONB row of numeric chemical properties.
+    arg_names: [row]
+    arg_types: [jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      row: "{{ inputs.row }}"
+smoke:
+  inputs:
+    - row: '{"fixed acidity":7.4,"volatile acidity":0.7,"citric acid":0.0,"residual sugar":1.9,"chlorides":0.076,"free sulfur dioxide":11,"total sulfur dioxide":34,"density":0.9978,"pH":3.51,"sulphates":0.56,"alcohol":9.4}'

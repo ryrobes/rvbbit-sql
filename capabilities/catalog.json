@@ -1,0 +1,449 @@
+{
+  "capabilities": [
+    {
+      "backend_name": "classify_deberta_base_zero_shot",
+      "backend_transport": "rvbbit",
+      "description": "Smaller NLI zero-shot classifier for classifying text or JSONB rows into caller-provided labels.",
+      "device": "auto",
+      "id": "classify/deberta-v3-base-zero-shot.yaml",
+      "kind": "hf_backend",
+      "license": "mit",
+      "manifest_path": "capabilities/manifests/classify/deberta-v3-base-zero-shot.yaml",
+      "name": "deberta_v3_base_zero_shot",
+      "operators": [
+        "classify_zero_shot_base",
+        "classify_row_zero_shot_base"
+      ],
+      "runtime_handler": "zero_shot_classification",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "classify",
+        "zero-shot",
+        "nli",
+        "row",
+        "cpu-friendly"
+      ],
+      "title": "DeBERTa v3 Base Zero-Shot Classifier"
+    },
+    {
+      "backend_name": "classify_deberta_zero_shot",
+      "backend_transport": "rvbbit",
+      "description": "NLI-based zero-shot classification over caller-provided labels.",
+      "device": "auto",
+      "id": "classify/deberta-v3-zero-shot.yaml",
+      "kind": "hf_backend",
+      "license": "mit",
+      "manifest_path": "capabilities/manifests/classify/deberta-v3-zero-shot.yaml",
+      "name": "deberta_v3_zero_shot",
+      "operators": [
+        "classify_zero_shot",
+        "classify_row_zero_shot"
+      ],
+      "runtime_handler": "zero_shot_classification",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "classify",
+        "zero-shot",
+        "nli",
+        "row"
+      ],
+      "title": "DeBERTa v3 Zero-Shot Classifier"
+    },
+    {
+      "backend_name": "classify_emotion_distilroberta",
+      "backend_transport": "rvbbit",
+      "description": "Classify text into emotion labels for support, survey, content, and conversation analytics.",
+      "device": "auto",
+      "id": "classify/emotion-distilroberta.yaml",
+      "kind": "hf_backend",
+      "license": "unknown",
+      "manifest_path": "capabilities/manifests/classify/emotion-distilroberta.yaml",
+      "name": "emotion_distilroberta",
+      "operators": [
+        "classify_emotion",
+        "classify_row_emotion"
+      ],
+      "runtime_handler": "sequence_classification",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "j-hartmann/emotion-english-distilroberta-base",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "classify",
+        "emotion",
+        "text",
+        "tabular",
+        "row"
+      ],
+      "title": "Emotion Classifier"
+    },
+    {
+      "backend_name": "detect_language_xlm_roberta",
+      "backend_transport": "rvbbit",
+      "description": "Detect the language of text for routing, normalization, and multilingual analytics.",
+      "device": "auto",
+      "id": "classify/language-detection-xlm-roberta.yaml",
+      "kind": "hf_backend",
+      "license": "mit",
+      "manifest_path": "capabilities/manifests/classify/language-detection-xlm-roberta.yaml",
+      "name": "language_detection_xlm_roberta",
+      "operators": [
+        "detect_language"
+      ],
+      "runtime_handler": "sequence_classification",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "papluca/xlm-roberta-base-language-detection",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "classify",
+        "language",
+        "multilingual",
+        "routing",
+        "tabular"
+      ],
+      "title": "XLM-R Language Detection"
+    },
+    {
+      "backend_name": "classify_toxic_bert",
+      "backend_transport": "rvbbit",
+      "description": "Multi-label toxicity classifier for moderation, support triage, and data quality workflows.",
+      "device": "auto",
+      "id": "classify/toxic-bert.yaml",
+      "kind": "hf_backend",
+      "license": "apache-2.0",
+      "manifest_path": "capabilities/manifests/classify/toxic-bert.yaml",
+      "name": "toxic_bert",
+      "operators": [
+        "classify_toxicity",
+        "classify_row_toxicity"
+      ],
+      "runtime_handler": "sequence_classification",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "unitary/toxic-bert",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "classify",
+        "toxicity",
+        "moderation",
+        "multilabel",
+        "tabular",
+        "row"
+      ],
+      "title": "Toxicity Classifier"
+    },
+    {
+      "backend_name": "classify_twitter_roberta_sentiment",
+      "backend_transport": "rvbbit",
+      "description": "Practical positive/neutral/negative sentiment classifier for reviews, tickets, social text, and notes.",
+      "device": "auto",
+      "id": "classify/twitter-roberta-sentiment.yaml",
+      "kind": "hf_backend",
+      "license": "cc-by-4.0",
+      "manifest_path": "capabilities/manifests/classify/twitter-roberta-sentiment.yaml",
+      "name": "twitter_roberta_sentiment",
+      "operators": [
+        "classify_sentiment",
+        "classify_row_sentiment"
+      ],
+      "runtime_handler": "sequence_classification",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "cardiffnlp/twitter-roberta-base-sentiment-latest",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "classify",
+        "sentiment",
+        "text",
+        "tabular",
+        "row"
+      ],
+      "title": "RoBERTa Sentiment Classifier"
+    },
+    {
+      "backend_name": "embed_bge_m3",
+      "backend_transport": "rvbbit",
+      "description": "High-quality multilingual BGE-M3 sentence embeddings for retrieval and semantic search.",
+      "device": "auto",
+      "id": "embeddings/bge-m3.yaml",
+      "kind": "hf_backend",
+      "license": "mit",
+      "manifest_path": "capabilities/manifests/embeddings/bge-m3.yaml",
+      "name": "bge_m3",
+      "operators": [
+        "embed_bge_m3"
+      ],
+      "runtime_handler": "embedding",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "BAAI/bge-m3",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "embedding",
+        "retrieval",
+        "multilingual",
+        "gpu"
+      ],
+      "title": "BGE-M3 Embeddings"
+    },
+    {
+      "backend_name": "embed_bge_small",
+      "backend_transport": "rvbbit",
+      "description": "CPU-friendly English sentence embeddings exposed as an Rvbbit backend.",
+      "device": "auto",
+      "id": "embeddings/bge-small-en-v1.5.yaml",
+      "kind": "hf_backend",
+      "license": "mit",
+      "manifest_path": "capabilities/manifests/embeddings/bge-small-en-v1.5.yaml",
+      "name": "bge_small_en_v1_5",
+      "operators": [
+        "embed_bge_small"
+      ],
+      "runtime_handler": "embedding",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "BAAI/bge-small-en-v1.5",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "embedding",
+        "retrieval",
+        "cpu-friendly"
+      ],
+      "title": "BGE Small English Embeddings"
+    },
+    {
+      "backend_name": "embed_e5_small",
+      "backend_transport": "rvbbit",
+      "description": "Small, fast E5 embeddings useful for CPU-friendly retrieval experiments and lightweight semantic joins.",
+      "device": "auto",
+      "id": "embeddings/e5-small-v2.yaml",
+      "kind": "hf_backend",
+      "license": "mit",
+      "manifest_path": "capabilities/manifests/embeddings/e5-small-v2.yaml",
+      "name": "e5_small_v2",
+      "operators": [
+        "embed_e5_small"
+      ],
+      "runtime_handler": "embedding",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "intfloat/e5-small-v2",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "embedding",
+        "retrieval",
+        "cpu-friendly",
+        "semantic-join"
+      ],
+      "title": "E5 Small Embeddings"
+    },
+    {
+      "backend_name": "extract_gliner",
+      "backend_transport": "rvbbit",
+      "description": "Zero-shot entity extraction over arbitrary user-provided labels.",
+      "device": "auto",
+      "id": "extract/gliner-medium-v2.1.yaml",
+      "kind": "hf_backend",
+      "license": "apache-2.0",
+      "manifest_path": "capabilities/manifests/extract/gliner-medium-v2.1.yaml",
+      "name": "gliner_medium_v2_1",
+      "operators": [
+        "extract_entities",
+        "extract_pii",
+        "extract_business_entities",
+        "extract_row_entities"
+      ],
+      "runtime_handler": "gliner",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "urchade/gliner_medium-v2.1",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "extract",
+        "ner",
+        "zero-shot",
+        "entities",
+        "pii",
+        "business",
+        "row"
+      ],
+      "title": "GLiNER Medium v2.1 Extraction"
+    },
+    {
+      "backend_name": "rerank_bge_base",
+      "backend_transport": "rvbbit",
+      "description": "Smaller BGE cross-encoder reranker for query/document scoring and row ranking.",
+      "device": "auto",
+      "id": "rerank/bge-reranker-base.yaml",
+      "kind": "hf_backend",
+      "license": "mit",
+      "manifest_path": "capabilities/manifests/rerank/bge-reranker-base.yaml",
+      "name": "bge_reranker_base",
+      "operators": [
+        "rerank_bge_base_score",
+        "rerank_bge_base_row"
+      ],
+      "runtime_handler": "sequence_classification",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "BAAI/bge-reranker-base",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "rerank",
+        "retrieval",
+        "relevance",
+        "row",
+        "cpu-friendly"
+      ],
+      "title": "BGE Reranker Base"
+    },
+    {
+      "backend_name": "rerank_bge_m3",
+      "backend_transport": "rvbbit",
+      "description": "Cross-encoder relevance scoring for query/document pairs.",
+      "device": "auto",
+      "id": "rerank/bge-reranker-v2-m3.yaml",
+      "kind": "hf_backend",
+      "license": "mit",
+      "manifest_path": "capabilities/manifests/rerank/bge-reranker-v2-m3.yaml",
+      "name": "bge_reranker_v2_m3",
+      "operators": [
+        "rerank_score",
+        "rerank_row"
+      ],
+      "runtime_handler": "sequence_classification",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "BAAI/bge-reranker-v2-m3",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "rerank",
+        "retrieval",
+        "relevance",
+        "gpu",
+        "row"
+      ],
+      "title": "BGE Reranker v2 M3"
+    },
+    {
+      "backend_name": "rerank_ms_marco_minilm",
+      "backend_transport": "rvbbit",
+      "description": "Lightweight cross-encoder reranker for query/document scoring and ranking table rows by relevance.",
+      "device": "auto",
+      "id": "rerank/ms-marco-minilm-l6-v2.yaml",
+      "kind": "hf_backend",
+      "license": "apache-2.0",
+      "manifest_path": "capabilities/manifests/rerank/ms-marco-minilm-l6-v2.yaml",
+      "name": "ms_marco_minilm_l6_v2",
+      "operators": [
+        "rerank_ms_marco_score",
+        "rerank_ms_marco_row"
+      ],
+      "runtime_handler": "sequence_classification",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "rerank",
+        "retrieval",
+        "relevance",
+        "row",
+        "cpu-friendly"
+      ],
+      "title": "MS MARCO MiniLM Reranker"
+    },
+    {
+      "backend_name": "warren_smoke_echo",
+      "backend_transport": "rvbbit",
+      "description": "Deterministic no-model sidecar for validating Warren deployment, backend registration, probing, and operator wiring.",
+      "device": "cpu",
+      "id": "smoke/warren-echo.yaml",
+      "kind": "hf_backend",
+      "license": "apache-2.0",
+      "manifest_path": "capabilities/manifests/smoke/warren-echo.yaml",
+      "name": "warren_smoke_echo",
+      "operators": [
+        "warren_smoke_echo"
+      ],
+      "runtime_handler": "echo",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "rvbbit/warren-smoke-echo",
+      "source_provider": "builtin",
+      "source_revision": null,
+      "tags": [
+        "smoke",
+        "warren",
+        "deterministic",
+        "no-model",
+        "cpu"
+      ],
+      "title": "Warren Smoke Echo"
+    },
+    {
+      "backend_name": "predict_california_housing_sklearn",
+      "backend_transport": "rvbbit",
+      "description": "Scikit-learn tabular regression example that predicts median house value from California housing row features.",
+      "device": "cpu",
+      "id": "tabular/california-housing-sklearn.yaml",
+      "kind": "hf_backend",
+      "license": "unknown",
+      "manifest_path": "capabilities/manifests/tabular/california-housing-sklearn.yaml",
+      "name": "california_housing_sklearn",
+      "operators": [
+        "predict_house_value"
+      ],
+      "runtime_handler": "tabular_regression",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "B4S/california-housing-predictor",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "tabular",
+        "regression",
+        "prediction",
+        "row",
+        "sklearn",
+        "real-estate",
+        "demo"
+      ],
+      "title": "California Housing Regressor"
+    },
+    {
+      "backend_name": "predict_wine_quality_sklearn",
+      "backend_transport": "rvbbit",
+      "description": "Scikit-learn tabular classification example that predicts red wine quality classes from numeric row features.",
+      "device": "cpu",
+      "id": "tabular/wine-quality-sklearn.yaml",
+      "kind": "hf_backend",
+      "license": "unknown",
+      "manifest_path": "capabilities/manifests/tabular/wine-quality-sklearn.yaml",
+      "name": "wine_quality_sklearn",
+      "operators": [
+        "predict_wine_quality"
+      ],
+      "runtime_handler": "tabular_classification",
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "julien-c/wine-quality",
+      "source_provider": "huggingface",
+      "source_revision": null,
+      "tags": [
+        "tabular",
+        "classify",
+        "prediction",
+        "row",
+        "sklearn",
+        "demo"
+      ],
+      "title": "Wine Quality Classifier"
+    }
+  ],
+  "schema_version": 1
+}

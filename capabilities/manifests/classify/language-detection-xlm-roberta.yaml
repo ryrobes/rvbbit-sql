@@ -1,0 +1,34 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: language_detection_xlm_roberta
+title: XLM-R Language Detection
+description: Detect the language of text for routing, normalization, and multilingual analytics.
+license: mit
+tags: [classify, language, multilingual, routing, tabular]
+source:
+  provider: huggingface
+  model: papluca/xlm-roberta-base-language-detection
+  url: https://huggingface.co/papluca/xlm-roberta-base-language-detection
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+backend:
+  name: detect_language_xlm_roberta
+  transport: rvbbit
+  batch_size: 64
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: XLM-R language detection classifier.
+operators:
+  - name: detect_language
+    description: Detect the language of a text value.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+smoke:
+  inputs:
+    - text: el pedido llegó tarde y necesito ayuda

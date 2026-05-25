@@ -1,0 +1,12 @@
+target/
+target-bookworm/
+results/
+*.swp
+.DS_Store
+.idea/
+.vscode/
+.env
+.rvbbit/
+bench/.venv/
+__pycache__/
+*.pyc

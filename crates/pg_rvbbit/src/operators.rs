@@ -1,0 +1,715 @@
+//! Semantic operator typed entry points.
+//!
+//! Three thin wrappers (`_exec_op_bool` / `_exec_op_text` / `_exec_op_float8`)
+//! that:
+//!   1. Load the operator definition from rvbbit.operators
+//!   2. Look up content-addressed cache in rvbbit.receipts
+//!   3. On miss, build a UnitOfWork and dispatch to the executor
+//!   4. Log the receipt (with sub_calls + query_id)
+//!   5. Parse the result string into the typed return value
+//!
+//! All prompt / step / model logic lives in catalog + unit_of_work — these
+//! functions are pure plumbing.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use pgrx::prelude::*;
+use pgrx::JsonB;
+
+use crate::unit_of_work::{self, OpDef, SubCall, WorkResult};
+
+// ---- Cache control (user-facing) ----------------------------------------
+
+#[pg_extern(volatile, parallel_safe)]
+fn flush_cache() {
+    crate::cache::flush();
+}
+
+#[pg_extern(stable, parallel_safe)]
+fn cache_size() -> i64 {
+    crate::cache::stats().size as i64
+}
+
+#[pg_extern(stable, parallel_safe)]
+fn cache_capacity() -> i64 {
+    crate::cache::stats().capacity as i64
+}
+
+/// Per-operator cache observability (RYR-301). Reads rvbbit.receipts —
+/// each successful operator call writes one row, so n_invocations is the
+/// total work the cache has spared on repeat queries.
+#[pg_extern(stable, parallel_safe)]
+fn judgment_stats(
+    op_name: &str,
+) -> TableIterator<
+    'static,
+    (
+        name!(op_name, String),
+        name!(n_invocations, i64),
+        name!(n_unique_inputs, i64),
+        name!(total_tokens_in, i64),
+        name!(total_tokens_out, i64),
+        name!(total_cost_usd, pgrx::AnyNumeric),
+        name!(total_latency_ms, i64),
+        name!(first_at, Option<TimestampWithTimeZone>),
+        name!(last_at, Option<TimestampWithTimeZone>),
+    ),
+> {
+    let name_esc = op_name.replace('\'', "''");
+    let sql = format!(
+        "SELECT operator, \
+                count(*)::bigint AS n_inv, \
+                count(DISTINCT inputs_hash)::bigint AS n_unique, \
+                coalesce(sum(n_tokens_in), 0)::bigint AS tin, \
+                coalesce(sum(n_tokens_out), 0)::bigint AS tout, \
+                coalesce(sum(cost_usd), 0::numeric) AS cost, \
+                coalesce(sum(latency_ms), 0)::bigint AS lat, \
+                min(invocation_at) AS first_at, \
+                max(invocation_at) AS last_at \
+         FROM rvbbit.receipts \
+         WHERE operator = '{name_esc}' \
+         GROUP BY operator"
+    );
+    let mut out: Vec<(
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        pgrx::AnyNumeric,
+        i64,
+        Option<TimestampWithTimeZone>,
+        Option<TimestampWithTimeZone>,
+    )> = Vec::new();
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(&sql, None, &[])?;
+        for row in table {
+            let op: Option<String> = row.get(1)?;
+            let n_inv: Option<i64> = row.get(2)?;
+            let n_unique: Option<i64> = row.get(3)?;
+            let tin: Option<i64> = row.get(4)?;
+            let tout: Option<i64> = row.get(5)?;
+            let cost: Option<pgrx::AnyNumeric> = row.get(6)?;
+            let lat: Option<i64> = row.get(7)?;
+            let first_at: Option<TimestampWithTimeZone> = row.get(8)?;
+            let last_at: Option<TimestampWithTimeZone> = row.get(9)?;
+            out.push((
+                op.unwrap_or_default(),
+                n_inv.unwrap_or(0),
+                n_unique.unwrap_or(0),
+                tin.unwrap_or(0),
+                tout.unwrap_or(0),
+                cost.unwrap_or_else(|| pgrx::AnyNumeric::try_from(0i64).unwrap()),
+                lat.unwrap_or(0),
+                first_at,
+                last_at,
+            ));
+        }
+        Ok(())
+    });
+    TableIterator::new(out.into_iter())
+}
+
+/// Manual purge of cached operator results. Useful when switching
+/// providers without touching rvbbit.operators, or for testing.
+#[pg_extern(volatile, parallel_safe)]
+fn judgment_purge(op_name: &str) -> i64 {
+    let name_esc = op_name.replace('\'', "''");
+    let before: i64 = Spi::get_one(&format!(
+        "SELECT count(*) FROM rvbbit.receipts WHERE operator = '{name_esc}'"
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+    Spi::run(&format!(
+        "DELETE FROM rvbbit.receipts WHERE operator = '{name_esc}'"
+    ))
+    .unwrap_or_else(|e| pgrx::error!("rvbbit.judgment_purge: {e}"));
+    // Bust in-memory LRU too — otherwise next call returns stale.
+    crate::cache::flush();
+    before
+}
+
+// ---- Public entry points (one per return type) ---------------------------
+
+#[pg_extern(parallel_safe, strict)]
+fn _exec_op_bool(op_name: &str, inputs: JsonB, opts: JsonB) -> bool {
+    let op = match load_op(op_name) {
+        Some(o) => o,
+        None => {
+            pgrx::warning!("rvbbit: unknown operator '{}'", op_name);
+            return false;
+        }
+    };
+    if op.return_type != "bool" {
+        pgrx::warning!(
+            "rvbbit: operator '{}' is not bool (got '{}')",
+            op_name,
+            op.return_type
+        );
+        return false;
+    }
+    match invoke_with_cache(&op, &inputs.0, &opts.0) {
+        Ok(s) => parse_bool(&s, &op.parser),
+        Err(_) => false,
+    }
+}
+
+#[pg_extern(parallel_safe, strict)]
+fn _exec_op_text(op_name: &str, inputs: JsonB, opts: JsonB) -> String {
+    let op = match load_op(op_name) {
+        Some(o) => o,
+        None => {
+            pgrx::warning!("rvbbit: unknown operator '{}'", op_name);
+            return String::new();
+        }
+    };
+    if op.return_type != "text" {
+        pgrx::warning!(
+            "rvbbit: operator '{}' is not text (got '{}')",
+            op_name,
+            op.return_type
+        );
+        return String::new();
+    }
+    match invoke_with_cache(&op, &inputs.0, &opts.0) {
+        Ok(s) => parse_text(&s, &op.parser),
+        Err(_) => String::new(),
+    }
+}
+
+#[pg_extern(parallel_safe, strict)]
+fn _exec_op_jsonb(op_name: &str, inputs: JsonB, opts: JsonB) -> Option<JsonB> {
+    let op = match load_op(op_name) {
+        Some(o) => o,
+        None => {
+            pgrx::warning!("rvbbit: unknown operator '{}'", op_name);
+            return None;
+        }
+    };
+    if op.return_type != "jsonb" {
+        pgrx::warning!(
+            "rvbbit: operator '{}' is not jsonb (got '{}')",
+            op_name,
+            op.return_type
+        );
+        return None;
+    }
+    let s = match invoke_with_cache(&op, &inputs.0, &opts.0) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    // parser == "json" expects the model/specialist output to BE valid JSON.
+    // For non-json parsers we wrap the raw string as a JSON string value.
+    match op.parser.as_str() {
+        "json" => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(v) => Some(JsonB(v)),
+            Err(_) => {
+                pgrx::warning!(
+                    "rvbbit: operator '{}' returned non-JSON output for jsonb return type",
+                    op.name
+                );
+                None
+            }
+        },
+        _ => Some(JsonB(serde_json::Value::String(s))),
+    }
+}
+
+#[pg_extern(parallel_safe, strict)]
+fn _exec_op_float8(op_name: &str, inputs: JsonB, opts: JsonB) -> f64 {
+    let op = match load_op(op_name) {
+        Some(o) => o,
+        None => {
+            pgrx::warning!("rvbbit: unknown operator '{}'", op_name);
+            return 0.0;
+        }
+    };
+    if op.return_type != "float8" {
+        pgrx::warning!(
+            "rvbbit: operator '{}' is not float8 (got '{}')",
+            op_name,
+            op.return_type
+        );
+        return 0.0;
+    }
+    match invoke_with_cache(&op, &inputs.0, &opts.0) {
+        Ok(s) => parse_float8(&s, &op.parser),
+        Err(_) => 0.0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dimension shape: SETOF return. Runs the operator pipeline once per call,
+// then splits the result into rows. Recognized splits:
+//   - JSON array → one row per element (string elements verbatim,
+//     non-string elements rendered as JSON)
+//   - newline-separated string → one row per non-empty line
+//   - anything else → single row
+// ---------------------------------------------------------------------------
+
+fn split_output_for_dim(s: &str) -> Vec<String> {
+    let trimmed = s.trim();
+    if trimmed.starts_with('[') {
+        if let Ok(serde_json::Value::Array(arr)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            return arr
+                .into_iter()
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                })
+                .collect();
+        }
+    }
+    let lines: Vec<String> = trimmed
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() > 1 {
+        return lines;
+    }
+    vec![trimmed.to_string()]
+}
+
+#[pg_extern(parallel_safe, strict)]
+fn _dim_exec_text(
+    op_name: &str,
+    inputs: JsonB,
+    opts: JsonB,
+) -> TableIterator<'static, (name!(value, String),)> {
+    let op = match load_op(op_name) {
+        Some(o) => o,
+        None => {
+            pgrx::warning!("rvbbit: unknown operator '{}'", op_name);
+            return TableIterator::new(Vec::<(String,)>::new().into_iter());
+        }
+    };
+    if op.shape != "dimension" {
+        pgrx::warning!(
+            "rvbbit: operator '{}' is not dimension shape (got '{}')",
+            op_name,
+            op.shape
+        );
+        return TableIterator::new(Vec::<(String,)>::new().into_iter());
+    }
+    let raw = match invoke_with_cache(&op, &inputs.0, &opts.0) {
+        Ok(s) => s,
+        Err(_) => return TableIterator::new(Vec::<(String,)>::new().into_iter()),
+    };
+    let rows: Vec<(String,)> = split_output_for_dim(&raw)
+        .into_iter()
+        .map(|s| (s,))
+        .collect();
+    TableIterator::new(rows.into_iter())
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate shape: CREATE AGGREGATE driven by these generic helpers.
+//   _agg_append_state(state, row_inputs) — SFUNC, runs per row
+//   _agg_run_op_<type>(op_name, state) — FFUNC, runs once per group
+// The per-operator SFUNC + FFUNC SQL wrappers (generated by
+// rvbbit.create_operator) bind the op_name string into the call.
+// State shape: {"collection": [<row1_inputs>, <row2_inputs>, ...]}.
+// ---------------------------------------------------------------------------
+
+#[pg_extern(parallel_safe)]
+fn _agg_append_state(state: Option<JsonB>, row_inputs: JsonB) -> JsonB {
+    let mut s = state.map(|j| j.0).unwrap_or_else(|| serde_json::json!({}));
+    if !s.is_object() {
+        s = serde_json::json!({});
+    }
+    let obj = s.as_object_mut().expect("just set to object");
+    let arr = obj
+        .entry("collection".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(a) = arr.as_array_mut() {
+        a.push(row_inputs.0);
+    }
+    JsonB(s)
+}
+
+/// Run the aggregate operator's pipeline once, with the accumulated
+/// collection bound as `inputs.collection`. Returns the result rendered
+/// as a plain string (parser applied), suitable for cast to text.
+#[pg_extern(parallel_safe)]
+fn _agg_run_op_text(op_name: &str, state: Option<JsonB>) -> Option<String> {
+    let raw = agg_run_inner(op_name, state, "text")?;
+    Some(parse_text(&raw, "raw_text"))
+}
+
+#[pg_extern(parallel_safe)]
+fn _agg_run_op_bool(op_name: &str, state: Option<JsonB>) -> Option<bool> {
+    let raw = agg_run_inner(op_name, state, "bool")?;
+    Some(parse_bool(&raw, "yes_no"))
+}
+
+#[pg_extern(parallel_safe)]
+fn _agg_run_op_float8(op_name: &str, state: Option<JsonB>) -> Option<f64> {
+    let raw = agg_run_inner(op_name, state, "float8")?;
+    Some(parse_float8(&raw, "score_0_1"))
+}
+
+#[pg_extern(parallel_safe)]
+fn _agg_run_op_jsonb(op_name: &str, state: Option<JsonB>) -> Option<JsonB> {
+    let raw = agg_run_inner(op_name, state, "jsonb")?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .map(JsonB)
+}
+
+fn agg_run_inner(op_name: &str, state: Option<JsonB>, expected_return: &str) -> Option<String> {
+    let op = load_op(op_name)?;
+    if op.shape != "aggregate" {
+        pgrx::warning!(
+            "rvbbit agg: op '{}' shape mismatch (got '{}', want 'aggregate')",
+            op_name,
+            op.shape
+        );
+        return None;
+    }
+    if op.return_type != expected_return {
+        pgrx::warning!(
+            "rvbbit agg: op '{}' return_type mismatch (op declares '{}', call expects '{}')",
+            op_name,
+            op.return_type,
+            expected_return
+        );
+        return None;
+    }
+    let collection = state
+        .as_ref()
+        .and_then(|j| j.0.get("collection").cloned())
+        .unwrap_or_else(|| serde_json::json!([]));
+    let inputs = serde_json::json!({ "collection": collection });
+    let opts = serde_json::json!({});
+    let result = unit_of_work::execute(&op, &inputs, &opts);
+    crate::probe::record_fresh(&op.name, &inputs, &result);
+    // Cache key + receipts for aggregates use the collection hash —
+    // same machinery as scalar invoke_with_cache, but the "inputs" is
+    // the full collection (so re-running the same group hits cache).
+    use blake3::Hasher;
+    let model_override = "";
+    let prompt_seed = format!(
+        "{}\0{}\0{}",
+        op.system_prompt,
+        op.user_prompt,
+        serde_json::to_string(&op.steps).unwrap_or_default()
+    );
+    let mut h = Hasher::new();
+    h.update(op.name.as_bytes());
+    h.update(b"\0");
+    // Match operators::input_hash + prewarm::build_hash key shape so the
+    // aggregate path uses the same cache entries as scalar.
+    h.update(op.model.as_bytes());
+    h.update(b"\0");
+    h.update(model_override.as_bytes());
+    h.update(b"\0");
+    h.update(
+        serde_json::to_string(&inputs)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    h.update(b"\0");
+    h.update(prompt_seed.as_bytes());
+    let hash = h.finalize().as_bytes().to_vec();
+    if result.error.is_none() {
+        crate::cache::put(&hash, result.output.clone());
+    }
+    log_receipt(&op, &hash, &result, &inputs);
+    if let Some(err) = &result.error {
+        pgrx::warning!("rvbbit agg: operator '{}' failed: {}", op.name, err);
+        return None;
+    }
+    Some(result.output)
+}
+
+// ---- Loaded operator definition -----------------------------------------
+
+fn load_op(name: &str) -> Option<OpDef> {
+    let escaped = name.replace('\'', "''");
+    let sql = format!(
+        "SELECT shape, return_type, model, system_prompt, user_prompt, parser, \
+                max_tokens, temperature, steps, retry, wards, takes \
+         FROM rvbbit.operators WHERE name = '{escaped}'"
+    );
+    let mut result: Option<OpDef> = None;
+    let _: Result<(), pgrx::spi::Error> = Spi::connect(|client| {
+        let table = client.select(&sql, Some(1), &[])?;
+        for row in table {
+            let shape: Option<String> = row.get(1)?;
+            let return_type: Option<String> = row.get(2)?;
+            let model: Option<String> = row.get(3)?;
+            let system_prompt: Option<String> = row.get(4)?;
+            let user_prompt: Option<String> = row.get(5)?;
+            let parser: Option<String> = row.get(6)?;
+            let max_tokens: Option<i32> = row.get(7)?;
+            let temperature: Option<f32> = row.get(8)?;
+            let steps_jsonb: Option<pgrx::JsonB> = row.get(9)?;
+            let retry_jsonb: Option<pgrx::JsonB> = row.get(10)?;
+            let wards_jsonb: Option<pgrx::JsonB> = row.get(11)?;
+            let takes_jsonb: Option<pgrx::JsonB> = row.get(12)?;
+            if let (Some(sh), Some(rt), Some(m), Some(sp), Some(up), Some(p), Some(mt)) = (
+                shape,
+                return_type,
+                model,
+                system_prompt,
+                user_prompt,
+                parser,
+                max_tokens,
+            ) {
+                result = Some(OpDef {
+                    name: name.to_string(),
+                    shape: sh,
+                    return_type: rt,
+                    model: m,
+                    system_prompt: sp,
+                    user_prompt: up,
+                    parser: p,
+                    max_tokens: mt,
+                    temperature,
+                    steps: steps_jsonb.map(|j| j.0),
+                    retry: retry_jsonb.map(|j| j.0),
+                    wards: wards_jsonb.map(|j| j.0),
+                    takes: takes_jsonb.map(|j| j.0),
+                });
+            }
+        }
+        Ok(())
+    });
+    result
+}
+
+// ---- The cached invoke ---------------------------------------------------
+
+fn invoke_with_cache(
+    op: &OpDef,
+    inputs: &serde_json::Value,
+    opts: &serde_json::Value,
+) -> Result<String, ()> {
+    // For now we hash on a canonical (operator name + inputs + opts.model)
+    // because the rendered prompt is internal and the operator name +
+    // inputs are the contract surface. If the prompt changes via UPDATE
+    // on rvbbit.operators, you'd want the cache to invalidate; we add a
+    // prompt-hash component below to do that cheaply.
+    let model_override = opts.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let prompt_seed = format!(
+        "{}\0{}\0{}",
+        op.system_prompt,
+        op.user_prompt,
+        serde_json::to_string(&op.steps).unwrap_or_default()
+    );
+    let hash = input_hash(&op.name, &op.model, model_override, inputs, &prompt_seed);
+
+    // L1: in-memory LRU cache. ~5μs lookup. Skips SPI entirely.
+    if let Some(cached) = crate::cache::get(&hash) {
+        crate::probe::record_l1_hit(&op.name, inputs);
+        return Ok(cached);
+    }
+
+    // L2: cross-backend persistent cache (rvbbit.receipts). ~1-3ms SPI.
+    if let Some(cached) = lookup_cached(&hash) {
+        crate::probe::record_l2_hit(&op.name, inputs);
+        // Backfill L1 so future calls in this backend skip the SPI cost.
+        crate::cache::put(&hash, cached.clone());
+        return Ok(cached);
+    }
+
+    // Pre-wards gate the inputs before the operator runs at all.
+    if let Err(reason) = crate::validator::check_pre_wards(op, inputs) {
+        let result = crate::validator::errored(reason);
+        crate::probe::record_fresh(&op.name, inputs, &result);
+        log_receipt(op, &hash, &result, inputs);
+        pgrx::warning!(
+            "rvbbit: operator '{}' blocked: {}",
+            op.name,
+            result.error.as_deref().unwrap_or("")
+        );
+        return Err(());
+    }
+
+    // Pre-load any specialist backends this operator references, so pool
+    // threads running specialist nodes (takes) find the spec cached — a
+    // worker thread cannot do the SPI spec load itself.
+    crate::specialists::warm_operator_specs(op.steps.as_ref(), op.takes.as_ref());
+
+    let result: WorkResult = crate::takes::execute_attempt(op, inputs, opts, None);
+    // Validators + retry: if the operator carries a retry plan and the
+    // output fails its validator, re-run with feedback. No-op otherwise.
+    let result = crate::validator::apply_retry(op, inputs, opts, result);
+    // Post-wards gate the final output.
+    let result = crate::validator::apply_post_wards(op, inputs, result);
+    crate::probe::record_fresh(&op.name, inputs, &result);
+
+    log_receipt(op, &hash, &result, inputs);
+
+    if let Some(err) = &result.error {
+        pgrx::warning!("rvbbit: operator '{}' failed: {}", op.name, err);
+        return Err(());
+    }
+    // Populate L1 so subsequent calls in this backend are sub-millisecond.
+    crate::cache::put(&hash, result.output.clone());
+    Ok(result.output)
+}
+
+// ---- Parsers (unchanged from previous session) ---------------------------
+
+fn parse_bool(s: &str, parser: &str) -> bool {
+    match parser {
+        "yes_no" => {
+            let t = s.trim().to_ascii_uppercase();
+            t.starts_with("YES") || t == "TRUE" || t == "1"
+        }
+        _ => s.trim().eq_ignore_ascii_case("true"),
+    }
+}
+
+fn parse_text(s: &str, parser: &str) -> String {
+    match parser {
+        "strip" => s.trim().to_string(),
+        _ => s.to_string(),
+    }
+}
+
+fn parse_float8(s: &str, parser: &str) -> f64 {
+    match parser {
+        "score_0_1" => {
+            for token in s.split(|c: char| !c.is_ascii_digit() && c != '.' && c != '-') {
+                if !token.is_empty() {
+                    if let Ok(f) = token.parse::<f64>() {
+                        return f.clamp(0.0, 1.0);
+                    }
+                }
+            }
+            0.0
+        }
+        _ => s.trim().parse().unwrap_or(0.0),
+    }
+}
+
+// ---- Cache + receipts ----------------------------------------------------
+
+fn input_hash(
+    op_name: &str,
+    op_model: &str,
+    model_override: &str,
+    inputs: &serde_json::Value,
+    prompt_seed: &str,
+) -> Vec<u8> {
+    let mut h = blake3::Hasher::new();
+    h.update(op_name.as_bytes());
+    h.update(b"\0");
+    // op_model is the catalog-default model; folding it in means editing
+    // `rvbbit.operators SET model = 'new'` auto-invalidates cache entries
+    // for that operator (RYR-301). model_override stays separate so an
+    // explicit per-call opts.model still differentiates.
+    h.update(op_model.as_bytes());
+    h.update(b"\0");
+    h.update(model_override.as_bytes());
+    h.update(b"\0");
+    h.update(serde_json::to_string(inputs).unwrap_or_default().as_bytes());
+    h.update(b"\0");
+    h.update(prompt_seed.as_bytes());
+    h.finalize().as_bytes().to_vec()
+}
+
+fn lookup_cached(hash: &[u8]) -> Option<String> {
+    let hex = bytes_to_hex(hash);
+    let sql = format!(
+        "SELECT output FROM rvbbit.receipts \
+         WHERE inputs_hash = '\\x{hex}'::bytea AND error IS NULL \
+         ORDER BY invocation_at DESC LIMIT 1"
+    );
+    Spi::get_one::<String>(&sql).ok().flatten()
+}
+
+// Receipts are INSERTs, which PG forbids during parallel queries.
+// `IsInParallelMode()` is true for BOTH the leader and workers when a
+// parallel scan is active. PG18 keeps it inline-static so pgrx can't
+// link to it. Workaround uses two detectors:
+//
+//   1. `ParallelWorkerNumber` (extern int, exported): identifies actual
+//      parallel workers. Skips INSERT in workers.
+//   2. SKIP_RECEIPTS thread-local + set_skip_receipts() SQL function:
+//      the leader sets it before launching a parallel query so the
+//      leader's own UDF calls during the parallel scan also skip.
+//
+// The L1 cache still works per-backend; receipts get logged for any
+// non-parallel calls. Worker→leader audit queue is a real follow-up
+// when receipts at scale matter more than maximum parallelism.
+#[allow(non_upper_case_globals)]
+extern "C" {
+    static ParallelWorkerNumber: i32;
+}
+
+thread_local! {
+    static SKIP_RECEIPTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[pg_extern(volatile, parallel_safe)]
+fn set_skip_receipts(skip: bool) -> bool {
+    SKIP_RECEIPTS.with(|c| c.set(skip));
+    skip
+}
+
+#[pg_extern(stable, parallel_safe)]
+fn get_skip_receipts() -> bool {
+    SKIP_RECEIPTS.with(|c| c.get())
+}
+
+fn log_receipt(op: &OpDef, hash: &[u8], res: &WorkResult, inputs: &serde_json::Value) {
+    let record = crate::costs::record_from_work(op, hash, res, inputs);
+    let pwn = unsafe { ParallelWorkerNumber };
+    if pwn >= 0 || SKIP_RECEIPTS.with(|c| c.get()) {
+        if let Err(e) = crate::costs::enqueue_receipt(
+            &record,
+            if pwn >= 0 {
+                "parallel_worker"
+            } else {
+                "skip_receipts"
+            },
+        ) {
+            pgrx::warning!("rvbbit: failed to queue delayed receipt: {}", e);
+        }
+        return;
+    }
+    crate::costs::flush_receipt_queue_best_effort(64);
+    if let Err(e) = crate::costs::write_receipt_now(&record, crate::costs::MissingQueryId::Generate)
+    {
+        pgrx::warning!("rvbbit: failed to log receipt: {}", e);
+    }
+}
+
+fn bytes_to_hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{:02x}", byte));
+    }
+    s
+}
+
+// Silence unused warnings for HashMap import — kept for future opt merging.
+#[allow(dead_code)]
+fn _unused() -> HashMap<String, String> {
+    HashMap::new()
+}
+#[allow(dead_code)]
+fn _once_lock() -> OnceLock<()> {
+    OnceLock::new()
+}
+#[allow(dead_code)]
+fn _sub() -> SubCall {
+    SubCall {
+        step: String::new(),
+        kind: String::new(),
+        model: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        latency_ms: 0,
+        error: None,
+        ..Default::default()
+    }
+}

@@ -1,0 +1,46 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: bge_reranker_base
+title: BGE Reranker Base
+description: Smaller BGE cross-encoder reranker for query/document scoring and row ranking.
+license: mit
+tags: [rerank, retrieval, relevance, row, cpu-friendly]
+source:
+  provider: huggingface
+  model: BAAI/bge-reranker-base
+  url: https://huggingface.co/BAAI/bge-reranker-base
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+backend:
+  name: rerank_bge_base
+  transport: rvbbit
+  batch_size: 24
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: BGE reranker base pair relevance scorer.
+operators:
+  - name: rerank_bge_base_score
+    description: Score how relevant text is to a query using BGE reranker base.
+    arg_names: [query, text]
+    arg_types: [text, text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      query: "{{ inputs.query }}"
+      text: "{{ inputs.text }}"
+  - name: rerank_bge_base_row
+    description: Score how relevant a JSONB row is to a query using BGE reranker base.
+    arg_names: [query, row]
+    arg_types: [text, jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      query: "{{ inputs.query }}"
+      text: "{{ inputs.row }}"
+smoke:
+  inputs:
+    - query: suspicious login
+      text: user had twelve failed logins from a new country
+      row: '{"event":"login_failed","count":12,"country":"new","risk":"high"}'

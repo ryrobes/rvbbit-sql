@@ -1,0 +1,18 @@
+[package]
+name = "warren-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "warren-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+postgres.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
