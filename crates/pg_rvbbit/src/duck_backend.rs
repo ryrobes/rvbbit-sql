@@ -43,9 +43,9 @@ impl DuckSession {
             .arg("--dsn")
             .arg(&key.dsn)
             .arg("--pgdata-prefix")
-            .arg("/var/lib/postgresql")
+            .arg(pgdata_prefix())
             .arg("--visible-pgdata-prefix")
-            .arg("/var/lib/postgresql")
+            .arg(visible_pgdata_prefix())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -164,6 +164,23 @@ fn duck_binary() -> Option<String> {
     let configured = std::env::var("RVBBIT_DUCK_BIN").ok();
     let path = configured.unwrap_or_else(|| DEFAULT_DUCK_BIN.to_string());
     Path::new(&path).exists().then_some(path)
+}
+
+/// PGDATA root the extension sees — what `rvbbit.row_groups.path` is rooted at.
+/// Falls back to `data_directory` GUC; can be overridden via env (useful when
+/// the sidecar runs in a separate mount namespace).
+fn pgdata_prefix() -> String {
+    if let Ok(p) = std::env::var("RVBBIT_PGDATA_PREFIX") {
+        return p;
+    }
+    guc_setting("data_directory").unwrap_or_else(|| "/var/lib/postgresql".to_string())
+}
+
+/// PGDATA root the rvbbit-duck process sees. Typically identical to
+/// `pgdata_prefix()` (same container / same host). Override only when the
+/// sidecar's view of the FS differs (e.g. a bind-mount under another path).
+fn visible_pgdata_prefix() -> String {
+    std::env::var("RVBBIT_VISIBLE_PGDATA_PREFIX").unwrap_or_else(|_| pgdata_prefix())
 }
 
 #[pg_extern(volatile)]
@@ -409,9 +426,9 @@ fn execute_engine_oneshot(
         .arg("--max-rows")
         .arg(max_rows.to_string())
         .arg("--pgdata-prefix")
-        .arg("/var/lib/postgresql")
+        .arg(pgdata_prefix())
         .arg("--visible-pgdata-prefix")
-        .arg("/var/lib/postgresql")
+        .arg(visible_pgdata_prefix())
         .output()
         .map_err(|e| format!("failed to start rvbbit-duck: {e}"))?;
 

@@ -210,3 +210,47 @@ warren-once: ## Claim at most one Warren job, useful for smoke/debug
 
 clean:           ## Remove built artifacts
 	cargo clean
+
+# ---------------------------------------------------------------------------
+# Packaging: extract the built extension + sidecar binary from the docker
+# image into a self-contained tarball that ./install.sh can apply on any
+# Debian/Ubuntu host with `postgresql-18` installed.
+# ---------------------------------------------------------------------------
+
+PG_VERSION ?= 18
+RVBBIT_VERSION ?= $(shell awk -F'"' '/^version[[:space:]]*=/ {print $$2; exit}' Cargo.toml)
+PKG_ARCH ?= $(shell dpkg --print-architecture 2>/dev/null || uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+PKG_NAME := rvbbit-$(RVBBIT_VERSION)-pg$(PG_VERSION)-linux-$(PKG_ARCH)
+PKG_DIR  := dist/$(PKG_NAME)
+PKG_TAR  := dist/$(PKG_NAME).tar.gz
+
+.PHONY: package package-extract package-clean
+
+package: ## Build the pg-rvbbit image, then emit dist/<name>.tar.gz
+	@echo ">>> building docker-pg-rvbbit (needed for artifact extraction)"
+	$(COMPOSE) build pg-rvbbit
+	$(MAKE) --no-print-directory package-extract
+
+package-extract: ## Extract a tarball from a pre-built docker-pg-rvbbit:latest (no build)
+	@echo ">>> extracting artifacts into $(PKG_DIR)/"
+	rm -rf $(PKG_DIR)
+	mkdir -p $(PKG_DIR)/extension $(PKG_DIR)/lib $(PKG_DIR)/bin
+	@cid=$$(docker create docker-pg-rvbbit:latest) && \
+	  docker cp $$cid:/usr/share/postgresql/$(PG_VERSION)/extension/. $(PKG_DIR)/extension/ && \
+	  docker cp $$cid:/usr/lib/postgresql/$(PG_VERSION)/lib/pg_rvbbit.so $(PKG_DIR)/lib/ && \
+	  docker cp $$cid:/usr/local/bin/rvbbit-duck $(PKG_DIR)/bin/ && \
+	  docker rm $$cid >/dev/null
+	@# Filter out the generic postgres extension files we didn't produce.
+	@find $(PKG_DIR)/extension -type f ! -name 'pg_rvbbit*' -delete
+	cp docker/init/01-create-extension.sql $(PKG_DIR)/init.sql
+	cp install.sh $(PKG_DIR)/install.sh
+	cp PACKAGING.md $(PKG_DIR)/README.md
+	chmod +x $(PKG_DIR)/install.sh
+	@echo "$(RVBBIT_VERSION)" > $(PKG_DIR)/VERSION
+	tar -C dist -czf $(PKG_TAR) $(PKG_NAME)
+	@echo
+	@echo "wrote $(PKG_TAR) ($$(du -h $(PKG_TAR) | cut -f1))"
+	@echo "    install with: tar xzf $(PKG_TAR) && cd $(PKG_NAME) && sudo ./install.sh"
+
+package-clean: ## Remove the dist/ packaging staging area
+	rm -rf dist/

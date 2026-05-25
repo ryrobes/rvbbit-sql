@@ -121,7 +121,8 @@ impl LocalEmbedOptions {
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .map(PathBuf::from)
-            });
+            })
+            .or_else(default_embed_cache_dir);
         let max_length = spec
             .transport_opts
             .get("max_length")
@@ -133,6 +134,28 @@ impl LocalEmbedOptions {
             max_length,
         })
     }
+}
+
+/// Last-resort cache location: `$data_directory/rvbbit/embed_cache/`.
+/// Always writable by the postgres user and travels with `pg_basebackup`.
+/// Returns `None` if `data_directory` cannot be read (rare; only at very
+/// early init).
+fn default_embed_cache_dir() -> Option<PathBuf> {
+    use std::ffi::{CStr, CString};
+    let name = CString::new("data_directory").ok()?;
+    let ptr = unsafe { pgrx::pg_sys::GetConfigOption(name.as_ptr(), true, false) };
+    if ptr.is_null() {
+        return None;
+    }
+    let dir = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
+    let mut path = PathBuf::from(dir);
+    path.push("rvbbit");
+    path.push("embed_cache");
+    // fastembed will create subdirs, but the root must exist. If we can't
+    // create it (e.g. permissions on a bare-metal install with a weird
+    // setup), fall back to None — fastembed will then use its own default.
+    std::fs::create_dir_all(&path).ok()?;
+    Some(path)
 }
 
 type SharedModel = Arc<Mutex<TextEmbedding>>;

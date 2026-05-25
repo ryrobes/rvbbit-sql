@@ -10,3 +10,4 @@ results/
 bench/.venv/
 __pycache__/
 *.pyc
+dist/

@@ -1,0 +1,86 @@
+name: Publish pg_rvbbit image
+
+# Builds the postgres:18 + pg_rvbbit extension image and pushes it to GHCR.
+# Tags:
+#   - push to main           -> ghcr.io/<owner>/rvbbit-postgres:main, :sha-<short>
+#   - push of git tag vX.Y.Z -> ghcr.io/<owner>/rvbbit-postgres:vX.Y.Z, :X.Y, :X, :latest, :pg18-X.Y.Z
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/rvbbit-postgres
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=semver,pattern=pg18-{{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.rvbbit
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.title=rvbbit-postgres
+            org.opencontainers.image.description=PostgreSQL 18 with the pg_rvbbit columnar + semantic-SQL extension and the rvbbit-duck routing sidecar pre-installed.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # On tag pushes, also produce the standalone install tarball and
+      # attach it to the GitHub Release. We pull the just-pushed image and
+      # tag it with the name `make package` expects, then run packaging.
+      - name: Build release tarball
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          IMG="$(echo "${{ steps.meta.outputs.tags }}" | head -n1)"
+          docker pull "$IMG"
+          docker tag "$IMG" docker-pg-rvbbit:latest
+          make package-extract PG_VERSION=18
+
+      - name: Upload tarball to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
+          generate_release_notes: true
