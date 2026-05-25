@@ -1,157 +1,172 @@
 # rvbbit
 
-A columnar storage extension for PostgreSQL 18 that doubles as the
-SQL-native substrate for cached, composable semantic operators —
-embeddings, LLM judgments, topic clustering, evidence retrieval —
-all in plain SQL with persistent caches.
+**The AI primitives Snowflake Cortex and Databricks AI Functions
+didn't ship. In your Postgres.**
 
-**Status:** v0.8.0. Columnar TAM + custom scan + per-group stats +
-predicate pushdown + LIKE/ILIKE pushdown + COUNT/SUM rewriter +
-semantic operators with persistent judgment cache + JIT embeddings
-with content-addressed cache + k-nearest-neighbor + topic clustering +
-EXPLAIN SEMANTIC. 163 deterministic tests pass; ClickBench at 1M
-rows beats plain PG, Citus, Hydra, AlloyDB.
+`AI_COMPLETE`, `AI_CLASSIFY`, `AI_FILTER`. One-shot. No retry. No
+ensemble. No validators. No composition. The cache is bolted on. The
+receipts aren't queryable. You can't `pg_dump` your judgments.
 
-## The semantic SQL surface
+Rvbbit's bet is that the unit of AI work in a database is the
+**operator** — a user-definable, planner-visible SQL function with
+multi-step pipelines, retry policies, ensembles, validators, and
+audit trails — not a function-per-task built into the vendor's stack.
 
 ```sql
--- Register an embedder once (Ollama / OpenAI / vLLM, anything OpenAI-compat)
-SELECT rvbbit.register_backend(
-  'embed', 'http://localhost:11434/v1/embeddings', 'openai',
-  backend_opts => '{"model":"nomic-embed-text"}'
+-- 1. Define once: a real operator. Three step kinds in one pipeline
+--    (specialist → LLM → MCP tool), 3-way ensemble, blocking validator.
+--    None of these compose in Cortex or Databricks AI Functions.
+SELECT rvbbit.create_operator(
+    op_name        => 'triage_ticket',
+    op_arg_names   => ARRAY['body'],
+    op_return_type => 'text',
+    op_steps => '[
+      {"name": "cheap", "kind": "specialist", "specialist": "classify",
+       "inputs": {"text":   "{{ inputs.body }}",
+                  "labels": "billing,bug,how-to,outage"}},
+      {"name": "judge", "kind": "llm", "model": "claude-haiku-4-5",
+       "system": "You categorize support tickets. Output one label.",
+       "user":   "Cheap classifier said: {{ steps.cheap.output }}. Ticket: {{ inputs.body }}"},
+      {"name": "enrich", "kind": "mcp", "server": "crm", "tool": "get_customer",
+       "inputs": {"ticket_text": "{{ inputs.body }}"}}
+    ]'::jsonb
 );
 
--- Top-k semantic retrieval in one SQL call (cached after first run)
-SELECT * FROM rvbbit.knn_text('tickets'::regclass::oid, 'body',
-                              'angry customer want refund', 10);
+-- Decorate: 3-way ensemble + reject anything outside the allowed labels.
+SELECT rvbbit.set_operator_takes('triage_ticket',
+    '{"factor": 3, "reduce": "vote"}'::jsonb);
+SELECT rvbbit.set_operator_wards('triage_ticket', jsonb_build_object(
+    'post', jsonb_build_array(jsonb_build_object(
+        'validator', jsonb_build_object(
+            'sql', '$output IN (''billing'',''bug'',''how-to'',''outage'')'),
+        'mode', 'blocking'))));
 
--- "What's in my data?" — k-means topic clustering
-SELECT cluster_id, count, exemplar,
-       rvbbit.about(exemplar, 'one-word topic label') AS label
-FROM rvbbit.topics('SELECT body FROM tickets', 5);
+-- 2. Use it like a function. Joins, WHERE, ORDER BY — the planner sees it.
+SELECT body, rvbbit.triage_ticket(body) AS category
+FROM tickets WHERE created_at > now() - interval '1 day';
 
--- Per-row similarity, ORDER BY composable
-SELECT body, rvbbit.similarity(body, 'angry customer') AS score
-FROM tickets
-ORDER BY score DESC LIMIT 10;
-
--- Highlighted snippets — show *why* a row matched
-SELECT body, rvbbit.text_evidence(body, 'angry refund')
-FROM tickets WHERE rvbbit.means(body, 'unhappy customer');
-
--- Cost preview before paying for it
-SELECT rvbbit.token_count(body, 'cl100k_base') FROM tickets;
-
-SELECT * FROM rvbbit.explain_semantic(
-  $q$ SELECT * FROM tickets WHERE rvbbit.means(body, 'cancellation risk') $q$
-);
+-- 3. Audit it.
+SELECT op_name, n_invocations, n_unique_inputs, total_cost_usd, total_latency_ms
+FROM rvbbit.judgment_stats('triage_ticket');
+-- op_name        n_invocations  n_unique_inputs  total_cost_usd  total_latency_ms
+-- triage_ticket  1247           284              0.42            47180
 ```
 
-Every cached value (embeddings, judgments, predicate bitmaps) is a
-first-class catalog object. Backed up by `pg_dump`. Invalidated by
-versioned keys. Inspectable via SQL:
+One SQL function. Three step kinds inside it, ensemble + validator
+wrapping it. Editable, planner-visible, content-hash-cached,
+`pg_dump`-able. That's the wedge.
 
-```sql
-SELECT * FROM rvbbit.embedding_cache_stats();
-SELECT * FROM rvbbit.judgment_stats('means');
-SELECT * FROM rvbbit.bitmap_stats('tickets'::regclass::oid);
-```
+## What's actually different
 
-## Why another columnar Postgres?
+Four orthogonal axes that compose. Most systems give you one at a time:
 
-Existing options (Hydra, Citus Columnar, cstore_fdw) all try to be a
-heap-replacement: they cram column data into 8KB pages so they can ride
-shared buffers, which destroys compression and forces brittle MVCC hacks.
-They also rely on TOAST for variable-length data, which is precisely
-wrong when your "wide" columns are 4KB LLM responses on every row.
+| Axis | What | Why it matters |
+|---|---|---|
+| **`steps`** | A pipeline of nodes: LLM, specialist (BERT / GLiNER / embed / rerank), code, SQL, MCP-tool — any order, each reading the previous | Real workflows, not one-shot functions |
+| **`takes`** | Run the pipeline N times, reduce via vote / median / evaluator / first-valid | Ensembles without orchestrator code |
+| **`retry`** | Re-execute until a SQL predicate holds, with feedback in the prompt | Bounded self-healing inside the function |
+| **`wards`** | Pre/post validators, blocking or advisory | Type/shape contracts at the function boundary |
 
-Rvbbit takes a different bet:
-
-- **Postgres is the control plane** (catalog, transactions, planner, snapshots).
-- **A separate data plane** holds immutable Parquet row groups outside the
-  page cache, plus a small heap "catcher" table that absorbs writes with
-  full MVCC.
-- **Compaction** drains catcher → new row group; deletes go to a tombstone log
-  applied as a bitmap during scans.
-- **No TOAST.** Variable-length columns (JSONB, text) use per-row-group
-  contiguous buffers with ZSTD shared dictionaries.
-- **Cached semantic state is catalog state.** LLM judgments, embeddings,
-  predicate bitmaps live in regular PG tables — survives restarts,
-  backed up with the rest, invalidated by versioned keys.
-
-See `docs/DESIGN.md` (TODO) for full architectural notes.
-
-## What rvbbit ISN'T trying to be
-
-- **pgvector replacement.** pgvector handles vector indexes (HNSW, IVF);
-  rvbbit's `cosine_vec` over `real[]` is sufficient for sub-1M-row
-  workloads but doesn't ship an ANN index. Use both.
-- **ParadeDB replacement.** ParadeDB owns BM25-in-Postgres. Rvbbit's
-  `text_evidence` is a lightweight inline matcher; the Tantivy sidecar
-  for production BM25 is a future ticket.
-- **A Python framework.** Embedders / LLMs are HTTP endpoints rvbbit
-  delegates to. No model files bundled.
-
-## Project layout
-
-```
-crates/
-  pg_rvbbit/         pgrx extension: TAM, custom scan, semantic operators,
-                     embeddings, topics, EXPLAIN SEMANTIC
-  rvbbit_storage/    pure Rust: row group read/write, metadata, delete log
-docker/
-  Dockerfile.rvbbit  builds extension against system PG18
-  docker-compose.yml heap baseline + rvbbit + bench harness
-bench/
-  clickbench/        ClickBench 43-query suite vs 7 systems
-  tpch/              TPC-H-derived analytics suite
-  tatp/              TATP-style transactional suite
-  columnar_comparison/ NYC taxi bench
-capabilities/        Hugging Face backend/operator manifests + scaffolding
-```
+Every operator is one row in `rvbbit.operators`. Edit the prompt →
+cache invalidates by content hash. `EXPLAIN (SEMANTIC ON) SELECT …`
+previews the dollar cost before you pay. Receipts live in
+`rvbbit.receipts`. Embeddings in `rvbbit.embedding_cache`. All
+queryable. All in your backup.
 
 ## Quick start
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d --build
-psql postgresql://postgres:rvbbit@localhost:55433/bench \
-  -c 'SELECT rvbbit.rvbbit_version();'
+docker run -d --name rvbbit \
+    -p 55433:5432 \
+    -e POSTGRES_PASSWORD=rvbbit \
+    -e POSTGRES_DB=demo \
+    ghcr.io/ryrobes/rvbbit-postgres:latest
+
+psql postgresql://postgres:rvbbit@localhost:55433/demo \
+    -c 'SELECT rvbbit.rvbbit_version();'
 ```
 
-To use the semantic surface, register a specialist endpoint (Ollama is
-the easiest: `ollama pull nomic-embed-text`). All `rvbbit.*` functions
-that take a specialist arg fall back to one literally named `embed`
-when omitted.
+Tarball + bare-metal install paths are in [PACKAGING.md](./PACKAGING.md).
 
-## Caches at a glance
+## Rvbbit tables: the storage layer that backs all of this
 
-| Catalog table | Caches | Key | Invalidation |
-|---|---|---|---|
-| `rvbbit.receipts` | LLM operator results | blake3(op + model + inputs + prompt_seed) | model change → auto-miss |
-| `rvbbit.embedding_cache` | Vector embeddings | blake3(specialist + text) | `embedding_purge(specialist)` |
-| `rvbbit.semantic_bitmaps` | Predicate results per row group | blake3(predicate_name + model_version) | `bitmap_drop(rel, name, ver)` |
+The same engine that hosts the operators also rewrites scans against
+`USING rvbbit` tables through a learned router — picking between
+native PG, DuckDB, DataFusion, and parquet layouts on a per-query
+basis, transparently. The numbers:
 
-## Tests
+**ClickBench, 10M rows, geomean of 43 queries** (median of 3 runs):
 
-```bash
-docker compose exec bench python -m pytest /tests -q --ignore=test_operators_live.py
-# 163 passed
-```
+| System  | geomean | sum of medians | wins (best of 43) |
+|---|---:|---:|---:|
+| **rvbbit** | **80ms** | **8.1s** | **31** |
+| AlloyDB | 231ms | 62.6s | 12 |
+| Hydra | 422ms | 73.4s | 0 |
+| Citus | 1.09s | 118.1s | 0 |
 
-Live LLM tests live in `test_operators_live.py` and need an
-`OPENROUTER_API_KEY` (skipped otherwise).
+**TPC-H scale 1, 22 queries, 4-way vs AlloyDB:**
 
-## Roadmap
+| System | geomean | sum of medians | wins | failures |
+|---|---:|---:|---:|---:|
+| **rvbbit** | **66ms** | **1.7s** | **14** | **0** |
+| AlloyDB | 139ms | 11.5s | 8 | 1 |
+| Hydra | 232ms | 8.6s | 0 | 2 |
+| Citus | 804ms | 46.4s | 0 | 2 |
 
-- [x] Phase 0 — scaffolding, Docker, extension loads
-- [x] Phase 1 — TAM registration, INSERT/SELECT through catcher
-- [x] Phase 2 — compaction, parquet row groups, union scan
-- [x] Phase 3 — delete log, UPDATE = delete+insert, zone maps
-- [x] Phase 4 — JSONB without TOAST (per-row-group ZSTD dictionary)
-- [x] Phase 5 — LLM-synthetic + ClickBench benchmarks vs heap
-- [x] Phase 6 — bloom-equivalent (per-group stats), projection pushdown
-- [x] Phase 7 — Semantic operator runtime, persistent judgment cache
-- [x] Phase 8 — JIT embeddings, knn_text, text_evidence, topics
-- [ ] Phase 9 — Bitmap auto-routing (RYR-300), Tantivy sidecar (RYR-293),
-                Incremental semantic MVs (RYR-292), HLL sketches (RYR-291),
-                DBSP-style real incremental view maintenance (RYR-294)
+Beats Hydra and Citus consistently across 100k–10M scales. Beats
+AlloyDB on geomean at every scale tested; trades query-by-query on
+small point lookups. Runs every TPC-H query the competitors crash on.
+
+[Full benchmark output →](./bench/clickbench/README.md)
+
+## Bigfoot demo
+
+If "ticket triage" reads as boring-money, run
+[`make bigfoot-demo`](./docs/BIGFOOT-DEMO.md) — 5,000 BFRO sasquatch
+encounter reports, every semantic primitive exercised on real data,
+no faked outputs. Topic clustering, semantic diff between Texas and
+Washington sightings, k-nearest-neighbor over witness narratives, the
+whole operator stack. ~3 minutes start to finish on a GPU box.
+
+## Documentation
+
+The README is the elevator pitch. Everything serious is in
+[`docs/`](./docs/):
+
+- **[OPERATORS.md](./docs/OPERATORS.md)** — every flow primitive
+  (steps, takes, retry, wards), every templating rule, the full
+  reference
+- **[COSTS_AND_RECEIPTS.md](./docs/COSTS_AND_RECEIPTS.md)** — how the
+  judgment cache is keyed, how EXPLAIN SEMANTIC prices a query, what
+  rows you can join receipts against
+- **[EMBEDDINGS.md](./docs/EMBEDDINGS.md)** + [LOCAL_EMBEDDINGS.md](./docs/LOCAL_EMBEDDINGS.md) — the embedding cache, knn_text,
+  topics, the local-CPU vs GPU sidecar story
+- **[CAPABILITIES.md](./docs/CAPABILITIES.md)** — HuggingFace-backed
+  specialist sidecars (DeBERTa NLI, GLiNER NER, BGE rerank, etc.) as
+  registerable backends
+- **[MCP.md](./docs/MCP.md)** — MCP tools as first-class steps inside
+  operators
+- **[KNOWLEDGE_GRAPH.md](./docs/KNOWLEDGE_GRAPH.md)** — entity
+  extraction + traversal in SQL
+- **[RVBBIT_ROUTING_PRODUCTION_GOAL.md](./docs/RVBBIT_ROUTING_PRODUCTION_GOAL.md)**
+  — how the storage-layer router learns and decides
+- **[PACKAGING.md](./PACKAGING.md)** — Docker image, release tarball,
+  build-from-source
+
+## Status
+
+PostgreSQL 18. Apache-2.0. Active development. The operator surface,
+storage routing, receipts, embeddings, and MCP integration are real
+and exercised by a 31-step end-to-end acceptance harness
+([`make e2e-realworld`](./docs/ACCEPTANCE_HARNESS.md)). PG17 backport
+is feasible but not shipped — see [PACKAGING.md](./PACKAGING.md).
+
+---
+
+Built on [pgrx](https://github.com/pgcentralfoundation/pgrx). Storage
+layer uses [Apache Arrow](https://arrow.apache.org/) + Parquet for
+columnar reads, [DuckDB](https://duckdb.org/) and
+[DataFusion](https://datafusion.apache.org/) as alternate execution
+engines, [fastembed](https://github.com/Anush008/fastembed-rs) for
+local CPU embeddings, and [ONNX Runtime](https://onnxruntime.ai/) for
+specialist models.
