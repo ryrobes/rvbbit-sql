@@ -24,7 +24,17 @@ compiles cleanly into pg_rvbbit alongside DF53/arrow58, and three
 direct SQL functions exercise the read+write+KNN paths. Verified
 KNN at 629µs/query on a 1000×16 demo dataset.
 
-Not yet built (next slices, in dependency order):
+Operator-explicit path landed in commit f854e72:
+- rvbbit.lance_import_column(reloid, pk, vec, dim, path) exports a
+  vector column to a Lance dataset
+- rvbbit.lance_build_index(path, column, num_partitions, num_sub_vectors)
+  creates an IVF-PQ index on the dataset
+- rvbbit.lance_knn(path, query, k) queries (already shipped in the
+  substrate commit)
+- 12.8x speedup over brute force on 100k x 128-dim (2.3 ms vs 29.5 ms
+  per query). Bigger gap at higher scales.
+
+Still pending (the transparent-integration slices that build on this):
 1. lance_url column on rvbbit.row_groups, mirroring cold_url. Vector
    columns of an rvbbit table live in a sibling Lance dataset; scalar
    columns stay in parquet.
@@ -39,8 +49,6 @@ Not yet built (next slices, in dependency order):
 4. knn_text auto-routing: when the table has a Lance-indexed embedding
    column, rvbbit.knn_text rewrites to a Lance vector search instead
    of brute-force parquet scan.
-5. Index build: rvbbit.lance_build_index(rel, column) creates an IVF-PQ
-   index on a vector column.
 
 ### A. Rewriter has metadata-only fast paths that bypass tombstones + AS OF
 
