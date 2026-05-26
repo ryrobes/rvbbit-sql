@@ -9,11 +9,19 @@
 #   RVBBIT_LOAD_ROUTE_PROFILE=1 ./bench/tpch/run_offline.sh
 #   BENCH_SYSTEMS=rvbbit,rvbbit_native,rvbbit_duck_forced ./bench/tpch/run_offline.sh
 #   RVBBIT_DUCK_HOT_VALIDATE=1 BENCH_SYSTEMS=rvbbit,rvbbit_native ./bench/tpch/run_offline.sh
+#   RVBBIT_DF_INPROCESS=off ./bench/tpch/run_offline.sh      # force legacy sidecar (A/B vs new)
+#   ./bench/tpch/run_offline.sh --rebuild --reset-rvbbit-extension
+#                                                            # full bench against current source
 #
 # Flags:
 #   --reset-rvbbit-extension  same as RVBBIT_RESET_EXTENSION=1
 #   --load-route-profile      same as RVBBIT_LOAD_ROUTE_PROFILE=1
 #   --skip-load               same as SKIP_LOAD=1
+#   --rebuild                 same as BENCH_REBUILD=1 — rebuilds the
+#                             pg-rvbbit + bench container images. Required
+#                             after pulling new rvbbit code so the .so +
+#                             sidecar binary in the running container are
+#                             actually current.
 
 set -euo pipefail
 
@@ -47,6 +55,9 @@ DUCK_HOT_ENV=()
 [ -n "${RVBBIT_ROUTE_OBSERVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_OBSERVE=${RVBBIT_ROUTE_OBSERVE}")
 [ -n "${RVBBIT_ROUTE_EXPLORE_PCT:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_EXPLORE_PCT=${RVBBIT_ROUTE_EXPLORE_PCT}")
 [ -n "${RVBBIT_HIVE_LAYOUT:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_HIVE_LAYOUT=${RVBBIT_HIVE_LAYOUT}")
+# In-process DataFusion vs legacy sidecar route. Default is on (post-Phase-1);
+# pass RVBBIT_DF_INPROCESS=off to force the sidecar path for A/B benches.
+[ -n "${RVBBIT_DF_INPROCESS:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_DF_INPROCESS=${RVBBIT_DF_INPROCESS}")
 LOAD_ENV=()
 [ -n "${RVBBIT_COMPACT_KEEP_HEAP:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_KEEP_HEAP=${RVBBIT_COMPACT_KEEP_HEAP}")
 [ -n "${RVBBIT_COMPACT_VARIANTS_SYNC:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_VARIANTS_SYNC=${RVBBIT_COMPACT_VARIANTS_SYNC}")
@@ -64,11 +75,13 @@ REPEATS="${BENCH_REPEATS:-3}"
 TIMEOUT_S="${BENCH_TIMEOUT:-300}"
 RVBBIT_RESET_EXTENSION="${RVBBIT_RESET_EXTENSION:-${RESET_RVBBIT_EXTENSION:-}}"
 RVBBIT_LOAD_ROUTE_PROFILE="${RVBBIT_LOAD_ROUTE_PROFILE:-}"
+BENCH_REBUILD="${BENCH_REBUILD:-}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT_FILE="bench/tpch/results/tpch_sf${SCALE_LABEL}_${STAMP}.txt"
 
-say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
-die() { printf '\033[1;31mXX %s\033[0m\n' "$*" >&2; exit 1; }
+say()  { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+warn() { printf '\033[1;33m!! %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[1;31mXX %s\033[0m\n' "$*" >&2; exit 1; }
 env_on() {
     case "${1:-}" in
         1|true|TRUE|yes|YES|on|ON) return 0 ;;
@@ -89,6 +102,9 @@ for arg in "$@"; do
             ;;
         --skip-load)
             export SKIP_LOAD=1
+            ;;
+        --rebuild)
+            BENCH_REBUILD=1
             ;;
         -h|--help)
             usage
@@ -111,6 +127,27 @@ echo "   timeout/q   : ${TIMEOUT_S}s"
 echo "   report file : ${REPORT_FILE}"
 echo "   rvbbit reset: $(env_on "${RVBBIT_RESET_EXTENSION}" && echo destructive || echo preserve-system-data)"
 echo "   route import: $(env_on "${RVBBIT_LOAD_ROUTE_PROFILE}" && echo yes || echo no)"
+echo "   rebuild     : $(env_on "${BENCH_REBUILD}" && echo yes || echo no)"
+echo "   df_inprocess: ${RVBBIT_DF_INPROCESS:-on (default)}"
+
+if ! env_on "${BENCH_REBUILD}" && ! env_on "${RVBBIT_RESET_EXTENSION}"; then
+    warn "benching without --rebuild + --reset-rvbbit-extension."
+    warn "if you pulled new rvbbit code (Phase 1+ post-2026-05-25), the running"
+    warn "container may have a stale .so and stale catalog. Use:"
+    warn ""
+    warn "    ./bench/tpch/run_offline.sh --rebuild --reset-rvbbit-extension"
+    warn ""
+fi
+if env_on "${RVBBIT_LOAD_ROUTE_PROFILE}"; then
+    warn "bench/rvbbit_route_profile.json was trained pre-Phase-1 (sidecar"
+    warn "DataFusion era). Latency curves there don't reflect the in-process"
+    warn "DataFusion path. Profile-driven route decisions may be suboptimal."
+fi
+
+if env_on "${BENCH_REBUILD}"; then
+    say "rebuilding pg-rvbbit + bench images from current source"
+    ${COMPOSE} --profile bench build pg-rvbbit bench
+fi
 
 say "starting competitor containers (profile=bench)"
 ${COMPOSE} --profile bench up -d

@@ -17,14 +17,25 @@
 #                                                            # destructive reset of rvbbit system/catalog data
 #   RVBBIT_LOAD_ROUTE_PROFILE=1 ./bench/clickbench/run_offline.sh
 #                                                            # import bench/rvbbit_route_profile.json
+#                                                            # NOTE: the shipped profile was trained
+#                                                            # pre-Phase-1 (sidecar DataFusion era);
+#                                                            # numbers are stale, retraining recommended.
 #   BENCH_SYSTEMS=rvbbit,rvbbit_native,rvbbit_duck_forced ./bench/clickbench/run_offline.sh
 #   RVBBIT_DUCK_HOT_VALIDATE=1 BENCH_SYSTEMS=rvbbit,rvbbit_native ./bench/clickbench/run_offline.sh
+#   RVBBIT_DF_INPROCESS=off ./bench/clickbench/run_offline.sh # force legacy sidecar route (A/B vs new)
+#   ./bench/clickbench/run_offline.sh --rebuild --reset-rvbbit-extension
+#                                                            # full bench against current source
 #
 # Flags:
 #   --reset-rvbbit-extension  same as RVBBIT_RESET_EXTENSION=1
 #   --load-route-profile      same as RVBBIT_LOAD_ROUTE_PROFILE=1
 #   --skip-load               same as SKIP_LOAD=1
 #   --skip-download           same as SKIP_DOWNLOAD=1
+#   --rebuild                 same as BENCH_REBUILD=1 — rebuilds the
+#                             pg-rvbbit + bench container images before
+#                             starting the bench. Required after pulling
+#                             new rvbbit code so the new .so + sidecar
+#                             binary are actually in the running container.
 #
 # Run from the repo root (./rvbbit/).
 
@@ -64,6 +75,9 @@ DUCK_HOT_ENV=()
 [ -n "${RVBBIT_ROUTE_OBSERVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_OBSERVE=${RVBBIT_ROUTE_OBSERVE}")
 [ -n "${RVBBIT_ROUTE_EXPLORE_PCT:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_EXPLORE_PCT=${RVBBIT_ROUTE_EXPLORE_PCT}")
 [ -n "${RVBBIT_HIVE_LAYOUT:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_HIVE_LAYOUT=${RVBBIT_HIVE_LAYOUT}")
+# In-process DataFusion vs legacy sidecar route. Default is on (post-Phase-1);
+# pass RVBBIT_DF_INPROCESS=off to force the sidecar path for A/B benches.
+[ -n "${RVBBIT_DF_INPROCESS:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_DF_INPROCESS=${RVBBIT_DF_INPROCESS}")
 LOAD_ENV=()
 [ -n "${RVBBIT_COMPACT_KEEP_HEAP:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_KEEP_HEAP=${RVBBIT_COMPACT_KEEP_HEAP}")
 [ -n "${RVBBIT_COMPACT_VARIANTS_SYNC:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_VARIANTS_SYNC=${RVBBIT_COMPACT_VARIANTS_SYNC}")
@@ -81,6 +95,7 @@ REPEATS="${BENCH_REPEATS:-3}"
 TIMEOUT_S="${BENCH_TIMEOUT:-300}"
 RVBBIT_RESET_EXTENSION="${RVBBIT_RESET_EXTENSION:-${RESET_RVBBIT_EXTENSION:-}}"
 RVBBIT_LOAD_ROUTE_PROFILE="${RVBBIT_LOAD_ROUTE_PROFILE:-}"
+BENCH_REBUILD="${BENCH_REBUILD:-}"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT_FILE="bench/clickbench/results/clickbench_${LIMIT}_${STAMP}.txt"
@@ -113,6 +128,9 @@ for arg in "$@"; do
         --skip-download)
             export SKIP_DOWNLOAD=1
             ;;
+        --rebuild)
+            BENCH_REBUILD=1
+            ;;
         -h|--help)
             usage
             exit 0
@@ -135,6 +153,23 @@ echo "   timeout/q   : ${TIMEOUT_S}s"
 echo "   report file : ${REPORT_FILE}"
 echo "   rvbbit reset: $(env_on "${RVBBIT_RESET_EXTENSION}" && echo destructive || echo preserve-system-data)"
 echo "   route import: $(env_on "${RVBBIT_LOAD_ROUTE_PROFILE}" && echo yes || echo no)"
+echo "   rebuild     : $(env_on "${BENCH_REBUILD}" && echo yes || echo no)"
+echo "   df_inprocess: ${RVBBIT_DF_INPROCESS:-on (default)}"
+
+if [ "${RVBBIT_SELECTED:-1}" = "1" ] && ! env_on "${BENCH_REBUILD}" && ! env_on "${RVBBIT_RESET_EXTENSION}"; then
+    warn "benching the pg-rvbbit image without --rebuild + --reset-rvbbit-extension."
+    warn "if you pulled new rvbbit code (Phase 1+ post-2026-05-25), the running"
+    warn "container may have a stale .so and stale catalog. For an apples-to-"
+    warn "apples bench against new machinery, use:"
+    warn ""
+    warn "    ./bench/clickbench/run_offline.sh --rebuild --reset-rvbbit-extension"
+    warn ""
+fi
+if env_on "${RVBBIT_LOAD_ROUTE_PROFILE}"; then
+    warn "bench/rvbbit_route_profile.json was trained pre-Phase-1 (sidecar"
+    warn "DataFusion era). Latency curves there don't reflect the in-process"
+    warn "DataFusion path. Profile-driven route decisions may be suboptimal."
+fi
 
 # ---- 1. Download hits.parquet ----------------------------------------------
 if [ -z "${SKIP_DOWNLOAD:-}" ] && [ ! -f "${HITS}" ]; then
@@ -149,6 +184,13 @@ HITS_SIZE="$(du -h "${HITS}" | awk '{print $1}')"
 say "hits.parquet present: ${HITS_SIZE}"
 
 # ---- 2. Bring up containers ------------------------------------------------
+if env_on "${BENCH_REBUILD}"; then
+    say "rebuilding pg-rvbbit + bench images from current source"
+    # Build serially: pg-rvbbit's cargo build pulls a large dep graph;
+    # bench is small. No need to parallelize.
+    ${COMPOSE} --profile bench build pg-rvbbit bench
+fi
+
 say "starting competitor containers (profile=bench)"
 ${COMPOSE} --profile bench up -d
 sleep 5

@@ -54,6 +54,9 @@ ROUTE_GUCS = {
     "RVBBIT_ROUTE_PG_ROWSTORE": "rvbbit.route_pg_rowstore",
     "RVBBIT_ROUTE_RVBBIT_NATIVE": "rvbbit.route_rvbbit_native",
     "RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE": "rvbbit.route_hive_min_confidence",
+    # In-process DataFusion (default on as of Phase 1). Set "off" to
+    # force the legacy rvbbit-duck sidecar path for A/B benchmarking.
+    "RVBBIT_DF_INPROCESS": "rvbbit.df_inprocess",
 }
 
 
