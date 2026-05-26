@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::c_char;
+use std::ffi::{c_char, CStr, CString};
 use std::sync::Arc;
 
 use rvbbit_storage::metadata::{ColumnStats, TextSketch};
@@ -186,6 +186,14 @@ struct RustScanState {
     /// `pushed_quals` value, so correlated scans stay vectorized.
     dynamic_quals: Vec<DynamicPushedQual>,
     dynamic_quals_dirty: bool,
+    /// Phase 2 slice 4: per-row-group tombstone bitmap. Built once at scan
+    /// begin from rvbbit.delete_log (filtered by AS OF if set). The hot
+    /// loop checks `delete_bitmaps[current_rg_id].contains(row_in_batch)`
+    /// and skips matched rows. Empty map = no tombstones, cheap.
+    delete_bitmaps: HashMap<i64, roaring::RoaringBitmap>,
+    /// rg_id of the row group whose batch is currently being emitted from.
+    /// Updated whenever current_batch transitions to a new row group.
+    current_rg_id: i64,
 }
 
 /// (attnum_idx, reader). attnum_idx is 0-based into pg_attrs.
@@ -300,6 +308,9 @@ struct RuntimeEqKey {
 
 struct RowGroupEntry {
     path: String,
+    /// rg_id from rvbbit.row_groups. Used to look up tombstones in the
+    /// per-rg delete bitmap during the hot scan loop.
+    rg_id: i64,
     stats: HashMap<String, PruneStats>,
 }
 
@@ -410,6 +421,16 @@ unsafe extern "C-unwind" fn begin_custom_scan(
             Err(e) => pgrx::error!("rvbbit custom scan: row group lookup failed: {}", e),
         };
 
+    // Phase 2 slice 4: load the tombstone bitmap for this scan, honoring
+    // rvbbit.as_of_generation if set. On any error we treat as "no
+    // tombstones" — better to over-include rows than to fail the query.
+    let asof = read_as_of_generation();
+    let delete_bitmaps = match crate::delete_log::load_for_table(table_oid, asof) {
+        Ok(m) => m,
+        Err(_) => HashMap::new(),
+    };
+    let current_rg_id = row_groups.first().map(|rg| rg.rg_id).unwrap_or(0);
+
     let rust_state = Box::new(RustScanState {
         row_groups,
         row_group_layout,
@@ -441,6 +462,8 @@ unsafe extern "C-unwind" fn begin_custom_scan(
         qual_rhs_readers: Vec::new(),
         dynamic_quals: pushed_plan.dynamic_quals,
         dynamic_quals_dirty: true,
+        delete_bitmaps,
+        current_rg_id,
     });
     (*ext).rust_state_ptr = Box::into_raw(rust_state);
 }
@@ -2150,6 +2173,16 @@ unsafe extern "C-unwind" fn exec_custom_scan(
         // Need a current batch with rows remaining?
         if let Some(batch) = &state.current_batch {
             if state.row_in_batch < batch.num_rows() {
+                // Phase 2 slice 4 tombstone filter: if this (rg_id, ordinal)
+                // is in the delete bitmap, skip without materializing. Cheap
+                // when there are no tombstones (the get() returns None
+                // immediately for the common case).
+                if let Some(bm) = state.delete_bitmaps.get(&state.current_rg_id) {
+                    if bm.contains(state.row_in_batch as u32) {
+                        state.row_in_batch += 1;
+                        continue;
+                    }
+                }
                 // Predicate pushdown: skip rows we can prove fail the
                 // pushed qual without ever materializing them. PG's
                 // ExecQual still runs below as a safety net for anything
@@ -2267,6 +2300,10 @@ unsafe extern "C-unwind" fn exec_custom_scan(
                     }
                     return std::ptr::null_mut(); // EOF
                 }
+                // Phase 2 slice 4: we're about to start emitting rows from
+                // a new row group — record its rg_id so the tombstone filter
+                // in the hot loop checks the right bitmap.
+                state.current_rg_id = state.row_groups[state.rg_idx].rg_id;
                 let path_str = state.row_groups[state.rg_idx].path.clone();
                 let path = std::path::Path::new(&path_str);
                 // Projection pushdown: only read columns the query touches.
@@ -2377,6 +2414,24 @@ fn layout_matches_pushed_filter(
     })
 }
 
+/// Read the rvbbit.as_of_generation GUC at scan-begin time. Same pattern
+/// as `df::current_asof`: direct GetConfigOption FFI so the cost is
+/// microseconds, not an SPI roundtrip. Positive → narrow to gen <= asof;
+/// unset/empty/0/negative → None (use the latest visible state).
+fn read_as_of_generation() -> Option<i64> {
+    let cname = CString::new("rvbbit.as_of_generation").ok()?;
+    let ptr = unsafe { pg_sys::GetConfigOption(cname.as_ptr(), true, false) };
+    if ptr.is_null() {
+        return None;
+    }
+    let raw = unsafe { CStr::from_ptr(ptr).to_string_lossy() };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<i64>().ok().filter(|&g| g > 0)
+}
+
 fn fetch_variant_layouts(table_oid: u32) -> Result<Vec<String>, String> {
     let prefix = CLUSTER_LAYOUT_PREFIX.replace('\'', "''");
     let mut layouts = Vec::new();
@@ -2412,32 +2467,41 @@ fn fetch_row_group_paths(
     variant_layout: Option<&str>,
 ) -> Result<Vec<RowGroupEntry>, String> {
     let mut out = Vec::new();
+    // Phase 2 slice 3: when AS OF is set, narrow row groups to those at
+    // generation <= asof. Variant layouts (hive/cluster) don't carry
+    // per-rg generations and can't honor this; routes will fall back to
+    // canonical scan when AS OF is active.
+    let asof = read_as_of_generation();
+    let asof_predicate = match (asof, variant_layout.is_some()) {
+        (Some(g), false) => format!("AND generation <= {g}"),
+        _ => String::new(),
+    };
     pgrx::Spi::connect(|client| -> Result<(), String> {
         let select_sql = if let Some(layout) = variant_layout {
             let layout = layout.replace('\'', "''");
             if include_stats {
                 format!(
-                    "SELECT path, stats::text FROM rvbbit.row_group_variants \
+                    "SELECT path, rg_id, stats::text FROM rvbbit.row_group_variants \
                      WHERE table_oid = {table_oid}::oid AND layout = '{layout}' \
                      ORDER BY rg_id"
                 )
             } else {
                 format!(
-                    "SELECT path, NULL::text FROM rvbbit.row_group_variants \
+                    "SELECT path, rg_id, NULL::text FROM rvbbit.row_group_variants \
                      WHERE table_oid = {table_oid}::oid AND layout = '{layout}' \
                      ORDER BY rg_id"
                 )
             }
         } else if include_stats {
             format!(
-                "SELECT path, stats::text FROM rvbbit.row_groups \
-                 WHERE table_oid = {table_oid}::oid \
+                "SELECT path, rg_id, stats::text FROM rvbbit.row_groups \
+                 WHERE table_oid = {table_oid}::oid {asof_predicate} \
                  ORDER BY rg_id"
             )
         } else {
             format!(
-                "SELECT path, NULL::text FROM rvbbit.row_groups \
-                 WHERE table_oid = {table_oid}::oid \
+                "SELECT path, rg_id, NULL::text FROM rvbbit.row_groups \
+                 WHERE table_oid = {table_oid}::oid {asof_predicate} \
                  ORDER BY rg_id"
             )
         };
@@ -2447,10 +2511,12 @@ fn fetch_row_group_paths(
         for row in table {
             let path: Option<String> = row.get(1).map_err(|e| format!("SPI get: {e}"))?;
             if let Some(p) = path {
+                let rg_id: i64 = row.get(2).map_err(|e| format!("SPI get rg_id: {e}"))?.unwrap_or(0);
                 let stats_text: Option<String> =
-                    row.get(2).map_err(|e| format!("SPI get stats: {e}"))?;
+                    row.get(3).map_err(|e| format!("SPI get stats: {e}"))?;
                 out.push(RowGroupEntry {
                     path: p,
+                    rg_id,
                     stats: parse_prune_stats(stats_text.as_deref()),
                 });
             }
@@ -2802,6 +2868,7 @@ unsafe extern "C-unwind" fn rescan_custom_scan(node: *mut pg_sys::CustomScanStat
     let state = &mut *(*ext).rust_state_ptr;
     state.rg_idx = 0;
     state.pruned_row_groups = 0;
+    state.current_rg_id = state.row_groups.first().map(|rg| rg.rg_id).unwrap_or(0);
     state.current_reader = None;
     state.current_cached_batches = None;
     state.current_cached_batch_idx = 0;

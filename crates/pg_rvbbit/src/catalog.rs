@@ -151,10 +151,104 @@ CREATE TABLE rvbbit.delete_log (
     rg_id           bigint NOT NULL,
     ordinal         int NOT NULL,
     deleted_xid     xid8 NOT NULL,
+    -- Phase 2 slice 4: tombstones carry a generation so AS OF queries
+    -- can honor them ("at AS OF gen N, apply tombstones with
+    -- deleted_generation <= N"). Default 0 covers any pre-Phase-2
+    -- entries written without this column.
+    deleted_generation bigint NOT NULL DEFAULT 0,
     PRIMARY KEY (table_oid, rg_id, ordinal)
 );
 
 CREATE INDEX delete_log_xid_idx ON rvbbit.delete_log (deleted_xid);
+CREATE INDEX delete_log_table_generation_idx
+    ON rvbbit.delete_log (table_oid, deleted_generation);
+
+-- Allocate a new generation for the given table — same per-table
+-- advisory-lock pattern that compact() uses, so any tombstone-writing
+-- code can stamp delete_log entries with a number that doesn't collide
+-- with a concurrent compact. Returns the allocated value.
+CREATE OR REPLACE FUNCTION rvbbit.allocate_generation(reloid regclass)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+    gen bigint;
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        ((1380336724::bigint) << 32) | reloid::oid::bigint);
+    UPDATE rvbbit.tables
+       SET next_generation = next_generation + 1
+     WHERE table_oid = reloid
+    RETURNING next_generation - 1 INTO gen;
+    IF gen IS NULL THEN
+        RAISE EXCEPTION 'rvbbit.allocate_generation: table % is not registered with the rvbbit access method', reloid;
+    END IF;
+    RETURN gen;
+END $$;
+
+-- Write a single tombstone. Allocates a new generation, inserts one
+-- delete_log entry, returns the allocated generation. Pre-existing
+-- tombstones for the same (rg_id, ordinal) update their deleted_xid
+-- and bump deleted_generation forward — a re-delete is a no-op
+-- semantically but should observably appear in a later generation.
+CREATE OR REPLACE FUNCTION rvbbit.tombstone(
+    reloid regclass, rg_id bigint, ordinal int
+) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+    gen bigint;
+BEGIN
+    gen := rvbbit.allocate_generation(reloid);
+    INSERT INTO rvbbit.delete_log
+        (table_oid, rg_id, ordinal, deleted_xid, deleted_generation)
+    VALUES
+        (reloid, rg_id, ordinal, pg_current_xact_id(), gen)
+    ON CONFLICT (table_oid, rg_id, ordinal) DO UPDATE SET
+        deleted_xid = EXCLUDED.deleted_xid,
+        deleted_generation = EXCLUDED.deleted_generation;
+    RETURN gen;
+END $$;
+
+-- Batch tombstones in one generation. `items` is a JSON array of
+-- {"rg": bigint, "ord": int} objects. All entries land at the same
+-- allocated generation, so a DELETE statement touching N rows is one
+-- atomic time-travel event.
+CREATE OR REPLACE FUNCTION rvbbit.tombstone_batch(
+    reloid regclass, items jsonb
+) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+    gen bigint;
+    n_items int;
+BEGIN
+    IF items IS NULL OR jsonb_typeof(items) <> 'array' THEN
+        RAISE EXCEPTION 'rvbbit.tombstone_batch: items must be a JSON array of {"rg":..,"ord":..} objects';
+    END IF;
+    n_items := jsonb_array_length(items);
+    IF n_items = 0 THEN
+        RETURN 0;   -- nothing to do; don't burn a generation
+    END IF;
+    gen := rvbbit.allocate_generation(reloid);
+    INSERT INTO rvbbit.delete_log
+        (table_oid, rg_id, ordinal, deleted_xid, deleted_generation)
+    SELECT reloid,
+           (e->>'rg')::bigint,
+           (e->>'ord')::int,
+           pg_current_xact_id(),
+           gen
+      FROM jsonb_array_elements(items) AS e
+    ON CONFLICT (table_oid, rg_id, ordinal) DO UPDATE SET
+        deleted_xid = EXCLUDED.deleted_xid,
+        deleted_generation = EXCLUDED.deleted_generation;
+    RETURN gen;
+END $$;
+
+-- Count effective tombstones for a table at a given AS OF generation.
+-- Pass NULL for the latest view (all tombstones applied).
+CREATE OR REPLACE FUNCTION rvbbit.tombstone_count(
+    reloid regclass, asof bigint DEFAULT NULL
+) RETURNS bigint LANGUAGE sql STABLE AS $$
+    SELECT count(*)::bigint
+    FROM rvbbit.delete_log
+    WHERE table_oid = reloid
+      AND (asof IS NULL OR deleted_generation <= asof)
+$$;
 
 -- Shreds: typed parquet columns that materialize a Postgres expression
 -- against the source row's data. Populated by rvbbit.compact() when it

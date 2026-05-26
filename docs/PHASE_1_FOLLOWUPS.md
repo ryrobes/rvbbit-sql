@@ -17,6 +17,38 @@ and bench cleanly. Each is independent; pick any in any order.
 
 ## Tier 3 — bigger lifts, deferred
 
+### A. Rewriter has metadata-only fast paths that bypass tombstones + AS OF
+
+Discovered while writing the Phase 2 slice 4 (tombstones) probe.
+`SELECT label, count(*) FROM t GROUP BY 1` (no predicate) gets rewritten
+into `Function Scan on vector_float_agg` — a metadata-aggregation path
+that reads pre-computed per-group counts from `rvbbit.row_groups.stats`
+and never touches the parquet, never applies tombstones, never honors
+`rvbbit.as_of_generation`. Queries with any predicate (e.g.
+`WHERE id > 0`) bypass this fast path and behave correctly.
+
+Fix sketch: the rewriter's metadata-aggregate code paths need a check
+for "are there tombstones for this table?" (cheap — one SPI row from
+delete_log) and for "is `rvbbit.as_of_generation` set?" (cheap — direct
+GetConfigOption). If either is true, fall through to the normal scan.
+
+Same gap likely exists for `count(*)` metadata fast path. Audit
+candidates: grep for "vector_float_agg" and any other rewriter SRFs
+that read stats directly.
+
+### B. df::query_engine eligibility check is too strict for AS OF
+
+`crates/pg_rvbbit/src/df.rs::discover_catalog_scan` rejects tables with
+any pending tombstones (`r.deletes != 0`) when AS OF is unset. That
+makes the in-process DF path refuse all queries the moment ANY delete
+exists, instead of just applying the tombstone bitmap. Phase 4 reader-
+side work for df.rs needs the same machinery as custom_scan.rs: load
+the per-rg delete bitmap, apply it during result rendering.
+
+When AS OF IS set, the existing code already skips the eligibility
+check. The fix for the unset case is symmetrical: also skip the
+deletes-block, but load tombstones into the catalog/registration step.
+
 ### 1. DataFusion 49 → 53 bump
 
 The rvbbit-duck sidecar uses DataFusion 53 (its own workspace pin); we
