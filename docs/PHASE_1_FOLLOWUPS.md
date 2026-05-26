@@ -17,6 +17,31 @@ and bench cleanly. Each is independent; pick any in any order.
 
 ## Tier 3 — bigger lifts, deferred
 
+### Lance datasets — substrate landed, integration TODO
+
+Commit 334ddc4 shipped the embedding-validation spike: lance 6.0.1
+compiles cleanly into pg_rvbbit alongside DF53/arrow58, and three
+direct SQL functions exercise the read+write+KNN paths. Verified
+KNN at 629µs/query on a 1000×16 demo dataset.
+
+Not yet built (next slices, in dependency order):
+1. lance_url column on rvbbit.row_groups, mirroring cold_url. Vector
+   columns of an rvbbit table live in a sibling Lance dataset; scalar
+   columns stay in parquet.
+2. compact() detects vector-typed columns (real[], or a registered
+   embedding marker) and writes them to Lance alongside the parquet
+   row group.
+3. Read-path integration: when a query touches a vector column,
+   join parquet + lance per row group. DataFusion can do this if we
+   register both as separate ListingTables and the query has an
+   identifying key column. (Or: a custom TableProvider that maps
+   row-group ordinal across the two.)
+4. knn_text auto-routing: when the table has a Lance-indexed embedding
+   column, rvbbit.knn_text rewrites to a Lance vector search instead
+   of brute-force parquet scan.
+5. Index build: rvbbit.lance_build_index(rel, column) creates an IVF-PQ
+   index on a vector column.
+
 ### A. Rewriter has metadata-only fast paths that bypass tombstones + AS OF
 
 Discovered while writing the Phase 2 slice 4 (tombstones) probe.
