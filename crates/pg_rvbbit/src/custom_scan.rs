@@ -35,6 +35,10 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+use parquet::bloom_filter::Sbbf;
+use parquet::file::properties::ReaderProperties;
+use parquet::file::reader::FileReader;
+use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
 use pgrx::pg_guard;
 use pgrx::IntoDatum;
 use pgrx::pg_sys;
@@ -1478,6 +1482,21 @@ fn row_group_clause_impossible(
     let Some(attr) = pg_attrs.get(attr_idx) else {
         return false;
     };
+    // Fast in-memory min/max check first (no I/O). If that doesn't
+    // prove impossibility, fall through to the bloom filter check —
+    // which costs an mmap-style read of the parquet bloom on first
+    // access per (path, col), then is cached for subsequent queries.
+    if row_group_clause_impossible_stats(row_group, attr, q) {
+        return true;
+    }
+    bloom_clause_impossible(row_group, attr, q)
+}
+
+fn row_group_clause_impossible_stats(
+    row_group: &RowGroupEntry,
+    attr: &PgAttr,
+    q: &PushedQual,
+) -> bool {
     let Some(stats) = row_group.stats.get(&attr.name) else {
         return false;
     };
@@ -1584,6 +1603,162 @@ fn row_group_clause_impossible(
 
 fn json_i64_bounds(min: &serde_json::Value, max: &serde_json::Value) -> Option<(i64, i64)> {
     Some((json_i64(min)?, json_i64(max)?))
+}
+
+// --- Bloom filter pushdown ------------------------------------------------
+//
+// Parquet 2.0 row groups carry an optional Sbbf (split-block bloom filter)
+// per column. We wrote them for text/binary columns in the v2 ship; the
+// numeric variant is gated by RVBBIT_PARQUET_BLOOM_NUMERIC. On the read
+// side these help when min/max can't prune — i.e. the literal sits inside
+// the column's value range but the column doesn't actually contain it.
+// That's the ClickBench Q19 shape (`UserID = 12345` against a 200k-row
+// table where UserID spans the int64 universe).
+//
+// We cache decoded blooms per (path, file_len, mtime) so the parquet
+// footer + bloom pages are read at most once per row-group file per
+// backend. The cache key mirrors BatchCache so a recompacted file
+// (different mtime/len) naturally misses and refreshes.
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct BloomCacheKey {
+    path: String,
+    file_len: u64,
+    file_mtime_nanos: u128,
+}
+
+thread_local! {
+    static BLOOM_CACHE: std::cell::RefCell<
+        HashMap<BloomCacheKey, std::sync::Arc<HashMap<String, Sbbf>>>,
+    > = std::cell::RefCell::new(HashMap::new());
+}
+
+fn bloom_cache_key(path: &str) -> BloomCacheKey {
+    let (file_len, file_mtime_nanos) = std::fs::metadata(path)
+        .ok()
+        .map(|m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            (m.len(), mtime)
+        })
+        .unwrap_or((0, 0));
+    BloomCacheKey {
+        path: path.to_string(),
+        file_len,
+        file_mtime_nanos,
+    }
+}
+
+/// Load all column blooms for the parquet at `path`. Cached per backend.
+/// Returns an empty map (not None) for files with no blooms so subsequent
+/// lookups still hit the cache instead of re-opening the file.
+fn load_blooms_for_path(path: &str) -> std::sync::Arc<HashMap<String, Sbbf>> {
+    let key = bloom_cache_key(path);
+    if let Some(cached) = BLOOM_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let mut blooms: HashMap<String, Sbbf> = HashMap::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        let props = ReaderProperties::builder().set_read_bloom_filter(true).build();
+        let options = ReadOptionsBuilder::new()
+            .with_reader_properties(props)
+            .build();
+        if let Ok(reader) = SerializedFileReader::new_with_options(file, options) {
+            let schema = reader.metadata().file_metadata().schema_descr_ptr();
+            // We only write one row group per parquet file (compact() is
+            // 1:1 with rg_id), so blooms live in row group 0.
+            if reader.num_row_groups() > 0 {
+                if let Ok(rg) = reader.get_row_group(0) {
+                    let n_cols = rg.num_columns();
+                    for c in 0..n_cols {
+                        if let Some(b) = rg.metadata().column(c).bloom_filter_offset() {
+                            let _ = b; // sanity; offset presence is checked again below
+                            if let Some(sbbf) = rg.get_column_bloom_filter(c) {
+                                let name = schema.column(c).name().to_string();
+                                blooms.insert(name, sbbf.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let arc = std::sync::Arc::new(blooms);
+    BLOOM_CACHE.with(|c| c.borrow_mut().insert(key, arc.clone()));
+    arc
+}
+
+fn bloom_clause_impossible(row_group: &RowGroupEntry, attr: &PgAttr, q: &PushedQual) -> bool {
+    // Bloom is only useful for equality / IN. Anything else falls through.
+    if !matches!(q.op, PushOp::Eq | PushOp::In) {
+        return false;
+    }
+    let blooms = load_blooms_for_path(&row_group.path);
+    let Some(bloom) = blooms.get(&attr.name) else {
+        return false;
+    };
+    match &q.value {
+        PushVal::I64(v) => bloom_int_absent(bloom, attr.typoid, *v),
+        PushVal::F64(v) => bloom_float_absent(bloom, attr.typoid, *v),
+        PushVal::Text(s) => !bloom.check(s.as_str()),
+        PushVal::I64Set(vs) if !vs.is_empty() => {
+            vs.iter().all(|&v| bloom_int_absent(bloom, attr.typoid, v))
+        }
+        PushVal::F64Set(vs) if !vs.is_empty() => {
+            vs.iter().all(|&v| bloom_float_absent(bloom, attr.typoid, v))
+        }
+        PushVal::TextSet(vs) if !vs.is_empty() => vs.iter().all(|s| !bloom.check(s.as_str())),
+        _ => false,
+    }
+}
+
+/// Check whether `v` (PG int8) is definitely absent from a numeric column's
+/// bloom. Arrow's parquet writer widens Int16/Int32 to physical INT32 and
+/// keeps Int64 as INT64; Date32 is INT32 days-since-1970; Timestamp(Micros)
+/// is INT64 micros-since-1970. The bloom hashes the on-disk physical type,
+/// so the literal needs the same width / epoch frame to hash identically.
+fn bloom_int_absent(bloom: &Sbbf, typoid: pg_sys::Oid, v: i64) -> bool {
+    let oid = typoid.to_u32();
+    if oid == pg_sys::INT2OID.to_u32() || oid == pg_sys::INT4OID.to_u32() {
+        return match i32::try_from(v) {
+            Ok(v32) => !bloom.check(&v32),
+            Err(_) => true,
+        };
+    }
+    if oid == pg_sys::INT8OID.to_u32() {
+        return !bloom.check(&v);
+    }
+    if oid == pg_sys::DATEOID.to_u32() {
+        let arrow_days = v + PG_EPOCH_OFFSET_DAYS as i64;
+        return match i32::try_from(arrow_days) {
+            Ok(d32) => !bloom.check(&d32),
+            Err(_) => true,
+        };
+    }
+    if oid == pg_sys::TIMESTAMPOID.to_u32() || oid == pg_sys::TIMESTAMPTZOID.to_u32() {
+        let arrow_micros = v + PG_EPOCH_OFFSET_MICROS;
+        return !bloom.check(&arrow_micros);
+    }
+    false
+}
+
+fn bloom_float_absent(bloom: &Sbbf, typoid: pg_sys::Oid, v: f64) -> bool {
+    let oid = typoid.to_u32();
+    if oid == pg_sys::FLOAT4OID.to_u32() {
+        let v32 = v as f32;
+        if (v32 as f64) != v {
+            return true;
+        }
+        return !bloom.check(&v32);
+    }
+    if oid == pg_sys::FLOAT8OID.to_u32() {
+        return !bloom.check(&v);
+    }
+    false
 }
 
 fn json_i64(v: &serde_json::Value) -> Option<i64> {

@@ -96,6 +96,12 @@ services:
       RVBBIT_PARQUET_V2: ${RVBBIT_PARQUET_V2:-on}
       RVBBIT_PARQUET_BLOOM: ${RVBBIT_PARQUET_BLOOM:-on}
       RVBBIT_PARQUET_PAGE_ROWS: ${RVBBIT_PARQUET_PAGE_ROWS:-5000}
+      # Extend bloom filters to numeric / temporal columns too. Off by
+      # default (text-only is the cheap-safe setting); flip on for
+      # workloads heavy in point-equality queries on integer/date cols.
+      # Re-compact after toggling to materialize blooms in the parquet
+      # files; existing row groups keep whatever they were written with.
+      RVBBIT_PARQUET_BLOOM_NUMERIC: ${RVBBIT_PARQUET_BLOOM_NUMERIC:-off}
     ports:
       - "55433:5432"
     volumes:

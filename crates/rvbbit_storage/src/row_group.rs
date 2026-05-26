@@ -146,26 +146,32 @@ fn build_writer_properties(schema: &SchemaRef) -> WriterProperties {
             .set_bloom_filter_enabled(true)
             .set_bloom_filter_fpp(bloom_fpp);
 
-        // Disable blooms on numeric / boolean / temporal columns: their
-        // column min/max already prune equality predicates and adding a
-        // bloom just wastes space + write time.
-        for field in schema.fields() {
-            let is_numeric_or_temporal = matches!(
-                field.data_type(),
-                DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Float32
-                    | DataType::Float64
-                    | DataType::Boolean
-                    | DataType::Date32
-                    | DataType::Timestamp(_, _)
-            );
-            if is_numeric_or_temporal {
-                builder = builder.set_column_bloom_filter_enabled(
-                    ColumnPath::from(field.name().as_str()),
-                    false,
+        // Numeric / temporal columns: bloom only useful for equality
+        // pushdown ON SPECIFIC VALUES that fall inside min/max but aren't
+        // actually present. ClickBench-style `WHERE id = literal` queries
+        // are the canonical case. Skipped by default (saves disk + write
+        // time on the column-stats-only workload) and turned on per
+        // workload via RVBBIT_PARQUET_BLOOM_NUMERIC=on.
+        let bloom_numeric = env_enabled("RVBBIT_PARQUET_BLOOM_NUMERIC", false);
+        if !bloom_numeric {
+            for field in schema.fields() {
+                let is_numeric_or_temporal = matches!(
+                    field.data_type(),
+                    DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                        | DataType::Boolean
+                        | DataType::Date32
+                        | DataType::Timestamp(_, _)
                 );
+                if is_numeric_or_temporal {
+                    builder = builder.set_column_bloom_filter_enabled(
+                        ColumnPath::from(field.name().as_str()),
+                        false,
+                    );
+                }
             }
         }
     }
