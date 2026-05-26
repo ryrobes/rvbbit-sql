@@ -16,6 +16,10 @@ services:
       - "55432:5432"
     volumes:
       - heap_data:/var/lib/postgresql
+    # pg-heap gets the same general tuning as pg-rvbbit (parallel-query
+    # pool sizes, AIO knobs, planner cost model) so the baseline isn't
+    # held back by vanilla defaults. The pg_rvbbit-specific bits are
+    # excluded — no extension preload, no extension-specific GUCs.
     command:
       - postgres
       - -c
@@ -23,7 +27,31 @@ services:
       - -c
       - work_mem=64MB
       - -c
+      - maintenance_work_mem=256MB
+      - -c
       - max_wal_size=4GB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_cache_size=4GB
+      - -c
+      - default_statistics_target=200
+      - -c
+      - max_worker_processes=32
+      - -c
+      - max_parallel_workers=16
+      - -c
+      - max_parallel_workers_per_gather=4
+      - -c
+      - max_parallel_maintenance_workers=4
+      - -c
+      - io_method=worker
+      - -c
+      - io_workers=16
+      - -c
+      - effective_io_concurrency=64
+      - -c
+      - maintenance_io_concurrency=16
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -59,20 +87,26 @@ services:
       RVBBIT_POOL_SIZE: ${RVBBIT_POOL_SIZE:-8}
       # In-memory cache capacity (entries). Tune for repeated workloads.
       RVBBIT_CACHE_SIZE: ${RVBBIT_CACHE_SIZE:-10000}
+      # DataFusion in-process tokio worker threads (df_inprocess route).
+      # Unset → pg_rvbbit picks min(num_cpus, 8). Set 0 to force a
+      # single-thread runtime, or N to pin to a specific count.
+      RVBBIT_DF_THREADS: ${RVBBIT_DF_THREADS:-}
+      # Parquet writer knobs. See crates/rvbbit_storage/src/row_group.rs
+      # for the full list of supported keys.
+      RVBBIT_PARQUET_V2: ${RVBBIT_PARQUET_V2:-on}
+      RVBBIT_PARQUET_BLOOM: ${RVBBIT_PARQUET_BLOOM:-on}
+      RVBBIT_PARQUET_PAGE_ROWS: ${RVBBIT_PARQUET_PAGE_ROWS:-5000}
     ports:
       - "55433:5432"
     volumes:
       - rvbbit_data:/var/lib/postgresql
+    # All knobs come from /etc/rvbbit/tuning.conf (see
+    # docker/config/rvbbit-tuning.conf). Override individual settings by
+    # adding `-c key=value` after the include line — last value wins.
     command:
       - postgres
       - -c
-      - shared_preload_libraries=pg_rvbbit
-      - -c
-      - shared_buffers=1GB
-      - -c
-      - work_mem=64MB
-      - -c
-      - max_wal_size=4GB
+      - include_if_exists=/etc/rvbbit/tuning.conf
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s

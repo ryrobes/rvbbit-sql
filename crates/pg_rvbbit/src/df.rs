@@ -52,16 +52,23 @@ thread_local! {
     static REG_CACHE: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
 }
 
-// Number of worker threads for the per-backend tokio runtime. 0 = use a
-// current_thread runtime (no extra threads, lowest overhead, but DataFusion
-// can't parallelize aggregates). Otherwise use a multi_thread runtime with
-// this many workers. Override per-backend with `SET rvbbit.df_threads = N`
-// before the first probe call.
+/// Number of worker threads for the per-backend tokio runtime.
+///
+/// Override via `RVBBIT_DF_THREADS=N`. Special value 0 forces a
+/// current_thread runtime (no parallelism, lowest overhead).
+///
+/// Default: min(available_parallelism, 8). DataFusion's hash aggregate,
+/// projection, and parquet scan all use this thread pool, so for the
+/// df_inprocess route this is the difference between a single-core run
+/// and a real parallel scan. We cap at 8 because each PG backend gets
+/// its own pool, and 32-core boxes don't need 32 threads per backend.
 fn worker_threads() -> usize {
-    std::env::var("RVBBIT_DF_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+    if let Ok(raw) = std::env::var("RVBBIT_DF_THREADS") {
+        return raw.parse().unwrap_or(0);
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4)
 }
 
 fn ensure_runtime() {

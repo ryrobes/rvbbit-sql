@@ -152,6 +152,9 @@ The README is the elevator pitch. Everything serious is in
   — how the storage-layer router learns and decides
 - **[PACKAGING.md](./PACKAGING.md)** — Docker image, release tarball,
   build-from-source
+- **[TUNING.md](./docs/TUNING.md)** — Postgres + DataFusion + Parquet
+  knobs the image bumps over vanilla defaults, and what to set when
+  running outside Docker
 
 ## Status
 
