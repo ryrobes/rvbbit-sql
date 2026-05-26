@@ -186,6 +186,14 @@ struct RustScanState {
     /// shape as `column_readers` but indexed by pushed_quals position.
     qual_readers: Vec<ColumnReader>,
     qual_rhs_readers: Vec<ColumnReader>,
+    /// Vectorized predicate cache. Computed once when `current_batch`
+    /// becomes a new RecordBatch by running the pushed expression through
+    /// Arrow compute kernels (cmp::eq, lt, etc.). The hot row loop then
+    /// indexes `current_filter_bitmask[row]` instead of calling the
+    /// per-row tree walker. `None` means we couldn't vectorize this
+    /// expression (LIKE, dynamic quals, unsupported types, …) and fall
+    /// back to the existing per-row evaluator.
+    current_filter_bitmask: Option<arrow::array::BooleanArray>,
     /// Pushed quals whose RHS is an outer/parameter expression. On each
     /// rescan we evaluate the expression once and update the corresponding
     /// `pushed_quals` value, so correlated scans stay vectorized.
@@ -530,6 +538,7 @@ unsafe extern "C-unwind" fn begin_custom_scan(
         qual_fully_pushed: pushed_plan.fully_pushed,
         qual_readers: Vec::new(),
         qual_rhs_readers: Vec::new(),
+        current_filter_bitmask: None,
         dynamic_quals: pushed_plan.dynamic_quals,
         dynamic_quals_dirty: true,
         delete_bitmaps,
@@ -1227,6 +1236,189 @@ unsafe fn pushed_expr_pass(
         PushExpr::Or(children) => children
             .iter()
             .any(|child| pushed_expr_pass(qual_readers, qual_rhs_readers, pushed, child, row)),
+    }
+}
+
+// --- Vectorized predicate evaluation (Phase 4b) ---------------------------
+//
+// Rather than walk the qual tree for every row, evaluate the whole pushed
+// expression as Arrow compute kernels once per batch, producing a single
+// BooleanArray bitmask. Per-row iteration then becomes `bitmask[i]`.
+//
+// Speed-up comes from two places: (1) the kernels are autovectorizable
+// SIMD loops, (2) the per-row tree walker's dispatch + boxed-array
+// downcasts are gone. The trade is that not every PushOp is vectorizable
+// — LIKE, dynamic quals, column-vs-column compares, and types we don't
+// special-case fall back to per-row eval (the function returns None).
+//
+// Filter semantics match PG: a NULL in the bitmask excludes the row.
+fn try_evaluate_pushed_expr_vectorized(
+    batch: &RecordBatch,
+    expr: &PushExpr,
+    pushed: &[PushedQual],
+    pg_attrs: &[PgAttr],
+) -> Option<arrow::array::BooleanArray> {
+    match expr {
+        PushExpr::Qual(idx) => {
+            let q = pushed.get(*idx)?;
+            try_evaluate_qual_vectorized(batch, q, pg_attrs)
+        }
+        PushExpr::And(children) => {
+            let mut acc: Option<arrow::array::BooleanArray> = None;
+            for child in children {
+                let m = try_evaluate_pushed_expr_vectorized(batch, child, pushed, pg_attrs)?;
+                acc = Some(match acc {
+                    None => m,
+                    Some(prev) => arrow::compute::and_kleene(&prev, &m).ok()?,
+                });
+            }
+            acc.or_else(|| {
+                // Empty AND → all rows pass.
+                Some(arrow::array::BooleanArray::from(vec![true; batch.num_rows()]))
+            })
+        }
+        PushExpr::Or(children) => {
+            let mut acc: Option<arrow::array::BooleanArray> = None;
+            for child in children {
+                let m = try_evaluate_pushed_expr_vectorized(batch, child, pushed, pg_attrs)?;
+                acc = Some(match acc {
+                    None => m,
+                    Some(prev) => arrow::compute::or_kleene(&prev, &m).ok()?,
+                });
+            }
+            // Empty OR → no rows pass, but we shouldn't get here from a
+            // valid parse.
+            acc
+        }
+    }
+}
+
+fn try_evaluate_qual_vectorized(
+    batch: &RecordBatch,
+    q: &PushedQual,
+    pg_attrs: &[PgAttr],
+) -> Option<arrow::array::BooleanArray> {
+    use arrow::array::{
+        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Scalar,
+        StringArray, TimestampMicrosecondArray,
+    };
+    use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq};
+
+    if q.attnum <= 0 {
+        return None;
+    }
+    let attr_idx = (q.attnum - 1) as usize;
+    let attr = pg_attrs.get(attr_idx)?;
+    let col_idx = batch.schema().index_of(&attr.name).ok()?;
+    let column = batch.column(col_idx).clone();
+
+    // Apply the comparison op between `column` (Arrow array) and a Scalar
+    // built from the literal. The macros below let us reuse the same six
+    // kernels across all primitive types without specialising each.
+    macro_rules! apply_op {
+        ($scalar:expr) => {{
+            let s = Scalar::new($scalar);
+            let result = match q.op {
+                PushOp::Eq => eq(&column, &s),
+                PushOp::Lt => lt(&column, &s),
+                PushOp::Le => lt_eq(&column, &s),
+                PushOp::Gt => gt(&column, &s),
+                PushOp::Ge => gt_eq(&column, &s),
+                _ => return None,
+            };
+            result.ok()
+        }};
+    }
+
+    match (&q.value, q.op) {
+        // ---- IS NULL / IS NOT NULL -----------------------------------
+        (PushVal::Null, PushOp::Eq) => arrow::compute::is_null(&column).ok(),
+        // (We don't have a separate IS NOT NULL push variant — quals
+        //  using `IS NOT NULL` get pushed as something else or not at all.)
+
+        // ---- Integer comparisons -------------------------------------
+        (PushVal::I64(v), op) if matches!(op, PushOp::Eq | PushOp::Lt | PushOp::Le | PushOp::Gt | PushOp::Ge) => {
+            let oid = attr.typoid.to_u32();
+            if oid == pg_sys::INT2OID.to_u32() || oid == pg_sys::INT4OID.to_u32() {
+                let v32 = i32::try_from(*v).ok()?;
+                let column_array = column.as_any().downcast_ref::<Int32Array>();
+                if column_array.is_some() {
+                    apply_op!(Int32Array::from(vec![v32]))
+                } else {
+                    // Int16 column: kernel needs same arrow type on both sides.
+                    let v16 = i16::try_from(*v).ok()?;
+                    let _ = column.as_any().downcast_ref::<Int16Array>()?;
+                    apply_op!(Int16Array::from(vec![v16]))
+                }
+            } else if oid == pg_sys::INT8OID.to_u32() {
+                let _ = column.as_any().downcast_ref::<Int64Array>()?;
+                apply_op!(Int64Array::from(vec![*v]))
+            } else if oid == pg_sys::DATEOID.to_u32() {
+                // Arrow Date32 days-since-1970; PG date days-since-2000.
+                let arrow_days = i32::try_from(*v + PG_EPOCH_OFFSET_DAYS as i64).ok()?;
+                let _ = column.as_any().downcast_ref::<arrow::array::Date32Array>()?;
+                apply_op!(arrow::array::Date32Array::from(vec![arrow_days]))
+            } else if oid == pg_sys::TIMESTAMPOID.to_u32() || oid == pg_sys::TIMESTAMPTZOID.to_u32() {
+                let arrow_micros = *v + PG_EPOCH_OFFSET_MICROS;
+                let _ = column
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()?;
+                apply_op!(TimestampMicrosecondArray::from(vec![arrow_micros]))
+            } else {
+                None
+            }
+        }
+
+        // ---- Float comparisons ---------------------------------------
+        (PushVal::F64(v), op) if matches!(op, PushOp::Eq | PushOp::Lt | PushOp::Le | PushOp::Gt | PushOp::Ge) => {
+            let oid = attr.typoid.to_u32();
+            if oid == pg_sys::FLOAT4OID.to_u32() {
+                let v32 = *v as f32;
+                let _ = column.as_any().downcast_ref::<Float32Array>()?;
+                apply_op!(Float32Array::from(vec![v32]))
+            } else if oid == pg_sys::FLOAT8OID.to_u32() {
+                let _ = column.as_any().downcast_ref::<Float64Array>()?;
+                apply_op!(Float64Array::from(vec![*v]))
+            } else {
+                None
+            }
+        }
+
+        // ---- Bool comparisons ----------------------------------------
+        (PushVal::Bool(b), PushOp::Eq) => {
+            let _ = column.as_any().downcast_ref::<BooleanArray>()?;
+            arrow::compute::kernels::cmp::eq(
+                &column,
+                &Scalar::new(BooleanArray::from(vec![*b])),
+            )
+            .ok()
+        }
+
+        // ---- Text equality / inequality ------------------------------
+        // LIKE / ILIKE not handled here — they fall through to per-row.
+        (PushVal::Text(s), PushOp::Eq) => {
+            let _ = column.as_any().downcast_ref::<StringArray>()?;
+            eq(
+                &column,
+                &Scalar::new(StringArray::from(vec![s.as_str()])),
+            )
+            .ok()
+        }
+        (PushVal::Text(s), op) if matches!(op, PushOp::Lt | PushOp::Le | PushOp::Gt | PushOp::Ge) => {
+            let _ = column.as_any().downcast_ref::<StringArray>()?;
+            let scalar = Scalar::new(StringArray::from(vec![s.as_str()]));
+            match op {
+                PushOp::Lt => lt(&column, &scalar).ok(),
+                PushOp::Le => lt_eq(&column, &scalar).ok(),
+                PushOp::Gt => gt(&column, &scalar).ok(),
+                PushOp::Ge => gt_eq(&column, &scalar).ok(),
+                _ => unreachable!(),
+            }
+        }
+
+        // Any other case (LIKE, ILIKE, IN-set, column-vs-column, etc.)
+        // falls back to the per-row evaluator.
+        _ => None,
     }
 }
 
@@ -1947,6 +2139,7 @@ unsafe fn rebuild_column_readers(state: &mut RustScanState) {
             state.column_readers.clear();
             state.qual_readers.clear();
             state.qual_rhs_readers.clear();
+            state.current_filter_bitmask = None;
             return;
         }
     };
@@ -1955,6 +2148,21 @@ unsafe fn rebuild_column_readers(state: &mut RustScanState) {
         build_qual_rhs_readers_for_batch(batch, &state.pg_attrs, &state.pushed_quals);
     state.column_readers =
         build_column_readers_for_batch(batch, &state.pg_attrs, &state.needed_attnums);
+    // Try to vectorize the pushed filter into a BooleanArray bitmask once
+    // per batch. If we succeed, the hot per-row loop just reads bitmask[i]
+    // instead of running the qual tree walker; if we can't (LIKE,
+    // dynamic quals, unsupported type), the bitmask is None and the
+    // existing per-row evaluator remains the path.
+    state.current_filter_bitmask = if !state.dynamic_quals.is_empty() {
+        // Dynamic quals depend on outer-row parameters; their RHS values
+        // change per outer row, so vectorizing once per batch would
+        // miscompute. Per-row eval is correct here.
+        None
+    } else if let Some(expr) = &state.pushed_expr {
+        try_evaluate_pushed_expr_vectorized(batch, expr, &state.pushed_quals, &state.pg_attrs)
+    } else {
+        None
+    };
 }
 
 unsafe fn build_qual_readers_for_batch(
@@ -2476,7 +2684,17 @@ unsafe extern "C-unwind" fn exec_custom_scan(
                 // pushed qual without ever materializing them. PG's
                 // ExecQual still runs below as a safety net for anything
                 // we couldn't recognize.
-                if let Some(expr) = &state.pushed_expr {
+                //
+                // Fast path: a vectorized bitmask was precomputed for the
+                // entire batch when current_batch transitioned. NULL in
+                // the bitmask follows PG filter semantics (excluded).
+                if let Some(bitmask) = &state.current_filter_bitmask {
+                    let row = state.row_in_batch;
+                    if bitmask.is_null(row) || !bitmask.value(row) {
+                        state.row_in_batch += 1;
+                        continue;
+                    }
+                } else if let Some(expr) = &state.pushed_expr {
                     if !pushed_expr_pass(
                         &state.qual_readers,
                         &state.qual_rhs_readers,
