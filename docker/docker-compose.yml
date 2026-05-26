@@ -23,9 +23,9 @@ services:
     command:
       - postgres
       - -c
-      - shared_buffers=1GB
+      - shared_buffers=3GB
       - -c
-      - work_mem=64MB
+      - work_mem=128MB
       - -c
       - maintenance_work_mem=256MB
       - -c
@@ -33,7 +33,7 @@ services:
       - -c
       - random_page_cost=1.1
       - -c
-      - effective_cache_size=4GB
+      - effective_cache_size=8GB
       - -c
       - default_statistics_target=200
       - -c
@@ -86,7 +86,7 @@ services:
       # by future multi-step parallel sub-steps and custom-scan batching.
       RVBBIT_POOL_SIZE: ${RVBBIT_POOL_SIZE:-8}
       # In-memory cache capacity (entries). Tune for repeated workloads.
-      RVBBIT_CACHE_SIZE: ${RVBBIT_CACHE_SIZE:-10000}
+      RVBBIT_CACHE_SIZE: ${RVBBIT_CACHE_SIZE:-30000}
       # DataFusion in-process tokio worker threads (df_inprocess route).
       # Unset → pg_rvbbit picks min(num_cpus, 8). Set 0 to force a
       # single-thread runtime, or N to pin to a specific count.
@@ -95,13 +95,18 @@ services:
       # for the full list of supported keys.
       RVBBIT_PARQUET_V2: ${RVBBIT_PARQUET_V2:-on}
       RVBBIT_PARQUET_BLOOM: ${RVBBIT_PARQUET_BLOOM:-on}
-      RVBBIT_PARQUET_PAGE_ROWS: ${RVBBIT_PARQUET_PAGE_ROWS:-5000}
+      RVBBIT_PARQUET_PAGE_ROWS: ${RVBBIT_PARQUET_PAGE_ROWS:-250000}
       # Extend bloom filters to numeric / temporal columns too. Off by
       # default (text-only is the cheap-safe setting); flip on for
       # workloads heavy in point-equality queries on integer/date cols.
       # Re-compact after toggling to materialize blooms in the parquet
       # files; existing row groups keep whatever they were written with.
-      RVBBIT_PARQUET_BLOOM_NUMERIC: ${RVBBIT_PARQUET_BLOOM_NUMERIC:-off}
+      RVBBIT_PARQUET_BLOOM_NUMERIC: ${RVBBIT_PARQUET_BLOOM_NUMERIC:-on}
+      # Backend-local scan batch cache (decoded Arrow batches keyed by
+      # (path, mtime, projection)). LRU eviction; per-backend, so total
+      # memory across the cluster is roughly N_backends × this size.
+      # Default 1024 MiB fits a 200k-row ClickBench hits table whole.
+      RVBBIT_SCAN_BATCH_CACHE_MB: ${RVBBIT_SCAN_BATCH_CACHE_MB:-1024}
     ports:
       - "55433:5432"
     volumes:

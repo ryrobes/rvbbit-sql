@@ -343,10 +343,21 @@ struct BatchCacheEntry {
     bytes: usize,
 }
 
+/// LRU-order access list. Most-recently-used at the back, oldest at the
+/// front. We use a VecDeque + linear remove on touch because the cache
+/// holds at most a few dozen entries — O(n) on touch is cheaper than the
+/// extra pointer dance of a doubly-linked-list LRU at this size.
 #[derive(Default)]
 struct ScanBatchCache {
     entries: HashMap<BatchCacheKey, BatchCacheEntry>,
     bytes: usize,
+    /// LRU access order, front = oldest, back = most-recent.
+    order: std::collections::VecDeque<BatchCacheKey>,
+    // ---- telemetry ----
+    hits: u64,
+    misses: u64,
+    inserts: u64,
+    evictions: u64,
 }
 
 #[derive(Clone)]
@@ -1627,10 +1638,19 @@ struct BloomCacheKey {
     file_mtime_nanos: u128,
 }
 
+#[derive(Default)]
+struct BloomCache {
+    entries: HashMap<BloomCacheKey, std::sync::Arc<HashMap<String, Sbbf>>>,
+    hits: u64,
+    misses: u64,
+    /// Times we ran bloom_clause_impossible and it returned true
+    /// (i.e. the bloom said "definitely absent" → row group pruned).
+    pruned: u64,
+}
+
 thread_local! {
-    static BLOOM_CACHE: std::cell::RefCell<
-        HashMap<BloomCacheKey, std::sync::Arc<HashMap<String, Sbbf>>>,
-    > = std::cell::RefCell::new(HashMap::new());
+    static BLOOM_CACHE: std::cell::RefCell<BloomCache> =
+        std::cell::RefCell::new(BloomCache::default());
 }
 
 fn bloom_cache_key(path: &str) -> BloomCacheKey {
@@ -1658,7 +1678,16 @@ fn bloom_cache_key(path: &str) -> BloomCacheKey {
 /// lookups still hit the cache instead of re-opening the file.
 fn load_blooms_for_path(path: &str) -> std::sync::Arc<HashMap<String, Sbbf>> {
     let key = bloom_cache_key(path);
-    if let Some(cached) = BLOOM_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+    if let Some(cached) = BLOOM_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(arc) = c.entries.get(&key).cloned() {
+            c.hits += 1;
+            Some(arc)
+        } else {
+            c.misses += 1;
+            None
+        }
+    }) {
         return cached;
     }
     let mut blooms: HashMap<String, Sbbf> = HashMap::new();
@@ -1688,7 +1717,7 @@ fn load_blooms_for_path(path: &str) -> std::sync::Arc<HashMap<String, Sbbf>> {
         }
     }
     let arc = std::sync::Arc::new(blooms);
-    BLOOM_CACHE.with(|c| c.borrow_mut().insert(key, arc.clone()));
+    BLOOM_CACHE.with(|c| c.borrow_mut().entries.insert(key, arc.clone()));
     arc
 }
 
@@ -1701,7 +1730,7 @@ fn bloom_clause_impossible(row_group: &RowGroupEntry, attr: &PgAttr, q: &PushedQ
     let Some(bloom) = blooms.get(&attr.name) else {
         return false;
     };
-    match &q.value {
+    let pruned = match &q.value {
         PushVal::I64(v) => bloom_int_absent(bloom, attr.typoid, *v),
         PushVal::F64(v) => bloom_float_absent(bloom, attr.typoid, *v),
         PushVal::Text(s) => !bloom.check(s.as_str()),
@@ -1713,7 +1742,11 @@ fn bloom_clause_impossible(row_group: &RowGroupEntry, attr: &PgAttr, q: &PushedQ
         }
         PushVal::TextSet(vs) if !vs.is_empty() => vs.iter().all(|s| !bloom.check(s.as_str())),
         _ => false,
+    };
+    if pruned {
+        BLOOM_CACHE.with(|c| c.borrow_mut().pruned += 1);
     }
+    pruned
 }
 
 /// Check whether `v` (PG int8) is definitely absent from a numeric column's
@@ -2209,10 +2242,13 @@ unsafe fn runtime_eq_row_key(readers: &[ColumnReader], row: usize) -> Option<Run
 }
 
 fn batch_cache_limit_bytes() -> usize {
+    // 1 GiB default: ClickBench-shape tables decode to ~500MB-1GB, so a
+    // smaller cap (the old 256MB default) thrashed when queries touched
+    // different projections. Override per-deployment via the env var.
     std::env::var("RVBBIT_SCAN_BATCH_CACHE_MB")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(256)
+        .unwrap_or(1024)
         .saturating_mul(1024 * 1024)
 }
 
@@ -2239,11 +2275,18 @@ fn batch_cache_key(path: &str, col_names: &[String]) -> BatchCacheKey {
 
 fn batch_cache_get(key: &BatchCacheKey) -> Option<Vec<RecordBatch>> {
     SCAN_BATCH_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .entries
-            .get(key)
-            .map(|entry| entry.batches.clone())
+        let mut cache = cache.borrow_mut();
+        if !cache.entries.contains_key(key) {
+            cache.misses += 1;
+            return None;
+        }
+        cache.hits += 1;
+        // Mark as most-recently-used: drop any prior position, push to back.
+        if let Some(pos) = cache.order.iter().position(|k| k == key) {
+            cache.order.remove(pos);
+        }
+        cache.order.push_back(key.clone());
+        cache.entries.get(key).map(|entry| entry.batches.clone())
     })
 }
 
@@ -2265,18 +2308,26 @@ fn batch_cache_put(key: BatchCacheKey, batches: Vec<RecordBatch>) {
 
     SCAN_BATCH_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
+        // Drop any prior entry for this key (a refresh, not an insert).
         if let Some(existing) = cache.entries.remove(&key) {
             cache.bytes = cache.bytes.saturating_sub(existing.bytes);
+            if let Some(pos) = cache.order.iter().position(|k| k == &key) {
+                cache.order.remove(pos);
+            }
         }
+        // Evict LRU (front of the order queue) until we fit.
         while cache.bytes.saturating_add(bytes) > limit {
-            let Some(victim) = cache.entries.keys().next().cloned() else {
+            let Some(victim) = cache.order.pop_front() else {
                 break;
             };
             if let Some(existing) = cache.entries.remove(&victim) {
                 cache.bytes = cache.bytes.saturating_sub(existing.bytes);
+                cache.evictions += 1;
             }
         }
         cache.bytes = cache.bytes.saturating_add(bytes);
+        cache.inserts += 1;
+        cache.order.push_back(key.clone());
         cache
             .entries
             .insert(key, BatchCacheEntry { batches, bytes });
@@ -2833,6 +2884,58 @@ pub fn invalidate_scan_metadata(oid: u32) {
         let mut cache = c.borrow_mut();
         cache.retain(|key, _| key.table_oid != oid);
     });
+}
+
+/// Per-backend cache statistics. Surface this from SQL via
+/// `SELECT * FROM rvbbit.scan_cache_stats()`. Counters reset on
+/// backend exit (they're thread-local), not on extension reload —
+/// they reflect this connection's lifetime work.
+#[pgrx::pg_extern]
+fn scan_cache_stats() -> pgrx::iter::TableIterator<
+    'static,
+    (
+        pgrx::name!(cache, String),
+        pgrx::name!(entries, i64),
+        pgrx::name!(bytes, i64),
+        pgrx::name!(hits, i64),
+        pgrx::name!(misses, i64),
+        pgrx::name!(inserts, i64),
+        pgrx::name!(evictions, i64),
+        pgrx::name!(pruned, i64),
+    ),
+> {
+    let batch = SCAN_BATCH_CACHE.with(|c| {
+        let c = c.borrow();
+        (
+            "batch".to_string(),
+            c.entries.len() as i64,
+            c.bytes as i64,
+            c.hits as i64,
+            c.misses as i64,
+            c.inserts as i64,
+            c.evictions as i64,
+            0i64,
+        )
+    });
+    let bloom = BLOOM_CACHE.with(|c| {
+        let c = c.borrow();
+        (
+            "bloom".to_string(),
+            c.entries.len() as i64,
+            // Sbbf size: each Block is 32 bytes; this is per-file, sum per-column.
+            // Each Sbbf Block is 8 u32s (32 bytes). num_blocks() gives the count.
+            c.entries
+                .values()
+                .map(|m| m.values().map(|b| b.num_blocks() * 32).sum::<usize>())
+                .sum::<usize>() as i64,
+            c.hits as i64,
+            c.misses as i64,
+            0i64,
+            0i64,
+            c.pruned as i64,
+        )
+    });
+    pgrx::iter::TableIterator::new(vec![batch, bloom].into_iter())
 }
 
 fn parse_prune_stats(stats_text: Option<&str>) -> HashMap<String, PruneStats> {
