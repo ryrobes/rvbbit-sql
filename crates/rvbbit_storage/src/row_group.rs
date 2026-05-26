@@ -97,8 +97,11 @@ impl RowGroupWriter {
 
 /// Default Parquet data-page row limit when `RVBBIT_PARQUET_PAGE_ROWS`
 /// isn't set. Smaller pages give finer-grained skip via column indexes
-/// at the cost of slightly bigger files.
-const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 20_000;
+/// at the cost of slightly bigger files. We default to 5k rows because
+/// rvbbit already keeps parquet alongside the PG heap, so disk footprint
+/// is already a known cost (with cold-tier storage as the mitigation);
+/// the better page-level skipping is the higher-leverage tradeoff.
+const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 5_000;
 
 /// Default bloom-filter false-positive rate. Lower → fewer wasted page
 /// reads on miss, higher → smaller bloom filters on disk.
@@ -114,7 +117,7 @@ const DEFAULT_COLUMN_INDEX_TRUNCATE: usize = 64;
 ///   RVBBIT_PARQUET_V2          (default: on)  — Parquet 2.0 writer + V2 pages
 ///   RVBBIT_PARQUET_BLOOM       (default: on)  — bloom filters on text/binary cols
 ///   RVBBIT_PARQUET_BLOOM_FPP   (default: 0.01)
-///   RVBBIT_PARQUET_PAGE_ROWS   (default: 20000) — data-page row count limit
+///   RVBBIT_PARQUET_PAGE_ROWS   (default: 5000) — data-page row count limit
 ///
 /// Numeric columns get bloom filters disabled because column min/max
 /// already cover the equality-pruning case for those types.
