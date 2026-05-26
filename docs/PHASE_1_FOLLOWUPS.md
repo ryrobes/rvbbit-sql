@@ -108,23 +108,29 @@ queries (Q28 regex in ClickBench, Q20-Q26 LIKE/ORDER BY).
 Estimated effort: 1 week. Touches the custom_scan exec hook in a
 load-bearing way.
 
-### 5. ObjectStore tiered storage — LANDED (file:// MVP)
+### 5. ObjectStore tiered storage — LANDED, FULL VANILLA SQL
 
-Commit 3f1e30f. Per-row-group tier: rvbbit.row_groups.cold_url IS NULL
-= local hot, non-NULL = ObjectStore URL. rvbbit.migrate_to_cold(reloid,
-cold_url_prefix) copies + relabels each row group. df.rs uses the
-URL-prefixed paths uniformly via ListingTableUrl. custom_scan rejects
-cold rows + emits a helpful WARNING pointing operators at
-rvbbit.datafusion_query_json.
+Commits 3f1e30f (initial plumbing) + 7f1d792 (close the loop). Per-row-
+group tier: rvbbit.row_groups.cold_url IS NULL = local hot, non-NULL =
+ObjectStore URL. rvbbit.migrate_to_cold(reloid, cold_url_prefix) copies
++ relabels each row group.
+
+The native CustomScan node reads cold-tier row groups transparently
+through DataFusion's ObjectStore path — same plan node, same hot loop,
+the bytes just come from a different source. Plain SELECT/COUNT/GROUP
+BY/AS OF/ORDER BY/LIMIT/min/max/avg all work on cold data without any
+operator workaround.
 
 MVP supports file:// only (single-machine demo). s3:// + gs:// land
 when we add credential helpers — the URL-based plumbing is already
 ObjectStore-scheme-agnostic.
 
-Known limitation: plain SELECT * on cold-tier tables returns empty
-(operator gets WARNING pointing to datafusion_query_json). Auto-
-routing plain SELECTs to the df.rs ObjectStore path requires planner-
-level work — separate followup. Doesn't block Lance.
+Limitations carried as separate followups:
+- Mixed-tier tables (some local rg's, some cold) not yet handled.
+  migrate_to_cold is all-or-nothing per table, so this only arises
+  from direct catalog UPDATE.
+- tombstones + cold rejects in df.rs (Phase 4 work to make in-process
+  DF apply per-rg bitmaps to ObjectStore reads).
 
 ### 6. Generation tracking primitive — LANDED
 
