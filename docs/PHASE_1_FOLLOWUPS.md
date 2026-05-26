@@ -103,9 +103,16 @@ increment + plumb to `register_primary_chunks`). Verified end-to-end:
 each compact() call atomically allocates a monotonic generation; old row
 groups keep theirs; `current_generation()` returns the max.
 
-### 7. Compact ignores new heap rows when parquet is authoritative
+### 7. Compact ignores new heap rows when parquet is authoritative — FIXED
 
-Discovered while writing the generation tracking probe. Reproducer:
+Fix landed alongside Phase 2 slice 2 (commit 2026-05-25). `write_layout_chunks`
+and `write_hive_layout_chunks` now bracket their SPI scan with
+`set_config('rvbbit.force_heap_scan', 'on', is_local=true)` and restore
+the prior value after, so the rewriter does NOT route the read through
+the parquet custom scan during compact(). Newly-INSERTed heap rows are
+preserved into the next generation correctly.
+
+Original symptom (kept for the audit log):
 
 ```sql
 CREATE TABLE t (id bigserial, label text) USING rvbbit;

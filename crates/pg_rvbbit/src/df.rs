@@ -239,13 +239,31 @@ impl RvbbitTable {
     }
 }
 
+/// Phase 2 slice 3: read the rvbbit.as_of_generation GUC. A positive value
+/// narrows row group selection to `generation <= asof`. Unset / empty / 0
+/// means "no AS OF filter — use the latest visible state". Negative values
+/// are normalized to None.
+fn current_asof() -> Option<i64> {
+    Spi::get_one::<i64>(
+        "SELECT nullif(current_setting('rvbbit.as_of_generation', true), '')::bigint",
+    )
+    .ok()
+    .flatten()
+    .filter(|&g| g > 0)
+}
+
 /// SPI-driven mirror of `rvbbit_duck::main::rvbbit_row_group_catalog` for the
 /// canonical "scan" layout. Eligibility = no pending deletes and either no
 /// retained heap or a clean shadow heap.
 ///
+/// When `asof` is Some(g), the catalog is narrowed to row groups with
+/// `generation <= g` AND the heap-authoritative check is bypassed — a
+/// historical read doesn't care about the current heap, only about what
+/// parquet existed at that generation.
+///
 /// Returns BTreeMap so iteration order is deterministic across calls (helps
 /// when registering many tables — DataFusion order can shift planning).
-fn discover_catalog_scan() -> Result<BTreeMap<String, RvbbitTable>, String> {
+fn discover_catalog_scan(asof: Option<i64>) -> Result<BTreeMap<String, RvbbitTable>, String> {
     // SPI returns plain Datums; we copy into a Vec so the borrow ends before
     // we leave the SPI scope.
     struct Row {
@@ -258,29 +276,33 @@ fn discover_catalog_scan() -> Result<BTreeMap<String, RvbbitTable>, String> {
         deletes: i64,
     }
     let mut rows: Vec<Row> = Vec::new();
+    let asof_predicate = match asof {
+        Some(g) => format!("AND rg.generation <= {g}"),
+        None => String::new(),
+    };
+    let sql = format!(
+        "
+        SELECT n.nspname::text                                            AS nspname,
+               c.relname::text                                            AS relname,
+               array_agg(rg.path ORDER BY rg.rg_id)::text[]               AS paths,
+               pg_relation_size(c.oid)::bigint                            AS heap_bytes,
+               coalesce(t.shadow_heap_retained, false)                    AS shadow_heap_retained,
+               coalesce(t.shadow_heap_dirty, false)                       AS shadow_heap_dirty,
+               (SELECT count(*)
+                  FROM rvbbit.delete_log dl
+                 WHERE dl.table_oid = c.oid)::bigint                      AS deletes
+        FROM rvbbit.row_groups rg
+        JOIN pg_class c       ON c.oid = rg.table_oid
+        JOIN pg_namespace n   ON n.oid = c.relnamespace
+        JOIN pg_am am         ON am.oid = c.relam
+        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
+        WHERE am.amname = 'rvbbit'
+          {asof_predicate}
+        GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
+        "
+    );
     Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
-        let table = client.select(
-            "
-            SELECT n.nspname::text                                            AS nspname,
-                   c.relname::text                                            AS relname,
-                   array_agg(rg.path ORDER BY rg.rg_id)::text[]               AS paths,
-                   pg_relation_size(c.oid)::bigint                            AS heap_bytes,
-                   coalesce(t.shadow_heap_retained, false)                    AS shadow_heap_retained,
-                   coalesce(t.shadow_heap_dirty, false)                       AS shadow_heap_dirty,
-                   (SELECT count(*)
-                      FROM rvbbit.delete_log dl
-                     WHERE dl.table_oid = c.oid)::bigint                      AS deletes
-            FROM rvbbit.row_groups rg
-            JOIN pg_class c       ON c.oid = rg.table_oid
-            JOIN pg_namespace n   ON n.oid = c.relnamespace
-            JOIN pg_am am         ON am.oid = c.relam
-            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-            WHERE am.amname = 'rvbbit'
-            GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
-            ",
-            None,
-            &[],
-        )?;
+        let table = client.select(&sql, None, &[])?;
         for row in table {
             let schema: String = row.get::<String>(1)?.unwrap_or_default();
             let relname: String = row.get::<String>(2)?.unwrap_or_default();
@@ -310,15 +332,18 @@ fn discover_catalog_scan() -> Result<BTreeMap<String, RvbbitTable>, String> {
 
     let mut out = BTreeMap::new();
     for r in rows {
-        // Same eligibility check as rvbbit_duck/main.rs:1263 — parquet must be
-        // authoritative for the table.
-        if r.deletes != 0 || (r.heap_bytes != 0 && !(r.shadow_retained && !r.shadow_dirty)) {
+        // Skip the parquet-authoritative check when reading historically:
+        // the heap's current state is irrelevant to a snapshot at gen <= asof,
+        // and a pending delete is by definition AFTER the snapshot we're
+        // reconstructing.
+        if asof.is_none()
+            && (r.deletes != 0 || (r.heap_bytes != 0 && !(r.shadow_retained && !r.shadow_dirty)))
+        {
             continue;
         }
         if r.paths.is_empty() {
             continue;
         }
-        // Every path must exist; otherwise this table isn't safe to read.
         if !r.paths.iter().all(|p| FsPath::new(p).exists()) {
             continue;
         }
@@ -340,10 +365,15 @@ fn discover_catalog_scan() -> Result<BTreeMap<String, RvbbitTable>, String> {
 /// signature — so a compact() between queries is reflected on the next
 /// call. mtime is cheap (one stat() per file) and catches the case where
 /// the file was rewritten in place under the same name.
-fn table_signature(t: &RvbbitTable) -> u64 {
+///
+/// `asof` participates in the signature so that the same table queried at
+/// a different AS OF generation gets re-registered with the narrowed file
+/// set instead of reusing the cached (full) registration.
+fn table_signature(t: &RvbbitTable, asof: Option<i64>) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
+    asof.hash(&mut h);
     t.paths.len().hash(&mut h);
     for p in &t.paths {
         p.hash(&mut h);
@@ -367,9 +397,10 @@ fn table_signature(t: &RvbbitTable) -> u64 {
 async fn register_tables(
     ctx: &SessionContext,
     tables: &BTreeMap<String, RvbbitTable>,
+    asof: Option<i64>,
 ) -> Result<(), String> {
     for (qualified, t) in tables {
-        let sig = table_signature(t);
+        let sig = table_signature(t, asof);
         let cached_sig = REG_CACHE.with(|c| c.borrow().get(qualified).copied());
         if cached_sig == Some(sig) {
             // File set hasn't changed since we last registered — DataFusion
@@ -426,16 +457,20 @@ pub(crate) fn query_engine(layout: &str, sql: &str, max_rows: i32) -> Result<Val
         ));
     }
 
-    let tables = discover_catalog_scan()?;
+    let asof = current_asof();
+    let tables = discover_catalog_scan(asof)?;
     if tables.is_empty() {
-        return Err("no authoritative compacted rvbbit parquet tables are visible".to_string());
+        return Err(match asof {
+            Some(g) => format!("no rvbbit row groups visible at AS OF generation {g}"),
+            None => "no authoritative compacted rvbbit parquet tables are visible".to_string(),
+        });
     }
 
     let max_rows = if max_rows > 0 { max_rows as usize } else { usize::MAX };
 
     with_rt_ctx(|rt, ctx| {
         rt.block_on(async {
-            register_tables(ctx, &tables).await?;
+            register_tables(ctx, &tables, asof).await?;
             let df = ctx.sql(sql).await.map_err(|e| format!("sql plan: {e}"))?;
             let batches: Vec<RecordBatch> =
                 df.collect().await.map_err(|e| format!("collect: {e}"))?;

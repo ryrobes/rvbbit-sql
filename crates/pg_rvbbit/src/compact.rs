@@ -904,6 +904,31 @@ fn write_layout_chunks(
 
     let chunks = Spi::connect(
         |client| -> Result<Vec<rvbbit_storage::metadata::RowGroupMeta>, pgrx::spi::Error> {
+            // Bug fix (Phase 2 slice 2): without this, compact() reads the
+            // rvbbit table through the rewriter, which routes authoritative
+            // parquet to the custom scan — so the SECOND compact re-reads
+            // the existing parquet contents and writes them as a new row
+            // group, silently losing any new INSERTs since the previous
+            // compact. force_heap_scan=on tells the planner+rewriter hooks
+            // to leave the heap path intact for this SPI scan only.
+            //
+            // Save/restore prevents leaking the setting back into the
+            // user's transaction if they had it explicitly off.
+            let prev: String = client
+                .select(
+                    "SELECT coalesce(current_setting('rvbbit.force_heap_scan', true), 'off')",
+                    Some(1),
+                    &[],
+                )?
+                .first()
+                .get::<String>(1)?
+                .unwrap_or_else(|| "off".to_string());
+            client.select(
+                "SELECT pg_catalog.set_config('rvbbit.force_heap_scan', 'on', true)",
+                Some(1),
+                &[],
+            )?;
+
             let table = client.select(&select_sql, None, &[])?;
             let mut chunks: Vec<rvbbit_storage::metadata::RowGroupMeta> = Vec::new();
             let mut builders: Vec<ColumnBuilder> = plans
@@ -961,6 +986,18 @@ fn write_layout_chunks(
                 chunks.push(meta);
             }
 
+            // Restore force_heap_scan to its prior value (see comment above).
+            // Quoting prev defensively in case some future GUC value contains
+            // a single quote.
+            let prev_escaped = prev.replace('\'', "''");
+            client.select(
+                &format!(
+                    "SELECT pg_catalog.set_config('rvbbit.force_heap_scan', '{prev_escaped}', true)"
+                ),
+                Some(1),
+                &[],
+            )?;
+
             Ok(chunks)
         },
     )?;
@@ -1003,6 +1040,23 @@ fn write_hive_layout_chunks(
 
     let chunks = Spi::connect(
         |client| -> Result<Vec<rvbbit_storage::metadata::RowGroupMeta>, pgrx::spi::Error> {
+            // Same heap-scan-forcing fix as write_layout_chunks. See comment
+            // there for why this is load-bearing.
+            let prev: String = client
+                .select(
+                    "SELECT coalesce(current_setting('rvbbit.force_heap_scan', true), 'off')",
+                    Some(1),
+                    &[],
+                )?
+                .first()
+                .get::<String>(1)?
+                .unwrap_or_else(|| "off".to_string());
+            client.select(
+                "SELECT pg_catalog.set_config('rvbbit.force_heap_scan', 'on', true)",
+                Some(1),
+                &[],
+            )?;
+
             let table = client.select(&select_sql, None, &[])?;
             let mut chunks: Vec<rvbbit_storage::metadata::RowGroupMeta> = Vec::new();
             let mut builders: Vec<ColumnBuilder> = file_plans
@@ -1091,6 +1145,15 @@ fn write_hive_layout_chunks(
                         .map_err(|e| pgrx::spi::Error::CursorNotFound(e.to_string()))?;
                 chunks.push(meta);
             }
+
+            let prev_escaped = prev.replace('\'', "''");
+            client.select(
+                &format!(
+                    "SELECT pg_catalog.set_config('rvbbit.force_heap_scan', '{prev_escaped}', true)"
+                ),
+                Some(1),
+                &[],
+            )?;
 
             Ok(chunks)
         },
