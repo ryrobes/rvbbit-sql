@@ -31,11 +31,12 @@ use rvbbit_storage::metadata::{ColumnStats, TextSketch};
 use rvbbit_storage::row_group::RowGroupReader;
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use pgrx::pg_guard;
+use pgrx::IntoDatum;
 use pgrx::pg_sys;
 
 const SCAN_LAYOUT: &str = "scan";
@@ -222,6 +223,13 @@ enum ColumnReader {
     },
     Binary(*const BinaryArray),
     TimestampMicros(*const TimestampMicrosecondArray),
+    /// Arrow List<Float32> → PG real[] (oid 1021). Vector columns land
+    /// here. The custom_scan constructs a fresh palloc'd PG float4 array
+    /// per row via pgrx's IntoDatum, so user-side SELECT returns the
+    /// vector intact (e.g. for inspection or downstream pgvector ops).
+    /// For high-throughput KNN, operators use rvbbit.knn() which goes
+    /// through Lance and skips this conversion entirely.
+    F32List(*const ListArray),
     /// Column requested by query but absent from this row group — always NULL.
     Missing,
 }
@@ -1854,6 +1862,11 @@ unsafe fn make_reader_for(array: &Arc<dyn Array>, attr: &PgAttr) -> ColumnReader
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap() as *const _,
         ),
+        DataType::List(field) if matches!(field.data_type(), DataType::Float32) => {
+            ColumnReader::F32List(
+                array.as_any().downcast_ref::<ListArray>().unwrap() as *const _,
+            )
+        }
         other => {
             pgrx::error!(
                 "rvbbit: unsupported arrow type {:?} for column '{}' (oid {})",
@@ -2751,6 +2764,34 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
             } else {
                 let pg_ts = a.value(row) - PG_EPOCH_OFFSET_MICROS;
                 (pg_sys::Datum::from(pg_ts as usize), false)
+            }
+        }
+        ColumnReader::F32List(p) => {
+            let a = &**p;
+            if a.is_null(row) {
+                return (pg_sys::Datum::from(0usize), true);
+            }
+            // Slice this row out of the flat values array.
+            let offsets = a.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let values = a
+                .values()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("F32List inner is Float32Array");
+            let mut data: Vec<Option<f32>> = Vec::with_capacity(end - start);
+            for i in start..end {
+                if values.is_null(i) {
+                    data.push(None);
+                } else {
+                    data.push(Some(values.value(i)));
+                }
+            }
+            // pgrx builds the PG float4 array (oid 1021) in palloc memory.
+            match data.into_datum() {
+                Some(d) => (d, false),
+                None => (pg_sys::Datum::from(0usize), true),
             }
         }
     }

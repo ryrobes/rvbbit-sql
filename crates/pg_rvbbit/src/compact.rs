@@ -36,7 +36,8 @@ use std::sync::Arc;
 use rvbbit_storage::row_group::RowGroupWriter;
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, RecordBatch, StringBuilder, TimestampMicrosecondBuilder,
+    Int32Builder, Int64Builder, ListBuilder, RecordBatch, StringBuilder,
+    TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use pgrx::prelude::*;
@@ -113,6 +114,13 @@ enum ColumnBuilder {
     Utf8(StringBuilder),
     TsMicros(TimestampMicrosecondBuilder),
     JsonbBinary(BinaryBuilder),
+    /// PG real[] (FLOAT4ARRAY, oid 1021) → Arrow List<Float32>. The list
+    /// is variable-length at the Arrow level even though embedding columns
+    /// are usually fixed-dimension; the dim invariant is enforced upstream
+    /// in Lance (lance_dim) and at refresh time. List<Float32> in parquet
+    /// is uniformly readable and survives a future shift to FixedSizeList
+    /// without a parquet rewrite.
+    F32List(ListBuilder<Float32Builder>),
 }
 
 impl ColumnBuilder {
@@ -129,6 +137,9 @@ impl ColumnBuilder {
                 ColumnBuilder::TsMicros(TimestampMicrosecondBuilder::new().with_timezone("UTC"))
             }
             DataType::Binary => ColumnBuilder::JsonbBinary(BinaryBuilder::new()),
+            DataType::List(field) if field.data_type() == &DataType::Float32 => {
+                ColumnBuilder::F32List(ListBuilder::new(Float32Builder::new()))
+            }
             other => panic!("ColumnBuilder::for_type: unhandled {:?}", other),
         }
     }
@@ -144,6 +155,7 @@ impl ColumnBuilder {
             ColumnBuilder::Utf8(mut b) => Arc::new(b.finish()),
             ColumnBuilder::TsMicros(mut b) => Arc::new(b.finish()),
             ColumnBuilder::JsonbBinary(mut b) => Arc::new(b.finish()),
+            ColumnBuilder::F32List(mut b) => Arc::new(b.finish()),
         }
     }
 }
@@ -172,6 +184,12 @@ fn plan_for_pg_type(pg_type: u32, col_name: &str) -> Result<(DataType, String), 
         1082 => (DataType::Int32, format!("({quoted} - 'epoch'::date)")),
         3802 => (DataType::Binary, format!("{quoted}::text")), // JSONBOID
         17 => (DataType::Binary, quoted),                      // BYTEAOID
+        // real[] / float4[] — oid 1021. Vectors land here; Lance ingest
+        // re-packs into FixedSizeList<Float32; dim> downstream.
+        1021 => (
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            quoted,
+        ),
         other => {
             return Err(format!(
                 "rvbbit.export_to_parquet: unsupported PG type oid {other} \
@@ -1006,6 +1024,21 @@ fn write_layout_chunks(
                                 b.append_option(row.get::<Vec<u8>>(idx)?.as_deref());
                             }
                         }
+                        ColumnBuilder::F32List(b) => {
+                            // PG real[] arrives as Vec<Option<f32>>. Inner
+                            // builder eats each element; outer builder
+                            // commits the list (true) or marks NULL (false).
+                            match row.get::<Vec<Option<f32>>>(idx)? {
+                                Some(arr) => {
+                                    let inner = b.values();
+                                    for v in arr {
+                                        inner.append_option(v);
+                                    }
+                                    b.append(true);
+                                }
+                                None => b.append(false),
+                            }
+                        }
                     }
                 }
                 chunk_count += 1;
@@ -1156,6 +1189,21 @@ fn write_hive_layout_chunks(
                                 }
                             } else {
                                 b.append_option(row.get::<Vec<u8>>(idx)?.as_deref());
+                            }
+                        }
+                        ColumnBuilder::F32List(b) => {
+                            // PG real[] arrives as Vec<Option<f32>>. Inner
+                            // builder eats each element; outer builder
+                            // commits the list (true) or marks NULL (false).
+                            match row.get::<Vec<Option<f32>>>(idx)? {
+                                Some(arr) => {
+                                    let inner = b.values();
+                                    for v in arr {
+                                        inner.append_option(v);
+                                    }
+                                    b.append(true);
+                                }
+                                None => b.append(false),
                             }
                         }
                     }
