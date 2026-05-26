@@ -250,6 +250,107 @@ CREATE OR REPLACE FUNCTION rvbbit.tombstone_count(
       AND (asof IS NULL OR deleted_generation <= asof)
 $$;
 
+-- ---------------------------------------------------------------------------
+-- Phase 2 slice 5: UPDATE-by-composition.
+--
+-- PG can't lower the SQL-standard UPDATE syntax onto a parquet-backed
+-- relation without exposing per-row identity in the scan, which is a
+-- multi-week change. Until that lands, the practical UPDATE operation
+-- on a rvbbit table is "tombstone old + INSERT new + compact" — the same
+-- three things a heap UPDATE does logically, just composed by the
+-- operator. This helper wraps that composition so the user can do it in
+-- a single SQL call, and so all three steps share a single transaction:
+--
+--   SELECT rvbbit.update_rows(
+--       'orders'::regclass,
+--       '[{"rg":0,"ord":17}, {"rg":1,"ord":4}]'::jsonb,
+--       $$INSERT INTO orders (status, amount) VALUES ('shipped', 99),
+--                                                    ('shipped', 145)$$);
+--
+-- Returns the tombstone generation and the new-insert generation as
+-- jsonb so AS OF queries against either can be constructed cleanly.
+-- Skipping tombstones (empty array) reduces to plain INSERT+compact;
+-- skipping inserts (NULL or empty string) reduces to plain tombstone.
+CREATE OR REPLACE FUNCTION rvbbit.update_rows(
+    reloid     regclass,
+    tombstones jsonb,
+    inserts    text
+) RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+    tombstone_gen bigint;
+    insert_gen    bigint;
+    insert_sql    text := coalesce(btrim(inserts), '');
+BEGIN
+    tombstone_gen := rvbbit.tombstone_batch(reloid, coalesce(tombstones, '[]'::jsonb));
+    IF length(insert_sql) > 0 THEN
+        EXECUTE insert_sql;
+        -- compact stamps a new generation and writes a fresh row group for
+        -- the inserted rows (heap is drained as part of the call).
+        PERFORM rvbbit.compact(reloid);
+    END IF;
+    insert_gen := rvbbit.current_generation(reloid);
+    RETURN jsonb_build_object(
+        'tombstone_generation', tombstone_gen,
+        'insert_generation',    insert_gen
+    );
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Phase 2 slice 6: pg_dump / pg_restore safety net.
+--
+-- Background. Rvbbit's parquet row groups live on disk under PGDATA, not
+-- inside the database itself. A pg_dump captures the heap, the catalog
+-- tables (rvbbit.tables, rvbbit.row_groups, rvbbit.generations, etc.),
+-- but NOT the parquet files. On the restore target the catalog ends up
+-- pointing at parquet files that don't exist — a broken state.
+--
+-- rebuild_acceleration is the recovery primitive: it wipes the derived
+-- catalog state for one table, resets next_generation to 1, and re-runs
+-- compact() to regenerate parquet from the current heap contents. After
+-- this call the table is queryable again.
+--
+-- IMPORTANT: for this to actually recover real data, the heap on the
+-- restored target must hold the source-of-truth rows. That means the
+-- pre-dump compact must have been done with the keep_heap=true variant
+-- (rvbbit.compact(rel, true)). The default compact truncates the heap
+-- to save disk; that mode is incompatible with pg_dump-only recovery.
+--
+-- Returns {dropped_row_groups, new_row_count} so the caller can sanity-
+-- check that the rebuild matches expectations.
+CREATE OR REPLACE FUNCTION rvbbit.rebuild_acceleration(reloid regclass)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+    dropped_rgs  int;
+    rebuilt_rows bigint;
+BEGIN
+    SELECT count(*)::int INTO dropped_rgs
+      FROM rvbbit.row_groups WHERE table_oid = reloid;
+
+    -- Wipe derived state. Old on-disk parquet files are left orphaned;
+    -- the re-compact uses the same path scheme (rg_id starting at 0)
+    -- so the next write overwrites them naturally. Stale orphans are
+    -- harmless because nothing in the catalog references them.
+    DELETE FROM rvbbit.delete_log         WHERE table_oid = reloid;
+    DELETE FROM rvbbit.row_groups         WHERE table_oid = reloid;
+    DELETE FROM rvbbit.row_group_variants WHERE table_oid = reloid;
+    DELETE FROM rvbbit.generations        WHERE table_oid = reloid;
+    UPDATE rvbbit.tables
+       SET next_generation = 1
+     WHERE table_oid = reloid;
+
+    PERFORM rvbbit.compact(reloid);
+
+    -- rg.n_rows qualified explicitly so plpgsql doesn't collide it with
+    -- the local variable name. (`SELECT sum(n_rows)` would be ambiguous.)
+    SELECT coalesce(sum(rg.n_rows), 0)::bigint INTO rebuilt_rows
+      FROM rvbbit.row_groups rg WHERE rg.table_oid = reloid;
+
+    RETURN jsonb_build_object(
+        'dropped_row_groups', dropped_rgs,
+        'new_row_count',      rebuilt_rows
+    );
+END $$;
+
 -- Shreds: typed parquet columns that materialize a Postgres expression
 -- against the source row's data. Populated by rvbbit.compact() when it
 -- knows about extractable paths (Phase 4 hardcodes the LLM shreds; future
