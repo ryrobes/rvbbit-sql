@@ -13,11 +13,13 @@ The image at `docker/Dockerfile.rvbbit` copies
 with:
 
 ```
-postgres -c include_if_exists=/etc/rvbbit/tuning.conf
+postgres -c config_file=/etc/rvbbit/tuning.conf
 ```
 
-Every setting below is in that file. Override an individual knob by
-appending `-c key=value` after the include line — last value wins.
+This replaces the default `$PGDATA/postgresql.conf` with our tuned
+file. `postgresql.auto.conf` is still read alongside, so `ALTER
+SYSTEM` continues to work. Override an individual knob by appending
+`-c key=value` after the config_file line — last value wins.
 
 ### Memory
 

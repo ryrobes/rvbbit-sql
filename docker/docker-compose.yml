@@ -102,11 +102,14 @@ services:
       - rvbbit_data:/var/lib/postgresql
     # All knobs come from /etc/rvbbit/tuning.conf (see
     # docker/config/rvbbit-tuning.conf). Override individual settings by
-    # adding `-c key=value` after the include line — last value wins.
+    # adding `-c key=value` after the config_file line — last value wins.
+    # `include_if_exists` is a config-file directive (not a GUC) so it
+    # can't be set via -c; using -c config_file=... is the supported
+    # path for replacing the primary postgresql.conf.
     command:
       - postgres
       - -c
-      - include_if_exists=/etc/rvbbit/tuning.conf
+      - config_file=/etc/rvbbit/tuning.conf
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s

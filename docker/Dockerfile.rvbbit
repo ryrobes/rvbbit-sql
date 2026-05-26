@@ -83,13 +83,14 @@ COPY --from=builder /build/rvbbit-duck /usr/local/bin/rvbbit-duck
 # Pre-load extension on first boot.
 COPY docker/init/ /docker-entrypoint-initdb.d/
 
-# Tuned Postgres config for analytics workloads. Pulled in via
-# `include_if_exists` from docker-compose's `-c` line. See the file
-# header for rationale on each setting; bump or override per service.
+# Tuned Postgres config for analytics workloads. docker-compose passes
+# `-c config_file=/etc/rvbbit/tuning.conf` so this file becomes the
+# primary postgresql.conf. See the file header for rationale on each
+# setting; bump or override per service.
 COPY docker/config/rvbbit-tuning.conf /etc/rvbbit/tuning.conf
 
 # Belt-and-suspenders: also stamp shared_preload_libraries into the
-# stock conf sample, so even a `-c config_file=...` override doesn't
-# accidentally drop the extension load.
+# stock conf sample. Only kicks in if someone runs the image without
+# `-c config_file=...` (in which case the data-dir conf is read).
 RUN echo "shared_preload_libraries = 'pg_rvbbit'" \
         >> /usr/share/postgresql/postgresql.conf.sample
