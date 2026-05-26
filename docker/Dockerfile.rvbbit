@@ -16,7 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # protoc — Lance's on-disk format is protobuf, and lance-encoding's
         # build.rs invokes protoc to generate Rust types from its .proto
         # files. Without this the lance crate fails its build script.
+        # libprotobuf-dev ships the well-known .proto files (Empty, Any,
+        # Timestamp, ...) that Lance's encodings_v2_0.proto imports.
         protobuf-compiler \
+        libprotobuf-dev \
         zstd libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
 
