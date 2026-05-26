@@ -41,6 +41,11 @@ base64 = "0.22"
 # Local CPU embedding transport. Keep image/CUDA features off here; Rvbbit
 # only needs text embeddings for the built-in `embed` backend.
 fastembed = { version = "5.13.4", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+# Phase 0 spike: embed DataFusion in-process so the `datafusion_*` routes
+# stop spawning the rvbbit-duck sidecar. Pinned to the DF release line that
+# tracks arrow 55 (workspace dep).
+datafusion = { version = "49", default-features = false, features = ["parquet"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 [profile.release]
 lto = "thin"

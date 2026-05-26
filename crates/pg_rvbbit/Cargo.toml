@@ -32,6 +32,8 @@ lru = { workspace = true }
 tiktoken-rs = { workspace = true }
 roaring = { workspace = true }
 fastembed = { workspace = true }
+datafusion = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 pgrx-tests = { workspace = true }

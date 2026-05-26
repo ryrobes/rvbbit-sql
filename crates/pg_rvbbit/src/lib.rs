@@ -21,6 +21,7 @@ mod compact;
 mod composites;
 mod costs;
 mod custom_scan;
+mod df;
 mod duck_backend;
 mod embeddings;
 mod evidence;
