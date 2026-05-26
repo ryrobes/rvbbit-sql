@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         pkg-config \
         postgresql-server-dev-18 \
+        # protoc — Lance's on-disk format is protobuf, and lance-encoding's
+        # build.rs invokes protoc to generate Rust types from its .proto
+        # files. Without this the lance crate fails its build script.
+        protobuf-compiler \
         zstd libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
 
