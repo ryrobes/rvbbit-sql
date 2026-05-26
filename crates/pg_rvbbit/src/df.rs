@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::{CStr, CString};
 use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::time::Instant;
@@ -243,13 +244,23 @@ impl RvbbitTable {
 /// narrows row group selection to `generation <= asof`. Unset / empty / 0
 /// means "no AS OF filter — use the latest visible state". Negative values
 /// are normalized to None.
+///
+/// Uses direct GetConfigOption FFI (microseconds) instead of an SPI
+/// roundtrip (milliseconds) so this primitive is cheap enough to call on
+/// every datafusion_query_json invocation without a measurable per-query
+/// tax. Same pattern as duck_backend::guc_setting.
 fn current_asof() -> Option<i64> {
-    Spi::get_one::<i64>(
-        "SELECT nullif(current_setting('rvbbit.as_of_generation', true), '')::bigint",
-    )
-    .ok()
-    .flatten()
-    .filter(|&g| g > 0)
+    let cname = CString::new("rvbbit.as_of_generation").ok()?;
+    let ptr = unsafe { pg_sys::GetConfigOption(cname.as_ptr(), true, false) };
+    if ptr.is_null() {
+        return None;
+    }
+    let raw = unsafe { CStr::from_ptr(ptr).to_string_lossy() };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<i64>().ok().filter(|&g| g > 0)
 }
 
 /// SPI-driven mirror of `rvbbit_duck::main::rvbbit_row_group_catalog` for the

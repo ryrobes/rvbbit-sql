@@ -63,6 +63,72 @@ RETURNS bigint LANGUAGE sql STABLE AS $$
     WHERE table_oid = reloid
 $$;
 
+-- Per-table generation timeline. compact() INSERTs one row per call with
+-- the wall-clock time the compaction committed, so future AS OF TIMESTAMP
+-- queries can resolve a timestamp to the right generation.
+CREATE TABLE rvbbit.generations (
+    table_oid     oid NOT NULL REFERENCES rvbbit.tables(table_oid) ON DELETE CASCADE,
+    generation    bigint NOT NULL,
+    committed_at  timestamptz NOT NULL DEFAULT clock_timestamp(),
+    n_rows        bigint NOT NULL DEFAULT 0,
+    n_row_groups  int NOT NULL DEFAULT 0,
+    PRIMARY KEY (table_oid, generation)
+);
+
+CREATE INDEX generations_table_committed_idx
+    ON rvbbit.generations (table_oid, committed_at);
+
+-- Return a table's generation timeline, latest first. Useful for picking
+-- an AS OF point manually before SETting rvbbit.as_of_generation.
+CREATE OR REPLACE FUNCTION rvbbit.list_generations(reloid regclass)
+RETURNS TABLE (generation bigint, committed_at timestamptz,
+               n_rows bigint, n_row_groups int)
+LANGUAGE sql STABLE AS $$
+    SELECT generation, committed_at, n_rows, n_row_groups
+    FROM rvbbit.generations
+    WHERE table_oid = reloid
+    ORDER BY generation DESC
+$$;
+
+-- Resolve a timestamp to the generation that was committed at or before
+-- that point, set rvbbit.as_of_generation to it, and return the value.
+-- The set is session-level (not transaction-local) so it persists across
+-- subsequent SELECTs in the same psql connection until RESET. Operators
+-- can use this as the AS OF TIMESTAMP user interface:
+--
+--   SELECT rvbbit.set_as_of('orders'::regclass, '2026-05-25 19:00');
+--   SELECT * FROM orders;          -- reads at that historical point
+--   SELECT rvbbit.set_as_of_reset();
+CREATE OR REPLACE FUNCTION rvbbit.set_as_of(reloid regclass, ts timestamptz)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+    gen bigint;
+BEGIN
+    SELECT max(generation) INTO gen
+    FROM rvbbit.generations
+    WHERE table_oid = reloid AND committed_at <= ts;
+
+    -- Resolves to 0 when ts predates the earliest generation. The catalog
+    -- discovery in df.rs treats 0/unset the same way: "no AS OF filter".
+    -- Result: querying before the table existed returns the current view.
+    -- That's a documented limitation rather than a silent failure — use
+    -- list_generations() to confirm a real generation exists before
+    -- setting an AS OF.
+    IF gen IS NULL THEN
+        gen := 0;
+    END IF;
+
+    PERFORM set_config('rvbbit.as_of_generation', gen::text, false);
+    RETURN gen;
+END $$;
+
+-- Convenience: clear the AS OF setting and go back to the latest view.
+CREATE OR REPLACE FUNCTION rvbbit.set_as_of_reset()
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM set_config('rvbbit.as_of_generation', '', false);
+END $$;
+
 -- Optional physical copies of the same compacted rows, with a different
 -- layout. `row_groups` remains the canonical scan layout consumed by older
 -- metadata paths; readers may opt into these variants when their predicates

@@ -747,6 +747,18 @@ fn export_to_parquet(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>
         total_rows += meta.n_rows;
     }
 
+    // Phase 2 slice 7: record the generation timeline so AS OF TIMESTAMP
+    // queries (rvbbit.set_as_of) can resolve a wall-clock time to the right
+    // generation. We only INSERT when this compaction actually wrote rows;
+    // a no-op compact (empty heap) doesn't extend the timeline.
+    if total_rows > 0 {
+        let n_groups = chunks.len() as i32;
+        Spi::run(&format!(
+            "INSERT INTO rvbbit.generations (table_oid, generation, n_rows, n_row_groups) \
+             VALUES ({rel_oid}::oid, {generation}, {total_rows}, {n_groups})"
+        ))?;
+    }
+
     if sync_variant_layouts_enabled() && total_rows > 0 {
         refresh_layout_variants_impl(rel_oid, &qualified, &plans, &schema, &path_root)?;
     }
