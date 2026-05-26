@@ -291,6 +291,15 @@ fn discover_catalog_scan(asof: Option<i64>) -> Result<BTreeMap<String, RvbbitTab
         Some(g) => format!("AND rg.generation <= {g}"),
         None => String::new(),
     };
+    // Phase 2 followup B: count tombstones that would actually apply to
+    // the read we're about to plan. For AS OF, that's tombstones at
+    // deleted_generation <= asof; for latest, all tombstones. Tables with
+    // relevant tombstones are excluded so we fall back to the native
+    // scan path which honors them via the custom_scan bitmap filter.
+    let tombstone_predicate = match asof {
+        Some(g) => format!("AND deleted_generation <= {g}"),
+        None => String::new(),
+    };
     let sql = format!(
         "
         SELECT n.nspname::text                                            AS nspname,
@@ -301,7 +310,8 @@ fn discover_catalog_scan(asof: Option<i64>) -> Result<BTreeMap<String, RvbbitTab
                coalesce(t.shadow_heap_dirty, false)                       AS shadow_heap_dirty,
                (SELECT count(*)
                   FROM rvbbit.delete_log dl
-                 WHERE dl.table_oid = c.oid)::bigint                      AS deletes
+                 WHERE dl.table_oid = c.oid
+                   {tombstone_predicate})::bigint                         AS deletes
         FROM rvbbit.row_groups rg
         JOIN pg_class c       ON c.oid = rg.table_oid
         JOIN pg_namespace n   ON n.oid = c.relnamespace
@@ -343,13 +353,19 @@ fn discover_catalog_scan(asof: Option<i64>) -> Result<BTreeMap<String, RvbbitTab
 
     let mut out = BTreeMap::new();
     for r in rows {
-        // Skip the parquet-authoritative check when reading historically:
-        // the heap's current state is irrelevant to a snapshot at gen <= asof,
-        // and a pending delete is by definition AFTER the snapshot we're
-        // reconstructing.
-        if asof.is_none()
-            && (r.deletes != 0 || (r.heap_bytes != 0 && !(r.shadow_retained && !r.shadow_dirty)))
-        {
+        // Always reject when relevant tombstones exist — the catalog SQL
+        // above already narrowed `r.deletes` to tombstones at <= asof
+        // (or all tombstones when asof is unset). In-process DataFusion
+        // can't apply a per-(rg_id, ordinal) bitmap during result
+        // rendering (DataFusion's RecordBatch doesn't expose origin
+        // file/index), so we fall back to the native scan path which
+        // does the bitmap filter in custom_scan.rs.
+        if r.deletes != 0 {
+            continue;
+        }
+        // Heap-authoritative check only matters at "latest" — historical
+        // reads don't care about the current heap.
+        if asof.is_none() && r.heap_bytes != 0 && !(r.shadow_retained && !r.shadow_dirty) {
             continue;
         }
         if r.paths.is_empty() {

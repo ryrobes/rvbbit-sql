@@ -2372,6 +2372,19 @@ unsafe fn rewrite_query(query: *mut pg_sys::Query) {
     // be warmed for the final executor target list.
     try_implicit_prewarm_rule(query);
 
+    // Phase 2 followup A: the metadata-only fast paths below
+    // (try_count_star_rule, try_simple_agg_rule, try_groupby_rule, the
+    // vector_float_aggregate rule, etc.) compute their answer from
+    // rvbbit.row_groups + rvbbit.row_groups.stats / per_group_stats
+    // directly, without scanning parquet — so they don't apply tombstones
+    // and don't honor rvbbit.as_of_generation. When either of those
+    // matters for correctness, fall through to the normal scan path
+    // (custom_scan honors both).
+    if metadata_rewrites_unsafe_for_correctness() {
+        CURRENT_QUERY.with(|c| c.set(prev_query));
+        return;
+    }
+
     // Rule family A (const-from-metadata): try to answer `count(*) FROM
     // rvbbit_table` from rvbbit.row_groups without any scan. If this
     // rule fires, we mutate the Query into a trivial "SELECT <const>"
@@ -9170,6 +9183,48 @@ fn force_heap_scan_enabled() -> bool {
         .as_deref()
         .map(|value| setting_enabled(value, false))
         .unwrap_or(false)
+}
+
+/// Phase 2 followup A: are any of the metadata-only fast path rewrites
+/// unsafe to apply right now? Returns true when:
+///   - rvbbit.as_of_generation is set to a positive value (historical
+///     reads need row-group narrowing the metadata path can't do); OR
+///   - any rvbbit table has at least one tombstone (metadata counts
+///     don't subtract tombstones).
+///
+/// Conservative: a query that references no tombstoned table still
+/// falls through when ANY rvbbit table has tombstones. That's the
+/// trade-off for keeping the check to a single cheap EXISTS query
+/// instead of walking the rtable per call. A more precise per-rtable
+/// check is a future refinement.
+fn metadata_rewrites_unsafe_for_correctness() -> bool {
+    // GUC check: free (direct GetConfigOption).
+    if let Some(val) = guc_setting("rvbbit.as_of_generation") {
+        if let Ok(g) = val.trim().parse::<i64>() {
+            if g > 0 {
+                return true;
+            }
+        }
+    }
+    // Existence guard: PG parses BOTH branches of a CASE at plan time, so
+    // a single CASE-guarded EXISTS still fails when rvbbit.delete_log
+    // doesn't exist yet (CREATE EXTENSION's first CREATE TABLE runs the
+    // planner hook before rvbbit.delete_log is created). Two separate
+    // SPI calls sidestep that — the first never references the table.
+    let table_exists: Option<bool> = pgrx::Spi::get_one(
+        "SELECT to_regclass('rvbbit.delete_log') IS NOT NULL",
+    )
+    .ok()
+    .flatten();
+    if !table_exists.unwrap_or(false) {
+        return false;
+    }
+    let has_tombstones: Option<bool> = pgrx::Spi::get_one(
+        "SELECT EXISTS(SELECT 1 FROM rvbbit.delete_log)",
+    )
+    .ok()
+    .flatten();
+    has_tombstones.unwrap_or(false)
 }
 
 fn setting_enabled(value: &str, default: bool) -> bool {
