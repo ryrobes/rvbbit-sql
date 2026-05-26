@@ -35,6 +35,8 @@ fastembed = { workspace = true }
 datafusion = { workspace = true }
 tokio = { workspace = true }
 lance = { workspace = true }
+lance-index = { workspace = true }
+lance-linalg = { workspace = true }
 
 [dev-dependencies]
 pgrx-tests = { workspace = true }

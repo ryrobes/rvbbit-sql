@@ -51,6 +51,10 @@ tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-t
 # index support (IVF-PQ, HNSW). Pinned to the release line that pulls
 # datafusion 53 + arrow 58 + parquet 58, exactly matching our workspace.
 lance = "6"
+# lance-index + lance-linalg expose IndexType + MetricType, which lance itself
+# doesn't publicly re-export. Same version line as lance.
+lance-index = "6"
+lance-linalg = "6"
 
 [profile.release]
 lto = "thin"

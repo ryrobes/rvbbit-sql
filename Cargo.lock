@@ -5153,6 +5153,8 @@ dependencies = [
  "fastembed",
  "jsonwebtoken",
  "lance",
+ "lance-index",
+ "lance-linalg",
  "lru",
  "parking_lot",
  "parquet",
