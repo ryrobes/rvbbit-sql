@@ -317,6 +317,7 @@ struct RuntimeEqKey {
     values: [i64; 4],
 }
 
+#[derive(Clone)]
 struct RowGroupEntry {
     path: String,
     /// rg_id from rvbbit.row_groups. Used to look up tombstones in the
@@ -344,6 +345,7 @@ struct ScanBatchCache {
     bytes: usize,
 }
 
+#[derive(Clone)]
 struct PruneStats {
     min: Option<serde_json::Value>,
     max: Option<serde_json::Value>,
@@ -2494,6 +2496,9 @@ fn read_as_of_generation() -> Option<i64> {
 }
 
 fn fetch_variant_layouts(table_oid: u32) -> Result<Vec<String>, String> {
+    if let Some(cached) = VARIANT_LAYOUTS_CACHE.with(|c| c.borrow().get(&table_oid).cloned()) {
+        return Ok(cached);
+    }
     let prefix = CLUSTER_LAYOUT_PREFIX.replace('\'', "''");
     let mut layouts = Vec::new();
     pgrx::Spi::connect(|client| -> Result<(), String> {
@@ -2519,6 +2524,7 @@ fn fetch_variant_layouts(table_oid: u32) -> Result<Vec<String>, String> {
         Ok(())
     })
     .map_err(|e| format!("Spi::connect variant layouts: {e}"))?;
+    VARIANT_LAYOUTS_CACHE.with(|c| c.borrow_mut().insert(table_oid, layouts.clone()));
     Ok(layouts)
 }
 
@@ -2537,6 +2543,23 @@ fn fetch_row_group_paths(
         (Some(g), false) => format!("AND generation <= {g}"),
         _ => String::new(),
     };
+    // Backend-local cache: same (table_oid, variant_layout, asof,
+    // include_stats) returns the previously-fetched paths until compact()
+    // or migrate_to_cold() invalidates this table's entries from THIS
+    // backend. Cross-backend mutations leave us stale until restart, so
+    // we deliberately key on these inputs (not on rg counts) to avoid
+    // surprise cache hits on rows we never saw.
+    let cache_key = RowGroupPathsKey {
+        table_oid,
+        variant_layout: variant_layout.map(|s| s.to_string()),
+        asof,
+        include_stats,
+    };
+    if let Some(cached) =
+        ROW_GROUP_PATHS_CACHE.with(|c| c.borrow().get(&cache_key).cloned())
+    {
+        return Ok(cached);
+    }
     pgrx::Spi::connect(|client| -> Result<(), String> {
         // Phase 2 ObjectStore tiering: native custom_scan only handles
         // local file paths (RowGroupReader::open does std::fs). When ANY
@@ -2594,7 +2617,47 @@ fn fetch_row_group_paths(
         Ok(())
     })
     .map_err(|e| format!("Spi::connect: {e}"))?;
+    ROW_GROUP_PATHS_CACHE.with(|c| c.borrow_mut().insert(cache_key, out.clone()));
     Ok(out)
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct RowGroupPathsKey {
+    table_oid: u32,
+    variant_layout: Option<String>,
+    asof: Option<i64>,
+    include_stats: bool,
+}
+
+thread_local! {
+    /// Cache for `fetch_variant_layouts` — list of cluster-layout variant
+    /// names per table. Stable until something rewrites
+    /// rvbbit.row_group_variants for this table.
+    static VARIANT_LAYOUTS_CACHE:
+        std::cell::RefCell<std::collections::HashMap<u32, Vec<String>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// Cache for `fetch_row_group_paths` — the actual row-group list a
+    /// scan iterates over. Keyed by all the inputs the SQL depends on
+    /// (oid, variant, asof, include_stats) so a parameter change forces
+    /// a fresh fetch. Invalidate on local compact() / migrate_to_cold().
+    static ROW_GROUP_PATHS_CACHE: std::cell::RefCell<
+        std::collections::HashMap<RowGroupPathsKey, Vec<RowGroupEntry>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Drop all cached scan metadata for this table from THIS backend.
+/// Called from compact() / migrate_to_cold() after they've mutated the
+/// row-groups catalog so subsequent queries in the same backend see
+/// the new state. Cross-backend mutations don't reach us — those
+/// backends keep serving from their own caches until they restart, or
+/// until they themselves observe an invalidation event.
+pub fn invalidate_scan_metadata(oid: u32) {
+    VARIANT_LAYOUTS_CACHE.with(|c| c.borrow_mut().remove(&oid));
+    ROW_GROUP_PATHS_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        cache.retain(|key, _| key.table_oid != oid);
+    });
 }
 
 fn parse_prune_stats(stats_text: Option<&str>) -> HashMap<String, PruneStats> {

@@ -886,6 +886,12 @@ fn refresh_layout_variants_impl(
         }
     }
 
+    // Drop backend-local caches that depend on rvbbit.row_groups state.
+    // Without this, the same session would keep planning + scanning from
+    // the pre-compact metadata snapshot.
+    crate::planner::invalidate_planner_aggregates(rel_oid);
+    crate::custom_scan::invalidate_scan_metadata(rel_oid);
+
     Ok(rows_written)
 }
 

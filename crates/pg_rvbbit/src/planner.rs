@@ -43,6 +43,22 @@ thread_local! {
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
     static IS_RVBBIT_CACHE: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::new());
     static ROW_GROUPS_CACHE: RefCell<HashMap<u32, i64>> = RefCell::new(HashMap::new());
+    /// Cached `(sum_n_rows, sum_n_bytes)` aggregates per table. Filled on
+    /// first planner pass over an rvbbit table, persists for the backend's
+    /// lifetime. Invalidated locally when this backend runs compact() (see
+    /// `invalidate_planner_aggregates`). Cross-backend writes (another
+    /// session compacts the table) leave the cache slightly stale until
+    /// this backend restarts — that means a slightly off cost estimate for
+    /// new row groups, not a correctness issue, so it's an acceptable
+    /// tradeoff for saving 2 SPI queries per plan.
+    static AGG_CACHE: RefCell<HashMap<u32, (f64, f64)>> = RefCell::new(HashMap::new());
+}
+
+/// Drop the per-table planner aggregate cache. Called from compact() so
+/// the same backend immediately sees its own writes reflected in plan
+/// row estimates.
+pub fn invalidate_planner_aggregates(oid: u32) {
+    AGG_CACHE.with(|c| c.borrow_mut().remove(&oid));
 }
 
 /// Wrapper to make `CustomPathMethods` (which contains raw fn pointers)
@@ -382,21 +398,42 @@ fn count_row_groups(oid: u32) -> i64 {
 }
 
 fn sum_row_group_rows(oid: u32) -> f64 {
-    IN_HOOK.with(|f| f.set(true));
-    let n: Result<Option<i64>, _> = pgrx::Spi::get_one(&format!(
-        "SELECT coalesce(sum(n_rows), 0)::bigint \
-         FROM rvbbit.row_groups WHERE table_oid = {oid}::oid"
-    ));
-    IN_HOOK.with(|f| f.set(false));
-    n.ok().flatten().unwrap_or(0) as f64
+    aggregate_for_oid(oid).0
 }
 
 fn sum_row_group_bytes(oid: u32) -> f64 {
+    aggregate_for_oid(oid).1
+}
+
+/// Fetch `(sum_n_rows, sum_n_bytes)` for a relation, using the
+/// backend-local cache. The two values are paired because the planner
+/// always asks for both on the same plan, and one SPI returning two
+/// columns is meaningfully cheaper than two SPIs.
+fn aggregate_for_oid(oid: u32) -> (f64, f64) {
+    if let Some(cached) = AGG_CACHE.with(|c| c.borrow().get(&oid).copied()) {
+        return cached;
+    }
     IN_HOOK.with(|f| f.set(true));
-    let n: Result<Option<i64>, _> = pgrx::Spi::get_one(&format!(
-        "SELECT coalesce(sum(n_bytes), 0)::bigint \
-         FROM rvbbit.row_groups WHERE table_oid = {oid}::oid"
-    ));
+    let mut rows = 0i64;
+    let mut bytes = 0i64;
+    let _ = pgrx::Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(
+            &format!(
+                "SELECT coalesce(sum(n_rows), 0)::bigint, \
+                        coalesce(sum(n_bytes), 0)::bigint \
+                 FROM rvbbit.row_groups WHERE table_oid = {oid}::oid"
+            ),
+            None,
+            &[],
+        )?;
+        for row in table {
+            rows = row.get::<i64>(1)?.unwrap_or(0);
+            bytes = row.get::<i64>(2)?.unwrap_or(0);
+        }
+        Ok(())
+    });
     IN_HOOK.with(|f| f.set(false));
-    n.ok().flatten().unwrap_or(0) as f64
+    let pair = (rows as f64, bytes as f64);
+    AGG_CACHE.with(|c| c.borrow_mut().insert(oid, pair));
+    pair
 }
