@@ -31,7 +31,8 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{WriterProperties, WriterVersion};
+use parquet::schema::types::ColumnPath;
 
 use crate::metadata::{
     ColumnStats, GroupBucket, NumericAgg, PerGroupBlock, RowGroupMeta, TextSketch,
@@ -58,12 +59,7 @@ impl RowGroupWriter {
         }
 
         let schema: SchemaRef = batch.schema();
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(
-                ZstdLevel::try_new(DEFAULT_ZSTD_LEVEL).expect("valid zstd level"),
-            ))
-            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
-            .build();
+        let props = build_writer_properties(&schema);
 
         let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
         let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
@@ -97,6 +93,95 @@ impl RowGroupWriter {
             per_group_stats,
         })
     }
+}
+
+/// Default Parquet data-page row limit when `RVBBIT_PARQUET_PAGE_ROWS`
+/// isn't set. Smaller pages give finer-grained skip via column indexes
+/// at the cost of slightly bigger files.
+const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 20_000;
+
+/// Default bloom-filter false-positive rate. Lower → fewer wasted page
+/// reads on miss, higher → smaller bloom filters on disk.
+const DEFAULT_BLOOM_FPP: f64 = 0.01;
+
+/// Default truncate length for column index min/max prefixes. Keeps the
+/// per-page index compact even when string columns are long.
+const DEFAULT_COLUMN_INDEX_TRUNCATE: usize = 64;
+
+/// Build WriterProperties for a row-group write. Knobs are env-gated so
+/// benchmark runs can A/B-compare without recompiling:
+///
+///   RVBBIT_PARQUET_V2          (default: on)  — Parquet 2.0 writer + V2 pages
+///   RVBBIT_PARQUET_BLOOM       (default: on)  — bloom filters on text/binary cols
+///   RVBBIT_PARQUET_BLOOM_FPP   (default: 0.01)
+///   RVBBIT_PARQUET_PAGE_ROWS   (default: 20000) — data-page row count limit
+///
+/// Numeric columns get bloom filters disabled because column min/max
+/// already cover the equality-pruning case for those types.
+fn build_writer_properties(schema: &SchemaRef) -> WriterProperties {
+    let writer_version = if env_enabled("RVBBIT_PARQUET_V2", true) {
+        WriterVersion::PARQUET_2_0
+    } else {
+        WriterVersion::PARQUET_1_0
+    };
+
+    let page_rows = env_usize("RVBBIT_PARQUET_PAGE_ROWS", DEFAULT_PAGE_ROW_COUNT_LIMIT);
+    let bloom_enabled = env_enabled("RVBBIT_PARQUET_BLOOM", true);
+    let bloom_fpp = env_f64("RVBBIT_PARQUET_BLOOM_FPP", DEFAULT_BLOOM_FPP);
+
+    let mut builder = WriterProperties::builder()
+        .set_writer_version(writer_version)
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(DEFAULT_ZSTD_LEVEL).expect("valid zstd level"),
+        ))
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
+        .set_column_index_truncate_length(Some(DEFAULT_COLUMN_INDEX_TRUNCATE))
+        .set_data_page_row_count_limit(page_rows);
+
+    if bloom_enabled {
+        builder = builder
+            .set_bloom_filter_enabled(true)
+            .set_bloom_filter_fpp(bloom_fpp);
+
+        // Disable blooms on numeric / boolean / temporal columns: their
+        // column min/max already prune equality predicates and adding a
+        // bloom just wastes space + write time.
+        for field in schema.fields() {
+            let is_numeric_or_temporal = matches!(
+                field.data_type(),
+                DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Boolean
+                    | DataType::Date32
+                    | DataType::Timestamp(_, _)
+            );
+            if is_numeric_or_temporal {
+                builder = builder.set_column_bloom_filter_enabled(
+                    ColumnPath::from(field.name().as_str()),
+                    false,
+                );
+            }
+        }
+    }
+
+    builder.build()
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_enabled(name: &str, default: bool) -> bool {
