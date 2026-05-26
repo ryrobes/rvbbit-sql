@@ -763,6 +763,37 @@ fn export_to_parquet(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>
         refresh_layout_variants_impl(rel_oid, &qualified, &plans, &schema, &path_root)?;
     }
 
+    // Phase 4 Lance auto-refresh. When the operator has opted this table
+    // into Lance acceleration (rvbbit.lance_enable), every compact()
+    // rebuilds the Lance dataset to match the current table state. The
+    // catalog row holds the URL + column name + dim. The Lance index, if
+    // any was built, will need to be rebuilt by the operator after this —
+    // future work to make that automatic too. For now this is best-effort:
+    // a Lance refresh failure is logged but doesn't fail the compact.
+    if let Ok(Some(lance_url)) = Spi::get_one::<String>(&format!(
+        "SELECT lance_url FROM rvbbit.tables \
+         WHERE table_oid = {rel_oid}::oid AND lance_url IS NOT NULL"
+    )) {
+        if let Ok(Some(vec_col)) = Spi::get_one::<String>(&format!(
+            "SELECT lance_vector_column FROM rvbbit.tables \
+             WHERE table_oid = {rel_oid}::oid"
+        )) {
+            if let Ok(Some(dim)) = Spi::get_one::<i32>(&format!(
+                "SELECT lance_dim FROM rvbbit.tables \
+                 WHERE table_oid = {rel_oid}::oid"
+            )) {
+                if let Err(e) =
+                    crate::lance::refresh_lance_dataset(rel_oid, "id", &vec_col, dim, &lance_url)
+                {
+                    pgrx::warning!(
+                        "rvbbit.compact: Lance auto-refresh of {qualified} failed: {e} \
+                         (parquet write completed; Lance dataset may be stale)"
+                    );
+                }
+            }
+        }
+    }
+
     register_legacy_llm_shreds_if_present(rel_oid, &plans)?;
 
     Ok(total_rows)

@@ -297,6 +297,155 @@ fn lance_import_column(
     n_rows
 }
 
+/// Core import logic factored out of the SQL wrapper so compact() can call
+/// it directly when auto-refresh is enabled for the table. Reads via SPI
+/// (works on cold-tier through the custom_scan fall-through), writes a
+/// fresh Lance dataset at `lance_path`. Returns the row count written.
+pub(crate) fn refresh_lance_dataset(
+    reloid: u32,
+    pk_col: &str,
+    vec_col: &str,
+    dim: i32,
+    lance_path: &str,
+) -> Result<i64, String> {
+    let dim_usize = dim.max(1) as usize;
+    let qualified: String = Spi::get_one::<String>(&format!(
+        "SELECT n.nspname::text || '.' || c.relname::text \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.oid = {reloid}::oid"
+    ))
+    .map_err(|e| format!("resolve oid: {e}"))?
+    .ok_or_else(|| format!("oid {reloid} does not exist"))?;
+
+    let select_sql = format!("SELECT {pk_col}::bigint, {vec_col}::real[] FROM {qualified}");
+
+    let mut pks: Vec<i64> = Vec::new();
+    let mut values: Vec<f32> = Vec::new();
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(&select_sql, None, &[])?;
+        for row in table {
+            let pk: i64 = row.get::<i64>(1)?.unwrap_or(0);
+            let vec_row: Vec<Option<f32>> =
+                row.get::<Vec<Option<f32>>>(2)?.unwrap_or_default();
+            if vec_row.len() != dim_usize {
+                return Err(pgrx::spi::Error::CursorNotFound(format!(
+                    "row pk={pk} has {} dims, expected {dim_usize}",
+                    vec_row.len()
+                )));
+            }
+            pks.push(pk);
+            for v in vec_row {
+                values.push(v.unwrap_or(0.0));
+            }
+        }
+        Ok(())
+    })
+    .map_err(|e| format!("SPI: {e}"))?;
+
+    let n_rows = pks.len() as i64;
+    if n_rows == 0 {
+        // Empty source: nothing to write. Caller can decide whether that's
+        // an error or expected (e.g. compact() of an empty table).
+        return Ok(0);
+    }
+
+    let pk_array = Int64Array::from(pks);
+    let values_array = Float32Array::from(values);
+    let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+    let embedding_array = FixedSizeListArray::try_new(
+        item_field.clone(),
+        dim,
+        Arc::new(values_array),
+        None,
+    )
+    .map_err(|e| format!("FixedSizeList: {e}"))?;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("embedding", DataType::FixedSizeList(item_field, dim), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(pk_array), Arc::new(embedding_array)],
+    )
+    .map_err(|e| format!("RecordBatch: {e}"))?;
+    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+    let lance_path = lance_path.to_string();
+    with_lance_runtime(|rt| {
+        rt.block_on(async {
+            let mut params = WriteParams::default();
+            params.mode = lance::dataset::WriteMode::Overwrite;
+            Dataset::write(batches, &lance_path, Some(params))
+                .await
+                .map_err(|e| format!("Dataset::write: {e}"))?;
+            Ok::<(), String>(())
+        })
+    })?;
+
+    Ok(n_rows)
+}
+
+/// rvbbit.lance_enable(reloid, vec_col, dim, lance_url) — opt a table
+/// in to automatic Lance refresh. Sets the catalog flags AND does an
+/// initial import so the Lance dataset reflects the current table
+/// state. After this, every compact() call rebuilds the Lance dataset
+/// to match the latest table contents.
+///
+/// To disable, pass NULL for lance_url (caller can use the catalog
+/// directly: UPDATE rvbbit.tables SET lance_url = NULL).
+#[pg_extern]
+fn lance_enable(
+    reloid: pg_sys::Oid,
+    vec_col: &str,
+    dim: i32,
+    lance_url: &str,
+) -> i64 {
+    let rel_oid = reloid.to_u32();
+    let vec_col_safe = vec_col.replace('\'', "''");
+    let lance_url_safe = lance_url.replace('\'', "''");
+
+    // Set the catalog flags BEFORE the initial write so any race with a
+    // concurrent compact() picks them up.
+    Spi::run(&format!(
+        "UPDATE rvbbit.tables \
+            SET lance_url = '{lance_url_safe}', \
+                lance_vector_column = '{vec_col_safe}', \
+                lance_dim = {dim} \
+          WHERE table_oid = {rel_oid}::oid"
+    ))
+    .unwrap_or_else(|e| pgrx::error!("rvbbit.lance_enable: catalog update: {e}"));
+
+    // Initial population. Uses 'id' as the implicit PK — convention that
+    // makes rvbbit.knn() simpler, matches what rvbbit.compact's LLM-events
+    // schema uses, and avoids exposing a fifth function parameter.
+    refresh_lance_dataset(rel_oid, "id", vec_col, dim, lance_url)
+        .unwrap_or_else(|e| pgrx::error!("rvbbit.lance_enable: initial refresh: {e}"))
+}
+
+/// rvbbit.knn(reloid, query, k) — catalog-driven KNN. Looks up
+/// lance_url + lance_vector_column from rvbbit.tables and runs
+/// vector search against the table's Lance dataset. No operator
+/// has to remember the URL or path.
+///
+/// Returns JSON array of {id, _distance} ordered nearest first.
+#[pg_extern]
+fn knn(reloid: pg_sys::Oid, query: Vec<f32>, k: i32) -> JsonB {
+    let rel_oid = reloid.to_u32();
+    let lance_url: String = match Spi::get_one::<String>(&format!(
+        "SELECT lance_url FROM rvbbit.tables \
+         WHERE table_oid = {rel_oid}::oid AND lance_url IS NOT NULL"
+    )) {
+        Ok(Some(u)) => u,
+        Ok(None) => pgrx::error!(
+            "rvbbit.knn: table oid {rel_oid} has no Lance dataset; \
+             call rvbbit.lance_enable() first"
+        ),
+        Err(e) => pgrx::error!("rvbbit.knn: catalog lookup: {e}"),
+    };
+    lance_knn(&lance_url, query, k)
+}
+
 /// rvbbit.lance_build_index(path, column, num_partitions, num_sub_vectors)
 /// — create an IVF-PQ vector index on a Lance dataset's embedding column.
 ///

@@ -26,6 +26,16 @@ CREATE TABLE rvbbit.tables (
     -- with the OLD value. Reads see the latest generation by default;
     -- AS OF queries (future) can narrow to `generation <= asof`.
     next_generation bigint NOT NULL DEFAULT 1,
+    -- Phase 4 Lance auto-refresh. When lance_url IS NOT NULL, compact()
+    -- mirrors the named vector column into a Lance dataset at this URL
+    -- (overwriting per compact), so rvbbit.knn() can do indexed KNN
+    -- without the operator having to call lance_import_column manually.
+    -- lance_vector_column is the source column name (must be real[]),
+    -- lance_dim is the expected vector dimension. Set together via
+    -- rvbbit.lance_enable().
+    lance_url            text,
+    lance_vector_column  text,
+    lance_dim            int,
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
