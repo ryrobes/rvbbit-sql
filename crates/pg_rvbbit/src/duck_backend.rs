@@ -132,6 +132,16 @@ pub(crate) fn fail_open_enabled() -> bool {
         .unwrap_or_else(|| env_enabled("RVBBIT_DUCK_BACKEND_FAIL_OPEN", true))
 }
 
+/// Phase 1: when on, the `datafusion` engine routes through the in-process
+/// DataFusion in `crate::df` instead of forking the rvbbit-duck sidecar.
+/// Default off so the system behaves identically until an operator opts in.
+/// On any in-process error we transparently fall back to the sidecar path.
+fn df_inprocess_enabled() -> bool {
+    guc_setting("rvbbit.df_inprocess")
+        .map(|value| setting_enabled(&value, false))
+        .unwrap_or_else(|| env_enabled("RVBBIT_DF_INPROCESS", false))
+}
+
 fn env_enabled(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(value) => setting_enabled(&value, default),
@@ -219,15 +229,37 @@ fn engine_query_json(
     } else {
         self::max_rows()
     };
-    let binary = duck_binary().unwrap_or_else(|| {
-        pgrx::error!("rvbbit.{engine}_query_json: rvbbit-duck binary not found")
-    });
-    let dsn = duck_dsn();
-    let timeout = timeout_s();
     let start = Instant::now();
-    let payload = match run_engine_query(engine, layout, &binary, &dsn, query, max_rows, timeout) {
-        Ok(payload) => payload,
-        Err(err) => return fail_open_or_error(engine, query, max_rows, &err),
+
+    // Phase 1: in-process DataFusion path. Only takes the datafusion engine
+    // (DuckDB still goes through the sidecar). If we hit an error, fall
+    // through to the sidecar path — safe rollback by design.
+    let inprocess_payload = if engine == "datafusion" && df_inprocess_enabled() {
+        match crate::df::query_engine(layout, query, max_rows) {
+            Ok(payload) => Some(payload),
+            Err(err) => {
+                pgrx::warning!(
+                    "rvbbit.{engine}_query_json: in-process DF failed ({err}); falling back to sidecar"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let payload = if let Some(p) = inprocess_payload {
+        p
+    } else {
+        let binary = duck_binary().unwrap_or_else(|| {
+            pgrx::error!("rvbbit.{engine}_query_json: rvbbit-duck binary not found")
+        });
+        let dsn = duck_dsn();
+        let timeout = timeout_s();
+        match run_engine_query(engine, layout, &binary, &dsn, query, max_rows, timeout) {
+            Ok(p) => p,
+            Err(err) => return fail_open_or_error(engine, query, max_rows, &err),
+        }
     };
 
     if payload.get("status").and_then(Value::as_str) != Some("ok") {

@@ -1,26 +1,41 @@
-//! Phase 0 spike: DataFusion embedded in-process.
+//! Phase 1: in-process DataFusion for the `datafusion_*` route candidates.
 //!
-//! Today the `datafusion_*` routes spawn `rvbbit-duck` as a child process and
-//! talk to it over stdin/stdout JSON (see `duck_backend.rs`). That's an install
-//! step, a fork/exec tax, and a hard wall against query cancellation,
-//! streaming, and DataFusion UDF integration with our semantic operators.
+//! Phase 0 (`df_probe_*`) proved DataFusion 49 embeds cleanly inside a pgrx
+//! backend. Phase 1 promotes that substrate to a real engine that the router
+//! can call instead of forking `rvbbit-duck`. The dispatch lives in
+//! `duck_backend::engine_query_json`; flip `rvbbit.df_inprocess = on` to
+//! route the `datafusion` engine through here.
 //!
-//! This module proves the alternative: a single thread-local tokio runtime
-//! plus a thread-local `SessionContext` per Postgres backend, with three
-//! probe functions to test viability and measure cost.
-//!
-//! If the spike succeeds, this module becomes the substrate for Phase 1
-//! (real `df::query` integrated into the router).
+//! Catalog discovery mirrors `rvbbit_duck::main::rvbbit_row_group_catalog`:
+//! we ask the same eligibility questions (no dirty heap tail, no pending
+//! deletes, parquet files exist) but answer them via SPI instead of a
+//! `postgres::Client` round-trip — we're already inside the backend, so
+//! catalog access is essentially free.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::path::Path as FsPath;
+use std::sync::Arc;
 use std::time::Instant;
 
+use datafusion::arrow::array::{
+    cast::{as_boolean_array, as_primitive_array, as_string_array},
+    Array, ArrayRef,
+};
+use datafusion::arrow::datatypes::{
+    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
+    UInt32Type, UInt64Type, UInt8Type,
+};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use pgrx::prelude::*;
-use pgrx::JsonB;
-use serde_json::json;
+use pgrx::{JsonB, Spi};
+use serde_json::{json, Value};
 use tokio::runtime::{Builder, Runtime};
 
 const PROBE_TABLE: &str = "t";
@@ -195,4 +210,268 @@ fn df_probe_bench(path: &str, sql: &str, iters: i32) -> JsonB {
         "row_count_first": row_count,
         "error": error,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: real engine entry point. Discoverable from SQL as
+// rvbbit.df_inprocess_query(sql, max_rows) for direct testing; called from
+// duck_backend::engine_query_json when rvbbit.df_inprocess GUC is on.
+// ---------------------------------------------------------------------------
+
+/// One eligible rvbbit table — schema-qualified name + the parquet files
+/// that make up its scan-layout row groups (canonical order by rg_id).
+#[derive(Debug, Clone)]
+struct RvbbitTable {
+    schema: String,
+    relname: String,
+    paths: Vec<String>,
+}
+
+impl RvbbitTable {
+    fn qualified(&self) -> String {
+        format!("{}.{}", self.schema, self.relname)
+    }
+}
+
+/// SPI-driven mirror of `rvbbit_duck::main::rvbbit_row_group_catalog` for the
+/// canonical "scan" layout. Eligibility = no pending deletes and either no
+/// retained heap or a clean shadow heap.
+///
+/// Returns BTreeMap so iteration order is deterministic across calls (helps
+/// when registering many tables — DataFusion order can shift planning).
+fn discover_catalog_scan() -> Result<BTreeMap<String, RvbbitTable>, String> {
+    // SPI returns plain Datums; we copy into a Vec so the borrow ends before
+    // we leave the SPI scope.
+    struct Row {
+        schema: String,
+        relname: String,
+        paths: Vec<String>,
+        heap_bytes: i64,
+        shadow_retained: bool,
+        shadow_dirty: bool,
+        deletes: i64,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(
+            "
+            SELECT n.nspname::text                                            AS nspname,
+                   c.relname::text                                            AS relname,
+                   array_agg(rg.path ORDER BY rg.rg_id)::text[]               AS paths,
+                   pg_relation_size(c.oid)::bigint                            AS heap_bytes,
+                   coalesce(t.shadow_heap_retained, false)                    AS shadow_heap_retained,
+                   coalesce(t.shadow_heap_dirty, false)                       AS shadow_heap_dirty,
+                   (SELECT count(*)
+                      FROM rvbbit.delete_log dl
+                     WHERE dl.table_oid = c.oid)::bigint                      AS deletes
+            FROM rvbbit.row_groups rg
+            JOIN pg_class c       ON c.oid = rg.table_oid
+            JOIN pg_namespace n   ON n.oid = c.relnamespace
+            JOIN pg_am am         ON am.oid = c.relam
+            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
+            WHERE am.amname = 'rvbbit'
+            GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
+            ",
+            None,
+            &[],
+        )?;
+        for row in table {
+            let schema: String = row.get::<String>(1)?.unwrap_or_default();
+            let relname: String = row.get::<String>(2)?.unwrap_or_default();
+            let paths: Vec<String> = row
+                .get::<Vec<Option<String>>>(3)?
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .collect();
+            let heap_bytes: i64 = row.get::<i64>(4)?.unwrap_or(0);
+            let shadow_retained: bool = row.get::<bool>(5)?.unwrap_or(false);
+            let shadow_dirty: bool = row.get::<bool>(6)?.unwrap_or(false);
+            let deletes: i64 = row.get::<i64>(7)?.unwrap_or(0);
+            rows.push(Row {
+                schema,
+                relname,
+                paths,
+                heap_bytes,
+                shadow_retained,
+                shadow_dirty,
+                deletes,
+            });
+        }
+        Ok(())
+    })
+    .map_err(|e| format!("catalog SPI: {e}"))?;
+
+    let mut out = BTreeMap::new();
+    for r in rows {
+        // Same eligibility check as rvbbit_duck/main.rs:1263 — parquet must be
+        // authoritative for the table.
+        if r.deletes != 0 || (r.heap_bytes != 0 && !(r.shadow_retained && !r.shadow_dirty)) {
+            continue;
+        }
+        if r.paths.is_empty() {
+            continue;
+        }
+        // Every path must exist; otherwise this table isn't safe to read.
+        if !r.paths.iter().all(|p| FsPath::new(p).exists()) {
+            continue;
+        }
+        let key = format!("{}.{}", r.schema, r.relname);
+        out.insert(
+            key,
+            RvbbitTable {
+                schema: r.schema,
+                relname: r.relname,
+                paths: r.paths,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Register each eligible table with the per-backend SessionContext as a
+/// ListingTable backed by its parquet file list. Idempotent: existing
+/// registrations are dropped and recreated so a compact() between calls is
+/// reflected on the next query.
+async fn register_tables(
+    ctx: &SessionContext,
+    tables: &BTreeMap<String, RvbbitTable>,
+) -> Result<(), String> {
+    for (qualified, t) in tables {
+        let _ = ctx.deregister_table(qualified);
+
+        // ListingTable with the explicit list of parquet files. We avoid
+        // directory globbing because the directory may contain transient
+        // files from a concurrent compact; the row_groups catalog is the
+        // authoritative file set.
+        let urls: Vec<ListingTableUrl> = t
+            .paths
+            .iter()
+            .map(|p| {
+                ListingTableUrl::parse(format!("file://{p}"))
+                    .map_err(|e| format!("ListingTableUrl({p}): {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let format = Arc::new(ParquetFormat::default());
+        let options = ListingOptions::new(format).with_file_extension(".parquet");
+        let schema = options
+            .infer_schema(&ctx.state(), &urls[0])
+            .await
+            .map_err(|e| format!("infer_schema({}): {e}", t.qualified()))?;
+        let config = ListingTableConfig::new_with_multi_paths(urls)
+            .with_listing_options(options)
+            .with_schema(schema);
+        let table = ListingTable::try_new(config)
+            .map_err(|e| format!("ListingTable::try_new({}): {e}", t.qualified()))?;
+        ctx.register_table(qualified.as_str(), Arc::new(table))
+            .map_err(|e| format!("register_table({qualified}): {e}"))?;
+    }
+    Ok(())
+}
+
+/// Run `sql` against the in-process DataFusion engine with all eligible
+/// rvbbit tables (canonical scan layout) registered. Returns the
+/// sidecar-compatible {status, row_count, columns, rows} JSON shape so
+/// `duck_backend::engine_query_json` can consume it unchanged.
+pub(crate) fn query_engine(layout: &str, sql: &str, max_rows: i32) -> Result<Value, String> {
+    // Phase 1 only handles canonical "scan" layout. Hive/cluster variants
+    // can be added in a follow-on slice once we exercise this on real data.
+    if !matches!(
+        layout.trim().to_ascii_lowercase().as_str(),
+        "" | "scan" | "canonical" | "default"
+    ) {
+        return Err(format!(
+            "in-process datafusion currently only supports scan layout, got {layout}"
+        ));
+    }
+
+    let tables = discover_catalog_scan()?;
+    if tables.is_empty() {
+        return Err("no authoritative compacted rvbbit parquet tables are visible".to_string());
+    }
+
+    let max_rows = if max_rows > 0 { max_rows as usize } else { usize::MAX };
+
+    with_rt_ctx(|rt, ctx| {
+        rt.block_on(async {
+            register_tables(ctx, &tables).await?;
+            let df = ctx.sql(sql).await.map_err(|e| format!("sql plan: {e}"))?;
+            let batches: Vec<RecordBatch> =
+                df.collect().await.map_err(|e| format!("collect: {e}"))?;
+
+            let columns: Vec<String> = batches
+                .first()
+                .map(|b| {
+                    b.schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut rows: Vec<Value> = Vec::new();
+            let mut row_count = 0usize;
+            for batch in &batches {
+                for row_idx in 0..batch.num_rows() {
+                    if rows.len() < max_rows {
+                        let mut row = Vec::with_capacity(batch.num_columns());
+                        for col_idx in 0..batch.num_columns() {
+                            row.push(arrow_value_to_json(batch.column(col_idx), row_idx)?);
+                        }
+                        rows.push(Value::Array(row));
+                    }
+                    row_count += 1;
+                }
+            }
+
+            Ok::<Value, String>(json!({
+                "status": "ok",
+                "row_count": row_count,
+                "columns": columns,
+                "rows": rows,
+            }))
+        })
+    })
+}
+
+/// Arrow → JSON, mirroring `rvbbit_duck::main::arrow_value_to_json`. Keeping
+/// the shape identical means the caller never has to know whether the rows
+/// came from the sidecar or from here.
+fn arrow_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<Value, String> {
+    if array.is_null(row_idx) {
+        return Ok(Value::Null);
+    }
+    let v = match array.data_type() {
+        DataType::Boolean => json!(as_boolean_array(array.as_ref()).value(row_idx)),
+        DataType::Int8 => json!(as_primitive_array::<Int8Type>(array.as_ref()).value(row_idx)),
+        DataType::Int16 => json!(as_primitive_array::<Int16Type>(array.as_ref()).value(row_idx)),
+        DataType::Int32 => json!(as_primitive_array::<Int32Type>(array.as_ref()).value(row_idx)),
+        DataType::Int64 => json!(as_primitive_array::<Int64Type>(array.as_ref()).value(row_idx)),
+        DataType::UInt8 => json!(as_primitive_array::<UInt8Type>(array.as_ref()).value(row_idx)),
+        DataType::UInt16 => json!(as_primitive_array::<UInt16Type>(array.as_ref()).value(row_idx)),
+        DataType::UInt32 => json!(as_primitive_array::<UInt32Type>(array.as_ref()).value(row_idx)),
+        DataType::UInt64 => json!(as_primitive_array::<UInt64Type>(array.as_ref()).value(row_idx)),
+        DataType::Float32 => {
+            json!(as_primitive_array::<Float32Type>(array.as_ref()).value(row_idx))
+        }
+        DataType::Float64 => {
+            json!(as_primitive_array::<Float64Type>(array.as_ref()).value(row_idx))
+        }
+        DataType::Utf8 => json!(as_string_array(array.as_ref()).value(row_idx)),
+        // Date/Timestamp/etc. fall through to display formatting; matches sidecar
+        _ => json!(array_value_to_string(array.as_ref(), row_idx)
+            .map_err(|e| format!("display row {row_idx}: {e}"))?),
+    };
+    Ok(v)
+}
+
+/// Direct SQL entry point for testing the in-process engine without going
+/// through the router/dispatch glue. Exposed as rvbbit.df_inprocess_query.
+#[pg_extern]
+fn df_inprocess_query(sql: &str, max_rows: default!(i32, 100000)) -> JsonB {
+    match query_engine("scan", sql, max_rows) {
+        Ok(v) => JsonB(v),
+        Err(e) => pgrx::error!("rvbbit.df_inprocess_query: {e}"),
+    }
 }
