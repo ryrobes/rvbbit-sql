@@ -42,6 +42,15 @@ CREATE TABLE rvbbit.row_groups (
     -- (>= 1) under a per-table advisory lock so two concurrent compacts
     -- can never collide.
     generation      bigint NOT NULL DEFAULT 0,
+    -- Phase 2 ObjectStore tiered storage. When NULL, this row group lives
+    -- at `path` (a local filesystem path under PGDATA/rvbbit/) and is read
+    -- by the native custom_scan. When non-NULL, this row group has been
+    -- migrated to a cold tier — `cold_url` is a full ObjectStore URL
+    -- (file://, s3://, gs://) and reads route through in-process
+    -- DataFusion which has ObjectStore-aware parquet support. The custom
+    -- scan path doesn't handle URL schemes, so tables with any cold row
+    -- groups fall back to df.rs entirely.
+    cold_url        text,
     stats           jsonb,
     -- Per-group aggregate blocks for low-cardinality columns. Powers
     -- GROUP BY pushdown — see rvbbit.agg_groupby_*. NULL when no
@@ -317,6 +326,94 @@ END $$;
 --
 -- Returns {dropped_row_groups, new_row_count} so the caller can sanity-
 -- check that the rebuild matches expectations.
+-- ---------------------------------------------------------------------------
+-- Phase 2 (post-DF53): ObjectStore tiered storage.
+--
+-- A row group with rvbbit.row_groups.cold_url IS NOT NULL lives on an
+-- ObjectStore-addressable URL (file://, s3://, gs://, ...) instead of the
+-- default local PGDATA path. In-process DataFusion reads via DataFusion's
+-- ObjectStore abstraction; the native custom_scan can't handle URL schemes,
+-- so it falls through to df.rs for any table with a cold row group.
+--
+-- rvbbit.migrate_to_cold copies every row group's parquet file from its
+-- current `path` to `<cold_url_prefix>/<table_oid>/scan/<rg_id>.parquet`
+-- and sets cold_url accordingly. Files are COPIED, not moved; the local
+-- copies remain on disk until the operator explicitly cleans them up
+-- (rvbbit.drop_local_after_migrate, future). Re-running the migration is
+-- idempotent for already-cold row groups.
+--
+-- The MVP supports file:// only — sufficient to validate the wiring on a
+-- single-machine demo (cold URL points to a different mount). s3:// and
+-- gs:// land when we add the corresponding ObjectStore credential helpers.
+CREATE OR REPLACE FUNCTION rvbbit.migrate_to_cold(
+    reloid          regclass,
+    cold_url_prefix text
+) RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+    table_oid_str text := reloid::oid::text;
+    prefix_norm   text := rtrim(cold_url_prefix, '/');
+    n_migrated    int := 0;
+    n_bytes_total bigint := 0;
+    rg_record     record;
+    src_path      text;
+    dest_url      text;
+    dest_local    text;
+    cp_status     int;
+BEGIN
+    -- MVP: file:// scheme only. Strip the prefix to get a local filesystem
+    -- destination. Future work plugs s3:// + gs:// in here.
+    IF position('://' IN prefix_norm) = 0 OR
+       (NOT prefix_norm LIKE 'file://%') THEN
+        RAISE EXCEPTION 'rvbbit.migrate_to_cold: only file:// cold_url_prefix is supported in this MVP, got %', cold_url_prefix;
+    END IF;
+    dest_local := substring(prefix_norm FROM 8);   -- strip "file://"
+
+    -- Create destination directory tree using COPY TO PROGRAM, which is the
+    -- least-bad way to invoke `mkdir -p` from inside a function. We're
+    -- already running as a superuser-only extension, so this stays inside
+    -- the existing trust boundary.
+    EXECUTE format(
+        'COPY (SELECT 1) TO PROGRAM ''mkdir -p %s/%s/scan''',
+        replace(dest_local, '''', ''''''), replace(table_oid_str, '''', '''''')
+    );
+
+    FOR rg_record IN
+        SELECT rg_id, path, n_bytes, cold_url
+        FROM rvbbit.row_groups
+        WHERE table_oid = reloid
+        ORDER BY rg_id
+    LOOP
+        IF rg_record.cold_url IS NOT NULL THEN
+            -- Already migrated; skip.
+            CONTINUE;
+        END IF;
+        src_path := rg_record.path;
+        dest_url := format('%s/%s/scan/%s.parquet',
+            prefix_norm, table_oid_str, rg_record.rg_id);
+
+        EXECUTE format(
+            'COPY (SELECT 1) TO PROGRAM ''cp %s %s/%s/scan/%s.parquet''',
+            replace(src_path, '''', ''''''),
+            replace(dest_local, '''', ''''''),
+            replace(table_oid_str, '''', ''''''),
+            rg_record.rg_id::text
+        );
+
+        UPDATE rvbbit.row_groups
+           SET cold_url = dest_url
+         WHERE table_oid = reloid AND rg_id = rg_record.rg_id;
+
+        n_migrated := n_migrated + 1;
+        n_bytes_total := n_bytes_total + rg_record.n_bytes;
+    END LOOP;
+
+    RETURN jsonb_build_object(
+        'migrated_row_groups', n_migrated,
+        'total_bytes',          n_bytes_total,
+        'cold_url_prefix',      prefix_norm
+    );
+END $$;
+
 CREATE OR REPLACE FUNCTION rvbbit.rebuild_acceleration(reloid regclass)
 RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE

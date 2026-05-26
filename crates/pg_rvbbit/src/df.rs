@@ -291,20 +291,22 @@ fn discover_catalog_scan(asof: Option<i64>) -> Result<BTreeMap<String, RvbbitTab
         Some(g) => format!("AND rg.generation <= {g}"),
         None => String::new(),
     };
-    // Phase 2 followup B: count tombstones that would actually apply to
-    // the read we're about to plan. For AS OF, that's tombstones at
-    // deleted_generation <= asof; for latest, all tombstones. Tables with
-    // relevant tombstones are excluded so we fall back to the native
-    // scan path which honors them via the custom_scan bitmap filter.
     let tombstone_predicate = match asof {
         Some(g) => format!("AND deleted_generation <= {g}"),
         None => String::new(),
     };
+    // Phase 2 ObjectStore tiered storage: prefer the cold_url when it's set
+    // (row group has been migrated to an ObjectStore-addressable location).
+    // Otherwise wrap the bare local path as a file:// URL so DataFusion's
+    // ListingTableUrl::parse picks the right ObjectStore consistently
+    // (LocalFileSystem for file://, ObjectStoreRegistry-resolved for others).
     let sql = format!(
         "
         SELECT n.nspname::text                                            AS nspname,
                c.relname::text                                            AS relname,
-               array_agg(rg.path ORDER BY rg.rg_id)::text[]               AS paths,
+               array_agg(coalesce(rg.cold_url,
+                                  'file://' || rg.path)
+                         ORDER BY rg.rg_id)::text[]                       AS paths,
                pg_relation_size(c.oid)::bigint                            AS heap_bytes,
                coalesce(t.shadow_heap_retained, false)                    AS shadow_heap_retained,
                coalesce(t.shadow_heap_dirty, false)                       AS shadow_heap_dirty,
@@ -371,7 +373,18 @@ fn discover_catalog_scan(asof: Option<i64>) -> Result<BTreeMap<String, RvbbitTab
         if r.paths.is_empty() {
             continue;
         }
-        if !r.paths.iter().all(|p| FsPath::new(p).exists()) {
+        // Filesystem-existence check only makes sense for local (file://)
+        // paths. Remote ObjectStore URLs (s3://, gs://, ...) are checked
+        // by DataFusion at registration time; here we trust the catalog.
+        if !r.paths.iter().all(|p| {
+            if let Some(local) = p.strip_prefix("file://") {
+                FsPath::new(local).exists()
+            } else {
+                // Non-file scheme — assume DataFusion's ObjectStore will
+                // surface any I/O error at registration/scan time.
+                true
+            }
+        }) {
             continue;
         }
         let key = format!("{}.{}", r.schema, r.relname);
@@ -441,11 +454,15 @@ async fn register_tables(
         // directory globbing because the directory may contain transient
         // files from a concurrent compact; the row_groups catalog is the
         // authoritative file set.
+        // Paths in t.paths are now full URLs (file:// for hot rows after
+        // the catalog SQL rewrite; s3:// or other for cold-tier rows when
+        // migrate_to_cold has run). Pass through to ListingTableUrl
+        // unchanged.
         let urls: Vec<ListingTableUrl> = t
             .paths
             .iter()
             .map(|p| {
-                ListingTableUrl::parse(format!("file://{p}"))
+                ListingTableUrl::parse(p)
                     .map_err(|e| format!("ListingTableUrl({p}): {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;

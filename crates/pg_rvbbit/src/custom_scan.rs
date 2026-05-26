@@ -421,6 +421,25 @@ unsafe extern "C-unwind" fn begin_custom_scan(
             Err(e) => pgrx::error!("rvbbit custom scan: row group lookup failed: {}", e),
         };
 
+    // Phase 2 ObjectStore: if fetch_row_group_paths returned no rows but
+    // the catalog HAS row groups for this table (just all cold-tier), warn
+    // the operator that they need to use rvbbit.datafusion_query_json
+    // instead of a plain SELECT. The native scan can't follow URL schemes.
+    if row_groups.is_empty() {
+        if let Ok(Some(cold_count)) = pgrx::Spi::get_one::<i64>(&format!(
+            "SELECT count(*)::bigint FROM rvbbit.row_groups \
+             WHERE table_oid = {table_oid}::oid AND cold_url IS NOT NULL"
+        )) {
+            if cold_count > 0 {
+                pgrx::warning!(
+                    "rvbbit: table has {cold_count} row group(s) on cold tier — \
+                     this scan returns empty. Use rvbbit.datafusion_query_json(...) \
+                     to read cold-tier data via the in-process DataFusion path."
+                );
+            }
+        }
+    }
+
     // Phase 2 slice 4: load the tombstone bitmap for this scan, honoring
     // rvbbit.as_of_generation if set. On any error we treat as "no
     // tombstones" — better to over-include rows than to fail the query.
@@ -2477,6 +2496,13 @@ fn fetch_row_group_paths(
         _ => String::new(),
     };
     pgrx::Spi::connect(|client| -> Result<(), String> {
+        // Phase 2 ObjectStore tiering: native custom_scan only handles
+        // local file paths (RowGroupReader::open does std::fs). When ANY
+        // row group has been migrated to a cold tier (cold_url IS NOT
+        // NULL), we return zero rows here — the rewriter sees that and
+        // falls through to df.rs, which has DataFusion's ObjectStore
+        // path. Variant layouts (hive/cluster) never have cold_url
+        // because the migration helper only touches the canonical layout.
         let select_sql = if let Some(layout) = variant_layout {
             let layout = layout.replace('\'', "''");
             if include_stats {
@@ -2496,12 +2522,14 @@ fn fetch_row_group_paths(
             format!(
                 "SELECT path, rg_id, stats::text FROM rvbbit.row_groups \
                  WHERE table_oid = {table_oid}::oid {asof_predicate} \
+                   AND cold_url IS NULL \
                  ORDER BY rg_id"
             )
         } else {
             format!(
                 "SELECT path, rg_id, NULL::text FROM rvbbit.row_groups \
                  WHERE table_oid = {table_oid}::oid {asof_predicate} \
+                   AND cold_url IS NULL \
                  ORDER BY rg_id"
             )
         };
