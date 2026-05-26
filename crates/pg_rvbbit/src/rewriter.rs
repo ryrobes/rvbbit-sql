@@ -9224,7 +9224,25 @@ fn metadata_rewrites_unsafe_for_correctness() -> bool {
     )
     .ok()
     .flatten();
-    has_tombstones.unwrap_or(false)
+    if has_tombstones.unwrap_or(false) {
+        return true;
+    }
+    // Phase 2 ObjectStore: metadata fast paths read rvbbit.row_groups
+    // stats and per_group_stats columns, then return without scanning
+    // parquet. Those stats are accurate for the LOCAL parquet — but if
+    // the file lives on a cold tier (cold_url IS NOT NULL), the row
+    // group is unreachable via the native scan path anyway, and the
+    // metadata fast path would return stats from a file the operator
+    // intended to be served via the in-process DataFusion route.
+    // Conservative: any cold row group anywhere disables metadata
+    // fast paths. Same one-EXISTS overhead pattern as the tombstone
+    // check above.
+    let has_cold: Option<bool> = pgrx::Spi::get_one(
+        "SELECT EXISTS(SELECT 1 FROM rvbbit.row_groups WHERE cold_url IS NOT NULL)",
+    )
+    .ok()
+    .flatten();
+    has_cold.unwrap_or(false)
 }
 
 fn setting_enabled(value: &str, default: bool) -> bool {

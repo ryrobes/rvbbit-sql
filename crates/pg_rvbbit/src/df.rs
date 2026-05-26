@@ -85,6 +85,10 @@ fn ensure_runtime() {
     });
     CTX.with(|cell| {
         if cell.borrow().is_none() {
+            // The Utf8View-vs-Utf8 forcing happens on the ParquetFormat
+            // we wire up in register_tables, not on the SessionContext.
+            // ParquetFormat doesn't honor SessionConfig for that flag
+            // (verified against DF 53.1's parquet datasource source).
             *cell.borrow_mut() = Some(SessionContext::new());
         }
     });
@@ -466,7 +470,11 @@ async fn register_tables(
                     .map_err(|e| format!("ListingTableUrl({p}): {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let format = Arc::new(ParquetFormat::default());
+        // DataFusion 53 defaults parquet string columns to Utf8View, which
+        // our custom_scan tuple-fill code (StringArray-based) doesn't
+        // accept. ParquetFormat doesn't honor SessionConfig; the option
+        // has to be set on the format directly.
+        let format = Arc::new(ParquetFormat::default().with_force_view_types(false));
         let options = ListingOptions::new(format).with_file_extension(".parquet");
         let schema = options
             .infer_schema(&ctx.state(), &urls[0])
@@ -594,4 +602,68 @@ fn df_inprocess_query(sql: &str, max_rows: default!(i32, 100000)) -> JsonB {
         Ok(v) => JsonB(v),
         Err(e) => pgrx::error!("rvbbit.df_inprocess_query: {e}"),
     }
+}
+
+/// Phase 2 ObjectStore: read a single rvbbit table's full row set as
+/// RecordBatches through the in-process DataFusion path. The custom_scan
+/// node calls this when it sees a table whose row groups have all been
+/// migrated to a cold tier (cold_url IS NOT NULL) and the native local-
+/// file scan therefore returns no row groups — DataFusion reads via its
+/// ObjectStore-aware parquet reader, which the std::fs-based
+/// `RowGroupReader` cannot.
+///
+/// Honors `rvbbit.as_of_generation` (the same catalog discovery that
+/// query_engine uses); rejects tables with relevant tombstones via the
+/// same eligibility logic — operators see a clear error in that
+/// (rare and documented) corner.
+///
+/// Returns RecordBatches with the table's columns in their natural order.
+/// CustomScan's fill_slot_from_batch picks out the projection it needs.
+pub(crate) fn collect_batches_for_table(
+    table_oid: u32,
+) -> Result<Vec<RecordBatch>, String> {
+    let asof = current_asof();
+    let tables = discover_catalog_scan(asof)?;
+    if tables.is_empty() {
+        return Err(format!(
+            "no eligible rvbbit row groups for table oid {table_oid} \
+             (tombstones at <= asof, or no rows visible at the as_of generation)"
+        ));
+    }
+
+    // Resolve the table_oid to its qualified name and confirm the table
+    // is in the eligible catalog. Looking it up via pg_class avoids any
+    // dependency on the ordering DataFusion uses internally.
+    let qualified: String = Spi::get_one::<String>(&format!(
+        "SELECT n.nspname::text || '.' || c.relname::text \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.oid = {table_oid}::oid"
+    ))
+    .map_err(|e| format!("resolve qualified name: {e}"))?
+    .ok_or_else(|| format!("table oid {table_oid} does not exist"))?;
+
+    if !tables.contains_key(&qualified) {
+        return Err(format!(
+            "table {qualified} is not eligible for in-process DataFusion scan \
+             (pending tombstones, dirty heap, or not a rvbbit table)"
+        ));
+    }
+
+    with_rt_ctx(|rt, ctx| {
+        rt.block_on(async {
+            register_tables(ctx, &tables, asof).await?;
+            // Quote schema + table identifiers so case-sensitive names work.
+            // DataFusion accepts standard SQL double-quotes for identifiers.
+            let parts: Vec<&str> = qualified.splitn(2, '.').collect();
+            let sql = if parts.len() == 2 {
+                format!("SELECT * FROM \"{}\".\"{}\"", parts[0], parts[1])
+            } else {
+                format!("SELECT * FROM \"{}\"", qualified)
+            };
+            let df = ctx.sql(&sql).await.map_err(|e| format!("sql plan: {e}"))?;
+            let batches: Vec<RecordBatch> = df.collect().await
+                .map_err(|e| format!("collect: {e}"))?;
+            Ok::<Vec<RecordBatch>, String>(batches)
+        })
+    })
 }

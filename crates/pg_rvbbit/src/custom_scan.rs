@@ -421,24 +421,43 @@ unsafe extern "C-unwind" fn begin_custom_scan(
             Err(e) => pgrx::error!("rvbbit custom scan: row group lookup failed: {}", e),
         };
 
-    // Phase 2 ObjectStore: if fetch_row_group_paths returned no rows but
-    // the catalog HAS row groups for this table (just all cold-tier), warn
-    // the operator that they need to use rvbbit.datafusion_query_json
-    // instead of a plain SELECT. The native scan can't follow URL schemes.
-    if row_groups.is_empty() {
-        if let Ok(Some(cold_count)) = pgrx::Spi::get_one::<i64>(&format!(
+    // Phase 2 ObjectStore: when the local-file fetch above returned empty
+    // but the catalog HAS row groups for this table (just all on the cold
+    // tier, cold_url IS NOT NULL), read them through the in-process
+    // DataFusion path which uses DataFusion's ObjectStore-aware parquet
+    // reader. The result is materialized into RecordBatches now and
+    // emitted later via the standard hot loop (state.current_cached_batches),
+    // so plain SELECT/COUNT/GROUP BY/AS OF all "just work" — vanilla SQL
+    // semantics preserved across the tier boundary.
+    //
+    // The MVP requires the table to be uniformly cold (no row groups
+    // returned above). Mixed-tier (some local, some cold) isn't yet
+    // supported here: we'd need to interleave the two emission paths.
+    // migrate_to_cold migrates the whole table at once, so mixed-tier
+    // can only arise from direct catalog UPDATEs and is documented as
+    // unsupported in the MVP.
+    let cold_cached_batches: Option<Vec<arrow::array::RecordBatch>> = if row_groups.is_empty() {
+        let cold_count: i64 = pgrx::Spi::get_one::<i64>(&format!(
             "SELECT count(*)::bigint FROM rvbbit.row_groups \
              WHERE table_oid = {table_oid}::oid AND cold_url IS NOT NULL"
-        )) {
-            if cold_count > 0 {
-                pgrx::warning!(
-                    "rvbbit: table has {cold_count} row group(s) on cold tier — \
-                     this scan returns empty. Use rvbbit.datafusion_query_json(...) \
-                     to read cold-tier data via the in-process DataFusion path."
-                );
+        ))
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        if cold_count > 0 {
+            match crate::df::collect_batches_for_table(table_oid) {
+                Ok(batches) => Some(batches),
+                Err(e) => pgrx::error!(
+                    "rvbbit: cold-tier read via in-process DataFusion failed: {}",
+                    e
+                ),
             }
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     // Phase 2 slice 4: load the tombstone bitmap for this scan, honoring
     // rvbbit.as_of_generation if set. On any error we treat as "no
@@ -456,7 +475,11 @@ unsafe extern "C-unwind" fn begin_custom_scan(
         rg_idx: 0,
         pruned_row_groups: 0,
         current_reader: None,
-        current_cached_batches: None,
+        // Cold-tier batches (if any) feed the hot loop via the same
+        // current_cached_batches mechanism the rest of the scan uses.
+        // When row_groups is non-empty (hot path), this stays None and
+        // the parquet reader pulls files lazily as before.
+        current_cached_batches: cold_cached_batches,
         current_cached_batch_idx: 0,
         current_cache_key: None,
         current_cache_accum: Vec::new(),
