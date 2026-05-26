@@ -419,57 +419,74 @@ pub(crate) fn scan_numeric_sum_count(
     let mut sum_i128 = Some(0i128);
     let mut count_nonnull = 0i64;
 
+    // Hot loops below take the no-null fast path when null_count() == 0 by
+    // iterating the raw values() slice — autovectorizable. When nulls are
+    // present we fall back to iter().flatten() over the bitmap.
+    macro_rules! fold_int_array {
+        ($a:expr) => {{
+            let a = $a;
+            if a.null_count() == 0 {
+                let (mut acc_i128, mut acc_f64) = (0i128, 0.0f64);
+                for &v in a.values().iter() {
+                    let v64 = v as i64;
+                    acc_i128 += v64 as i128;
+                    acc_f64 += v64 as f64;
+                }
+                sum_f64 += acc_f64;
+                if let Some(s) = &mut sum_i128 {
+                    *s += acc_i128;
+                }
+                count_nonnull += a.len() as i64;
+            } else {
+                for v in a.iter().flatten() {
+                    let v64 = v as i64;
+                    sum_f64 += v64 as f64;
+                    if let Some(s) = &mut sum_i128 {
+                        *s += v64 as i128;
+                    }
+                    count_nonnull += 1;
+                }
+            }
+        }};
+    }
+
     for path in paths {
         let reader = RowGroupReader::open_projected(&path, &[col])?;
         for batch in reader {
             let batch = batch?;
             let array = batch.column(0);
             if let Some(a) = array.as_any().downcast_ref::<Int16Array>() {
-                for row in 0..a.len() {
-                    if !a.is_null(row) {
-                        let v = a.value(row) as i128;
-                        sum_f64 += v as f64;
-                        if let Some(s) = &mut sum_i128 {
-                            *s += v;
-                        }
-                        count_nonnull += 1;
-                    }
-                }
+                fold_int_array!(a);
             } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
-                for row in 0..a.len() {
-                    if !a.is_null(row) {
-                        let v = a.value(row) as i128;
-                        sum_f64 += v as f64;
-                        if let Some(s) = &mut sum_i128 {
-                            *s += v;
-                        }
-                        count_nonnull += 1;
-                    }
-                }
+                fold_int_array!(a);
             } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
-                for row in 0..a.len() {
-                    if !a.is_null(row) {
-                        let v = a.value(row) as i128;
-                        sum_f64 += v as f64;
-                        if let Some(s) = &mut sum_i128 {
-                            *s += v;
-                        }
-                        count_nonnull += 1;
-                    }
-                }
+                fold_int_array!(a);
             } else if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
                 sum_i128 = None;
-                for row in 0..a.len() {
-                    if !a.is_null(row) {
-                        sum_f64 += a.value(row) as f64;
+                if a.null_count() == 0 {
+                    let mut acc = 0.0f64;
+                    for &v in a.values().iter() {
+                        acc += v as f64;
+                    }
+                    sum_f64 += acc;
+                    count_nonnull += a.len() as i64;
+                } else {
+                    for v in a.iter().flatten() {
+                        sum_f64 += v as f64;
                         count_nonnull += 1;
                     }
                 }
             } else if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
                 sum_i128 = None;
-                for row in 0..a.len() {
-                    if !a.is_null(row) {
-                        sum_f64 += a.value(row);
+                if a.null_count() == 0 {
+                    // Use arrow::compute::sum — SIMD-optimized for f64 without nulls.
+                    if let Some(s) = arrow::compute::sum(a) {
+                        sum_f64 += s;
+                    }
+                    count_nonnull += a.len() as i64;
+                } else {
+                    for v in a.iter().flatten() {
+                        sum_f64 += v;
                         count_nonnull += 1;
                     }
                 }
@@ -1139,43 +1156,37 @@ fn top_count_1col(
                         format!("rvbbit.top_count_1col: mixed column type for '{col}'").into(),
                     );
                 };
-                for row in 0..a.len() {
-                    if a.is_null(row) {
-                        if !skip_empty {
-                            *map.entry(None).or_insert(0) += 1;
+                // Fast path: no nulls. Iterate the raw value indices and
+                // skip the per-row bitmap check that dominated the loop.
+                if a.null_count() == 0 {
+                    for row in 0..a.len() {
+                        let value = a.value(row);
+                        if skip_empty && value.is_empty() {
+                            continue;
                         }
-                        continue;
+                        *map.entry(Some(value.to_string())).or_insert(0) += 1;
                     }
-                    let value = a.value(row);
-                    if skip_empty && value.is_empty() {
-                        continue;
+                } else {
+                    for row in 0..a.len() {
+                        if a.is_null(row) {
+                            if !skip_empty {
+                                *map.entry(None).or_insert(0) += 1;
+                            }
+                            continue;
+                        }
+                        let value = a.value(row);
+                        if skip_empty && value.is_empty() {
+                            continue;
+                        }
+                        *map.entry(Some(value.to_string())).or_insert(0) += 1;
                     }
-                    *map.entry(Some(value.to_string())).or_insert(0) += 1;
                 }
             } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
-                count_i64_values(col, skip_empty, &mut counts, a.len(), |row| {
-                    if a.is_null(row) {
-                        None
-                    } else {
-                        Some(a.value(row))
-                    }
-                })?;
+                count_i64_values_arr(col, skip_empty, &mut counts, a.values(), |row| a.is_null(row), a.null_count() == 0)?;
             } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
-                count_i64_values(col, skip_empty, &mut counts, a.len(), |row| {
-                    if a.is_null(row) {
-                        None
-                    } else {
-                        Some(a.value(row) as i64)
-                    }
-                })?;
+                count_i64_values_arr(col, skip_empty, &mut counts, a.values(), |row| a.is_null(row), a.null_count() == 0)?;
             } else if let Some(a) = array.as_any().downcast_ref::<Int16Array>() {
-                count_i64_values(col, skip_empty, &mut counts, a.len(), |row| {
-                    if a.is_null(row) {
-                        None
-                    } else {
-                        Some(a.value(row) as i64)
-                    }
-                })?;
+                count_i64_values_arr(col, skip_empty, &mut counts, a.values(), |row| a.is_null(row), a.null_count() == 0)?;
             } else {
                 return Err(format!(
                     "rvbbit.top_count_1col: column '{}' has unsupported type {:?}",
@@ -1236,6 +1247,25 @@ fn count_distinct_int(rel: pg_sys::Oid, col: &str) -> Result<i64, Box<dyn std::e
     let paths = lookup_paths_for_oid(rel.to_u32())?;
     let mut values = HashSet::default();
 
+    // Fast path when null_count == 0 iterates the values() slice directly,
+    // avoiding the per-row is_null bitmap check. With nulls present we use
+    // iter().flatten() which fuses null skipping into a single branch.
+    macro_rules! insert_int_distinct {
+        ($a:expr) => {{
+            let a = $a;
+            if a.null_count() == 0 {
+                values.reserve(a.len());
+                for &v in a.values().iter() {
+                    values.insert(v as i64);
+                }
+            } else {
+                for v in a.iter().flatten() {
+                    values.insert(v as i64);
+                }
+            }
+        }};
+    }
+
     for path in paths {
         let reader = RowGroupReader::open_projected(&path, &[col])?;
         for batch in reader {
@@ -1244,23 +1274,11 @@ fn count_distinct_int(rel: pg_sys::Oid, col: &str) -> Result<i64, Box<dyn std::e
             let col_idx = schema.index_of(col)?;
             let array = batch.column(col_idx);
             if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
-                for row in 0..a.len() {
-                    if !a.is_null(row) {
-                        values.insert(a.value(row));
-                    }
-                }
+                insert_int_distinct!(a);
             } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
-                for row in 0..a.len() {
-                    if !a.is_null(row) {
-                        values.insert(a.value(row) as i64);
-                    }
-                }
+                insert_int_distinct!(a);
             } else if let Some(a) = array.as_any().downcast_ref::<Int16Array>() {
-                for row in 0..a.len() {
-                    if !a.is_null(row) {
-                        values.insert(a.value(row) as i64);
-                    }
-                }
+                insert_int_distinct!(a);
             } else {
                 return Err(format!(
                     "rvbbit.count_distinct_int: column '{}' has unsupported type {:?}",
@@ -4193,15 +4211,19 @@ fn update_min_string(slot: &mut Option<String>, value: &str) {
     }
 }
 
-fn count_i64_values<F>(
+/// Used by `top_count_1col`'s int branches. Takes the Arrow values slice
+/// directly with a no-nulls fast path.
+fn count_i64_values_arr<T, F>(
     col: &str,
     skip_empty: bool,
     counts: &mut Option<Counts>,
-    len: usize,
-    mut value_at: F,
+    values: &[T],
+    is_null: F,
+    no_nulls: bool,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: FnMut(usize) -> Option<i64>,
+    T: Copy + Into<i64>,
+    F: Fn(usize) -> bool,
 {
     if counts.is_none() {
         *counts = Some(Counts::Int(HashMap::default(), 0));
@@ -4209,11 +4231,19 @@ where
     let Some(Counts::Int(map, null_count)) = counts.as_mut() else {
         return Err(format!("rvbbit.top_count_1col: mixed column type for '{col}'").into());
     };
-    for row in 0..len {
-        match value_at(row) {
-            Some(value) => *map.entry(value).or_insert(0) += 1,
-            None if !skip_empty => *null_count += 1,
-            None => {}
+    if no_nulls {
+        for &v in values.iter() {
+            *map.entry(v.into()).or_insert(0) += 1;
+        }
+    } else {
+        for (row, &v) in values.iter().enumerate() {
+            if is_null(row) {
+                if !skip_empty {
+                    *null_count += 1;
+                }
+            } else {
+                *map.entry(v.into()).or_insert(0) += 1;
+            }
         }
     }
     Ok(())

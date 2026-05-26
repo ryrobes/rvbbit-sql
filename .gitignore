@@ -12,3 +12,7 @@ __pycache__/
 *.pyc
 dist/
 bench/columnar_comparison/data/hits.parquet
+bench/**/*.parquet
+bench/**/*.db
+bench/**/_SUCCESS
+test_runs

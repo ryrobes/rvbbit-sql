@@ -197,10 +197,13 @@ struct RustScanState {
     current_rg_id: i64,
 }
 
-/// (attnum_idx, reader). attnum_idx is 0-based into pg_attrs.
+/// (attnum_idx, reader, has_nulls). attnum_idx is 0-based into pg_attrs.
+/// `has_nulls` is computed once when the batch is loaded so the per-row
+/// hot loop can skip the validity bitmap check on dense columns.
 struct NeededColumn {
     attnum_idx: usize,
     reader: ColumnReader,
+    has_nulls: bool,
 }
 
 /// Typed read into the currently-active Arrow batch.
@@ -1807,15 +1810,18 @@ unsafe fn build_column_readers_for_batch(
                 out.push(NeededColumn {
                     attnum_idx: col_idx,
                     reader: ColumnReader::Missing,
+                    has_nulls: true,
                 });
                 continue;
             }
         };
         let array = batch.column(arrow_col_idx);
         let reader = make_reader_for(array, attr);
+        let has_nulls = array.null_count() != 0;
         out.push(NeededColumn {
             attnum_idx: col_idx,
             reader,
+            has_nulls,
         });
     }
     out
@@ -2622,6 +2628,7 @@ fn parse_prune_stats(stats_text: Option<&str>) -> HashMap<String, PruneStats> {
 const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
 const PG_EPOCH_OFFSET_DAYS: i32 = 10_957;
 
+#[inline(always)]
 unsafe fn fill_slot_from_batch(
     slot: *mut pg_sys::TupleTableSlot,
     row: usize,
@@ -2632,7 +2639,7 @@ unsafe fn fill_slot_from_batch(
 
     for col in column_readers {
         let col_idx = col.attnum_idx;
-        let (datum, was_null) = read_via(&col.reader, row);
+        let (datum, was_null) = read_via(&col.reader, row, col.has_nulls);
         *values.add(col_idx) = datum;
         *nulls.add(col_idx) = was_null;
     }
@@ -2650,12 +2657,22 @@ unsafe fn initialize_slot_nulls(slot: *mut pg_sys::TupleTableSlot, n_attrs: usiz
 /// Resolve one cell of the current batch. Pointer dispatch is the only
 /// per-row cost — no Arc<dyn Array> downcast, no schema lookup, no
 /// branchy type matching against an Arrow DataType enum.
-unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
+///
+/// `has_nulls` is precomputed once per batch by the caller; when false,
+/// the per-row `is_null` bitmap probe is skipped. For column groups with
+/// no nulls (the common case for dense columns) this removes one branch
+/// and one bitmap load per cell.
+#[inline(always)]
+unsafe fn read_via(
+    reader: &ColumnReader,
+    row: usize,
+    has_nulls: bool,
+) -> (pg_sys::Datum, bool) {
     match reader {
         ColumnReader::Missing => (pg_sys::Datum::from(0usize), true),
         ColumnReader::Int16(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 (pg_sys::Datum::from(0usize), true)
             } else {
                 (pg_sys::Datum::from(a.value(row) as i64 as usize), false)
@@ -2663,7 +2680,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::Int32(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 (pg_sys::Datum::from(0usize), true)
             } else {
                 (pg_sys::Datum::from(a.value(row) as i64 as usize), false)
@@ -2671,7 +2688,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::Date32(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 (pg_sys::Datum::from(0usize), true)
             } else {
                 let pg_date = a.value(row) - PG_EPOCH_OFFSET_DAYS;
@@ -2680,7 +2697,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::Date32Int32(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 (pg_sys::Datum::from(0usize), true)
             } else {
                 let pg_date = a.value(row) - PG_EPOCH_OFFSET_DAYS;
@@ -2689,7 +2706,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::Int64(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 (pg_sys::Datum::from(0usize), true)
             } else {
                 (pg_sys::Datum::from(a.value(row) as usize), false)
@@ -2697,7 +2714,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::Float32(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 (pg_sys::Datum::from(0usize), true)
             } else {
                 (pg_sys::Datum::from(a.value(row).to_bits() as usize), false)
@@ -2705,7 +2722,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::Float64(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 (pg_sys::Datum::from(0usize), true)
             } else {
                 (pg_sys::Datum::from(a.value(row).to_bits() as usize), false)
@@ -2713,7 +2730,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::Bool(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 (pg_sys::Datum::from(0usize), true)
             } else {
                 (pg_sys::Datum::from(a.value(row) as usize), false)
@@ -2721,7 +2738,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::Utf8 { arr, is_jsonb } => {
             let a = &**arr;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 return (pg_sys::Datum::from(0usize), true);
             }
             let s = a.value(row);
@@ -2747,7 +2764,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::Binary(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 return (pg_sys::Datum::from(0usize), true);
             }
             let bytes = a.value(row);
@@ -2759,7 +2776,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::TimestampMicros(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 (pg_sys::Datum::from(0usize), true)
             } else {
                 let pg_ts = a.value(row) - PG_EPOCH_OFFSET_MICROS;
@@ -2768,7 +2785,7 @@ unsafe fn read_via(reader: &ColumnReader, row: usize) -> (pg_sys::Datum, bool) {
         }
         ColumnReader::F32List(p) => {
             let a = &**p;
-            if a.is_null(row) {
+            if has_nulls && a.is_null(row) {
                 return (pg_sys::Datum::from(0usize), true);
             }
             // Slice this row out of the flat values array.
