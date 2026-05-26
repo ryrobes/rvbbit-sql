@@ -95,7 +95,7 @@ services:
       # for the full list of supported keys.
       RVBBIT_PARQUET_V2: ${RVBBIT_PARQUET_V2:-on}
       RVBBIT_PARQUET_BLOOM: ${RVBBIT_PARQUET_BLOOM:-on}
-      RVBBIT_PARQUET_PAGE_ROWS: ${RVBBIT_PARQUET_PAGE_ROWS:-250000}
+      RVBBIT_PARQUET_PAGE_ROWS: ${RVBBIT_PARQUET_PAGE_ROWS:-5000}
       # Extend bloom filters to numeric / temporal columns too. Off by
       # default (text-only is the cheap-safe setting); flip on for
       # workloads heavy in point-equality queries on integer/date cols.
@@ -106,7 +106,7 @@ services:
       # (path, mtime, projection)). LRU eviction; per-backend, so total
       # memory across the cluster is roughly N_backends × this size.
       # Default 1024 MiB fits a 200k-row ClickBench hits table whole.
-      RVBBIT_SCAN_BATCH_CACHE_MB: ${RVBBIT_SCAN_BATCH_CACHE_MB:-1024}
+      RVBBIT_SCAN_BATCH_CACHE_MB: ${RVBBIT_SCAN_BATCH_CACHE_MB:-2048}
     ports:
       - "55433:5432"
     volumes:
