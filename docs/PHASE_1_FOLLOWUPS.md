@@ -49,25 +49,17 @@ When AS OF IS set, the existing code already skips the eligibility
 check. The fix for the unset case is symmetrical: also skip the
 deletes-block, but load tombstones into the catalog/registration step.
 
-### 1. DataFusion 49 → 53 bump
+### 1. DataFusion 49 → 53 bump — LANDED
 
-The rvbbit-duck sidecar uses DataFusion 53 (its own workspace pin); we
-embed 49 because the rvbbit workspace pins `arrow = 55` and DF 53 needs
-arrow 58. Bumping pg_rvbbit's DataFusion alone is impossible without a
-cascading arrow bump across:
+Commit c4e4502. Took under an hour wall-time and ZERO code changes —
+only Cargo.toml version pins + one feature add (`sql`). Our use of
+Arrow/parquet/DataFusion is conservative enough that the API changes
+across versions didn't touch our surface.
 
-- `crates/rvbbit_storage` (row_group writer, metadata, HLL serialization)
-- `crates/pg_rvbbit/src/compact.rs` (arrow schema construction in
-  `export_to_parquet`, type oid mappings)
-- `crates/pg_rvbbit/src/scan.rs` (hand-rolled arrow kernels)
-- `crates/pg_rvbbit/src/sketches.rs`, `bitmap.rs`, `row_group.rs`
-
-Worth it: closes the engine-quality gap on heavy 1M+ queries where the
-sidecar persistent path still has a slight edge, plus picks up
-~6 minor releases of DataFusion query-planner improvements.
-
-Estimated effort: 1-2 days. Should be its own branch with a clean
-arrow-58 commit and the DF bump on top.
+Aligns pg_rvbbit with the rvbbit_duck sidecar (which already used DF
+53.1.0 + parquet 58.3.0). In-process DataFusion now wins or ties every
+query vs persistent sidecar at 1M with 5 row groups (1.26x-1.60x wins,
+including flipping the previous lone Q2 loss into a 60% win).
 
 ### 2. Hive/cluster layout support in `query_engine`
 
