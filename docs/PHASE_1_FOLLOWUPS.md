@@ -25,30 +25,34 @@ direct SQL functions exercise the read+write+KNN paths. Verified
 KNN at 629µs/query on a 1000×16 demo dataset.
 
 Operator-explicit path landed in commit f854e72:
-- rvbbit.lance_import_column(reloid, pk, vec, dim, path) exports a
-  vector column to a Lance dataset
-- rvbbit.lance_build_index(path, column, num_partitions, num_sub_vectors)
-  creates an IVF-PQ index on the dataset
-- rvbbit.lance_knn(path, query, k) queries (already shipped in the
-  substrate commit)
-- 12.8x speedup over brute force on 100k x 128-dim (2.3 ms vs 29.5 ms
-  per query). Bigger gap at higher scales.
+- rvbbit.lance_import_column / lance_build_index / lance_knn —
+  operator manages paths
+- 12.8x speedup over brute force on 100k x 128-dim
 
-Still pending (the transparent-integration slices that build on this):
-1. lance_url column on rvbbit.row_groups, mirroring cold_url. Vector
-   columns of an rvbbit table live in a sibling Lance dataset; scalar
-   columns stay in parquet.
-2. compact() detects vector-typed columns (real[], or a registered
-   embedding marker) and writes them to Lance alongside the parquet
-   row group.
-3. Read-path integration: when a query touches a vector column,
-   join parquet + lance per row group. DataFusion can do this if we
-   register both as separate ListingTables and the query has an
-   identifying key column. (Or: a custom TableProvider that maps
-   row-group ordinal across the two.)
-4. knn_text auto-routing: when the table has a Lance-indexed embedding
-   column, rvbbit.knn_text rewrites to a Lance vector search instead
-   of brute-force parquet scan.
+Catalog-driven path landed in commit b2e4594:
+- lance_url + lance_vector_column + lance_dim columns on
+  rvbbit.tables
+- rvbbit.lance_enable(reloid, vec_col, dim, url) — opt a table in
+- rvbbit.knn(reloid, query, k) — looks up the URL from the catalog
+- compact() auto-refresh hook ready (fires when Lance is enabled
+  for the table — though today compact errors on real[] before it
+  gets there)
+
+Still pending — the harder slices that require compact() to handle
+real[] columns:
+1. plan_for_pg_type in compact.rs needs a case for oid 1021 (real[])
+   that converts to Arrow FixedSizeList<Float32; dim>. Requires Arrow
+   list-builder integration in compact.rs's SPI-row loop AND for the
+   custom_scan to know how to read FixedSizeList from parquet back
+   to PG real[] datum. Two-sided change.
+2. Once that lands, compact() works on vector tables and the auto-
+   refresh hook in compact ships automatically.
+3. knn_text auto-routing: when the rvbbit operator pipeline calls
+   knn_text, rewrite to use Lance when the table has lance_url set.
+   Independent of #1; rewriter-level.
+4. Per-row-group lance_url (mirroring cold_url) instead of per-table
+   — would let some row groups be Lance-indexed and others not.
+   Operationally similar to mixed-tier in ObjectStore.
 
 ### A. Rewriter has metadata-only fast paths that bypass tombstones + AS OF
 
