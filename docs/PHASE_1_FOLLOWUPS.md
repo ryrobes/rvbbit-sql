@@ -108,15 +108,23 @@ queries (Q28 regex in ClickBench, Q20-Q26 LIKE/ORDER BY).
 Estimated effort: 1 week. Touches the custom_scan exec hook in a
 load-bearing way.
 
-### 5. ObjectStore tiered storage
+### 5. ObjectStore tiered storage — LANDED (file:// MVP)
 
-DataFusion exposes the `ObjectStore` trait so cold row groups can live in
-S3/GCS while hot stays on local NVMe. Per-table or per-row-group policy
-via a new `rvbbit.tables` column. Pairs well with Phase 2 generation
-tracking (cold tier = old generation).
+Commit 3f1e30f. Per-row-group tier: rvbbit.row_groups.cold_url IS NULL
+= local hot, non-NULL = ObjectStore URL. rvbbit.migrate_to_cold(reloid,
+cold_url_prefix) copies + relabels each row group. df.rs uses the
+URL-prefixed paths uniformly via ListingTableUrl. custom_scan rejects
+cold rows + emits a helpful WARNING pointing operators at
+rvbbit.datafusion_query_json.
 
-Estimated effort: 1 week (S3 client wiring, IAM story, eviction policy,
-tests).
+MVP supports file:// only (single-machine demo). s3:// + gs:// land
+when we add credential helpers — the URL-based plumbing is already
+ObjectStore-scheme-agnostic.
+
+Known limitation: plain SELECT * on cold-tier tables returns empty
+(operator gets WARNING pointing to datafusion_query_json). Auto-
+routing plain SELECTs to the df.rs ObjectStore path requires planner-
+level work — separate followup. Doesn't block Lance.
 
 ### 6. Generation tracking primitive — LANDED
 
