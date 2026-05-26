@@ -47,6 +47,10 @@ fastembed = { version = "5.13.4", default-features = false, features = ["hf-hub-
 # what gates SessionContext::sql() in DF 53+ (was implicit in DF 49).
 datafusion = { version = "53", default-features = false, features = ["parquet", "sql"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
+# Lance dataset format: DataFusion-native columnar format with native vector
+# index support (IVF-PQ, HNSW). Pinned to the release line that pulls
+# datafusion 53 + arrow 58 + parquet 58, exactly matching our workspace.
+lance = "6"
 
 [profile.release]
 lto = "thin"

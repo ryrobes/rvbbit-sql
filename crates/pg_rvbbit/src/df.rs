@@ -107,6 +107,20 @@ fn with_rt_ctx<R>(f: impl FnOnce(&Runtime, &SessionContext) -> R) -> R {
     })
 }
 
+/// Expose the per-backend tokio Runtime to other modules that need
+/// async (e.g. Lance dataset operations) without forcing them to also
+/// build a DataFusion SessionContext. The Runtime is shared across
+/// every async caller in this backend, so they all see the same task
+/// queue and there's only one tokio thread pool per PG backend.
+pub(crate) fn with_lance_runtime<R>(f: impl FnOnce(&Runtime) -> R) -> R {
+    ensure_runtime();
+    RT.with(|rt_cell| {
+        let rt_ref = rt_cell.borrow();
+        let rt = rt_ref.as_ref().expect("runtime initialized");
+        f(rt)
+    })
+}
+
 fn run_sql_to_text(path: &str, sql: &str) -> Result<Vec<String>, String> {
     with_rt_ctx(|rt, ctx| {
         rt.block_on(async {
