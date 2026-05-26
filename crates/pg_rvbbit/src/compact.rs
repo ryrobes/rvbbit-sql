@@ -695,6 +695,28 @@ fn export_to_parquet(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>
     ))?
     .unwrap_or(0);
 
+    // Phase 2 generation allocation. The advisory_xact_lock is per-table:
+    // class id 0x52564254 (ASCII "RVBT") + table_oid packed into one bigint,
+    // so two concurrent compacts on the SAME table serialize but two on
+    // DIFFERENT tables proceed in parallel. UPDATE...RETURNING gives us the
+    // value BEFORE the increment, which is the generation we stamp on this
+    // compaction's row groups.
+    let generation: i64 = Spi::get_one(&format!(
+        "WITH locked AS (
+             SELECT pg_advisory_xact_lock(
+                 ((1380336724::bigint) << 32) | {rel_oid}::bigint
+             ) AS x
+         ),
+         bumped AS (
+             UPDATE rvbbit.tables
+                SET next_generation = next_generation + 1
+              WHERE table_oid = {rel_oid}::oid
+            RETURNING next_generation - 1 AS g
+         )
+         SELECT g FROM bumped, locked"
+    ))?
+    .unwrap_or(1);
+
     let mut plans = introspect_columns(rel_oid)?;
     extend_plans_with_legacy_shreds(&mut plans);
 
@@ -718,7 +740,7 @@ fn export_to_parquet(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>
         scan_chunk_rows,
         &[],
     )?;
-    register_primary_chunks(rel_oid, &chunks)?;
+    register_primary_chunks(rel_oid, &chunks, generation)?;
 
     let mut total_rows: i64 = 0;
     for meta in &chunks {
@@ -1107,14 +1129,16 @@ fn escaped_row_group_json(
 fn register_primary_chunks(
     rel_oid: u32,
     chunks: &[rvbbit_storage::metadata::RowGroupMeta],
+    generation: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for meta in chunks {
         let (stats_escaped, per_group_escaped) = escaped_row_group_json(meta)?;
         let path_str = meta.path.replace('\'', "''");
         Spi::run(&format!(
             "INSERT INTO rvbbit.row_groups \
-             (table_oid, rg_id, path, n_rows, n_bytes, stats, per_group_stats) \
+             (table_oid, rg_id, path, n_rows, n_bytes, generation, stats, per_group_stats) \
              VALUES ({rel_oid}::oid, {rg_id}, '{path_str}', {n_rows_meta}, {n_bytes}, \
+                     {generation}, \
                      $rvbbit${stats_escaped}$rvbbit$::jsonb, \
                      $rvbbit${per_group_escaped}$rvbbit$::jsonb)",
             rg_id = meta.rg_id,

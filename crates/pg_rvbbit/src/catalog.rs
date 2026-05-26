@@ -21,6 +21,11 @@ CREATE TABLE rvbbit.tables (
     data_dir        text,                 -- NULL until Phase 2
     shadow_heap_retained boolean NOT NULL DEFAULT false,
     shadow_heap_dirty boolean NOT NULL DEFAULT false,
+    -- Phase 2: monotonic per-table compaction generation. Each compact()
+    -- call atomically increments this and stamps every row group it writes
+    -- with the OLD value. Reads see the latest generation by default;
+    -- AS OF queries (future) can narrow to `generation <= asof`.
+    next_generation bigint NOT NULL DEFAULT 1,
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
@@ -32,6 +37,11 @@ CREATE TABLE rvbbit.row_groups (
     n_bytes         bigint NOT NULL,
     min_xid         xid8,
     max_xid         xid8,
+    -- Phase 2 generation stamp. Default 0 covers pre-Phase-2 row groups
+    -- that pre-date the column; new compactions allocate a real value
+    -- (>= 1) under a per-table advisory lock so two concurrent compacts
+    -- can never collide.
+    generation      bigint NOT NULL DEFAULT 0,
     stats           jsonb,
     -- Per-group aggregate blocks for low-cardinality columns. Powers
     -- GROUP BY pushdown — see rvbbit.agg_groupby_*. NULL when no
@@ -40,6 +50,18 @@ CREATE TABLE rvbbit.row_groups (
     created_at      timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (table_oid, rg_id)
 );
+
+CREATE INDEX row_groups_table_generation_idx
+    ON rvbbit.row_groups (table_oid, generation);
+
+-- The latest generation present in row_groups for a table. Returns 0 when
+-- nothing has been compacted yet (matches the row_groups column default).
+CREATE OR REPLACE FUNCTION rvbbit.current_generation(reloid regclass)
+RETURNS bigint LANGUAGE sql STABLE AS $$
+    SELECT coalesce(max(generation), 0)::bigint
+    FROM rvbbit.row_groups
+    WHERE table_oid = reloid
+$$;
 
 -- Optional physical copies of the same compacted rows, with a different
 -- layout. `row_groups` remains the canonical scan layout consumed by older

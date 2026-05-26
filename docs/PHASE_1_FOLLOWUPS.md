@@ -94,20 +94,47 @@ tracking (cold tier = old generation).
 Estimated effort: 1 week (S3 client wiring, IAM story, eviction policy,
 tests).
 
-### 6. Generation tracking primitive
+### 6. Generation tracking primitive — LANDED
 
-Originally part of the Phase 1 scope (task #15), deferred because it's
-independent of the DataFusion in-process work. Sets up Phase 2 time
-travel (`AS OF`). Plumbing only:
+Landed as Phase 2's first slice. See `catalog.rs` (`next_generation` on
+`rvbbit.tables`, `generation` on `rvbbit.row_groups`, `current_generation`
+SQL function), `compact.rs::export_to_parquet` (advisory-lock-protected
+increment + plumb to `register_primary_chunks`). Verified end-to-end:
+each compact() call atomically allocates a monotonic generation; old row
+groups keep theirs; `current_generation()` returns the max.
 
-- `generation BIGINT NOT NULL DEFAULT 0` column on `rvbbit.row_groups`.
-- Per-table sequence (or advisory-lock counter) to monotonically
-  increment on each `compact()` call.
-- Wire through `compact.rs` to assign at row-group write time.
-- Expose `rvbbit.current_generation(reloid regclass)`.
-- Don't use for routing yet — that's Phase 2.
+### 7. Compact ignores new heap rows when parquet is authoritative
 
-Estimated effort: half a day.
+Discovered while writing the generation tracking probe. Reproducer:
+
+```sql
+CREATE TABLE t (id bigserial, label text) USING rvbbit;
+INSERT INTO t (label) SELECT 'a' FROM generate_series(1,100);
+SELECT rvbbit.compact('t'::regclass);  -- parquet has 100 'a' (correct)
+INSERT INTO t (label) SELECT 'b' FROM generate_series(1,100);
+SELECT rvbbit.compact('t'::regclass);
+-- second compact's parquet has 100 'a' again — the 'b' rows were
+-- silently dropped from the heap during truncation
+```
+
+Root cause: `compact()` reads rows via `SELECT * FROM {qualified}` through
+SPI. That goes through the rewriter, which redirects authoritative-parquet
+reads to the custom scan, which reads parquet only (not heap). So the
+second compact sees the existing parquet contents and re-writes them as
+a new row group, then truncates the heap, losing the new INSERTs.
+
+This is a load-bearing bug for Phase 2 AS OF semantics: time travel
+across generations needs each generation to reflect the actual delta
+since the previous one, not a re-write of the prior snapshot.
+
+Fix sketch: `export_to_parquet` should read directly from the heap
+(`SELECT * FROM <table> WHERE ctid IS NOT NULL` against the underlying
+heap, bypassing the rewriter — or use SPI with a GUC that suppresses the
+rewriter) and only emit row groups for those rows. Subsequent compacts
+would then produce true incremental row groups.
+
+Estimated effort: 1 day, including a regression test that catches this
+pattern.
 
 ## Bench results that motivated some of these
 
