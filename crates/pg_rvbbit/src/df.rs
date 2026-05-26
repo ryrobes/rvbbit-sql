@@ -13,7 +13,7 @@
 //! catalog access is essentially free.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::time::Instant;
@@ -43,6 +43,12 @@ const PROBE_TABLE: &str = "t";
 thread_local! {
     static RT: RefCell<Option<Runtime>> = const { RefCell::new(None) };
     static CTX: RefCell<Option<SessionContext>> = const { RefCell::new(None) };
+    // Phase 1 hot-path optimization: remember which qualified-name we've
+    // already registered with what file-set signature, so we can skip the
+    // deregister + infer_schema + register round-trip when the catalog
+    // hasn't changed between queries. Signature changes the moment a
+    // compact() rewrites the file list.
+    static REG_CACHE: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
 }
 
 // Number of worker threads for the per-backend tokio runtime. 0 = use a
@@ -329,15 +335,48 @@ fn discover_catalog_scan() -> Result<BTreeMap<String, RvbbitTable>, String> {
     Ok(out)
 }
 
+/// Fingerprint a table's catalog state for the registration cache. Any
+/// change in path list, order, or mtime/size of any file changes the
+/// signature — so a compact() between queries is reflected on the next
+/// call. mtime is cheap (one stat() per file) and catches the case where
+/// the file was rewritten in place under the same name.
+fn table_signature(t: &RvbbitTable) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    t.paths.len().hash(&mut h);
+    for p in &t.paths {
+        p.hash(&mut h);
+        if let Ok(meta) = std::fs::metadata(p) {
+            meta.len().hash(&mut h);
+            if let Ok(mtime) = meta.modified() {
+                if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    d.as_nanos().hash(&mut h);
+                }
+            }
+        }
+    }
+    h.finish()
+}
+
 /// Register each eligible table with the per-backend SessionContext as a
-/// ListingTable backed by its parquet file list. Idempotent: existing
-/// registrations are dropped and recreated so a compact() between calls is
-/// reflected on the next query.
+/// ListingTable backed by its parquet file list. Skips the dance entirely
+/// when the table's signature matches the one we registered last time —
+/// hot-path optimization, falls back to the full register on any signature
+/// change.
 async fn register_tables(
     ctx: &SessionContext,
     tables: &BTreeMap<String, RvbbitTable>,
 ) -> Result<(), String> {
     for (qualified, t) in tables {
+        let sig = table_signature(t);
+        let cached_sig = REG_CACHE.with(|c| c.borrow().get(qualified).copied());
+        if cached_sig == Some(sig) {
+            // File set hasn't changed since we last registered — DataFusion
+            // still has the table provider; skip the round-trip.
+            continue;
+        }
+
         let _ = ctx.deregister_table(qualified);
 
         // ListingTable with the explicit list of parquet files. We avoid
@@ -365,6 +404,8 @@ async fn register_tables(
             .map_err(|e| format!("ListingTable::try_new({}): {e}", t.qualified()))?;
         ctx.register_table(qualified.as_str(), Arc::new(table))
             .map_err(|e| format!("register_table({qualified}): {e}"))?;
+
+        REG_CACHE.with(|c| c.borrow_mut().insert(qualified.clone(), sig));
     }
     Ok(())
 }

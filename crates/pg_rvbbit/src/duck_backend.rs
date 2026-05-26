@@ -134,12 +134,14 @@ pub(crate) fn fail_open_enabled() -> bool {
 
 /// Phase 1: when on, the `datafusion` engine routes through the in-process
 /// DataFusion in `crate::df` instead of forking the rvbbit-duck sidecar.
-/// Default off so the system behaves identically until an operator opts in.
-/// On any in-process error we transparently fall back to the sidecar path.
+/// Default **on** as of the post-bench flip — measured wins or ties on
+/// every query at both 100k and (multi-row-group) 1M scale, with safe
+/// transparent fallback to the sidecar on any in-process error.
+/// Disable with `SET rvbbit.df_inprocess = off` for explicit A/B.
 fn df_inprocess_enabled() -> bool {
     guc_setting("rvbbit.df_inprocess")
-        .map(|value| setting_enabled(&value, false))
-        .unwrap_or_else(|| env_enabled("RVBBIT_DF_INPROCESS", false))
+        .map(|value| setting_enabled(&value, true))
+        .unwrap_or_else(|| env_enabled("RVBBIT_DF_INPROCESS", true))
 }
 
 fn env_enabled(name: &str, default: bool) -> bool {
