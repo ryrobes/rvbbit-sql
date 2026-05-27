@@ -42,6 +42,7 @@ use crate::vector::{self, key_value_to_text, AggSpec, AggValue, FilterSpec, KeyS
 
 const CLUSTER_LAYOUT_PREFIX: &str = "cluster:";
 const BITMAP_TOP_COUNT_MAX_KEY_PRODUCT: usize = 250_000;
+const NATIVE_ROW_GROUP_THREADS_MAX: usize = 8;
 
 thread_local! {
     static GROUP_COUNT_CACHE: RefCell<HashMap<GroupCountCacheKey, HashMap<Option<String>, i64>>> =
@@ -83,7 +84,50 @@ struct IndexedTextDictionaryPath {
     n_bytes: i64,
 }
 
+#[derive(Debug)]
+enum DictionaryCountError {
+    Invalid(&'static str),
+    Read(String),
+    WorkerPanic(&'static str),
+}
+
+impl std::fmt::Display for DictionaryCountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) | Self::WorkerPanic(message) => f.write_str(message),
+            Self::Read(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for DictionaryCountError {}
+
+fn dictionary_count_result<T>(
+    result: Result<T, DictionaryCountError>,
+) -> Result<Option<T>, Box<dyn std::error::Error>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(DictionaryCountError::Invalid(_)) => Ok(None),
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
 // --- Helpers ----------------------------------------------------------------
+
+fn native_row_group_threads(work_items: usize) -> usize {
+    if work_items <= 1 {
+        return 1;
+    }
+    let threads = std::env::var("RVBBIT_NATIVE_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(NATIVE_ROW_GROUP_THREADS_MAX))
+                .unwrap_or(4)
+        });
+    threads.clamp(1, work_items)
+}
 
 fn lookup_path(rel: pg_sys::Oid, rg_id: i64) -> Result<PathBuf, String> {
     let rel_oid = rel.to_u32();
@@ -1674,6 +1718,276 @@ fn top_count2_rows_from_counts(
     rows
 }
 
+fn load_text_dictionaries_for_row_groups(
+    rel_oid: u32,
+    col: &str,
+    row_groups: &[IndexedTextDictionaryPath],
+) -> Result<Option<Vec<(IndexedTextDictionaryPath, Arc<TextDictionary>)>>, Box<dyn std::error::Error>>
+{
+    let mut loaded = Vec::with_capacity(row_groups.len());
+    for row_group in row_groups {
+        let dictionary = load_text_dictionary_cached(rel_oid, col, row_group)?;
+        if dictionary.codes.len() != row_group.n_rows.max(0) as usize {
+            return Ok(None);
+        }
+        loaded.push((row_group.clone(), dictionary));
+    }
+    Ok(Some(loaded))
+}
+
+fn count_text_dictionary_codes(
+    dictionary: &TextDictionary,
+    skip_empty: bool,
+) -> Result<Vec<i64>, DictionaryCountError> {
+    let mut local_counts = vec![0i64; dictionary.values.len() + 1];
+    for &code in &dictionary.codes {
+        let idx = code as usize;
+        if idx > dictionary.values.len() {
+            return Err(DictionaryCountError::Invalid(
+                "text dictionary code exceeds value count",
+            ));
+        }
+        if idx == 0 {
+            if !skip_empty {
+                local_counts[0] += 1;
+            }
+            continue;
+        }
+        if skip_empty && dictionary.values[idx - 1].is_empty() {
+            continue;
+        }
+        local_counts[idx] += 1;
+    }
+    Ok(local_counts)
+}
+
+fn text_dictionary_count_partials(
+    loaded: &[(IndexedTextDictionaryPath, Arc<TextDictionary>)],
+    skip_empty: bool,
+) -> Result<Vec<(Arc<TextDictionary>, Vec<i64>)>, DictionaryCountError> {
+    let workers = native_row_group_threads(loaded.len());
+    if workers <= 1 {
+        let mut out = Vec::with_capacity(loaded.len());
+        for (_, dictionary) in loaded {
+            out.push((
+                Arc::clone(dictionary),
+                count_text_dictionary_codes(dictionary, skip_empty)?,
+            ));
+        }
+        return Ok(out);
+    }
+
+    let chunk_size = loaded.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in loaded.chunks(chunk_size) {
+            handles.push(scope.spawn(
+                move || -> Result<Vec<(Arc<TextDictionary>, Vec<i64>)>, DictionaryCountError> {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (_, dictionary) in chunk {
+                        out.push((
+                            Arc::clone(dictionary),
+                            count_text_dictionary_codes(dictionary, skip_empty)?,
+                        ));
+                    }
+                    Ok(out)
+                },
+            ));
+        }
+
+        let mut partials = Vec::with_capacity(loaded.len());
+        for handle in handles {
+            let chunk = handle.join().map_err(|_| {
+                DictionaryCountError::WorkerPanic("rvbbit: native text dictionary worker panicked")
+            })??;
+            partials.extend(chunk);
+        }
+        Ok(partials)
+    })
+}
+
+fn count_text_dictionary_int_text_row_group(
+    row_group: &IndexedTextDictionaryPath,
+    dictionary: &TextDictionary,
+    int_col: &str,
+    skip_empty_text: bool,
+) -> Result<HashMap<(Option<i64>, Option<String>), i64>, DictionaryCountError> {
+    let mut local_counts = HashMap::<(Option<i64>, u32), i64>::default();
+    let reader = RowGroupReader::open_projected(&row_group.row_group_path, &[int_col])
+        .map_err(|e| DictionaryCountError::Read(e.to_string()))?;
+    let mut base_row = 0usize;
+    for batch in reader {
+        let batch = batch.map_err(|e| DictionaryCountError::Read(e.to_string()))?;
+        let schema = batch.schema();
+        let int_idx = schema
+            .index_of(int_col)
+            .map_err(|e| DictionaryCountError::Read(e.to_string()))?;
+        let int_values = int_array_ref(int_col, batch.column(int_idx).as_ref())
+            .map_err(|e| DictionaryCountError::Read(e.to_string()))?;
+        for row in 0..batch.num_rows() {
+            let dict_row = base_row + row;
+            if dict_row >= dictionary.codes.len() {
+                return Err(DictionaryCountError::Invalid(
+                    "text dictionary row offset exceeds code count",
+                ));
+            }
+            let code = dictionary.codes[dict_row];
+            if code as usize > dictionary.values.len() {
+                return Err(DictionaryCountError::Invalid(
+                    "text dictionary code exceeds value count",
+                ));
+            }
+            if code == 0 {
+                if skip_empty_text {
+                    continue;
+                }
+            } else if skip_empty_text && dictionary.values[(code - 1) as usize].is_empty() {
+                continue;
+            }
+            *local_counts
+                .entry((int_values.value(row), code))
+                .or_insert(0) += 1;
+        }
+        base_row += batch.num_rows();
+    }
+    if base_row != dictionary.codes.len() {
+        return Err(DictionaryCountError::Invalid(
+            "projected int row count does not match text dictionary",
+        ));
+    }
+
+    let mut counts = HashMap::<(Option<i64>, Option<String>), i64>::default();
+    for ((int_value, code), count) in local_counts {
+        let text_value = dictionary.value_for_code(code).map(str::to_string);
+        *counts.entry((int_value, text_value)).or_insert(0) += count;
+    }
+    Ok(counts)
+}
+
+fn text_dictionary_int_text_partials(
+    loaded: &[(IndexedTextDictionaryPath, Arc<TextDictionary>)],
+    int_col: &str,
+    skip_empty_text: bool,
+) -> Result<Vec<HashMap<(Option<i64>, Option<String>), i64>>, DictionaryCountError> {
+    let workers = native_row_group_threads(loaded.len());
+    if workers <= 1 {
+        let mut out = Vec::with_capacity(loaded.len());
+        for (row_group, dictionary) in loaded {
+            out.push(count_text_dictionary_int_text_row_group(
+                row_group,
+                dictionary,
+                int_col,
+                skip_empty_text,
+            )?);
+        }
+        return Ok(out);
+    }
+
+    let chunk_size = loaded.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in loaded.chunks(chunk_size) {
+            handles.push(scope.spawn(
+                move || -> Result<
+                    Vec<HashMap<(Option<i64>, Option<String>), i64>>,
+                    DictionaryCountError,
+                > {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (row_group, dictionary) in chunk {
+                        out.push(count_text_dictionary_int_text_row_group(
+                            row_group,
+                            dictionary,
+                            int_col,
+                            skip_empty_text,
+                        )?);
+                    }
+                    Ok(out)
+                },
+            ));
+        }
+
+        let mut partials = Vec::with_capacity(loaded.len());
+        for handle in handles {
+            let chunk = handle.join().map_err(|_| {
+                DictionaryCountError::WorkerPanic(
+                    "rvbbit: native int/text dictionary worker panicked",
+                )
+            })??;
+            partials.extend(chunk);
+        }
+        Ok(partials)
+    })
+}
+
+fn count_text_dictionary_filtered_codes(
+    dictionary: &TextDictionary,
+    filter_bitmap: &RoaringBitmap,
+) -> Result<Vec<i64>, DictionaryCountError> {
+    let mut local_counts = vec![0i64; dictionary.values.len() + 1];
+    for row in filter_bitmap.iter() {
+        let idx = row as usize;
+        if idx >= dictionary.codes.len() {
+            return Err(DictionaryCountError::Invalid(
+                "filter bitmap row exceeds text dictionary code count",
+            ));
+        }
+        let code = dictionary.codes[idx] as usize;
+        if code > dictionary.values.len() {
+            return Err(DictionaryCountError::Invalid(
+                "text dictionary code exceeds value count",
+            ));
+        }
+        local_counts[code] += 1;
+    }
+    Ok(local_counts)
+}
+
+fn text_dictionary_filtered_partials(
+    loaded: &[(Arc<TextDictionary>, RoaringBitmap)],
+) -> Result<Vec<(Arc<TextDictionary>, Vec<i64>)>, DictionaryCountError> {
+    let workers = native_row_group_threads(loaded.len());
+    if workers <= 1 {
+        let mut out = Vec::with_capacity(loaded.len());
+        for (dictionary, filter_bitmap) in loaded {
+            out.push((
+                Arc::clone(dictionary),
+                count_text_dictionary_filtered_codes(dictionary, filter_bitmap)?,
+            ));
+        }
+        return Ok(out);
+    }
+
+    let chunk_size = loaded.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in loaded.chunks(chunk_size) {
+            handles.push(scope.spawn(
+                move || -> Result<Vec<(Arc<TextDictionary>, Vec<i64>)>, DictionaryCountError> {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (dictionary, filter_bitmap) in chunk {
+                        out.push((
+                            Arc::clone(dictionary),
+                            count_text_dictionary_filtered_codes(dictionary, filter_bitmap)?,
+                        ));
+                    }
+                    Ok(out)
+                },
+            ));
+        }
+
+        let mut partials = Vec::with_capacity(loaded.len());
+        for handle in handles {
+            let chunk = handle.join().map_err(|_| {
+                DictionaryCountError::WorkerPanic(
+                    "rvbbit: native filtered dictionary worker panicked",
+                )
+            })??;
+            partials.extend(chunk);
+        }
+        Ok(partials)
+    })
+}
+
 fn try_text_dictionary_top_count_1col(
     rel_oid: u32,
     col: &str,
@@ -1687,29 +2001,16 @@ fn try_text_dictionary_top_count_1col(
         return Ok(Some(Vec::new()));
     }
 
+    let Some(loaded) = load_text_dictionaries_for_row_groups(rel_oid, col, &row_groups)? else {
+        return Ok(None);
+    };
+    let Some(partials) =
+        dictionary_count_result(text_dictionary_count_partials(&loaded, skip_empty))?
+    else {
+        return Ok(None);
+    };
     let mut counts = HashMap::<Option<String>, i64>::default();
-    for row_group in &row_groups {
-        let dictionary = load_text_dictionary_cached(rel_oid, col, row_group)?;
-        if dictionary.codes.len() != row_group.n_rows.max(0) as usize {
-            return Ok(None);
-        }
-        let mut local_counts = vec![0i64; dictionary.values.len() + 1];
-        for &code in &dictionary.codes {
-            let idx = code as usize;
-            if idx > dictionary.values.len() {
-                return Ok(None);
-            }
-            if idx == 0 {
-                if !skip_empty {
-                    local_counts[0] += 1;
-                }
-                continue;
-            }
-            if skip_empty && dictionary.values[idx - 1].is_empty() {
-                continue;
-            }
-            local_counts[idx] += 1;
-        }
+    for (dictionary, local_counts) in partials {
         merge_text_dictionary_counts(&mut counts, &dictionary, local_counts);
     }
 
@@ -1730,50 +2031,22 @@ fn try_text_dictionary_top_count_int_text(
         return Ok(Some(Vec::new()));
     }
 
+    let Some(loaded) = load_text_dictionaries_for_row_groups(rel_oid, text_col, &row_groups)?
+    else {
+        return Ok(None);
+    };
+    let Some(partials) = dictionary_count_result(text_dictionary_int_text_partials(
+        &loaded,
+        int_col,
+        skip_empty_text,
+    ))?
+    else {
+        return Ok(None);
+    };
     let mut counts = HashMap::<(Option<i64>, Option<String>), i64>::default();
-    for row_group in &row_groups {
-        let dictionary = load_text_dictionary_cached(rel_oid, text_col, row_group)?;
-        if dictionary.codes.len() != row_group.n_rows.max(0) as usize {
-            return Ok(None);
-        }
-
-        let mut local_counts = HashMap::<(Option<i64>, u32), i64>::default();
-        let reader = RowGroupReader::open_projected(&row_group.row_group_path, &[int_col])?;
-        let mut base_row = 0usize;
-        for batch in reader {
-            let batch = batch?;
-            let schema = batch.schema();
-            let int_idx = schema.index_of(int_col)?;
-            let int_values = int_array_ref(int_col, batch.column(int_idx).as_ref())?;
-            for row in 0..batch.num_rows() {
-                let dict_row = base_row + row;
-                if dict_row >= dictionary.codes.len() {
-                    return Ok(None);
-                }
-                let code = dictionary.codes[dict_row];
-                if code as usize > dictionary.values.len() {
-                    return Ok(None);
-                }
-                if code == 0 {
-                    if skip_empty_text {
-                        continue;
-                    }
-                } else if skip_empty_text && dictionary.values[(code - 1) as usize].is_empty() {
-                    continue;
-                }
-                *local_counts
-                    .entry((int_values.value(row), code))
-                    .or_insert(0) += 1;
-            }
-            base_row += batch.num_rows();
-        }
-        if base_row != dictionary.codes.len() {
-            return Ok(None);
-        }
-
-        for ((int_value, code), count) in local_counts {
-            let text_value = dictionary.value_for_code(code).map(str::to_string);
-            *counts.entry((int_value, text_value)).or_insert(0) += count;
+    for partial in partials {
+        for (key, count) in partial {
+            *counts.entry(key).or_insert(0) += count;
         }
     }
 
@@ -1852,6 +2125,7 @@ fn try_text_dictionary_filtered_top_count(
     }
 
     let mut counts = HashMap::<Option<String>, i64>::default();
+    let mut loaded = Vec::new();
     for (row_group, (rg_id, n_rows, filter_bitmap)) in
         dictionary_row_groups.iter().zip(filtered_row_groups.iter())
     {
@@ -1866,18 +2140,13 @@ fn try_text_dictionary_filtered_top_count(
         if dictionary.codes.len() != row_group.n_rows.max(0) as usize {
             return Ok(None);
         }
-        let mut local_counts = vec![0i64; dictionary.values.len() + 1];
-        for row in filter_bitmap.iter() {
-            let idx = row as usize;
-            if idx >= dictionary.codes.len() {
-                return Ok(None);
-            }
-            let code = dictionary.codes[idx] as usize;
-            if code > dictionary.values.len() {
-                return Ok(None);
-            }
-            local_counts[code] += 1;
-        }
+        loaded.push((dictionary, filter_bitmap.clone()));
+    }
+    let Some(partials) = dictionary_count_result(text_dictionary_filtered_partials(&loaded))?
+    else {
+        return Ok(None);
+    };
+    for (dictionary, local_counts) in partials {
         merge_text_dictionary_counts(&mut counts, &dictionary, local_counts);
     }
 

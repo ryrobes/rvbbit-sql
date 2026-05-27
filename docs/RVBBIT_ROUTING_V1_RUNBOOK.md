@@ -4,9 +4,21 @@ This is the operator checklist for the adaptive router.
 
 ## Safe Defaults
 
-Fresh installs are conservative. Without an active route profile, Rvbbit keeps
-queries on the native PostgreSQL/Rvbbit path after hard-rule rewrites. That
-avoids surprising Duck/DataFusion execution on a new workload.
+Fresh installs use deterministic cold-start rules. Without an active route
+profile, Rvbbit keeps metadata/native plan rewrites and row-returning queries
+on the native PostgreSQL/Rvbbit path. Analytical parquet shapes are split by
+cheap shape and physical metadata: small/simple shapes stay native, text-heavy
+distinct/top-k/rollup shapes can use Hive parquet variants, and the remaining
+analytical shapes use vector execution when the parquet catalog is
+authoritative. DuckDB remains available for trained profiles, forced routing,
+or fallback when it is the first available candidate in a chosen class.
+
+The no-profile small/simple native cutoff defaults to 500,000 rows. Tune it with
+`RVBBIT_ROUTE_NO_PROFILE_NATIVE_MAX_ROWS` or the session setting
+`rvbbit.route_no_profile_native_max_rows` when comparing native/DataFusion
+crossover points. Variant-first no-profile routing starts at 250,000 rows by
+default; tune it with `RVBBIT_ROUTE_NO_PROFILE_VARIANT_MIN_ROWS` or
+`rvbbit.route_no_profile_variant_min_rows`.
 
 ```sql
 SELECT jsonb_pretty(rvbbit.route_status());
@@ -17,8 +29,10 @@ Expected cold-install state:
 
 - `current_profile.profile_source = "none"`
 - `current_profile.profile_name = null`
-- route explanations for Rvbbit tables choose `rvbbit_native` with
-  `route_source = "no-profile"` unless a hard rule applies.
+- route explanations for Rvbbit tables choose either `rvbbit_native` with
+  `route_source = "no-profile-native"`, `datafusion_vector` with
+  `route_source = "no-profile-datafusion"`, or a Hive candidate with
+  `route_source = "no-profile-variant"` after hard rules apply.
 
 ## Enable Routing
 
@@ -100,7 +114,47 @@ Important warning states:
 
 ## Training Loop
 
-For v1, offline forced-run training is the supported UX:
+For UI builders, table contracts, candidate/result status semantics, and SQL
+recipes for adding/removing saved profile queries, see
+`docs/RVBBIT_ROUTE_TRAINING_UI.md`.
+
+Preferred SQL-native workflow for a single query:
+
+```sql
+SELECT jsonb_pretty(rvbbit.route_train_query(
+  'dashboard-fast-path',
+  'SELECT "RegionID", count(DISTINCT "UserID") FROM hits GROUP BY 1 ORDER BY 1',
+  repeats => 3,
+  min_gain_pct => 0.05,
+  activate => true,
+  candidates => 'all',
+  label => 'dashboard region distinct users'
+));
+```
+
+This runs the original SELECT through the normal backend path once per
+candidate/repeat with `rvbbit.route_force_candidate` scoped locally, validates
+candidate result digests against `rvbbit_native`, writes
+`route_training_queries`, `route_training_runs`, `route_training_results`, and
+then rebuilds the named profile from those persisted results.
+
+Useful SQL controls:
+
+```sql
+SELECT * FROM rvbbit.route_training_summary
+WHERE profile_name = 'dashboard-fast-path'
+ORDER BY last_seen DESC;
+
+SELECT jsonb_pretty(rvbbit.route_profile_rebuild('dashboard-fast-path', 0.05, true));
+
+SELECT jsonb_pretty(rvbbit.route_training_delete_query(
+  'dashboard-fast-path',
+  42,
+  rebuild => true
+));
+```
+
+Offline forced-run training is still useful for broad benchmark sweeps:
 
 ```bash
 RVBBIT_ROUTE_IMPORT=1 ./bench/rebuild_rvbbit_route_training.sh
@@ -114,4 +168,5 @@ SELECT jsonb_pretty(rvbbit.route_train('workload-current', 3, 0.05));
 ```
 
 Use `route_train(...)` only after you have enough observations across candidate
-families. Forced benchmark profiles remain the more reliable baseline.
+families. For named, UI-driven curation, prefer `route_train_query(...)`
+because its corpus and run results are table-backed and removable from SQL.

@@ -133,7 +133,8 @@ the measured result. Control that bridge with:
   SELECTs with both native and Duck available, the bridge occasionally executes
   the non-chosen candidate and records it with `source=explore:...`. The chosen
   exploratory path is the returned result; this is not shadow execution.
-- `RVBBIT_ROUTE_DUCK_VECTOR`, `RVBBIT_ROUTE_DATAFUSION_VECTOR`,
+- `RVBBIT_ROUTE_DUCK_VECTOR`, `RVBBIT_ROUTE_DATAFUSION_MEM`,
+  `RVBBIT_ROUTE_DATAFUSION_VECTOR`,
   `RVBBIT_ROUTE_DUCK_HIVE`, `RVBBIT_ROUTE_DATAFUSION_HIVE`,
   `RVBBIT_ROUTE_HIVE`, `RVBBIT_ROUTE_PG_ROWSTORE`, and
   `RVBBIT_ROUTE_RVBBIT_NATIVE`: set any to `0`/`off` to remove that candidate
@@ -141,6 +142,12 @@ the measured result. Control that bridge with:
   candidates without disabling normal parquet scans.
 - `RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE=0.08` default: require a stronger predicted
   win before routing to a Hive layout, since it costs extra write/storage work.
+- `RVBBIT_ROUTE_NO_PROFILE_NATIVE_MAX_ROWS=500000` default: keep small/simple
+  no-profile analytical shapes on the native path unless the shape looks like a
+  better vector/variant candidate.
+- `RVBBIT_ROUTE_NO_PROFILE_VARIANT_MIN_ROWS=250000` default: allow no-profile
+  fallback and profile-miss fallback to choose Hive parquet variants for
+  text-heavy distinct/top-k/rollup shapes once variants are available.
 - `RVBBIT_DUCK_BACKEND_FAIL_OPEN=1` default: runtime Duck/DataFusion failures
   fall back to native PostgreSQL/Rvbbit execution instead of failing the user
   query.
@@ -162,7 +169,8 @@ the measured result. Control that bridge with:
   `FROM`/`JOIN` SELECTs whose referenced relations all resolve to authoritative
   Rvbbit parquet catalog entries. Complex SQL falls back to `route_explain`.
 - `RVBBIT_DUCK_RUST_PERSISTENT=1` default for offline forced benchmark paths:
-  `rvbbit_duck_forced`, `rvbbit_datafusion_forced`, and Hive variants keep one
+  `rvbbit_duck_forced`, `rvbbit_datafusion_mem_forced`,
+  `rvbbit_datafusion_forced`, and Hive variants keep one
   Rust sidecar process per engine/layout for the duration of the Python
   benchmark runner. Set to `0` to restore one process per query.
 
@@ -189,12 +197,16 @@ the orchestration script:
 ```
 
 By default it runs ClickBench at `5000,50000,500000,5000000` rows and TPC-H at
-scale factors `0.05,0.1,0.33,1`, using `rvbbit_native`,
+scale factors `0.05,0.1,0.33,1`, using `rvbbit_native_forced`,
 `rvbbit_duck_forced`, `rvbbit_duck_hive_forced`,
-`rvbbit_datafusion_forced`, `rvbbit_datafusion_hive_forced`, and
+`rvbbit_datafusion_mem_forced`, `rvbbit_datafusion_forced`,
+`rvbbit_datafusion_hive_forced`, and
 `rvbbit_pg_heap_forced`, then merges everything into
-`bench/rvbbit_route_profile.json`. Set `RVBBIT_ROUTE_INCLUDE_HIVE=0` to skip
-Hive forced paths and avoid building Hive layout variants during training. It
+`bench/rvbbit_route_profile.json`. `rvbbit_native_forced` forces
+`rvbbit.route_force_candidate=rvbbit_native`; legacy `rvbbit_native` is still
+available as the `rvbbit.duck_backend=off` baseline. Set
+`RVBBIT_ROUTE_INCLUDE_HIVE=0` to skip Hive forced paths and avoid building Hive
+layout variants during training. It
 also archives each raw forced-timing
 result as `rvbbit_route_results.*.json` next to the suite profile. Useful knobs:
 

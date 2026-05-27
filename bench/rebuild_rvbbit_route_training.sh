@@ -2,7 +2,8 @@
 # Rebuild Rvbbit adaptive-route training data from forced executor benchmarks.
 #
 # This runs each routing-relevant benchmark suite at several sizes with:
-#   rvbbit_native, rvbbit_duck_forced, rvbbit_datafusion_forced,
+#   rvbbit_native_forced, rvbbit_duck_forced,
+#   rvbbit_datafusion_mem_forced, rvbbit_datafusion_forced,
 #   rvbbit_pg_heap_forced
 #
 # It then merges the suite/size profiles into one combined route profile.
@@ -42,9 +43,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 COMPOSE="docker compose -f docker/docker-compose.yml -f docker/docker-compose.competitors.yml"
-DEFAULT_FORCED_SYSTEMS="rvbbit_native,rvbbit_duck_forced,rvbbit_datafusion_forced,rvbbit_pg_heap_forced"
+DEFAULT_FORCED_SYSTEMS="rvbbit_native_forced,rvbbit_duck_forced,rvbbit_datafusion_mem_forced,rvbbit_datafusion_forced,rvbbit_pg_heap_forced"
 if [ "${RVBBIT_ROUTE_INCLUDE_HIVE:-1}" != "0" ]; then
-    DEFAULT_FORCED_SYSTEMS="rvbbit_native,rvbbit_duck_forced,rvbbit_duck_hive_forced,rvbbit_datafusion_forced,rvbbit_datafusion_hive_forced,rvbbit_pg_heap_forced"
+    DEFAULT_FORCED_SYSTEMS="rvbbit_native_forced,rvbbit_duck_forced,rvbbit_duck_hive_forced,rvbbit_datafusion_mem_forced,rvbbit_datafusion_forced,rvbbit_datafusion_hive_forced,rvbbit_pg_heap_forced"
 fi
 FORCED_SYSTEMS="${RVBBIT_ROUTE_FORCED_SYSTEMS:-${DEFAULT_FORCED_SYSTEMS}}"
 

@@ -73,6 +73,7 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      RVBBIT_DUCK_BACKEND: ${RVBBIT_DUCK_BACKEND:-true}
       # Google ADC can be a normal credentials path inside the container or
       # compact service-account JSON for local/dev Compose usage.
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
@@ -91,6 +92,9 @@ services:
       # Unset → pg_rvbbit picks min(num_cpus, 8). Set 0 to force a
       # single-thread runtime, or N to pin to a specific count.
       RVBBIT_DF_THREADS: ${RVBBIT_DF_THREADS:-}
+      # Native CustomScan row-group worker threads for selected fast paths.
+      # Unset → min(num_cpus, 8); clamped to row-group count. Set 1 for serial.
+      RVBBIT_NATIVE_THREADS: ${RVBBIT_NATIVE_THREADS:-}
       # Parquet writer knobs. See crates/rvbbit_storage/src/row_group.rs
       # for the full list of supported keys.
       RVBBIT_PARQUET_V2: ${RVBBIT_PARQUET_V2:-on}
@@ -109,6 +113,8 @@ services:
       RVBBIT_SCAN_BATCH_CACHE_MB: ${RVBBIT_SCAN_BATCH_CACHE_MB:-2048}
       RVBBIT_COLUMNAR_CACHE_MB: ${RVBBIT_COLUMNAR_CACHE_MB:-2048}
       # budgeted per-backend columnar accelerator cache ^
+      # RVBBIT_ROUTE_NO_PROFILE_NATIVE_MAX_ROWS: 500000
+      # RVBBIT_ROUTE_NO_PROFILE_VARIANT_MIN_ROWS: 250000
     ports:
       - "55433:5432"
     volumes:

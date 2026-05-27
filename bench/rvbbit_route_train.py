@@ -1,8 +1,10 @@
 """Build an explainable Rvbbit route profile from forced-path benchmark data.
 
 Expected input is a normal benchmark `last_run.json` containing forced Rvbbit
-execution candidates (`rvbbit_native`, `rvbbit_duck_forced`,
-`rvbbit_datafusion_forced`, and optionally `rvbbit_pg_heap_forced`). The output
+execution candidates (`rvbbit_native_forced` or legacy `rvbbit_native`,
+`rvbbit_duck_forced`,
+`rvbbit_datafusion_forced`, `rvbbit_datafusion_mem_forced`, and optionally
+`rvbbit_pg_heap_forced`). The output
 is a JSON profile keyed by query shape, not by benchmark query id.
 """
 from __future__ import annotations
@@ -38,8 +40,10 @@ RVBBIT_DSN = os.environ.get(
 )
 CANDIDATE_SYSTEMS = {
     "rvbbit_native": "rvbbit_native",
+    "rvbbit_native_forced": "rvbbit_native",
     "rvbbit_duck_forced": "duck_vector",
     "rvbbit_duck_hive_forced": "duck_hive",
+    "rvbbit_datafusion_mem_forced": "datafusion_mem",
     "rvbbit_datafusion_forced": "datafusion_vector",
     "rvbbit_datafusion_hive_forced": "datafusion_hive",
     "rvbbit_pg_heap_forced": "pg_rowstore",
@@ -161,22 +165,24 @@ def _query_table_metrics(
     conn: psycopg.Connection,
     sql: str,
     scale_rows: int | None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     refs = extract_table_refs(sql)
     metrics = {
         "rows": scale_rows or 0,
         "bytes": 0,
         "row_groups": 0,
+        "text_columns": [],
     }
     if not refs:
         return metrics if scale_rows is not None else {}
 
     matched = False
+    matched_oids: list[int] = []
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT lower(n.nspname), lower(c.relname),
+                SELECT lower(n.nspname), lower(c.relname), c.oid::bigint,
                        count(rg.*)::bigint,
                        coalesce(sum(rg.n_rows), 0)::bigint,
                        coalesce(sum(rg.n_bytes), 0)::bigint
@@ -185,17 +191,31 @@ def _query_table_metrics(
                 JOIN pg_am am ON am.oid = c.relam
                 LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = c.oid
                 WHERE am.amname = 'rvbbit'
-                GROUP BY n.nspname, c.relname
+                GROUP BY n.nspname, c.relname, c.oid
                 """.encode()
             )  # type: ignore[arg-type]
-            for schema, relname, row_groups, rows, bytes_ in cur.fetchall():
+            for schema, relname, oid, row_groups, rows, bytes_ in cur.fetchall():
                 if relname not in refs and f"{schema}.{relname}" not in refs:
                     continue
                 matched = True
+                matched_oids.append(int(oid))
                 if scale_rows is None:
                     metrics["rows"] += int(rows or 0)
                 metrics["row_groups"] += int(row_groups or 0)
                 metrics["bytes"] += int(bytes_ or 0)
+            if matched_oids:
+                oid_array = ", ".join(f"{oid}::oid" for oid in sorted(set(matched_oids)))
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT lower(attname::text)
+                    FROM pg_attribute
+                    WHERE attrelid = ANY(ARRAY[{oid_array}]::oid[])
+                      AND attnum > 0
+                      AND NOT attisdropped
+                      AND atttypid IN ('text'::regtype, 'varchar'::regtype, 'bpchar'::regtype, 'name'::regtype)
+                    """.encode(),
+                )  # type: ignore[arg-type]
+                metrics["text_columns"] = [row[0] for row in cur.fetchall() if row[0]]
     except Exception:
         conn.rollback()
     if matched or scale_rows is not None:
@@ -267,6 +287,7 @@ def build_profile(
                         "native_ms": candidate_ms.get("rvbbit_native"),
                         "duck_ms": candidate_ms.get("duck_vector"),
                         "duck_hive_ms": candidate_ms.get("duck_hive"),
+                        "datafusion_mem_ms": candidate_ms.get("datafusion_mem"),
                         "datafusion_ms": candidate_ms.get("datafusion_vector"),
                         "datafusion_hive_ms": candidate_ms.get("datafusion_hive"),
                         "pg_ms": candidate_ms.get("pg_rowstore"),
@@ -320,6 +341,11 @@ def build_profile(
                 if "duck_hive" in candidate_medians
                 else None
             ),
+            "datafusion_mem_ms_median": (
+                round(candidate_medians["datafusion_mem"], 4)
+                if "datafusion_mem" in candidate_medians
+                else None
+            ),
             "datafusion_ms_median": (
                 round(candidate_medians["datafusion_vector"], 4)
                 if "datafusion_vector" in candidate_medians
@@ -363,9 +389,10 @@ def build_profile(
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "suite": suite,
         "source_results": results_paths,
-        "native_system": "rvbbit_native",
+        "native_system": "rvbbit_native_forced",
         "duck_system": "rvbbit_duck_forced",
         "duck_hive_system": "rvbbit_duck_hive_forced",
+        "datafusion_mem_system": "rvbbit_datafusion_mem_forced",
         "datafusion_system": "rvbbit_datafusion_forced",
         "datafusion_hive_system": "rvbbit_datafusion_hive_forced",
         "pg_heap_system": "rvbbit_pg_heap_forced",
@@ -412,6 +439,7 @@ def main() -> None:
             f"native={entry.get('native_ms_median')}ms "
             f"duck={entry.get('duck_ms_median')}ms "
             f"duck_hive={entry.get('duck_hive_ms_median')}ms "
+            f"datafusion_mem={entry.get('datafusion_mem_ms_median')}ms "
             f"datafusion={entry.get('datafusion_ms_median')}ms "
             f"datafusion_hive={entry.get('datafusion_hive_ms_median')}ms "
             f"pg_heap={entry.get('pg_ms_median')}ms "

@@ -66,14 +66,14 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
             return run_clickhouse(sql, REPEATS), "ok"
         if system == "rvbbit":
             return run_pg(PG_DSNS["rvbbit"], sql, REPEATS, TIMEOUT_S), "ok"
-        if system == "rvbbit_native":
-            ms = run_pg(PG_DSNS["rvbbit_native"], sql, REPEATS, TIMEOUT_S)
+        if system in {"rvbbit_native", "rvbbit_native_forced"}:
+            ms = run_pg(PG_DSNS[system], sql, REPEATS, TIMEOUT_S)
             record_rvbbit_route_observation(
                 sql,
                 "rvbbit_native",
                 ms,
                 "ok",
-                "benchmark:clickbench:rvbbit_native",
+                f"benchmark:clickbench:{system}",
             )
             return ms, "ok"
         if system in {"rvbbit_pg_heap_forced", "rvbbit_pg_heap", "pg_heap"}:
@@ -104,6 +104,16 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
         if system == "rvbbit_datafusion_hive_forced":
             ms = run_rvbbit_datafusion_hive_forced(sql, REPEATS, TIMEOUT_S, label=qid, suite="clickbench")
             return ms, rvbbit_duck_hot_status()
+        if system == "rvbbit_datafusion_mem_forced":
+            ms = run_pg(PG_DSNS[system], sql, REPEATS, TIMEOUT_S)
+            record_rvbbit_route_observation(
+                sql,
+                "datafusion_mem",
+                ms,
+                "ok",
+                f"benchmark:clickbench:{system}",
+            )
+            return ms, "ok"
         if system in PG_DSNS:
             return run_pg(PG_DSNS[system], sql, REPEATS, TIMEOUT_S), "ok"
         return None, "unknown system"

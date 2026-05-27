@@ -4,6 +4,10 @@ This document is the UI/data contract for building an adaptive query routing
 dashboard. It describes the stable catalog surfaces a UI should read. Do not
 scrape logs or infer routing state from rewritten SQL.
 
+For the SQL-native training/profile curation UI contract, including adding and
+removing saved training queries, candidate benchmarking, validation status, and
+profile rebuild actions, see `docs/RVBBIT_ROUTE_TRAINING_UI.md`.
+
 ## Concepts
 
 - **Candidate**: the execution engine selected or measured for a query shape.
@@ -15,6 +19,9 @@ scrape logs or infer routing state from rewritten SQL.
   This is the primary online workload signal.
 - **Observation**: explicit benchmark/training timing for a candidate. These
   rows compare possible candidates and are used by `rvbbit.route_train(...)`.
+- **SQL training run**: table-backed profiling started by
+  `rvbbit.route_train_query(...)`. These runs preserve the source query,
+  candidate timings, validation status, errors, and generated profile updates.
   `duck_hive`/`datafusion_hive` require Hive parquet variants, and can be
   disabled with `RVBBIT_ROUTE_HIVE=0`. `pg_rowstore` is routable when the
   referenced Rvbbit tables have retained shadow heaps; the router applies a
@@ -78,12 +85,12 @@ Profile controls:
 - `route_clear_profile(...)`: clears the explicit profile override and returns
   to the active default profile.
 
-Fresh installs with no active profile intentionally route conservatively:
-`profile_source='none'`, `profile_name=NULL`, and profile misses stay on the
-native PostgreSQL/Rvbbit path unless an active profile has been imported or
-trained. Treat `guc-missing` as an operator warning; it means a requested
-profile name does not exist and the router did not silently fall back to the
-active profile.
+Fresh installs with no active profile use deterministic cold-start rules:
+`profile_source='none'`, `profile_name=NULL`, native rewrites and row-returning
+queries stay on `rvbbit_native`, and analytical parquet shapes route to
+`datafusion_vector` when the parquet catalog is authoritative. Treat
+`guc-missing` as an operator warning; it means a requested profile name does
+not exist and the router did not silently fall back to the active profile.
 
 ## Route Decision Log
 
@@ -220,6 +227,39 @@ Summary view: `rvbbit.route_observation_summary`
 
 Profile view: `rvbbit.route_profile_summary`
 
+SQL-native training tables:
+
+For the full UI contract and action recipes, see
+`docs/RVBBIT_ROUTE_TRAINING_UI.md`.
+
+- `rvbbit.route_training_queries`: one row per named-profile training query,
+  including SQL text, feature JSON, shape key, label, enabled flag, and owner.
+- `rvbbit.route_training_runs`: one row per invocation of
+  `route_train_query(...)`, with repeats, candidate list, settings, status, and
+  JSON summary.
+- `rvbbit.route_training_results`: one row per candidate repeat, including
+  elapsed time, rows returned, result digest, validation status, error, and
+  route doc.
+- `rvbbit.route_training_summary`: UI-friendly candidate medians and latest
+  status by training query.
+
+UI actions can call:
+
+```sql
+SELECT rvbbit.route_train_query(
+  profile_name => 'dashboard-fast-path',
+  query => $SQL$SELECT ...$SQL$,
+  repeats => 3,
+  min_gain_pct => 0.05,
+  activate => true,
+  candidates => 'all',
+  label => 'dashboard panel name'
+);
+
+SELECT rvbbit.route_training_delete_query('dashboard-fast-path', 123, rebuild => true);
+SELECT rvbbit.route_profile_rebuild('dashboard-fast-path', 0.05, true);
+```
+
 Training profile JSON and `route_profile_entries.entry` include
 `candidate_medians`; when Hive or heap is measured, look for `duck_hive`,
 `datafusion_hive`, `pg_rowstore`, the matching `*_ms_median` fields, and
@@ -257,9 +297,9 @@ LIMIT 50;
    `profile_source`, highlighting explicit overrides and missing-profile cases.
 7. Install health: render `route_status()` with active profile, enabled
    candidates, fail-open state, and catalog counts.
-7. Online vs trained mismatch: join online runtime summaries to trained profile
+8. Online vs trained mismatch: join online runtime summaries to trained profile
    summaries by `shape_family`.
-8. Telemetry health: dropped/write/connect error counters from the status JSON
+9. Telemetry health: dropped/write/connect error counters from the status JSON
    for the backend serving the UI request. Use table counts for global history.
 
 ## Notes And Limits

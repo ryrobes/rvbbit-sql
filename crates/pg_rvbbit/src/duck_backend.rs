@@ -215,6 +215,11 @@ fn datafusion_hive_query_json(query: &str, column_names: JsonB, max_rows: i32) -
     engine_query_json("datafusion", "hive", query, column_names, max_rows)
 }
 
+#[pg_extern(volatile)]
+fn datafusion_mem_query_json(query: &str, column_names: JsonB, max_rows: i32) -> JsonB {
+    engine_query_json("datafusion", "mem", query, column_names, max_rows)
+}
+
 fn engine_query_json(
     engine: &str,
     layout: &str,
@@ -240,6 +245,9 @@ fn engine_query_json(
         match crate::df::query_engine(layout, query, max_rows) {
             Ok(payload) => Some(payload),
             Err(err) => {
+                if matches!(layout, "mem" | "memory") {
+                    return fail_open_or_error(engine, query, max_rows, &err);
+                }
                 pgrx::warning!(
                     "rvbbit.{engine}_query_json: in-process DF failed ({err}); falling back to sidecar"
                 );
@@ -319,6 +327,7 @@ fn engine_query_json(
 
     if env_enabled("RVBBIT_DUCK_BACKEND_OBSERVE", false) {
         let candidate = match (engine, layout) {
+            ("datafusion", "mem") => "datafusion_mem",
             ("datafusion", "hive") => "datafusion_hive",
             ("datafusion", _) => "datafusion_vector",
             (_, "hive") => "duck_hive",

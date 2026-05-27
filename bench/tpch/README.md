@@ -20,14 +20,21 @@ Environment:
 
 - `TPCH_SCALE`: DuckDB `dbgen` scale factor. Default `0.1`.
 - `BENCH_SYSTEMS`: comma list. Default `rvbbit,duckdb,clickhouse,pg_baseline,citus,hydra,alloydb`.
-  Rvbbit aliases include `rvbbit_native`, `rvbbit_duck_forced`,
-  `rvbbit_datafusion_forced`, `rvbbit_duck_hive_forced`,
+  Rvbbit aliases include `rvbbit_native_forced`, legacy `rvbbit_native`,
+  `rvbbit_duck_forced`,
+  `rvbbit_datafusion_mem_forced`, `rvbbit_datafusion_forced`,
+  `rvbbit_duck_hive_forced`,
   `rvbbit_datafusion_hive_forced`, and `rvbbit_pg_heap_forced` for executor
-  comparison over the same compacted tables. Rvbbit loads set
-  `RVBBIT_COMPACT_HIVE_LAYOUT=on` by default, but `rvbbit.compact` only writes
-  canonical scan parquet unless `RVBBIT_COMPACT_VARIANTS_SYNC=1`. Use
-  `RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=1` when a benchmark run should
-  build hive/cluster variants after the main load.
+  comparison over the same compacted tables. `rvbbit_native_forced` uses the
+  router's `rvbbit.route_force_candidate=rvbbit_native`; `rvbbit_native` is the
+  older `rvbbit.duck_backend=off` baseline.
+  `rvbbit_datafusion_mem_forced` also loads `rvbbit.hot_objects` after compact
+  so the forced memory route has hot all-column objects to use.
+  Rvbbit loads start hive/cluster layout refresh asynchronously by default, so
+  the canonical scan parquet is available immediately while segmented variants
+  build in the background. Set `RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=0` to
+  disable that, or `sync`/`1` when a forced-hive benchmark must wait for
+  variants before queries run.
 - `RVBBIT_PARQUET_META_CACHE=1` / `RVBBIT_PARQUET_PREWARM=1`: default-on Rust
   sidecar metadata cache for compacted parquet catalog and footer/schema
   metadata. Set either to `0`/`off` for a cold metadata comparison.

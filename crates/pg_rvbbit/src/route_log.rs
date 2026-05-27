@@ -12,7 +12,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -26,8 +26,10 @@ use serde_json::{json, Value};
 const DEFAULT_QUEUE_CAPACITY: usize = 8192;
 const DEFAULT_BATCH_SIZE: usize = 64;
 const DEFAULT_FLUSH_MS: u64 = 250;
+const DEFAULT_EXIT_FLUSH_MS: u64 = 500;
 
 static LOGGER: OnceLock<DecisionLogger> = OnceLock::new();
+static EXIT_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
 static mut PREV_EXECUTOR_START_HOOK: pg_sys::ExecutorStart_hook_type = None;
 static mut PREV_EXECUTOR_END_HOOK: pg_sys::ExecutorEnd_hook_type = None;
 
@@ -423,7 +425,49 @@ fn start_logger() -> DecisionLogger {
     {
         pgrx::warning!("rvbbit: failed to start route log writer: {e}");
     }
+    register_exit_flush_hook();
     DecisionLogger { tx, counters }
+}
+
+fn register_exit_flush_hook() {
+    if EXIT_HOOK_REGISTERED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        unsafe {
+            pg_sys::on_proc_exit(Some(route_log_proc_exit), pg_sys::Datum::from(0));
+        }
+    }
+}
+
+unsafe extern "C-unwind" fn route_log_proc_exit(_code: std::ffi::c_int, _arg: pg_sys::Datum) {
+    wait_for_logger_drain();
+}
+
+fn wait_for_logger_drain() {
+    let Some(logger) = LOGGER.get() else {
+        return;
+    };
+    let timeout_ms = std::env::var("RVBBIT_ROUTE_DECISION_LOG_EXIT_FLUSH_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_EXIT_FLUSH_MS);
+    if timeout_ms == 0 {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let enqueued = logger.counters.enqueued.load(Ordering::Relaxed);
+        let completed = logger.counters.written.load(Ordering::Relaxed)
+            + logger.counters.dropped.load(Ordering::Relaxed);
+        if completed >= enqueued {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn writer_loop(rx: Receiver<RouteLogEvent>, counters: Arc<DecisionLogCounters>) {

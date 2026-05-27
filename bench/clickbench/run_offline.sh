@@ -20,8 +20,8 @@
 #                                                            # NOTE: the shipped profile was trained
 #                                                            # pre-Phase-1 (sidecar DataFusion era);
 #                                                            # numbers are stale, retraining recommended.
-#   BENCH_SYSTEMS=rvbbit,rvbbit_native,rvbbit_duck_forced ./bench/clickbench/run_offline.sh
-#   RVBBIT_DUCK_HOT_VALIDATE=1 BENCH_SYSTEMS=rvbbit,rvbbit_native ./bench/clickbench/run_offline.sh
+#   BENCH_SYSTEMS=rvbbit,rvbbit_native_forced,rvbbit_datafusion_mem_forced ./bench/clickbench/run_offline.sh
+#   RVBBIT_DUCK_HOT_VALIDATE=1 BENCH_SYSTEMS=rvbbit,rvbbit_native_forced ./bench/clickbench/run_offline.sh
 #   RVBBIT_DF_INPROCESS=off ./bench/clickbench/run_offline.sh # force legacy sidecar route (A/B vs new)
 #   ./bench/clickbench/run_offline.sh --rebuild --reset-rvbbit-extension
 #                                                            # full bench against current source
@@ -53,6 +53,17 @@ HITS="${DATA_DIR}/hits.parquet"
 
 LIMIT="${BENCH_LIMIT:-10000000}"
 SYSTEMS="${BENCH_SYSTEMS:-rvbbit,duckdb,clickhouse,pg_baseline,citus,hydra,alloydb}"
+RVBBIT_SELECTED=0
+if [[ ",${SYSTEMS}," == *",rvbbit,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hot,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_auto,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_mem_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",pg_heap,"* ]]; then
+    RVBBIT_SELECTED=1
+fi
+HIVE_FORCED_SELECTED=0
+if [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]]; then
+    HIVE_FORCED_SELECTED=1
+fi
+HIVE_REFRESH_DEFAULT="off"
+[ "${RVBBIT_SELECTED}" = "1" ] && HIVE_REFRESH_DEFAULT="async"
+HIVE_REFRESH_DISPLAY="${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD:-${HIVE_REFRESH_DEFAULT}}"
 QUERIES_ENV=()
 [ -n "${BENCH_QUERIES:-}" ] && QUERIES_ENV=(-e "BENCH_QUERIES=${BENCH_QUERIES}")
 DUCK_HOT_ENV=()
@@ -66,26 +77,35 @@ DUCK_HOT_ENV=()
 [ -n "${RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE=${RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE}")
 [ -n "${RVBBIT_ROUTE_DUCK_VECTOR:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DUCK_VECTOR=${RVBBIT_ROUTE_DUCK_VECTOR}")
 [ -n "${RVBBIT_ROUTE_DUCK_HIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DUCK_HIVE=${RVBBIT_ROUTE_DUCK_HIVE}")
+[ -n "${RVBBIT_ROUTE_DATAFUSION_MEM:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_MEM=${RVBBIT_ROUTE_DATAFUSION_MEM}")
 [ -n "${RVBBIT_ROUTE_DATAFUSION_VECTOR:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_VECTOR=${RVBBIT_ROUTE_DATAFUSION_VECTOR}")
 [ -n "${RVBBIT_ROUTE_DATAFUSION_HIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_HIVE=${RVBBIT_ROUTE_DATAFUSION_HIVE}")
 [ -n "${RVBBIT_ROUTE_HIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_HIVE=${RVBBIT_ROUTE_HIVE}")
 [ -n "${RVBBIT_ROUTE_PG_ROWSTORE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_PG_ROWSTORE=${RVBBIT_ROUTE_PG_ROWSTORE}")
 [ -n "${RVBBIT_ROUTE_RVBBIT_NATIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_RVBBIT_NATIVE=${RVBBIT_ROUTE_RVBBIT_NATIVE}")
+[ -n "${RVBBIT_ROUTE_FORCE_CANDIDATE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_FORCE_CANDIDATE=${RVBBIT_ROUTE_FORCE_CANDIDATE}")
 [ -n "${RVBBIT_NATIVE_ROUTER:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_NATIVE_ROUTER=${RVBBIT_NATIVE_ROUTER}")
 [ -n "${RVBBIT_ROUTE_OBSERVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_OBSERVE=${RVBBIT_ROUTE_OBSERVE}")
 [ -n "${RVBBIT_ROUTE_EXPLORE_PCT:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_EXPLORE_PCT=${RVBBIT_ROUTE_EXPLORE_PCT}")
 [ -n "${RVBBIT_HIVE_LAYOUT:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_HIVE_LAYOUT=${RVBBIT_HIVE_LAYOUT}")
+[ -n "${RVBBIT_HOT_STORE_BUDGET_MB:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_HOT_STORE_BUDGET_MB=${RVBBIT_HOT_STORE_BUDGET_MB}")
+[ -n "${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_HOT_STORE_ROUTE_MAX_ROWS=${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS}")
 # In-process DataFusion vs legacy sidecar route. Default is on (post-Phase-1);
 # pass RVBBIT_DF_INPROCESS=off to force the sidecar path for A/B benches.
 [ -n "${RVBBIT_DF_INPROCESS:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_DF_INPROCESS=${RVBBIT_DF_INPROCESS}")
 LOAD_ENV=()
 [ -n "${RVBBIT_COMPACT_KEEP_HEAP:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_KEEP_HEAP=${RVBBIT_COMPACT_KEEP_HEAP}")
+[ -n "${RVBBIT_HOT_LOAD_AFTER_LOAD:-}" ] && LOAD_ENV+=(-e "RVBBIT_HOT_LOAD_AFTER_LOAD=${RVBBIT_HOT_LOAD_AFTER_LOAD}")
+[ -n "${RVBBIT_HOT_STORE_BUDGET_MB:-}" ] && LOAD_ENV+=(-e "RVBBIT_HOT_STORE_BUDGET_MB=${RVBBIT_HOT_STORE_BUDGET_MB}")
+[ -n "${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS:-}" ] && LOAD_ENV+=(-e "RVBBIT_HOT_STORE_ROUTE_MAX_ROWS=${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS}")
 [ -n "${RVBBIT_COMPACT_VARIANTS_SYNC:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_VARIANTS_SYNC=${RVBBIT_COMPACT_VARIANTS_SYNC}")
-[ -n "${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD:-}" ] && LOAD_ENV+=(-e "RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD}")
-if [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]]; then
+if [ "${HIVE_FORCED_SELECTED}" = "1" ]; then
     LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_LAYOUT=${RVBBIT_COMPACT_HIVE_LAYOUT:-on}")
 elif [ -n "${RVBBIT_COMPACT_HIVE_LAYOUT:-}" ]; then
     LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_LAYOUT=${RVBBIT_COMPACT_HIVE_LAYOUT}")
+fi
+if [ "${RVBBIT_SELECTED}" = "1" ] || [ -n "${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD:-}" ]; then
+    LOAD_ENV+=(-e "RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=${HIVE_REFRESH_DISPLAY}")
 fi
 [ -n "${RVBBIT_COMPACT_HIVE_KEYS:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_KEYS=${RVBBIT_COMPACT_HIVE_KEYS}")
 [ -n "${RVBBIT_COMPACT_HIVE_VARIANTS:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_VARIANTS=${RVBBIT_COMPACT_HIVE_VARIANTS}")
@@ -155,6 +175,8 @@ echo "   rvbbit reset: $(env_on "${RVBBIT_RESET_EXTENSION}" && echo destructive 
 echo "   route import: $(env_on "${RVBBIT_LOAD_ROUTE_PROFILE}" && echo yes || echo no)"
 echo "   rebuild     : $(env_on "${BENCH_REBUILD}" && echo yes || echo no)"
 echo "   df_inprocess: ${RVBBIT_DF_INPROCESS:-on (default)}"
+echo "   hive refresh: ${HIVE_REFRESH_DISPLAY}"
+echo "   hot store   : budget=${RVBBIT_HOT_STORE_BUDGET_MB:-512}MB route_max_rows=${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS:-500000}"
 
 if [ "${RVBBIT_SELECTED:-1}" = "1" ] && ! env_on "${BENCH_REBUILD}" && ! env_on "${RVBBIT_RESET_EXTENSION}"; then
     warn "benching the pg-rvbbit image without --rebuild + --reset-rvbbit-extension."
@@ -196,11 +218,6 @@ ${COMPOSE} --profile bench up -d
 sleep 5
 
 # ---- 3. Prepare rvbbit extension ------------------------------------------
-RVBBIT_SELECTED=0
-if [[ ",${SYSTEMS}," == *",rvbbit,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hot,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_auto,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",pg_heap,"* ]]; then
-    RVBBIT_SELECTED=1
-fi
-
 if [ "${RVBBIT_SELECTED}" = "1" ]; then
     if env_on "${RVBBIT_RESET_EXTENSION}"; then
         say "resetting pg_rvbbit extension (DESTRUCTIVE: drops rvbbit system/catalog data)"

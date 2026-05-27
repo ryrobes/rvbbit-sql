@@ -39,10 +39,15 @@ SELECT rvbbit.df_inprocess_query(
 -- → {"status":"ok","row_count":1,"columns":["count"],"rows":[[42]]}
 ```
 
-Per-backend behavior is controlled by two env vars:
+Per-backend behavior is controlled by these env vars:
 
 - `RVBBIT_DF_THREADS=N` — multi-thread tokio runtime workers
-  (0 = current_thread, default).
+  and DataFusion `target_partitions` (default `min(num_cpus, 8)`;
+  `0` = current_thread).
+- `RVBBIT_NATIVE_THREADS=N` — native row-group worker threads for
+  CustomScan fast paths that can split independent row groups, currently
+  dictionary-backed text top-count paths (default `min(num_cpus, 8)`,
+  clamped to row-group count).
 - `RVBBIT_DUCK_BIN` / `RVBBIT_DUCK_DSN` — sidecar fallback config
   (kept as a route option for A/B and to handle anything in-process
   DF refuses to plan).

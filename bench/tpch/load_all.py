@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 
@@ -12,11 +13,13 @@ from schema import data_dir_for_scale, table_names  # noqa: E402
 ALL_SYSTEMS = [
     "rvbbit",
     "rvbbit_native",
+    "rvbbit_native_forced",
     "rvbbit_duck_auto",
     "rvbbit_duck_forced",
     "rvbbit_duck_hive_forced",
     "rvbbit_datafusion_forced",
     "rvbbit_datafusion_hive_forced",
+    "rvbbit_datafusion_mem_forced",
     "rvbbit_pg_heap_forced",
     "duckdb",
     "clickhouse",
@@ -36,6 +39,43 @@ def _env_enabled(name: str, default: bool = False) -> bool:
 
 def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _variant_refresh_mode() -> str:
+    raw = os.environ.get("RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD", "")
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on", "sync"}:
+        return "sync"
+    if value in {"async", "background", "bg"}:
+        return "async"
+    return "off"
+
+
+def _hot_load_after_load() -> bool:
+    if _env_enabled("RVBBIT_HOT_LOAD_AFTER_LOAD"):
+        return True
+    selected = os.environ.get("BENCH_SYSTEMS", "")
+    return any(
+        system.strip() == "rvbbit_datafusion_mem_forced"
+        for system in selected.split(",")
+    )
+
+
+def _start_async_variant_refresh(dsn: str, sql: str, log_path: str) -> int | None:
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    try:
+        with open(log_path, "ab") as log:
+            proc = subprocess.Popen(
+                ["psql", dsn, "-v", "ON_ERROR_STOP=1", "-c", sql],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return proc.pid
+    except OSError as exc:
+        print(f"    async variant refresh failed to start: {exc}")
+        return None
 
 
 def _rvbbit_compact_settings_sql() -> list[str]:
@@ -58,6 +98,19 @@ def _rvbbit_compact_settings_sql() -> list[str]:
     return out
 
 
+def _rvbbit_hot_settings_sql() -> list[str]:
+    settings = {
+        "RVBBIT_HOT_STORE_BUDGET_MB": "rvbbit.hot_store_budget_mb",
+        "RVBBIT_HOT_STORE_ROUTE_MAX_ROWS": "rvbbit.hot_store_route_max_rows",
+    }
+    out: list[str] = []
+    for env_name, guc_name in settings.items():
+        value = os.environ.get(env_name)
+        if value is not None and value.strip():
+            out.append(f"SET {guc_name} = {_sql_literal(value.strip())}")
+    return out
+
+
 def _human(n: int | None) -> str:
     if n is None:
         return "?"
@@ -73,12 +126,14 @@ def _human(n: int | None) -> str:
 def _load_system_name(name: str) -> str:
     if name in {
         "rvbbit_native",
+        "rvbbit_native_forced",
         "rvbbit_duck_hot",
         "rvbbit_duck_auto",
         "rvbbit_duck_forced",
         "rvbbit_duck_hive_forced",
         "rvbbit_datafusion_forced",
         "rvbbit_datafusion_hive_forced",
+        "rvbbit_datafusion_mem_forced",
         "rvbbit_pg_heap_forced",
         "rvbbit_pg_heap",
         "pg_heap",
@@ -135,29 +190,61 @@ def run_one(name: str, data_dir: str, scale: str) -> dict:
             )
         elif name == "rvbbit":
             from loaders.postgres_loader import load_pg
+            dsn = "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench"
             keep_heap = _env_enabled("RVBBIT_COMPACT_KEEP_HEAP", default=True)
-            refresh_variants = _env_enabled("RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD", default=False)
+            refresh_mode = _variant_refresh_mode()
+            if refresh_mode != "off" and not keep_heap:
+                print(
+                    "    skip layout variant refresh: "
+                    "RVBBIT_COMPACT_KEEP_HEAP=0 leaves no retained heap for refresh"
+                )
+                refresh_mode = "off"
             compact_sql = [
                 *[f"ANALYZE {t}" for t in table_names()],
                 *_rvbbit_compact_settings_sql(),
+                *_rvbbit_hot_settings_sql(),
                 *[
                     f"SELECT rvbbit.compact('{t}'::regclass, {str(keep_heap).lower()})"
                     for t in table_names()
                 ],
             ]
-            if refresh_variants:
+            if refresh_mode == "sync":
                 compact_sql.extend(
                     [
                         f"SELECT rvbbit.refresh_layout_variants('{t}'::regclass)"
                         for t in table_names()
                     ]
                 )
+            if _hot_load_after_load():
+                compact_sql.extend(
+                    [f"SELECT rvbbit.hot_load('{t}'::regclass)" for t in table_names()]
+                )
             res = load_pg(
-                "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench",
+                dsn,
                 data_dir,
                 using="rvbbit",
                 post_sql=compact_sql,
             )
+            if refresh_mode == "async":
+                refresh_sql = "; ".join(
+                    [
+                        *_rvbbit_compact_settings_sql(),
+                        *[
+                            f"SELECT rvbbit.refresh_layout_variants('{t}'::regclass)"
+                            for t in table_names()
+                        ],
+                    ]
+                )
+                pid = _start_async_variant_refresh(
+                    dsn,
+                    refresh_sql,
+                    "/bench/tpch/results/refresh_layout_variants.log",
+                )
+                res["variant_refresh"] = "async" if pid else "failed-to-start"
+                if pid:
+                    res["variant_refresh_pid"] = pid
+            if _hot_load_after_load():
+                res["hot_load"] = "on"
         else:
             return {"name": name, "status": "unknown"}
     except Exception as e:
@@ -165,7 +252,14 @@ def run_one(name: str, data_dir: str, scale: str) -> dict:
         return {"name": name, "status": f"FAIL: {str(e)[:100]}", "wall_s": wall}
     wall = time.perf_counter() - t0
     res["name"] = name
-    res["status"] = "ok"
+    status_parts = ["ok"]
+    if res.get("hot_load") == "on":
+        status_parts.append("hot loaded")
+    if res.get("variant_refresh") == "async":
+        status_parts.append(f"variants async pid={res.get('variant_refresh_pid')}")
+    elif res.get("variant_refresh"):
+        status_parts.append(f"variants {res['variant_refresh']}")
+    res["status"] = "; ".join(status_parts)
     res["wall_s"] = wall
     return res
 

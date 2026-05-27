@@ -57,10 +57,11 @@ ClickBench and TPC-H loaders honor:
 ```bash
 RVBBIT_COMPACT_KEEP_HEAP=1
 RVBBIT_COMPACT_VARIANTS_SYNC=0
-RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=0
+RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async
 ```
 
-The current route-training harness sets this to `1` by default. With
+The current benchmark harness keeps this asynchronous by default for Rvbbit
+loads. With
 `RVBBIT_COMPACT_KEEP_HEAP=1`, loaders call `rvbbit.compact(..., true)` and
 report `size_bytes` as `parquet_size_bytes + heap_total_bytes`.
 Use `RVBBIT_COMPACT_KEEP_HEAP=0` to restore parquet-only compaction.
@@ -72,17 +73,21 @@ and hive variants are derived copies; build them explicitly with:
 SELECT rvbbit.refresh_layout_variants('hits'::regclass);
 ```
 
-Set `RVBBIT_COMPACT_VARIANTS_SYNC=1` only when you want `compact` to block on
-variant generation. Set `RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=1` in the
-benchmark loaders when you want route-training runs to build hive/cluster
-copies after the canonical layout has loaded. This keeps normal load/write
-latency focused on the authoritative scan layout while still allowing route
-profiles to measure hive-backed Duck/DataFusion paths.
+Set `RVBBIT_COMPACT_VARIANTS_SYNC=1` only when you want `compact` itself to
+block on variant generation. In benchmark loaders,
+`RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async` starts a detached `psql`
+refresh after the canonical layout has loaded, `sync`/`1` blocks until
+variants are ready, and `0` disables the post-load refresh. This keeps normal
+load/write latency focused on the authoritative scan layout while still letting
+hive-backed Duck/DataFusion paths become available as the background refresh
+finishes.
 
 Current caveat: variant refresh still reads the retained heap through SPI. It is
 therefore useful with the benchmark/default shadow-heap mode, but a future
 generation-aware compactor should rebuild variants from canonical Parquet
-instead of requiring heap rows.
+instead of requiring heap rows. The benchmark loaders skip post-load variant
+refresh when `RVBBIT_COMPACT_KEEP_HEAP=0` to avoid replacing variants with empty
+copies.
 
 Example small probe:
 

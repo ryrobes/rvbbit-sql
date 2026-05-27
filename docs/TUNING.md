@@ -74,7 +74,10 @@ the most because they're latency-bound — more in-flight reads helps.
 
 The in-process DataFusion route (`SET rvbbit.df_inprocess = on`, on by
 default) runs on a per-backend tokio runtime. Sizing comes from
-`RVBBIT_DF_THREADS` if set, otherwise from `min(num_cpus, 8)`.
+`RVBBIT_DF_THREADS` if set, otherwise from `min(num_cpus, 8)`. The same
+value is also passed to DataFusion as `target_partitions`, so parquet
+planning and execution partitioning track the runtime size instead of
+using DataFusion's generic default.
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -83,6 +86,53 @@ default) runs on a per-backend tokio runtime. Sizing comes from
 The 8-core cap is deliberate: each PG backend gets its own tokio pool,
 so a 32-core box doesn't need 32 threads × N backends. Bump higher
 only if you run few-but-large analytical queries.
+
+## Hot columnar objects
+
+Rvbbit can manually pin compacted Rvbbit tables as decoded Arrow batches for
+the in-process DataFusion route. This is a per-backend cache with catalog
+intent in `rvbbit.hot_objects`: one backend loads the table with SQL, and other
+backends lazily materialize their own copy when the router chooses
+`datafusion_mem`.
+
+```sql
+SELECT rvbbit.hot_load('hits'::regclass);
+SELECT jsonb_pretty(rvbbit.hot_status());
+SELECT rvbbit.hot_evict('hits'::regclass);
+```
+
+The first version is intentionally manual. `datafusion_mem` is a first-class
+candidate for forced routing and SQL-native route training, but no-profile
+routing does not prefer it by default. ClickBench showed that decoded memory
+can lose to native rewrites and regular DataFusion scans on enough shapes that
+training/profile evidence is the safer default. Projection loads via
+`rvbbit.hot_load_columns(...)` are available for direct `rvbbit.df_hot_query`
+experiments, but the automatic router currently requires all columns so it
+cannot misroute queries that reference unloaded columns.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `rvbbit.hot_store_budget_mb` / `RVBBIT_HOT_STORE_BUDGET_MB` | `512` | Per-backend decoded Arrow cache budget. `0` disables loading and routing. |
+| `rvbbit.hot_store_route_max_rows` / `RVBBIT_HOT_STORE_ROUTE_MAX_ROWS` | `500000` | Router ceiling for automatic `datafusion_mem` selection. |
+| `RVBBIT_ROUTE_DATAFUSION_MEM` | `on` | Set to `0`/`off` to remove the memory candidate. |
+| `rvbbit.route_datafusion_mem_no_profile` / `RVBBIT_ROUTE_DATAFUSION_MEM_NO_PROFILE` | `off` | Opt into no-profile hot-object preference. Leave off for benchmark-like mixed workloads. |
+
+## Native row-group worker threads
+
+Some native CustomScan fast paths can split independent row-group work
+inside a single PostgreSQL backend without using PG parallel scans. Today
+this is used for dictionary-backed text top-count paths: dictionaries and
+catalog state are loaded by the leader backend, then code counting and
+projected parquet reads are divided across scoped worker threads.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `RVBBIT_NATIVE_THREADS` (env var) | `min(num_cpus, 8)` | Clamped to row-group count. Set to `1` for serial execution. |
+
+This knob is intentionally separate from `RVBBIT_DF_THREADS`: DataFusion
+queries and native CustomScan queries are different execution paths.
+Keep both values conservative on installations with many concurrent PG
+backends, because the limits are per backend.
 
 ## Parquet writer knobs
 

@@ -30,6 +30,8 @@ PG_DSNS = {
     "alloydb":     "postgresql://postgres:bench@bench-alloydb:5432/postgres",
     "rvbbit":      "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench",
     "rvbbit_native": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff",
+    "rvbbit_native_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Drvbbit_native",
+    "rvbbit_datafusion_mem_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_mem",
     "rvbbit_pg_heap_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
     "rvbbit_pg_heap": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
     "pg_heap": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
@@ -47,12 +49,16 @@ _LAST_RUN_DETAIL: dict[str, float] = {}
 ROUTE_GUCS = {
     "RVBBIT_ROUTE_DUCK_VECTOR": "rvbbit.route_duck_vector",
     "RVBBIT_ROUTE_DUCK_HIVE": "rvbbit.route_duck_hive",
+    "RVBBIT_ROUTE_DATAFUSION_MEM": "rvbbit.route_datafusion_mem",
     "RVBBIT_ROUTE_DATAFUSION_VECTOR": "rvbbit.route_datafusion_vector",
     "RVBBIT_ROUTE_DATAFUSION_HIVE": "rvbbit.route_datafusion_hive",
     "RVBBIT_ROUTE_HIVE": "rvbbit.route_hive",
     "RVBBIT_ROUTE_PG_ROWSTORE": "rvbbit.route_pg_rowstore",
     "RVBBIT_ROUTE_RVBBIT_NATIVE": "rvbbit.route_rvbbit_native",
+    "RVBBIT_ROUTE_FORCE_CANDIDATE": "rvbbit.route_force_candidate",
     "RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE": "rvbbit.route_hive_min_confidence",
+    "RVBBIT_HOT_STORE_BUDGET_MB": "rvbbit.hot_store_budget_mb",
+    "RVBBIT_HOT_STORE_ROUTE_MAX_ROWS": "rvbbit.hot_store_route_max_rows",
     # In-process DataFusion (default on as of Phase 1). Set "off" to
     # force the legacy rvbbit-duck sidecar path for A/B benchmarking
     # against the older system. The GUC is read by duck_backend's
@@ -134,6 +140,8 @@ def runner_for(system: str) -> Callable[..., float]:
         return lambda sql, repeat=3: run_pg(PG_DSNS["rvbbit"], sql, repeat)
     if system == "rvbbit_native":
         return lambda sql, repeat=3: run_pg(PG_DSNS["rvbbit_native"], sql, repeat)
+    if system == "rvbbit_native_forced":
+        return lambda sql, repeat=3: run_pg(PG_DSNS["rvbbit_native_forced"], sql, repeat)
     if system in {"rvbbit_pg_heap_forced", "rvbbit_pg_heap", "pg_heap"}:
         return lambda sql, repeat=3: run_pg(PG_DSNS[system], sql, repeat)
     if system == "rvbbit_duck_hot":

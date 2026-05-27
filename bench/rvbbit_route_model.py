@@ -361,10 +361,52 @@ def _clause_signature(value: str) -> tuple[int, str]:
 
 
 def _count_distinct_signature(lowered: str) -> str:
+    expr = _count_distinct_expr(lowered)
+    if not expr:
+        return "none"
+    return _expr_signature(expr)
+
+
+def _count_distinct_expr(lowered: str) -> str | None:
     match = re.search(r"\bcount\s*\(\s*distinct\s+(.+?)\)", lowered, flags=re.S)
     if not match:
-        return "none"
-    return _expr_signature(match.group(1))
+        return None
+    return match.group(1).strip()
+
+
+def _identifier_present(value: str, ident: str) -> bool:
+    ident = _strip_identifier_quotes(ident)
+    if not ident:
+        return False
+    quoted = re.escape(f'"{ident}"')
+    plain = re.escape(ident)
+    return re.search(rf"(?<![\w$])(?:{quoted}|{plain})(?![\w$])", value, flags=re.I) is not None
+
+
+def _text_column_ref_count(value: str, text_columns: list[str]) -> int:
+    return sum(1 for column in text_columns if _identifier_present(value, column))
+
+
+def _text_column_features(sql: str, text_columns: list[str] | None) -> dict[str, Any]:
+    lowered = sql_stringless(sql).lower()
+    text_columns = [_strip_identifier_quotes(col) for col in (text_columns or []) if col]
+    group_clause = _top_level_clause(
+        lowered,
+        "group by",
+        ["order by", "having", "limit", "offset", "union", "except", "intersect"],
+    )
+    order_clause = _top_level_clause(
+        lowered,
+        "order by",
+        ["limit", "offset", "union", "except", "intersect"],
+    )
+    distinct_expr = _count_distinct_expr(lowered) or ""
+    return {
+        "referenced_text_col_count": _text_column_ref_count(lowered, text_columns),
+        "group_text_col_count": _text_column_ref_count(group_clause, text_columns),
+        "order_text_col_count": _text_column_ref_count(order_clause, text_columns),
+        "count_distinct_text_count": _text_column_ref_count(distinct_expr, text_columns),
+    }
 
 
 def _add_table_ref(refs: set[str], first: str, second: str | None = None) -> None:
@@ -469,6 +511,10 @@ def extract_sql_features(sql: str) -> dict[str, Any]:
         "count_count": _count(r"\bcount\s*\(", lowered),
         "min_count": _count(r"\bmin\s*\(", lowered),
         "max_count": _count(r"\bmax\s*\(", lowered),
+        "referenced_text_col_count": 0,
+        "group_text_col_count": 0,
+        "order_text_col_count": 0,
+        "count_distinct_text_count": 0,
         "exists_count": _count(r"\bexists\s*\(", lowered),
         "in_count": _count(r"\bin\s*\(", lowered),
         "between_count": _count(r"\bbetween\b", lowered),
@@ -537,6 +583,7 @@ def build_route_features(
     features = extract_sql_features(sql)
     features.update(extract_plan_features(plan_text))
     table_metrics = table_metrics or {}
+    features.update(_text_column_features(sql, table_metrics.get("text_columns")))
     features.update(
         {
             "table_rows": table_metrics.get("rows"),
@@ -610,6 +657,9 @@ PATH_TO_CANDIDATE = {
     "duck-hive": "duck_hive",
     "datafusion": "datafusion_vector",
     "df": "datafusion_vector",
+    "datafusion_mem": "datafusion_mem",
+    "datafusion-memory": "datafusion_mem",
+    "df_mem": "datafusion_mem",
     "datafusion_vector": "datafusion_vector",
     "datafusion_hive": "datafusion_hive",
     "datafusion-hive": "datafusion_hive",
@@ -625,6 +675,7 @@ CANDIDATE_TO_PATH = {
     "rvbbit_native": "native",
     "duck_vector": "duck",
     "duck_hive": "duck_hive",
+    "datafusion_mem": "datafusion_mem",
     "datafusion_vector": "datafusion",
     "datafusion_hive": "datafusion_hive",
     "pg_rowstore": "pg_heap",
@@ -633,6 +684,7 @@ ROUTABLE_CANDIDATES = {
     "rvbbit_native",
     "duck_vector",
     "duck_hive",
+    "datafusion_mem",
     "datafusion_vector",
     "datafusion_hive",
     "pg_rowstore",
@@ -652,6 +704,8 @@ def candidate_enabled(candidate: str | None) -> bool:
         return _env_enabled("RVBBIT_ROUTE_DUCK_VECTOR", True)
     if candidate == "datafusion_vector":
         return _env_enabled("RVBBIT_ROUTE_DATAFUSION_VECTOR", True)
+    if candidate == "datafusion_mem":
+        return _env_enabled("RVBBIT_ROUTE_DATAFUSION_MEM", True)
     if candidate == "duck_hive":
         return _env_enabled("RVBBIT_ROUTE_HIVE", True) and _env_enabled(
             "RVBBIT_ROUTE_DUCK_HIVE", True
@@ -707,6 +761,7 @@ def observation_candidate_ms(observation: dict[str, Any]) -> dict[str, float]:
         "native_ms": "rvbbit_native",
         "duck_ms": "duck_vector",
         "duck_hive_ms": "duck_hive",
+        "datafusion_mem_ms": "datafusion_mem",
         "datafusion_ms": "datafusion_vector",
         "datafusion_hive_ms": "datafusion_hive",
         "pg_ms": "pg_rowstore",
@@ -802,6 +857,7 @@ class RouteProfile:
                         "native_ms": candidate_medians.get("rvbbit_native"),
                         "duck_ms": candidate_medians.get("duck_vector"),
                         "duck_hive_ms": candidate_medians.get("duck_hive"),
+                        "datafusion_mem_ms": candidate_medians.get("datafusion_mem"),
                         "datafusion_ms": candidate_medians.get("datafusion_vector"),
                         "datafusion_hive_ms": candidate_medians.get("datafusion_hive"),
                         "pg_ms": candidate_medians.get("pg_rowstore"),
@@ -912,6 +968,7 @@ class RouteProfile:
             "native_ms_predicted": predicted.get("rvbbit_native"),
             "duck_ms_predicted": predicted.get("duck_vector"),
             "duck_hive_ms_predicted": predicted.get("duck_hive"),
+            "datafusion_mem_ms_predicted": predicted.get("datafusion_mem"),
             "datafusion_ms_predicted": predicted.get("datafusion_vector"),
             "datafusion_hive_ms_predicted": predicted.get("datafusion_hive"),
             "pg_ms_predicted": predicted.get("pg_rowstore"),

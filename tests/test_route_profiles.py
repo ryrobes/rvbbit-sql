@@ -176,8 +176,70 @@ def test_no_active_profile_uses_conservative_native_route(rvbbit, temp_table):
         assert explained["profile_name"] is None
         assert explained["profile_source"] == "none"
         assert explained["chosen_candidate"] == "rvbbit_native"
-        assert explained["route_source"] == "no-profile"
+        assert explained["route_source"] == "hard-rule"
+        assert "native simple aggregate metadata" in explained["reason"]
     finally:
+        if old_active is not None:
+            rvbbit.execute(
+                "UPDATE rvbbit.route_profiles SET active = true WHERE name = %s",
+                (old_active[0],),
+            )
+
+
+def test_sql_route_training_records_candidates(rvbbit, temp_table):
+    old_active = rvbbit.execute(
+        "SELECT name FROM rvbbit.route_profiles WHERE active LIMIT 1"
+    ).fetchone()
+    profile_name = f"pytest_sql_train_{uuid.uuid4().hex[:8]}"
+    query = (
+        f"SELECT grp, count(DISTINCT id) AS c "
+        f"FROM {temp_table} GROUP BY grp ORDER BY grp"
+    )
+    try:
+        rvbbit.execute(f"CREATE TABLE {temp_table} (id int, grp int) USING rvbbit")
+        rvbbit.execute(
+            f"INSERT INTO {temp_table} SELECT g, g % 5 FROM generate_series(1, 1000) g"
+        )
+        rvbbit.execute(f"SELECT rvbbit.compact('{temp_table}'::regclass)").fetchone()
+        rvbbit.execute("UPDATE rvbbit.route_profiles SET active = false WHERE active")
+
+        trained = rvbbit.execute(
+            "SELECT rvbbit.route_train_query(%s, %s, 1, 0.0, false, %s, %s)",
+            (
+                profile_name,
+                query,
+                "rvbbit_native,datafusion_vector",
+                "pytest sql training",
+            ),
+        ).fetchone()[0]
+        assert trained["profile"] == profile_name
+        assert trained["run_id"] > 0
+        training_query_id = trained["training_query_id"]
+
+        rows = rvbbit.execute(
+            """
+            SELECT candidate, ok_runs, error_runs, last_validation_status
+            FROM rvbbit.route_training_summary
+            WHERE profile_name = %s AND training_query_id = %s
+            """,
+            (profile_name, training_query_id),
+        ).fetchall()
+        by_candidate = {row[0]: row for row in rows}
+        assert by_candidate["rvbbit_native"][1] == 1
+        assert by_candidate["rvbbit_native"][3] == "baseline"
+        assert (
+            by_candidate["datafusion_vector"][1]
+            + by_candidate["datafusion_vector"][2]
+        ) == 1
+
+        deleted = rvbbit.execute(
+            "SELECT rvbbit.route_training_delete_query(%s, %s, true)",
+            (profile_name, training_query_id),
+        ).fetchone()[0]
+        assert deleted["deleted"] == 1
+    finally:
+        rvbbit.execute("SELECT rvbbit.route_clear_profile(false)")
+        rvbbit.execute("DELETE FROM rvbbit.route_profiles WHERE name = %s", (profile_name,))
         if old_active is not None:
             rvbbit.execute(
                 "UPDATE rvbbit.route_profiles SET active = true WHERE name = %s",

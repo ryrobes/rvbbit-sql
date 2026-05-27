@@ -126,6 +126,11 @@ def build_profile_from_observations(
                 if "duck_hive" in candidate_medians
                 else None
             ),
+            "datafusion_mem_ms_median": (
+                round(candidate_medians["datafusion_mem"], 4)
+                if "datafusion_mem" in candidate_medians
+                else None
+            ),
             "datafusion_ms_median": (
                 round(candidate_medians["datafusion_vector"], 4)
                 if "datafusion_vector" in candidate_medians
@@ -170,9 +175,10 @@ def build_profile_from_observations(
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "suite": "combined",
         "source_profiles": source_profiles,
-        "native_system": "rvbbit_native",
+        "native_system": "rvbbit_native_forced",
         "duck_system": "rvbbit_duck_forced",
         "duck_hive_system": "rvbbit_duck_hive_forced",
+        "datafusion_mem_system": "rvbbit_datafusion_mem_forced",
         "datafusion_system": "rvbbit_datafusion_forced",
         "datafusion_hive_system": "rvbbit_datafusion_hive_forced",
         "pg_heap_system": "rvbbit_pg_heap_forced",

@@ -7,7 +7,9 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::{CStr, CString};
+use std::ffi::{c_void, CStr, CString};
+use std::panic::AssertUnwindSafe;
+use std::time::Instant;
 
 use pgrx::extension_sql;
 use pgrx::prelude::*;
@@ -60,7 +62,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_observations (
     candidate     text NOT NULL,
     elapsed_ms    double precision NOT NULL,
     status        text NOT NULL DEFAULT 'ok',
-    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
     CHECK (elapsed_ms >= 0)
 );
 
@@ -69,6 +71,99 @@ CREATE INDEX IF NOT EXISTS route_observations_shape_idx
 
 CREATE INDEX IF NOT EXISTS route_observations_family_idx
     ON rvbbit.route_observations (shape_family, candidate, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS rvbbit.route_training_queries (
+    id            bigserial PRIMARY KEY,
+    profile_name  text NOT NULL REFERENCES rvbbit.route_profiles(name) ON DELETE CASCADE,
+    query_sql     text NOT NULL,
+    query_hash    text NOT NULL,
+    shape_key     text NOT NULL,
+    shape_family  text NOT NULL,
+    features      jsonb NOT NULL,
+    label         text,
+    enabled       boolean NOT NULL DEFAULT true,
+    created_by    text NOT NULL DEFAULT current_user,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (profile_name, query_hash)
+);
+
+CREATE INDEX IF NOT EXISTS route_training_queries_profile_idx
+    ON rvbbit.route_training_queries (profile_name, enabled, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS route_training_queries_shape_idx
+    ON rvbbit.route_training_queries (profile_name, shape_key);
+
+CREATE TABLE IF NOT EXISTS rvbbit.route_training_runs (
+    id                 bigserial PRIMARY KEY,
+    training_query_id  bigint NOT NULL REFERENCES rvbbit.route_training_queries(id) ON DELETE CASCADE,
+    profile_name       text NOT NULL REFERENCES rvbbit.route_profiles(name) ON DELETE CASCADE,
+    started_at         timestamptz NOT NULL DEFAULT now(),
+    finished_at        timestamptz,
+    status             text NOT NULL DEFAULT 'running',
+    repeats            integer NOT NULL DEFAULT 1,
+    candidates         text[] NOT NULL DEFAULT ARRAY[]::text[],
+    settings           jsonb NOT NULL DEFAULT '{}'::jsonb,
+    summary            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    CHECK (repeats > 0)
+);
+
+CREATE INDEX IF NOT EXISTS route_training_runs_profile_idx
+    ON rvbbit.route_training_runs (profile_name, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS rvbbit.route_training_results (
+    id                 bigserial PRIMARY KEY,
+    run_id             bigint NOT NULL REFERENCES rvbbit.route_training_runs(id) ON DELETE CASCADE,
+    training_query_id  bigint NOT NULL REFERENCES rvbbit.route_training_queries(id) ON DELETE CASCADE,
+    profile_name       text NOT NULL REFERENCES rvbbit.route_profiles(name) ON DELETE CASCADE,
+    observed_at        timestamptz NOT NULL DEFAULT now(),
+    candidate          text NOT NULL,
+    repeat_idx         integer NOT NULL DEFAULT 1,
+    elapsed_ms         double precision,
+    rows_returned      bigint,
+    result_digest      text,
+    status             text NOT NULL DEFAULT 'ok',
+    validation_status  text NOT NULL DEFAULT 'unknown',
+    error              text,
+    route_doc          jsonb NOT NULL DEFAULT '{}'::jsonb,
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
+    CHECK (rows_returned IS NULL OR rows_returned >= 0),
+    CHECK (repeat_idx > 0)
+);
+
+CREATE INDEX IF NOT EXISTS route_training_results_profile_idx
+    ON rvbbit.route_training_results (profile_name, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS route_training_results_query_idx
+    ON rvbbit.route_training_results (training_query_id, candidate, observed_at DESC);
+
+CREATE OR REPLACE VIEW rvbbit.route_training_summary AS
+WITH candidate_stats AS (
+    SELECT
+        tq.profile_name,
+        tq.id AS training_query_id,
+        tq.query_hash,
+        tq.shape_key,
+        tq.shape_family,
+        tq.label,
+        tq.enabled,
+        tr.candidate,
+        count(*) FILTER (WHERE tr.status = 'ok')::bigint AS ok_runs,
+        count(*) FILTER (WHERE tr.status <> 'ok')::bigint AS error_runs,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY tr.elapsed_ms)
+            FILTER (WHERE tr.status = 'ok' AND tr.elapsed_ms IS NOT NULL) AS median_ms,
+        min(tr.observed_at) AS first_seen,
+        max(tr.observed_at) AS last_seen,
+        (array_agg(tr.validation_status ORDER BY tr.observed_at DESC))[1] AS last_validation_status,
+        (array_agg(tr.error ORDER BY tr.observed_at DESC))[1] AS last_error
+    FROM rvbbit.route_training_queries tq
+    LEFT JOIN rvbbit.route_training_results tr ON tr.training_query_id = tq.id
+    GROUP BY tq.profile_name, tq.id, tq.query_hash, tq.shape_key, tq.shape_family,
+             tq.label, tq.enabled, tr.candidate
+)
+SELECT *
+FROM candidate_stats;
 
 CREATE TABLE IF NOT EXISTS rvbbit.route_decisions (
     id            bigserial PRIMARY KEY,
@@ -90,7 +185,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_decisions (
     rewritten     boolean NOT NULL DEFAULT false,
     features      jsonb NOT NULL DEFAULT '{}'::jsonb,
     route_doc     jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
     CHECK (confidence IS NULL OR confidence >= 0)
 );
 
@@ -135,7 +230,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_executions (
     status        text NOT NULL DEFAULT 'ok',
     features      jsonb NOT NULL DEFAULT '{}'::jsonb,
     route_doc     jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
     CHECK (confidence IS NULL OR confidence >= 0),
     CHECK (elapsed_ms >= 0),
     CHECK (rows_returned >= 0)
@@ -159,6 +254,30 @@ ALTER TABLE IF EXISTS rvbbit.route_executions
 ALTER TABLE IF EXISTS rvbbit.route_executions
     ADD COLUMN IF NOT EXISTS profile_source text NOT NULL DEFAULT 'unknown';
 
+ALTER TABLE IF EXISTS rvbbit.route_observations
+    DROP CONSTRAINT IF EXISTS route_observations_candidate_check;
+ALTER TABLE IF EXISTS rvbbit.route_observations
+    ADD CONSTRAINT route_observations_candidate_check
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore'));
+
+ALTER TABLE IF EXISTS rvbbit.route_training_results
+    DROP CONSTRAINT IF EXISTS route_training_results_candidate_check;
+ALTER TABLE IF EXISTS rvbbit.route_training_results
+    ADD CONSTRAINT route_training_results_candidate_check
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore'));
+
+ALTER TABLE IF EXISTS rvbbit.route_decisions
+    DROP CONSTRAINT IF EXISTS route_decisions_candidate_check;
+ALTER TABLE IF EXISTS rvbbit.route_decisions
+    ADD CONSTRAINT route_decisions_candidate_check
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore'));
+
+ALTER TABLE IF EXISTS rvbbit.route_executions
+    DROP CONSTRAINT IF EXISTS route_executions_candidate_check;
+ALTER TABLE IF EXISTS rvbbit.route_executions
+    ADD CONSTRAINT route_executions_candidate_check
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore'));
+
 CREATE UNIQUE INDEX IF NOT EXISTS route_profiles_one_active_idx
     ON rvbbit.route_profiles ((active))
     WHERE active;
@@ -180,7 +299,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_profile_entries (
     created_at    timestamptz NOT NULL DEFAULT now(),
     updated_at    timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (profile_name, shape_key),
-    CHECK (choice IN ('duck_vector', 'duck_hive', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (choice IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
     CHECK (confidence >= 0)
 );
 
@@ -223,6 +342,12 @@ ALTER TABLE IF EXISTS rvbbit.route_profile_points
 
 ALTER TABLE IF EXISTS rvbbit.route_profile_points
     ADD COLUMN IF NOT EXISTS datafusion_hive_ms double precision;
+
+ALTER TABLE IF EXISTS rvbbit.route_profile_entries
+    DROP CONSTRAINT IF EXISTS route_profile_entries_choice_check;
+ALTER TABLE IF EXISTS rvbbit.route_profile_entries
+    ADD CONSTRAINT route_profile_entries_choice_check
+    CHECK (choice IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore'));
 
 CREATE INDEX IF NOT EXISTS route_profile_points_family_idx
     ON rvbbit.route_profile_points (profile_name, shape_family, table_rows);
@@ -337,7 +462,7 @@ CREATE OR REPLACE VIEW rvbbit.route_shape_summary AS
 WITH candidate_stats AS (
     SELECT *
     FROM rvbbit.route_observation_summary
-    WHERE candidate IN ('rvbbit_native', 'duck_vector', 'duck_hive', 'datafusion_vector', 'datafusion_hive', 'pg_rowstore')
+    WHERE candidate IN ('rvbbit_native', 'duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'pg_rowstore')
 ),
 shape_stats AS (
     SELECT
@@ -348,12 +473,14 @@ shape_stats AS (
         max(median_ms) FILTER (WHERE candidate = 'rvbbit_native') AS native_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'duck_vector') AS duck_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'duck_hive') AS duck_hive_median_ms,
+        max(median_ms) FILTER (WHERE candidate = 'datafusion_mem') AS datafusion_mem_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'datafusion_vector') AS datafusion_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'datafusion_hive') AS datafusion_hive_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'pg_rowstore') AS pg_median_ms,
         max(observations) FILTER (WHERE candidate = 'rvbbit_native') AS native_observations,
         max(observations) FILTER (WHERE candidate = 'duck_vector') AS duck_observations,
         max(observations) FILTER (WHERE candidate = 'duck_hive') AS duck_hive_observations,
+        max(observations) FILTER (WHERE candidate = 'datafusion_mem') AS datafusion_mem_observations,
         max(observations) FILTER (WHERE candidate = 'datafusion_vector') AS datafusion_observations,
         max(observations) FILTER (WHERE candidate = 'datafusion_hive') AS datafusion_hive_observations,
         max(observations) FILTER (WHERE candidate = 'pg_rowstore') AS pg_observations
@@ -376,12 +503,14 @@ SELECT
     ss.native_median_ms,
     ss.duck_median_ms,
     ss.duck_hive_median_ms,
+    ss.datafusion_mem_median_ms,
     ss.datafusion_median_ms,
     ss.datafusion_hive_median_ms,
     ss.pg_median_ms,
     ss.native_observations,
     ss.duck_observations,
     ss.duck_hive_observations,
+    ss.datafusion_mem_observations,
     ss.datafusion_observations,
     ss.datafusion_hive_observations,
     ss.pg_observations,
@@ -394,6 +523,7 @@ SELECT
                     (ss.native_median_ms),
                     (ss.duck_median_ms),
                     (ss.duck_hive_median_ms),
+                    (ss.datafusion_mem_median_ms),
                     (ss.datafusion_median_ms),
                     (ss.datafusion_hive_median_ms),
                     (ss.pg_median_ms)
@@ -408,6 +538,7 @@ SELECT
                         (ss.native_median_ms),
                         (ss.duck_median_ms),
                         (ss.duck_hive_median_ms),
+                        (ss.datafusion_mem_median_ms),
                         (ss.datafusion_median_ms),
                         (ss.datafusion_hive_median_ms),
                         (ss.pg_median_ms)
@@ -418,6 +549,7 @@ SELECT
     (
         coalesce(ss.native_observations, 0) = 0
         OR coalesce(ss.duck_observations, 0) = 0
+        OR coalesce(ss.datafusion_mem_observations, 0) = 0
         OR coalesce(ss.datafusion_observations, 0) = 0
         OR coalesce(ss.pg_observations, 0) = 0
     )
@@ -490,6 +622,7 @@ JOIN rvbbit.route_profile_entries pe ON pe.profile_name = rp.name;
 enum Candidate {
     DuckVector,
     DuckHive,
+    DataFusionMem,
     DataFusionVector,
     DataFusionHive,
     RvbbitNative,
@@ -497,10 +630,11 @@ enum Candidate {
 }
 
 impl Candidate {
-    fn all() -> [Self; 6] {
+    fn all() -> [Self; 7] {
         [
             Candidate::DuckVector,
             Candidate::DuckHive,
+            Candidate::DataFusionMem,
             Candidate::DataFusionVector,
             Candidate::DataFusionHive,
             Candidate::RvbbitNative,
@@ -512,6 +646,7 @@ impl Candidate {
         match self {
             Candidate::DuckVector => "duck_vector",
             Candidate::DuckHive => "duck_hive",
+            Candidate::DataFusionMem => "datafusion_mem",
             Candidate::DataFusionVector => "datafusion_vector",
             Candidate::DataFusionHive => "datafusion_hive",
             Candidate::RvbbitNative => "rvbbit_native",
@@ -523,6 +658,7 @@ impl Candidate {
         match self {
             Candidate::DuckVector => "duck",
             Candidate::DuckHive => "duck_hive",
+            Candidate::DataFusionMem => "datafusion_mem",
             Candidate::DataFusionVector => "datafusion",
             Candidate::DataFusionHive => "datafusion_hive",
             Candidate::RvbbitNative => "native",
@@ -534,6 +670,7 @@ impl Candidate {
         match s {
             "duck_vector" | "duck" => Some(Candidate::DuckVector),
             "duck_hive" | "duck-hive" => Some(Candidate::DuckHive),
+            "datafusion_mem" | "datafusion-memory" | "df_mem" => Some(Candidate::DataFusionMem),
             "datafusion_vector" | "datafusion" | "df" => Some(Candidate::DataFusionVector),
             "datafusion_hive" | "datafusion-hive" | "df_hive" => Some(Candidate::DataFusionHive),
             "rvbbit_native" | "native" => Some(Candidate::RvbbitNative),
@@ -567,6 +704,7 @@ struct RvbbitTableMetric {
     shadow_heap_retained: bool,
     shadow_heap_dirty: bool,
     delete_count: i64,
+    text_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -595,6 +733,10 @@ struct RouteFeatures {
     count_count: i64,
     min_count: i64,
     max_count: i64,
+    referenced_text_col_count: i64,
+    group_text_col_count: i64,
+    order_text_col_count: i64,
+    count_distinct_text_count: i64,
     exists_count: i64,
     in_count: i64,
     between_count: i64,
@@ -672,6 +814,36 @@ struct CandidateBuckets {
     datafusion: Vec<f64>,
     datafusion_hive: Vec<f64>,
     pg: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct CandidateExecution {
+    elapsed_ms: f64,
+    rows_returned: i64,
+    result_digest: String,
+    route_doc: Value,
+}
+
+#[derive(Clone, Debug)]
+struct TrainingRunResult {
+    candidate: Candidate,
+    repeat_idx: i32,
+    elapsed_ms: Option<f64>,
+    rows_returned: Option<i64>,
+    result_digest: Option<String>,
+    status: String,
+    validation_status: String,
+    error: Option<String>,
+    route_doc: Value,
+}
+
+#[derive(Clone, Debug)]
+struct TrainingObservation {
+    shape_key: String,
+    shape_family: String,
+    features: Value,
+    candidate: Candidate,
+    elapsed_ms: f64,
 }
 
 impl RouteCurveSample {
@@ -806,6 +978,201 @@ fn route_train(profile_name: &str, min_observations: i64, min_gain_pct: f64) -> 
 }
 
 #[pg_extern(volatile)]
+fn route_create_profile(profile_name: &str, active: default!(bool, "false")) -> JsonB {
+    let name = validate_route_profile_name(profile_name, "route_create_profile");
+    ensure_route_profile_row(name, active, "route_create_profile");
+    if active {
+        route_activate_profile(name);
+    }
+    JsonB(profile_lifecycle_summary(name, "created"))
+}
+
+#[pg_extern(volatile)]
+fn route_train_query(
+    profile_name: &str,
+    query: &str,
+    repeats: default!(i32, "3"),
+    min_gain_pct: default!(f64, "0.05"),
+    activate: default!(bool, "true"),
+    candidates: default!(&str, "'all'"),
+    label: default!(&str, "''"),
+) -> JsonB {
+    let profile = validate_route_profile_name(profile_name, "route_train_query");
+    if let Err(reason) = safe_select(query) {
+        pgrx::error!("rvbbit.route_train_query: {reason}");
+    }
+    if !min_gain_pct.is_finite() || min_gain_pct < 0.0 {
+        pgrx::error!("rvbbit.route_train_query: min_gain_pct must be finite and >= 0");
+    }
+    let repeats = repeats.max(1).min(100);
+    let plan = explain_sql(query).ok();
+    let tables = referenced_rvbbit_tables(query);
+    if tables.is_empty() {
+        pgrx::error!("rvbbit.route_train_query: query does not reference an rvbbit table");
+    }
+    let features = build_features(query, plan.as_deref(), &tables);
+    let features_json = features.to_json();
+    let candidates = parse_training_candidates(candidates, "route_train_query");
+    ensure_route_profile_row(profile, false, "route_train_query");
+
+    let training_query_id = upsert_training_query(profile, query, &features, &features_json, label);
+    let run_id = insert_training_run(
+        profile,
+        training_query_id,
+        repeats,
+        &candidates,
+        json!({
+            "min_gain_pct": min_gain_pct,
+            "activate": activate,
+            "candidate_request": candidates.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+        }),
+    );
+
+    let mut run_results = Vec::new();
+    let mut baseline_digest: Option<String> = None;
+    let mut baseline_rows: Option<i64> = None;
+    for candidate in &candidates {
+        let (available, reason) = candidate_availability(*candidate, &features, &tables);
+        if !available {
+            let skipped = TrainingRunResult {
+                candidate: *candidate,
+                repeat_idx: 1,
+                elapsed_ms: None,
+                rows_returned: None,
+                result_digest: None,
+                status: "skipped".to_string(),
+                validation_status: "skipped".to_string(),
+                error: Some(reason),
+                route_doc: json!({}),
+            };
+            insert_training_result(profile, training_query_id, run_id, &skipped);
+            run_results.push(skipped);
+            continue;
+        }
+
+        for repeat_idx in 1..=repeats {
+            let execution = execute_candidate_once(query, *candidate, features.order_by);
+            let result = match execution {
+                Ok(outcome) => {
+                    let validation_status =
+                        if *candidate == Candidate::RvbbitNative && baseline_digest.is_none() {
+                            baseline_digest = Some(outcome.result_digest.clone());
+                            baseline_rows = Some(outcome.rows_returned);
+                            "baseline".to_string()
+                        } else if let Some(baseline) = baseline_digest.as_deref() {
+                            if baseline == outcome.result_digest
+                                && baseline_rows == Some(outcome.rows_returned)
+                            {
+                                "ok".to_string()
+                            } else {
+                                "mismatch".to_string()
+                            }
+                        } else if *candidate == Candidate::RvbbitNative {
+                            "baseline".to_string()
+                        } else {
+                            "no_baseline".to_string()
+                        };
+                    TrainingRunResult {
+                        candidate: *candidate,
+                        repeat_idx,
+                        elapsed_ms: Some(outcome.elapsed_ms),
+                        rows_returned: Some(outcome.rows_returned),
+                        result_digest: Some(outcome.result_digest),
+                        status: "ok".to_string(),
+                        validation_status,
+                        error: None,
+                        route_doc: outcome.route_doc,
+                    }
+                }
+                Err(error) => TrainingRunResult {
+                    candidate: *candidate,
+                    repeat_idx,
+                    elapsed_ms: None,
+                    rows_returned: None,
+                    result_digest: None,
+                    status: "error".to_string(),
+                    validation_status: "error".to_string(),
+                    error: Some(error),
+                    route_doc: json!({}),
+                },
+            };
+
+            insert_training_result(profile, training_query_id, run_id, &result);
+            if result.status == "ok"
+                && matches!(result.validation_status.as_str(), "baseline" | "ok")
+                && result.elapsed_ms.is_some()
+            {
+                insert_route_observation(
+                    query,
+                    &features,
+                    &features_json,
+                    result.candidate,
+                    result.elapsed_ms.unwrap_or(0.0),
+                    "ok",
+                    &format!("sql-train:{profile}:{run_id}"),
+                );
+            }
+            run_results.push(result);
+        }
+    }
+
+    let rebuild = route_profile_rebuild_inner(profile, min_gain_pct, activate);
+    let summary = training_run_summary(profile, training_query_id, run_id, &run_results, rebuild);
+    finish_training_run(run_id, "finished", &summary);
+    JsonB(summary)
+}
+
+#[pg_extern(volatile)]
+fn route_profile_rebuild(
+    profile_name: &str,
+    min_gain_pct: default!(f64, "0.05"),
+    activate: default!(bool, "true"),
+) -> JsonB {
+    let profile = validate_route_profile_name(profile_name, "route_profile_rebuild");
+    if !min_gain_pct.is_finite() || min_gain_pct < 0.0 {
+        pgrx::error!("rvbbit.route_profile_rebuild: min_gain_pct must be finite and >= 0");
+    }
+    ensure_route_profile_row(profile, false, "route_profile_rebuild");
+    JsonB(route_profile_rebuild_inner(profile, min_gain_pct, activate))
+}
+
+#[pg_extern(volatile)]
+fn route_training_delete_query(
+    profile_name: &str,
+    training_query_id: i64,
+    rebuild: default!(bool, "true"),
+) -> JsonB {
+    let profile = validate_route_profile_name(profile_name, "route_training_delete_query");
+    let name_lit = sql_lit(profile);
+    let id = training_query_id.max(0);
+    let deleted: i64 = Spi::get_one(&format!(
+        "WITH deleted AS ( \
+             DELETE FROM rvbbit.route_training_queries \
+             WHERE profile_name = {name_lit} AND id = {id} \
+             RETURNING 1 \
+         ) SELECT count(*)::bigint FROM deleted"
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+    if deleted == 0 {
+        pgrx::error!(
+            "rvbbit.route_training_delete_query: training query {} was not found in profile '{}'",
+            training_query_id,
+            profile
+        );
+    }
+    let rebuild_summary = rebuild.then(|| route_profile_rebuild_inner(profile, 0.05, true));
+    JsonB(json!({
+        "action": "deleted",
+        "profile": profile,
+        "training_query_id": training_query_id,
+        "deleted": deleted,
+        "rebuild": rebuild_summary,
+    }))
+}
+
+#[pg_extern(volatile)]
 fn route_eval(profile_name: &str) -> JsonB {
     let name_lit = sql_lit(profile_name);
     let active: bool = Spi::get_one(&format!(
@@ -837,6 +1204,13 @@ fn route_eval(profile_name: &str) -> JsonB {
     let datafusion_entries: i64 = Spi::get_one(&format!(
         "SELECT count(*)::bigint FROM rvbbit.route_profile_entries \
          WHERE profile_name = {name_lit} AND choice = 'datafusion_vector'"
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+    let datafusion_mem_entries: i64 = Spi::get_one(&format!(
+        "SELECT count(*)::bigint FROM rvbbit.route_profile_entries \
+         WHERE profile_name = {name_lit} AND choice = 'datafusion_mem'"
     ))
     .ok()
     .flatten()
@@ -899,6 +1273,7 @@ fn route_eval(profile_name: &str) -> JsonB {
         "entries": entries,
         "duck_entries": duck_entries,
         "duck_hive_entries": duck_hive_entries,
+        "datafusion_mem_entries": datafusion_mem_entries,
         "datafusion_entries": datafusion_entries,
         "datafusion_hive_entries": datafusion_hive_entries,
         "native_entries": native_entries,
@@ -1312,14 +1687,19 @@ fn choose_route_fast(
             None,
         ));
     }
-    let (_duck_available, duck_reason) = duck_availability(features, tables);
+    if let Some(decision) = forced_route_decision(features, tables) {
+        return Some(decision);
+    }
+    let (_vector_available, vector_reason) = duck_availability(features, tables);
     let (pg_available, pg_reason) = pg_rowstore_availability(tables);
     let external_available = default_external_candidate(features, tables).is_some();
     if !external_available && !pg_available {
         return Some(decision(
             Candidate::RvbbitNative,
             "eligibility-fast",
-            &format!("duck ineligible: {duck_reason}; pg rowstore ineligible: {pg_reason}"),
+            &format!(
+                "parquet vector ineligible: {vector_reason}; pg rowstore ineligible: {pg_reason}"
+            ),
             None,
             None,
         ));
@@ -1343,6 +1723,15 @@ fn choose_route_fast(
             Candidate::RvbbitNative,
             "hard-rule-fast",
             "native count metadata",
+            None,
+            None,
+        ));
+    }
+    if simple_metadata_aggregate_should_stay_native(features) {
+        return Some(decision(
+            Candidate::RvbbitNative,
+            "hard-rule-fast",
+            "native simple aggregate metadata",
             None,
             None,
         ));
@@ -1382,14 +1771,19 @@ fn choose_route(
             None,
         );
     }
-    let (_duck_available, duck_reason) = duck_availability(features, tables);
+    if let Some(decision) = forced_route_decision(features, tables) {
+        return decision;
+    }
+    let (_vector_available, vector_reason) = duck_availability(features, tables);
     let (pg_available, pg_reason) = pg_rowstore_availability(tables);
     let external_available = default_external_candidate(features, tables).is_some();
     if !external_available && !pg_available {
         return decision(
             Candidate::RvbbitNative,
             "eligibility",
-            &format!("duck ineligible: {duck_reason}; pg rowstore ineligible: {pg_reason}"),
+            &format!(
+                "parquet vector ineligible: {vector_reason}; pg rowstore ineligible: {pg_reason}"
+            ),
             None,
             None,
         );
@@ -1428,6 +1822,15 @@ fn choose_route(
             Candidate::RvbbitNative,
             "hard-rule",
             "native fixed LIKE count rewrite",
+            None,
+            None,
+        );
+    }
+    if simple_metadata_aggregate_should_stay_native(features) {
+        return decision(
+            Candidate::RvbbitNative,
+            "hard-rule",
+            "native simple aggregate metadata",
             None,
             None,
         );
@@ -1477,24 +1880,48 @@ fn choose_route(
     }
 
     if profile.effective.is_none() {
+        return choose_no_profile_route(features, tables, profile);
+    }
+
+    if hot_store_no_profile_enabled() && hot_store_prefers_mem(features) {
+        if let Some(candidate) =
+            first_available_candidate(&[Candidate::DataFusionMem], features, tables)
+        {
+            return decision(
+                candidate,
+                "default-hot",
+                "route profile miss; manually loaded hot columnar object uses in-memory DataFusion",
+                None,
+                None,
+            );
+        }
+    }
+
+    if let Some(reason) = fallback_native_reason(features) {
         return decision(
             Candidate::RvbbitNative,
-            "no-profile",
-            profile
-                .warning
-                .as_deref()
-                .unwrap_or("no active route profile; using conservative native path"),
+            "default-native",
+            &format!("route profile miss; {reason}"),
             None,
             None,
         );
     }
-
+    if let Some(candidates) = fallback_external_candidate_order(features) {
+        if let Some(candidate) = first_available_candidate(candidates, features, tables) {
+            let reason = if matches!(candidate, Candidate::DataFusionHive | Candidate::DuckHive) {
+                "route profile miss; variant-friendly analytical shape uses a parquet variant path"
+            } else {
+                "route profile miss; analytical parquet shape uses vector execution"
+            };
+            return decision(candidate, "default-fallback", reason, None, None);
+        }
+    }
     let default_candidate =
         default_external_candidate(features, tables).unwrap_or(Candidate::RvbbitNative);
     decision(
         default_candidate,
         "default",
-        "default parquet vector candidate",
+        "default parquet candidate",
         None,
         None,
     )
@@ -1803,7 +2230,7 @@ fn choose_from_observation_curve(
                  FROM rvbbit.route_observations \
                  WHERE shape_family IN ({family_lit}, {legacy_family_lit}) \
                    AND status = 'ok' \
-                   AND candidate IN ('rvbbit_native', 'duck_vector', 'duck_hive', 'datafusion_vector', 'datafusion_hive', 'pg_rowstore') \
+                   AND candidate IN ('rvbbit_native', 'duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'pg_rowstore') \
                    AND features ? 'table_rows' \
                  ORDER BY observed_at DESC \
                  LIMIT 2000"
@@ -2067,6 +2494,602 @@ fn load_route_observations() -> Vec<Value> {
     out
 }
 
+fn route_profile_rebuild_inner(profile_name: &str, min_gain_pct: f64, activate: bool) -> Value {
+    let observations = load_route_training_observations(profile_name);
+    let mut by_shape: BTreeMap<String, Vec<TrainingObservation>> = BTreeMap::new();
+    for obs in observations.iter().cloned() {
+        by_shape.entry(obs.shape_key.clone()).or_default().push(obs);
+    }
+
+    let mut entries = Map::new();
+    let mut rejected = Map::new();
+    let mut profile_points = Vec::new();
+    for (shape, rows) in by_shape {
+        let mut by_candidate: HashMap<&'static str, Vec<f64>> = HashMap::new();
+        let mut shape_family = String::new();
+        let mut features = json!({});
+        for row in &rows {
+            if shape_family.is_empty() {
+                shape_family = row.shape_family.clone();
+            }
+            if features == json!({}) {
+                features = row.features.clone();
+            }
+            by_candidate
+                .entry(row.candidate.as_str())
+                .or_default()
+                .push(row.elapsed_ms);
+        }
+        let mut medians: Vec<(String, f64, usize)> = by_candidate
+            .into_iter()
+            .map(|(candidate, values)| {
+                let n = values.len();
+                (candidate.to_string(), median_f64(values), n)
+            })
+            .collect();
+        medians.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        if medians.len() < 2 {
+            rejected.insert(
+                shape,
+                json!({"reason": "need at least two validated candidate timings"}),
+            );
+            continue;
+        }
+        let best = &medians[0];
+        let second = &medians[1];
+        let Some(best_candidate) = Candidate::from_str(&best.0) else {
+            rejected.insert(shape, json!({"reason": "unknown best candidate"}));
+            continue;
+        };
+        let gain = if second.1 > 0.0 {
+            (1.0 - best.1 / second.1).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let required_gain = min_gain_pct.max(min_confidence_for_candidate(best_candidate));
+        if gain < required_gain {
+            rejected.insert(
+                shape,
+                json!({
+                    "reason": "gain below threshold",
+                    "gain": gain,
+                    "required_gain": required_gain,
+                    "candidate_medians": medians.iter().map(|(c, ms, n)| {
+                        json!({"candidate": c, "median_ms": ms, "observations": n})
+                    }).collect::<Vec<_>>(),
+                }),
+            );
+            continue;
+        }
+
+        let total_obs: usize = medians.iter().map(|m| m.2).sum();
+        let mut entry = Map::new();
+        entry.insert("choice".into(), json!(best.0));
+        entry.insert("confidence".into(), json!(gain));
+        entry.insert(
+            "reason".into(),
+            json!(format!(
+                "{} {:.2}x faster than next candidate over {} validated run(s)",
+                best.0,
+                second.1 / best.1,
+                total_obs
+            )),
+        );
+        entry.insert("median_ms".into(), json!(best.1));
+        entry.insert("next_best_ms".into(), json!(second.1));
+        entry.insert("observations".into(), json!(total_obs));
+        entry.insert(
+            "candidate_medians".into(),
+            Value::Array(
+                medians
+                    .iter()
+                    .map(|(c, ms, n)| json!({"candidate": c, "median_ms": ms, "observations": n}))
+                    .collect(),
+            ),
+        );
+        for (candidate, ms, _) in &medians {
+            if let Some(field) = candidate_median_field(candidate) {
+                entry.insert(field.to_string(), json!(ms));
+            }
+        }
+        entries.insert(shape.clone(), Value::Object(entry));
+
+        let point = profile_point_from_medians(&shape_family, &features, &medians);
+        if !point.is_null() {
+            profile_points.push(point);
+        }
+    }
+
+    let active = if entries.is_empty() {
+        false
+    } else {
+        activate || route_profile_is_active(profile_name)
+    };
+    let profile = json!({
+        "version": 2,
+        "kind": "rvbbit_route_profile",
+        "generated_by": "pg_rvbbit.route_profile_rebuild",
+        "source": "sql-training",
+        "entries": entries,
+        "rejected": rejected,
+        "profile_points": profile_points,
+        "training_observation_count": observations.len(),
+        "min_gain_pct": min_gain_pct,
+    });
+    let (stored_entries, stored_points, stored_profile) =
+        store_route_profile(profile_name, &profile, active, "route_profile_rebuild");
+    json!({
+        "profile": profile_name,
+        "active": active,
+        "entries": stored_entries,
+        "rejected": profile.get("rejected").and_then(Value::as_object).map(|m| m.len()).unwrap_or(0),
+        "points": stored_points,
+        "training_observation_count": observations.len(),
+        "profile_json": stored_profile,
+    })
+}
+
+fn load_route_training_observations(profile_name: &str) -> Vec<TrainingObservation> {
+    let name_lit = sql_lit(profile_name);
+    let mut out = Vec::new();
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(
+            &format!(
+                "SELECT tq.shape_key, tq.shape_family, tq.features, tr.candidate, tr.elapsed_ms \
+                 FROM rvbbit.route_training_queries tq \
+                 JOIN rvbbit.route_training_results tr ON tr.training_query_id = tq.id \
+                 WHERE tq.profile_name = {name_lit} \
+                   AND tq.enabled \
+                   AND tr.status = 'ok' \
+                   AND tr.validation_status IN ('baseline', 'ok') \
+                   AND tr.elapsed_ms IS NOT NULL \
+                   AND tr.elapsed_ms > 0 \
+                 ORDER BY tr.observed_at DESC \
+                 LIMIT 20000"
+            ),
+            None,
+            &[],
+        )?;
+        for row in table {
+            let stored_shape_key: String = row.get(1)?.unwrap_or_default();
+            let stored_shape_family: String = row.get(2)?.unwrap_or_default();
+            let features: JsonB = row.get(3)?.unwrap_or_else(|| JsonB(json!({})));
+            let (shape_key, shape_family, features) =
+                canonical_observation_shape(stored_shape_key, stored_shape_family, features.0);
+            let candidate_name: String = row.get(4)?.unwrap_or_default();
+            let Some(candidate) = Candidate::from_str(&candidate_name) else {
+                continue;
+            };
+            let elapsed_ms: f64 = row.get(5)?.unwrap_or_default();
+            if elapsed_ms <= 0.0 || !elapsed_ms.is_finite() {
+                continue;
+            }
+            out.push(TrainingObservation {
+                shape_key,
+                shape_family,
+                features,
+                candidate,
+                elapsed_ms,
+            });
+        }
+        Ok(())
+    });
+    out
+}
+
+fn profile_point_from_medians(
+    shape_family: &str,
+    features: &Value,
+    medians: &[(String, f64, usize)],
+) -> Value {
+    let get = |candidate: Candidate| -> Option<f64> {
+        medians
+            .iter()
+            .find_map(|(name, ms, _)| (name == candidate.as_str()).then_some(*ms))
+    };
+    let Some(native_ms) = get(Candidate::RvbbitNative) else {
+        return Value::Null;
+    };
+    let Some(duck_ms) = get(Candidate::DuckVector) else {
+        return Value::Null;
+    };
+    let table_rows = features
+        .get("table_rows")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if table_rows <= 0 {
+        return Value::Null;
+    }
+    json!({
+        "shape_family": shape_family,
+        "table_rows": table_rows,
+        "native_ms": native_ms,
+        "duck_ms": duck_ms,
+        "duck_hive_ms": get(Candidate::DuckHive),
+        "datafusion_ms": get(Candidate::DataFusionVector),
+        "datafusion_hive_ms": get(Candidate::DataFusionHive),
+        "pg_ms": get(Candidate::PgRowstore),
+        "point": {
+            "shape_family": shape_family,
+            "table_rows": table_rows,
+            "features": features,
+            "candidate_medians": medians.iter().map(|(candidate, ms, n)| {
+                json!({"candidate": candidate, "median_ms": ms, "observations": n})
+            }).collect::<Vec<_>>(),
+        }
+    })
+}
+
+fn candidate_median_field(candidate: &str) -> Option<&'static str> {
+    match Candidate::from_str(candidate)? {
+        Candidate::RvbbitNative => Some("native_ms_median"),
+        Candidate::DuckVector => Some("duck_ms_median"),
+        Candidate::DuckHive => Some("duck_hive_ms_median"),
+        Candidate::DataFusionMem => None,
+        Candidate::DataFusionVector => Some("datafusion_ms_median"),
+        Candidate::DataFusionHive => Some("datafusion_hive_ms_median"),
+        Candidate::PgRowstore => Some("pg_ms_median"),
+    }
+}
+
+fn parse_training_candidates(value: &str, caller: &str) -> Vec<Candidate> {
+    let trimmed = value.trim();
+    let requested = if trimmed.is_empty() { "all" } else { trimmed };
+    let raw = if requested.eq_ignore_ascii_case("all") {
+        vec![
+            Candidate::RvbbitNative,
+            Candidate::DataFusionMem,
+            Candidate::DataFusionVector,
+            Candidate::DuckVector,
+            Candidate::PgRowstore,
+            Candidate::DataFusionHive,
+            Candidate::DuckHive,
+        ]
+    } else {
+        requested
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|candidate| {
+                Candidate::from_str(&candidate.to_ascii_lowercase()).unwrap_or_else(|| {
+                    pgrx::error!("rvbbit.{caller}: unknown candidate '{candidate}'")
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut out = Vec::with_capacity(raw.len() + 1);
+    out.push(Candidate::RvbbitNative);
+    for candidate in raw {
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+fn validate_route_profile_name<'a>(profile_name: &'a str, caller: &str) -> &'a str {
+    let trimmed = profile_name.trim();
+    if trimmed.is_empty() {
+        pgrx::error!("rvbbit.{caller}: profile_name must not be empty");
+    }
+    if trimmed.len() > 128 {
+        pgrx::error!("rvbbit.{caller}: profile_name must be 128 bytes or less");
+    }
+    trimmed
+}
+
+fn ensure_route_profile_row(profile_name: &str, active: bool, caller: &str) {
+    let name_lit = sql_lit(profile_name);
+    if active {
+        Spi::run("UPDATE rvbbit.route_profiles SET active = false WHERE active")
+            .unwrap_or_else(|e| pgrx::error!("rvbbit.{caller}: {e}"));
+    }
+    let profile = json!({
+        "version": 2,
+        "kind": "rvbbit_route_profile",
+        "generated_by": format!("pg_rvbbit.{caller}"),
+        "source": "sql-training",
+        "entries": {},
+    });
+    let profile_lit = sql_json_lit(&profile);
+    Spi::run(&format!(
+        "INSERT INTO rvbbit.route_profiles (name, active, profile) \
+         VALUES ({name_lit}, {active}, {profile_lit}::jsonb) \
+         ON CONFLICT (name) DO NOTHING"
+    ))
+    .unwrap_or_else(|e| pgrx::error!("rvbbit.{caller}: {e}"));
+}
+
+fn route_profile_is_active(profile_name: &str) -> bool {
+    let name_lit = sql_lit(profile_name);
+    Spi::get_one(&format!(
+        "SELECT coalesce((SELECT active FROM rvbbit.route_profiles WHERE name = {name_lit}), false)"
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+fn upsert_training_query(
+    profile_name: &str,
+    query: &str,
+    features: &RouteFeatures,
+    features_json: &Value,
+    label: &str,
+) -> i64 {
+    let label_sql = sql_nullable_text(label.trim());
+    Spi::get_one(&format!(
+        "INSERT INTO rvbbit.route_training_queries \
+             (profile_name, query_sql, query_hash, shape_key, shape_family, features, label, enabled) \
+         VALUES ({}, {}, {}, {}, {}, {}::jsonb, {label_sql}, true) \
+         ON CONFLICT (profile_name, query_hash) DO UPDATE SET \
+             query_sql = EXCLUDED.query_sql, \
+             shape_key = EXCLUDED.shape_key, \
+             shape_family = EXCLUDED.shape_family, \
+             features = EXCLUDED.features, \
+             label = EXCLUDED.label, \
+             enabled = true, \
+             updated_at = now() \
+         RETURNING id",
+        sql_lit(profile_name),
+        sql_lit(query.trim()),
+        sql_lit(&features.sql_hash),
+        sql_lit(&features.shape_key),
+        sql_lit(&features.shape_family),
+        sql_json_lit(features_json),
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| pgrx::error!("rvbbit.route_train_query: failed to persist training query"))
+}
+
+fn insert_training_run(
+    profile_name: &str,
+    training_query_id: i64,
+    repeats: i32,
+    candidates: &[Candidate],
+    settings: Value,
+) -> i64 {
+    let candidate_names = candidates
+        .iter()
+        .map(|candidate| candidate.as_str().to_string())
+        .collect::<Vec<_>>();
+    Spi::get_one(&format!(
+        "INSERT INTO rvbbit.route_training_runs \
+             (training_query_id, profile_name, repeats, candidates, settings) \
+         VALUES ({training_query_id}, {}, {repeats}, {}, {}::jsonb) \
+         RETURNING id",
+        sql_lit(profile_name),
+        sql_text_array_lit(&candidate_names),
+        sql_json_lit(&settings),
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| pgrx::error!("rvbbit.route_train_query: failed to create training run"))
+}
+
+fn finish_training_run(run_id: i64, status: &str, summary: &Value) {
+    Spi::run(&format!(
+        "UPDATE rvbbit.route_training_runs \
+         SET status = {}, finished_at = now(), summary = {}::jsonb \
+         WHERE id = {run_id}",
+        sql_lit(status),
+        sql_json_lit(summary),
+    ))
+    .unwrap_or_else(|e| pgrx::error!("rvbbit.route_train_query: {e}"));
+}
+
+fn insert_training_result(
+    profile_name: &str,
+    training_query_id: i64,
+    run_id: i64,
+    result: &TrainingRunResult,
+) {
+    Spi::run(&format!(
+        "INSERT INTO rvbbit.route_training_results \
+             (run_id, training_query_id, profile_name, candidate, repeat_idx, elapsed_ms, \
+              rows_returned, result_digest, status, validation_status, error, route_doc) \
+         VALUES ({run_id}, {training_query_id}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}::jsonb)",
+        sql_lit(profile_name),
+        sql_lit(result.candidate.as_str()),
+        result.repeat_idx,
+        sql_nullable_f64(result.elapsed_ms),
+        sql_nullable_i64(result.rows_returned),
+        sql_nullable_text(result.result_digest.as_deref().unwrap_or("")),
+        sql_lit(&result.status),
+        sql_lit(&result.validation_status),
+        sql_nullable_text(result.error.as_deref().unwrap_or("")),
+        sql_json_lit(&result.route_doc),
+    ))
+    .unwrap_or_else(|e| pgrx::error!("rvbbit.route_train_query: {e}"));
+}
+
+fn insert_route_observation(
+    query: &str,
+    features: &RouteFeatures,
+    features_json: &Value,
+    candidate: Candidate,
+    elapsed_ms: f64,
+    status: &str,
+    source: &str,
+) {
+    if !elapsed_ms.is_finite() || elapsed_ms < 0.0 {
+        return;
+    }
+    let _ = query;
+    Spi::run(&format!(
+        "INSERT INTO rvbbit.route_observations \
+             (source, query_hash, shape_key, shape_family, features, candidate, elapsed_ms, status) \
+         VALUES ({}, {}, {}, {}, {}::jsonb, {}, {}, {})",
+        sql_lit(source),
+        sql_lit(&features.sql_hash),
+        sql_lit(&features.shape_key),
+        sql_lit(&features.shape_family),
+        sql_json_lit(features_json),
+        sql_lit(candidate.as_str()),
+        elapsed_ms,
+        sql_lit(status),
+    ))
+    .unwrap_or_else(|e| pgrx::error!("rvbbit.route_train_query: {e}"));
+}
+
+fn execute_candidate_once(
+    query: &str,
+    candidate: Candidate,
+    ordered_digest: bool,
+) -> Result<CandidateExecution, String> {
+    let previous = guc_setting("rvbbit.route_force_candidate").unwrap_or_default();
+    let restore = previous.clone();
+    PgTryBuilder::new(AssertUnwindSafe(|| {
+        set_route_force_candidate(candidate.as_str())?;
+        let started = Instant::now();
+        let (rows_returned, result_digest) =
+            Spi::connect(|client| -> Result<(i64, String), pgrx::spi::Error> {
+                let mut table = client.select(query, None, &[])?;
+                digest_spi_table(&mut table, ordered_digest)
+            })
+            .map_err(|e| e.to_string())?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let route_doc = route_rewrite_value(query);
+        Ok(CandidateExecution {
+            elapsed_ms,
+            rows_returned,
+            result_digest,
+            route_doc,
+        })
+    }))
+    .catch_others(|cause| Err(caught_error_message(cause)))
+    .catch_rust_panic(|cause| Err(caught_error_message(cause)))
+    .finally(move || {
+        let _ = set_route_force_candidate(&restore);
+    })
+    .execute()
+}
+
+fn set_route_force_candidate(value: &str) -> Result<(), String> {
+    Spi::run(&format!(
+        "SELECT pg_catalog.set_config('rvbbit.route_force_candidate', {}, true)",
+        sql_lit(value)
+    ))
+    .map_err(|e| e.to_string())
+}
+
+fn digest_spi_table(
+    table: &mut pgrx::spi::SpiTupleTable<'_>,
+    ordered: bool,
+) -> Result<(i64, String), pgrx::spi::Error> {
+    let columns = table.columns().unwrap_or(0);
+    let mut row_hashes = Vec::with_capacity(table.len());
+    while table.next().is_some() {
+        let mut row_hasher = Sha256::new();
+        row_hasher.update((columns as u64).to_le_bytes());
+        for ordinal in 1..=columns {
+            let typoid = table.column_type_oid(ordinal)?.value();
+            row_hasher.update(typoid.to_u32().to_le_bytes());
+            let datum = table.get_datum_by_ordinal(ordinal)?;
+            match datum {
+                Some(datum) => {
+                    row_hasher.update([1]);
+                    let text = unsafe { datum_output_text(datum, typoid) };
+                    row_hasher.update((text.len() as u64).to_le_bytes());
+                    row_hasher.update(text.as_bytes());
+                }
+                None => row_hasher.update([0]),
+            }
+        }
+        row_hashes.push(format!("{:x}", row_hasher.finalize()));
+    }
+    if !ordered {
+        row_hashes.sort();
+    }
+    let mut final_hasher = Sha256::new();
+    final_hasher.update((columns as u64).to_le_bytes());
+    final_hasher.update((row_hashes.len() as u64).to_le_bytes());
+    for row_hash in &row_hashes {
+        final_hasher.update(row_hash.as_bytes());
+    }
+    Ok((
+        row_hashes.len() as i64,
+        format!("{:x}", final_hasher.finalize()),
+    ))
+}
+
+unsafe fn datum_output_text(datum: pg_sys::Datum, typoid: pg_sys::Oid) -> String {
+    let mut typoutput = pg_sys::InvalidOid;
+    let mut typisvarlena = false;
+    pg_sys::getTypeOutputInfo(typoid, &mut typoutput, &mut typisvarlena);
+    let cstr = pg_sys::OidOutputFunctionCall(typoutput, datum);
+    if cstr.is_null() {
+        return String::new();
+    }
+    let out = CStr::from_ptr(cstr).to_string_lossy().into_owned();
+    pg_sys::pfree(cstr as *mut c_void);
+    out
+}
+
+fn caught_error_message(cause: pg_sys::panic::CaughtError) -> String {
+    match cause {
+        pg_sys::panic::CaughtError::PostgresError(report)
+        | pg_sys::panic::CaughtError::ErrorReport(report) => {
+            if let Some(detail) = report.detail() {
+                format!("{}: {}", report.message(), detail)
+            } else {
+                report.message().to_string()
+            }
+        }
+        pg_sys::panic::CaughtError::RustPanic { ereport, .. } => {
+            if let Some(detail) = ereport.detail() {
+                format!("{}: {}", ereport.message(), detail)
+            } else {
+                ereport.message().to_string()
+            }
+        }
+    }
+}
+
+fn training_run_summary(
+    profile_name: &str,
+    training_query_id: i64,
+    run_id: i64,
+    results: &[TrainingRunResult],
+    rebuild: Value,
+) -> Value {
+    let mut by_candidate: BTreeMap<String, Vec<&TrainingRunResult>> = BTreeMap::new();
+    for result in results {
+        by_candidate
+            .entry(result.candidate.as_str().to_string())
+            .or_default()
+            .push(result);
+    }
+    let candidates = by_candidate
+        .into_iter()
+        .map(|(candidate, rows)| {
+            let timings = rows
+                .iter()
+                .filter(|r| r.status == "ok")
+                .filter_map(|r| r.elapsed_ms)
+                .collect::<Vec<_>>();
+            json!({
+                "candidate": candidate,
+                "runs": rows.len(),
+                "ok_runs": rows.iter().filter(|r| r.status == "ok").count(),
+                "error_runs": rows.iter().filter(|r| r.status == "error").count(),
+                "skipped_runs": rows.iter().filter(|r| r.status == "skipped").count(),
+                "median_ms": (!timings.is_empty()).then(|| median_f64(timings)),
+                "last_validation_status": rows.last().map(|r| r.validation_status.as_str()),
+                "last_error": rows.iter().rev().find_map(|r| r.error.as_deref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "profile": profile_name,
+        "training_query_id": training_query_id,
+        "run_id": run_id,
+        "results": candidates,
+        "rebuild": rebuild,
+    })
+}
+
 fn canonical_observation_shape(
     stored_shape_key: String,
     stored_shape_family: String,
@@ -2121,6 +3144,7 @@ fn route_profiles_json() -> Value {
                 'points', points,
                 'duck_entries', duck_entries,
                 'duck_hive_entries', duck_hive_entries,
+                'datafusion_mem_entries', datafusion_mem_entries,
                 'datafusion_entries', datafusion_entries,
                 'datafusion_hive_entries', datafusion_hive_entries,
                 'native_entries', native_entries,
@@ -2141,6 +3165,7 @@ fn route_profiles_json() -> Value {
                 coalesce(p.points, 0) AS points,
                 coalesce(e.duck_entries, 0) AS duck_entries,
                 coalesce(e.duck_hive_entries, 0) AS duck_hive_entries,
+                coalesce(e.datafusion_mem_entries, 0) AS datafusion_mem_entries,
                 coalesce(e.datafusion_entries, 0) AS datafusion_entries,
                 coalesce(e.datafusion_hive_entries, 0) AS datafusion_hive_entries,
                 coalesce(e.native_entries, 0) AS native_entries,
@@ -2155,6 +3180,7 @@ fn route_profiles_json() -> Value {
                     count(*)::bigint AS entries,
                     count(*) FILTER (WHERE choice = 'duck_vector')::bigint AS duck_entries,
                     count(*) FILTER (WHERE choice = 'duck_hive')::bigint AS duck_hive_entries,
+                    count(*) FILTER (WHERE choice = 'datafusion_mem')::bigint AS datafusion_mem_entries,
                     count(*) FILTER (WHERE choice = 'datafusion_vector')::bigint AS datafusion_entries,
                     count(*) FILTER (WHERE choice = 'datafusion_hive')::bigint AS datafusion_hive_entries,
                     count(*) FILTER (WHERE choice = 'rvbbit_native')::bigint AS native_entries,
@@ -2303,10 +3329,13 @@ pub(crate) fn route_runtime_stamp() -> String {
     }
     let profile = route_profile_selection();
     let profile_stamp = format!(
-        "profile:{}:{}@{}",
+        "profile:{}:{}@{}|force:{}",
         profile.source,
         profile.effective.as_deref().unwrap_or("none"),
-        profile.updated_epoch.as_deref().unwrap_or("unknown")
+        profile.updated_epoch.as_deref().unwrap_or("unknown"),
+        guc_setting("rvbbit.route_force_candidate")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default()
     );
     let profile_stamp_lit = sql_lit(&profile_stamp);
     Spi::get_one::<String>(&format!(
@@ -2353,7 +3382,15 @@ fn referenced_rvbbit_tables(sql: &str) -> Vec<RvbbitTableMetric> {
                     pg_relation_size(c.oid)::bigint, \
                     coalesce(t.shadow_heap_retained, false), \
                     coalesce(t.shadow_heap_dirty, false), \
-                    (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) \
+                    (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid), \
+                    coalesce(( \
+                        SELECT string_agg(lower(a.attname::text), ',' ORDER BY a.attnum) \
+                        FROM pg_attribute a \
+                        WHERE a.attrelid = c.oid \
+                          AND a.attnum > 0 \
+                          AND NOT a.attisdropped \
+                          AND a.atttypid IN ('text'::regtype, 'varchar'::regtype, 'bpchar'::regtype, 'name'::regtype) \
+                    ), '') \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_am am ON am.oid = c.relam \
@@ -2384,6 +3421,14 @@ fn referenced_rvbbit_tables(sql: &str) -> Vec<RvbbitTableMetric> {
                 shadow_heap_retained: row.get(8)?.unwrap_or_default(),
                 shadow_heap_dirty: row.get(9)?.unwrap_or_default(),
                 delete_count: row.get(10)?.unwrap_or_default(),
+                text_columns: row
+                    .get::<String>(11)?
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|col| !col.is_empty())
+                    .map(str::to_string)
+                    .collect(),
             });
         }
         Ok(())
@@ -2442,6 +3487,13 @@ fn build_features(
     let min_count = count_word_fn(&lowered, "min");
     let max_count = count_word_fn(&lowered, "max");
     let aggregate_count = count_count + sum_count + avg_count + min_count + max_count;
+    let text_columns = text_columns_for_tables(tables);
+    let referenced_text_col_count = text_column_ref_count(&lowered, &text_columns);
+    let group_text_col_count = text_column_ref_count(&group_clause, &text_columns);
+    let order_text_col_count = text_column_ref_count(&order_clause, &text_columns);
+    let count_distinct_text_count = count_distinct_expr(&lowered)
+        .map(|expr| text_column_ref_count(&expr, &text_columns))
+        .unwrap_or(0);
 
     let mut f = RouteFeatures {
         normalized_sql: normalized.clone(),
@@ -2468,6 +3520,10 @@ fn build_features(
         count_count,
         min_count,
         max_count,
+        referenced_text_col_count,
+        group_text_col_count,
+        order_text_col_count,
+        count_distinct_text_count,
         exists_count: count_substr(&lowered, "exists(") + count_substr(&lowered, "exists ("),
         in_count: count_substr(&lowered, " in(") + count_substr(&lowered, " in ("),
         between_count: count_word(&lowered, "between"),
@@ -2511,6 +3567,29 @@ fn build_features(
     f.shape_key = shape_key(&f);
     f.shape_family = shape_family_key(&f.shape_key);
     f
+}
+
+fn text_columns_for_tables(tables: &[RvbbitTableMetric]) -> Vec<String> {
+    let mut out = Vec::new();
+    for table in tables {
+        for column in &table.text_columns {
+            if !out.iter().any(|seen| seen == column) {
+                out.push(column.clone());
+            }
+        }
+    }
+    out
+}
+
+fn text_column_ref_count(sql: &str, text_columns: &[String]) -> i64 {
+    text_columns
+        .iter()
+        .filter(|column| contains_column_identifier(sql, column))
+        .count() as i64
+}
+
+fn contains_column_identifier(sql: &str, column: &str) -> bool {
+    contains_identifier(sql, column) || sql.contains(&format!("\"{column}\""))
 }
 
 struct PlanFeatures {
@@ -2730,6 +3809,7 @@ fn table_metric_json(t: &RvbbitTableMetric) -> Value {
         "heap_bytes": t.heap_bytes,
         "shadow_heap_retained": t.shadow_heap_retained,
         "shadow_heap_dirty": t.shadow_heap_dirty,
+        "text_columns": t.text_columns,
         "parquet_authoritative": t.delete_count == 0
             && (t.heap_bytes == 0 || (t.shadow_heap_retained && !t.shadow_heap_dirty)),
         "delete_count": t.delete_count,
@@ -2859,6 +3939,11 @@ fn candidate_gate_enabled(candidate: Candidate) -> bool {
         Candidate::DuckVector => {
             route_enabled("RVBBIT_ROUTE_DUCK_VECTOR", "rvbbit.route_duck_vector", true)
         }
+        Candidate::DataFusionMem => route_enabled(
+            "RVBBIT_ROUTE_DATAFUSION_MEM",
+            "rvbbit.route_datafusion_mem",
+            true,
+        ),
         Candidate::DataFusionVector => route_enabled(
             "RVBBIT_ROUTE_DATAFUSION_VECTOR",
             "rvbbit.route_datafusion_vector",
@@ -2941,16 +4026,56 @@ fn candidate_availability(
         );
     }
     match candidate {
-        Candidate::DuckVector | Candidate::DataFusionVector => duck_availability(features, tables),
+        Candidate::DuckVector => vector_availability("DuckDB", features, tables),
+        Candidate::DataFusionMem => hot_mem_availability(features, tables),
+        Candidate::DataFusionVector => vector_availability("DataFusion", features, tables),
         Candidate::DuckHive | Candidate::DataFusionHive => hive_availability(features, tables),
         Candidate::RvbbitNative => (true, "Rvbbit native PostgreSQL path available".to_string()),
         Candidate::PgRowstore => pg_rowstore_availability(tables),
     }
 }
 
+fn vector_availability(
+    engine_name: &str,
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> (bool, String) {
+    let (available, reason) = duck_availability(features, tables);
+    if available {
+        (
+            true,
+            format!("{engine_name} vector execution over authoritative Rvbbit parquet row groups"),
+        )
+    } else {
+        (false, reason)
+    }
+}
+
+fn hot_mem_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> (bool, String) {
+    if features.regex_count > 0 {
+        return (false, "Postgres regex semantics required".to_string());
+    }
+    if features.table_rows > crate::df::hot_store_route_max_rows() {
+        return (
+            false,
+            format!(
+                "table rows {} exceed rvbbit.hot_store_route_max_rows {}",
+                features.table_rows,
+                crate::df::hot_store_route_max_rows()
+            ),
+        );
+    }
+    let table_ids = tables
+        .iter()
+        .map(|table| (table.oid, format!("{}.{}", table.schema, table.relname)))
+        .collect::<Vec<_>>();
+    crate::df::hot_tables_available(&table_ids)
+}
+
 fn min_confidence_for_candidate(candidate: Candidate) -> f64 {
     match candidate {
         Candidate::PgRowstore => 0.25,
+        Candidate::DataFusionMem => 0.05,
         Candidate::DuckHive | Candidate::DataFusionHive => env_f64(
             "RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE",
             "rvbbit.route_hive_min_confidence",
@@ -2960,18 +4085,48 @@ fn min_confidence_for_candidate(candidate: Candidate) -> f64 {
     }
 }
 
+const FALLBACK_VECTOR_FIRST: [Candidate; 4] = [
+    Candidate::DataFusionVector,
+    Candidate::DataFusionHive,
+    Candidate::DuckVector,
+    Candidate::DuckHive,
+];
+
+const FALLBACK_MEM_FIRST: [Candidate; 5] = [
+    Candidate::DataFusionMem,
+    Candidate::DataFusionVector,
+    Candidate::DataFusionHive,
+    Candidate::DuckVector,
+    Candidate::DuckHive,
+];
+
+const FALLBACK_VARIANT_FIRST: [Candidate; 4] = [
+    Candidate::DataFusionHive,
+    Candidate::DataFusionVector,
+    Candidate::DuckHive,
+    Candidate::DuckVector,
+];
+
 fn default_external_candidate(
     features: &RouteFeatures,
     tables: &[RvbbitTableMetric],
 ) -> Option<Candidate> {
-    [
-        Candidate::DuckVector,
-        Candidate::DataFusionVector,
-        Candidate::DuckHive,
-        Candidate::DataFusionHive,
-    ]
-    .into_iter()
-    .find(|candidate| candidate_availability(*candidate, features, tables).0)
+    if hot_store_no_profile_enabled() && hot_store_prefers_mem(features) {
+        first_available_candidate(&FALLBACK_MEM_FIRST, features, tables)
+    } else {
+        first_available_candidate(&FALLBACK_VECTOR_FIRST, features, tables)
+    }
+}
+
+fn first_available_candidate(
+    candidates: &[Candidate],
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<Candidate> {
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| candidate_availability(*candidate, features, tables).0)
 }
 
 fn candidate_can_route(
@@ -2984,6 +4139,331 @@ fn candidate_can_route(
         return false;
     }
     candidate_availability(candidate, features, tables).0
+}
+
+fn forced_candidate_setting() -> Option<Candidate> {
+    guc_setting("rvbbit.route_force_candidate")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty() && value != "default" && value != "auto")
+        .and_then(|value| Candidate::from_str(&value))
+}
+
+fn forced_route_decision(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<RouteDecision> {
+    let candidate = forced_candidate_setting()?;
+    let (available, reason) = candidate_availability(candidate, features, tables);
+    if available {
+        Some(decision(
+            candidate,
+            "forced",
+            &format!("forced by rvbbit.route_force_candidate; {reason}"),
+            Some(1.0),
+            None,
+        ))
+    } else {
+        Some(decision(
+            Candidate::RvbbitNative,
+            "forced-unavailable",
+            &format!(
+                "forced candidate {} unavailable: {reason}; using native path",
+                candidate.as_str()
+            ),
+            None,
+            None,
+        ))
+    }
+}
+
+fn simple_metadata_aggregate_should_stay_native(features: &RouteFeatures) -> bool {
+    features.aggregate_count > 0
+        && features.aggregate_count
+            == features.count_count
+                + features.sum_count
+                + features.avg_count
+                + features.min_count
+                + features.max_count
+        && features.count_distinct_count == 0
+        && !features.where_present
+        && !features.group_by
+        && !features.having
+        && !features.distinct
+        && features.from_count == 1
+        && features.join_count == 0
+        && !features.plan_has_join
+        && !features.plan_has_subplan
+}
+
+fn fallback_native_reason(features: &RouteFeatures) -> Option<&'static str> {
+    if features.has_native_function && !fallback_prefers_external_analytical_shape(features) {
+        return Some("native PostgreSQL plan rewrite is available");
+    }
+    if features.table_rows > 0
+        && features.table_rows <= no_profile_native_max_rows()
+        && (features.aggregate_count > 0 || features.group_by || features.distinct)
+        && !fallback_prefers_external_analytical_shape(features)
+    {
+        return Some("small/simple analytical table stays on native path");
+    }
+    if features.aggregate_count == 0
+        && !features.group_by
+        && !features.distinct
+        && !features.having
+        && features.join_count == 0
+    {
+        return Some("row-returning query stays on native path");
+    }
+    None
+}
+
+fn no_profile_native_reason(features: &RouteFeatures) -> Option<&'static str> {
+    match fallback_native_reason(features)? {
+        "native PostgreSQL plan rewrite is available" => {
+            Some("no active route profile; native PostgreSQL plan rewrite is available")
+        }
+        "small/simple analytical table stays on native path" => {
+            Some("no active route profile; small/simple analytical table stays on native path")
+        }
+        "row-returning query stays on native path" => {
+            Some("no active route profile; row-returning query stays on native path")
+        }
+        _ => Some("no active route profile; using native path"),
+    }
+}
+
+fn no_profile_native_max_rows() -> i64 {
+    let configured = {
+        #[cfg(not(test))]
+        {
+            guc_setting("rvbbit.route_no_profile_native_max_rows")
+                .or_else(|| std::env::var("RVBBIT_ROUTE_NO_PROFILE_NATIVE_MAX_ROWS").ok())
+        }
+        #[cfg(test)]
+        {
+            std::env::var("RVBBIT_ROUTE_NO_PROFILE_NATIVE_MAX_ROWS").ok()
+        }
+    };
+    configured
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(500_000)
+}
+
+fn no_profile_prefers_datafusion(features: &RouteFeatures) -> bool {
+    features.aggregate_count > 0
+        || features.group_by
+        || features.distinct
+        || features.having
+        || features.join_count > 0
+        || features.from_count > 1
+}
+
+fn no_profile_variant_min_rows() -> i64 {
+    let configured = {
+        #[cfg(not(test))]
+        {
+            guc_setting("rvbbit.route_no_profile_variant_min_rows")
+                .or_else(|| std::env::var("RVBBIT_ROUTE_NO_PROFILE_VARIANT_MIN_ROWS").ok())
+        }
+        #[cfg(test)]
+        {
+            std::env::var("RVBBIT_ROUTE_NO_PROFILE_VARIANT_MIN_ROWS").ok()
+        }
+    };
+    configured
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(250_000)
+}
+
+fn fallback_prefers_external_analytical_shape(features: &RouteFeatures) -> bool {
+    if native_function_should_stay_native(features)
+        || simple_metadata_aggregate_should_stay_native(features)
+    {
+        return false;
+    }
+    if features.count_distinct_count > 0
+        && (!features.group_by
+            || features.count_distinct_text_count > 0
+            || features.table_rows >= no_profile_variant_min_rows())
+    {
+        return true;
+    }
+    if has_time_bucket_group(features) {
+        return true;
+    }
+    if features.group_by
+        && features.order_by
+        && has_limit(features)
+        && features.group_text_col_count > 0
+        && features.table_rows >= 100_000
+        && (has_multiple_group_keys(features)
+            || features.count_distinct_count > 0
+            || features.table_rows >= 1_000_000)
+    {
+        return true;
+    }
+    if features.group_by
+        && features.order_by
+        && has_limit(features)
+        && has_multiple_group_keys(features)
+        && features.table_rows >= no_profile_native_max_rows()
+    {
+        return true;
+    }
+    if features.fixed_contains_like_count > 0
+        && features.group_by
+        && features.table_rows >= no_profile_variant_min_rows()
+    {
+        return true;
+    }
+    false
+}
+
+fn fallback_prefers_variant(features: &RouteFeatures) -> bool {
+    if !fallback_prefers_external_analytical_shape(features) {
+        return false;
+    }
+    if features.table_rows < no_profile_variant_min_rows() {
+        return false;
+    }
+    if features.count_distinct_text_count > 0 {
+        return true;
+    }
+    if features.fixed_contains_like_count > 0 && features.group_by {
+        return true;
+    }
+    if features.group_by
+        && features.order_by
+        && has_limit(features)
+        && features.group_text_col_count > 0
+        && (has_multiple_group_keys(features)
+            || features.count_distinct_count > 0
+            || features.table_rows >= 1_000_000)
+    {
+        return true;
+    }
+    if features.group_by
+        && features.order_by
+        && has_limit(features)
+        && features.where_present
+        && has_multiple_group_keys(features)
+    {
+        return true;
+    }
+    false
+}
+
+fn fallback_external_candidate_order(features: &RouteFeatures) -> Option<&'static [Candidate]> {
+    if fallback_prefers_variant(features) {
+        Some(&FALLBACK_VARIANT_FIRST)
+    } else if fallback_prefers_external_analytical_shape(features)
+        || no_profile_prefers_datafusion(features)
+    {
+        Some(&FALLBACK_VECTOR_FIRST)
+    } else {
+        None
+    }
+}
+
+fn hot_store_prefers_mem(features: &RouteFeatures) -> bool {
+    features.table_rows > 0
+        && features.table_rows <= crate::df::hot_store_route_max_rows()
+        && !simple_metadata_aggregate_should_stay_native(features)
+        && !native_function_should_stay_native(features)
+        && (features.aggregate_count > 0
+            || features.group_by
+            || features.distinct
+            || features.having)
+        && !(features.select_star && features.aggregate_count == 0 && !features.group_by)
+}
+
+fn hot_store_no_profile_enabled() -> bool {
+    route_enabled(
+        "RVBBIT_ROUTE_DATAFUSION_MEM_NO_PROFILE",
+        "rvbbit.route_datafusion_mem_no_profile",
+        false,
+    )
+}
+
+fn has_limit(features: &RouteFeatures) -> bool {
+    features.limit_bucket != "unknown"
+}
+
+fn has_multiple_group_keys(features: &RouteFeatures) -> bool {
+    !matches!(features.group_expr_count_bucket.as_str(), "<=0" | "<=1")
+}
+
+fn has_time_bucket_group(features: &RouteFeatures) -> bool {
+    features.group_by
+        && (features.normalized_sql.contains("date_trunc")
+            || features.normalized_sql.contains("extract("))
+}
+
+fn choose_no_profile_route(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+    profile: &RouteProfileSelection,
+) -> RouteDecision {
+    if hot_store_no_profile_enabled() && hot_store_prefers_mem(features) {
+        if let Some(candidate) =
+            first_available_candidate(&[Candidate::DataFusionMem], features, tables)
+        {
+            return decision(
+                candidate,
+                "no-profile-hot",
+                "no active route profile; manually loaded hot columnar object uses in-memory DataFusion",
+                None,
+                None,
+            );
+        }
+    }
+    if let Some(reason) = no_profile_native_reason(features) {
+        return decision(
+            Candidate::RvbbitNative,
+            "no-profile-native",
+            reason,
+            None,
+            None,
+        );
+    }
+    if let Some(candidates) = fallback_external_candidate_order(features) {
+        if let Some(candidate) = first_available_candidate(candidates, features, tables) {
+            let (source, reason) = if matches!(
+                candidate,
+                Candidate::DataFusionHive | Candidate::DuckHive
+            ) {
+                (
+                    "no-profile-variant",
+                    "no active route profile; variant-friendly analytical shape uses a parquet variant path",
+                )
+            } else {
+                (
+                    "no-profile-datafusion",
+                    "no active route profile; analytical parquet shape uses vector execution",
+                )
+            };
+            return decision(candidate, source, reason, None, None);
+        }
+        return decision(
+            Candidate::RvbbitNative,
+            "no-profile-native",
+            "no active route profile; external parquet path is unavailable",
+            None,
+            None,
+        );
+    }
+    decision(
+        Candidate::RvbbitNative,
+        "no-profile-native",
+        profile
+            .warning
+            .as_deref()
+            .unwrap_or("no active route profile; using native path"),
+        None,
+        None,
+    )
 }
 
 fn native_function_should_stay_native(features: &RouteFeatures) -> bool {
@@ -3231,6 +4711,7 @@ fn persist_profile_tables(
                CASE e.value->>'choice'
                    WHEN 'native' THEN 'rvbbit_native'
                    WHEN 'duck' THEN 'duck_vector'
+                   WHEN 'df_mem' THEN 'datafusion_mem'
                    WHEN 'datafusion' THEN 'datafusion_vector'
                    WHEN 'df_hive' THEN 'datafusion_hive'
                    WHEN 'pg_heap' THEN 'pg_rowstore'
@@ -3278,7 +4759,7 @@ fn persist_profile_tables(
                e.value
         FROM jsonb_each(coalesce({profile_lit}::jsonb->'entries', '{{}}'::jsonb)) AS e(key, value)
         WHERE e.value ? 'choice'
-          AND e.value->>'choice' IN ('duck', 'duck_hive', 'native', 'datafusion', 'datafusion_hive', 'df_hive', 'pg_heap', 'duck_vector', 'datafusion_vector', 'rvbbit_native', 'pg_rowstore')
+          AND e.value->>'choice' IN ('duck', 'duck_hive', 'native', 'datafusion_mem', 'df_mem', 'datafusion', 'datafusion_hive', 'df_hive', 'pg_heap', 'duck_vector', 'datafusion_vector', 'rvbbit_native', 'pg_rowstore')
         "#
     ))?;
     Spi::run(&format!(
@@ -3739,20 +5220,28 @@ fn split_top_level_commas(value: &str) -> Vec<String> {
 }
 
 fn count_distinct_signature(sql: &str) -> String {
-    let Some(pos) = sql.find("count") else {
+    let Some(expr) = count_distinct_expr(sql) else {
         return "none".into();
     };
-    let tail = &sql[pos..];
-    let Some(distinct) = tail.find("distinct") else {
-        return "none".into();
-    };
-    let expr = &tail[distinct + "distinct".len()..];
-    let expr = expr.trim().trim_end_matches(')').trim();
     if expr.is_empty() {
         "none".into()
     } else {
-        hash_short(expr)
+        hash_short(&expr)
     }
+}
+
+fn count_distinct_expr(sql: &str) -> Option<String> {
+    let Some(pos) = sql.find("count") else {
+        return None;
+    };
+    let tail = &sql[pos..];
+    let Some(distinct) = tail.find("distinct") else {
+        return None;
+    };
+    let expr = &tail[distinct + "distinct".len()..];
+    let expr = expr.trim().trim_start_matches('(').trim();
+    let end = expr.find(')').unwrap_or(expr.len());
+    Some(expr[..end].trim().to_string())
 }
 
 fn expr_signature(expr: &str) -> String {
@@ -4140,6 +5629,36 @@ fn sql_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+fn sql_nullable_text(s: &str) -> String {
+    if s.is_empty() {
+        "NULL".to_string()
+    } else {
+        sql_lit(s)
+    }
+}
+
+fn sql_nullable_i64(value: Option<i64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL".to_string())
+}
+
+fn sql_nullable_f64(value: Option<f64>) -> String {
+    value
+        .filter(|v| v.is_finite())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL".to_string())
+}
+
+fn sql_text_array_lit(items: &[String]) -> String {
+    let values = items
+        .iter()
+        .map(|item| sql_lit(item))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ARRAY[{values}]::text[]")
+}
+
 fn sql_json_lit(v: &Value) -> String {
     sql_lit(&v.to_string())
 }
@@ -4147,6 +5666,32 @@ fn sql_json_lit(v: &Value) -> String {
 #[cfg(test)]
 mod route_unit_tests {
     use super::*;
+
+    fn test_table(rows: i64) -> RvbbitTableMetric {
+        RvbbitTableMetric {
+            schema: "public".to_string(),
+            relname: "hits".to_string(),
+            oid: 1,
+            row_groups: 1,
+            rows,
+            bytes: rows.saturating_mul(100),
+            heap_bytes: 0,
+            shadow_heap_retained: true,
+            shadow_heap_dirty: false,
+            delete_count: 0,
+            text_columns: Vec::new(),
+        }
+    }
+
+    fn test_features(sql: &str, rows: i64) -> RouteFeatures {
+        build_features(sql, None, &[test_table(rows)])
+    }
+
+    fn test_features_with_text(sql: &str, rows: i64, text_columns: &[&str]) -> RouteFeatures {
+        let mut table = test_table(rows);
+        table.text_columns = text_columns.iter().map(|col| col.to_string()).collect();
+        build_features(sql, None, &[table])
+    }
 
     #[test]
     fn route_rejects_non_select() {
@@ -4178,5 +5723,113 @@ mod route_unit_tests {
             0
         );
         assert_eq!(fixed_contains_like_count("x LIKE '%foo_bar%'"), 0);
+    }
+
+    #[test]
+    fn route_keeps_simple_metadata_aggregates_native() {
+        let features = test_features(
+            r#"SELECT SUM("AdvEngineID"), COUNT(*), AVG("ResolutionWidth") FROM hits"#,
+            2_000_000,
+        );
+        assert!(simple_metadata_aggregate_should_stay_native(&features));
+
+        let distinct_features =
+            test_features(r#"SELECT COUNT(DISTINCT "UserID") FROM hits"#, 2_000_000);
+        assert!(!simple_metadata_aggregate_should_stay_native(
+            &distinct_features
+        ));
+    }
+
+    #[test]
+    fn route_no_profile_splits_native_and_datafusion_shapes() {
+        let mut native_rewrite = test_features(
+            r#"SELECT "URL", COUNT(*) AS c FROM hits GROUP BY "URL" ORDER BY c DESC LIMIT 10"#,
+            2_000_000,
+        );
+        native_rewrite.has_native_function = true;
+        native_rewrite.native_function = Some("top_count_1col".to_string());
+        assert!(no_profile_native_reason(&native_rewrite)
+            .is_some_and(|reason| reason.contains("native PostgreSQL plan rewrite")));
+
+        let analytical = test_features(
+            r#"SELECT "RegionID", COUNT(DISTINCT "UserID") AS u FROM hits GROUP BY "RegionID" ORDER BY u DESC LIMIT 10"#,
+            2_000_000,
+        );
+        assert!(no_profile_native_reason(&analytical).is_none());
+        assert!(no_profile_prefers_datafusion(&analytical));
+
+        let row_returning = test_features(
+            r#"SELECT "UserID" FROM hits WHERE "UserID" = 435090932899640449"#,
+            2_000_000,
+        );
+        assert!(no_profile_native_reason(&row_returning)
+            .is_some_and(|reason| reason.contains("row-returning query")));
+    }
+
+    #[test]
+    fn route_no_profile_keeps_small_simple_analytics_native() {
+        let features = test_features(
+            r#"SELECT "AdvEngineID", COUNT(*) FROM hits WHERE "AdvEngineID" <> 0 GROUP BY "AdvEngineID" ORDER BY COUNT(*) DESC"#,
+            100_000,
+        );
+        assert!(no_profile_native_reason(&features)
+            .is_some_and(|reason| reason.contains("small/simple analytical table")));
+        assert!(!fallback_prefers_external_analytical_shape(&features));
+    }
+
+    #[test]
+    fn route_no_profile_lets_text_count_distinct_escape_small_native() {
+        let features = test_features_with_text(
+            r#"SELECT COUNT(DISTINCT "SearchPhrase") FROM hits"#,
+            50_000,
+            &["searchphrase"],
+        );
+
+        assert!(no_profile_native_reason(&features).is_none());
+        assert!(fallback_prefers_external_analytical_shape(&features));
+        assert!(!fallback_prefers_variant(&features));
+        assert_eq!(
+            fallback_external_candidate_order(&features).map(|order| order[0]),
+            Some(Candidate::DataFusionVector)
+        );
+    }
+
+    #[test]
+    fn route_no_profile_promotes_large_text_shapes_to_variants() {
+        let distinct_text = test_features_with_text(
+            r#"SELECT COUNT(DISTINCT "SearchPhrase") FROM hits"#,
+            500_000,
+            &["searchphrase"],
+        );
+        assert!(fallback_prefers_variant(&distinct_text));
+        assert_eq!(
+            fallback_external_candidate_order(&distinct_text).map(|order| order[0]),
+            Some(Candidate::DataFusionHive)
+        );
+
+        let text_topk = test_features_with_text(
+            r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", "SearchPhrase" ORDER BY COUNT(*) DESC LIMIT 10"#,
+            500_000,
+            &["searchphrase"],
+        );
+        assert!(fallback_prefers_variant(&text_topk));
+        assert_eq!(
+            fallback_external_candidate_order(&text_topk).map(|order| order[0]),
+            Some(Candidate::DataFusionHive)
+        );
+    }
+
+    #[test]
+    fn route_no_profile_keeps_time_bucket_without_text_vector_first() {
+        let features = test_features(
+            r#"SELECT DATE_TRUNC('minute', "EventTime") AS m, COUNT(*) FROM hits GROUP BY DATE_TRUNC('minute', "EventTime") ORDER BY DATE_TRUNC('minute', "EventTime") LIMIT 10 OFFSET 1000"#,
+            1_000_000,
+        );
+        assert!(fallback_prefers_external_analytical_shape(&features));
+        assert!(!fallback_prefers_variant(&features));
+        assert_eq!(
+            fallback_external_candidate_order(&features).map(|order| order[0]),
+            Some(Candidate::DataFusionVector)
+        );
     }
 }

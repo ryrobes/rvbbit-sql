@@ -34,6 +34,8 @@ def _route_path(status: str | None) -> str | None:
         return "duck"
     if status.startswith("datafusion_hive"):
         return "datafusion_hive"
+    if status.startswith("datafusion_mem"):
+        return "datafusion_mem"
     if status.startswith("datafusion"):
         return "datafusion"
     if status.startswith("pg_heap") or status.startswith("pg_rowstore"):
@@ -84,6 +86,7 @@ def evaluate_profile(path: str, top: int) -> None:
             "native": "rvbbit_native",
             "duck": "duck_vector",
             "duck_hive": "duck_hive",
+            "datafusion_mem": "datafusion_mem",
             "datafusion": "datafusion_vector",
             "datafusion_hive": "datafusion_hive",
             "pg_heap": "pg_rowstore",
@@ -130,6 +133,7 @@ def evaluate_profile(path: str, top: int) -> None:
                 f"native={_fmt_ms(float(obs['native_ms'])) if obs.get('native_ms') is not None else '-'} "
                 f"duck={_fmt_ms(float(obs['duck_ms'])) if obs.get('duck_ms') is not None else '-'} "
                 f"duck_hive={_fmt_ms(float(obs['duck_hive_ms'])) if obs.get('duck_hive_ms') is not None else '-'} "
+                f"datafusion_mem={_fmt_ms(float(obs['datafusion_mem_ms'])) if obs.get('datafusion_mem_ms') is not None else '-'} "
                 f"datafusion={_fmt_ms(float(obs['datafusion_ms'])) if obs.get('datafusion_ms') is not None else '-'} "
                 f"datafusion_hive={_fmt_ms(float(obs['datafusion_hive_ms'])) if obs.get('datafusion_hive_ms') is not None else '-'} "
                 f"pg_heap={_fmt_ms(float(obs['pg_ms'])) if obs.get('pg_ms') is not None else '-'} "
@@ -152,8 +156,11 @@ def evaluate_results(path: str, top: int) -> None:
     data = _load_json(path)
     queries = data.get("queries", [])
     systems = set(data.get("systems", []))
-    required = {"rvbbit", "rvbbit_native", "rvbbit_duck_forced"}
+    required = {"rvbbit", "rvbbit_duck_forced"}
     missing = sorted(required - systems)
+    has_native = "rvbbit_native" in systems or "rvbbit_native_forced" in systems
+    if not has_native:
+        missing.append("rvbbit_native or rvbbit_native_forced")
     if missing:
         raise SystemExit(f"{path} is missing systems needed for route evaluation: {', '.join(missing)}")
 
@@ -164,8 +171,9 @@ def evaluate_results(path: str, top: int) -> None:
     for query in queries:
         qid = query.get("qid")
         auto = _result_ms(query, "rvbbit")
-        native = _result_ms(query, "rvbbit_native")
+        native = _result_ms(query, "rvbbit_native_forced") or _result_ms(query, "rvbbit_native")
         duck = _result_ms(query, "rvbbit_duck_forced")
+        datafusion_mem = _result_ms(query, "rvbbit_datafusion_mem_forced")
         datafusion = _result_ms(query, "rvbbit_datafusion_forced")
         pg_heap = (
             _result_ms(query, "rvbbit_pg_heap_forced")
@@ -178,6 +186,8 @@ def evaluate_results(path: str, top: int) -> None:
         if auto is None or native is None or duck is None:
             continue
         candidate_ms = {"native": native, "duck": duck}
+        if datafusion_mem is not None:
+            candidate_ms["datafusion_mem"] = datafusion_mem
         if datafusion is not None:
             candidate_ms["datafusion"] = datafusion
         if pg_heap is not None:
@@ -186,7 +196,7 @@ def evaluate_results(path: str, top: int) -> None:
         oracle_sum += oracle
         auto_sum += auto
         if route and route != winner:
-            misses.append((auto - oracle, auto / oracle if oracle > 0 else math.inf, qid, route, winner, auto, native, duck, datafusion, pg_heap, status))
+            misses.append((auto - oracle, auto / oracle if oracle > 0 else math.inf, qid, route, winner, auto, native, duck, datafusion_mem, datafusion, pg_heap, status))
 
     print(f"results: {path}")
     print(f"  suite       : {data.get('suite', 'ClickBench')}")
@@ -201,11 +211,12 @@ def evaluate_results(path: str, top: int) -> None:
 
     if misses:
         print("\nworst route misses:")
-        for regret, ratio, qid, route, winner, auto, native, duck, datafusion, pg_heap, status in sorted(misses, reverse=True)[:top]:
+        for regret, ratio, qid, route, winner, auto, native, duck, datafusion_mem, datafusion, pg_heap, status in sorted(misses, reverse=True)[:top]:
             print(
                 "  "
                 f"{qid}: route={route} oracle={winner} "
                 f"auto={_fmt_ms(auto)} native={_fmt_ms(native)} duck={_fmt_ms(duck)} "
+                f"datafusion_mem={_fmt_ms(datafusion_mem) if datafusion_mem is not None else '-'} "
                 f"datafusion={_fmt_ms(datafusion) if datafusion is not None else '-'} "
                 f"pg_heap={_fmt_ms(pg_heap) if pg_heap is not None else '-'} "
                 f"regret={_fmt_ms(regret)} ratio={ratio:.2f} status={status}"
@@ -215,7 +226,7 @@ def evaluate_results(path: str, top: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", help="Evaluate a route profile's training observations")
-    parser.add_argument("--results", help="Evaluate a benchmark result containing rvbbit/rvbbit_native/rvbbit_duck_forced[/rvbbit_datafusion_forced/rvbbit_pg_heap_forced]")
+    parser.add_argument("--results", help="Evaluate a benchmark result containing rvbbit plus rvbbit_native_forced or rvbbit_native and rvbbit_duck_forced[/rvbbit_datafusion_mem_forced/rvbbit_datafusion_forced/rvbbit_pg_heap_forced]")
     parser.add_argument("--top", type=int, default=10)
     args = parser.parse_args()
 
