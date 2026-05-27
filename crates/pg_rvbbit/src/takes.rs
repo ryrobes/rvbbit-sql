@@ -331,7 +331,7 @@ fn evaluator_pick(
         system: Some(instructions),
         user,
         temperature: Some(0.0),
-        max_tokens: Some(8),
+        max_tokens: Some(16),
         provider: None,
     }) {
         Ok(resp) => {

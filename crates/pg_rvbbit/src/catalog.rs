@@ -1023,7 +1023,7 @@ BEGIN
             'either YES or NO — and nothing else.',
         op_user =>
             E'CRITERION: {{ criterion }}\n\nTEXT: {{ text }}\n\nDoes TEXT express CRITERION?',
-        op_max_tokens => 8,
+        op_max_tokens => 16,
         op_description => 'Binary semantic match: does TEXT express CRITERION?',
         op_infix_symbol => '~~?',
         op_infix_word => 'MEANS',
@@ -1054,7 +1054,7 @@ BEGIN
             'Respond with ONLY the number — for example "0.73" — and nothing else.',
         op_user =>
             E'TOPIC: {{ topic }}\n\nTEXT: {{ text }}\n\nRelevance score (0.0 to 1.0):',
-        op_max_tokens => 8,
+        op_max_tokens => 16,
         op_description => 'Relevance score in [0,1] of TEXT to TOPIC.',
         op_infix_symbol => '~~%',
         op_infix_word => 'ABOUT',
@@ -1238,7 +1238,7 @@ BEGIN
             'explanation, no period, just the label.',
         op_user =>
             E'TEXT: {{ text }}\n\nSentiment:',
-        op_max_tokens => 8,
+        op_max_tokens => 16,
         op_description => 'Sentiment label: positive | negative | neutral | mixed.',
         op_parser => 'strip'
     );
@@ -1255,7 +1255,7 @@ BEGIN
             'Respond ONLY with YES or NO.',
         op_user =>
             E'A: {{ a }}\n\nB: {{ b }}\n\nDoes A contradict B?',
-        op_max_tokens => 8,
+        op_max_tokens => 16,
         op_description => 'Does statement A contradict statement B?',
         op_parser => 'yes_no'
     );
@@ -1271,7 +1271,7 @@ BEGIN
             'SUPPORTING B. Respond ONLY with YES or NO.',
         op_user =>
             E'A: {{ a }}\n\nB: {{ b }}\n\nDoes A support B?',
-        op_max_tokens => 8,
+        op_max_tokens => 16,
         op_description => 'Does statement A support statement B?',
         op_parser => 'yes_no'
     );
@@ -1287,7 +1287,7 @@ BEGIN
             '(if A is true, B must also be true). Respond ONLY with YES or NO.',
         op_user =>
             E'A: {{ a }}\n\nB: {{ b }}\n\nDoes A imply B?',
-        op_max_tokens => 8,
+        op_max_tokens => 16,
         op_description => 'Does statement A logically imply statement B?',
         op_parser => 'yes_no'
     );

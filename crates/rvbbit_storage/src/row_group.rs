@@ -314,7 +314,7 @@ fn env_enabled(name: &str, default: bool) -> bool {
 }
 
 fn compact_text_stats_enabled() -> bool {
-    env_enabled("RVBBIT_COMPACT_TEXT_STATS", false)
+    env_enabled("RVBBIT_COMPACT_TEXT_STATS", true)
 }
 
 fn compact_per_group_stats_enabled() -> bool {

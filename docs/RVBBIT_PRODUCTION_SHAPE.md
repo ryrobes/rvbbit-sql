@@ -57,11 +57,12 @@ ClickBench and TPC-H loaders honor:
 ```bash
 RVBBIT_COMPACT_KEEP_HEAP=1
 RVBBIT_COMPACT_VARIANTS_SYNC=0
-RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async
+RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=sync
 ```
 
-The current benchmark harness keeps this asynchronous by default for Rvbbit
-loads. With
+The current benchmark harness refreshes variants synchronously by default for
+Rvbbit loads so auto routing can consider hive/cluster layouts during the
+measured query run. With
 `RVBBIT_COMPACT_KEEP_HEAP=1`, loaders call `rvbbit.compact(..., true)` and
 report `size_bytes` as `parquet_size_bytes + heap_total_bytes`.
 Use `RVBBIT_COMPACT_KEEP_HEAP=0` to restore parquet-only compaction.

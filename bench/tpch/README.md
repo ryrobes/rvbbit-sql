@@ -30,11 +30,11 @@ Environment:
   older `rvbbit.duck_backend=off` baseline.
   `rvbbit_datafusion_mem_forced` also loads `rvbbit.hot_objects` after compact
   so the forced memory route has hot all-column objects to use.
-  Rvbbit loads start hive/cluster layout refresh asynchronously by default, so
-  the canonical scan parquet is available immediately while segmented variants
-  build in the background. Set `RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=0` to
-  disable that, or `sync`/`1` when a forced-hive benchmark must wait for
-  variants before queries run.
+  Rvbbit benchmark loads refresh hive/cluster layouts synchronously by default,
+  so auto routing can consider segmented variants during the measured query
+  run. Set `RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async` to restore
+  background refresh, or `0` to disable refresh for non-Hive comparisons or to
+  require already-materialized variants.
 - `RVBBIT_PARQUET_META_CACHE=1` / `RVBBIT_PARQUET_PREWARM=1`: default-on Rust
   sidecar metadata cache for compacted parquet catalog and footer/schema
   metadata. Set either to `0`/`off` for a cold metadata comparison.

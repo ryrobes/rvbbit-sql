@@ -62,7 +62,9 @@ if [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," ==
     HIVE_FORCED_SELECTED=1
 fi
 HIVE_REFRESH_DEFAULT="off"
-[ "${RVBBIT_SELECTED}" = "1" ] && HIVE_REFRESH_DEFAULT="async"
+if [ "${RVBBIT_SELECTED}" = "1" ]; then
+    HIVE_REFRESH_DEFAULT="sync"
+fi
 HIVE_REFRESH_DISPLAY="${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD:-${HIVE_REFRESH_DEFAULT}}"
 QUERIES_ENV=()
 [ -n "${BENCH_QUERIES:-}" ] && QUERIES_ENV=(-e "BENCH_QUERIES=${BENCH_QUERIES}")
@@ -129,6 +131,75 @@ env_on() {
         1|true|TRUE|yes|YES|on|ON) return 0 ;;
         *) return 1 ;;
     esac
+}
+hive_refresh_explicitly_disabled() {
+    case "${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD:-}" in
+        0|false|FALSE|no|NO|off|OFF|disabled|DISABLED) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+wait_for_hive_variant_refresh() {
+    local timeout_s="${RVBBIT_HIVE_VARIANT_WAIT_TIMEOUT:-3600}"
+    local start_s now_s active
+    start_s="$(date +%s)"
+    while true; do
+        active="$(${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -Atq -v ON_ERROR_STOP=1 -c "
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND datname = current_database()
+                  AND state <> 'idle'
+                  AND query LIKE '%refresh_layout_variants%'
+            );
+        " | tr -d '[:space:]')"
+        [ "${active}" != "t" ] && break
+        now_s="$(date +%s)"
+        if [ $((now_s - start_s)) -ge "${timeout_s}" ]; then
+            die "timed out waiting for async Hive variant refresh after ${timeout_s}s"
+        fi
+        sleep 5
+    done
+}
+clickbench_hive_variants_ready() {
+    ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -Atq -v ON_ERROR_STOP=1 -c "
+        SELECT EXISTS (
+            SELECT 1
+            FROM rvbbit.row_group_variants
+            WHERE table_oid = 'hits'::regclass
+              AND layout LIKE 'hive:%'
+        );
+    " | tr -d '[:space:]'
+}
+ensure_clickbench_hive_variants_ready() {
+    [ "${HIVE_FORCED_SELECTED}" = "1" ] || return 0
+    say "ensuring Hive variants are ready for forced-Hive systems"
+    wait_for_hive_variant_refresh
+    if [ "$(clickbench_hive_variants_ready)" = "t" ]; then
+        return 0
+    fi
+    if hive_refresh_explicitly_disabled; then
+        die "forced-Hive variants are missing for public.hits and RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD disables refresh"
+    fi
+    if [ -n "${RVBBIT_COMPACT_KEEP_HEAP:-}" ] && ! env_on "${RVBBIT_COMPACT_KEEP_HEAP}"; then
+        die "forced-Hive benchmarks need retained heap until variant refresh can rebuild from canonical parquet; unset RVBBIT_COMPACT_KEEP_HEAP or set it to 1"
+    fi
+    ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 \
+        -v hive_layout="${RVBBIT_COMPACT_HIVE_LAYOUT:-on}" \
+        -v hive_keys="${RVBBIT_COMPACT_HIVE_KEYS:-}" \
+        -v hive_variants="${RVBBIT_COMPACT_HIVE_VARIANTS:-}" \
+        -v hive_min_distinct="${RVBBIT_COMPACT_HIVE_MIN_DISTINCT:-}" \
+        -v hive_max_distinct="${RVBBIT_COMPACT_HIVE_MAX_DISTINCT:-}" <<'SQL'
+SELECT set_config('rvbbit.compact_hive_layout', :'hive_layout', true);
+SELECT set_config('rvbbit.compact_hive_keys', :'hive_keys', true) WHERE :'hive_keys' <> '';
+SELECT set_config('rvbbit.compact_hive_variants', :'hive_variants', true) WHERE :'hive_variants' <> '';
+SELECT set_config('rvbbit.compact_hive_min_distinct', :'hive_min_distinct', true) WHERE :'hive_min_distinct' <> '';
+SELECT set_config('rvbbit.compact_hive_max_distinct', :'hive_max_distinct', true) WHERE :'hive_max_distinct' <> '';
+SELECT rvbbit.refresh_layout_variants('hits'::regclass);
+SQL
+    if [ "$(clickbench_hive_variants_ready)" != "t" ]; then
+        die "forced-Hive variants are still missing for public.hits after refresh"
+    fi
 }
 usage() {
     awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "$0"
@@ -255,6 +326,8 @@ if [ -z "${SKIP_LOAD:-}" ]; then
 else
     say "skipping load (SKIP_LOAD set)"
 fi
+
+ensure_clickbench_hive_variants_ready
 
 # ---- 5. Run queries -------------------------------------------------------
 say "running queries"

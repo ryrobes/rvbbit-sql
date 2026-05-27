@@ -1,6 +1,14 @@
 -- pg_rvbbit 0.56.0 -> 0.57.0
 -- SQL-native adaptive route training.
 
+-- OpenAI-compatible providers can reject extremely small completions
+-- (`max_output_tokens` must be at least 16 on current OpenAI/Azure-backed
+-- routes). Keep existing short classifier operators live after upgrade.
+UPDATE rvbbit.operators
+SET max_tokens = 16
+WHERE max_tokens IS NOT NULL
+  AND max_tokens < 16;
+
 CREATE TABLE IF NOT EXISTS rvbbit.route_training_queries (
     id            bigserial PRIMARY KEY,
     profile_name  text NOT NULL REFERENCES rvbbit.route_profiles(name) ON DELETE CASCADE,

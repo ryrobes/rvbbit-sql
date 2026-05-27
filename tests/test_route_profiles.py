@@ -95,6 +95,7 @@ def test_route_profiles_and_status_helpers(rvbbit):
             item["candidate"] for item in status["candidate_gates"]
         } == {
             "rvbbit_native",
+            "datafusion_mem",
             "datafusion_hive",
             "datafusion_vector",
             "duck_hive",

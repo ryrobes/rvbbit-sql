@@ -48,7 +48,10 @@ impl OpenAiChatTransport {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
         let temperature = input.get("temperature").and_then(|v| v.as_f64());
-        let max_tokens = input.get("max_tokens").and_then(|v| v.as_u64());
+        let max_tokens = input
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.max(16));
 
         let mut messages = Vec::with_capacity(2);
         if let Some(s) = system {

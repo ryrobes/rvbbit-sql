@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::panic::AssertUnwindSafe;
 use std::time::Instant;
 
 use pgrx::extension_sql;
@@ -566,7 +567,13 @@ fn estimate_invocations(query: &str) -> BTreeMap<String, (Option<u64>, Option<St
         return out;
     }
     let explain_sql = format!("EXPLAIN (VERBOSE, FORMAT JSON) {query}");
-    let json = match Spi::get_one::<pgrx::Json>(&explain_sql) {
+    let json = match PgTryBuilder::new(AssertUnwindSafe(|| {
+        Spi::get_one::<pgrx::Json>(&explain_sql)
+    }))
+    .catch_others(|_| Ok(None))
+    .catch_rust_panic(|_| Ok(None))
+    .execute()
+    {
         Ok(Some(j)) => j.0,
         _ => return out,
     };
@@ -695,12 +702,12 @@ fn walk_plan(
 
     for op in ops {
         let mentions = |text: &str| -> bool {
-            text.contains(&op.fn_form)
-                || text.contains(&op.fn_form_quoted)
+            contains_outside_single_quotes(text, &op.fn_form)
+                || contains_outside_single_quotes(text, &op.fn_form_quoted)
                 || op
                     .infix
                     .as_deref()
-                    .map(|s| text.contains(s))
+                    .map(|s| contains_outside_single_quotes(text, s))
                     .unwrap_or(false)
         };
         let in_filter = mentions(&filter_text);
@@ -1719,6 +1726,26 @@ fn scan_rvbbit_calls(query: &str) -> Vec<RvbbitCall> {
         }
     }
     out
+}
+
+fn contains_outside_single_quotes(text: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let bytes = text.as_bytes();
+    let needle = needle.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i = skip_quoted(bytes, i, '\'');
+            continue;
+        }
+        if bytes[i..].starts_with(needle) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn skip_quoted(bytes: &[u8], start: usize, quote: char) -> usize {
