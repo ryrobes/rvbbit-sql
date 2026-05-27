@@ -9,4 +9,4 @@ pub mod metadata;
 pub mod row_group;
 
 pub use hll::Hll;
-pub use metadata::{ColumnStats, RowGroupMeta, TableMeta, TextSketch};
+pub use metadata::{ColumnStats, RowGroupMeta, TableMeta, TextDictionaryBlock, TextSketch};

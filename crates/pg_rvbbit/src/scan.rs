@@ -18,10 +18,12 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
+use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
-use rvbbit_storage::metadata::{ColumnStats, PerGroupBlock, TextSketch};
-use rvbbit_storage::row_group::RowGroupReader;
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
     Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
@@ -29,17 +31,25 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use pgrx::prelude::*;
 use pgrx::Spi;
+use roaring::RoaringBitmap;
+use rvbbit_storage::metadata::{ColumnStats, PerGroupBlock, TextSketch};
+use rvbbit_storage::row_group::{RowGroupReader, TextDictionary};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
+use crate::columnar_cache;
 use crate::fast_hash::{FastHashMap as HashMap, FastHashSet as HashSet};
 use crate::vector::{self, key_value_to_text, AggSpec, AggValue, FilterSpec, KeySpec, KeyValue};
 
 const CLUSTER_LAYOUT_PREFIX: &str = "cluster:";
+const BITMAP_TOP_COUNT_MAX_KEY_PRODUCT: usize = 250_000;
 
 thread_local! {
     static GROUP_COUNT_CACHE: RefCell<HashMap<GroupCountCacheKey, HashMap<Option<String>, i64>>> =
         RefCell::new(HashMap::default());
 }
+
+static COLUMN_BITMAPS_TABLE_EXISTS: AtomicBool = AtomicBool::new(false);
+static TEXT_DICTIONARIES_TABLE_EXISTS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct GroupCountCacheKey {
@@ -53,6 +63,24 @@ struct GroupCountCacheKey {
 struct RowGroupPathStats {
     path: PathBuf,
     stats_text: Option<String>,
+}
+
+struct IndexedRowGroupPath {
+    rg_id: i64,
+    path: PathBuf,
+    n_rows: i64,
+}
+
+#[derive(Clone)]
+struct IndexedTextDictionaryPath {
+    rg_id: i64,
+    row_group_path: PathBuf,
+    dictionary_path: PathBuf,
+    n_rows: i64,
+    n_values: i64,
+    n_nulls: i64,
+    n_empty: i64,
+    n_bytes: i64,
 }
 
 // --- Helpers ----------------------------------------------------------------
@@ -92,6 +120,180 @@ fn lookup_paths_for_oid(rel_oid: u32) -> Result<Vec<PathBuf>, String> {
     })
     .map_err(|e| format!("SPI row-group lookup: {e}"))?;
     Ok(paths)
+}
+
+fn lookup_paths_for_oid_with_ids(rel_oid: u32) -> Result<Vec<IndexedRowGroupPath>, String> {
+    let mut paths = Vec::new();
+    Spi::connect(|client| -> Result<(), String> {
+        let table = client
+            .select(
+                &format!(
+                    "SELECT rg_id, path, n_rows FROM rvbbit.row_groups \
+                     WHERE table_oid = {rel_oid}::oid \
+                     ORDER BY rg_id"
+                ),
+                None,
+                &[],
+            )
+            .map_err(|e| format!("looking up indexed row groups: {e}"))?;
+        for row in table {
+            let rg_id: Option<i64> = row.get(1).map_err(|e| format!("reading rg_id: {e}"))?;
+            let path: Option<String> = row.get(2).map_err(|e| format!("reading path: {e}"))?;
+            let n_rows: Option<i64> = row.get(3).map_err(|e| format!("reading n_rows: {e}"))?;
+            if let (Some(rg_id), Some(path), Some(n_rows)) = (rg_id, path, n_rows) {
+                paths.push(IndexedRowGroupPath {
+                    rg_id,
+                    path: PathBuf::from(path),
+                    n_rows,
+                });
+            }
+        }
+        Ok(())
+    })
+    .map_err(|e| format!("SPI indexed row-group lookup: {e}"))?;
+    Ok(paths)
+}
+
+fn lookup_text_dictionary_row_groups(
+    rel_oid: u32,
+    col: &str,
+) -> Result<Option<Vec<IndexedTextDictionaryPath>>, Box<dyn std::error::Error>> {
+    if !text_dictionaries_table_available()? {
+        return Ok(None);
+    }
+    let col_esc = col.replace('\'', "''");
+    let sql = format!(
+        "SELECT rg.rg_id, rg.path, rg.n_rows, \
+                td.path, td.n_values, td.n_nulls, td.n_empty, td.n_bytes \
+         FROM rvbbit.row_groups rg \
+         LEFT JOIN rvbbit.text_dictionaries td \
+           ON td.table_oid = rg.table_oid \
+          AND td.rg_id = rg.rg_id \
+          AND td.column_name = '{col_esc}' \
+         WHERE rg.table_oid = {rel_oid}::oid \
+         ORDER BY rg.rg_id"
+    );
+
+    let mut out = Vec::new();
+    let mut missing = false;
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(&sql, None, &[])?;
+        for row in table {
+            let rg_id: Option<i64> = row.get(1)?;
+            let row_group_path: Option<String> = row.get(2)?;
+            let n_rows: Option<i64> = row.get(3)?;
+            let dictionary_path: Option<String> = row.get(4)?;
+            let n_values: Option<i64> = row.get(5)?;
+            let n_nulls: Option<i64> = row.get(6)?;
+            let n_empty: Option<i64> = row.get(7)?;
+            let n_bytes: Option<i64> = row.get(8)?;
+            let (Some(rg_id), Some(row_group_path), Some(n_rows)) = (rg_id, row_group_path, n_rows)
+            else {
+                missing = true;
+                continue;
+            };
+            let (
+                Some(dictionary_path),
+                Some(n_values),
+                Some(n_nulls),
+                Some(n_empty),
+                Some(n_bytes),
+            ) = (dictionary_path, n_values, n_nulls, n_empty, n_bytes)
+            else {
+                missing = true;
+                continue;
+            };
+            out.push(IndexedTextDictionaryPath {
+                rg_id,
+                row_group_path: PathBuf::from(row_group_path),
+                dictionary_path: PathBuf::from(dictionary_path),
+                n_rows,
+                n_values,
+                n_nulls,
+                n_empty,
+                n_bytes,
+            });
+        }
+        Ok(())
+    })?;
+
+    if missing {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+fn text_dictionaries_table_available() -> Result<bool, Box<dyn std::error::Error>> {
+    if TEXT_DICTIONARIES_TABLE_EXISTS.load(AtomicOrdering::Relaxed) {
+        return Ok(true);
+    }
+    let exists: Option<bool> =
+        Spi::get_one("SELECT to_regclass('rvbbit.text_dictionaries') IS NOT NULL")?;
+    if exists.unwrap_or(false) {
+        TEXT_DICTIONARIES_TABLE_EXISTS.store(true, AtomicOrdering::Relaxed);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn load_text_dictionary_cached(
+    rel_oid: u32,
+    col: &str,
+    row_group: &IndexedTextDictionaryPath,
+) -> Result<Arc<TextDictionary>, Box<dyn std::error::Error>> {
+    let key = text_dictionary_cache_key(rel_oid, col, &row_group.dictionary_path)?;
+    if let Some(dictionary) = columnar_cache::get::<TextDictionary>("text_dictionaries", &key) {
+        return Ok(dictionary);
+    }
+
+    let dictionary = TextDictionary::read(&row_group.dictionary_path)?;
+    let expected_rows = usize::try_from(row_group.n_rows).unwrap_or(usize::MAX);
+    let expected_values = usize::try_from(row_group.n_values).unwrap_or(usize::MAX);
+    if dictionary.codes.len() != expected_rows || dictionary.values.len() != expected_values {
+        return Err(format!(
+            "rvbbit: text dictionary metadata mismatch for {}",
+            row_group.dictionary_path.display()
+        )
+        .into());
+    }
+    if dictionary.n_nulls != row_group.n_nulls || dictionary.n_empty != row_group.n_empty {
+        return Err(format!(
+            "rvbbit: text dictionary count mismatch for {}",
+            row_group.dictionary_path.display()
+        )
+        .into());
+    }
+    let bytes = dictionary
+        .memory_size()
+        .max(row_group.n_bytes.max(0) as usize);
+    Ok(columnar_cache::put(
+        "text_dictionaries",
+        key,
+        bytes,
+        dictionary,
+    ))
+}
+
+fn text_dictionary_cache_key(
+    rel_oid: u32,
+    col: &str,
+    path: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let metadata = std::fs::metadata(path)?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Ok(format!(
+        "rel={rel_oid}|col={}|path={}|len={}|mtime={}",
+        col.replace('|', "||"),
+        path.to_string_lossy(),
+        metadata.len(),
+        modified_nanos,
+    ))
 }
 
 fn int_column_range_width(rel_oid: u32, col: &str) -> Option<i64> {
@@ -387,6 +589,508 @@ fn stat_text_sketch(stats: &HashMap<String, ColumnStats>, col: &str) -> Option<T
     TextSketch::from_b64(stat.text_sketch_b64.as_ref()?)
 }
 
+type RowGroupBitmapCatalog = HashMap<(i64, String, String), HashMap<String, RoaringBitmap>>;
+
+fn try_filter_bitmaps(
+    rel_oid: u32,
+    filters: &[FilterSpec],
+) -> Result<Option<Vec<(PathBuf, RoaringBitmap)>>, Box<dyn std::error::Error>> {
+    let columns = bitmap_filter_columns(filters);
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    if !column_bitmaps_table_available()? {
+        return Ok(None);
+    }
+
+    let row_groups = lookup_paths_for_oid_with_ids(rel_oid)?;
+    if row_groups.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let catalog = load_column_bitmaps_cached(rel_oid, &columns, &row_groups)?;
+    if catalog.is_empty() {
+        return Ok(None);
+    }
+
+    let mut used_any = false;
+    let mut out = Vec::with_capacity(row_groups.len());
+    for row_group in row_groups {
+        let mut bitmap: Option<RoaringBitmap> = None;
+        let mut used_for_group = false;
+        for filter in filters {
+            let Some(next) = bitmap_for_filter(&catalog, row_group.rg_id, filter) else {
+                continue;
+            };
+            used_for_group = true;
+            intersect_bitmap(&mut bitmap, next);
+            if bitmap.as_ref().is_some_and(RoaringBitmap::is_empty) {
+                break;
+            }
+        }
+
+        if used_for_group {
+            used_any = true;
+            if let Some(bitmap) = bitmap {
+                if !bitmap.is_empty() {
+                    out.push((row_group.path, bitmap));
+                }
+            }
+        } else {
+            out.push((row_group.path, full_row_bitmap(row_group.n_rows)));
+        }
+    }
+
+    if used_any {
+        Ok(Some(out))
+    } else {
+        Ok(None)
+    }
+}
+
+#[derive(Clone)]
+enum BitmapTopKey {
+    Int(String),
+    Date(String),
+}
+
+fn try_bitmap_top_count(
+    rel_oid: u32,
+    keys: &[KeySpec],
+    filters: &[FilterSpec],
+    k: usize,
+) -> Result<Option<Vec<vector::GroupRow>>, Box<dyn std::error::Error>> {
+    if k == 0 || keys.is_empty() || keys.len() > 2 {
+        return Ok(None);
+    }
+    if filters.iter().any(|filter| {
+        matches!(
+            filter,
+            FilterSpec::TextContains { .. } | FilterSpec::TextNotContains { .. }
+        )
+    }) {
+        return Ok(None);
+    }
+    let Some(key_specs) = bitmap_top_keys(keys) else {
+        return Ok(None);
+    };
+    if !column_bitmaps_table_available()? {
+        return Ok(None);
+    }
+
+    let row_groups = lookup_paths_for_oid_with_ids(rel_oid)?;
+    if row_groups.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let columns = bitmap_top_count_columns(&key_specs, filters);
+    let catalog = load_column_bitmaps_cached(rel_oid, &columns, &row_groups)?;
+    if catalog.is_empty() {
+        return Ok(None);
+    }
+
+    let mut counts = HashMap::<Vec<KeyValue>, i64>::default();
+    for row_group in &row_groups {
+        let Some(filter_bitmap) =
+            bitmap_for_all_filters(&catalog, row_group.rg_id, row_group.n_rows, filters)
+        else {
+            return Ok(None);
+        };
+        if filter_bitmap.is_empty() {
+            continue;
+        }
+        match key_specs.as_slice() {
+            [key] => {
+                let Some(entries) =
+                    bitmap_entries(&catalog, row_group.rg_id, key.column(), "value")
+                else {
+                    return Ok(None);
+                };
+                if !bitmap_entries_cover_filter(entries, &filter_bitmap) {
+                    return Ok(None);
+                }
+                for (value_text, bitmap) in entries {
+                    let count = bitmap_intersection_len(&filter_bitmap, bitmap);
+                    if count == 0 {
+                        continue;
+                    }
+                    let Some(value) = key.value(value_text) else {
+                        return Ok(None);
+                    };
+                    *counts.entry(vec![value]).or_insert(0) += count;
+                }
+            }
+            [first, second] => {
+                let Some(first_entries) =
+                    bitmap_entries(&catalog, row_group.rg_id, first.column(), "value")
+                else {
+                    return Ok(None);
+                };
+                let Some(second_entries) =
+                    bitmap_entries(&catalog, row_group.rg_id, second.column(), "value")
+                else {
+                    return Ok(None);
+                };
+                if first_entries
+                    .len()
+                    .checked_mul(second_entries.len())
+                    .filter(|product| *product <= BITMAP_TOP_COUNT_MAX_KEY_PRODUCT)
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                if !bitmap_entries_cover_filter(first_entries, &filter_bitmap)
+                    || !bitmap_entries_cover_filter(second_entries, &filter_bitmap)
+                {
+                    return Ok(None);
+                }
+                let mut first_filtered = Vec::new();
+                for (value_text, bitmap) in first_entries {
+                    let mut row_bitmap = filter_bitmap.clone();
+                    row_bitmap &= bitmap;
+                    if row_bitmap.is_empty() {
+                        continue;
+                    }
+                    let Some(value) = first.value(value_text) else {
+                        return Ok(None);
+                    };
+                    first_filtered.push((value, row_bitmap));
+                }
+                for (first_value, first_bitmap) in first_filtered {
+                    for (second_text, second_bitmap) in second_entries {
+                        let count = bitmap_intersection_len(&first_bitmap, second_bitmap);
+                        if count == 0 {
+                            continue;
+                        }
+                        let Some(second_value) = second.value(second_text) else {
+                            return Ok(None);
+                        };
+                        *counts
+                            .entry(vec![first_value.clone(), second_value])
+                            .or_insert(0) += count;
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    let mut rows = counts
+        .into_iter()
+        .map(|(keys, count)| vector::GroupRow {
+            keys,
+            count,
+            aggs: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable_by(|a, b| b.count.cmp(&a.count).then_with(|| a.keys.cmp(&b.keys)));
+    rows.truncate(k);
+    Ok(Some(rows))
+}
+
+impl BitmapTopKey {
+    fn column(&self) -> &str {
+        match self {
+            Self::Int(col) | Self::Date(col) => col,
+        }
+    }
+
+    fn value(&self, value_text: &str) -> Option<KeyValue> {
+        match self {
+            Self::Int(_) => value_text
+                .parse::<i64>()
+                .ok()
+                .map(|v| KeyValue::Int(Some(v))),
+            Self::Date(_) => value_text
+                .parse::<i32>()
+                .ok()
+                .map(|v| KeyValue::Date(Some(v))),
+        }
+    }
+}
+
+fn bitmap_top_keys(keys: &[KeySpec]) -> Option<Vec<BitmapTopKey>> {
+    keys.iter()
+        .map(|key| match key {
+            KeySpec::Int { col } => Some(BitmapTopKey::Int(col.clone())),
+            KeySpec::Date { col } => Some(BitmapTopKey::Date(col.clone())),
+            KeySpec::Text { .. }
+            | KeySpec::TimestampMinute { .. }
+            | KeySpec::TimestampTruncMinute { .. } => None,
+        })
+        .collect()
+}
+
+fn bitmap_top_count_columns(keys: &[BitmapTopKey], filters: &[FilterSpec]) -> Vec<String> {
+    let mut columns = bitmap_filter_columns(filters);
+    for key in keys {
+        let col = key.column();
+        if !columns.iter().any(|existing| existing == col) {
+            columns.push(col.to_string());
+        }
+    }
+    columns
+}
+
+fn bitmap_for_all_filters(
+    catalog: &RowGroupBitmapCatalog,
+    rg_id: i64,
+    n_rows: i64,
+    filters: &[FilterSpec],
+) -> Option<RoaringBitmap> {
+    let mut bitmap = full_row_bitmap(n_rows);
+    for filter in filters {
+        let next = bitmap_for_filter(catalog, rg_id, filter)?;
+        bitmap &= &next;
+        if bitmap.is_empty() {
+            break;
+        }
+    }
+    Some(bitmap)
+}
+
+fn bitmap_entries_cover_filter(
+    entries: &HashMap<String, RoaringBitmap>,
+    filter_bitmap: &RoaringBitmap,
+) -> bool {
+    let mut covered = RoaringBitmap::new();
+    for bitmap in entries.values() {
+        covered |= bitmap;
+    }
+    let mut missing = filter_bitmap.clone();
+    missing -= &covered;
+    missing.is_empty()
+}
+
+fn bitmap_intersection_len(left: &RoaringBitmap, right: &RoaringBitmap) -> i64 {
+    let mut bitmap = left.clone();
+    bitmap &= right;
+    bitmap.len().min(i64::MAX as u64) as i64
+}
+
+fn column_bitmaps_table_available() -> Result<bool, Box<dyn std::error::Error>> {
+    if COLUMN_BITMAPS_TABLE_EXISTS.load(AtomicOrdering::Relaxed) {
+        return Ok(true);
+    }
+    let exists: Option<bool> =
+        Spi::get_one("SELECT to_regclass('rvbbit.column_bitmaps') IS NOT NULL")?;
+    if exists.unwrap_or(false) {
+        COLUMN_BITMAPS_TABLE_EXISTS.store(true, AtomicOrdering::Relaxed);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn bitmap_filter_columns(filters: &[FilterSpec]) -> Vec<String> {
+    let mut out = Vec::new();
+    for filter in filters {
+        let col = match filter {
+            FilterSpec::IntEq { col, .. }
+            | FilterSpec::IntNe { col, .. }
+            | FilterSpec::IntGe { col, .. }
+            | FilterSpec::IntLe { col, .. }
+            | FilterSpec::IntIn { col, .. }
+            | FilterSpec::TextNotEmpty { col } => col,
+            FilterSpec::TextContains { .. } | FilterSpec::TextNotContains { .. } => continue,
+        };
+        if !out.iter().any(|existing| existing == col) {
+            out.push(col.clone());
+        }
+    }
+    out
+}
+
+fn load_column_bitmaps_cached(
+    rel_oid: u32,
+    columns: &[String],
+    row_groups: &[IndexedRowGroupPath],
+) -> Result<std::sync::Arc<RowGroupBitmapCatalog>, Box<dyn std::error::Error>> {
+    let key = bitmap_catalog_cache_key(rel_oid, columns, row_groups);
+    if let Some(catalog) = columnar_cache::get::<RowGroupBitmapCatalog>("bitmap_catalogs", &key) {
+        return Ok(catalog);
+    }
+
+    let catalog = load_column_bitmaps(rel_oid, columns)?;
+    let bytes = bitmap_catalog_memory_size(&catalog);
+    Ok(columnar_cache::put("bitmap_catalogs", key, bytes, catalog))
+}
+
+fn bitmap_catalog_cache_key(
+    rel_oid: u32,
+    columns: &[String],
+    row_groups: &[IndexedRowGroupPath],
+) -> String {
+    let mut cols = columns.to_vec();
+    cols.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(row_groups.len() as u64).to_le_bytes());
+    for row_group in row_groups {
+        hasher.update(&row_group.rg_id.to_le_bytes());
+        hasher.update(&row_group.n_rows.to_le_bytes());
+        hasher.update(row_group.path.to_string_lossy().as_bytes());
+        hasher.update(&[0]);
+    }
+    format!(
+        "rel={rel_oid}|cols={}|sig={}",
+        cols.join("\u{1f}"),
+        hasher.finalize().to_hex()
+    )
+}
+
+fn bitmap_catalog_memory_size(catalog: &RowGroupBitmapCatalog) -> usize {
+    let mut bytes = 0usize;
+    for ((_, column_name, bitmap_kind), entries) in catalog {
+        bytes = bytes
+            .saturating_add(column_name.len())
+            .saturating_add(bitmap_kind.len())
+            .saturating_add(64);
+        for (value_text, bitmap) in entries {
+            bytes = bytes
+                .saturating_add(value_text.len())
+                .saturating_add(bitmap.serialized_size())
+                .saturating_add(64);
+        }
+    }
+    bytes
+}
+
+fn load_column_bitmaps(
+    rel_oid: u32,
+    columns: &[String],
+) -> Result<RowGroupBitmapCatalog, Box<dyn std::error::Error>> {
+    let column_list = columns
+        .iter()
+        .map(|col| format!("'{}'", col.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT rg_id, column_name, bitmap_kind, value_text, bitmap \
+         FROM rvbbit.column_bitmaps \
+         WHERE table_oid = {rel_oid}::oid \
+           AND column_name IN ({column_list})"
+    );
+
+    let mut raw = Vec::<(i64, String, String, String, Vec<u8>)>::new();
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(&sql, None, &[])?;
+        for row in table {
+            let rg_id: Option<i64> = row.get(1)?;
+            let column_name: Option<String> = row.get(2)?;
+            let bitmap_kind: Option<String> = row.get(3)?;
+            let value_text: Option<String> = row.get(4)?;
+            let bitmap: Option<Vec<u8>> = row.get(5)?;
+            if let (
+                Some(rg_id),
+                Some(column_name),
+                Some(bitmap_kind),
+                Some(value_text),
+                Some(bitmap),
+            ) = (rg_id, column_name, bitmap_kind, value_text, bitmap)
+            {
+                raw.push((rg_id, column_name, bitmap_kind, value_text, bitmap));
+            }
+        }
+        Ok(())
+    })?;
+
+    let mut catalog = RowGroupBitmapCatalog::default();
+    for (rg_id, column_name, bitmap_kind, value_text, bytes) in raw {
+        let Ok(bitmap) = RoaringBitmap::deserialize_from(&mut Cursor::new(&bytes)) else {
+            return Ok(RowGroupBitmapCatalog::default());
+        };
+        catalog
+            .entry((rg_id, column_name, bitmap_kind))
+            .or_default()
+            .insert(value_text, bitmap);
+    }
+    Ok(catalog)
+}
+
+fn bitmap_for_filter(
+    catalog: &RowGroupBitmapCatalog,
+    rg_id: i64,
+    filter: &FilterSpec,
+) -> Option<RoaringBitmap> {
+    match filter {
+        FilterSpec::IntEq { col, value } => {
+            let entries = bitmap_entries(catalog, rg_id, col, "value")?;
+            Some(entries.get(&value.to_string()).cloned().unwrap_or_default())
+        }
+        FilterSpec::IntNe { col, value } => {
+            let entries = bitmap_entries(catalog, rg_id, col, "value")?;
+            Some(bitmap_union_by_int(entries, |candidate| {
+                candidate != *value
+            }))
+        }
+        FilterSpec::IntGe { col, value } => {
+            let entries = bitmap_entries(catalog, rg_id, col, "value")?;
+            Some(bitmap_union_by_int(entries, |candidate| {
+                candidate >= *value
+            }))
+        }
+        FilterSpec::IntLe { col, value } => {
+            let entries = bitmap_entries(catalog, rg_id, col, "value")?;
+            Some(bitmap_union_by_int(entries, |candidate| {
+                candidate <= *value
+            }))
+        }
+        FilterSpec::IntIn { col, values } => {
+            let entries = bitmap_entries(catalog, rg_id, col, "value")?;
+            let mut out = RoaringBitmap::new();
+            for value in values {
+                if let Some(bitmap) = entries.get(&value.to_string()) {
+                    out |= bitmap;
+                }
+            }
+            Some(out)
+        }
+        FilterSpec::TextNotEmpty { col } => {
+            let entries = bitmap_entries(catalog, rg_id, col, "not_empty")?;
+            Some(entries.get("__not_empty__").cloned().unwrap_or_default())
+        }
+        FilterSpec::TextContains { .. } | FilterSpec::TextNotContains { .. } => None,
+    }
+}
+
+fn bitmap_entries<'a>(
+    catalog: &'a RowGroupBitmapCatalog,
+    rg_id: i64,
+    col: &str,
+    kind: &str,
+) -> Option<&'a HashMap<String, RoaringBitmap>> {
+    catalog.get(&(rg_id, col.to_string(), kind.to_string()))
+}
+
+fn bitmap_union_by_int<F>(entries: &HashMap<String, RoaringBitmap>, predicate: F) -> RoaringBitmap
+where
+    F: Fn(i64) -> bool,
+{
+    let mut out = RoaringBitmap::new();
+    for (value_text, bitmap) in entries {
+        if value_text
+            .parse::<i64>()
+            .ok()
+            .filter(|value| predicate(*value))
+            .is_some()
+        {
+            out |= bitmap;
+        }
+    }
+    out
+}
+
+fn intersect_bitmap(current: &mut Option<RoaringBitmap>, next: RoaringBitmap) {
+    match current {
+        Some(existing) => *existing &= &next,
+        None => *current = Some(next),
+    }
+}
+
+fn full_row_bitmap(n_rows: i64) -> RoaringBitmap {
+    let end = n_rows.max(0).min(u32::MAX as i64) as u32;
+    (0..end).collect()
+}
+
 fn required_text_trigrams(value: &str) -> Vec<String> {
     let bytes = value.as_bytes();
     if bytes.len() < 3 {
@@ -399,6 +1103,7 @@ fn required_text_trigrams(value: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct NumericScan {
     pub sum_f64: f64,
     pub sum_i128: Option<i128>,
@@ -517,6 +1222,13 @@ pub(crate) fn group_count_map(
         return Ok(cached);
     }
 
+    if let Some(out) = group_count_map_catalog(rel_oid, group_col)? {
+        GROUP_COUNT_CACHE.with(|cache| {
+            cache.borrow_mut().insert(key, out.clone());
+        });
+        return Ok(out);
+    }
+
     let sql = format!(
         "SELECT per_group_stats::text \
          FROM rvbbit.row_groups \
@@ -554,6 +1266,40 @@ pub(crate) fn group_count_map(
         cache.borrow_mut().insert(key, out.clone());
     });
     Ok(out)
+}
+
+fn group_count_map_catalog(
+    rel_oid: u32,
+    group_col: &str,
+) -> Result<Option<HashMap<Option<String>, i64>>, Box<dyn std::error::Error>> {
+    let exists: Option<bool> = Spi::get_one("SELECT to_regclass('rvbbit.group_stats') IS NOT NULL")
+        .ok()
+        .flatten();
+    if !exists.unwrap_or(false) {
+        return Ok(None);
+    }
+    let col = group_col.replace('\'', "''");
+    let sql = format!(
+        "SELECT group_value_text, sum(count)::bigint \
+         FROM rvbbit.group_stats \
+         WHERE table_oid = {rel_oid}::oid AND group_col = '{col}' \
+         GROUP BY group_value_text"
+    );
+    let mut out: HashMap<Option<String>, i64> = HashMap::default();
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(&sql, None, &[])?;
+        for row in table {
+            let value: Option<String> = row.get(1)?;
+            let count: Option<i64> = row.get(2)?;
+            out.insert(value, count.unwrap_or(0));
+        }
+        Ok(())
+    })?;
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -885,6 +1631,285 @@ fn push_top_count2_row(heap: &mut BinaryHeap<Reverse<CountTop2Row>>, row: CountT
     heap.push(Reverse(row));
 }
 
+fn top_count_rows_from_text_counts(
+    counts: HashMap<Option<String>, i64>,
+    k: usize,
+) -> Vec<CountTopRow> {
+    let mut heap: BinaryHeap<Reverse<CountTopRow>> = BinaryHeap::with_capacity(k + 1);
+    for (group_value, count) in counts {
+        push_top_count_row(&mut heap, CountTopRow { count, group_value }, k);
+    }
+    let mut rows: Vec<CountTopRow> = heap.into_iter().map(|Reverse(row)| row).collect();
+    rows.sort_unstable_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.group_value.cmp(&b.group_value))
+    });
+    rows
+}
+
+fn top_count2_rows_from_counts(
+    counts: HashMap<(Option<i64>, Option<String>), i64>,
+    k: usize,
+) -> Vec<CountTop2Row> {
+    let mut heap: BinaryHeap<Reverse<CountTop2Row>> = BinaryHeap::with_capacity(k + 1);
+    for ((int_value, text_value), count) in counts {
+        push_top_count2_row(
+            &mut heap,
+            CountTop2Row {
+                count,
+                int_value,
+                text_value,
+            },
+            k,
+        );
+    }
+    let mut rows: Vec<CountTop2Row> = heap.into_iter().map(|Reverse(row)| row).collect();
+    rows.sort_unstable_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.int_value.cmp(&b.int_value))
+            .then_with(|| a.text_value.cmp(&b.text_value))
+    });
+    rows
+}
+
+fn try_text_dictionary_top_count_1col(
+    rel_oid: u32,
+    col: &str,
+    skip_empty: bool,
+    k: usize,
+) -> Result<Option<Vec<CountTopRow>>, Box<dyn std::error::Error>> {
+    let Some(row_groups) = lookup_text_dictionary_row_groups(rel_oid, col)? else {
+        return Ok(None);
+    };
+    if row_groups.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut counts = HashMap::<Option<String>, i64>::default();
+    for row_group in &row_groups {
+        let dictionary = load_text_dictionary_cached(rel_oid, col, row_group)?;
+        if dictionary.codes.len() != row_group.n_rows.max(0) as usize {
+            return Ok(None);
+        }
+        let mut local_counts = vec![0i64; dictionary.values.len() + 1];
+        for &code in &dictionary.codes {
+            let idx = code as usize;
+            if idx > dictionary.values.len() {
+                return Ok(None);
+            }
+            if idx == 0 {
+                if !skip_empty {
+                    local_counts[0] += 1;
+                }
+                continue;
+            }
+            if skip_empty && dictionary.values[idx - 1].is_empty() {
+                continue;
+            }
+            local_counts[idx] += 1;
+        }
+        merge_text_dictionary_counts(&mut counts, &dictionary, local_counts);
+    }
+
+    Ok(Some(top_count_rows_from_text_counts(counts, k)))
+}
+
+fn try_text_dictionary_top_count_int_text(
+    rel_oid: u32,
+    int_col: &str,
+    text_col: &str,
+    skip_empty_text: bool,
+    k: usize,
+) -> Result<Option<Vec<CountTop2Row>>, Box<dyn std::error::Error>> {
+    let Some(row_groups) = lookup_text_dictionary_row_groups(rel_oid, text_col)? else {
+        return Ok(None);
+    };
+    if row_groups.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut counts = HashMap::<(Option<i64>, Option<String>), i64>::default();
+    for row_group in &row_groups {
+        let dictionary = load_text_dictionary_cached(rel_oid, text_col, row_group)?;
+        if dictionary.codes.len() != row_group.n_rows.max(0) as usize {
+            return Ok(None);
+        }
+
+        let mut local_counts = HashMap::<(Option<i64>, u32), i64>::default();
+        let reader = RowGroupReader::open_projected(&row_group.row_group_path, &[int_col])?;
+        let mut base_row = 0usize;
+        for batch in reader {
+            let batch = batch?;
+            let schema = batch.schema();
+            let int_idx = schema.index_of(int_col)?;
+            let int_values = int_array_ref(int_col, batch.column(int_idx).as_ref())?;
+            for row in 0..batch.num_rows() {
+                let dict_row = base_row + row;
+                if dict_row >= dictionary.codes.len() {
+                    return Ok(None);
+                }
+                let code = dictionary.codes[dict_row];
+                if code as usize > dictionary.values.len() {
+                    return Ok(None);
+                }
+                if code == 0 {
+                    if skip_empty_text {
+                        continue;
+                    }
+                } else if skip_empty_text && dictionary.values[(code - 1) as usize].is_empty() {
+                    continue;
+                }
+                *local_counts
+                    .entry((int_values.value(row), code))
+                    .or_insert(0) += 1;
+            }
+            base_row += batch.num_rows();
+        }
+        if base_row != dictionary.codes.len() {
+            return Ok(None);
+        }
+
+        for ((int_value, code), count) in local_counts {
+            let text_value = dictionary.value_for_code(code).map(str::to_string);
+            *counts.entry((int_value, text_value)).or_insert(0) += count;
+        }
+    }
+
+    Ok(Some(top_count2_rows_from_counts(counts, k)))
+}
+
+fn try_text_dictionary_filtered_top_count(
+    rel_oid: u32,
+    keys: &[KeySpec],
+    filters: &[FilterSpec],
+    k: usize,
+) -> Result<Option<Vec<vector::GroupRow>>, Box<dyn std::error::Error>> {
+    if k == 0 || keys.len() != 1 {
+        return Ok(None);
+    }
+    if filters.iter().any(|filter| {
+        matches!(
+            filter,
+            FilterSpec::TextContains { .. } | FilterSpec::TextNotContains { .. }
+        )
+    }) {
+        return Ok(None);
+    }
+    let KeySpec::Text { col } = &keys[0] else {
+        return Ok(None);
+    };
+
+    let row_groups = lookup_paths_for_oid_with_ids(rel_oid)?;
+    if row_groups.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let columns = bitmap_filter_columns(filters);
+    let filtered_row_groups = if columns.is_empty() {
+        row_groups
+            .iter()
+            .map(|row_group| {
+                (
+                    row_group.rg_id,
+                    row_group.n_rows,
+                    full_row_bitmap(row_group.n_rows),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        if !column_bitmaps_table_available()? {
+            return Ok(None);
+        }
+        let catalog = load_column_bitmaps_cached(rel_oid, &columns, &row_groups)?;
+        if catalog.is_empty() {
+            return Ok(None);
+        }
+        let mut filtered = Vec::with_capacity(row_groups.len());
+        for row_group in &row_groups {
+            let Some(bitmap) =
+                bitmap_for_all_filters(&catalog, row_group.rg_id, row_group.n_rows, filters)
+            else {
+                return Ok(None);
+            };
+            filtered.push((row_group.rg_id, row_group.n_rows, bitmap));
+        }
+        filtered
+    };
+    if filtered_row_groups
+        .iter()
+        .all(|(_, _, bitmap)| bitmap.is_empty())
+    {
+        return Ok(Some(Vec::new()));
+    }
+
+    let Some(dictionary_row_groups) = lookup_text_dictionary_row_groups(rel_oid, col)? else {
+        return Ok(None);
+    };
+    if dictionary_row_groups.len() != filtered_row_groups.len() {
+        return Ok(None);
+    }
+
+    let mut counts = HashMap::<Option<String>, i64>::default();
+    for (row_group, (rg_id, n_rows, filter_bitmap)) in
+        dictionary_row_groups.iter().zip(filtered_row_groups.iter())
+    {
+        if row_group.rg_id != *rg_id || row_group.n_rows != *n_rows {
+            return Ok(None);
+        }
+        if filter_bitmap.is_empty() {
+            continue;
+        }
+
+        let dictionary = load_text_dictionary_cached(rel_oid, col, row_group)?;
+        if dictionary.codes.len() != row_group.n_rows.max(0) as usize {
+            return Ok(None);
+        }
+        let mut local_counts = vec![0i64; dictionary.values.len() + 1];
+        for row in filter_bitmap.iter() {
+            let idx = row as usize;
+            if idx >= dictionary.codes.len() {
+                return Ok(None);
+            }
+            let code = dictionary.codes[idx] as usize;
+            if code > dictionary.values.len() {
+                return Ok(None);
+            }
+            local_counts[code] += 1;
+        }
+        merge_text_dictionary_counts(&mut counts, &dictionary, local_counts);
+    }
+
+    let rows = top_count_rows_from_text_counts(counts, k)
+        .into_iter()
+        .map(|row| vector::GroupRow {
+            keys: vec![KeyValue::Text(row.group_value)],
+            count: row.count,
+            aggs: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(rows))
+}
+
+fn merge_text_dictionary_counts(
+    counts: &mut HashMap<Option<String>, i64>,
+    dictionary: &TextDictionary,
+    local_counts: Vec<i64>,
+) {
+    for (code, count) in local_counts.into_iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let value = if code == 0 {
+            None
+        } else {
+            dictionary.values.get(code - 1).cloned()
+        };
+        *counts.entry(value).or_insert(0) += count;
+    }
+}
+
 fn push_distinct_top_row(
     heap: &mut BinaryHeap<Reverse<DistinctTopRow>>,
     row: DistinctTopRow,
@@ -1136,7 +2161,13 @@ fn top_count_1col(
         ));
     }
     let k = k as usize;
-    let paths = lookup_paths_for_oid(rel.to_u32())?;
+    let rel_oid = rel.to_u32();
+    if let Some(rows) = try_text_dictionary_top_count_1col(rel_oid, col, skip_empty, k)? {
+        return Ok(TableIterator::new(
+            rows.into_iter().map(|row| (row.group_value, row.count)),
+        ));
+    }
+    let paths = lookup_paths_for_oid(rel_oid)?;
 
     let mut counts: Option<Counts> = None;
 
@@ -1182,11 +2213,32 @@ fn top_count_1col(
                     }
                 }
             } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
-                count_i64_values_arr(col, skip_empty, &mut counts, a.values(), |row| a.is_null(row), a.null_count() == 0)?;
+                count_i64_values_arr(
+                    col,
+                    skip_empty,
+                    &mut counts,
+                    a.values(),
+                    |row| a.is_null(row),
+                    a.null_count() == 0,
+                )?;
             } else if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
-                count_i64_values_arr(col, skip_empty, &mut counts, a.values(), |row| a.is_null(row), a.null_count() == 0)?;
+                count_i64_values_arr(
+                    col,
+                    skip_empty,
+                    &mut counts,
+                    a.values(),
+                    |row| a.is_null(row),
+                    a.null_count() == 0,
+                )?;
             } else if let Some(a) = array.as_any().downcast_ref::<Int16Array>() {
-                count_i64_values_arr(col, skip_empty, &mut counts, a.values(), |row| a.is_null(row), a.null_count() == 0)?;
+                count_i64_values_arr(
+                    col,
+                    skip_empty,
+                    &mut counts,
+                    a.values(),
+                    |row| a.is_null(row),
+                    a.null_count() == 0,
+                )?;
             } else {
                 return Err(format!(
                     "rvbbit.top_count_1col: column '{}' has unsupported type {:?}",
@@ -1323,6 +2375,17 @@ fn top_count_int_text(
     }
     let k = k as usize;
     let rel_oid = rel.to_u32();
+    if let Some(rows) =
+        try_text_dictionary_top_count_int_text(rel_oid, int_col, text_col, skip_empty_text, k)?
+    {
+        return Ok(TableIterator::new(rows.into_iter().map(|row| {
+            (
+                row.int_value.map(|v| v.to_string()),
+                row.text_value,
+                row.count,
+            )
+        })));
+    }
     let paths = lookup_paths_for_oid(rel_oid)?;
     if should_use_owned_text_pair_counts(rel_oid, int_col, skip_empty_text) {
         let rows = top_count_int_text_owned_rows(&paths, int_col, text_col, skip_empty_text, k)?;
@@ -1712,21 +2775,45 @@ fn top_count_filtered(
 
     let offset = offset.max(0) as usize;
     let wanted = (k as usize).saturating_add(offset);
-    let paths = lookup_paths_for_oid_pruned(rel.to_u32(), &filters)?;
-    if paths.is_empty() {
-        return Ok(TableIterator::new(
-            Vec::<(
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                i64,
-            )>::new()
-            .into_iter(),
-        ));
-    }
-    let rows = vector::topk_group_aggregate(paths, &keys, &filters, &[], wanted)?;
+    let rel_oid = rel.to_u32();
+    let rows = if let Some(rows) =
+        try_text_dictionary_filtered_top_count(rel_oid, &keys, &filters, wanted)?
+    {
+        rows
+    } else if let Some(rows) = try_bitmap_top_count(rel_oid, &keys, &filters, wanted)? {
+        rows
+    } else if let Some(paths) = try_filter_bitmaps(rel_oid, &filters)? {
+        if paths.is_empty() {
+            return Ok(TableIterator::new(
+                Vec::<(
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    i64,
+                )>::new()
+                .into_iter(),
+            ));
+        }
+        vector::topk_group_aggregate_with_row_bitmaps(paths, &keys, &filters, &[], wanted)?
+    } else {
+        let paths = lookup_paths_for_oid_pruned(rel_oid, &filters)?;
+        if paths.is_empty() {
+            return Ok(TableIterator::new(
+                Vec::<(
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    i64,
+                )>::new()
+                .into_iter(),
+            ));
+        }
+        vector::topk_group_aggregate(paths, &keys, &filters, &[], wanted)?
+    };
     let out = rows
         .into_iter()
         .skip(offset)

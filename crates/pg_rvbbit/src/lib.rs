@@ -17,6 +17,7 @@ mod catalog;
 mod catcher;
 mod cluster;
 mod code_steps;
+mod columnar_cache;
 mod compact;
 mod composites;
 mod costs;

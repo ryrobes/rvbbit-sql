@@ -138,10 +138,7 @@ fn run_sql_to_text(path: &str, sql: &str) -> Result<Vec<String>, String> {
                 .await
                 .map_err(|e| format!("register_parquet({path}): {e}"))?;
 
-            let df = ctx
-                .sql(sql)
-                .await
-                .map_err(|e| format!("sql plan: {e}"))?;
+            let df = ctx.sql(sql).await.map_err(|e| format!("sql plan: {e}"))?;
             let batches: Vec<RecordBatch> =
                 df.collect().await.map_err(|e| format!("collect: {e}"))?;
 
@@ -486,10 +483,7 @@ async fn register_tables(
         let urls: Vec<ListingTableUrl> = t
             .paths
             .iter()
-            .map(|p| {
-                ListingTableUrl::parse(p)
-                    .map_err(|e| format!("ListingTableUrl({p}): {e}"))
-            })
+            .map(|p| ListingTableUrl::parse(p).map_err(|e| format!("ListingTableUrl({p}): {e}")))
             .collect::<Result<Vec<_>, _>>()?;
         // DataFusion 53 defaults parquet string columns to Utf8View, which
         // our custom_scan tuple-fill code (StringArray-based) doesn't
@@ -539,7 +533,11 @@ pub(crate) fn query_engine(layout: &str, sql: &str, max_rows: i32) -> Result<Val
         });
     }
 
-    let max_rows = if max_rows > 0 { max_rows as usize } else { usize::MAX };
+    let max_rows = if max_rows > 0 {
+        max_rows as usize
+    } else {
+        usize::MAX
+    };
 
     with_rt_ctx(|rt, ctx| {
         rt.block_on(async {
@@ -640,9 +638,7 @@ fn df_inprocess_query(sql: &str, max_rows: default!(i32, 100000)) -> JsonB {
 ///
 /// Returns RecordBatches with the table's columns in their natural order.
 /// CustomScan's fill_slot_from_batch picks out the projection it needs.
-pub(crate) fn collect_batches_for_table(
-    table_oid: u32,
-) -> Result<Vec<RecordBatch>, String> {
+pub(crate) fn collect_batches_for_table(table_oid: u32) -> Result<Vec<RecordBatch>, String> {
     let asof = current_asof();
     let tables = discover_catalog_scan(asof)?;
     if tables.is_empty() {
@@ -682,8 +678,8 @@ pub(crate) fn collect_batches_for_table(
                 format!("SELECT * FROM \"{}\"", qualified)
             };
             let df = ctx.sql(&sql).await.map_err(|e| format!("sql plan: {e}"))?;
-            let batches: Vec<RecordBatch> = df.collect().await
-                .map_err(|e| format!("collect: {e}"))?;
+            let batches: Vec<RecordBatch> =
+                df.collect().await.map_err(|e| format!("collect: {e}"))?;
             Ok::<Vec<RecordBatch>, String>(batches)
         })
     })

@@ -50,23 +50,15 @@ fn lance_create_demo(path: &str, n_rows: i64, dim: i32) -> i64 {
     }
     let values_array = Float32Array::from(values);
     let item_field = Arc::new(Field::new("item", DataType::Float32, false));
-    let embedding_array = match FixedSizeListArray::try_new(
-        item_field.clone(),
-        dim,
-        Arc::new(values_array),
-        None,
-    ) {
-        Ok(a) => a,
-        Err(e) => pgrx::error!("rvbbit.lance_create_demo: FixedSizeList: {e}"),
-    };
+    let embedding_array =
+        match FixedSizeListArray::try_new(item_field.clone(), dim, Arc::new(values_array), None) {
+            Ok(a) => a,
+            Err(e) => pgrx::error!("rvbbit.lance_create_demo: FixedSizeList: {e}"),
+        };
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
-        Field::new(
-            "embedding",
-            DataType::FixedSizeList(item_field, dim),
-            false,
-        ),
+        Field::new("embedding", DataType::FixedSizeList(item_field, dim), false),
     ]));
 
     let batch = match RecordBatch::try_new(
@@ -159,7 +151,10 @@ fn batch_to_json_rows(batch: &RecordBatch) -> Value {
     for row_idx in 0..batch.num_rows() {
         let mut obj = serde_json::Map::with_capacity(batch.num_columns());
         for (col_idx, field) in fields.iter().enumerate() {
-            if matches!(field.data_type(), DataType::FixedSizeList(_, _) | DataType::List(_)) {
+            if matches!(
+                field.data_type(),
+                DataType::FixedSizeList(_, _) | DataType::List(_)
+            ) {
                 // Skip large vector columns to keep the JSON small.
                 continue;
             }
@@ -173,8 +168,9 @@ fn batch_to_json_rows(batch: &RecordBatch) -> Value {
                     let a = col.as_any().downcast_ref::<Float32Array>().unwrap();
                     json!(a.value(row_idx))
                 }
-                _ => json!(arrow::array::cast::AsArray::as_string::<i32>(col.as_ref())
-                    .value(row_idx)),
+                _ => {
+                    json!(arrow::array::cast::AsArray::as_string::<i32>(col.as_ref()).value(row_idx))
+                }
             };
             obj.insert(field.name().clone(), val);
         }
@@ -216,9 +212,7 @@ fn lance_import_column(
         Ok(None) => pgrx::error!("rvbbit.lance_import_column: oid {rel_oid} does not exist"),
         Err(e) => pgrx::error!("rvbbit.lance_import_column: resolve oid: {e}"),
     };
-    let select_sql = format!(
-        "SELECT {pk_col}::bigint, {vec_col}::real[] FROM {qualified}"
-    );
+    let select_sql = format!("SELECT {pk_col}::bigint, {vec_col}::real[] FROM {qualified}");
 
     // Read rows via SPI into Rust Vecs. SPI is sync, so we materialize
     // before entering the tokio runtime block.
@@ -228,9 +222,7 @@ fn lance_import_column(
         let table = client.select(&select_sql, None, &[])?;
         for row in table {
             let pk: i64 = row.get::<i64>(1)?.unwrap_or(0);
-            let vec_row: Vec<Option<f32>> = row
-                .get::<Vec<Option<f32>>>(2)?
-                .unwrap_or_default();
+            let vec_row: Vec<Option<f32>> = row.get::<Vec<Option<f32>>>(2)?.unwrap_or_default();
             if vec_row.len() != dim_usize {
                 pgrx::error!(
                     "rvbbit.lance_import_column: row pk={pk} has {} dims, expected {dim_usize}",
@@ -255,23 +247,15 @@ fn lance_import_column(
     let pk_array = Int64Array::from(pks);
     let values_array = Float32Array::from(values);
     let item_field = Arc::new(Field::new("item", DataType::Float32, false));
-    let embedding_array = match FixedSizeListArray::try_new(
-        item_field.clone(),
-        dim,
-        Arc::new(values_array),
-        None,
-    ) {
-        Ok(a) => a,
-        Err(e) => pgrx::error!("rvbbit.lance_import_column: FixedSizeList: {e}"),
-    };
+    let embedding_array =
+        match FixedSizeListArray::try_new(item_field.clone(), dim, Arc::new(values_array), None) {
+            Ok(a) => a,
+            Err(e) => pgrx::error!("rvbbit.lance_import_column: FixedSizeList: {e}"),
+        };
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
-        Field::new(
-            "embedding",
-            DataType::FixedSizeList(item_field, dim),
-            false,
-        ),
+        Field::new("embedding", DataType::FixedSizeList(item_field, dim), false),
     ]));
     let batch = match RecordBatch::try_new(
         schema.clone(),
@@ -325,8 +309,7 @@ pub(crate) fn refresh_lance_dataset(
         let table = client.select(&select_sql, None, &[])?;
         for row in table {
             let pk: i64 = row.get::<i64>(1)?.unwrap_or(0);
-            let vec_row: Vec<Option<f32>> =
-                row.get::<Vec<Option<f32>>>(2)?.unwrap_or_default();
+            let vec_row: Vec<Option<f32>> = row.get::<Vec<Option<f32>>>(2)?.unwrap_or_default();
             if vec_row.len() != dim_usize {
                 return Err(pgrx::spi::Error::CursorNotFound(format!(
                     "row pk={pk} has {} dims, expected {dim_usize}",
@@ -352,13 +335,9 @@ pub(crate) fn refresh_lance_dataset(
     let pk_array = Int64Array::from(pks);
     let values_array = Float32Array::from(values);
     let item_field = Arc::new(Field::new("item", DataType::Float32, false));
-    let embedding_array = FixedSizeListArray::try_new(
-        item_field.clone(),
-        dim,
-        Arc::new(values_array),
-        None,
-    )
-    .map_err(|e| format!("FixedSizeList: {e}"))?;
+    let embedding_array =
+        FixedSizeListArray::try_new(item_field.clone(), dim, Arc::new(values_array), None)
+            .map_err(|e| format!("FixedSizeList: {e}"))?;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -395,12 +374,7 @@ pub(crate) fn refresh_lance_dataset(
 /// To disable, pass NULL for lance_url (caller can use the catalog
 /// directly: UPDATE rvbbit.tables SET lance_url = NULL).
 #[pg_extern]
-fn lance_enable(
-    reloid: pg_sys::Oid,
-    vec_col: &str,
-    dim: i32,
-    lance_url: &str,
-) -> i64 {
+fn lance_enable(reloid: pg_sys::Oid, vec_col: &str, dim: i32, lance_url: &str) -> i64 {
     let rel_oid = reloid.to_u32();
     let vec_col_safe = vec_col.replace('\'', "''");
     let lance_url_safe = lance_url.replace('\'', "''");
@@ -455,12 +429,7 @@ fn knn(reloid: pg_sys::Oid, query: Vec<f32>, k: i32) -> JsonB {
 /// Subsequent rvbbit.lance_knn() calls automatically use the index when
 /// present.
 #[pg_extern]
-fn lance_build_index(
-    path: &str,
-    column: &str,
-    num_partitions: i32,
-    num_sub_vectors: i32,
-) -> i64 {
+fn lance_build_index(path: &str, column: &str, num_partitions: i32, num_sub_vectors: i32) -> i64 {
     let path = path.to_string();
     let column = column.to_string();
     let num_partitions = num_partitions.max(1) as usize;
@@ -473,13 +442,8 @@ fn lance_build_index(
                 .map_err(|e| format!("Dataset::open({path}): {e}"))?;
 
             // IVF-PQ params: 8-bit PQ codes, L2 metric, 50 k-means iterations.
-            let params = VectorIndexParams::ivf_pq(
-                num_partitions,
-                8,
-                num_sub_vectors,
-                MetricType::L2,
-                50,
-            );
+            let params =
+                VectorIndexParams::ivf_pq(num_partitions, 8, num_sub_vectors, MetricType::L2, 50);
 
             dataset
                 .create_index(

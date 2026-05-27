@@ -7,22 +7,17 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 
-use rvbbit_storage::row_group::RowGroupReader;
 use arrow::array::{
     Array, Date32Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use arrow::record_batch::RecordBatch;
-use parking_lot::Mutex;
+use roaring::RoaringBitmap;
+use rvbbit_storage::row_group::RowGroupReader;
 
+use crate::columnar_cache;
 use crate::fast_hash::{FastHashMap as HashMap, FastHashSet as HashSet};
-
-const PROJECTED_BATCH_CACHE_MAX_ENTRIES: usize = 256;
-
-static PROJECTED_BATCH_CACHE: OnceLock<Mutex<HashMap<ProjectedBatchCacheKey, Vec<RecordBatch>>>> =
-    OnceLock::new();
 
 #[derive(Clone)]
 pub(crate) enum KeySpec {
@@ -132,14 +127,6 @@ struct TextRollupAgg {
     min_first: Option<String>,
     min_second: Option<String>,
     distincts: HashSet<i64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-struct ProjectedBatchCacheKey {
-    path: String,
-    columns: String,
-    len: u64,
-    modified_nanos: u128,
 }
 
 #[derive(Clone, Copy)]
@@ -353,29 +340,90 @@ pub(crate) fn topk_group_aggregate(
                 if !filters_match(row, &batch_plan.filters) {
                     continue;
                 }
-                let key = key_for_row(row, &batch_plan.keys);
-                let group_id = match group_ids.get(&key) {
-                    Some(id) => *id,
-                    None => {
-                        let id = states.len();
-                        group_ids.insert(key.clone(), id);
-                        states.push(GroupState {
-                            key,
-                            count: 0,
-                            aggs: plan.aggs.iter().map(AggState::new).collect(),
-                        });
-                        id
-                    }
-                };
-                let state = &mut states[group_id];
-                state.count += 1;
-                for (slot, spec) in state.aggs.iter_mut().zip(&batch_plan.aggs) {
-                    slot.update(row, spec);
-                }
+                update_group_state_for_row(
+                    row,
+                    &batch_plan,
+                    &plan.aggs,
+                    &mut states,
+                    &mut group_ids,
+                );
             }
         }
     }
 
+    Ok(finish_topk_group_rows(&states, k))
+}
+
+pub(crate) fn topk_group_aggregate_with_row_bitmaps(
+    paths: Vec<(PathBuf, RoaringBitmap)>,
+    keys: &[KeySpec],
+    filters: &[FilterSpec],
+    aggs: &[AggSpec],
+    k: usize,
+) -> Result<Vec<GroupRow>, Box<dyn std::error::Error>> {
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+
+    let plan = compile_plan(keys, filters, aggs)?;
+    let projection_refs: Vec<&str> = plan.projection.iter().map(String::as_str).collect();
+    let mut states = Vec::<GroupState>::new();
+    let mut group_ids = HashMap::<GroupKey, usize>::default();
+
+    for (path, bitmap) in paths {
+        if bitmap.is_empty() {
+            continue;
+        }
+        for batch in read_projected_selected_batches(&path, &projection_refs, &bitmap)? {
+            let columns = batch_columns(&batch, &plan.projection)?;
+            let batch_plan = batch_plan(&plan, &columns)?;
+            for row in 0..batch.num_rows() {
+                if !filters_match(row, &batch_plan.filters) {
+                    continue;
+                }
+                update_group_state_for_row(
+                    row,
+                    &batch_plan,
+                    &plan.aggs,
+                    &mut states,
+                    &mut group_ids,
+                );
+            }
+        }
+    }
+
+    Ok(finish_topk_group_rows(&states, k))
+}
+
+fn update_group_state_for_row(
+    row: usize,
+    batch_plan: &BatchPlan<'_>,
+    aggs: &[AggPlan],
+    states: &mut Vec<GroupState>,
+    group_ids: &mut HashMap<GroupKey, usize>,
+) {
+    let key = key_for_row(row, &batch_plan.keys);
+    let group_id = match group_ids.get(&key) {
+        Some(id) => *id,
+        None => {
+            let id = states.len();
+            group_ids.insert(key.clone(), id);
+            states.push(GroupState {
+                key,
+                count: 0,
+                aggs: aggs.iter().map(AggState::new).collect(),
+            });
+            id
+        }
+    };
+    let state = &mut states[group_id];
+    state.count += 1;
+    for (slot, spec) in state.aggs.iter_mut().zip(&batch_plan.aggs) {
+        slot.update(row, spec);
+    }
+}
+
+fn finish_topk_group_rows(states: &[GroupState], k: usize) -> Vec<GroupRow> {
     let mut heap = BinaryHeap::<Reverse<TopRow>>::with_capacity(k + 1);
     for (group_id, state) in states.iter().enumerate() {
         let row = TopRow {
@@ -395,7 +443,7 @@ pub(crate) fn topk_group_aggregate(
     let mut top_rows: Vec<TopRow> = heap.into_iter().map(|Reverse(row)| row).collect();
     top_rows.sort_unstable_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
 
-    Ok(top_rows
+    top_rows
         .into_iter()
         .map(|top| {
             let state = states
@@ -407,7 +455,7 @@ pub(crate) fn topk_group_aggregate(
                 aggs: state.aggs.iter().map(AggState::finish).collect(),
             }
         })
-        .collect())
+        .collect()
 }
 
 fn try_count_fast_path(
@@ -933,9 +981,8 @@ pub(crate) fn read_projected_batches(
     columns: &[&str],
 ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
     let key = projected_batch_cache_key(path, columns)?;
-    let cache = PROJECTED_BATCH_CACHE.get_or_init(|| Mutex::new(HashMap::default()));
-    if let Some(batches) = cache.lock().get(&key).cloned() {
-        return Ok(batches);
+    if let Some(batches) = columnar_cache::get::<Vec<RecordBatch>>("projected_batches", &key) {
+        return Ok((*batches).clone());
     }
 
     let mut batches = Vec::new();
@@ -944,18 +991,37 @@ pub(crate) fn read_projected_batches(
         batches.push(batch?);
     }
 
-    let mut guard = cache.lock();
-    if guard.len() >= PROJECTED_BATCH_CACHE_MAX_ENTRIES {
-        guard.clear();
+    let bytes = record_batches_memory_size(&batches);
+    let cached = columnar_cache::put("projected_batches", key, bytes, batches);
+    Ok((*cached).clone())
+}
+
+fn read_projected_selected_batches(
+    path: &Path,
+    columns: &[&str],
+    bitmap: &RoaringBitmap,
+) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+    let key = projected_selected_batch_cache_key(path, columns, bitmap)?;
+    if let Some(batches) = columnar_cache::get::<Vec<RecordBatch>>("selected_batches", &key) {
+        return Ok((*batches).clone());
     }
-    guard.insert(key, batches.clone());
-    Ok(batches)
+
+    let rows = bitmap.iter().map(|row| row as usize).collect::<Vec<_>>();
+    let reader = RowGroupReader::open_projected_selected_rows(path, columns, &rows)?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch?);
+    }
+
+    let bytes = record_batches_memory_size(&batches);
+    let cached = columnar_cache::put("selected_batches", key, bytes, batches);
+    Ok((*cached).clone())
 }
 
 fn projected_batch_cache_key(
     path: &Path,
     columns: &[&str],
-) -> Result<ProjectedBatchCacheKey, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     let metadata = std::fs::metadata(path)?;
     let modified_nanos = metadata
         .modified()
@@ -963,12 +1029,34 @@ fn projected_batch_cache_key(
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    Ok(ProjectedBatchCacheKey {
-        path: path.to_string_lossy().into_owned(),
-        columns: columns.join("\u{1f}"),
-        len: metadata.len(),
+    Ok(format!(
+        "path={}|cols={}|len={}|mtime={}",
+        path.to_string_lossy(),
+        columns.join("\u{1f}"),
+        metadata.len(),
         modified_nanos,
-    })
+    ))
+}
+
+fn projected_selected_batch_cache_key(
+    path: &Path,
+    columns: &[&str],
+    bitmap: &RoaringBitmap,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let base = projected_batch_cache_key(path, columns)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bitmap.len().to_le_bytes());
+    for row in bitmap.iter() {
+        hasher.update(&row.to_le_bytes());
+    }
+    Ok(format!("{base}|rows={}", hasher.finalize().to_hex()))
+}
+
+fn record_batches_memory_size(batches: &[RecordBatch]) -> usize {
+    batches
+        .iter()
+        .map(RecordBatch::get_array_memory_size)
+        .sum::<usize>()
 }
 
 fn compile_plan(

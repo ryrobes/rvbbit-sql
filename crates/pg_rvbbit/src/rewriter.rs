@@ -29,6 +29,8 @@ use pgrx::pg_extern;
 use pgrx::pg_guard;
 use pgrx::pg_sys;
 use pgrx::IntoDatum;
+use pgrx::PgMemoryContexts;
+use rvbbit_storage::metadata::ColumnStats;
 use serde_json::Value;
 
 use crate::scan::{group_count_map, scan_numeric_sum_count, NumericScan};
@@ -40,6 +42,10 @@ thread_local! {
     static IN_REWRITER: Cell<bool> = const { Cell::new(false) };
     static DUCK_REWRITE_DISABLED: Cell<bool> = const { Cell::new(false) };
     static DUCK_ROUTE_CACHE: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static NATIVE_REWRITE_CACHE: RefCell<HashMap<String, NativeRewriteCacheEntry>> =
+        RefCell::new(HashMap::new());
+    static NUMERIC_STATS_CACHE: RefCell<HashMap<NumericStatsCacheKey, HashMap<String, NumericScan>>> =
+        RefCell::new(HashMap::new());
     /// Lazy per-table cache of shred mappings, loaded from rvbbit.shreds
     /// on first use. R3a: refreshed only on backend restart or
     /// `rvbbit_reset_shred_cache()` (TODO). When compact() adds new shred
@@ -56,21 +62,53 @@ thread_local! {
     static CURRENT_SOURCE_SQL: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct NumericStatsCacheKey {
+    rel_oid: u32,
+    row_group_count: i64,
+    max_rg_id: i64,
+    total_rows: i64,
+}
+
 // jsonb operator OIDs from pg_operator.
 const JSONB_OBJECT_FIELD_OP: u32 = 3211; // jsonb -> text -> jsonb
 const JSONB_OBJECT_FIELD_TEXT_OP: u32 = 3477; // jsonb ->> text -> text
 
 const TEXT_OID: u32 = 25;
 const DUCK_ROUTE_CACHE_MAX: usize = 512;
+const NATIVE_REWRITE_CACHE_MAX: usize = 512;
 
 #[pg_extern]
 fn route_cache_reset() -> i64 {
-    DUCK_ROUTE_CACHE.with(|cache| {
+    let duck = DUCK_ROUTE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let count = cache.len() as i64;
         cache.clear();
         count
-    })
+    });
+    let native = NATIVE_REWRITE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let count = cache.len() as i64;
+        cache.clear();
+        count
+    });
+    duck + native
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeRewriteTableSignature {
+    rel_oid: u32,
+    row_group_count: i64,
+    max_rg_id: i64,
+    max_generation: i64,
+    total_rows: i64,
+    total_bytes: i64,
+}
+
+#[derive(Clone)]
+struct NativeRewriteCacheEntry {
+    table_sig: NativeRewriteTableSignature,
+    donor_query: *mut pg_sys::Query,
 }
 
 #[derive(Debug, Clone)]
@@ -128,8 +166,14 @@ unsafe extern "C-unwind" fn rvbbit_post_parse_analyze_hook(
     IN_REWRITER.with(|f| f.set(true));
     let duck_rewritten = try_duck_backend_rewrite(pstate, query);
     let pg_rowstore_selected = router::pg_rowstore_route_selected();
+    let native_cache_rewritten = if !duck_rewritten && !pg_rowstore_selected {
+        try_apply_native_rewrite_cache(query)
+    } else {
+        false
+    };
     if !duck_rewritten
         && !pg_rowstore_selected
+        && !native_cache_rewritten
         && !try_source_correlated_scalar_agg_rule(pstate, query)
         && !try_source_exclusive_member_semijoin_rule(pstate, query)
         && !try_source_simple_exists_semijoin_rule(pstate, query)
@@ -294,6 +338,239 @@ unsafe fn source_slice_for_query<'a>(source: &'a str, query: *mut pg_sys::Query)
             .or_else(|| source_select_tail(source))
             .unwrap_or(slice)
     }
+}
+
+unsafe fn try_apply_native_rewrite_cache(query: *mut pg_sys::Query) -> bool {
+    let Some(cache_key) = native_rewrite_cache_source(query) else {
+        return false;
+    };
+    let Some(entry) = NATIVE_REWRITE_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned())
+    else {
+        return false;
+    };
+    let Some(rel_oid) = primary_relation_oid_for_cache(query) else {
+        NATIVE_REWRITE_CACHE.with(|cache| {
+            cache.borrow_mut().remove(&cache_key);
+        });
+        return false;
+    };
+    if rel_oid != entry.table_sig.rel_oid {
+        NATIVE_REWRITE_CACHE.with(|cache| {
+            cache.borrow_mut().remove(&cache_key);
+        });
+        return false;
+    }
+    let Some(current_sig) = native_rewrite_table_signature(rel_oid) else {
+        NATIVE_REWRITE_CACHE.with(|cache| {
+            cache.borrow_mut().remove(&cache_key);
+        });
+        return false;
+    };
+    if current_sig != entry.table_sig || entry.donor_query.is_null() {
+        NATIVE_REWRITE_CACHE.with(|cache| {
+            cache.borrow_mut().remove(&cache_key);
+        });
+        return false;
+    }
+
+    let donor = pg_sys::copyObjectImpl(entry.donor_query as *const c_void) as *mut pg_sys::Query;
+    if donor.is_null() {
+        NATIVE_REWRITE_CACHE.with(|cache| {
+            cache.borrow_mut().remove(&cache_key);
+        });
+        return false;
+    }
+    apply_native_rewrite_donor(query, donor);
+    true
+}
+
+unsafe fn apply_native_rewrite_and_cache(
+    query: *mut pg_sys::Query,
+    table_oid: u32,
+    sql: &str,
+    warning_label: &str,
+) -> bool {
+    let donor = match parse_to_query(sql) {
+        Some(q) => q,
+        None => {
+            pgrx::warning!(
+                "rvbbit: {} rewrite parse failed for: {}",
+                warning_label,
+                sql
+            );
+            return false;
+        }
+    };
+    store_native_rewrite_cache(query, table_oid, donor);
+    apply_native_rewrite_donor(query, donor);
+    true
+}
+
+unsafe fn apply_native_rewrite_donor(query: *mut pg_sys::Query, donor: *mut pg_sys::Query) {
+    (*query).targetList = (*donor).targetList;
+    (*query).rtable = (*donor).rtable;
+    (*query).jointree = (*donor).jointree;
+    (*query).rteperminfos = (*donor).rteperminfos;
+    (*query).sortClause = std::ptr::null_mut();
+    (*query).limitCount = std::ptr::null_mut();
+    (*query).limitOffset = std::ptr::null_mut();
+    (*query).groupClause = std::ptr::null_mut();
+    (*query).groupingSets = std::ptr::null_mut();
+    (*query).havingQual = std::ptr::null_mut();
+    (*query).distinctClause = std::ptr::null_mut();
+    (*query).hasAggs = false;
+    (*query).hasWindowFuncs = false;
+    (*query).hasSubLinks = false;
+}
+
+unsafe fn store_native_rewrite_cache(
+    query: *mut pg_sys::Query,
+    table_oid: u32,
+    donor: *mut pg_sys::Query,
+) {
+    let Some(cache_key) = native_rewrite_cache_source(query) else {
+        return;
+    };
+    if cache_key.to_ascii_lowercase().contains("rvbbit.") {
+        return;
+    }
+    if primary_relation_oid_for_cache(query) != Some(table_oid) {
+        return;
+    }
+    let Some(table_sig) = native_rewrite_table_signature(table_oid) else {
+        return;
+    };
+    let mut cache_context = PgMemoryContexts::CacheMemoryContext;
+    let donor_query = cache_context
+        .switch_to(|_| pg_sys::copyObjectImpl(donor as *const c_void) as *mut pg_sys::Query);
+    if donor_query.is_null() {
+        return;
+    }
+    NATIVE_REWRITE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&cache_key) && cache.len() >= NATIVE_REWRITE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(
+            cache_key,
+            NativeRewriteCacheEntry {
+                table_sig,
+                donor_query,
+            },
+        );
+    });
+}
+
+unsafe fn native_rewrite_cache_source(query: *mut pg_sys::Query) -> Option<String> {
+    CURRENT_SOURCE_SQL.with(|cell| {
+        let source = cell.borrow();
+        let source = source.as_ref()?;
+        let query_source = source_slice_for_query(source, query).trim();
+        if query_source.is_empty() || query_source.to_ascii_lowercase().contains("rvbbit.") {
+            None
+        } else {
+            Some(query_source.to_string())
+        }
+    })
+}
+
+unsafe fn primary_relation_oid_for_cache(query: *mut pg_sys::Query) -> Option<u32> {
+    if query.is_null()
+        || (*query).commandType != pg_sys::CmdType::CMD_SELECT
+        || !(*query).cteList.is_null()
+        || !(*query).setOperations.is_null()
+        || (*query).hasSubLinks
+    {
+        return None;
+    }
+    let rtable = (*query).rtable;
+    if rtable.is_null() {
+        return None;
+    }
+    let mut rel_oid = None;
+    for i in 0..(*rtable).length {
+        let rte = (*(*rtable).elements.add(i as usize)).ptr_value as *mut pg_sys::RangeTblEntry;
+        if rte.is_null() {
+            continue;
+        }
+        match (*rte).rtekind {
+            pg_sys::RTEKind::RTE_RELATION => {
+                let oid = (*rte).relid.to_u32();
+                if rel_oid.replace(oid).is_some() {
+                    return None;
+                }
+            }
+            pg_sys::RTEKind::RTE_GROUP => {}
+            _ => return None,
+        }
+    }
+    rel_oid
+}
+
+fn native_rewrite_table_signature(table_oid: u32) -> Option<NativeRewriteTableSignature> {
+    if let Some(val) = guc_setting("rvbbit.as_of_generation") {
+        if val.trim().parse::<i64>().ok().is_some_and(|g| g > 0) {
+            return None;
+        }
+    }
+    let sql = format!(
+        "SELECT rg.row_group_count, rg.max_rg_id, rg.max_generation, \
+                rg.total_rows, rg.total_bytes, \
+                pg_relation_size(t.table_oid)::bigint, \
+                coalesce(t.shadow_heap_retained, false), \
+                coalesce(t.shadow_heap_dirty, false), \
+                EXISTS(SELECT 1 FROM rvbbit.delete_log), \
+                EXISTS(SELECT 1 FROM rvbbit.row_groups WHERE cold_url IS NOT NULL) \
+         FROM rvbbit.tables t \
+         LEFT JOIN LATERAL ( \
+             SELECT count(*)::bigint AS row_group_count, \
+                    coalesce(max(rg_id), -1)::bigint AS max_rg_id, \
+                    coalesce(max(generation), 0)::bigint AS max_generation, \
+                    coalesce(sum(n_rows), 0)::bigint AS total_rows, \
+                    coalesce(sum(n_bytes), 0)::bigint AS total_bytes \
+             FROM rvbbit.row_groups \
+             WHERE table_oid = t.table_oid \
+         ) rg ON true \
+         WHERE t.table_oid = {table_oid}::oid"
+    );
+    let mut out = None;
+    pgrx::Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(&sql, Some(1), &[])?;
+        for row in table {
+            let row_group_count = row.get::<i64>(1)?.unwrap_or(0);
+            let max_rg_id = row.get::<i64>(2)?.unwrap_or(-1);
+            let max_generation = row.get::<i64>(3)?.unwrap_or(0);
+            let total_rows = row.get::<i64>(4)?.unwrap_or(0);
+            let total_bytes = row.get::<i64>(5)?.unwrap_or(0);
+            let heap_bytes = row.get::<i64>(6)?.unwrap_or(0);
+            let shadow_heap_retained = row.get::<bool>(7)?.unwrap_or(false);
+            let shadow_heap_dirty = row.get::<bool>(8)?.unwrap_or(false);
+            let has_tombstones = row.get::<bool>(9)?.unwrap_or(false);
+            let has_cold = row.get::<bool>(10)?.unwrap_or(false);
+            if has_tombstones || has_cold {
+                continue;
+            }
+            if row_group_count <= 0 || total_rows <= 0 {
+                continue;
+            }
+            if heap_bytes > 0 && !(shadow_heap_retained && !shadow_heap_dirty) {
+                if unsafe { heap_visible_row_count(table_oid) }.unwrap_or(1) != 0 {
+                    continue;
+                }
+            }
+            out = Some(NativeRewriteTableSignature {
+                rel_oid: table_oid,
+                row_group_count,
+                max_rg_id,
+                max_generation,
+                total_rows,
+                total_bytes,
+            });
+        }
+        Ok(())
+    })
+    .ok()?;
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -3254,6 +3531,166 @@ fn fetch_attnames(table_oid: u32) -> Option<Vec<String>> {
     Some(v?.into_iter().flatten().collect())
 }
 
+fn metadata_numeric_sum_count(
+    table_oid: u32,
+    col_name: &str,
+    input_typoid: u32,
+) -> Option<NumericScan> {
+    let key = numeric_stats_cache_key(table_oid)?;
+    let scan = if let Some(cached) = NUMERIC_STATS_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&key)
+            .and_then(|cols| cols.get(col_name).cloned())
+    }) {
+        cached
+    } else {
+        let stats = load_numeric_stats_for_table(table_oid, &key)?;
+        NUMERIC_STATS_CACHE.with(|cache| {
+            cache.borrow_mut().insert(key, stats.clone());
+        });
+        stats.get(col_name)?.clone()
+    };
+    if input_typoid == pg_sys::INT8OID.to_u32() && scan.sum_i128.is_none() && scan.count_nonnull > 0
+    {
+        return None;
+    }
+    Some(scan)
+}
+
+fn numeric_stats_cache_key(table_oid: u32) -> Option<NumericStatsCacheKey> {
+    let sql = format!(
+        "SELECT count(*)::bigint, \
+                COALESCE(max(rg_id), -1)::bigint, \
+                COALESCE(sum(n_rows), 0)::bigint \
+         FROM rvbbit.row_groups \
+         WHERE table_oid = {table_oid}::oid"
+    );
+    let mut key = None;
+    pgrx::Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(&sql, Some(1), &[])?;
+        for row in table {
+            key = Some(NumericStatsCacheKey {
+                rel_oid: table_oid,
+                row_group_count: row.get::<i64>(1)?.unwrap_or(0),
+                max_rg_id: row.get::<i64>(2)?.unwrap_or(-1),
+                total_rows: row.get::<i64>(3)?.unwrap_or(0),
+            });
+        }
+        Ok(())
+    })
+    .ok()?;
+    key
+}
+
+fn load_numeric_stats_for_table(
+    table_oid: u32,
+    key: &NumericStatsCacheKey,
+) -> Option<HashMap<String, NumericScan>> {
+    if key.row_group_count <= 0 {
+        return None;
+    }
+    let att_types = fetch_att_type_map(table_oid)?;
+    let sql = format!(
+        "SELECT n_rows::bigint, stats::text \
+         FROM rvbbit.row_groups \
+         WHERE table_oid = {table_oid}::oid \
+         ORDER BY rg_id"
+    );
+    let mut out: HashMap<String, NumericScan> = HashMap::new();
+    let mut complete_counts: HashMap<String, i64> = HashMap::new();
+    pgrx::Spi::connect(|client| -> Result<(), String> {
+        let table = client
+            .select(&sql, None, &[])
+            .map_err(|e| format!("select numeric stats: {e}"))?;
+        for row in table {
+            let n_rows = row
+                .get::<i64>(1)
+                .map_err(|e| format!("get n_rows: {e}"))?
+                .unwrap_or(0);
+            let Some(stats_text) = row
+                .get::<String>(2)
+                .map_err(|e| format!("get stats: {e}"))?
+            else {
+                continue;
+            };
+            let stats: Vec<ColumnStats> =
+                serde_json::from_str(&stats_text).map_err(|e| format!("parse stats: {e}"))?;
+            for stat in stats {
+                let Some(sum_value) = stat.sum.as_ref() else {
+                    continue;
+                };
+                let count_nonnull = n_rows.saturating_sub(stat.null_count);
+                *complete_counts.entry(stat.name.clone()).or_insert(0) += 1;
+                let typoid = att_types.get(&stat.name).copied().unwrap_or(0);
+                let entry = out.entry(stat.name).or_insert(NumericScan {
+                    sum_f64: 0.0,
+                    sum_i128: Some(0),
+                    count_nonnull: 0,
+                });
+                entry.count_nonnull += count_nonnull;
+                if typoid == pg_sys::INT8OID.to_u32() && !sum_value.is_string() && count_nonnull > 0
+                {
+                    // Pre-exact-sum row groups stored i64 sums as JSON
+                    // numbers. They might already be overflowed, so bigint
+                    // SUM/AVG must use the old scan fallback until recompact.
+                    entry.sum_i128 = None;
+                    continue;
+                }
+                if let Some(sum_i128) = json_sum_i128(sum_value) {
+                    entry.sum_f64 += sum_i128 as f64;
+                    if let Some(total) = &mut entry.sum_i128 {
+                        *total += sum_i128;
+                    }
+                } else if let Some(sum_f64) = sum_value.as_f64() {
+                    entry.sum_f64 += sum_f64;
+                    entry.sum_i128 = None;
+                } else if count_nonnull > 0 {
+                    entry.sum_i128 = None;
+                }
+            }
+        }
+        Ok(())
+    })
+    .ok()?;
+    out.retain(|col, _| complete_counts.get(col).copied().unwrap_or(0) == key.row_group_count);
+    Some(out)
+}
+
+fn fetch_att_type_map(table_oid: u32) -> Option<HashMap<String, u32>> {
+    let sql = format!(
+        "SELECT attname::text, atttypid::oid::bigint \
+         FROM pg_attribute \
+         WHERE attrelid = {table_oid}::oid AND attnum > 0 AND NOT attisdropped"
+    );
+    let mut out = HashMap::new();
+    pgrx::Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(&sql, None, &[])?;
+        for row in table {
+            let name: Option<String> = row.get(1)?;
+            let typoid: Option<i64> = row.get(2)?;
+            if let (Some(name), Some(typoid)) = (name, typoid) {
+                if (0..=u32::MAX as i64).contains(&typoid) {
+                    out.insert(name, typoid as u32);
+                }
+            }
+        }
+        Ok(())
+    })
+    .ok()?;
+    Some(out)
+}
+
+fn json_sum_i128(value: &Value) -> Option<i128> {
+    if let Some(v) = value.as_i64() {
+        return Some(v as i128);
+    }
+    if let Some(v) = value.as_u64() {
+        return Some(v as i128);
+    }
+    value.as_str()?.parse::<i128>().ok()
+}
+
 unsafe fn compute_and_make_const(table_oid: u32, plan: &AggPlan) -> Option<*mut pg_sys::Const> {
     let col_esc = plan.col_name.replace('\'', "''");
     match plan.kind {
@@ -3271,11 +3708,13 @@ unsafe fn compute_and_make_const(table_oid: u32, plan: &AggPlan) -> Option<*mut 
             Some(make_int8_const(v))
         }
         AggKind::Sum => {
-            let scan = scan_numeric_sum_count(table_oid, &plan.col_name).ok()?;
+            let scan = metadata_numeric_sum_count(table_oid, &plan.col_name, plan.input_typoid)
+                .or_else(|| scan_numeric_sum_count(table_oid, &plan.col_name).ok())?;
             make_typed_sum_const(plan.result_typoid, &scan)
         }
         AggKind::Avg => {
-            let scan = scan_numeric_sum_count(table_oid, &plan.col_name).ok()?;
+            let scan = metadata_numeric_sum_count(table_oid, &plan.col_name, plan.input_typoid)
+                .or_else(|| scan_numeric_sum_count(table_oid, &plan.col_name).ok())?;
             make_typed_avg_const(plan.result_typoid, &scan)
         }
         AggKind::Min | AggKind::Max => make_typed_minmax_const(table_oid, plan),
@@ -3951,6 +4390,25 @@ fn source_vector_filter_kind(typoid: u32) -> Option<&'static str> {
 
 fn has_per_group_stats(table_oid: u32, group_col: &str) -> bool {
     let col_esc = group_col.replace('\'', "''");
+    let group_stats_exists: Option<bool> =
+        pgrx::Spi::get_one("SELECT to_regclass('rvbbit.group_stats') IS NOT NULL")
+            .ok()
+            .flatten();
+    if group_stats_exists.unwrap_or(false) {
+        let sql = format!(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM rvbbit.group_stats \
+                 WHERE table_oid = {table_oid}::oid AND group_col = '{col_esc}' \
+             )"
+        );
+        if pgrx::Spi::get_one::<bool>(&sql)
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
     let sql = format!(
         "SELECT EXISTS ( \
              SELECT 1 FROM rvbbit.row_groups, \
@@ -5276,26 +5734,7 @@ unsafe fn try_top_count_1col_rule(query: *mut pg_sys::Query) -> bool {
         skip_empty = skip_empty,
         limit = info.limit,
     );
-    let donor = match parse_to_query(&sql) {
-        Some(q) => q,
-        None => {
-            pgrx::warning!("rvbbit: top-count rewrite parse failed for: {}", sql);
-            return false;
-        }
-    };
-
-    (*query).targetList = (*donor).targetList;
-    (*query).rtable = (*donor).rtable;
-    (*query).jointree = (*donor).jointree;
-    (*query).rteperminfos = (*donor).rteperminfos;
-    (*query).sortClause = std::ptr::null_mut();
-    (*query).limitCount = std::ptr::null_mut();
-    (*query).limitOffset = std::ptr::null_mut();
-    (*query).groupClause = std::ptr::null_mut();
-    (*query).havingQual = std::ptr::null_mut();
-    (*query).distinctClause = std::ptr::null_mut();
-    (*query).hasAggs = false;
-    true
+    apply_native_rewrite_and_cache(query, info.table_oid, &sql, "top-count")
 }
 
 unsafe fn analyze_top_count_1col(query: *mut pg_sys::Query) -> Option<TopCount1ColInfo> {
@@ -6590,29 +7029,7 @@ unsafe fn try_top_count_int_text_rule(query: *mut pg_sys::Query) -> bool {
             limit = info.limit,
         )
     };
-    let donor = match parse_to_query(&sql) {
-        Some(q) => q,
-        None => {
-            pgrx::warning!(
-                "rvbbit: int/text top-count rewrite parse failed for: {}",
-                sql
-            );
-            return false;
-        }
-    };
-
-    (*query).targetList = (*donor).targetList;
-    (*query).rtable = (*donor).rtable;
-    (*query).jointree = (*donor).jointree;
-    (*query).rteperminfos = (*donor).rteperminfos;
-    (*query).sortClause = std::ptr::null_mut();
-    (*query).limitCount = std::ptr::null_mut();
-    (*query).limitOffset = std::ptr::null_mut();
-    (*query).groupClause = std::ptr::null_mut();
-    (*query).havingQual = std::ptr::null_mut();
-    (*query).distinctClause = std::ptr::null_mut();
-    (*query).hasAggs = false;
-    true
+    apply_native_rewrite_and_cache(query, info.table_oid, &sql, "int/text top-count")
 }
 
 unsafe fn analyze_top_count_int_text(query: *mut pg_sys::Query) -> Option<TopCountIntTextInfo> {
@@ -7836,29 +8253,7 @@ unsafe fn try_top_count_int_minute_text_rule(query: *mut pg_sys::Query) -> bool 
         text_col = text_col,
         limit = info.limit,
     );
-    let donor = match parse_to_query(&sql) {
-        Some(q) => q,
-        None => {
-            pgrx::warning!(
-                "rvbbit: int/minute/text top-count rewrite parse failed for: {}",
-                sql
-            );
-            return false;
-        }
-    };
-
-    (*query).targetList = (*donor).targetList;
-    (*query).rtable = (*donor).rtable;
-    (*query).jointree = (*donor).jointree;
-    (*query).rteperminfos = (*donor).rteperminfos;
-    (*query).sortClause = std::ptr::null_mut();
-    (*query).limitCount = std::ptr::null_mut();
-    (*query).limitOffset = std::ptr::null_mut();
-    (*query).groupClause = std::ptr::null_mut();
-    (*query).havingQual = std::ptr::null_mut();
-    (*query).distinctClause = std::ptr::null_mut();
-    (*query).hasAggs = false;
-    true
+    apply_native_rewrite_and_cache(query, info.table_oid, &sql, "int/minute/text top-count")
 }
 
 unsafe fn analyze_top_count_int_minute_text(
@@ -8130,29 +8525,7 @@ unsafe fn try_filtered_top_count_rule(query: *mut pg_sys::Query) -> bool {
         limit = info.limit,
         offset = info.offset,
     );
-    let donor = match parse_to_query(&sql) {
-        Some(q) => q,
-        None => {
-            pgrx::warning!(
-                "rvbbit: filtered top-count rewrite parse failed for: {}",
-                sql
-            );
-            return false;
-        }
-    };
-
-    (*query).targetList = (*donor).targetList;
-    (*query).rtable = (*donor).rtable;
-    (*query).jointree = (*donor).jointree;
-    (*query).rteperminfos = (*donor).rteperminfos;
-    (*query).sortClause = std::ptr::null_mut();
-    (*query).limitCount = std::ptr::null_mut();
-    (*query).limitOffset = std::ptr::null_mut();
-    (*query).groupClause = std::ptr::null_mut();
-    (*query).havingQual = std::ptr::null_mut();
-    (*query).distinctClause = std::ptr::null_mut();
-    (*query).hasAggs = false;
-    true
+    apply_native_rewrite_and_cache(query, info.table_oid, &sql, "filtered top-count")
 }
 
 unsafe fn analyze_filtered_top_count(query: *mut pg_sys::Query) -> Option<FilteredTopCountInfo> {
@@ -9211,19 +9584,17 @@ fn metadata_rewrites_unsafe_for_correctness() -> bool {
     // doesn't exist yet (CREATE EXTENSION's first CREATE TABLE runs the
     // planner hook before rvbbit.delete_log is created). Two separate
     // SPI calls sidestep that — the first never references the table.
-    let table_exists: Option<bool> = pgrx::Spi::get_one(
-        "SELECT to_regclass('rvbbit.delete_log') IS NOT NULL",
-    )
-    .ok()
-    .flatten();
+    let table_exists: Option<bool> =
+        pgrx::Spi::get_one("SELECT to_regclass('rvbbit.delete_log') IS NOT NULL")
+            .ok()
+            .flatten();
     if !table_exists.unwrap_or(false) {
         return false;
     }
-    let has_tombstones: Option<bool> = pgrx::Spi::get_one(
-        "SELECT EXISTS(SELECT 1 FROM rvbbit.delete_log)",
-    )
-    .ok()
-    .flatten();
+    let has_tombstones: Option<bool> =
+        pgrx::Spi::get_one("SELECT EXISTS(SELECT 1 FROM rvbbit.delete_log)")
+            .ok()
+            .flatten();
     if has_tombstones.unwrap_or(false) {
         return true;
     }

@@ -1,6 +1,61 @@
 -- pg_rvbbit 0.55.0 -> 0.56.0
 -- Release diagnostics for install/provider/runtime health.
 
+CREATE TABLE IF NOT EXISTS rvbbit.group_stats (
+    table_oid        oid NOT NULL,
+    rg_id            bigint NOT NULL,
+    group_col        text NOT NULL,
+    group_key        text NOT NULL,
+    group_value_text text,
+    count            bigint NOT NULL,
+    agg              jsonb,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (table_oid, rg_id, group_col, group_key),
+    FOREIGN KEY (table_oid, rg_id)
+        REFERENCES rvbbit.row_groups(table_oid, rg_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS group_stats_lookup_idx
+    ON rvbbit.group_stats (table_oid, group_col, group_key);
+
+CREATE TABLE IF NOT EXISTS rvbbit.column_bitmaps (
+    table_oid   oid NOT NULL,
+    rg_id       bigint NOT NULL,
+    column_name text NOT NULL,
+    bitmap_kind text NOT NULL,
+    value_text  text NOT NULL,
+    value_json  jsonb,
+    bitmap      bytea NOT NULL,
+    n_set       bigint NOT NULL,
+    n_total     bigint NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (table_oid, rg_id, column_name, bitmap_kind, value_text),
+    FOREIGN KEY (table_oid, rg_id)
+        REFERENCES rvbbit.row_groups(table_oid, rg_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS column_bitmaps_lookup_idx
+    ON rvbbit.column_bitmaps (table_oid, column_name, bitmap_kind, value_text);
+
+CREATE TABLE IF NOT EXISTS rvbbit.text_dictionaries (
+    table_oid   oid NOT NULL,
+    rg_id       bigint NOT NULL,
+    column_name text NOT NULL,
+    path        text NOT NULL,
+    n_rows      bigint NOT NULL,
+    n_values    bigint NOT NULL,
+    n_nulls     bigint NOT NULL,
+    n_empty     bigint NOT NULL,
+    n_bytes     bigint NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (table_oid, rg_id, column_name),
+    FOREIGN KEY (table_oid, rg_id)
+        REFERENCES rvbbit.row_groups(table_oid, rg_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS text_dictionaries_lookup_idx
+    ON rvbbit.text_dictionaries (table_oid, column_name, rg_id);
+
 CREATE OR REPLACE FUNCTION rvbbit.env_present(env_name text)
 RETURNS boolean
 STRICT STABLE

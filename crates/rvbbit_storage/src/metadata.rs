@@ -31,6 +31,41 @@ pub struct RowGroupMeta {
     /// numeric "other" column. Powers GROUP BY pushdown without scanning.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub per_group_stats: Vec<PerGroupBlock>,
+    /// Compact-time per-row-group bitmap indexes for selective filters.
+    /// These are derived artifacts keyed by row ordinal inside this row group.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_bitmaps: Vec<ColumnBitmapBlock>,
+    /// Compact-time text dictionary sidecars. Codes are row-ordinal aligned
+    /// with the parquet row group and let scan-time top-count paths group text
+    /// keys without decoding parquet string pages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_dictionaries: Vec<TextDictionaryBlock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnBitmapBlock {
+    pub column: String,
+    pub kind: String,
+    pub entries: Vec<ColumnBitmapEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnBitmapEntry {
+    pub value: serde_json::Value,
+    pub value_text: String,
+    pub bitmap_b64: String,
+    pub n_set: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextDictionaryBlock {
+    pub column: String,
+    pub path: String,
+    pub n_rows: i64,
+    pub n_values: i64,
+    pub n_nulls: i64,
+    pub n_empty: i64,
+    pub n_bytes: i64,
 }
 
 /// Per-group aggregate stats for one group column. `groups` holds one

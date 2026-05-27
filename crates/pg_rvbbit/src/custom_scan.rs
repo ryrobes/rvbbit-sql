@@ -27,8 +27,6 @@ use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::sync::Arc;
 
-use rvbbit_storage::metadata::{ColumnStats, TextSketch};
-use rvbbit_storage::row_group::RowGroupReader;
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
     Int32Array, Int64Array, ListArray, RecordBatch, StringArray, TimestampMicrosecondArray,
@@ -40,8 +38,10 @@ use parquet::file::properties::ReaderProperties;
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
 use pgrx::pg_guard;
-use pgrx::IntoDatum;
 use pgrx::pg_sys;
+use pgrx::IntoDatum;
+use rvbbit_storage::metadata::{ColumnStats, TextSketch};
+use rvbbit_storage::row_group::RowGroupReader;
 
 const SCAN_LAYOUT: &str = "scan";
 const CLUSTER_LAYOUT_PREFIX: &str = "cluster:";
@@ -1274,7 +1274,10 @@ fn try_evaluate_pushed_expr_vectorized(
             }
             acc.or_else(|| {
                 // Empty AND → all rows pass.
-                Some(arrow::array::BooleanArray::from(vec![true; batch.num_rows()]))
+                Some(arrow::array::BooleanArray::from(vec![
+                    true;
+                    batch.num_rows()
+                ]))
             })
         }
         PushExpr::Or(children) => {
@@ -1337,7 +1340,12 @@ fn try_evaluate_qual_vectorized(
         //  using `IS NOT NULL` get pushed as something else or not at all.)
 
         // ---- Integer comparisons -------------------------------------
-        (PushVal::I64(v), op) if matches!(op, PushOp::Eq | PushOp::Lt | PushOp::Le | PushOp::Gt | PushOp::Ge) => {
+        (PushVal::I64(v), op)
+            if matches!(
+                op,
+                PushOp::Eq | PushOp::Lt | PushOp::Le | PushOp::Gt | PushOp::Ge
+            ) =>
+        {
             let oid = attr.typoid.to_u32();
             if oid == pg_sys::INT2OID.to_u32() || oid == pg_sys::INT4OID.to_u32() {
                 let v32 = i32::try_from(*v).ok()?;
@@ -1356,9 +1364,12 @@ fn try_evaluate_qual_vectorized(
             } else if oid == pg_sys::DATEOID.to_u32() {
                 // Arrow Date32 days-since-1970; PG date days-since-2000.
                 let arrow_days = i32::try_from(*v + PG_EPOCH_OFFSET_DAYS as i64).ok()?;
-                let _ = column.as_any().downcast_ref::<arrow::array::Date32Array>()?;
+                let _ = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Date32Array>()?;
                 apply_op!(arrow::array::Date32Array::from(vec![arrow_days]))
-            } else if oid == pg_sys::TIMESTAMPOID.to_u32() || oid == pg_sys::TIMESTAMPTZOID.to_u32() {
+            } else if oid == pg_sys::TIMESTAMPOID.to_u32() || oid == pg_sys::TIMESTAMPTZOID.to_u32()
+            {
                 let arrow_micros = *v + PG_EPOCH_OFFSET_MICROS;
                 let _ = column
                     .as_any()
@@ -1370,7 +1381,12 @@ fn try_evaluate_qual_vectorized(
         }
 
         // ---- Float comparisons ---------------------------------------
-        (PushVal::F64(v), op) if matches!(op, PushOp::Eq | PushOp::Lt | PushOp::Le | PushOp::Gt | PushOp::Ge) => {
+        (PushVal::F64(v), op)
+            if matches!(
+                op,
+                PushOp::Eq | PushOp::Lt | PushOp::Le | PushOp::Gt | PushOp::Ge
+            ) =>
+        {
             let oid = attr.typoid.to_u32();
             if oid == pg_sys::FLOAT4OID.to_u32() {
                 let v32 = *v as f32;
@@ -1387,24 +1403,19 @@ fn try_evaluate_qual_vectorized(
         // ---- Bool comparisons ----------------------------------------
         (PushVal::Bool(b), PushOp::Eq) => {
             let _ = column.as_any().downcast_ref::<BooleanArray>()?;
-            arrow::compute::kernels::cmp::eq(
-                &column,
-                &Scalar::new(BooleanArray::from(vec![*b])),
-            )
-            .ok()
+            arrow::compute::kernels::cmp::eq(&column, &Scalar::new(BooleanArray::from(vec![*b])))
+                .ok()
         }
 
         // ---- Text equality / inequality ------------------------------
         // LIKE / ILIKE not handled here — they fall through to per-row.
         (PushVal::Text(s), PushOp::Eq) => {
             let _ = column.as_any().downcast_ref::<StringArray>()?;
-            eq(
-                &column,
-                &Scalar::new(StringArray::from(vec![s.as_str()])),
-            )
-            .ok()
+            eq(&column, &Scalar::new(StringArray::from(vec![s.as_str()]))).ok()
         }
-        (PushVal::Text(s), op) if matches!(op, PushOp::Lt | PushOp::Le | PushOp::Gt | PushOp::Ge) => {
+        (PushVal::Text(s), op)
+            if matches!(op, PushOp::Lt | PushOp::Le | PushOp::Gt | PushOp::Ge) =>
+        {
             let _ = column.as_any().downcast_ref::<StringArray>()?;
             let scalar = Scalar::new(StringArray::from(vec![s.as_str()]));
             match op {
@@ -1884,7 +1895,9 @@ fn load_blooms_for_path(path: &str) -> std::sync::Arc<HashMap<String, Sbbf>> {
     }
     let mut blooms: HashMap<String, Sbbf> = HashMap::new();
     if let Ok(file) = std::fs::File::open(path) {
-        let props = ReaderProperties::builder().set_read_bloom_filter(true).build();
+        let props = ReaderProperties::builder()
+            .set_read_bloom_filter(true)
+            .build();
         let options = ReadOptionsBuilder::new()
             .with_reader_properties(props)
             .build();
@@ -1929,9 +1942,9 @@ fn bloom_clause_impossible(row_group: &RowGroupEntry, attr: &PgAttr, q: &PushedQ
         PushVal::I64Set(vs) if !vs.is_empty() => {
             vs.iter().all(|&v| bloom_int_absent(bloom, attr.typoid, v))
         }
-        PushVal::F64Set(vs) if !vs.is_empty() => {
-            vs.iter().all(|&v| bloom_float_absent(bloom, attr.typoid, v))
-        }
+        PushVal::F64Set(vs) if !vs.is_empty() => vs
+            .iter()
+            .all(|&v| bloom_float_absent(bloom, attr.typoid, v)),
         PushVal::TextSet(vs) if !vs.is_empty() => vs.iter().all(|s| !bloom.check(s.as_str())),
         _ => false,
     };
@@ -2287,9 +2300,7 @@ unsafe fn make_reader_for(array: &Arc<dyn Array>, attr: &PgAttr) -> ColumnReader
                 .unwrap() as *const _,
         ),
         DataType::List(field) if matches!(field.data_type(), DataType::Float32) => {
-            ColumnReader::F32List(
-                array.as_any().downcast_ref::<ListArray>().unwrap() as *const _,
-            )
+            ColumnReader::F32List(array.as_any().downcast_ref::<ListArray>().unwrap() as *const _)
         }
         other => {
             pgrx::error!(
@@ -2999,9 +3010,7 @@ fn fetch_row_group_paths(
         asof,
         include_stats,
     };
-    if let Some(cached) =
-        ROW_GROUP_PATHS_CACHE.with(|c| c.borrow().get(&cache_key).cloned())
-    {
+    if let Some(cached) = ROW_GROUP_PATHS_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
         return Ok(cached);
     }
     pgrx::Spi::connect(|client| -> Result<(), String> {
@@ -3048,7 +3057,10 @@ fn fetch_row_group_paths(
         for row in table {
             let path: Option<String> = row.get(1).map_err(|e| format!("SPI get: {e}"))?;
             if let Some(p) = path {
-                let rg_id: i64 = row.get(2).map_err(|e| format!("SPI get rg_id: {e}"))?.unwrap_or(0);
+                let rg_id: i64 = row
+                    .get(2)
+                    .map_err(|e| format!("SPI get rg_id: {e}"))?
+                    .unwrap_or(0);
                 let stats_text: Option<String> =
                     row.get(3).map_err(|e| format!("SPI get stats: {e}"))?;
                 out.push(RowGroupEntry {
@@ -3222,11 +3234,7 @@ unsafe fn initialize_slot_nulls(slot: *mut pg_sys::TupleTableSlot, n_attrs: usiz
 /// no nulls (the common case for dense columns) this removes one branch
 /// and one bitmap load per cell.
 #[inline(always)]
-unsafe fn read_via(
-    reader: &ColumnReader,
-    row: usize,
-    has_nulls: bool,
-) -> (pg_sys::Datum, bool) {
+unsafe fn read_via(reader: &ColumnReader, row: usize, has_nulls: bool) -> (pg_sys::Datum, bool) {
     match reader {
         ColumnReader::Missing => (pg_sys::Datum::from(0usize), true),
         ColumnReader::Int16(p) => {

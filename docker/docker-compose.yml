@@ -107,6 +107,8 @@ services:
       # memory across the cluster is roughly N_backends × this size.
       # Default 1024 MiB fits a 200k-row ClickBench hits table whole.
       RVBBIT_SCAN_BATCH_CACHE_MB: ${RVBBIT_SCAN_BATCH_CACHE_MB:-2048}
+      RVBBIT_COLUMNAR_CACHE_MB: ${RVBBIT_COLUMNAR_CACHE_MB:-2048}
+      # budgeted per-backend columnar accelerator cache ^
     ports:
       - "55433:5432"
     volumes:

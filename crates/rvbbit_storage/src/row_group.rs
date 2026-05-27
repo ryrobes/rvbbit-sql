@@ -13,18 +13,21 @@
 //! blocks off disk.
 
 use std::fs::File;
+use std::io::{Read, Write};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::compute::kernels::aggregate::{
     max as arrow_max, max_boolean, min as arrow_min, min_boolean, sum as arrow_sum,
 };
 use arrow::datatypes::{DataType, SchemaRef};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use parquet::arrow::arrow_reader::{
     ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
 };
@@ -33,9 +36,11 @@ use parquet::arrow::ProjectionMask;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
 use parquet::schema::types::ColumnPath;
+use roaring::RoaringBitmap;
 
 use crate::metadata::{
-    ColumnStats, GroupBucket, NumericAgg, PerGroupBlock, RowGroupMeta, TextSketch,
+    ColumnBitmapBlock, ColumnBitmapEntry, ColumnStats, GroupBucket, NumericAgg, PerGroupBlock,
+    RowGroupMeta, TextDictionaryBlock, TextSketch,
 };
 use std::collections::HashMap;
 
@@ -48,6 +53,95 @@ const DEFAULT_ZSTD_LEVEL: i32 = 3;
 /// amortize that overhead almost completely while keeping per-batch
 /// memory under ~512KB for typical narrow projections.
 const READ_BATCH_SIZE: usize = 65_536;
+const TEXT_DICTIONARY_MAGIC: &[u8; 8] = b"RVBTD001";
+
+#[derive(Clone, Debug)]
+pub struct TextDictionary {
+    pub values: Vec<String>,
+    pub codes: Vec<u32>,
+    pub n_nulls: i64,
+    pub n_empty: i64,
+}
+
+impl TextDictionary {
+    pub fn read(path: &Path) -> Result<Self> {
+        let mut file = File::open(path)
+            .with_context(|| format!("opening text dictionary {}", path.display()))?;
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)
+            .with_context(|| format!("reading text dictionary magic {}", path.display()))?;
+        if &magic != TEXT_DICTIONARY_MAGIC {
+            return Err(anyhow!(
+                "invalid text dictionary magic for {}",
+                path.display()
+            ));
+        }
+
+        let n_rows = read_u64(&mut file, path)?;
+        let n_values = read_u64(&mut file, path)?;
+        let n_nulls = read_u64(&mut file, path)?;
+        let n_empty = read_u64(&mut file, path)?;
+        let n_rows_usize = usize::try_from(n_rows)
+            .map_err(|_| anyhow!("text dictionary row count too large: {n_rows}"))?;
+        let n_values_usize = usize::try_from(n_values)
+            .map_err(|_| anyhow!("text dictionary value count too large: {n_values}"))?;
+
+        let mut values = Vec::with_capacity(n_values_usize);
+        for _ in 0..n_values_usize {
+            let len = read_u32(&mut file, path)? as usize;
+            let mut bytes = vec![0u8; len];
+            file.read_exact(&mut bytes)
+                .with_context(|| format!("reading text dictionary value {}", path.display()))?;
+            values.push(String::from_utf8(bytes).with_context(|| {
+                format!(
+                    "text dictionary value is not valid UTF-8 in {}",
+                    path.display()
+                )
+            })?);
+        }
+
+        let mut codes = Vec::with_capacity(n_rows_usize);
+        for _ in 0..n_rows_usize {
+            let code = read_u32(&mut file, path)?;
+            if code as usize > values.len() {
+                return Err(anyhow!(
+                    "text dictionary code {} out of range for {} values in {}",
+                    code,
+                    values.len(),
+                    path.display()
+                ));
+            }
+            codes.push(code);
+        }
+
+        Ok(Self {
+            values,
+            codes,
+            n_nulls: n_nulls.min(i64::MAX as u64) as i64,
+            n_empty: n_empty.min(i64::MAX as u64) as i64,
+        })
+    }
+
+    pub fn value_for_code(&self, code: u32) -> Option<&str> {
+        if code == 0 {
+            return None;
+        }
+        self.values.get((code - 1) as usize).map(String::as_str)
+    }
+
+    pub fn memory_size(&self) -> usize {
+        self.codes
+            .len()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(
+                self.values
+                    .iter()
+                    .map(|value| value.len() + 24)
+                    .sum::<usize>(),
+            )
+            .saturating_add(64)
+    }
+}
 
 pub struct RowGroupWriter;
 
@@ -80,6 +174,16 @@ impl RowGroupWriter {
         } else {
             Vec::new()
         };
+        let column_bitmaps = if compact_value_bitmaps_enabled() {
+            compute_column_bitmaps(batch)?
+        } else {
+            Vec::new()
+        };
+        let text_dictionaries = if compact_text_dictionaries_enabled() {
+            compute_text_dictionaries(path, batch)?
+        } else {
+            Vec::new()
+        };
         let _ = parquet_metadata; // kept in case we want page-level stats later
 
         Ok(RowGroupMeta {
@@ -91,6 +195,8 @@ impl RowGroupWriter {
             max_xid: None,
             column_stats,
             per_group_stats,
+            column_bitmaps,
+            text_dictionaries,
         })
     }
 }
@@ -212,7 +318,26 @@ fn compact_text_stats_enabled() -> bool {
 }
 
 fn compact_per_group_stats_enabled() -> bool {
-    env_enabled("RVBBIT_COMPACT_PER_GROUP_STATS", false)
+    env_enabled("RVBBIT_COMPACT_PER_GROUP_STATS", true)
+}
+
+fn compact_value_bitmaps_enabled() -> bool {
+    env_enabled("RVBBIT_COMPACT_VALUE_BITMAPS", true)
+}
+
+fn compact_text_dictionaries_enabled() -> bool {
+    env_enabled("RVBBIT_COMPACT_TEXT_DICTIONARIES", true)
+}
+
+fn compact_value_bitmap_max_distinct() -> usize {
+    env_usize("RVBBIT_COMPACT_VALUE_BITMAP_MAX_DISTINCT", 4096)
+}
+
+fn compact_text_dictionary_max_bytes() -> usize {
+    env_usize(
+        "RVBBIT_COMPACT_TEXT_DICTIONARY_MAX_BYTES",
+        128 * 1024 * 1024,
+    )
 }
 
 fn compute_arrow_stats(batch: &RecordBatch, text_stats_enabled: bool) -> Vec<ColumnStats> {
@@ -247,7 +372,10 @@ fn compute_arrow_stats(batch: &RecordBatch, text_stats_enabled: bool) -> Vec<Col
                     (
                         arrow_min(a).map(|v| json!(v)),
                         arrow_max(a).map(|v| json!(v)),
-                        arrow_sum(a).map(|v| json!(v)),
+                        // Store i64 sums as a decimal string so compact-time
+                        // metadata can answer PG's SUM(bigint)/AVG(bigint)
+                        // exactly even when the total exceeds i64.
+                        Some(json!(sum_int64(a).to_string())),
                     )
                 }
                 DataType::Float32 => {
@@ -362,6 +490,16 @@ fn sum_int32(a: &Int32Array) -> i64 {
     for row in 0..a.len() {
         if !a.is_null(row) {
             total += a.value(row) as i64;
+        }
+    }
+    total
+}
+
+fn sum_int64(a: &Int64Array) -> i128 {
+    let mut total = 0i128;
+    for row in 0..a.len() {
+        if !a.is_null(row) {
+            total += a.value(row) as i128;
         }
     }
     total
@@ -578,6 +716,309 @@ fn numeric_agg_for_bucket(arr: &dyn Array, rows: &[u32]) -> Option<NumericAgg> {
     Some(NumericAgg { sum, count_nonnull })
 }
 
+fn compute_column_bitmaps(batch: &RecordBatch) -> Result<Vec<ColumnBitmapBlock>> {
+    use serde_json::json;
+
+    let schema = batch.schema();
+    let max_distinct = compact_value_bitmap_max_distinct();
+    let mut out = Vec::new();
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let array = batch.column(idx);
+        match array.data_type() {
+            DataType::Boolean => {
+                let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                let entries = bitmap_entries_for_rows(a.len(), max_distinct, |row| {
+                    if a.is_null(row) {
+                        None
+                    } else {
+                        Some((a.value(row).to_string(), json!(a.value(row))))
+                    }
+                })?;
+                if !entries.is_empty() {
+                    out.push(ColumnBitmapBlock {
+                        column: field.name().clone(),
+                        kind: "value".to_string(),
+                        entries,
+                    });
+                }
+            }
+            DataType::Int16 => {
+                let a = array.as_any().downcast_ref::<Int16Array>().unwrap();
+                let entries = bitmap_entries_for_rows(a.len(), max_distinct, |row| {
+                    if a.is_null(row) {
+                        None
+                    } else {
+                        let value = a.value(row) as i64;
+                        Some((value.to_string(), json!(value)))
+                    }
+                })?;
+                if !entries.is_empty() {
+                    out.push(ColumnBitmapBlock {
+                        column: field.name().clone(),
+                        kind: "value".to_string(),
+                        entries,
+                    });
+                }
+            }
+            DataType::Int32 => {
+                let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
+                let entries = bitmap_entries_for_rows(a.len(), max_distinct, |row| {
+                    if a.is_null(row) {
+                        None
+                    } else {
+                        let value = a.value(row) as i64;
+                        Some((value.to_string(), json!(value)))
+                    }
+                })?;
+                if !entries.is_empty() {
+                    out.push(ColumnBitmapBlock {
+                        column: field.name().clone(),
+                        kind: "value".to_string(),
+                        entries,
+                    });
+                }
+            }
+            DataType::Date32 => {
+                let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
+                let entries = bitmap_entries_for_rows(a.len(), max_distinct, |row| {
+                    if a.is_null(row) {
+                        None
+                    } else {
+                        let value = a.value(row) as i64;
+                        Some((value.to_string(), json!(value)))
+                    }
+                })?;
+                if !entries.is_empty() {
+                    out.push(ColumnBitmapBlock {
+                        column: field.name().clone(),
+                        kind: "value".to_string(),
+                        entries,
+                    });
+                }
+            }
+            DataType::Int64 => {
+                let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                let entries = bitmap_entries_for_rows(a.len(), max_distinct, |row| {
+                    if a.is_null(row) {
+                        None
+                    } else {
+                        let value = a.value(row);
+                        Some((value.to_string(), json!(value)))
+                    }
+                })?;
+                if !entries.is_empty() {
+                    out.push(ColumnBitmapBlock {
+                        column: field.name().clone(),
+                        kind: "value".to_string(),
+                        entries,
+                    });
+                }
+            }
+            DataType::Utf8 => {
+                let a = array.as_any().downcast_ref::<StringArray>().unwrap();
+                let mut bitmap = RoaringBitmap::new();
+                for row in 0..a.len() {
+                    if !a.is_null(row) && !a.value(row).is_empty() {
+                        bitmap.insert(row as u32);
+                    }
+                }
+                if !bitmap.is_empty() {
+                    out.push(ColumnBitmapBlock {
+                        column: field.name().clone(),
+                        kind: "not_empty".to_string(),
+                        entries: vec![bitmap_entry(
+                            "__not_empty__",
+                            json!("__not_empty__"),
+                            bitmap,
+                        )?],
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(out)
+}
+
+fn bitmap_entries_for_rows<F>(
+    len: usize,
+    max_distinct: usize,
+    mut value_for_row: F,
+) -> Result<Vec<ColumnBitmapEntry>>
+where
+    F: FnMut(usize) -> Option<(String, serde_json::Value)>,
+{
+    let mut buckets: HashMap<String, (serde_json::Value, RoaringBitmap)> = HashMap::new();
+    for row in 0..len {
+        let Some((key, value)) = value_for_row(row) else {
+            continue;
+        };
+        if !buckets.contains_key(&key) && buckets.len() >= max_distinct {
+            return Ok(Vec::new());
+        }
+        buckets
+            .entry(key)
+            .or_insert_with(|| (value, RoaringBitmap::new()))
+            .1
+            .insert(row as u32);
+    }
+
+    let mut entries = Vec::with_capacity(buckets.len());
+    for (value_text, (value, bitmap)) in buckets {
+        entries.push(bitmap_entry(&value_text, value, bitmap)?);
+    }
+    entries.sort_unstable_by(|a, b| a.value_text.cmp(&b.value_text));
+    Ok(entries)
+}
+
+fn bitmap_entry(
+    value_text: &str,
+    value: serde_json::Value,
+    bitmap: RoaringBitmap,
+) -> Result<ColumnBitmapEntry> {
+    let mut buf = Vec::with_capacity(bitmap.serialized_size());
+    bitmap
+        .serialize_into(&mut buf)
+        .context("serializing compact value bitmap")?;
+    Ok(ColumnBitmapEntry {
+        value,
+        value_text: value_text.to_string(),
+        bitmap_b64: B64.encode(buf),
+        n_set: bitmap.len() as i64,
+    })
+}
+
+fn compute_text_dictionaries(
+    row_group_path: &Path,
+    batch: &RecordBatch,
+) -> Result<Vec<TextDictionaryBlock>> {
+    let schema = batch.schema();
+    let max_bytes = compact_text_dictionary_max_bytes();
+    let mut out = Vec::new();
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let array = batch.column(idx);
+        if array.data_type() != &DataType::Utf8 {
+            continue;
+        }
+        let strings = array.as_any().downcast_ref::<StringArray>().unwrap();
+        let path = text_dictionary_path(row_group_path, idx);
+        if let Some(block) = write_text_dictionary(&path, field.name(), strings, max_bytes)? {
+            out.push(block);
+        }
+    }
+
+    Ok(out)
+}
+
+fn write_text_dictionary(
+    path: &Path,
+    column: &str,
+    array: &StringArray,
+    max_bytes: usize,
+) -> Result<Option<TextDictionaryBlock>> {
+    let mut ids = HashMap::<String, u32>::new();
+    let mut values = Vec::<String>::new();
+    let mut codes = Vec::<u32>::with_capacity(array.len());
+    let mut n_nulls = 0i64;
+    let mut n_empty = 0i64;
+    let mut value_bytes = 0usize;
+
+    for row in 0..array.len() {
+        if array.is_null(row) {
+            codes.push(0);
+            n_nulls += 1;
+            continue;
+        }
+        let value = array.value(row);
+        if value.is_empty() {
+            n_empty += 1;
+        }
+        let code = if let Some(code) = ids.get(value) {
+            *code
+        } else {
+            if values.len() >= u32::MAX as usize {
+                return Ok(None);
+            }
+            let owned = value.to_string();
+            let code = (values.len() + 1) as u32;
+            value_bytes = value_bytes.saturating_add(owned.len());
+            values.push(owned.clone());
+            ids.insert(owned, code);
+            code
+        };
+        codes.push(code);
+    }
+
+    let estimated_bytes = TEXT_DICTIONARY_MAGIC
+        .len()
+        .saturating_add(8 * 4)
+        .saturating_add(values.len().saturating_mul(4))
+        .saturating_add(value_bytes)
+        .saturating_add(codes.len().saturating_mul(std::mem::size_of::<u32>()));
+    if estimated_bytes > max_bytes {
+        return Ok(None);
+    }
+
+    let mut file = File::create(path)
+        .with_context(|| format!("creating text dictionary {}", path.display()))?;
+    file.write_all(TEXT_DICTIONARY_MAGIC)
+        .with_context(|| format!("writing text dictionary magic {}", path.display()))?;
+    file.write_all(&(codes.len() as u64).to_le_bytes())?;
+    file.write_all(&(values.len() as u64).to_le_bytes())?;
+    file.write_all(&(n_nulls as u64).to_le_bytes())?;
+    file.write_all(&(n_empty as u64).to_le_bytes())?;
+    for value in &values {
+        let bytes = value.as_bytes();
+        if bytes.len() > u32::MAX as usize {
+            return Ok(None);
+        }
+        file.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        file.write_all(bytes)?;
+    }
+    for code in &codes {
+        file.write_all(&code.to_le_bytes())?;
+    }
+    file.flush()?;
+
+    let n_bytes = std::fs::metadata(path)
+        .with_context(|| format!("stat text dictionary {}", path.display()))?
+        .len() as i64;
+    Ok(Some(TextDictionaryBlock {
+        column: column.to_string(),
+        path: path.to_string_lossy().into_owned(),
+        n_rows: codes.len() as i64,
+        n_values: values.len() as i64,
+        n_nulls,
+        n_empty,
+        n_bytes,
+    }))
+}
+
+fn text_dictionary_path(row_group_path: &Path, column_idx: usize) -> PathBuf {
+    let file_name = row_group_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "row_group".into());
+    row_group_path.with_file_name(format!("{file_name}.textdict.{column_idx}.rvbbit"))
+}
+
+fn read_u64(file: &mut File, path: &Path) -> Result<u64> {
+    let mut buf = [0u8; 8];
+    file.read_exact(&mut buf)
+        .with_context(|| format!("reading u64 from text dictionary {}", path.display()))?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn read_u32(file: &mut File, path: &Path) -> Result<u32> {
+    let mut buf = [0u8; 4];
+    file.read_exact(&mut buf)
+        .with_context(|| format!("reading u32 from text dictionary {}", path.display()))?;
+    Ok(u32::from_le_bytes(buf))
+}
+
 // ---------------------------------------------------------------------------
 // Reader
 // ---------------------------------------------------------------------------
@@ -636,6 +1077,49 @@ impl RowGroupReader {
             .with_batch_size(READ_BATCH_SIZE)
             .build()
             .context("building selected-row parquet reader")
+    }
+
+    /// Open a reader that materializes only the named columns and only the
+    /// requested row offsets. Offsets are relative to this row-group file.
+    pub fn open_projected_selected_rows(
+        path: &Path,
+        columns: &[&str],
+        rows: &[usize],
+    ) -> Result<ParquetRecordBatchReader> {
+        if rows.is_empty() {
+            return Err(anyhow!(
+                "open_projected_selected_rows requires at least one row"
+            ));
+        }
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).context("opening parquet reader")?;
+        let schema = builder.schema();
+        let mut indices = Vec::with_capacity(columns.len());
+        for name in columns {
+            let idx = schema.index_of(name).map_err(|_| {
+                anyhow!(
+                    "column '{}' not found in parquet schema (has: {:?})",
+                    name,
+                    schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                )
+            })?;
+            indices.push(idx);
+        }
+        let total_rows = builder.metadata().file_metadata().num_rows() as usize;
+        let ranges = selected_row_ranges(rows, total_rows)?;
+        let selection = RowSelection::from_consecutive_ranges(ranges.into_iter(), total_rows);
+        let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
+        builder
+            .with_projection(mask)
+            .with_row_selection(selection)
+            .with_batch_size(READ_BATCH_SIZE)
+            .build()
+            .context("building projected selected-row parquet reader")
     }
 
     /// Open a reader that materializes only the named columns. Names not
@@ -775,6 +1259,20 @@ mod tests {
 
         assert_eq!(ids, vec![2, 4]);
         assert_eq!(names, vec!["bb", "dddd"]);
+    }
+
+    #[test]
+    fn text_dictionary_sidecar_round_trips_codes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rg.parquet");
+        let batch = sample_batch();
+        let meta = RowGroupWriter::write(&path, 0, &batch).unwrap();
+        assert_eq!(meta.text_dictionaries.len(), 1);
+
+        let dict = TextDictionary::read(Path::new(&meta.text_dictionaries[0].path)).unwrap();
+        assert_eq!(dict.values, vec!["a", "bb", "ccc", "dddd"]);
+        assert_eq!(dict.codes, vec![1, 2, 3, 4]);
+        assert_eq!(dict.value_for_code(2), Some("bb"));
     }
 
     #[test]

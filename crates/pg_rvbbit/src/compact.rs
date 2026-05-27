@@ -33,7 +33,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rvbbit_storage::row_group::RowGroupWriter;
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder,
     Int32Builder, Int64Builder, ListBuilder, RecordBatch, StringBuilder,
@@ -42,6 +41,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use pgrx::prelude::*;
 use pgrx::Spi;
+use rvbbit_storage::row_group::RowGroupWriter;
 
 const SCAN_LAYOUT_DIR: &str = "scan";
 const CLUSTER_LAYOUT_PREFIX: &str = "cluster:";
@@ -891,6 +891,7 @@ fn refresh_layout_variants_impl(
     // the pre-compact metadata snapshot.
     crate::planner::invalidate_planner_aggregates(rel_oid);
     crate::custom_scan::invalidate_scan_metadata(rel_oid);
+    crate::columnar_cache::invalidate_table(rel_oid);
 
     Ok(rows_written)
 }
@@ -1305,8 +1306,131 @@ fn register_primary_chunks(
             n_rows_meta = meta.n_rows,
             n_bytes = meta.n_bytes,
         ))?;
+        register_group_stats(rel_oid, meta)?;
+        register_column_bitmaps(rel_oid, meta)?;
+        register_text_dictionaries(rel_oid, meta)?;
     }
     Ok(())
+}
+
+fn register_group_stats(
+    rel_oid: u32,
+    meta: &rvbbit_storage::metadata::RowGroupMeta,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if meta.per_group_stats.is_empty() || !rvbbit_catalog_table_exists("group_stats") {
+        return Ok(());
+    }
+    for block in &meta.per_group_stats {
+        let group_col = block.group_column.replace('\'', "''");
+        for bucket in &block.groups {
+            let group_key = group_value_key(&bucket.value).replace('\'', "''");
+            let group_value_text_sql = match group_value_to_text(&bucket.value) {
+                Some(value) => format!("'{}'", value.replace('\'', "''")),
+                None => "NULL".to_string(),
+            };
+            let agg_sql = if bucket.agg.is_empty() {
+                "NULL::jsonb".to_string()
+            } else {
+                let agg_json = serde_json::to_string(&bucket.agg)?;
+                let agg_escaped = agg_json.replace("$rvbbit$", "$rvbbit$$rvbbit$");
+                format!("$rvbbit${agg_escaped}$rvbbit$::jsonb")
+            };
+            Spi::run(&format!(
+                "INSERT INTO rvbbit.group_stats \
+                 (table_oid, rg_id, group_col, group_key, group_value_text, count, agg) \
+                 VALUES ({rel_oid}::oid, {rg_id}, '{group_col}', '{group_key}', \
+                         {group_value_text_sql}, {count}, {agg_sql})",
+                rg_id = meta.rg_id,
+                count = bucket.count,
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn group_value_key(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "z:null".to_string(),
+        serde_json::Value::Bool(v) => format!("b:{v}"),
+        serde_json::Value::Number(v) => format!("n:{v}"),
+        serde_json::Value::String(v) => format!("s:{v}"),
+        other => format!("j:{other}"),
+    }
+}
+
+fn group_value_to_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(v) => Some(v.to_string()),
+        serde_json::Value::Number(v) => Some(v.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn register_column_bitmaps(
+    rel_oid: u32,
+    meta: &rvbbit_storage::metadata::RowGroupMeta,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if meta.column_bitmaps.is_empty() || !rvbbit_catalog_table_exists("column_bitmaps") {
+        return Ok(());
+    }
+    for block in &meta.column_bitmaps {
+        let column_name = block.column.replace('\'', "''");
+        let bitmap_kind = block.kind.replace('\'', "''");
+        for entry in &block.entries {
+            let value_text = entry.value_text.replace('\'', "''");
+            let value_json = serde_json::to_string(&entry.value)?;
+            let value_json = value_json.replace("$rvbbit$", "$rvbbit$$rvbbit$");
+            let bitmap_b64 = entry.bitmap_b64.replace('\'', "''");
+            Spi::run(&format!(
+                "INSERT INTO rvbbit.column_bitmaps \
+                 (table_oid, rg_id, column_name, bitmap_kind, value_text, value_json, \
+                  bitmap, n_set, n_total) \
+                 VALUES ({rel_oid}::oid, {rg_id}, '{column_name}', '{bitmap_kind}', \
+                         '{value_text}', $rvbbit${value_json}$rvbbit$::jsonb, \
+                         decode('{bitmap_b64}', 'base64'), {n_set}, {n_total})",
+                rg_id = meta.rg_id,
+                n_set = entry.n_set,
+                n_total = meta.n_rows,
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn register_text_dictionaries(
+    rel_oid: u32,
+    meta: &rvbbit_storage::metadata::RowGroupMeta,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if meta.text_dictionaries.is_empty() || !rvbbit_catalog_table_exists("text_dictionaries") {
+        return Ok(());
+    }
+    for block in &meta.text_dictionaries {
+        let column_name = block.column.replace('\'', "''");
+        let path = block.path.replace('\'', "''");
+        Spi::run(&format!(
+            "INSERT INTO rvbbit.text_dictionaries \
+             (table_oid, rg_id, column_name, path, n_rows, n_values, n_nulls, n_empty, n_bytes) \
+             VALUES ({rel_oid}::oid, {rg_id}, '{column_name}', '{path}', \
+                     {n_rows}, {n_values}, {n_nulls}, {n_empty}, {n_bytes})",
+            rg_id = meta.rg_id,
+            n_rows = block.n_rows,
+            n_values = block.n_values,
+            n_nulls = block.n_nulls,
+            n_empty = block.n_empty,
+            n_bytes = block.n_bytes,
+        ))?;
+    }
+    Ok(())
+}
+
+fn rvbbit_catalog_table_exists(table: &str) -> bool {
+    let table = table.replace('\'', "''");
+    Spi::get_one::<bool>(&format!("SELECT to_regclass('rvbbit.{table}') IS NOT NULL"))
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 fn register_variant_chunks(

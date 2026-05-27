@@ -11,8 +11,8 @@
 //! `SUM(distinct_estimate)` over per-group counts would overestimate
 //! by the duplication factor.
 
-use rvbbit_storage::Hll;
 use pgrx::prelude::*;
+use rvbbit_storage::Hll;
 
 /// HLL-based approximate distinct count for a text column.
 /// Returns NULL if the column has no per-group sketches (e.g. numeric
