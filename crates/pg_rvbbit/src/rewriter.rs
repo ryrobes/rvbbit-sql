@@ -3046,6 +3046,9 @@ unsafe fn try_count_star_group_filter_rule(query: *mut pg_sys::Query) -> bool {
     if !is_rvbbit_table_cached(table_oid) {
         return false;
     }
+    if fetch_total_row_count(table_oid).is_none() {
+        return false;
+    }
     let col_names = match fetch_attnames(table_oid) {
         Some(v) => v,
         None => return false,
@@ -9480,10 +9483,11 @@ fn estimate_relation_rows(table_oid: u32) -> i64 {
 
 /// Exact count for the trivial `SELECT count(*) FROM rel` rewrite.
 ///
-/// Fully compacted benchmark tables take the metadata-only path. If a table
-/// has received heap rows after compact, include those live heap rows with a
-/// direct table-AM scan so count(*) does not silently undercount. More complex
-/// rewrites still require a fully compacted table via `fetch_total_row_count`.
+/// Fully compacted benchmark tables take the metadata-only path. If a retained
+/// heap has been dirtied after an acceleration refresh, the heap is the source
+/// of truth and already contains every visible row, so use a direct heap count
+/// instead of adding parquet rows and double-counting. More complex rewrites
+/// still require a clean authoritative parquet view via `fetch_total_row_count`.
 fn fetch_count_star_row_count(table_oid: u32) -> Option<i64> {
     let row_group_rows = fetch_row_group_row_count(table_oid)?;
     if heap_relation_size(table_oid).unwrap_or(0) == 0 {
@@ -9492,7 +9496,10 @@ fn fetch_count_star_row_count(table_oid: u32) -> Option<i64> {
     if clean_shadow_heap_retained(table_oid) {
         return Some(row_group_rows);
     }
-    Some(row_group_rows + unsafe { heap_visible_row_count(table_oid)? })
+    if shadow_heap_retained(table_oid) {
+        return unsafe { heap_visible_row_count(table_oid) };
+    }
+    None
 }
 
 /// Look up the total row count from rvbbit.row_groups for a fully compacted
@@ -9522,6 +9529,17 @@ fn fetch_total_row_count(table_oid: u32) -> Option<i64> {
 fn clean_shadow_heap_retained(table_oid: u32) -> bool {
     let sql = format!(
         "SELECT coalesce(shadow_heap_retained AND NOT shadow_heap_dirty, false) \
+         FROM rvbbit.tables WHERE table_oid = {table_oid}::oid"
+    );
+    pgrx::Spi::get_one::<bool>(&sql)
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+fn shadow_heap_retained(table_oid: u32) -> bool {
+    let sql = format!(
+        "SELECT coalesce(shadow_heap_retained, false) \
          FROM rvbbit.tables WHERE table_oid = {table_oid}::oid"
     );
     pgrx::Spi::get_one::<bool>(&sql)

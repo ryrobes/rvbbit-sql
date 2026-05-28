@@ -6,6 +6,12 @@ It is not an audited TPC result. Use it as a local engineering signal and compar
 
 The harness stores TPC-H decimal columns as `DOUBLE PRECISION`/`Float64` so Rvbbit can compact the tables into parquet today. That keeps the suite useful for engine profiling while avoiding the current PG `numeric` export gap.
 
+TPC-H Q2, Q4, Q17, Q19, Q20, Q21, and Q22 are run as equivalent
+join/aggregate forms. The canonical text depends heavily on correlated
+subquery decorrelation or comma-join OR planning; some local comparison
+engines otherwise spend the full timeout on small scale factors before
+producing any benchmark signal.
+
 ```bash
 ./bench/tpch/run_offline.sh
 TPCH_SCALE=1 BENCH_SYSTEMS=rvbbit,duckdb,clickhouse,hydra,citus ./bench/tpch/run_offline.sh
@@ -50,7 +56,12 @@ Environment:
   exercise metadata cache behavior.
 - `BENCH_QUERIES`: optional query list such as `Q1,Q6,Q14`.
 - `BENCH_REPEATS`: runs per query. Default `3`.
-- `BENCH_TIMEOUT`: per-query timeout seconds for Postgres-family systems. Default `300`.
+- `BENCH_TIMEOUT`: per-query timeout seconds for Postgres-family systems and
+  the wall-clock watchdog for DuckDB/ClickHouse. Default `300`.
+- `BENCH_WALL_TIMEOUT`: optional wall-clock watchdog override for DuckDB and
+  ClickHouse. Defaults to `BENCH_TIMEOUT`.
+- `BENCH_WALL_TIMEOUT_GRACE`: extra seconds before a stuck DuckDB/ClickHouse
+  runner process is terminated. Default `5`.
 - `SKIP_LOAD=1`: reuse existing loaded tables.
 - `TPCH_FORCE_REGEN=1`: regenerate parquet for the selected scale.
 - `RVBBIT_RESET_EXTENSION=1`: destructive Rvbbit extension reset. This wipes
@@ -60,6 +71,11 @@ Environment:
 - `RVBBIT_LOAD_ROUTE_PROFILE=1`: import `bench/rvbbit_route_profile.json` into
   the native router catalog. The default is to leave the current trained profile
   state alone.
+- `BENCH_PERSIST_RESULTS=0`: skip recording the completed run into
+  `bench_history.runs` and `bench_history.query_results`.
+- `BENCH_RUN_ID` and `--test-name <name>` / `--name <name>` or
+  `BENCH_TEST_NAME`: override the persisted run id or group related scale
+  sweeps. See `bench/BENCHMARK_HISTORY.md` for SQL examples.
 
 Generated parquet lives under `bench/columnar_comparison/data/tpch/`, mounted into the benchmark container as `/data/tpch/`.
 

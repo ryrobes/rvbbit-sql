@@ -3343,11 +3343,14 @@ pub(crate) fn route_runtime_stamp() -> String {
              SELECT string_agg( \
                         c.oid::text || ':' || pg_relation_size(c.oid)::text || ':' || \
                         coalesce(rg.rows, 0)::text || ':' || coalesce(rg.bytes, 0)::text || ':' || \
-                        coalesce(dl.deletes, 0)::text, \
+                        coalesce(dl.deletes, 0)::text || ':' || \
+                        coalesce(t.shadow_heap_retained, false)::text || ':' || \
+                        coalesce(t.shadow_heap_dirty, false)::text, \
                         ',' ORDER BY c.oid \
                     ) AS stamp \
              FROM pg_class c \
              JOIN pg_am am ON am.oid = c.relam \
+             LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid \
              LEFT JOIN ( \
                  SELECT table_oid, sum(n_rows)::bigint AS rows, sum(n_bytes)::bigint AS bytes \
                  FROM rvbbit.row_groups \

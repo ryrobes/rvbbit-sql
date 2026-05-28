@@ -12,6 +12,8 @@ TATP_SUBSCRIBERS=100000 TATP_TXNS=50000 TATP_CLIENTS=4 ./bench/tatp/run_offline.
 TATP_TABLE_AM=heap BENCH_SYSTEMS=rvbbit,pg_baseline ./bench/tatp/run_offline.sh
 RVBBIT_RESET_EXTENSION=1 ./bench/tatp/run_offline.sh
 ./bench/tatp/run_offline.sh --reset-rvbbit-extension
+./bench/tatp/run_offline.sh --rebuild --reset-rvbbit-extension
+./bench/tatp/run_offline.sh --test-name nightly-main
 ```
 
 Environment:
@@ -26,6 +28,12 @@ Environment:
   extension-owned system data such as router profiles/observations and KG
   tables. The default is to preserve system data and run `ALTER EXTENSION
   UPDATE`.
+- `BENCH_PERSIST_RESULTS=0`: skip recording the completed run into
+  `bench_history.runs` and `bench_history.query_results`.
+- `BENCH_RUN_ID` and `--test-name <name>` / `--name <name>` or
+  `BENCH_TEST_NAME`: override the persisted run id or group related runs. See
+  `bench/BENCHMARK_HISTORY.md` for SQL examples.
+- `--rebuild`: rebuild the `pg-rvbbit` and `bench` images before running.
 
 When loading is enabled, the TATP benchmark tables are replaced for a clean
 transactional run. Extension-owned Rvbbit system state is preserved unless

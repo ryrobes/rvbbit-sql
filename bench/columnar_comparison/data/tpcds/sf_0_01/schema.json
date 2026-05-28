@@ -1,0 +1,2179 @@
+{
+  "suite": "TPC-DS",
+  "scale": "0.01",
+  "tables": {
+    "call_center": [
+      {
+        "name": "cc_call_center_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cc_call_center_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_rec_start_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "cc_rec_end_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "cc_closed_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cc_open_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cc_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_class",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_employees",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cc_sq_ft",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cc_hours",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_manager",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_mkt_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cc_mkt_class",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_mkt_desc",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_market_manager",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_division",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cc_division_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_company",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cc_company_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_street_number",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_street_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_street_type",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_suite_number",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_city",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_county",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_state",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_zip",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_country",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cc_gmt_offset",
+        "duck_type": "DECIMAL(5,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cc_tax_percentage",
+        "duck_type": "DECIMAL(5,2)",
+        "pg_type": "DOUBLE PRECISION"
+      }
+    ],
+    "catalog_page": [
+      {
+        "name": "cp_catalog_page_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cp_catalog_page_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cp_start_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cp_end_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cp_department",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cp_catalog_number",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cp_catalog_page_number",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cp_description",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cp_type",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      }
+    ],
+    "catalog_returns": [
+      {
+        "name": "cr_returned_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_returned_time_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_item_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_refunded_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_refunded_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_refunded_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_refunded_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_returning_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_returning_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_returning_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_returning_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_call_center_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_catalog_page_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_ship_mode_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_warehouse_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_reason_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_order_number",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_return_quantity",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cr_return_amount",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cr_return_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cr_return_amt_inc_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cr_fee",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cr_return_ship_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cr_refunded_cash",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cr_reversed_charge",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cr_store_credit",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cr_net_loss",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      }
+    ],
+    "catalog_sales": [
+      {
+        "name": "cs_sold_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_sold_time_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_ship_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_bill_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_bill_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_bill_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_bill_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_ship_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_ship_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_ship_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_ship_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_call_center_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_catalog_page_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_ship_mode_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_warehouse_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_item_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_promo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_order_number",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_quantity",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cs_wholesale_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_list_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_sales_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_ext_discount_amt",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_ext_sales_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_ext_wholesale_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_ext_list_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_ext_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_coupon_amt",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_ext_ship_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_net_paid",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_net_paid_inc_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_net_paid_inc_ship",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_net_paid_inc_ship_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "cs_net_profit",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      }
+    ],
+    "customer": [
+      {
+        "name": "c_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "c_customer_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "c_current_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "c_current_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "c_current_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "c_first_shipto_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "c_first_sales_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "c_salutation",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "c_first_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "c_last_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "c_preferred_cust_flag",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "c_birth_day",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "c_birth_month",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "c_birth_year",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "c_birth_country",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "c_login",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "c_email_address",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "c_last_review_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      }
+    ],
+    "customer_address": [
+      {
+        "name": "ca_address_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ca_address_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "ca_street_number",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "ca_street_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "ca_street_type",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "ca_suite_number",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "ca_city",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "ca_county",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "ca_state",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "ca_zip",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "ca_country",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "ca_gmt_offset",
+        "duck_type": "DECIMAL(5,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ca_location_type",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      }
+    ],
+    "customer_demographics": [
+      {
+        "name": "cd_demo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cd_gender",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cd_marital_status",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cd_education_status",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cd_purchase_estimate",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cd_credit_rating",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "cd_dep_count",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cd_dep_employed_count",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "cd_dep_college_count",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      }
+    ],
+    "date_dim": [
+      {
+        "name": "d_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_date_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "d_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "d_month_seq",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_week_seq",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_quarter_seq",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_year",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_dow",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_moy",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_dom",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_qoy",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_fy_year",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_fy_quarter_seq",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_fy_week_seq",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_day_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "d_quarter_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "d_holiday",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "d_weekend",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "d_following_holiday",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "d_first_dom",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_last_dom",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_same_day_ly",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_same_day_lq",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "d_current_day",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "d_current_week",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "d_current_month",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "d_current_quarter",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "d_current_year",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      }
+    ],
+    "household_demographics": [
+      {
+        "name": "hd_demo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "hd_income_band_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "hd_buy_potential",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "hd_dep_count",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "hd_vehicle_count",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      }
+    ],
+    "income_band": [
+      {
+        "name": "ib_income_band_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ib_lower_bound",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ib_upper_bound",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      }
+    ],
+    "inventory": [
+      {
+        "name": "inv_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "inv_item_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "inv_warehouse_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "inv_quantity_on_hand",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      }
+    ],
+    "item": [
+      {
+        "name": "i_item_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "i_item_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_rec_start_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "i_rec_end_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "i_item_desc",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_current_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "i_wholesale_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "i_brand_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "i_brand",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_class_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "i_class",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_category_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "i_category",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_manufact_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "i_manufact",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_size",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_formulation",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_color",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_units",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_container",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "i_manager_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "i_product_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      }
+    ],
+    "promotion": [
+      {
+        "name": "p_promo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "p_promo_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_start_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "p_end_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "p_item_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "p_cost",
+        "duck_type": "DECIMAL(15,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "p_response_target",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "p_promo_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_channel_dmail",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_channel_email",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_channel_catalog",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_channel_tv",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_channel_radio",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_channel_press",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_channel_event",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_channel_demo",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_channel_details",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_purpose",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "p_discount_active",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      }
+    ],
+    "reason": [
+      {
+        "name": "r_reason_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "r_reason_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "r_reason_desc",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      }
+    ],
+    "ship_mode": [
+      {
+        "name": "sm_ship_mode_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sm_ship_mode_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "sm_type",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "sm_code",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "sm_carrier",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "sm_contract",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      }
+    ],
+    "store": [
+      {
+        "name": "s_store_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "s_store_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_rec_start_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "s_rec_end_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "s_closed_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "s_store_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_number_employees",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "s_floor_space",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "s_hours",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_manager",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_market_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "s_geography_class",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_market_desc",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_market_manager",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_division_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "s_division_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_company_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "s_company_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_street_number",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_street_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_street_type",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_suite_number",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_city",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_county",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_state",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_zip",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_country",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "s_gmt_offset",
+        "duck_type": "DECIMAL(5,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "s_tax_percentage",
+        "duck_type": "DECIMAL(5,2)",
+        "pg_type": "DOUBLE PRECISION"
+      }
+    ],
+    "store_returns": [
+      {
+        "name": "sr_returned_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_return_time_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_item_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_store_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_reason_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_ticket_number",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_return_quantity",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "sr_return_amt",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "sr_return_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "sr_return_amt_inc_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "sr_fee",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "sr_return_ship_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "sr_refunded_cash",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "sr_reversed_charge",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "sr_store_credit",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "sr_net_loss",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      }
+    ],
+    "store_sales": [
+      {
+        "name": "ss_sold_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_sold_time_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_item_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_store_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_promo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_ticket_number",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_quantity",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ss_wholesale_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_list_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_sales_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_ext_discount_amt",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_ext_sales_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_ext_wholesale_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_ext_list_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_ext_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_coupon_amt",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_net_paid",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_net_paid_inc_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ss_net_profit",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      }
+    ],
+    "time_dim": [
+      {
+        "name": "t_time_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "t_time_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "t_time",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "t_hour",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "t_minute",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "t_second",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "t_am_pm",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "t_shift",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "t_sub_shift",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "t_meal_time",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      }
+    ],
+    "warehouse": [
+      {
+        "name": "w_warehouse_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "w_warehouse_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_warehouse_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_warehouse_sq_ft",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "w_street_number",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_street_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_street_type",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_suite_number",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_city",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_county",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_state",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_zip",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_country",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "w_gmt_offset",
+        "duck_type": "DECIMAL(5,2)",
+        "pg_type": "DOUBLE PRECISION"
+      }
+    ],
+    "web_page": [
+      {
+        "name": "wp_web_page_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wp_web_page_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "wp_rec_start_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "wp_rec_end_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "wp_creation_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wp_access_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wp_autogen_flag",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "wp_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wp_url",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "wp_type",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "wp_char_count",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wp_link_count",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wp_image_count",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wp_max_ad_count",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      }
+    ],
+    "web_returns": [
+      {
+        "name": "wr_returned_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_returned_time_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_item_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_refunded_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_refunded_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_refunded_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_refunded_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_returning_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_returning_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_returning_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_returning_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_web_page_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_reason_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_order_number",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_return_quantity",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "wr_return_amt",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "wr_return_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "wr_return_amt_inc_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "wr_fee",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "wr_return_ship_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "wr_refunded_cash",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "wr_reversed_charge",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "wr_account_credit",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "wr_net_loss",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      }
+    ],
+    "web_sales": [
+      {
+        "name": "ws_sold_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_sold_time_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_ship_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_item_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_bill_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_bill_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_bill_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_bill_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_ship_customer_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_ship_cdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_ship_hdemo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_ship_addr_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_web_page_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_web_site_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_ship_mode_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_warehouse_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_promo_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_order_number",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_quantity",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "ws_wholesale_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_list_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_sales_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_ext_discount_amt",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_ext_sales_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_ext_wholesale_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_ext_list_price",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_ext_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_coupon_amt",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_ext_ship_cost",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_net_paid",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_net_paid_inc_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_net_paid_inc_ship",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_net_paid_inc_ship_tax",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "ws_net_profit",
+        "duck_type": "DECIMAL(7,2)",
+        "pg_type": "DOUBLE PRECISION"
+      }
+    ],
+    "web_site": [
+      {
+        "name": "web_site_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "web_site_id",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_rec_start_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "web_rec_end_date",
+        "duck_type": "DATE",
+        "pg_type": "DATE"
+      },
+      {
+        "name": "web_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_open_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "web_close_date_sk",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "web_class",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_manager",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_mkt_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "web_mkt_class",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_mkt_desc",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_market_manager",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_company_id",
+        "duck_type": "INTEGER",
+        "pg_type": "INTEGER"
+      },
+      {
+        "name": "web_company_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_street_number",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_street_name",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_street_type",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_suite_number",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_city",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_county",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_state",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_zip",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_country",
+        "duck_type": "VARCHAR",
+        "pg_type": "TEXT"
+      },
+      {
+        "name": "web_gmt_offset",
+        "duck_type": "DECIMAL(5,2)",
+        "pg_type": "DOUBLE PRECISION"
+      },
+      {
+        "name": "web_tax_percentage",
+        "duck_type": "DECIMAL(5,2)",
+        "pg_type": "DOUBLE PRECISION"
+      }
+    ]
+  }
+}

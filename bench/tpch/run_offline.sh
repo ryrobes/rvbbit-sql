@@ -12,11 +12,15 @@
 #   RVBBIT_DF_INPROCESS=off ./bench/tpch/run_offline.sh      # force legacy sidecar (A/B vs new)
 #   ./bench/tpch/run_offline.sh --rebuild --reset-rvbbit-extension
 #                                                            # full bench against current source
+#   ./bench/tpch/run_offline.sh --test-name nightly-main
+#                                                            # group persisted benchmark history
 #
 # Flags:
 #   --reset-rvbbit-extension  same as RVBBIT_RESET_EXTENSION=1
 #   --load-route-profile      same as RVBBIT_LOAD_ROUTE_PROFILE=1
 #   --skip-load               same as SKIP_LOAD=1
+#   --test-name NAME          same as BENCH_TEST_NAME=NAME
+#   --name NAME               alias for --test-name
 #   --rebuild                 same as BENCH_REBUILD=1 — rebuilds the
 #                             pg-rvbbit + bench container images. Required
 #                             after pulling new rvbbit code so the .so +
@@ -99,7 +103,13 @@ RVBBIT_RESET_EXTENSION="${RVBBIT_RESET_EXTENSION:-${RESET_RVBBIT_EXTENSION:-}}"
 RVBBIT_LOAD_ROUTE_PROFILE="${RVBBIT_LOAD_ROUTE_PROFILE:-}"
 BENCH_REBUILD="${BENCH_REBUILD:-}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_ID="${BENCH_RUN_ID:-tpch_sf${SCALE_LABEL}_${STAMP}}"
+BENCH_TEST_NAME="${BENCH_TEST_NAME:-tpch}"
+BENCH_PERSIST_RESULTS="${BENCH_PERSIST_RESULTS:-1}"
 REPORT_FILE="bench/tpch/results/tpch_sf${SCALE_LABEL}_${STAMP}.txt"
+RESULTS_DIR="$(dirname "${REPORT_FILE}")"
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
 
 say()  { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m!! %s\033[0m\n' "$*" >&2; }
@@ -109,6 +119,12 @@ env_on() {
         1|true|TRUE|yes|YES|on|ON) return 0 ;;
         *) return 1 ;;
     esac
+}
+fix_results_ownership() {
+    mkdir -p "${RESULTS_DIR}" 2>/dev/null || true
+    ${COMPOSE} exec -T bench sh -c \
+        "mkdir -p /bench/tpch/results && chown -R ${HOST_UID}:${HOST_GID} /bench/tpch/results" \
+        >/dev/null 2>&1 || warn "could not chown bench/tpch/results from the bench container"
 }
 hive_refresh_explicitly_disabled() {
     case "${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD:-}" in
@@ -201,12 +217,48 @@ SQL
         die "forced-Hive variants are still missing for one or more TPC-H tables after refresh"
     fi
 }
+record_benchmark_history() {
+    env_on "${BENCH_PERSIST_RESULTS}" || return 0
+    local git_commit git_dirty_arg
+    git_commit="$(git rev-parse --short=12 HEAD 2>/dev/null || true)"
+    if [ -n "$(git status --porcelain 2>/dev/null || true)" ]; then
+        git_dirty_arg="--git-dirty"
+    else
+        git_dirty_arg="--no-git-dirty"
+    fi
+    say "recording benchmark history (${RUN_ID})"
+    if ! ${COMPOSE} exec -T bench python /bench/record_benchmark_run.py \
+        --results /bench/tpch/results/last_run.json \
+        --results-path bench/tpch/results/last_run.json \
+        --report-path "${REPORT_FILE}" \
+        --run-id "${RUN_ID}" \
+        --test-name "${BENCH_TEST_NAME}" \
+        --suite TPC-H \
+        --scale "${SCALE}" \
+        --started-at "${STAMP}" \
+        --git-commit "${git_commit}" \
+        "${git_dirty_arg}" \
+        --setting "scale=${SCALE}" \
+        --setting "systems=${SYSTEMS}" \
+        --setting "repeats=${REPEATS}" \
+        --setting "timeout_s=${TIMEOUT_S}" \
+        --setting "queries=${BENCH_QUERIES:-}" \
+        --setting "skip_load=${SKIP_LOAD:-0}" \
+        --setting "rebuild=${BENCH_REBUILD:-0}" \
+        --setting "rvbbit_reset_extension=${RVBBIT_RESET_EXTENSION:-0}" \
+        --setting "hive_refresh=${HIVE_REFRESH_DISPLAY}" \
+        --setting "df_inprocess=${RVBBIT_DF_INPROCESS:-on}" \
+        --setting "hot_store_budget_mb=${RVBBIT_HOT_STORE_BUDGET_MB:-512}" \
+        --setting "hot_store_route_max_rows=${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS:-500000}"; then
+        warn "benchmark completed, but history recording failed"
+    fi
+}
 usage() {
     awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "$0"
 }
 
-for arg in "$@"; do
-    case "${arg}" in
+while [ "$#" -gt 0 ]; do
+    case "$1" in
         --reset-rvbbit-extension|--clear-rvbbit-system-data)
             RVBBIT_RESET_EXTENSION=1
             ;;
@@ -219,14 +271,23 @@ for arg in "$@"; do
         --rebuild)
             BENCH_REBUILD=1
             ;;
+        --test-name|--name)
+            [ "$#" -ge 2 ] || die "$1 requires a value"
+            BENCH_TEST_NAME="$2"
+            shift
+            ;;
+        --test-name=*|--name=*)
+            BENCH_TEST_NAME="${1#*=}"
+            ;;
         -h|--help)
             usage
             exit 0
             ;;
         *)
-            die "unknown argument: ${arg}"
+            die "unknown argument: $1"
             ;;
     esac
+    shift
 done
 
 command -v docker >/dev/null || die "docker not found in PATH"
@@ -238,9 +299,12 @@ echo "   systems     : ${SYSTEMS}"
 echo "   repeats     : ${REPEATS}"
 echo "   timeout/q   : ${TIMEOUT_S}s"
 echo "   report file : ${REPORT_FILE}"
+echo "   run id      : ${RUN_ID}"
+echo "   test name   : ${BENCH_TEST_NAME}"
 echo "   rvbbit reset: $(env_on "${RVBBIT_RESET_EXTENSION}" && echo destructive || echo preserve-system-data)"
 echo "   route import: $(env_on "${RVBBIT_LOAD_ROUTE_PROFILE}" && echo yes || echo no)"
 echo "   rebuild     : $(env_on "${BENCH_REBUILD}" && echo yes || echo no)"
+echo "   persist     : $(env_on "${BENCH_PERSIST_RESULTS}" && echo yes || echo no)"
 echo "   df_inprocess: ${RVBBIT_DF_INPROCESS:-on (default)}"
 echo "   hive refresh: ${HIVE_REFRESH_DISPLAY}"
 echo "   hot store   : budget=${RVBBIT_HOT_STORE_BUDGET_MB:-512}MB route_max_rows=${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS:-500000}"
@@ -267,6 +331,7 @@ fi
 say "starting competitor containers (profile=bench)"
 ${COMPOSE} --profile bench up -d
 sleep 5
+fix_results_ownership
 
 if [ "${RVBBIT_SELECTED}" = "1" ]; then
     if env_on "${RVBBIT_RESET_EXTENSION}"; then
@@ -295,13 +360,13 @@ SQL
 fi
 
 say "generating TPC-H parquet"
-${COMPOSE} exec -T -e "TPCH_SCALE=${SCALE}" bench python /bench/tpch/generate_data.py
+${COMPOSE} exec -T -e "TPCH_SCALE=${SCALE}" bench python -u /bench/tpch/generate_data.py
 
 if [ -z "${SKIP_LOAD:-}" ]; then
     say "loading TPC-H sf=${SCALE} into [${SYSTEMS}]"
     ${COMPOSE} exec -T \
         -e "TPCH_SCALE=${SCALE}" -e "BENCH_SYSTEMS=${SYSTEMS}" "${LOAD_ENV[@]}" \
-        bench python /bench/tpch/load_all.py
+        bench python -u /bench/tpch/load_all.py
 else
     say "skipping load (SKIP_LOAD set)"
 fi
@@ -313,16 +378,19 @@ ${COMPOSE} exec -T \
     -e "TPCH_SCALE=${SCALE}" -e "BENCH_SYSTEMS=${SYSTEMS}" \
     -e "BENCH_REPEATS=${REPEATS}" -e "BENCH_TIMEOUT=${TIMEOUT_S}" \
     "${QUERIES_ENV[@]}" "${DUCK_HOT_ENV[@]}" \
-    bench python /bench/tpch/run_queries.py
+    bench python -u /bench/tpch/run_queries.py
 
 say "formatting report"
-mkdir -p "$(dirname "${REPORT_FILE}")"
+fix_results_ownership
+mkdir -p "${RESULTS_DIR}"
 ${COMPOSE} exec -T -e NO_COLOR=1 bench \
     python /bench/tpch/format_report.py \
     > "${REPORT_FILE}"
 
 ${COMPOSE} exec -T -e FORCE_COLOR=1 bench \
     python /bench/tpch/format_report.py
+
+record_benchmark_history
 
 say "report saved to ${REPORT_FILE}"
 echo "raw JSON at bench/tpch/results/last_run.json"

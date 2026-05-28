@@ -155,16 +155,15 @@ Rvbbit's parquet files live on disk under PGDATA. `pg_dump` captures
 the heap + catalog tables, but not the parquet files themselves. On
 the restore target the catalog points at parquet that doesn't exist.
 `rebuild_acceleration` wipes derived state for one table and
-re-runs `compact()` from the heap:
+rebuilds the derived Parquet files from the retained heap:
 
 ```sql
 SELECT rvbbit.rebuild_acceleration('orders'::regclass);
--- → {"dropped_row_groups": 3, "new_row_count": 5000}
+-- → {"status":"ok","dropped_row_groups":3,"rows_written":5000,...}
 ```
 
-For this to actually recover real data, the pre-dump compact must
-have used `compact(rel, true)` (keep_heap=true) so the heap holds the
-source-of-truth rows.
+The heap is now the source-of-truth layer for normal acceleration workflows, so
+`pg_dump`/`pg_restore` can recover by running this function after restore.
 
 ## ObjectStore tiered storage
 

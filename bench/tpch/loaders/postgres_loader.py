@@ -97,9 +97,8 @@ def _measure_size(cur, using: str | None) -> dict:
             if row:
                 heap_bytes += int(row[0])
                 heap_total_bytes += int(row[1])
-        keep_heap = _env_enabled("RVBBIT_COMPACT_KEEP_HEAP", default=True)
         return {
-            "size_bytes": parquet_size + heap_total_bytes if keep_heap else parquet_size,
+            "size_bytes": parquet_size + heap_total_bytes,
             "parquet_size_bytes": parquet_size,
             "parquet_variant_size_bytes": variant_size,
             "heap_bytes": heap_bytes,

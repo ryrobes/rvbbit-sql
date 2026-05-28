@@ -207,22 +207,14 @@ def run_one(name: str, limit: int | None) -> dict:
         elif name == "rvbbit":
             from loaders.postgres_loader import load_pg
             dsn = "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench"
-            keep_heap = _env_enabled("RVBBIT_COMPACT_KEEP_HEAP", default=True)
             refresh_mode = _variant_refresh_mode()
-            if refresh_mode != "off" and not keep_heap:
-                print(
-                    "    skip layout variant refresh: "
-                    "RVBBIT_COMPACT_KEEP_HEAP=0 leaves no retained heap for refresh"
-                )
-                refresh_mode = "off"
             compact_sql = [
                 "ANALYZE hits",
                 *_rvbbit_compact_settings_sql(),
                 *_rvbbit_hot_settings_sql(),
-                f"SELECT rvbbit.compact('hits'::regclass, {str(keep_heap).lower()})",
+                "SELECT rvbbit.refresh_acceleration("
+                f"'hits'::regclass, {str(refresh_mode == 'sync').lower()})",
             ]
-            if refresh_mode == "sync":
-                compact_sql.append("SELECT rvbbit.refresh_layout_variants('hits'::regclass)")
             if _hot_load_after_load():
                 compact_sql.append("SELECT rvbbit.hot_load('hits'::regclass)")
             res = load_pg(

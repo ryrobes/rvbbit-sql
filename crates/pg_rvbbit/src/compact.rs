@@ -701,11 +701,55 @@ fn cluster_score(
 
 #[pg_extern]
 fn export_to_parquet(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>> {
+    export_to_parquet_impl(rel, None, true)
+}
+
+#[pg_extern]
+fn export_to_parquet_full_scan(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>> {
+    export_to_parquet_impl(rel, None, false)
+}
+
+#[pg_extern]
+fn export_to_parquet_xid_range(
+    rel: pg_sys::Oid,
+    min_xid: &str,
+    max_xid: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let min_xid = xid_numeric_literal(min_xid)?;
+    let max_xid = xid_numeric_literal(max_xid)?;
+    if max_xid.parse::<u128>()? <= min_xid.parse::<u128>()? {
+        return Ok(0);
+    }
+    let filter = format!(
+        "(xmin::text)::numeric > {min_xid}::numeric \
+         AND (xmin::text)::numeric <= {max_xid}::numeric"
+    );
+    export_to_parquet_impl(rel, Some(filter), false)
+}
+
+fn xid_numeric_literal(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("xid watermark cannot be empty".into());
+    }
+    let parsed: u128 = trimmed.parse()?;
+    Ok(parsed.to_string())
+}
+
+fn export_to_parquet_impl(
+    rel: pg_sys::Oid,
+    heap_filter: Option<String>,
+    refresh_sync_variants: bool,
+) -> Result<i64, Box<dyn std::error::Error>> {
     let rel_oid = rel.to_u32();
     let scan_chunk_rows = scan_chunk_rows_setting();
 
     let qualified: String = Spi::get_one(&format!("SELECT {rel_oid}::oid::regclass::text"))?
         .ok_or("relation does not exist")?;
+    let scan_source = match heap_filter {
+        Some(filter) => format!("(SELECT * FROM {qualified} WHERE {filter}) AS rvbbit_delta"),
+        None => qualified.clone(),
+    };
 
     let first_rg_id: i64 = Spi::get_one(&format!(
         "SELECT coalesce(max(rg_id), -1) + 1 \
@@ -750,7 +794,7 @@ fn export_to_parquet(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>
 
     let scan_root = path_root.join(SCAN_LAYOUT_DIR);
     let chunks = write_layout_chunks(
-        &qualified,
+        &scan_source,
         &plans,
         &schema,
         &scan_root,
@@ -777,7 +821,7 @@ fn export_to_parquet(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>
         ))?;
     }
 
-    if sync_variant_layouts_enabled() && total_rows > 0 {
+    if refresh_sync_variants && sync_variant_layouts_enabled() && total_rows > 0 {
         refresh_layout_variants_impl(rel_oid, &qualified, &plans, &schema, &path_root)?;
     }
 

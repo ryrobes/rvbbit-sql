@@ -1061,9 +1061,21 @@ unsafe fn extract_array_value_set(node: *mut pg_sys::Node) -> Option<PushVal> {
             let mut elems: *mut pg_sys::Datum = std::ptr::null_mut();
             let mut nulls: *mut bool = std::ptr::null_mut();
             let mut nelems: std::ffi::c_int = 0;
-            pg_sys::deconstruct_array_builtin(
+            let mut elem_len: i16 = 0;
+            let mut elem_byval = false;
+            let mut elem_align: std::ffi::c_char = 0;
+            pg_sys::get_typlenbyvalalign(
+                elem_oid,
+                &mut elem_len,
+                &mut elem_byval,
+                &mut elem_align,
+            );
+            pg_sys::deconstruct_array(
                 any_array as *mut pg_sys::ArrayType,
                 elem_oid,
+                elem_len as std::ffi::c_int,
+                elem_byval,
+                elem_align,
                 &mut elems,
                 &mut nulls,
                 &mut nelems,

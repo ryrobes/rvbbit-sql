@@ -191,30 +191,17 @@ def run_one(name: str, data_dir: str, scale: str) -> dict:
         elif name == "rvbbit":
             from loaders.postgres_loader import load_pg
             dsn = "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench"
-            keep_heap = _env_enabled("RVBBIT_COMPACT_KEEP_HEAP", default=True)
             refresh_mode = _variant_refresh_mode()
-            if refresh_mode != "off" and not keep_heap:
-                print(
-                    "    skip layout variant refresh: "
-                    "RVBBIT_COMPACT_KEEP_HEAP=0 leaves no retained heap for refresh"
-                )
-                refresh_mode = "off"
             compact_sql = [
                 *[f"ANALYZE {t}" for t in table_names()],
                 *_rvbbit_compact_settings_sql(),
                 *_rvbbit_hot_settings_sql(),
                 *[
-                    f"SELECT rvbbit.compact('{t}'::regclass, {str(keep_heap).lower()})"
+                    "SELECT rvbbit.refresh_acceleration("
+                    f"'{t}'::regclass, {str(refresh_mode == 'sync').lower()})"
                     for t in table_names()
                 ],
             ]
-            if refresh_mode == "sync":
-                compact_sql.extend(
-                    [
-                        f"SELECT rvbbit.refresh_layout_variants('{t}'::regclass)"
-                        for t in table_names()
-                    ]
-                )
             if _hot_load_after_load():
                 compact_sql.extend(
                     [f"SELECT rvbbit.hot_load('{t}'::regclass)" for t in table_names()]

@@ -54,10 +54,16 @@ The script:
 6. Prints a colored grid: best per-row in **green**, failures in **red**
 7. Writes the uncolored grid to `bench/clickbench/results/clickbench_<limit>_<timestamp>.txt`
 8. Raw JSON to `results/last_run.json` (incrementally — survives mid-run crashes)
+9. Records the completed run into `bench_history.runs` and
+   `bench_history.query_results` unless `BENCH_PERSIST_RESULTS=0`
 
 Env overrides: `BENCH_LIMIT`, `BENCH_SYSTEMS`, `BENCH_QUERIES`,
 `BENCH_REPEATS`, `BENCH_TIMEOUT`, `SKIP_LOAD`, `SKIP_DOWNLOAD`,
 `RVBBIT_RESET_EXTENSION`, `RVBBIT_LOAD_ROUTE_PROFILE`.
+
+Use `BENCH_RUN_ID=<id>` to control the persisted run id and
+`--test-name <name>` / `--name <name>` or `BENCH_TEST_NAME=<name>` to group
+related scale sweeps. See `bench/BENCHMARK_HISTORY.md` for SQL examples.
 
 By default, the offline script preserves extension-owned Rvbbit system data:
 router profiles, route observations, KG tables, semantic caches, and similar

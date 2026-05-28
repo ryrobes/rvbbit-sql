@@ -197,6 +197,9 @@ unsafe extern "C-unwind" fn rvbbit_get_relation_info_hook(
     if force_heap_scan_enabled() || router::pg_rowstore_route_selected() {
         return;
     }
+    if !as_of_generation_enabled() && !parquet_authoritative_for_oid(oid_u32) {
+        return;
+    }
     // Our replacement scan is not parallel-aware yet. If PG keeps heap
     // partial paths around for a grouped query, the final plan can bypass
     // parquet entirely and read stale heap residue after export_to_parquet.
@@ -245,6 +248,9 @@ unsafe extern "C-unwind" fn rvbbit_set_rel_pathlist_hook(
     if force_heap_scan_enabled() || router::pg_rowstore_route_selected() {
         return;
     }
+    if !as_of_generation_enabled() && !parquet_authoritative_for_oid(oid_u32) {
+        return;
+    }
 
     let n_rgs = count_row_groups(oid_u32);
     if n_rgs == 0 {
@@ -256,15 +262,10 @@ unsafe extern "C-unwind" fn rvbbit_set_rel_pathlist_hook(
     (*rel).tuples = total_rows;
     (*rel).consider_parallel = false;
 
-    // After compact, the heap is empty and any IndexScan / IndexOnlyScan
-    // path generated against it would (correctly) return zero rows from
-    // its empty index. Those paths are CHEAPER than ours for queries
-    // like SELECT ... ORDER BY id LIMIT N, so the planner picks them
-    // and the user sees zero rows where parquet has 100k.
-    //
-    // Until Phase 3 adds heap-as-delta-tier (where we'd UNION heap +
-    // parquet), the right semantics are "all data lives in parquet" —
-    // wipe every path that reads the heap.
+    // Only wipe heap paths when parquet is authoritative: either the legacy
+    // heap was truncated, or the retained heap is marked clean by the
+    // acceleration refresh machinery. A dirty retained heap remains the SQL
+    // source of truth and must be planned by PostgreSQL normally.
     (*rel).pathlist = std::ptr::null_mut();
     (*rel).partial_pathlist = std::ptr::null_mut();
     (*rel).cheapest_total_path = std::ptr::null_mut();
@@ -348,6 +349,12 @@ fn force_heap_scan_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn as_of_generation_enabled() -> bool {
+    guc_setting("rvbbit.as_of_generation")
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .is_some_and(|generation| generation > 0)
+}
+
 fn setting_enabled(value: &str, default: bool) -> bool {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -384,6 +391,22 @@ fn is_rvbbit_table(oid: u32) -> bool {
     let is = result.ok().flatten().unwrap_or(false);
     IS_RVBBIT_CACHE.with(|c| c.borrow_mut().insert(oid, is));
     is
+}
+
+/// Latest-view parquet scans are correct only when the heap is empty
+/// (legacy compact) or the retained heap has not been mutated since the
+/// last acceleration refresh. Historical AS OF reads are handled by the
+/// caller and intentionally bypass this latest-view check.
+fn parquet_authoritative_for_oid(oid: u32) -> bool {
+    IN_HOOK.with(|f| f.set(true));
+    let result: Result<Option<bool>, _> = pgrx::Spi::get_one(&format!(
+        "SELECT pg_relation_size(t.table_oid) = 0 \
+                OR coalesce(t.shadow_heap_retained AND NOT t.shadow_heap_dirty, false) \
+         FROM rvbbit.tables t \
+         WHERE t.table_oid = {oid}::oid"
+    ));
+    IN_HOOK.with(|f| f.set(false));
+    result.ok().flatten().unwrap_or(false)
 }
 
 /// How many row groups does this table have? Not cached because compact()

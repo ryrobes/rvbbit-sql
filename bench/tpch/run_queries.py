@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import os
+import queue
 import sys
 import time
 import traceback
@@ -32,6 +34,9 @@ SYSTEMS = os.environ.get(
 SYSTEMS = [s.strip() for s in SYSTEMS if s.strip()]
 REPEATS = int(os.environ.get("BENCH_REPEATS", "3"))
 TIMEOUT_S = int(os.environ.get("BENCH_TIMEOUT", "300"))
+WALL_TIMEOUT_S = float(os.environ.get("BENCH_WALL_TIMEOUT", str(TIMEOUT_S)))
+WALL_TIMEOUT_GRACE_S = float(os.environ.get("BENCH_WALL_TIMEOUT_GRACE", "5"))
+WALL_TIMEOUT_SYSTEMS = {"duckdb", "clickhouse"}
 SELECTED = os.environ.get("BENCH_QUERIES")
 SELECTED_SET = set(SELECTED.split(",")) if SELECTED else None
 REPORT_COLD_WARM = os.environ.get("BENCH_REPORT_COLD_WARM", "").strip().lower() in {
@@ -113,6 +118,44 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
         return None, str(e).splitlines()[0][:120]
 
 
+def _run_one_worker(result_queue, system: str, sql: str, qid: str) -> None:
+    try:
+        clear_run_detail()
+        ms, status = run_one(system, sql, qid)
+        result_queue.put((ms, status, last_run_detail()))
+    except BaseException as e:
+        result_queue.put((None, str(e).splitlines()[0][:120], {}))
+
+
+def run_one_guarded(system: str, sql: str, qid: str) -> tuple[float | None, str, dict]:
+    if system not in WALL_TIMEOUT_SYSTEMS:
+        clear_run_detail()
+        ms, status = run_one(system, sql, qid)
+        return ms, status, last_run_detail()
+
+    ctx = mp.get_context("fork")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=_run_one_worker, args=(result_queue, system, sql, qid))
+    proc.start()
+    proc.join(WALL_TIMEOUT_S + WALL_TIMEOUT_GRACE_S)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(2)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(2)
+        return (
+            None,
+            f"wall timeout after {WALL_TIMEOUT_S:.0f}s",
+            {"wall_timeout_s": WALL_TIMEOUT_S},
+        )
+    try:
+        return result_queue.get_nowait()
+    except queue.Empty:
+        status = f"runner exited without result (exit={proc.exitcode})"
+        return None, status[:120], {}
+
+
 def _write_json(path: str, systems: list, queries: list, results: dict, details: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
@@ -145,22 +188,20 @@ def _write_json(path: str, systems: list, queries: list, results: dict, details:
 
 
 def main() -> None:
-    print(f"\n=== TPC-H query bench ({REPEATS} runs, median, {TIMEOUT_S}s timeout) ===")
-    print(f"systems: {SYSTEMS}\n")
+    print(f"\n=== TPC-H query bench ({REPEATS} runs, median, {TIMEOUT_S}s timeout) ===", flush=True)
+    print(f"systems: {SYSTEMS}\n", flush=True)
     queries = [q for q in base_queries() if SELECTED_SET is None or q[0] in SELECTED_SET]
     results: dict = {}
     details: dict = {}
     out_path = "/bench/tpch/results/last_run.json"
 
     for qid, qdesc, sql in queries:
-        print(f"-> {qid}: {qdesc}")
+        print(f"-> {qid}: {qdesc}", flush=True)
         results[qid] = {}
         details[qid] = {}
         for sys_ in SYSTEMS:
             t0 = time.perf_counter()
-            clear_run_detail()
-            ms, status = run_one(sys_, sql_for_system(sql, sys_, qid), qid)
-            detail = last_run_detail()
+            ms, status, detail = run_one_guarded(sys_, sql_for_system(sql, sys_, qid), qid)
             took = time.perf_counter() - t0
             results[qid][sys_] = (ms, status)
             details[qid][sys_] = detail
@@ -170,24 +211,24 @@ def main() -> None:
                 suffix = f" cold {fmt_ms(detail['first_ms'])}"
                 if "warm_median_ms" in detail:
                     suffix += f" warm {fmt_ms(detail['warm_median_ms'])}"
-            print(f"     {sys_:<14} {label:>14}    (wall {took:.1f}s){suffix}")
+            print(f"     {sys_:<14} {label:>14}    (wall {took:.1f}s){suffix}", flush=True)
         _write_json(out_path, SYSTEMS, queries, results, details)
-        print()
+        print(flush=True)
 
-    print("\n=== markdown summary ===\n")
+    print("\n=== markdown summary ===\n", flush=True)
     header = "| Query | " + " | ".join(SYSTEMS) + " |"
     sep = "|" + "|".join(["---"] * (1 + len(SYSTEMS))) + "|"
-    print(header)
-    print(sep)
+    print(header, flush=True)
+    print(sep, flush=True)
     for qid, _, _ in queries:
         row = [qid]
         for sys_ in SYSTEMS:
             ms, status = results[qid].get(sys_, (None, "missing"))
             row.append(fmt_ms(ms) if ms is not None else "FAIL")
-        print("| " + " | ".join(row) + " |")
+        print("| " + " | ".join(row) + " |", flush=True)
 
     _write_json(out_path, SYSTEMS, queries, results, details)
-    print(f"\nresults JSON: {out_path}")
+    print(f"\nresults JSON: {out_path}", flush=True)
 
 
 if __name__ == "__main__":
