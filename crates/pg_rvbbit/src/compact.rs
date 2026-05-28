@@ -1197,24 +1197,25 @@ fn write_hive_layout_chunks(
             for row in table {
                 let raw_partition: Option<String> = row.get::<String>(partition_idx)?;
                 let partition = encode_hive_partition_value(raw_partition.as_deref());
-                if current_partition.as_deref() != Some(partition.as_str()) {
-                    if chunk_count > 0 {
-                        let rg_id = first_rg_id + chunk_idx;
-                        let chunk_path = path_root
-                            .join(format!("{}={partition}", layout_dir_name(hive_key)))
-                            .join(format!("{rg_id}.parquet"));
-                        let meta = flush_chunk(
-                            &file_schema,
-                            &mut builders,
-                            &file_plans,
-                            &chunk_path,
-                            rg_id,
-                        )
-                        .map_err(|e| pgrx::spi::Error::CursorNotFound(e.to_string()))?;
-                        chunks.push(meta);
-                        chunk_count = 0;
-                        chunk_idx += 1;
-                    }
+                if let Some(flush_partition) = hive_partition_to_flush_on_transition(
+                    current_partition.as_deref(),
+                    partition.as_str(),
+                    chunk_count,
+                )
+                .map_err(|e| pgrx::spi::Error::CursorNotFound(e.to_string()))?
+                {
+                    let rg_id = first_rg_id + chunk_idx;
+                    let chunk_path = path_root
+                        .join(format!("{}={flush_partition}", layout_dir_name(hive_key)))
+                        .join(format!("{rg_id}.parquet"));
+                    let meta =
+                        flush_chunk(&file_schema, &mut builders, &file_plans, &chunk_path, rg_id)
+                            .map_err(|e| pgrx::spi::Error::CursorNotFound(e.to_string()))?;
+                    chunks.push(meta);
+                    chunk_count = 0;
+                    chunk_idx += 1;
+                    current_partition = Some(partition.clone());
+                } else if current_partition.as_deref() != Some(partition.as_str()) {
                     current_partition = Some(partition.clone());
                 }
 
@@ -1302,6 +1303,19 @@ fn write_hive_layout_chunks(
     )?;
 
     Ok(chunks)
+}
+
+fn hive_partition_to_flush_on_transition<'a>(
+    current_partition: Option<&'a str>,
+    incoming_partition: &str,
+    chunk_count: usize,
+) -> Result<Option<&'a str>, &'static str> {
+    if current_partition == Some(incoming_partition) || chunk_count == 0 {
+        return Ok(None);
+    }
+    current_partition
+        .map(Some)
+        .ok_or("hive writer has buffered rows without a current partition")
 }
 
 fn encode_hive_partition_value(value: Option<&str>) -> String {
@@ -1614,4 +1628,37 @@ fn register_legacy_llm_shreds_if_present(
          ON CONFLICT DO NOTHING"
     ))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hive_partition_to_flush_on_transition;
+
+    #[test]
+    fn hive_boundary_flushes_buffered_rows_to_previous_partition() {
+        assert_eq!(
+            hive_partition_to_flush_on_transition(Some("A"), "B", 12),
+            Ok(Some("A"))
+        );
+    }
+
+    #[test]
+    fn hive_boundary_does_not_flush_empty_or_same_partition() {
+        assert_eq!(
+            hive_partition_to_flush_on_transition(Some("A"), "A", 12),
+            Ok(None)
+        );
+        assert_eq!(
+            hive_partition_to_flush_on_transition(None, "A", 0),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn hive_boundary_rejects_buffered_rows_without_partition() {
+        assert_eq!(
+            hive_partition_to_flush_on_transition(None, "A", 1),
+            Err("hive writer has buffered rows without a current partition")
+        );
+    }
 }

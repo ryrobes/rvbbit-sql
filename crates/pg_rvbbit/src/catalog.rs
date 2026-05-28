@@ -748,7 +748,7 @@ CREATE TABLE rvbbit.operators (
     -- Multi-step pipeline. When NULL the operator is single-LLM-call
     -- (system_prompt + user_prompt + parser, today's path — backward
     -- compatible). When non-NULL, the executor iterates the array, each
-    -- entry is one step with `kind` in {'llm', 'code', 'specialist'}.
+    -- entry is one step with `kind` in {'llm', 'code', 'python', 'specialist'}.
     -- The output of each step is available to subsequent steps as
     -- {{ steps.<step_name>.<field> }} in templates.
     --
@@ -810,7 +810,7 @@ CREATE OR REPLACE FUNCTION rvbbit.create_operator(
     op_name        text,
     op_arg_names   text[],
     op_return_type text,
-    -- Prompts default to '' so a steps-only operator (specialist / code
+    -- Prompts default to '' so a steps-only operator (specialist / python / code
     -- nodes, no LLM) needs no prompt boilerplate. They are used only when
     -- op_steps is NULL (the single-LLM-call path).
     op_system      text DEFAULT '',

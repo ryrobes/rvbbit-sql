@@ -62,7 +62,7 @@ Four orthogonal axes that compose. Most systems give you one at a time:
 
 | Axis | What | Why it matters |
 |---|---|---|
-| **`steps`** | A pipeline of nodes: LLM, specialist (BERT / GLiNER / embed / rerank), code, SQL, MCP-tool — any order, each reading the previous | Real workflows, not one-shot functions |
+| **`steps`** | A pipeline of nodes: LLM, specialist (BERT / GLiNER / embed / rerank), Python, code, SQL, MCP-tool — any order, each reading the previous | Real workflows, not one-shot functions |
 | **`takes`** | Run the pipeline N times, reduce via vote / median / evaluator / first-valid | Ensembles without orchestrator code |
 | **`retry`** | Re-execute until a SQL predicate holds, with feedback in the prompt | Bounded self-healing inside the function |
 | **`wards`** | Pre/post validators, blocking or advisory | Type/shape contracts at the function boundary |

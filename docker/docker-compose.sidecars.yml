@@ -208,7 +208,28 @@ services:
       timeout: 2s
       retries: 5
 
+  # Managed CPython runtime for operator `kind: python` nodes. The database
+  # owns env/package/handler metadata; this sidecar lazily creates hashed
+  # venvs and executes handlers over JSON.
+  python-runtime:
+    build:
+      context: ../sidecars/python-runtime
+    container_name: rvbbit-python-runtime
+    ports:
+      - "8096:8080"
+    environment:
+      RVBBIT_PYTHON_ENVS_DIR: /var/lib/rvbbit/python-envs
+      RVBBIT_PYTHON_HANDLERS_DIR: /var/lib/rvbbit/python-handlers
+    volumes:
+      - python_envs:/var/lib/rvbbit
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
 # Shared HuggingFace cache so the heavy model weights only download once
 # and survive container rebuilds.
 volumes:
   hf_cache:
+  python_envs:

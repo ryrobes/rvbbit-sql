@@ -117,7 +117,7 @@ fn execute_takes(op: &OpDef, inputs: &Value, opts: &Value, feedback: Option<&str
 
     // Build the take jobs. Two modes:
     //   heterogeneous — an explicit `nodes` list: each take is a distinct
-    //     node (an llm / specialist / code engine), run once.
+    //     node (an llm / specialist / python / code engine), run once.
     //   homogeneous   — `factor` runs of the operator body, optionally
     //     round-robined across a `models` pool.
     let jobs: Vec<TakeKind> = match &plan.nodes {

@@ -60,7 +60,7 @@ inputs ─▶ pre-wards ─▶ execute (1 call, or an N-take ensemble) ─▶ re
 ```
 
 The `execute` stage is itself a pipeline of one or more **nodes** — each a
-primitive of kind `llm`, `specialist`, or `code`. A plain operator is one
+primitive of kind `llm`, `specialist`, `python`, or `code`. A plain operator is one
 `llm` node; specialists and chained workflows are covered in §16.
 
 ---
@@ -482,7 +482,7 @@ candidate answers, then reduce them to one. Two modes:
 - **homogeneous** — run the operator `factor` times, optionally across a
   pool of models;
 - **heterogeneous** — run an explicit list of `nodes`, each a different
-  engine (llm / specialist / code). See "Heterogeneous takes" below.
+  engine (llm / specialist / python / code). See "Heterogeneous takes" below.
 
 ### Set / clear
 
@@ -675,7 +675,7 @@ ORDER BY invocation_at DESC LIMIT 1;
 -- flow_steps = 4, evaluator_calls = 1   (3 takes + 1 evaluator)
 ```
 
-Each `sub_calls` entry has `step`, `kind` (`llm`/`code`/`specialist`),
+Each `sub_calls` entry has `step`, `kind` (`llm`/`code`/`python`/`specialist`),
 `model`, `backend`, `transport`, token counts, latency, error, and provider
 ids/cost metadata when the backend exposes them. A retry appends each attempt's
 sub-calls, so `sub_calls` length tells you how hard the flow worked.
@@ -747,12 +747,13 @@ re-run every time until they succeed.
 ## 16. Node kinds & model backends
 
 An operator's body is a **pipeline of nodes**. Each node is a primitive of
-one `kind`, and the five kinds are peers — each is `inputs → output`:
+one `kind`, and the six kinds are peers — each is `inputs → output`:
 
 | `kind` | what it runs | node fields |
 |---|---|---|
 | `llm` | a language-model call | `model`, `system`, `user`, `max_tokens`, `temperature`, `provider` |
 | `specialist` | a call to a registered model backend — embedder, reranker, classifier, extractor, NLI… | `specialist`, `inputs` |
+| `python` | a managed CPython handler in a sidecar-created venv | `env`, `handler`, `inputs`, `timeout_ms` |
 | `code` | a built-in deterministic function | `fn`, `inputs` |
 | `sql` | a parameterized SELECT against the database — lookups, reference data | `sql`, `params` |
 | `mcp` | a tool on a registered MCP server (Model Context Protocol) | `server`, `tool`, `inputs` |
@@ -775,6 +776,50 @@ A later node reads an earlier one via `{{ steps.<name>.output }}` (§12);
 the operator's output is the last node's output. The whole pipeline is
 wrapped by flow control (pre-wards → … → post-wards) like any operator.
 
+### A `python` node
+
+A `python` node runs a named handler from `rvbbit.python_handlers` inside a
+managed environment from `rvbbit.python_envs`. Users define both with SQL;
+the sidecar creates the venv from the package list and executes the handler
+over JSON inputs.
+
+```sql
+SELECT rvbbit.create_python_env(
+  env_name => 'analytics',
+  python_version => '3.12',
+  requirements => ARRAY['rapidfuzz==3.9.7'],
+  timeout_ms => 1000
+);
+
+SELECT rvbbit.create_python_handler(
+  handler_name => 'ticket_score',
+  env_name => 'analytics',
+  code => $py$
+def run(inputs):
+    text = inputs["text"].lower()
+    return {"is_outage": "outage" in text or "down" in text}
+$py$
+);
+```
+
+Then use it in an operator pipeline:
+
+```json
+{ "name": "score", "kind": "python", "env": "analytics",
+  "handler": "ticket_score",
+  "inputs": { "text": "{{ inputs.body }}" },
+  "timeout_ms": 1000 }
+```
+
+- **Input** — the rendered `inputs` object is passed to `run(inputs)`.
+- **Output** — JSON-serializable Python return values become
+  `{{ steps.score.output }}` for downstream nodes.
+- **Packages** — package lists live in SQL env rows; no manual server venv
+  setup is required. Env/handler hashes are folded into the operator cache
+  key, so changing code or packages invalidates cached results.
+- **Scope** — this is a workflow primitive, not a general PL/Python
+  replacement. Python code runs in the sidecar, not in the Postgres backend.
+
 ### The three layers
 
 rvbbit has exactly three kinds of object — keep them straight:
@@ -782,7 +827,7 @@ rvbbit has exactly three kinds of object — keep them straight:
 | layer | what it is | callable from SQL? |
 |---|---|---|
 | **Backend** — row in `rvbbit.backends` | *infrastructure*: where a model is served (URL, transport, batching, auth). Registered once, shared. Like a connection / foreign-server registry. Covers **both** specialist endpoints **and** LLM providers. | no — it is plumbing |
-| **Node primitive** — a `kind` (`llm` / `specialist` / `code` / `sql`) | an invocable unit inside an operator's `steps`; an `llm` node names a provider backend, a `specialist` node names a specialist backend | only inside an operator |
+| **Node primitive** — a `kind` (`llm` / `specialist` / `python` / `code` / `sql` / `mcp`) | an invocable unit inside an operator's `steps`; an `llm` node names a provider backend, a `specialist` node names a specialist backend, and a `python` node names managed handler code | only inside an operator |
 | **Operator** — row in `rvbbit.operators` | a flow over a pipeline of nodes | **yes — the one callable thing** |
 
 A specialist endpoint — and an LLM provider — is **not** its own class of

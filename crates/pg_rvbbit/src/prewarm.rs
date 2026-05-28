@@ -57,6 +57,8 @@ pub fn warm(op: &Arc<OpDef>, opts: &Value, inputs: Vec<Value>) -> WarmStats {
     // Pre-load specialist specs on the leader before any pool dispatch —
     // worker threads can only read the spec cache, not do the SPI load.
     crate::specialists::warm_operator_specs(op.steps.as_ref(), op.takes.as_ref());
+    // Pre-load Python handler/env specs for the same reason.
+    crate::python_runtime::warm_operator_specs(op.steps.as_ref(), op.takes.as_ref());
 
     // A sql node needs the leader (SPI is illegal on a pool thread), so an
     // operator that contains one can't ride the pooled batched path — run
@@ -653,11 +655,13 @@ fn load_op(name: &str) -> Option<OpDef> {
 
 fn build_hash(op: &OpDef, opts: &Value, inputs: &Value) -> Vec<u8> {
     let model_override = opts.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let runtime_seed = crate::python_runtime::dependency_seed(op.steps.as_ref(), op.takes.as_ref());
     let prompt_seed = format!(
-        "{}\0{}\0{}",
+        "{}\0{}\0{}\0{}",
         op.system_prompt,
         op.user_prompt,
-        serde_json::to_string(&op.steps).unwrap_or_default()
+        serde_json::to_string(&op.steps).unwrap_or_default(),
+        runtime_seed
     );
     let mut h = blake3::Hasher::new();
     h.update(op.name.as_bytes());

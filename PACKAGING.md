@@ -113,7 +113,7 @@ Drop in the new artifacts (via tarball, docker pull, or rebuild), then:
 ALTER EXTENSION pg_rvbbit UPDATE;
 ```
 
-The 56 versioned migration scripts are installed alongside the .control
+The versioned migration scripts are installed alongside the .control
 file. `ALTER EXTENSION ... UPDATE` walks the upgrade chain from your
 current installed version to the new `default_version`. Database state
 (parquet files, judgment cache, embeddings, KG, route decisions) is

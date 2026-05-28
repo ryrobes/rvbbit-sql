@@ -2,7 +2,7 @@
 //!
 //! One operator invocation = one UnitOfWork = one receipt row.
 //! Internally the unit may execute N steps of different kinds (llm, code,
-//! specialist). The receipt's `sub_calls` jsonb captures the per-step
+//! python, specialist). The receipt's `sub_calls` jsonb captures the per-step
 //! audit (tokens, latency, errors). Roll-up totals are in the receipt's
 //! top-level columns.
 //!
@@ -254,6 +254,7 @@ fn run_multi_step(op: &OpDef, steps: &[Value], scope: &mut Scope) -> WorkResult 
         let (sub, step_output, output_text) = match kind {
             "llm" => run_step_llm(op, step, &step_name, scope),
             "code" => run_step_code(step, &step_name, scope),
+            "python" => run_step_python(step, &step_name, scope),
             "specialist" => run_step_specialist(step, &step_name, scope),
             "sql" => run_step_sql(step, &step_name, scope),
             "mcp" => run_step_mcp(step, &step_name, scope),
@@ -449,6 +450,82 @@ fn run_step_code(step: &Value, step_name: &str, scope: &Scope) -> (SubCall, Valu
             String::new(),
         ),
     }
+}
+
+/// Run a Python sidecar step. The step config looks like:
+///   {"name":"score","kind":"python","handler":"sla_score","env":"analytics",
+///    "inputs":{"text":"{{ inputs.body }}"}, "timeout_ms":1000}
+fn run_step_python(step: &Value, step_name: &str, scope: &Scope) -> (SubCall, Value, String) {
+    let handler_name = step
+        .get("handler")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if handler_name.is_empty() {
+        return python_error(step_name, "?", "step missing 'handler' field");
+    }
+    let expected_env = step
+        .get("env")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let inputs_raw = step
+        .get("inputs")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+    let rendered = render_value_templates(&inputs_raw, scope);
+    let timeout_override = step
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0);
+
+    let spec = match crate::python_runtime::load_spec(&handler_name, expected_env) {
+        Ok(s) => s,
+        Err(e) => return python_error(step_name, &handler_name, &e),
+    };
+    let label = crate::python_runtime::label(&spec);
+    match crate::python_runtime::run(&spec, &rendered, timeout_override) {
+        Ok(run) => {
+            let text = match &run.output {
+                Value::String(s) => s.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            (
+                SubCall {
+                    step: step_name.into(),
+                    kind: "python".into(),
+                    model: Some(label),
+                    backend: Some(spec.env_name.clone()),
+                    transport: Some("python_sidecar".into()),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    latency_ms: run.duration_ms,
+                    error: None,
+                    ..Default::default()
+                },
+                serde_json::json!({"output": run.output}),
+                text,
+            )
+        }
+        Err(e) => python_error(step_name, &handler_name, &e),
+    }
+}
+
+fn python_error(step_name: &str, handler_name: &str, err: &str) -> (SubCall, Value, String) {
+    (
+        SubCall {
+            step: step_name.into(),
+            kind: "python".into(),
+            model: Some(handler_name.into()),
+            tokens_in: 0,
+            tokens_out: 0,
+            latency_ms: 0,
+            error: Some(err.into()),
+            ..Default::default()
+        },
+        Value::Null,
+        String::new(),
+    )
 }
 
 /// Run a specialist step. The step config looks like:

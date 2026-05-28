@@ -1,7 +1,7 @@
 """Heterogeneous takes (Loop 21) — a take can be any node.
 
 The takes config gains a `nodes` array: each entry is a node spec (the
-same shape as a `steps` node — llm / specialist / code). The ensemble runs
+same shape as a `steps` node — llm / specialist / python / code). The ensemble runs
 every node and reduces to one answer, so an operator can vote or evaluate
 across *different engine types*, not just N runs of one model.
 

@@ -393,11 +393,13 @@ fn agg_run_inner(op_name: &str, state: Option<JsonB>, expected_return: &str) -> 
     // the full collection (so re-running the same group hits cache).
     use blake3::Hasher;
     let model_override = "";
+    let runtime_seed = crate::python_runtime::dependency_seed(op.steps.as_ref(), op.takes.as_ref());
     let prompt_seed = format!(
-        "{}\0{}\0{}",
+        "{}\0{}\0{}\0{}",
         op.system_prompt,
         op.user_prompt,
-        serde_json::to_string(&op.steps).unwrap_or_default()
+        serde_json::to_string(&op.steps).unwrap_or_default(),
+        runtime_seed
     );
     let mut h = Hasher::new();
     h.update(op.name.as_bytes());
@@ -496,11 +498,13 @@ fn invoke_with_cache(
     // on rvbbit.operators, you'd want the cache to invalidate; we add a
     // prompt-hash component below to do that cheaply.
     let model_override = opts.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let runtime_seed = crate::python_runtime::dependency_seed(op.steps.as_ref(), op.takes.as_ref());
     let prompt_seed = format!(
-        "{}\0{}\0{}",
+        "{}\0{}\0{}\0{}",
         op.system_prompt,
         op.user_prompt,
-        serde_json::to_string(&op.steps).unwrap_or_default()
+        serde_json::to_string(&op.steps).unwrap_or_default(),
+        runtime_seed
     );
     let hash = input_hash(&op.name, &op.model, model_override, inputs, &prompt_seed);
 
@@ -535,6 +539,9 @@ fn invoke_with_cache(
     // threads running specialist nodes (takes) find the spec cached — a
     // worker thread cannot do the SPI spec load itself.
     crate::specialists::warm_operator_specs(op.steps.as_ref(), op.takes.as_ref());
+    // Same for Python handler/env specs; workers can call the sidecar, but
+    // they cannot look up handler code or package lists through SPI.
+    crate::python_runtime::warm_operator_specs(op.steps.as_ref(), op.takes.as_ref());
 
     let result: WorkResult = crate::takes::execute_attempt(op, inputs, opts, None);
     // Validators + retry: if the operator carries a retry plan and the

@@ -171,7 +171,7 @@ enum EndpointKind {
 impl EndpointKind {
     fn from_subcall_kind(k: &str) -> EndpointKind {
         match k {
-            "specialist" => EndpointKind::Sidecar,
+            "specialist" | "python" => EndpointKind::Sidecar,
             "code" => EndpointKind::Code,
             _ => EndpointKind::Llm,
         }

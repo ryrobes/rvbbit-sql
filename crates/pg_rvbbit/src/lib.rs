@@ -39,6 +39,7 @@ mod prewarm;
 mod probe;
 mod provider_catalog;
 mod providers;
+mod python_runtime;
 mod rewriter;
 #[cfg(not(test))]
 mod route_log;

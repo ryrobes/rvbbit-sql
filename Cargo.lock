@@ -5143,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "pg_rvbbit"
-version = "0.59.0"
+version = "0.60.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6171,7 +6171,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rvbbit_storage"
-version = "0.59.0"
+version = "0.60.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7482,7 +7482,7 @@ dependencies = [
 
 [[package]]
 name = "warren-agent"
-version = "0.59.0"
+version = "0.60.0"
 dependencies = [
  "anyhow",
  "postgres",
