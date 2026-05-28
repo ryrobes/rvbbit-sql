@@ -1,10 +1,13 @@
 """Per-system query runners for TPC-DS."""
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import statistics
 import sys
 import time
+from decimal import Decimal
 
 import clickhouse_connect
 import duckdb
@@ -46,7 +49,7 @@ def _median_ms(times: list[float]) -> float:
     return statistics.median(times) * 1000.0
 
 
-_LAST_RUN_DETAIL: dict[str, float] = {}
+_LAST_RUN_DETAIL: dict[str, object] = {}
 ROUTE_GUCS = {
     "RVBBIT_ROUTE_DUCK_VECTOR": "rvbbit.route_duck_vector",
     "RVBBIT_ROUTE_DUCK_HIVE": "rvbbit.route_duck_hive",
@@ -69,13 +72,26 @@ def clear_run_detail() -> None:
     clear_rvbbit_duck_hot_detail()
 
 
-def last_run_detail() -> dict[str, float]:
+def last_run_detail() -> dict[str, object]:
     detail = dict(_LAST_RUN_DETAIL)
     detail.update(rvbbit_duck_hot_detail())
     return detail
 
 
-def _record_times(times: list[float]) -> None:
+def _json_default(value):
+    if isinstance(value, Decimal):
+        return str(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _result_digest(rows) -> str:
+    payload = json.dumps(rows, default=_json_default, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _record_times(times: list[float], rows=None, route_doc=None) -> None:
     _LAST_RUN_DETAIL.clear()
     if not times:
         return
@@ -83,6 +99,11 @@ def _record_times(times: list[float]) -> None:
     _LAST_RUN_DETAIL["median_ms"] = _median_ms(times)
     if len(times) > 1:
         _LAST_RUN_DETAIL["warm_median_ms"] = _median_ms(times[1:])
+    if rows is not None:
+        _LAST_RUN_DETAIL["row_count"] = len(rows)
+        _LAST_RUN_DETAIL["result_digest"] = _result_digest(rows)
+    if route_doc is not None:
+        _LAST_RUN_DETAIL["route"] = route_doc
 
 
 def _apply_route_gucs(cur) -> None:
@@ -94,29 +115,58 @@ def _apply_route_gucs(cur) -> None:
         cur.execute(f"SET {guc_name} = '{safe_value}'".encode())  # type: ignore[arg-type]
 
 
-def run_pg(dsn: str, sql: str, repeat: int = 3, timeout_s: int = 300) -> float:
+def _route_explain(cur, sql: str):
+    try:
+        cur.execute("SELECT rvbbit.route_explain(%s)::text", (sql,))
+        value = cur.fetchone()
+        if value and value[0]:
+            return json.loads(value[0])
+    except Exception as e:
+        try:
+            cur.connection.rollback()
+        except Exception:
+            pass
+        return {"error": str(e).splitlines()[0][:240]}
+    return None
+
+
+def run_pg(
+    dsn: str,
+    sql: str,
+    repeat: int = 3,
+    timeout_s: int = 300,
+    capture_route: bool = False,
+) -> float:
     times: list[float] = []
+    last_rows = None
+    route_doc = None
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(f"SET statement_timeout = {timeout_s * 1000}".encode())  # type: ignore[arg-type]
             _apply_route_gucs(cur)
+            if capture_route:
+                route_doc = _route_explain(cur, sql)
+                if isinstance(route_doc, dict) and route_doc.get("error"):
+                    cur.execute(f"SET statement_timeout = {timeout_s * 1000}".encode())  # type: ignore[arg-type]
+                    _apply_route_gucs(cur)
             for _ in range(repeat):
                 t0 = time.perf_counter()
                 cur.execute(sql.encode())  # type: ignore[arg-type]
-                cur.fetchall()
+                last_rows = cur.fetchall()
                 times.append(time.perf_counter() - t0)
-    _record_times(times)
+    _record_times(times, last_rows, route_doc)
     return _median_ms(times)
 
 
 def run_clickhouse(sql: str, repeat: int = 3) -> float:
     client = clickhouse_connect.get_client(host=CH_HOST, port=CH_PORT)
     times: list[float] = []
+    last_rows = None
     for _ in range(repeat):
         t0 = time.perf_counter()
-        client.query(sql).result_rows
+        last_rows = client.query(sql).result_rows
         times.append(time.perf_counter() - t0)
-    _record_times(times)
+    _record_times(times, last_rows)
     return _median_ms(times)
 
 
@@ -124,11 +174,11 @@ def run_duckdb(sql: str, repeat: int = 3) -> float:
     scale = os.environ.get("TPCDS_SCALE", "0.1")
     con = duckdb.connect(duckdb_path_for_scale(scale), read_only=True)
     times: list[float] = []
+    last_rows = None
     for _ in range(repeat):
         t0 = time.perf_counter()
-        con.execute(sql).fetchall()
+        last_rows = con.execute(sql).fetchall()
         times.append(time.perf_counter() - t0)
     con.close()
-    _record_times(times)
+    _record_times(times, last_rows)
     return _median_ms(times)
-

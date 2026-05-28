@@ -7,6 +7,7 @@ falls back to normal Rvbbit/Postgres execution.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import re
@@ -233,6 +234,13 @@ def _record_rust_detail(payload: dict, request_wall_ms: float, engine: str, layo
     elapsed = payload.get("elapsed_ms")
     if isinstance(elapsed, (int, float)):
         _LAST_RUST_DETAIL["engine_elapsed_ms"] = float(elapsed)
+    row_count = payload.get("row_count")
+    if isinstance(row_count, int):
+        _LAST_RUST_DETAIL["row_count"] = row_count
+    rows = payload.get("rows")
+    if isinstance(rows, list) and (rows or row_count == 0):
+        payload_json = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+        _LAST_RUST_DETAIL["result_digest"] = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
     _LAST_RUST_DETAIL["request_wall_ms"] = request_wall_ms
     if isinstance(elapsed, (int, float)):
         _LAST_RUST_DETAIL["sidecar_overhead_ms"] = max(0.0, request_wall_ms - float(elapsed))

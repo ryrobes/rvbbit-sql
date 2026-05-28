@@ -881,7 +881,7 @@ fn route_features(query: &str) -> JsonB {
     } else {
         None
     };
-    let tables = referenced_rvbbit_tables(query);
+    let tables = referenced_rvbbit_tables(query, plan.as_deref());
     let features = build_features(query, plan.as_deref(), &tables);
     JsonB(features.to_json())
 }
@@ -908,7 +908,7 @@ fn route_record_observation(
     }
 
     let plan = explain_sql(query).ok();
-    let tables = referenced_rvbbit_tables(query);
+    let tables = referenced_rvbbit_tables(query, plan.as_deref());
     let features = build_features(query, plan.as_deref(), &tables);
     let features_json = features.to_json();
     let features_lit = sql_json_lit(&features_json);
@@ -1006,7 +1006,7 @@ fn route_train_query(
     }
     let repeats = repeats.max(1).min(100);
     let plan = explain_sql(query).ok();
-    let tables = referenced_rvbbit_tables(query);
+    let tables = referenced_rvbbit_tables(query, plan.as_deref());
     if tables.is_empty() {
         pgrx::error!("rvbbit.route_train_query: query does not reference an rvbbit table");
     }
@@ -1547,7 +1547,7 @@ pub(crate) fn route_explain_value(query: &str, include_plan: bool) -> Value {
         );
     }
 
-    let tables = referenced_rvbbit_tables(query);
+    let tables = referenced_rvbbit_tables(query, plan.as_deref());
     out.insert(
         "rvbbit_tables".into(),
         Value::Array(tables.iter().map(table_metric_json).collect()),
@@ -1598,7 +1598,7 @@ fn route_rewrite_value_fast(query: &str) -> Option<Value> {
     if safe_select(query).is_err() {
         return None;
     }
-    let tables = referenced_rvbbit_tables(query);
+    let tables = referenced_rvbbit_tables(query, None);
     if tables.is_empty() {
         return None;
     }
@@ -1910,6 +1910,8 @@ fn choose_route(
         if let Some(candidate) = first_available_candidate(candidates, features, tables) {
             let reason = if matches!(candidate, Candidate::DataFusionHive | Candidate::DuckHive) {
                 "route profile miss; variant-friendly analytical shape uses a parquet variant path"
+            } else if candidate == Candidate::DuckVector {
+                "route profile miss; complex analytical shape uses DuckDB vector execution"
             } else {
                 "route profile miss; analytical parquet shape uses vector execution"
             };
@@ -3371,11 +3373,12 @@ pub(crate) fn route_runtime_stamp() -> String {
     .unwrap_or_else(|| "route-runtime-stamp-unavailable".to_string())
 }
 
-fn referenced_rvbbit_tables(sql: &str) -> Vec<RvbbitTableMetric> {
+fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTableMetric> {
     if !relations_present(&["rvbbit.row_groups", "rvbbit.delete_log"]) {
         return Vec::new();
     }
     let stringless = sql_stringless(sql).to_lowercase();
+    let plan_lower = plan_text.map(str::to_lowercase);
     let mut out = Vec::new();
     let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let table = client.select(
@@ -3407,9 +3410,11 @@ fn referenced_rvbbit_tables(sql: &str) -> Vec<RvbbitTableMetric> {
         for row in table {
             let schema: String = row.get(1)?.unwrap_or_default();
             let relname: String = row.get(2)?.unwrap_or_default();
-            if !contains_identifier(&stringless, &relname)
-                && !stringless.contains(&format!("{}.{}", schema, relname))
-            {
+            let referenced = plan_lower
+                .as_deref()
+                .map(|plan| plan_mentions_relation(plan, &schema, &relname))
+                .unwrap_or_else(|| sql_mentions_relation(&stringless, &schema, &relname));
+            if !referenced {
                 continue;
             }
             let oid_i64: i64 = row.get(3)?.unwrap_or_default();
@@ -3903,24 +3908,30 @@ fn hive_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> 
             "hive parquet variants catalog is not available".to_string(),
         );
     }
-    let missing = tables
+    let variant_count = tables
         .iter()
-        .filter(|table| !table_has_hive_variant(table.oid))
-        .map(|table| format!("{}.{}", table.schema, table.relname))
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
+        .filter(|table| table_has_hive_variant(table.oid))
+        .count();
+    if variant_count == 0 {
         return (
             false,
-            format!(
-                "hive parquet variants are missing for {}",
-                missing.join(", ")
-            ),
+            "no referenced table has a hive parquet variant".to_string(),
         );
     }
-    (
-        true,
-        "Hive-partitioned parquet variant available and authoritative".to_string(),
-    )
+    let canonical_count = tables.len().saturating_sub(variant_count);
+    if canonical_count > 0 {
+        (
+            true,
+            format!(
+                "Hive-partitioned parquet variant available for {variant_count} table(s); canonical parquet used for {canonical_count} table(s)"
+            ),
+        )
+    } else {
+        (
+            true,
+            "Hive-partitioned parquet variants available and authoritative".to_string(),
+        )
+    }
 }
 
 fn table_has_hive_variant(table_oid: u32) -> bool {
@@ -4108,6 +4119,13 @@ const FALLBACK_VARIANT_FIRST: [Candidate; 4] = [
     Candidate::DataFusionVector,
     Candidate::DuckHive,
     Candidate::DuckVector,
+];
+
+const FALLBACK_DUCK_FIRST: [Candidate; 4] = [
+    Candidate::DuckVector,
+    Candidate::DuckHive,
+    Candidate::DataFusionVector,
+    Candidate::DataFusionHive,
 ];
 
 fn default_external_candidate(
@@ -4359,7 +4377,9 @@ fn fallback_prefers_variant(features: &RouteFeatures) -> bool {
 }
 
 fn fallback_external_candidate_order(features: &RouteFeatures) -> Option<&'static [Candidate]> {
-    if fallback_prefers_variant(features) {
+    if fallback_prefers_duck_vector(features) {
+        Some(&FALLBACK_DUCK_FIRST)
+    } else if fallback_prefers_variant(features) {
         Some(&FALLBACK_VARIANT_FIRST)
     } else if fallback_prefers_external_analytical_shape(features)
         || no_profile_prefers_datafusion(features)
@@ -4368,6 +4388,31 @@ fn fallback_external_candidate_order(features: &RouteFeatures) -> Option<&'stati
     } else {
         None
     }
+}
+
+fn fallback_prefers_duck_vector(features: &RouteFeatures) -> bool {
+    if features.table_rows < 1_000_000 || simple_metadata_aggregate_should_stay_native(features) {
+        return false;
+    }
+    if features.normalized_sql.contains("full outer join")
+        || features.normalized_sql.contains(" over (")
+    {
+        return true;
+    }
+    if features.join_count >= 4 {
+        return true;
+    }
+    if features.from_count >= 5 && features.aggregate_count >= 3 {
+        return true;
+    }
+    if features.starts_with_with
+        && features.plan_has_subplan
+        && features.from_count >= 4
+        && features.aggregate_count >= 2
+    {
+        return true;
+    }
+    false
 }
 
 fn hot_store_prefers_mem(features: &RouteFeatures) -> bool {
@@ -4440,6 +4485,11 @@ fn choose_no_profile_route(
                 (
                     "no-profile-variant",
                     "no active route profile; variant-friendly analytical shape uses a parquet variant path",
+                )
+            } else if candidate == Candidate::DuckVector {
+                (
+                    "no-profile-duck",
+                    "no active route profile; complex analytical shape uses DuckDB vector execution",
                 )
             } else {
                 (
@@ -5416,6 +5466,109 @@ fn contains_identifier(haystack: &str, ident: &str) -> bool {
     false
 }
 
+fn plan_mentions_relation(plan: &str, schema: &str, relname: &str) -> bool {
+    let qualified = format!("{schema}.{relname}");
+    plan.lines().any(|line| {
+        let line = line.trim();
+        if line.contains("cte scan on ")
+            || line.contains("subquery scan on ")
+            || line.contains("function scan on ")
+            || line.contains("values scan on ")
+        {
+            return false;
+        }
+        line.contains(&format!(" on {relname} "))
+            || line.ends_with(&format!(" on {relname}"))
+            || line.contains(&format!(" on {qualified} "))
+            || line.ends_with(&format!(" on {qualified}"))
+            || line.contains(&format!(" on \"{relname}\" "))
+            || line.ends_with(&format!(" on \"{relname}\""))
+            || line.contains(&format!(" on \"{schema}\".\"{relname}\" "))
+            || line.ends_with(&format!(" on \"{schema}\".\"{relname}\""))
+    })
+}
+
+fn sql_mentions_relation(sql: &str, schema: &str, relname: &str) -> bool {
+    let tokens = sql_relation_tokens(sql);
+    let mut in_from_clause = false;
+    let mut expect_table = false;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let token = tokens[i].as_str();
+        if matches!(
+            token,
+            "where"
+                | "group"
+                | "order"
+                | "having"
+                | "limit"
+                | "offset"
+                | "union"
+                | "except"
+                | "intersect"
+                | "on"
+        ) {
+            in_from_clause = false;
+            expect_table = false;
+        }
+        if token == "from" || token == "join" {
+            in_from_clause = true;
+            expect_table = true;
+            i += 1;
+            continue;
+        }
+        if token == "," && in_from_clause {
+            expect_table = true;
+            i += 1;
+            continue;
+        }
+        if expect_table {
+            if matches!(token, "lateral" | "only") {
+                i += 1;
+                continue;
+            }
+            if token == "(" {
+                expect_table = false;
+                i += 1;
+                continue;
+            }
+            if token == schema
+                && tokens.get(i + 1).is_some_and(|t| t == ".")
+                && tokens.get(i + 2).is_some_and(|t| t == relname)
+            {
+                return true;
+            }
+            if token == relname {
+                return true;
+            }
+            expect_table = false;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn sql_relation_tokens(sql: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in sql.chars() {
+        if is_ident_char(ch) {
+            current.push(ch.to_ascii_lowercase());
+            continue;
+        }
+        if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+        if matches!(ch, '.' | ',' | '(' | ')') {
+            tokens.push(ch.to_string());
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 fn has_word(s: &str, word: &str) -> bool {
     contains_identifier(s, word)
 }
@@ -5833,6 +5986,39 @@ mod route_unit_tests {
         assert_eq!(
             fallback_external_candidate_order(&features).map(|order| order[0]),
             Some(Candidate::DataFusionVector)
+        );
+    }
+
+    #[test]
+    fn route_table_parser_does_not_treat_alias_as_table() {
+        let sql = "WITH store_v AS (SELECT 1) \
+                   SELECT * FROM store_v store \
+                   JOIN store_sales ss ON ss.id = store.id";
+
+        assert!(!sql_mentions_relation(sql, "public", "store"));
+        assert!(sql_mentions_relation(sql, "public", "store_sales"));
+        assert!(sql_mentions_relation(
+            "SELECT * FROM public.hits h WHERE h.id = 1",
+            "public",
+            "hits"
+        ));
+    }
+
+    #[test]
+    fn route_no_profile_prefers_duck_for_complex_large_join_shapes() {
+        let features = test_features(
+            "SELECT COUNT(*) FROM hits h1 \
+             JOIN hits h2 ON h1.id = h2.id \
+             JOIN hits h3 ON h1.id = h3.id \
+             JOIN hits h4 ON h1.id = h4.id \
+             JOIN hits h5 ON h1.id = h5.id",
+            2_000_000,
+        );
+
+        assert!(fallback_prefers_duck_vector(&features));
+        assert_eq!(
+            fallback_external_candidate_order(&features).map(|order| order[0]),
+            Some(Candidate::DuckVector)
         );
     }
 }

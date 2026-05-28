@@ -1176,18 +1176,90 @@ fn catalog_fingerprint_sql_for_layout(layout: &str) -> Result<String> {
 }
 
 fn variant_catalog_fingerprint_sql(layout_predicate: &str) -> String {
-    catalog_fingerprint_sql(
-        "cl.layout",
-        "cl.layout",
-        "rvbbit.row_group_variants rg",
-        &format!(
-            "JOIN (
-                SELECT table_oid, min(layout) AS layout
-                FROM rvbbit.row_group_variants
-                WHERE {layout_predicate}
-                GROUP BY table_oid
-             ) cl ON cl.table_oid = rg.table_oid AND cl.layout = rg.layout"
+    format!(
+        "
+        WITH chosen_layout AS (
+            SELECT table_oid, min(layout) AS layout
+            FROM rvbbit.row_group_variants
+            WHERE {layout_predicate}
+            GROUP BY table_oid
         ),
+        table_state AS (
+            SELECT n.nspname,
+                   c.relname,
+                   c.oid::bigint AS oid,
+                   cl.layout AS layout,
+                   count(rg.*)::bigint AS row_groups,
+                   coalesce(sum(rg.n_rows), 0)::bigint AS row_group_rows,
+                   coalesce(sum(rg.n_bytes), 0)::bigint AS row_group_bytes,
+                   coalesce(max(rg.rg_id), -1)::bigint AS max_rg_id,
+                   coalesce((extract(epoch FROM max(rg.created_at)) * 1000000)::bigint, 0)::bigint AS max_created_us,
+                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
+                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) AS deletes,
+                   coalesce(md5(string_agg(rg.path || ':' || rg.n_rows || ':' || rg.n_bytes || ':' ||
+                           coalesce((extract(epoch FROM rg.created_at) * 1000000)::bigint, 0), ',' ORDER BY rg.rg_id)), '') AS path_sig,
+                   coalesce((
+                       SELECT md5(string_agg(a.attname::text || ':' || a.atttypid::regtype::text, ',' ORDER BY a.attnum))
+                       FROM pg_attribute a
+                       WHERE a.attrelid = c.oid
+                         AND a.attnum > 0
+                         AND NOT a.attisdropped
+                   ), '') AS column_sig
+            FROM rvbbit.row_group_variants rg
+            JOIN chosen_layout cl ON cl.table_oid = rg.table_oid AND cl.layout = rg.layout
+            JOIN pg_class c ON c.oid = rg.table_oid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_am am ON am.oid = c.relam
+            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
+            WHERE am.amname = 'rvbbit'
+            GROUP BY n.nspname, c.relname, c.oid, cl.layout, t.shadow_heap_retained, t.shadow_heap_dirty
+            UNION ALL
+            SELECT n.nspname,
+                   c.relname,
+                   c.oid::bigint AS oid,
+                   NULL::text AS layout,
+                   count(rg.*)::bigint AS row_groups,
+                   coalesce(sum(rg.n_rows), 0)::bigint AS row_group_rows,
+                   coalesce(sum(rg.n_bytes), 0)::bigint AS row_group_bytes,
+                   coalesce(max(rg.rg_id), -1)::bigint AS max_rg_id,
+                   coalesce((extract(epoch FROM max(rg.created_at)) * 1000000)::bigint, 0)::bigint AS max_created_us,
+                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
+                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) AS deletes,
+                   coalesce(md5(string_agg(rg.path || ':' || rg.n_rows || ':' || rg.n_bytes || ':' ||
+                           coalesce((extract(epoch FROM rg.created_at) * 1000000)::bigint, 0), ',' ORDER BY rg.rg_id)), '') AS path_sig,
+                   coalesce((
+                       SELECT md5(string_agg(a.attname::text || ':' || a.atttypid::regtype::text, ',' ORDER BY a.attnum))
+                       FROM pg_attribute a
+                       WHERE a.attrelid = c.oid
+                         AND a.attnum > 0
+                         AND NOT a.attisdropped
+                   ), '') AS column_sig
+            FROM rvbbit.row_groups rg
+            JOIN pg_class c ON c.oid = rg.table_oid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_am am ON am.oid = c.relam
+            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
+            WHERE am.amname = 'rvbbit'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM chosen_layout cl
+                  WHERE cl.table_oid = rg.table_oid
+              )
+            GROUP BY n.nspname, c.relname, c.oid, t.shadow_heap_retained, t.shadow_heap_dirty
+        )
+        SELECT coalesce(string_agg(
+            nspname || '.' || relname || ':' || oid || ':' || coalesce(layout, 'scan') || ':' ||
+            row_groups || ':' || row_group_rows || ':' || row_group_bytes || ':' || max_rg_id || ':' ||
+            max_created_us || ':' || heap_bytes || ':' || shadow_heap_retained || ':' ||
+            shadow_heap_dirty || ':' || deletes || ':' || path_sig || ':' || column_sig,
+            E'\\n' ORDER BY nspname, relname, coalesce(layout, 'scan')
+        ), 'empty') AS fingerprint
+        FROM table_state
+        "
     )
 }
 
@@ -1387,25 +1459,54 @@ fn variant_catalog_sql(layout_predicate: &str) -> String {
             FROM rvbbit.row_group_variants
             WHERE {layout_predicate}
             GROUP BY table_oid
+        ),
+        variant_rows AS (
+            SELECT n.nspname,
+                   c.relname,
+                   cl.layout,
+                   array_agg(rg.path ORDER BY rg.rg_id) AS paths,
+                   sum(rg.n_rows)::bigint AS row_group_rows,
+                   sum(rg.n_bytes)::bigint AS row_group_bytes,
+                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
+                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
+            FROM rvbbit.row_group_variants rg
+            JOIN chosen_layout cl ON cl.table_oid = rg.table_oid AND cl.layout = rg.layout
+            JOIN pg_class c ON c.oid = rg.table_oid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_am am ON am.oid = c.relam
+            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
+            WHERE am.amname = 'rvbbit'
+            GROUP BY n.nspname, c.oid, c.relname, cl.layout, t.shadow_heap_retained, t.shadow_heap_dirty
+        ),
+        canonical_rows AS (
+            SELECT n.nspname,
+                   c.relname,
+                   NULL::text AS layout,
+                   array_agg(rg.path ORDER BY rg.rg_id) AS paths,
+                   sum(rg.n_rows)::bigint AS row_group_rows,
+                   sum(rg.n_bytes)::bigint AS row_group_bytes,
+                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
+                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
+            FROM rvbbit.row_groups rg
+            JOIN pg_class c ON c.oid = rg.table_oid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_am am ON am.oid = c.relam
+            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
+            WHERE am.amname = 'rvbbit'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM chosen_layout cl
+                  WHERE cl.table_oid = rg.table_oid
+              )
+            GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
         )
-        SELECT n.nspname,
-               c.relname,
-               cl.layout,
-               array_agg(rg.path ORDER BY rg.rg_id) AS paths,
-               sum(rg.n_rows)::bigint AS row_group_rows,
-               sum(rg.n_bytes)::bigint AS row_group_bytes,
-               pg_relation_size(c.oid)::bigint AS heap_bytes,
-               coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-               coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
-               (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
-        FROM rvbbit.row_group_variants rg
-        JOIN chosen_layout cl ON cl.table_oid = rg.table_oid AND cl.layout = rg.layout
-        JOIN pg_class c ON c.oid = rg.table_oid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_am am ON am.oid = c.relam
-        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-        WHERE am.amname = 'rvbbit'
-        GROUP BY n.nspname, c.oid, c.relname, cl.layout, t.shadow_heap_retained, t.shadow_heap_dirty
+        SELECT * FROM variant_rows
+        UNION ALL
+        SELECT * FROM canonical_rows
         "
     )
 }

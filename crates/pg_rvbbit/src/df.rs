@@ -360,6 +360,13 @@ struct RvbbitTable {
     schema: String,
     relname: String,
     paths: Vec<String>,
+    columns: Vec<RvbbitColumn>,
+}
+
+#[derive(Clone, Debug)]
+struct RvbbitColumn {
+    name: String,
+    typname: String,
 }
 
 impl RvbbitTable {
@@ -401,6 +408,7 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
         schema: String,
         relname: String,
         paths: Vec<String>,
+        columns: Vec<RvbbitColumn>,
         heap_bytes: i64,
         shadow_retained: bool,
         shadow_dirty: bool,
@@ -427,6 +435,15 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
                array_agg(coalesce(rg.cold_url,
                                   'file://' || rg.path)
                          ORDER BY rg.rg_id)::text[]                       AS paths,
+               coalesce((
+                   SELECT array_agg(a.attname::text || E'\t' ||
+                                    a.atttypid::regtype::text
+                                    ORDER BY a.attnum)::text[]
+                   FROM pg_attribute a
+                   WHERE a.attrelid = c.oid
+                     AND a.attnum > 0
+                     AND NOT a.attisdropped
+               ), ARRAY[]::text[])                                         AS columns,
                pg_relation_size(c.oid)::bigint                            AS heap_bytes,
                coalesce(t.shadow_heap_retained, false)                    AS shadow_heap_retained,
                coalesce(t.shadow_heap_dirty, false)                       AS shadow_heap_dirty,
@@ -455,14 +472,28 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
                 .into_iter()
                 .flatten()
                 .collect();
-            let heap_bytes: i64 = row.get::<i64>(4)?.unwrap_or(0);
-            let shadow_retained: bool = row.get::<bool>(5)?.unwrap_or(false);
-            let shadow_dirty: bool = row.get::<bool>(6)?.unwrap_or(false);
-            let deletes: i64 = row.get::<i64>(7)?.unwrap_or(0);
+            let columns: Vec<RvbbitColumn> = row
+                .get::<Vec<Option<String>>>(4)?
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let (name, typname) = entry.split_once('\t')?;
+                    Some(RvbbitColumn {
+                        name: name.to_string(),
+                        typname: typname.to_string(),
+                    })
+                })
+                .collect();
+            let heap_bytes: i64 = row.get::<i64>(5)?.unwrap_or(0);
+            let shadow_retained: bool = row.get::<bool>(6)?.unwrap_or(false);
+            let shadow_dirty: bool = row.get::<bool>(7)?.unwrap_or(false);
+            let deletes: i64 = row.get::<i64>(8)?.unwrap_or(0);
             rows.push(Row {
                 schema,
                 relname,
                 paths,
+                columns,
                 heap_bytes,
                 shadow_retained,
                 shadow_dirty,
@@ -514,6 +545,7 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
                 schema: r.schema,
                 relname: r.relname,
                 paths: r.paths,
+                columns: r.columns,
             },
         );
     }
@@ -535,6 +567,11 @@ fn table_signature(t: &RvbbitTable, asof: Option<&AsOf>) -> u64 {
     let mut h = DefaultHasher::new();
     asof.hash(&mut h);
     t.paths.len().hash(&mut h);
+    t.columns.len().hash(&mut h);
+    for c in &t.columns {
+        c.name.hash(&mut h);
+        c.typname.hash(&mut h);
+    }
     for p in &t.paths {
         p.hash(&mut h);
         if let Ok(meta) = std::fs::metadata(p) {
@@ -555,6 +592,11 @@ async fn register_listing_table(
     t: &RvbbitTable,
 ) -> Result<(), String> {
     let _ = ctx.deregister_table(qualified);
+    let raw_name = raw_table_name(t);
+    let date_projection = t.columns.iter().any(|c| c.typname == "date");
+    if date_projection {
+        let _ = ctx.deregister_table(&raw_name);
+    }
 
     // ListingTable with the explicit list of parquet files. We avoid
     // directory globbing because the directory may contain transient
@@ -582,9 +624,63 @@ async fn register_listing_table(
         .with_schema(schema);
     let table = ListingTable::try_new(config)
         .map_err(|e| format!("ListingTable::try_new({}): {e}", t.qualified()))?;
-    ctx.register_table(qualified, Arc::new(table))
-        .map_err(|e| format!("register_table({qualified}): {e}"))?;
+    let target_name = if date_projection {
+        raw_name.as_str()
+    } else {
+        qualified
+    };
+    ctx.register_table(target_name, Arc::new(table))
+        .map_err(|e| format!("register_table({target_name}): {e}"))?;
+    if date_projection {
+        let select_list = t
+            .columns
+            .iter()
+            .map(datafusion_select_expr)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let view_sql = format!("SELECT {select_list} FROM {}", quote_df_ident(&raw_name));
+        let view_df = ctx
+            .sql(&view_sql)
+            .await
+            .map_err(|e| format!("planning date-aware view for {}: {e}", t.qualified()))?;
+        ctx.register_table(qualified, view_df.into_view())
+            .map_err(|e| format!("register date-aware table {qualified}: {e}"))?;
+    }
     Ok(())
+}
+
+fn raw_table_name(t: &RvbbitTable) -> String {
+    format!(
+        "__rvbbit_raw_{}_{}",
+        sanitize_datafusion_ident(&t.schema),
+        sanitize_datafusion_ident(&t.relname)
+    )
+}
+
+fn sanitize_datafusion_ident(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn quote_df_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+fn datafusion_select_expr(column: &RvbbitColumn) -> String {
+    let ident = quote_df_ident(&column.name);
+    if column.typname == "date" {
+        format!("CAST({ident} AS DATE) AS {ident}")
+    } else {
+        ident
+    }
 }
 
 /// Register each eligible table with the per-backend SessionContext as a

@@ -45,6 +45,27 @@ REPORT_COLD_WARM = os.environ.get("BENCH_REPORT_COLD_WARM", "").strip().lower() 
     "yes",
     "on",
 }
+VALIDATE_RESULTS = os.environ.get("BENCH_VALIDATE_RESULTS", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+VALIDATE_DIGESTS = os.environ.get("BENCH_VALIDATE_DIGESTS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+REFERENCE_SYSTEMS = [
+    "pg_baseline",
+    "alloydb",
+    "citus",
+    "hydra",
+    "duckdb",
+    "clickhouse",
+    "rvbbit",
+]
 
 
 def fmt_ms(ms: float) -> str:
@@ -62,7 +83,7 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
         if system == "clickhouse":
             return run_clickhouse(sql, REPEATS), "ok"
         if system == "rvbbit":
-            return run_pg(PG_DSNS["rvbbit"], sql, REPEATS, TIMEOUT_S), "ok"
+            return run_pg(PG_DSNS["rvbbit"], sql, REPEATS, TIMEOUT_S, capture_route=True), "ok"
         if system in {"rvbbit_native", "rvbbit_native_forced"}:
             ms = run_pg(PG_DSNS[system], sql, REPEATS, TIMEOUT_S)
             record_rvbbit_route_observation(
@@ -187,6 +208,65 @@ def _write_json(path: str, systems: list, queries: list, results: dict, details:
         )
 
 
+def _ok_result(result) -> bool:
+    if not result:
+        return False
+    ms, status = result
+    return ms is not None and status == "ok"
+
+
+def _detail_value(detail: dict, key: str):
+    if not isinstance(detail, dict):
+        return None
+    return detail.get(key)
+
+
+def _validate_query_results(qid: str, systems: list[str], results: dict, details: dict) -> list[str]:
+    if not VALIDATE_RESULTS:
+        return []
+    query_results = results.get(qid, {})
+    query_details = details.get(qid, {})
+    ref_system = None
+    ref_row_count = None
+    ref_digest = None
+    for candidate in REFERENCE_SYSTEMS:
+        if candidate not in systems or not _ok_result(query_results.get(candidate)):
+            continue
+        detail = query_details.get(candidate, {})
+        row_count = _detail_value(detail, "row_count")
+        if row_count is None:
+            continue
+        ref_system = candidate
+        ref_row_count = row_count
+        ref_digest = _detail_value(detail, "result_digest")
+        break
+    if ref_system is None:
+        return []
+
+    messages = []
+    for system in systems:
+        if system == ref_system or not _ok_result(query_results.get(system)):
+            continue
+        detail = query_details.get(system, {})
+        row_count = _detail_value(detail, "row_count")
+        if row_count is None:
+            continue
+        reason = None
+        if row_count != ref_row_count:
+            reason = (
+                f"row-count mismatch vs {ref_system}: got {row_count}, "
+                f"expected {ref_row_count}"
+            )
+        elif VALIDATE_DIGESTS and ref_digest:
+            digest = _detail_value(detail, "result_digest")
+            if digest and digest != ref_digest:
+                reason = f"result digest mismatch vs {ref_system}"
+        if reason:
+            results[qid][system] = (None, reason[:120])
+            messages.append(f"{system}: {reason}")
+    return messages
+
+
 def main() -> None:
     print(f"\n=== TPC-DS query bench ({REPEATS} runs, median, {TIMEOUT_S}s timeout) ===", flush=True)
     print(f"systems: {SYSTEMS}\n", flush=True)
@@ -212,6 +292,8 @@ def main() -> None:
                 if "warm_median_ms" in detail:
                     suffix += f" warm {fmt_ms(detail['warm_median_ms'])}"
             print(f"     {sys_:<14} {label:>14}    (wall {took:.1f}s){suffix}", flush=True)
+        for message in _validate_query_results(qid, SYSTEMS, results, details):
+            print(f"     validation {message}", flush=True)
         _write_json(out_path, SYSTEMS, queries, results, details)
         print(flush=True)
 
