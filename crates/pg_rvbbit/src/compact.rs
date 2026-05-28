@@ -367,6 +367,10 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn auto_clustering_enabled() -> bool {
     !matches!(
         std::env::var("RVBBIT_COMPACT_AUTO_CLUSTER")
@@ -907,8 +911,11 @@ fn refresh_layout_variants_impl(
                 cluster_chunk_rows,
                 std::slice::from_ref(cluster_key),
             )?;
-            rows_written += variant_chunks.iter().map(|c| c.n_rows).sum::<i64>();
-            register_variant_chunks(rel_oid, &layout, &variant_chunks)?;
+            if validate_variant_chunks(rel_oid, &layout, &variant_chunks)? {
+                rows_written += variant_chunks.iter().map(|c| c.n_rows).sum::<i64>();
+                register_variant_chunks(rel_oid, &layout, &variant_chunks)?;
+                mark_variant_status_ready(rel_oid, &layout, &variant_chunks)?;
+            }
         }
     }
 
@@ -925,8 +932,11 @@ fn refresh_layout_variants_impl(
                 cluster_chunk_rows,
                 hive_key,
             )?;
-            rows_written += variant_chunks.iter().map(|c| c.n_rows).sum::<i64>();
-            register_variant_chunks(rel_oid, &layout, &variant_chunks)?;
+            if validate_variant_chunks(rel_oid, &layout, &variant_chunks)? {
+                rows_written += variant_chunks.iter().map(|c| c.n_rows).sum::<i64>();
+                register_variant_chunks(rel_oid, &layout, &variant_chunks)?;
+                mark_variant_status_ready(rel_oid, &layout, &variant_chunks)?;
+            }
         }
     }
 
@@ -947,6 +957,10 @@ fn clear_variant_layout(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let layout_escaped = layout.replace('\'', "''");
     Spi::run(&format!(
+        "DELETE FROM rvbbit.layout_variant_status \
+         WHERE table_oid = {rel_oid}::oid AND layout = '{layout_escaped}'"
+    ))?;
+    Spi::run(&format!(
         "DELETE FROM rvbbit.row_group_variants \
          WHERE table_oid = {rel_oid}::oid AND layout = '{layout_escaped}'"
     ))?;
@@ -956,6 +970,98 @@ fn clear_variant_layout(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(Box::new(err)),
     }
+    Ok(())
+}
+
+fn canonical_row_count(rel_oid: u32) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(Spi::get_one::<i64>(&format!(
+        "SELECT coalesce(sum(n_rows), 0)::bigint \
+         FROM rvbbit.row_groups \
+         WHERE table_oid = {rel_oid}::oid"
+    ))?
+    .unwrap_or(0))
+}
+
+fn validate_variant_chunks(
+    rel_oid: u32,
+    layout: &str,
+    chunks: &[rvbbit_storage::metadata::RowGroupMeta],
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let expected_rows = canonical_row_count(rel_oid)?;
+    let actual_rows = chunks.iter().map(|c| c.n_rows).sum::<i64>();
+    let file_count = chunks.len() as i32;
+    let missing_files = chunks
+        .iter()
+        .filter(|c| !std::path::Path::new(&c.path).exists())
+        .count();
+
+    if expected_rows > 0 && actual_rows == expected_rows && file_count > 0 && missing_files == 0 {
+        return Ok(true);
+    }
+
+    let message = if expected_rows != actual_rows {
+        format!("row count mismatch: expected {expected_rows}, wrote {actual_rows}")
+    } else if file_count == 0 {
+        "no variant files were written".to_string()
+    } else {
+        format!("{missing_files} variant parquet file(s) are missing")
+    };
+    mark_variant_status(
+        rel_oid,
+        layout,
+        "invalid",
+        expected_rows,
+        actual_rows,
+        file_count,
+        Some(&message),
+    )?;
+    Ok(false)
+}
+
+fn mark_variant_status_ready(
+    rel_oid: u32,
+    layout: &str,
+    chunks: &[rvbbit_storage::metadata::RowGroupMeta],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_rows = canonical_row_count(rel_oid)?;
+    let actual_rows = chunks.iter().map(|c| c.n_rows).sum::<i64>();
+    mark_variant_status(
+        rel_oid,
+        layout,
+        "ready",
+        expected_rows,
+        actual_rows,
+        chunks.len() as i32,
+        None,
+    )
+}
+
+fn mark_variant_status(
+    rel_oid: u32,
+    layout: &str,
+    status: &str,
+    expected_rows: i64,
+    actual_rows: i64,
+    file_count: i32,
+    message: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let layout_lit = sql_literal(layout);
+    let status_lit = sql_literal(status);
+    let message_sql = message
+        .map(|m| format!("{}::text", sql_literal(m)))
+        .unwrap_or_else(|| "NULL::text".to_string());
+    Spi::run(&format!(
+        "INSERT INTO rvbbit.layout_variant_status \
+             (table_oid, layout, status, expected_rows, actual_rows, file_count, status_message) \
+         VALUES ({rel_oid}::oid, {layout_lit}, {status_lit}, {expected_rows}, {actual_rows}, {file_count}, {message_sql}) \
+         ON CONFLICT (table_oid, layout) DO UPDATE SET \
+             status = EXCLUDED.status, \
+             expected_rows = EXCLUDED.expected_rows, \
+             actual_rows = EXCLUDED.actual_rows, \
+             file_count = EXCLUDED.file_count, \
+             status_message = EXCLUDED.status_message, \
+             refreshed_at = now()"
+    ))?;
     Ok(())
 }
 

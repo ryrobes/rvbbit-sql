@@ -35,6 +35,7 @@ RUN pip install --no-cache-dir \
         requests \
         clickhouse-connect==0.8.* \
         fastapi \
+        httpx \
         uvicorn \
         joblib==1.4.2 \
         pandas==2.2.3 \

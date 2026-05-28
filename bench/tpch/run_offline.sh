@@ -168,15 +168,14 @@ tpch_hive_variants_ready() {
                 ('orders'::regclass),
                 ('lineitem'::regclass)
         )
-        SELECT NOT EXISTS (
+        SELECT EXISTS (
             SELECT 1
-            FROM expected e
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM rvbbit.row_group_variants rg
-                WHERE rg.table_oid = e.table_oid
-                  AND rg.layout LIKE 'hive:%'
-            )
+            FROM rvbbit.row_group_variants rg
+            JOIN rvbbit.layout_variant_status s
+              ON s.table_oid = rg.table_oid AND s.layout = rg.layout
+            JOIN expected e ON e.table_oid = rg.table_oid
+            WHERE rg.layout LIKE 'hive:%'
+              AND s.status = 'ready'
         );
     " | tr -d '[:space:]'
 }
@@ -188,7 +187,7 @@ ensure_tpch_hive_variants_ready() {
         return 0
     fi
     if hive_refresh_explicitly_disabled; then
-        die "forced-Hive variants are missing for one or more TPC-H tables and RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD disables refresh"
+        die "forced-Hive variants are missing for TPC-H and RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD disables refresh"
     fi
     if [ -n "${RVBBIT_COMPACT_KEEP_HEAP:-}" ] && ! env_on "${RVBBIT_COMPACT_KEEP_HEAP}"; then
         die "forced-Hive benchmarks need retained heap until variant refresh can rebuild from canonical parquet; unset RVBBIT_COMPACT_KEEP_HEAP or set it to 1"
@@ -199,11 +198,11 @@ ensure_tpch_hive_variants_ready() {
         -v hive_variants="${RVBBIT_COMPACT_HIVE_VARIANTS:-}" \
         -v hive_min_distinct="${RVBBIT_COMPACT_HIVE_MIN_DISTINCT:-}" \
         -v hive_max_distinct="${RVBBIT_COMPACT_HIVE_MAX_DISTINCT:-}" <<'SQL'
-SELECT set_config('rvbbit.compact_hive_layout', :'hive_layout', true);
-SELECT set_config('rvbbit.compact_hive_keys', :'hive_keys', true) WHERE :'hive_keys' <> '';
-SELECT set_config('rvbbit.compact_hive_variants', :'hive_variants', true) WHERE :'hive_variants' <> '';
-SELECT set_config('rvbbit.compact_hive_min_distinct', :'hive_min_distinct', true) WHERE :'hive_min_distinct' <> '';
-SELECT set_config('rvbbit.compact_hive_max_distinct', :'hive_max_distinct', true) WHERE :'hive_max_distinct' <> '';
+SELECT set_config('rvbbit.compact_hive_layout', :'hive_layout', false);
+SELECT set_config('rvbbit.compact_hive_keys', :'hive_keys', false) WHERE :'hive_keys' <> '';
+SELECT set_config('rvbbit.compact_hive_variants', :'hive_variants', false) WHERE :'hive_variants' <> '';
+SELECT set_config('rvbbit.compact_hive_min_distinct', :'hive_min_distinct', false) WHERE :'hive_min_distinct' <> '';
+SELECT set_config('rvbbit.compact_hive_max_distinct', :'hive_max_distinct', false) WHERE :'hive_max_distinct' <> '';
 SELECT rvbbit.refresh_layout_variants('region'::regclass);
 SELECT rvbbit.refresh_layout_variants('nation'::regclass);
 SELECT rvbbit.refresh_layout_variants('part'::regclass);
@@ -214,7 +213,7 @@ SELECT rvbbit.refresh_layout_variants('orders'::regclass);
 SELECT rvbbit.refresh_layout_variants('lineitem'::regclass);
 SQL
     if [ "$(tpch_hive_variants_ready)" != "t" ]; then
-        die "forced-Hive variants are still missing for one or more TPC-H tables after refresh"
+        die "forced-Hive variants are still missing for TPC-H after refresh"
     fi
 }
 record_benchmark_history() {

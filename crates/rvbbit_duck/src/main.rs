@@ -1160,14 +1160,14 @@ fn catalog_fingerprint_sql_for_layout(layout: &str) -> Result<String> {
         "hive" | "cluster" => {
             let prefix = format!("{lower}:%");
             Ok(variant_catalog_fingerprint_sql(&format!(
-                "layout LIKE '{}'",
+                "rg.layout LIKE '{}'",
                 prefix.replace('\'', "''")
             )))
         }
         _ if lower.starts_with("hive:") || lower.starts_with("cluster:") => {
             validate_layout_name(trimmed)?;
             Ok(variant_catalog_fingerprint_sql(&format!(
-                "layout = '{}'",
+                "rg.layout = '{}'",
                 trimmed.replace('\'', "''")
             )))
         }
@@ -1179,10 +1179,13 @@ fn variant_catalog_fingerprint_sql(layout_predicate: &str) -> String {
     format!(
         "
         WITH chosen_layout AS (
-            SELECT table_oid, min(layout) AS layout
-            FROM rvbbit.row_group_variants
+            SELECT rg.table_oid, min(rg.layout) AS layout
+            FROM rvbbit.row_group_variants rg
+            JOIN rvbbit.layout_variant_status s
+              ON s.table_oid = rg.table_oid AND s.layout = rg.layout
             WHERE {layout_predicate}
-            GROUP BY table_oid
+              AND s.status = 'ready'
+            GROUP BY rg.table_oid
         ),
         table_state AS (
             SELECT n.nspname,
@@ -1438,12 +1441,15 @@ fn catalog_sql_for_layout(layout: &str) -> Result<String> {
         ),
         "hive" | "cluster" => {
             let prefix = format!("{lower}:%");
-            Ok(variant_catalog_sql(&format!("layout LIKE '{}'", prefix.replace('\'', "''"))))
+            Ok(variant_catalog_sql(&format!(
+                "rg.layout LIKE '{}'",
+                prefix.replace('\'', "''")
+            )))
         }
         _ if lower.starts_with("hive:") || lower.starts_with("cluster:") => {
             validate_layout_name(trimmed)?;
             Ok(variant_catalog_sql(&format!(
-                "layout = '{}'",
+                "rg.layout = '{}'",
                 trimmed.replace('\'', "''")
             )))
         }
@@ -1455,10 +1461,13 @@ fn variant_catalog_sql(layout_predicate: &str) -> String {
     format!(
         "
         WITH chosen_layout AS (
-            SELECT table_oid, min(layout) AS layout
-            FROM rvbbit.row_group_variants
+            SELECT rg.table_oid, min(rg.layout) AS layout
+            FROM rvbbit.row_group_variants rg
+            JOIN rvbbit.layout_variant_status s
+              ON s.table_oid = rg.table_oid AND s.layout = rg.layout
             WHERE {layout_predicate}
-            GROUP BY table_oid
+              AND s.status = 'ready'
+            GROUP BY rg.table_oid
         ),
         variant_rows AS (
             SELECT n.nspname,

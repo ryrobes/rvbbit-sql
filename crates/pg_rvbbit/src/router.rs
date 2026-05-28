@@ -72,6 +72,25 @@ CREATE INDEX IF NOT EXISTS route_observations_shape_idx
 CREATE INDEX IF NOT EXISTS route_observations_family_idx
     ON rvbbit.route_observations (shape_family, candidate, observed_at DESC);
 
+CREATE TABLE IF NOT EXISTS rvbbit.route_shadow_decisions (
+    id                bigserial PRIMARY KEY,
+    observed_at       timestamptz NOT NULL DEFAULT now(),
+    query_hash        text NOT NULL,
+    shape_key         text NOT NULL,
+    shape_family      text NOT NULL,
+    chosen_candidate  text,
+    shadow_candidate  text,
+    shadow_source     text,
+    confidence        double precision,
+    table_rows        bigint NOT NULL DEFAULT 0,
+    features          jsonb NOT NULL,
+    decision          jsonb NOT NULL,
+    CHECK (confidence IS NULL OR confidence >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS route_shadow_decisions_shape_idx
+    ON rvbbit.route_shadow_decisions (shape_key, observed_at DESC);
+
 CREATE TABLE IF NOT EXISTS rvbbit.route_training_queries (
     id            bigserial PRIMARY KEY,
     profile_name  text NOT NULL REFERENCES rvbbit.route_profiles(name) ON DELETE CASCADE,
@@ -869,6 +888,11 @@ fn route_explain(query: &str) -> JsonB {
 }
 
 #[pg_extern(volatile)]
+fn route_shadow_explain(query: &str, log: default!(bool, "false")) -> JsonB {
+    JsonB(route_explain_value_inner(query, true, true, log))
+}
+
+#[pg_extern(volatile)]
 fn route_explain_text(query: &str) -> String {
     format_route_explain_text(&route_explain_value(query, true))
 }
@@ -1522,6 +1546,15 @@ fn route_merge_profiles(target_profile: &str, source_profiles: JsonB, active: bo
 }
 
 pub(crate) fn route_explain_value(query: &str, include_plan: bool) -> Value {
+    route_explain_value_inner(query, include_plan, false, false)
+}
+
+fn route_explain_value_inner(
+    query: &str,
+    include_plan: bool,
+    include_shadow: bool,
+    log_shadow: bool,
+) -> Value {
     let mut out = Map::new();
     out.insert("route".into(), json!("none"));
     out.insert("chosen_candidate".into(), Value::Null);
@@ -1584,6 +1617,10 @@ pub(crate) fn route_explain_value(query: &str, include_plan: bool) -> Value {
         "candidates".into(),
         candidate_list_json(candidate, &features, &tables),
     );
+    if include_shadow {
+        let shadow = shadow_learned_route_json(query, &features, &tables, candidate, log_shadow);
+        out.insert("shadow_learned_route".into(), shadow);
+    }
     Value::Object(out)
 }
 
@@ -1649,6 +1686,75 @@ fn route_doc_from_decision(
         );
     }
     Value::Object(out)
+}
+
+fn shadow_learned_route_json(
+    query: &str,
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+    chosen_candidate: Option<Candidate>,
+    log_shadow: bool,
+) -> Value {
+    let Some(decision) = choose_shadow_learned_route(features, tables) else {
+        return json!({
+            "available": false,
+            "reason": "insufficient route observations for this shape"
+        });
+    };
+    let value = route_decision_json(&decision);
+    if log_shadow {
+        log_shadow_decision(query, features, chosen_candidate, &decision, &value);
+    }
+    value
+}
+
+fn route_decision_json(decision: &RouteDecision) -> Value {
+    json!({
+        "available": true,
+        "route": decision.route,
+        "candidate": decision.candidate.map(|c| c.as_str()),
+        "source": decision.source,
+        "reason": decision.reason,
+        "confidence": decision.confidence,
+        "entry": decision.profile_entry.clone(),
+    })
+}
+
+fn log_shadow_decision(
+    _query: &str,
+    features: &RouteFeatures,
+    chosen_candidate: Option<Candidate>,
+    decision: &RouteDecision,
+    decision_json: &Value,
+) {
+    if !relations_present(&["rvbbit.route_shadow_decisions"]) {
+        return;
+    }
+    let chosen_sql = chosen_candidate
+        .map(|c| format!("{}::text", sql_lit(c.as_str())))
+        .unwrap_or_else(|| "NULL::text".to_string());
+    let shadow_sql = decision
+        .candidate
+        .map(|c| format!("{}::text", sql_lit(c.as_str())))
+        .unwrap_or_else(|| "NULL::text".to_string());
+    let confidence_sql = decision
+        .confidence
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL::double precision".to_string());
+    let _ = Spi::run(&format!(
+        "INSERT INTO rvbbit.route_shadow_decisions \
+             (query_hash, shape_key, shape_family, chosen_candidate, shadow_candidate, \
+              shadow_source, confidence, table_rows, features, decision) \
+         VALUES ({}, {}, {}, {chosen_sql}, {shadow_sql}, {}, {confidence_sql}, {}, {}::jsonb, {}::jsonb)",
+        sql_lit(&features.sql_hash),
+        sql_lit(&features.shape_key),
+        sql_lit(&features.shape_family),
+        sql_lit(decision.source),
+        features.table_rows,
+        sql_json_lit(&features.to_json()),
+        sql_json_lit(decision_json),
+    ));
 }
 
 fn insert_profile_selection_json(out: &mut Map<String, Value>, profile: &RouteProfileSelection) {
@@ -2213,6 +2319,97 @@ fn choose_from_profile_points(
         Ok(())
     });
     route_curve_from_anchors(anchors, features, tables, "profile-point-curve")
+}
+
+fn choose_shadow_learned_route(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<RouteDecision> {
+    choose_from_observation_exact(features, tables)
+        .or_else(|| choose_from_observation_curve(features, tables))
+}
+
+fn choose_from_observation_exact(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<RouteDecision> {
+    if !relations_present(&["rvbbit.route_observations"]) {
+        return None;
+    }
+    let shape_lit = sql_lit(&features.shape_key);
+    let legacy_shape_lit = sql_lit(&features.legacy_shape_key);
+    let mut by_candidate: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(
+            &format!(
+                "SELECT candidate, elapsed_ms \
+                 FROM rvbbit.route_observations \
+                 WHERE shape_key IN ({shape_lit}, {legacy_shape_lit}) \
+                   AND status = 'ok' \
+                   AND elapsed_ms > 0 \
+                 ORDER BY observed_at DESC \
+                 LIMIT 1000"
+            ),
+            None,
+            &[],
+        )?;
+        for row in table {
+            let candidate: String = row.get(1)?.unwrap_or_default();
+            let elapsed_ms: f64 = row.get(2)?.unwrap_or_default();
+            if Candidate::from_str(&candidate).is_some() && elapsed_ms > 0.0 {
+                by_candidate.entry(candidate).or_default().push(elapsed_ms);
+            }
+        }
+        Ok(())
+    });
+
+    let mut medians = by_candidate
+        .into_iter()
+        .filter_map(|(candidate, values)| {
+            let candidate = Candidate::from_str(&candidate)?;
+            if !candidate_availability(candidate, features, tables).0 {
+                return None;
+            }
+            let n = values.len();
+            (n > 0).then(|| (candidate, median_f64(values), n))
+        })
+        .collect::<Vec<_>>();
+    medians.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    if medians.len() < 2 {
+        return None;
+    }
+    let (candidate, best_ms, observations) = medians[0];
+    let (_, second_ms, _) = medians[1];
+    let confidence = if second_ms > 0.0 {
+        (1.0 - best_ms / second_ms).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let source = if confidence >= min_confidence_for_candidate(candidate) {
+        "shadow-observation-exact"
+    } else {
+        "shadow-observation-low-confidence"
+    };
+    let entry = json!({
+        "choice": candidate.as_str(),
+        "confidence": confidence,
+        "median_ms": best_ms,
+        "next_best_ms": second_ms,
+        "observations": observations,
+        "candidate_medians": medians.iter().map(|(candidate, ms, n)| {
+            json!({"candidate": candidate.as_str(), "median_ms": ms, "observations": n})
+        }).collect::<Vec<_>>(),
+    });
+    Some(decision(
+        candidate,
+        source,
+        &format!(
+            "shadow exact observations: {}",
+            ratio_text_many(candidate, best_ms, second_ms)
+        ),
+        Some(confidence),
+        Some(entry),
+    ))
 }
 
 fn choose_from_observation_curve(
@@ -3410,10 +3607,12 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
         for row in table {
             let schema: String = row.get(1)?.unwrap_or_default();
             let relname: String = row.get(2)?.unwrap_or_default();
-            let referenced = plan_lower
+            let sql_referenced = sql_mentions_relation(&stringless, &schema, &relname);
+            let plan_referenced = plan_lower
                 .as_deref()
                 .map(|plan| plan_mentions_relation(plan, &schema, &relname))
-                .unwrap_or_else(|| sql_mentions_relation(&stringless, &schema, &relname));
+                .unwrap_or(false);
+            let referenced = sql_referenced || plan_referenced;
             if !referenced {
                 continue;
             }
@@ -3902,7 +4101,7 @@ fn hive_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> 
     if !base_available {
         return (false, base_reason);
     }
-    if !relations_present(&["rvbbit.row_group_variants"]) {
+    if !relations_present(&["rvbbit.row_group_variants", "rvbbit.layout_variant_status"]) {
         return (
             false,
             "hive parquet variants catalog is not available".to_string(),
@@ -3937,9 +4136,12 @@ fn hive_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> 
 fn table_has_hive_variant(table_oid: u32) -> bool {
     Spi::get_one::<bool>(&format!(
         "SELECT EXISTS (\
-             SELECT 1 FROM rvbbit.row_group_variants \
-             WHERE table_oid = {table_oid}::oid \
-               AND layout LIKE 'hive:%' \
+             SELECT 1 FROM rvbbit.row_group_variants rg \
+             JOIN rvbbit.layout_variant_status s \
+               ON s.table_oid = rg.table_oid AND s.layout = rg.layout \
+             WHERE rg.table_oid = {table_oid}::oid \
+               AND rg.layout LIKE 'hive:%' \
+               AND s.status = 'ready' \
              LIMIT 1\
          )"
     ))
@@ -4099,33 +4301,29 @@ fn min_confidence_for_candidate(candidate: Candidate) -> f64 {
     }
 }
 
-const FALLBACK_VECTOR_FIRST: [Candidate; 4] = [
+const FALLBACK_VECTOR_FIRST: [Candidate; 3] = [
     Candidate::DataFusionVector,
-    Candidate::DataFusionHive,
     Candidate::DuckVector,
     Candidate::DuckHive,
 ];
 
-const FALLBACK_MEM_FIRST: [Candidate; 5] = [
+const FALLBACK_MEM_FIRST: [Candidate; 4] = [
     Candidate::DataFusionMem,
     Candidate::DataFusionVector,
-    Candidate::DataFusionHive,
     Candidate::DuckVector,
     Candidate::DuckHive,
 ];
 
-const FALLBACK_VARIANT_FIRST: [Candidate; 4] = [
-    Candidate::DataFusionHive,
-    Candidate::DataFusionVector,
+const FALLBACK_VARIANT_FIRST: [Candidate; 3] = [
     Candidate::DuckHive,
+    Candidate::DataFusionVector,
     Candidate::DuckVector,
 ];
 
-const FALLBACK_DUCK_FIRST: [Candidate; 4] = [
+const FALLBACK_DUCK_FIRST: [Candidate; 3] = [
     Candidate::DuckVector,
     Candidate::DuckHive,
     Candidate::DataFusionVector,
-    Candidate::DataFusionHive,
 ];
 
 fn default_external_candidate(
@@ -5960,7 +6158,7 @@ mod route_unit_tests {
         assert!(fallback_prefers_variant(&distinct_text));
         assert_eq!(
             fallback_external_candidate_order(&distinct_text).map(|order| order[0]),
-            Some(Candidate::DataFusionHive)
+            Some(Candidate::DuckHive)
         );
 
         let text_topk = test_features_with_text(
@@ -5971,7 +6169,7 @@ mod route_unit_tests {
         assert!(fallback_prefers_variant(&text_topk));
         assert_eq!(
             fallback_external_candidate_order(&text_topk).map(|order| order[0]),
-            Some(Candidate::DataFusionHive)
+            Some(Candidate::DuckHive)
         );
     }
 

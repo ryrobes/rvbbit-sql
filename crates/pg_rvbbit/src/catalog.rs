@@ -39,6 +39,22 @@ CREATE TABLE rvbbit.tables (
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE rvbbit.lance_text_indexes (
+    table_oid      oid NOT NULL REFERENCES rvbbit.tables(table_oid) ON DELETE CASCADE,
+    column_name    text NOT NULL,
+    specialist     text NOT NULL DEFAULT 'embed',
+    lance_url      text NOT NULL,
+    dim            int NOT NULL,
+    n_values       bigint NOT NULL DEFAULT 0,
+    status         text NOT NULL DEFAULT 'ready',
+    status_message text,
+    refreshed_at   timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (table_oid, column_name, specialist),
+    CONSTRAINT lance_text_indexes_status_check CHECK (
+        status IN ('ready', 'refreshing', 'failed', 'disabled')
+    )
+);
+
 CREATE TABLE rvbbit.row_groups (
     table_oid       oid NOT NULL REFERENCES rvbbit.tables(table_oid) ON DELETE CASCADE,
     rg_id           bigint NOT NULL,
@@ -263,6 +279,19 @@ CREATE TABLE rvbbit.row_group_variants (
     per_group_stats jsonb,
     created_at      timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (table_oid, layout, rg_id)
+);
+
+CREATE TABLE rvbbit.layout_variant_status (
+    table_oid       oid NOT NULL REFERENCES rvbbit.tables(table_oid) ON DELETE CASCADE,
+    layout          text NOT NULL,
+    status          text NOT NULL DEFAULT 'ready',
+    expected_rows   bigint NOT NULL DEFAULT 0,
+    actual_rows     bigint NOT NULL DEFAULT 0,
+    file_count      integer NOT NULL DEFAULT 0,
+    status_message  text,
+    refreshed_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (table_oid, layout),
+    CHECK (status IN ('ready', 'refreshing', 'invalid', 'failed'))
 );
 
 CREATE TABLE rvbbit.acceleration_state (
@@ -615,6 +644,7 @@ BEGIN
     -- next write overwrites active names. Stale orphans are harmless because
     -- nothing in the catalog references them.
     DELETE FROM rvbbit.delete_log         WHERE table_oid = reloid;
+    DELETE FROM rvbbit.layout_variant_status WHERE table_oid = reloid;
     DELETE FROM rvbbit.row_group_variants WHERE table_oid = reloid;
     DELETE FROM rvbbit.row_groups         WHERE table_oid = reloid;
     DELETE FROM rvbbit.generations        WHERE table_oid = reloid;
@@ -3610,6 +3640,31 @@ AS $$
     FROM rvbbit.row_group_variants rg
     WHERE rg.table_oid = rel
     ORDER BY rg.layout, rg.rg_id;
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.layout_variant_status_for(rel regclass)
+RETURNS TABLE (
+    layout text,
+    status text,
+    expected_rows bigint,
+    actual_rows bigint,
+    file_count integer,
+    status_message text,
+    refreshed_at timestamptz
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT s.layout,
+           s.status,
+           s.expected_rows,
+           s.actual_rows,
+           s.file_count,
+           s.status_message,
+           s.refreshed_at
+    FROM rvbbit.layout_variant_status s
+    WHERE s.table_oid = rel
+    ORDER BY s.layout;
 $$;
 "#,
     name = "rvbbit_bootstrap",

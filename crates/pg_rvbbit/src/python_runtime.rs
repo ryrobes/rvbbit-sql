@@ -115,20 +115,23 @@ CREATE OR REPLACE FUNCTION rvbbit.python_env_hash(
     python_version text,
     requirements text[]
 ) RETURNS text
-LANGUAGE sql
+LANGUAGE plpgsql
 IMMUTABLE
 AS $$
-    SELECT md5(
+DECLARE
+    normalized_requirements text[];
+BEGIN
+    normalized_requirements := ARRAY(
+        SELECT btrim(req)
+        FROM unnest(coalesce(requirements, ARRAY[]::text[])) AS r(req)
+        WHERE btrim(req) <> ''
+        ORDER BY btrim(req)
+    );
+    RETURN md5(
         coalesce(python_version, '') || E'\x1f' ||
-        coalesce(
-            (
-                SELECT string_agg(req, E'\x1e' ORDER BY req)
-                FROM unnest(coalesce(requirements, ARRAY[]::text[])) AS r(req)
-                WHERE btrim(req) <> ''
-            ),
-            ''
-        )
-    )
+        coalesce(array_to_string(normalized_requirements, E'\x1e'), '')
+    );
+END
 $$;
 
 CREATE OR REPLACE FUNCTION rvbbit.require_python_admin()

@@ -53,14 +53,17 @@ def llm_table(rvbbit, temp_table):
 # ---- Compact ----------------------------------------------------------------
 
 
-def test_compact_drains_heap(rvbbit, llm_table):
-    # The heap is empty post-compact because the scan now reads parquet.
-    # Use pg_relation_size to check the underlying heap, not the AM-wrapped
-    # row count (which goes through our scan).
+def test_compact_retains_heap_gold_source(rvbbit, llm_table):
+    # The heap remains the gold-source fallback after acceleration. Rvbbit
+    # reads accelerated files when safe, but pg_dump/restore and rebuilds still
+    # have ordinary heap state available.
     row = rvbbit.execute(
         f"SELECT pg_relation_size('{llm_table}'::regclass)"
     ).fetchone()
-    assert row[0] == 0
+    assert row[0] > 0
+
+    visible = rvbbit.execute(f"SELECT count(*) FROM {llm_table}").fetchone()
+    assert visible[0] == 200
 
 
 def test_row_groups_registered(rvbbit, llm_table):
@@ -72,7 +75,7 @@ def test_row_groups_registered(rvbbit, llm_table):
     assert row[1] == 200
 
 
-def test_shred_columns_added(rvbbit, llm_table):
+def test_no_physical_shred_columns_required(rvbbit, llm_table):
     cols = {
         r[0]
         for r in rvbbit.execute(
@@ -80,15 +83,13 @@ def test_shred_columns_added(rvbbit, llm_table):
             f"WHERE table_name = '{llm_table}' AND column_name LIKE 'x\\_%' ESCAPE '\\'"
         ).fetchall()
     }
-    expected = {
-        "x_response_stop_reason",
-        "x_response_model",
-        "x_response_input_tokens",
-        "x_response_output_tokens",
-        "x_metadata_region",
-    }
-    missing = expected - cols
-    assert not missing, f"shred columns missing: {missing}"
+    assert cols == set()
+
+    rows = rvbbit.execute(
+        f"SELECT response->>'stop_reason' AS r, count(*) FROM {llm_table} "
+        f"GROUP BY 1 ORDER BY r"
+    ).fetchall()
+    assert rows == [("end_turn", 66), ("max_tokens", 67), ("stop_sequence", 67)]
 
 
 # ---- Rewriter: count(*) → metadata constant ---------------------------------
@@ -124,7 +125,7 @@ def test_count_star_includes_post_compact_heap_delta(rvbbit, llm_table):
         f"EXPLAIN (FORMAT TEXT) SELECT count(*) FROM {llm_table}"
     ).fetchall()
     plan_text = "\n".join(r[0] for r in plan)
-    assert "Result" in plan_text
+    assert "Result" not in plan_text
 
     row = rvbbit.execute(f"SELECT count(*) FROM {llm_table}").fetchone()
     assert row[0] == 202
@@ -139,33 +140,24 @@ def test_count_star_with_where_falls_through(rvbbit, llm_table):
     assert "Custom Scan" in plan_text
 
 
-# ---- Rewriter: shred substitution -------------------------------------------
+# ---- JSON expression execution ----------------------------------------------
 
 
-def test_shred_substitution_groupby(rvbbit, llm_table):
-    # Same answer as the heap-style query, faster path.
-    rewriter_rows = rvbbit.execute(
+def test_json_expression_groupby(rvbbit, llm_table):
+    rows = rvbbit.execute(
         f"SELECT response->>'stop_reason' AS r, count(*) FROM {llm_table} "
         f"GROUP BY 1 ORDER BY r"
     ).fetchall()
-    direct_rows = rvbbit.execute(
-        f"SELECT x_response_stop_reason AS r, count(*) FROM {llm_table} "
-        f"GROUP BY 1 ORDER BY r"
-    ).fetchall()
-    assert rewriter_rows == direct_rows
+    assert rows == [("end_turn", 66), ("max_tokens", 67), ("stop_sequence", 67)]
 
 
-def test_shred_substitution_nested_cast(rvbbit, llm_table):
+def test_json_expression_nested_cast(rvbbit, llm_table):
     # (response->'usage'->>'input_tokens')::int  — the Q7 case
-    rewriter = rvbbit.execute(
+    row = rvbbit.execute(
         f"SELECT sum((response->'usage'->>'input_tokens')::int) FROM {llm_table}"
     ).fetchone()
-    direct = rvbbit.execute(
-        f"SELECT sum(x_response_input_tokens) FROM {llm_table}"
-    ).fetchone()
-    assert rewriter == direct
     # 1+2+...+200 = 20100
-    assert rewriter[0] == 20100
+    assert row[0] == 20100
 
 
 # ---- The CRITICAL ExecQual bug: regression test -----------------------------
@@ -183,15 +175,10 @@ def test_where_filter_actually_applies(rvbbit, llm_table):
     assert 0 < row_filt[0] < row_all[0]
 
 
-def test_where_via_rewriter_path(rvbbit, llm_table):
-    """Rewriter substitutes response->>'X' for the shred column, then
-    WHERE applies to the substituted Var. End-to-end correctness."""
-    rewriter = rvbbit.execute(
+def test_where_via_json_expression_path(rvbbit, llm_table):
+    """JSON-expression quals must still apply correctly after acceleration."""
+    row = rvbbit.execute(
         f"SELECT count(*) FROM {llm_table} WHERE response->>'stop_reason' = 'max_tokens'"
     ).fetchone()
-    direct = rvbbit.execute(
-        f"SELECT count(*) FROM {llm_table} WHERE x_response_stop_reason = 'max_tokens'"
-    ).fetchone()
-    assert rewriter == direct
     # ~67 rows with stop_reason='max_tokens'
-    assert 50 < rewriter[0] < 100
+    assert row[0] == 67

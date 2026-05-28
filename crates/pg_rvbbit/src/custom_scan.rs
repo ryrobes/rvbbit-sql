@@ -2968,9 +2968,13 @@ fn fetch_variant_layouts(table_oid: u32) -> Result<Vec<String>, String> {
         let table = client
             .select(
                 &format!(
-                    "SELECT DISTINCT layout FROM rvbbit.row_group_variants \
-                     WHERE table_oid = {table_oid}::oid AND layout LIKE '{prefix}%' \
-                     ORDER BY layout"
+                    "SELECT DISTINCT rg.layout FROM rvbbit.row_group_variants rg \
+                     JOIN rvbbit.layout_variant_status s \
+                       ON s.table_oid = rg.table_oid AND s.layout = rg.layout \
+                     WHERE rg.table_oid = {table_oid}::oid \
+                       AND rg.layout LIKE '{prefix}%' \
+                       AND s.status = 'ready' \
+                     ORDER BY rg.layout"
                 ),
                 None,
                 &[],
@@ -3033,15 +3037,23 @@ fn fetch_row_group_paths(
             let layout = layout.replace('\'', "''");
             if include_stats {
                 format!(
-                    "SELECT path, rg_id, stats::text FROM rvbbit.row_group_variants \
-                     WHERE table_oid = {table_oid}::oid AND layout = '{layout}' \
-                     ORDER BY rg_id"
+                    "SELECT rg.path, rg.rg_id, rg.stats::text FROM rvbbit.row_group_variants rg \
+                     JOIN rvbbit.layout_variant_status s \
+                       ON s.table_oid = rg.table_oid AND s.layout = rg.layout \
+                     WHERE rg.table_oid = {table_oid}::oid \
+                       AND rg.layout = '{layout}' \
+                       AND s.status = 'ready' \
+                     ORDER BY rg.rg_id"
                 )
             } else {
                 format!(
-                    "SELECT path, rg_id, NULL::text FROM rvbbit.row_group_variants \
-                     WHERE table_oid = {table_oid}::oid AND layout = '{layout}' \
-                     ORDER BY rg_id"
+                    "SELECT rg.path, rg.rg_id, NULL::text FROM rvbbit.row_group_variants rg \
+                     JOIN rvbbit.layout_variant_status s \
+                       ON s.table_oid = rg.table_oid AND s.layout = rg.layout \
+                     WHERE rg.table_oid = {table_oid}::oid \
+                       AND rg.layout = '{layout}' \
+                       AND s.status = 'ready' \
+                     ORDER BY rg.rg_id"
                 )
             }
         } else if include_stats {

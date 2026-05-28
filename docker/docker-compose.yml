@@ -184,6 +184,7 @@ services:
     volumes:
       - ../bench:/bench
       - ../tests:/tests
+      - ../sidecars:/sidecars:ro
       - ../results:/results
       - ../capabilities:/capabilities:ro
       # POC: allow the benchmark harness to run DuckDB directly over

@@ -204,7 +204,7 @@ pub(crate) fn parse_embedding_value(v: &JsonValue) -> Result<Vec<f32>, String> {
 // ---------------------------------------------------------------------------
 // Core embed path (single-text)
 
-fn embed_one(text: &str, specialist_name_arg: &str) -> Result<Vec<f32>, String> {
+pub(crate) fn embed_one(text: &str, specialist_name_arg: &str) -> Result<Vec<f32>, String> {
     let spec = resolve_specialist(specialist_name_arg)?;
     let model = spec_model(&spec);
     let h = text_hash(&spec.name, text);
@@ -499,6 +499,12 @@ fn knn_text(
         Ok(v) => v,
         Err(e) => pgrx::error!("rvbbit.knn_text: query embed: {e}"),
     };
+
+    match crate::lance::try_knn_text_lance(rel_oid, col, &spec.name, &q_vec, k_usize) {
+        Ok(Some(rows)) => return TableIterator::new(rows.into_iter()),
+        Ok(None) => {}
+        Err(e) => pgrx::warning!("rvbbit.knn_text: Lance text index fallback: {e}"),
+    }
 
     let qualified: String =
         match Spi::get_one::<String>(&format!("SELECT {rel_oid}::oid::regclass::text")) {

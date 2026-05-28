@@ -8,9 +8,29 @@ def _kind(prefix: str) -> str:
 
 
 def _cleanup_kind(rvbbit, kind: str) -> None:
+    rvbbit.execute("DELETE FROM rvbbit.kg_lance_indexes WHERE kind = %s", (kind,))
     rvbbit.execute("DELETE FROM rvbbit.kg_node_merges WHERE loser_kind = %s", (kind,))
     rvbbit.execute("DELETE FROM rvbbit.kg_merge_candidates WHERE kind = %s", (kind,))
     rvbbit.execute("DELETE FROM rvbbit.kg_nodes WHERE kind = %s", (kind,))
+
+
+def _register_stub_embed(rvbbit, dim: int = 16) -> str:
+    name = f"stub_kg_{uuid.uuid4().hex[:8]}"
+    rvbbit.execute(
+        "SELECT rvbbit.register_backend("
+        "  backend_name => %s, "
+        "  backend_endpoint => %s, "
+        "  backend_transport => 'stub')",
+        (name, f"stub://{dim}"),
+    )
+    rvbbit.execute("SELECT rvbbit.reload_backends()")
+    return name
+
+
+def _drop_stub_embed(rvbbit, name: str) -> None:
+    rvbbit.execute("DELETE FROM rvbbit.backends WHERE name = %s", (name,))
+    rvbbit.execute("SELECT rvbbit.embedding_purge(%s)", (name,))
+    rvbbit.execute("SELECT rvbbit.reload_backends()")
 
 
 def test_kg_catalog_tables_exist(rvbbit):
@@ -22,7 +42,8 @@ def test_kg_catalog_tables_exist(rvbbit):
           AND tablename IN (
               'kg_nodes', 'kg_aliases', 'kg_edges', 'kg_evidence',
               'kg_merge_candidates', 'kg_node_merges',
-              'kg_extraction_runs', 'kg_extraction_errors'
+              'kg_extraction_runs', 'kg_extraction_errors',
+              'kg_lance_indexes'
           )
         ORDER BY tablename
         """
@@ -33,6 +54,7 @@ def test_kg_catalog_tables_exist(rvbbit):
         "kg_evidence",
         "kg_extraction_errors",
         "kg_extraction_runs",
+        "kg_lance_indexes",
         "kg_merge_candidates",
         "kg_node_merges",
         "kg_nodes",
@@ -169,6 +191,81 @@ def test_kg_alias_can_resolve_alternate_surface_form(rvbbit):
         assert resolved == (node_id, "OpenAI Incorporated", "alias")
     finally:
         _cleanup_kind(rvbbit, kind)
+
+
+def test_kg_lance_index_accelerates_resolution_with_embedding_fallback(rvbbit):
+    kind = _kind("kg_lance_org")
+    specialist = _register_stub_embed(rvbbit)
+    try:
+        openai_id = rvbbit.execute(
+            "SELECT rvbbit.kg_assert_node(%s, 'OpenAI Incorporated', '{}'::jsonb, 1.0, %s, 0.0)",
+            (kind, specialist),
+        ).fetchone()[0]
+        rvbbit.execute(
+            "SELECT rvbbit.kg_assert_node(%s, 'Anthropic PBC', '{}'::jsonb, 1.0, %s, 0.0)",
+            (kind, specialist),
+        )
+        rvbbit.execute("DELETE FROM rvbbit.kg_aliases WHERE node_id = %s", (openai_id,))
+
+        enabled = rvbbit.execute(
+            "SELECT rvbbit.kg_lance_enable(%s, specialist => %s)",
+            (kind, specialist),
+        ).fetchone()[0]
+        assert enabled["status"] == "ready"
+        assert enabled["n_values"] == 2
+
+        status = rvbbit.execute(
+            """
+            SELECT status, n_values, specialist
+            FROM rvbbit.kg_lance_indexes
+            WHERE kind = %s
+            """,
+            (kind,),
+        ).fetchone()
+        assert status == ("ready", 2, specialist)
+
+        resolved = rvbbit.execute(
+            """
+            SELECT node_id, label, match_method
+            FROM rvbbit.kg_resolve_node(%s, 'OpenAI Incorporated', %s, 0.9999)
+            """,
+            (kind, specialist),
+        ).fetchone()
+        assert resolved == (openai_id, "OpenAI Incorporated", "lance")
+
+        fresh_id = rvbbit.execute(
+            "SELECT rvbbit.kg_assert_node(%s, 'Fresh Entity', '{}'::jsonb, 1.0, %s, 0.0)",
+            (kind, specialist),
+        ).fetchone()[0]
+        rvbbit.execute("DELETE FROM rvbbit.kg_aliases WHERE node_id = %s", (fresh_id,))
+
+        stale_resolved = rvbbit.execute(
+            """
+            SELECT node_id, label, match_method
+            FROM rvbbit.kg_resolve_node(%s, 'Fresh Entity', %s, 0.9999)
+            """,
+            (kind, specialist),
+        ).fetchone()
+        assert stale_resolved == (fresh_id, "Fresh Entity", "embedding")
+
+        refreshed = rvbbit.execute(
+            "SELECT rvbbit.kg_lance_refresh(%s, specialist => %s)",
+            (kind, specialist),
+        ).fetchone()[0]
+        assert refreshed["status"] == "ready"
+        assert refreshed["n_values"] == 3
+
+        refreshed_resolved = rvbbit.execute(
+            """
+            SELECT node_id, label, match_method
+            FROM rvbbit.kg_resolve_node(%s, 'Fresh Entity', %s, 0.9999)
+            """,
+            (kind, specialist),
+        ).fetchone()
+        assert refreshed_resolved == (fresh_id, "Fresh Entity", "lance")
+    finally:
+        _cleanup_kind(rvbbit, kind)
+        _drop_stub_embed(rvbbit, specialist)
 
 
 def test_kg_assert_edge_records_evidence_and_neighbors(rvbbit):

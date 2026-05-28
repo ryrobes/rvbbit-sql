@@ -57,6 +57,8 @@ pipeline. This is the execution-provenance spine for UI traces and debugging.
 | `rvbbit.kg_resolve_node(kind, label, ...)` | Resolve exact alias or fuzzy embedding match. |
 | `rvbbit.kg_assert_edge(...)` | Create/update a directed fact and optional evidence. |
 | `rvbbit.kg_link_evidence(...)` | Attach provenance to an edge or node. |
+| `rvbbit.kg_lance_enable(kind, ...)` | Build a Lance ANN index for fuzzy node resolution. |
+| `rvbbit.kg_lance_refresh(kind, ...)` | Refresh a KG Lance index after node changes. |
 | `rvbbit.kg_suggest_merges(...)` | Populate/retrieve pending duplicate-node candidates. |
 | `rvbbit.kg_accept_merge(...)` | Accept a candidate and merge the two nodes. |
 | `rvbbit.kg_reject_merge(...)` | Reject a candidate so it is not re-suggested. |
@@ -193,6 +195,54 @@ FROM rvbbit.kg_resolve_node(
 `match_threshold => 0.0` disables fuzzy matching. This is useful for tests,
 strict imports, and cases where accidental merging would be worse than
 duplicates.
+
+### Lance-Accelerated Resolution
+
+KG storage remains ordinary heap-backed catalog tables. For large node sets,
+you can add a derived Lance index over node labels for one `(graph, kind,
+specialist)` pair:
+
+```sql
+SELECT rvbbit.kg_lance_enable(
+  'company',
+  graph => 'support_demo',
+  specialist => 'embed'
+);
+```
+
+After that, `kg_resolve_node(... match_threshold > 0)` checks resolution in
+this order:
+
+1. exact alias match from `rvbbit.kg_aliases`;
+2. ready Lance node-label index from `rvbbit.kg_lance_indexes`;
+3. the existing SQL embedding scan over `rvbbit.kg_nodes`.
+
+The third step is always the fallback. A missing, stale, failed, or disabled
+Lance index cannot make a query fail or hide a node that the old resolver would
+have found.
+
+Refresh after bulk node changes:
+
+```sql
+SELECT rvbbit.kg_lance_refresh(
+  'company',
+  graph => 'support_demo',
+  specialist => 'embed'
+);
+```
+
+Inspect index state from SQL:
+
+```sql
+SELECT graph_id, kind, specialist, status, n_values, dim, refreshed_at,
+       status_message, lance_url
+FROM rvbbit.kg_lance_indexes
+ORDER BY refreshed_at DESC;
+```
+
+If `lance_url` is omitted, Rvbbit stores the derived dataset under Postgres'
+`data_directory` in `rvbbit/kg_lance/...`. You can pass an explicit local path
+when you want to manage storage placement yourself.
 
 ## Merge Review
 

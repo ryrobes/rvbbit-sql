@@ -172,9 +172,12 @@ clickbench_hive_variants_ready() {
     ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -Atq -v ON_ERROR_STOP=1 -c "
         SELECT EXISTS (
             SELECT 1
-            FROM rvbbit.row_group_variants
-            WHERE table_oid = 'hits'::regclass
-              AND layout LIKE 'hive:%'
+            FROM rvbbit.row_group_variants rg
+            JOIN rvbbit.layout_variant_status s
+              ON s.table_oid = rg.table_oid AND s.layout = rg.layout
+            WHERE rg.table_oid = 'hits'::regclass
+              AND rg.layout LIKE 'hive:%'
+              AND s.status = 'ready'
         );
     " | tr -d '[:space:]'
 }
@@ -197,11 +200,11 @@ ensure_clickbench_hive_variants_ready() {
         -v hive_variants="${RVBBIT_COMPACT_HIVE_VARIANTS:-}" \
         -v hive_min_distinct="${RVBBIT_COMPACT_HIVE_MIN_DISTINCT:-}" \
         -v hive_max_distinct="${RVBBIT_COMPACT_HIVE_MAX_DISTINCT:-}" <<'SQL'
-SELECT set_config('rvbbit.compact_hive_layout', :'hive_layout', true);
-SELECT set_config('rvbbit.compact_hive_keys', :'hive_keys', true) WHERE :'hive_keys' <> '';
-SELECT set_config('rvbbit.compact_hive_variants', :'hive_variants', true) WHERE :'hive_variants' <> '';
-SELECT set_config('rvbbit.compact_hive_min_distinct', :'hive_min_distinct', true) WHERE :'hive_min_distinct' <> '';
-SELECT set_config('rvbbit.compact_hive_max_distinct', :'hive_max_distinct', true) WHERE :'hive_max_distinct' <> '';
+SELECT set_config('rvbbit.compact_hive_layout', :'hive_layout', false);
+SELECT set_config('rvbbit.compact_hive_keys', :'hive_keys', false) WHERE :'hive_keys' <> '';
+SELECT set_config('rvbbit.compact_hive_variants', :'hive_variants', false) WHERE :'hive_variants' <> '';
+SELECT set_config('rvbbit.compact_hive_min_distinct', :'hive_min_distinct', false) WHERE :'hive_min_distinct' <> '';
+SELECT set_config('rvbbit.compact_hive_max_distinct', :'hive_max_distinct', false) WHERE :'hive_max_distinct' <> '';
 SELECT rvbbit.refresh_layout_variants('hits'::regclass);
 SQL
     if [ "$(clickbench_hive_variants_ready)" != "t" ]; then

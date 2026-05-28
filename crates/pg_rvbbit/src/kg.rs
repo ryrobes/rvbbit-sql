@@ -107,6 +107,24 @@ CREATE TABLE IF NOT EXISTS rvbbit.kg_node_merges (
     merged_at         timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS rvbbit.kg_lance_indexes (
+    graph_id       text NOT NULL DEFAULT 'default',
+    kind           text NOT NULL,
+    target         text NOT NULL DEFAULT 'nodes',
+    specialist     text NOT NULL DEFAULT 'embed',
+    lance_url      text NOT NULL,
+    dim            int NOT NULL DEFAULT 0,
+    n_values       bigint NOT NULL DEFAULT 0,
+    status         text NOT NULL DEFAULT 'ready',
+    status_message text,
+    refreshed_at   timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (graph_id, kind, target, specialist),
+    CONSTRAINT kg_lance_indexes_target_check CHECK (target IN ('nodes')),
+    CONSTRAINT kg_lance_indexes_status_check CHECK (
+        status IN ('ready', 'refreshing', 'failed', 'disabled')
+    )
+);
+
 CREATE INDEX IF NOT EXISTS kg_aliases_node_idx ON rvbbit.kg_aliases(node_id);
 CREATE INDEX IF NOT EXISTS kg_nodes_graph_kind_idx ON rvbbit.kg_nodes(graph_id, kind);
 CREATE INDEX IF NOT EXISTS kg_aliases_graph_kind_idx ON rvbbit.kg_aliases(graph_id, kind);
@@ -134,6 +152,8 @@ CREATE INDEX IF NOT EXISTS kg_merge_candidates_query_id_idx ON rvbbit.kg_merge_c
 CREATE INDEX IF NOT EXISTS kg_node_merges_winner_idx ON rvbbit.kg_node_merges(winner_node_id);
 CREATE INDEX IF NOT EXISTS kg_node_merges_loser_idx ON rvbbit.kg_node_merges(loser_node_id);
 CREATE INDEX IF NOT EXISTS kg_node_merges_query_id_idx ON rvbbit.kg_node_merges(query_id);
+CREATE INDEX IF NOT EXISTS kg_lance_indexes_status_idx
+    ON rvbbit.kg_lance_indexes(graph_id, kind, target, status);
 
 CREATE TABLE IF NOT EXISTS rvbbit.kg_extraction_runs (
     run_id           bigserial PRIMARY KEY,
@@ -190,28 +210,34 @@ CREATE TRIGGER kg_edges_touch_updated_at
 
 CREATE OR REPLACE FUNCTION rvbbit.kg_normalize_label(value text)
 RETURNS text
-LANGUAGE sql
+LANGUAGE plpgsql
 IMMUTABLE
 STRICT
 AS $$
-    SELECT regexp_replace(lower(btrim(value)), '\s+', ' ', 'g')
+BEGIN
+    RETURN regexp_replace(lower(btrim(value)), '\s+', ' ', 'g');
+END
 $$;
 
 CREATE OR REPLACE FUNCTION rvbbit.kg_normalize_predicate(value text)
 RETURNS text
-LANGUAGE sql
+LANGUAGE plpgsql
 IMMUTABLE
 STRICT
 AS $$
-    SELECT regexp_replace(lower(btrim(value)), '\s+', '_', 'g')
+BEGIN
+    RETURN regexp_replace(lower(btrim(value)), '\s+', '_', 'g');
+END
 $$;
 
 CREATE OR REPLACE FUNCTION rvbbit.kg_normalize_graph(value text DEFAULT NULL)
 RETURNS text
-LANGUAGE sql
+LANGUAGE plpgsql
 IMMUTABLE
 AS $$
-    SELECT COALESCE(NULLIF(regexp_replace(lower(btrim(value)), '\s+', '_', 'g'), ''), 'default')
+BEGIN
+    RETURN COALESCE(NULLIF(regexp_replace(lower(btrim(value)), '\s+', '_', 'g'), ''), 'default');
+END
 $$;
 
 CREATE OR REPLACE FUNCTION rvbbit.kg_label_similarity(left_label text, right_label text)
@@ -381,6 +407,30 @@ BEGIN
     END IF;
 
     IF match_threshold > 0.0 THEN
+        RETURN QUERY
+        SELECT (r.doc->>'node_id')::bigint,
+               r.doc->>'kind',
+               r.doc->>'label',
+               (r.doc->>'score')::double precision,
+               'lance'::text
+        FROM jsonb_array_elements(
+            rvbbit.kg_lance_resolve_nodes(
+                norm_kind,
+                node_label,
+                specialist,
+                match_threshold,
+                norm_graph,
+                10
+            )
+        ) AS r(doc)
+        ORDER BY (r.doc->>'score')::double precision DESC,
+                 (r.doc->>'node_id')::bigint
+        LIMIT 10;
+
+        IF FOUND THEN
+            RETURN;
+        END IF;
+
         RETURN QUERY
         SELECT n.node_id, n.kind, n.label, s.score, 'embedding'::text
         FROM rvbbit.kg_nodes n
