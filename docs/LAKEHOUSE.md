@@ -11,8 +11,10 @@ The five things rvbbit can do that no other Postgres extension can:
 1. Read parquet row groups through an in-process Arrow/DataFusion
    stack with **no sidecar process** — eliminates the
    fork-exec-IPC tax on every query.
-2. Time-travel reads (`AS OF GENERATION N` and `AS OF TIMESTAMP ts`)
-   on the analytic columnar layer.
+2. Time-travel reads on the analytic columnar layer through comment
+   directives, `rvbbit.as_of_generation`, and `rvbbit.set_as_of(...)`. See
+   [TIME_TRAVEL.md](TIME_TRAVEL.md) for exact syntax and current parser
+   limitations.
 3. Merge-on-read tombstones with generation-aware visibility.
 4. Per-row-group ObjectStore tiering (file:// today, s3:// + gs://
    on the same code path) with **transparent SQL semantics** —
@@ -52,7 +54,7 @@ Per-backend behavior is controlled by these env vars:
   (kept as a route option for A/B and to handle anything in-process
   DF refuses to plan).
 
-## Time travel: `AS OF GENERATION`
+## Time travel: generation snapshots
 
 Every `compact()` call atomically allocates a new monotonic
 `generation` per table (advisory-lock-protected so concurrent
@@ -79,7 +81,7 @@ Row groups with `generation > asof` are excluded from the scan.
 Tombstones with `deleted_generation > asof` are NOT applied. Together
 those give you the exact state at that point in time.
 
-## Time travel: `AS OF TIMESTAMP`
+## Time travel: timestamp helper
 
 Resolves a wall-clock time to a generation, then sets the GUC:
 

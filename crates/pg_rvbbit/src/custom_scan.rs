@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::c_char;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -451,11 +451,22 @@ unsafe extern "C-unwind" fn begin_custom_scan(
     // predicate can actually use them for row-group pruning. If the clustered
     // variant can prune enough row groups, scan that copy; otherwise use the
     // scan-friendly canonical layout.
-    let (row_groups, row_group_layout) =
-        match fetch_best_row_group_paths(table_oid, &attrs, &pushed_plan, needs_row_group_stats) {
-            Ok(result) => result,
-            Err(e) => pgrx::error!("rvbbit custom scan: row group lookup failed: {}", e),
-        };
+    let statement_asof = crate::time_travel::active_as_of();
+    let asof = match crate::time_travel::generation_for_table(table_oid, statement_asof.as_ref()) {
+        Ok(value) => value,
+        Err(e) => pgrx::error!("rvbbit custom scan: AS OF resolution failed: {}", e),
+    };
+
+    let (row_groups, row_group_layout) = match fetch_best_row_group_paths(
+        table_oid,
+        &attrs,
+        &pushed_plan,
+        needs_row_group_stats,
+        asof,
+    ) {
+        Ok(result) => result,
+        Err(e) => pgrx::error!("rvbbit custom scan: row group lookup failed: {}", e),
+    };
 
     // Phase 2 ObjectStore: when the local-file fetch above returned empty
     // but the catalog HAS row groups for this table (just all on the cold
@@ -481,7 +492,7 @@ unsafe extern "C-unwind" fn begin_custom_scan(
         .flatten()
         .unwrap_or(0);
         if cold_count > 0 {
-            match crate::df::collect_batches_for_table(table_oid) {
+            match crate::df::collect_batches_for_table_asof(table_oid, statement_asof.clone()) {
                 Ok(batches) => Some(batches),
                 Err(e) => pgrx::error!(
                     "rvbbit: cold-tier read via in-process DataFusion failed: {}",
@@ -496,9 +507,9 @@ unsafe extern "C-unwind" fn begin_custom_scan(
     };
 
     // Phase 2 slice 4: load the tombstone bitmap for this scan, honoring
-    // rvbbit.as_of_generation if set. On any error we treat as "no
-    // tombstones" — better to over-include rows than to fail the query.
-    let asof = read_as_of_generation();
+    // either rvbbit.as_of_generation or a statement timestamp directive.
+    // On any error we treat as "no tombstones" — better to over-include rows
+    // than to fail the query.
     let delete_bitmaps = match crate::delete_log::load_for_table(table_oid, asof) {
         Ok(m) => m,
         Err(_) => HashMap::new(),
@@ -1064,12 +1075,7 @@ unsafe fn extract_array_value_set(node: *mut pg_sys::Node) -> Option<PushVal> {
             let mut elem_len: i16 = 0;
             let mut elem_byval = false;
             let mut elem_align: std::ffi::c_char = 0;
-            pg_sys::get_typlenbyvalalign(
-                elem_oid,
-                &mut elem_len,
-                &mut elem_byval,
-                &mut elem_align,
-            );
+            pg_sys::get_typlenbyvalalign(elem_oid, &mut elem_len, &mut elem_byval, &mut elem_align);
             pg_sys::deconstruct_array(
                 any_array as *mut pg_sys::ArrayType,
                 elem_oid,
@@ -2868,47 +2874,55 @@ fn fetch_best_row_group_paths(
     pg_attrs: &[PgAttr],
     pushed_plan: &PushedQualPlan,
     include_stats: bool,
+    asof: Option<i64>,
 ) -> Result<(Vec<RowGroupEntry>, String), String> {
     if !include_stats {
         return Ok((
-            fetch_row_group_paths(table_oid, include_stats, None)?,
+            fetch_row_group_paths(table_oid, include_stats, None, asof)?,
             SCAN_LAYOUT.to_string(),
         ));
     }
 
-    let mut best_variant: Option<(Vec<RowGroupEntry>, String, usize, bool)> = None;
-    for layout in fetch_variant_layouts(table_oid)? {
-        let clustered = fetch_row_group_paths(table_oid, true, Some(&layout))?;
-        if clustered.is_empty() {
-            continue;
-        }
-        let pruned = clustered
-            .iter()
-            .filter(|rg| {
-                !row_group_may_satisfy(rg, pg_attrs, &pushed_plan.quals, pushed_plan.expr.as_ref())
-            })
-            .count();
-        if should_use_cluster_layout(clustered.len(), pruned) {
-            let kept = clustered.len().saturating_sub(pruned);
-            let matches_filter = layout_matches_pushed_filter(&layout, pg_attrs, pushed_plan);
-            let replace =
-                best_variant
-                    .as_ref()
-                    .is_none_or(|(_, _, best_kept, best_matches_filter)| {
-                        kept < *best_kept
-                            || (kept == *best_kept && matches_filter && !*best_matches_filter)
-                    });
-            if replace {
-                best_variant = Some((clustered, layout, kept, matches_filter));
+    if asof.is_none() {
+        let mut best_variant: Option<(Vec<RowGroupEntry>, String, usize, bool)> = None;
+        for layout in fetch_variant_layouts(table_oid)? {
+            let clustered = fetch_row_group_paths(table_oid, true, Some(&layout), asof)?;
+            if clustered.is_empty() {
+                continue;
+            }
+            let pruned = clustered
+                .iter()
+                .filter(|rg| {
+                    !row_group_may_satisfy(
+                        rg,
+                        pg_attrs,
+                        &pushed_plan.quals,
+                        pushed_plan.expr.as_ref(),
+                    )
+                })
+                .count();
+            if should_use_cluster_layout(clustered.len(), pruned) {
+                let kept = clustered.len().saturating_sub(pruned);
+                let matches_filter = layout_matches_pushed_filter(&layout, pg_attrs, pushed_plan);
+                let replace =
+                    best_variant
+                        .as_ref()
+                        .is_none_or(|(_, _, best_kept, best_matches_filter)| {
+                            kept < *best_kept
+                                || (kept == *best_kept && matches_filter && !*best_matches_filter)
+                        });
+                if replace {
+                    best_variant = Some((clustered, layout, kept, matches_filter));
+                }
             }
         }
-    }
-    if let Some((row_groups, layout, _, _)) = best_variant {
-        return Ok((row_groups, layout));
+        if let Some((row_groups, layout, _, _)) = best_variant {
+            return Ok((row_groups, layout));
+        }
     }
 
     Ok((
-        fetch_row_group_paths(table_oid, include_stats, None)?,
+        fetch_row_group_paths(table_oid, include_stats, None, asof)?,
         SCAN_LAYOUT.to_string(),
     ))
 }
@@ -2942,24 +2956,6 @@ fn layout_matches_pushed_filter(
             .get((attnum - 1) as usize)
             .is_some_and(|attr| attr.name == column)
     })
-}
-
-/// Read the rvbbit.as_of_generation GUC at scan-begin time. Same pattern
-/// as `df::current_asof`: direct GetConfigOption FFI so the cost is
-/// microseconds, not an SPI roundtrip. Positive → narrow to gen <= asof;
-/// unset/empty/0/negative → None (use the latest visible state).
-fn read_as_of_generation() -> Option<i64> {
-    let cname = CString::new("rvbbit.as_of_generation").ok()?;
-    let ptr = unsafe { pg_sys::GetConfigOption(cname.as_ptr(), true, false) };
-    if ptr.is_null() {
-        return None;
-    }
-    let raw = unsafe { CStr::from_ptr(ptr).to_string_lossy() };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed.parse::<i64>().ok().filter(|&g| g > 0)
 }
 
 fn fetch_variant_layouts(table_oid: u32) -> Result<Vec<String>, String> {
@@ -2999,13 +2995,13 @@ fn fetch_row_group_paths(
     table_oid: u32,
     include_stats: bool,
     variant_layout: Option<&str>,
+    asof: Option<i64>,
 ) -> Result<Vec<RowGroupEntry>, String> {
     let mut out = Vec::new();
     // Phase 2 slice 3: when AS OF is set, narrow row groups to those at
     // generation <= asof. Variant layouts (hive/cluster) don't carry
     // per-rg generations and can't honor this; routes will fall back to
     // canonical scan when AS OF is active.
-    let asof = read_as_of_generation();
     let asof_predicate = match (asof, variant_layout.is_some()) {
         (Some(g), false) => format!("AND generation <= {g}"),
         _ => String::new(),

@@ -43,6 +43,8 @@ use pgrx::{JsonB, Spi};
 use serde_json::{json, Value};
 use tokio::runtime::{Builder, Runtime};
 
+use crate::time_travel::AsOf;
+
 const PROBE_TABLE: &str = "t";
 const DEFAULT_HOT_STORE_BUDGET_MB: usize = 512;
 const DEFAULT_HOT_STORE_ROUTE_MAX_ROWS: i64 = 500_000;
@@ -366,27 +368,8 @@ impl RvbbitTable {
     }
 }
 
-/// Phase 2 slice 3: read the rvbbit.as_of_generation GUC. A positive value
-/// narrows row group selection to `generation <= asof`. Unset / empty / 0
-/// means "no AS OF filter — use the latest visible state". Negative values
-/// are normalized to None.
-///
-/// Uses direct GetConfigOption FFI (microseconds) instead of an SPI
-/// roundtrip (milliseconds) so this primitive is cheap enough to call on
-/// every datafusion_query_json invocation without a measurable per-query
-/// tax. Same pattern as duck_backend::guc_setting.
-fn current_asof() -> Option<i64> {
-    let cname = CString::new("rvbbit.as_of_generation").ok()?;
-    let ptr = unsafe { pg_sys::GetConfigOption(cname.as_ptr(), true, false) };
-    if ptr.is_null() {
-        return None;
-    }
-    let raw = unsafe { CStr::from_ptr(ptr).to_string_lossy() };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed.parse::<i64>().ok().filter(|&g| g > 0)
+fn current_asof() -> Option<AsOf> {
+    crate::time_travel::active_as_of()
 }
 
 #[cfg(not(test))]
@@ -411,7 +394,7 @@ fn guc_setting(name: &str) -> Option<String> {
 ///
 /// Returns BTreeMap so iteration order is deterministic across calls (helps
 /// when registering many tables — DataFusion order can shift planning).
-fn discover_catalog_scan(asof: Option<i64>) -> Result<BTreeMap<String, RvbbitTable>, String> {
+fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTable>, String> {
     // SPI returns plain Datums; we copy into a Vec so the borrow ends before
     // we leave the SPI scope.
     struct Row {
@@ -424,12 +407,12 @@ fn discover_catalog_scan(asof: Option<i64>) -> Result<BTreeMap<String, RvbbitTab
         deletes: i64,
     }
     let mut rows: Vec<Row> = Vec::new();
-    let asof_predicate = match asof {
-        Some(g) => format!("AND rg.generation <= {g}"),
+    let asof_predicate = match asof.as_ref() {
+        Some(asof) => crate::time_travel::row_group_predicate(asof, "c.oid", "rg.generation"),
         None => String::new(),
     };
-    let tombstone_predicate = match asof {
-        Some(g) => format!("AND deleted_generation <= {g}"),
+    let tombstone_predicate = match asof.as_ref() {
+        Some(asof) => crate::time_travel::tombstone_predicate(asof, "c.oid", "deleted_generation"),
         None => String::new(),
     };
     // Phase 2 ObjectStore tiered storage: prefer the cold_url when it's set
@@ -546,7 +529,7 @@ fn discover_catalog_scan(asof: Option<i64>) -> Result<BTreeMap<String, RvbbitTab
 /// `asof` participates in the signature so that the same table queried at
 /// a different AS OF generation gets re-registered with the narrowed file
 /// set instead of reusing the cached (full) registration.
-fn table_signature(t: &RvbbitTable, asof: Option<i64>) -> u64 {
+fn table_signature(t: &RvbbitTable, asof: Option<&AsOf>) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -612,7 +595,7 @@ async fn register_listing_table(
 async fn register_tables(
     ctx: &SessionContext,
     tables: &BTreeMap<String, RvbbitTable>,
-    asof: Option<i64>,
+    asof: Option<&AsOf>,
 ) -> Result<(), String> {
     for (qualified, t) in tables {
         let sig = table_signature(t, asof);
@@ -1027,10 +1010,7 @@ fn hot_object_is_fresh(object: &HotCatalogObject) -> bool {
 
 pub(crate) fn hot_tables_available(tables: &[(u32, String)]) -> (bool, String) {
     if current_asof().is_some() {
-        return (
-            false,
-            "hot store is not used for AS OF generation queries".to_string(),
-        );
+        return (false, "hot store is not used for AS OF queries".to_string());
     }
     if hot_budget_bytes() == 0 {
         return (false, "hot store budget is 0".to_string());
@@ -1225,12 +1205,15 @@ pub(crate) fn query_engine(layout: &str, sql: &str, max_rows: i32) -> Result<Val
 
     let asof = current_asof();
     if use_hot_mem && asof.is_some() {
-        return Err("hot store is not used for AS OF generation queries".to_string());
+        return Err("hot store is not used for AS OF queries".to_string());
     }
-    let tables = discover_catalog_scan(asof)?;
+    let tables = discover_catalog_scan(asof.clone())?;
     if tables.is_empty() {
         return Err(match asof {
-            Some(g) => format!("no rvbbit row groups visible at AS OF generation {g}"),
+            Some(ref asof) => format!(
+                "no rvbbit row groups visible at AS OF {}",
+                crate::time_travel::label(asof)
+            ),
             None => "no authoritative compacted rvbbit parquet tables are visible".to_string(),
         });
     }
@@ -1253,7 +1236,7 @@ pub(crate) fn query_engine(layout: &str, sql: &str, max_rows: i32) -> Result<Val
                 }
                 execute_sql_json(&mem_ctx, sql, max_rows).await
             } else {
-                register_tables(ctx, &tables, asof).await?;
+                register_tables(ctx, &tables, asof.as_ref()).await?;
                 execute_sql_json(ctx, sql, max_rows).await
             }
         })
@@ -1529,9 +1512,17 @@ fn hot_status() -> JsonB {
 ///
 /// Returns RecordBatches with the table's columns in their natural order.
 /// CustomScan's fill_slot_from_batch picks out the projection it needs.
+#[allow(dead_code)]
 pub(crate) fn collect_batches_for_table(table_oid: u32) -> Result<Vec<RecordBatch>, String> {
     let asof = current_asof();
-    let tables = discover_catalog_scan(asof)?;
+    collect_batches_for_table_asof(table_oid, asof)
+}
+
+pub(crate) fn collect_batches_for_table_asof(
+    table_oid: u32,
+    asof: Option<AsOf>,
+) -> Result<Vec<RecordBatch>, String> {
+    let tables = discover_catalog_scan(asof.clone())?;
     if tables.is_empty() {
         return Err(format!(
             "no eligible rvbbit row groups for table oid {table_oid} \
@@ -1559,7 +1550,7 @@ pub(crate) fn collect_batches_for_table(table_oid: u32) -> Result<Vec<RecordBatc
 
     with_rt_ctx(|rt, ctx| {
         rt.block_on(async {
-            register_tables(ctx, &tables, asof).await?;
+            register_tables(ctx, &tables, asof.as_ref()).await?;
             // Quote schema + table identifiers so case-sensitive names work.
             // DataFusion accepts standard SQL double-quotes for identifiers.
             let parts: Vec<&str> = qualified.splitn(2, '.').collect();

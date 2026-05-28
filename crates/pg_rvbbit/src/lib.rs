@@ -70,6 +70,7 @@ mod specialists;
 mod takes;
 mod tam;
 mod telemetry;
+mod time_travel;
 mod tokens;
 mod triples;
 mod unit_of_work;
@@ -181,6 +182,7 @@ pub extern "C-unwind" fn _PG_init() {
         planner::register_hooks();
         rewriter::register_hooks();
         route_log::register_hooks();
+        time_travel::register_hooks();
         explain::register_explain_semantic();
     }
 }

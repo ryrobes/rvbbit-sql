@@ -102,6 +102,7 @@ unsafe extern "C-unwind" fn rvbbit_planner_hook(
     cursor_options: std::ffi::c_int,
     bound_params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
+    let _asof_scope = crate::time_travel::planner_scope(query_string);
     if force_heap_scan_enabled() {
         return call_next_planner(parse, query_string, cursor_options, bound_params);
     }
@@ -350,9 +351,7 @@ fn force_heap_scan_enabled() -> bool {
 }
 
 fn as_of_generation_enabled() -> bool {
-    guc_setting("rvbbit.as_of_generation")
-        .and_then(|value| value.trim().parse::<i64>().ok())
-        .is_some_and(|generation| generation > 0)
+    crate::time_travel::active_as_of_enabled()
 }
 
 fn setting_enabled(value: &str, default: bool) -> bool {

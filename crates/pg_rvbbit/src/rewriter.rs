@@ -508,6 +508,9 @@ unsafe fn primary_relation_oid_for_cache(query: *mut pg_sys::Query) -> Option<u3
 }
 
 fn native_rewrite_table_signature(table_oid: u32) -> Option<NativeRewriteTableSignature> {
+    if current_source_has_asof_timestamp_directive() {
+        return None;
+    }
     if let Some(val) = guc_setting("rvbbit.as_of_generation") {
         if val.trim().parse::<i64>().ok().is_some_and(|g| g > 0) {
             return None;
@@ -600,6 +603,9 @@ unsafe fn try_duck_backend_rewrite(
         .into_owned();
     let query_source = source_slice_for_query(&source, query).trim();
     if query_source.is_empty() || query_source.to_ascii_lowercase().contains("rvbbit.") {
+        return false;
+    }
+    if crate::time_travel::has_as_of_timestamp_directive(query_source) {
         return false;
     }
 
@@ -9590,6 +9596,9 @@ fn force_heap_scan_enabled() -> bool {
 /// instead of walking the rtable per call. A more precise per-rtable
 /// check is a future refinement.
 fn metadata_rewrites_unsafe_for_correctness() -> bool {
+    if current_source_has_asof_timestamp_directive() {
+        return true;
+    }
     // GUC check: free (direct GetConfigOption).
     if let Some(val) = guc_setting("rvbbit.as_of_generation") {
         if let Ok(g) = val.trim().parse::<i64>() {
@@ -9633,6 +9642,15 @@ fn metadata_rewrites_unsafe_for_correctness() -> bool {
     .ok()
     .flatten();
     has_cold.unwrap_or(false)
+}
+
+fn current_source_has_asof_timestamp_directive() -> bool {
+    CURRENT_SOURCE_SQL.with(|cell| {
+        cell.borrow()
+            .as_deref()
+            .map(crate::time_travel::has_as_of_timestamp_directive)
+            .unwrap_or(false)
+    })
 }
 
 fn setting_enabled(value: &str, default: bool) -> bool {
