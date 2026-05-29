@@ -22,7 +22,8 @@ def test_refresh_phase_log_and_hive_delta_append(rvbbit, temp_table):
     ).fetchone()
 
     phases = rvbbit.execute(f"""
-        SELECT phase, layout_kind, partition_key, status, rows_written
+        SELECT phase, layout_kind, partition_key, status, rows_written,
+               details->>'source', details->>'metadata_profile'
         FROM rvbbit.acceleration_phase_log_for('{temp_table}'::regclass)
     """).fetchall()
     assert any(p[0] == "canonical_delta_export" and p[3] == "ok" for p in phases)
@@ -31,6 +32,8 @@ def test_refresh_phase_log_and_hive_delta_append(rvbbit, temp_table):
         and p[1] == "hive"
         and p[2] == "bucket"
         and p[3] == "ok"
+        and p[5] == "canonical_parquet"
+        and p[6] == "minimal"
         for p in phases
     )
 
@@ -44,7 +47,8 @@ def test_refresh_phase_log_and_hive_delta_append(rvbbit, temp_table):
     ).fetchone()
 
     phases = rvbbit.execute(f"""
-        SELECT phase, layout_kind, partition_key, status, rows_written
+        SELECT phase, layout_kind, partition_key, status, rows_written,
+               details->>'source', details->>'metadata_profile'
         FROM rvbbit.acceleration_phase_log_for('{temp_table}'::regclass)
     """).fetchall()
     assert any(

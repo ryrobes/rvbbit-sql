@@ -29,19 +29,23 @@
 //! tables (>>10M rows) we'll want to chunk by row count and emit multiple
 //! row groups so each one fits comfortably in memory.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, ListBuilder, RecordBatch, StringBuilder,
-    TimestampMicrosecondBuilder,
+    Array, ArrayRef, BinaryBuilder, BooleanArray, BooleanBuilder, Float32Builder, Float64Builder,
+    Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, LargeStringArray,
+    ListBuilder, RecordBatch, StringArray, StringBuilder, StringViewArray,
+    TimestampMicrosecondBuilder, UInt32Array,
 };
+use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pgrx::prelude::*;
 use pgrx::Spi;
-use rvbbit_storage::row_group::RowGroupWriter;
+use rvbbit_storage::row_group::{RowGroupWriteOptions, RowGroupWriter};
 
 const SCAN_LAYOUT_DIR: &str = "scan";
 const CLUSTER_LAYOUT_PREFIX: &str = "cluster:";
@@ -348,6 +352,87 @@ fn hive_max_distinct_setting() -> f64 {
 
 fn hive_layout_for_key(key: &str) -> String {
     format!("{HIVE_LAYOUT_PREFIX}{key}")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LayoutVariantSource {
+    Heap,
+    CanonicalParquet,
+}
+
+impl LayoutVariantSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            LayoutVariantSource::Heap => "heap",
+            LayoutVariantSource::CanonicalParquet => "canonical_parquet",
+        }
+    }
+}
+
+fn layout_variant_source_setting() -> LayoutVariantSource {
+    match compact_setting(
+        "RVBBIT_LAYOUT_VARIANT_SOURCE",
+        "rvbbit.layout_variant_source",
+    )
+    .unwrap_or_else(|| "canonical_parquet".to_string())
+    .to_ascii_lowercase()
+    .replace('-', "_")
+    .as_str()
+    {
+        "heap" | "spi" | "postgres" => LayoutVariantSource::Heap,
+        "canonical" | "parquet" | "canonical_parquet" | "mono_parquet" => {
+            LayoutVariantSource::CanonicalParquet
+        }
+        _ => LayoutVariantSource::CanonicalParquet,
+    }
+}
+
+fn layout_variant_parquet_batch_rows_setting(default_rows: usize) -> usize {
+    compact_setting(
+        "RVBBIT_LAYOUT_VARIANT_PARQUET_BATCH_ROWS",
+        "rvbbit.layout_variant_parquet_batch_rows",
+    )
+    .and_then(|s| s.parse::<usize>().ok())
+    .filter(|n| *n > 0)
+    .unwrap_or(default_rows)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HiveVariantMetadataProfile {
+    Minimal,
+    Rich,
+}
+
+impl HiveVariantMetadataProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            HiveVariantMetadataProfile::Minimal => "minimal",
+            HiveVariantMetadataProfile::Rich => "rich",
+        }
+    }
+
+    fn write_options(self) -> RowGroupWriteOptions {
+        match self {
+            HiveVariantMetadataProfile::Minimal => RowGroupWriteOptions::minimal(),
+            HiveVariantMetadataProfile::Rich => RowGroupWriteOptions::from_env(),
+        }
+    }
+}
+
+fn hive_variant_metadata_profile() -> HiveVariantMetadataProfile {
+    match compact_setting(
+        "RVBBIT_HIVE_VARIANT_METADATA",
+        "rvbbit.hive_variant_metadata",
+    )
+    .unwrap_or_else(|| "minimal".to_string())
+    .to_ascii_lowercase()
+    .replace('-', "_")
+    .as_str()
+    {
+        "rich" | "full" | "canonical" => HiveVariantMetadataProfile::Rich,
+        "minimal" | "min" | "none" | "duck" | "duck_only" => HiveVariantMetadataProfile::Minimal,
+        _ => HiveVariantMetadataProfile::Minimal,
+    }
 }
 
 fn layout_dir_name(layout: &str) -> String {
@@ -934,8 +1019,13 @@ fn refresh_layout_variants_impl(
     path_root: &PathBuf,
 ) -> Result<i64, Box<dyn std::error::Error>> {
     let cluster_chunk_rows = chunk_rows_setting();
+    let scan_chunk_rows = scan_chunk_rows_setting();
     let cluster_keys = auto_cluster_keys(rel_oid, plans);
     let hive_keys = auto_hive_partition_keys(rel_oid, plans);
+    let hive_source = layout_variant_source_setting();
+    let hive_parquet_batch_rows =
+        layout_variant_parquet_batch_rows_setting(scan_chunk_rows.max(cluster_chunk_rows));
+    let hive_metadata_profile = hive_variant_metadata_profile();
     let mut rows_written = 0_i64;
 
     if dual_layout_enabled() && !cluster_keys.is_empty() {
@@ -1022,23 +1112,40 @@ fn refresh_layout_variants_impl(
                 serde_json::json!({
                     "layout_kind": "hive",
                     "build_mode": "full_rebuild",
-                    "source": "heap",
+                    "source": hive_source.as_str(),
                     "hive_key": hive_key,
                     "selected_hive_keys": &hive_keys,
                     "chunk_rows": cluster_chunk_rows,
+                    "parquet_batch_rows": hive_parquet_batch_rows,
+                    "metadata_profile": hive_metadata_profile.as_str(),
                 }),
             )?;
             let build_result = (|| -> Result<_, Box<dyn std::error::Error>> {
                 clear_variant_layout(rel_oid, &layout, path_root)?;
                 let hive_root = path_root.join(layout_dir_name(&layout));
-                let variant_chunks = write_hive_layout_chunks(
-                    qualified,
-                    plans,
-                    &hive_root,
-                    0,
-                    cluster_chunk_rows,
-                    hive_key,
-                )?;
+                let variant_chunks = match hive_source {
+                    LayoutVariantSource::Heap => write_hive_layout_chunks(
+                        qualified,
+                        plans,
+                        &hive_root,
+                        0,
+                        cluster_chunk_rows,
+                        hive_key,
+                        hive_metadata_profile.write_options(),
+                    )?,
+                    LayoutVariantSource::CanonicalParquet => {
+                        write_hive_layout_chunks_from_canonical_parquet(
+                            rel_oid,
+                            plans,
+                            &hive_root,
+                            0,
+                            cluster_chunk_rows,
+                            hive_parquet_batch_rows,
+                            hive_key,
+                            hive_metadata_profile.write_options(),
+                        )?
+                    }
+                };
                 Ok(variant_chunks)
             })();
             let variant_chunks = match build_result {
@@ -1075,7 +1182,12 @@ fn refresh_layout_variants_impl(
                 variant_bytes,
                 Some(expected_rows),
                 Some(variant_rows),
-                serde_json::json!({"validated": valid}),
+                serde_json::json!({
+                    "validated": valid,
+                    "source": hive_source.as_str(),
+                    "parquet_batch_rows": hive_parquet_batch_rows,
+                    "metadata_profile": hive_metadata_profile.as_str(),
+                }),
                 None,
             )?;
         }
@@ -1105,6 +1217,7 @@ fn refresh_layout_variants_delta_impl(
 
     let chunk_rows = chunk_rows_setting();
     let hive_keys = auto_hive_partition_keys(rel_oid, plans);
+    let hive_metadata_profile = hive_variant_metadata_profile();
     if !hive_layout_enabled() || hive_keys.is_empty() {
         return Ok(0);
     }
@@ -1169,6 +1282,7 @@ fn refresh_layout_variants_delta_impl(
                 "selected_hive_keys": &selected_hive_keys,
                 "first_rg_id": first_rg_id,
                 "chunk_rows": chunk_rows,
+                "metadata_profile": hive_metadata_profile.as_str(),
             }),
         )?;
         let hive_root = path_root.join(layout_dir_name(&layout));
@@ -1179,6 +1293,7 @@ fn refresh_layout_variants_delta_impl(
             first_rg_id,
             chunk_rows,
             hive_key,
+            hive_metadata_profile.write_options(),
         );
         let variant_chunks = match build_result {
             Ok(chunks) => chunks,
@@ -1699,6 +1814,7 @@ fn write_hive_layout_chunks(
     first_rg_id: i64,
     chunk_rows: usize,
     hive_key: &str,
+    write_options: RowGroupWriteOptions,
 ) -> Result<Vec<rvbbit_storage::metadata::RowGroupMeta>, Box<dyn std::error::Error>> {
     let Some(partition_plan) = plans.iter().find(|p| p.name == hive_key) else {
         return Err(format!("hive partition key '{hive_key}' is not a table column").into());
@@ -1768,9 +1884,15 @@ fn write_hive_layout_chunks(
                     let chunk_path = path_root
                         .join(format!("{}={flush_partition}", layout_dir_name(hive_key)))
                         .join(format!("{rg_id}.parquet"));
-                    let meta =
-                        flush_chunk(&file_schema, &mut builders, &file_plans, &chunk_path, rg_id)
-                            .map_err(|e| pgrx::spi::Error::CursorNotFound(e.to_string()))?;
+                    let meta = flush_chunk_with_options(
+                        &file_schema,
+                        &mut builders,
+                        &file_plans,
+                        &chunk_path,
+                        rg_id,
+                        write_options,
+                    )
+                    .map_err(|e| pgrx::spi::Error::CursorNotFound(e.to_string()))?;
                     chunks.push(meta);
                     chunk_count = 0;
                     chunk_idx += 1;
@@ -1828,9 +1950,15 @@ fn write_hive_layout_chunks(
                     let chunk_path = path_root
                         .join(format!("{}={partition}", layout_dir_name(hive_key)))
                         .join(format!("{rg_id}.parquet"));
-                    let meta =
-                        flush_chunk(&file_schema, &mut builders, &file_plans, &chunk_path, rg_id)
-                            .map_err(|e| pgrx::spi::Error::CursorNotFound(e.to_string()))?;
+                    let meta = flush_chunk_with_options(
+                        &file_schema,
+                        &mut builders,
+                        &file_plans,
+                        &chunk_path,
+                        rg_id,
+                        write_options,
+                    )
+                    .map_err(|e| pgrx::spi::Error::CursorNotFound(e.to_string()))?;
                     chunks.push(meta);
                     chunk_count = 0;
                     chunk_idx += 1;
@@ -1843,9 +1971,15 @@ fn write_hive_layout_chunks(
                 let chunk_path = path_root
                     .join(format!("{}={partition}", layout_dir_name(hive_key)))
                     .join(format!("{rg_id}.parquet"));
-                let meta =
-                    flush_chunk(&file_schema, &mut builders, &file_plans, &chunk_path, rg_id)
-                        .map_err(|e| pgrx::spi::Error::CursorNotFound(e.to_string()))?;
+                let meta = flush_chunk_with_options(
+                    &file_schema,
+                    &mut builders,
+                    &file_plans,
+                    &chunk_path,
+                    rg_id,
+                    write_options,
+                )
+                .map_err(|e| pgrx::spi::Error::CursorNotFound(e.to_string()))?;
                 chunks.push(meta);
             }
 
@@ -1863,6 +1997,235 @@ fn write_hive_layout_chunks(
     )?;
 
     Ok(chunks)
+}
+
+fn write_hive_layout_chunks_from_canonical_parquet(
+    rel_oid: u32,
+    plans: &[ColumnPlan],
+    path_root: &PathBuf,
+    first_rg_id: i64,
+    chunk_rows: usize,
+    batch_rows: usize,
+    hive_key: &str,
+    write_options: RowGroupWriteOptions,
+) -> Result<Vec<rvbbit_storage::metadata::RowGroupMeta>, Box<dyn std::error::Error>> {
+    let Some(partition_plan) = plans.iter().find(|p| p.name == hive_key) else {
+        return Err(format!("hive partition key '{hive_key}' is not a table column").into());
+    };
+    if !is_hive_partitionable_type(partition_plan.pg_type) {
+        return Err(format!("hive partition key '{hive_key}' has unsupported type").into());
+    }
+
+    let file_plans: Vec<ColumnPlan> = plans
+        .iter()
+        .filter(|p| p.name != hive_key)
+        .cloned()
+        .collect();
+    let file_schema = schema_for_plans(&file_plans);
+    let row_groups = canonical_row_group_paths(rel_oid)?;
+    if row_groups.is_empty() {
+        return Err(format!("table oid {rel_oid} has no canonical parquet row groups").into());
+    }
+
+    let mut chunks: Vec<rvbbit_storage::metadata::RowGroupMeta> = Vec::new();
+    let mut chunk_idx = 0_i64;
+    for (_source_rg_id, source_path) in row_groups {
+        let file = File::open(&source_path)
+            .map_err(|e| format!("opening canonical parquet {source_path}: {e}"))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| format!("opening canonical parquet reader {source_path}: {e}"))?
+            .with_batch_size(batch_rows)
+            .build()
+            .map_err(|e| format!("building canonical parquet reader {source_path}: {e}"))?;
+
+        for batch in reader {
+            let batch =
+                batch.map_err(|e| format!("reading canonical parquet {source_path}: {e}"))?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let partition_idx = batch.schema().index_of(hive_key).map_err(|_| {
+                format!(
+                    "hive partition key '{hive_key}' not found in canonical parquet schema for {source_path}"
+                )
+            })?;
+            let partition_array = batch.column(partition_idx);
+            let mut rows_by_partition: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+            for row_idx in 0..batch.num_rows() {
+                let partition =
+                    encoded_hive_partition_from_arrow(partition_array, row_idx, partition_plan)?;
+                rows_by_partition
+                    .entry(partition)
+                    .or_default()
+                    .push(row_idx as u32);
+            }
+
+            for (partition, row_indices) in rows_by_partition {
+                if row_indices.is_empty() {
+                    continue;
+                }
+                for row_chunk in row_indices.chunks(chunk_rows) {
+                    let rg_id = first_rg_id + chunk_idx;
+                    let chunk_path = path_root
+                        .join(format!("{}={partition}", layout_dir_name(hive_key)))
+                        .join(format!("{rg_id}.parquet"));
+                    let partition_batch =
+                        take_hive_file_batch(&batch, &file_plans, &file_schema, row_chunk)?;
+                    let meta = RowGroupWriter::write_with_options(
+                        &chunk_path,
+                        rg_id,
+                        &partition_batch,
+                        write_options,
+                    )?;
+                    chunks.push(meta);
+                    chunk_idx += 1;
+                }
+            }
+        }
+    }
+
+    Ok(chunks)
+}
+
+fn canonical_row_group_paths(
+    rel_oid: u32,
+) -> Result<Vec<(i64, String)>, Box<dyn std::error::Error>> {
+    let mut row_groups = Vec::new();
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(
+            &format!(
+                "SELECT rg_id, path \
+                 FROM rvbbit.row_groups \
+                 WHERE table_oid = {rel_oid}::oid \
+                 ORDER BY rg_id"
+            ),
+            None,
+            &[],
+        )?;
+        for row in table {
+            let rg_id = row.get::<i64>(1)?.unwrap_or(0);
+            let path = row.get::<String>(2)?.unwrap_or_default();
+            if !path.is_empty() {
+                row_groups.push((rg_id, path));
+            }
+        }
+        Ok(())
+    })?;
+    Ok(row_groups)
+}
+
+fn take_hive_file_batch(
+    batch: &RecordBatch,
+    file_plans: &[ColumnPlan],
+    file_schema: &Arc<Schema>,
+    row_indices: &[u32],
+) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    let indices = UInt32Array::from(row_indices.to_vec());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(file_plans.len());
+    for plan in file_plans {
+        let idx = batch.schema().index_of(&plan.name).map_err(|_| {
+            format!(
+                "column '{}' not found in canonical parquet batch",
+                plan.name
+            )
+        })?;
+        arrays.push(take(batch.column(idx).as_ref(), &indices, None)?);
+    }
+    Ok(RecordBatch::try_new(file_schema.clone(), arrays)?)
+}
+
+fn encoded_hive_partition_from_arrow(
+    array: &ArrayRef,
+    row_idx: usize,
+    plan: &ColumnPlan,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if array.is_null(row_idx) {
+        return Ok(encode_hive_partition_value(None));
+    }
+
+    let value = match plan.pg_type {
+        16 => {
+            let Some(array) = array.as_any().downcast_ref::<BooleanArray>() else {
+                return Err(format!(
+                    "hive partition key '{}' expected boolean parquet array, found {:?}",
+                    plan.name,
+                    array.data_type()
+                )
+                .into());
+            };
+            array.value(row_idx).to_string()
+        }
+        21 | 23 | 20 => arrow_integer_partition_value(array, row_idx, &plan.name)?.to_string(),
+        25 | 1042 | 1043 => arrow_string_partition_value(array, row_idx, &plan.name)?,
+        _ => {
+            return Err(format!(
+                "hive partition key '{}' has unsupported pg type {}",
+                plan.name, plan.pg_type
+            )
+            .into())
+        }
+    };
+
+    Ok(encode_hive_partition_value(Some(&value)))
+}
+
+fn arrow_integer_partition_value(
+    array: &ArrayRef,
+    row_idx: usize,
+    column_name: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    match array.data_type() {
+        DataType::Int16 => Ok(array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .ok_or_else(|| format!("column '{column_name}' is not Int16"))?
+            .value(row_idx) as i64),
+        DataType::Int32 => Ok(array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| format!("column '{column_name}' is not Int32"))?
+            .value(row_idx) as i64),
+        DataType::Int64 => Ok(array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| format!("column '{column_name}' is not Int64"))?
+            .value(row_idx)),
+        other => Err(format!(
+            "hive partition key '{column_name}' expected integer parquet array, found {other:?}"
+        )
+        .into()),
+    }
+}
+
+fn arrow_string_partition_value(
+    array: &ArrayRef,
+    row_idx: usize,
+    column_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match array.data_type() {
+        DataType::Utf8 => Ok(array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| format!("column '{column_name}' is not Utf8"))?
+            .value(row_idx)
+            .to_string()),
+        DataType::LargeUtf8 => Ok(array
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .ok_or_else(|| format!("column '{column_name}' is not LargeUtf8"))?
+            .value(row_idx)
+            .to_string()),
+        DataType::Utf8View => Ok(array
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .ok_or_else(|| format!("column '{column_name}' is not Utf8View"))?
+            .value(row_idx)
+            .to_string()),
+        other => Err(format!(
+            "hive partition key '{column_name}' expected string parquet array, found {other:?}"
+        )
+        .into()),
+    }
 }
 
 fn hive_partition_to_flush_on_transition<'a>(
@@ -2085,6 +2448,24 @@ fn flush_chunk(
     path: &PathBuf,
     rg_id: i64,
 ) -> Result<rvbbit_storage::metadata::RowGroupMeta, Box<dyn std::error::Error>> {
+    flush_chunk_with_options(
+        schema,
+        builders,
+        plans,
+        path,
+        rg_id,
+        RowGroupWriteOptions::from_env(),
+    )
+}
+
+fn flush_chunk_with_options(
+    schema: &Arc<Schema>,
+    builders: &mut Vec<ColumnBuilder>,
+    plans: &[ColumnPlan],
+    path: &PathBuf,
+    rg_id: i64,
+    write_options: RowGroupWriteOptions,
+) -> Result<rvbbit_storage::metadata::RowGroupMeta, Box<dyn std::error::Error>> {
     // Steal the current builders out, replace with fresh ones for the next chunk.
     let fresh: Vec<ColumnBuilder> = plans
         .iter()
@@ -2093,7 +2474,7 @@ fn flush_chunk(
     let old = std::mem::replace(builders, fresh);
     let arrays: Vec<ArrayRef> = old.into_iter().map(|b| b.finish()).collect();
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    let meta = RowGroupWriter::write(path, rg_id, &batch)?;
+    let meta = RowGroupWriter::write_with_options(path, rg_id, &batch, write_options)?;
     Ok(meta)
 }
 

@@ -145,15 +145,58 @@ impl TextDictionary {
 
 pub struct RowGroupWriter;
 
+#[derive(Clone, Copy, Debug)]
+pub struct RowGroupWriteOptions {
+    pub column_stats: bool,
+    pub text_stats: bool,
+    pub per_group_stats: bool,
+    pub value_bitmaps: bool,
+    pub text_dictionaries: bool,
+    pub parquet_bloom: Option<bool>,
+}
+
+impl RowGroupWriteOptions {
+    pub fn from_env() -> Self {
+        Self {
+            column_stats: true,
+            text_stats: compact_text_stats_enabled(),
+            per_group_stats: compact_per_group_stats_enabled(),
+            value_bitmaps: compact_value_bitmaps_enabled(),
+            text_dictionaries: compact_text_dictionaries_enabled(),
+            parquet_bloom: None,
+        }
+    }
+
+    pub fn minimal() -> Self {
+        Self {
+            column_stats: false,
+            text_stats: false,
+            per_group_stats: false,
+            value_bitmaps: false,
+            text_dictionaries: false,
+            parquet_bloom: Some(false),
+        }
+    }
+}
+
 impl RowGroupWriter {
     pub fn write(path: &Path, rg_id: i64, batch: &RecordBatch) -> Result<RowGroupMeta> {
+        Self::write_with_options(path, rg_id, batch, RowGroupWriteOptions::from_env())
+    }
+
+    pub fn write_with_options(
+        path: &Path,
+        rg_id: i64,
+        batch: &RecordBatch,
+        options: RowGroupWriteOptions,
+    ) -> Result<RowGroupMeta> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating parent dir {}", parent.display()))?;
         }
 
         let schema: SchemaRef = batch.schema();
-        let props = build_writer_properties(&schema);
+        let props = build_writer_properties(&schema, options);
 
         let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
         let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
@@ -168,18 +211,22 @@ impl RowGroupWriter {
         // Compute min/max/sum/null_count from the Arrow batch ourselves —
         // parquet only stores byte-encoded min/max, easier to extract from
         // the typed Arrow arrays we just wrote.
-        let column_stats = compute_arrow_stats(batch, compact_text_stats_enabled());
-        let per_group_stats = if compact_per_group_stats_enabled() {
+        let column_stats = if options.column_stats {
+            compute_arrow_stats(batch, options.text_stats)
+        } else {
+            Vec::new()
+        };
+        let per_group_stats = if options.per_group_stats {
             compute_per_group_stats(batch)
         } else {
             Vec::new()
         };
-        let column_bitmaps = if compact_value_bitmaps_enabled() {
+        let column_bitmaps = if options.value_bitmaps {
             compute_column_bitmaps(batch)?
         } else {
             Vec::new()
         };
-        let text_dictionaries = if compact_text_dictionaries_enabled() {
+        let text_dictionaries = if options.text_dictionaries {
             compute_text_dictionaries(path, batch)?
         } else {
             Vec::new()
@@ -227,7 +274,7 @@ const DEFAULT_COLUMN_INDEX_TRUNCATE: usize = 64;
 ///
 /// Numeric columns get bloom filters disabled because column min/max
 /// already cover the equality-pruning case for those types.
-fn build_writer_properties(schema: &SchemaRef) -> WriterProperties {
+fn build_writer_properties(schema: &SchemaRef, options: RowGroupWriteOptions) -> WriterProperties {
     let writer_version = if env_enabled("RVBBIT_PARQUET_V2", true) {
         WriterVersion::PARQUET_2_0
     } else {
@@ -235,7 +282,9 @@ fn build_writer_properties(schema: &SchemaRef) -> WriterProperties {
     };
 
     let page_rows = env_usize("RVBBIT_PARQUET_PAGE_ROWS", DEFAULT_PAGE_ROW_COUNT_LIMIT);
-    let bloom_enabled = env_enabled("RVBBIT_PARQUET_BLOOM", true);
+    let bloom_enabled = options
+        .parquet_bloom
+        .unwrap_or_else(|| env_enabled("RVBBIT_PARQUET_BLOOM", true));
     let bloom_fpp = env_f64("RVBBIT_PARQUET_BLOOM_FPP", DEFAULT_BLOOM_FPP);
 
     let mut builder = WriterProperties::builder()
