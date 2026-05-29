@@ -35,6 +35,7 @@ const NATIVE_FUNCTION_MARKERS: &[&str] = &[
     "top_rollup_1int_distinct",
     "top_count_int_minute_text",
     "top_count_filtered",
+    "agg_groupby_count",
     "top_avg_len_by_int_col",
     "top_count_int_text",
 ];
@@ -1842,6 +1843,15 @@ fn choose_route_fast(
             None,
         ));
     }
+    if filtered_count_should_stay_native(features) {
+        return Some(decision(
+            Candidate::RvbbitNative,
+            "hard-rule-fast",
+            "native filtered count metadata",
+            None,
+            None,
+        ));
+    }
     if features.min_count > 0 && features.max_count > 0 && !features.where_present {
         return Some(decision(
             Candidate::RvbbitNative,
@@ -1937,6 +1947,15 @@ fn choose_route(
             Candidate::RvbbitNative,
             "hard-rule",
             "native simple aggregate metadata",
+            None,
+            None,
+        );
+    }
+    if filtered_count_should_stay_native(features) {
+        return decision(
+            Candidate::RvbbitNative,
+            "hard-rule",
+            "native filtered count metadata",
             None,
             None,
         );
@@ -4326,6 +4345,12 @@ const FALLBACK_DUCK_FIRST: [Candidate; 3] = [
     Candidate::DataFusionVector,
 ];
 
+const FALLBACK_COMPLEX_HIVE_FIRST: [Candidate; 3] = [
+    Candidate::DuckHive,
+    Candidate::DuckVector,
+    Candidate::DataFusionVector,
+];
+
 fn default_external_candidate(
     features: &RouteFeatures,
     tables: &[RvbbitTableMetric],
@@ -4414,7 +4439,27 @@ fn simple_metadata_aggregate_should_stay_native(features: &RouteFeatures) -> boo
         && !features.plan_has_subplan
 }
 
+fn filtered_count_should_stay_native(features: &RouteFeatures) -> bool {
+    features.count_count > 0
+        && features.aggregate_count == features.count_count
+        && features.count_distinct_count == 0
+        && features.where_present
+        && !features.group_by
+        && !features.having
+        && !features.distinct
+        && features.from_count == 1
+        && features.join_count == 0
+        && !features.plan_has_join
+        && !features.plan_has_subplan
+}
+
 fn fallback_native_reason(features: &RouteFeatures) -> Option<&'static str> {
+    if filtered_count_should_stay_native(features) {
+        return Some("filtered count metadata stays on native path");
+    }
+    if selective_single_table_topk_should_stay_native(features) && features.has_native_function {
+        return Some("selective single-table top-k rewrite stays on native path");
+    }
     if features.has_native_function && !fallback_prefers_external_analytical_shape(features) {
         return Some("native PostgreSQL plan rewrite is available");
     }
@@ -4430,6 +4475,9 @@ fn fallback_native_reason(features: &RouteFeatures) -> Option<&'static str> {
         && !features.distinct
         && !features.having
         && features.join_count == 0
+        && features.from_count <= 1
+        && !features.plan_has_join
+        && !features.plan_has_subplan
     {
         return Some("row-returning query stays on native path");
     }
@@ -4446,6 +4494,12 @@ fn no_profile_native_reason(features: &RouteFeatures) -> Option<&'static str> {
         }
         "row-returning query stays on native path" => {
             Some("no active route profile; row-returning query stays on native path")
+        }
+        "selective single-table top-k rewrite stays on native path" => Some(
+            "no active route profile; selective single-table top-k rewrite stays on native path",
+        ),
+        "filtered count metadata stays on native path" => {
+            Some("no active route profile; filtered count metadata stays on native path")
         }
         _ => Some("no active route profile; using native path"),
     }
@@ -4497,10 +4551,25 @@ fn no_profile_variant_min_rows() -> i64 {
 }
 
 fn fallback_prefers_external_analytical_shape(features: &RouteFeatures) -> bool {
+    if filtered_count_should_stay_native(features) {
+        return false;
+    }
+    if selective_single_table_topk_should_stay_native(features) {
+        return false;
+    }
+    if native_function_prefers_vector_external(features) {
+        return true;
+    }
     if native_function_should_stay_native(features)
         || simple_metadata_aggregate_should_stay_native(features)
     {
         return false;
+    }
+    if complex_analytical_shape(features) {
+        return true;
+    }
+    if large_wide_grouped_aggregate_prefers_vector(features) {
+        return true;
     }
     if features.count_distinct_count > 0
         && (!features.group_by
@@ -4517,9 +4586,7 @@ fn fallback_prefers_external_analytical_shape(features: &RouteFeatures) -> bool 
         && has_limit(features)
         && features.group_text_col_count > 0
         && features.table_rows >= 100_000
-        && (has_multiple_group_keys(features)
-            || features.count_distinct_count > 0
-            || features.table_rows >= 1_000_000)
+        && (has_multiple_group_keys(features) || features.count_distinct_count > 0)
     {
         return true;
     }
@@ -4575,7 +4642,13 @@ fn fallback_prefers_variant(features: &RouteFeatures) -> bool {
 }
 
 fn fallback_external_candidate_order(features: &RouteFeatures) -> Option<&'static [Candidate]> {
-    if fallback_prefers_duck_vector(features) {
+    if native_function_prefers_vector_external(features) {
+        Some(&FALLBACK_VECTOR_FIRST)
+    } else if single_table_text_distinct_prefers_vector(features) {
+        Some(&FALLBACK_VECTOR_FIRST)
+    } else if fallback_prefers_complex_duck_hive(features) {
+        Some(&FALLBACK_COMPLEX_HIVE_FIRST)
+    } else if fallback_prefers_duck_vector(features) {
         Some(&FALLBACK_DUCK_FIRST)
     } else if fallback_prefers_variant(features) {
         Some(&FALLBACK_VARIANT_FIRST)
@@ -4611,6 +4684,69 @@ fn fallback_prefers_duck_vector(features: &RouteFeatures) -> bool {
         return true;
     }
     false
+}
+
+fn single_table_text_distinct_prefers_vector(features: &RouteFeatures) -> bool {
+    features.from_count <= 1
+        && features.join_count == 0
+        && !features.plan_has_join
+        && !features.plan_has_subplan
+        && !features.group_by
+        && features.count_distinct_text_count > 0
+}
+
+fn fallback_prefers_complex_duck_hive(features: &RouteFeatures) -> bool {
+    complex_analytical_shape(features)
+        && features.table_rows >= no_profile_variant_min_rows()
+        && !duck_hive_known_unsupported(features)
+}
+
+fn complex_analytical_shape(features: &RouteFeatures) -> bool {
+    let complex_from = features.join_count > 0
+        || features.from_count > 1
+        || features.plan_has_join
+        || features.plan_has_subplan
+        || features.exists_count > 0
+        || features.starts_with_with;
+    let analytical = features.aggregate_count > 0
+        || features.group_by
+        || features.order_by
+        || features.distinct
+        || features.having
+        || features.exists_count > 0
+        || features.in_count > 0;
+    complex_from && analytical
+}
+
+fn duck_hive_known_unsupported(features: &RouteFeatures) -> bool {
+    features.regex_count > 0 || features.normalized_sql.contains(") at_")
+}
+
+fn selective_single_table_topk_should_stay_native(features: &RouteFeatures) -> bool {
+    features.from_count <= 1
+        && features.join_count == 0
+        && !features.plan_has_join
+        && !features.plan_has_subplan
+        && features.where_present
+        && features.group_by
+        && features.order_by
+        && has_limit(features)
+        && features.count_distinct_count == 0
+        && features.aggregate_count <= 1
+        && features.and_count >= 3
+        && features.comparison_count >= 4
+        && features.fixed_contains_like_count == 0
+}
+
+fn large_wide_grouped_aggregate_prefers_vector(features: &RouteFeatures) -> bool {
+    features.from_count <= 1
+        && features.join_count == 0
+        && !features.plan_has_join
+        && !features.plan_has_subplan
+        && features.group_by
+        && features.aggregate_count >= 4
+        && features.table_rows >= no_profile_native_max_rows()
+        && !selective_single_table_topk_should_stay_native(features)
 }
 
 fn hot_store_prefers_mem(features: &RouteFeatures) -> bool {
@@ -4721,23 +4857,72 @@ fn native_function_should_stay_native(features: &RouteFeatures) -> bool {
     let Some(name) = features.native_function.as_deref() else {
         return false;
     };
+
+    if !single_table_native_rewrite(features) {
+        return false;
+    }
+
+    if native_function_prefers_vector_external(features) {
+        return false;
+    }
+
+    if name == "agg_groupby_count" || name == "top_rollup_1int_distinct" {
+        return true;
+    }
+
+    if scalable_native_topk_threshold(name).is_some() {
+        return true;
+    }
+
     if !matches!(
         name,
         "vector_float_agg"
-            | "top_searchphrase_ordered"
             | "count_text_contains"
             | "top_phrase_min_url_for_url_contains"
             | "top_phrase_url_title_rollup"
             | "top_rows_text_contains_ordered_json"
             | "top_text_transform_avg_len"
             | "any_count_int_text"
+            | "top_count_filtered"
     ) {
         return false;
     }
+
     !(features.plan_has_sort
         || features.plan_has_group
         || features.plan_has_join
         || features.plan_has_subplan)
+}
+
+fn native_function_prefers_vector_external(features: &RouteFeatures) -> bool {
+    let Some(name) = features.native_function.as_deref() else {
+        return false;
+    };
+    let Some(threshold) = scalable_native_topk_threshold(name) else {
+        return false;
+    };
+    single_table_native_rewrite(features) && features.table_rows > threshold
+}
+
+fn scalable_native_topk_threshold(name: &str) -> Option<i64> {
+    match name {
+        "top_avg_len_by_int_col" | "top_rollup_2int" | "top_count_int_minute_text" => {
+            Some(no_profile_native_max_rows())
+        }
+        "top_count_1col"
+        | "top_count_distinct_1col"
+        | "top_count_distinct_int_text"
+        | "top_count_int_text"
+        | "top_searchphrase_ordered" => Some(1_000_000),
+        _ => None,
+    }
+}
+
+fn single_table_native_rewrite(features: &RouteFeatures) -> bool {
+    features.from_count <= 1
+        && features.join_count == 0
+        && !features.plan_has_join
+        && !features.plan_has_subplan
 }
 
 fn format_route_explain_text(doc: &Value) -> String {
@@ -6098,7 +6283,7 @@ mod route_unit_tests {
     fn route_no_profile_splits_native_and_datafusion_shapes() {
         let mut native_rewrite = test_features(
             r#"SELECT "URL", COUNT(*) AS c FROM hits GROUP BY "URL" ORDER BY c DESC LIMIT 10"#,
-            2_000_000,
+            500_000,
         );
         native_rewrite.has_native_function = true;
         native_rewrite.native_function = Some("top_count_1col".to_string());
@@ -6118,6 +6303,34 @@ mod route_unit_tests {
         );
         assert!(no_profile_native_reason(&row_returning)
             .is_some_and(|reason| reason.contains("row-returning query")));
+    }
+
+    #[test]
+    fn route_no_profile_keeps_filtered_counts_native() {
+        let features = test_features(
+            r#"SELECT COUNT(*) FROM hits WHERE "AdvEngineID" <> 0"#,
+            5_000_000,
+        );
+
+        assert!(filtered_count_should_stay_native(&features));
+        assert!(no_profile_native_reason(&features)
+            .is_some_and(|reason| reason.contains("filtered count metadata")));
+        assert!(!fallback_prefers_external_analytical_shape(&features));
+    }
+
+    #[test]
+    fn route_no_profile_keeps_metadata_group_counts_native() {
+        let mut features = test_features(
+            r#"SELECT "AdvEngineID", COUNT(*) FROM hits WHERE "AdvEngineID" <> 0 GROUP BY "AdvEngineID" ORDER BY COUNT(*) DESC"#,
+            5_000_000,
+        );
+        features.has_native_function = true;
+        features.native_function = Some("agg_groupby_count".to_string());
+
+        assert!(native_function_should_stay_native(&features));
+        assert!(!fallback_prefers_external_analytical_shape(&features));
+        assert!(no_profile_native_reason(&features)
+            .is_some_and(|reason| reason.contains("native PostgreSQL plan rewrite")));
     }
 
     #[test]
@@ -6156,9 +6369,10 @@ mod route_unit_tests {
             &["searchphrase"],
         );
         assert!(fallback_prefers_variant(&distinct_text));
+        assert!(single_table_text_distinct_prefers_vector(&distinct_text));
         assert_eq!(
             fallback_external_candidate_order(&distinct_text).map(|order| order[0]),
-            Some(Candidate::DuckHive)
+            Some(Candidate::DataFusionVector)
         );
 
         let text_topk = test_features_with_text(
@@ -6171,6 +6385,52 @@ mod route_unit_tests {
             fallback_external_candidate_order(&text_topk).map(|order| order[0]),
             Some(Candidate::DuckHive)
         );
+
+        let single_text_topk = test_features_with_text(
+            r#"SELECT "SearchPhrase", COUNT(*) AS c FROM hits WHERE "SearchPhrase" <> '' GROUP BY "SearchPhrase" ORDER BY c DESC LIMIT 10"#,
+            5_000_000,
+            &["searchphrase"],
+        );
+        assert!(!fallback_prefers_external_analytical_shape(
+            &single_text_topk
+        ));
+        assert!(!fallback_prefers_variant(&single_text_topk));
+    }
+
+    #[test]
+    fn route_no_profile_sends_large_native_topk_rewrites_to_vector() {
+        let mut text_topk = test_features_with_text(
+            r#"SELECT "URL", COUNT(*) AS c FROM hits GROUP BY "URL" ORDER BY c DESC LIMIT 10"#,
+            5_000_000,
+            &["url"],
+        );
+        text_topk.has_native_function = true;
+        text_topk.native_function = Some("top_count_1col".to_string());
+
+        assert!(native_function_prefers_vector_external(&text_topk));
+        assert!(fallback_prefers_external_analytical_shape(&text_topk));
+        assert!(no_profile_native_reason(&text_topk).is_none());
+        assert_eq!(
+            fallback_external_candidate_order(&text_topk).map(|order| order[0]),
+            Some(Candidate::DataFusionVector)
+        );
+
+        let mut mid_sized_distinct = test_features_with_text(
+            r#"SELECT "MobilePhoneModel", COUNT(DISTINCT "UserID") AS u FROM hits WHERE "MobilePhoneModel" <> '' GROUP BY "MobilePhoneModel" ORDER BY u DESC LIMIT 10"#,
+            1_000_000,
+            &["mobilephonemodel"],
+        );
+        mid_sized_distinct.has_native_function = true;
+        mid_sized_distinct.native_function = Some("top_count_distinct_1col".to_string());
+        assert!(native_function_should_stay_native(&mid_sized_distinct));
+
+        let mut large_distinct = mid_sized_distinct.clone();
+        large_distinct.table_rows = 5_000_000;
+        assert!(native_function_prefers_vector_external(&large_distinct));
+        assert_eq!(
+            fallback_external_candidate_order(&large_distinct).map(|order| order[0]),
+            Some(Candidate::DataFusionVector)
+        );
     }
 
     #[test]
@@ -6181,6 +6441,34 @@ mod route_unit_tests {
         );
         assert!(fallback_prefers_external_analytical_shape(&features));
         assert!(!fallback_prefers_variant(&features));
+        assert_eq!(
+            fallback_external_candidate_order(&features).map(|order| order[0]),
+            Some(Candidate::DataFusionVector)
+        );
+    }
+
+    #[test]
+    fn route_no_profile_sends_large_wide_grouped_aggregate_to_vector() {
+        let mut features = test_features(
+            r#"SELECT
+                 "EventDate",
+                 "AdvEngineID",
+                 SUM("ResolutionWidth"),
+                 SUM("ResolutionHeight"),
+                 AVG("UserID"),
+                 COUNT(*)
+               FROM hits
+               WHERE "EventDate" <= '2013-07-31'
+               GROUP BY "EventDate", "AdvEngineID"
+               ORDER BY "EventDate", "AdvEngineID""#,
+            5_000_000,
+        );
+        features.has_native_function = true;
+        features.native_function = Some("top_count_1col".to_string());
+
+        assert!(large_wide_grouped_aggregate_prefers_vector(&features));
+        assert!(fallback_prefers_external_analytical_shape(&features));
+        assert!(no_profile_native_reason(&features).is_none());
         assert_eq!(
             fallback_external_candidate_order(&features).map(|order| order[0]),
             Some(Candidate::DataFusionVector)
@@ -6203,7 +6491,7 @@ mod route_unit_tests {
     }
 
     #[test]
-    fn route_no_profile_prefers_duck_for_complex_large_join_shapes() {
+    fn route_no_profile_prefers_duck_hive_for_complex_large_join_shapes() {
         let features = test_features(
             "SELECT COUNT(*) FROM hits h1 \
              JOIN hits h2 ON h1.id = h2.id \
@@ -6213,10 +6501,77 @@ mod route_unit_tests {
             2_000_000,
         );
 
+        assert!(complex_analytical_shape(&features));
+        assert!(fallback_prefers_complex_duck_hive(&features));
         assert!(fallback_prefers_duck_vector(&features));
         assert_eq!(
             fallback_external_candidate_order(&features).map(|order| order[0]),
-            Some(Candidate::DuckVector)
+            Some(Candidate::DuckHive)
+        );
+    }
+
+    #[test]
+    fn route_no_profile_demotes_native_for_complex_plan_rewrites() {
+        let mut features = test_features(
+            "WITH x AS (SELECT h1.id, count(*) c FROM hits h1 \
+             JOIN hits h2 ON h1.id = h2.id GROUP BY h1.id) \
+             SELECT id FROM x ORDER BY c DESC LIMIT 100",
+            2_000_000,
+        );
+        features.has_native_function = true;
+        features.native_function = Some("top_count_1col".to_string());
+        features.plan_has_join = true;
+        features.plan_has_subplan = true;
+
+        assert!(complex_analytical_shape(&features));
+        assert!(fallback_prefers_external_analytical_shape(&features));
+        assert!(no_profile_native_reason(&features).is_none());
+        assert_eq!(
+            fallback_external_candidate_order(&features).map(|order| order[0]),
+            Some(Candidate::DuckHive)
+        );
+    }
+
+    #[test]
+    fn route_no_profile_keeps_selective_single_table_topk_native() {
+        let mut features = test_features_with_text(
+            r#"SELECT "Title", COUNT(*) AS pageviews FROM hits
+               WHERE "CounterID" = 62
+                 AND "EventDate" >= '2013-07-01'
+                 AND "EventDate" <= '2013-07-31'
+                 AND "DontCountHits" = 0
+                 AND "IsRefresh" = 0
+                 AND "Title" <> ''
+               GROUP BY "Title" ORDER BY pageviews DESC LIMIT 10"#,
+            5_000_000,
+            &["title"],
+        );
+        features.has_native_function = true;
+        features.native_function = Some("top_count_1col".to_string());
+
+        assert!(selective_single_table_topk_should_stay_native(&features));
+        assert!(!fallback_prefers_external_analytical_shape(&features));
+        assert!(no_profile_native_reason(&features)
+            .is_some_and(|reason| reason.contains("selective single-table top-k")));
+    }
+
+    #[test]
+    fn route_no_profile_avoids_duck_hive_for_known_unsupported_alias_shape() {
+        let mut features = test_features(
+            "SELECT ratio FROM \
+             (SELECT count(*) AS amc FROM hits WHERE id BETWEEN 1 AND 2) at_, \
+             (SELECT count(*) AS pmc FROM hits WHERE id BETWEEN 3 AND 4) pt \
+             ORDER BY ratio LIMIT 100",
+            2_000_000,
+        );
+        features.from_count = 2;
+
+        assert!(complex_analytical_shape(&features));
+        assert!(duck_hive_known_unsupported(&features));
+        assert!(!fallback_prefers_complex_duck_hive(&features));
+        assert_eq!(
+            fallback_external_candidate_order(&features).map(|order| order[0]),
+            Some(Candidate::DataFusionVector)
         );
     }
 }

@@ -1,6 +1,7 @@
 """Per-system query runners for TPC-H."""
 from __future__ import annotations
 
+import json
 import os
 import statistics
 import sys
@@ -46,7 +47,7 @@ def _median_ms(times: list[float]) -> float:
     return statistics.median(times) * 1000.0
 
 
-_LAST_RUN_DETAIL: dict[str, float] = {}
+_LAST_RUN_DETAIL: dict[str, object] = {}
 ROUTE_GUCS = {
     "RVBBIT_ROUTE_DUCK_VECTOR": "rvbbit.route_duck_vector",
     "RVBBIT_ROUTE_DUCK_HIVE": "rvbbit.route_duck_hive",
@@ -71,7 +72,7 @@ def clear_run_detail() -> None:
     clear_rvbbit_duck_hot_detail()
 
 
-def last_run_detail() -> dict[str, float]:
+def last_run_detail() -> dict[str, object]:
     detail = dict(_LAST_RUN_DETAIL)
     detail.update(rvbbit_duck_hot_detail())
     return detail
@@ -96,18 +97,47 @@ def _apply_route_gucs(cur) -> None:
         cur.execute(f"SET {guc_name} = '{safe_value}'".encode())  # type: ignore[arg-type]
 
 
-def run_pg(dsn: str, sql: str, repeat: int = 3, timeout_s: int = 300) -> float:
+def _route_explain(cur, sql: str):
+    try:
+        cur.execute("SELECT rvbbit.route_explain(%s)::text", (sql,))
+        value = cur.fetchone()
+        if value and value[0]:
+            return json.loads(value[0])
+    except Exception as e:
+        try:
+            cur.connection.rollback()
+        except Exception:
+            pass
+        return {"error": str(e).splitlines()[0][:240]}
+    return None
+
+
+def run_pg(
+    dsn: str,
+    sql: str,
+    repeat: int = 3,
+    timeout_s: int = 300,
+    capture_route: bool = False,
+) -> float:
     times: list[float] = []
+    route_doc = None
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(f"SET statement_timeout = {timeout_s * 1000}".encode())  # type: ignore[arg-type]
             _apply_route_gucs(cur)
+            if capture_route:
+                route_doc = _route_explain(cur, sql)
+                if isinstance(route_doc, dict) and route_doc.get("error"):
+                    cur.execute(f"SET statement_timeout = {timeout_s * 1000}".encode())  # type: ignore[arg-type]
+                    _apply_route_gucs(cur)
             for _ in range(repeat):
                 t0 = time.perf_counter()
                 cur.execute(sql.encode())  # type: ignore[arg-type]
                 cur.fetchall()
                 times.append(time.perf_counter() - t0)
     _record_times(times)
+    if route_doc is not None:
+        _LAST_RUN_DETAIL["route"] = route_doc
     return _median_ms(times)
 
 

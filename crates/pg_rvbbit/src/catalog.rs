@@ -340,6 +340,40 @@ CREATE INDEX acceleration_operations_table_started_idx
 CREATE INDEX acceleration_operations_status_idx
     ON rvbbit.acceleration_operations (status, started_at DESC);
 
+CREATE TABLE rvbbit.acceleration_operation_phases (
+    id                  bigserial PRIMARY KEY,
+    operation_id        bigint REFERENCES rvbbit.acceleration_operations(id) ON DELETE CASCADE,
+    table_oid           oid REFERENCES rvbbit.tables(table_oid) ON DELETE SET NULL,
+    table_name          text NOT NULL,
+    phase               text NOT NULL,
+    layout              text,
+    partition_key       text,
+    status              text NOT NULL DEFAULT 'running',
+    started_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
+    finished_at         timestamptz,
+    rows_written        bigint,
+    row_groups_written  bigint,
+    bytes_written       bigint,
+    files_written       integer,
+    expected_rows       bigint,
+    actual_rows         bigint,
+    details             jsonb NOT NULL DEFAULT '{}'::jsonb,
+    error               text,
+    CHECK (status IN ('running', 'ok', 'failed', 'invalid', 'skipped')),
+    CHECK (rows_written IS NULL OR rows_written >= 0),
+    CHECK (row_groups_written IS NULL OR row_groups_written >= 0),
+    CHECK (bytes_written IS NULL OR bytes_written >= 0),
+    CHECK (files_written IS NULL OR files_written >= 0),
+    CHECK (expected_rows IS NULL OR expected_rows >= 0),
+    CHECK (actual_rows IS NULL OR actual_rows >= 0)
+);
+
+CREATE INDEX acceleration_operation_phases_operation_idx
+    ON rvbbit.acceleration_operation_phases (operation_id, started_at);
+
+CREATE INDEX acceleration_operation_phases_table_started_idx
+    ON rvbbit.acceleration_operation_phases (table_oid, started_at DESC);
+
 CREATE TABLE rvbbit.delete_log (
     table_oid       oid NOT NULL,
     rg_id           bigint NOT NULL,
@@ -607,6 +641,8 @@ DECLARE
     variants_rows bigint;
     generation_after bigint := 0;
     safe_upper_xid numeric;
+    phase_id bigint;
+    phase_bytes_written bigint := 0;
 BEGIN
     IF NOT rvbbit.is_rvbbit_table(reloid) THEN
         RAISE EXCEPTION '% is not an rvbbit table', reloid;
@@ -655,6 +691,18 @@ BEGIN
      WHERE table_oid = reloid;
     DELETE FROM rvbbit.acceleration_state WHERE table_oid = reloid;
 
+    INSERT INTO rvbbit.acceleration_operation_phases (
+        operation_id, table_oid, table_name, phase, layout, status, details
+    ) VALUES (
+        op_id, reloid, table_name_text, 'canonical_full_export', 'scan', 'running',
+        jsonb_build_object(
+            'source', 'heap',
+            'mode', 'full_heap_rebuild',
+            'dropped_row_groups', dropped_rgs
+        )
+    )
+    RETURNING id INTO phase_id;
+
     SELECT rvbbit.export_to_parquet_full_scan(reloid::oid) INTO rebuilt_rows;
 
     SELECT count(*)::bigint, coalesce(max(generation), 0)::bigint
@@ -662,8 +710,26 @@ BEGIN
       FROM rvbbit.row_groups
      WHERE table_oid = reloid;
 
+    SELECT coalesce(sum(n_bytes), 0)::bigint
+      INTO phase_bytes_written
+      FROM rvbbit.row_groups
+     WHERE table_oid = reloid;
+
+    UPDATE rvbbit.acceleration_operation_phases
+       SET status = 'ok',
+           finished_at = clock_timestamp(),
+           rows_written = rebuilt_rows,
+           row_groups_written = accel_rebuild.row_groups_written,
+           files_written = accel_rebuild.row_groups_written::integer,
+           bytes_written = phase_bytes_written,
+           expected_rows = rebuilt_rows,
+           actual_rows = rebuilt_rows
+     WHERE id = phase_id;
+
     IF refresh_variants AND rebuilt_rows > 0 THEN
+        PERFORM set_config('rvbbit.acceleration_operation_id', op_id::text, true);
         SELECT rvbbit.refresh_layout_variants(reloid) INTO variants_rows;
+        PERFORM set_config('rvbbit.acceleration_operation_id', '', true);
     END IF;
 
     INSERT INTO rvbbit.acceleration_state (
@@ -721,6 +787,12 @@ BEGIN
     );
 EXCEPTION WHEN OTHERS THEN
     IF op_id IS NOT NULL THEN
+        UPDATE rvbbit.acceleration_operation_phases
+           SET status = 'failed',
+               finished_at = clock_timestamp(),
+               error = SQLERRM
+         WHERE operation_id = op_id
+           AND status = 'running';
         UPDATE rvbbit.acceleration_operations
            SET status = 'failed',
                finished_at = clock_timestamp(),
@@ -3240,6 +3312,9 @@ DECLARE
     shadow_retained boolean := false;
     shadow_dirty boolean := false;
     heap_bytes bigint := 0;
+    phase_id bigint;
+    phase_bytes_before bigint := 0;
+    phase_bytes_after bigint := 0;
 BEGIN
     IF NOT rvbbit.is_rvbbit_table(reloid) THEN
         RAISE EXCEPTION '% is not an rvbbit table', reloid;
@@ -3368,6 +3443,24 @@ BEGIN
         );
     END IF;
 
+    SELECT coalesce(sum(n_bytes), 0)::bigint
+      INTO phase_bytes_before
+      FROM rvbbit.row_groups
+     WHERE table_oid = reloid;
+
+    INSERT INTO rvbbit.acceleration_operation_phases (
+        operation_id, table_oid, table_name, phase, layout, status, details
+    ) VALUES (
+        op_id, reloid, table_name_text, 'canonical_delta_export', 'scan', 'running',
+        jsonb_build_object(
+            'source', 'heap',
+            'mode', 'watermark_delta',
+            'watermark_before', last_xid,
+            'watermark_after', safe_upper_xid
+        )
+    )
+    RETURNING id INTO phase_id;
+
     SELECT rvbbit.export_to_parquet_xid_range(
         reloid::oid,
         last_xid::text,
@@ -3380,8 +3473,30 @@ BEGIN
      WHERE table_oid = reloid
        AND rg_id > max_rg_id_pre;
 
+    SELECT coalesce(sum(n_bytes), 0)::bigint
+      INTO phase_bytes_after
+      FROM rvbbit.row_groups
+     WHERE table_oid = reloid;
+
+    UPDATE rvbbit.acceleration_operation_phases
+       SET status = 'ok',
+           finished_at = clock_timestamp(),
+           rows_written = accel_refresh.rows_written,
+           row_groups_written = accel_refresh.row_groups_written,
+           files_written = accel_refresh.row_groups_written::integer,
+           bytes_written = greatest(0, phase_bytes_after - phase_bytes_before),
+           expected_rows = accel_refresh.rows_written,
+           actual_rows = accel_refresh.rows_written
+     WHERE id = phase_id;
+
     IF refresh_variants AND rows_written > 0 THEN
-        SELECT rvbbit.refresh_layout_variants(reloid) INTO variants_rows;
+        PERFORM set_config('rvbbit.acceleration_operation_id', op_id::text, true);
+        SELECT rvbbit.refresh_layout_variants_xid_range(
+            reloid::oid,
+            last_xid::text,
+            safe_upper_xid::text
+        ) INTO variants_rows;
+        PERFORM set_config('rvbbit.acceleration_operation_id', '', true);
     END IF;
 
     IF existing_rgs > 0 OR row_groups_written > 0 THEN
@@ -3427,6 +3542,12 @@ BEGIN
     );
 EXCEPTION WHEN OTHERS THEN
     IF op_id IS NOT NULL THEN
+        UPDATE rvbbit.acceleration_operation_phases
+           SET status = 'failed',
+               finished_at = clock_timestamp(),
+               error = SQLERRM
+         WHERE operation_id = op_id
+           AND status = 'running';
         UPDATE rvbbit.acceleration_operations
            SET status = 'failed',
                finished_at = clock_timestamp(),
@@ -3645,10 +3766,13 @@ $$;
 CREATE OR REPLACE FUNCTION rvbbit.layout_variant_status_for(rel regclass)
 RETURNS TABLE (
     layout text,
+    layout_kind text,
+    partition_key text,
     status text,
     expected_rows bigint,
     actual_rows bigint,
     file_count integer,
+    n_bytes bigint,
     status_message text,
     refreshed_at timestamptz
 )
@@ -3656,15 +3780,90 @@ LANGUAGE sql
 STABLE
 AS $$
     SELECT s.layout,
+           CASE
+             WHEN s.layout LIKE 'hive:%' THEN 'hive'
+             WHEN s.layout LIKE 'cluster:%' THEN 'cluster'
+             ELSE s.layout
+           END,
+           CASE
+             WHEN s.layout LIKE 'hive:%' THEN substring(s.layout from 6)
+             WHEN s.layout LIKE 'cluster:%' THEN substring(s.layout from 9)
+             ELSE NULL
+           END,
            s.status,
            s.expected_rows,
            s.actual_rows,
            s.file_count,
+           coalesce((
+             SELECT sum(v.n_bytes)::bigint
+             FROM rvbbit.row_group_variants v
+             WHERE v.table_oid = s.table_oid AND v.layout = s.layout
+           ), 0),
            s.status_message,
            s.refreshed_at
     FROM rvbbit.layout_variant_status s
     WHERE s.table_oid = rel
     ORDER BY s.layout;
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.acceleration_phase_log_for(rel regclass)
+RETURNS TABLE (
+    operation_id bigint,
+    operation text,
+    phase text,
+    layout text,
+    layout_kind text,
+    partition_key text,
+    status text,
+    started_at timestamptz,
+    finished_at timestamptz,
+    elapsed_ms numeric,
+    rows_written bigint,
+    row_groups_written bigint,
+    bytes_written bigint,
+    files_written integer,
+    expected_rows bigint,
+    actual_rows bigint,
+    details jsonb,
+    error text
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        p.operation_id,
+        o.operation,
+        p.phase,
+        p.layout,
+        CASE
+          WHEN p.layout LIKE 'hive:%' THEN 'hive'
+          WHEN p.layout LIKE 'cluster:%' THEN 'cluster'
+          ELSE p.layout
+        END,
+        coalesce(
+          p.partition_key,
+          CASE
+            WHEN p.layout LIKE 'hive:%' THEN substring(p.layout from 6)
+            WHEN p.layout LIKE 'cluster:%' THEN substring(p.layout from 9)
+            ELSE NULL
+          END
+        ),
+        p.status,
+        p.started_at,
+        p.finished_at,
+        round((extract(epoch FROM coalesce(p.finished_at, clock_timestamp()) - p.started_at) * 1000)::numeric, 3),
+        p.rows_written,
+        p.row_groups_written,
+        p.bytes_written,
+        p.files_written,
+        p.expected_rows,
+        p.actual_rows,
+        p.details,
+        p.error
+    FROM rvbbit.acceleration_operation_phases p
+    LEFT JOIN rvbbit.acceleration_operations o ON o.id = p.operation_id
+    WHERE p.table_oid = rel
+    ORDER BY p.started_at DESC, p.id DESC;
 $$;
 "#,
     name = "rvbbit_bootstrap",

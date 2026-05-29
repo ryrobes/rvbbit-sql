@@ -885,6 +885,47 @@ fn refresh_layout_variants(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::
     refresh_layout_variants_impl(rel_oid, &qualified, &plans, &schema, &path_root)
 }
 
+#[pg_extern]
+fn refresh_layout_variants_xid_range(
+    rel: pg_sys::Oid,
+    min_xid: &str,
+    max_xid: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let rel_oid = rel.to_u32();
+    let min_xid = xid_numeric_literal(min_xid)?;
+    let max_xid = xid_numeric_literal(max_xid)?;
+    if max_xid.parse::<u128>()? <= min_xid.parse::<u128>()? {
+        return Ok(0);
+    }
+    let qualified: String = Spi::get_one(&format!("SELECT {rel_oid}::oid::regclass::text"))?
+        .ok_or("relation does not exist")?;
+    let delta_source = format!(
+        "(SELECT * FROM {qualified} \
+          WHERE (xmin::text)::numeric > {min_xid}::numeric \
+            AND (xmin::text)::numeric <= {max_xid}::numeric) AS rvbbit_variant_delta"
+    );
+
+    let mut plans = introspect_columns(rel_oid)?;
+    extend_plans_with_legacy_shreds(&mut plans);
+    let schema = schema_for_plans(&plans);
+
+    let data_dir: String =
+        Spi::get_one("SHOW data_directory")?.ok_or("data_directory GUC is NULL")?;
+    let mut path_root = PathBuf::from(data_dir);
+    path_root.push("rvbbit");
+    path_root.push(rel_oid.to_string());
+    std::fs::create_dir_all(&path_root)?;
+
+    refresh_layout_variants_delta_impl(
+        rel_oid,
+        &qualified,
+        &delta_source,
+        &plans,
+        &schema,
+        &path_root,
+    )
+}
+
 fn refresh_layout_variants_impl(
     rel_oid: u32,
     qualified: &str,
@@ -900,49 +941,284 @@ fn refresh_layout_variants_impl(
     if dual_layout_enabled() && !cluster_keys.is_empty() {
         for cluster_key in cluster_keys.iter().take(cluster_variant_limit()) {
             let layout = cluster_layout_for_key(cluster_key);
-            clear_variant_layout(rel_oid, &layout, path_root)?;
-            let cluster_root = path_root.join(layout_dir_name(&layout));
-            let variant_chunks = write_layout_chunks(
+            let phase_id = start_acceleration_phase(
+                rel_oid,
                 qualified,
-                plans,
-                schema,
-                &cluster_root,
-                0,
-                cluster_chunk_rows,
-                std::slice::from_ref(cluster_key),
+                "layout_variant_rebuild",
+                Some(&layout),
+                Some(cluster_key),
+                serde_json::json!({
+                    "layout_kind": "cluster",
+                    "build_mode": "full_rebuild",
+                    "source": "heap",
+                    "cluster_key": cluster_key,
+                    "selected_cluster_keys": &cluster_keys,
+                    "chunk_rows": cluster_chunk_rows,
+                }),
             )?;
-            if validate_variant_chunks(rel_oid, &layout, &variant_chunks)? {
-                rows_written += variant_chunks.iter().map(|c| c.n_rows).sum::<i64>();
+            let build_result = (|| -> Result<_, Box<dyn std::error::Error>> {
+                clear_variant_layout(rel_oid, &layout, path_root)?;
+                let cluster_root = path_root.join(layout_dir_name(&layout));
+                let variant_chunks = write_layout_chunks(
+                    qualified,
+                    plans,
+                    schema,
+                    &cluster_root,
+                    0,
+                    cluster_chunk_rows,
+                    std::slice::from_ref(cluster_key),
+                )?;
+                Ok(variant_chunks)
+            })();
+            let variant_chunks = match build_result {
+                Ok(chunks) => chunks,
+                Err(err) => {
+                    let _ = finish_acceleration_phase(
+                        phase_id,
+                        "failed",
+                        0,
+                        0,
+                        0,
+                        None,
+                        None,
+                        serde_json::json!({"layout_kind": "cluster"}),
+                        Some(&err.to_string()),
+                    );
+                    return Err(err);
+                }
+            };
+            let (variant_rows, variant_files, variant_bytes) =
+                variant_chunk_totals(&variant_chunks);
+            let expected_rows = canonical_row_count(rel_oid)?;
+            let valid = validate_variant_chunks(rel_oid, &layout, &variant_chunks)?;
+            if valid {
+                rows_written += variant_rows;
                 register_variant_chunks(rel_oid, &layout, &variant_chunks)?;
                 mark_variant_status_ready(rel_oid, &layout, &variant_chunks)?;
             }
+            finish_acceleration_phase(
+                phase_id,
+                if valid { "ok" } else { "invalid" },
+                variant_rows,
+                variant_files,
+                variant_bytes,
+                Some(expected_rows),
+                Some(variant_rows),
+                serde_json::json!({"validated": valid}),
+                None,
+            )?;
         }
     }
 
     if hive_layout_enabled() && !hive_keys.is_empty() {
         for hive_key in hive_keys.iter().take(hive_variant_limit()) {
             let layout = hive_layout_for_key(hive_key);
-            clear_variant_layout(rel_oid, &layout, path_root)?;
-            let hive_root = path_root.join(layout_dir_name(&layout));
-            let variant_chunks = write_hive_layout_chunks(
+            let phase_id = start_acceleration_phase(
+                rel_oid,
                 qualified,
-                plans,
-                &hive_root,
-                0,
-                cluster_chunk_rows,
-                hive_key,
+                "layout_variant_rebuild",
+                Some(&layout),
+                Some(hive_key),
+                serde_json::json!({
+                    "layout_kind": "hive",
+                    "build_mode": "full_rebuild",
+                    "source": "heap",
+                    "hive_key": hive_key,
+                    "selected_hive_keys": &hive_keys,
+                    "chunk_rows": cluster_chunk_rows,
+                }),
             )?;
-            if validate_variant_chunks(rel_oid, &layout, &variant_chunks)? {
-                rows_written += variant_chunks.iter().map(|c| c.n_rows).sum::<i64>();
+            let build_result = (|| -> Result<_, Box<dyn std::error::Error>> {
+                clear_variant_layout(rel_oid, &layout, path_root)?;
+                let hive_root = path_root.join(layout_dir_name(&layout));
+                let variant_chunks = write_hive_layout_chunks(
+                    qualified,
+                    plans,
+                    &hive_root,
+                    0,
+                    cluster_chunk_rows,
+                    hive_key,
+                )?;
+                Ok(variant_chunks)
+            })();
+            let variant_chunks = match build_result {
+                Ok(chunks) => chunks,
+                Err(err) => {
+                    let _ = finish_acceleration_phase(
+                        phase_id,
+                        "failed",
+                        0,
+                        0,
+                        0,
+                        None,
+                        None,
+                        serde_json::json!({"layout_kind": "hive"}),
+                        Some(&err.to_string()),
+                    );
+                    return Err(err);
+                }
+            };
+            let (variant_rows, variant_files, variant_bytes) =
+                variant_chunk_totals(&variant_chunks);
+            let expected_rows = canonical_row_count(rel_oid)?;
+            let valid = validate_variant_chunks(rel_oid, &layout, &variant_chunks)?;
+            if valid {
+                rows_written += variant_rows;
                 register_variant_chunks(rel_oid, &layout, &variant_chunks)?;
                 mark_variant_status_ready(rel_oid, &layout, &variant_chunks)?;
             }
+            finish_acceleration_phase(
+                phase_id,
+                if valid { "ok" } else { "invalid" },
+                variant_rows,
+                variant_files,
+                variant_bytes,
+                Some(expected_rows),
+                Some(variant_rows),
+                serde_json::json!({"validated": valid}),
+                None,
+            )?;
         }
     }
 
     // Drop backend-local caches that depend on rvbbit.row_groups state.
     // Without this, the same session would keep planning + scanning from
     // the pre-compact metadata snapshot.
+    crate::planner::invalidate_planner_aggregates(rel_oid);
+    crate::custom_scan::invalidate_scan_metadata(rel_oid);
+    crate::columnar_cache::invalidate_table(rel_oid);
+
+    Ok(rows_written)
+}
+
+fn refresh_layout_variants_delta_impl(
+    rel_oid: u32,
+    qualified: &str,
+    delta_source: &str,
+    plans: &[ColumnPlan],
+    schema: &Arc<Schema>,
+    path_root: &PathBuf,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    if dual_layout_enabled() {
+        return refresh_layout_variants_impl(rel_oid, qualified, plans, schema, path_root);
+    }
+
+    let chunk_rows = chunk_rows_setting();
+    let hive_keys = auto_hive_partition_keys(rel_oid, plans);
+    if !hive_layout_enabled() || hive_keys.is_empty() {
+        return Ok(0);
+    }
+
+    let selected_hive_keys: Vec<String> =
+        hive_keys.into_iter().take(hive_variant_limit()).collect();
+    let all_ready = selected_hive_keys
+        .iter()
+        .map(|key| hive_layout_for_key(key))
+        .all(|layout| variant_layout_ready(rel_oid, &layout));
+    if !all_ready {
+        let phase_id = start_acceleration_phase(
+            rel_oid,
+            qualified,
+            "layout_variant_delta_append",
+            None,
+            None,
+            serde_json::json!({
+                "layout_kind": "hive",
+                "build_mode": "delta_append",
+                "source": "heap_delta",
+                "selected_hive_keys": &selected_hive_keys,
+                "fallback": "full_rebuild",
+                "reason": "one or more selected hive layouts are not ready",
+            }),
+        )?;
+        finish_acceleration_phase(
+            phase_id,
+            "skipped",
+            0,
+            0,
+            0,
+            Some(canonical_row_count(rel_oid)?),
+            None,
+            serde_json::json!({"fallback": "full_rebuild"}),
+            None,
+        )?;
+        return refresh_layout_variants_impl(rel_oid, qualified, plans, schema, path_root);
+    }
+
+    let mut rows_written = 0_i64;
+    for hive_key in &selected_hive_keys {
+        let layout = hive_layout_for_key(hive_key);
+        let first_rg_id: i64 = Spi::get_one(&format!(
+            "SELECT coalesce(max(rg_id), -1) + 1 \
+             FROM rvbbit.row_group_variants \
+             WHERE table_oid = {rel_oid}::oid AND layout = {}",
+            sql_literal(&layout)
+        ))?
+        .unwrap_or(0);
+        let phase_id = start_acceleration_phase(
+            rel_oid,
+            qualified,
+            "layout_variant_delta_append",
+            Some(&layout),
+            Some(hive_key),
+            serde_json::json!({
+                "layout_kind": "hive",
+                "build_mode": "delta_append",
+                "source": "heap_delta",
+                "hive_key": hive_key,
+                "selected_hive_keys": &selected_hive_keys,
+                "first_rg_id": first_rg_id,
+                "chunk_rows": chunk_rows,
+            }),
+        )?;
+        let hive_root = path_root.join(layout_dir_name(&layout));
+        let build_result = write_hive_layout_chunks(
+            delta_source,
+            plans,
+            &hive_root,
+            first_rg_id,
+            chunk_rows,
+            hive_key,
+        );
+        let variant_chunks = match build_result {
+            Ok(chunks) => chunks,
+            Err(err) => {
+                let _ = finish_acceleration_phase(
+                    phase_id,
+                    "failed",
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    serde_json::json!({"layout_kind": "hive"}),
+                    Some(&err.to_string()),
+                );
+                return Err(err);
+            }
+        };
+        let (variant_rows, variant_files, variant_bytes) = variant_chunk_totals(&variant_chunks);
+        if variant_rows > 0 {
+            register_variant_chunks(rel_oid, &layout, &variant_chunks)?;
+        }
+        let expected_rows = canonical_row_count(rel_oid)?;
+        let valid = validate_registered_variant_layout(rel_oid, &layout)?;
+        if valid {
+            rows_written += variant_rows;
+        }
+        finish_acceleration_phase(
+            phase_id,
+            if valid { "ok" } else { "invalid" },
+            variant_rows,
+            variant_files,
+            variant_bytes,
+            Some(expected_rows),
+            None,
+            serde_json::json!({"validated": valid}),
+            None,
+        )?;
+    }
+
     crate::planner::invalidate_planner_aggregates(rel_oid);
     crate::custom_scan::invalidate_scan_metadata(rel_oid);
     crate::columnar_cache::invalidate_table(rel_oid);
@@ -1016,6 +1292,184 @@ fn validate_variant_chunks(
         Some(&message),
     )?;
     Ok(false)
+}
+
+fn variant_chunk_totals(chunks: &[rvbbit_storage::metadata::RowGroupMeta]) -> (i64, i32, i64) {
+    (
+        chunks.iter().map(|c| c.n_rows).sum::<i64>(),
+        chunks.len() as i32,
+        chunks.iter().map(|c| c.n_bytes).sum::<i64>(),
+    )
+}
+
+fn variant_layout_ready(rel_oid: u32, layout: &str) -> bool {
+    let layout_lit = sql_literal(layout);
+    Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM rvbbit.layout_variant_status
+             WHERE table_oid = {rel_oid}::oid
+               AND layout = {layout_lit}
+               AND status = 'ready'
+               AND actual_rows > 0
+         )"
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+fn validate_registered_variant_layout(
+    rel_oid: u32,
+    layout: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let layout_lit = sql_literal(layout);
+    let expected_rows = canonical_row_count(rel_oid)?;
+    let mut actual_rows = 0_i64;
+    let mut file_count = 0_i32;
+    let mut n_bytes = 0_i64;
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(
+            &format!(
+                "SELECT coalesce(sum(n_rows), 0)::bigint,
+                        count(*)::int,
+                        coalesce(sum(n_bytes), 0)::bigint
+                 FROM rvbbit.row_group_variants
+                 WHERE table_oid = {rel_oid}::oid AND layout = {layout_lit}"
+            ),
+            Some(1),
+            &[],
+        )?;
+        let row = table.first();
+        actual_rows = row.get::<i64>(1)?.unwrap_or(0);
+        file_count = row.get::<i32>(2)?.unwrap_or(0);
+        n_bytes = row.get::<i64>(3)?.unwrap_or(0);
+        Ok(())
+    })?;
+
+    if expected_rows > 0 && actual_rows == expected_rows && file_count > 0 {
+        mark_variant_status(
+            rel_oid,
+            layout,
+            "ready",
+            expected_rows,
+            actual_rows,
+            file_count,
+            None,
+        )?;
+        return Ok(true);
+    }
+
+    let message = if expected_rows != actual_rows {
+        format!("row count mismatch: expected {expected_rows}, catalog has {actual_rows}")
+    } else {
+        "no variant files are registered".to_string()
+    };
+    mark_variant_status(
+        rel_oid,
+        layout,
+        "invalid",
+        expected_rows,
+        actual_rows,
+        file_count,
+        Some(&message),
+    )?;
+    pgrx::warning!(
+        "rvbbit.refresh_layout_variants: layout {layout} for table oid {rel_oid} is invalid after write ({message}; bytes={n_bytes})"
+    );
+    Ok(false)
+}
+
+fn acceleration_phase_table_exists() -> bool {
+    Spi::get_one::<bool>("SELECT to_regclass('rvbbit.acceleration_operation_phases') IS NOT NULL")
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+fn current_acceleration_operation_id() -> Option<i64> {
+    Spi::get_one::<i64>(
+        "SELECT nullif(current_setting('rvbbit.acceleration_operation_id', true), '')::bigint",
+    )
+    .ok()
+    .flatten()
+}
+
+fn start_acceleration_phase(
+    rel_oid: u32,
+    qualified: &str,
+    phase: &str,
+    layout: Option<&str>,
+    partition_key: Option<&str>,
+    details: serde_json::Value,
+) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+    if !acceleration_phase_table_exists() {
+        return Ok(None);
+    }
+    let operation_id_sql = current_acceleration_operation_id()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "NULL::bigint".to_string());
+    let layout_sql = layout
+        .map(|v| format!("{}::text", sql_literal(v)))
+        .unwrap_or_else(|| "NULL::text".to_string());
+    let key_sql = partition_key
+        .map(|v| format!("{}::text", sql_literal(v)))
+        .unwrap_or_else(|| "NULL::text".to_string());
+    let details_json = serde_json::to_string(&details)?;
+    let phase_id = Spi::get_one::<i64>(&format!(
+        "INSERT INTO rvbbit.acceleration_operation_phases \
+             (operation_id, table_oid, table_name, phase, layout, partition_key, status, details) \
+         VALUES ({operation_id_sql}, {rel_oid}::oid, {}, {}, {layout_sql}, {key_sql}, 'running', {}::jsonb) \
+         RETURNING id",
+        sql_literal(qualified),
+        sql_literal(phase),
+        sql_literal(&details_json),
+    ))?;
+    Ok(phase_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_acceleration_phase(
+    phase_id: Option<i64>,
+    status: &str,
+    rows_written: i64,
+    files_written: i32,
+    bytes_written: i64,
+    expected_rows: Option<i64>,
+    actual_rows: Option<i64>,
+    details: serde_json::Value,
+    error: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(phase_id) = phase_id else {
+        return Ok(());
+    };
+    let details_json = serde_json::to_string(&details)?;
+    let expected_sql = expected_rows
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL::bigint".to_string());
+    let actual_sql = actual_rows
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL::bigint".to_string());
+    let error_sql = error
+        .map(|v| format!("{}::text", sql_literal(v)))
+        .unwrap_or_else(|| "NULL::text".to_string());
+    Spi::run(&format!(
+        "UPDATE rvbbit.acceleration_operation_phases \
+            SET status = {}, \
+                finished_at = clock_timestamp(), \
+                rows_written = {rows_written}, \
+                row_groups_written = {files_written}, \
+                files_written = {files_written}, \
+                bytes_written = {bytes_written}, \
+                expected_rows = {expected_sql}, \
+                actual_rows = {actual_sql}, \
+                details = details || {}::jsonb, \
+                error = {error_sql} \
+          WHERE id = {phase_id}",
+        sql_literal(status),
+        sql_literal(&details_json),
+    ))?;
+    Ok(())
 }
 
 fn mark_variant_status_ready(

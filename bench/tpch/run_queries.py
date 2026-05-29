@@ -62,7 +62,7 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
         if system == "clickhouse":
             return run_clickhouse(sql, REPEATS), "ok"
         if system == "rvbbit":
-            return run_pg(PG_DSNS["rvbbit"], sql, REPEATS, TIMEOUT_S), "ok"
+            return run_pg(PG_DSNS["rvbbit"], sql, REPEATS, TIMEOUT_S, capture_route=True), "ok"
         if system in {"rvbbit_native", "rvbbit_native_forced"}:
             ms = run_pg(PG_DSNS[system], sql, REPEATS, TIMEOUT_S)
             record_rvbbit_route_observation(
