@@ -21,7 +21,7 @@ import pytest
 SIDECAR_BASE = os.environ.get(
     "RVBBIT_PYTHON_RUNTIME_BASE", "http://rvbbit-python-runtime:8080"
 )
-RUN_URL = f"{SIDECAR_BASE}/run"
+RUN_URL = os.environ.get("RVBBIT_PYTHON_RUNTIME_RUN_URL", f"{SIDECAR_BASE}/run")
 
 
 def _alive() -> bool:

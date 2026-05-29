@@ -63,13 +63,17 @@ query-llm:       ## Pair-wise compare heap vs rvbbit on the LLM query set
 	$(COMPOSE) exec bench python run.py query llm
 
 test:            ## Run E2E tests (skips live-LLM ones; cheap & deterministic)
-	$(COMPOSE) exec bench pytest /tests -x
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench python-runtime
+	$(MAKE) --no-print-directory reload-extension
+	$(COMPOSE_SIDECARS) exec -T bench pytest /tests -x
 
 test-live:       ## Run E2E tests INCLUDING live LLM calls (costs $$)
-	$(COMPOSE) exec -e RUN_LLM_TESTS=1 bench pytest /tests
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench python-runtime
+	$(MAKE) --no-print-directory reload-extension
+	$(COMPOSE_SIDECARS) exec -T -e RUN_LLM_TESTS=1 bench pytest /tests
 
 e2e-realworld:   ## Run the real-world acceptance harness (deterministic/default)
-	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed python-runtime
 	$(MAKE) --no-print-directory reload-extension
 	$(COMPOSE) exec -T bench python /bench/e2e_realworld.py
 
@@ -78,7 +82,7 @@ e2e-realworld-fresh: ## Destructive fresh acceptance run (deletes Docker volumes
 	$(MAKE) --no-print-directory e2e-realworld
 
 e2e-realworld-live: ## Run acceptance harness with live provider calls enabled
-	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed python-runtime
 	$(MAKE) --no-print-directory reload-extension
 	$(COMPOSE) exec -T -e RVBBIT_E2E_LIVE_LLM=1 bench python /bench/e2e_realworld.py
 
