@@ -41,6 +41,9 @@ Runs the heavier Warren deployment smoke: queue
 `capabilities/manifests/smoke/warren-echo.yaml`, run `warren-agent --once` on the
 host, build/start the generated sidecar container, register its backend and SQL
 operator, probe the backend, and call `rvbbit.warren_smoke_echo(...)`.
+The same path can deploy runtime sidecars such as
+`capabilities/manifests/runtimes/python-runtime.yaml`; add that to the host
+Docker target when validating the full Python runtime lifecycle.
 
 ## Environment
 
@@ -74,7 +77,7 @@ The current harness checks these user-facing surfaces:
 | `embeddings` | Stub embedding backend, `rvbbit.embed`, materialized embedding cache, `rvbbit.knn_text`, and optional default local CPU `embed` backend smoke coverage when it is registered. |
 | `mcp` | MCP server registration, tool refresh, `rvbbit.mcp_call`, `rvbbit.mcp_rows`, invocation `query_id` audit, intentional tool-error audit, MCP-as-operator flow, and an `mcp -> code -> specialist` operator chain with receipt sub-call audit. |
 | `kg` | Deterministic triples JSON, `rvbbit.kg_ingest_triples`, graph traversal, evidence `query_id`, plus a deterministic KG built from imported free-form text with context/evidence traversal. |
-| `warren` | Warren node catalog, metrics ingest, capability deploy job, job claim, inventory view. The separate `make e2e-realworld-warren` target also runs the host-Docker sidecar lifecycle. |
+| `warren` | Warren node catalog, metrics ingest, capability deploy job, job claim, inventory view, and runtime-capability catalog shape. The separate `make e2e-realworld-warren` target also runs the host-Docker sidecar lifecycle. |
 | `costs` | Receipt cost backfill and audit views. |
 | `diagnostics` | `rvbbit.doctor(false)` plus self-hosted OpenAI-compatible backend registration, live provider doctor probe, default-provider routing, and cost receipt verification. |
 | `live_llm` | Optional paid/provider SQL calls: multi-row `rvbbit.summarize(...)`, direct OpenAI, Anthropic, Gemini API-key, and Gemini ADC provider routing, receipt/cost audit checks, and live `rvbbit.triples_rows(...)`. |
@@ -91,7 +94,8 @@ audit event. Live provider cost settlement is still covered separately by
 
 The default Python harness does not start Docker-managed Warren sidecars. Use
 `make e2e-realworld-warren` when you want the full deployment path because that
-must run `warren-agent` from the host with access to Docker.
+must run `warren-agent` from the host with access to Docker. The Python runtime
+sidecar still has sidecar-level tests independent of Warren.
 
 ## Artifacts
 

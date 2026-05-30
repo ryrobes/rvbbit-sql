@@ -41,8 +41,10 @@ struct WarrenJob {
 #[derive(Debug)]
 struct DeploymentResult {
     endpoint_url: String,
+    probe_url: String,
     backend_name: Option<String>,
     operator_name: Option<String>,
+    runtime_name: Option<String>,
     compose_project: String,
     work_dir: PathBuf,
     health: Value,
@@ -106,7 +108,7 @@ impl Config {
                 .unwrap_or_else(|_| PathBuf::from(".rvbbit/warren")),
             template_dir: env::var("WARREN_TEMPLATE_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("capabilities/templates/hf-rvbbit-fastapi")),
+                .unwrap_or_else(|_| PathBuf::from("capabilities/templates")),
             advertise_base_url: env::var("WARREN_ADVERTISE_BASE_URL").ok(),
             docker_network: env::var("RVBBIT_DOCKER_NETWORK")
                 .unwrap_or_else(|_| "docker_default".into()),
@@ -183,7 +185,7 @@ fn print_help() {
            --dsn <postgres-url>               Postgres DSN (or RVBBIT_DSN)\n\
            --node <name>                      Warren node name (or WARREN_NODE)\n\
            --work-dir <dir>                   Deployment workspace\n\
-           --template-dir <dir>               hf-rvbbit-fastapi template directory\n\
+           --template-dir <dir>               capability template root or template directory\n\
            --advertise-base-url <url>         Remote base URL; default is Docker service URL\n\
            --docker-network <name>            Docker network for generated compose projects\n\
            --labels <json>                    Node labels used by target selectors\n\
@@ -586,20 +588,37 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
         other => bail!("Warren job kind {other:?} is not implemented yet"),
     };
 
-    register_backend_and_operators(db, &job.manifest, &result)?;
-    if !config.dry_run {
-        let probe = probe_backend(db, &job.manifest)?;
-        if !probe.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            bail!("backend probe failed after deployment: {probe}");
+    if is_runtime_sidecar(&job.manifest) {
+        if !config.dry_run {
+            let probe = probe_runtime(&job.manifest, &result)?;
+            if !probe.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                bail!("runtime probe failed after deployment: {probe}");
+            }
+            if let Some(obj) = result.health.as_object_mut() {
+                obj.insert("runtime_probe".into(), probe);
+            }
         }
-        if let Some(obj) = result.health.as_object_mut() {
-            obj.insert("backend_probe".into(), probe);
+        register_runtime(db, &job.manifest, &result)?;
+    } else {
+        register_backend_and_operators(db, &job.manifest, &result)?;
+        if !config.dry_run {
+            let probe = probe_backend(db, &job.manifest)?;
+            if !probe.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                bail!("backend probe failed after deployment: {probe}");
+            }
+            if let Some(obj) = result.health.as_object_mut() {
+                obj.insert("backend_probe".into(), probe);
+            }
         }
     }
     complete_job(db, config, job, &result)?;
     println!(
-        "completed job={} endpoint={} backend={:?} operator={:?}",
-        job.job_id, result.endpoint_url, result.backend_name, result.operator_name
+        "completed job={} endpoint={} backend={:?} operator={:?} runtime={:?}",
+        job.job_id,
+        result.endpoint_url,
+        result.backend_name,
+        result.operator_name,
+        result.runtime_name
     );
     Ok(())
 }
@@ -630,6 +649,7 @@ fn deploy_capability(config: &Config, job: &WarrenJob) -> Result<DeploymentResul
         .map(|v| v as u16)
         .unwrap_or_else(|| deterministic_port(&job.job_id, config.port_base));
     let endpoint_url = endpoint_for(config, manifest, port, &safe_name);
+    let probe_url = local_probe_endpoint_for(manifest, port);
 
     if config.dry_run {
         println!(
@@ -649,6 +669,7 @@ fn deploy_capability(config: &Config, job: &WarrenJob) -> Result<DeploymentResul
     });
     Ok(DeploymentResult {
         endpoint_url,
+        probe_url,
         backend_name: manifest
             .pointer("/backend/name")
             .and_then(Value::as_str)
@@ -660,6 +681,11 @@ fn deploy_capability(config: &Config, job: &WarrenJob) -> Result<DeploymentResul
             .and_then(|op| op.get("name"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        runtime_name: if is_runtime_sidecar(manifest) {
+            runtime_registration_name(manifest).ok()
+        } else {
+            None
+        },
         compose_project: safe_name,
         work_dir: project_dir,
         health,
@@ -674,6 +700,11 @@ fn scaffold_project(
 ) -> Result<()> {
     let runtime = manifest.get("runtime").unwrap_or(&Value::Null);
     let source = manifest.get("source").unwrap_or(&Value::Null);
+    let template = runtime
+        .get("template")
+        .and_then(Value::as_str)
+        .unwrap_or("hf-rvbbit-fastapi");
+    let template_dir = resolve_template_dir(config, template);
     let handler = runtime
         .get("handler")
         .and_then(Value::as_str)
@@ -689,28 +720,36 @@ fn scaffold_project(
         .and_then(Value::as_str)
         .unwrap_or("pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime");
 
-    let dockerfile = render_tokens(
-        &fs::read_to_string(config.template_dir.join("Dockerfile"))
-            .context("reading template Dockerfile")?,
-        &[
-            ("base_image", base_image),
-            ("model", model),
-            ("revision", revision),
-            ("handler", handler),
-            ("device", device),
-        ],
-    );
-    let main_py = fs::read_to_string(config.template_dir.join("main.py"))
-        .context("reading template main.py")?;
-    let requirements = render_requirements(
-        &fs::read_to_string(config.template_dir.join("requirements.txt"))
-            .context("reading template requirements.txt")?,
-        handler,
-    );
-
-    fs::write(out_dir.join("Dockerfile"), dockerfile)?;
-    fs::write(out_dir.join("main.py"), main_py)?;
-    fs::write(out_dir.join("requirements.txt"), requirements)?;
+    let values = [
+        ("base_image", base_image),
+        ("model", model),
+        ("revision", revision),
+        ("handler", handler),
+        ("device", device),
+    ];
+    for entry in fs::read_dir(&template_dir)
+        .with_context(|| format!("reading template dir {}", template_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let text = render_tokens(
+            &fs::read_to_string(&path)
+                .with_context(|| format!("reading template file {}", path.display()))?,
+            &values,
+        );
+        fs::write(out_dir.join(entry.file_name()), text)?;
+    }
+    let requirements_path = out_dir.join("requirements.txt");
+    if requirements_path.exists() {
+        let requirements = render_requirements(
+            &fs::read_to_string(&requirements_path).context("reading rendered requirements")?,
+            handler,
+        );
+        fs::write(requirements_path, requirements)?;
+    }
     fs::write(
         out_dir.join("rvbbit.backend.json"),
         serde_json::to_string_pretty(manifest)?,
@@ -720,6 +759,22 @@ fn scaffold_project(
         render_compose(manifest, safe_name)?,
     )?;
     Ok(())
+}
+
+fn resolve_template_dir(config: &Config, template: &str) -> PathBuf {
+    let direct = config.template_dir.join(template);
+    if direct.exists() {
+        return direct;
+    }
+    if config
+        .template_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some(template)
+    {
+        return config.template_dir.clone();
+    }
+    config.template_dir.clone()
 }
 
 fn render_tokens(input: &str, values: &[(&str, &str)]) -> String {
@@ -803,10 +858,37 @@ fn render_compose(manifest: &Value, safe_name: &str) -> Result<String> {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let (volume_mounts, volume_defs) = render_runtime_volumes(runtime);
 
     Ok(format!(
-        "services:\n  {service}:\n    build: .\n    container_name: rvbbit-{service}\n    ports:\n      - \"${{RVBBIT_CAPABILITY_PORT:-8080}}:8080\"\n    environment:\n{env_yaml}\n    volumes:\n      - hf_cache:/root/.cache/huggingface\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n  hf_cache:\n"
+        "services:\n  {service}:\n    build: .\n    container_name: rvbbit-{service}\n    ports:\n      - \"${{RVBBIT_CAPABILITY_PORT:-8080}}:8080\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
     ))
+}
+
+fn render_runtime_volumes(runtime: &Value) -> (String, String) {
+    let specs = runtime
+        .get("volumes")
+        .and_then(Value::as_array)
+        .filter(|arr| !arr.is_empty())
+        .cloned()
+        .unwrap_or_else(|| vec![json!({"name": "hf_cache", "mount": "/root/.cache/huggingface"})]);
+    let mut mounts = Vec::new();
+    let mut defs = Vec::new();
+    for spec in specs {
+        let Some(name) = spec.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(mount) = spec.get("mount").and_then(Value::as_str) else {
+            continue;
+        };
+        mounts.push(format!("      - {name}:{mount}"));
+        defs.push(format!("  {name}:"));
+    }
+    if mounts.is_empty() {
+        mounts.push("      - hf_cache:/root/.cache/huggingface".into());
+        defs.push("  hf_cache:".into());
+    }
+    (mounts.join("\n"), defs.join("\n"))
 }
 
 fn docker_compose_up(project_dir: &Path, port: u16, network: &str) -> Result<()> {
@@ -977,6 +1059,111 @@ fn probe_backend(db: &mut Client, manifest: &Value) -> Result<Value> {
     serde_json::from_str(&probe_text).context("parsing backend probe output")
 }
 
+fn is_runtime_sidecar(manifest: &Value) -> bool {
+    manifest.get("kind").and_then(Value::as_str) == Some("runtime_sidecar")
+}
+
+fn runtime_registration_name(manifest: &Value) -> Result<String> {
+    manifest
+        .pointer("/runtime_registration/name")
+        .and_then(Value::as_str)
+        .or_else(|| manifest.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("runtime sidecar manifest needs runtime_registration.name or name"))
+}
+
+fn runtime_language(manifest: &Value) -> String {
+    manifest
+        .pointer("/runtime_registration/language")
+        .or_else(|| manifest.pointer("/runtime/language"))
+        .and_then(Value::as_str)
+        .unwrap_or("python")
+        .to_string()
+}
+
+fn register_runtime(db: &mut Client, manifest: &Value, result: &DeploymentResult) -> Result<()> {
+    let language = runtime_language(manifest);
+    if language != "python" {
+        bail!("runtime sidecar language {language:?} is not supported by this agent yet");
+    }
+    let runtime_name = runtime_registration_name(manifest)?;
+    let runtime_registration = manifest.get("runtime_registration").unwrap_or(&Value::Null);
+    let labels = runtime_registration
+        .get("labels")
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "language": language,
+                "capability_kind": "runtime_sidecar",
+            })
+        })
+        .to_string();
+    let set_default = runtime_registration
+        .get("set_default")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let install_manifest = manifest.to_string();
+    let health = result.health.to_string();
+    db.execute(
+        "SELECT rvbbit.register_python_runtime(\
+         runtime_name => $1, endpoint_url => $2, runtime_status => 'ready', \
+         runtime_labels => $3::text::jsonb, runtime_source => 'warren', \
+         warren_deployment_id => NULL, install_manifest => $4::text::jsonb, \
+         health => $5::text::jsonb, set_default => $6)",
+        &[
+            &runtime_name,
+            &result.endpoint_url,
+            &labels,
+            &install_manifest,
+            &health,
+            &set_default,
+        ],
+    )
+    .context("registering Python runtime")?;
+    Ok(())
+}
+
+fn probe_runtime(manifest: &Value, result: &DeploymentResult) -> Result<Value> {
+    let language = runtime_language(manifest);
+    if language != "python" {
+        bail!("runtime probe for language {language:?} is not implemented");
+    }
+    let python_version = manifest
+        .pointer("/runtime/python_version")
+        .and_then(Value::as_str)
+        .unwrap_or("3.12");
+    let payload = json!({
+        "env": {
+            "name": "warren_probe",
+            "python_version": python_version,
+            "requirements": [],
+            "env_hash": "00000000000000000000000000000000"
+        },
+        "handler": {
+            "name": "warren_probe",
+            "code_hash": "11111111111111111111111111111111",
+            "entrypoint": "run",
+            "code": "def run(inputs):\n    return {'ok': bool(inputs.get('ok')), 'runtime': 'python'}\n"
+        },
+        "inputs": {"ok": true},
+        "timeout_ms": 5000
+    });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .post(&result.probe_url)
+        .json(&payload)
+        .send()
+        .with_context(|| format!("probing runtime {}", result.probe_url))?;
+    let status = resp.status();
+    let body = resp.text().context("reading runtime probe response")?;
+    if !status.is_success() {
+        bail!("runtime probe returned HTTP {}: {}", status.as_u16(), body);
+    }
+    serde_json::from_str(&body).context("parsing runtime probe response")
+}
+
 fn register_operator(
     db: &mut Client,
     manifest: &Value,
@@ -1086,7 +1273,7 @@ fn complete_job(
          job_id => $1::text::uuid, node_name => $2, deployment_status => 'running', \
          endpoint_url => $3, backend_name => $4, operator_name => $5, \
          deploy_manifest => $6::text::jsonb, compose_project => $7, work_dir => $8, \
-         health => $9::text::jsonb, logs => $10::text::jsonb)",
+         health => $9::text::jsonb, logs => $10::text::jsonb, runtime_name => $11)",
         &[
             &job.job_id,
             &config.node_name,
@@ -1098,6 +1285,7 @@ fn complete_job(
             &result.work_dir.display().to_string(),
             &health,
             &logs,
+            &result.runtime_name,
         ],
     )
     .context("marking Warren job complete")?;
@@ -1155,9 +1343,44 @@ fn endpoint_for(config: &Config, manifest: &Value, port: u16, safe_name: &str) -
     {
         return endpoint.to_string();
     }
+    let endpoint_path = manifest
+        .pointer("/warren/endpoint_path")
+        .or_else(|| manifest.pointer("/runtime_registration/endpoint_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("/predict");
     if let Some(base_url) = config.advertise_base_url.as_deref() {
-        return format!("{}:{}/predict", base_url.trim_end_matches('/'), port);
+        return format!(
+            "{}:{}{}",
+            base_url.trim_end_matches('/'),
+            port,
+            normalized_endpoint_path(endpoint_path)
+        );
     }
     let service = safe_name.replace('_', "-");
-    format!("http://rvbbit-{}:8080/predict", service.trim_matches('-'))
+    format!(
+        "http://rvbbit-{}:8080{}",
+        service.trim_matches('-'),
+        normalized_endpoint_path(endpoint_path)
+    )
+}
+
+fn local_probe_endpoint_for(manifest: &Value, port: u16) -> String {
+    let endpoint_path = manifest
+        .pointer("/warren/endpoint_path")
+        .or_else(|| manifest.pointer("/runtime_registration/endpoint_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("/predict");
+    format!(
+        "http://127.0.0.1:{port}{}",
+        normalized_endpoint_path(endpoint_path)
+    )
+}
+
+fn normalized_endpoint_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
 }

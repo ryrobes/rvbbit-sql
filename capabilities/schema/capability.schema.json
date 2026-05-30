@@ -3,7 +3,7 @@
   "$id": "https://rvbbit.dev/schemas/capability.schema.json",
   "title": "Rvbbit Capability Manifest",
   "type": "object",
-  "required": ["api_version", "kind", "name", "backend"],
+  "required": ["api_version", "kind", "name"],
   "additionalProperties": false,
   "properties": {
     "api_version": {
@@ -12,7 +12,7 @@
     },
     "kind": {
       "type": "string",
-      "enum": ["hf_backend"]
+      "enum": ["hf_backend", "runtime_sidecar"]
     },
     "name": {
       "type": "string",
@@ -36,7 +36,7 @@
       "required": ["provider", "model"],
       "additionalProperties": false,
       "properties": {
-        "provider": { "type": "string", "const": "huggingface" },
+        "provider": { "type": "string", "enum": ["huggingface", "builtin"] },
         "model": { "type": "string" },
         "revision": { "type": "string" },
         "url": { "type": "string" }
@@ -56,10 +56,25 @@
             "gliner",
             "tabular_classification",
             "tabular_regression",
+            "python_runtime",
             "custom"
           ]
         },
         "device": { "type": "string", "enum": ["auto", "cpu", "cuda"] },
+        "language": { "type": "string" },
+        "python_version": { "type": "string" },
+        "volumes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "mount"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "mount": { "type": "string" }
+            }
+          }
+        },
         "base_image": { "type": "string" },
         "extra_requirements": {
           "type": "array",
@@ -69,6 +84,19 @@
           "type": "object",
           "additionalProperties": { "type": "string" }
         }
+      }
+    },
+    "runtime_registration": {
+      "type": "object",
+      "required": ["name", "language"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "language": { "type": "string", "enum": ["python"] },
+        "endpoint": { "type": "string" },
+        "endpoint_path": { "type": "string" },
+        "set_default": { "type": "boolean" },
+        "labels": { "type": "object" }
       }
     },
     "backend": {
@@ -147,6 +175,25 @@
           "items": { "type": "string" }
         }
       }
+    },
+    "warren": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "port": { "type": "integer" },
+        "endpoint_url": { "type": "string" },
+        "endpoint_path": { "type": "string" }
+      }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "hf_backend" } } },
+      "then": { "required": ["backend"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "runtime_sidecar" } } },
+      "then": { "required": ["runtime", "runtime_registration"] }
+    }
+  ]
 }

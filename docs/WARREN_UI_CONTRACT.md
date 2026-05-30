@@ -7,18 +7,19 @@ need to inspect extension SQL to understand the available state.
 Warren is an optional deployment scheduler for capability sidecars. Postgres is
 the control plane. A `warren-agent` process runs on a host with Docker and
 optional CPU/GPU resources, polls Postgres for jobs, deploys sidecars, then
-registers resulting Rvbbit backends and SQL operators.
+registers resulting Rvbbit backends/operators or runtime endpoints.
 
 ## Core Screens
 
-A useful first UI should expose five views:
+A useful first UI should expose six views:
 
 | View | Primary source | Purpose |
 |---|---|---|
 | Inventory | `rvbbit.warren_inventory` | Node list with latest metrics and active deployments. |
 | Jobs | `rvbbit.warren_jobs` | Deployment queue, running jobs, failures, and history. |
-| Deployments | `rvbbit.warren_deployments` | Sidecars currently known to Warren, linked to backend/operator names. |
+| Deployments | `rvbbit.warren_deployments` | Sidecars currently known to Warren, linked to backend/operator/runtime names. |
 | Metrics | `rvbbit.warren_node_latest_metrics`, `rvbbit.warren_node_metrics` | CPU, memory, disk, and GPU observability. |
+| Python runtimes | `rvbbit.python_runtimes`, `rvbbit.python_envs` | Runtime endpoints and SQL-managed package environments for `kind: python` nodes. |
 | Capability deploy | `capabilities/catalog.json`, manifest YAML, `rvbbit.deploy_capability(...)` | Queue new deployments from curated capability packs. |
 
 The UI should be data-driven. It should not hardcode curated capability names,
@@ -57,6 +58,7 @@ SELECT
   endpoint_url,
   backend_name,
   operator_name,
+  runtime_name,
   health,
   error,
   deployment_updated_at
@@ -170,6 +172,7 @@ SELECT
   endpoint_url,
   backend_name,
   operator_name,
+  runtime_name,
   error,
   logs,
   created_at,
@@ -257,6 +260,7 @@ SELECT
   endpoint_url,
   backend_name,
   operator_name,
+  runtime_name,
   manifest,
   compose_project,
   work_dir,
@@ -279,9 +283,11 @@ Deployment statuses:
 | `failed` | Deployment job failed or final probe failed. |
 | `removed` | Reserved for future teardown state. |
 
-For active runtime health, join to `rvbbit.backend_health` on
-`backend_name`. `warren_deployments.status = 'running'` means Warren completed
-the deployment workflow. It does not replace backend probes.
+For model backend health, join to `rvbbit.backend_health` on `backend_name`.
+For execution runtime health, join to the runtime catalog, currently
+`rvbbit.python_runtimes` on `runtime_name`. `warren_deployments.status =
+'running'` means Warren completed the deployment workflow. It does not replace
+backend probes or runtime health checks.
 
 ```sql
 SELECT
@@ -290,6 +296,7 @@ SELECT
   d.name AS deployment_name,
   d.status AS deployment_status,
   d.backend_name,
+  d.runtime_name,
   h.n_calls,
   h.n_errors,
   h.avg_latency_ms,
@@ -301,9 +308,74 @@ LEFT JOIN rvbbit.backend_health h
 ORDER BY d.updated_at DESC;
 ```
 
+Runtime deployment state:
+
+```sql
+SELECT
+  d.deployment_id,
+  d.node_name,
+  d.name AS deployment_name,
+  d.status AS deployment_status,
+  d.runtime_name,
+  r.endpoint_url,
+  r.status AS runtime_status,
+  r.labels,
+  r.health,
+  r.updated_at AS runtime_updated_at
+FROM rvbbit.warren_deployments d
+LEFT JOIN rvbbit.python_runtimes r
+  ON r.name = d.runtime_name
+WHERE d.runtime_name IS NOT NULL
+ORDER BY d.updated_at DESC;
+```
+
 The `health` JSON can include agent-written details such as sidecar health and
 backend probe output. Treat it as arbitrary JSON and render it in an expandable
 details panel.
+
+## Python Runtimes
+
+Use `rvbbit.python_runtimes` for registered execution endpoints that can run
+`kind: python` operator nodes. A Warren-deployed Python runtime appears here
+with `runtime_source = 'warren'`.
+
+```sql
+SELECT
+  name,
+  endpoint_url,
+  language,
+  status,
+  labels,
+  runtime_source,
+  install_manifest,
+  health,
+  created_at,
+  updated_at
+FROM rvbbit.python_runtimes
+ORDER BY name;
+```
+
+Use `rvbbit.python_envs` for SQL-managed package environments. When
+`runtime_name` is set, the effective endpoint is resolved from
+`rvbbit.python_runtimes` at call time; `python_envs.endpoint_url` is only for
+direct endpoint overrides.
+
+```sql
+SELECT
+  e.name,
+  e.runtime_name,
+  coalesce(r.endpoint_url, e.endpoint_url) AS effective_endpoint_url,
+  e.python_version,
+  e.requirements,
+  e.env_hash,
+  e.status,
+  e.timeout_ms,
+  e.updated_at
+FROM rvbbit.python_envs e
+LEFT JOIN rvbbit.python_runtimes r
+  ON r.name = e.runtime_name
+ORDER BY e.name;
+```
 
 ## Metrics
 
@@ -380,6 +452,9 @@ Catalog sources:
 | `capabilities/catalog.json` | Fast browse/search list. |
 | `capabilities/manifests/**/*.yaml` | Full manifest shown on detail/deploy screen. |
 
+The catalog is still a local JSON file in this version. A database-backed
+catalog table is a separate follow-up and is not part of this contract yet.
+
 Recommended deploy flow:
 
 1. User picks a capability from `capabilities/catalog.json`.
@@ -408,8 +483,11 @@ capabilities/tools/rvbbit-capability deploy \
   --target '{"gpu":false}'
 ```
 
-The `smoke/warren-echo.yaml` capability is the safest first UI test because it
-does not download a model.
+The `smoke/warren-echo.yaml` capability is the safest first model-backend UI
+test because it does not download a model. The
+`runtimes/python-runtime.yaml` capability is the first runtime-sidecar UI test;
+it should complete with `backend_name IS NULL` and `runtime_name =
+'python_default'`.
 
 ## Placement UI
 
@@ -465,12 +543,14 @@ Recommended default selectors:
 
 If a selector is empty (`{}`), any ready/busy node can claim the job.
 
-## Backend And Operator Links
+## Backend, Operator, And Runtime Links
 
-A completed Warren deployment usually registers:
+A completed Warren deployment registers either model backend/operator plumbing
+or an execution runtime:
 
 - `backend_name`: row in `rvbbit.backends` and `rvbbit.backend_health`.
 - `operator_name`: SQL operator created by `rvbbit.create_operator(...)`.
+- `runtime_name`: runtime row such as `rvbbit.python_runtimes.name`.
 
 Useful checks:
 
@@ -490,6 +570,11 @@ separate:
 | Job status | `rvbbit.warren_jobs.status` | Whether Warren completed the requested action. |
 | Deployment status | `rvbbit.warren_deployments.status` | Warren's remembered service state. |
 | Backend health | `rvbbit.backend_health` and `rvbbit.backend_probe(...)` | Whether Rvbbit can call the backend successfully. |
+| Runtime health | `rvbbit.python_runtimes.status` and `health` | Whether a Python runtime endpoint is registered and ready. |
+
+For a runtime deployment, `backend_name` and `operator_name` are expected to be
+null. That is not an error; `runtime_name` is the capability handle used by
+SQL-managed Python envs.
 
 ## Suggested UI Actions
 
@@ -500,6 +585,8 @@ Read-only actions are safe for v0:
 - Chart node metrics.
 - View job manifest, logs, error, and deployment health JSON.
 - Probe a deployed backend with `rvbbit.backend_probe(...)`.
+- Inspect registered Python runtimes and their envs from
+  `rvbbit.python_runtimes` and `rvbbit.python_envs`.
 
 Write actions available in v0:
 
@@ -523,6 +610,8 @@ Show these fields prominently when present:
 | `warren_deployments.error` | Deployment row | Last deployment-level error. |
 | `warren_deployments.health` | Deployment row | Sidecar health/probe details or failure details. |
 | `backend_health.n_errors` | Backend health | Runtime invocation errors after registration. |
+| `python_runtimes.status` | Python runtime row | Runtime registration state. |
+| `python_runtimes.health` | Python runtime row | Warren/runtime probe details. |
 
 Common failure categories:
 
@@ -530,8 +619,9 @@ Common failure categories:
 |---|---|
 | Job remains `queued` | No node labels match the target selector, or no agent is polling. |
 | Job becomes `failed` before deployment | Docker build/run/scaffold error. |
-| Deployment `failed` with probe data | Sidecar started but Rvbbit backend probe failed. |
+| Deployment `failed` with probe data | Sidecar started but backend/runtime probe failed. |
 | Backend probe fails after deployment | Endpoint URL/network changed, sidecar exited, or operator/backend config mismatch. |
+| Python runtime row missing | Runtime sidecar job failed before `rvbbit.register_python_runtime(...)`, or the extension version is too old. |
 | Metrics missing | `WARREN_METRICS_MS=0`, agent cannot write metrics, or metrics collector unavailable. |
 
 ## Smoke Test
@@ -569,9 +659,25 @@ Expected UI sequence:
 6. `rvbbit.backend_probe('warren_smoke_echo')` returns `{"ok": true, ...}`.
 7. `SELECT rvbbit.warren_smoke_echo('hello')->>'echo';` returns `hello`.
 
+Use this sequence to validate the Python runtime sidecar path:
+
+```bash
+capabilities/tools/rvbbit-capability deploy \
+  capabilities/manifests/runtimes/python-runtime.yaml \
+  --dsn "$RVBBIT_DSN" \
+  --target '{"docker":true}'
+```
+
+Expected runtime sequence:
+
+1. Job follows the same queued/running/completed flow.
+2. `rvbbit.warren_deployments.runtime_name = 'python_default'`.
+3. `rvbbit.python_runtimes` has a ready row named `python_default`.
+4. Python env creation can name `runtime_name => 'python_default'`.
+
 ## Version Notes
 
-This contract targets Rvbbit extension version `0.47.0` and the Rust
-`warren-agent` introduced with that version. Future scheduling policies should
-preserve the current SQL surfaces where possible and extend JSON fields rather
-than replacing table shapes.
+This contract targets Rvbbit extension version `0.60.4` and the Rust
+`warren-agent`. Future scheduling policies should preserve the current SQL
+surfaces where possible and extend JSON fields rather than replacing table
+shapes.

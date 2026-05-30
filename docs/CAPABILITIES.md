@@ -1,18 +1,23 @@
 # Rvbbit Capabilities
 
-A capability pack is a portable bundle that turns an external model into a
-registered Rvbbit backend and, when useful, one or more SQL operators.
+A capability pack is a portable bundle that turns an external service into a
+registered Rvbbit capability: usually a model backend plus SQL operators, and
+now also execution runtimes such as the managed Python sidecar.
 
-V1 capability packs live in `capabilities/` and focus on Hugging Face models.
-The directory is intentionally self-contained so it can move to a separate
-`rvbbit-capabilities` repository later.
+V1 capability packs live in `capabilities/`. Most curated packs focus on
+Hugging Face models, but the manifest shape also supports Warren-deployed
+runtime sidecars. The directory is intentionally self-contained so it can move
+to a separate `rvbbit-capabilities` repository later.
 
 ## What A Pack Contains
 
-- `rvbbit.backend.yaml`: source model, runtime, endpoint, batching, and SQL
-  operator definitions.
-- `register.sql`: calls `rvbbit.register_backend(...)`.
-- `operator.sql`: optional `rvbbit.create_operator(...)` calls.
+- `rvbbit.backend.yaml`: source, runtime, endpoint, batching/registration, and
+  optional SQL operator definitions.
+- `register.sql`: calls `rvbbit.register_backend(...)` for model backends or
+  runtime-specific registration such as `rvbbit.register_python_runtime(...)`.
+- `operator.sql`: optional `rvbbit.create_operator(...)` calls. Runtime
+  sidecars usually do not create operators directly; they become node
+  primitives used by operators.
 - `smoke.sql`: active backend probe plus example operator calls.
 - `Dockerfile`, `main.py`, `requirements.txt`: a FastAPI sidecar scaffold
   speaking Rvbbit's native batch transport.
@@ -73,6 +78,15 @@ capabilities/tools/rvbbit-capability deploy \
   --target '{"gpu":false}'
 ```
 
+Queue the managed Python runtime through Warren:
+
+```bash
+capabilities/tools/rvbbit-capability deploy \
+  capabilities/manifests/runtimes/python-runtime.yaml \
+  --dsn "$RVBBIT_DSN" \
+  --target '{"docker":true}'
+```
+
 Or from SQL:
 
 ```sql
@@ -117,7 +131,7 @@ Generated compose files attach the service to
 dev stack. If your Rvbbit Postgres container is on another network, set
 `RVBBIT_DOCKER_NETWORK` before `docker compose up`.
 
-## Runtime Contract
+## Backend Runtime Contract
 
 The generated sidecar uses the native Rvbbit specialist transport:
 
@@ -132,6 +146,28 @@ POST /predict
 The response must contain one output per input in the same order. Operators
 send templated input objects from their `steps` definition directly to this
 endpoint.
+
+## Execution Runtime Contract
+
+Runtime sidecars expose language-specific execution surfaces rather than the
+specialist `/predict` batch transport. The managed Python runtime uses:
+
+```http
+POST /run
+{
+  "env": {"name": "...", "python_version": "3.12", "requirements": [], "env_hash": "..."},
+  "handler": {"name": "...", "code": "...", "code_hash": "...", "entrypoint": "run"},
+  "inputs": {},
+  "timeout_ms": 1000
+}
+
+200
+{"ok": true, "output": {...}, "stdout": "", "stderr": "", "duration_ms": 12}
+```
+
+Users should not hand-build server venvs. They define package lists in SQL via
+`rvbbit.create_python_env(...)`; the sidecar reconciles those specs into
+persistent venvs.
 
 ## Server Metadata
 
@@ -172,6 +208,9 @@ pack names or generated SQL bodies.
 - `rvbbit.backend_probe(name)`: active backend check with default sample input.
 - `rvbbit.backend_probe_with_input(name, sample_jsonb)`: active backend check
   with UI-supplied sample input.
+- `rvbbit.python_runtimes`: registered Python execution endpoints, including
+  Warren-deployed runtimes.
+- `rvbbit.python_envs`: SQL-managed Python package environments.
 - `rvbbit.ml_model_status`: passive trained-model registry with latest
   training-run state.
 - `rvbbit.ml_training_runs`: queued/running/completed training jobs.
@@ -208,21 +247,25 @@ Each `capabilities[]` entry has these fields:
 | `title` | string | Human-readable title. |
 | `description` | string/null | Short description. |
 | `tags` | string[] | UI filters such as `embedding`, `extract`, `gpu`. |
-| `kind` | string | Currently `hf_backend`. |
+| `kind` | string | `hf_backend` or `runtime_sidecar`. |
 | `license` | string/null | Model or pack license hint. |
-| `source_provider` | string/null | Currently usually `huggingface`. |
-| `source_model` | string/null | Hugging Face model id. |
+| `source_provider` | string/null | Usually `huggingface` for model packs or `builtin` for bundled runtimes. |
+| `source_model` | string/null | Hugging Face model id or bundled capability id. |
 | `source_revision` | string/null | Optional pinned model revision. |
-| `backend_name` | string | Name registered in `rvbbit.backends`. |
-| `backend_transport` | string | Usually `rvbbit` for generated sidecars. |
+| `backend_name` | string/null | Name registered in `rvbbit.backends`; null for runtime sidecars. |
+| `backend_transport` | string/null | Usually `rvbbit` for generated model sidecars. |
+| `runtime_name` | string/null | Name registered in a runtime catalog such as `rvbbit.python_runtimes`. |
+| `runtime_language` | string/null | Runtime language, currently `python` for runtime sidecars. |
 | `runtime_template` | string | Generated runtime template. |
-| `runtime_handler` | string | Handler such as `echo`, `embedding`, `gliner`, `sequence_classification`, `tabular_classification`, or `tabular_regression`. |
+| `runtime_handler` | string | Handler such as `echo`, `embedding`, `gliner`, `sequence_classification`, `tabular_classification`, `tabular_regression`, or `python_runtime`. |
+| `endpoint_path` | string/null | Warren registration path such as `/predict` or `/run`. |
 | `device` | string | Manifest preference: `auto`, `cpu`, or `cuda`. |
 | `operators` | string[] | SQL operator functions created by `operator.sql`. |
 
-The UI can filter by `tags`, `runtime_handler`, `source_provider`,
-`source_model`, and `license`. The UI should use `backend_name` to join catalog
-entries to installed backend rows.
+The UI can filter by `tags`, `kind`, `runtime_handler`, `source_provider`,
+`source_model`, and `license`. Use `backend_name` to join model entries to
+installed backend rows. Use `runtime_name` to join runtime entries to runtime
+catalogs such as `rvbbit.python_runtimes`.
 
 ### Manifest Shape
 
@@ -255,9 +298,36 @@ operators:
     return_type: jsonb
 ```
 
-The UI should treat unknown manifest keys as pass-through data. V1 only
-supports `kind: hf_backend` in the CLI, but future pack kinds should not break
-catalog rendering.
+The UI should treat unknown manifest keys as pass-through data. V1 supports
+`kind: hf_backend` and `kind: runtime_sidecar` in the CLI, but future pack
+kinds should not break catalog rendering.
+
+Runtime sidecar example:
+
+```yaml
+api_version: rvbbit.capability/v1
+kind: runtime_sidecar
+name: python_runtime
+title: Managed CPython Runtime
+source:
+  provider: builtin
+  model: rvbbit/python-runtime
+runtime:
+  template: python-runtime
+  language: python
+  handler: python_runtime
+  base_image: python:3.12-slim
+  volumes:
+    - name: python_envs
+      mount: /var/lib/rvbbit
+runtime_registration:
+  name: python_default
+  language: python
+  endpoint_path: /run
+  set_default: true
+warren:
+  endpoint_path: /run
+```
 
 ### Tabular Handler Shape
 
@@ -527,19 +597,45 @@ ORDER BY name;
 capability pack or compatible generated SQL. Hand-authored backends may have no
 manifest and should still be shown in an "Installed Backends" view.
 
+### Installed Runtime Query
+
+Use this query for runtime-sidecar installs:
+
+```sql
+SELECT
+  name,
+  endpoint_url,
+  language,
+  status,
+  labels,
+  runtime_source,
+  install_manifest,
+  health,
+  created_at,
+  updated_at
+FROM rvbbit.python_runtimes
+ORDER BY name;
+```
+
+`runtime_source = 'warren'` means Warren deployed and registered the endpoint.
+Join catalog entries with `kind = 'runtime_sidecar'` on
+`catalog.runtime_name = python_runtimes.name`.
+
 ### Install State Model
 
 For v0, use this state model:
 
 | State | How To Infer |
 |---|---|
-| `catalog_only` | Entry exists in `catalog.json`, no matching backend row. |
-| `registered` | `rvbbit.backend_health.name = catalog.backend_name`. |
+| `catalog_only` | Entry exists in `catalog.json`, no matching backend/runtime row. |
+| `registered` | `rvbbit.backend_health.name = catalog.backend_name` or `rvbbit.python_runtimes.name = catalog.runtime_name`. |
 | `used` | Registered and `n_calls > 0`. |
 | `error_seen` | Registered and `n_errors > 0`. |
 | `healthy` | Latest `rvbbit.backend_probe(...)` returned `{"ok": true}`. |
 | `failing` | Latest probe returned `{"ok": false}` or raised a SQL/client error. |
-| `external` | Backend row exists with no matching catalog entry. |
+| `runtime_ready` | Runtime row exists with `status = 'ready'`. |
+| `runtime_failing` | Runtime row exists with `status IN ('failed', 'disabled')`. |
+| `external` | Backend/runtime row exists with no matching catalog entry. |
 
 Scaffolded and container-running states are currently outside the database.
 If the UI manages local Docker itself, track those states in UI-local state by

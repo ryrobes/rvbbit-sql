@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::time::{Instant, UNIX_EPOCH};
+use std::process;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use datafusion::arrow::array::{
@@ -11,9 +12,10 @@ use datafusion::arrow::array::{
     Array, ArrayRef,
 };
 use datafusion::arrow::datatypes::{
-    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
-    UInt32Type, UInt64Type, UInt8Type,
+    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef,
+    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
+use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
@@ -41,6 +43,7 @@ struct Args {
     pgdata_prefix: String,
     visible_pgdata_prefix: String,
     layout: String,
+    result_format: ResultFormat,
     explain_only: bool,
     serve: bool,
 }
@@ -49,6 +52,21 @@ struct Args {
 enum Engine {
     Duck,
     DataFusion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultFormat {
+    Json,
+    ArrowIpcFile,
+}
+
+impl ResultFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResultFormat::Json => "json",
+            ResultFormat::ArrowIpcFile => "arrow_ipc_file",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +109,11 @@ struct QuerySummary {
     row_count: usize,
     columns: Vec<String>,
     rows: Vec<Vec<Value>>,
+    result_format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arrow_ipc_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arrow_ipc_bytes: Option<u64>,
     tables: Vec<TableSummary>,
     cache: CacheSummary,
 }
@@ -192,6 +215,9 @@ fn run_duck_once(
             row_count: 0,
             columns: Vec::new(),
             rows: Vec::new(),
+            result_format: ResultFormat::Json.as_str().to_string(),
+            arrow_ipc_path: None,
+            arrow_ipc_bytes: None,
             tables: table_summaries(&catalog),
             cache,
         });
@@ -200,23 +226,21 @@ fn run_duck_once(
     let mut elapsed = Vec::with_capacity(args.repeat);
     let mut last = QueryRows::default();
     for _ in 0..args.repeat.max(1) {
+        cleanup_query_rows(&mut last);
         let start = Instant::now();
-        last = execute_duck_query(&con, sql, args.max_rows)?;
+        last = execute_duck_query_result(&con, sql, args.max_rows, args.result_format)?;
         elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     elapsed.sort_by(|a, b| a.total_cmp(b));
     let median = elapsed[elapsed.len() / 2];
-    Ok(QuerySummary {
-        status: "ok".to_string(),
-        elapsed_ms: median,
-        repeat: args.repeat.max(1),
-        timeout_s: args.timeout_s,
-        row_count: last.row_count,
-        columns: last.columns,
-        rows: last.rows,
-        tables: table_summaries(&catalog),
+    Ok(query_summary_from_rows(
+        median,
+        args.repeat.max(1),
+        args.timeout_s,
+        last,
+        &catalog,
         cache,
-    })
+    ))
 }
 
 fn run_datafusion_once(
@@ -253,6 +277,9 @@ async fn run_datafusion_once_async(
             row_count: 0,
             columns: Vec::new(),
             rows: Vec::new(),
+            result_format: ResultFormat::Json.as_str().to_string(),
+            arrow_ipc_path: None,
+            arrow_ipc_bytes: None,
             tables: table_summaries(&catalog),
             cache,
         });
@@ -261,22 +288,21 @@ async fn run_datafusion_once_async(
     let mut elapsed = Vec::with_capacity(args.repeat.max(1));
     let mut last = QueryRows::default();
     for _ in 0..args.repeat.max(1) {
+        cleanup_query_rows(&mut last);
         let start = Instant::now();
-        last = execute_datafusion_query(&ctx, sql, args.max_rows).await?;
+        last =
+            execute_datafusion_query_result(&ctx, sql, args.max_rows, args.result_format).await?;
         elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     elapsed.sort_by(|a, b| a.total_cmp(b));
-    Ok(QuerySummary {
-        status: "ok".to_string(),
-        elapsed_ms: elapsed[elapsed.len() / 2],
-        repeat: args.repeat.max(1),
-        timeout_s: args.timeout_s,
-        row_count: last.row_count,
-        columns: last.columns,
-        rows: last.rows,
-        tables: table_summaries(&catalog),
+    Ok(query_summary_from_rows(
+        elapsed[elapsed.len() / 2],
+        args.repeat.max(1),
+        args.timeout_s,
+        last,
+        &catalog,
         cache,
-    })
+    ))
 }
 
 async fn create_datafusion_views(
@@ -391,6 +417,31 @@ async fn execute_datafusion_query(
     Ok(record_batches_to_query_rows(&batches, max_rows)?)
 }
 
+async fn execute_datafusion_query_result(
+    ctx: &SessionContext,
+    sql: &str,
+    max_rows: usize,
+    result_format: ResultFormat,
+) -> Result<QueryRows> {
+    match result_format {
+        ResultFormat::Json => execute_datafusion_query(ctx, sql, max_rows).await,
+        ResultFormat::ArrowIpcFile => execute_datafusion_query_arrow_ipc(ctx, sql, max_rows).await,
+    }
+}
+
+async fn execute_datafusion_query_arrow_ipc(
+    ctx: &SessionContext,
+    sql: &str,
+    max_rows: usize,
+) -> Result<QueryRows> {
+    let dataframe = ctx.sql(sql).await.context("planning DataFusion query")?;
+    let batches = dataframe
+        .collect()
+        .await
+        .context("executing DataFusion query")?;
+    record_batches_to_arrow_ipc_rows(&batches, max_rows)
+}
+
 fn record_batches_to_query_rows(batches: &[RecordBatch], max_rows: usize) -> Result<QueryRows> {
     let columns = batches
         .first()
@@ -407,6 +458,9 @@ fn record_batches_to_query_rows(batches: &[RecordBatch], max_rows: usize) -> Res
         columns,
         rows: Vec::new(),
         row_count: 0,
+        result_format: ResultFormat::Json,
+        arrow_ipc_path: None,
+        arrow_ipc_bytes: None,
     };
     for batch in batches {
         for row_idx in 0..batch.num_rows() {
@@ -421,6 +475,82 @@ fn record_batches_to_query_rows(batches: &[RecordBatch], max_rows: usize) -> Res
         }
     }
     Ok(out)
+}
+
+fn record_batches_to_arrow_ipc_rows(batches: &[RecordBatch], max_rows: usize) -> Result<QueryRows> {
+    let Some(first) = batches.first() else {
+        return Ok(QueryRows::default());
+    };
+    let columns = schema_column_names(&first.schema());
+    let (capped, row_count) = capped_record_batches(batches, max_rows);
+    if capped.is_empty() {
+        return Ok(QueryRows {
+            columns,
+            rows: Vec::new(),
+            row_count,
+            result_format: ResultFormat::Json,
+            arrow_ipc_path: None,
+            arrow_ipc_bytes: None,
+        });
+    }
+    let (path, bytes) = write_arrow_ipc_file(first.schema(), &capped)?;
+    Ok(QueryRows {
+        columns,
+        rows: Vec::new(),
+        row_count,
+        result_format: ResultFormat::ArrowIpcFile,
+        arrow_ipc_path: Some(path),
+        arrow_ipc_bytes: Some(bytes),
+    })
+}
+
+fn capped_record_batches(batches: &[RecordBatch], max_rows: usize) -> (Vec<RecordBatch>, usize) {
+    let mut row_count = 0usize;
+    let mut remaining = max_rows;
+    let mut capped = Vec::new();
+    for batch in batches {
+        row_count += batch.num_rows();
+        if remaining == 0 {
+            continue;
+        }
+        let len = remaining.min(batch.num_rows());
+        if len > 0 {
+            capped.push(batch.slice(0, len));
+            remaining -= len;
+        }
+    }
+    (capped, row_count)
+}
+
+fn schema_column_names(schema: &SchemaRef) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect()
+}
+
+fn write_arrow_ipc_file(schema: SchemaRef, batches: &[RecordBatch]) -> Result<(String, u64)> {
+    let dir =
+        env::var("RVBBIT_ARROW_IPC_DIR").unwrap_or_else(|_| "/tmp/rvbbit-arrow-ipc".to_string());
+    fs::create_dir_all(&dir).with_context(|| format!("creating Arrow IPC dir {dir}"))?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let path = format!("{dir}/rvbbit-{}-{nanos}.arrow", process::id());
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("creating Arrow IPC file {path}"))?;
+    let mut writer = StreamWriter::try_new(file, &schema)?;
+    for batch in batches {
+        writer.write(batch)?;
+    }
+    writer.finish()?;
+    let bytes = fs::metadata(&path)?.len();
+    Ok((path, bytes))
 }
 
 fn arrow_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<Value> {
@@ -461,6 +591,7 @@ struct ServerRequest {
     timeout_s: Option<u64>,
     threads: Option<usize>,
     max_rows: Option<usize>,
+    result_format: Option<String>,
     explain_only: Option<bool>,
 }
 
@@ -587,6 +718,12 @@ impl ServerState {
         let repeat = req.repeat.unwrap_or(args.repeat).max(1);
         let timeout_s = req.timeout_s.unwrap_or(args.timeout_s);
         let max_rows = req.max_rows.unwrap_or(args.max_rows);
+        let result_format = req
+            .result_format
+            .as_deref()
+            .map(parse_result_format)
+            .transpose()?
+            .unwrap_or(args.result_format);
         let explain_only = req.explain_only.unwrap_or(args.explain_only);
         let threads = req.threads.unwrap_or(args.threads).max(1);
 
@@ -633,22 +770,20 @@ impl ServerState {
                 let mut elapsed = Vec::with_capacity(repeat);
                 let mut last = QueryRows::default();
                 for _ in 0..repeat {
+                    cleanup_query_rows(&mut last);
                     let start = Instant::now();
-                    last = execute_duck_query(con, sql, max_rows)?;
+                    last = execute_duck_query_result(con, sql, max_rows, result_format)?;
                     elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
                 }
                 elapsed.sort_by(|a, b| a.total_cmp(b));
-                Ok(QuerySummary {
-                    status: "ok".to_string(),
-                    elapsed_ms: elapsed[elapsed.len() / 2],
+                Ok(query_summary_from_rows(
+                    elapsed[elapsed.len() / 2],
                     repeat,
                     timeout_s,
-                    row_count: last.row_count,
-                    columns: last.columns,
-                    rows: last.rows,
-                    tables: table_summaries(&catalog),
+                    last,
+                    &catalog,
                     cache,
-                })
+                ))
             }
             ServerExecutor::DataFusion { runtime, ctx } => runtime.block_on(async {
                 if explain_only {
@@ -664,22 +799,21 @@ impl ServerState {
                 let mut elapsed = Vec::with_capacity(repeat);
                 let mut last = QueryRows::default();
                 for _ in 0..repeat {
+                    cleanup_query_rows(&mut last);
                     let start = Instant::now();
-                    last = execute_datafusion_query(ctx, sql, max_rows).await?;
+                    last =
+                        execute_datafusion_query_result(ctx, sql, max_rows, result_format).await?;
                     elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
                 }
                 elapsed.sort_by(|a, b| a.total_cmp(b));
-                Ok(QuerySummary {
-                    status: "ok".to_string(),
-                    elapsed_ms: elapsed[elapsed.len() / 2],
+                Ok(query_summary_from_rows(
+                    elapsed[elapsed.len() / 2],
                     repeat,
                     timeout_s,
-                    row_count: last.row_count,
-                    columns: last.columns,
-                    rows: last.rows,
-                    tables: table_summaries(&catalog),
+                    last,
+                    &catalog,
                     cache,
-                })
+                ))
             }),
         }
     }
@@ -866,8 +1000,41 @@ fn empty_query_summary(
         row_count: 0,
         columns: Vec::new(),
         rows: Vec::new(),
+        result_format: ResultFormat::Json.as_str().to_string(),
+        arrow_ipc_path: None,
+        arrow_ipc_bytes: None,
         tables: table_summaries(catalog),
         cache,
+    }
+}
+
+fn query_summary_from_rows(
+    elapsed_ms: f64,
+    repeat: usize,
+    timeout_s: u64,
+    rows: QueryRows,
+    catalog: &BTreeMap<String, RvbbitDuckTable>,
+    cache: CacheSummary,
+) -> QuerySummary {
+    QuerySummary {
+        status: "ok".to_string(),
+        elapsed_ms,
+        repeat,
+        timeout_s,
+        row_count: rows.row_count,
+        columns: rows.columns,
+        rows: rows.rows,
+        result_format: rows.result_format.as_str().to_string(),
+        arrow_ipc_path: rows.arrow_ipc_path,
+        arrow_ipc_bytes: rows.arrow_ipc_bytes,
+        tables: table_summaries(catalog),
+        cache,
+    }
+}
+
+fn cleanup_query_rows(rows: &mut QueryRows) {
+    if let Some(path) = rows.arrow_ipc_path.take() {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -889,6 +1056,12 @@ fn parse_args() -> Result<Args> {
     let mut visible_pgdata_prefix = env::var("RVBBIT_VISIBLE_PGDATA_PREFIX")
         .unwrap_or_else(|_| DEFAULT_VISIBLE_PGDATA_PREFIX.to_string());
     let mut layout = env::var("RVBBIT_PARQUET_LAYOUT").unwrap_or_else(|_| "scan".to_string());
+    let mut result_format = env::var("RVBBIT_RESULT_FORMAT")
+        .ok()
+        .as_deref()
+        .map(parse_result_format)
+        .transpose()?
+        .unwrap_or(ResultFormat::Json);
     let mut explain_only = false;
     let mut serve = false;
 
@@ -907,6 +1080,9 @@ fn parse_args() -> Result<Args> {
                 visible_pgdata_prefix = need_value(&mut it, "--visible-pgdata-prefix")?
             }
             "--layout" => layout = need_value(&mut it, "--layout")?,
+            "--result-format" => {
+                result_format = parse_result_format(&need_value(&mut it, "--result-format")?)?
+            }
             "--explain-only" => explain_only = true,
             "--serve" => serve = true,
             "-h" | "--help" => {
@@ -931,6 +1107,7 @@ fn parse_args() -> Result<Args> {
         pgdata_prefix,
         visible_pgdata_prefix,
         layout,
+        result_format,
         explain_only,
         serve,
     })
@@ -944,15 +1121,23 @@ fn parse_engine(raw: &str) -> Result<Engine> {
     }
 }
 
+fn parse_result_format(raw: &str) -> Result<ResultFormat> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "json" => Ok(ResultFormat::Json),
+        "arrow" | "arrow_ipc" | "arrow_ipc_file" => Ok(ResultFormat::ArrowIpcFile),
+        other => bail!("unsupported result format: {other}"),
+    }
+}
+
 fn need_value(it: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
     it.next().ok_or_else(|| anyhow!("{name} requires a value"))
 }
 
 fn print_help() {
     println!(
-        "rvbbit-duck --sql SQL [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--repeat N] [--timeout-s N] [--threads N] [--max-rows N]\n\
+        "rvbbit-duck --sql SQL [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--repeat N] [--timeout-s N] [--threads N] [--max-rows N] [--result-format json|arrow_ipc_file]\n\
          rvbbit-duck --serve [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
-         Server JSONL requests: {{\"sql\":\"SELECT ...\"}} or {{\"command\":\"prewarm\"}}"
+         Server JSONL requests: {{\"sql\":\"SELECT ...\",\"result_format\":\"json|arrow_ipc_file\"}} or {{\"command\":\"prewarm\"}}"
     );
 }
 
@@ -2034,7 +2219,12 @@ enum DuckSourceFormat {
 }
 
 fn table_source_format(table: &RvbbitDuckTable) -> DuckSourceFormat {
-    match table.layout.as_deref().map(str::to_ascii_lowercase).as_deref() {
+    match table
+        .layout
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("vortex") | Some("vortex_scan") => DuckSourceFormat::Vortex,
         _ => DuckSourceFormat::Parquet,
     }
@@ -2151,8 +2341,7 @@ fn duck_select_expr(col: &str, typname: &str, source_format: DuckSourceFormat) -
     let ident = quote_ident(col);
     if typname == "date" {
         format!("(DATE '1970-01-01' + CAST({ident} AS INTEGER)) AS {ident}")
-    } else if source_format == DuckSourceFormat::Vortex
-        && typname == "timestamp without time zone"
+    } else if source_format == DuckSourceFormat::Vortex && typname == "timestamp without time zone"
     {
         format!("make_timestamp(CAST({ident} AS BIGINT)) AS {ident}")
     } else if source_format == DuckSourceFormat::Vortex && typname == "timestamp with time zone" {
@@ -2162,11 +2351,26 @@ fn duck_select_expr(col: &str, typname: &str, source_format: DuckSourceFormat) -
     }
 }
 
-#[derive(Default)]
 struct QueryRows {
     columns: Vec<String>,
     rows: Vec<Vec<Value>>,
     row_count: usize,
+    result_format: ResultFormat,
+    arrow_ipc_path: Option<String>,
+    arrow_ipc_bytes: Option<u64>,
+}
+
+impl Default for QueryRows {
+    fn default() -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            result_format: ResultFormat::Json,
+            arrow_ipc_path: None,
+            arrow_ipc_bytes: None,
+        }
+    }
 }
 
 fn execute_duck_query(con: &Connection, sql: &str, max_rows: usize) -> Result<QueryRows> {
@@ -2181,6 +2385,9 @@ fn execute_duck_query(con: &Connection, sql: &str, max_rows: usize) -> Result<Qu
         columns,
         rows: Vec::new(),
         row_count: 0,
+        result_format: ResultFormat::Json,
+        arrow_ipc_path: None,
+        arrow_ipc_bytes: None,
     };
     while let Some(row) = rows.next()? {
         if out.rows.len() < max_rows {
@@ -2193,6 +2400,58 @@ fn execute_duck_query(con: &Connection, sql: &str, max_rows: usize) -> Result<Qu
         out.row_count += 1;
     }
     Ok(out)
+}
+
+fn execute_duck_query_result(
+    con: &Connection,
+    sql: &str,
+    max_rows: usize,
+    result_format: ResultFormat,
+) -> Result<QueryRows> {
+    match result_format {
+        ResultFormat::Json => execute_duck_query(con, sql, max_rows),
+        ResultFormat::ArrowIpcFile => execute_duck_query_arrow_ipc(con, sql, max_rows),
+    }
+}
+
+fn execute_duck_query_arrow_ipc(con: &Connection, sql: &str, max_rows: usize) -> Result<QueryRows> {
+    let mut stmt = con.prepare(sql)?;
+    let mut arrow = stmt.query_arrow([])?;
+    let schema = arrow.get_schema();
+    let columns = schema_column_names(&schema);
+    let mut row_count = 0usize;
+    let mut remaining = max_rows;
+    let mut capped = Vec::new();
+    for batch in &mut arrow {
+        row_count += batch.num_rows();
+        if remaining == 0 {
+            continue;
+        }
+        let len = batch.num_rows().min(remaining);
+        if len > 0 {
+            capped.push(batch.slice(0, len));
+            remaining -= len;
+        }
+    }
+    if capped.is_empty() {
+        return Ok(QueryRows {
+            columns,
+            rows: Vec::new(),
+            row_count,
+            result_format: ResultFormat::Json,
+            arrow_ipc_path: None,
+            arrow_ipc_bytes: None,
+        });
+    }
+    let (path, bytes) = write_arrow_ipc_file(schema, &capped)?;
+    Ok(QueryRows {
+        columns,
+        rows: Vec::new(),
+        row_count,
+        result_format: ResultFormat::ArrowIpcFile,
+        arrow_ipc_path: Some(path),
+        arrow_ipc_bytes: Some(bytes),
+    })
 }
 
 fn value_ref_to_json(value: ValueRef<'_>) -> Value {

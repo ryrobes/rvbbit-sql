@@ -1,8 +1,21 @@
 use std::cell::RefCell;
+use std::fs;
+use std::fs::File;
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
+use arrow::array::{
+    cast::{as_boolean_array, as_primitive_array, as_string_array},
+    Array, ArrayRef,
+};
+use arrow::datatypes::{
+    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
+    UInt32Type, UInt64Type, UInt8Type,
+};
+use arrow::ipc::reader::StreamReader;
+use arrow::record_batch::RecordBatch;
+use arrow::util::display::array_value_to_string;
 use pgrx::prelude::*;
 use pgrx::{pg_sys, JsonB, Spi};
 use serde_json::{json, Map, Value};
@@ -12,6 +25,21 @@ use std::io::{BufRead, BufReader, Write};
 const DEFAULT_DUCK_BIN: &str = "/usr/local/bin/rvbbit-duck";
 const DEFAULT_MAX_ROWS: i32 = 100_000;
 const DEFAULT_TIMEOUT_S: i32 = 300;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidecarResultFormat {
+    Json,
+    ArrowIpcFile,
+}
+
+impl SidecarResultFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            SidecarResultFormat::Json => "json",
+            SidecarResultFormat::ArrowIpcFile => "arrow_ipc_file",
+        }
+    }
+}
 
 thread_local! {
     static DUCK_SESSION: RefCell<Option<DuckSession>> = const { RefCell::new(None) };
@@ -124,6 +152,26 @@ fn persistent_enabled() -> bool {
     guc_setting("rvbbit.duck_backend_persistent")
         .map(|value| setting_enabled(&value, true))
         .unwrap_or_else(|| env_enabled("RVBBIT_DUCK_BACKEND_PERSISTENT", true))
+}
+
+fn arrow_ipc_enabled() -> bool {
+    guc_setting("rvbbit.duck_arrow_ipc")
+        .map(|value| setting_enabled(&value, true))
+        .unwrap_or_else(|| env_enabled("RVBBIT_DUCK_ARROW_IPC", true))
+}
+
+fn arrow_ipc_fallback_enabled() -> bool {
+    guc_setting("rvbbit.duck_arrow_ipc_fallback")
+        .map(|value| setting_enabled(&value, true))
+        .unwrap_or_else(|| env_enabled("RVBBIT_DUCK_ARROW_IPC_FALLBACK", true))
+}
+
+fn sidecar_result_format() -> SidecarResultFormat {
+    if arrow_ipc_enabled() {
+        SidecarResultFormat::ArrowIpcFile
+    } else {
+        SidecarResultFormat::Json
+    }
 }
 
 pub(crate) fn fail_open_enabled() -> bool {
@@ -247,6 +295,8 @@ fn engine_query_json(
         self::max_rows()
     };
     let start = Instant::now();
+    let result_format = sidecar_result_format();
+    let mut sidecar_context: Option<(String, String, i32)> = None;
 
     // Phase 1: in-process DataFusion path. Only takes the datafusion engine
     // (DuckDB still goes through the sidecar). If we hit an error, fall
@@ -271,7 +321,7 @@ fn engine_query_json(
         None
     };
 
-    let payload = if let Some(p) = inprocess_payload {
+    let mut payload = if let Some(p) = inprocess_payload {
         p
     } else {
         let binary = duck_binary().unwrap_or_else(|| {
@@ -279,7 +329,17 @@ fn engine_query_json(
         });
         let dsn = duck_dsn();
         let timeout = timeout_s();
-        match run_engine_query(engine, layout, &binary, &dsn, query, max_rows, timeout) {
+        sidecar_context = Some((binary.clone(), dsn.clone(), timeout));
+        match run_engine_query(
+            engine,
+            layout,
+            &binary,
+            &dsn,
+            query,
+            max_rows,
+            timeout,
+            result_format,
+        ) {
             Ok(p) => p,
             Err(err) if matches!(layout, "vortex" | "vortex_scan") => {
                 return engine_error(engine, &err);
@@ -293,56 +353,103 @@ fn engine_query_json(
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("rvbbit-duck returned non-ok status");
-        if matches!(layout, "vortex" | "vortex_scan") {
-            return engine_error(engine, err);
-        }
-        return fail_open_or_error(engine, query, max_rows, err);
-    }
-
-    let row_count = payload
-        .get("row_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
-    let Some(rows) = payload.get("rows").and_then(Value::as_array) else {
-        return fail_open_or_error(
-            engine,
-            query,
-            max_rows,
-            "rvbbit-duck returned no rows array",
-        );
-    };
-    if row_count > rows.len() {
-        return fail_open_or_error(
-            engine,
-            query,
-            max_rows,
-            &format!("result has {row_count} row(s), exceeding backend cap {max_rows}"),
-        );
-    }
-
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let Some(values) = row.as_array() else {
-            return fail_open_or_error(engine, query, max_rows, "row is not a JSON array");
-        };
-        if values.len() != columns.len() {
-            return fail_open_or_error(
+        if result_format == SidecarResultFormat::ArrowIpcFile
+            && arrow_ipc_fallback_enabled()
+            && sidecar_context.is_some()
+        {
+            pgrx::warning!(
+                "rvbbit.{engine}_query_json: Arrow IPC sidecar response failed ({err}); retrying JSON sidecar transport"
+            );
+            let (binary, dsn, timeout) = sidecar_context.as_ref().unwrap();
+            match run_engine_query(
                 engine,
+                layout,
+                binary,
+                dsn,
                 query,
                 max_rows,
-                &format!(
-                    "row width {} does not match expected width {}",
-                    values.len(),
-                    columns.len()
-                ),
-            );
+                *timeout,
+                SidecarResultFormat::Json,
+            ) {
+                Ok(fallback_payload)
+                    if fallback_payload.get("status").and_then(Value::as_str) == Some("ok") =>
+                {
+                    payload = fallback_payload;
+                }
+                Ok(fallback_payload) => {
+                    let fallback_err = fallback_payload
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("rvbbit-duck returned non-ok status");
+                    if matches!(layout, "vortex" | "vortex_scan") {
+                        return engine_error(engine, fallback_err);
+                    }
+                    return fail_open_or_error(engine, query, max_rows, fallback_err);
+                }
+                Err(fallback_err) if matches!(layout, "vortex" | "vortex_scan") => {
+                    return engine_error(engine, &fallback_err);
+                }
+                Err(fallback_err) => {
+                    return fail_open_or_error(engine, query, max_rows, &fallback_err);
+                }
+            }
+        } else {
+            if matches!(layout, "vortex" | "vortex_scan") {
+                return engine_error(engine, err);
+            }
+            return fail_open_or_error(engine, query, max_rows, err);
         }
-        let mut obj = Map::with_capacity(columns.len());
-        for (name, value) in columns.iter().zip(values.iter()) {
-            obj.insert(name.clone(), value.clone());
-        }
-        out.push(Value::Object(obj));
     }
+
+    let out = match payload_to_json_objects(&payload, &columns, max_rows) {
+        Ok(out) => out,
+        Err(err)
+            if result_format == SidecarResultFormat::ArrowIpcFile
+                && arrow_ipc_fallback_enabled()
+                && sidecar_context.is_some() =>
+        {
+            pgrx::warning!(
+                "rvbbit.{engine}_query_json: Arrow IPC decode failed ({err}); retrying JSON sidecar transport"
+            );
+            let (binary, dsn, timeout) = sidecar_context.as_ref().unwrap();
+            let fallback_payload = match run_engine_query(
+                engine,
+                layout,
+                binary,
+                dsn,
+                query,
+                max_rows,
+                *timeout,
+                SidecarResultFormat::Json,
+            ) {
+                Ok(p) => p,
+                Err(sidecar_err) if matches!(layout, "vortex" | "vortex_scan") => {
+                    return engine_error(engine, &sidecar_err);
+                }
+                Err(sidecar_err) => {
+                    return fail_open_or_error(engine, query, max_rows, &sidecar_err)
+                }
+            };
+            if fallback_payload.get("status").and_then(Value::as_str) != Some("ok") {
+                let err = fallback_payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("rvbbit-duck returned non-ok status");
+                if matches!(layout, "vortex" | "vortex_scan") {
+                    return engine_error(engine, err);
+                }
+                return fail_open_or_error(engine, query, max_rows, err);
+            }
+            match payload_to_json_objects(&fallback_payload, &columns, max_rows) {
+                Ok(out) => out,
+                Err(json_err) => return fail_open_or_error(engine, query, max_rows, &json_err),
+            }
+        }
+        Err(err) if matches!(layout, "vortex" | "vortex_scan") => {
+            return engine_error(engine, &err);
+        }
+        Err(err) => return fail_open_or_error(engine, query, max_rows, &err),
+    };
 
     if env_enabled("RVBBIT_DUCK_BACKEND_OBSERVE", false) {
         let candidate = match (engine, layout) {
@@ -357,6 +464,164 @@ fn engine_query_json(
         record_engine_observation(query, candidate, start.elapsed().as_secs_f64() * 1000.0);
     }
     JsonB(Value::Array(out))
+}
+
+fn payload_to_json_objects(
+    payload: &Value,
+    columns: &[String],
+    max_rows: i32,
+) -> Result<Vec<Value>, String> {
+    match payload
+        .get("result_format")
+        .and_then(Value::as_str)
+        .unwrap_or("json")
+    {
+        "arrow_ipc_file" => arrow_payload_to_json_objects(payload, columns, max_rows),
+        _ => json_payload_to_json_objects(payload, columns, max_rows),
+    }
+}
+
+fn json_payload_to_json_objects(
+    payload: &Value,
+    columns: &[String],
+    max_rows: i32,
+) -> Result<Vec<Value>, String> {
+    let row_count = payload
+        .get("row_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let Some(rows) = payload.get("rows").and_then(Value::as_array) else {
+        return Err("rvbbit-duck returned no rows array".to_string());
+    };
+    if row_count > rows.len() {
+        return Err(format!(
+            "result has {row_count} row(s), exceeding backend cap {max_rows}"
+        ));
+    }
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(values) = row.as_array() else {
+            return Err("row is not a JSON array".to_string());
+        };
+        out.push(values_to_json_object(values, columns)?);
+    }
+    Ok(out)
+}
+
+fn arrow_payload_to_json_objects(
+    payload: &Value,
+    columns: &[String],
+    max_rows: i32,
+) -> Result<Vec<Value>, String> {
+    let row_count = payload
+        .get("row_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let Some(path) = payload.get("arrow_ipc_path").and_then(Value::as_str) else {
+        if row_count == 0 {
+            return Ok(Vec::new());
+        }
+        return Err("rvbbit-duck returned no Arrow IPC path".to_string());
+    };
+    let result = read_arrow_ipc_objects(path, columns, max_rows.max(1) as usize);
+    let _ = fs::remove_file(path);
+    let out = result?;
+    if row_count > out.len() {
+        return Err(format!(
+            "result has {row_count} row(s), exceeding backend cap {max_rows}"
+        ));
+    }
+    Ok(out)
+}
+
+fn read_arrow_ipc_objects(
+    path: &str,
+    columns: &[String],
+    max_rows: usize,
+) -> Result<Vec<Value>, String> {
+    let file = File::open(path).map_err(|e| format!("opening Arrow IPC file {path}: {e}"))?;
+    let reader = StreamReader::try_new(file, None)
+        .map_err(|e| format!("reading Arrow IPC stream {path}: {e}"))?;
+    let mut out = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("reading Arrow IPC batch {path}: {e}"))?;
+        if batch.num_columns() != columns.len() {
+            return Err(format!(
+                "Arrow IPC row width {} does not match expected width {}",
+                batch.num_columns(),
+                columns.len()
+            ));
+        }
+        for row_idx in 0..batch.num_rows() {
+            if out.len() >= max_rows {
+                return Ok(out);
+            }
+            out.push(arrow_row_to_json_object(&batch, row_idx, columns)?);
+        }
+    }
+    Ok(out)
+}
+
+fn values_to_json_object(values: &[Value], columns: &[String]) -> Result<Value, String> {
+    if values.len() != columns.len() {
+        return Err(format!(
+            "row width {} does not match expected width {}",
+            values.len(),
+            columns.len()
+        ));
+    }
+    let mut obj = Map::with_capacity(columns.len());
+    for (name, value) in columns.iter().zip(values.iter()) {
+        obj.insert(name.clone(), value.clone());
+    }
+    Ok(Value::Object(obj))
+}
+
+fn arrow_row_to_json_object(
+    batch: &RecordBatch,
+    row_idx: usize,
+    columns: &[String],
+) -> Result<Value, String> {
+    let mut obj = Map::with_capacity(columns.len());
+    for (col_idx, name) in columns.iter().enumerate() {
+        obj.insert(
+            name.clone(),
+            arrow_value_to_json(batch.column(col_idx), row_idx)?,
+        );
+    }
+    Ok(Value::Object(obj))
+}
+
+fn arrow_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<Value, String> {
+    if array.is_null(row_idx) {
+        return Ok(Value::Null);
+    }
+    let value = match array.data_type() {
+        DataType::Boolean => json!(as_boolean_array(array.as_ref()).value(row_idx)),
+        DataType::Int8 => json!(as_primitive_array::<Int8Type>(array.as_ref()).value(row_idx)),
+        DataType::Int16 => json!(as_primitive_array::<Int16Type>(array.as_ref()).value(row_idx)),
+        DataType::Int32 => json!(as_primitive_array::<Int32Type>(array.as_ref()).value(row_idx)),
+        DataType::Int64 => json!(as_primitive_array::<Int64Type>(array.as_ref()).value(row_idx)),
+        DataType::UInt8 => json!(as_primitive_array::<UInt8Type>(array.as_ref()).value(row_idx)),
+        DataType::UInt16 => json!(as_primitive_array::<UInt16Type>(array.as_ref()).value(row_idx)),
+        DataType::UInt32 => json!(as_primitive_array::<UInt32Type>(array.as_ref()).value(row_idx)),
+        DataType::UInt64 => json!(as_primitive_array::<UInt64Type>(array.as_ref()).value(row_idx)),
+        DataType::Float32 => {
+            json!(as_primitive_array::<Float32Type>(array.as_ref()).value(row_idx))
+        }
+        DataType::Float64 => {
+            json!(as_primitive_array::<Float64Type>(array.as_ref()).value(row_idx))
+        }
+        DataType::Utf8 => json!(as_string_array(array.as_ref()).value(row_idx)),
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            json!(array_value_to_string(array.as_ref(), row_idx).map_err(|e| e.to_string())?)
+        }
+        _ => {
+            json!(array_value_to_string(array.as_ref(), row_idx).map_err(|e| e.to_string())?)
+        }
+    };
+    Ok(value)
 }
 
 fn engine_error(engine: &str, err: &str) -> JsonB {
@@ -409,13 +674,42 @@ fn run_engine_query(
     query: &str,
     max_rows: i32,
     timeout: i32,
+    result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
     if persistent_enabled() {
-        execute_persistent(engine, layout, binary, dsn, query, max_rows, timeout).or_else(|_| {
-            execute_engine_oneshot(engine, layout, binary, dsn, query, max_rows, timeout)
+        execute_persistent(
+            engine,
+            layout,
+            binary,
+            dsn,
+            query,
+            max_rows,
+            timeout,
+            result_format,
+        )
+        .or_else(|_| {
+            execute_engine_oneshot(
+                engine,
+                layout,
+                binary,
+                dsn,
+                query,
+                max_rows,
+                timeout,
+                result_format,
+            )
         })
     } else {
-        execute_engine_oneshot(engine, layout, binary, dsn, query, max_rows, timeout)
+        execute_engine_oneshot(
+            engine,
+            layout,
+            binary,
+            dsn,
+            query,
+            max_rows,
+            timeout,
+            result_format,
+        )
     }
 }
 
@@ -427,6 +721,7 @@ fn execute_persistent(
     query: &str,
     max_rows: i32,
     timeout: i32,
+    result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
     let key = DuckSessionKey {
         binary: binary.to_string(),
@@ -439,6 +734,7 @@ fn execute_persistent(
         "repeat": 1,
         "timeout_s": timeout,
         "max_rows": max_rows,
+        "result_format": result_format.as_str(),
     }))
     .map_err(|e| e.to_string())?;
     DUCK_SESSION.with(|slot| {
@@ -477,6 +773,7 @@ fn execute_engine_oneshot(
     query: &str,
     max_rows: i32,
     timeout: i32,
+    result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
     let output = Command::new(binary)
         .arg("--engine")
@@ -493,6 +790,8 @@ fn execute_engine_oneshot(
         .arg(timeout.to_string())
         .arg("--max-rows")
         .arg(max_rows.to_string())
+        .arg("--result-format")
+        .arg(result_format.as_str())
         .arg("--pgdata-prefix")
         .arg(pgdata_prefix())
         .arg("--visible-pgdata-prefix")

@@ -46,6 +46,11 @@ def _drop_python(rvbbit, handler: str | None = None, env: str | None = None) -> 
     rvbbit.execute("SELECT rvbbit.reload_python_runtime()")
 
 
+def _drop_python_runtime(rvbbit, runtime: str) -> None:
+    rvbbit.execute("DELETE FROM rvbbit.python_runtimes WHERE name = %s", (runtime,))
+    rvbbit.execute("SELECT rvbbit.reload_python_runtime()")
+
+
 def _drop_op(rvbbit, name: str, n_args: int) -> None:
     sig = ", ".join(["text"] * n_args + ["jsonb"])
     rvbbit.execute("DELETE FROM rvbbit.operators WHERE name = %s", (name,))
@@ -55,12 +60,31 @@ def _drop_op(rvbbit, name: str, n_args: int) -> None:
 def test_python_env_and_handler_ddl(rvbbit):
     env = f"pyenv_{uuid.uuid4().hex[:8]}"
     handler = f"pyh_{uuid.uuid4().hex[:8]}"
+    runtime = f"pyrt_{uuid.uuid4().hex[:8]}"
     try:
+        runtime_doc = rvbbit.execute(
+            "SELECT rvbbit.register_python_runtime("
+            "  runtime_name => %s, endpoint_url => %s, runtime_status => 'ready', "
+            "  runtime_labels => %s::jsonb, runtime_source => 'test', "
+            "  install_manifest => %s::jsonb, health => %s::jsonb, set_default => false)",
+            (
+                runtime,
+                "http://example.invalid/run",
+                json.dumps({"suite": "python_nodes"}),
+                json.dumps({"kind": "runtime_sidecar", "name": "test"}),
+                json.dumps({"ok": True}),
+            ),
+        ).fetchone()[0]
+        assert runtime_doc["name"] == runtime
+        assert runtime_doc["endpoint_url"] == "http://example.invalid/run"
+
         env_doc = rvbbit.execute(
-            "SELECT rvbbit.create_python_env(%s, %s, %s::text[], NULL, %s)",
-            (env, "3.12", [" packaging==24.2 ", ""], 1500),
+            "SELECT rvbbit.create_python_env(%s, %s, %s::text[], NULL, %s, %s)",
+            (env, "3.12", [" packaging==24.2 ", ""], 1500, runtime),
         ).fetchone()[0]
         assert env_doc["name"] == env
+        assert env_doc["runtime_name"] == runtime
+        assert env_doc["endpoint_url"] is None
         assert env_doc["requirements"] == ["packaging==24.2"]
         assert env_doc["timeout_ms"] == 1500
         assert len(env_doc["env_hash"]) == 32
@@ -79,6 +103,7 @@ def test_python_env_and_handler_ddl(rvbbit):
         assert len(handler_doc["code_hash"]) == 32
     finally:
         _drop_python(rvbbit, handler, env)
+        _drop_python_runtime(rvbbit, runtime)
 
 
 @PYTHON_RUNTIME

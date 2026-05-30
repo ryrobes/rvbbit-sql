@@ -1,9 +1,9 @@
 # Warren Remote Capability Agents
 
-Warren is Rvbbit's optional deployment control plane for model and tool
-sidecars. The database remains the source of truth. A Warren agent runs on any
-host with the right resources, polls Postgres for deployment jobs, starts the
-requested service, then registers the resulting endpoint back into Rvbbit.
+Warren is Rvbbit's optional deployment control plane for model, runtime, and
+tool sidecars. The database remains the source of truth. A Warren agent runs on
+any host with the right resources, polls Postgres for deployment jobs, starts
+the requested service, then registers the resulting endpoint back into Rvbbit.
 
 The first agent is Rust (`warren-agent`). Generated Hugging Face serving
 containers still use the existing FastAPI template because the Python model
@@ -16,14 +16,17 @@ plane.
 - Warren agents register themselves with labels such as `{"gpu": true}`.
 - SQL queues a deployment job with a target selector.
 - A matching Warren claims the job using `FOR UPDATE SKIP LOCKED`.
-- The Warren scaffolds/builds/runs the sidecar and calls
-  `rvbbit.register_backend(...)`, `rvbbit.create_operator(...)`, and
-  `rvbbit.reload_backends()`.
-- Rvbbit query execution keeps using the normal backend/operator machinery.
+- The Warren scaffolds/builds/runs the sidecar.
+- Model capabilities call `rvbbit.register_backend(...)`,
+  `rvbbit.create_operator(...)`, and `rvbbit.reload_backends()`.
+- Runtime capabilities call runtime-specific registration functions such as
+  `rvbbit.register_python_runtime(...)`.
+- Rvbbit query execution keeps using the normal backend/operator or runtime
+  node machinery.
 
 This keeps routing simple: SQL asks for a capability; Warren decides where it
-runs; Rvbbit stores only the endpoint and operator definition it already knows
-how to execute.
+runs; Rvbbit stores only the backend/operator or runtime catalog rows it
+already knows how to execute.
 
 ## Catalog
 
@@ -33,7 +36,7 @@ Core tables and view:
   inventory, and future auth metadata.
 - `rvbbit.warren_jobs`: queued/running/completed deployment requests.
 - `rvbbit.warren_deployments`: materialized deployment records tied to nodes
-  and backend/operator names.
+  and backend/operator/runtime names.
 - `rvbbit.warren_node_metrics`: append-only node telemetry snapshots.
 - `rvbbit.warren_node_latest_metrics`: latest telemetry row per node.
 - `rvbbit.warren_inventory`: UI-friendly node plus active deployment view.
@@ -119,6 +122,40 @@ SELECT jsonb_pretty(rvbbit.backend_probe('warren_smoke_echo'));
 SELECT rvbbit.warren_smoke_echo('hello from SQL')->>'echo';
 ```
 
+To deploy the managed Python execution runtime instead of a model backend:
+
+```bash
+capabilities/tools/rvbbit-capability deploy \
+  capabilities/manifests/runtimes/python-runtime.yaml \
+  --dsn "$RVBBIT_DSN" \
+  --target '{"docker":true}'
+```
+
+After Warren completes the job, the deployment has `runtime_name =
+'python_default'` instead of a backend name:
+
+```sql
+SELECT name, endpoint_url, status, runtime_source
+FROM rvbbit.python_runtimes
+WHERE name = 'python_default';
+
+SELECT deployment_name, runtime_name, endpoint_url
+FROM rvbbit.warren_inventory
+WHERE runtime_name IS NOT NULL;
+```
+
+Users can then define Python workflow envs against that named runtime entirely
+from SQL:
+
+```sql
+SELECT rvbbit.create_python_env(
+  env_name => 'analytics',
+  python_version => '3.12',
+  requirements => ARRAY['rapidfuzz==3.9.7'],
+  runtime_name => 'python_default'
+);
+```
+
 Remote GPU host on the same private network:
 
 ```bash
@@ -131,17 +168,19 @@ cargo run -p warren-agent -- \
   --work-dir /var/lib/rvbbit/warren
 ```
 
-If `--advertise-base-url` is omitted, Warren registers
-`http://rvbbit-<service>:8080/predict`, which is correct when the generated
-sidecar and `pg-rvbbit` are on the same Docker network. If Warren runs on a
-different box, pass the URL that the Postgres host can reach.
+If `--advertise-base-url` is omitted, Warren registers a Docker-network URL
+such as `http://rvbbit-<service>:8080/predict` for model backends or
+`http://rvbbit-<service>:8080/run` for runtime sidecars. That is correct when
+the generated sidecar and `pg-rvbbit` are on the same Docker network. If Warren
+runs on a different box, pass the URL that the Postgres host can reach.
 
 Useful environment variables mirror the CLI:
 
 - `RVBBIT_DSN`
 - `WARREN_NODE`
 - `WARREN_WORK_DIR`
-- `WARREN_TEMPLATE_DIR`
+- `WARREN_TEMPLATE_DIR`: template root such as `capabilities/templates`, or a
+  specific legacy template directory.
 - `WARREN_ADVERTISE_BASE_URL`
 - `RVBBIT_DOCKER_NETWORK`
 - `WARREN_POLL_MS`
@@ -238,6 +277,8 @@ At a high level:
 - Let advanced users choose a target selector, for example `{"gpu":true}` or
   `{"region":"lab"}`.
 - Link deployed `backend_name` to `rvbbit.backend_health`.
+- Link deployed `runtime_name` to runtime catalogs such as
+  `rvbbit.python_runtimes`.
 
 Initial job kinds are:
 

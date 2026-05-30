@@ -788,6 +788,7 @@ SELECT rvbbit.create_python_env(
   env_name => 'analytics',
   python_version => '3.12',
   requirements => ARRAY['rapidfuzz==3.9.7'],
+  runtime_name => 'python_default',
   timeout_ms => 1000
 );
 
@@ -817,6 +818,10 @@ Then use it in an operator pipeline:
 - **Packages** — package lists live in SQL env rows; no manual server venv
   setup is required. Env/handler hashes are folded into the operator cache
   key, so changing code or packages invalidates cached results.
+- **Runtime** — `runtime_name` points at a registered execution runtime such
+  as a Warren-deployed row in `rvbbit.python_runtimes`. Direct `endpoint_url`
+  overrides still work for local tests, but named runtimes are the preferred
+  operational path.
 - **Scope** — this is a workflow primitive, not a general PL/Python
   replacement. Python code runs in the sidecar, not in the Postgres backend.
 

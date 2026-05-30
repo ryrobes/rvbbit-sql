@@ -2455,6 +2455,7 @@ CREATE TABLE rvbbit.warren_jobs (
     endpoint_url     text,
     backend_name     text,
     operator_name    text,
+    runtime_name     text,
     error            text,
     logs             jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -2490,6 +2491,7 @@ CREATE TABLE rvbbit.warren_deployments (
     endpoint_url     text,
     backend_name     text,
     operator_name    text,
+    runtime_name     text,
     manifest         jsonb NOT NULL DEFAULT '{}'::jsonb,
     compose_project  text,
     work_dir         text,
@@ -2594,6 +2596,7 @@ SELECT
     d.endpoint_url,
     d.backend_name,
     d.operator_name,
+    d.runtime_name,
     d.health,
     d.error,
     d.updated_at AS deployment_updated_at
@@ -2872,7 +2875,8 @@ CREATE OR REPLACE FUNCTION rvbbit.complete_warren_job(
     compose_project   text DEFAULT NULL,
     work_dir          text DEFAULT NULL,
     health            jsonb DEFAULT '{}'::jsonb,
-    logs              jsonb DEFAULT '{}'::jsonb
+    logs              jsonb DEFAULT '{}'::jsonb,
+    runtime_name      text DEFAULT NULL
 ) RETURNS void
 LANGUAGE plpgsql
 VOLATILE
@@ -2903,6 +2907,7 @@ BEGIN
         endpoint_url = complete_warren_job.endpoint_url,
         backend_name = complete_warren_job.backend_name,
         operator_name = complete_warren_job.operator_name,
+        runtime_name = complete_warren_job.runtime_name,
         logs = complete_warren_job.logs,
         error = NULL,
         finished_at = clock_timestamp()
@@ -2910,12 +2915,12 @@ BEGIN
 
     INSERT INTO rvbbit.warren_deployments
         (job_id, node_id, node_name, kind, name, status, endpoint_url,
-         backend_name, operator_name, manifest, compose_project, work_dir,
+         backend_name, operator_name, runtime_name, manifest, compose_project, work_dir,
          health, error)
     VALUES
         (complete_warren_job.job_id, actual_node_id, complete_warren_job.node_name,
          actual_kind, actual_name, deployment_status, endpoint_url,
-         backend_name, operator_name, deploy_manifest, compose_project, work_dir,
+         backend_name, operator_name, runtime_name, deploy_manifest, compose_project, work_dir,
          health, NULL)
     ON CONFLICT ON CONSTRAINT warren_deployments_job_id_key DO UPDATE SET
         node_id = EXCLUDED.node_id,
@@ -2924,6 +2929,7 @@ BEGIN
         endpoint_url = EXCLUDED.endpoint_url,
         backend_name = EXCLUDED.backend_name,
         operator_name = EXCLUDED.operator_name,
+        runtime_name = EXCLUDED.runtime_name,
         manifest = EXCLUDED.manifest,
         compose_project = EXCLUDED.compose_project,
         work_dir = EXCLUDED.work_dir,

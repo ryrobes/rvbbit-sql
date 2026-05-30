@@ -1,0 +1,36 @@
+api_version: rvbbit.capability/v1
+kind: runtime_sidecar
+name: python_runtime
+title: Managed CPython Runtime
+description: "Warren-managed CPython runtime for rvbbit operator `kind: python` nodes."
+license: apache-2.0
+tags: [runtime, python, warren, code, cpu]
+source:
+  provider: builtin
+  model: rvbbit/python-runtime
+runtime:
+  template: python-runtime
+  language: python
+  handler: python_runtime
+  device: cpu
+  base_image: python:3.12-slim
+  python_version: "3.12"
+  env:
+    RVBBIT_PYTHON_ENVS_DIR: /var/lib/rvbbit/python-envs
+    RVBBIT_PYTHON_HANDLERS_DIR: /var/lib/rvbbit/python-handlers
+  volumes:
+    - name: python_envs
+      mount: /var/lib/rvbbit
+runtime_registration:
+  name: python_default
+  language: python
+  endpoint_path: /run
+  set_default: true
+  labels:
+    language: python
+    capability_kind: runtime_sidecar
+warren:
+  endpoint_path: /run
+smoke:
+  sql:
+    - "SELECT name, endpoint_url, status FROM rvbbit.python_runtimes WHERE name = 'python_default';"

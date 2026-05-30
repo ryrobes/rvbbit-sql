@@ -19,6 +19,7 @@ pgrx::extension_sql!(
     r#"
 CREATE TABLE IF NOT EXISTS rvbbit.python_envs (
     name            text PRIMARY KEY,
+    runtime_name    text,
     python_version  text NOT NULL DEFAULT '3.12',
     requirements    text[] NOT NULL DEFAULT ARRAY[]::text[],
     env_hash        text NOT NULL,
@@ -48,6 +49,30 @@ CREATE TABLE IF NOT EXISTS rvbbit.python_handlers (
     CONSTRAINT python_handlers_entrypoint_check CHECK (entrypoint ~ '^[A-Za-z_][A-Za-z0-9_]*$')
 );
 
+CREATE TABLE IF NOT EXISTS rvbbit.python_runtimes (
+    name                  text PRIMARY KEY,
+    endpoint_url          text NOT NULL,
+    language              text NOT NULL DEFAULT 'python',
+    status                text NOT NULL DEFAULT 'ready',
+    labels                jsonb NOT NULL DEFAULT '{}'::jsonb,
+    runtime_source        text NOT NULL DEFAULT 'manual',
+    warren_deployment_id  uuid,
+    install_manifest      jsonb NOT NULL DEFAULT '{}'::jsonb,
+    health                jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_by            oid NOT NULL DEFAULT (current_user::regrole::oid),
+    created_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT python_runtimes_name_check CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_]*$'),
+    CONSTRAINT python_runtimes_language_check CHECK (language = 'python'),
+    CONSTRAINT python_runtimes_status_check CHECK (
+        status IN ('starting', 'ready', 'failed', 'disabled')
+    ),
+    CONSTRAINT python_runtimes_endpoint_check CHECK (endpoint_url ~ '^https?://'),
+    CONSTRAINT python_runtimes_labels_is_object CHECK (jsonb_typeof(labels) = 'object'),
+    CONSTRAINT python_runtimes_manifest_is_object CHECK (jsonb_typeof(install_manifest) = 'object'),
+    CONSTRAINT python_runtimes_health_is_object CHECK (jsonb_typeof(health) = 'object')
+);
+
 CREATE OR REPLACE FUNCTION rvbbit.touch_python_envs_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -71,6 +96,18 @@ DROP TRIGGER IF EXISTS python_handlers_touch_updated_at ON rvbbit.python_handler
 CREATE TRIGGER python_handlers_touch_updated_at
     BEFORE UPDATE ON rvbbit.python_handlers
     FOR EACH ROW EXECUTE FUNCTION rvbbit.touch_python_handlers_updated_at();
+
+CREATE OR REPLACE FUNCTION rvbbit.touch_python_runtimes_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at := clock_timestamp();
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS python_runtimes_touch_updated_at ON rvbbit.python_runtimes;
+CREATE TRIGGER python_runtimes_touch_updated_at
+    BEFORE UPDATE ON rvbbit.python_runtimes
+    FOR EACH ROW EXECUTE FUNCTION rvbbit.touch_python_runtimes_updated_at();
 
 INSERT INTO rvbbit.settings (key, value)
 VALUES ('python_runtime_endpoint', to_jsonb('http://rvbbit-python-runtime:8080/run'::text))
@@ -147,12 +184,88 @@ BEGIN
 END
 $$;
 
+CREATE OR REPLACE FUNCTION rvbbit.register_python_runtime(
+    runtime_name text,
+    endpoint_url text,
+    runtime_status text DEFAULT 'ready',
+    runtime_labels jsonb DEFAULT '{}'::jsonb,
+    runtime_source text DEFAULT 'manual',
+    warren_deployment_id uuid DEFAULT NULL,
+    install_manifest jsonb DEFAULT '{}'::jsonb,
+    health jsonb DEFAULT '{}'::jsonb,
+    set_default boolean DEFAULT true
+) RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    normalized_name text := nullif(btrim(runtime_name), '');
+    normalized_endpoint text := nullif(btrim(endpoint_url), '');
+    normalized_status text := coalesce(nullif(btrim(runtime_status), ''), 'ready');
+    normalized_source text := coalesce(nullif(btrim(runtime_source), ''), 'manual');
+    row_doc jsonb;
+BEGIN
+    PERFORM rvbbit.require_python_admin();
+    IF normalized_name IS NULL THEN
+        RAISE EXCEPTION 'rvbbit.register_python_runtime: runtime_name cannot be empty';
+    END IF;
+    IF normalized_name !~ '^[A-Za-z_][A-Za-z0-9_]*$' THEN
+        RAISE EXCEPTION 'rvbbit.register_python_runtime: runtime_name must be an identifier-like name';
+    END IF;
+    IF normalized_endpoint IS NULL OR normalized_endpoint !~ '^https?://' THEN
+        RAISE EXCEPTION 'rvbbit.register_python_runtime: endpoint_url must be an http(s) URL';
+    END IF;
+    IF normalized_status NOT IN ('starting', 'ready', 'failed', 'disabled') THEN
+        RAISE EXCEPTION 'rvbbit.register_python_runtime: unsupported status "%"', runtime_status;
+    END IF;
+    IF jsonb_typeof(coalesce(runtime_labels, '{}'::jsonb)) <> 'object' THEN
+        RAISE EXCEPTION 'rvbbit.register_python_runtime: runtime_labels must be a JSON object';
+    END IF;
+    IF jsonb_typeof(coalesce(install_manifest, '{}'::jsonb)) <> 'object' THEN
+        RAISE EXCEPTION 'rvbbit.register_python_runtime: install_manifest must be a JSON object';
+    END IF;
+    IF jsonb_typeof(coalesce(health, '{}'::jsonb)) <> 'object' THEN
+        RAISE EXCEPTION 'rvbbit.register_python_runtime: health must be a JSON object';
+    END IF;
+
+    INSERT INTO rvbbit.python_runtimes
+        (name, endpoint_url, language, status, labels, runtime_source,
+         warren_deployment_id, install_manifest, health)
+    VALUES
+        (normalized_name, normalized_endpoint, 'python', normalized_status,
+         coalesce(runtime_labels, '{}'::jsonb), normalized_source,
+         register_python_runtime.warren_deployment_id,
+         coalesce(install_manifest, '{}'::jsonb), coalesce(health, '{}'::jsonb))
+    ON CONFLICT (name) DO UPDATE SET
+        endpoint_url = EXCLUDED.endpoint_url,
+        status = EXCLUDED.status,
+        labels = EXCLUDED.labels,
+        runtime_source = EXCLUDED.runtime_source,
+        warren_deployment_id = EXCLUDED.warren_deployment_id,
+        install_manifest = EXCLUDED.install_manifest,
+        health = EXCLUDED.health;
+
+    IF coalesce(set_default, true) AND normalized_status = 'ready' THEN
+        PERFORM rvbbit.set_python_runtime_endpoint(normalized_endpoint);
+    ELSE
+        BEGIN
+            PERFORM rvbbit.reload_python_runtime();
+        EXCEPTION WHEN undefined_function THEN
+            NULL;
+        END;
+    END IF;
+
+    SELECT to_jsonb(r) INTO row_doc FROM rvbbit.python_runtimes r WHERE r.name = normalized_name;
+    RETURN row_doc;
+END
+$$;
+
 CREATE OR REPLACE FUNCTION rvbbit.create_python_env(
     env_name text,
     python_version text DEFAULT '3.12',
     requirements text[] DEFAULT ARRAY[]::text[],
     endpoint_url text DEFAULT NULL,
-    timeout_ms int DEFAULT 1000
+    timeout_ms int DEFAULT 1000,
+    runtime_name text DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 AS $$
@@ -161,6 +274,8 @@ DECLARE
     normalized_version text := coalesce(nullif(btrim(python_version), ''), '3.12');
     normalized_requirements text[];
     normalized_endpoint text := nullif(btrim(endpoint_url), '');
+    normalized_runtime text := nullif(btrim(runtime_name), '');
+    resolved_runtime_endpoint text;
     computed_hash text;
     row_doc jsonb;
 BEGIN
@@ -183,15 +298,30 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'rvbbit.create_python_env: requirements cannot contain newlines';
     END IF;
+    IF normalized_runtime IS NOT NULL THEN
+        IF normalized_endpoint IS NOT NULL THEN
+            RAISE EXCEPTION 'rvbbit.create_python_env: pass endpoint_url or runtime_name, not both';
+        END IF;
+        SELECT r.endpoint_url INTO resolved_runtime_endpoint
+        FROM rvbbit.python_runtimes r
+        WHERE r.name = normalized_runtime
+          AND r.status = 'ready';
+        IF resolved_runtime_endpoint IS NULL THEN
+            RAISE EXCEPTION 'rvbbit.create_python_env: python runtime "%" is not registered or ready',
+                runtime_name;
+        END IF;
+    END IF;
     computed_hash := rvbbit.python_env_hash(normalized_version, normalized_requirements);
 
     INSERT INTO rvbbit.python_envs
-        (name, python_version, requirements, env_hash, endpoint_url, timeout_ms,
+        (name, runtime_name, python_version, requirements, env_hash, endpoint_url, timeout_ms,
          status, status_message)
     VALUES
-        (normalized_name, normalized_version, normalized_requirements, computed_hash,
-         normalized_endpoint, greatest(coalesce(timeout_ms, 1000), 1), 'registered', NULL)
+        (normalized_name, normalized_runtime, normalized_version, normalized_requirements,
+         computed_hash, normalized_endpoint,
+         greatest(coalesce(timeout_ms, 1000), 1), 'registered', NULL)
     ON CONFLICT (name) DO UPDATE SET
+        runtime_name = EXCLUDED.runtime_name,
         python_version = EXCLUDED.python_version,
         requirements = EXCLUDED.requirements,
         env_hash = EXCLUDED.env_hash,
@@ -535,11 +665,14 @@ fn load_spec_from_spi(
     let sql = format!(
         "SELECT h.name, h.env_name, h.code, h.code_hash, h.entrypoint, \
                 e.python_version, e.requirements, e.env_hash, \
-                coalesce(e.endpoint_url, rvbbit.python_runtime_endpoint()) AS endpoint_url, \
+                coalesce(r.endpoint_url, e.endpoint_url, rvbbit.python_runtime_endpoint()) AS endpoint_url, \
                 e.timeout_ms \
          FROM rvbbit.python_handlers h \
          JOIN rvbbit.python_envs e ON e.name = h.env_name \
-         WHERE h.name = '{escaped}' AND e.status <> 'disabled'"
+         LEFT JOIN rvbbit.python_runtimes r ON r.name = e.runtime_name \
+         WHERE h.name = '{escaped}' \
+           AND e.status <> 'disabled' \
+           AND (e.runtime_name IS NULL OR r.status = 'ready')"
     );
     let mut result: Option<PythonSpec> = None;
     Spi::connect(|client| {
