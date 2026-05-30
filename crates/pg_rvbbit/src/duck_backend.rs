@@ -211,6 +211,11 @@ fn duck_hive_query_json(query: &str, column_names: JsonB, max_rows: i32) -> Json
 }
 
 #[pg_extern(volatile)]
+fn duck_vortex_query_json(query: &str, column_names: JsonB, max_rows: i32) -> JsonB {
+    engine_query_json("duck", "vortex", query, column_names, max_rows)
+}
+
+#[pg_extern(volatile)]
 fn datafusion_hive_query_json(query: &str, column_names: JsonB, max_rows: i32) -> JsonB {
     engine_query_json("datafusion", "hive", query, column_names, max_rows)
 }
@@ -345,6 +350,7 @@ fn engine_query_json(
             ("datafusion", "hive") => "datafusion_hive",
             ("datafusion", "vortex") => "datafusion_vortex",
             ("datafusion", _) => "datafusion_vector",
+            ("duck", "vortex") => "duck_vortex",
             (_, "hive") => "duck_hive",
             _ => "duck_vector",
         };

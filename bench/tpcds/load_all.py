@@ -61,6 +61,34 @@ def _variant_refresh_mode() -> str:
     return "off"
 
 
+def _setting_enabled(raw: str | None, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if not value:
+        return default
+    return value not in {"0", "false", "no", "off", "disabled"}
+
+
+def _vortex_forced_selected() -> bool:
+    selected = os.environ.get("BENCH_SYSTEMS", "")
+    return any(
+        system.strip() in {"rvbbit_datafusion_vortex_forced", "rvbbit_duck_vortex_forced"}
+        for system in selected.split(",")
+    )
+
+
+def _vortex_layout_requested() -> bool:
+    return _setting_enabled(
+        os.environ.get("RVBBIT_COMPACT_VORTEX_LAYOUT"),
+        default=_vortex_forced_selected(),
+    )
+
+
+def _refresh_variants_inline(refresh_mode: str) -> bool:
+    return refresh_mode == "sync" or _vortex_layout_requested()
+
+
 def _hot_load_after_load() -> bool:
     if _env_enabled("RVBBIT_HOT_LOAD_AFTER_LOAD"):
         return True
@@ -100,6 +128,7 @@ def _rvbbit_compact_settings_sql() -> list[str]:
     }
     defaults = {
         "RVBBIT_COMPACT_HIVE_LAYOUT": "on",
+        "RVBBIT_COMPACT_VORTEX_LAYOUT": "on" if _vortex_forced_selected() else None,
     }
     out: list[str] = []
     for env_name, guc_name in settings.items():
@@ -211,7 +240,7 @@ def run_one(name: str, data_dir: str, scale: str) -> dict:
                 *_rvbbit_hot_settings_sql(),
                 *[
                     "SELECT rvbbit.refresh_acceleration("
-                    f"'{t}'::regclass, {str(refresh_mode == 'sync').lower()})"
+                    f"'{t}'::regclass, {str(_refresh_variants_inline(refresh_mode)).lower()})"
                     for t in table_names(data_dir)
                 ],
             ]

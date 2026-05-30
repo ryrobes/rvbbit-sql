@@ -52,6 +52,7 @@ _LAST_RUN_DETAIL: dict[str, object] = {}
 ROUTE_GUCS = {
     "RVBBIT_ROUTE_DUCK_VECTOR": "rvbbit.route_duck_vector",
     "RVBBIT_ROUTE_DUCK_HIVE": "rvbbit.route_duck_hive",
+    "RVBBIT_ROUTE_DUCK_VORTEX": "rvbbit.route_duck_vortex",
     "RVBBIT_ROUTE_DATAFUSION_MEM": "rvbbit.route_datafusion_mem",
     "RVBBIT_ROUTE_DATAFUSION_VECTOR": "rvbbit.route_datafusion_vector",
     "RVBBIT_ROUTE_DATAFUSION_HIVE": "rvbbit.route_datafusion_hive",

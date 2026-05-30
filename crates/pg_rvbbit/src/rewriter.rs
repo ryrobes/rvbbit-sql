@@ -636,6 +636,7 @@ unsafe fn try_duck_backend_rewrite(
         "duck_vector"
             | "datafusion_vector"
             | "duck_hive"
+            | "duck_vortex"
             | "datafusion_hive"
             | "datafusion_vortex"
             | "datafusion_mem"
@@ -778,6 +779,7 @@ fn build_duck_backend_sql(
         "datafusion_mem" => "rvbbit.datafusion_mem_query_json",
         "datafusion_vector" => "rvbbit.datafusion_query_json",
         "duck_hive" => "rvbbit.duck_hive_query_json",
+        "duck_vortex" => "rvbbit.duck_vortex_query_json",
         "datafusion_hive" => "rvbbit.datafusion_hive_query_json",
         "datafusion_vortex" => "rvbbit.datafusion_vortex_query_json",
         _ => "rvbbit.duck_query_json",

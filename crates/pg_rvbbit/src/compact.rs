@@ -40,7 +40,7 @@ use arrow::array::{
     ListBuilder, RecordBatch, StringArray, StringBuilder, StringViewArray,
     TimestampMicrosecondBuilder, UInt32Array,
 };
-use arrow::compute::take;
+use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pgrx::prelude::*;
@@ -1458,8 +1458,10 @@ fn refresh_vortex_scan_delta_impl(
         }),
     )?;
     let vortex_root = path_root.join(layout_dir_name(layout));
+    let mut plans = introspect_columns(rel_oid)?;
+    extend_plans_with_legacy_shreds(&mut plans);
     let build_result =
-        write_vortex_scan_chunks_from_canonical_parquet(rel_oid, &[], &vortex_root, layout, true);
+        write_vortex_scan_chunks_from_canonical_parquet(rel_oid, &plans, &vortex_root, layout, true);
     let variant_chunks = match build_result {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -2269,7 +2271,7 @@ fn write_hive_layout_chunks_from_canonical_parquet(
 
 fn write_vortex_scan_chunks_from_canonical_parquet(
     rel_oid: u32,
-    _plans: &[ColumnPlan],
+    plans: &[ColumnPlan],
     path_root: &PathBuf,
     layout: &str,
     only_missing: bool,
@@ -2310,6 +2312,7 @@ fn write_vortex_scan_chunks_from_canonical_parquet(
             if batch.num_rows() == 0 {
                 continue;
             }
+            let batch = vortex_record_batch_for_plans(plans, batch)?;
             let rg_id = if batch_idx == 0 {
                 source_rg_id
             } else {
@@ -2324,6 +2327,39 @@ fn write_vortex_scan_chunks_from_canonical_parquet(
     }
 
     Ok(chunks)
+}
+
+fn vortex_record_batch_for_plans(
+    plans: &[ColumnPlan],
+    batch: RecordBatch,
+) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    if plans.is_empty() {
+        return Ok(batch);
+    }
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let plan = plans.iter().find(|plan| plan.name == field.name().as_str());
+        if plan.is_some_and(|plan| matches!(plan.pg_type, 1114 | 1184)) {
+            let as_i64 = cast(column, &DataType::Int64).map_err(|e| {
+                format!(
+                    "casting Vortex timestamp column {} to epoch micros: {e}",
+                    field.name()
+                )
+            })?;
+            fields.push(Field::new(
+                field.name(),
+                DataType::Int64,
+                field.is_nullable(),
+            ));
+            columns.push(as_i64);
+        } else {
+            fields.push((**field).clone());
+            columns.push(column.clone());
+        }
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("building Vortex-safe record batch: {e}").into())
 }
 
 fn registered_variant_rg_ids(

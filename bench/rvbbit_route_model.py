@@ -655,6 +655,8 @@ PATH_TO_CANDIDATE = {
     "duck_vector": "duck_vector",
     "duck_hive": "duck_hive",
     "duck-hive": "duck_hive",
+    "duck_vortex": "duck_vortex",
+    "duck-vortex": "duck_vortex",
     "datafusion": "datafusion_vector",
     "df": "datafusion_vector",
     "datafusion_mem": "datafusion_mem",
@@ -675,6 +677,7 @@ CANDIDATE_TO_PATH = {
     "rvbbit_native": "native",
     "duck_vector": "duck",
     "duck_hive": "duck_hive",
+    "duck_vortex": "duck_vortex",
     "datafusion_mem": "datafusion_mem",
     "datafusion_vector": "datafusion",
     "datafusion_hive": "datafusion_hive",
@@ -684,6 +687,7 @@ ROUTABLE_CANDIDATES = {
     "rvbbit_native",
     "duck_vector",
     "duck_hive",
+    "duck_vortex",
     "datafusion_mem",
     "datafusion_vector",
     "datafusion_hive",
@@ -710,6 +714,8 @@ def candidate_enabled(candidate: str | None) -> bool:
         return _env_enabled("RVBBIT_ROUTE_HIVE", True) and _env_enabled(
             "RVBBIT_ROUTE_DUCK_HIVE", True
         )
+    if candidate == "duck_vortex":
+        return _env_enabled("RVBBIT_ROUTE_DUCK_VORTEX", True)
     if candidate == "datafusion_hive":
         return _env_enabled("RVBBIT_ROUTE_HIVE", True) and _env_enabled(
             "RVBBIT_ROUTE_DATAFUSION_HIVE", True
@@ -740,6 +746,8 @@ def min_confidence_for_candidate(candidate: str | None) -> float:
         return float(os.environ.get(PG_HEAP_MIN_CONFIDENCE_ENV, "0.25"))
     if candidate in {"duck_hive", "datafusion_hive"}:
         return float(os.environ.get(HIVE_MIN_CONFIDENCE_ENV, "0.08"))
+    if candidate == "duck_vortex":
+        return float(os.environ.get("RVBBIT_ROUTE_DUCK_VORTEX_MIN_CONFIDENCE", "0.05"))
     return float(os.environ.get(MIN_CONFIDENCE_ENV, "0.05"))
 
 
@@ -761,6 +769,7 @@ def observation_candidate_ms(observation: dict[str, Any]) -> dict[str, float]:
         "native_ms": "rvbbit_native",
         "duck_ms": "duck_vector",
         "duck_hive_ms": "duck_hive",
+        "duck_vortex_ms": "duck_vortex",
         "datafusion_mem_ms": "datafusion_mem",
         "datafusion_ms": "datafusion_vector",
         "datafusion_hive_ms": "datafusion_hive",
@@ -857,6 +866,7 @@ class RouteProfile:
                         "native_ms": candidate_medians.get("rvbbit_native"),
                         "duck_ms": candidate_medians.get("duck_vector"),
                         "duck_hive_ms": candidate_medians.get("duck_hive"),
+                        "duck_vortex_ms": candidate_medians.get("duck_vortex"),
                         "datafusion_mem_ms": candidate_medians.get("datafusion_mem"),
                         "datafusion_ms": candidate_medians.get("datafusion_vector"),
                         "datafusion_hive_ms": candidate_medians.get("datafusion_hive"),
@@ -889,7 +899,7 @@ class RouteProfile:
         if not entry:
             return None
         choice = path_for_candidate(entry.get("choice"))
-        if choice not in {"native", "duck", "duck_hive", "datafusion", "datafusion_hive", "pg_heap"}:
+        if choice not in {"native", "duck", "duck_hive", "duck_vortex", "datafusion", "datafusion_hive", "pg_heap"}:
             return None
         if not candidate_enabled(entry.get("choice")):
             return None
@@ -968,6 +978,7 @@ class RouteProfile:
             "native_ms_predicted": predicted.get("rvbbit_native"),
             "duck_ms_predicted": predicted.get("duck_vector"),
             "duck_hive_ms_predicted": predicted.get("duck_hive"),
+            "duck_vortex_ms_predicted": predicted.get("duck_vortex"),
             "datafusion_mem_ms_predicted": predicted.get("datafusion_mem"),
             "datafusion_ms_predicted": predicted.get("datafusion_vector"),
             "datafusion_hive_ms_predicted": predicted.get("datafusion_hive"),

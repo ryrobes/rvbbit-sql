@@ -126,6 +126,11 @@ def build_profile_from_observations(
                 if "duck_hive" in candidate_medians
                 else None
             ),
+            "duck_vortex_ms_median": (
+                round(candidate_medians["duck_vortex"], 4)
+                if "duck_vortex" in candidate_medians
+                else None
+            ),
             "datafusion_mem_ms_median": (
                 round(candidate_medians["datafusion_mem"], 4)
                 if "datafusion_mem" in candidate_medians
@@ -178,6 +183,7 @@ def build_profile_from_observations(
         "native_system": "rvbbit_native_forced",
         "duck_system": "rvbbit_duck_forced",
         "duck_hive_system": "rvbbit_duck_hive_forced",
+        "duck_vortex_system": "rvbbit_duck_vortex_forced",
         "datafusion_mem_system": "rvbbit_datafusion_mem_forced",
         "datafusion_system": "rvbbit_datafusion_forced",
         "datafusion_hive_system": "rvbbit_datafusion_hive_forced",

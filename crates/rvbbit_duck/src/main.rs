@@ -950,8 +950,8 @@ fn need_value(it: &mut impl Iterator<Item = String>, name: &str) -> Result<Strin
 
 fn print_help() {
     println!(
-        "rvbbit-duck --sql SQL [--engine duck|datafusion] [--layout scan|hive|cluster|hive:col] [--dsn DSN] [--repeat N] [--timeout-s N] [--threads N] [--max-rows N]\n\
-         rvbbit-duck --serve [--engine duck|datafusion] [--layout scan|hive|cluster|hive:col] [--dsn DSN] [--threads N]\n\
+        "rvbbit-duck --sql SQL [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--repeat N] [--timeout-s N] [--threads N] [--max-rows N]\n\
+         rvbbit-duck --serve [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
          Server JSONL requests: {{\"sql\":\"SELECT ...\"}} or {{\"command\":\"prewarm\"}}"
     );
 }
@@ -1164,6 +1164,9 @@ fn catalog_fingerprint_sql_for_layout(layout: &str) -> Result<String> {
                 prefix.replace('\'', "''")
             )))
         }
+        "vortex" | "vortex_scan" => Ok(variant_catalog_fingerprint_sql_exact(
+            "rg.layout = 'vortex_scan'",
+        )),
         _ if lower.starts_with("hive:") || lower.starts_with("cluster:") => {
             validate_layout_name(trimmed)?;
             Ok(variant_catalog_fingerprint_sql(&format!(
@@ -1253,6 +1256,56 @@ fn variant_catalog_fingerprint_sql(layout_predicate: &str) -> String {
                   WHERE cl.table_oid = rg.table_oid
               )
             GROUP BY n.nspname, c.relname, c.oid, t.shadow_heap_retained, t.shadow_heap_dirty
+        )
+        SELECT coalesce(string_agg(
+            nspname || '.' || relname || ':' || oid || ':' || coalesce(layout, 'scan') || ':' ||
+            row_groups || ':' || row_group_rows || ':' || row_group_bytes || ':' || max_rg_id || ':' ||
+            max_created_us || ':' || heap_bytes || ':' || shadow_heap_retained || ':' ||
+            shadow_heap_dirty || ':' || deletes || ':' || path_sig || ':' || column_sig,
+            E'\\n' ORDER BY nspname, relname, coalesce(layout, 'scan')
+        ), 'empty') AS fingerprint
+        FROM table_state
+        "
+    )
+}
+
+fn variant_catalog_fingerprint_sql_exact(layout_predicate: &str) -> String {
+    format!(
+        "
+        WITH table_state AS (
+            SELECT n.nspname,
+                   c.relname,
+                   c.oid::bigint AS oid,
+                   rg.layout AS layout,
+                   count(rg.*)::bigint AS row_groups,
+                   coalesce(sum(rg.n_rows), 0)::bigint AS row_group_rows,
+                   coalesce(sum(rg.n_bytes), 0)::bigint AS row_group_bytes,
+                   coalesce(max(rg.rg_id), -1)::bigint AS max_rg_id,
+                   coalesce((extract(epoch FROM max(rg.created_at)) * 1000000)::bigint, 0)::bigint AS max_created_us,
+                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
+                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) AS deletes,
+                   coalesce(md5(string_agg(rg.path || ':' || rg.n_rows || ':' || rg.n_bytes || ':' ||
+                           coalesce((extract(epoch FROM rg.created_at) * 1000000)::bigint, 0), ',' ORDER BY rg.rg_id)), '') AS path_sig,
+                   coalesce((
+                       SELECT md5(string_agg(a.attname::text || ':' || a.atttypid::regtype::text, ',' ORDER BY a.attnum))
+                       FROM pg_attribute a
+                       WHERE a.attrelid = c.oid
+                         AND a.attnum > 0
+                         AND NOT a.attisdropped
+                   ), '') AS column_sig
+            FROM rvbbit.row_group_variants rg
+            JOIN rvbbit.layout_variant_status s
+              ON s.table_oid = rg.table_oid AND s.layout = rg.layout
+            JOIN pg_class c ON c.oid = rg.table_oid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_am am ON am.oid = c.relam
+            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
+            WHERE am.amname = 'rvbbit'
+              AND {layout_predicate}
+              AND s.status = 'ready'
+            GROUP BY n.nspname, c.relname, c.oid, rg.layout, t.shadow_heap_retained, t.shadow_heap_dirty
         )
         SELECT coalesce(string_agg(
             nspname || '.' || relname || ':' || oid || ':' || coalesce(layout, 'scan') || ':' ||
@@ -1446,6 +1499,7 @@ fn catalog_sql_for_layout(layout: &str) -> Result<String> {
                 prefix.replace('\'', "''")
             )))
         }
+        "vortex" | "vortex_scan" => Ok(variant_catalog_sql_exact("rg.layout = 'vortex_scan'")),
         _ if lower.starts_with("hive:") || lower.starts_with("cluster:") => {
             validate_layout_name(trimmed)?;
             Ok(variant_catalog_sql(&format!(
@@ -1520,6 +1574,34 @@ fn variant_catalog_sql(layout_predicate: &str) -> String {
     )
 }
 
+fn variant_catalog_sql_exact(layout_predicate: &str) -> String {
+    format!(
+        "
+        SELECT n.nspname,
+               c.relname,
+               rg.layout,
+               array_agg(rg.path ORDER BY rg.rg_id) AS paths,
+               sum(rg.n_rows)::bigint AS row_group_rows,
+               sum(rg.n_bytes)::bigint AS row_group_bytes,
+               pg_relation_size(c.oid)::bigint AS heap_bytes,
+               coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
+               coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+               (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
+        FROM rvbbit.row_group_variants rg
+        JOIN rvbbit.layout_variant_status s
+          ON s.table_oid = rg.table_oid AND s.layout = rg.layout
+        JOIN pg_class c ON c.oid = rg.table_oid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_am am ON am.oid = c.relam
+        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
+        WHERE am.amname = 'rvbbit'
+          AND {layout_predicate}
+          AND s.status = 'ready'
+        GROUP BY n.nspname, c.oid, c.relname, rg.layout, t.shadow_heap_retained, t.shadow_heap_dirty
+        "
+    )
+}
+
 fn validate_layout_name(layout: &str) -> Result<()> {
     if layout
         .chars()
@@ -1563,7 +1645,7 @@ fn prewarm_parquet_metadata(
         return Ok(stats);
     }
 
-    for table in catalog.values() {
+    for table in catalog.values().filter(|table| !table_uses_vortex(table)) {
         for path in &table.paths {
             stats.files += 1;
             let (hit, entry) = cache.ensure(path)?;
@@ -1589,7 +1671,7 @@ impl ParquetFooterCache {
             return stats;
         }
 
-        for table in catalog.values() {
+        for table in catalog.values().filter(|table| !table_uses_vortex(table)) {
             for path in &table.paths {
                 stats.files += 1;
                 if let Some(entry) = self.entries.get(path) {
@@ -1945,7 +2027,38 @@ fn supported_pg_type(typname: &str) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuckSourceFormat {
+    Parquet,
+    Vortex,
+}
+
+fn table_source_format(table: &RvbbitDuckTable) -> DuckSourceFormat {
+    match table.layout.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("vortex") | Some("vortex_scan") => DuckSourceFormat::Vortex,
+        _ => DuckSourceFormat::Parquet,
+    }
+}
+
+fn table_uses_vortex(table: &RvbbitDuckTable) -> bool {
+    table_source_format(table) == DuckSourceFormat::Vortex
+}
+
+fn ensure_duck_vortex(con: &Connection) -> Result<()> {
+    if con.execute_batch("LOAD vortex").is_ok() {
+        return Ok(());
+    }
+    con.execute_batch("INSTALL vortex")
+        .context("installing DuckDB vortex extension")?;
+    con.execute_batch("LOAD vortex")
+        .context("loading DuckDB vortex extension")?;
+    Ok(())
+}
+
 fn create_duck_views(con: &Connection, catalog: &BTreeMap<String, RvbbitDuckTable>) -> Result<()> {
+    if catalog.values().any(table_uses_vortex) {
+        ensure_duck_vortex(con)?;
+    }
     let mut rel_counts = BTreeMap::<String, usize>::new();
     for table in catalog.values() {
         *rel_counts.entry(table.relname.clone()).or_default() += 1;
@@ -1957,10 +2070,15 @@ fn create_duck_views(con: &Connection, catalog: &BTreeMap<String, RvbbitDuckTabl
             .map(|path| quote_sql_string(path))
             .collect::<Vec<_>>()
             .join(", ");
-        let source = if table.partition_cols.is_empty() {
-            format!("read_parquet([{paths}], union_by_name=true)")
-        } else {
-            format!("read_parquet([{paths}], union_by_name=true, hive_partitioning=true)")
+        let source_format = table_source_format(table);
+        let source = match source_format {
+            DuckSourceFormat::Vortex => format!("read_vortex([{paths}])"),
+            DuckSourceFormat::Parquet if table.partition_cols.is_empty() => {
+                format!("read_parquet([{paths}], union_by_name=true)")
+            }
+            DuckSourceFormat::Parquet => {
+                format!("read_parquet([{paths}], union_by_name=true, hive_partitioning=true)")
+            }
         };
         let select_list = if table.columns.is_empty() {
             "*".to_string()
@@ -1968,7 +2086,7 @@ fn create_duck_views(con: &Connection, catalog: &BTreeMap<String, RvbbitDuckTabl
             table
                 .columns
                 .iter()
-                .map(|(col, typ)| duck_select_expr(col, typ))
+                .map(|(col, typ)| duck_select_expr(col, typ, source_format))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -2029,10 +2147,16 @@ fn quote_sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn duck_select_expr(col: &str, typname: &str) -> String {
+fn duck_select_expr(col: &str, typname: &str, source_format: DuckSourceFormat) -> String {
     let ident = quote_ident(col);
     if typname == "date" {
         format!("(DATE '1970-01-01' + CAST({ident} AS INTEGER)) AS {ident}")
+    } else if source_format == DuckSourceFormat::Vortex
+        && typname == "timestamp without time zone"
+    {
+        format!("make_timestamp(CAST({ident} AS BIGINT)) AS {ident}")
+    } else if source_format == DuckSourceFormat::Vortex && typname == "timestamp with time zone" {
+        format!("make_timestamptz(CAST({ident} AS BIGINT)) AS {ident}")
     } else {
         ident
     }

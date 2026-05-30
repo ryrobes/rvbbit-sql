@@ -674,6 +674,10 @@ def _duck_select_expr(col: str, typname: str, source_format: str = "parquet") ->
     ident = _quote_ident(col)
     if source_format in {"parquet", "vortex"} and typname == "date":
         return f"(DATE '1970-01-01' + CAST({ident} AS INTEGER)) AS {ident}"
+    if source_format == "vortex" and typname == "timestamp without time zone":
+        return f"make_timestamp(CAST({ident} AS BIGINT)) AS {ident}"
+    if source_format == "vortex" and typname == "timestamp with time zone":
+        return f"make_timestamptz(CAST({ident} AS BIGINT)) AS {ident}"
     return ident
 
 
@@ -882,6 +886,27 @@ def run_rvbbit_duck_vortex_forced(
     _set_status("not-run")
     _reset_route_decision()
     _duck_safe_select(sql)
+    if os.environ.get("RVBBIT_DUCK_VORTEX_FORCE_PYTHON", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        ms = _run_rust_engine(sql, repeat, timeout_s, "duck", required=True, layout="vortex")
+        if ms is None:
+            raise DuckHotPathFallback("Rust DuckDB Vortex executor returned no elapsed_ms")
+        status = "duck_vortex:vortex:forced+rust" + _rust_cache_status()
+        _set_status(status)
+        _write_route_log(sql, "force-duck-vortex", status, ms, label=label, suite=suite)
+        record_rvbbit_route_observation(
+            sql,
+            "duck_vortex",
+            ms,
+            status="ok",
+            source=f"benchmark:{suite or 'unknown'}:duck_vortex_forced",
+        )
+        return ms
+
     with psycopg.connect(RVBBIT_DSN) as pg_conn:
         catalog = _rvbbit_variant_catalog(pg_conn, "vortex_scan")
     if not catalog:
@@ -905,6 +930,13 @@ def run_rvbbit_duck_vortex_forced(
     status = "duck_vortex:vortex_scan:forced+python"
     _set_status(status)
     _write_route_log(sql, "force-duck-vortex", status, ms, label=label, suite=suite)
+    record_rvbbit_route_observation(
+        sql,
+        "duck_vortex",
+        ms,
+        status="ok",
+        source=f"benchmark:{suite or 'unknown'}:duck_vortex_forced_python",
+    )
     return ms
 
 
@@ -991,7 +1023,7 @@ def _native_route_reason(pg_conn: psycopg.Connection, sql: str, mode: str) -> st
         )
         if native_decision.path in {"native", "pg_heap"}:
             return f"native router: {native_decision.reason}"
-        if native_decision.path in {"duck", "duck_hive", "datafusion", "datafusion_hive"}:
+        if native_decision.path in {"duck", "duck_hive", "duck_vortex", "datafusion", "datafusion_hive"}:
             return None
 
     table_metrics = _rvbbit_query_table_metrics(pg_conn, sql)
@@ -1042,6 +1074,8 @@ def _native_router_decision(pg_conn: psycopg.Connection, sql: str) -> RouteDecis
         path = "duck"
     elif candidate == "duck_hive":
         path = "duck_hive"
+    elif candidate == "duck_vortex":
+        path = "duck_vortex"
     elif candidate == "datafusion_vector":
         path = "datafusion"
     elif candidate == "datafusion_hive":
@@ -1049,7 +1083,7 @@ def _native_router_decision(pg_conn: psycopg.Connection, sql: str) -> RouteDecis
     elif candidate == "pg_rowstore":
         path = "pg_heap"
     else:
-        path = route if route in {"duck_hive", "datafusion_hive"} else ("duck" if route == "duck" else "native")
+        path = route if route in {"duck_hive", "duck_vortex", "datafusion_hive"} else ("duck" if route == "duck" else "native")
 
     reason = route_doc.get("reason") or "native router decision"
     source = route_doc.get("route_source") or "native-router"
@@ -1071,6 +1105,7 @@ def _route_candidate_available(entry: dict | None, path: str) -> bool:
     candidate_name = {
         "duck": "duck_vector",
         "duck_hive": "duck_hive",
+        "duck_vortex": "duck_vortex",
         "datafusion": "datafusion_vector",
         "datafusion_hive": "datafusion_hive",
         "native": "rvbbit_native",
@@ -1091,14 +1126,14 @@ def _maybe_apply_route_exploration(mode: str, native_reason: str | None) -> str 
     if pct <= 0.0 or random.random() >= pct:
         return native_reason
     decision = _LAST_ROUTE_DECISION
-    if not decision or decision.path not in {"duck", "duck_hive", "datafusion", "datafusion_hive", "native", "pg_heap"}:
+    if not decision or decision.path not in {"duck", "duck_hive", "duck_vortex", "datafusion", "datafusion_hive", "native", "pg_heap"}:
         return native_reason
     if decision.source.startswith("explore:"):
         return native_reason
 
     alternates = [
         path
-        for path in ("native", "duck", "duck_hive", "datafusion", "datafusion_hive", "pg_heap")
+        for path in ("native", "duck", "duck_hive", "duck_vortex", "datafusion", "datafusion_hive", "pg_heap")
         if path != decision.path and _route_candidate_available(decision.entry, path)
     ]
     if not alternates:
@@ -1131,11 +1166,12 @@ def _record_route_observation(sql: str, elapsed_ms: float, status: str) -> None:
     if observe in {"0", "false", "no", "off", "disabled"}:
         return
     decision = _LAST_ROUTE_DECISION
-    if not decision or decision.path not in {"duck", "duck_hive", "datafusion", "datafusion_hive", "native", "pg_heap"}:
+    if not decision or decision.path not in {"duck", "duck_hive", "duck_vortex", "datafusion", "datafusion_hive", "native", "pg_heap"}:
         return
     candidate = {
         "duck": "duck_vector",
         "duck_hive": "duck_hive",
+        "duck_vortex": "duck_vortex",
         "datafusion": "datafusion_vector",
         "datafusion_hive": "datafusion_hive",
         "native": "rvbbit_native",
@@ -1143,7 +1179,7 @@ def _record_route_observation(sql: str, elapsed_ms: float, status: str) -> None:
     }[decision.path]
     obs_status = (
         "ok"
-        if status in {"duck", "duck_hive", "datafusion", "datafusion_hive", "native", "pg_heap"}
+        if status in {"duck", "duck_hive", "duck_vortex", "datafusion", "datafusion_hive", "native", "pg_heap"}
         or status.startswith(f"{decision.path}:")
         else status
     )
@@ -1242,10 +1278,15 @@ def run_rvbbit_duck_hot(
             catalog = _rvbbit_row_group_catalog(pg_conn)
         route_path = _LAST_ROUTE_DECISION.path if _LAST_ROUTE_DECISION else "duck"
         engine = "datafusion" if route_path in {"datafusion", "datafusion_hive"} else "duck"
-        layout = os.environ.get(HIVE_LAYOUT_ENV, "hive") if route_path in {"duck_hive", "datafusion_hive"} else "scan"
+        if route_path in {"duck_hive", "datafusion_hive"}:
+            layout = os.environ.get(HIVE_LAYOUT_ENV, "hive")
+        elif route_path == "duck_vortex":
+            layout = "vortex"
+        else:
+            layout = "scan"
         rust_ms = _run_rust_engine(sql, repeat, timeout_s, engine, required=False, layout=layout)
         if rust_ms is not None:
-            status_path = route_path if route_path in {"duck_hive", "datafusion_hive"} else engine
+            status_path = route_path if route_path in {"duck_hive", "duck_vortex", "datafusion_hive"} else engine
             status = _route_status(status_path) if mode == "auto" else f"{status_path}:{mode}"
             status = f"{status}+rust" + _rust_cache_status()
             _set_status(status)
@@ -1253,7 +1294,7 @@ def run_rvbbit_duck_hot(
             _record_route_observation(sql, rust_ms, status)
             return rust_ms
         if layout != "scan":
-            raise DuckHotPathFallback("Rust Hive executor unavailable")
+            raise DuckHotPathFallback("Rust layout executor unavailable")
         if engine == "datafusion":
             raise DuckHotPathFallback("Rust DataFusion executor unavailable")
         con = duckdb.connect(":memory:")

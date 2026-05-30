@@ -43,6 +43,7 @@ CANDIDATE_SYSTEMS = {
     "rvbbit_native_forced": "rvbbit_native",
     "rvbbit_duck_forced": "duck_vector",
     "rvbbit_duck_hive_forced": "duck_hive",
+    "rvbbit_duck_vortex_forced": "duck_vortex",
     "rvbbit_datafusion_mem_forced": "datafusion_mem",
     "rvbbit_datafusion_forced": "datafusion_vector",
     "rvbbit_datafusion_hive_forced": "datafusion_hive",
@@ -287,6 +288,7 @@ def build_profile(
                         "native_ms": candidate_ms.get("rvbbit_native"),
                         "duck_ms": candidate_ms.get("duck_vector"),
                         "duck_hive_ms": candidate_ms.get("duck_hive"),
+                        "duck_vortex_ms": candidate_ms.get("duck_vortex"),
                         "datafusion_mem_ms": candidate_ms.get("datafusion_mem"),
                         "datafusion_ms": candidate_ms.get("datafusion_vector"),
                         "datafusion_hive_ms": candidate_ms.get("datafusion_hive"),
@@ -341,6 +343,11 @@ def build_profile(
                 if "duck_hive" in candidate_medians
                 else None
             ),
+            "duck_vortex_ms_median": (
+                round(candidate_medians["duck_vortex"], 4)
+                if "duck_vortex" in candidate_medians
+                else None
+            ),
             "datafusion_mem_ms_median": (
                 round(candidate_medians["datafusion_mem"], 4)
                 if "datafusion_mem" in candidate_medians
@@ -392,6 +399,7 @@ def build_profile(
         "native_system": "rvbbit_native_forced",
         "duck_system": "rvbbit_duck_forced",
         "duck_hive_system": "rvbbit_duck_hive_forced",
+        "duck_vortex_system": "rvbbit_duck_vortex_forced",
         "datafusion_mem_system": "rvbbit_datafusion_mem_forced",
         "datafusion_system": "rvbbit_datafusion_forced",
         "datafusion_hive_system": "rvbbit_datafusion_hive_forced",
@@ -439,6 +447,7 @@ def main() -> None:
             f"native={entry.get('native_ms_median')}ms "
             f"duck={entry.get('duck_ms_median')}ms "
             f"duck_hive={entry.get('duck_hive_ms_median')}ms "
+            f"duck_vortex={entry.get('duck_vortex_ms_median')}ms "
             f"datafusion_mem={entry.get('datafusion_mem_ms_median')}ms "
             f"datafusion={entry.get('datafusion_ms_median')}ms "
             f"datafusion_hive={entry.get('datafusion_hive_ms_median')}ms "
