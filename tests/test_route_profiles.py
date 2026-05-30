@@ -97,6 +97,7 @@ def test_route_profiles_and_status_helpers(rvbbit):
             "rvbbit_native",
             "datafusion_mem",
             "datafusion_hive",
+            "datafusion_vortex",
             "datafusion_vector",
             "duck_hive",
             "duck_vector",

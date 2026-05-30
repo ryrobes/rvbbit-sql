@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+#[cfg(not(test))]
 use std::ffi::{CStr, CString};
 use std::path::Path as FsPath;
 use std::sync::{Arc, OnceLock};
@@ -42,6 +43,10 @@ use pgrx::prelude::*;
 use pgrx::{JsonB, Spi};
 use serde_json::{json, Value};
 use tokio::runtime::{Builder, Runtime};
+use vortex::io::session::RuntimeSessionExt;
+use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
+use vortex_datafusion::VortexFormat;
 
 use crate::time_travel::AsOf;
 
@@ -361,12 +366,28 @@ struct RvbbitTable {
     relname: String,
     paths: Vec<String>,
     columns: Vec<RvbbitColumn>,
+    format: AcceleratorFormat,
 }
 
 #[derive(Clone, Debug)]
 struct RvbbitColumn {
     name: String,
     typname: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AcceleratorFormat {
+    Parquet,
+    Vortex,
+}
+
+impl AcceleratorFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            AcceleratorFormat::Parquet => ".parquet",
+            AcceleratorFormat::Vortex => ".vortex",
+        }
+    }
 }
 
 impl RvbbitTable {
@@ -546,6 +567,126 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
                 relname: r.relname,
                 paths: r.paths,
                 columns: r.columns,
+                format: AcceleratorFormat::Parquet,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn discover_catalog_vortex() -> Result<BTreeMap<String, RvbbitTable>, String> {
+    struct Row {
+        schema: String,
+        relname: String,
+        paths: Vec<String>,
+        columns: Vec<RvbbitColumn>,
+        heap_bytes: i64,
+        shadow_retained: bool,
+        shadow_dirty: bool,
+        deletes: i64,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let sql = "
+        SELECT n.nspname::text                                      AS nspname,
+               c.relname::text                                      AS relname,
+               array_agg('file://' || v.path ORDER BY v.rg_id)::text[] AS paths,
+               coalesce((
+                   SELECT array_agg(a.attname::text || E'\t' ||
+                                    a.atttypid::regtype::text
+                                    ORDER BY a.attnum)::text[]
+                   FROM pg_attribute a
+                   WHERE a.attrelid = c.oid
+                     AND a.attnum > 0
+                     AND NOT a.attisdropped
+               ), ARRAY[]::text[])                                  AS columns,
+               pg_relation_size(c.oid)::bigint                      AS heap_bytes,
+               coalesce(t.shadow_heap_retained, false)              AS shadow_heap_retained,
+               coalesce(t.shadow_heap_dirty, false)                 AS shadow_heap_dirty,
+               (SELECT count(*)
+                  FROM rvbbit.delete_log dl
+                 WHERE dl.table_oid = c.oid)::bigint                AS deletes
+        FROM rvbbit.row_group_variants v
+        JOIN rvbbit.layout_variant_status s
+          ON s.table_oid = v.table_oid
+         AND s.layout = v.layout
+         AND s.status = 'ready'
+        JOIN pg_class c       ON c.oid = v.table_oid
+        JOIN pg_namespace n   ON n.oid = c.relnamespace
+        JOIN pg_am am         ON am.oid = c.relam
+        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
+        WHERE am.amname = 'rvbbit'
+          AND v.layout = 'vortex_scan'
+        GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
+    ";
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(sql, None, &[])?;
+        for row in table {
+            let schema: String = row.get::<String>(1)?.unwrap_or_default();
+            let relname: String = row.get::<String>(2)?.unwrap_or_default();
+            let paths: Vec<String> = row
+                .get::<Vec<Option<String>>>(3)?
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .collect();
+            let columns: Vec<RvbbitColumn> = row
+                .get::<Vec<Option<String>>>(4)?
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let (name, typname) = entry.split_once('\t')?;
+                    Some(RvbbitColumn {
+                        name: name.to_string(),
+                        typname: typname.to_string(),
+                    })
+                })
+                .collect();
+            let heap_bytes: i64 = row.get::<i64>(5)?.unwrap_or(0);
+            let shadow_retained: bool = row.get::<bool>(6)?.unwrap_or(false);
+            let shadow_dirty: bool = row.get::<bool>(7)?.unwrap_or(false);
+            let deletes: i64 = row.get::<i64>(8)?.unwrap_or(0);
+            rows.push(Row {
+                schema,
+                relname,
+                paths,
+                columns,
+                heap_bytes,
+                shadow_retained,
+                shadow_dirty,
+                deletes,
+            });
+        }
+        Ok(())
+    })
+    .map_err(|e| format!("vortex catalog SPI: {e}"))?;
+
+    let mut out = BTreeMap::new();
+    for r in rows {
+        if r.deletes != 0 {
+            continue;
+        }
+        if r.heap_bytes != 0 && !(r.shadow_retained && !r.shadow_dirty) {
+            continue;
+        }
+        if r.paths.is_empty() {
+            continue;
+        }
+        if !r.paths.iter().all(|p| {
+            p.strip_prefix("file://")
+                .is_some_and(|local| FsPath::new(local).exists())
+        }) {
+            continue;
+        }
+        let key = format!("{}.{}", r.schema, r.relname);
+        out.insert(
+            key,
+            RvbbitTable {
+                schema: r.schema,
+                relname: r.relname,
+                paths: r.paths,
+                columns: r.columns,
+                format: AcceleratorFormat::Vortex,
             },
         );
     }
@@ -566,6 +707,7 @@ fn table_signature(t: &RvbbitTable, asof: Option<&AsOf>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     asof.hash(&mut h);
+    t.format.hash(&mut h);
     t.paths.len().hash(&mut h);
     t.columns.len().hash(&mut h);
     for c in &t.columns {
@@ -609,12 +751,20 @@ async fn register_listing_table(
         .iter()
         .map(|p| ListingTableUrl::parse(p).map_err(|e| format!("ListingTableUrl({p}): {e}")))
         .collect::<Result<Vec<_>, _>>()?;
-    // DataFusion 53 defaults parquet string columns to Utf8View, which
-    // our custom_scan tuple-fill code (StringArray-based) doesn't
-    // accept. ParquetFormat doesn't honor SessionConfig; the option
-    // has to be set on the format directly.
-    let format = Arc::new(ParquetFormat::default().with_force_view_types(false));
-    let options = ListingOptions::new(format).with_file_extension(".parquet");
+    let options = match t.format {
+        AcceleratorFormat::Parquet => {
+            // DataFusion 53 defaults parquet string columns to Utf8View, which
+            // our custom_scan tuple-fill code (StringArray-based) doesn't
+            // accept. ParquetFormat doesn't honor SessionConfig; the option
+            // has to be set on the format directly.
+            let format = Arc::new(ParquetFormat::default().with_force_view_types(false));
+            ListingOptions::new(format).with_file_extension(t.format.extension())
+        }
+        AcceleratorFormat::Vortex => {
+            let format = Arc::new(VortexFormat::new(VortexSession::default().with_tokio()));
+            ListingOptions::new(format).with_file_extension(t.format.extension())
+        }
+    };
     let schema = options
         .infer_schema(&ctx.state(), &urls[0])
         .await
@@ -1290,12 +1440,13 @@ async fn execute_sql_json(
 pub(crate) fn query_engine(layout: &str, sql: &str, max_rows: i32) -> Result<Value, String> {
     let normalized_layout = layout.trim().to_ascii_lowercase();
     let use_hot_mem = normalized_layout == "mem" || normalized_layout == "memory";
+    let use_vortex = normalized_layout == "vortex" || normalized_layout == "vortex_scan";
     if !matches!(
         normalized_layout.as_str(),
-        "" | "scan" | "canonical" | "default" | "mem" | "memory"
+        "" | "scan" | "canonical" | "default" | "mem" | "memory" | "vortex" | "vortex_scan"
     ) {
         return Err(format!(
-            "in-process datafusion currently only supports scan layout, got {layout}"
+            "in-process datafusion currently only supports scan, mem, and vortex layouts, got {layout}"
         ));
     }
 
@@ -1303,13 +1454,26 @@ pub(crate) fn query_engine(layout: &str, sql: &str, max_rows: i32) -> Result<Val
     if use_hot_mem && asof.is_some() {
         return Err("hot store is not used for AS OF queries".to_string());
     }
-    let tables = discover_catalog_scan(asof.clone())?;
+    if use_vortex && asof.is_some() {
+        return Err("Vortex accelerator is not used for AS OF queries".to_string());
+    }
+    let tables = if use_vortex {
+        discover_catalog_vortex()?
+    } else {
+        discover_catalog_scan(asof.clone())?
+    };
     if tables.is_empty() {
         return Err(match asof {
+            Some(_) if use_vortex => {
+                "no ready rvbbit Vortex accelerator files are visible".to_string()
+            }
             Some(ref asof) => format!(
                 "no rvbbit row groups visible at AS OF {}",
                 crate::time_travel::label(asof)
             ),
+            None if use_vortex => {
+                "no ready rvbbit Vortex accelerator files are visible".to_string()
+            }
             None => "no authoritative compacted rvbbit parquet tables are visible".to_string(),
         });
     }

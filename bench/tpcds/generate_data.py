@@ -16,6 +16,14 @@ from schema import (  # noqa: E402
 )
 
 
+def _load_tpcds(con: duckdb.DuckDBPyConnection) -> None:
+    try:
+        con.execute("LOAD tpcds")
+    except duckdb.IOException:
+        con.execute("INSTALL tpcds")
+        con.execute("LOAD tpcds")
+
+
 def _table_schema(con: duckdb.DuckDBPyConnection, table: str) -> list[dict]:
     cols = []
     for name, duck_type, *_ in con.execute(f"DESCRIBE {table}").fetchall():
@@ -46,7 +54,7 @@ def main() -> int:
 
     os.makedirs(out_dir, exist_ok=True)
     con = duckdb.connect(":memory:")
-    con.execute("LOAD tpcds")
+    _load_tpcds(con)
     print(f"Generating TPC-DS sf={scale} into {out_dir}")
     con.execute(f"CALL dsdgen(sf={float(scale)})")
 
@@ -74,4 +82,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -74,6 +74,7 @@ class RvbbitDuckTable:
     columns: list[tuple[str, str]]
     row_group_rows: int
     row_group_bytes: int
+    layout: str | None = None
 
 
 @dataclass
@@ -532,6 +533,100 @@ def _rvbbit_row_group_catalog(pg_conn: psycopg.Connection) -> dict[str, RvbbitDu
     return catalog
 
 
+def _rvbbit_variant_catalog(pg_conn: psycopg.Connection, layout: str) -> dict[str, RvbbitDuckTable]:
+    layout = layout.strip()
+    if not re.match(r"^[A-Za-z0-9_:-]+$", layout):
+        raise DuckHotPathFallback(f"invalid rvbbit layout: {layout}")
+    sql = """
+        SELECT n.nspname,
+               c.relname,
+               rg.layout,
+               array_agg(rg.path ORDER BY rg.rg_id) AS paths,
+               sum(rg.n_rows)::bigint AS row_group_rows,
+               sum(rg.n_bytes)::bigint AS row_group_bytes,
+               pg_relation_size(c.oid)::bigint AS heap_bytes,
+               coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
+               coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+               (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) AS deletes
+        FROM rvbbit.row_group_variants rg
+        JOIN rvbbit.layout_variant_status s
+          ON s.table_oid = rg.table_oid AND s.layout = rg.layout
+        JOIN pg_class c ON c.oid = rg.table_oid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_am am ON am.oid = c.relam
+        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
+        WHERE am.amname = 'rvbbit'
+          AND rg.layout = %s
+          AND s.status = 'ready'
+        GROUP BY n.nspname, c.oid, c.relname, rg.layout, t.shadow_heap_retained, t.shadow_heap_dirty
+    """
+    catalog: dict[str, RvbbitDuckTable] = {}
+    with pg_conn.cursor() as cur:
+        cur.execute(sql, (layout,))
+        for (
+            schema,
+            relname,
+            variant_layout,
+            paths,
+            rows,
+            bytes_,
+            heap_bytes,
+            shadow_heap_retained,
+            shadow_heap_dirty,
+            deletes,
+        ) in cur.fetchall():
+            clean_shadow_heap = bool(shadow_heap_retained) and not bool(shadow_heap_dirty)
+            if deletes or (heap_bytes and not clean_shadow_heap):
+                continue
+            mapped = []
+            visible = True
+            for path in paths:
+                if not path.startswith(PGDATA_PREFIX + "/"):
+                    visible = False
+                    break
+                bench_path = BENCH_PGDATA_PREFIX + path[len(PGDATA_PREFIX) :]
+                if not os.path.exists(bench_path):
+                    visible = False
+                    break
+                mapped.append(bench_path)
+            if mapped and visible:
+                key = f"{schema}.{relname}"
+                catalog[key] = RvbbitDuckTable(
+                    schema=schema,
+                    relname=relname,
+                    paths=mapped,
+                    columns=[],
+                    row_group_rows=int(rows or 0),
+                    row_group_bytes=int(bytes_ or 0),
+                    layout=str(variant_layout or layout),
+                )
+        cur.execute(
+            """
+            SELECT n.nspname, c.relname, a.attname, a.atttypid::regtype::text
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_am am ON am.oid = c.relam
+            JOIN pg_attribute a ON a.attrelid = c.oid
+            WHERE am.amname = 'rvbbit'
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            ORDER BY n.nspname, c.relname, a.attnum
+            """
+        )
+        unsupported: set[str] = set()
+        for schema, relname, attname, typname in cur.fetchall():
+            key = f"{schema}.{relname}"
+            if key not in catalog:
+                continue
+            if typname not in SUPPORTED_PG_TYPES:
+                unsupported.add(key)
+                continue
+            catalog[key].columns.append((attname, typname))
+        for key in unsupported:
+            catalog.pop(key, None)
+    return catalog
+
+
 def _rvbbit_query_table_metrics(pg_conn: psycopg.Connection, sql: str) -> dict:
     refs = extract_table_refs(sql)
     if not refs:
@@ -575,21 +670,45 @@ def _quote_qualified(schema: str, rel: str) -> str:
     return f"{_quote_ident(schema)}.{_quote_ident(rel)}"
 
 
-def _duck_select_expr(col: str, typname: str) -> str:
+def _duck_select_expr(col: str, typname: str, source_format: str = "parquet") -> str:
     ident = _quote_ident(col)
-    if typname == "date":
+    if source_format in {"parquet", "vortex"} and typname == "date":
         return f"(DATE '1970-01-01' + CAST({ident} AS INTEGER)) AS {ident}"
     return ident
 
 
-def _create_duck_views(con: duckdb.DuckDBPyConnection, _sql: str, catalog: dict[str, RvbbitDuckTable]) -> None:
+def _ensure_duck_vortex(con: duckdb.DuckDBPyConnection) -> None:
+    try:
+        con.execute("LOAD vortex")
+    except Exception:
+        con.execute("INSTALL vortex")
+        con.execute("LOAD vortex")
+
+
+def _create_duck_views(
+    con: duckdb.DuckDBPyConnection,
+    _sql: str,
+    catalog: dict[str, RvbbitDuckTable],
+    source_format: str = "parquet",
+) -> None:
     if not catalog:
         raise DuckHotPathFallback("no compacted rvbbit tables")
+    source_format = source_format.strip().lower()
+    if source_format not in {"parquet", "vortex"}:
+        raise DuckHotPathFallback(f"unsupported DuckDB source format: {source_format}")
+    if source_format == "vortex":
+        _ensure_duck_vortex(con)
     relname_counts = Counter(table.relname for table in catalog.values())
     for _key, table in sorted(catalog.items()):
         paths = ", ".join(_quote_sql_string(path) for path in table.paths)
-        source = f"read_parquet([{paths}], union_by_name=true)"
-        select_list = ", ".join(_duck_select_expr(col, typ) for col, typ in table.columns)
+        if source_format == "vortex":
+            source = f"read_vortex([{paths}])"
+        else:
+            source = f"read_parquet([{paths}], union_by_name=true)"
+        select_list = ", ".join(
+            _duck_select_expr(col, typ, source_format=source_format)
+            for col, typ in table.columns
+        )
         if not select_list:
             select_list = "*"
         con.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(table.schema)}")
@@ -750,6 +869,42 @@ def run_rvbbit_duck_hive_forced(
         status="ok",
         source=f"benchmark:{suite or 'unknown'}:duck_hive_forced",
     )
+    return ms
+
+
+def run_rvbbit_duck_vortex_forced(
+    sql: str,
+    repeat: int = 3,
+    timeout_s: int = 300,
+    label: str | None = None,
+    suite: str | None = None,
+) -> float:
+    _set_status("not-run")
+    _reset_route_decision()
+    _duck_safe_select(sql)
+    with psycopg.connect(RVBBIT_DSN) as pg_conn:
+        catalog = _rvbbit_variant_catalog(pg_conn, "vortex_scan")
+    if not catalog:
+        raise DuckHotPathFallback("no ready rvbbit vortex_scan accelerator files")
+    repeat = max(1, repeat)
+
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("PRAGMA threads=4")
+        _create_duck_views(con, sql, catalog, source_format="vortex")
+        con.execute("EXPLAIN " + sql).fetchall()
+        times: list[float] = []
+        for _ in range(repeat):
+            t0 = time.perf_counter()
+            con.execute(sql).fetchall()
+            times.append(time.perf_counter() - t0)
+        ms = _median_ms(times)
+    finally:
+        con.close()
+
+    status = "duck_vortex:vortex_scan:forced+python"
+    _set_status(status)
+    _write_route_log(sql, "force-duck-vortex", status, ms, label=label, suite=suite)
     return ms
 
 

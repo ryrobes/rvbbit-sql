@@ -31,7 +31,7 @@ RUN pip install --no-cache-dir \
         click \
         pytest \
         pytest-xdist \
-        duckdb==1.1.* \
+        duckdb==1.5.3 \
         requests \
         clickhouse-connect==0.8.* \
         fastapi \

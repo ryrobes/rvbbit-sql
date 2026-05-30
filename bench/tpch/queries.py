@@ -6,6 +6,14 @@ import re
 import duckdb
 
 
+def _load_tpch(con: duckdb.DuckDBPyConnection) -> None:
+    try:
+        con.execute("LOAD tpch")
+    except duckdb.IOException:
+        con.execute("INSTALL tpch")
+        con.execute("LOAD tpch")
+
+
 Q2_DECORRELATED = """
 SELECT
     s_acctbal,
@@ -272,7 +280,7 @@ def _normalize_query(qid: str, sql: str) -> str:
 
 def base_queries() -> list[tuple[str, str, str]]:
     con = duckdb.connect(":memory:")
-    con.execute("LOAD tpch")
+    _load_tpch(con)
     rows = con.execute(
         "SELECT query_nr, query FROM tpch_queries() ORDER BY query_nr"
     ).fetchall()

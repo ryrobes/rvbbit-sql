@@ -493,6 +493,7 @@ AS $$
            CASE
              WHEN s.layout LIKE 'hive:%' THEN 'hive'
              WHEN s.layout LIKE 'cluster:%' THEN 'cluster'
+             WHEN s.layout = 'vortex_scan' THEN 'vortex'
              ELSE s.layout
            END,
            CASE
@@ -548,6 +549,7 @@ AS $$
         CASE
           WHEN p.layout LIKE 'hive:%' THEN 'hive'
           WHEN p.layout LIKE 'cluster:%' THEN 'cluster'
+          WHEN p.layout = 'vortex_scan' THEN 'vortex'
           ELSE p.layout
         END,
         coalesce(

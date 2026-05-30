@@ -6,9 +6,17 @@ import re
 import duckdb
 
 
+def _load_tpcds(con: duckdb.DuckDBPyConnection) -> None:
+    try:
+        con.execute("LOAD tpcds")
+    except duckdb.IOException:
+        con.execute("INSTALL tpcds")
+        con.execute("LOAD tpcds")
+
+
 def base_queries() -> list[tuple[str, str, str]]:
     con = duckdb.connect(":memory:")
-    con.execute("LOAD tpcds")
+    _load_tpcds(con)
     rows = con.execute(
         "SELECT query_nr, query FROM tpcds_queries() ORDER BY query_nr"
     ).fetchall()

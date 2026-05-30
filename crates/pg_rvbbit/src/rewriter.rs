@@ -633,7 +633,12 @@ unsafe fn try_duck_backend_rewrite(
     }
     if !matches!(
         chosen_candidate,
-        "duck_vector" | "datafusion_vector" | "duck_hive" | "datafusion_hive" | "datafusion_mem"
+        "duck_vector"
+            | "datafusion_vector"
+            | "duck_hive"
+            | "datafusion_hive"
+            | "datafusion_vortex"
+            | "datafusion_mem"
     ) {
         log_route_probe(query_source, route_doc, route_probe.cache_hit, false);
         return false;
@@ -774,6 +779,7 @@ fn build_duck_backend_sql(
         "datafusion_vector" => "rvbbit.datafusion_query_json",
         "duck_hive" => "rvbbit.duck_hive_query_json",
         "datafusion_hive" => "rvbbit.datafusion_hive_query_json",
+        "datafusion_vortex" => "rvbbit.datafusion_vortex_query_json",
         _ => "rvbbit.duck_query_json",
     };
     format!(

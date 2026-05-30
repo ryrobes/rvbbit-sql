@@ -216,6 +216,11 @@ fn datafusion_hive_query_json(query: &str, column_names: JsonB, max_rows: i32) -
 }
 
 #[pg_extern(volatile)]
+fn datafusion_vortex_query_json(query: &str, column_names: JsonB, max_rows: i32) -> JsonB {
+    engine_query_json("datafusion", "vortex", query, column_names, max_rows)
+}
+
+#[pg_extern(volatile)]
 fn datafusion_mem_query_json(query: &str, column_names: JsonB, max_rows: i32) -> JsonB {
     engine_query_json("datafusion", "mem", query, column_names, max_rows)
 }
@@ -248,6 +253,9 @@ fn engine_query_json(
                 if matches!(layout, "mem" | "memory") {
                     return fail_open_or_error(engine, query, max_rows, &err);
                 }
+                if matches!(layout, "vortex" | "vortex_scan") {
+                    return engine_error(engine, &err);
+                }
                 pgrx::warning!(
                     "rvbbit.{engine}_query_json: in-process DF failed ({err}); falling back to sidecar"
                 );
@@ -268,6 +276,9 @@ fn engine_query_json(
         let timeout = timeout_s();
         match run_engine_query(engine, layout, &binary, &dsn, query, max_rows, timeout) {
             Ok(p) => p,
+            Err(err) if matches!(layout, "vortex" | "vortex_scan") => {
+                return engine_error(engine, &err);
+            }
             Err(err) => return fail_open_or_error(engine, query, max_rows, &err),
         }
     };
@@ -277,6 +288,9 @@ fn engine_query_json(
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("rvbbit-duck returned non-ok status");
+        if matches!(layout, "vortex" | "vortex_scan") {
+            return engine_error(engine, err);
+        }
         return fail_open_or_error(engine, query, max_rows, err);
     }
 
@@ -329,6 +343,7 @@ fn engine_query_json(
         let candidate = match (engine, layout) {
             ("datafusion", "mem") => "datafusion_mem",
             ("datafusion", "hive") => "datafusion_hive",
+            ("datafusion", "vortex") => "datafusion_vortex",
             ("datafusion", _) => "datafusion_vector",
             (_, "hive") => "duck_hive",
             _ => "duck_vector",
@@ -336,6 +351,10 @@ fn engine_query_json(
         record_engine_observation(query, candidate, start.elapsed().as_secs_f64() * 1000.0);
     }
     JsonB(Value::Array(out))
+}
+
+fn engine_error(engine: &str, err: &str) -> JsonB {
+    pgrx::error!("rvbbit.{engine}_query_json: {err}");
 }
 
 fn fail_open_or_error(engine: &str, query: &str, max_rows: i32, err: &str) -> JsonB {

@@ -10,6 +10,14 @@ sys.path.insert(0, "/bench/tpch")
 from schema import data_dir_for_scale, table_names  # noqa: E402
 
 
+def _load_tpch(con: duckdb.DuckDBPyConnection) -> None:
+    try:
+        con.execute("LOAD tpch")
+    except duckdb.IOException:
+        con.execute("INSTALL tpch")
+        con.execute("LOAD tpch")
+
+
 def main() -> int:
     scale = os.environ.get("TPCH_SCALE", "0.1")
     out_dir = data_dir_for_scale(scale)
@@ -21,7 +29,7 @@ def main() -> int:
 
     os.makedirs(out_dir, exist_ok=True)
     con = duckdb.connect(":memory:")
-    con.execute("LOAD tpch")
+    _load_tpch(con)
     print(f"Generating TPC-H sf={scale} into {out_dir}")
     con.execute(f"CALL dbgen(sf={float(scale)})")
     for table in table_names():

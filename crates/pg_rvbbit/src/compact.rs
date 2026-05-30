@@ -29,7 +29,7 @@
 //! tables (>>10M rows) we'll want to chunk by row count and emit multiple
 //! row groups so each one fits comfortably in memory.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,10 +46,17 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pgrx::prelude::*;
 use pgrx::Spi;
 use rvbbit_storage::row_group::{RowGroupWriteOptions, RowGroupWriter};
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use vortex::array::arrow::ArrowSessionExt;
+use vortex::file::WriteOptionsSessionExt;
+use vortex::io::session::RuntimeSessionExt;
+use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
 
 const SCAN_LAYOUT_DIR: &str = "scan";
 const CLUSTER_LAYOUT_PREFIX: &str = "cluster:";
 const HIVE_LAYOUT_PREFIX: &str = "hive:";
+const VORTEX_SCAN_LAYOUT: &str = "vortex_scan";
 
 /// Parse a JSON text string through PG's jsonb_in and return the binary
 /// varlena BODY bytes (i.e. without the 4-byte varlena header).
@@ -352,6 +359,19 @@ fn hive_max_distinct_setting() -> f64 {
 
 fn hive_layout_for_key(key: &str) -> String {
     format!("{HIVE_LAYOUT_PREFIX}{key}")
+}
+
+fn vortex_layout_enabled() -> bool {
+    matches!(
+        compact_setting(
+            "RVBBIT_COMPACT_VORTEX_LAYOUT",
+            "rvbbit.compact_vortex_layout"
+        )
+        .unwrap_or_else(|| "off".to_string())
+        .to_ascii_lowercase()
+        .as_str(),
+        "1" | "on" | "true" | "yes"
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1193,6 +1213,74 @@ fn refresh_layout_variants_impl(
         }
     }
 
+    if vortex_layout_enabled() {
+        let layout = VORTEX_SCAN_LAYOUT;
+        let phase_id = start_acceleration_phase(
+            rel_oid,
+            qualified,
+            "format_variant_rebuild",
+            Some(layout),
+            None,
+            serde_json::json!({
+                "layout_kind": "vortex",
+                "build_mode": "full_rebuild",
+                "source": "canonical_parquet",
+                "file_extension": "vortex",
+            }),
+        )?;
+        let build_result = (|| -> Result<_, Box<dyn std::error::Error>> {
+            clear_variant_layout(rel_oid, layout, path_root)?;
+            let vortex_root = path_root.join(layout_dir_name(layout));
+            write_vortex_scan_chunks_from_canonical_parquet(
+                rel_oid,
+                plans,
+                &vortex_root,
+                layout,
+                false,
+            )
+        })();
+        let variant_chunks = match build_result {
+            Ok(chunks) => chunks,
+            Err(err) => {
+                let _ = finish_acceleration_phase(
+                    phase_id,
+                    "failed",
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    serde_json::json!({"layout_kind": "vortex"}),
+                    Some(&err.to_string()),
+                );
+                return Err(err);
+            }
+        };
+        let (variant_rows, variant_files, variant_bytes) = variant_chunk_totals(&variant_chunks);
+        let expected_rows = canonical_row_count(rel_oid)?;
+        let valid = validate_variant_chunks(rel_oid, layout, &variant_chunks)?;
+        if valid {
+            rows_written += variant_rows;
+            register_variant_chunks(rel_oid, layout, &variant_chunks)?;
+            mark_variant_status_ready(rel_oid, layout, &variant_chunks)?;
+        }
+        finish_acceleration_phase(
+            phase_id,
+            if valid { "ok" } else { "invalid" },
+            variant_rows,
+            variant_files,
+            variant_bytes,
+            Some(expected_rows),
+            Some(variant_rows),
+            serde_json::json!({
+                "validated": valid,
+                "source": "canonical_parquet",
+                "file_extension": "vortex",
+            }),
+            None,
+        )?;
+    }
+
     // Drop backend-local caches that depend on rvbbit.row_groups state.
     // Without this, the same session would keep planning + scanning from
     // the pre-compact metadata snapshot.
@@ -1219,6 +1307,9 @@ fn refresh_layout_variants_delta_impl(
     let hive_keys = auto_hive_partition_keys(rel_oid, plans);
     let hive_metadata_profile = hive_variant_metadata_profile();
     if !hive_layout_enabled() || hive_keys.is_empty() {
+        if vortex_layout_enabled() {
+            return refresh_vortex_scan_delta_impl(rel_oid, qualified, path_root);
+        }
         return Ok(0);
     }
 
@@ -1334,11 +1425,80 @@ fn refresh_layout_variants_delta_impl(
         )?;
     }
 
+    if vortex_layout_enabled() {
+        rows_written += refresh_vortex_scan_delta_impl(rel_oid, qualified, path_root)?;
+    }
+
     crate::planner::invalidate_planner_aggregates(rel_oid);
     crate::custom_scan::invalidate_scan_metadata(rel_oid);
     crate::columnar_cache::invalidate_table(rel_oid);
 
     Ok(rows_written)
+}
+
+fn refresh_vortex_scan_delta_impl(
+    rel_oid: u32,
+    qualified: &str,
+    path_root: &PathBuf,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let layout = VORTEX_SCAN_LAYOUT;
+    let first_missing = missing_vortex_row_group_count(rel_oid, layout)?;
+    let phase_id = start_acceleration_phase(
+        rel_oid,
+        qualified,
+        "format_variant_delta_append",
+        Some(layout),
+        None,
+        serde_json::json!({
+            "layout_kind": "vortex",
+            "build_mode": "delta_append",
+            "source": "canonical_parquet",
+            "file_extension": "vortex",
+            "missing_canonical_row_groups": first_missing,
+        }),
+    )?;
+    let vortex_root = path_root.join(layout_dir_name(layout));
+    let build_result =
+        write_vortex_scan_chunks_from_canonical_parquet(rel_oid, &[], &vortex_root, layout, true);
+    let variant_chunks = match build_result {
+        Ok(chunks) => chunks,
+        Err(err) => {
+            let _ = finish_acceleration_phase(
+                phase_id,
+                "failed",
+                0,
+                0,
+                0,
+                None,
+                None,
+                serde_json::json!({"layout_kind": "vortex"}),
+                Some(&err.to_string()),
+            );
+            return Err(err);
+        }
+    };
+    let (variant_rows, variant_files, variant_bytes) = variant_chunk_totals(&variant_chunks);
+    if variant_rows > 0 {
+        register_variant_chunks(rel_oid, layout, &variant_chunks)?;
+    }
+    let expected_rows = canonical_row_count(rel_oid)?;
+    let valid = validate_registered_variant_layout(rel_oid, layout)?;
+    finish_acceleration_phase(
+        phase_id,
+        if valid { "ok" } else { "invalid" },
+        variant_rows,
+        variant_files,
+        variant_bytes,
+        Some(expected_rows),
+        None,
+        serde_json::json!({
+            "validated": valid,
+            "source": "canonical_parquet",
+            "file_extension": "vortex",
+        }),
+        None,
+    )?;
+    Ok(if valid { variant_rows } else { 0 })
 }
 
 fn clear_variant_layout(
@@ -1432,6 +1592,26 @@ fn variant_layout_ready(rel_oid: u32, layout: &str) -> bool {
     .ok()
     .flatten()
     .unwrap_or(false)
+}
+
+fn missing_vortex_row_group_count(
+    rel_oid: u32,
+    layout: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let layout_lit = sql_literal(layout);
+    Ok(Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::bigint
+         FROM rvbbit.row_groups rg
+         WHERE rg.table_oid = {rel_oid}::oid
+           AND NOT EXISTS (
+               SELECT 1
+               FROM rvbbit.row_group_variants v
+               WHERE v.table_oid = rg.table_oid
+                 AND v.layout = {layout_lit}
+                 AND v.rg_id = rg.rg_id
+           )"
+    ))?
+    .unwrap_or(0))
 }
 
 fn validate_registered_variant_layout(
@@ -2085,6 +2265,135 @@ fn write_hive_layout_chunks_from_canonical_parquet(
     }
 
     Ok(chunks)
+}
+
+fn write_vortex_scan_chunks_from_canonical_parquet(
+    rel_oid: u32,
+    _plans: &[ColumnPlan],
+    path_root: &PathBuf,
+    layout: &str,
+    only_missing: bool,
+) -> Result<Vec<rvbbit_storage::metadata::RowGroupMeta>, Box<dyn std::error::Error>> {
+    let row_groups = canonical_row_group_paths(rel_oid)?;
+    if row_groups.is_empty() {
+        return Err(format!("table oid {rel_oid} has no canonical parquet row groups").into());
+    }
+
+    std::fs::create_dir_all(path_root)?;
+    let existing = if only_missing {
+        registered_variant_rg_ids(rel_oid, layout)?
+    } else {
+        HashSet::new()
+    };
+    let rt = TokioRuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("creating Vortex writer runtime: {e}"))?;
+    let session = VortexSession::default().with_tokio();
+
+    let mut chunks: Vec<rvbbit_storage::metadata::RowGroupMeta> = Vec::new();
+    for (source_rg_id, source_path) in row_groups {
+        if existing.contains(&source_rg_id) {
+            continue;
+        }
+        let file = File::open(&source_path)
+            .map_err(|e| format!("opening canonical parquet {source_path}: {e}"))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| format!("opening canonical parquet reader {source_path}: {e}"))?
+            .with_batch_size(scan_chunk_rows_setting())
+            .build()
+            .map_err(|e| format!("building canonical parquet reader {source_path}: {e}"))?;
+
+        for (batch_idx, batch) in reader.enumerate() {
+            let batch =
+                batch.map_err(|e| format!("reading canonical parquet {source_path}: {e}"))?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let rg_id = if batch_idx == 0 {
+                source_rg_id
+            } else {
+                source_rg_id
+                    .saturating_mul(1_000_000)
+                    .saturating_add(batch_idx as i64)
+            };
+            let chunk_path = path_root.join(format!("{rg_id}.vortex"));
+            let meta = write_vortex_record_batch(&rt, &session, &chunk_path, rg_id, batch)?;
+            chunks.push(meta);
+        }
+    }
+
+    Ok(chunks)
+}
+
+fn registered_variant_rg_ids(
+    rel_oid: u32,
+    layout: &str,
+) -> Result<HashSet<i64>, Box<dyn std::error::Error>> {
+    let mut out = HashSet::new();
+    let layout_lit = sql_literal(layout);
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(
+            &format!(
+                "SELECT rg_id
+                 FROM rvbbit.row_group_variants
+                 WHERE table_oid = {rel_oid}::oid AND layout = {layout_lit}"
+            ),
+            None,
+            &[],
+        )?;
+        for row in table {
+            if let Some(rg_id) = row.get::<i64>(1)? {
+                out.insert(rg_id);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn write_vortex_record_batch(
+    rt: &tokio::runtime::Runtime,
+    session: &VortexSession,
+    path: &PathBuf,
+    rg_id: i64,
+    batch: RecordBatch,
+) -> Result<rvbbit_storage::metadata::RowGroupMeta, Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let n_rows = batch.num_rows() as i64;
+    let schema = batch.schema();
+    rt.block_on(async {
+        let array = session
+            .arrow()
+            .from_arrow_record_batch(batch, &schema)
+            .map_err(|e| format!("converting Arrow batch to Vortex: {e}"))?;
+        let mut file = tokio::fs::File::create(path)
+            .await
+            .map_err(|e| format!("creating Vortex file {}: {e}", path.display()))?;
+        session
+            .write_options()
+            .write(&mut file, array.to_array_stream())
+            .await
+            .map_err(|e| format!("writing Vortex file {}: {e}", path.display()))?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    let n_bytes = std::fs::metadata(path)
+        .map_err(|e| format!("stat Vortex file {}: {e}", path.display()))?
+        .len() as i64;
+    Ok(rvbbit_storage::metadata::RowGroupMeta {
+        rg_id,
+        path: path.to_string_lossy().into_owned(),
+        n_rows,
+        n_bytes,
+        min_xid: None,
+        max_xid: None,
+        column_stats: Vec::new(),
+        per_group_stats: Vec::new(),
+        column_bitmaps: Vec::new(),
+        text_dictionaries: Vec::new(),
+    })
 }
 
 fn canonical_row_group_paths(

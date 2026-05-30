@@ -21,6 +21,7 @@ from rvbbit_duck_hot import (  # noqa: E402
     run_rvbbit_datafusion_hive_forced,
     run_rvbbit_datafusion_forced,
     run_rvbbit_duck_hive_forced,
+    run_rvbbit_duck_vortex_forced,
     run_rvbbit_duck_hot,
 )
 
@@ -33,6 +34,7 @@ PG_DSNS = {
     "rvbbit_native": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff",
     "rvbbit_native_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Drvbbit_native",
     "rvbbit_datafusion_mem_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_mem",
+    "rvbbit_datafusion_vortex_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_vortex",
     "rvbbit_pg_heap_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
     "rvbbit_pg_heap": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
     "pg_heap": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
@@ -53,6 +55,8 @@ ROUTE_GUCS = {
     "RVBBIT_ROUTE_DATAFUSION_MEM": "rvbbit.route_datafusion_mem",
     "RVBBIT_ROUTE_DATAFUSION_VECTOR": "rvbbit.route_datafusion_vector",
     "RVBBIT_ROUTE_DATAFUSION_HIVE": "rvbbit.route_datafusion_hive",
+    "RVBBIT_ROUTE_DATAFUSION_VORTEX": "rvbbit.route_datafusion_vortex",
+    "RVBBIT_ROUTE_DATAFUSION_VORTEX_ALLOW_TEMPORAL": "rvbbit.route_datafusion_vortex_allow_temporal",
     "RVBBIT_ROUTE_HIVE": "rvbbit.route_hive",
     "RVBBIT_ROUTE_PG_ROWSTORE": "rvbbit.route_pg_rowstore",
     "RVBBIT_ROUTE_RVBBIT_NATIVE": "rvbbit.route_rvbbit_native",
@@ -119,6 +123,7 @@ def run_pg(
     repeat: int = 3,
     timeout_s: int = 300,
     capture_route: bool = False,
+    expect_candidate: str | None = None,
 ) -> float:
     times: list[float] = []
     route_doc = None
@@ -126,11 +131,20 @@ def run_pg(
         with conn.cursor() as cur:
             cur.execute(f"SET statement_timeout = {timeout_s * 1000}".encode())  # type: ignore[arg-type]
             _apply_route_gucs(cur)
-            if capture_route:
+            if capture_route or expect_candidate:
                 route_doc = _route_explain(cur, sql)
                 if isinstance(route_doc, dict) and route_doc.get("error"):
                     cur.execute(f"SET statement_timeout = {timeout_s * 1000}".encode())  # type: ignore[arg-type]
                     _apply_route_gucs(cur)
+                if expect_candidate:
+                    if not isinstance(route_doc, dict):
+                        raise RuntimeError("route_explain returned no route document")
+                    chosen = route_doc.get("chosen_candidate")
+                    if chosen != expect_candidate:
+                        reason = str(route_doc.get("reason") or "no reason")
+                        raise RuntimeError(
+                            f"route {chosen or 'none'} != {expect_candidate}: {reason}"
+                        )
             for _ in range(repeat):
                 t0 = time.perf_counter()
                 cur.execute(sql.encode())  # type: ignore[arg-type]
@@ -174,6 +188,8 @@ def runner_for(system: str) -> Callable[..., float]:
         return lambda sql, repeat=3: run_pg(PG_DSNS["rvbbit_native_forced"], sql, repeat)
     if system in {"rvbbit_pg_heap_forced", "rvbbit_pg_heap", "pg_heap"}:
         return lambda sql, repeat=3: run_pg(PG_DSNS[system], sql, repeat)
+    if system == "rvbbit_datafusion_vortex_forced":
+        return lambda sql, repeat=3: run_pg(PG_DSNS[system], sql, repeat)
     if system == "rvbbit_duck_hot":
         return run_rvbbit_duck_hot
     if system == "rvbbit_duck_auto":
@@ -182,6 +198,8 @@ def runner_for(system: str) -> Callable[..., float]:
         return lambda sql, repeat=3: run_rvbbit_duck_hot(sql, repeat, mode="force-duck")
     if system == "rvbbit_duck_hive_forced":
         return run_rvbbit_duck_hive_forced
+    if system == "rvbbit_duck_vortex_forced":
+        return run_rvbbit_duck_vortex_forced
     if system == "rvbbit_datafusion_forced":
         return run_rvbbit_datafusion_forced
     if system == "rvbbit_datafusion_hive_forced":

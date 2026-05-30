@@ -58,18 +58,26 @@ HITS="${DATA_DIR}/hits.parquet"
 LIMIT="${BENCH_LIMIT:-10000000}"
 SYSTEMS="${BENCH_SYSTEMS:-rvbbit,duckdb,clickhouse,pg_baseline,citus,hydra,alloydb}"
 RVBBIT_SELECTED=0
-if [[ ",${SYSTEMS}," == *",rvbbit,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hot,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_auto,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_mem_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",pg_heap,"* ]]; then
+if [[ ",${SYSTEMS}," == *",rvbbit,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hot,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_auto,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_mem_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",pg_heap,"* ]]; then
     RVBBIT_SELECTED=1
 fi
 HIVE_FORCED_SELECTED=0
 if [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]]; then
     HIVE_FORCED_SELECTED=1
 fi
+VORTEX_FORCED_SELECTED=0
+if [[ ",${SYSTEMS}," == *",rvbbit_datafusion_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_vortex_forced,"* ]]; then
+    VORTEX_FORCED_SELECTED=1
+fi
 HIVE_REFRESH_DEFAULT="off"
 if [ "${RVBBIT_SELECTED}" = "1" ]; then
     HIVE_REFRESH_DEFAULT="sync"
 fi
 HIVE_REFRESH_DISPLAY="${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD:-${HIVE_REFRESH_DEFAULT}}"
+VORTEX_LAYOUT_DISPLAY="${RVBBIT_COMPACT_VORTEX_LAYOUT:-off}"
+if [ "${VORTEX_FORCED_SELECTED}" = "1" ] && [ -z "${RVBBIT_COMPACT_VORTEX_LAYOUT:-}" ]; then
+    VORTEX_LAYOUT_DISPLAY="on"
+fi
 QUERIES_ENV=()
 [ -n "${BENCH_QUERIES:-}" ] && QUERIES_ENV=(-e "BENCH_QUERIES=${BENCH_QUERIES}")
 DUCK_HOT_ENV=()
@@ -86,6 +94,7 @@ DUCK_HOT_ENV=()
 [ -n "${RVBBIT_ROUTE_DATAFUSION_MEM:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_MEM=${RVBBIT_ROUTE_DATAFUSION_MEM}")
 [ -n "${RVBBIT_ROUTE_DATAFUSION_VECTOR:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_VECTOR=${RVBBIT_ROUTE_DATAFUSION_VECTOR}")
 [ -n "${RVBBIT_ROUTE_DATAFUSION_HIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_HIVE=${RVBBIT_ROUTE_DATAFUSION_HIVE}")
+[ -n "${RVBBIT_ROUTE_DATAFUSION_VORTEX:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_VORTEX=${RVBBIT_ROUTE_DATAFUSION_VORTEX}")
 [ -n "${RVBBIT_ROUTE_HIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_HIVE=${RVBBIT_ROUTE_HIVE}")
 [ -n "${RVBBIT_ROUTE_PG_ROWSTORE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_PG_ROWSTORE=${RVBBIT_ROUTE_PG_ROWSTORE}")
 [ -n "${RVBBIT_ROUTE_RVBBIT_NATIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_RVBBIT_NATIVE=${RVBBIT_ROUTE_RVBBIT_NATIVE}")
@@ -109,6 +118,11 @@ if [ "${HIVE_FORCED_SELECTED}" = "1" ]; then
     LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_LAYOUT=${RVBBIT_COMPACT_HIVE_LAYOUT:-on}")
 elif [ -n "${RVBBIT_COMPACT_HIVE_LAYOUT:-}" ]; then
     LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_LAYOUT=${RVBBIT_COMPACT_HIVE_LAYOUT}")
+fi
+if [ "${VORTEX_FORCED_SELECTED}" = "1" ]; then
+    LOAD_ENV+=(-e "RVBBIT_COMPACT_VORTEX_LAYOUT=${RVBBIT_COMPACT_VORTEX_LAYOUT:-on}")
+elif [ -n "${RVBBIT_COMPACT_VORTEX_LAYOUT:-}" ]; then
+    LOAD_ENV+=(-e "RVBBIT_COMPACT_VORTEX_LAYOUT=${RVBBIT_COMPACT_VORTEX_LAYOUT}")
 fi
 if [ "${RVBBIT_SELECTED}" = "1" ] || [ -n "${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD:-}" ]; then
     LOAD_ENV+=(-e "RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=${HIVE_REFRESH_DISPLAY}")
@@ -243,6 +257,7 @@ record_benchmark_history() {
         --setting "rebuild=${BENCH_REBUILD:-0}" \
         --setting "rvbbit_reset_extension=${RVBBIT_RESET_EXTENSION:-0}" \
         --setting "hive_refresh=${HIVE_REFRESH_DISPLAY}" \
+        --setting "vortex_layout=${VORTEX_LAYOUT_DISPLAY}" \
         --setting "df_inprocess=${RVBBIT_DF_INPROCESS:-on}" \
         --setting "hot_store_budget_mb=${RVBBIT_HOT_STORE_BUDGET_MB:-512}" \
         --setting "hot_store_route_max_rows=${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS:-500000}"; then
@@ -307,6 +322,7 @@ echo "   rebuild     : $(env_on "${BENCH_REBUILD}" && echo yes || echo no)"
 echo "   persist     : $(env_on "${BENCH_PERSIST_RESULTS}" && echo yes || echo no)"
 echo "   df_inprocess: ${RVBBIT_DF_INPROCESS:-on (default)}"
 echo "   hive refresh: ${HIVE_REFRESH_DISPLAY}"
+echo "   vortex      : ${VORTEX_LAYOUT_DISPLAY}"
 echo "   hot store   : budget=${RVBBIT_HOT_STORE_BUDGET_MB:-512}MB route_max_rows=${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS:-500000}"
 
 if [ "${RVBBIT_SELECTED:-1}" = "1" ] && ! env_on "${BENCH_REBUILD}" && ! env_on "${RVBBIT_RESET_EXTENSION}"; then

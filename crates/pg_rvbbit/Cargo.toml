@@ -34,6 +34,8 @@ roaring = { workspace = true }
 fastembed = { workspace = true }
 datafusion = { workspace = true }
 tokio = { workspace = true }
+vortex = { workspace = true }
+vortex-datafusion = { workspace = true }
 lance = { workspace = true }
 lance-index = { workspace = true }
 lance-linalg = { workspace = true }

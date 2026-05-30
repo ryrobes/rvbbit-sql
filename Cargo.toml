@@ -3,7 +3,7 @@ members = ["crates/pg_rvbbit", "crates/rvbbit_storage", "warren/agent"]
 resolver = "2"
 
 [workspace.package]
-version = "0.60.1"
+version = "0.60.2"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Rvbbit contributors"]
@@ -46,7 +46,9 @@ fastembed = { version = "5.13.4", default-features = false, features = ["hf-hub-
 # so both engines share a single Arrow/parquet ABI. The `sql` feature is
 # what gates SessionContext::sql() in DF 53+ (was implicit in DF 49).
 datafusion = { version = "53", default-features = false, features = ["parquet", "sql"] }
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", default-features = false, features = ["fs", "rt", "rt-multi-thread", "macros", "time"] }
+vortex = { version = "0.73", features = ["tokio", "object_store"] }
+vortex-datafusion = "0.73"
 # Lance dataset format: DataFusion-native columnar format with native vector
 # index support (IVF-PQ, HNSW). Pinned to the release line that pulls
 # datafusion 53 + arrow 58 + parquet 58, exactly matching our workspace.

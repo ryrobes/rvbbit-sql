@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_observations (
     candidate     text NOT NULL,
     elapsed_ms    double precision NOT NULL,
     status        text NOT NULL DEFAULT 'ok',
-    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore')),
     CHECK (elapsed_ms >= 0)
 );
 
@@ -146,7 +146,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_training_results (
     validation_status  text NOT NULL DEFAULT 'unknown',
     error              text,
     route_doc          jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore')),
     CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
     CHECK (rows_returned IS NULL OR rows_returned >= 0),
     CHECK (repeat_idx > 0)
@@ -205,7 +205,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_decisions (
     rewritten     boolean NOT NULL DEFAULT false,
     features      jsonb NOT NULL DEFAULT '{}'::jsonb,
     route_doc     jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore')),
     CHECK (confidence IS NULL OR confidence >= 0)
 );
 
@@ -250,7 +250,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_executions (
     status        text NOT NULL DEFAULT 'ok',
     features      jsonb NOT NULL DEFAULT '{}'::jsonb,
     route_doc     jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore')),
     CHECK (confidence IS NULL OR confidence >= 0),
     CHECK (elapsed_ms >= 0),
     CHECK (rows_returned >= 0)
@@ -278,25 +278,25 @@ ALTER TABLE IF EXISTS rvbbit.route_observations
     DROP CONSTRAINT IF EXISTS route_observations_candidate_check;
 ALTER TABLE IF EXISTS rvbbit.route_observations
     ADD CONSTRAINT route_observations_candidate_check
-    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore'));
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore'));
 
 ALTER TABLE IF EXISTS rvbbit.route_training_results
     DROP CONSTRAINT IF EXISTS route_training_results_candidate_check;
 ALTER TABLE IF EXISTS rvbbit.route_training_results
     ADD CONSTRAINT route_training_results_candidate_check
-    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore'));
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore'));
 
 ALTER TABLE IF EXISTS rvbbit.route_decisions
     DROP CONSTRAINT IF EXISTS route_decisions_candidate_check;
 ALTER TABLE IF EXISTS rvbbit.route_decisions
     ADD CONSTRAINT route_decisions_candidate_check
-    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore'));
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore'));
 
 ALTER TABLE IF EXISTS rvbbit.route_executions
     DROP CONSTRAINT IF EXISTS route_executions_candidate_check;
 ALTER TABLE IF EXISTS rvbbit.route_executions
     ADD CONSTRAINT route_executions_candidate_check
-    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore'));
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS route_profiles_one_active_idx
     ON rvbbit.route_profiles ((active))
@@ -319,7 +319,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_profile_entries (
     created_at    timestamptz NOT NULL DEFAULT now(),
     updated_at    timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (profile_name, shape_key),
-    CHECK (choice IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (choice IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore')),
     CHECK (confidence >= 0)
 );
 
@@ -367,7 +367,7 @@ ALTER TABLE IF EXISTS rvbbit.route_profile_entries
     DROP CONSTRAINT IF EXISTS route_profile_entries_choice_check;
 ALTER TABLE IF EXISTS rvbbit.route_profile_entries
     ADD CONSTRAINT route_profile_entries_choice_check
-    CHECK (choice IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'rvbbit_native', 'pg_rowstore'));
+    CHECK (choice IN ('duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore'));
 
 CREATE INDEX IF NOT EXISTS route_profile_points_family_idx
     ON rvbbit.route_profile_points (profile_name, shape_family, table_rows);
@@ -482,7 +482,7 @@ CREATE OR REPLACE VIEW rvbbit.route_shape_summary AS
 WITH candidate_stats AS (
     SELECT *
     FROM rvbbit.route_observation_summary
-    WHERE candidate IN ('rvbbit_native', 'duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'pg_rowstore')
+    WHERE candidate IN ('rvbbit_native', 'duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'pg_rowstore')
 ),
 shape_stats AS (
     SELECT
@@ -645,18 +645,20 @@ enum Candidate {
     DataFusionMem,
     DataFusionVector,
     DataFusionHive,
+    DataFusionVortex,
     RvbbitNative,
     PgRowstore,
 }
 
 impl Candidate {
-    fn all() -> [Self; 7] {
+    fn all() -> [Self; 8] {
         [
             Candidate::DuckVector,
             Candidate::DuckHive,
             Candidate::DataFusionMem,
             Candidate::DataFusionVector,
             Candidate::DataFusionHive,
+            Candidate::DataFusionVortex,
             Candidate::RvbbitNative,
             Candidate::PgRowstore,
         ]
@@ -669,6 +671,7 @@ impl Candidate {
             Candidate::DataFusionMem => "datafusion_mem",
             Candidate::DataFusionVector => "datafusion_vector",
             Candidate::DataFusionHive => "datafusion_hive",
+            Candidate::DataFusionVortex => "datafusion_vortex",
             Candidate::RvbbitNative => "rvbbit_native",
             Candidate::PgRowstore => "pg_rowstore",
         }
@@ -681,6 +684,7 @@ impl Candidate {
             Candidate::DataFusionMem => "datafusion_mem",
             Candidate::DataFusionVector => "datafusion",
             Candidate::DataFusionHive => "datafusion_hive",
+            Candidate::DataFusionVortex => "datafusion_vortex",
             Candidate::RvbbitNative => "native",
             Candidate::PgRowstore => "postgres_rowstore",
         }
@@ -693,6 +697,9 @@ impl Candidate {
             "datafusion_mem" | "datafusion-memory" | "df_mem" => Some(Candidate::DataFusionMem),
             "datafusion_vector" | "datafusion" | "df" => Some(Candidate::DataFusionVector),
             "datafusion_hive" | "datafusion-hive" | "df_hive" => Some(Candidate::DataFusionHive),
+            "datafusion_vortex" | "datafusion-vortex" | "df_vortex" | "vortex" => {
+                Some(Candidate::DataFusionVortex)
+            }
             "rvbbit_native" | "native" => Some(Candidate::RvbbitNative),
             "pg_rowstore" | "postgres_rowstore" => Some(Candidate::PgRowstore),
             _ => None,
@@ -725,6 +732,7 @@ struct RvbbitTableMetric {
     shadow_heap_dirty: bool,
     delete_count: i64,
     text_columns: Vec<String>,
+    temporal_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2448,7 +2456,7 @@ fn choose_from_observation_curve(
                  FROM rvbbit.route_observations \
                  WHERE shape_family IN ({family_lit}, {legacy_family_lit}) \
                    AND status = 'ok' \
-                   AND candidate IN ('rvbbit_native', 'duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'pg_rowstore') \
+                   AND candidate IN ('rvbbit_native', 'duck_vector', 'duck_hive', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'pg_rowstore') \
                    AND features ? 'table_rows' \
                  ORDER BY observed_at DESC \
                  LIMIT 2000"
@@ -2946,6 +2954,7 @@ fn candidate_median_field(candidate: &str) -> Option<&'static str> {
         Candidate::DataFusionMem => None,
         Candidate::DataFusionVector => Some("datafusion_ms_median"),
         Candidate::DataFusionHive => Some("datafusion_hive_ms_median"),
+        Candidate::DataFusionVortex => None,
         Candidate::PgRowstore => Some("pg_ms_median"),
     }
 }
@@ -3612,6 +3621,20 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
                           AND a.attnum > 0 \
                           AND NOT a.attisdropped \
                           AND a.atttypid IN ('text'::regtype, 'varchar'::regtype, 'bpchar'::regtype, 'name'::regtype) \
+                    ), ''), \
+                    coalesce(( \
+                        SELECT string_agg(lower(a.attname::text), ',' ORDER BY a.attnum) \
+                        FROM pg_attribute a \
+                        WHERE a.attrelid = c.oid \
+                          AND a.attnum > 0 \
+                          AND NOT a.attisdropped \
+                          AND a.atttypid IN ( \
+                              'date'::regtype, \
+                              'timestamp without time zone'::regtype, \
+                              'timestamp with time zone'::regtype, \
+                              'time without time zone'::regtype, \
+                              'time with time zone'::regtype \
+                          ) \
                     ), '') \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -3649,6 +3672,14 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
                 delete_count: row.get(10)?.unwrap_or_default(),
                 text_columns: row
                     .get::<String>(11)?
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|col| !col.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                temporal_columns: row
+                    .get::<String>(12)?
                     .unwrap_or_default()
                     .split(',')
                     .map(str::trim)
@@ -4036,6 +4067,7 @@ fn table_metric_json(t: &RvbbitTableMetric) -> Value {
         "shadow_heap_retained": t.shadow_heap_retained,
         "shadow_heap_dirty": t.shadow_heap_dirty,
         "text_columns": t.text_columns,
+        "temporal_columns": t.temporal_columns,
         "parquet_authoritative": t.delete_count == 0
             && (t.heap_bytes == 0 || (t.shadow_heap_retained && !t.shadow_heap_dirty)),
         "delete_count": t.delete_count,
@@ -4169,6 +4201,93 @@ fn table_has_hive_variant(table_oid: u32) -> bool {
     .unwrap_or(false)
 }
 
+fn vortex_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> (bool, String) {
+    let (base_available, base_reason) = duck_availability(features, tables);
+    if !base_available {
+        return (false, base_reason);
+    }
+    if features.regex_count > 0 {
+        return (false, "Postgres regex semantics required".to_string());
+    }
+    if !vortex_temporal_allowed() {
+        if let Some(reason) = vortex_temporal_reference_reason(features, tables) {
+            return (false, reason);
+        }
+    }
+    if !relations_present(&["rvbbit.row_group_variants", "rvbbit.layout_variant_status"]) {
+        return (
+            false,
+            "Vortex accelerator catalog is not available".to_string(),
+        );
+    }
+    let missing = tables
+        .iter()
+        .filter(|table| !table_has_vortex_scan(table.oid))
+        .map(|table| format!("{}.{}", table.schema, table.relname))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return (
+            false,
+            format!("Vortex accelerator is missing for {}", missing.join(", ")),
+        );
+    }
+    (
+        true,
+        "DataFusion Vortex accelerator files available and authoritative".to_string(),
+    )
+}
+
+fn vortex_temporal_reference_reason(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<String> {
+    let referenced = tables
+        .iter()
+        .flat_map(|table| {
+            table.temporal_columns.iter().filter_map(|column| {
+                if contains_column_identifier(&features.normalized_sql, column) {
+                    Some(format!("{}.{}.{}", table.schema, table.relname, column))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    if referenced.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Vortex/DataFusion temporal pruning is disabled for referenced date/time column(s): {}",
+            referenced.join(", ")
+        ))
+    }
+}
+
+fn vortex_temporal_allowed() -> bool {
+    route_enabled(
+        "RVBBIT_ROUTE_DATAFUSION_VORTEX_ALLOW_TEMPORAL",
+        "rvbbit.route_datafusion_vortex_allow_temporal",
+        false,
+    )
+}
+
+fn table_has_vortex_scan(table_oid: u32) -> bool {
+    Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS (\
+             SELECT 1 FROM rvbbit.row_group_variants rg \
+             JOIN rvbbit.layout_variant_status s \
+               ON s.table_oid = rg.table_oid AND s.layout = rg.layout \
+             WHERE rg.table_oid = {table_oid}::oid \
+               AND rg.layout = 'vortex_scan' \
+               AND s.status = 'ready' \
+             LIMIT 1\
+         )"
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 fn candidate_gate_enabled(candidate: Candidate) -> bool {
     match candidate {
         Candidate::DuckVector => {
@@ -4196,6 +4315,11 @@ fn candidate_gate_enabled(candidate: Candidate) -> bool {
                     true,
                 )
         }
+        Candidate::DataFusionVortex => route_enabled(
+            "RVBBIT_ROUTE_DATAFUSION_VORTEX",
+            "rvbbit.route_datafusion_vortex",
+            true,
+        ),
         Candidate::RvbbitNative => route_enabled(
             "RVBBIT_ROUTE_RVBBIT_NATIVE",
             "rvbbit.route_rvbbit_native",
@@ -4265,6 +4389,7 @@ fn candidate_availability(
         Candidate::DataFusionMem => hot_mem_availability(features, tables),
         Candidate::DataFusionVector => vector_availability("DataFusion", features, tables),
         Candidate::DuckHive | Candidate::DataFusionHive => hive_availability(features, tables),
+        Candidate::DataFusionVortex => vortex_availability(features, tables),
         Candidate::RvbbitNative => (true, "Rvbbit native PostgreSQL path available".to_string()),
         Candidate::PgRowstore => pg_rowstore_availability(tables),
     }
@@ -5195,7 +5320,7 @@ fn persist_profile_tables(
                e.value
         FROM jsonb_each(coalesce({profile_lit}::jsonb->'entries', '{{}}'::jsonb)) AS e(key, value)
         WHERE e.value ? 'choice'
-          AND e.value->>'choice' IN ('duck', 'duck_hive', 'native', 'datafusion_mem', 'df_mem', 'datafusion', 'datafusion_hive', 'df_hive', 'pg_heap', 'duck_vector', 'datafusion_vector', 'rvbbit_native', 'pg_rowstore')
+          AND e.value->>'choice' IN ('duck', 'duck_hive', 'native', 'datafusion_mem', 'df_mem', 'datafusion', 'datafusion_hive', 'datafusion_vortex', 'df_hive', 'pg_heap', 'duck_vector', 'datafusion_vector', 'rvbbit_native', 'pg_rowstore')
         "#
     ))?;
     Spi::run(&format!(
@@ -6219,6 +6344,7 @@ mod route_unit_tests {
             shadow_heap_dirty: false,
             delete_count: 0,
             text_columns: Vec::new(),
+            temporal_columns: Vec::new(),
         }
     }
 

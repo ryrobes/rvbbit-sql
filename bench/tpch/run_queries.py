@@ -20,6 +20,7 @@ from runners import (  # noqa: E402
     run_rvbbit_datafusion_hive_forced,
     run_rvbbit_datafusion_forced,
     run_rvbbit_duck_hive_forced,
+    run_rvbbit_duck_vortex_forced,
     run_rvbbit_duck_hot,
     run_clickhouse,
     run_duckdb,
@@ -36,7 +37,7 @@ REPEATS = int(os.environ.get("BENCH_REPEATS", "3"))
 TIMEOUT_S = int(os.environ.get("BENCH_TIMEOUT", "300"))
 WALL_TIMEOUT_S = float(os.environ.get("BENCH_WALL_TIMEOUT", str(TIMEOUT_S)))
 WALL_TIMEOUT_GRACE_S = float(os.environ.get("BENCH_WALL_TIMEOUT_GRACE", "5"))
-WALL_TIMEOUT_SYSTEMS = {"duckdb", "clickhouse"}
+WALL_TIMEOUT_SYSTEMS = {"duckdb", "clickhouse", "rvbbit_duck_vortex_forced"}
 SELECTED = os.environ.get("BENCH_QUERIES")
 SELECTED_SET = set(SELECTED.split(",")) if SELECTED else None
 REPORT_COLD_WARM = os.environ.get("BENCH_REPORT_COLD_WARM", "").strip().lower() in {
@@ -95,6 +96,9 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
         if system == "rvbbit_duck_hive_forced":
             ms = run_rvbbit_duck_hive_forced(sql, REPEATS, TIMEOUT_S, label=qid, suite="tpch")
             return ms, rvbbit_duck_hot_status()
+        if system == "rvbbit_duck_vortex_forced":
+            ms = run_rvbbit_duck_vortex_forced(sql, REPEATS, TIMEOUT_S, label=qid, suite="tpch")
+            return ms, rvbbit_duck_hot_status()
         if system == "rvbbit_datafusion_forced":
             ms = run_rvbbit_datafusion_forced(sql, REPEATS, TIMEOUT_S, label=qid, suite="tpch")
             return ms, rvbbit_duck_hot_status()
@@ -106,6 +110,23 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
             record_rvbbit_route_observation(
                 sql,
                 "datafusion_mem",
+                ms,
+                "ok",
+                f"benchmark:tpch:{system}",
+            )
+            return ms, "ok"
+        if system == "rvbbit_datafusion_vortex_forced":
+            ms = run_pg(
+                PG_DSNS[system],
+                sql,
+                REPEATS,
+                TIMEOUT_S,
+                capture_route=True,
+                expect_candidate="datafusion_vortex",
+            )
+            record_rvbbit_route_observation(
+                sql,
+                "datafusion_vortex",
                 ms,
                 "ok",
                 f"benchmark:tpch:{system}",
