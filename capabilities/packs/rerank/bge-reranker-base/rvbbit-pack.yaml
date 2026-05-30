@@ -1,0 +1,31 @@
+api_version: rvbbit.pack/v1
+id: rerank/bge-reranker-base
+name: bge_reranker_base
+title: BGE Reranker Base
+description: Smaller BGE cross-encoder reranker for query/document scoring and row ranking.
+license: mit
+tags:
+- rerank
+- retrieval
+- relevance
+- row
+- cpu-friendly
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: BAAI/bge-reranker-base
+  url: https://huggingface.co/BAAI/bge-reranker-base
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+exports:
+  backend: rerank_bge_base
+  operators:
+  - rerank_bge_base_score
+  - rerank_bge_base_row
+install:
+  mode: build
+  warren: true
+  docker: true

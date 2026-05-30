@@ -1,0 +1,31 @@
+api_version: rvbbit.pack/v1
+id: classify/emotion-distilroberta
+name: emotion_distilroberta
+title: Emotion Classifier
+description: Classify text into emotion labels for support, survey, content, and conversation analytics.
+license: unknown
+tags:
+- classify
+- emotion
+- text
+- tabular
+- row
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: j-hartmann/emotion-english-distilroberta-base
+  url: https://huggingface.co/j-hartmann/emotion-english-distilroberta-base
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+exports:
+  backend: classify_emotion_distilroberta
+  operators:
+  - classify_emotion
+  - classify_row_emotion
+install:
+  mode: build
+  warren: true
+  docker: true

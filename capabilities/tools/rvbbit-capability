@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Render and scaffold Rvbbit capability manifests.
+"""Render and scaffold Rvbbit capability packs and manifests.
 
-The tool is intentionally dependency-light. YAML manifests require PyYAML;
-JSON manifests work with the Python standard library.
+The tool is intentionally dependency-light. YAML pack/manifests require PyYAML;
+JSON pack/manifests work with the Python standard library.
 """
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import subprocess
@@ -16,10 +17,19 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = ROOT.parent
+PACKS = ROOT / "packs"
 TEMPLATES = ROOT / "templates"
+PACK_MANIFEST_NAMES = ("rvbbit-pack.yaml", "rvbbit-pack.json")
+CAPABILITY_MANIFEST_NAMES = (
+    "capability.yaml",
+    "capability.json",
+    "rvbbit.backend.yaml",
+    "rvbbit.backend.json",
+)
 
 
-def load_manifest(path: Path) -> dict[str, Any]:
+def load_doc(path: Path) -> dict[str, Any]:
     text = path.read_text()
     if path.suffix.lower() == ".json":
         data = json.loads(text)
@@ -33,8 +43,75 @@ def load_manifest(path: Path) -> dict[str, Any]:
         data = yaml.safe_load(text)
     if not isinstance(data, dict):
         raise SystemExit(f"{path}: manifest must be an object")
-    validate_manifest(data, path)
     return data
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    manifest_path = resolve_manifest_path(path)
+    data = load_doc(manifest_path)
+    validate_manifest(data, manifest_path)
+    return data
+
+
+def load_pack_metadata(path: Path) -> dict[str, Any]:
+    data = load_doc(path)
+    validate_pack_metadata(data, path)
+    return data
+
+
+def load_pack_and_manifest(path: Path) -> tuple[Path | None, dict[str, Any], Path, dict[str, Any]]:
+    pack_path = find_pack_manifest(path)
+    if pack_path:
+        pack = load_pack_metadata(pack_path)
+        manifest_path = pack_capability_path(pack_path, pack)
+        manifest = load_manifest(manifest_path)
+        return pack_path, pack, manifest_path, manifest
+    manifest_path = resolve_manifest_path(path)
+    return None, {}, manifest_path, load_manifest(manifest_path)
+
+
+def validate_pack_metadata(pack: dict[str, Any], path: Path) -> None:
+    required = ["api_version", "id", "name", "capability"]
+    missing = [key for key in required if key not in pack]
+    if missing:
+        raise SystemExit(f"{path}: missing required pack field(s): {', '.join(missing)}")
+    if pack["api_version"] != "rvbbit.pack/v1":
+        raise SystemExit(f"{path}: unsupported pack api_version {pack['api_version']!r}")
+    if not str(pack["id"]).strip():
+        raise SystemExit(f"{path}: pack id cannot be empty")
+    if not str(pack["capability"]).strip():
+        raise SystemExit(f"{path}: capability path cannot be empty")
+
+
+def find_pack_manifest(path: Path) -> Path | None:
+    if path.is_file() and path.name in PACK_MANIFEST_NAMES:
+        return path
+    if path.is_dir():
+        for name in PACK_MANIFEST_NAMES:
+            candidate = path / name
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def pack_capability_path(pack_path: Path, pack: dict[str, Any]) -> Path:
+    capability = Path(str(pack.get("capability") or "capability.yaml"))
+    if capability.is_absolute():
+        return capability
+    return pack_path.parent / capability
+
+
+def resolve_manifest_path(path: Path) -> Path:
+    pack_path = find_pack_manifest(path)
+    if pack_path:
+        pack = load_pack_metadata(pack_path)
+        return pack_capability_path(pack_path, pack)
+    if path.is_dir():
+        for name in CAPABILITY_MANIFEST_NAMES:
+            candidate = path / name
+            if candidate.exists():
+                return candidate
+    return path
 
 
 def validate_manifest(manifest: dict[str, Any], path: Path) -> None:
@@ -288,10 +365,10 @@ def render_compose(manifest: dict[str, Any]) -> str:
         for spec in volume_specs
         if spec.get("name") and spec.get("mount")
     )
+    runtime_source = render_runtime_source(runtime)
     return f"""services:
   {service}:
-    build: .
-    container_name: rvbbit-{service}
+{runtime_source}    container_name: rvbbit-{service}
     ports:
       - "${{RVBBIT_CAPABILITY_PORT:-8080}}:8080"
     environment:
@@ -314,6 +391,24 @@ networks:
 volumes:
 {volume_defs}
 """
+
+
+def runtime_image(runtime: dict[str, Any]) -> str | None:
+    image = str(runtime.get("image") or "").strip()
+    if not image:
+        return None
+    digest = str(runtime.get("image_digest") or "").strip()
+    if digest and "@" not in image:
+        return f"{image}@{digest}"
+    return image
+
+
+def render_runtime_source(runtime: dict[str, Any]) -> str:
+    image = runtime_image(runtime)
+    if image:
+        pull_policy = runtime.get("pull_policy") or "missing"
+        return f"    image: {json.dumps(image)}\n    pull_policy: {json.dumps(pull_policy)}\n"
+    return "    build: .\n"
 
 
 def render_gpu_compose(manifest: dict[str, Any]) -> str:
@@ -384,36 +479,37 @@ def scaffold(manifest: dict[str, Any], out_dir: Path, force: bool = False) -> No
 
     runtime = manifest.get("runtime") or {}
     source = manifest.get("source") or {}
-    template = runtime.get("template", "hf-rvbbit-fastapi")
-    template_dir = TEMPLATES / template
-    if not template_dir.exists():
-        raise SystemExit(f"template not found: {template}")
+    if not runtime_image(runtime):
+        template = runtime.get("template", "hf-rvbbit-fastapi")
+        template_dir = TEMPLATES / template
+        if not template_dir.exists():
+            raise SystemExit(f"template not found: {template}")
 
-    base_image = runtime.get("base_image", "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime")
-    values = {
-        "base_image": base_image,
-        "model": source.get("model", ""),
-        "revision": source.get("revision", ""),
-        "handler": runtime.get("handler", "custom"),
-        "device": runtime.get("device", "auto"),
-    }
+        base_image = runtime.get("base_image", "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime")
+        values = {
+            "base_image": base_image,
+            "model": source.get("model", ""),
+            "revision": source.get("revision", ""),
+            "handler": runtime.get("handler", "custom"),
+            "device": runtime.get("device", "auto"),
+        }
 
-    for path in template_dir.iterdir():
-        if path.is_file():
-            text = replace_tokens(path.read_text(), values)
-            target = out_dir / path.name
-            target.write_text(text)
+        for path in template_dir.iterdir():
+            if path.is_file():
+                text = replace_tokens(path.read_text(), values)
+                target = out_dir / path.name
+                target.write_text(text)
 
-    extra = handler_requirements(runtime.get("handler", "custom"))
-    extra.extend(runtime.get("extra_requirements") or [])
-    if extra:
-        req_path = out_dir / "requirements.txt"
-        existing = set(req_path.read_text().splitlines()) if req_path.exists() else set()
-        with req_path.open("a") as fh:
-            for req in extra:
-                if req not in existing:
-                    fh.write(f"\n{req}\n")
-                    existing.add(req)
+        extra = handler_requirements(runtime.get("handler", "custom"))
+        extra.extend(runtime.get("extra_requirements") or [])
+        if extra:
+            req_path = out_dir / "requirements.txt"
+            existing = set(req_path.read_text().splitlines()) if req_path.exists() else set()
+            with req_path.open("a") as fh:
+                for req in extra:
+                    if req not in existing:
+                        fh.write(f"\n{req}\n")
+                        existing.add(req)
 
     manifest_path = out_dir / "rvbbit.backend.yaml"
     try:
@@ -433,6 +529,13 @@ def scaffold(manifest: dict[str, Any], out_dir: Path, force: bool = False) -> No
 
 def scaffold_readme(manifest: dict[str, Any]) -> str:
     service = manifest["name"].replace("_", "-")
+    runtime = manifest.get("runtime") or {}
+    compose_up = "docker compose up -d" if runtime_image(runtime) else "docker compose up -d --build"
+    gpu_compose_up = (
+        "docker compose -f compose.yaml -f compose.gpu.yaml up -d"
+        if runtime_image(runtime)
+        else "docker compose -f compose.yaml -f compose.gpu.yaml up -d --build"
+    )
     if manifest.get("kind") == "runtime_sidecar":
         endpoint_path = (
             manifest.get("warren", {}).get("endpoint_path")
@@ -447,7 +550,7 @@ def scaffold_readme(manifest: dict[str, Any]) -> str:
 ## Run
 
 ```bash
-docker compose up -d --build
+{compose_up}
 ```
 
 ## Register In Rvbbit
@@ -470,13 +573,13 @@ reachable at a different hostname.
 ## Run
 
 ```bash
-docker compose up -d --build
+{compose_up}
 ```
 
 With NVIDIA GPU access:
 
 ```bash
-docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
+{gpu_compose_up}
 ```
 
 ## Register In Rvbbit
@@ -501,58 +604,123 @@ def manifest_relpath(path: Path, root: Path) -> str:
         return str(path)
 
 
-def catalog_entry(path: Path, root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+def repo_relpath(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT.resolve())).replace("\\", "/")
+    except ValueError:
+        return str(path).replace("\\", "/")
+
+
+def catalog_entry(
+    path: Path,
+    root: Path,
+    manifest: dict[str, Any],
+    pack_path: Path | None = None,
+    pack: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     rel = manifest_relpath(path, root).replace("\\", "/")
-    default_root = (ROOT / "manifests").resolve()
-    manifest_path = (
-        f"capabilities/manifests/{rel}"
-        if root.resolve() == default_root
-        else rel
-    )
+    manifest_path = repo_relpath(path)
     source = manifest.get("source") or {}
     runtime = manifest.get("runtime") or {}
     backend = manifest.get("backend") or {}
     operators = manifest.get("operators") or []
+    pack_source = (pack or {}).get("source") or {}
+    pack_runtime = (pack or {}).get("runtime") or {}
+    pack_exports = (pack or {}).get("exports") or {}
+    pack_install = (pack or {}).get("install") or {}
+    pack_acceptance = (pack or {}).get("acceptance") or {}
+    acceptance_tests = [
+        test.get("name")
+        for test in pack_acceptance.get("tests") or []
+        if isinstance(test, dict) and test.get("name")
+    ]
+    runtime_mode = pack_install.get("mode") or ("image" if runtime_image(runtime) else "build")
     return {
-        "id": rel,
-        "name": manifest["name"],
-        "title": manifest.get("title") or manifest["name"],
-        "description": manifest.get("description"),
-        "tags": manifest.get("tags") or [],
+        "id": (pack or {}).get("id") or rel,
+        "pack_id": (pack or {}).get("id"),
+        "pack_path": repo_relpath(pack_path.parent) if pack_path else None,
+        "pack_manifest_path": repo_relpath(pack_path) if pack_path else None,
+        "pack_api_version": (pack or {}).get("api_version"),
+        "name": (pack or {}).get("name") or manifest["name"],
+        "title": (pack or {}).get("title") or manifest.get("title") or manifest["name"],
+        "description": (pack or {}).get("description") or manifest.get("description"),
+        "tags": (pack or {}).get("tags") or manifest.get("tags") or [],
         "kind": manifest.get("kind"),
-        "source_provider": source.get("provider"),
-        "source_model": source.get("model"),
-        "source_revision": source.get("revision"),
-        "license": manifest.get("license"),
-        "backend_name": backend.get("name"),
+        "source_provider": pack_source.get("provider") or source.get("provider"),
+        "source_model": pack_source.get("model") or source.get("model"),
+        "source_revision": pack_source.get("revision") or source.get("revision"),
+        "source_url": pack_source.get("url") or source.get("url"),
+        "repo_url": (pack or {}).get("repo_url"),
+        "license": (pack or {}).get("license") or manifest.get("license"),
+        "backend_name": pack_exports.get("backend") or backend.get("name"),
         "backend_transport": backend.get("transport", "rvbbit"),
-        "runtime_name": (manifest.get("runtime_registration") or {}).get("name"),
+        "runtime_name": pack_exports.get("runtime")
+        or (manifest.get("runtime_registration") or {}).get("name"),
         "runtime_language": (manifest.get("runtime_registration") or {}).get("language")
         or runtime.get("language"),
+        "runtime_image": runtime_image(runtime),
+        "runtime_mode": runtime_mode,
         "runtime_template": runtime.get("template", "hf-rvbbit-fastapi"),
-        "runtime_handler": runtime.get("handler", "custom"),
+        "runtime_handler": pack_runtime.get("handler") or runtime.get("handler", "custom"),
+        "install_mode": runtime_mode,
+        "install_warren": pack_install.get("warren"),
+        "install_docker": pack_install.get("docker"),
+        "acceptance_tests": acceptance_tests,
         "endpoint_path": (manifest.get("warren") or {}).get("endpoint_path")
         or (manifest.get("runtime_registration") or {}).get("endpoint_path"),
-        "device": runtime.get("device", "auto"),
-        "operators": [op.get("name") for op in operators if op.get("name")],
+        "device": pack_runtime.get("device") or runtime.get("device", "auto"),
+        "operators": pack_exports.get("operators")
+        or [op.get("name") for op in operators if op.get("name")],
         "manifest_path": manifest_path,
     }
 
 
-def load_catalog(root: Path) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
+def discover_pack_manifests(root: Path) -> list[Path]:
+    pack_path = find_pack_manifest(root)
+    if pack_path:
+        return [pack_path]
+    if not root.exists() or not root.is_dir():
+        return []
+    paths: list[Path] = []
+    for name in PACK_MANIFEST_NAMES:
+        paths.extend(root.rglob(name))
+    return sorted(set(paths))
+
+
+def iter_catalog_manifests(root: Path):
+    pack_paths = discover_pack_manifests(root)
+    if pack_paths:
+        for pack_path in pack_paths:
+            try:
+                pack = load_pack_metadata(pack_path)
+                manifest_path = pack_capability_path(pack_path, pack)
+                manifest = load_manifest(manifest_path)
+            except SystemExit:
+                raise
+            yield manifest_path, manifest, catalog_entry(
+                manifest_path, root, manifest, pack_path, pack
+            )
+        return
+
     for path in sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.json")):
         try:
             manifest = load_manifest(path)
         except SystemExit:
             continue
-        entries.append(catalog_entry(path, root, manifest))
+        yield path, manifest, catalog_entry(path, root, manifest)
+
+
+def load_catalog(root: Path) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for _path, _manifest, entry in iter_catalog_manifests(root):
+        entries.append(entry)
     return entries
 
 
 def catalog_doc(root: Path, include_timestamp: bool = False) -> dict[str, Any]:
     doc: dict[str, Any] = {
         "schema_version": 1,
+        "catalog_layout": "rvbbit.pack/v1",
         "capabilities": load_catalog(root),
     }
     if include_timestamp:
@@ -560,6 +728,23 @@ def catalog_doc(root: Path, include_timestamp: bool = False) -> dict[str, Any]:
 
         doc["generated_at"] = datetime.now(timezone.utc).isoformat()
     return doc
+
+
+def catalog_seed_doc(root: Path, source: str) -> dict[str, Any]:
+    entries = []
+    for _path, manifest, entry in iter_catalog_manifests(root):
+        entries.append(
+            {
+                "catalog_entry": entry,
+                "capability_manifest": install_manifest(manifest),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "catalog_layout": "rvbbit.pack/v1",
+        "catalog_source": source,
+        "capabilities": entries,
+    }
 
 
 def matches_entry(entry: dict[str, Any], terms: list[str]) -> bool:
@@ -585,6 +770,146 @@ def psql_scalar(dsn: str, sql: str) -> str:
         stdout=subprocess.PIPE,
     )
     return result.stdout.strip()
+
+
+def psql_exec_sql(dsn: str, sql: str) -> None:
+    print("+ psql <catalog-sql>", file=sys.stderr)
+    subprocess.run(
+        ["psql", dsn, "-v", "ON_ERROR_STOP=1", "-q", "-o", "/dev/null"],
+        check=True,
+        text=True,
+        input=sql,
+    )
+
+
+def psql_capture_sql(dsn: str, sql: str) -> str:
+    result = subprocess.run(
+        ["psql", dsn, "-v", "ON_ERROR_STOP=1", "-P", "pager=off"],
+        check=True,
+        text=True,
+        input=sql,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    output = (result.stdout or "").strip()
+    errors = (result.stderr or "").strip()
+    if errors:
+        return f"{output}\n{errors}".strip()
+    return output
+
+
+def run_warren_once(args: argparse.Namespace) -> None:
+    command = [
+        "cargo",
+        "run",
+        "-p",
+        "warren-agent",
+        "--",
+        "--dsn",
+        args.dsn,
+        "--node",
+        args.node,
+        "--work-dir",
+        args.work_dir,
+        "--docker-network",
+        args.docker_network,
+        "--labels",
+        args.labels,
+        "--capacity",
+        args.capacity,
+        "--metrics-ms",
+        str(args.metrics_ms),
+        "--once",
+    ]
+    run_command(command, cwd=REPO_ROOT)
+
+
+def cmd_test(args: argparse.Namespace) -> None:
+    pack_path, pack, _manifest_path, manifest = load_pack_and_manifest(Path(args.pack))
+    acceptance = pack.get("acceptance") or {}
+    tests = acceptance.get("tests") or []
+    if not isinstance(tests, list) or not tests:
+        raise SystemExit(f"{args.pack}: pack has no acceptance.tests")
+
+    dsn = args.dsn or os.environ.get("RVBBIT_DSN")
+    if not dsn:
+        raise SystemExit("set --dsn or RVBBIT_DSN")
+    args.dsn = dsn
+
+    target = json.loads(args.target) if args.target else acceptance.get("target_selector") or {}
+    if not isinstance(target, dict):
+        raise SystemExit("acceptance target_selector/--target must be a JSON object")
+
+    pack_id = pack.get("id") or manifest["name"]
+    job_name = args.job_name or (
+        "accept-"
+        + str(pack_id).replace("/", "-").replace("_", "-")[:42]
+        + "-"
+        + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+    )
+    events: list[dict[str, Any]] = []
+
+    def event(step: str, status: str, **details: Any) -> None:
+        doc = {"step": step, "status": status, **details}
+        events.append(doc)
+        print(json.dumps(doc, sort_keys=True), flush=True)
+
+    if not args.no_deploy:
+        sql = render_deploy_sql(manifest, target, job_name)
+        job_id = psql_scalar(dsn, sql)
+        event("deploy", "ok", job_id=job_id, job_name=job_name, target_selector=target)
+        if not args.no_warren:
+            run_warren_once(args)
+            event("warren_once", "ok", node=args.node, work_dir=args.work_dir)
+
+    for idx, sql in enumerate(acceptance.get("setup_sql") or [], start=1):
+        output = psql_capture_sql(dsn, sql)
+        event(f"setup_{idx}", "ok", output=output[-2000:])
+
+    failures = 0
+    for test in tests:
+        if not isinstance(test, dict):
+            raise SystemExit(f"{args.pack}: acceptance test must be an object")
+        name = test.get("name") or "unnamed"
+        sql = test.get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            raise SystemExit(f"{args.pack}: acceptance test {name!r} missing sql")
+        try:
+            output = psql_capture_sql(dsn, sql)
+        except subprocess.CalledProcessError as exc:
+            failures += 1
+            event(
+                str(name),
+                "fail",
+                stdout=(exc.stdout or "")[-2000:],
+                stderr=(exc.stderr or "")[-2000:],
+            )
+        else:
+            event(str(name), "ok", output=output[-2000:])
+
+    for idx, sql in enumerate(acceptance.get("teardown_sql") or [], start=1):
+        try:
+            output = psql_capture_sql(dsn, sql)
+        except subprocess.CalledProcessError as exc:
+            failures += 1
+            event(
+                f"teardown_{idx}",
+                "fail",
+                stdout=(exc.stdout or "")[-2000:],
+                stderr=(exc.stderr or "")[-2000:],
+            )
+        else:
+            event(f"teardown_{idx}", "ok", output=output[-2000:])
+
+    summary = {
+        "pack": pack_id,
+        "pack_path": str(pack_path) if pack_path else None,
+        "tests": len(tests),
+        "failures": failures,
+    }
+    event("summary", "fail" if failures else "ok", **summary)
+    if failures:
+        raise SystemExit(1)
 
 
 def cmd_render(args: argparse.Namespace) -> None:
@@ -632,6 +957,15 @@ def cmd_catalog_build(args: argparse.Namespace) -> None:
         print(text, end="")
 
 
+def cmd_catalog_seed_json(args: argparse.Namespace) -> None:
+    doc = catalog_seed_doc(Path(args.root), args.source)
+    text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        Path(args.output).write_text(text)
+    else:
+        print(text, end="")
+
+
 def cmd_catalog_search(args: argparse.Namespace) -> None:
     entries = load_catalog(Path(args.root))
     terms = args.terms
@@ -645,6 +979,48 @@ def cmd_catalog_search(args: argparse.Namespace) -> None:
         )
 
 
+def render_catalog_publish_sql(root: Path, source: str, prune: bool) -> tuple[str, list[str]]:
+    lines = ["-- Publish curated capability catalog into rvbbit.capability_catalog."]
+    ids: list[str] = []
+    for _path, manifest, entry in iter_catalog_manifests(root):
+        ids.append(entry["id"])
+        lines.extend(
+            [
+                "SELECT rvbbit.upsert_capability_catalog_entry(",
+                f"  catalog_entry       => {sql_json(entry)},",
+                f"  capability_manifest => {sql_json(install_manifest(manifest))},",
+                f"  catalog_source      => {sql_lit(source)},",
+                "  entry_active        => true",
+                ");",
+                "",
+            ]
+        )
+    if prune:
+        lines.extend(
+            [
+                "SELECT rvbbit.prune_capability_catalog(",
+                f"  catalog_source => {sql_lit(source)},",
+                f"  keep_ids       => {sql_text_array(ids)}",
+                ");",
+                "",
+            ]
+        )
+    return "\n".join(lines), ids
+
+
+def cmd_catalog_publish(args: argparse.Namespace) -> None:
+    root = Path(args.root)
+    sql, ids = render_catalog_publish_sql(root, args.source, args.prune)
+    if args.print_sql:
+        print(sql, end="")
+        return
+    dsn = args.dsn or os.environ.get("RVBBIT_DSN")
+    if not dsn:
+        raise SystemExit("set --dsn or RVBBIT_DSN, or pass --print-sql")
+    psql_exec_sql(dsn, sql)
+    print(f"published {len(ids)} catalog entries")
+
+
 def cmd_install(args: argparse.Namespace) -> None:
     manifest_path = Path(args.manifest)
     manifest = load_manifest(manifest_path)
@@ -656,7 +1032,9 @@ def cmd_install(args: argparse.Namespace) -> None:
         compose_cmd = ["docker", "compose", "-f", "compose.yaml"]
         if args.gpu:
             compose_cmd.extend(["-f", "compose.gpu.yaml"])
-        compose_cmd.extend(["up", "-d", "--build"])
+        compose_cmd.extend(["up", "-d"])
+        if not runtime_image(manifest.get("runtime") or {}):
+            compose_cmd.append("--build")
         run_command(compose_cmd, cwd=out_dir)
 
     if args.no_sql:
@@ -740,23 +1118,60 @@ def main(argv: list[str]) -> int:
     p_deploy.add_argument("--print-sql", action="store_true")
     p_deploy.set_defaults(func=cmd_deploy)
 
-    p_list = sub.add_parser("list", help="list curated manifests")
-    p_list.add_argument("--root", default=str(ROOT / "manifests"))
+    p_test = sub.add_parser("test", help="deploy a pack through Warren and run pack acceptance SQL")
+    p_test.add_argument("pack")
+    p_test.add_argument("--dsn")
+    p_test.add_argument("--target")
+    p_test.add_argument("--job-name")
+    p_test.add_argument("--no-deploy", action="store_true")
+    p_test.add_argument("--no-warren", action="store_true")
+    p_test.add_argument("--node", default=os.environ.get("WARREN_NODE", "capability-test-warren"))
+    p_test.add_argument("--work-dir", default=os.environ.get("WARREN_WORK_DIR", ".rvbbit/warren-test"))
+    p_test.add_argument(
+        "--docker-network",
+        default=os.environ.get("RVBBIT_DOCKER_NETWORK", "docker_default"),
+    )
+    p_test.add_argument(
+        "--labels",
+        default=os.environ.get(
+            "WARREN_LABELS", '{"capability":true,"docker":true,"gpu":false}'
+        ),
+    )
+    p_test.add_argument("--capacity", default=os.environ.get("WARREN_CAPACITY", "{}"))
+    p_test.add_argument("--metrics-ms", type=int, default=int(os.environ.get("WARREN_METRICS_MS", "1000")))
+    p_test.set_defaults(func=cmd_test)
+
+    p_list = sub.add_parser("list", help="list curated packs")
+    p_list.add_argument("--root", default=str(PACKS))
     p_list.set_defaults(func=cmd_list)
 
-    p_catalog = sub.add_parser("catalog", help="build or search a capability catalog")
+    p_catalog = sub.add_parser("catalog", help="build, publish, or search a capability catalog")
     catalog_sub = p_catalog.add_subparsers(required=True)
 
     p_catalog_build = catalog_sub.add_parser("build", help="build catalog JSON")
-    p_catalog_build.add_argument("--root", default=str(ROOT / "manifests"))
+    p_catalog_build.add_argument("--root", default=str(PACKS))
     p_catalog_build.add_argument("--output", "-o")
     p_catalog_build.add_argument("--timestamp", action="store_true")
     p_catalog_build.set_defaults(func=cmd_catalog_build)
 
     p_catalog_search = catalog_sub.add_parser("search", help="search curated manifests")
     p_catalog_search.add_argument("terms", nargs="*")
-    p_catalog_search.add_argument("--root", default=str(ROOT / "manifests"))
+    p_catalog_search.add_argument("--root", default=str(PACKS))
     p_catalog_search.set_defaults(func=cmd_catalog_search)
+
+    p_catalog_seed = catalog_sub.add_parser("seed-json", help="build extension seed JSON")
+    p_catalog_seed.add_argument("--root", default=str(PACKS))
+    p_catalog_seed.add_argument("--source", default="curated")
+    p_catalog_seed.add_argument("--output")
+    p_catalog_seed.set_defaults(func=cmd_catalog_seed_json)
+
+    p_catalog_publish = catalog_sub.add_parser("publish", help="publish catalog into Postgres")
+    p_catalog_publish.add_argument("--root", default=str(PACKS))
+    p_catalog_publish.add_argument("--dsn")
+    p_catalog_publish.add_argument("--source", default="curated")
+    p_catalog_publish.add_argument("--prune", action="store_true")
+    p_catalog_publish.add_argument("--print-sql", action="store_true")
+    p_catalog_publish.set_defaults(func=cmd_catalog_publish)
 
     args = parser.parse_args(argv)
     args.func(args)

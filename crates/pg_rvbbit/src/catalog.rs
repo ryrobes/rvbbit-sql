@@ -9,7 +9,8 @@
 //! Phase 1b will introduce our own handler that routes inserts to a
 //! shadow catcher heap. Phase 2 layers parquet on top.
 
-use pgrx::extension_sql;
+use pgrx::{extension_sql, pg_extern, JsonB, Spi};
+use serde_json::{json, Value};
 
 extension_sql!(
     r#"
@@ -2395,6 +2396,220 @@ END
 $fmt$;
 
 -- ---------------------------------------------------------------------------
+-- Capability catalog — curated deployable sidecars exposed through SQL.
+--
+-- The local capabilities/catalog.json remains a build artifact. Fresh
+-- extension installs seed this table from the bundled canonical seed; the
+-- capability CLI can refresh it after manifest changes. The manifest column is
+-- the deployable Warren payload.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE rvbbit.capability_catalog (
+    id                 text PRIMARY KEY,
+    manifest_path      text,
+    name               text NOT NULL,
+    title              text NOT NULL,
+    description        text,
+    tags               text[] NOT NULL DEFAULT ARRAY[]::text[],
+    kind               text NOT NULL,
+    license            text,
+    source_provider    text,
+    source_model       text,
+    source_revision    text,
+    backend_name       text,
+    backend_transport  text,
+    runtime_name       text,
+    runtime_language   text,
+    runtime_template   text,
+    runtime_handler    text,
+    endpoint_path      text,
+    device             text,
+    operators          text[] NOT NULL DEFAULT ARRAY[]::text[],
+    manifest           jsonb NOT NULL,
+    catalog_entry      jsonb NOT NULL DEFAULT '{}'::jsonb,
+    catalog_source     text NOT NULL DEFAULT 'manual',
+    active             boolean NOT NULL DEFAULT true,
+    created_by         oid NOT NULL DEFAULT (current_user::regrole::oid),
+    created_at         timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at         timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT capability_catalog_id_check CHECK (id ~ '^[A-Za-z0-9_./-]+$'),
+    CONSTRAINT capability_catalog_kind_check CHECK (kind <> ''),
+    CONSTRAINT capability_catalog_manifest_is_object CHECK (jsonb_typeof(manifest) = 'object'),
+    CONSTRAINT capability_catalog_entry_is_object CHECK (jsonb_typeof(catalog_entry) = 'object')
+);
+
+CREATE INDEX capability_catalog_active_idx ON rvbbit.capability_catalog (active, kind, name);
+CREATE INDEX capability_catalog_tags_idx ON rvbbit.capability_catalog USING gin (tags);
+CREATE INDEX capability_catalog_manifest_idx ON rvbbit.capability_catalog USING gin (manifest);
+CREATE INDEX capability_catalog_backend_idx ON rvbbit.capability_catalog (backend_name)
+    WHERE backend_name IS NOT NULL;
+CREATE INDEX capability_catalog_runtime_idx ON rvbbit.capability_catalog (runtime_name)
+    WHERE runtime_name IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION rvbbit.touch_capability_catalog_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at := clock_timestamp();
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER capability_catalog_touch_updated_at
+    BEFORE UPDATE ON rvbbit.capability_catalog
+    FOR EACH ROW EXECUTE FUNCTION rvbbit.touch_capability_catalog_updated_at();
+
+CREATE OR REPLACE FUNCTION rvbbit.require_capability_catalog_admin()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_roles WHERE rolname = current_user AND rolsuper
+    ) THEN
+        RAISE EXCEPTION 'rvbbit capability catalog changes require a superuser in this release';
+    END IF;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.upsert_capability_catalog_entry(
+    catalog_entry jsonb,
+    capability_manifest jsonb,
+    catalog_source text DEFAULT 'curated',
+    entry_active boolean DEFAULT true
+) RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+AS $ucc$
+DECLARE
+    normalized_entry jsonb := coalesce(catalog_entry, '{}'::jsonb);
+    normalized_manifest jsonb := coalesce(capability_manifest, '{}'::jsonb);
+    normalized_id text;
+    normalized_source text := coalesce(nullif(btrim(catalog_source), ''), 'curated');
+    entry_tags text[] := ARRAY[]::text[];
+    entry_operators text[] := ARRAY[]::text[];
+    row_doc jsonb;
+BEGIN
+    PERFORM rvbbit.require_capability_catalog_admin();
+    IF jsonb_typeof(normalized_entry) <> 'object' THEN
+        RAISE EXCEPTION 'catalog_entry must be a JSON object';
+    END IF;
+    IF jsonb_typeof(normalized_manifest) <> 'object' THEN
+        RAISE EXCEPTION 'capability_manifest must be a JSON object';
+    END IF;
+
+    normalized_id := nullif(btrim(coalesce(
+        normalized_entry->>'id',
+        normalized_entry->>'manifest_path',
+        normalized_manifest->>'name'
+    )), '');
+    IF normalized_id IS NULL THEN
+        RAISE EXCEPTION 'catalog entry id is required';
+    END IF;
+    IF normalized_id !~ '^[A-Za-z0-9_./-]+$' THEN
+        RAISE EXCEPTION 'catalog entry id contains unsupported characters: %', normalized_id;
+    END IF;
+
+    IF jsonb_typeof(coalesce(normalized_entry->'tags', '[]'::jsonb)) = 'array' THEN
+        SELECT coalesce(array_agg(tag ORDER BY tag), ARRAY[]::text[])
+        INTO entry_tags
+        FROM jsonb_array_elements_text(normalized_entry->'tags') AS t(tag);
+    END IF;
+
+    IF jsonb_typeof(coalesce(normalized_entry->'operators', '[]'::jsonb)) = 'array' THEN
+        SELECT coalesce(array_agg(op ORDER BY op), ARRAY[]::text[])
+        INTO entry_operators
+        FROM jsonb_array_elements_text(normalized_entry->'operators') AS o(op);
+    END IF;
+
+    INSERT INTO rvbbit.capability_catalog
+        (id, manifest_path, name, title, description, tags, kind, license,
+         source_provider, source_model, source_revision,
+         backend_name, backend_transport,
+         runtime_name, runtime_language, runtime_template, runtime_handler,
+         endpoint_path, device, operators, manifest, catalog_entry,
+         catalog_source, active)
+    VALUES
+        (normalized_id,
+         nullif(normalized_entry->>'manifest_path', ''),
+         coalesce(nullif(normalized_entry->>'name', ''), normalized_manifest->>'name', normalized_id),
+         coalesce(nullif(normalized_entry->>'title', ''), normalized_manifest->>'title',
+                  normalized_manifest->>'name', normalized_id),
+         coalesce(normalized_entry->>'description', normalized_manifest->>'description'),
+         entry_tags,
+         coalesce(nullif(normalized_entry->>'kind', ''), normalized_manifest->>'kind', 'unknown'),
+         coalesce(normalized_entry->>'license', normalized_manifest->>'license'),
+         coalesce(normalized_entry->>'source_provider', normalized_manifest #>> '{source,provider}'),
+         coalesce(normalized_entry->>'source_model', normalized_manifest #>> '{source,model}'),
+         coalesce(normalized_entry->>'source_revision', normalized_manifest #>> '{source,revision}'),
+         coalesce(normalized_entry->>'backend_name', normalized_manifest #>> '{backend,name}'),
+         coalesce(normalized_entry->>'backend_transport', normalized_manifest #>> '{backend,transport}'),
+         coalesce(normalized_entry->>'runtime_name', normalized_manifest #>> '{runtime_registration,name}'),
+         coalesce(normalized_entry->>'runtime_language', normalized_manifest #>> '{runtime_registration,language}',
+                  normalized_manifest #>> '{runtime,language}'),
+         coalesce(normalized_entry->>'runtime_template', normalized_manifest #>> '{runtime,template}'),
+         coalesce(normalized_entry->>'runtime_handler', normalized_manifest #>> '{runtime,handler}'),
+         coalesce(normalized_entry->>'endpoint_path', normalized_manifest #>> '{warren,endpoint_path}',
+                  normalized_manifest #>> '{runtime_registration,endpoint_path}'),
+         coalesce(normalized_entry->>'device', normalized_manifest #>> '{runtime,device}'),
+         entry_operators,
+         normalized_manifest,
+         normalized_entry,
+         normalized_source,
+         coalesce(entry_active, true))
+    ON CONFLICT (id) DO UPDATE SET
+        manifest_path = EXCLUDED.manifest_path,
+        name = EXCLUDED.name,
+        title = EXCLUDED.title,
+        description = EXCLUDED.description,
+        tags = EXCLUDED.tags,
+        kind = EXCLUDED.kind,
+        license = EXCLUDED.license,
+        source_provider = EXCLUDED.source_provider,
+        source_model = EXCLUDED.source_model,
+        source_revision = EXCLUDED.source_revision,
+        backend_name = EXCLUDED.backend_name,
+        backend_transport = EXCLUDED.backend_transport,
+        runtime_name = EXCLUDED.runtime_name,
+        runtime_language = EXCLUDED.runtime_language,
+        runtime_template = EXCLUDED.runtime_template,
+        runtime_handler = EXCLUDED.runtime_handler,
+        endpoint_path = EXCLUDED.endpoint_path,
+        device = EXCLUDED.device,
+        operators = EXCLUDED.operators,
+        manifest = EXCLUDED.manifest,
+        catalog_entry = EXCLUDED.catalog_entry,
+        catalog_source = EXCLUDED.catalog_source,
+        active = EXCLUDED.active;
+
+    SELECT to_jsonb(c) INTO row_doc
+    FROM rvbbit.capability_catalog c
+    WHERE c.id = normalized_id;
+    RETURN row_doc;
+END
+$ucc$;
+
+CREATE OR REPLACE FUNCTION rvbbit.prune_capability_catalog(
+    catalog_source text DEFAULT 'curated',
+    keep_ids text[] DEFAULT ARRAY[]::text[]
+) RETURNS integer
+LANGUAGE plpgsql
+VOLATILE
+AS $pcc$
+DECLARE
+    affected integer;
+    normalized_source text := coalesce(nullif(btrim(catalog_source), ''), 'curated');
+BEGIN
+    PERFORM rvbbit.require_capability_catalog_admin();
+    UPDATE rvbbit.capability_catalog c
+    SET active = false
+    WHERE c.catalog_source = normalized_source
+      AND NOT (c.id = ANY(coalesce(keep_ids, ARRAY[]::text[])))
+      AND c.active;
+    GET DIAGNOSTICS affected = ROW_COUNT;
+    RETURN affected;
+END
+$pcc$;
+
+-- ---------------------------------------------------------------------------
 -- Warren nodes — optional remote deployment agents.
 --
 -- A Warren is a host-local agent that can build/run sidecars near CPU/GPU
@@ -2814,6 +3029,53 @@ BEGIN
     );
 END
 $dcap$;
+
+CREATE OR REPLACE FUNCTION rvbbit.deploy_catalog_capability(
+    catalog_id      text,
+    target_selector jsonb DEFAULT '{}'::jsonb,
+    job_name        text DEFAULT NULL
+) RETURNS uuid
+LANGUAGE plpgsql
+VOLATILE
+AS $dcc$
+DECLARE
+    catalog_manifest jsonb;
+    catalog_name text;
+    catalog_backend_name text;
+    catalog_runtime_name text;
+    catalog_operator_name text;
+    queued_job_id uuid;
+BEGIN
+    IF catalog_id IS NULL OR btrim(catalog_id) = '' THEN
+        RAISE EXCEPTION 'catalog_id is required';
+    END IF;
+    IF jsonb_typeof(target_selector) <> 'object' THEN
+        RAISE EXCEPTION 'target_selector must be a JSON object';
+    END IF;
+
+    SELECT manifest, name, backend_name, runtime_name, operators[1]
+    INTO catalog_manifest, catalog_name, catalog_backend_name, catalog_runtime_name, catalog_operator_name
+    FROM rvbbit.capability_catalog
+    WHERE id = btrim(catalog_id)
+      AND active;
+
+    IF catalog_manifest IS NULL THEN
+        RAISE EXCEPTION 'active capability catalog entry % not found', catalog_id;
+    END IF;
+
+    queued_job_id := rvbbit.deploy_capability(
+        catalog_manifest,
+        target_selector,
+        coalesce(job_name, catalog_name)
+    );
+    UPDATE rvbbit.warren_jobs AS j
+    SET backend_name = coalesce(catalog_backend_name, j.backend_name),
+        runtime_name = coalesce(catalog_runtime_name, j.runtime_name),
+        operator_name = coalesce(catalog_operator_name, j.operator_name)
+    WHERE j.job_id = queued_job_id;
+    RETURN queued_job_id;
+END
+$dcc$;
 
 CREATE OR REPLACE FUNCTION rvbbit.claim_warren_job(
     node_name text
@@ -3875,4 +4137,108 @@ AS $$
 $$;
 "#,
     name = "rvbbit_bootstrap",
+);
+
+const CAPABILITY_CATALOG_SEED: &str = include_str!("capability_catalog_seed.json");
+
+fn seed_sql_lit(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn seed_jsonb_sql(value: &Value) -> String {
+    let text = serde_json::to_string(value).unwrap_or_else(|err| {
+        pgrx::error!("rvbbit.seed_capability_catalog: JSON encode failed: {err}")
+    });
+    format!("{}::jsonb", seed_sql_lit(&text))
+}
+
+fn seed_text_array_sql(values: &[String]) -> String {
+    let inner = values
+        .iter()
+        .map(|value| seed_sql_lit(value))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("ARRAY[{inner}]::text[]")
+}
+
+#[pg_extern(volatile)]
+fn seed_capability_catalog() -> JsonB {
+    let doc: Value = serde_json::from_str(CAPABILITY_CATALOG_SEED).unwrap_or_else(|err| {
+        pgrx::error!("rvbbit.seed_capability_catalog: seed JSON is invalid: {err}")
+    });
+    let source = doc
+        .get("catalog_source")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("curated")
+        .to_string();
+    let Some(entries) = doc.get("capabilities").and_then(Value::as_array) else {
+        pgrx::error!("rvbbit.seed_capability_catalog: seed JSON missing capabilities array");
+    };
+
+    let mut keep_ids = Vec::with_capacity(entries.len());
+    let mut prepared_rows = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(catalog_entry) = entry.get("catalog_entry").filter(|value| value.is_object())
+        else {
+            pgrx::error!("rvbbit.seed_capability_catalog: seed entry missing catalog_entry object");
+        };
+        let Some(capability_manifest) = entry
+            .get("capability_manifest")
+            .filter(|value| value.is_object())
+        else {
+            pgrx::error!(
+                "rvbbit.seed_capability_catalog: seed entry missing capability_manifest object"
+            );
+        };
+        let Some(id) = catalog_entry.get("id").and_then(Value::as_str) else {
+            pgrx::error!("rvbbit.seed_capability_catalog: seed entry missing catalog id");
+        };
+        keep_ids.push(id.to_string());
+        prepared_rows.push((catalog_entry, capability_manifest));
+    }
+
+    let result = Spi::connect_mut(|client| -> Result<(usize, i32), pgrx::spi::Error> {
+        for (catalog_entry, capability_manifest) in &prepared_rows {
+            let sql = format!(
+                "SELECT rvbbit.upsert_capability_catalog_entry(\
+                    catalog_entry => {}, \
+                    capability_manifest => {}, \
+                    catalog_source => {}, \
+                    entry_active => true)",
+                seed_jsonb_sql(catalog_entry),
+                seed_jsonb_sql(capability_manifest),
+                seed_sql_lit(&source),
+            );
+            client.update(&sql, None, &[])?;
+        }
+
+        let prune_sql = format!(
+            "SELECT rvbbit.prune_capability_catalog(catalog_source => {}, keep_ids => {})",
+            seed_sql_lit(&source),
+            seed_text_array_sql(&keep_ids),
+        );
+        let pruned = client
+            .update(&prune_sql, Some(1), &[])?
+            .first()
+            .get_one::<i32>()?
+            .unwrap_or(0);
+        Ok((prepared_rows.len(), pruned))
+    })
+    .unwrap_or_else(|err| pgrx::error!("rvbbit.seed_capability_catalog: {err}"));
+
+    JsonB(json!({
+        "ok": true,
+        "catalog_source": source,
+        "seeded": result.0,
+        "pruned": result.1,
+    }))
+}
+
+extension_sql!(
+    r#"
+SELECT rvbbit.seed_capability_catalog();
+"#,
+    name = "seed_capability_catalog_on_install",
+    requires = ["rvbbit_bootstrap", seed_capability_catalog],
 );

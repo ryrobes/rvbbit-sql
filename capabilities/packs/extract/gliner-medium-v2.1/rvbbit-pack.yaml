@@ -1,0 +1,35 @@
+api_version: rvbbit.pack/v1
+id: extract/gliner-medium-v2.1
+name: gliner_medium_v2_1
+title: GLiNER Medium v2.1 Extraction
+description: Zero-shot entity extraction over arbitrary user-provided labels.
+license: apache-2.0
+tags:
+- extract
+- ner
+- zero-shot
+- entities
+- pii
+- business
+- row
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: urchade/gliner_medium-v2.1
+  url: https://huggingface.co/urchade/gliner_medium-v2.1
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: gliner
+  device: auto
+exports:
+  backend: extract_gliner
+  operators:
+  - extract_entities
+  - extract_pii
+  - extract_business_entities
+  - extract_row_entities
+install:
+  mode: build
+  warren: true
+  docker: true

@@ -22,10 +22,7 @@ from runners import (  # noqa: E402
     clear_run_detail,
     last_run_detail,
     record_rvbbit_route_observation,
-    run_rvbbit_datafusion_hive_forced,
-    run_rvbbit_datafusion_forced,
-    run_rvbbit_duck_hive_forced,
-    run_rvbbit_duck_vortex_forced,
+    FORCED_SQL_CANDIDATES,
     run_rvbbit_duck_hot,
     run_clickhouse,
     run_duckdb,
@@ -93,46 +90,22 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
         if system == "rvbbit_duck_auto":
             ms = run_rvbbit_duck_hot(sql, REPEATS, TIMEOUT_S, mode="auto", label=qid, suite="clickbench")
             return ms, rvbbit_duck_hot_status()
-        if system == "rvbbit_duck_forced":
-            ms = run_rvbbit_duck_hot(sql, REPEATS, TIMEOUT_S, mode="force-duck", label=qid, suite="clickbench")
-            return ms, rvbbit_duck_hot_status()
-        if system == "rvbbit_duck_hive_forced":
-            ms = run_rvbbit_duck_hive_forced(sql, REPEATS, TIMEOUT_S, label=qid, suite="clickbench")
-            return ms, rvbbit_duck_hot_status()
-        if system == "rvbbit_duck_vortex_forced":
-            ms = run_rvbbit_duck_vortex_forced(sql, REPEATS, TIMEOUT_S, label=qid, suite="clickbench")
-            return ms, rvbbit_duck_hot_status()
-        if system == "rvbbit_datafusion_forced":
-            ms = run_rvbbit_datafusion_forced(sql, REPEATS, TIMEOUT_S, label=qid, suite="clickbench")
-            return ms, rvbbit_duck_hot_status()
-        if system == "rvbbit_datafusion_hive_forced":
-            ms = run_rvbbit_datafusion_hive_forced(sql, REPEATS, TIMEOUT_S, label=qid, suite="clickbench")
-            return ms, rvbbit_duck_hot_status()
-        if system == "rvbbit_datafusion_mem_forced":
-            ms = run_pg(PG_DSNS[system], sql, REPEATS, TIMEOUT_S)
-            record_rvbbit_route_observation(
-                sql,
-                "datafusion_mem",
-                ms,
-                "ok",
-                f"benchmark:clickbench:{system}",
-            )
-            return ms, "ok"
-        if system == "rvbbit_datafusion_vortex_forced":
+        if system in FORCED_SQL_CANDIDATES:
+            candidate = FORCED_SQL_CANDIDATES[system]
             ms = run_pg(
                 PG_DSNS[system],
                 sql,
                 REPEATS,
                 TIMEOUT_S,
                 capture_route=True,
-                expect_candidate="datafusion_vortex",
+                expect_candidate=candidate,
             )
             record_rvbbit_route_observation(
                 sql,
-                "datafusion_vortex",
+                candidate,
                 ms,
                 "ok",
-                f"benchmark:clickbench:{system}",
+                f"benchmark:clickbench:{system}:sql_forced",
             )
             return ms, "ok"
         if system in PG_DSNS:

@@ -1,0 +1,32 @@
+api_version: rvbbit.pack/v1
+id: tabular/wine-quality-sklearn
+name: wine_quality_sklearn
+title: Wine Quality Classifier
+description: Scikit-learn tabular classification example that predicts red wine quality classes from numeric
+  row features.
+license: unknown
+tags:
+- tabular
+- classify
+- prediction
+- row
+- sklearn
+- demo
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: julien-c/wine-quality
+  url: https://huggingface.co/julien-c/wine-quality
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: tabular_classification
+  device: cpu
+exports:
+  backend: predict_wine_quality_sklearn
+  operators:
+  - predict_wine_quality
+install:
+  mode: build
+  warren: true
+  docker: true

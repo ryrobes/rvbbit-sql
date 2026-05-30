@@ -1,8 +1,7 @@
 -- Managed Python node demo.
 --
--- Start the runtime first:
---   docker compose -f docker/docker-compose.yml \
---                  -f docker/docker-compose.sidecars.yml up -d python-runtime
+-- Start and register the runtime first:
+--   make python-runtime-up
 --
 -- Then run this file in the bench database. It shows the intended shape:
 -- SQL owns reference data, Python is deterministic workflow glue, and the
@@ -12,6 +11,7 @@ SELECT rvbbit.create_python_env(
     env_name => 'ops_rules',
     python_version => '3.12',
     requirements => ARRAY[]::text[],
+    runtime_name => 'python_default',
     timeout_ms => 1000
 );
 

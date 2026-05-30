@@ -1,0 +1,32 @@
+api_version: rvbbit.pack/v1
+id: classify/twitter-roberta-sentiment
+name: twitter_roberta_sentiment
+title: RoBERTa Sentiment Classifier
+description: Practical positive/neutral/negative sentiment classifier for reviews, tickets, social text,
+  and notes.
+license: cc-by-4.0
+tags:
+- classify
+- sentiment
+- text
+- tabular
+- row
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: cardiffnlp/twitter-roberta-base-sentiment-latest
+  url: https://huggingface.co/cardiffnlp/twitter-roberta-base-sentiment-latest
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+exports:
+  backend: classify_twitter_roberta_sentiment
+  operators:
+  - classify_sentiment
+  - classify_row_sentiment
+install:
+  mode: build
+  warren: true
+  docker: true

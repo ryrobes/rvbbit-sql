@@ -3,9 +3,7 @@
 The catalog tests need only Postgres. The runtime tests need the managed
 CPython sidecar:
 
-  docker compose -f docker/docker-compose.yml \\
-                 -f docker/docker-compose.sidecars.yml \\
-                 up -d python-runtime
+  make python-runtime-up
 """
 
 from __future__ import annotations
@@ -21,7 +19,6 @@ import pytest
 SIDECAR_BASE = os.environ.get(
     "RVBBIT_PYTHON_RUNTIME_BASE", "http://rvbbit-python-runtime:8080"
 )
-RUN_URL = os.environ.get("RVBBIT_PYTHON_RUNTIME_RUN_URL", f"{SIDECAR_BASE}/run")
 
 
 def _alive() -> bool:
@@ -49,6 +46,16 @@ def _drop_python(rvbbit, handler: str | None = None, env: str | None = None) -> 
 def _drop_python_runtime(rvbbit, runtime: str) -> None:
     rvbbit.execute("DELETE FROM rvbbit.python_runtimes WHERE name = %s", (runtime,))
     rvbbit.execute("SELECT rvbbit.reload_python_runtime()")
+
+
+def _require_python_default_runtime(rvbbit) -> None:
+    row = rvbbit.execute(
+        "SELECT status, runtime_source FROM rvbbit.python_runtimes WHERE name = 'python_default'"
+    ).fetchone()
+    if row is None:
+        pytest.skip("python_default runtime is not registered; run make python-runtime-up")
+    assert row[0] == "ready"
+    assert row[1] == "warren"
 
 
 def _drop_op(rvbbit, name: str, n_args: int) -> None:
@@ -150,13 +157,16 @@ def run(inputs):
 '''
     try:
         urllib.request.urlopen(f"{SIDECAR_BASE}/debug/reset", timeout=3, data=b"{}").read()
+        _require_python_default_runtime(rvbbit)
         rvbbit.execute(f"CREATE TABLE {table} (id int PRIMARY KEY, tier text, annual_revenue float8)")
         rvbbit.execute(
             f"INSERT INTO {table} VALUES (101, 'enterprise', 2400000), (202, 'standard', 12000)"
         )
         rvbbit.execute(
-            "SELECT rvbbit.create_python_env(%s, '3.12', ARRAY[]::text[], %s, 2000)",
-            (env, RUN_URL),
+            "SELECT rvbbit.create_python_env("
+            "  env_name => %s, python_version => '3.12', requirements => ARRAY[]::text[], "
+            "  runtime_name => 'python_default', timeout_ms => 2000)",
+            (env,),
         )
         rvbbit.execute(
             "SELECT rvbbit.create_python_handler(%s, %s, %s)",
@@ -275,12 +285,15 @@ def run(inputs):
     ]
     try:
         urllib.request.urlopen(f"{SIDECAR_BASE}/debug/reset", timeout=3, data=b"{}").read()
+        _require_python_default_runtime(rvbbit)
         rvbbit.execute(f"CREATE TABLE {table} (url text, status text, bytes_sent text)")
         for row in events:
             rvbbit.execute(f"INSERT INTO {table} VALUES (%s, %s, %s)", row)
         rvbbit.execute(
-            "SELECT rvbbit.create_python_env(%s, '3.12', ARRAY[]::text[], %s, 2000)",
-            (env, RUN_URL),
+            "SELECT rvbbit.create_python_env("
+            "  env_name => %s, python_version => '3.12', requirements => ARRAY[]::text[], "
+            "  runtime_name => 'python_default', timeout_ms => 2000)",
+            (env,),
         )
         rvbbit.execute("SELECT rvbbit.create_python_handler(%s, %s, %s)", (handler, env, code))
         rvbbit.execute(

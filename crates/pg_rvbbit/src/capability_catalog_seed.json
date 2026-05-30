@@ -1,0 +1,1840 @@
+{
+  "capabilities": [
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 24,
+          "description": "DeBERTa v3 base NLI zero-shot classifier.",
+          "max_concurrent": 4,
+          "name": "classify_deberta_base_zero_shot",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Smaller NLI zero-shot classifier for classifying text or JSONB rows into caller-provided labels.",
+        "kind": "hf_backend",
+        "license": "mit",
+        "name": "deberta_v3_base_zero_shot",
+        "operators": [
+          {
+            "arg_names": [
+              "text",
+              "categories"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Classify text into comma-separated categories using a smaller DeBERTa v3 zero-shot model.",
+            "inputs": {
+              "labels": "{{ inputs.categories }}",
+              "text": "{{ inputs.text }}"
+            },
+            "name": "classify_zero_shot_base",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "row",
+              "categories"
+            ],
+            "arg_types": [
+              "jsonb",
+              "text"
+            ],
+            "description": "Classify a JSONB row into comma-separated categories using a smaller DeBERTa v3 zero-shot model.",
+            "inputs": {
+              "labels": "{{ inputs.categories }}",
+              "text": "{{ inputs.row }}"
+            },
+            "name": "classify_row_zero_shot_base",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "zero_shot_classification",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/MoritzLaurer/deberta-v3-base-zeroshot-v2.0"
+        },
+        "tags": [
+          "classify",
+          "zero-shot",
+          "nli",
+          "row",
+          "cpu-friendly"
+        ],
+        "title": "DeBERTa v3 Base Zero-Shot Classifier"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "classify_deberta_base_zero_shot",
+        "backend_transport": "rvbbit",
+        "description": "Smaller NLI zero-shot classifier for classifying text or JSONB rows into caller-provided labels.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "classify/deberta-v3-base-zero-shot",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "mit",
+        "manifest_path": "capabilities/packs/classify/deberta-v3-base-zero-shot/capability.yaml",
+        "name": "deberta_v3_base_zero_shot",
+        "operators": [
+          "classify_zero_shot_base",
+          "classify_row_zero_shot_base"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "classify/deberta-v3-base-zero-shot",
+        "pack_manifest_path": "capabilities/packs/classify/deberta-v3-base-zero-shot/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/classify/deberta-v3-base-zero-shot",
+        "repo_url": null,
+        "runtime_handler": "zero_shot_classification",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
+        "tags": [
+          "classify",
+          "zero-shot",
+          "nli",
+          "row",
+          "cpu-friendly"
+        ],
+        "title": "DeBERTa v3 Base Zero-Shot Classifier"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 16,
+          "description": "DeBERTa v3 NLI zero-shot classifier.",
+          "max_concurrent": 4,
+          "name": "classify_deberta_zero_shot",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "NLI-based zero-shot classification over caller-provided labels.",
+        "kind": "hf_backend",
+        "license": "mit",
+        "name": "deberta_v3_zero_shot",
+        "operators": [
+          {
+            "arg_names": [
+              "text",
+              "categories"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Classify text into comma-separated categories using DeBERTa v3 zero-shot NLI.",
+            "inputs": {
+              "labels": "{{ inputs.categories }}",
+              "text": "{{ inputs.text }}"
+            },
+            "name": "classify_zero_shot",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "row",
+              "categories"
+            ],
+            "arg_types": [
+              "jsonb",
+              "text"
+            ],
+            "description": "Classify a JSONB row into comma-separated categories using DeBERTa v3 zero-shot NLI.",
+            "inputs": {
+              "labels": "{{ inputs.categories }}",
+              "text": "{{ inputs.row }}"
+            },
+            "name": "classify_row_zero_shot",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "zero_shot_classification",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
+        },
+        "tags": [
+          "classify",
+          "zero-shot",
+          "nli",
+          "row"
+        ],
+        "title": "DeBERTa v3 Zero-Shot Classifier"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "classify_deberta_zero_shot",
+        "backend_transport": "rvbbit",
+        "description": "NLI-based zero-shot classification over caller-provided labels.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "classify/deberta-v3-zero-shot",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "mit",
+        "manifest_path": "capabilities/packs/classify/deberta-v3-zero-shot/capability.yaml",
+        "name": "deberta_v3_zero_shot",
+        "operators": [
+          "classify_zero_shot",
+          "classify_row_zero_shot"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "classify/deberta-v3-zero-shot",
+        "pack_manifest_path": "capabilities/packs/classify/deberta-v3-zero-shot/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/classify/deberta-v3-zero-shot",
+        "repo_url": null,
+        "runtime_handler": "zero_shot_classification",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli",
+        "tags": [
+          "classify",
+          "zero-shot",
+          "nli",
+          "row"
+        ],
+        "title": "DeBERTa v3 Zero-Shot Classifier"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 32,
+          "description": "DistilRoBERTa emotion classifier.",
+          "max_concurrent": 4,
+          "name": "classify_emotion_distilroberta",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Classify text into emotion labels for support, survey, content, and conversation analytics.",
+        "kind": "hf_backend",
+        "license": "unknown",
+        "name": "emotion_distilroberta",
+        "operators": [
+          {
+            "arg_names": [
+              "text"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Classify free text into emotion labels.",
+            "inputs": {
+              "text": "{{ inputs.text }}"
+            },
+            "name": "classify_emotion",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "row"
+            ],
+            "arg_types": [
+              "jsonb"
+            ],
+            "description": "Classify the emotional tone of a JSONB row.",
+            "inputs": {
+              "text": "{{ inputs.row }}"
+            },
+            "name": "classify_row_emotion",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "sequence_classification",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "j-hartmann/emotion-english-distilroberta-base",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/j-hartmann/emotion-english-distilroberta-base"
+        },
+        "tags": [
+          "classify",
+          "emotion",
+          "text",
+          "tabular",
+          "row"
+        ],
+        "title": "Emotion Classifier"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "classify_emotion_distilroberta",
+        "backend_transport": "rvbbit",
+        "description": "Classify text into emotion labels for support, survey, content, and conversation analytics.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "classify/emotion-distilroberta",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "unknown",
+        "manifest_path": "capabilities/packs/classify/emotion-distilroberta/capability.yaml",
+        "name": "emotion_distilroberta",
+        "operators": [
+          "classify_emotion",
+          "classify_row_emotion"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "classify/emotion-distilroberta",
+        "pack_manifest_path": "capabilities/packs/classify/emotion-distilroberta/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/classify/emotion-distilroberta",
+        "repo_url": null,
+        "runtime_handler": "sequence_classification",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "j-hartmann/emotion-english-distilroberta-base",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/j-hartmann/emotion-english-distilroberta-base",
+        "tags": [
+          "classify",
+          "emotion",
+          "text",
+          "tabular",
+          "row"
+        ],
+        "title": "Emotion Classifier"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 64,
+          "description": "XLM-R language detection classifier.",
+          "max_concurrent": 4,
+          "name": "detect_language_xlm_roberta",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Detect the language of text for routing, normalization, and multilingual analytics.",
+        "kind": "hf_backend",
+        "license": "mit",
+        "name": "language_detection_xlm_roberta",
+        "operators": [
+          {
+            "arg_names": [
+              "text"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Detect the language of a text value.",
+            "inputs": {
+              "text": "{{ inputs.text }}"
+            },
+            "name": "detect_language",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "sequence_classification",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "papluca/xlm-roberta-base-language-detection",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/papluca/xlm-roberta-base-language-detection"
+        },
+        "tags": [
+          "classify",
+          "language",
+          "multilingual",
+          "routing",
+          "tabular"
+        ],
+        "title": "XLM-R Language Detection"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "detect_language_xlm_roberta",
+        "backend_transport": "rvbbit",
+        "description": "Detect the language of text for routing, normalization, and multilingual analytics.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "classify/language-detection-xlm-roberta",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "mit",
+        "manifest_path": "capabilities/packs/classify/language-detection-xlm-roberta/capability.yaml",
+        "name": "language_detection_xlm_roberta",
+        "operators": [
+          "detect_language"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "classify/language-detection-xlm-roberta",
+        "pack_manifest_path": "capabilities/packs/classify/language-detection-xlm-roberta/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/classify/language-detection-xlm-roberta",
+        "repo_url": null,
+        "runtime_handler": "sequence_classification",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "papluca/xlm-roberta-base-language-detection",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/papluca/xlm-roberta-base-language-detection",
+        "tags": [
+          "classify",
+          "language",
+          "multilingual",
+          "routing",
+          "tabular"
+        ],
+        "title": "XLM-R Language Detection"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 32,
+          "description": "Multi-label toxic-bert classifier.",
+          "max_concurrent": 4,
+          "name": "classify_toxic_bert",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Multi-label toxicity classifier for moderation, support triage, and data quality workflows.",
+        "kind": "hf_backend",
+        "license": "apache-2.0",
+        "name": "toxic_bert",
+        "operators": [
+          {
+            "arg_names": [
+              "text"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Return toxicity category scores for text.",
+            "inputs": {
+              "text": "{{ inputs.text }}"
+            },
+            "name": "classify_toxicity",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "row"
+            ],
+            "arg_types": [
+              "jsonb"
+            ],
+            "description": "Return toxicity category scores for a JSONB row.",
+            "inputs": {
+              "text": "{{ inputs.row }}"
+            },
+            "name": "classify_row_toxicity",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "env": {
+            "RVBBIT_SEQUENCE_MODE": "sigmoid"
+          },
+          "handler": "sequence_classification",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "unitary/toxic-bert",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/unitary/toxic-bert"
+        },
+        "tags": [
+          "classify",
+          "toxicity",
+          "moderation",
+          "multilabel",
+          "tabular",
+          "row"
+        ],
+        "title": "Toxicity Classifier"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "classify_toxic_bert",
+        "backend_transport": "rvbbit",
+        "description": "Multi-label toxicity classifier for moderation, support triage, and data quality workflows.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "classify/toxic-bert",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "apache-2.0",
+        "manifest_path": "capabilities/packs/classify/toxic-bert/capability.yaml",
+        "name": "toxic_bert",
+        "operators": [
+          "classify_toxicity",
+          "classify_row_toxicity"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "classify/toxic-bert",
+        "pack_manifest_path": "capabilities/packs/classify/toxic-bert/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/classify/toxic-bert",
+        "repo_url": null,
+        "runtime_handler": "sequence_classification",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "unitary/toxic-bert",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/unitary/toxic-bert",
+        "tags": [
+          "classify",
+          "toxicity",
+          "moderation",
+          "multilabel",
+          "tabular",
+          "row"
+        ],
+        "title": "Toxicity Classifier"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 64,
+          "description": "RoBERTa sentiment classifier.",
+          "max_concurrent": 4,
+          "name": "classify_twitter_roberta_sentiment",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Practical positive/neutral/negative sentiment classifier for reviews, tickets, social text, and notes.",
+        "kind": "hf_backend",
+        "license": "cc-by-4.0",
+        "name": "twitter_roberta_sentiment",
+        "operators": [
+          {
+            "arg_names": [
+              "text"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Classify text as negative, neutral, or positive.",
+            "inputs": {
+              "text": "{{ inputs.text }}"
+            },
+            "name": "classify_sentiment",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "row"
+            ],
+            "arg_types": [
+              "jsonb"
+            ],
+            "description": "Classify the sentiment of a JSONB row serialized as text.",
+            "inputs": {
+              "text": "{{ inputs.row }}"
+            },
+            "name": "classify_row_sentiment",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "sequence_classification",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "cardiffnlp/twitter-roberta-base-sentiment-latest",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/cardiffnlp/twitter-roberta-base-sentiment-latest"
+        },
+        "tags": [
+          "classify",
+          "sentiment",
+          "text",
+          "tabular",
+          "row"
+        ],
+        "title": "RoBERTa Sentiment Classifier"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "classify_twitter_roberta_sentiment",
+        "backend_transport": "rvbbit",
+        "description": "Practical positive/neutral/negative sentiment classifier for reviews, tickets, social text, and notes.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "classify/twitter-roberta-sentiment",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "cc-by-4.0",
+        "manifest_path": "capabilities/packs/classify/twitter-roberta-sentiment/capability.yaml",
+        "name": "twitter_roberta_sentiment",
+        "operators": [
+          "classify_sentiment",
+          "classify_row_sentiment"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "classify/twitter-roberta-sentiment",
+        "pack_manifest_path": "capabilities/packs/classify/twitter-roberta-sentiment/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/classify/twitter-roberta-sentiment",
+        "repo_url": null,
+        "runtime_handler": "sequence_classification",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "cardiffnlp/twitter-roberta-base-sentiment-latest",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/cardiffnlp/twitter-roberta-base-sentiment-latest",
+        "tags": [
+          "classify",
+          "sentiment",
+          "text",
+          "tabular",
+          "row"
+        ],
+        "title": "RoBERTa Sentiment Classifier"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 64,
+          "description": "BAAI/bge-m3 multilingual sentence embeddings.",
+          "max_concurrent": 4,
+          "name": "embed_bge_m3",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "High-quality multilingual BGE-M3 sentence embeddings for retrieval and semantic search.",
+        "kind": "hf_backend",
+        "license": "mit",
+        "name": "bge_m3",
+        "operators": [
+          {
+            "arg_names": [
+              "text"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Return a BGE-M3 embedding as JSON for exploratory use. Register this backend as `embed` if you want the built-in embedding SQL to use it.",
+            "inputs": {
+              "text": "{{ inputs.text }}"
+            },
+            "name": "embed_bge_m3",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "embedding",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "BAAI/bge-m3",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/BAAI/bge-m3"
+        },
+        "tags": [
+          "embedding",
+          "retrieval",
+          "multilingual",
+          "gpu"
+        ],
+        "title": "BGE-M3 Embeddings"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "embed_bge_m3",
+        "backend_transport": "rvbbit",
+        "description": "High-quality multilingual BGE-M3 sentence embeddings for retrieval and semantic search.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "embeddings/bge-m3",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "mit",
+        "manifest_path": "capabilities/packs/embeddings/bge-m3/capability.yaml",
+        "name": "bge_m3",
+        "operators": [
+          "embed_bge_m3"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "embeddings/bge-m3",
+        "pack_manifest_path": "capabilities/packs/embeddings/bge-m3/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/embeddings/bge-m3",
+        "repo_url": null,
+        "runtime_handler": "embedding",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "BAAI/bge-m3",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/BAAI/bge-m3",
+        "tags": [
+          "embedding",
+          "retrieval",
+          "multilingual",
+          "gpu"
+        ],
+        "title": "BGE-M3 Embeddings"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 128,
+          "description": "BAAI/bge-small-en-v1.5 sentence embeddings.",
+          "max_concurrent": 2,
+          "name": "embed_bge_small",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "CPU-friendly English sentence embeddings exposed as an Rvbbit backend.",
+        "kind": "hf_backend",
+        "license": "mit",
+        "name": "bge_small_en_v1_5",
+        "operators": [
+          {
+            "arg_names": [
+              "text"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Return a bge-small-en-v1.5 embedding as JSON for exploratory use. Prefer rvbbit.embed for production retrieval workflows.",
+            "inputs": {
+              "text": "{{ inputs.text }}"
+            },
+            "name": "embed_bge_small",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "embedding",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "BAAI/bge-small-en-v1.5",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/BAAI/bge-small-en-v1.5"
+        },
+        "tags": [
+          "embedding",
+          "retrieval",
+          "cpu-friendly"
+        ],
+        "title": "BGE Small English Embeddings"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "embed_bge_small",
+        "backend_transport": "rvbbit",
+        "description": "CPU-friendly English sentence embeddings exposed as an Rvbbit backend.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "embeddings/bge-small-en-v1.5",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "mit",
+        "manifest_path": "capabilities/packs/embeddings/bge-small-en-v1.5/capability.yaml",
+        "name": "bge_small_en_v1_5",
+        "operators": [
+          "embed_bge_small"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "embeddings/bge-small-en-v1.5",
+        "pack_manifest_path": "capabilities/packs/embeddings/bge-small-en-v1.5/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/embeddings/bge-small-en-v1.5",
+        "repo_url": null,
+        "runtime_handler": "embedding",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "BAAI/bge-small-en-v1.5",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/BAAI/bge-small-en-v1.5",
+        "tags": [
+          "embedding",
+          "retrieval",
+          "cpu-friendly"
+        ],
+        "title": "BGE Small English Embeddings"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 128,
+          "description": "intfloat/e5-small-v2 sentence embeddings.",
+          "max_concurrent": 2,
+          "name": "embed_e5_small",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Small, fast E5 embeddings useful for CPU-friendly retrieval experiments and lightweight semantic joins.",
+        "kind": "hf_backend",
+        "license": "mit",
+        "name": "e5_small_v2",
+        "operators": [
+          {
+            "arg_names": [
+              "text"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Return an E5-small embedding as JSON. For best retrieval quality, prefix inputs with `query:` or `passage:`.",
+            "inputs": {
+              "text": "{{ inputs.text }}"
+            },
+            "name": "embed_e5_small",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "embedding",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "intfloat/e5-small-v2",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/intfloat/e5-small-v2"
+        },
+        "tags": [
+          "embedding",
+          "retrieval",
+          "cpu-friendly",
+          "semantic-join"
+        ],
+        "title": "E5 Small Embeddings"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "embed_e5_small",
+        "backend_transport": "rvbbit",
+        "description": "Small, fast E5 embeddings useful for CPU-friendly retrieval experiments and lightweight semantic joins.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "embeddings/e5-small-v2",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "mit",
+        "manifest_path": "capabilities/packs/embeddings/e5-small-v2/capability.yaml",
+        "name": "e5_small_v2",
+        "operators": [
+          "embed_e5_small"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "embeddings/e5-small-v2",
+        "pack_manifest_path": "capabilities/packs/embeddings/e5-small-v2/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/embeddings/e5-small-v2",
+        "repo_url": null,
+        "runtime_handler": "embedding",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "intfloat/e5-small-v2",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/intfloat/e5-small-v2",
+        "tags": [
+          "embedding",
+          "retrieval",
+          "cpu-friendly",
+          "semantic-join"
+        ],
+        "title": "E5 Small Embeddings"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 16,
+          "description": "GLiNER medium zero-shot entity extraction.",
+          "max_concurrent": 4,
+          "name": "extract_gliner",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Zero-shot entity extraction over arbitrary user-provided labels.",
+        "kind": "hf_backend",
+        "license": "apache-2.0",
+        "name": "gliner_medium_v2_1",
+        "operators": [
+          {
+            "arg_names": [
+              "text",
+              "labels"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Extract entities from text using GLiNER with comma-separated labels.",
+            "inputs": {
+              "labels": "{{ inputs.labels }}",
+              "text": "{{ inputs.text }}"
+            },
+            "name": "extract_entities",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "text"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Extract likely PII spans from text using a fixed label set.",
+            "inputs": {
+              "labels": "person, email, phone number, address, credit card, bank account, ssn, date of birth, username, password",
+              "text": "{{ inputs.text }}"
+            },
+            "name": "extract_pii",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "text"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Extract business-oriented entities from notes, tickets, contracts, and CRM records.",
+            "inputs": {
+              "labels": "person, organization, product, location, money, date, contract, account, issue, competitor",
+              "text": "{{ inputs.text }}"
+            },
+            "name": "extract_business_entities",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "row",
+              "labels"
+            ],
+            "arg_types": [
+              "jsonb",
+              "text"
+            ],
+            "description": "Extract caller-selected entity labels from a JSONB row serialized as text.",
+            "inputs": {
+              "labels": "{{ inputs.labels }}",
+              "text": "{{ inputs.row }}"
+            },
+            "name": "extract_row_entities",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "extra_requirements": [
+            "gliner==0.2.16"
+          ],
+          "handler": "gliner",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "urchade/gliner_medium-v2.1",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/urchade/gliner_medium-v2.1"
+        },
+        "tags": [
+          "extract",
+          "ner",
+          "zero-shot",
+          "entities",
+          "pii",
+          "business",
+          "row"
+        ],
+        "title": "GLiNER Medium v2.1 Extraction"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "extract_gliner",
+        "backend_transport": "rvbbit",
+        "description": "Zero-shot entity extraction over arbitrary user-provided labels.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "extract/gliner-medium-v2.1",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "apache-2.0",
+        "manifest_path": "capabilities/packs/extract/gliner-medium-v2.1/capability.yaml",
+        "name": "gliner_medium_v2_1",
+        "operators": [
+          "extract_entities",
+          "extract_pii",
+          "extract_business_entities",
+          "extract_row_entities"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "extract/gliner-medium-v2.1",
+        "pack_manifest_path": "capabilities/packs/extract/gliner-medium-v2.1/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/extract/gliner-medium-v2.1",
+        "repo_url": null,
+        "runtime_handler": "gliner",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "urchade/gliner_medium-v2.1",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/urchade/gliner_medium-v2.1",
+        "tags": [
+          "extract",
+          "ner",
+          "zero-shot",
+          "entities",
+          "pii",
+          "business",
+          "row"
+        ],
+        "title": "GLiNER Medium v2.1 Extraction"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 24,
+          "description": "BGE reranker base pair relevance scorer.",
+          "max_concurrent": 4,
+          "name": "rerank_bge_base",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Smaller BGE cross-encoder reranker for query/document scoring and row ranking.",
+        "kind": "hf_backend",
+        "license": "mit",
+        "name": "bge_reranker_base",
+        "operators": [
+          {
+            "arg_names": [
+              "query",
+              "text"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Score how relevant text is to a query using BGE reranker base.",
+            "inputs": {
+              "query": "{{ inputs.query }}",
+              "text": "{{ inputs.text }}"
+            },
+            "name": "rerank_bge_base_score",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "query",
+              "row"
+            ],
+            "arg_types": [
+              "text",
+              "jsonb"
+            ],
+            "description": "Score how relevant a JSONB row is to a query using BGE reranker base.",
+            "inputs": {
+              "query": "{{ inputs.query }}",
+              "text": "{{ inputs.row }}"
+            },
+            "name": "rerank_bge_base_row",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "sequence_classification",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "BAAI/bge-reranker-base",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/BAAI/bge-reranker-base"
+        },
+        "tags": [
+          "rerank",
+          "retrieval",
+          "relevance",
+          "row",
+          "cpu-friendly"
+        ],
+        "title": "BGE Reranker Base"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "rerank_bge_base",
+        "backend_transport": "rvbbit",
+        "description": "Smaller BGE cross-encoder reranker for query/document scoring and row ranking.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "rerank/bge-reranker-base",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "mit",
+        "manifest_path": "capabilities/packs/rerank/bge-reranker-base/capability.yaml",
+        "name": "bge_reranker_base",
+        "operators": [
+          "rerank_bge_base_score",
+          "rerank_bge_base_row"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "rerank/bge-reranker-base",
+        "pack_manifest_path": "capabilities/packs/rerank/bge-reranker-base/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/rerank/bge-reranker-base",
+        "repo_url": null,
+        "runtime_handler": "sequence_classification",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "BAAI/bge-reranker-base",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/BAAI/bge-reranker-base",
+        "tags": [
+          "rerank",
+          "retrieval",
+          "relevance",
+          "row",
+          "cpu-friendly"
+        ],
+        "title": "BGE Reranker Base"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 16,
+          "description": "BGE reranker v2 M3 pair relevance scorer.",
+          "max_concurrent": 4,
+          "name": "rerank_bge_m3",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Cross-encoder relevance scoring for query/document pairs.",
+        "kind": "hf_backend",
+        "license": "mit",
+        "name": "bge_reranker_v2_m3",
+        "operators": [
+          {
+            "arg_names": [
+              "query",
+              "text"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Score how relevant text is to a query using BGE reranker v2 M3.",
+            "inputs": {
+              "query": "{{ inputs.query }}",
+              "text": "{{ inputs.text }}"
+            },
+            "name": "rerank_score",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "query",
+              "row"
+            ],
+            "arg_types": [
+              "text",
+              "jsonb"
+            ],
+            "description": "Score how relevant a JSONB row is to a query using BGE reranker v2 M3.",
+            "inputs": {
+              "query": "{{ inputs.query }}",
+              "text": "{{ inputs.row }}"
+            },
+            "name": "rerank_row",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "sequence_classification",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "BAAI/bge-reranker-v2-m3",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/BAAI/bge-reranker-v2-m3"
+        },
+        "tags": [
+          "rerank",
+          "retrieval",
+          "relevance",
+          "gpu",
+          "row"
+        ],
+        "title": "BGE Reranker v2 M3"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "rerank_bge_m3",
+        "backend_transport": "rvbbit",
+        "description": "Cross-encoder relevance scoring for query/document pairs.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "rerank/bge-reranker-v2-m3",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "mit",
+        "manifest_path": "capabilities/packs/rerank/bge-reranker-v2-m3/capability.yaml",
+        "name": "bge_reranker_v2_m3",
+        "operators": [
+          "rerank_score",
+          "rerank_row"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "rerank/bge-reranker-v2-m3",
+        "pack_manifest_path": "capabilities/packs/rerank/bge-reranker-v2-m3/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/rerank/bge-reranker-v2-m3",
+        "repo_url": null,
+        "runtime_handler": "sequence_classification",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "BAAI/bge-reranker-v2-m3",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/BAAI/bge-reranker-v2-m3",
+        "tags": [
+          "rerank",
+          "retrieval",
+          "relevance",
+          "gpu",
+          "row"
+        ],
+        "title": "BGE Reranker v2 M3"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 32,
+          "description": "MS MARCO MiniLM cross-encoder relevance scorer.",
+          "max_concurrent": 4,
+          "name": "rerank_ms_marco_minilm",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Lightweight cross-encoder reranker for query/document scoring and ranking table rows by relevance.",
+        "kind": "hf_backend",
+        "license": "apache-2.0",
+        "name": "ms_marco_minilm_l6_v2",
+        "operators": [
+          {
+            "arg_names": [
+              "query",
+              "text"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Score how relevant text is to a query using a lightweight MS MARCO MiniLM cross-encoder.",
+            "inputs": {
+              "query": "{{ inputs.query }}",
+              "text": "{{ inputs.text }}"
+            },
+            "name": "rerank_ms_marco_score",
+            "parser": "json",
+            "return_type": "jsonb"
+          },
+          {
+            "arg_names": [
+              "query",
+              "row"
+            ],
+            "arg_types": [
+              "text",
+              "jsonb"
+            ],
+            "description": "Score how relevant a JSONB row is to a query using a lightweight MS MARCO MiniLM cross-encoder.",
+            "inputs": {
+              "query": "{{ inputs.query }}",
+              "text": "{{ inputs.row }}"
+            },
+            "name": "rerank_ms_marco_row",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "auto",
+          "handler": "sequence_classification",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2"
+        },
+        "tags": [
+          "rerank",
+          "retrieval",
+          "relevance",
+          "row",
+          "cpu-friendly"
+        ],
+        "title": "MS MARCO MiniLM Reranker"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "rerank_ms_marco_minilm",
+        "backend_transport": "rvbbit",
+        "description": "Lightweight cross-encoder reranker for query/document scoring and ranking table rows by relevance.",
+        "device": "auto",
+        "endpoint_path": null,
+        "id": "rerank/ms-marco-minilm-l6-v2",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "apache-2.0",
+        "manifest_path": "capabilities/packs/rerank/ms-marco-minilm-l6-v2/capability.yaml",
+        "name": "ms_marco_minilm_l6_v2",
+        "operators": [
+          "rerank_ms_marco_score",
+          "rerank_ms_marco_row"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "rerank/ms-marco-minilm-l6-v2",
+        "pack_manifest_path": "capabilities/packs/rerank/ms-marco-minilm-l6-v2/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/rerank/ms-marco-minilm-l6-v2",
+        "repo_url": null,
+        "runtime_handler": "sequence_classification",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2",
+        "tags": [
+          "rerank",
+          "retrieval",
+          "relevance",
+          "row",
+          "cpu-friendly"
+        ],
+        "title": "MS MARCO MiniLM Reranker"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "description": "Warren-managed CPython runtime for rvbbit operator `kind: python` nodes.",
+        "kind": "runtime_sidecar",
+        "license": "apache-2.0",
+        "name": "python_runtime",
+        "runtime": {
+          "base_image": "python:3.12-slim",
+          "device": "cpu",
+          "env": {
+            "RVBBIT_PYTHON_ENVS_DIR": "/var/lib/rvbbit/python-envs",
+            "RVBBIT_PYTHON_HANDLERS_DIR": "/var/lib/rvbbit/python-handlers"
+          },
+          "handler": "python_runtime",
+          "image": "ghcr.io/rvbbit/python-runtime:0.60.4",
+          "language": "python",
+          "pull_policy": "missing",
+          "python_version": "3.12",
+          "template": "python-runtime",
+          "volumes": [
+            {
+              "mount": "/var/lib/rvbbit",
+              "name": "python_envs"
+            }
+          ]
+        },
+        "runtime_registration": {
+          "endpoint_path": "/run",
+          "labels": {
+            "capability_kind": "runtime_sidecar",
+            "language": "python"
+          },
+          "language": "python",
+          "name": "python_default",
+          "set_default": true
+        },
+        "source": {
+          "model": "rvbbit/python-runtime",
+          "provider": "builtin"
+        },
+        "tags": [
+          "runtime",
+          "python",
+          "warren",
+          "code",
+          "cpu"
+        ],
+        "title": "Managed CPython Runtime",
+        "warren": {
+          "endpoint_path": "/run"
+        }
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": null,
+        "backend_transport": "rvbbit",
+        "description": "Warren-managed CPython runtime for rvbbit operator `kind: python` nodes.",
+        "device": "cpu",
+        "endpoint_path": "/run",
+        "id": "runtimes/python-runtime",
+        "install_docker": true,
+        "install_mode": "image",
+        "install_warren": true,
+        "kind": "runtime_sidecar",
+        "license": "apache-2.0",
+        "manifest_path": "capabilities/packs/runtimes/python-runtime/capability.yaml",
+        "name": "python_runtime",
+        "operators": [],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "runtimes/python-runtime",
+        "pack_manifest_path": "capabilities/packs/runtimes/python-runtime/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/runtimes/python-runtime",
+        "repo_url": null,
+        "runtime_handler": "python_runtime",
+        "runtime_image": "ghcr.io/rvbbit/python-runtime:0.60.4",
+        "runtime_language": "python",
+        "runtime_mode": "image",
+        "runtime_name": "python_default",
+        "runtime_template": "python-runtime",
+        "source_model": "rvbbit/python-runtime",
+        "source_provider": "builtin",
+        "source_revision": null,
+        "source_url": null,
+        "tags": [
+          "runtime",
+          "python",
+          "warren",
+          "code",
+          "cpu"
+        ],
+        "title": "Managed CPython Runtime"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 256,
+          "description": "Deterministic echo backend for Warren smoke tests.",
+          "max_concurrent": 8,
+          "name": "warren_smoke_echo",
+          "timeout_ms": 10000,
+          "transport": "rvbbit"
+        },
+        "description": "Deterministic no-model sidecar for validating Warren deployment, backend registration, probing, and operator wiring.",
+        "kind": "hf_backend",
+        "license": "apache-2.0",
+        "name": "warren_smoke_echo",
+        "operators": [
+          {
+            "arg_names": [
+              "text"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Echo text through a Warren-managed sidecar.",
+            "inputs": {
+              "text": "{{ inputs.text }}"
+            },
+            "name": "warren_smoke_echo",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "base_image": "python:3.12-slim",
+          "device": "cpu",
+          "handler": "echo",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "rvbbit/warren-smoke-echo",
+          "provider": "builtin"
+        },
+        "tags": [
+          "smoke",
+          "warren",
+          "deterministic",
+          "no-model",
+          "cpu"
+        ],
+        "title": "Warren Smoke Echo"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [
+          "echo_operator_sample_table",
+          "backend_and_deployment_observability"
+        ],
+        "backend_name": "warren_smoke_echo",
+        "backend_transport": "rvbbit",
+        "description": "Deterministic no-model sidecar for validating Warren deployment, backend registration, probing, and operator wiring.",
+        "device": "cpu",
+        "endpoint_path": null,
+        "id": "smoke/warren-echo",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "apache-2.0",
+        "manifest_path": "capabilities/packs/smoke/warren-echo/capability.yaml",
+        "name": "warren_smoke_echo",
+        "operators": [
+          "warren_smoke_echo"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "smoke/warren-echo",
+        "pack_manifest_path": "capabilities/packs/smoke/warren-echo/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/smoke/warren-echo",
+        "repo_url": null,
+        "runtime_handler": "echo",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "rvbbit/warren-smoke-echo",
+        "source_provider": "builtin",
+        "source_revision": null,
+        "source_url": null,
+        "tags": [
+          "smoke",
+          "warren",
+          "deterministic",
+          "no-model",
+          "cpu"
+        ],
+        "title": "Warren Smoke Echo"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 256,
+          "description": "Scikit-learn California housing regression demo model.",
+          "max_concurrent": 2,
+          "name": "predict_california_housing_sklearn",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Scikit-learn tabular regression example that predicts median house value from California housing row features.",
+        "kind": "hf_backend",
+        "license": "unknown",
+        "name": "california_housing_sklearn",
+        "operators": [
+          {
+            "arg_names": [
+              "row"
+            ],
+            "arg_types": [
+              "jsonb"
+            ],
+            "description": "Predict median house value from a JSONB row of California housing features.",
+            "inputs": {
+              "row": "{{ inputs.row }}"
+            },
+            "name": "predict_house_value",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "cpu",
+          "env": {
+            "RVBBIT_CAPABILITY_EAGER": "0",
+            "RVBBIT_TABULAR_CONFIG_FILE": "config.json",
+            "RVBBIT_TABULAR_MODEL_FILE": "model.joblib"
+          },
+          "handler": "tabular_regression",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "B4S/california-housing-predictor",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/B4S/california-housing-predictor"
+        },
+        "tags": [
+          "tabular",
+          "regression",
+          "prediction",
+          "row",
+          "sklearn",
+          "real-estate",
+          "demo"
+        ],
+        "title": "California Housing Regressor"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "predict_california_housing_sklearn",
+        "backend_transport": "rvbbit",
+        "description": "Scikit-learn tabular regression example that predicts median house value from California housing row features.",
+        "device": "cpu",
+        "endpoint_path": null,
+        "id": "tabular/california-housing-sklearn",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "unknown",
+        "manifest_path": "capabilities/packs/tabular/california-housing-sklearn/capability.yaml",
+        "name": "california_housing_sklearn",
+        "operators": [
+          "predict_house_value"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "tabular/california-housing-sklearn",
+        "pack_manifest_path": "capabilities/packs/tabular/california-housing-sklearn/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/tabular/california-housing-sklearn",
+        "repo_url": null,
+        "runtime_handler": "tabular_regression",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "B4S/california-housing-predictor",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/B4S/california-housing-predictor",
+        "tags": [
+          "tabular",
+          "regression",
+          "prediction",
+          "row",
+          "sklearn",
+          "real-estate",
+          "demo"
+        ],
+        "title": "California Housing Regressor"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "backend": {
+          "batch_size": 256,
+          "description": "Scikit-learn wine quality classification demo model.",
+          "max_concurrent": 2,
+          "name": "predict_wine_quality_sklearn",
+          "timeout_ms": 120000,
+          "transport": "rvbbit"
+        },
+        "description": "Scikit-learn tabular classification example that predicts red wine quality classes from numeric row features.",
+        "kind": "hf_backend",
+        "license": "unknown",
+        "name": "wine_quality_sklearn",
+        "operators": [
+          {
+            "arg_names": [
+              "row"
+            ],
+            "arg_types": [
+              "jsonb"
+            ],
+            "description": "Predict wine quality class from a JSONB row of numeric chemical properties.",
+            "inputs": {
+              "row": "{{ inputs.row }}"
+            },
+            "name": "predict_wine_quality",
+            "parser": "json",
+            "return_type": "jsonb"
+          }
+        ],
+        "runtime": {
+          "device": "cpu",
+          "env": {
+            "RVBBIT_CAPABILITY_EAGER": "0",
+            "RVBBIT_TABULAR_FEATURES": "[\"fixed acidity\",\"volatile acidity\",\"citric acid\",\"residual sugar\",\"chlorides\",\"free sulfur dioxide\",\"total sulfur dioxide\",\"density\",\"pH\",\"sulphates\",\"alcohol\"]",
+            "RVBBIT_TABULAR_MODEL_FILE": "sklearn_model.joblib"
+          },
+          "handler": "tabular_classification",
+          "template": "hf-rvbbit-fastapi"
+        },
+        "source": {
+          "model": "julien-c/wine-quality",
+          "provider": "huggingface",
+          "url": "https://huggingface.co/julien-c/wine-quality"
+        },
+        "tags": [
+          "tabular",
+          "classify",
+          "prediction",
+          "row",
+          "sklearn",
+          "demo"
+        ],
+        "title": "Wine Quality Classifier"
+      },
+      "catalog_entry": {
+        "acceptance_tests": [],
+        "backend_name": "predict_wine_quality_sklearn",
+        "backend_transport": "rvbbit",
+        "description": "Scikit-learn tabular classification example that predicts red wine quality classes from numeric row features.",
+        "device": "cpu",
+        "endpoint_path": null,
+        "id": "tabular/wine-quality-sklearn",
+        "install_docker": true,
+        "install_mode": "build",
+        "install_warren": true,
+        "kind": "hf_backend",
+        "license": "unknown",
+        "manifest_path": "capabilities/packs/tabular/wine-quality-sklearn/capability.yaml",
+        "name": "wine_quality_sklearn",
+        "operators": [
+          "predict_wine_quality"
+        ],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "tabular/wine-quality-sklearn",
+        "pack_manifest_path": "capabilities/packs/tabular/wine-quality-sklearn/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/tabular/wine-quality-sklearn",
+        "repo_url": null,
+        "runtime_handler": "tabular_classification",
+        "runtime_image": null,
+        "runtime_language": null,
+        "runtime_mode": "build",
+        "runtime_name": null,
+        "runtime_template": "hf-rvbbit-fastapi",
+        "source_model": "julien-c/wine-quality",
+        "source_provider": "huggingface",
+        "source_revision": null,
+        "source_url": "https://huggingface.co/julien-c/wine-quality",
+        "tags": [
+          "tabular",
+          "classify",
+          "prediction",
+          "row",
+          "sklearn",
+          "demo"
+        ],
+        "title": "Wine Quality Classifier"
+      }
+    }
+  ],
+  "catalog_layout": "rvbbit.pack/v1",
+  "catalog_source": "curated",
+  "schema_version": 1
+}

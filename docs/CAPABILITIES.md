@@ -11,22 +11,21 @@ to a separate `rvbbit-capabilities` repository later.
 
 ## What A Pack Contains
 
-- `rvbbit.backend.yaml`: source, runtime, endpoint, batching/registration, and
-  optional SQL operator definitions.
-- `register.sql`: calls `rvbbit.register_backend(...)` for model backends or
-  runtime-specific registration such as `rvbbit.register_python_runtime(...)`.
-- `operator.sql`: optional `rvbbit.create_operator(...)` calls. Runtime
-  sidecars usually do not create operators directly; they become node
-  primitives used by operators.
-- `smoke.sql`: active backend probe plus example operator calls.
-- `Dockerfile`, `main.py`, `requirements.txt`: a FastAPI sidecar scaffold
-  speaking Rvbbit's native batch transport.
-- `compose.yaml`: standalone local deployment.
-- `compose.gpu.yaml`: optional NVIDIA GPU overlay.
+- `rvbbit-pack.yaml`: root metadata for fast browse, catalog sync, provenance,
+  and future marketplace fetches.
+- `capability.yaml`: the deployable `rvbbit.capability/v1` manifest with
+  runtime, endpoint, batching/registration, and optional operator definitions.
+- Optional local runtime source when the pack builds its own image.
+- A prebuilt `runtime.image` reference or enough build/template metadata for
+  Warren to materialize the sidecar.
+
+The CLI scaffold output is separate from the source pack. It writes generated
+files such as `register.sql`, `operator.sql`, `smoke.sql`, `compose.yaml`, and
+template-rendered runtime files under the target directory.
 
 ## CLI
 
-List curated manifests:
+List curated packs:
 
 ```bash
 capabilities/tools/rvbbit-capability list
@@ -36,22 +35,37 @@ Render SQL:
 
 ```bash
 capabilities/tools/rvbbit-capability render \
-  capabilities/manifests/extract/gliner-medium-v2.1.yaml
+  capabilities/packs/extract/gliner-medium-v2.1
 ```
 
 Scaffold a runnable sidecar:
 
 ```bash
 capabilities/tools/rvbbit-capability scaffold \
-  capabilities/manifests/extract/gliner-medium-v2.1.yaml \
+  capabilities/packs/extract/gliner-medium-v2.1 \
   /tmp/rvbbit-gliner
 ```
 
-Build the UI catalog:
+Build the JSON catalog artifact:
 
 ```bash
 capabilities/tools/rvbbit-capability catalog build \
   --output capabilities/catalog.json
+```
+
+Build the extension install seed artifact:
+
+```bash
+capabilities/tools/rvbbit-capability catalog seed-json \
+  --output crates/pg_rvbbit/src/capability_catalog_seed.json
+```
+
+Publish the catalog into Postgres for the UI:
+
+```bash
+capabilities/tools/rvbbit-capability catalog publish \
+  --dsn "$RVBBIT_DSN" \
+  --prune
 ```
 
 Search the curated catalog:
@@ -65,7 +79,7 @@ Install locally:
 ```bash
 RVBBIT_DSN=postgresql://postgres:rvbbit@localhost:55433/bench \
 capabilities/tools/rvbbit-capability install \
-  capabilities/manifests/extract/gliner-medium-v2.1.yaml \
+  capabilities/packs/extract/gliner-medium-v2.1 \
   --gpu
 ```
 
@@ -73,26 +87,41 @@ Queue an install through a Warren agent:
 
 ```bash
 capabilities/tools/rvbbit-capability deploy \
-  capabilities/manifests/smoke/warren-echo.yaml \
+  capabilities/packs/smoke/warren-echo \
   --dsn "$RVBBIT_DSN" \
   --target '{"gpu":false}'
+```
+
+Run a pack's Warren acceptance tests:
+
+```bash
+capabilities/tools/rvbbit-capability test \
+  capabilities/packs/smoke/warren-echo \
+  --dsn "$RVBBIT_DSN"
 ```
 
 Queue the managed Python runtime through Warren:
 
 ```bash
 capabilities/tools/rvbbit-capability deploy \
-  capabilities/manifests/runtimes/python-runtime.yaml \
+  capabilities/packs/runtimes/python-runtime \
   --dsn "$RVBBIT_DSN" \
   --target '{"docker":true}'
+```
+
+For the local stack, this shortcut uses the same catalog/Warren path: it queues
+the built-in item, runs one Warren claim, and verifies `python_default`:
+
+```bash
+make python-runtime-up
 ```
 
 Or from SQL:
 
 ```sql
-SELECT rvbbit.deploy_capability(
-  capability_manifest => '<rendered manifest json>'::jsonb,
-  target_selector => '{"gpu":true}'::jsonb
+SELECT rvbbit.deploy_catalog_capability(
+  catalog_id => 'runtimes/python-runtime',
+  target_selector => '{"docker":true}'::jsonb
 );
 ```
 
@@ -110,7 +139,7 @@ Example:
 
 ```bash
 capabilities/tools/rvbbit-capability scaffold \
-  capabilities/manifests/classify/deberta-v3-zero-shot.yaml \
+  capabilities/packs/classify/deberta-v3-zero-shot \
   /tmp/rvbbit-deberta
 
 cd /tmp/rvbbit-deberta
@@ -194,16 +223,20 @@ backend through the same transport path used by specialist operator nodes.
 ## UI Builder Contract
 
 This section is the stable v0 contract for an early capability UI. The UI
-should be data-driven: read the catalog, inspect installed backend state from
-SQL, and call the CLI for scaffold/install actions. Do not hardcode curated
-pack names or generated SQL bodies.
+should be data-driven: read the SQL catalog, inspect installed backend state
+from SQL, and call the CLI only for local scaffold/install actions. Do not
+hardcode curated pack names or generated SQL bodies.
 
 ### Primary Data Sources
 
-- `capabilities/catalog.json`: curated pack catalog for browsing and install
-  selection.
-- `capabilities/manifests/**/*.yaml`: full source manifest for a selected
-  catalog item.
+- `rvbbit.capability_catalog`: curated pack catalog for browsing and install
+  selection from the database.
+- `capabilities/catalog.json`: local build artifact generated from packs,
+  and optional fallback when the database catalog has not been published.
+- `capabilities/packs/**/rvbbit-pack.yaml`: root pack metadata used by the
+  catalog publisher and future marketplace fetch/sync flows.
+- `capabilities/packs/**/capability.yaml`: full deployable Warren manifests
+  used by the CLI and stored in `rvbbit.capability_catalog.manifest`.
 - `rvbbit.backend_health`: passive installed backend and usage state.
 - `rvbbit.backend_probe(name)`: active backend check with default sample input.
 - `rvbbit.backend_probe_with_input(name, sample_jsonb)`: active backend check
@@ -226,13 +259,70 @@ pack names or generated SQL bodies.
 For the Warren-specific inventory, deployment, metrics, placement, and error
 state contract, see [WARREN_UI_CONTRACT.md](WARREN_UI_CONTRACT.md).
 
-### Catalog JSON Shape
+### SQL Catalog Shape
 
-`capabilities/catalog.json` has this top-level shape:
+The primary UI catalog is `rvbbit.capability_catalog`. Fresh extension installs
+seed it from the canonical bundled capability seed. Use the CLI publish command
+to refresh it after manifest changes:
+
+```bash
+capabilities/tools/rvbbit-capability catalog publish --dsn "$RVBBIT_DSN" --prune
+```
+
+Useful browse query:
+
+```sql
+SELECT
+  id,
+  name,
+  title,
+  description,
+  tags,
+  kind,
+  source_provider,
+  source_model,
+  catalog_entry->>'pack_path' AS pack_path,
+  catalog_entry->>'runtime_mode' AS runtime_mode,
+  backend_name,
+  runtime_name,
+  runtime_language,
+  runtime_template,
+  runtime_handler,
+  endpoint_path,
+  device,
+  operators,
+  active,
+  updated_at
+FROM rvbbit.capability_catalog
+WHERE active
+ORDER BY title;
+```
+
+Deploy from the SQL catalog:
+
+```sql
+SELECT rvbbit.deploy_catalog_capability(
+  catalog_id => 'smoke/warren-echo',
+  target_selector => '{"gpu":false}'::jsonb
+);
+```
+
+`manifest` contains the Warren deploy payload. `catalog_entry` contains the
+JSON browse entry generated by the CLI. `rvbbit.deploy_catalog_capability(...)`
+also stamps the queued `rvbbit.warren_jobs` row with the catalog's
+`backend_name`, `runtime_name`, and first `operator_name` when those values are
+known, so the UI can show install intent before a Warren claims the job.
+
+### Catalog JSON Fallback Shape
+
+`capabilities/catalog.json` is a build artifact and optional fallback. The
+primary UI source is `rvbbit.capability_catalog`. The JSON artifact has this
+top-level shape:
 
 ```json
 {
   "schema_version": 1,
+  "catalog_layout": "rvbbit.pack/v1",
   "capabilities": []
 }
 ```
@@ -241,7 +331,10 @@ Each `capabilities[]` entry has these fields:
 
 | Field | Type | Meaning |
 |---|---:|---|
-| `id` | string | Stable catalog id, relative to `capabilities/manifests/`. |
+| `id` | string | Stable catalog id, normally the pack id such as `embeddings/bge-small-en-v1.5`. |
+| `pack_id` | string/null | Pack metadata id from `rvbbit-pack.yaml`. |
+| `pack_path` | string/null | Repo-relative pack root. |
+| `pack_manifest_path` | string/null | Repo-relative `rvbbit-pack.yaml` path. |
 | `manifest_path` | string | Repo-relative path to the full manifest. |
 | `name` | string | Capability pack name. |
 | `title` | string | Human-readable title. |
@@ -256,6 +349,12 @@ Each `capabilities[]` entry has these fields:
 | `backend_transport` | string/null | Usually `rvbbit` for generated model sidecars. |
 | `runtime_name` | string/null | Name registered in a runtime catalog such as `rvbbit.python_runtimes`. |
 | `runtime_language` | string/null | Runtime language, currently `python` for runtime sidecars. |
+| `runtime_image` | string/null | OCI image Warren should run when the capability is image-based. |
+| `runtime_mode` | string | `image` for pull/run packs, `build` for local build/template packs. |
+| `install_mode` | string | Pack install mode, currently usually the same as `runtime_mode`. |
+| `install_warren` | boolean/null | Whether the pack metadata declares Warren install support. |
+| `install_docker` | boolean/null | Whether the pack expects Docker as the sidecar runtime. |
+| `acceptance_tests` | string[] | Named pack acceptance SQL tests, if present. |
 | `runtime_template` | string | Generated runtime template. |
 | `runtime_handler` | string | Handler such as `echo`, `embedding`, `gliner`, `sequence_classification`, `tabular_classification`, `tabular_regression`, or `python_runtime`. |
 | `endpoint_path` | string/null | Warren registration path such as `/predict` or `/run`. |
@@ -269,8 +368,47 @@ catalogs such as `rvbbit.python_runtimes`.
 
 ### Manifest Shape
 
-The full manifest is the source of truth for install details. A UI can display
-or edit advanced settings from these sections:
+Each pack has two layers. `rvbbit-pack.yaml` is the lightweight root metadata
+used for discovery, provenance, filtering, and future marketplace sync.
+`capability.yaml` is the deployable payload stored in
+`rvbbit.capability_catalog.manifest` and handed to Warren.
+
+Minimal pack metadata:
+
+```yaml
+api_version: rvbbit.pack/v1
+id: embeddings/bge-small-en-v1.5
+name: bge_small_en_v1_5
+title: BGE Small English Embeddings
+capability: capability.yaml
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: embedding
+exports:
+  backend: embed_bge_small
+  operators: [embed_bge_small]
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  tests:
+    - name: smoke_operator_sample_table
+      sql: |
+        DO $$
+        BEGIN
+          -- Create tiny sample data, call installed functions, raise on mismatch.
+        END
+        $$;
+```
+
+The full capability manifest is the source of truth for install details. A UI
+can display or edit advanced settings from these sections:
 
 ```yaml
 api_version: rvbbit.capability/v1
@@ -313,6 +451,8 @@ source:
   provider: builtin
   model: rvbbit/python-runtime
 runtime:
+  image: ghcr.io/rvbbit/python-runtime:0.60.4
+  pull_policy: missing
   template: python-runtime
   language: python
   handler: python_runtime
@@ -328,6 +468,12 @@ runtime_registration:
 warren:
   endpoint_path: /run
 ```
+
+`runtime.image` is the preferred deployment shape. Warren can run these
+manifests without a source checkout: it writes a tiny compose project, pulls the
+image if missing, starts the container, probes it, and registers SQL state.
+`runtime.template` remains a trusted local-build fallback for development and
+custom packs that have not been published as images yet.
 
 ### Tabular Handler Shape
 
@@ -540,7 +686,7 @@ Important fields:
 The UI should show trained models beside curated capability packs but keep the
 origin clear:
 
-- Curated packs come from `capabilities/catalog.json`.
+- Curated packs come from `rvbbit.capability_catalog`.
 - User-trained models come from `rvbbit.ml_model_status`.
 - Both ultimately register rows in `rvbbit.backends` and optionally
   `rvbbit.operators`.
@@ -627,7 +773,7 @@ For v0, use this state model:
 
 | State | How To Infer |
 |---|---|
-| `catalog_only` | Entry exists in `catalog.json`, no matching backend/runtime row. |
+| `catalog_only` | Entry exists in `rvbbit.capability_catalog`, no matching backend/runtime row. |
 | `registered` | `rvbbit.backend_health.name = catalog.backend_name` or `rvbbit.python_runtimes.name = catalog.runtime_name`. |
 | `used` | Registered and `n_calls > 0`. |
 | `error_seen` | Registered and `n_errors > 0`. |
@@ -689,13 +835,21 @@ drawer.
 
 ### CLI Actions For The UI
 
+Publish or refresh the SQL catalog:
+
+```bash
+capabilities/tools/rvbbit-capability catalog publish \
+  --dsn "$RVBBIT_DSN" \
+  --prune
+```
+
 List curated packs:
 
 ```bash
 capabilities/tools/rvbbit-capability list
 ```
 
-Build or refresh catalog JSON:
+Build or refresh the JSON fallback artifact:
 
 ```bash
 capabilities/tools/rvbbit-capability catalog build \
@@ -712,7 +866,7 @@ Scaffold without installing:
 
 ```bash
 capabilities/tools/rvbbit-capability scaffold \
-  capabilities/manifests/embeddings/bge-small-en-v1.5.yaml \
+  capabilities/packs/embeddings/bge-small-en-v1.5 \
   .rvbbit/capabilities/bge_small_en_v1_5 \
   --force
 ```
@@ -722,7 +876,7 @@ Install with Docker + SQL:
 ```bash
 RVBBIT_DSN=postgresql://postgres:rvbbit@localhost:55433/bench \
 capabilities/tools/rvbbit-capability install \
-  capabilities/manifests/embeddings/bge-small-en-v1.5.yaml \
+  capabilities/packs/embeddings/bge-small-en-v1.5 \
   --out-dir .rvbbit/capabilities/bge_small_en_v1_5 \
   --gpu \
   --force
@@ -732,7 +886,7 @@ Install without running Docker or SQL, useful for preview:
 
 ```bash
 capabilities/tools/rvbbit-capability install \
-  capabilities/manifests/embeddings/bge-small-en-v1.5.yaml \
+  capabilities/packs/embeddings/bge-small-en-v1.5 \
   --out-dir .rvbbit/capabilities/bge_small_en_v1_5 \
   --no-compose \
   --no-sql \
@@ -774,7 +928,7 @@ overlay assumes Docker has NVIDIA GPU support configured.
 
 ### Suggested V0 UI
 
-- Catalog browser: cards/table from `capabilities/catalog.json`, filter by
+- Catalog browser: cards/table from `rvbbit.capability_catalog`, filter by
   tags, provider, runtime handler, device, and installed state.
 - Capability detail: manifest summary, model/source link, operators, runtime
   settings, generated SQL preview.
@@ -804,21 +958,23 @@ overlay assumes Docker has NVIDIA GPU support configured.
 
 ## Curated V1 Packs
 
-- `classify/deberta-v3-base-zero-shot.yaml`
-- `classify/deberta-v3-zero-shot.yaml`
-- `classify/emotion-distilroberta.yaml`
-- `classify/language-detection-xlm-roberta.yaml`
-- `classify/toxic-bert.yaml`
-- `classify/twitter-roberta-sentiment.yaml`
-- `embeddings/bge-small-en-v1.5.yaml`
-- `embeddings/bge-m3.yaml`
-- `embeddings/e5-small-v2.yaml`
-- `extract/gliner-medium-v2.1.yaml`
-- `rerank/bge-reranker-base.yaml`
-- `rerank/bge-reranker-v2-m3.yaml`
-- `rerank/ms-marco-minilm-l6-v2.yaml`
-- `tabular/california-housing-sklearn.yaml`
-- `tabular/wine-quality-sklearn.yaml`
+- `classify/deberta-v3-base-zero-shot`
+- `classify/deberta-v3-zero-shot`
+- `classify/emotion-distilroberta`
+- `classify/language-detection-xlm-roberta`
+- `classify/toxic-bert`
+- `classify/twitter-roberta-sentiment`
+- `embeddings/bge-small-en-v1.5`
+- `embeddings/bge-m3`
+- `embeddings/e5-small-v2`
+- `extract/gliner-medium-v2.1`
+- `rerank/bge-reranker-base`
+- `rerank/bge-reranker-v2-m3`
+- `rerank/ms-marco-minilm-l6-v2`
+- `runtimes/python-runtime`
+- `smoke/warren-echo`
+- `tabular/california-housing-sklearn`
+- `tabular/wine-quality-sklearn`
 
 These are starting points, not a claim that every model is ideal for every
 workload. Pin model revisions before production use when reproducibility

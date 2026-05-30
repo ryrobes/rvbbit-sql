@@ -1,0 +1,30 @@
+api_version: rvbbit.pack/v1
+id: classify/language-detection-xlm-roberta
+name: language_detection_xlm_roberta
+title: XLM-R Language Detection
+description: Detect the language of text for routing, normalization, and multilingual analytics.
+license: mit
+tags:
+- classify
+- language
+- multilingual
+- routing
+- tabular
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: papluca/xlm-roberta-base-language-detection
+  url: https://huggingface.co/papluca/xlm-roberta-base-language-detection
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+exports:
+  backend: detect_language_xlm_roberta
+  operators:
+  - detect_language
+install:
+  mode: build
+  warren: true
+  docker: true

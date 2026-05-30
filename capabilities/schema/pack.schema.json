@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rvbbit.dev/schemas/pack.schema.json",
+  "title": "Rvbbit Capability Pack",
+  "type": "object",
+  "required": ["api_version", "id", "name", "capability"],
+  "additionalProperties": false,
+  "properties": {
+    "api_version": {
+      "type": "string",
+      "const": "rvbbit.pack/v1"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_./-]+$"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_\\-]*$"
+    },
+    "title": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "license": {
+      "type": "string"
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "repo_url": {
+      "type": "string"
+    },
+    "capability": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "revision": { "type": "string" },
+        "url": { "type": "string" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "type": "string", "enum": ["image", "build", "external"] },
+        "image": { "type": "string" },
+        "image_digest": { "type": "string" },
+        "template": { "type": "string" },
+        "handler": { "type": "string" },
+        "device": { "type": "string" }
+      }
+    },
+    "exports": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": { "type": "string" },
+        "runtime": { "type": "string" },
+        "operators": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "install": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "type": "string", "enum": ["image", "build", "external"] },
+        "warren": { "type": "boolean" },
+        "docker": { "type": "boolean" }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target_selector": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "setup_sql": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "tests": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "sql"],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_\\-]*$"
+              },
+              "description": { "type": "string" },
+              "sql": { "type": "string" }
+            }
+          }
+        },
+        "teardown_sql": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

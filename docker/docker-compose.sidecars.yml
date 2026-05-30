@@ -1,4 +1,8 @@
-# Opt-in sidecar containers. Bring up alongside the main stack with:
+# Local development harness for hand-run sidecar containers. The Warren catalog
+# path is the product path for built-in capabilities: queue one catalog item and
+# let the Warren agent materialize its isolated generated compose project.
+#
+# Bring dev harness containers up alongside the main stack with:
 #   docker compose -f docker/docker-compose.yml \
 #                  -f docker/docker-compose.sidecars.yml up -d echo
 #
@@ -208,9 +212,8 @@ services:
       timeout: 2s
       retries: 5
 
-  # Managed CPython runtime for operator `kind: python` nodes. The database
-  # owns env/package/handler metadata; this sidecar lazily creates hashed
-  # venvs and executes handlers over JSON.
+  # Dev-harness managed CPython runtime for operator `kind: python` nodes.
+  # The catalog/Warren path is `make python-runtime-up`.
   python-runtime:
     build:
       context: ../sidecars/python-runtime

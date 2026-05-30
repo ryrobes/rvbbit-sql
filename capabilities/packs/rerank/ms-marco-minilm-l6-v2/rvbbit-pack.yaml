@@ -1,0 +1,31 @@
+api_version: rvbbit.pack/v1
+id: rerank/ms-marco-minilm-l6-v2
+name: ms_marco_minilm_l6_v2
+title: MS MARCO MiniLM Reranker
+description: Lightweight cross-encoder reranker for query/document scoring and ranking table rows by relevance.
+license: apache-2.0
+tags:
+- rerank
+- retrieval
+- relevance
+- row
+- cpu-friendly
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: cross-encoder/ms-marco-MiniLM-L6-v2
+  url: https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+exports:
+  backend: rerank_ms_marco_minilm
+  operators:
+  - rerank_ms_marco_score
+  - rerank_ms_marco_row
+install:
+  mode: build
+  warren: true
+  docker: true

@@ -46,6 +46,12 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "image": { "type": "string" },
+        "image_digest": { "type": "string" },
+        "pull_policy": {
+          "type": "string",
+          "enum": ["missing", "always", "never"]
+        },
         "template": { "type": "string", "default": "hf-rvbbit-fastapi" },
         "handler": {
           "type": "string",

@@ -1,0 +1,28 @@
+api_version: rvbbit.pack/v1
+id: embeddings/bge-small-en-v1.5
+name: bge_small_en_v1_5
+title: BGE Small English Embeddings
+description: CPU-friendly English sentence embeddings exposed as an Rvbbit backend.
+license: mit
+tags:
+- embedding
+- retrieval
+- cpu-friendly
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: BAAI/bge-small-en-v1.5
+  url: https://huggingface.co/BAAI/bge-small-en-v1.5
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: embedding
+  device: auto
+exports:
+  backend: embed_bge_small
+  operators:
+  - embed_bge_small
+install:
+  mode: build
+  warren: true
+  docker: true

@@ -5,10 +5,9 @@ tool sidecars. The database remains the source of truth. A Warren agent runs on
 any host with the right resources, polls Postgres for deployment jobs, starts
 the requested service, then registers the resulting endpoint back into Rvbbit.
 
-The first agent is Rust (`warren-agent`). Generated Hugging Face serving
-containers still use the existing FastAPI template because the Python model
-ecosystem is the useful capability there; Warren itself is not a Python control
-plane.
+The first agent is Rust (`warren-agent`). Its steady-state job is small:
+communicate with Postgres, pull/run Docker images, probe deployed services, and
+report endpoint/backend/runtime state back to the database.
 
 ## Shape
 
@@ -16,7 +15,8 @@ plane.
 - Warren agents register themselves with labels such as `{"gpu": true}`.
 - SQL queues a deployment job with a target selector.
 - A matching Warren claims the job using `FOR UPDATE SKIP LOCKED`.
-- The Warren scaffolds/builds/runs the sidecar.
+- The Warren pulls/runs the declared sidecar image. Local template scaffolding
+  remains a development fallback for manifests that have no `runtime.image`.
 - Model capabilities call `rvbbit.register_backend(...)`,
   `rvbbit.create_operator(...)`, and `rvbbit.reload_backends()`.
 - Runtime capabilities call runtime-specific registration functions such as
@@ -27,6 +27,26 @@ plane.
 This keeps routing simple: SQL asks for a capability; Warren decides where it
 runs; Rvbbit stores only the backend/operator or runtime catalog rows it
 already knows how to execute.
+
+Built-in catalog entries should follow the same a-la-carte path as external
+capabilities. The shared `docker/docker-compose.sidecars.yml` file is a local
+development harness for hand-run services, not the deployment contract. For
+curated capabilities, the contract is: a catalog row identifies one pack,
+Warren materializes one generated project under its work directory, Docker
+pulls a declared image or builds the declared runtime fallback, and the agent
+writes the bootstrapped backend/operator or runtime rows back to SQL.
+
+Built-ins are stored like standalone repositories under
+`capabilities/packs/<category>/<pack>/`:
+
+- `rvbbit-pack.yaml`: root metadata for fast catalog/marketplace queries.
+- `capability.yaml`: the deployable Warren manifest.
+- Optional local source/runtime files for packs that build instead of pulling a
+  prebuilt image.
+
+External catalogs should use the same shape. A Warren-installable pack can be
+published as a Git repository, tarball, or other fetched artifact as long as the
+root metadata points at a deployable `capability.yaml`.
 
 ## Catalog
 
@@ -54,6 +74,11 @@ SELECT rvbbit.register_warren_node(
 SELECT rvbbit.deploy_capability(
   capability_manifest => $manifest_json$ { ... capability manifest ... } $manifest_json$::jsonb,
   target_selector => '{"gpu":true}'::jsonb
+);
+
+SELECT rvbbit.deploy_catalog_capability(
+  catalog_id => 'runtimes/python-runtime',
+  target_selector => '{"docker":true}'::jsonb
 );
 
 SELECT * FROM rvbbit.warren_inventory ORDER BY node_name, deployment_name;
@@ -96,7 +121,7 @@ Queue a capability for the agent:
 
 ```bash
 make capability-deploy \
-  MANIFEST=capabilities/manifests/smoke/warren-echo.yaml \
+  MANIFEST=capabilities/packs/smoke/warren-echo \
   TARGET='{"gpu":false}'
 ```
 
@@ -104,12 +129,34 @@ The same deploy step can be called directly:
 
 ```bash
 capabilities/tools/rvbbit-capability deploy \
-  capabilities/manifests/smoke/warren-echo.yaml \
+  capabilities/packs/smoke/warren-echo \
   --dsn "$RVBBIT_DSN" \
   --target '{"gpu":false}'
 ```
 
-`capabilities/manifests/smoke/warren-echo.yaml` is the recommended first test.
+Fresh extension installs seed the curated catalog into SQL so the UI can browse
+without reading repository files. Refresh it after manifest changes with:
+
+```bash
+make capability-catalog-db
+```
+
+Then queue by catalog id:
+
+```sql
+SELECT rvbbit.deploy_catalog_capability(
+  catalog_id => 'smoke/warren-echo',
+  target_selector => '{"gpu":false}'::jsonb
+);
+```
+
+To run the pack's own Warren acceptance SQL, use:
+
+```bash
+make capability-test MANIFEST=capabilities/packs/smoke/warren-echo
+```
+
+`capabilities/packs/smoke/warren-echo` is the recommended first test.
 It uses the existing FastAPI sidecar template with an `echo` handler and
 `python:3.12-slim`, so it validates Warren, Docker, backend registration,
 probing, and operator wiring without downloading a model.
@@ -126,9 +173,17 @@ To deploy the managed Python execution runtime instead of a model backend:
 
 ```bash
 capabilities/tools/rvbbit-capability deploy \
-  capabilities/manifests/runtimes/python-runtime.yaml \
+  capabilities/packs/runtimes/python-runtime \
   --dsn "$RVBBIT_DSN" \
   --target '{"docker":true}'
+```
+
+For the local stack, the shortcut is still Warren-driven. It starts the core
+database, queues the catalog item, runs `warren-agent --once`, and verifies the
+registered runtime:
+
+```bash
+make python-runtime-up
 ```
 
 After Warren completes the job, the deployment has `runtime_name =
@@ -272,8 +327,8 @@ At a high level:
 - Show latest node telemetry from `rvbbit.warren_node_latest_metrics`.
 - Chart node telemetry history from `rvbbit.warren_node_metrics`.
 - Surface node label and capacity JSON as filters/placement hints.
-- Let users queue a capability by reading a manifest from the capability
-  catalog and calling `rvbbit.deploy_capability(...)`.
+- Let users browse `rvbbit.capability_catalog` and queue with
+  `rvbbit.deploy_catalog_capability(...)`.
 - Let advanced users choose a target selector, for example `{"gpu":true}` or
   `{"region":"lab"}`.
 - Link deployed `backend_name` to `rvbbit.backend_health`.
@@ -292,3 +347,29 @@ Initial job kinds are:
 
 Initial agent behavior is intentionally conservative: one claimed job at a
 time, Docker Compose as the runtime, and label-subset matching for placement.
+
+## Warren-Installable Pack Contract
+
+A pack that can be installed by Warren should keep the root small and
+inspectable:
+
+- `rvbbit-pack.yaml` with `api_version: rvbbit.pack/v1`, stable `id`, display
+  metadata, `capability: capability.yaml`, source/runtime hints, exported
+  backend/runtime/operator names, and install mode.
+- `capability.yaml` with `api_version: rvbbit.capability/v1`, `kind`,
+  `runtime`, backend/runtime registration, operators, and smoke checks.
+- Prebuilt-image packs should set `runtime.image`; production catalogs should
+  also pin `runtime.image_digest`.
+- Build-mode packs should include or reference the runtime source/template that
+  Warren is expected to build.
+- `acceptance.tests` may define small SQL blocks for pack-level tests. The
+  runner deploys the pack through Warren, runs one Warren claim, then executes
+  each SQL block with `ON_ERROR_STOP`; the SQL should raise on failure.
+- Runtime sidecars must expose `GET /health`; model backends must expose
+  Rvbbit's batch `POST /predict`; Python runtimes must expose `POST /run`.
+
+Sidecars do not need direct database credentials in the normal flow. Warren
+talks to Postgres, starts Docker, probes the service, and registers the
+resulting endpoint. A custom control-plane integration should use the same SQL
+functions Warren uses: claim or enqueue jobs, complete/fail jobs, register
+backends or runtimes, and record health/metrics through the Warren tables.

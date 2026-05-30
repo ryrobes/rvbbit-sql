@@ -38,12 +38,25 @@ make e2e-realworld-warren
 ```
 
 Runs the heavier Warren deployment smoke: queue
-`capabilities/manifests/smoke/warren-echo.yaml`, run `warren-agent --once` on the
+`capabilities/packs/smoke/warren-echo`, run `warren-agent --once` on the
 host, build/start the generated sidecar container, register its backend and SQL
 operator, probe the backend, and call `rvbbit.warren_smoke_echo(...)`.
 The same path can deploy runtime sidecars such as
-`capabilities/manifests/runtimes/python-runtime.yaml`; add that to the host
-Docker target when validating the full Python runtime lifecycle.
+`capabilities/packs/runtimes/python-runtime`; add that to the host
+Docker target when validating the full Python runtime lifecycle. Locally,
+`make python-runtime-up` queues that catalog item and runs one Warren claim.
+
+Capability packs can also carry their own small Warren acceptance SQL in
+`rvbbit-pack.yaml`. For example:
+
+```bash
+make capability-test MANIFEST=capabilities/packs/smoke/warren-echo
+```
+
+The runner queues the pack, runs one Warren claim, then executes the pack's
+named SQL assertions. Use this for tiny realistic samples that validate the
+sidecar build/image, Warren registration, generated operators, and
+observability rows together.
 
 ## Environment
 

@@ -100,6 +100,7 @@ def test_route_profiles_and_status_helpers(rvbbit):
             "datafusion_vortex",
             "datafusion_vector",
             "duck_hive",
+            "duck_vortex",
             "duck_vector",
             "pg_rowstore",
         }

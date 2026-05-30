@@ -18,10 +18,6 @@ from rvbbit_duck_hot import (  # noqa: E402
     rvbbit_duck_hot_detail,
     clear_rvbbit_duck_hot_detail,
     record_rvbbit_route_observation,
-    run_rvbbit_datafusion_hive_forced,
-    run_rvbbit_datafusion_forced,
-    run_rvbbit_duck_hive_forced,
-    run_rvbbit_duck_vortex_forced,
     run_rvbbit_duck_hot,
 )
 from schema import duckdb_path_for_scale  # noqa: E402
@@ -35,6 +31,11 @@ PG_DSNS = {
     "rvbbit": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench",
     "rvbbit_native": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff",
     "rvbbit_native_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Drvbbit_native",
+    "rvbbit_duck_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Dduck_vector",
+    "rvbbit_duck_hive_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Dduck_hive",
+    "rvbbit_duck_vortex_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Dduck_vortex",
+    "rvbbit_datafusion_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_vector",
+    "rvbbit_datafusion_hive_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_hive",
     "rvbbit_datafusion_mem_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_mem",
     "rvbbit_datafusion_vortex_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_vortex",
     "rvbbit_pg_heap_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
@@ -43,6 +44,15 @@ PG_DSNS = {
 }
 CH_HOST = "bench-clickhouse"
 CH_PORT = 8123
+FORCED_SQL_CANDIDATES = {
+    "rvbbit_duck_forced": "duck_vector",
+    "rvbbit_duck_hive_forced": "duck_hive",
+    "rvbbit_duck_vortex_forced": "duck_vortex",
+    "rvbbit_datafusion_forced": "datafusion_vector",
+    "rvbbit_datafusion_hive_forced": "datafusion_hive",
+    "rvbbit_datafusion_mem_forced": "datafusion_mem",
+    "rvbbit_datafusion_vortex_forced": "datafusion_vortex",
+}
 
 
 def _median_ms(times: list[float]) -> float:

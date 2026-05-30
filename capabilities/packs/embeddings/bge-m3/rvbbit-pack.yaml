@@ -1,0 +1,29 @@
+api_version: rvbbit.pack/v1
+id: embeddings/bge-m3
+name: bge_m3
+title: BGE-M3 Embeddings
+description: High-quality multilingual BGE-M3 sentence embeddings for retrieval and semantic search.
+license: mit
+tags:
+- embedding
+- retrieval
+- multilingual
+- gpu
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: BAAI/bge-m3
+  url: https://huggingface.co/BAAI/bge-m3
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: embedding
+  device: auto
+exports:
+  backend: embed_bge_m3
+  operators:
+  - embed_bge_m3
+install:
+  mode: build
+  warren: true
+  docker: true

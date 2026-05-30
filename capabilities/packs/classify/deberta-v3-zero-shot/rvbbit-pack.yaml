@@ -1,0 +1,30 @@
+api_version: rvbbit.pack/v1
+id: classify/deberta-v3-zero-shot
+name: deberta_v3_zero_shot
+title: DeBERTa v3 Zero-Shot Classifier
+description: NLI-based zero-shot classification over caller-provided labels.
+license: mit
+tags:
+- classify
+- zero-shot
+- nli
+- row
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli
+  url: https://huggingface.co/MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: zero_shot_classification
+  device: auto
+exports:
+  backend: classify_deberta_zero_shot
+  operators:
+  - classify_zero_shot
+  - classify_row_zero_shot
+install:
+  mode: build
+  warren: true
+  docker: true

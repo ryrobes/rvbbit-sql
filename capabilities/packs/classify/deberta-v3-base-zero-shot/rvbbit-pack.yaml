@@ -1,0 +1,32 @@
+api_version: rvbbit.pack/v1
+id: classify/deberta-v3-base-zero-shot
+name: deberta_v3_base_zero_shot
+title: DeBERTa v3 Base Zero-Shot Classifier
+description: Smaller NLI zero-shot classifier for classifying text or JSONB rows into caller-provided
+  labels.
+license: mit
+tags:
+- classify
+- zero-shot
+- nli
+- row
+- cpu-friendly
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: MoritzLaurer/deberta-v3-base-zeroshot-v2.0
+  url: https://huggingface.co/MoritzLaurer/deberta-v3-base-zeroshot-v2.0
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: zero_shot_classification
+  device: auto
+exports:
+  backend: classify_deberta_base_zero_shot
+  operators:
+  - classify_zero_shot_base
+  - classify_row_zero_shot_base
+install:
+  mode: build
+  warren: true
+  docker: true

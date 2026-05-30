@@ -1,0 +1,28 @@
+api_version: rvbbit.pack/v1
+id: runtimes/python-runtime
+name: python_runtime
+title: Managed CPython Runtime
+description: 'Warren-managed CPython runtime for rvbbit operator `kind: python` nodes.'
+license: apache-2.0
+tags:
+- runtime
+- python
+- warren
+- code
+- cpu
+capability: capability.yaml
+source:
+  provider: builtin
+  model: rvbbit/python-runtime
+runtime:
+  mode: image
+  image: ghcr.io/rvbbit/python-runtime:0.60.4
+  template: python-runtime
+  handler: python_runtime
+  device: cpu
+exports:
+  runtime: python_default
+install:
+  mode: image
+  warren: true
+  docker: true

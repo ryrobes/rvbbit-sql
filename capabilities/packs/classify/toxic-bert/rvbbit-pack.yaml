@@ -1,0 +1,32 @@
+api_version: rvbbit.pack/v1
+id: classify/toxic-bert
+name: toxic_bert
+title: Toxicity Classifier
+description: Multi-label toxicity classifier for moderation, support triage, and data quality workflows.
+license: apache-2.0
+tags:
+- classify
+- toxicity
+- moderation
+- multilabel
+- tabular
+- row
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: unitary/toxic-bert
+  url: https://huggingface.co/unitary/toxic-bert
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+exports:
+  backend: classify_toxic_bert
+  operators:
+  - classify_toxicity
+  - classify_row_toxicity
+install:
+  mode: build
+  warren: true
+  docker: true

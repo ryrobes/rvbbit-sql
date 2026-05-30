@@ -18,10 +18,6 @@ from rvbbit_duck_hot import (  # noqa: E402
     rvbbit_duck_hot_detail,
     clear_rvbbit_duck_hot_detail,
     record_rvbbit_route_observation,
-    run_rvbbit_datafusion_hive_forced,
-    run_rvbbit_datafusion_forced,
-    run_rvbbit_duck_hive_forced,
-    run_rvbbit_duck_vortex_forced,
     run_rvbbit_duck_hot,
 )
 
@@ -33,6 +29,11 @@ PG_DSNS = {
     "rvbbit":      "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench",
     "rvbbit_native": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff",
     "rvbbit_native_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Drvbbit_native",
+    "rvbbit_duck_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Dduck_vector",
+    "rvbbit_duck_hive_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Dduck_hive",
+    "rvbbit_duck_vortex_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Dduck_vortex",
+    "rvbbit_datafusion_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_vector",
+    "rvbbit_datafusion_hive_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_hive",
     "rvbbit_datafusion_mem_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_mem",
     "rvbbit_datafusion_vortex_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_vortex",
     "rvbbit_pg_heap_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
@@ -42,6 +43,15 @@ PG_DSNS = {
 CH_HOST = "bench-clickhouse"
 CH_PORT = 8123
 DUCKDB_PATH = "/data/hits_duckdb.db"
+FORCED_SQL_CANDIDATES = {
+    "rvbbit_duck_forced": "duck_vector",
+    "rvbbit_duck_hive_forced": "duck_hive",
+    "rvbbit_duck_vortex_forced": "duck_vortex",
+    "rvbbit_datafusion_forced": "datafusion_vector",
+    "rvbbit_datafusion_hive_forced": "datafusion_hive",
+    "rvbbit_datafusion_mem_forced": "datafusion_mem",
+    "rvbbit_datafusion_vortex_forced": "datafusion_vortex",
+}
 
 
 def _median_ms(times: list[float]) -> float:
@@ -189,22 +199,19 @@ def runner_for(system: str) -> Callable[..., float]:
         return lambda sql, repeat=3: run_pg(PG_DSNS["rvbbit_native_forced"], sql, repeat)
     if system in {"rvbbit_pg_heap_forced", "rvbbit_pg_heap", "pg_heap"}:
         return lambda sql, repeat=3: run_pg(PG_DSNS[system], sql, repeat)
-    if system == "rvbbit_datafusion_vortex_forced":
-        return lambda sql, repeat=3: run_pg(PG_DSNS[system], sql, repeat)
     if system == "rvbbit_duck_hot":
         return run_rvbbit_duck_hot
     if system == "rvbbit_duck_auto":
         return lambda sql, repeat=3: run_rvbbit_duck_hot(sql, repeat, mode="auto")
-    if system == "rvbbit_duck_forced":
-        return lambda sql, repeat=3: run_rvbbit_duck_hot(sql, repeat, mode="force-duck")
-    if system == "rvbbit_duck_hive_forced":
-        return run_rvbbit_duck_hive_forced
-    if system == "rvbbit_duck_vortex_forced":
-        return run_rvbbit_duck_vortex_forced
-    if system == "rvbbit_datafusion_forced":
-        return run_rvbbit_datafusion_forced
-    if system == "rvbbit_datafusion_hive_forced":
-        return run_rvbbit_datafusion_hive_forced
+    if system in FORCED_SQL_CANDIDATES:
+        candidate = FORCED_SQL_CANDIDATES[system]
+        return lambda sql, repeat=3: run_pg(
+            PG_DSNS[system],
+            sql,
+            repeat,
+            capture_route=True,
+            expect_candidate=candidate,
+        )
     if system == "duckdb":
         return run_duckdb
     if system == "clickhouse":

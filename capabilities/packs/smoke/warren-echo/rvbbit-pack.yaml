@@ -1,0 +1,100 @@
+api_version: rvbbit.pack/v1
+id: smoke/warren-echo
+name: warren_smoke_echo
+title: Warren Smoke Echo
+description: Deterministic no-model sidecar for validating Warren deployment, backend registration, probing,
+  and operator wiring.
+license: apache-2.0
+tags:
+- smoke
+- warren
+- deterministic
+- no-model
+- cpu
+capability: capability.yaml
+source:
+  provider: builtin
+  model: rvbbit/warren-smoke-echo
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: echo
+  device: cpu
+exports:
+  backend: warren_smoke_echo
+  operators:
+  - warren_smoke_echo
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  tests:
+  - name: echo_operator_sample_table
+    description: Run the Warren-managed operator over realistic support-note rows and assert row-level results.
+    sql: |
+      DO $$
+      DECLARE
+          mismatches integer;
+      BEGIN
+          CREATE TEMP TABLE warren_echo_cases (
+              case_id integer,
+              note text,
+              expected text
+          ) ON COMMIT DROP;
+
+          INSERT INTO warren_echo_cases(case_id, note, expected) VALUES
+              (1, 'refund request after delayed shipment', 'refund request after delayed shipment'),
+              (2, 'warehouse damaged item needs replacement', 'warehouse damaged item needs replacement'),
+              (3, 'vip customer asks for invoice correction', 'vip customer asks for invoice correction');
+
+          SELECT count(*)
+          INTO mismatches
+          FROM (
+              SELECT
+                  note,
+                  expected,
+                  rvbbit.warren_smoke_echo(note)->>'echo' AS got
+              FROM warren_echo_cases
+          ) checked
+          WHERE got IS DISTINCT FROM expected;
+
+          IF mismatches <> 0 THEN
+              RAISE EXCEPTION 'warren_smoke_echo mismatches: %', mismatches;
+          END IF;
+      END
+      $$;
+  - name: backend_and_deployment_observability
+    description: Assert Warren registered the backend, deployment inventory, and probe path.
+    sql: |
+      DO $$
+      DECLARE
+          probe jsonb;
+      BEGIN
+          IF NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.backend_health
+              WHERE name = 'warren_smoke_echo'
+          ) THEN
+              RAISE EXCEPTION 'warren_smoke_echo backend is not registered';
+          END IF;
+
+          IF NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.warren_inventory
+              WHERE backend_name = 'warren_smoke_echo'
+                AND deployment_status = 'running'
+          ) THEN
+              RAISE EXCEPTION 'warren_smoke_echo deployment is not running in Warren inventory';
+          END IF;
+
+          probe := rvbbit.backend_probe('warren_smoke_echo');
+          IF coalesce((probe->>'ok')::boolean, false) IS DISTINCT FROM true THEN
+              RAISE EXCEPTION 'warren_smoke_echo backend probe failed: %', probe;
+          END IF;
+      END
+      $$;

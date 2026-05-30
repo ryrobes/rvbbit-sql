@@ -657,7 +657,8 @@ fn deploy_capability(config: &Config, job: &WarrenJob) -> Result<DeploymentResul
             safe_name, port
         );
     } else {
-        docker_compose_up(&project_dir, port, &config.docker_network)?;
+        let should_build = manifest.get("runtime").and_then(runtime_image).is_none();
+        docker_compose_up(&project_dir, port, &config.docker_network, should_build)?;
         wait_for_health(port, Duration::from_secs(180))?;
     }
 
@@ -699,6 +700,18 @@ fn scaffold_project(
     safe_name: &str,
 ) -> Result<()> {
     let runtime = manifest.get("runtime").unwrap_or(&Value::Null);
+    if runtime_image(runtime).is_some() {
+        fs::write(
+            out_dir.join("rvbbit.backend.json"),
+            serde_json::to_string_pretty(manifest)?,
+        )?;
+        fs::write(
+            out_dir.join("compose.yaml"),
+            render_compose(manifest, safe_name)?,
+        )?;
+        return Ok(());
+    }
+
     let source = manifest.get("source").unwrap_or(&Value::Null);
     let template = runtime
         .get("template")
@@ -859,10 +872,42 @@ fn render_compose(manifest: &Value, safe_name: &str) -> Result<String> {
         .collect::<Vec<_>>()
         .join("\n");
     let (volume_mounts, volume_defs) = render_runtime_volumes(runtime);
+    let runtime_source = render_runtime_source(runtime);
 
     Ok(format!(
-        "services:\n  {service}:\n    build: .\n    container_name: rvbbit-{service}\n    ports:\n      - \"${{RVBBIT_CAPABILITY_PORT:-8080}}:8080\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
+        "services:\n  {service}:\n{runtime_source}    container_name: rvbbit-{service}\n    ports:\n      - \"${{RVBBIT_CAPABILITY_PORT:-8080}}:8080\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
     ))
+}
+
+fn runtime_image(runtime: &Value) -> Option<String> {
+    let image = runtime.get("image").and_then(Value::as_str)?.trim();
+    if image.is_empty() {
+        return None;
+    }
+    let digest = runtime
+        .get("image_digest")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    match digest {
+        Some(digest) if !image.contains('@') => Some(format!("{image}@{digest}")),
+        _ => Some(image.to_string()),
+    }
+}
+
+fn render_runtime_source(runtime: &Value) -> String {
+    if let Some(image) = runtime_image(runtime) {
+        let pull_policy = runtime
+            .get("pull_policy")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        return format!(
+            "    image: {}\n    pull_policy: {}\n",
+            serde_json::to_string(&image).unwrap(),
+            serde_json::to_string(pull_policy).unwrap()
+        );
+    }
+    "    build: .\n".into()
 }
 
 fn render_runtime_volumes(runtime: &Value) -> (String, String) {
@@ -891,12 +936,13 @@ fn render_runtime_volumes(runtime: &Value) -> (String, String) {
     (mounts.join("\n"), defs.join("\n"))
 }
 
-fn docker_compose_up(project_dir: &Path, port: u16, network: &str) -> Result<()> {
-    let status = Command::new("docker")
-        .arg("compose")
-        .arg("up")
-        .arg("-d")
-        .arg("--build")
+fn docker_compose_up(project_dir: &Path, port: u16, network: &str, build: bool) -> Result<()> {
+    let mut command = Command::new("docker");
+    command.arg("compose").arg("up").arg("-d");
+    if build {
+        command.arg("--build");
+    }
+    let status = command
         .current_dir(project_dir)
         .env("RVBBIT_CAPABILITY_PORT", port.to_string())
         .env("RVBBIT_DOCKER_NETWORK", network)

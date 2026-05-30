@@ -20,7 +20,7 @@ A useful first UI should expose six views:
 | Deployments | `rvbbit.warren_deployments` | Sidecars currently known to Warren, linked to backend/operator/runtime names. |
 | Metrics | `rvbbit.warren_node_latest_metrics`, `rvbbit.warren_node_metrics` | CPU, memory, disk, and GPU observability. |
 | Python runtimes | `rvbbit.python_runtimes`, `rvbbit.python_envs` | Runtime endpoints and SQL-managed package environments for `kind: python` nodes. |
-| Capability deploy | `capabilities/catalog.json`, manifest YAML, `rvbbit.deploy_capability(...)` | Queue new deployments from curated capability packs. |
+| Capability deploy | `rvbbit.capability_catalog`, `rvbbit.deploy_catalog_capability(...)` | Queue new deployments from curated capability packs. |
 
 The UI should be data-driven. It should not hardcode curated capability names,
 backend names, generated SQL bodies, or deployment states beyond the enums in
@@ -337,7 +337,13 @@ details panel.
 
 Use `rvbbit.python_runtimes` for registered execution endpoints that can run
 `kind: python` operator nodes. A Warren-deployed Python runtime appears here
-with `runtime_source = 'warren'`.
+with `runtime_source = 'warren'`. The local shortcut is also Warren-driven: it
+queues the built-in catalog item, runs one Warren claim, and registers
+`python_default` from the materialized sidecar:
+
+```bash
+make python-runtime-up
+```
 
 ```sql
 SELECT
@@ -442,52 +448,193 @@ SELECT rvbbit.prune_warren_metrics('7 days'::interval);
 
 ## Capability Deployment Action
 
-The UI should use the curated capability catalog for browsing, then queue the
-selected manifest with `rvbbit.deploy_capability`.
+The UI should use the SQL capability catalog for browsing, then queue the
+selected row with `rvbbit.deploy_catalog_capability`.
+
+### What Changes From The JSON Catalog
+
+The old UI path treated `capabilities/catalog.json` as the browse source, loaded
+the manifest YAML from disk, then sent the full manifest JSON to
+`rvbbit.deploy_capability(...)`. The table-backed catalog changes that contract:
+
+| Area | Old Contract | New Contract |
+|---|---|---|
+| Browse source | `capabilities/catalog.json` from repo files. | `rvbbit.capability_catalog` from SQL. |
+| Detail source | Load `manifest_path` from local disk. | Read `manifest` and `catalog_entry` JSONB from the selected SQL row. |
+| Deploy action | UI sends full manifest JSON to `rvbbit.deploy_capability(...)`. | UI sends only `catalog_id` to `rvbbit.deploy_catalog_capability(...)`. |
+| Install intent | UI infers intent after Warren claims or completes a job. | Queued jobs are stamped with known `backend_name`, `runtime_name`, and first `operator_name`. |
+| Refresh | Rebuild local JSON file. | Fresh installs are seeded; publish manifest changes into SQL with `catalog publish` or `make capability-catalog-db`. |
+| File access | UI needs repo file access for catalog details. | UI can browse and deploy through database access only. |
+
+For UI code, this means the catalog should become a normal database-backed
+resource. Do not require the browser, API server, or desktop UI to read files
+from `capabilities/` for the default Warren deployment flow.
 
 Catalog sources:
 
 | Source | Purpose |
 |---|---|
-| `capabilities/catalog.json` | Fast browse/search list. |
-| `capabilities/manifests/**/*.yaml` | Full manifest shown on detail/deploy screen. |
+| `rvbbit.capability_catalog` | Primary UI browse/search/deploy source. |
+| `capabilities/catalog.json` | Build artifact used by the CLI; optional fallback only. |
+| `capabilities/packs/**/rvbbit-pack.yaml` | Root pack metadata used by catalog publishing tools and future marketplace sync. |
+| `capabilities/packs/**/capability.yaml` | Full deployable Warren manifest stored in the SQL catalog. |
 
-The catalog is still a local JSON file in this version. A database-backed
-catalog table is a separate follow-up and is not part of this contract yet.
+Fresh extension installs seed the SQL catalog from the bundled canonical seed.
+Publish or refresh the SQL catalog from the repo after manifest changes with:
+
+```bash
+capabilities/tools/rvbbit-capability catalog publish \
+  --dsn "$RVBBIT_DSN" \
+  --prune
+```
+
+Browse query:
+
+```sql
+SELECT
+  id,
+  name,
+  title,
+  description,
+  tags,
+  kind,
+  source_provider,
+  source_model,
+  catalog_entry->>'pack_path' AS pack_path,
+  catalog_entry->>'runtime_mode' AS runtime_mode,
+  catalog_entry->'acceptance_tests' AS acceptance_tests,
+  manifest #>> '{runtime,image}' AS runtime_image,
+  backend_name,
+  runtime_name,
+  runtime_language,
+  runtime_template,
+  runtime_handler,
+  endpoint_path,
+  device,
+  operators,
+  active,
+  updated_at
+FROM rvbbit.capability_catalog
+WHERE active
+ORDER BY title;
+```
+
+Recommended browse query with install state:
+
+```sql
+SELECT
+  c.id,
+  c.name,
+  c.title,
+  c.description,
+  c.tags,
+  c.kind,
+  c.source_provider,
+  c.source_model,
+  c.catalog_entry->>'pack_path' AS pack_path,
+  c.catalog_entry->>'runtime_mode' AS runtime_mode,
+  c.catalog_entry->'acceptance_tests' AS acceptance_tests,
+  c.manifest #>> '{runtime,image}' AS runtime_image,
+  c.backend_name,
+  c.runtime_name,
+  c.runtime_language,
+  c.runtime_template,
+  c.runtime_handler,
+  c.endpoint_path,
+  c.device,
+  c.operators,
+  c.active,
+  c.updated_at,
+  b.name IS NOT NULL AS backend_registered,
+  b.n_calls,
+  b.n_errors,
+  b.avg_latency_ms,
+  r.name IS NOT NULL AS runtime_registered,
+  r.status AS runtime_status
+FROM rvbbit.capability_catalog c
+LEFT JOIN rvbbit.backend_health b
+  ON b.name = c.backend_name
+LEFT JOIN rvbbit.python_runtimes r
+  ON r.name = c.runtime_name
+WHERE c.active
+ORDER BY c.title;
+```
+
+Use `kind = 'runtime_sidecar'` for runtime capability cards, currently the
+managed Python runtime. Use `kind = 'hf_backend'` for model/backend cards.
+Runtime-sidecar rows normally have `backend_name IS NULL`; backend rows normally
+have `runtime_name IS NULL`.
+
+Detail panels should read these fields from the selected row:
+
+| Field | UI Use |
+|---|---|
+| `manifest` | Exact Warren deploy payload used by `deploy_catalog_capability`. Show as advanced JSON detail. |
+| `catalog_entry` | Generated browse entry from the CLI. Useful for compatibility with old card rendering. |
+| `catalog_entry.pack_path` / `catalog_entry.pack_manifest_path` | Source pack location for inspect/provenance views. |
+| `manifest_path` | Provenance/debug only. Do not require the UI to load this file. |
+| `catalog_entry.acceptance_tests` | Named pack acceptance tests that an operator can run through the CLI/ops path. |
+| `tags`, `kind`, `device`, `runtime_*`, `manifest.runtime.image`, `catalog_entry.runtime_mode` | Filters and deployment badges. |
+| `backend_name`, `runtime_name`, `operators` | Install-state joins and post-deploy navigation. |
 
 Recommended deploy flow:
 
-1. User picks a capability from `capabilities/catalog.json`.
-2. UI loads the full manifest YAML from `manifest_path`.
+1. User picks a capability from `rvbbit.capability_catalog`.
+2. UI displays metadata columns and the optional `manifest` JSON detail panel.
 3. UI offers target selector controls based on known Warren labels.
-4. UI renders or sends the manifest JSON to SQL.
-5. SQL queues the job with `rvbbit.deploy_capability(...)`.
-6. UI navigates to the job detail row and watches status.
+4. SQL queues the job with `rvbbit.deploy_catalog_capability(...)`.
+5. UI navigates to the job detail row and watches status.
 
 SQL shape:
 
 ```sql
-SELECT rvbbit.deploy_capability(
-  capability_manifest => $manifest$ { ... } $manifest$::jsonb,
-  target_selector => '{"gpu":true}'::jsonb,
+SELECT rvbbit.deploy_catalog_capability(
+  catalog_id => 'runtimes/python-runtime',
+  target_selector => '{"docker":true}'::jsonb,
   job_name => NULL
 );
 ```
 
-CLI equivalent:
+`rvbbit.deploy_capability(manifest, target_selector, job_name)` remains the
+lower-level escape hatch for ad hoc manifests.
+
+Catalog deployments stamp the queued `rvbbit.warren_jobs` row with known
+catalog metadata (`backend_name`, `runtime_name`, and first `operator_name`)
+before a Warren claims the job.
+
+The deploy function returns a `job_id`. The UI should immediately navigate to
+or subscribe to that job:
+
+```sql
+SELECT *
+FROM rvbbit.warren_jobs
+WHERE job_id = '<returned job id>'::uuid;
+```
+
+Publishing and pruning the catalog is an administrative operation in this
+release. The UI may expose a "refresh catalog" action for trusted operators, but
+it should call the CLI/ops path rather than attempting to mutate rows as a
+normal application user. An empty catalog after extension install should be
+treated as an operational problem. If the table is missing or empty, the UI may
+fall back to `capabilities/catalog.json` as a read-only browse source, but
+deploy buttons should be disabled or routed through the advanced ad hoc manifest
+flow.
+
+Manifest deploy CLI equivalent for ad hoc/manual testing:
 
 ```bash
 capabilities/tools/rvbbit-capability deploy \
-  capabilities/manifests/smoke/warren-echo.yaml \
+  capabilities/packs/smoke/warren-echo \
   --dsn "$RVBBIT_DSN" \
   --target '{"gpu":false}'
 ```
 
-The `smoke/warren-echo.yaml` capability is the safest first model-backend UI
+The `smoke/warren-echo` capability is the safest first model-backend UI
 test because it does not download a model. The
-`runtimes/python-runtime.yaml` capability is the first runtime-sidecar UI test;
+`runtimes/python-runtime` capability is the first runtime-sidecar UI test;
 it should complete with `backend_name IS NULL` and `runtime_name =
-'python_default'`.
+'python_default'`. For local validation, `make python-runtime-up` exercises the
+same Warren placement path against the built-in catalog item.
 
 ## Placement UI
 
@@ -590,7 +737,8 @@ Read-only actions are safe for v0:
 
 Write actions available in v0:
 
-- Queue a capability deployment with `rvbbit.deploy_capability(...)`.
+- Queue a catalog deployment with `rvbbit.deploy_catalog_capability(...)`.
+- Queue an ad hoc manifest deployment with `rvbbit.deploy_capability(...)`.
 - Register/update a node manually with `rvbbit.register_warren_node(...)`.
 - Prune old metrics with `rvbbit.prune_warren_metrics(...)`.
 
@@ -636,7 +784,7 @@ Then queue:
 
 ```bash
 make capability-deploy \
-  MANIFEST=capabilities/manifests/smoke/warren-echo.yaml \
+  MANIFEST=capabilities/packs/smoke/warren-echo \
   TARGET='{"gpu":false}'
 ```
 
@@ -645,6 +793,15 @@ Or queue from SQL with the manifest JSON:
 ```sql
 SELECT rvbbit.deploy_capability(
   capability_manifest => '<warren-echo manifest json>'::jsonb,
+  target_selector => '{"gpu":false}'::jsonb
+);
+```
+
+Or queue directly from the SQL catalog:
+
+```sql
+SELECT rvbbit.deploy_catalog_capability(
+  catalog_id => 'smoke/warren-echo',
   target_selector => '{"gpu":false}'::jsonb
 );
 ```
@@ -663,9 +820,15 @@ Use this sequence to validate the Python runtime sidecar path:
 
 ```bash
 capabilities/tools/rvbbit-capability deploy \
-  capabilities/manifests/runtimes/python-runtime.yaml \
+  capabilities/packs/runtimes/python-runtime \
   --dsn "$RVBBIT_DSN" \
   --target '{"docker":true}'
+```
+
+For the local preconfigured shortcut:
+
+```bash
+make python-runtime-up
 ```
 
 Expected runtime sequence:
@@ -673,7 +836,8 @@ Expected runtime sequence:
 1. Job follows the same queued/running/completed flow.
 2. `rvbbit.warren_deployments.runtime_name = 'python_default'`.
 3. `rvbbit.python_runtimes` has a ready row named `python_default`.
-4. Python env creation can name `runtime_name => 'python_default'`.
+4. `runtime_source = 'warren'`.
+5. Python env creation can name `runtime_name => 'python_default'`.
 
 ## Version Notes
 

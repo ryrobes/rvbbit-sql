@@ -821,7 +821,8 @@ Then use it in an operator pipeline:
 - **Runtime** — `runtime_name` points at a registered execution runtime such
   as a Warren-deployed row in `rvbbit.python_runtimes`. Direct `endpoint_url`
   overrides still work for local tests, but named runtimes are the preferred
-  operational path.
+  operational path. Locally, `make python-runtime-up` deploys the built-in
+  Python runtime catalog item through Warren and registers `python_default`.
 - **Scope** — this is a workflow primitive, not a general PL/Python
   replacement. Python code runs in the sidecar, not in the Postgres backend.
 

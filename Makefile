@@ -1,12 +1,17 @@
 COMPOSE := docker compose -f docker/docker-compose.yml
 COMPOSE_SIDECARS := docker compose -f docker/docker-compose.yml -f docker/docker-compose.sidecars.yml
+RVBBIT_VERSION ?= $(shell awk -F'"' '/^version[[:space:]]*=/ {print $$2; exit}' Cargo.toml)
+PYTHON_RUNTIME_IMAGE ?= ghcr.io/rvbbit/python-runtime:$(RVBBIT_VERSION)
 
 .PHONY: help build up down logs psql-heap psql-rvbbit bench-shell info clean \
         reload-extension e2e-realworld e2e-realworld-fresh e2e-realworld-live \
         e2e-realworld-warren \
-        gpu-up gpu-down register-specialists restore-local-embed gpu-status \
+        gpu-up gpu-down register-specialists \
+        python-runtime-image python-runtime-up restore-local-embed gpu-status \
         bigfoot-kg-demo capabilities-list capability-render capability-catalog \
-        capability-scaffold capability-install capability-deploy warren-agent warren-once
+        capability-catalog-seed capability-catalog-db \
+        capability-scaffold capability-install capability-deploy capability-test \
+        warren-agent warren-once
 
 RVBBIT_DSN ?= postgresql://postgres:rvbbit@localhost:55433/bench
 WARREN_NODE ?= local-warren
@@ -63,18 +68,16 @@ query-llm:       ## Pair-wise compare heap vs rvbbit on the LLM query set
 	$(COMPOSE) exec bench python run.py query llm
 
 test:            ## Run E2E tests (skips live-LLM ones; cheap & deterministic)
-	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench python-runtime
-	$(MAKE) --no-print-directory reload-extension
-	$(COMPOSE_SIDECARS) exec -T bench pytest /tests -x
+	$(MAKE) --no-print-directory python-runtime-up
+	$(COMPOSE) exec -T bench pytest /tests -x
 
 test-live:       ## Run E2E tests INCLUDING live LLM calls (costs $$)
-	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench python-runtime
-	$(MAKE) --no-print-directory reload-extension
-	$(COMPOSE_SIDECARS) exec -T -e RUN_LLM_TESTS=1 bench pytest /tests
+	$(MAKE) --no-print-directory python-runtime-up
+	$(COMPOSE) exec -T -e RUN_LLM_TESTS=1 bench pytest /tests
 
 e2e-realworld:   ## Run the real-world acceptance harness (deterministic/default)
-	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed python-runtime
-	$(MAKE) --no-print-directory reload-extension
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed
+	$(MAKE) --no-print-directory python-runtime-up
 	$(COMPOSE) exec -T bench python /bench/e2e_realworld.py
 
 e2e-realworld-fresh: ## Destructive fresh acceptance run (deletes Docker volumes)
@@ -82,8 +85,8 @@ e2e-realworld-fresh: ## Destructive fresh acceptance run (deletes Docker volumes
 	$(MAKE) --no-print-directory e2e-realworld
 
 e2e-realworld-live: ## Run acceptance harness with live provider calls enabled
-	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed python-runtime
-	$(MAKE) --no-print-directory reload-extension
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed
+	$(MAKE) --no-print-directory python-runtime-up
 	$(COMPOSE) exec -T -e RVBBIT_E2E_LIVE_LLM=1 bench python /bench/e2e_realworld.py
 
 e2e-realworld-warren: ## Run real Warren deploy/probe/operator acceptance smoke
@@ -91,7 +94,7 @@ e2e-realworld-warren: ## Run real Warren deploy/probe/operator acceptance smoke
 	$(MAKE) --no-print-directory reload-extension
 	@JOB_NAME=e2e-warren-smoke-$$(date +%Y%m%d%H%M%S); \
 	  echo "queueing $$JOB_NAME"; \
-	  capabilities/tools/rvbbit-capability deploy capabilities/manifests/smoke/warren-echo.yaml \
+	  capabilities/tools/rvbbit-capability deploy capabilities/packs/smoke/warren-echo \
 	    --dsn '$(RVBBIT_DSN)' \
 	    --target '{"capability":true,"docker":true,"gpu":false}' \
 	    --job-name "$$JOB_NAME"; \
@@ -155,6 +158,22 @@ wire-specialists:  ## (Re)wire the LLM operators to route through the GPU specia
 	  -v ON_ERROR_STOP=1 \
 	  < docker/sql/wire-operators-to-specialists.sql
 
+python-runtime-image: ## Build the built-in Python runtime OCI image for local Warren deploys
+	docker build -t '$(PYTHON_RUNTIME_IMAGE)' sidecars/python-runtime
+
+python-runtime-up: ## Deploy/register the built-in Python runtime through Warren
+	$(COMPOSE) up -d --build pg-rvbbit pg-heap bench
+	$(MAKE) --no-print-directory reload-extension
+	$(MAKE) --no-print-directory python-runtime-image
+	@docker rm -f rvbbit-python-runtime >/dev/null 2>&1 || true
+	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench \
+	  -v ON_ERROR_STOP=1 \
+	  < docker/sql/deploy-python-runtime.sql
+	$(MAKE) --no-print-directory warren-once
+	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench -P pager=off \
+	  -v ON_ERROR_STOP=1 \
+	  -c "SELECT name, endpoint_url, status, runtime_source FROM rvbbit.python_runtimes WHERE name = 'python_default';"
+
 bigfoot-demo:    ## Run the bigfoot demo (self-registers + wires specialists; only needs `make gpu-up` + `make bigfoot-load` first)
 	cat docker/sql/register-gpu-specialists.sql \
 	    docker/sql/wire-operators-to-specialists.sql \
@@ -166,30 +185,49 @@ bigfoot-kg-demo: ## Build/query a deterministic KG over BFRO observations (no GP
 	  -P pager=off -v ON_ERROR_STOP=1 \
 	  < docker/sql/bigfoot-kg-demo.sql
 
-capabilities-list: ## List curated Rvbbit backend/operator capability manifests
+capabilities-list: ## List curated Rvbbit backend/operator capability packs
 	capabilities/tools/rvbbit-capability list
 
-capability-render: ## Render a capability manifest (MANIFEST=capabilities/manifests/...)
-	@test -n "$${MANIFEST:-}" || (echo "set MANIFEST=capabilities/manifests/..." >&2; exit 2)
+capability-render: ## Render a capability pack or manifest (MANIFEST=capabilities/packs/...)
+	@test -n "$${MANIFEST:-}" || (echo "set MANIFEST=capabilities/packs/..." >&2; exit 2)
 	capabilities/tools/rvbbit-capability render "$${MANIFEST}"
 
 capability-catalog: ## Rebuild capabilities/catalog.json for UI browsing
 	capabilities/tools/rvbbit-capability catalog build --output capabilities/catalog.json
+	capabilities/tools/rvbbit-capability catalog seed-json --output crates/pg_rvbbit/src/capability_catalog_seed.json
+
+capability-catalog-seed: ## Rebuild extension install seed JSON for rvbbit.capability_catalog
+	capabilities/tools/rvbbit-capability catalog seed-json --output crates/pg_rvbbit/src/capability_catalog_seed.json
+
+capability-catalog-db: ## Publish curated capability catalog into rvbbit.capability_catalog
+	capabilities/tools/rvbbit-capability catalog publish --dsn '$(RVBBIT_DSN)' --prune
 
 capability-scaffold: ## Scaffold a capability (MANIFEST=... OUT=.rvbbit/capabilities/name)
-	@test -n "$${MANIFEST:-}" || (echo "set MANIFEST=capabilities/manifests/..." >&2; exit 2)
+	@test -n "$${MANIFEST:-}" || (echo "set MANIFEST=capabilities/packs/..." >&2; exit 2)
 	capabilities/tools/rvbbit-capability scaffold "$${MANIFEST}" "$${OUT:-.rvbbit/capabilities/$$(basename "$${MANIFEST%.*}")}" --force
 
 capability-install: ## Scaffold/run/register a capability (MANIFEST=..., optional GPU=1, RVBBIT_DSN=...)
-	@test -n "$${MANIFEST:-}" || (echo "set MANIFEST=capabilities/manifests/..." >&2; exit 2)
+	@test -n "$${MANIFEST:-}" || (echo "set MANIFEST=capabilities/packs/..." >&2; exit 2)
 	capabilities/tools/rvbbit-capability install "$${MANIFEST}" --force $${GPU:+--gpu}
 
 capability-deploy: ## Queue a capability for Warren (MANIFEST=..., optional TARGET='{"gpu":true}')
-	@test -n "$(MANIFEST)" || (echo "set MANIFEST=capabilities/manifests/..." >&2; exit 2)
+	@test -n "$(MANIFEST)" || (echo "set MANIFEST=capabilities/packs/..." >&2; exit 2)
 	capabilities/tools/rvbbit-capability deploy "$(MANIFEST)" \
 	  --dsn '$(RVBBIT_DSN)' \
 	  --target '$(if $(TARGET),$(TARGET),{})' \
 	  $(if $(JOB_NAME),--job-name '$(JOB_NAME)',)
+
+capability-test: ## Deploy a capability pack through Warren and run its acceptance SQL
+	@test -n "$(MANIFEST)" || (echo "set MANIFEST=capabilities/packs/..." >&2; exit 2)
+	capabilities/tools/rvbbit-capability test "$(MANIFEST)" \
+	  --dsn '$(RVBBIT_DSN)' \
+	  $(if $(TARGET),--target '$(TARGET)',) \
+	  --node 'capability-test-warren' \
+	  --work-dir '.rvbbit/warren-capability-test' \
+	  --docker-network '$(WARREN_DOCKER_NETWORK)' \
+	  --labels '$(WARREN_LABELS)' \
+	  --capacity '{"capability_test":true}' \
+	  --metrics-ms 1000
 
 warren-agent: ## Run a local Warren deployment agent
 	cargo run -p warren-agent -- \
@@ -222,7 +260,6 @@ clean:           ## Remove built artifacts
 # ---------------------------------------------------------------------------
 
 PG_VERSION ?= 18
-RVBBIT_VERSION ?= $(shell awk -F'"' '/^version[[:space:]]*=/ {print $$2; exit}' Cargo.toml)
 PKG_ARCH ?= $(shell dpkg --print-architecture 2>/dev/null || uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
 PKG_NAME := rvbbit-$(RVBBIT_VERSION)-pg$(PG_VERSION)-linux-$(PKG_ARCH)
 PKG_DIR  := dist/$(PKG_NAME)

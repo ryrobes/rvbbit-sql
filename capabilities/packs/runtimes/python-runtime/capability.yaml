@@ -9,6 +9,8 @@ source:
   provider: builtin
   model: rvbbit/python-runtime
 runtime:
+  image: ghcr.io/rvbbit/python-runtime:0.60.4
+  pull_policy: missing
   template: python-runtime
   language: python
   handler: python_runtime
