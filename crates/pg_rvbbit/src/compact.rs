@@ -1460,8 +1460,13 @@ fn refresh_vortex_scan_delta_impl(
     let vortex_root = path_root.join(layout_dir_name(layout));
     let mut plans = introspect_columns(rel_oid)?;
     extend_plans_with_legacy_shreds(&mut plans);
-    let build_result =
-        write_vortex_scan_chunks_from_canonical_parquet(rel_oid, &plans, &vortex_root, layout, true);
+    let build_result = write_vortex_scan_chunks_from_canonical_parquet(
+        rel_oid,
+        &plans,
+        &vortex_root,
+        layout,
+        true,
+    );
     let variant_chunks = match build_result {
         Ok(chunks) => chunks,
         Err(err) => {

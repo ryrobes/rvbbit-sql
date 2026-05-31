@@ -2031,6 +2031,7 @@ fn choose_route(
     if features.native_function.as_deref() == Some("top_count_1col")
         && features.group_by
         && features.normalized_sql.contains(" - ")
+        && features.table_rows < no_profile_variant_min_rows()
     {
         return decision(
             Candidate::RvbbitNative,
@@ -4396,11 +4397,9 @@ fn candidate_gate_enabled(candidate: Candidate) -> bool {
             route_enabled("RVBBIT_ROUTE_HIVE", "rvbbit.route_hive", true)
                 && route_enabled("RVBBIT_ROUTE_DUCK_HIVE", "rvbbit.route_duck_hive", true)
         }
-        Candidate::DuckVortex => route_enabled(
-            "RVBBIT_ROUTE_DUCK_VORTEX",
-            "rvbbit.route_duck_vortex",
-            true,
-        ),
+        Candidate::DuckVortex => {
+            route_enabled("RVBBIT_ROUTE_DUCK_VORTEX", "rvbbit.route_duck_vortex", true)
+        }
         Candidate::DataFusionHive => {
             route_enabled("RVBBIT_ROUTE_HIVE", "rvbbit.route_hive", true)
                 && route_enabled(
@@ -4551,6 +4550,27 @@ const FALLBACK_VECTOR_FIRST: [Candidate; 3] = [
     Candidate::DuckHive,
 ];
 
+const FALLBACK_VORTEX_VECTOR_FIRST: [Candidate; 4] = [
+    Candidate::DuckVortex,
+    Candidate::DataFusionVector,
+    Candidate::DuckVector,
+    Candidate::DuckHive,
+];
+
+const FALLBACK_VORTEX_DUCK_FIRST: [Candidate; 4] = [
+    Candidate::DuckVortex,
+    Candidate::DuckVector,
+    Candidate::DataFusionVector,
+    Candidate::DuckHive,
+];
+
+const FALLBACK_VORTEX_VARIANT_FIRST: [Candidate; 4] = [
+    Candidate::DuckVortex,
+    Candidate::DuckHive,
+    Candidate::DataFusionVector,
+    Candidate::DuckVector,
+];
+
 const FALLBACK_MEM_FIRST: [Candidate; 4] = [
     Candidate::DataFusionMem,
     Candidate::DataFusionVector,
@@ -4582,8 +4602,20 @@ fn default_external_candidate(
 ) -> Option<Candidate> {
     if hot_store_no_profile_enabled() && hot_store_prefers_mem(features) {
         first_available_candidate(&FALLBACK_MEM_FIRST, features, tables)
+    } else if fallback_prefers_vortex_default(features) {
+        first_available_candidate(vortex_first_candidate_order(features), features, tables)
     } else {
         first_available_candidate(&FALLBACK_VECTOR_FIRST, features, tables)
+    }
+}
+
+fn vortex_first_candidate_order(features: &RouteFeatures) -> &'static [Candidate] {
+    if fallback_prefers_complex_duck_hive(features) || fallback_prefers_variant(features) {
+        &FALLBACK_VORTEX_VARIANT_FIRST
+    } else if fallback_prefers_duck_vector(features) {
+        &FALLBACK_VORTEX_DUCK_FIRST
+    } else {
+        &FALLBACK_VORTEX_VECTOR_FIRST
     }
 }
 
@@ -4682,7 +4714,10 @@ fn fallback_native_reason(features: &RouteFeatures) -> Option<&'static str> {
     if filtered_count_should_stay_native(features) {
         return Some("filtered count metadata stays on native path");
     }
-    if selective_single_table_topk_should_stay_native(features) && features.has_native_function {
+    if selective_single_table_topk_should_stay_native(features)
+        && features.has_native_function
+        && !native_function_prefers_external_at_scale(features)
+    {
         return Some("selective single-table top-k rewrite stays on native path");
     }
     if features.has_native_function && !fallback_prefers_external_analytical_shape(features) {
@@ -4779,6 +4814,9 @@ fn fallback_prefers_external_analytical_shape(features: &RouteFeatures) -> bool 
     if filtered_count_should_stay_native(features) {
         return false;
     }
+    if native_function_prefers_external_at_scale(features) {
+        return true;
+    }
     if selective_single_table_topk_should_stay_native(features) {
         return false;
     }
@@ -4867,7 +4905,9 @@ fn fallback_prefers_variant(features: &RouteFeatures) -> bool {
 }
 
 fn fallback_external_candidate_order(features: &RouteFeatures) -> Option<&'static [Candidate]> {
-    if native_function_prefers_vector_external(features) {
+    if fallback_prefers_vortex_default(features) {
+        Some(vortex_first_candidate_order(features))
+    } else if native_function_prefers_vector_external(features) {
         Some(&FALLBACK_VECTOR_FIRST)
     } else if single_table_text_distinct_prefers_vector(features) {
         Some(&FALLBACK_VECTOR_FIRST)
@@ -4884,6 +4924,13 @@ fn fallback_external_candidate_order(features: &RouteFeatures) -> Option<&'stati
     } else {
         None
     }
+}
+
+fn fallback_prefers_vortex_default(features: &RouteFeatures) -> bool {
+    features.table_rows >= no_profile_variant_min_rows()
+        && (fallback_prefers_external_analytical_shape(features)
+            || fallback_prefers_duck_vector(features)
+            || no_profile_prefers_datafusion(features))
 }
 
 fn fallback_prefers_duck_vector(features: &RouteFeatures) -> bool {
@@ -5087,6 +5134,10 @@ fn native_function_should_stay_native(features: &RouteFeatures) -> bool {
         return false;
     }
 
+    if native_function_prefers_external_at_scale(features) {
+        return false;
+    }
+
     if native_function_prefers_vector_external(features) {
         return false;
     }
@@ -5117,6 +5168,16 @@ fn native_function_should_stay_native(features: &RouteFeatures) -> bool {
         || features.plan_has_group
         || features.plan_has_join
         || features.plan_has_subplan)
+}
+
+fn native_function_prefers_external_at_scale(features: &RouteFeatures) -> bool {
+    if features.table_rows < no_profile_variant_min_rows() {
+        return false;
+    }
+    matches!(
+        features.native_function.as_deref(),
+        Some("top_rollup_1int_distinct" | "any_count_int_text" | "top_count_filtered")
+    )
 }
 
 fn native_function_prefers_vector_external(features: &RouteFeatures) -> bool {
@@ -6617,7 +6678,7 @@ mod route_unit_tests {
         assert!(single_table_text_distinct_prefers_vector(&distinct_text));
         assert_eq!(
             fallback_external_candidate_order(&distinct_text).map(|order| order[0]),
-            Some(Candidate::DataFusionVector)
+            Some(Candidate::DuckVortex)
         );
 
         let text_topk = test_features_with_text(
@@ -6628,7 +6689,7 @@ mod route_unit_tests {
         assert!(fallback_prefers_variant(&text_topk));
         assert_eq!(
             fallback_external_candidate_order(&text_topk).map(|order| order[0]),
-            Some(Candidate::DuckHive)
+            Some(Candidate::DuckVortex)
         );
 
         let single_text_topk = test_features_with_text(
@@ -6643,7 +6704,7 @@ mod route_unit_tests {
     }
 
     #[test]
-    fn route_no_profile_sends_large_native_topk_rewrites_to_vector() {
+    fn route_no_profile_sends_large_native_topk_rewrites_to_vortex() {
         let mut text_topk = test_features_with_text(
             r#"SELECT "URL", COUNT(*) AS c FROM hits GROUP BY "URL" ORDER BY c DESC LIMIT 10"#,
             5_000_000,
@@ -6657,7 +6718,7 @@ mod route_unit_tests {
         assert!(no_profile_native_reason(&text_topk).is_none());
         assert_eq!(
             fallback_external_candidate_order(&text_topk).map(|order| order[0]),
-            Some(Candidate::DataFusionVector)
+            Some(Candidate::DuckVortex)
         );
 
         let mut mid_sized_distinct = test_features_with_text(
@@ -6674,12 +6735,66 @@ mod route_unit_tests {
         assert!(native_function_prefers_vector_external(&large_distinct));
         assert_eq!(
             fallback_external_candidate_order(&large_distinct).map(|order| order[0]),
-            Some(Candidate::DataFusionVector)
+            Some(Candidate::DuckVortex)
+        );
+
+        let mut rollup_distinct = test_features(
+            r#"SELECT "RegionID", SUM("AdvEngineID"), COUNT(*) AS c,
+                      AVG("ResolutionWidth"), COUNT(DISTINCT "UserID")
+               FROM hits GROUP BY "RegionID" ORDER BY c DESC LIMIT 10"#,
+            5_000_000,
+        );
+        rollup_distinct.has_native_function = true;
+        rollup_distinct.native_function = Some("top_rollup_1int_distinct".to_string());
+        assert!(!native_function_should_stay_native(&rollup_distinct));
+        assert!(no_profile_native_reason(&rollup_distinct).is_none());
+        assert_eq!(
+            fallback_external_candidate_order(&rollup_distinct).map(|order| order[0]),
+            Some(Candidate::DuckVortex)
+        );
+
+        let mut any_int_text = test_features_with_text(
+            r#"SELECT "UserID", "SearchPhrase", COUNT(*)
+               FROM hits GROUP BY "UserID", "SearchPhrase" LIMIT 10"#,
+            5_000_000,
+            &["searchphrase"],
+        );
+        any_int_text.has_native_function = true;
+        any_int_text.native_function = Some("any_count_int_text".to_string());
+        assert!(!native_function_should_stay_native(&any_int_text));
+        assert!(no_profile_native_reason(&any_int_text).is_none());
+        assert_eq!(
+            fallback_external_candidate_order(&any_int_text).map(|order| order[0]),
+            Some(Candidate::DuckVortex)
+        );
+
+        let mut filtered_topk = test_features_with_text(
+            r#"SELECT "URL", COUNT(*) AS pageviews FROM hits
+               WHERE "CounterID" = 62
+                 AND "EventDate" >= '2013-07-01'
+                 AND "EventDate" <= '2013-07-31'
+                 AND "DontCountHits" = 0
+                 AND "IsRefresh" = 0
+                 AND "URL" <> ''
+               GROUP BY "URL" ORDER BY pageviews DESC LIMIT 10"#,
+            5_000_000,
+            &["url"],
+        );
+        filtered_topk.has_native_function = true;
+        filtered_topk.native_function = Some("top_count_filtered".to_string());
+        assert!(selective_single_table_topk_should_stay_native(
+            &filtered_topk
+        ));
+        assert!(!native_function_should_stay_native(&filtered_topk));
+        assert!(no_profile_native_reason(&filtered_topk).is_none());
+        assert_eq!(
+            fallback_external_candidate_order(&filtered_topk).map(|order| order[0]),
+            Some(Candidate::DuckVortex)
         );
     }
 
     #[test]
-    fn route_no_profile_keeps_time_bucket_without_text_vector_first() {
+    fn route_no_profile_sends_large_time_bucket_to_vortex() {
         let features = test_features(
             r#"SELECT DATE_TRUNC('minute', "EventTime") AS m, COUNT(*) FROM hits GROUP BY DATE_TRUNC('minute', "EventTime") ORDER BY DATE_TRUNC('minute', "EventTime") LIMIT 10 OFFSET 1000"#,
             1_000_000,
@@ -6688,12 +6803,12 @@ mod route_unit_tests {
         assert!(!fallback_prefers_variant(&features));
         assert_eq!(
             fallback_external_candidate_order(&features).map(|order| order[0]),
-            Some(Candidate::DataFusionVector)
+            Some(Candidate::DuckVortex)
         );
     }
 
     #[test]
-    fn route_no_profile_sends_large_wide_grouped_aggregate_to_vector() {
+    fn route_no_profile_sends_large_wide_grouped_aggregate_to_vortex() {
         let mut features = test_features(
             r#"SELECT
                  "EventDate",
@@ -6716,7 +6831,7 @@ mod route_unit_tests {
         assert!(no_profile_native_reason(&features).is_none());
         assert_eq!(
             fallback_external_candidate_order(&features).map(|order| order[0]),
-            Some(Candidate::DataFusionVector)
+            Some(Candidate::DuckVortex)
         );
     }
 
@@ -6736,7 +6851,7 @@ mod route_unit_tests {
     }
 
     #[test]
-    fn route_no_profile_prefers_duck_hive_for_complex_large_join_shapes() {
+    fn route_no_profile_prefers_vortex_for_complex_large_join_shapes() {
         let features = test_features(
             "SELECT COUNT(*) FROM hits h1 \
              JOIN hits h2 ON h1.id = h2.id \
@@ -6751,7 +6866,7 @@ mod route_unit_tests {
         assert!(fallback_prefers_duck_vector(&features));
         assert_eq!(
             fallback_external_candidate_order(&features).map(|order| order[0]),
-            Some(Candidate::DuckHive)
+            Some(Candidate::DuckVortex)
         );
     }
 
@@ -6773,7 +6888,7 @@ mod route_unit_tests {
         assert!(no_profile_native_reason(&features).is_none());
         assert_eq!(
             fallback_external_candidate_order(&features).map(|order| order[0]),
-            Some(Candidate::DuckHive)
+            Some(Candidate::DuckVortex)
         );
     }
 
@@ -6816,7 +6931,7 @@ mod route_unit_tests {
         assert!(!fallback_prefers_complex_duck_hive(&features));
         assert_eq!(
             fallback_external_candidate_order(&features).map(|order| order[0]),
-            Some(Candidate::DataFusionVector)
+            Some(Candidate::DuckVortex)
         );
     }
 }

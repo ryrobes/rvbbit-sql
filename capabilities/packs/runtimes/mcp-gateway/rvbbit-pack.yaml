@@ -1,0 +1,132 @@
+api_version: rvbbit.pack/v1
+id: runtimes/mcp-gateway
+name: mcp_gateway
+title: MCP Gateway Runtime
+description: 'Warren-managed MCP gateway for rvbbit operator `kind: mcp` nodes and SQL MCP calls.'
+license: apache-2.0
+system_runtime: true
+capability_role: operator_runtime
+tags:
+- runtime
+- mcp
+- warren
+- code
+- tools
+- cpu
+- system-runtime
+- operator-runtime
+capability: capability.yaml
+source:
+  provider: builtin
+  model: rvbbit/mcp-gateway
+runtime:
+  mode: image
+  image: ghcr.io/rvbbit/mcp-gateway:0.60.4
+  template: mcp-gateway
+  handler: mcp_gateway
+  device: cpu
+  port: 9100
+  health_path: /health
+exports:
+  runtime: mcp_default
+install:
+  mode: image
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  setup_sql:
+  - |
+    DELETE FROM rvbbit.operators WHERE name = 'acceptance_mcp_case_echo';
+    DROP FUNCTION IF EXISTS rvbbit.acceptance_mcp_case_echo(text, jsonb);
+    DELETE FROM rvbbit.mcp_servers WHERE name = 'acceptance_mcp_echo';
+    INSERT INTO rvbbit.mcp_servers
+        (name, transport, command, args, env, timeout_ms, description)
+    VALUES
+        ('acceptance_mcp_echo', 'stdio', 'python',
+         ARRAY['/opt/mcp-test-server/main.py'],
+         '{}'::jsonb, 30000,
+         'Deterministic MCP echo server bundled with the rvbbit MCP gateway image');
+    SELECT rvbbit.refresh_mcp_server('acceptance_mcp_echo');
+  tests:
+  - name: mcp_gateway_registered_ready
+    description: Assert Warren registered the default MCP gateway runtime and inventory row.
+    sql: |
+      DO $$
+      BEGIN
+          IF NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.mcp_gateways
+              WHERE name = 'mcp_default'
+                AND status = 'ready'
+                AND gateway_source = 'warren'
+          ) THEN
+              RAISE EXCEPTION 'mcp_default gateway is not registered as a ready Warren runtime';
+          END IF;
+
+          IF NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.warren_inventory
+              WHERE runtime_name = 'mcp_default'
+                AND deployment_status = 'running'
+          ) THEN
+              RAISE EXCEPTION 'mcp_default deployment is not running in Warren inventory';
+          END IF;
+      END
+      $$;
+  - name: mcp_sql_tool_call
+    description: Call the bundled deterministic MCP echo server through SQL.
+    sql: |
+      DO $$
+      DECLARE
+          response jsonb;
+      BEGIN
+          SELECT rvbbit.mcp_call(
+              'acceptance_mcp_echo',
+              'echo',
+              '{"text":"chargeback review queue"}'::jsonb
+          ) INTO response;
+          IF rvbbit.mcp_text(response) <> 'chargeback review queue' THEN
+              RAISE EXCEPTION 'unexpected MCP echo response: %', response;
+          END IF;
+      END
+      $$;
+  - name: mcp_operator_node_echo
+    description: Create an MCP-backed operator node and assert deterministic workflow output.
+    sql: |
+      DO $$
+      DECLARE
+          result text;
+      BEGIN
+          PERFORM rvbbit.create_operator(
+              op_name => 'acceptance_mcp_case_echo',
+              op_arg_names => ARRAY['case_text'],
+              op_arg_types => ARRAY['text'],
+              op_return_type => 'text',
+              op_parser => 'strip',
+              op_steps => $steps$[
+                {
+                  "name": "echo_case",
+                  "kind": "mcp",
+                  "server": "acceptance_mcp_echo",
+                  "tool": "echo",
+                  "inputs": {
+                    "text": "{{ inputs.case_text }}"
+                  }
+                }
+              ]$steps$::jsonb
+          );
+          SELECT rvbbit.acceptance_mcp_case_echo('enterprise refund escalation') INTO result;
+          IF result <> 'enterprise refund escalation' THEN
+              RAISE EXCEPTION 'unexpected MCP operator result: %', result;
+          END IF;
+      END
+      $$;
+  teardown_sql:
+  - |
+    DELETE FROM rvbbit.operators WHERE name = 'acceptance_mcp_case_echo';
+    DROP FUNCTION IF EXISTS rvbbit.acceptance_mcp_case_echo(text, jsonb);
+    DELETE FROM rvbbit.mcp_servers WHERE name = 'acceptance_mcp_echo';

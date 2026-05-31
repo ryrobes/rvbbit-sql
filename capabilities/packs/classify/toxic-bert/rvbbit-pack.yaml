@@ -30,3 +30,34 @@ install:
   mode: build
   warren: true
   docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: moderation_sample_shape
+    description: Run a moderation-oriented comment through toxic-bert and assert score-bearing JSON.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.classify_toxicity('you are awful and nobody wants you here') INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'classify_toxicity returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object'
+             OR NOT (result ? 'score') THEN
+              RAISE EXCEPTION 'unexpected toxicity result shape: %', result;
+          END IF;
+          IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
+              RAISE EXCEPTION 'toxicity score out of range: %', result;
+          END IF;
+      END
+      $$;

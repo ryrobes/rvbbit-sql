@@ -19,9 +19,10 @@
 //! network error) raise a SQL error and roll back; that row is lost.
 //! Adding async/out-of-band logging is a future enhancement.
 
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
-use pgrx::prelude::*;
+use pgrx::{prelude::*, Spi};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -30,12 +31,66 @@ use crate::specialists::http_client;
 
 /// HTTP base URL of the gateway sidecar. Overridable via env for tests /
 /// non-default deployments; defaults to the docker-compose service name.
+static MCP_GATEWAY_URL: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
 pub fn gateway_url() -> String {
-    std::env::var("RVBBIT_MCP_GATEWAY_URL")
+    if let Some(url) = std::env::var("RVBBIT_MCP_GATEWAY_URL")
         .ok()
-        .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "http://mcp-gateway:9100".into())
+        .and_then(|s| normalize_gateway_url(&s))
+    {
+        return url;
+    }
+    if let Some(url) = cached_gateway_url() {
+        return url;
+    }
+    if let Some(url) = load_gateway_url_from_sql() {
+        set_cached_gateway_url(Some(url.clone()));
+        return url;
+    }
+    "http://mcp-gateway:9100".into()
+}
+
+#[pg_extern]
+fn reload_mcp_gateway() -> bool {
+    let url = load_gateway_url_from_sql();
+    set_cached_gateway_url(url.clone());
+    url.is_some()
+}
+
+fn normalize_gateway_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn gateway_cache() -> &'static RwLock<Option<String>> {
+    MCP_GATEWAY_URL.get_or_init(|| RwLock::new(None))
+}
+
+fn cached_gateway_url() -> Option<String> {
+    gateway_cache()
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned())
+}
+
+fn set_cached_gateway_url(url: Option<String>) {
+    if let Ok(mut guard) = gateway_cache().write() {
+        *guard = url;
+    }
+}
+
+fn load_gateway_url_from_sql() -> Option<String> {
+    if crate::flow::in_pool_worker() {
+        return None;
+    }
+    Spi::get_one::<String>("SELECT rvbbit.mcp_gateway_endpoint()")
+        .ok()
+        .flatten()
+        .and_then(|url| normalize_gateway_url(&url))
 }
 
 // ---- wire types ----------------------------------------------------------

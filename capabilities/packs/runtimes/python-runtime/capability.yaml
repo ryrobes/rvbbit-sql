@@ -4,6 +4,8 @@ name: python_runtime
 title: Managed CPython Runtime
 description: "Warren-managed CPython runtime for rvbbit operator `kind: python` nodes."
 license: apache-2.0
+system_runtime: true
+capability_role: operator_runtime
 tags: [runtime, python, warren, code, cpu]
 source:
   provider: builtin

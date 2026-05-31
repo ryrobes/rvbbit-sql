@@ -19,7 +19,7 @@ A useful first UI should expose six views:
 | Jobs | `rvbbit.warren_jobs` | Deployment queue, running jobs, failures, and history. |
 | Deployments | `rvbbit.warren_deployments` | Sidecars currently known to Warren, linked to backend/operator/runtime names. |
 | Metrics | `rvbbit.warren_node_latest_metrics`, `rvbbit.warren_node_metrics` | CPU, memory, disk, and GPU observability. |
-| Python runtimes | `rvbbit.python_runtimes`, `rvbbit.python_envs` | Runtime endpoints and SQL-managed package environments for `kind: python` nodes. |
+| Execution runtimes | `rvbbit.python_runtimes`, `rvbbit.python_envs`, `rvbbit.mcp_gateways` | Runtime endpoints for workflow node kinds such as `kind: python` and `kind: mcp`. |
 | Capability deploy | `rvbbit.capability_catalog`, `rvbbit.deploy_catalog_capability(...)` | Queue new deployments from curated capability packs. |
 
 The UI should be data-driven. It should not hardcode curated capability names,
@@ -498,17 +498,22 @@ SELECT
   description,
   tags,
   kind,
+  system_runtime,
+  capability_role,
   source_provider,
   source_model,
   catalog_entry->>'pack_path' AS pack_path,
   catalog_entry->>'runtime_mode' AS runtime_mode,
   catalog_entry->'acceptance_tests' AS acceptance_tests,
+  catalog_entry->'acceptance' AS acceptance,
   manifest #>> '{runtime,image}' AS runtime_image,
   backend_name,
   runtime_name,
   runtime_language,
   runtime_template,
   runtime_handler,
+  runtime_port,
+  health_path,
   endpoint_path,
   device,
   operators,
@@ -529,17 +534,22 @@ SELECT
   c.description,
   c.tags,
   c.kind,
+  c.system_runtime,
+  c.capability_role,
   c.source_provider,
   c.source_model,
   c.catalog_entry->>'pack_path' AS pack_path,
   c.catalog_entry->>'runtime_mode' AS runtime_mode,
   c.catalog_entry->'acceptance_tests' AS acceptance_tests,
+  c.catalog_entry->'acceptance' AS acceptance,
   c.manifest #>> '{runtime,image}' AS runtime_image,
   c.backend_name,
   c.runtime_name,
   c.runtime_language,
   c.runtime_template,
   c.runtime_handler,
+  c.runtime_port,
+  c.health_path,
   c.endpoint_path,
   c.device,
   c.operators,
@@ -549,21 +559,26 @@ SELECT
   b.n_calls,
   b.n_errors,
   b.avg_latency_ms,
-  r.name IS NOT NULL AS runtime_registered,
-  r.status AS runtime_status
+  coalesce(r.name, m.name) IS NOT NULL AS runtime_registered,
+  coalesce(r.status, m.status) AS runtime_status,
+  m.name IS NOT NULL AS mcp_gateway_registered,
+  m.status AS mcp_gateway_status
 FROM rvbbit.capability_catalog c
 LEFT JOIN rvbbit.backend_health b
   ON b.name = c.backend_name
 LEFT JOIN rvbbit.python_runtimes r
   ON r.name = c.runtime_name
+LEFT JOIN rvbbit.mcp_gateways m
+  ON m.name = c.runtime_name
 WHERE c.active
 ORDER BY c.title;
 ```
 
-Use `kind = 'runtime_sidecar'` for runtime capability cards, currently the
-managed Python runtime. Use `kind = 'hf_backend'` for model/backend cards.
-Runtime-sidecar rows normally have `backend_name IS NULL`; backend rows normally
-have `runtime_name IS NULL`.
+Use `kind = 'runtime_sidecar'` for runtime capability cards. Rows with
+`system_runtime = true` and `capability_role = 'operator_runtime'` are broader
+workflow runtimes, currently CPython and MCP Gateway. Use `kind = 'hf_backend'`
+for model/backend cards. Runtime-sidecar rows normally have
+`backend_name IS NULL`; backend rows normally have `runtime_name IS NULL`.
 
 Detail panels should read these fields from the selected row:
 
@@ -573,8 +588,9 @@ Detail panels should read these fields from the selected row:
 | `catalog_entry` | Generated browse entry from the CLI. Useful for compatibility with old card rendering. |
 | `catalog_entry.pack_path` / `catalog_entry.pack_manifest_path` | Source pack location for inspect/provenance views. |
 | `manifest_path` | Provenance/debug only. Do not require the UI to load this file. |
-| `catalog_entry.acceptance_tests` | Named pack acceptance tests that an operator can run through the CLI/ops path. |
-| `tags`, `kind`, `device`, `runtime_*`, `manifest.runtime.image`, `catalog_entry.runtime_mode` | Filters and deployment badges. |
+| `catalog_entry.acceptance_tests` | Compact list of named pack acceptance tests for badges and search. |
+| `catalog_entry.acceptance` | Runnable acceptance test contract: optional `target_selector`, `setup_sql[]`, `tests[{name, description, sql}]`, and `teardown_sql[]`. UIs may execute this SQL after Warren deploys a pack. |
+| `tags`, `kind`, `system_runtime`, `capability_role`, `device`, `runtime_*`, `manifest.runtime.image`, `catalog_entry.runtime_mode` | Filters and deployment badges. |
 | `backend_name`, `runtime_name`, `operators` | Install-state joins and post-deploy navigation. |
 
 Recommended deploy flow:
@@ -635,6 +651,58 @@ test because it does not download a model. The
 it should complete with `backend_name IS NULL` and `runtime_name =
 'python_default'`. For local validation, `make python-runtime-up` exercises the
 same Warren placement path against the built-in catalog item.
+
+## MCP Gateway Runtime
+
+The MCP Gateway is no longer an assumed always-on service. It is a
+Warren-installable system runtime capability with catalog id
+`runtimes/mcp-gateway`, similar to the CPython runtime and model sidecars.
+Treat it as a prerequisite runtime for the MCP UI, SQL MCP calls, and
+`kind: mcp` operator nodes.
+
+Recommended UI gate:
+
+```sql
+WITH gateway AS (
+  SELECT name, endpoint_url, status, gateway_source, health, updated_at
+  FROM rvbbit.mcp_gateways
+  ORDER BY (status = 'ready') DESC, (name = 'mcp_default') DESC, updated_at DESC
+  LIMIT 1
+),
+catalog AS (
+  SELECT id
+  FROM rvbbit.capability_catalog
+  WHERE id = 'runtimes/mcp-gateway' AND active
+  LIMIT 1
+)
+SELECT
+  coalesce(g.name IS NOT NULL, false) AS installed,
+  coalesce(g.status = 'ready', false) AS ready,
+  g.name,
+  g.endpoint_url,
+  g.status,
+  g.gateway_source,
+  g.health,
+  g.updated_at,
+  c.id AS catalog_id
+FROM (SELECT 1) x
+LEFT JOIN gateway g ON true
+LEFT JOIN catalog c ON true;
+```
+
+Recommended behavior:
+
+| UI surface | Behavior when no ready gateway |
+|---|---|
+| Capability browser | Show `runtimes/mcp-gateway` as a system runtime and allow normal Warren deployment through `rvbbit.deploy_catalog_capability(...)`. |
+| MCP servers list | Show the gateway prerequisite panel and deep-link to the MCP Gateway capability install tab. Do not imply the gateway is bundled with the database. |
+| MCP server detail | Keep catalog/audit/cache reads available, but disable `refresh_mcp_server`, `mcp_probe`, `mcp_call`, and `mcp_resource` actions. |
+| Operator editor | Allow `kind: mcp` nodes to be inspected, but show a gateway warning and an install/open-runtime action before users run the operator. |
+
+Registering rows in `rvbbit.mcp_servers` is SQL catalog DDL and can be
+saved before the gateway exists. Discovery and execution are active operations
+and require a ready gateway. In practical UI flows, prefer guiding users to
+install the gateway first because tool discovery depends on it.
 
 ## Placement UI
 
@@ -717,7 +785,7 @@ separate:
 | Job status | `rvbbit.warren_jobs.status` | Whether Warren completed the requested action. |
 | Deployment status | `rvbbit.warren_deployments.status` | Warren's remembered service state. |
 | Backend health | `rvbbit.backend_health` and `rvbbit.backend_probe(...)` | Whether Rvbbit can call the backend successfully. |
-| Runtime health | `rvbbit.python_runtimes.status` and `health` | Whether a Python runtime endpoint is registered and ready. |
+| Runtime health | `rvbbit.python_runtimes` / `rvbbit.mcp_gateways` status and `health` | Whether an execution runtime endpoint is registered and ready. |
 
 For a runtime deployment, `backend_name` and `operator_name` are expected to be
 null. That is not an error; `runtime_name` is the capability handle used by
@@ -734,6 +802,8 @@ Read-only actions are safe for v0:
 - Probe a deployed backend with `rvbbit.backend_probe(...)`.
 - Inspect registered Python runtimes and their envs from
   `rvbbit.python_runtimes` and `rvbbit.python_envs`.
+- Inspect registered MCP gateway runtimes from `rvbbit.mcp_gateways` and gate
+  MCP active operations until a row is `status = 'ready'`.
 
 Write actions available in v0:
 
@@ -760,6 +830,8 @@ Show these fields prominently when present:
 | `backend_health.n_errors` | Backend health | Runtime invocation errors after registration. |
 | `python_runtimes.status` | Python runtime row | Runtime registration state. |
 | `python_runtimes.health` | Python runtime row | Warren/runtime probe details. |
+| `mcp_gateways.status` | MCP gateway runtime row | Runtime registration state for SQL MCP calls and `kind: mcp` nodes. |
+| `mcp_gateways.health` | MCP gateway runtime row | Warren/runtime probe details. |
 
 Common failure categories:
 
@@ -770,6 +842,7 @@ Common failure categories:
 | Deployment `failed` with probe data | Sidecar started but backend/runtime probe failed. |
 | Backend probe fails after deployment | Endpoint URL/network changed, sidecar exited, or operator/backend config mismatch. |
 | Python runtime row missing | Runtime sidecar job failed before `rvbbit.register_python_runtime(...)`, or the extension version is too old. |
+| MCP gateway row missing | Runtime sidecar job failed before `rvbbit.register_mcp_gateway(...)`, or the extension version is too old. |
 | Metrics missing | `WARREN_METRICS_MS=0`, agent cannot write metrics, or metrics collector unavailable. |
 
 ## Smoke Test
@@ -802,6 +875,15 @@ Or queue directly from the SQL catalog:
 ```sql
 SELECT rvbbit.deploy_catalog_capability(
   catalog_id => 'smoke/warren-echo',
+  target_selector => '{"gpu":false}'::jsonb
+);
+```
+
+For the MCP runtime prerequisite, use the same catalog path:
+
+```sql
+SELECT rvbbit.deploy_catalog_capability(
+  catalog_id => 'runtimes/mcp-gateway',
   target_selector => '{"gpu":false}'::jsonb
 );
 ```

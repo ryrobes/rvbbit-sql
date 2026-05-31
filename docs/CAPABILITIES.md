@@ -341,6 +341,8 @@ Each `capabilities[]` entry has these fields:
 | `description` | string/null | Short description. |
 | `tags` | string[] | UI filters such as `embedding`, `extract`, `gpu`. |
 | `kind` | string | `hf_backend` or `runtime_sidecar`. |
+| `system_runtime` | boolean | True for operator-runtime capabilities that unlock broader workflow primitives instead of a single model specialist. |
+| `capability_role` | string/null | Role hint such as `operator_runtime`. |
 | `license` | string/null | Model or pack license hint. |
 | `source_provider` | string/null | Usually `huggingface` for model packs or `builtin` for bundled runtimes. |
 | `source_model` | string/null | Hugging Face model id or bundled capability id. |
@@ -348,23 +350,27 @@ Each `capabilities[]` entry has these fields:
 | `backend_name` | string/null | Name registered in `rvbbit.backends`; null for runtime sidecars. |
 | `backend_transport` | string/null | Usually `rvbbit` for generated model sidecars. |
 | `runtime_name` | string/null | Name registered in a runtime catalog such as `rvbbit.python_runtimes`. |
-| `runtime_language` | string/null | Runtime language, currently `python` for runtime sidecars. |
+| `runtime_language` | string/null | Runtime language, currently `python` or `mcp` for runtime sidecars. |
 | `runtime_image` | string/null | OCI image Warren should run when the capability is image-based. |
 | `runtime_mode` | string | `image` for pull/run packs, `build` for local build/template packs. |
 | `install_mode` | string | Pack install mode, currently usually the same as `runtime_mode`. |
 | `install_warren` | boolean/null | Whether the pack metadata declares Warren install support. |
 | `install_docker` | boolean/null | Whether the pack expects Docker as the sidecar runtime. |
 | `acceptance_tests` | string[] | Named pack acceptance SQL tests, if present. |
+| `acceptance` | object/null | Runnable pack acceptance SQL: optional `target_selector`, `setup_sql[]`, `tests[{name, description, sql}]`, and `teardown_sql[]`. |
 | `runtime_template` | string | Generated runtime template. |
-| `runtime_handler` | string | Handler such as `echo`, `embedding`, `gliner`, `sequence_classification`, `tabular_classification`, `tabular_regression`, or `python_runtime`. |
+| `runtime_handler` | string | Handler such as `echo`, `embedding`, `gliner`, `sequence_classification`, `tabular_classification`, `tabular_regression`, `python_runtime`, or `mcp_gateway`. |
+| `runtime_port` | integer/null | Container port exposed by this runtime; defaults to `8080` when absent. |
+| `health_path` | string/null | HTTP path Warren should poll for sidecar health; defaults to `/health`. |
 | `endpoint_path` | string/null | Warren registration path such as `/predict` or `/run`. |
 | `device` | string | Manifest preference: `auto`, `cpu`, or `cuda`. |
 | `operators` | string[] | SQL operator functions created by `operator.sql`. |
 
 The UI can filter by `tags`, `kind`, `runtime_handler`, `source_provider`,
-`source_model`, and `license`. Use `backend_name` to join model entries to
-installed backend rows. Use `runtime_name` to join runtime entries to runtime
-catalogs such as `rvbbit.python_runtimes`.
+`source_model`, `license`, and `system_runtime`. Use `backend_name` to join
+model entries to installed backend rows. Use `runtime_name` to join runtime
+entries to runtime catalogs such as `rvbbit.python_runtimes` and
+`rvbbit.mcp_gateways`.
 
 ### Manifest Shape
 
@@ -468,6 +474,12 @@ runtime_registration:
 warren:
   endpoint_path: /run
 ```
+
+System runtime sidecars are still `kind: runtime_sidecar`, but their pack
+metadata sets `system_runtime: true` and `capability_role: operator_runtime`.
+The built-ins are `runtimes/python-runtime` for `kind: python` operator nodes
+and `runtimes/mcp-gateway` for `kind: mcp` nodes and SQL MCP calls. Treat them
+as higher-level runtime primitives in the UI rather than ordinary model cards.
 
 `runtime.image` is the preferred deployment shape. Warren can run these
 manifests without a source checkout: it writes a tiny compose project, pulls the
@@ -767,6 +779,26 @@ ORDER BY name;
 Join catalog entries with `kind = 'runtime_sidecar'` on
 `catalog.runtime_name = python_runtimes.name`.
 
+MCP gateway runtime state:
+
+```sql
+SELECT
+  name,
+  endpoint_url,
+  status,
+  labels,
+  gateway_source,
+  install_manifest,
+  health,
+  created_at,
+  updated_at
+FROM rvbbit.mcp_gateways
+ORDER BY name;
+```
+
+Join MCP runtime catalog entries with `runtime_language = 'mcp'` on
+`catalog.runtime_name = mcp_gateways.name`.
+
 ### Install State Model
 
 For v0, use this state model:
@@ -920,7 +952,7 @@ After scaffold/install, the output directory contains:
 |---|---|
 | `RVBBIT_DSN` | Postgres DSN used by install and generated `psql` examples. |
 | `RVBBIT_DOCKER_NETWORK` | Docker network joined by generated sidecars. Defaults to `docker_default`. |
-| `RVBBIT_CAPABILITY_PORT` | Host port for generated sidecar. Defaults to `8080`. |
+| `RVBBIT_CAPABILITY_PORT` | Host port for generated sidecar. Defaults to the manifest runtime port, usually `8080` or `9100` for MCP gateway. |
 | `RVBBIT_CAPABILITY_DEVICE` | Runtime device inside sidecar. GPU overlay sets `cuda`. |
 
 GPU install should be exposed as an option, not forced. The generated GPU

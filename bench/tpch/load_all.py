@@ -62,18 +62,31 @@ def _setting_enabled(raw: str | None, default: bool = False) -> bool:
     return value not in {"0", "false", "no", "off", "disabled"}
 
 
-def _vortex_forced_selected() -> bool:
+def _selected_systems() -> list[str]:
     selected = os.environ.get("BENCH_SYSTEMS", "")
+    if not selected.strip():
+        selected = ",".join(ALL_SYSTEMS)
+    return [system.strip() for system in selected.split(",") if system.strip()]
+
+
+def _vortex_forced_selected() -> bool:
     return any(
-        system.strip() in {"rvbbit_datafusion_vortex_forced", "rvbbit_duck_vortex_forced"}
-        for system in selected.split(",")
+        system in {"rvbbit_datafusion_vortex_forced", "rvbbit_duck_vortex_forced"}
+        for system in _selected_systems()
+    )
+
+
+def _vortex_auto_selected() -> bool:
+    return "rvbbit" in _selected_systems() and _setting_enabled(
+        os.environ.get("RVBBIT_ROUTE_DUCK_VORTEX"),
+        default=True,
     )
 
 
 def _vortex_layout_requested() -> bool:
     return _setting_enabled(
         os.environ.get("RVBBIT_COMPACT_VORTEX_LAYOUT"),
-        default=_vortex_forced_selected(),
+        default=_vortex_forced_selected() or _vortex_auto_selected(),
     )
 
 
@@ -120,7 +133,7 @@ def _rvbbit_compact_settings_sql() -> list[str]:
     }
     defaults = {
         "RVBBIT_COMPACT_HIVE_LAYOUT": "on",
-        "RVBBIT_COMPACT_VORTEX_LAYOUT": "on" if _vortex_forced_selected() else None,
+        "RVBBIT_COMPACT_VORTEX_LAYOUT": "on" if _vortex_layout_requested() else None,
     }
     out: list[str] = []
     for env_name, guc_name in settings.items():

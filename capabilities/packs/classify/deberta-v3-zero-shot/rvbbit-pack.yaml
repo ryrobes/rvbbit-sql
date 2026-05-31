@@ -28,3 +28,39 @@ install:
   mode: build
   warren: true
   docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: zero_shot_refund_triage
+    description: Classify a refund-oriented ticket into a caller-provided taxonomy and assert candidate-safe output.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.classify_zero_shot(
+                  'the delivery arrived late and the customer wants a refund',
+                  'billing,shipping,product_quality,cancellation'
+              ) INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'classify_zero_shot returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object'
+             OR NOT (result ? 'label')
+             OR NOT (result ? 'score')
+             OR NOT (result ? 'scores') THEN
+              RAISE EXCEPTION 'unexpected zero-shot result shape: %', result;
+          END IF;
+          IF NOT (result->>'label' = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN
+              RAISE EXCEPTION 'zero-shot label was outside candidate set: %', result;
+          END IF;
+      END
+      $$;

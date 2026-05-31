@@ -34,6 +34,14 @@
     "repo_url": {
       "type": "string"
     },
+    "system_runtime": {
+      "type": "boolean",
+      "default": false
+    },
+    "capability_role": {
+      "type": "string",
+      "enum": ["model_capability", "system_runtime", "operator_runtime"]
+    },
     "capability": {
       "type": "string"
     },
@@ -56,7 +64,9 @@
         "image_digest": { "type": "string" },
         "template": { "type": "string" },
         "handler": { "type": "string" },
-        "device": { "type": "string" }
+        "device": { "type": "string" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "health_path": { "type": "string" }
       }
     },
     "exports": {

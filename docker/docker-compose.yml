@@ -137,7 +137,7 @@ services:
 
   mcp-gateway:
     build:
-      context: ../sidecars/mcp-gateway
+      context: ../capabilities/packs/runtimes/mcp-gateway
     container_name: rvbbit-mcp-gateway
     depends_on:
       pg-rvbbit:

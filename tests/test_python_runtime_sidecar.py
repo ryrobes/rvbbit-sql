@@ -1,5 +1,6 @@
 """Sidecar-level tests for managed Python operator execution."""
 
+import hashlib
 import importlib.util
 import os
 import sys
@@ -27,31 +28,46 @@ def _load_runtime(monkeypatch, tmp_path):
     return module
 
 
+def _payload(
+    *,
+    env_name="ops_rules",
+    handler_name="sla_score",
+    code: str,
+    inputs,
+    entrypoint="run",
+    timeout_ms=5000,
+):
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return {
+        "env": {
+            "name": env_name,
+            "python_version": version,
+            "requirements": [],
+            "env_hash": hashlib.md5(f"{version}\n".encode()).hexdigest(),
+        },
+        "handler": {
+            "name": handler_name,
+            "code_hash": hashlib.sha256(code.encode()).hexdigest(),
+            "entrypoint": entrypoint,
+            "code": code,
+        },
+        "inputs": inputs,
+        "timeout_ms": timeout_ms,
+    }
+
+
 def test_sidecar_reconciles_venv_handler_and_runs(monkeypatch, tmp_path):
     runtime = _load_runtime(monkeypatch, tmp_path)
     client = TestClient(runtime.app)
-    version = f"{sys.version_info.major}.{sys.version_info.minor}"
-    payload = {
-        "env": {
-            "name": "ops_rules",
-            "python_version": version,
-            "requirements": [],
-            "env_hash": "a" * 32,
-        },
-        "handler": {
-            "name": "sla_score",
-            "code_hash": "b" * 64,
-            "entrypoint": "run",
-            "code": (
-                "def run(inputs):\n"
-                "    print('scoring ticket')\n"
-                "    priority = 4 if inputs['tier'] == 'enterprise' else 2\n"
-                "    return {'priority': priority, 'breached': inputs['age_hours'] > 24}\n"
-            ),
-        },
-        "inputs": {"tier": "enterprise", "age_hours": 31},
-        "timeout_ms": 5000,
-    }
+    payload = _payload(
+        code=(
+            "def run(inputs):\n"
+            "    print('scoring ticket')\n"
+            "    priority = 4 if inputs['tier'] == 'enterprise' else 2\n"
+            "    return {'priority': priority, 'breached': inputs['age_hours'] > 24}\n"
+        ),
+        inputs={"tier": "enterprise", "age_hours": 31},
+    )
 
     first = client.post("/run", json=payload)
     assert first.status_code == 200
@@ -63,3 +79,90 @@ def test_sidecar_reconciles_venv_handler_and_runs(monkeypatch, tmp_path):
     assert second.json()["ok"] is True
     assert client.get("/debug/stats").json()["env_builds"] == 1
     assert client.get("/debug/stats").json()["handler_writes"] == 1
+
+
+def test_sidecar_uses_declared_entrypoint_for_scalar_inputs(monkeypatch, tmp_path):
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    client = TestClient(runtime.app)
+    payload = _payload(
+        handler_name="double_value",
+        entrypoint="transform",
+        code=(
+            "def transform(inputs):\n"
+            "    return {'value': int(inputs) * 2, 'kind': type(inputs).__name__}\n"
+        ),
+        inputs=21,
+    )
+
+    res = client.post("/run", json=payload)
+
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
+    assert res.json()["output"] == {"value": 42, "kind": "int"}
+
+
+def test_sidecar_returns_handler_failures_with_stderr(monkeypatch, tmp_path):
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    client = TestClient(runtime.app)
+    payload = _payload(
+        handler_name="broken_rule",
+        code=(
+            "def run(inputs):\n"
+            "    print('about to fail')\n"
+            "    raise ValueError('bad support ticket')\n"
+        ),
+        inputs={"ticket_id": 7},
+    )
+
+    res = client.post("/run", json=payload)
+    body = res.json()
+
+    assert res.status_code == 200
+    assert body["ok"] is False
+    assert body["error"] == "bad support ticket"
+    assert "ValueError: bad support ticket" in body["stderr"]
+    assert body["stdout"] == ""
+    assert client.get("/debug/stats").json()["failures"] == 1
+
+
+def test_sidecar_times_out_long_running_handlers(monkeypatch, tmp_path):
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    client = TestClient(runtime.app)
+    payload = _payload(
+        handler_name="slow_rule",
+        code=(
+            "import time\n"
+            "def run(inputs):\n"
+            "    time.sleep(1)\n"
+            "    return {'done': True}\n"
+        ),
+        inputs={"ticket_id": 8},
+        timeout_ms=50,
+    )
+
+    res = client.post("/run", json=payload)
+    body = res.json()
+
+    assert res.status_code == 200
+    assert body["ok"] is False
+    assert "timed out" in body["error"]
+    assert client.get("/debug/stats").json()["failures"] == 1
+
+
+def test_sidecar_rejects_invalid_hashes_before_reconcile(monkeypatch, tmp_path):
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    client = TestClient(runtime.app)
+    payload = _payload(
+        handler_name="hash_rule",
+        code="def run(inputs):\n    return inputs\n",
+        inputs={"ok": True},
+    )
+    payload["env"]["env_hash"] = "not-a-hex-hash"
+
+    res = client.post("/run", json=payload)
+    body = res.json()
+
+    assert res.status_code == 200
+    assert body["ok"] is False
+    assert "env_hash must be a lowercase hex hash" in body["error"]
+    assert not (tmp_path / "envs").exists()

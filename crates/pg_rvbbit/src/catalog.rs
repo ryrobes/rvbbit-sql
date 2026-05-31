@@ -2412,6 +2412,8 @@ CREATE TABLE rvbbit.capability_catalog (
     description        text,
     tags               text[] NOT NULL DEFAULT ARRAY[]::text[],
     kind               text NOT NULL,
+    system_runtime     boolean NOT NULL DEFAULT false,
+    capability_role    text,
     license            text,
     source_provider    text,
     source_model       text,
@@ -2422,6 +2424,8 @@ CREATE TABLE rvbbit.capability_catalog (
     runtime_language   text,
     runtime_template   text,
     runtime_handler    text,
+    runtime_port       int,
+    health_path        text,
     endpoint_path      text,
     device             text,
     operators          text[] NOT NULL DEFAULT ARRAY[]::text[],
@@ -2521,11 +2525,12 @@ BEGIN
     END IF;
 
     INSERT INTO rvbbit.capability_catalog
-        (id, manifest_path, name, title, description, tags, kind, license,
+        (id, manifest_path, name, title, description, tags, kind,
+         system_runtime, capability_role, license,
          source_provider, source_model, source_revision,
          backend_name, backend_transport,
          runtime_name, runtime_language, runtime_template, runtime_handler,
-         endpoint_path, device, operators, manifest, catalog_entry,
+         runtime_port, health_path, endpoint_path, device, operators, manifest, catalog_entry,
          catalog_source, active)
     VALUES
         (normalized_id,
@@ -2536,6 +2541,12 @@ BEGIN
          coalesce(normalized_entry->>'description', normalized_manifest->>'description'),
          entry_tags,
          coalesce(nullif(normalized_entry->>'kind', ''), normalized_manifest->>'kind', 'unknown'),
+         CASE
+             WHEN normalized_entry ? 'system_runtime' THEN coalesce((normalized_entry->>'system_runtime')::boolean, false)
+             WHEN normalized_manifest ? 'system_runtime' THEN coalesce((normalized_manifest->>'system_runtime')::boolean, false)
+             ELSE false
+         END,
+         coalesce(nullif(normalized_entry->>'capability_role', ''), nullif(normalized_manifest->>'capability_role', '')),
          coalesce(normalized_entry->>'license', normalized_manifest->>'license'),
          coalesce(normalized_entry->>'source_provider', normalized_manifest #>> '{source,provider}'),
          coalesce(normalized_entry->>'source_model', normalized_manifest #>> '{source,model}'),
@@ -2547,6 +2558,9 @@ BEGIN
                   normalized_manifest #>> '{runtime,language}'),
          coalesce(normalized_entry->>'runtime_template', normalized_manifest #>> '{runtime,template}'),
          coalesce(normalized_entry->>'runtime_handler', normalized_manifest #>> '{runtime,handler}'),
+         nullif(coalesce(normalized_entry->>'runtime_port', normalized_manifest #>> '{runtime,port}'), '')::int,
+         coalesce(normalized_entry->>'health_path', normalized_manifest #>> '{warren,health_path}',
+                  normalized_manifest #>> '{runtime,health_path}'),
          coalesce(normalized_entry->>'endpoint_path', normalized_manifest #>> '{warren,endpoint_path}',
                   normalized_manifest #>> '{runtime_registration,endpoint_path}'),
          coalesce(normalized_entry->>'device', normalized_manifest #>> '{runtime,device}'),
@@ -2562,6 +2576,8 @@ BEGIN
         description = EXCLUDED.description,
         tags = EXCLUDED.tags,
         kind = EXCLUDED.kind,
+        system_runtime = EXCLUDED.system_runtime,
+        capability_role = EXCLUDED.capability_role,
         license = EXCLUDED.license,
         source_provider = EXCLUDED.source_provider,
         source_model = EXCLUDED.source_model,
@@ -2572,6 +2588,8 @@ BEGIN
         runtime_language = EXCLUDED.runtime_language,
         runtime_template = EXCLUDED.runtime_template,
         runtime_handler = EXCLUDED.runtime_handler,
+        runtime_port = EXCLUDED.runtime_port,
+        health_path = EXCLUDED.health_path,
         endpoint_path = EXCLUDED.endpoint_path,
         device = EXCLUDED.device,
         operators = EXCLUDED.operators,
@@ -3261,6 +3279,171 @@ $fwj$;
 -- know what to spawn. Subprocess lifecycle, per-server locking,
 -- re-introspection, and crash recovery all live in the sidecar.
 -- ---------------------------------------------------------------------------
+
+INSERT INTO rvbbit.settings (key, value)
+VALUES ('mcp_gateway_endpoint', to_jsonb('http://mcp-gateway:9100'::text))
+ON CONFLICT (key) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION rvbbit.mcp_gateway_endpoint()
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT coalesce(
+        (SELECT value #>> '{}' FROM rvbbit.settings WHERE key = 'mcp_gateway_endpoint'),
+        'http://mcp-gateway:9100'
+    )
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.set_mcp_gateway_endpoint(endpoint_url text)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    normalized text := nullif(btrim(endpoint_url), '');
+BEGIN
+    IF normalized IS NULL THEN
+        RAISE EXCEPTION 'rvbbit.set_mcp_gateway_endpoint: endpoint_url cannot be empty';
+    END IF;
+    IF normalized !~ '^https?://' THEN
+        RAISE EXCEPTION 'rvbbit.set_mcp_gateway_endpoint: endpoint_url must be an http(s) URL';
+    END IF;
+    INSERT INTO rvbbit.settings (key, value, updated_at)
+    VALUES ('mcp_gateway_endpoint', to_jsonb(rtrim(normalized, '/')), clock_timestamp())
+    ON CONFLICT (key) DO UPDATE SET
+        value = EXCLUDED.value,
+        updated_at = clock_timestamp();
+
+    BEGIN
+        PERFORM rvbbit.reload_mcp_gateway();
+    EXCEPTION WHEN undefined_function THEN
+        NULL;
+    END;
+
+    RETURN rtrim(normalized, '/');
+END
+$$;
+
+CREATE TABLE rvbbit.mcp_gateways (
+    name                  text PRIMARY KEY,
+    endpoint_url          text NOT NULL,
+    status                text NOT NULL DEFAULT 'ready',
+    labels                jsonb NOT NULL DEFAULT '{}'::jsonb,
+    gateway_source        text NOT NULL DEFAULT 'manual',
+    warren_deployment_id  uuid,
+    install_manifest      jsonb NOT NULL DEFAULT '{}'::jsonb,
+    health                jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_by            oid NOT NULL DEFAULT (current_user::regrole::oid),
+    created_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT mcp_gateways_name_check CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_]*$'),
+    CONSTRAINT mcp_gateways_status_check CHECK (
+        status IN ('starting', 'ready', 'failed', 'disabled')
+    ),
+    CONSTRAINT mcp_gateways_endpoint_check CHECK (endpoint_url ~ '^https?://'),
+    CONSTRAINT mcp_gateways_labels_is_object CHECK (jsonb_typeof(labels) = 'object'),
+    CONSTRAINT mcp_gateways_manifest_is_object CHECK (jsonb_typeof(install_manifest) = 'object'),
+    CONSTRAINT mcp_gateways_health_is_object CHECK (jsonb_typeof(health) = 'object')
+);
+
+CREATE OR REPLACE FUNCTION rvbbit.touch_mcp_gateways_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at := clock_timestamp();
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER mcp_gateways_touch_updated_at
+    BEFORE UPDATE ON rvbbit.mcp_gateways
+    FOR EACH ROW EXECUTE FUNCTION rvbbit.touch_mcp_gateways_updated_at();
+
+CREATE OR REPLACE FUNCTION rvbbit.require_mcp_gateway_admin()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_roles WHERE rolname = current_user AND rolsuper
+    ) THEN
+        RAISE EXCEPTION 'rvbbit MCP gateway DDL requires a superuser in this release';
+    END IF;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.register_mcp_gateway(
+    gateway_name text,
+    endpoint_url text,
+    gateway_status text DEFAULT 'ready',
+    gateway_labels jsonb DEFAULT '{}'::jsonb,
+    gateway_source text DEFAULT 'manual',
+    warren_deployment_id uuid DEFAULT NULL,
+    install_manifest jsonb DEFAULT '{}'::jsonb,
+    health jsonb DEFAULT '{}'::jsonb,
+    set_default boolean DEFAULT true
+) RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    normalized_name text := nullif(btrim(gateway_name), '');
+    normalized_endpoint text := nullif(btrim(endpoint_url), '');
+    normalized_status text := coalesce(nullif(btrim(gateway_status), ''), 'ready');
+    normalized_source text := coalesce(nullif(btrim(gateway_source), ''), 'manual');
+    row_doc jsonb;
+BEGIN
+    PERFORM rvbbit.require_mcp_gateway_admin();
+    IF normalized_name IS NULL THEN
+        RAISE EXCEPTION 'rvbbit.register_mcp_gateway: gateway_name cannot be empty';
+    END IF;
+    IF normalized_name !~ '^[A-Za-z_][A-Za-z0-9_]*$' THEN
+        RAISE EXCEPTION 'rvbbit.register_mcp_gateway: gateway_name must be an identifier-like name';
+    END IF;
+    IF normalized_endpoint IS NULL OR normalized_endpoint !~ '^https?://' THEN
+        RAISE EXCEPTION 'rvbbit.register_mcp_gateway: endpoint_url must be an http(s) URL';
+    END IF;
+    IF normalized_status NOT IN ('starting', 'ready', 'failed', 'disabled') THEN
+        RAISE EXCEPTION 'rvbbit.register_mcp_gateway: unsupported status "%"', gateway_status;
+    END IF;
+    IF jsonb_typeof(coalesce(gateway_labels, '{}'::jsonb)) <> 'object' THEN
+        RAISE EXCEPTION 'rvbbit.register_mcp_gateway: gateway_labels must be a JSON object';
+    END IF;
+    IF jsonb_typeof(coalesce(install_manifest, '{}'::jsonb)) <> 'object' THEN
+        RAISE EXCEPTION 'rvbbit.register_mcp_gateway: install_manifest must be a JSON object';
+    END IF;
+    IF jsonb_typeof(coalesce(health, '{}'::jsonb)) <> 'object' THEN
+        RAISE EXCEPTION 'rvbbit.register_mcp_gateway: health must be a JSON object';
+    END IF;
+
+    INSERT INTO rvbbit.mcp_gateways
+        (name, endpoint_url, status, labels, gateway_source,
+         warren_deployment_id, install_manifest, health)
+    VALUES
+        (normalized_name, rtrim(normalized_endpoint, '/'), normalized_status,
+         coalesce(gateway_labels, '{}'::jsonb), normalized_source,
+         register_mcp_gateway.warren_deployment_id,
+         coalesce(install_manifest, '{}'::jsonb), coalesce(health, '{}'::jsonb))
+    ON CONFLICT (name) DO UPDATE SET
+        endpoint_url = EXCLUDED.endpoint_url,
+        status = EXCLUDED.status,
+        labels = EXCLUDED.labels,
+        gateway_source = EXCLUDED.gateway_source,
+        warren_deployment_id = EXCLUDED.warren_deployment_id,
+        install_manifest = EXCLUDED.install_manifest,
+        health = EXCLUDED.health;
+
+    IF coalesce(set_default, true) AND normalized_status = 'ready' THEN
+        PERFORM rvbbit.set_mcp_gateway_endpoint(rtrim(normalized_endpoint, '/'));
+    ELSE
+        BEGIN
+            PERFORM rvbbit.reload_mcp_gateway();
+        EXCEPTION WHEN undefined_function THEN
+            NULL;
+        END;
+    END IF;
+
+    SELECT to_jsonb(g) INTO row_doc FROM rvbbit.mcp_gateways g WHERE g.name = normalized_name;
+    RETURN row_doc;
+END
+$$;
 
 CREATE TABLE rvbbit.mcp_servers (
     name             text PRIMARY KEY,

@@ -28,3 +28,30 @@ install:
   mode: build
   warren: true
   docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: embedding_vector_shape
+    description: Embed an E5-formatted query and assert a non-empty vector payload.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.embed_e5_small('query: refund request from angry customer') INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'embed_e5_small returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN
+              RAISE EXCEPTION 'unexpected E5 embedding shape: %', left(result::text, 200);
+          END IF;
+      END
+      $$;

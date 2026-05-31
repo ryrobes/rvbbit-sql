@@ -30,3 +30,39 @@ install:
   mode: build
   warren: true
   docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: zero_shot_support_triage
+    description: Classify support tickets into caller-provided labels and assert the zero-shot JSON shape.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.classify_zero_shot_base(
+                  'customer cannot log in after the MFA reset',
+                  'auth,billing,shipping,fraud'
+              ) INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'classify_zero_shot_base returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object'
+             OR NOT (result ? 'label')
+             OR NOT (result ? 'score')
+             OR NOT (result ? 'scores') THEN
+              RAISE EXCEPTION 'unexpected zero-shot result shape: %', result;
+          END IF;
+          IF NOT (result->>'label' = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN
+              RAISE EXCEPTION 'zero-shot label was outside candidate set: %', result;
+          END IF;
+      END
+      $$;

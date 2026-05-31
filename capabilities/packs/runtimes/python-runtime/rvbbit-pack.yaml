@@ -4,12 +4,16 @@ name: python_runtime
 title: Managed CPython Runtime
 description: 'Warren-managed CPython runtime for rvbbit operator `kind: python` nodes.'
 license: apache-2.0
+system_runtime: true
+capability_role: operator_runtime
 tags:
 - runtime
 - python
 - warren
 - code
 - cpu
+- system-runtime
+- operator-runtime
 capability: capability.yaml
 source:
   provider: builtin
@@ -26,3 +30,103 @@ install:
   mode: image
   warren: true
   docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  setup_sql:
+  - |
+    DELETE FROM rvbbit.operators WHERE name = 'acceptance_python_sla';
+    DROP FUNCTION IF EXISTS rvbbit.acceptance_python_sla(text, text, jsonb);
+    DELETE FROM rvbbit.python_handlers WHERE name = 'acceptance_python_sla';
+    DELETE FROM rvbbit.python_envs WHERE name = 'acceptance_python_env';
+    SELECT rvbbit.reload_python_runtime();
+  tests:
+  - name: runtime_registered_ready
+    description: Assert Warren registered the default CPython runtime and inventory row.
+    sql: |
+      DO $$
+      BEGIN
+          IF NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.python_runtimes
+              WHERE name = 'python_default'
+                AND status = 'ready'
+                AND runtime_source = 'warren'
+          ) THEN
+              RAISE EXCEPTION 'python_default runtime is not registered as a ready Warren runtime';
+          END IF;
+
+          IF NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.warren_inventory
+              WHERE runtime_name = 'python_default'
+                AND deployment_status = 'running'
+          ) THEN
+              RAISE EXCEPTION 'python_default deployment is not running in Warren inventory';
+          END IF;
+      END
+      $$;
+  - name: python_operator_sla_scoring
+    description: Create a tiny Python handler, call it through an operator pipeline, and assert deterministic JSON output.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+      BEGIN
+          PERFORM rvbbit.create_python_env(
+              env_name => 'acceptance_python_env',
+              python_version => '3.12',
+              requirements => ARRAY[]::text[],
+              runtime_name => 'python_default',
+              timeout_ms => 3000
+          );
+          PERFORM rvbbit.create_python_handler(
+              handler_name => 'acceptance_python_sla',
+              env_name => 'acceptance_python_env',
+              code => $code$
+      def run(inputs):
+          tier = str(inputs.get("tier") or "standard").lower()
+          age_hours = int(inputs.get("age_hours") or 0)
+          breached = age_hours > 24
+          priority = "urgent" if tier == "enterprise" and breached else "standard"
+          return {"priority": priority, "breached": breached, "age_hours": age_hours}
+      $code$,
+              entrypoint => 'run',
+              description => 'Acceptance test handler for Warren-managed CPython runtime'
+          );
+          PERFORM rvbbit.create_operator(
+              op_name => 'acceptance_python_sla',
+              op_arg_names => ARRAY['tier','age_hours'],
+              op_arg_types => ARRAY['text','text'],
+              op_return_type => 'jsonb',
+              op_parser => 'json',
+              op_steps => $steps$[
+                {
+                  "name": "score",
+                  "kind": "python",
+                  "env": "acceptance_python_env",
+                  "handler": "acceptance_python_sla",
+                  "inputs": {
+                    "tier": "{{ inputs.tier }}",
+                    "age_hours": "{{ inputs.age_hours }}"
+                  }
+                }
+              ]$steps$::jsonb
+          );
+          SELECT rvbbit.acceptance_python_sla('enterprise', '31') INTO result;
+          IF jsonb_typeof(result) <> 'object'
+             OR result->>'priority' <> 'urgent'
+             OR coalesce((result->>'breached')::boolean, false) IS DISTINCT FROM true THEN
+              RAISE EXCEPTION 'unexpected CPython operator result: %', result;
+          END IF;
+      END
+      $$;
+  teardown_sql:
+  - |
+    DELETE FROM rvbbit.operators WHERE name = 'acceptance_python_sla';
+    DROP FUNCTION IF EXISTS rvbbit.acceptance_python_sla(text, text, jsonb);
+    DELETE FROM rvbbit.python_handlers WHERE name = 'acceptance_python_sla';
+    DELETE FROM rvbbit.python_envs WHERE name = 'acceptance_python_env';
+    SELECT rvbbit.reload_python_runtime();

@@ -29,3 +29,36 @@ install:
   mode: build
   warren: true
   docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: rerank_score_shape
+    description: Score refund-query relevance and assert a bounded score.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.rerank_score(
+                  'refund request',
+                  'customer says they were charged twice and wants money back'
+              ) INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'rerank_score returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN
+              RAISE EXCEPTION 'unexpected BGE-M3 reranker result shape: %', result;
+          END IF;
+          IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
+              RAISE EXCEPTION 'reranker score out of range: %', result;
+          END IF;
+      END
+      $$;

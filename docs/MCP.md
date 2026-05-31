@@ -57,14 +57,33 @@ Architecture:
   each server. The catalog is the source of truth.
 
 The UI never talks to the gateway directly — it always goes through SQL.
+The gateway itself is a Warren-installable system runtime pack
+(`runtimes/mcp-gateway`). When installed, Warren records the endpoint in
+`rvbbit.mcp_gateways` and updates `rvbbit.mcp_gateway_endpoint()`, so SQL MCP
+calls and `kind: mcp` operator nodes use the deployed gateway without a
+database-host subprocess.
 
 ---
 
 ## 2. Quick start
 
-Register a server, discover its tools, call one, look at the audit:
+Install or verify the gateway runtime, register a server, discover its tools,
+call one, look at the audit:
 
 ```sql
+-- 0. Gateway prerequisite. If this returns no ready row, deploy the
+--    runtimes/mcp-gateway capability from Warren before active MCP calls.
+SELECT name, endpoint_url, status, health
+FROM rvbbit.mcp_gateways
+WHERE status = 'ready'
+ORDER BY (name = 'mcp_default') DESC, updated_at DESC
+LIMIT 1;
+
+-- Queue the runtime install from the built-in catalog when needed.
+SELECT rvbbit.deploy_catalog_capability(
+    catalog_id => 'runtimes/mcp-gateway',
+    target_selector => '{"gpu":false}'::jsonb);
+
 -- 1. Register the official GitHub MCP server.
 SELECT rvbbit.register_mcp_server(
     server_name      => 'github',
@@ -127,6 +146,34 @@ Constraints:
 ```sql
 SELECT * FROM rvbbit.mcp_servers ORDER BY name;
 ```
+
+### `rvbbit.mcp_gateways` — installed MCP gateway runtimes
+
+Source of truth for deployed gateway runtime endpoints. Warren writes this
+table when the `runtimes/mcp-gateway` capability finishes registering.
+
+| column | type | meaning |
+|---|---|---|
+| `name` | text (PK) | runtime handle, usually `mcp_default` |
+| `endpoint_url` | text | gateway base URL used by SQL MCP functions |
+| `gateway_source` | text | where the endpoint came from, usually `warren` |
+| `status` | text | `ready`, `starting`, `failed`, or `disabled` |
+| `health` | jsonb | Warren/runtime probe details |
+| `warren_deployment_id` | uuid | deployment that produced this gateway, when available |
+| `updated_at` | timestamptz | latest registration/probe update |
+
+Recommended UI gate:
+
+```sql
+SELECT name, endpoint_url, status, gateway_source, health, updated_at
+FROM rvbbit.mcp_gateways
+ORDER BY (status = 'ready') DESC, (name = 'mcp_default') DESC, updated_at DESC
+LIMIT 1;
+```
+
+If no row is ready, render the MCP Gateway capability
+(`runtimes/mcp-gateway`) as the install/open-runtime action. The UI should not
+assume `http://mcp-gateway:9100` is alive.
 
 ### `rvbbit.mcp_tools` — discovered tools per server
 
@@ -347,6 +394,22 @@ See §10. Creates a per-server schema with one typed SQL function per tool.
 SELECT rvbbit.generate_mcp_wrappers('github');  -- returns n_wrappers
 ```
 
+### Gateway endpoint helpers
+
+These are mostly operational surfaces. Warren calls
+`register_mcp_gateway(...)` after the sidecar is reachable; SQL MCP functions
+read `mcp_gateway_endpoint()` before making HTTP calls.
+
+```sql
+SELECT rvbbit.mcp_gateway_endpoint();
+
+-- Manual override for custom deployments.
+SELECT rvbbit.set_mcp_gateway_endpoint('http://my-gateway.internal:9100');
+```
+
+The UI should prefer `rvbbit.mcp_gateways` for readiness and provenance, and
+only expose endpoint overrides in an advanced/operator context.
+
 ---
 
 ## 5. Reading patterns
@@ -508,6 +571,18 @@ WHERE step->>'kind' = 'mcp'
 
 These actually hit the gateway. Use them for "test this tool" REPL
 panels, "refresh now" buttons, "probe health" buttons.
+
+All active operations require a ready gateway row:
+
+```sql
+SELECT 1
+FROM rvbbit.mcp_gateways
+WHERE status = 'ready'
+LIMIT 1;
+```
+
+If this is empty, disable active buttons and deep-link to the
+`runtimes/mcp-gateway` capability install flow.
 
 ### `mcp_call(server, tool, args jsonb) → jsonb` — invoke
 
@@ -731,19 +806,25 @@ SELECT rvbbit.summarize_repo('anthropic-ai/claude-code');
 A nice operator editor should let the user:
 
 1. **Pick "mcp" as a node kind** (the dropdown alongside llm/specialist/code/sql).
-2. **Pick a server** — autocomplete from:
+2. **Show gateway readiness** before server/tool selection:
+   ```sql
+   SELECT name, endpoint_url, status FROM rvbbit.mcp_gateways
+   ORDER BY (status = 'ready') DESC, updated_at DESC LIMIT 1;
+   ```
+   If no row is ready, show an install/open action for `runtimes/mcp-gateway`.
+3. **Pick a server** — autocomplete from:
    ```sql
    SELECT name FROM rvbbit.mcp_servers ORDER BY name;
    ```
-3. **Pick a tool from that server** — autocomplete from:
+4. **Pick a tool from that server** — autocomplete from:
    ```sql
    SELECT name, description FROM rvbbit.mcp_tools WHERE server = $1 ORDER BY name;
    ```
-4. **Render an inputs form** from the tool's `input_schema` (a typed form
+5. **Render an inputs form** from the tool's `input_schema` (a typed form
    per property, with templating hints — `{{ inputs.x }}` autocompletes
    from the operator's `arg_names`, `{{ steps.X.output.… }}` from prior
    steps).
-5. **Show output addressability**: after picking a tool, hint to the user
+6. **Show output addressability**: after picking a tool, hint to the user
    "if this tool returns `{items:[…]}` you can reference
    `{{ steps.<name>.output.items.0.… }}` downstream."
 
@@ -905,10 +986,12 @@ DROP SCHEMA IF EXISTS "github" CASCADE;
 
 ### Transport-level errors aren't logged
 
-If the gateway is down, or the network blows up, `mcp_call` raises a SQL
+If the gateway is not installed, down, or unreachable, `mcp_call` raises a SQL
 error and rolls back — including the audit row. The UI should catch SQL
-errors and surface them as "transport unreachable: …", separately from
-tool-level `isError=true`.
+errors and surface them as "gateway unavailable" or "transport unreachable",
+separately from tool-level `isError=true`. In normal UI flows, check
+`rvbbit.mcp_gateways` first and route users to install `runtimes/mcp-gateway`
+instead of letting active MCP calls fail.
 
 ### `${VAR}` env resolution is at SPAWN time
 

@@ -73,12 +73,31 @@
         "title": "DeBERTa v3 Base Zero-Shot Classifier"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Classify support tickets into caller-provided labels and assert the zero-shot JSON shape.",
+              "name": "zero_shot_support_triage",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_zero_shot_base(\n            'customer cannot log in after the MFA reset',\n            'auth,billing,shipping,fraud'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_zero_shot_base returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score')\n       OR NOT (result ? 'scores') THEN\n        RAISE EXCEPTION 'unexpected zero-shot result shape: %', result;\n    END IF;\n    IF NOT (result->>'label' = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN\n        RAISE EXCEPTION 'zero-shot label was outside candidate set: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "zero_shot_support_triage"
+        ],
         "backend_name": "classify_deberta_base_zero_shot",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Smaller NLI zero-shot classifier for classifying text or JSONB rows into caller-provided labels.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "classify/deberta-v3-base-zero-shot",
         "install_docker": true,
         "install_mode": "build",
@@ -101,11 +120,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
+        "system_runtime": false,
         "tags": [
           "classify",
           "zero-shot",
@@ -188,12 +209,31 @@
         "title": "DeBERTa v3 Zero-Shot Classifier"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Classify a refund-oriented ticket into a caller-provided taxonomy and assert candidate-safe output.",
+              "name": "zero_shot_refund_triage",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_zero_shot(\n            'the delivery arrived late and the customer wants a refund',\n            'billing,shipping,product_quality,cancellation'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_zero_shot returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score')\n       OR NOT (result ? 'scores') THEN\n        RAISE EXCEPTION 'unexpected zero-shot result shape: %', result;\n    END IF;\n    IF NOT (result->>'label' = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN\n        RAISE EXCEPTION 'zero-shot label was outside candidate set: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "zero_shot_refund_triage"
+        ],
         "backend_name": "classify_deberta_zero_shot",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "NLI-based zero-shot classification over caller-provided labels.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "classify/deberta-v3-zero-shot",
         "install_docker": true,
         "install_mode": "build",
@@ -216,11 +256,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli",
+        "system_runtime": false,
         "tags": [
           "classify",
           "zero-shot",
@@ -297,12 +339,31 @@
         "title": "Emotion Classifier"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Classify an unambiguous customer-success note and assert classifier JSON shape.",
+              "name": "emotion_ticket_sample",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_emotion('I am thrilled that the replacement arrived early') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_emotion returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected emotion result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'emotion score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "emotion_ticket_sample"
+        ],
         "backend_name": "classify_emotion_distilroberta",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Classify text into emotion labels for support, survey, content, and conversation analytics.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "classify/emotion-distilroberta",
         "install_docker": true,
         "install_mode": "build",
@@ -325,11 +386,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "j-hartmann/emotion-english-distilroberta-base",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/j-hartmann/emotion-english-distilroberta-base",
+        "system_runtime": false,
         "tags": [
           "classify",
           "emotion",
@@ -392,12 +455,31 @@
         "title": "XLM-R Language Detection"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Detect language on a multilingual support note and assert classifier JSON shape.",
+              "name": "language_routing_sample",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.detect_language('el pedido llego tarde y necesito ayuda') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'detect_language returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected language result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'language score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "language_routing_sample"
+        ],
         "backend_name": "detect_language_xlm_roberta",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Detect the language of text for routing, normalization, and multilingual analytics.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "classify/language-detection-xlm-roberta",
         "install_docker": true,
         "install_mode": "build",
@@ -419,11 +501,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "papluca/xlm-roberta-base-language-detection",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/papluca/xlm-roberta-base-language-detection",
+        "system_runtime": false,
         "tags": [
           "classify",
           "language",
@@ -505,12 +589,31 @@
         "title": "Toxicity Classifier"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Run a moderation-oriented comment through toxic-bert and assert score-bearing JSON.",
+              "name": "moderation_sample_shape",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_toxicity('you are awful and nobody wants you here') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_toxicity returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected toxicity result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'toxicity score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "moderation_sample_shape"
+        ],
         "backend_name": "classify_toxic_bert",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Multi-label toxicity classifier for moderation, support triage, and data quality workflows.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "classify/toxic-bert",
         "install_docker": true,
         "install_mode": "build",
@@ -533,11 +636,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "unitary/toxic-bert",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/unitary/toxic-bert",
+        "system_runtime": false,
         "tags": [
           "classify",
           "toxicity",
@@ -616,12 +721,31 @@
         "title": "RoBERTa Sentiment Classifier"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Classify a product-review style note and assert sentiment JSON shape.",
+              "name": "sentiment_review_sample",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_sentiment('the setup was simple and the dashboard is fantastic') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_sentiment returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected sentiment result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'sentiment score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "sentiment_review_sample"
+        ],
         "backend_name": "classify_twitter_roberta_sentiment",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Practical positive/neutral/negative sentiment classifier for reviews, tickets, social text, and notes.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "classify/twitter-roberta-sentiment",
         "install_docker": true,
         "install_mode": "build",
@@ -644,11 +768,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "cardiffnlp/twitter-roberta-base-sentiment-latest",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/cardiffnlp/twitter-roberta-base-sentiment-latest",
+        "system_runtime": false,
         "tags": [
           "classify",
           "sentiment",
@@ -710,12 +836,31 @@
         "title": "BGE-M3 Embeddings"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Embed realistic retrieval text and assert a non-empty vector payload.",
+              "name": "embedding_vector_shape",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.embed_bge_m3('query: suspicious movement near a wooded creek') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'embed_bge_m3 returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected BGE-M3 embedding shape: %', left(result::text, 200);\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "embedding_vector_shape"
+        ],
         "backend_name": "embed_bge_m3",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "High-quality multilingual BGE-M3 sentence embeddings for retrieval and semantic search.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "embeddings/bge-m3",
         "install_docker": true,
         "install_mode": "build",
@@ -737,11 +882,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "BAAI/bge-m3",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/BAAI/bge-m3",
+        "system_runtime": false,
         "tags": [
           "embedding",
           "retrieval",
@@ -801,12 +948,31 @@
         "title": "BGE Small English Embeddings"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Embed a support-search phrase and assert a non-empty vector payload.",
+              "name": "embedding_vector_shape",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.embed_bge_small('refund request from angry customer') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'embed_bge_small returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected BGE-small embedding shape: %', left(result::text, 200);\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "embedding_vector_shape"
+        ],
         "backend_name": "embed_bge_small",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "CPU-friendly English sentence embeddings exposed as an Rvbbit backend.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "embeddings/bge-small-en-v1.5",
         "install_docker": true,
         "install_mode": "build",
@@ -828,11 +994,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "BAAI/bge-small-en-v1.5",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/BAAI/bge-small-en-v1.5",
+        "system_runtime": false,
         "tags": [
           "embedding",
           "retrieval",
@@ -892,12 +1060,31 @@
         "title": "E5 Small Embeddings"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Embed an E5-formatted query and assert a non-empty vector payload.",
+              "name": "embedding_vector_shape",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.embed_e5_small('query: refund request from angry customer') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'embed_e5_small returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected E5 embedding shape: %', left(result::text, 200);\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "embedding_vector_shape"
+        ],
         "backend_name": "embed_e5_small",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Small, fast E5 embeddings useful for CPU-friendly retrieval experiments and lightweight semantic joins.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "embeddings/e5-small-v2",
         "install_docker": true,
         "install_mode": "build",
@@ -919,11 +1106,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "intfloat/e5-small-v2",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/intfloat/e5-small-v2",
+        "system_runtime": false,
         "tags": [
           "embedding",
           "retrieval",
@@ -1043,12 +1232,31 @@
         "title": "GLiNER Medium v2.1 Extraction"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Extract business entities from an operations note and assert array output.",
+              "name": "entity_extraction_shape",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.extract_entities(\n            'Invoice INV-1042 for Acme Corp is due Friday in Portland.',\n            'organization, invoice number, date, location'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'extract_entities returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' THEN\n        RAISE EXCEPTION 'unexpected GLiNER extraction shape: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "entity_extraction_shape"
+        ],
         "backend_name": "extract_gliner",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Zero-shot entity extraction over arbitrary user-provided labels.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "extract/gliner-medium-v2.1",
         "install_docker": true,
         "install_mode": "build",
@@ -1073,11 +1281,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "urchade/gliner_medium-v2.1",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/urchade/gliner_medium-v2.1",
+        "system_runtime": false,
         "tags": [
           "extract",
           "ner",
@@ -1163,12 +1373,31 @@
         "title": "BGE Reranker Base"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Score query/document relevance and assert a bounded score.",
+              "name": "rerank_score_shape",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.rerank_bge_base_score(\n            'suspicious login',\n            'user had twelve failed logins from a new country'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rerank_bge_base_score returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected BGE reranker result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "rerank_score_shape"
+        ],
         "backend_name": "rerank_bge_base",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Smaller BGE cross-encoder reranker for query/document scoring and row ranking.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "rerank/bge-reranker-base",
         "install_docker": true,
         "install_mode": "build",
@@ -1191,11 +1420,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "BAAI/bge-reranker-base",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/BAAI/bge-reranker-base",
+        "system_runtime": false,
         "tags": [
           "rerank",
           "retrieval",
@@ -1279,12 +1510,31 @@
         "title": "BGE Reranker v2 M3"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Score refund-query relevance and assert a bounded score.",
+              "name": "rerank_score_shape",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.rerank_score(\n            'refund request',\n            'customer says they were charged twice and wants money back'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rerank_score returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected BGE-M3 reranker result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "rerank_score_shape"
+        ],
         "backend_name": "rerank_bge_m3",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Cross-encoder relevance scoring for query/document pairs.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "rerank/bge-reranker-v2-m3",
         "install_docker": true,
         "install_mode": "build",
@@ -1307,11 +1557,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "BAAI/bge-reranker-v2-m3",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/BAAI/bge-reranker-v2-m3",
+        "system_runtime": false,
         "tags": [
           "rerank",
           "retrieval",
@@ -1395,12 +1647,31 @@
         "title": "MS MARCO MiniLM Reranker"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Score billing-query relevance and assert a bounded score.",
+              "name": "rerank_score_shape",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.rerank_ms_marco_score(\n            'billing refund',\n            'customer was charged twice and asks for their money back'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rerank_ms_marco_score returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected MS MARCO reranker result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "rerank_score_shape"
+        ],
         "backend_name": "rerank_ms_marco_minilm",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Lightweight cross-encoder reranker for query/document scoring and ranking table rows by relevance.",
         "device": "auto",
         "endpoint_path": null,
+        "health_path": null,
         "id": "rerank/ms-marco-minilm-l6-v2",
         "install_docker": true,
         "install_mode": "build",
@@ -1423,11 +1694,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "cross-encoder/ms-marco-MiniLM-L6-v2",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2",
+        "system_runtime": false,
         "tags": [
           "rerank",
           "retrieval",
@@ -1441,6 +1714,158 @@
     {
       "capability_manifest": {
         "api_version": "rvbbit.capability/v1",
+        "capability_role": "operator_runtime",
+        "description": "Warren-managed MCP gateway for rvbbit operator `kind: mcp` nodes and SQL MCP calls.",
+        "kind": "runtime_sidecar",
+        "license": "apache-2.0",
+        "name": "mcp_gateway",
+        "runtime": {
+          "device": "cpu",
+          "env": {
+            "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY:-}",
+            "GEMINI_API_KEY": "${GEMINI_API_KEY:-}",
+            "GITHUB_TOKEN": "${GITHUB_TOKEN:-}",
+            "GITHUB_USERNAME": "${GITHUB_USERNAME:-}",
+            "GOOGLE_APPLICATION_CREDENTIALS": "${GOOGLE_APPLICATION_CREDENTIALS:-}",
+            "GOOGLE_CLOUD_PROJECT": "${GOOGLE_CLOUD_PROJECT:-}",
+            "GOOGLE_CLOUD_QUOTA_PROJECT": "${GOOGLE_CLOUD_QUOTA_PROJECT:-}",
+            "OPENAI_API_KEY": "${OPENAI_API_KEY:-}",
+            "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY:-}",
+            "RVBBIT_DSN": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench"
+          },
+          "handler": "mcp_gateway",
+          "health_path": "/health",
+          "image": "ghcr.io/rvbbit/mcp-gateway:0.60.4",
+          "language": "mcp",
+          "port": 9100,
+          "pull_policy": "missing",
+          "template": "mcp-gateway",
+          "volumes": [
+            {
+              "mount": "/root/.npm",
+              "name": "mcp_npm_cache"
+            }
+          ]
+        },
+        "runtime_registration": {
+          "endpoint_path": "/",
+          "labels": {
+            "capability_kind": "runtime_sidecar",
+            "language": "mcp",
+            "runtime_handler": "mcp_gateway",
+            "system_runtime": true
+          },
+          "language": "mcp",
+          "name": "mcp_default",
+          "set_default": true
+        },
+        "source": {
+          "model": "rvbbit/mcp-gateway",
+          "provider": "builtin"
+        },
+        "system_runtime": true,
+        "tags": [
+          "runtime",
+          "mcp",
+          "warren",
+          "code",
+          "tools",
+          "cpu",
+          "system-runtime",
+          "operator-runtime"
+        ],
+        "title": "MCP Gateway Runtime",
+        "warren": {
+          "endpoint_path": "/",
+          "health_path": "/health"
+        }
+      },
+      "catalog_entry": {
+        "acceptance": {
+          "setup_sql": [
+            "DELETE FROM rvbbit.operators WHERE name = 'acceptance_mcp_case_echo';\nDROP FUNCTION IF EXISTS rvbbit.acceptance_mcp_case_echo(text, jsonb);\nDELETE FROM rvbbit.mcp_servers WHERE name = 'acceptance_mcp_echo';\nINSERT INTO rvbbit.mcp_servers\n    (name, transport, command, args, env, timeout_ms, description)\nVALUES\n    ('acceptance_mcp_echo', 'stdio', 'python',\n     ARRAY['/opt/mcp-test-server/main.py'],\n     '{}'::jsonb, 30000,\n     'Deterministic MCP echo server bundled with the rvbbit MCP gateway image');\nSELECT rvbbit.refresh_mcp_server('acceptance_mcp_echo');\n"
+          ],
+          "target_selector": {
+            "capability": true,
+            "docker": true,
+            "gpu": false
+          },
+          "teardown_sql": [
+            "DELETE FROM rvbbit.operators WHERE name = 'acceptance_mcp_case_echo';\nDROP FUNCTION IF EXISTS rvbbit.acceptance_mcp_case_echo(text, jsonb);\nDELETE FROM rvbbit.mcp_servers WHERE name = 'acceptance_mcp_echo';\n"
+          ],
+          "tests": [
+            {
+              "description": "Assert Warren registered the default MCP gateway runtime and inventory row.",
+              "name": "mcp_gateway_registered_ready",
+              "sql": "DO $$\nBEGIN\n    IF NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.mcp_gateways\n        WHERE name = 'mcp_default'\n          AND status = 'ready'\n          AND gateway_source = 'warren'\n    ) THEN\n        RAISE EXCEPTION 'mcp_default gateway is not registered as a ready Warren runtime';\n    END IF;\n\n    IF NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'mcp_default'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'mcp_default deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"
+            },
+            {
+              "description": "Call the bundled deterministic MCP echo server through SQL.",
+              "name": "mcp_sql_tool_call",
+              "sql": "DO $$\nDECLARE\n    response jsonb;\nBEGIN\n    SELECT rvbbit.mcp_call(\n        'acceptance_mcp_echo',\n        'echo',\n        '{\"text\":\"chargeback review queue\"}'::jsonb\n    ) INTO response;\n    IF rvbbit.mcp_text(response) <> 'chargeback review queue' THEN\n        RAISE EXCEPTION 'unexpected MCP echo response: %', response;\n    END IF;\nEND\n$$;\n"
+            },
+            {
+              "description": "Create an MCP-backed operator node and assert deterministic workflow output.",
+              "name": "mcp_operator_node_echo",
+              "sql": "DO $$\nDECLARE\n    result text;\nBEGIN\n    PERFORM rvbbit.create_operator(\n        op_name => 'acceptance_mcp_case_echo',\n        op_arg_names => ARRAY['case_text'],\n        op_arg_types => ARRAY['text'],\n        op_return_type => 'text',\n        op_parser => 'strip',\n        op_steps => $steps$[\n          {\n            \"name\": \"echo_case\",\n            \"kind\": \"mcp\",\n            \"server\": \"acceptance_mcp_echo\",\n            \"tool\": \"echo\",\n            \"inputs\": {\n              \"text\": \"{{ inputs.case_text }}\"\n            }\n          }\n        ]$steps$::jsonb\n    );\n    SELECT rvbbit.acceptance_mcp_case_echo('enterprise refund escalation') INTO result;\n    IF result <> 'enterprise refund escalation' THEN\n        RAISE EXCEPTION 'unexpected MCP operator result: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "mcp_gateway_registered_ready",
+          "mcp_sql_tool_call",
+          "mcp_operator_node_echo"
+        ],
+        "backend_name": null,
+        "backend_transport": "rvbbit",
+        "capability_role": "operator_runtime",
+        "description": "Warren-managed MCP gateway for rvbbit operator `kind: mcp` nodes and SQL MCP calls.",
+        "device": "cpu",
+        "endpoint_path": "/",
+        "health_path": "/health",
+        "id": "runtimes/mcp-gateway",
+        "install_docker": true,
+        "install_mode": "image",
+        "install_warren": true,
+        "kind": "runtime_sidecar",
+        "license": "apache-2.0",
+        "manifest_path": "capabilities/packs/runtimes/mcp-gateway/capability.yaml",
+        "name": "mcp_gateway",
+        "operators": [],
+        "pack_api_version": "rvbbit.pack/v1",
+        "pack_id": "runtimes/mcp-gateway",
+        "pack_manifest_path": "capabilities/packs/runtimes/mcp-gateway/rvbbit-pack.yaml",
+        "pack_path": "capabilities/packs/runtimes/mcp-gateway",
+        "repo_url": null,
+        "runtime_handler": "mcp_gateway",
+        "runtime_image": "ghcr.io/rvbbit/mcp-gateway:0.60.4",
+        "runtime_language": "mcp",
+        "runtime_mode": "image",
+        "runtime_name": "mcp_default",
+        "runtime_port": 9100,
+        "runtime_template": "mcp-gateway",
+        "source_model": "rvbbit/mcp-gateway",
+        "source_provider": "builtin",
+        "source_revision": null,
+        "source_url": null,
+        "system_runtime": true,
+        "tags": [
+          "runtime",
+          "mcp",
+          "warren",
+          "code",
+          "tools",
+          "cpu",
+          "system-runtime",
+          "operator-runtime"
+        ],
+        "title": "MCP Gateway Runtime"
+      }
+    },
+    {
+      "capability_manifest": {
+        "api_version": "rvbbit.capability/v1",
+        "capability_role": "operator_runtime",
         "description": "Warren-managed CPython runtime for rvbbit operator `kind: python` nodes.",
         "kind": "runtime_sidecar",
         "license": "apache-2.0",
@@ -1479,6 +1904,7 @@
           "model": "rvbbit/python-runtime",
           "provider": "builtin"
         },
+        "system_runtime": true,
         "tags": [
           "runtime",
           "python",
@@ -1492,12 +1918,42 @@
         }
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [
+            "DELETE FROM rvbbit.operators WHERE name = 'acceptance_python_sla';\nDROP FUNCTION IF EXISTS rvbbit.acceptance_python_sla(text, text, jsonb);\nDELETE FROM rvbbit.python_handlers WHERE name = 'acceptance_python_sla';\nDELETE FROM rvbbit.python_envs WHERE name = 'acceptance_python_env';\nSELECT rvbbit.reload_python_runtime();\n"
+          ],
+          "target_selector": {
+            "capability": true,
+            "docker": true,
+            "gpu": false
+          },
+          "teardown_sql": [
+            "DELETE FROM rvbbit.operators WHERE name = 'acceptance_python_sla';\nDROP FUNCTION IF EXISTS rvbbit.acceptance_python_sla(text, text, jsonb);\nDELETE FROM rvbbit.python_handlers WHERE name = 'acceptance_python_sla';\nDELETE FROM rvbbit.python_envs WHERE name = 'acceptance_python_env';\nSELECT rvbbit.reload_python_runtime();\n"
+          ],
+          "tests": [
+            {
+              "description": "Assert Warren registered the default CPython runtime and inventory row.",
+              "name": "runtime_registered_ready",
+              "sql": "DO $$\nBEGIN\n    IF NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.python_runtimes\n        WHERE name = 'python_default'\n          AND status = 'ready'\n          AND runtime_source = 'warren'\n    ) THEN\n        RAISE EXCEPTION 'python_default runtime is not registered as a ready Warren runtime';\n    END IF;\n\n    IF NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'python_default'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'python_default deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"
+            },
+            {
+              "description": "Create a tiny Python handler, call it through an operator pipeline, and assert deterministic JSON output.",
+              "name": "python_operator_sla_scoring",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\nBEGIN\n    PERFORM rvbbit.create_python_env(\n        env_name => 'acceptance_python_env',\n        python_version => '3.12',\n        requirements => ARRAY[]::text[],\n        runtime_name => 'python_default',\n        timeout_ms => 3000\n    );\n    PERFORM rvbbit.create_python_handler(\n        handler_name => 'acceptance_python_sla',\n        env_name => 'acceptance_python_env',\n        code => $code$\ndef run(inputs):\n    tier = str(inputs.get(\"tier\") or \"standard\").lower()\n    age_hours = int(inputs.get(\"age_hours\") or 0)\n    breached = age_hours > 24\n    priority = \"urgent\" if tier == \"enterprise\" and breached else \"standard\"\n    return {\"priority\": priority, \"breached\": breached, \"age_hours\": age_hours}\n$code$,\n        entrypoint => 'run',\n        description => 'Acceptance test handler for Warren-managed CPython runtime'\n    );\n    PERFORM rvbbit.create_operator(\n        op_name => 'acceptance_python_sla',\n        op_arg_names => ARRAY['tier','age_hours'],\n        op_arg_types => ARRAY['text','text'],\n        op_return_type => 'jsonb',\n        op_parser => 'json',\n        op_steps => $steps$[\n          {\n            \"name\": \"score\",\n            \"kind\": \"python\",\n            \"env\": \"acceptance_python_env\",\n            \"handler\": \"acceptance_python_sla\",\n            \"inputs\": {\n              \"tier\": \"{{ inputs.tier }}\",\n              \"age_hours\": \"{{ inputs.age_hours }}\"\n            }\n          }\n        ]$steps$::jsonb\n    );\n    SELECT rvbbit.acceptance_python_sla('enterprise', '31') INTO result;\n    IF jsonb_typeof(result) <> 'object'\n       OR result->>'priority' <> 'urgent'\n       OR coalesce((result->>'breached')::boolean, false) IS DISTINCT FROM true THEN\n        RAISE EXCEPTION 'unexpected CPython operator result: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "runtime_registered_ready",
+          "python_operator_sla_scoring"
+        ],
         "backend_name": null,
         "backend_transport": "rvbbit",
+        "capability_role": "operator_runtime",
         "description": "Warren-managed CPython runtime for rvbbit operator `kind: python` nodes.",
         "device": "cpu",
         "endpoint_path": "/run",
+        "health_path": null,
         "id": "runtimes/python-runtime",
         "install_docker": true,
         "install_mode": "image",
@@ -1517,17 +1973,21 @@
         "runtime_language": "python",
         "runtime_mode": "image",
         "runtime_name": "python_default",
+        "runtime_port": null,
         "runtime_template": "python-runtime",
         "source_model": "rvbbit/python-runtime",
         "source_provider": "builtin",
         "source_revision": null,
         "source_url": null,
+        "system_runtime": true,
         "tags": [
           "runtime",
           "python",
           "warren",
           "code",
-          "cpu"
+          "cpu",
+          "system-runtime",
+          "operator-runtime"
         ],
         "title": "Managed CPython Runtime"
       }
@@ -1584,15 +2044,38 @@
         "title": "Warren Smoke Echo"
       },
       "catalog_entry": {
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true,
+            "gpu": false
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Run the Warren-managed operator over realistic support-note rows and assert row-level results.",
+              "name": "echo_operator_sample_table",
+              "sql": "DO $$\nDECLARE\n    mismatches integer;\nBEGIN\n    CREATE TEMP TABLE warren_echo_cases (\n        case_id integer,\n        note text,\n        expected text\n    ) ON COMMIT DROP;\n\n    INSERT INTO warren_echo_cases(case_id, note, expected) VALUES\n        (1, 'refund request after delayed shipment', 'refund request after delayed shipment'),\n        (2, 'warehouse damaged item needs replacement', 'warehouse damaged item needs replacement'),\n        (3, 'vip customer asks for invoice correction', 'vip customer asks for invoice correction');\n\n    SELECT count(*)\n    INTO mismatches\n    FROM (\n        SELECT\n            note,\n            expected,\n            rvbbit.warren_smoke_echo(note)->>'echo' AS got\n        FROM warren_echo_cases\n    ) checked\n    WHERE got IS DISTINCT FROM expected;\n\n    IF mismatches <> 0 THEN\n        RAISE EXCEPTION 'warren_smoke_echo mismatches: %', mismatches;\n    END IF;\nEND\n$$;\n"
+            },
+            {
+              "description": "Assert Warren registered the backend, deployment inventory, and probe path.",
+              "name": "backend_and_deployment_observability",
+              "sql": "DO $$\nDECLARE\n    probe jsonb;\nBEGIN\n    IF NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.backend_health\n        WHERE name = 'warren_smoke_echo'\n    ) THEN\n        RAISE EXCEPTION 'warren_smoke_echo backend is not registered';\n    END IF;\n\n    IF NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE backend_name = 'warren_smoke_echo'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'warren_smoke_echo deployment is not running in Warren inventory';\n    END IF;\n\n    probe := rvbbit.backend_probe('warren_smoke_echo');\n    IF coalesce((probe->>'ok')::boolean, false) IS DISTINCT FROM true THEN\n        RAISE EXCEPTION 'warren_smoke_echo backend probe failed: %', probe;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
         "acceptance_tests": [
           "echo_operator_sample_table",
           "backend_and_deployment_observability"
         ],
         "backend_name": "warren_smoke_echo",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Deterministic no-model sidecar for validating Warren deployment, backend registration, probing, and operator wiring.",
         "device": "cpu",
         "endpoint_path": null,
+        "health_path": null,
         "id": "smoke/warren-echo",
         "install_docker": true,
         "install_mode": "build",
@@ -1614,11 +2097,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "rvbbit/warren-smoke-echo",
         "source_provider": "builtin",
         "source_revision": null,
         "source_url": null,
+        "system_runtime": false,
         "tags": [
           "smoke",
           "warren",
@@ -1688,12 +2173,31 @@
         "title": "California Housing Regressor"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Predict a California housing row and assert numeric regression output.",
+              "name": "housing_prediction_shape",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.predict_house_value(\n            '{\"MedInc\":8.3252,\"HouseAge\":41.0,\"AveRooms\":6.984127,\"AveBedrms\":1.02381,\"Population\":322.0,\"AveOccup\":2.555556,\"Latitude\":37.88,\"Longitude\":-122.23}'::jsonb\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'predict_house_value returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'value') THEN\n        RAISE EXCEPTION 'unexpected housing prediction shape: %', result;\n    END IF;\n    IF (result->>'value')::float8 <= 0 THEN\n        RAISE EXCEPTION 'housing prediction should be positive: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "housing_prediction_shape"
+        ],
         "backend_name": "predict_california_housing_sklearn",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Scikit-learn tabular regression example that predicts median house value from California housing row features.",
         "device": "cpu",
         "endpoint_path": null,
+        "health_path": null,
         "id": "tabular/california-housing-sklearn",
         "install_docker": true,
         "install_mode": "build",
@@ -1715,11 +2219,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "B4S/california-housing-predictor",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/B4S/california-housing-predictor",
+        "system_runtime": false,
         "tags": [
           "tabular",
           "regression",
@@ -1790,12 +2296,31 @@
         "title": "Wine Quality Classifier"
       },
       "catalog_entry": {
-        "acceptance_tests": [],
+        "acceptance": {
+          "setup_sql": [],
+          "target_selector": {
+            "capability": true,
+            "docker": true
+          },
+          "teardown_sql": [],
+          "tests": [
+            {
+              "description": "Predict a red-wine feature row and assert classifier JSON output.",
+              "name": "wine_quality_prediction_shape",
+              "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.predict_wine_quality(\n            '{\"fixed acidity\":7.4,\"volatile acidity\":0.7,\"citric acid\":0.0,\"residual sugar\":1.9,\"chlorides\":0.076,\"free sulfur dioxide\":11,\"total sulfur dioxide\":34,\"density\":0.9978,\"pH\":3.51,\"sulphates\":0.56,\"alcohol\":9.4}'::jsonb\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'predict_wine_quality returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'prediction') THEN\n        RAISE EXCEPTION 'unexpected wine prediction shape: %', result;\n    END IF;\nEND\n$$;\n"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          "wine_quality_prediction_shape"
+        ],
         "backend_name": "predict_wine_quality_sklearn",
         "backend_transport": "rvbbit",
+        "capability_role": null,
         "description": "Scikit-learn tabular classification example that predicts red wine quality classes from numeric row features.",
         "device": "cpu",
         "endpoint_path": null,
+        "health_path": null,
         "id": "tabular/wine-quality-sklearn",
         "install_docker": true,
         "install_mode": "build",
@@ -1817,11 +2342,13 @@
         "runtime_language": null,
         "runtime_mode": "build",
         "runtime_name": null,
+        "runtime_port": null,
         "runtime_template": "hf-rvbbit-fastapi",
         "source_model": "julien-c/wine-quality",
         "source_provider": "huggingface",
         "source_revision": null,
         "source_url": "https://huggingface.co/julien-c/wine-quality",
+        "system_runtime": false,
         "tags": [
           "tabular",
           "classify",

@@ -51,6 +51,7 @@ struct DuckSessionKey {
     dsn: String,
     engine: String,
     layout: String,
+    threads: usize,
 }
 
 struct DuckSession {
@@ -70,6 +71,8 @@ impl DuckSession {
             .arg(&key.layout)
             .arg("--dsn")
             .arg(&key.dsn)
+            .arg("--threads")
+            .arg(key.threads.to_string())
             .arg("--pgdata-prefix")
             .arg(pgdata_prefix())
             .arg("--visible-pgdata-prefix")
@@ -146,6 +149,14 @@ fn timeout_s() -> i32 {
         .and_then(|s| s.parse::<i32>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_TIMEOUT_S)
+}
+
+fn duck_threads() -> usize {
+    guc_setting("rvbbit.duck_threads")
+        .or_else(|| std::env::var("RVBBIT_DUCK_THREADS").ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(4)
 }
 
 fn persistent_enabled() -> bool {
@@ -296,6 +307,7 @@ fn engine_query_json(
     };
     let start = Instant::now();
     let result_format = sidecar_result_format();
+    let threads = duck_threads();
     let mut sidecar_context: Option<(String, String, i32)> = None;
 
     // Phase 1: in-process DataFusion path. Only takes the datafusion engine
@@ -338,6 +350,7 @@ fn engine_query_json(
             query,
             max_rows,
             timeout,
+            threads,
             result_format,
         ) {
             Ok(p) => p,
@@ -369,6 +382,7 @@ fn engine_query_json(
                 query,
                 max_rows,
                 *timeout,
+                threads,
                 SidecarResultFormat::Json,
             ) {
                 Ok(fallback_payload)
@@ -420,6 +434,7 @@ fn engine_query_json(
                 query,
                 max_rows,
                 *timeout,
+                threads,
                 SidecarResultFormat::Json,
             ) {
                 Ok(p) => p,
@@ -674,6 +689,7 @@ fn run_engine_query(
     query: &str,
     max_rows: i32,
     timeout: i32,
+    threads: usize,
     result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
     if persistent_enabled() {
@@ -685,6 +701,7 @@ fn run_engine_query(
             query,
             max_rows,
             timeout,
+            threads,
             result_format,
         )
         .or_else(|_| {
@@ -696,6 +713,7 @@ fn run_engine_query(
                 query,
                 max_rows,
                 timeout,
+                threads,
                 result_format,
             )
         })
@@ -708,6 +726,7 @@ fn run_engine_query(
             query,
             max_rows,
             timeout,
+            threads,
             result_format,
         )
     }
@@ -721,6 +740,7 @@ fn execute_persistent(
     query: &str,
     max_rows: i32,
     timeout: i32,
+    threads: usize,
     result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
     let key = DuckSessionKey {
@@ -728,12 +748,14 @@ fn execute_persistent(
         dsn: dsn.to_string(),
         engine: engine.to_string(),
         layout: layout.to_string(),
+        threads,
     };
     let request = serde_json::to_string(&json!({
         "sql": query,
         "repeat": 1,
         "timeout_s": timeout,
         "max_rows": max_rows,
+        "threads": threads,
         "result_format": result_format.as_str(),
     }))
     .map_err(|e| e.to_string())?;
@@ -773,6 +795,7 @@ fn execute_engine_oneshot(
     query: &str,
     max_rows: i32,
     timeout: i32,
+    threads: usize,
     result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
     let output = Command::new(binary)
@@ -788,6 +811,8 @@ fn execute_engine_oneshot(
         .arg("1")
         .arg("--timeout-s")
         .arg(timeout.to_string())
+        .arg("--threads")
+        .arg(threads.to_string())
         .arg("--max-rows")
         .arg(max_rows.to_string())
         .arg("--result-format")
@@ -829,10 +854,11 @@ fn duck_dsn() -> String {
     let db = unsafe { current_database_name() }.unwrap_or_else(|| "postgres".to_string());
     let user = unsafe { current_user_name() }.unwrap_or_else(|| "postgres".to_string());
     format!(
-        "host={} dbname={} user={}",
+        "host={} dbname={} user={} application_name={}",
         conninfo_value("/var/run/postgresql"),
         conninfo_value(&db),
-        conninfo_value(&user)
+        conninfo_value(&user),
+        conninfo_value("rvbbit-duck-sidecar")
     )
 }
 

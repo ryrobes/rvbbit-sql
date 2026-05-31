@@ -20,7 +20,8 @@ report endpoint/backend/runtime state back to the database.
 - Model capabilities call `rvbbit.register_backend(...)`,
   `rvbbit.create_operator(...)`, and `rvbbit.reload_backends()`.
 - Runtime capabilities call runtime-specific registration functions such as
-  `rvbbit.register_python_runtime(...)`.
+  `rvbbit.register_python_runtime(...)` and
+  `rvbbit.register_mcp_gateway(...)`.
 - Rvbbit query execution keeps using the normal backend/operator or runtime
   node machinery.
 
@@ -43,6 +44,12 @@ Built-ins are stored like standalone repositories under
 - `capability.yaml`: the deployable Warren manifest.
 - Optional local source/runtime files for packs that build instead of pulling a
   prebuilt image.
+
+System runtime packs set `system_runtime: true` and
+`capability_role: operator_runtime` in `rvbbit-pack.yaml`. These are not model
+specialists; they unlock workflow node kinds or SQL primitives. The current
+built-ins are `runtimes/python-runtime` for `kind: python` operator nodes and
+`runtimes/mcp-gateway` for SQL MCP calls plus `kind: mcp` operator nodes.
 
 External catalogs should use the same shape. A Warren-installable pack can be
 published as a Git repository, tarball, or other fetched artifact as long as the

@@ -893,6 +893,11 @@ server — the same servers you talk to with `rvbbit.mcp_call(...)`, just
 inside an operator pipeline. Composition is the point: classify intent,
 fetch via MCP, summarize with an `llm` node, gate with a post-ward.
 
+Runtime prerequisite: a ready MCP Gateway runtime must exist in
+`rvbbit.mcp_gateways`. Install it from the Warren catalog capability
+`runtimes/mcp-gateway`; do not assume a gateway process is bundled with the
+database instance.
+
 ```json
 { "name": "fetch", "kind": "mcp",
   "server": "github",

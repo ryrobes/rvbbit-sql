@@ -60,11 +60,10 @@ pub fn warm(op: &Arc<OpDef>, opts: &Value, inputs: Vec<Value>) -> WarmStats {
     // Pre-load Python handler/env specs for the same reason.
     crate::python_runtime::warm_operator_specs(op.steps.as_ref(), op.takes.as_ref());
 
-    // A sql node needs the leader (SPI is illegal on a pool thread), so an
-    // operator that contains one can't ride the pooled batched path — run
-    // it row-by-row on the leader instead.
-    if crate::unit_of_work::contains_sql_node(op.steps.as_ref())
-        || crate::unit_of_work::contains_sql_node(op.takes.as_ref().and_then(|t| t.get("nodes")))
+    // Some nodes need the leader (SPI is illegal on a pool thread), so an
+    // operator that contains one can't ride the pooled batched path.
+    if crate::unit_of_work::contains_leader_node(op.steps.as_ref())
+        || crate::unit_of_work::contains_leader_node(op.takes.as_ref().and_then(|t| t.get("nodes")))
     {
         return warm_on_leader(op, opts, inputs);
     }

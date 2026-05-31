@@ -204,14 +204,14 @@ fn run_take_jobs(
     feedback: Option<&str>,
     jobs: Vec<TakeKind>,
 ) -> Vec<WorkResult> {
-    // A sql node needs the leader (SPI). Run all takes inline rather than
+    // SQL and MCP nodes need the leader. Run all takes inline rather than
     // pooling when the operator body has one (homogeneous takes) or a take
     // node is one (heterogeneous). Inside a pool worker we run inline too
     // — sub-submitting would deadlock the pool.
-    let needs_leader = unit_of_work::contains_sql_node(op.steps.as_ref())
+    let needs_leader = unit_of_work::contains_leader_node(op.steps.as_ref())
         || jobs.iter().any(|j| {
             matches!(j, TakeKind::Node(n)
-                if n.get("kind").and_then(|k| k.as_str()) == Some("sql"))
+                if matches!(n.get("kind").and_then(|k| k.as_str()), Some("sql" | "mcp")))
         });
     if flow::in_pool_worker() || needs_leader {
         return jobs

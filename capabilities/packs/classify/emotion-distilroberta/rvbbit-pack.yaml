@@ -29,3 +29,35 @@ install:
   mode: build
   warren: true
   docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: emotion_ticket_sample
+    description: Classify an unambiguous customer-success note and assert classifier JSON shape.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.classify_emotion('I am thrilled that the replacement arrived early') INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'classify_emotion returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object'
+             OR NOT (result ? 'label')
+             OR NOT (result ? 'score') THEN
+              RAISE EXCEPTION 'unexpected emotion result shape: %', result;
+          END IF;
+          IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
+              RAISE EXCEPTION 'emotion score out of range: %', result;
+          END IF;
+      END
+      $$;

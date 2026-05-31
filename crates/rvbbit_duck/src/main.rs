@@ -136,7 +136,7 @@ fn main() {
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "status": "fallback",
-                    "error": err.to_string(),
+                    "error": format_error_chain(&err),
                 }))
                 .unwrap()
             );
@@ -157,12 +157,25 @@ fn main() {
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "status": "fallback",
-                    "error": err.to_string(),
+                    "error": format_error_chain(&err),
                 }))
                 .unwrap()
             );
             std::process::exit(2);
         }
+    }
+}
+
+fn format_error_chain(err: &anyhow::Error) -> String {
+    let mut parts = err.chain().map(ToString::to_string);
+    let Some(first) = parts.next() else {
+        return err.to_string();
+    };
+    let rest = parts.collect::<Vec<_>>();
+    if rest.is_empty() {
+        first
+    } else {
+        format!("{first}: {}", rest.join(": "))
     }
 }
 
@@ -173,7 +186,7 @@ fn run_once_from_args(args: &Args) -> Result<QuerySummary> {
         .ok_or_else(|| anyhow!("--sql is required unless --serve is set"))?;
     guarded_safe_select(sql)?;
 
-    let mut pg = Client::connect(&args.dsn, NoTls).context("connecting to Postgres")?;
+    let mut pg = connect_pg(args)?;
     let catalog = rvbbit_row_group_catalog(&mut pg, args)?;
     ensure_query_tables_authoritative(&mut pg, sql, &catalog)?;
     if catalog.is_empty() {
@@ -191,6 +204,13 @@ fn run_once_from_args(args: &Args) -> Result<QuerySummary> {
         Engine::Duck => run_duck_once(args, sql, catalog, cache),
         Engine::DataFusion => run_datafusion_once(args, sql, catalog, cache),
     }
+}
+
+fn connect_pg(args: &Args) -> Result<Client> {
+    let mut pg = Client::connect(&args.dsn, NoTls).context("connecting to Postgres")?;
+    pg.simple_query("SET application_name = 'rvbbit-duck-sidecar'")
+        .context("setting Postgres application_name")?;
+    Ok(pg)
 }
 
 fn run_duck_once(
@@ -688,7 +708,7 @@ enum ServerExecutor {
 
 impl ServerState {
     fn new(args: &Args) -> Result<Self> {
-        let pg = Client::connect(&args.dsn, NoTls).context("connecting to Postgres")?;
+        let pg = connect_pg(args)?;
         Ok(Self {
             pg,
             engine: args.engine,
@@ -953,7 +973,7 @@ fn run_server(args: Args) -> Result<()> {
         let response = match serde_json::from_str::<ServerRequest>(&line) {
             Ok(req) => match state.execute(&args, req) {
                 Ok(summary) => serde_json::to_value(summary)?,
-                Err(err) => json!({"status": "fallback", "error": err.to_string()}),
+                Err(err) => json!({"status": "fallback", "error": format_error_chain(&err)}),
             },
             Err(err) => {
                 json!({"status": "fallback", "error": format!("invalid request JSON: {err}")})

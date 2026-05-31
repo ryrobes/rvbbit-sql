@@ -1,0 +1,51 @@
+api_version: rvbbit.capability/v1
+kind: runtime_sidecar
+name: mcp_gateway
+title: MCP Gateway Runtime
+description: "Warren-managed MCP gateway for rvbbit operator `kind: mcp` nodes and SQL MCP calls."
+license: apache-2.0
+system_runtime: true
+capability_role: operator_runtime
+tags: [runtime, mcp, warren, code, tools, cpu, system-runtime, operator-runtime]
+source:
+  provider: builtin
+  model: rvbbit/mcp-gateway
+runtime:
+  image: ghcr.io/rvbbit/mcp-gateway:0.60.4
+  pull_policy: missing
+  template: mcp-gateway
+  language: mcp
+  handler: mcp_gateway
+  device: cpu
+  port: 9100
+  health_path: /health
+  env:
+    RVBBIT_DSN: postgresql://postgres:rvbbit@pg-rvbbit:5432/bench
+    GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    GITHUB_USERNAME: ${GITHUB_USERNAME:-}
+    OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+    GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+    GOOGLE_CLOUD_QUOTA_PROJECT: ${GOOGLE_CLOUD_QUOTA_PROJECT:-}
+  volumes:
+    - name: mcp_npm_cache
+      mount: /root/.npm
+runtime_registration:
+  name: mcp_default
+  language: mcp
+  endpoint_path: /
+  set_default: true
+  labels:
+    language: mcp
+    capability_kind: runtime_sidecar
+    runtime_handler: mcp_gateway
+    system_runtime: true
+warren:
+  endpoint_path: /
+  health_path: /health
+smoke:
+  sql:
+    - "SELECT name, endpoint_url, status FROM rvbbit.mcp_gateways WHERE name = 'mcp_default';"

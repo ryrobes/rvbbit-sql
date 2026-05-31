@@ -27,6 +27,14 @@
     "license": {
       "type": "string"
     },
+    "system_runtime": {
+      "type": "boolean",
+      "default": false
+    },
+    "capability_role": {
+      "type": "string",
+      "enum": ["model_capability", "system_runtime", "operator_runtime"]
+    },
     "tags": {
       "type": "array",
       "items": { "type": "string" }
@@ -63,10 +71,13 @@
             "tabular_classification",
             "tabular_regression",
             "python_runtime",
+            "mcp_gateway",
             "custom"
           ]
         },
         "device": { "type": "string", "enum": ["auto", "cpu", "cuda"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "health_path": { "type": "string" },
         "language": { "type": "string" },
         "python_version": { "type": "string" },
         "volumes": {
@@ -98,7 +109,7 @@
       "additionalProperties": false,
       "properties": {
         "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
-        "language": { "type": "string", "enum": ["python"] },
+        "language": { "type": "string", "enum": ["python", "mcp"] },
         "endpoint": { "type": "string" },
         "endpoint_path": { "type": "string" },
         "set_default": { "type": "boolean" },
@@ -187,8 +198,10 @@
       "additionalProperties": true,
       "properties": {
         "port": { "type": "integer" },
+        "container_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "endpoint_url": { "type": "string" },
-        "endpoint_path": { "type": "string" }
+        "endpoint_path": { "type": "string" },
+        "health_path": { "type": "string" }
       }
     }
   },

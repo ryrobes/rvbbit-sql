@@ -649,7 +649,11 @@ fn deploy_capability(config: &Config, job: &WarrenJob) -> Result<DeploymentResul
         .map(|v| v as u16)
         .unwrap_or_else(|| deterministic_port(&job.job_id, config.port_base));
     let endpoint_url = endpoint_for(config, manifest, port, &safe_name);
-    let probe_url = local_probe_endpoint_for(manifest, port);
+    let probe_url = if is_runtime_sidecar(manifest) {
+        local_runtime_probe_endpoint_for(manifest, port)
+    } else {
+        local_probe_endpoint_for(manifest, port)
+    };
 
     if config.dry_run {
         println!(
@@ -659,7 +663,11 @@ fn deploy_capability(config: &Config, job: &WarrenJob) -> Result<DeploymentResul
     } else {
         let should_build = manifest.get("runtime").and_then(runtime_image).is_none();
         docker_compose_up(&project_dir, port, &config.docker_network, should_build)?;
-        wait_for_health(port, Duration::from_secs(180))?;
+        wait_for_health(
+            port,
+            runtime_health_path(manifest),
+            Duration::from_secs(180),
+        )?;
     }
 
     let health = json!({
@@ -832,6 +840,8 @@ fn render_compose(manifest: &Value, safe_name: &str) -> Result<String> {
     let service = safe_name.replace('_', "-");
     let source = manifest.get("source").unwrap_or(&Value::Null);
     let runtime = manifest.get("runtime").unwrap_or(&Value::Null);
+    let container_port = runtime_container_port(manifest);
+    let health_path = runtime_health_path(manifest);
     let mut envs = Map::new();
     envs.insert(
         "RVBBIT_CAPABILITY_MODEL".into(),
@@ -875,8 +885,26 @@ fn render_compose(manifest: &Value, safe_name: &str) -> Result<String> {
     let runtime_source = render_runtime_source(runtime);
 
     Ok(format!(
-        "services:\n  {service}:\n{runtime_source}    container_name: rvbbit-{service}\n    ports:\n      - \"${{RVBBIT_CAPABILITY_PORT:-8080}}:8080\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
+        "services:\n  {service}:\n{runtime_source}    container_name: rvbbit-{service}\n    ports:\n      - \"${{RVBBIT_CAPABILITY_PORT:-{container_port}}}:{container_port}\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:{container_port}{health_path}').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
     ))
+}
+
+fn runtime_container_port(manifest: &Value) -> u16 {
+    manifest
+        .pointer("/warren/container_port")
+        .or_else(|| manifest.pointer("/runtime/port"))
+        .and_then(Value::as_u64)
+        .filter(|port| (1..=u16::MAX as u64).contains(port))
+        .map(|port| port as u16)
+        .unwrap_or(8080)
+}
+
+fn runtime_health_path(manifest: &Value) -> &str {
+    manifest
+        .pointer("/warren/health_path")
+        .or_else(|| manifest.pointer("/runtime/health_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("/health")
 }
 
 fn runtime_image(runtime: &Value) -> Option<String> {
@@ -967,8 +995,11 @@ fn docker_compose_down(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_health(port: u16, timeout: Duration) -> Result<()> {
-    let url = format!("http://127.0.0.1:{port}/health");
+fn wait_for_health(port: u16, health_path: &str, timeout: Duration) -> Result<()> {
+    let url = format!(
+        "http://127.0.0.1:{port}{}",
+        normalized_endpoint_path(health_path)
+    );
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
@@ -1129,9 +1160,6 @@ fn runtime_language(manifest: &Value) -> String {
 
 fn register_runtime(db: &mut Client, manifest: &Value, result: &DeploymentResult) -> Result<()> {
     let language = runtime_language(manifest);
-    if language != "python" {
-        bail!("runtime sidecar language {language:?} is not supported by this agent yet");
-    }
     let runtime_name = runtime_registration_name(manifest)?;
     let runtime_registration = manifest.get("runtime_registration").unwrap_or(&Value::Null);
     let labels = runtime_registration
@@ -1150,27 +1178,77 @@ fn register_runtime(db: &mut Client, manifest: &Value, result: &DeploymentResult
         .unwrap_or(true);
     let install_manifest = manifest.to_string();
     let health = result.health.to_string();
-    db.execute(
-        "SELECT rvbbit.register_python_runtime(\
-         runtime_name => $1, endpoint_url => $2, runtime_status => 'ready', \
-         runtime_labels => $3::text::jsonb, runtime_source => 'warren', \
-         warren_deployment_id => NULL, install_manifest => $4::text::jsonb, \
-         health => $5::text::jsonb, set_default => $6)",
-        &[
-            &runtime_name,
-            &result.endpoint_url,
-            &labels,
-            &install_manifest,
-            &health,
-            &set_default,
-        ],
-    )
-    .context("registering Python runtime")?;
+    match language.as_str() {
+        "python" => {
+            db.execute(
+                "SELECT rvbbit.register_python_runtime(\
+                 runtime_name => $1, endpoint_url => $2, runtime_status => 'ready', \
+                 runtime_labels => $3::text::jsonb, runtime_source => 'warren', \
+                 warren_deployment_id => NULL, install_manifest => $4::text::jsonb, \
+                 health => $5::text::jsonb, set_default => $6)",
+                &[
+                    &runtime_name,
+                    &result.endpoint_url,
+                    &labels,
+                    &install_manifest,
+                    &health,
+                    &set_default,
+                ],
+            )
+            .context("registering Python runtime")?;
+        }
+        "mcp" | "mcp_gateway" => {
+            db.execute(
+                "SELECT rvbbit.register_mcp_gateway(\
+                 gateway_name => $1, endpoint_url => $2, gateway_status => 'ready', \
+                 gateway_labels => $3::text::jsonb, gateway_source => 'warren', \
+                 warren_deployment_id => NULL, install_manifest => $4::text::jsonb, \
+                 health => $5::text::jsonb, set_default => $6)",
+                &[
+                    &runtime_name,
+                    &result.endpoint_url,
+                    &labels,
+                    &install_manifest,
+                    &health,
+                    &set_default,
+                ],
+            )
+            .context("registering MCP gateway runtime")?;
+        }
+        _ => bail!("runtime sidecar language {language:?} is not supported by this agent yet"),
+    }
     Ok(())
 }
 
 fn probe_runtime(manifest: &Value, result: &DeploymentResult) -> Result<Value> {
     let language = runtime_language(manifest);
+    if matches!(language.as_str(), "mcp" | "mcp_gateway") {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let resp = client
+            .get(&result.probe_url)
+            .send()
+            .with_context(|| format!("probing MCP gateway {}", result.probe_url))?;
+        let status = resp.status();
+        let body = resp.text().context("reading MCP gateway probe response")?;
+        if !status.is_success() {
+            bail!(
+                "MCP gateway probe returned HTTP {}: {}",
+                status.as_u16(),
+                body
+            );
+        }
+        let parsed =
+            serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({ "body": body }));
+        return Ok(json!({
+            "ok": parsed.get("status").and_then(Value::as_str) == Some("ok")
+                || parsed.get("ok").and_then(Value::as_bool).unwrap_or(false)
+                || status.is_success(),
+            "runtime": "mcp",
+            "health": parsed,
+        }));
+    }
     if language != "python" {
         bail!("runtime probe for language {language:?} is not implemented");
     }
@@ -1403,9 +1481,11 @@ fn endpoint_for(config: &Config, manifest: &Value, port: u16, safe_name: &str) -
         );
     }
     let service = safe_name.replace('_', "-");
+    let container_port = runtime_container_port(manifest);
     format!(
-        "http://rvbbit-{}:8080{}",
+        "http://rvbbit-{}:{}{}",
         service.trim_matches('-'),
+        container_port,
         normalized_endpoint_path(endpoint_path)
     )
 }
@@ -1419,6 +1499,21 @@ fn local_probe_endpoint_for(manifest: &Value, port: u16) -> String {
     format!(
         "http://127.0.0.1:{port}{}",
         normalized_endpoint_path(endpoint_path)
+    )
+}
+
+fn local_runtime_probe_endpoint_for(manifest: &Value, port: u16) -> String {
+    let probe_path = match runtime_language(manifest).as_str() {
+        "python" => manifest
+            .pointer("/warren/endpoint_path")
+            .or_else(|| manifest.pointer("/runtime_registration/endpoint_path"))
+            .and_then(Value::as_str)
+            .unwrap_or("/run"),
+        _ => runtime_health_path(manifest),
+    };
+    format!(
+        "http://127.0.0.1:{port}{}",
+        normalized_endpoint_path(probe_path)
     )
 }
 

@@ -136,11 +136,26 @@ pub fn execute_steps(op: &OpDef, steps: &[Value], inputs: &Value, opts: &Value) 
 /// backend (SPI), so an operator containing one must run on the leader,
 /// never a flow pool thread — callers use this to route execution.
 pub fn contains_sql_node(steps: Option<&Value>) -> bool {
+    contains_step_kind(steps, &["sql"])
+}
+
+/// True if any node must run on the leader backend instead of a flow-pool
+/// worker. SQL nodes use SPI directly. MCP nodes may resolve the active
+/// gateway URL from SQL and log per-call audit rows.
+pub fn contains_leader_node(steps: Option<&Value>) -> bool {
+    contains_sql_node(steps) || contains_step_kind(steps, &["mcp"])
+}
+
+fn contains_step_kind(steps: Option<&Value>, kinds: &[&str]) -> bool {
     steps
         .and_then(|s| s.as_array())
         .map(|arr| {
-            arr.iter()
-                .any(|n| n.get("kind").and_then(|k| k.as_str()) == Some("sql"))
+            arr.iter().any(|n| {
+                n.get("kind")
+                    .and_then(|k| k.as_str())
+                    .map(|kind| kinds.contains(&kind))
+                    .unwrap_or(false)
+            })
         })
         .unwrap_or(false)
 }

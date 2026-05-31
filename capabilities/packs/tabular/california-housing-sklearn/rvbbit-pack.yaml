@@ -31,3 +31,35 @@ install:
   mode: build
   warren: true
   docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: housing_prediction_shape
+    description: Predict a California housing row and assert numeric regression output.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.predict_house_value(
+                  '{"MedInc":8.3252,"HouseAge":41.0,"AveRooms":6.984127,"AveBedrms":1.02381,"Population":322.0,"AveOccup":2.555556,"Latitude":37.88,"Longitude":-122.23}'::jsonb
+              ) INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'predict_house_value returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'value') THEN
+              RAISE EXCEPTION 'unexpected housing prediction shape: %', result;
+          END IF;
+          IF (result->>'value')::float8 <= 0 THEN
+              RAISE EXCEPTION 'housing prediction should be positive: %', result;
+          END IF;
+      END
+      $$;
