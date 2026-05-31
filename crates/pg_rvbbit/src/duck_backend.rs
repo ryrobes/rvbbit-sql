@@ -1,9 +1,16 @@
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use arrow::array::{
     cast::{as_boolean_array, as_primitive_array, as_string_array},
@@ -19,8 +26,7 @@ use arrow::util::display::array_value_to_string;
 use pgrx::prelude::*;
 use pgrx::{pg_sys, JsonB, Spi};
 use serde_json::{json, Map, Value};
-use std::ffi::{CStr, CString};
-use std::io::{BufRead, BufReader, Write};
+use std::ffi::{CStr, CString, OsStr};
 
 const DEFAULT_DUCK_BIN: &str = "/usr/local/bin/rvbbit-duck";
 const DEFAULT_MAX_ROWS: i32 = 100_000;
@@ -59,6 +65,18 @@ struct DuckSession {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+#[derive(Clone, Debug, Hash)]
+struct DuckSharedKey {
+    binary: String,
+    dsn: String,
+    engine: String,
+    layout: String,
+    threads: usize,
+    workers: usize,
+    pgdata_prefix: String,
+    visible_pgdata_prefix: String,
 }
 
 impl DuckSession {
@@ -165,6 +183,39 @@ fn persistent_enabled() -> bool {
         .unwrap_or_else(|| env_enabled("RVBBIT_DUCK_BACKEND_PERSISTENT", true))
 }
 
+fn shared_enabled() -> bool {
+    guc_setting("rvbbit.duck_backend_shared")
+        .map(|value| setting_enabled(&value, false))
+        .unwrap_or_else(|| env_enabled("RVBBIT_DUCK_BACKEND_SHARED", false))
+}
+
+fn shared_workers() -> usize {
+    guc_setting("rvbbit.duck_backend_shared_workers")
+        .or_else(|| std::env::var("RVBBIT_DUCK_BACKEND_SHARED_WORKERS").ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(4)
+}
+
+fn shared_launch_enabled() -> bool {
+    guc_setting("rvbbit.duck_backend_shared_launch")
+        .map(|value| setting_enabled(&value, false))
+        .unwrap_or_else(|| env_enabled("RVBBIT_DUCK_BACKEND_SHARED_LAUNCH", false))
+}
+
+fn shared_socket_dir() -> String {
+    guc_setting("rvbbit.duck_backend_shared_dir")
+        .or_else(|| std::env::var("RVBBIT_DUCK_BACKEND_SHARED_DIR").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/tmp/rvbbit-duck".to_string())
+}
+
+fn shared_socket_override() -> Option<String> {
+    guc_setting("rvbbit.duck_backend_shared_socket")
+        .or_else(|| std::env::var("RVBBIT_DUCK_BACKEND_SHARED_SOCKET").ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn arrow_ipc_enabled() -> bool {
     guc_setting("rvbbit.duck_arrow_ipc")
         .map(|value| setting_enabled(&value, true))
@@ -232,9 +283,42 @@ fn guc_setting(name: &str) -> Option<String> {
 }
 
 fn duck_binary() -> Option<String> {
-    let configured = std::env::var("RVBBIT_DUCK_BIN").ok();
-    let path = configured.unwrap_or_else(|| DEFAULT_DUCK_BIN.to_string());
-    Path::new(&path).exists().then_some(path)
+    if let Ok(configured) = std::env::var("RVBBIT_DUCK_BIN") {
+        return resolve_duck_binary_candidate(&configured);
+    }
+    if executable_file(Path::new(DEFAULT_DUCK_BIN)) {
+        return Some(DEFAULT_DUCK_BIN.to_string());
+    }
+    find_executable_on_path("rvbbit-duck", std::env::var_os("PATH").as_deref())
+}
+
+fn resolve_duck_binary_candidate(candidate: &str) -> Option<String> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    if candidate.contains('/') {
+        return executable_file(Path::new(candidate)).then_some(candidate.to_string());
+    }
+    find_executable_on_path(candidate, std::env::var_os("PATH").as_deref())
+}
+
+fn find_executable_on_path(name: &str, path_env: Option<&OsStr>) -> Option<String> {
+    let path_env = path_env?;
+    for dir in std::env::split_paths(path_env) {
+        let candidate = dir.join(name);
+        if executable_file(&candidate) {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
 }
 
 /// PGDATA root the extension sees — what `rvbbit.row_groups.path` is rooted at.
@@ -692,7 +776,62 @@ fn run_engine_query(
     threads: usize,
     result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
-    if persistent_enabled() {
+    if shared_enabled() {
+        execute_shared(
+            engine,
+            layout,
+            binary,
+            dsn,
+            query,
+            max_rows,
+            timeout,
+            threads,
+            result_format,
+        )
+        .or_else(|shared_err| {
+            pgrx::warning!(
+                "rvbbit.{engine}_query_json: shared rvbbit-duck failed ({shared_err}); falling back to per-backend sidecar"
+            );
+            if persistent_enabled() {
+                execute_persistent(
+                    engine,
+                    layout,
+                    binary,
+                    dsn,
+                    query,
+                    max_rows,
+                    timeout,
+                    threads,
+                    result_format,
+                )
+                .or_else(|_| {
+                    execute_engine_oneshot(
+                        engine,
+                        layout,
+                        binary,
+                        dsn,
+                        query,
+                        max_rows,
+                        timeout,
+                        threads,
+                        result_format,
+                    )
+                })
+            } else {
+                execute_engine_oneshot(
+                    engine,
+                    layout,
+                    binary,
+                    dsn,
+                    query,
+                    max_rows,
+                    timeout,
+                    threads,
+                    result_format,
+                )
+            }
+        })
+    } else if persistent_enabled() {
         execute_persistent(
             engine,
             layout,
@@ -730,6 +869,165 @@ fn run_engine_query(
             result_format,
         )
     }
+}
+
+fn execute_shared(
+    engine: &str,
+    layout: &str,
+    binary: &str,
+    dsn: &str,
+    query: &str,
+    max_rows: i32,
+    timeout: i32,
+    threads: usize,
+    result_format: SidecarResultFormat,
+) -> Result<Value, String> {
+    let key = DuckSharedKey {
+        binary: binary.to_string(),
+        dsn: dsn.to_string(),
+        engine: engine.to_string(),
+        layout: layout.to_string(),
+        threads,
+        workers: shared_workers(),
+        pgdata_prefix: pgdata_prefix(),
+        visible_pgdata_prefix: visible_pgdata_prefix(),
+    };
+    let request = serde_json::to_string(&json!({
+        "sql": query,
+        "repeat": 1,
+        "timeout_s": timeout,
+        "max_rows": max_rows,
+        "threads": threads,
+        "result_format": result_format.as_str(),
+    }))
+    .map_err(|e| e.to_string())?;
+    let socket_path = shared_socket_path(&key)?;
+    match send_shared_request(&socket_path, &request, timeout) {
+        Ok(value) => Ok(value),
+        Err(first) => {
+            if !shared_launch_enabled() {
+                return Err(first);
+            }
+            ensure_shared_daemon(&key, &socket_path)?;
+            let wait_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match send_shared_request(&socket_path, &request, timeout) {
+                    Ok(value) => return Ok(value),
+                    Err(err) if Instant::now() < wait_deadline => {
+                        thread::sleep(Duration::from_millis(25));
+                        if err.contains("Connection refused") || err.contains("No such file") {
+                            continue;
+                        }
+                        return Err(format!("{first}; retry failed: {err}"));
+                    }
+                    Err(err) => return Err(format!("{first}; retry failed: {err}")),
+                }
+            }
+        }
+    }
+}
+
+fn shared_socket_path(key: &DuckSharedKey) -> Result<String, String> {
+    if let Some(path) = shared_socket_override() {
+        if let Some(parent) = Path::new(&path).parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!("creating shared rvbbit-duck dir {}: {e}", parent.display())
+            })?;
+        }
+        return Ok(path);
+    }
+    let dir = shared_socket_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("creating shared rvbbit-duck dir {dir}: {e}"))?;
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    Ok(format!(
+        "{}/rvbbit-duck-{:016x}.sock",
+        dir.trim_end_matches('/'),
+        hasher.finish()
+    ))
+}
+
+fn send_shared_request(socket_path: &str, request: &str, timeout: i32) -> Result<Value, String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| format!("connecting to shared rvbbit-duck {socket_path}: {e}"))?;
+    let io_timeout = Duration::from_secs(timeout.max(1) as u64 + 5);
+    let _ = stream.set_read_timeout(Some(io_timeout));
+    let _ = stream.set_write_timeout(Some(io_timeout));
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("shared rvbbit-duck write failed: {e}"))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|e| format!("shared rvbbit-duck write failed: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("shared rvbbit-duck flush failed: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    let bytes = reader
+        .read_line(&mut response)
+        .map_err(|e| format!("shared rvbbit-duck read failed: {e}"))?;
+    if bytes == 0 {
+        return Err("shared rvbbit-duck returned no response".to_string());
+    }
+    serde_json::from_str(response.trim_end())
+        .map_err(|e| format!("invalid shared rvbbit-duck JSON: {e}"))
+}
+
+fn ensure_shared_daemon(key: &DuckSharedKey, socket_path: &str) -> Result<(), String> {
+    let lock_path = format!("{socket_path}.lock");
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(_lock) => {
+            spawn_shared_daemon(key, socket_path)?;
+            let result = wait_for_shared_socket(socket_path, Duration::from_secs(5));
+            let _ = fs::remove_file(&lock_path);
+            result
+        }
+        Err(_) => wait_for_shared_socket(socket_path, Duration::from_secs(5)),
+    }
+}
+
+fn spawn_shared_daemon(key: &DuckSharedKey, socket_path: &str) -> Result<(), String> {
+    Command::new(&key.binary)
+        .arg("--serve-socket")
+        .arg(socket_path)
+        .arg("--workers")
+        .arg(key.workers.to_string())
+        .arg("--engine")
+        .arg(&key.engine)
+        .arg("--layout")
+        .arg(&key.layout)
+        .arg("--dsn")
+        .arg(&key.dsn)
+        .arg("--threads")
+        .arg(key.threads.to_string())
+        .arg("--pgdata-prefix")
+        .arg(&key.pgdata_prefix)
+        .arg("--visible-pgdata-prefix")
+        .arg(&key.visible_pgdata_prefix)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("starting shared rvbbit-duck daemon: {e}"))?;
+    Ok(())
+}
+
+fn wait_for_shared_socket(socket_path: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if UnixStream::connect(socket_path).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "shared rvbbit-duck socket {socket_path} did not become ready"
+    ))
 }
 
 fn execute_persistent(
@@ -918,5 +1216,45 @@ mod tests {
             vec!["a".to_string(), "b".to_string()]
         );
         assert!(parse_column_names(&json!({"a": 1})).is_empty());
+    }
+
+    #[test]
+    fn finds_duck_binary_on_path() {
+        let dir =
+            std::env::temp_dir().join(format!("rvbbit-duck-path-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("rvbbit-duck");
+        fs::write(&binary, b"#!/bin/sh\n").unwrap();
+        let mut perms = fs::metadata(&binary).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&binary, perms).unwrap();
+
+        assert_eq!(
+            find_executable_on_path("rvbbit-duck", Some(dir.as_os_str())),
+            Some(binary.to_string_lossy().into_owned())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignores_non_executable_duck_binary_on_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "rvbbit-duck-path-nonexec-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("rvbbit-duck");
+        fs::write(&binary, b"not executable\n").unwrap();
+        let mut perms = fs::metadata(&binary).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&binary, perms).unwrap();
+
+        assert_eq!(
+            find_executable_on_path("rvbbit-duck", Some(dir.as_os_str())),
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

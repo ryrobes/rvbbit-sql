@@ -134,6 +134,20 @@ queries and native CustomScan queries are different execution paths.
 Keep both values conservative on installations with many concurrent PG
 backends, because the limits are per backend.
 
+## Duck/Vortex sidecar modes
+
+Duck-backed routes use the external `rvbbit-duck` binary. The default is still
+the simple local persistent sidecar path: no broker service is required to try
+or run the extension. Install the binary at `/usr/local/bin/rvbbit-duck`, set
+`RVBBIT_DUCK_BIN`, or ensure `rvbbit-duck` is on the postmaster `PATH`.
+`/usr/local/bin/rvbbit-duck` or `RVBBIT_DUCK_BIN` is preferred for production
+because Postgres service `PATH` values vary by supervisor. A shared Unix-socket
+broker is available for high concurrency deployments that need bounded sidecar
+process count and memory.
+
+See [DUCK_SIDECAR.md](DUCK_SIDECAR.md) for the full deployment model, fallback
+semantics, production caveats, and load-test commands.
+
 ## Parquet writer knobs
 
 Set as env vars on the `pg-rvbbit` container (env vars are read on each

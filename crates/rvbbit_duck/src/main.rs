@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -31,7 +35,7 @@ const DEFAULT_DSN: &str = "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench";
 const DEFAULT_PGDATA_PREFIX: &str = "/var/lib/postgresql";
 const DEFAULT_VISIBLE_PGDATA_PREFIX: &str = "/rvbbit_pgdata";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Args {
     engine: Engine,
     dsn: String,
@@ -46,6 +50,8 @@ struct Args {
     result_format: ResultFormat,
     explain_only: bool,
     serve: bool,
+    serve_socket: Option<String>,
+    workers: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +149,13 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if args.serve_socket.is_some() {
+        if let Err(err) = run_socket_server(args) {
+            eprintln!("rvbbit-duck socket server error: {err:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.serve {
         if let Err(err) = run_server(args) {
             eprintln!("rvbbit-duck server error: {err:#}");
@@ -970,19 +983,120 @@ fn run_server(args: Args) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<ServerRequest>(&line) {
-            Ok(req) => match state.execute(&args, req) {
-                Ok(summary) => serde_json::to_value(summary)?,
-                Err(err) => json!({"status": "fallback", "error": format_error_chain(&err)}),
-            },
-            Err(err) => {
-                json!({"status": "fallback", "error": format!("invalid request JSON: {err}")})
-            }
-        };
-        writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+        writeln!(stdout, "{}", server_response_json(&mut state, &args, &line))?;
         stdout.flush()?;
     }
     Ok(())
+}
+
+struct SocketJob {
+    line: String,
+    respond: mpsc::Sender<String>,
+}
+
+fn run_socket_server(args: Args) -> Result<()> {
+    let socket_path = args
+        .serve_socket
+        .as_deref()
+        .ok_or_else(|| anyhow!("--serve-socket requires a path"))?;
+    if let Some(parent) = Path::new(socket_path).parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket directory {}", parent.display()))?;
+    }
+    let _ = fs::remove_file(socket_path);
+    let listener =
+        UnixListener::bind(socket_path).with_context(|| format!("binding {socket_path}"))?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o777))
+        .with_context(|| format!("setting socket permissions on {socket_path}"))?;
+    let workers = args.workers.max(1);
+    let (tx, rx) = mpsc::channel::<SocketJob>();
+    let rx = Arc::new(Mutex::new(rx));
+
+    for idx in 0..workers {
+        let worker_args = args.clone();
+        let rx = Arc::clone(&rx);
+        thread::Builder::new()
+            .name(format!("rvbbit-duck-worker-{idx}"))
+            .spawn(move || {
+                let mut state = match ServerState::new(&worker_args) {
+                    Ok(state) => state,
+                    Err(err) => {
+                        eprintln!("rvbbit-duck worker startup failed: {err:#}");
+                        return;
+                    }
+                };
+                loop {
+                    let job = {
+                        let guard = match rx.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => return,
+                        };
+                        guard.recv()
+                    };
+                    match job {
+                        Ok(job) => {
+                            let response =
+                                server_response_json(&mut state, &worker_args, &job.line);
+                            let _ = job.respond.send(response);
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+            .context("spawning rvbbit-duck worker")?;
+    }
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let _ = handle_socket_client(stream, tx);
+                });
+            }
+            Err(err) => eprintln!("rvbbit-duck socket accept failed: {err}"),
+        }
+    }
+    Ok(())
+}
+
+fn handle_socket_client(mut stream: UnixStream, tx: mpsc::Sender<SocketJob>) -> Result<()> {
+    let reader_stream = stream.try_clone().context("cloning Unix stream")?;
+    let mut reader = BufReader::new(reader_stream);
+    let mut line = String::new();
+    let bytes = reader
+        .read_line(&mut line)
+        .context("reading socket request")?;
+    if bytes == 0 || line.trim().is_empty() {
+        return Ok(());
+    }
+    let (respond, response_rx) = mpsc::channel();
+    tx.send(SocketJob { line, respond })
+        .context("dispatching socket request")?;
+    let response = response_rx.recv().context("waiting for socket response")?;
+    stream
+        .write_all(response.as_bytes())
+        .context("writing socket response")?;
+    stream
+        .write_all(b"\n")
+        .context("writing socket response newline")?;
+    stream.flush().context("flushing socket response")?;
+    Ok(())
+}
+
+fn server_response_json(state: &mut ServerState, args: &Args, line: &str) -> String {
+    let response = match serde_json::from_str::<ServerRequest>(line) {
+        Ok(req) => match state.execute(args, req) {
+            Ok(summary) => serde_json::to_value(summary)
+                .unwrap_or_else(|err| json!({"status": "fallback", "error": err.to_string()})),
+            Err(err) => json!({"status": "fallback", "error": format_error_chain(&err)}),
+        },
+        Err(err) => {
+            json!({"status": "fallback", "error": format!("invalid request JSON: {err}")})
+        }
+    };
+    serde_json::to_string(&response)
+        .unwrap_or_else(|err| json!({"status": "fallback", "error": err.to_string()}).to_string())
 }
 
 fn open_duck(threads: usize) -> Result<Connection> {
@@ -1084,6 +1198,12 @@ fn parse_args() -> Result<Args> {
         .unwrap_or(ResultFormat::Json);
     let mut explain_only = false;
     let mut serve = false;
+    let mut serve_socket = None;
+    let mut workers = env::var("RVBBIT_DUCK_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4);
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -1105,6 +1225,8 @@ fn parse_args() -> Result<Args> {
             }
             "--explain-only" => explain_only = true,
             "--serve" => serve = true,
+            "--serve-socket" => serve_socket = Some(need_value(&mut it, "--serve-socket")?),
+            "--workers" => workers = need_value(&mut it, "--workers")?.parse()?,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -1113,7 +1235,7 @@ fn parse_args() -> Result<Args> {
         }
     }
 
-    if !serve && sql.is_none() {
+    if !serve && serve_socket.is_none() && sql.is_none() {
         bail!("--sql is required unless --serve is set");
     }
     Ok(Args {
@@ -1130,6 +1252,8 @@ fn parse_args() -> Result<Args> {
         result_format,
         explain_only,
         serve,
+        serve_socket,
+        workers,
     })
 }
 
@@ -1157,6 +1281,7 @@ fn print_help() {
     println!(
         "rvbbit-duck --sql SQL [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--repeat N] [--timeout-s N] [--threads N] [--max-rows N] [--result-format json|arrow_ipc_file]\n\
          rvbbit-duck --serve [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
+         rvbbit-duck --serve-socket PATH [--workers N] [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
          Server JSONL requests: {{\"sql\":\"SELECT ...\",\"result_format\":\"json|arrow_ipc_file\"}} or {{\"command\":\"prewarm\"}}"
     );
 }

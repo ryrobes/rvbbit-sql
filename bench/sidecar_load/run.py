@@ -109,6 +109,12 @@ def apply_session_settings(cur: psycopg.Cursor[Any], args: argparse.Namespace, a
         set_guc(cur, "rvbbit.route_force_candidate", args.candidate)
     if args.persistent != "default":
         set_guc(cur, "rvbbit.duck_backend_persistent", args.persistent)
+    if args.shared != "default":
+        set_guc(cur, "rvbbit.duck_backend_shared", args.shared)
+    if args.shared_workers > 0:
+        set_guc(cur, "rvbbit.duck_backend_shared_workers", str(args.shared_workers))
+    if args.shared_socket:
+        set_guc(cur, "rvbbit.duck_backend_shared_socket", args.shared_socket)
     if args.arrow_ipc != "default":
         set_guc(cur, "rvbbit.duck_arrow_ipc", args.arrow_ipc)
     if args.fail_open != "default":
@@ -401,6 +407,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--allow-fallback", action="store_true")
     parser.add_argument("--persistent", choices=["default", "on", "off"], default=os.environ.get("SIDECAR_LOAD_PERSISTENT", "default"))
+    parser.add_argument("--shared", choices=["default", "on", "off"], default=os.environ.get("SIDECAR_LOAD_SHARED", "default"))
+    parser.add_argument("--shared-socket", default=os.environ.get("SIDECAR_LOAD_SHARED_SOCKET", ""))
+    parser.add_argument(
+        "--shared-workers",
+        type=int,
+        default=int(os.environ.get("SIDECAR_LOAD_SHARED_WORKERS", "0")),
+        help="Set rvbbit.duck_backend_shared_workers for each client session. 0 keeps the extension default.",
+    )
     parser.add_argument("--arrow-ipc", choices=["default", "on", "off"], default=os.environ.get("SIDECAR_LOAD_ARROW_IPC", "default"))
     parser.add_argument("--fail-open", choices=["default", "on", "off"], default=os.environ.get("SIDECAR_LOAD_FAIL_OPEN", "off"))
     parser.add_argument(
@@ -459,6 +473,9 @@ def main() -> int:
             "candidate": args.candidate,
             "queries": [qid for qid, _desc, _sql in queries],
             "persistent": args.persistent,
+            "shared": args.shared,
+            "shared_socket": args.shared_socket,
+            "shared_workers": args.shared_workers,
             "arrow_ipc": args.arrow_ipc,
             "fail_open": args.fail_open,
             "duck_threads": args.duck_threads,
@@ -478,7 +495,9 @@ def main() -> int:
 
     print(
         f"sidecar load run: candidate={args.candidate} clients={args.clients} "
-        f"duration={args.duration_s}s warmup={args.warmup_s}s duck_threads={args.duck_threads or 'default'}"
+        f"duration={args.duration_s}s warmup={args.warmup_s}s "
+        f"duck_threads={args.duck_threads or 'default'} shared={args.shared} "
+        f"shared_workers={args.shared_workers or 'default'}"
     )
     print(f"queries: {', '.join(qid for qid, _desc, _sql in queries)}")
     print(f"vortex catalog: {catalog}")
