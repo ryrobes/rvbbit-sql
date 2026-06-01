@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -223,6 +224,46 @@ def test_huggingface_model_packs_publish_gpu_weight_estimates():
 
     assert not missing, "HF model packs missing resources.gpu estimates: " + ", ".join(missing)
     assert not invalid, "invalid resources.gpu estimates: " + ", ".join(invalid)
+
+
+def test_catalog_json_flattens_gpu_weight_estimates():
+    proc = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "catalog",
+            "build",
+            "--root",
+            str(PACKS),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    doc = json.loads(proc.stdout)
+    by_id = {entry["id"]: entry for entry in doc["capabilities"]}
+
+    bad: list[str] = []
+    for path, pack in _pack_docs():
+        source = pack.get("source") or {}
+        runtime = pack.get("runtime") or {}
+        if source.get("provider") != "huggingface" or runtime.get("device") == "cpu":
+            continue
+        gpu = ((pack.get("resources") or {}).get("gpu") or {})
+        entry = by_id.get(pack["id"])
+        expected_required = bool(gpu.get("required")) or runtime.get("device") == "cuda"
+        if not entry:
+            bad.append(f"{path.relative_to(ROOT)} missing catalog entry")
+            continue
+        if (
+            entry.get("gpu_required") != expected_required
+            or entry.get("gpu_placement") != gpu.get("placement")
+            or entry.get("model_size_bytes") != gpu.get("model_size_bytes")
+            or entry.get("vram_required_bytes") != gpu.get("vram_required_bytes")
+            or entry.get("vram_headroom_pct") != gpu.get("headroom_pct")
+        ):
+            bad.append(str(path.relative_to(ROOT)))
+
+    assert not bad, "catalog JSON must expose flattened GPU weight estimates: " + "; ".join(bad)
 
 
 def test_mcp_gateway_pack_is_self_contained():

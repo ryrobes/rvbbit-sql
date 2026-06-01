@@ -256,6 +256,8 @@
         "description": "Smaller NLI zero-shot classifier for classifying text or JSONB rows into caller-provided labels.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "classify/deberta-v3-base-zero-shot",
         "install_docker": true,
@@ -264,6 +266,7 @@
         "kind": "hf_backend",
         "license": "mit",
         "manifest_path": "capabilities/packs/classify/deberta-v3-base-zero-shot/capability.yaml",
+        "model_size_bytes": 368871908,
         "name": "deberta_v3_base_zero_shot",
         "operators": [
           "classify_zero_shot_base",
@@ -307,7 +310,9 @@
           "row",
           "cpu-friendly"
         ],
-        "title": "DeBERTa v3 Base Zero-Shot Classifier"
+        "title": "DeBERTa v3 Base Zero-Shot Classifier",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 461089885
       }
     },
     {
@@ -842,6 +847,8 @@
         "description": "NLI-based zero-shot classification over caller-provided labels.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "classify/deberta-v3-zero-shot",
         "install_docker": true,
@@ -850,6 +857,7 @@
         "kind": "hf_backend",
         "license": "mit",
         "manifest_path": "capabilities/packs/classify/deberta-v3-zero-shot/capability.yaml",
+        "model_size_bytes": 870182606,
         "name": "deberta_v3_zero_shot",
         "operators": [
           "classify_zero_shot",
@@ -900,7 +908,9 @@
           "nli",
           "row"
         ],
-        "title": "DeBERTa v3 Zero-Shot Classifier"
+        "title": "DeBERTa v3 Zero-Shot Classifier",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 1087728258
       }
     },
     {
@@ -1077,6 +1087,8 @@
         "description": "Classify text into emotion labels for support, survey, content, and conversation analytics.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "classify/emotion-distilroberta",
         "install_docker": true,
@@ -1085,6 +1097,7 @@
         "kind": "hf_backend",
         "license": "unknown",
         "manifest_path": "capabilities/packs/classify/emotion-distilroberta/capability.yaml",
+        "model_size_bytes": 328544361,
         "name": "emotion_distilroberta",
         "operators": [
           "classify_emotion",
@@ -1126,7 +1139,9 @@
           "tabular",
           "row"
         ],
-        "title": "Emotion Classifier"
+        "title": "Emotion Classifier",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 410680452
       }
     },
     {
@@ -1255,6 +1270,8 @@
         "description": "Detect the language of text for routing, normalization, and multilingual analytics.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "classify/language-detection-xlm-roberta",
         "install_docker": true,
@@ -1263,6 +1280,7 @@
         "kind": "hf_backend",
         "license": "mit",
         "manifest_path": "capabilities/packs/classify/language-detection-xlm-roberta/capability.yaml",
+        "model_size_bytes": 1112264584,
         "name": "language_detection_xlm_roberta",
         "operators": [
           "detect_language",
@@ -1302,7 +1320,9 @@
           "routing",
           "tabular"
         ],
-        "title": "XLM-R Language Detection"
+        "title": "XLM-R Language Detection",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 1390330730
       }
     },
     {
@@ -1483,6 +1503,8 @@
         "description": "Multi-label toxicity classifier for moderation, support triage, and data quality workflows.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "classify/toxic-bert",
         "install_docker": true,
@@ -1491,6 +1513,7 @@
         "kind": "hf_backend",
         "license": "apache-2.0",
         "manifest_path": "capabilities/packs/classify/toxic-bert/capability.yaml",
+        "model_size_bytes": 437975136,
         "name": "toxic_bert",
         "operators": [
           "classify_toxicity",
@@ -1533,7 +1556,9 @@
           "tabular",
           "row"
         ],
-        "title": "Toxicity Classifier"
+        "title": "Toxicity Classifier",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 547468920
       }
     },
     {
@@ -1710,6 +1735,8 @@
         "description": "Practical positive/neutral/negative sentiment classifier for reviews, tickets, social text, and notes.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "classify/twitter-roberta-sentiment",
         "install_docker": true,
@@ -1718,6 +1745,7 @@
         "kind": "hf_backend",
         "license": "cc-by-4.0",
         "manifest_path": "capabilities/packs/classify/twitter-roberta-sentiment/capability.yaml",
+        "model_size_bytes": 501045531,
         "name": "twitter_roberta_sentiment",
         "operators": [
           "classify_sentiment",
@@ -1759,7 +1787,9 @@
           "tabular",
           "row"
         ],
-        "title": "RoBERTa Sentiment Classifier"
+        "title": "RoBERTa Sentiment Classifier",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 626306914
       }
     },
     {
@@ -1916,6 +1946,8 @@
         "description": "High-quality multilingual BGE-M3 sentence embeddings for retrieval and semantic search.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "embeddings/bge-m3",
         "install_docker": true,
@@ -1924,6 +1956,7 @@
         "kind": "hf_backend",
         "license": "mit",
         "manifest_path": "capabilities/packs/embeddings/bge-m3/capability.yaml",
+        "model_size_bytes": 2273250020,
         "name": "bge_m3",
         "operators": [
           "embed_bge_m3",
@@ -1963,7 +1996,9 @@
           "multilingual",
           "gpu"
         ],
-        "title": "BGE-M3 Embeddings"
+        "title": "BGE-M3 Embeddings",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 2841562525
       }
     },
     {
@@ -2119,6 +2154,8 @@
         "description": "CPU-friendly English sentence embeddings exposed as an Rvbbit backend.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "embeddings/bge-small-en-v1.5",
         "install_docker": true,
@@ -2127,6 +2164,7 @@
         "kind": "hf_backend",
         "license": "mit",
         "manifest_path": "capabilities/packs/embeddings/bge-small-en-v1.5/capability.yaml",
+        "model_size_bytes": 133466304,
         "name": "bge_small_en_v1_5",
         "operators": [
           "embed_bge_small",
@@ -2165,7 +2203,9 @@
           "retrieval",
           "cpu-friendly"
         ],
-        "title": "BGE Small English Embeddings"
+        "title": "BGE Small English Embeddings",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 166832880
       }
     },
     {
@@ -2322,6 +2362,8 @@
         "description": "Small, fast E5 embeddings useful for CPU-friendly retrieval experiments and lightweight semantic joins.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "embeddings/e5-small-v2",
         "install_docker": true,
@@ -2330,6 +2372,7 @@
         "kind": "hf_backend",
         "license": "mit",
         "manifest_path": "capabilities/packs/embeddings/e5-small-v2/capability.yaml",
+        "model_size_bytes": 133466304,
         "name": "e5_small_v2",
         "operators": [
           "embed_e5_small",
@@ -2369,7 +2412,9 @@
           "cpu-friendly",
           "semantic-join"
         ],
-        "title": "E5 Small Embeddings"
+        "title": "E5 Small Embeddings",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 166832880
       }
     },
     {
@@ -2629,6 +2674,8 @@
         "description": "Zero-shot entity extraction over arbitrary user-provided labels.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "extract/gliner-medium-v2.1",
         "install_docker": true,
@@ -2637,6 +2684,7 @@
         "kind": "hf_backend",
         "license": "apache-2.0",
         "manifest_path": "capabilities/packs/extract/gliner-medium-v2.1/capability.yaml",
+        "model_size_bytes": 780735696,
         "name": "gliner_medium_v2_1",
         "operators": [
           "extract_entities",
@@ -2683,7 +2731,9 @@
           "business",
           "row"
         ],
-        "title": "GLiNER Medium v2.1 Extraction"
+        "title": "GLiNER Medium v2.1 Extraction",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 975919620
       }
     },
     {
@@ -2947,6 +2997,8 @@
         "description": "Smaller BGE cross-encoder reranker for query/document scoring and row ranking.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "rerank/bge-reranker-base",
         "install_docker": true,
@@ -2955,6 +3007,7 @@
         "kind": "hf_backend",
         "license": "mit",
         "manifest_path": "capabilities/packs/rerank/bge-reranker-base/capability.yaml",
+        "model_size_bytes": 1112206140,
         "name": "bge_reranker_base",
         "operators": [
           "rerank_bge_base_score",
@@ -2998,7 +3051,9 @@
           "row",
           "cpu-friendly"
         ],
-        "title": "BGE Reranker Base"
+        "title": "BGE Reranker Base",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 1390257675
       }
     },
     {
@@ -3262,6 +3317,8 @@
         "description": "Cross-encoder relevance scoring for query/document pairs.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "rerank/bge-reranker-v2-m3",
         "install_docker": true,
@@ -3270,6 +3327,7 @@
         "kind": "hf_backend",
         "license": "mit",
         "manifest_path": "capabilities/packs/rerank/bge-reranker-v2-m3/capability.yaml",
+        "model_size_bytes": 2271071852,
         "name": "bge_reranker_v2_m3",
         "operators": [
           "rerank_score",
@@ -3313,7 +3371,9 @@
           "gpu",
           "row"
         ],
-        "title": "BGE Reranker v2 M3"
+        "title": "BGE Reranker v2 M3",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 2838839815
       }
     },
     {
@@ -3577,6 +3637,8 @@
         "description": "Lightweight cross-encoder reranker for query/document scoring and ranking table rows by relevance.",
         "device": "auto",
         "endpoint_path": null,
+        "gpu_placement": "single_gpu",
+        "gpu_required": false,
         "health_path": null,
         "id": "rerank/ms-marco-minilm-l6-v2",
         "install_docker": true,
@@ -3585,6 +3647,7 @@
         "kind": "hf_backend",
         "license": "apache-2.0",
         "manifest_path": "capabilities/packs/rerank/ms-marco-minilm-l6-v2/capability.yaml",
+        "model_size_bytes": 90870598,
         "name": "ms_marco_minilm_l6_v2",
         "operators": [
           "rerank_ms_marco_score",
@@ -3628,7 +3691,9 @@
           "row",
           "cpu-friendly"
         ],
-        "title": "MS MARCO MiniLM Reranker"
+        "title": "MS MARCO MiniLM Reranker",
+        "vram_headroom_pct": 25,
+        "vram_required_bytes": 113588248
       }
     },
     {
@@ -3746,6 +3811,8 @@
         "description": "Warren-managed MCP gateway for rvbbit operator `kind: mcp` nodes and SQL MCP calls.",
         "device": "cpu",
         "endpoint_path": "/",
+        "gpu_placement": null,
+        "gpu_required": false,
         "health_path": "/health",
         "id": "runtimes/mcp-gateway",
         "install_docker": true,
@@ -3754,6 +3821,7 @@
         "kind": "runtime_sidecar",
         "license": "apache-2.0",
         "manifest_path": "capabilities/packs/runtimes/mcp-gateway/capability.yaml",
+        "model_size_bytes": null,
         "name": "mcp_gateway",
         "operators": [],
         "pack_api_version": "rvbbit.pack/v1",
@@ -3784,7 +3852,9 @@
           "system-runtime",
           "operator-runtime"
         ],
-        "title": "MCP Gateway Runtime"
+        "title": "MCP Gateway Runtime",
+        "vram_headroom_pct": null,
+        "vram_required_bytes": null
       }
     },
     {
@@ -3882,6 +3952,8 @@
         "description": "Warren-managed CPython runtime for rvbbit operator `kind: python` nodes.",
         "device": "cpu",
         "endpoint_path": "/run",
+        "gpu_placement": null,
+        "gpu_required": false,
         "health_path": null,
         "id": "runtimes/python-runtime",
         "install_docker": true,
@@ -3890,6 +3962,7 @@
         "kind": "runtime_sidecar",
         "license": "apache-2.0",
         "manifest_path": "capabilities/packs/runtimes/python-runtime/capability.yaml",
+        "model_size_bytes": null,
         "name": "python_runtime",
         "operators": [],
         "pack_api_version": "rvbbit.pack/v1",
@@ -3919,7 +3992,9 @@
           "system-runtime",
           "operator-runtime"
         ],
-        "title": "Managed CPython Runtime"
+        "title": "Managed CPython Runtime",
+        "vram_headroom_pct": null,
+        "vram_required_bytes": null
       }
     },
     {
@@ -4016,6 +4091,8 @@
         "description": "Deterministic no-model sidecar for validating Warren deployment, backend registration, probing, and operator wiring.",
         "device": "cpu",
         "endpoint_path": null,
+        "gpu_placement": null,
+        "gpu_required": false,
         "health_path": null,
         "id": "smoke/warren-echo",
         "install_docker": true,
@@ -4024,6 +4101,7 @@
         "kind": "hf_backend",
         "license": "apache-2.0",
         "manifest_path": "capabilities/packs/smoke/warren-echo/capability.yaml",
+        "model_size_bytes": null,
         "name": "warren_smoke_echo",
         "operators": [
           "warren_smoke_echo"
@@ -4053,7 +4131,9 @@
           "no-model",
           "cpu"
         ],
-        "title": "Warren Smoke Echo"
+        "title": "Warren Smoke Echo",
+        "vram_headroom_pct": null,
+        "vram_required_bytes": null
       }
     },
     {
@@ -4179,6 +4259,8 @@
         "description": "Scikit-learn tabular regression example that predicts median house value from California housing row features.",
         "device": "cpu",
         "endpoint_path": null,
+        "gpu_placement": null,
+        "gpu_required": false,
         "health_path": null,
         "id": "tabular/california-housing-sklearn",
         "install_docker": true,
@@ -4187,6 +4269,7 @@
         "kind": "hf_backend",
         "license": "unknown",
         "manifest_path": "capabilities/packs/tabular/california-housing-sklearn/capability.yaml",
+        "model_size_bytes": null,
         "name": "california_housing_sklearn",
         "operators": [
           "predict_house_value",
@@ -4219,7 +4302,9 @@
           "real-estate",
           "demo"
         ],
-        "title": "California Housing Regressor"
+        "title": "California Housing Regressor",
+        "vram_headroom_pct": null,
+        "vram_required_bytes": null
       }
     },
     {
@@ -4376,6 +4461,8 @@
         "description": "Scikit-learn tabular classification example that predicts red wine quality classes from numeric row features.",
         "device": "cpu",
         "endpoint_path": null,
+        "gpu_placement": null,
+        "gpu_required": false,
         "health_path": null,
         "id": "tabular/wine-quality-sklearn",
         "install_docker": true,
@@ -4384,6 +4471,7 @@
         "kind": "hf_backend",
         "license": "unknown",
         "manifest_path": "capabilities/packs/tabular/wine-quality-sklearn/capability.yaml",
+        "model_size_bytes": null,
         "name": "wine_quality_sklearn",
         "operators": [
           "predict_wine_quality",
@@ -4416,7 +4504,9 @@
           "sklearn",
           "demo"
         ],
-        "title": "Wine Quality Classifier"
+        "title": "Wine Quality Classifier",
+        "vram_headroom_pct": null,
+        "vram_required_bytes": null
       }
     }
   ],

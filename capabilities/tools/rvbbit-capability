@@ -696,6 +696,42 @@ def repo_relpath(path: Path) -> str:
         return str(path).replace("\\", "/")
 
 
+def int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def number_or_none(value: Any) -> int | float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.is_integer():
+        return int(parsed)
+    return parsed
+
+
+def gpu_resource_fields(resources: dict[str, Any], device: str | None) -> dict[str, Any]:
+    gpu = resources.get("gpu") if isinstance(resources, dict) else None
+    if not isinstance(gpu, dict):
+        gpu = {}
+    gpu_required = bool(gpu.get("required")) or device == "cuda"
+    placement = gpu.get("placement")
+    return {
+        "gpu_required": gpu_required,
+        "gpu_placement": str(placement) if placement not in {None, ""} else None,
+        "model_size_bytes": int_or_none(gpu.get("model_size_bytes")),
+        "vram_required_bytes": int_or_none(gpu.get("vram_required_bytes")),
+        "vram_headroom_pct": number_or_none(gpu.get("headroom_pct")),
+    }
+
+
 def catalog_entry(
     path: Path,
     root: Path,
@@ -715,6 +751,8 @@ def catalog_entry(
     pack_install = (pack or {}).get("install") or {}
     pack_acceptance = (pack or {}).get("acceptance") or {}
     resources = (pack or {}).get("resources") or manifest.get("resources") or {}
+    device = pack_runtime.get("device") or runtime.get("device", "auto")
+    gpu_fields = gpu_resource_fields(resources, device)
     acceptance_tests = [
         test.get("name")
         for test in pack_acceptance.get("tests") or []
@@ -770,6 +808,7 @@ def catalog_entry(
         "runtime_port": pack_runtime.get("port") or runtime.get("port"),
         "health_path": pack_runtime.get("health_path") or runtime.get("health_path"),
         "resources": resources,
+        **gpu_fields,
         "install_mode": runtime_mode,
         "install_warren": pack_install.get("warren"),
         "install_docker": pack_install.get("docker"),
@@ -777,7 +816,7 @@ def catalog_entry(
         "acceptance": acceptance,
         "endpoint_path": (manifest.get("warren") or {}).get("endpoint_path")
         or (manifest.get("runtime_registration") or {}).get("endpoint_path"),
-        "device": pack_runtime.get("device") or runtime.get("device", "auto"),
+        "device": device,
         "operators": pack_exports.get("operators")
         or [op.get("name") for op in operators if op.get("name")],
         "manifest_path": manifest_path,

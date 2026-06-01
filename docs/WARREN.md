@@ -167,6 +167,9 @@ deployment health/logs.
 
 ## Running An Agent
 
+For a short operator-focused install guide, see
+[WARREN_END_USER_INSTALL.md](WARREN_END_USER_INSTALL.md).
+
 ### Production Host Service
 
 For V1, Warren should be installed as a normal host service on a machine with

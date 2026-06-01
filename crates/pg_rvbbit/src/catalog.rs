@@ -3932,11 +3932,24 @@ BEGIN
             WHEN deployment_status IN ('starting', 'running', 'stopping') THEN NULL
             ELSE coalesce(d.stopped_at, clock_timestamp())
         END
-    WHERE d.node_name = complete_warren_job.node_name
-      AND d.kind = actual_kind
-      AND d.name = actual_name
-      AND d.status IN ('starting', 'running', 'stopping', 'stopped',
-                       'failed', 'removed', 'drifted', 'orphaned');
+    WHERE d.deployment_id = (
+        SELECT d2.deployment_id
+        FROM rvbbit.warren_deployments d2
+        WHERE d2.node_name = complete_warren_job.node_name
+          AND d2.kind = actual_kind
+          AND d2.name = actual_name
+          AND d2.status IN ('starting', 'running', 'stopping', 'stopped',
+                           'failed', 'removed', 'drifted', 'orphaned')
+        ORDER BY
+            CASE
+                WHEN d2.status IN ('starting', 'running', 'stopping') THEN 0
+                WHEN d2.job_id = complete_warren_job.job_id THEN 1
+                ELSE 2
+            END,
+            d2.updated_at DESC,
+            d2.created_at DESC
+        LIMIT 1
+    );
 
     IF NOT FOUND THEN
         INSERT INTO rvbbit.warren_deployments

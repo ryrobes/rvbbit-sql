@@ -31,6 +31,7 @@ RUN pip install --no-cache-dir \
         click \
         pytest \
         pytest-xdist \
+        PyYAML==6.* \
         duckdb==1.5.3 \
         requests \
         clickhouse-connect==0.8.* \
