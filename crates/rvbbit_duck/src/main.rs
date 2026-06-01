@@ -6,9 +6,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use datafusion::arrow::array::{
@@ -34,6 +35,18 @@ use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 const DEFAULT_DSN: &str = "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench";
 const DEFAULT_PGDATA_PREFIX: &str = "/var/lib/postgresql";
 const DEFAULT_VISIBLE_PGDATA_PREFIX: &str = "/rvbbit_pgdata";
+const DEFAULT_TELEMETRY_QUEUE_CAPACITY: usize = 8192;
+const DEFAULT_TELEMETRY_BATCH_SIZE: usize = 64;
+const DEFAULT_TELEMETRY_FLUSH_MS: u64 = 250;
+const DEFAULT_TELEMETRY_HEARTBEAT_MS: u64 = 5000;
+
+static TELEMETRY_SINK: OnceLock<Option<Arc<TelemetrySink>>> = OnceLock::new();
+static TELEMETRY_QUEUE_DEPTH: AtomicI64 = AtomicI64::new(0);
+static TELEMETRY_EVENTS_ENQUEUED: AtomicI64 = AtomicI64::new(0);
+static TELEMETRY_EVENTS_WRITTEN: AtomicI64 = AtomicI64::new(0);
+static TELEMETRY_EVENTS_DROPPED: AtomicI64 = AtomicI64::new(0);
+static BROKER_QUEUE_DEPTH: AtomicI64 = AtomicI64::new(0);
+static BROKER_ACTIVE_WORKERS: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -58,6 +71,15 @@ struct Args {
 enum Engine {
     Duck,
     DataFusion,
+}
+
+impl Engine {
+    fn as_str(self) -> &'static str {
+        match self {
+            Engine::Duck => "duck",
+            Engine::DataFusion => "datafusion",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +156,59 @@ struct TableSummary {
     layout: Option<String>,
 }
 
+#[derive(Clone)]
+struct TelemetrySink {
+    tx: mpsc::SyncSender<TelemetryMessage>,
+}
+
+enum TelemetryMessage {
+    Query(QueryTelemetryEvent),
+}
+
+#[derive(Clone)]
+struct TelemetryConfig {
+    instance_id: String,
+    hostname: String,
+    node_id: String,
+    pid: i32,
+    mode: String,
+    engine: String,
+    layout: String,
+    socket_path: Option<String>,
+    dsn_hash: String,
+    dsn: String,
+    worker_count: i32,
+    duck_threads: i32,
+    binary_path: Option<String>,
+    batch_size: usize,
+    flush_ms: u64,
+    heartbeat_ms: u64,
+    metadata_json: String,
+}
+
+#[derive(Clone)]
+struct QueryTelemetryEvent {
+    worker_id: Option<i32>,
+    command: Option<String>,
+    query_hash: Option<String>,
+    status: String,
+    queue_wait_ms: Option<f64>,
+    elapsed_ms: f64,
+    execute_ms: Option<f64>,
+    route_safety_ms: Option<f64>,
+    parquet_prewarm_ms: Option<f64>,
+    row_count: Option<i64>,
+    result_format: Option<String>,
+    arrow_ipc_bytes: Option<i64>,
+    repeat_count: Option<i32>,
+    timeout_s: Option<i32>,
+    max_rows: Option<i32>,
+    error: Option<String>,
+    cache_json: String,
+    tables_json: String,
+    metadata_json: String,
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(args) => args,
@@ -163,14 +238,67 @@ fn main() {
         }
         return;
     }
+    let started = Instant::now();
+    let query_hash = args.sql.as_deref().map(stable_hash_hex);
     match run_once_from_args(&args) {
-        Ok(summary) => println!("{}", serde_json::to_string_pretty(&summary).unwrap()),
+        Ok(summary) => {
+            record_oneshot_query_telemetry(
+                &args,
+                QueryTelemetryEvent {
+                    worker_id: None,
+                    command: None,
+                    query_hash,
+                    status: summary.status.clone(),
+                    queue_wait_ms: None,
+                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    execute_ms: Some(summary.elapsed_ms),
+                    route_safety_ms: Some(summary.cache.route_safety_check_ms),
+                    parquet_prewarm_ms: Some(summary.cache.parquet_prewarm_ms),
+                    row_count: Some(summary.row_count as i64),
+                    result_format: Some(summary.result_format.clone()),
+                    arrow_ipc_bytes: summary.arrow_ipc_bytes.map(|value| value as i64),
+                    repeat_count: Some(args.repeat.max(1) as i32),
+                    timeout_s: Some(args.timeout_s as i32),
+                    max_rows: Some(args.max_rows as i32),
+                    error: None,
+                    cache_json: json_string(&summary.cache, "{}"),
+                    tables_json: json_string(&summary.tables, "[]"),
+                    metadata_json: json!({"explain_only": args.explain_only}).to_string(),
+                },
+            );
+            println!("{}", serde_json::to_string_pretty(&summary).unwrap())
+        }
         Err(err) => {
+            let error = format_error_chain(&err);
+            record_oneshot_query_telemetry(
+                &args,
+                QueryTelemetryEvent {
+                    worker_id: None,
+                    command: None,
+                    query_hash,
+                    status: "fallback".to_string(),
+                    queue_wait_ms: None,
+                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    execute_ms: None,
+                    route_safety_ms: None,
+                    parquet_prewarm_ms: None,
+                    row_count: None,
+                    result_format: None,
+                    arrow_ipc_bytes: None,
+                    repeat_count: Some(args.repeat.max(1) as i32),
+                    timeout_s: Some(args.timeout_s as i32),
+                    max_rows: Some(args.max_rows as i32),
+                    error: Some(error.clone()),
+                    cache_json: "{}".to_string(),
+                    tables_json: "[]".to_string(),
+                    metadata_json: json!({"explain_only": args.explain_only}).to_string(),
+                },
+            );
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "status": "fallback",
-                    "error": format_error_chain(&err),
+                    "error": error,
                 }))
                 .unwrap()
             );
@@ -190,6 +318,389 @@ fn format_error_chain(err: &anyhow::Error) -> String {
     } else {
         format!("{first}: {}", rest.join(": "))
     }
+}
+
+impl TelemetrySink {
+    fn start(args: &Args) -> Option<Arc<Self>> {
+        if !env_enabled("RVBBIT_DUCK_TELEMETRY", true) {
+            return None;
+        }
+        let config = Arc::new(TelemetryConfig::from_args(args));
+        let capacity = env_usize(
+            "RVBBIT_DUCK_TELEMETRY_QUEUE",
+            DEFAULT_TELEMETRY_QUEUE_CAPACITY,
+        )
+        .max(1);
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        let worker_config = Arc::clone(&config);
+        if let Err(err) = thread::Builder::new()
+            .name("rvbbit-duck-telemetry".to_string())
+            .spawn(move || telemetry_writer_loop(worker_config, rx))
+        {
+            eprintln!("rvbbit-duck telemetry disabled: failed to start writer: {err}");
+            return None;
+        }
+        Some(Arc::new(Self { tx }))
+    }
+
+    fn record(&self, event: QueryTelemetryEvent) {
+        TELEMETRY_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
+        match self.tx.try_send(TelemetryMessage::Query(event)) {
+            Ok(()) => {
+                TELEMETRY_EVENTS_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                TELEMETRY_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                TELEMETRY_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl TelemetryConfig {
+    fn from_args(args: &Args) -> Self {
+        let hostname = local_hostname();
+        let node_id = env::var("RVBBIT_NODE_ID")
+            .or_else(|_| env::var("RVBBIT_DUCK_NODE_ID"))
+            .unwrap_or_else(|_| hostname.clone());
+        let pid = process::id() as i32;
+        let started_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let instance_id = env::var("RVBBIT_DUCK_INSTANCE_ID").unwrap_or_else(|_| {
+            format!(
+                "{}-{}-{}",
+                node_id.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"),
+                pid,
+                started_nanos
+            )
+        });
+        let mode = if args.serve_socket.is_some() {
+            "shared_broker"
+        } else if args.serve {
+            "local_persistent"
+        } else {
+            "local_oneshot"
+        }
+        .to_string();
+        let binary_path = env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string());
+        let metadata_json = json!({
+            "pgdata_prefix": args.pgdata_prefix,
+            "visible_pgdata_prefix": args.visible_pgdata_prefix,
+            "max_rows_default": args.max_rows,
+            "timeout_s_default": args.timeout_s,
+            "result_format_default": args.result_format.as_str(),
+        })
+        .to_string();
+        Self {
+            instance_id,
+            hostname,
+            node_id,
+            pid,
+            mode,
+            engine: args.engine.as_str().to_string(),
+            layout: args.layout.clone(),
+            socket_path: args.serve_socket.clone(),
+            dsn_hash: stable_hash_hex(&args.dsn),
+            dsn: args.dsn.clone(),
+            worker_count: if args.serve_socket.is_some() {
+                args.workers.max(1) as i32
+            } else {
+                1
+            },
+            duck_threads: args.threads.max(1) as i32,
+            binary_path,
+            batch_size: env_usize("RVBBIT_DUCK_TELEMETRY_BATCH", DEFAULT_TELEMETRY_BATCH_SIZE)
+                .max(1),
+            flush_ms: env_u64("RVBBIT_DUCK_TELEMETRY_FLUSH_MS", DEFAULT_TELEMETRY_FLUSH_MS).max(1),
+            heartbeat_ms: env_u64(
+                "RVBBIT_DUCK_TELEMETRY_HEARTBEAT_MS",
+                DEFAULT_TELEMETRY_HEARTBEAT_MS,
+            ),
+            metadata_json,
+        }
+    }
+}
+
+fn telemetry_sink(args: &Args) -> Option<Arc<TelemetrySink>> {
+    TELEMETRY_SINK
+        .get_or_init(|| TelemetrySink::start(args))
+        .clone()
+}
+
+fn record_oneshot_query_telemetry(args: &Args, event: QueryTelemetryEvent) {
+    if !env_enabled("RVBBIT_DUCK_TELEMETRY", true) {
+        return;
+    }
+    let config = TelemetryConfig::from_args(args);
+    let Ok(mut pg) = connect_telemetry_pg(&config.dsn) else {
+        return;
+    };
+    let _ = upsert_sidecar_instance(&mut pg, &config);
+    if write_query_telemetry_batch(&mut pg, &config, &[event]).is_ok() {
+        TELEMETRY_EVENTS_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = write_heartbeat(&mut pg, &config);
+}
+
+fn telemetry_writer_loop(config: Arc<TelemetryConfig>, rx: mpsc::Receiver<TelemetryMessage>) {
+    let mut client: Option<Client> = None;
+    let mut batch = Vec::<QueryTelemetryEvent>::with_capacity(config.batch_size);
+    let mut last_heartbeat = Instant::now()
+        .checked_sub(Duration::from_millis(config.heartbeat_ms.max(1)))
+        .unwrap_or_else(Instant::now);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(config.flush_ms)) {
+            Ok(TelemetryMessage::Query(event)) => {
+                TELEMETRY_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                batch.push(event);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        while batch.len() < config.batch_size {
+            match rx.try_recv() {
+                Ok(TelemetryMessage::Query(event)) => {
+                    TELEMETRY_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                    batch.push(event);
+                }
+                Err(_) => break,
+            }
+        }
+
+        if client.is_none() {
+            client = match connect_telemetry_pg(&config.dsn) {
+                Ok(mut pg) => {
+                    let _ = upsert_sidecar_instance(&mut pg, &config);
+                    Some(pg)
+                }
+                Err(_) => {
+                    if !batch.is_empty() {
+                        TELEMETRY_EVENTS_DROPPED.fetch_add(batch.len() as i64, Ordering::Relaxed);
+                        batch.clear();
+                    }
+                    continue;
+                }
+            };
+        }
+
+        let Some(pg) = client.as_mut() else {
+            continue;
+        };
+
+        if !batch.is_empty() {
+            match write_query_telemetry_batch(pg, &config, &batch) {
+                Ok(()) => {
+                    TELEMETRY_EVENTS_WRITTEN.fetch_add(batch.len() as i64, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    TELEMETRY_EVENTS_DROPPED.fetch_add(batch.len() as i64, Ordering::Relaxed);
+                    client = None;
+                }
+            }
+            batch.clear();
+        }
+
+        if config.heartbeat_ms > 0
+            && last_heartbeat.elapsed() >= Duration::from_millis(config.heartbeat_ms)
+        {
+            if let Some(pg) = client.as_mut() {
+                if write_heartbeat(pg, &config).is_err() {
+                    client = None;
+                } else {
+                    last_heartbeat = Instant::now();
+                }
+            }
+        }
+    }
+}
+
+fn connect_telemetry_pg(dsn: &str) -> Result<Client> {
+    let mut pg = Client::connect(dsn, NoTls).context("connecting telemetry to Postgres")?;
+    pg.simple_query("SET application_name = 'rvbbit-duck-telemetry'")
+        .context("setting telemetry application_name")?;
+    Ok(pg)
+}
+
+fn upsert_sidecar_instance(pg: &mut Client, config: &TelemetryConfig) -> Result<()> {
+    pg.execute(
+        "INSERT INTO rvbbit.duck_sidecar_instances \
+         (instance_id, hostname, node_id, pid, mode, engine, layout, socket_path, dsn_hash, \
+          worker_count, duck_threads, binary_path, last_heartbeat_at, status, metadata) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, clock_timestamp(), $13, $14::text::jsonb) \
+         ON CONFLICT (instance_id) DO UPDATE SET \
+             hostname = excluded.hostname, \
+             node_id = excluded.node_id, \
+             pid = excluded.pid, \
+             mode = excluded.mode, \
+             engine = excluded.engine, \
+             layout = excluded.layout, \
+             socket_path = excluded.socket_path, \
+             dsn_hash = excluded.dsn_hash, \
+             worker_count = excluded.worker_count, \
+             duck_threads = excluded.duck_threads, \
+             binary_path = excluded.binary_path, \
+             last_heartbeat_at = excluded.last_heartbeat_at, \
+             status = excluded.status, \
+             metadata = excluded.metadata",
+        &[
+            &config.instance_id,
+            &config.hostname,
+            &config.node_id,
+            &config.pid,
+            &config.mode,
+            &config.engine,
+            &config.layout,
+            &config.socket_path,
+            &config.dsn_hash,
+            &config.worker_count,
+            &config.duck_threads,
+            &config.binary_path,
+            &"online",
+            &config.metadata_json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn write_heartbeat(pg: &mut Client, config: &TelemetryConfig) -> Result<()> {
+    let rss_bytes = process_rss_bytes();
+    let queue_depth = BROKER_QUEUE_DEPTH.load(Ordering::Relaxed) as i32;
+    let active_workers = BROKER_ACTIVE_WORKERS.load(Ordering::Relaxed) as i32;
+    let telemetry_queue_depth = TELEMETRY_QUEUE_DEPTH.load(Ordering::Relaxed);
+    let metadata_json = json!({
+        "telemetry_queue_depth": telemetry_queue_depth,
+    })
+    .to_string();
+    pg.execute(
+        "INSERT INTO rvbbit.duck_sidecar_heartbeats \
+         (instance_id, hostname, node_id, pid, mode, engine, layout, queue_depth, active_workers, \
+          worker_count, duck_threads, rss_bytes, pg_connections, events_enqueued, events_written, events_dropped, metadata) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, $13, $14, $15, $16::text::jsonb)",
+        &[
+            &config.instance_id,
+            &config.hostname,
+            &config.node_id,
+            &config.pid,
+            &config.mode,
+            &config.engine,
+            &config.layout,
+            &queue_depth,
+            &active_workers,
+            &config.worker_count,
+            &config.duck_threads,
+            &rss_bytes,
+            &TELEMETRY_EVENTS_ENQUEUED.load(Ordering::Relaxed),
+            &TELEMETRY_EVENTS_WRITTEN.load(Ordering::Relaxed),
+            &TELEMETRY_EVENTS_DROPPED.load(Ordering::Relaxed),
+            &metadata_json,
+        ],
+    )?;
+    upsert_sidecar_instance(pg, config)
+}
+
+fn write_query_telemetry_batch(
+    pg: &mut Client,
+    config: &TelemetryConfig,
+    batch: &[QueryTelemetryEvent],
+) -> Result<()> {
+    let mut tx = pg.transaction()?;
+    let stmt = tx.prepare(
+        "INSERT INTO rvbbit.duck_sidecar_query_events \
+         (instance_id, hostname, node_id, pid, mode, engine, layout, worker_id, command, query_hash, status, \
+          queue_wait_ms, elapsed_ms, execute_ms, route_safety_ms, parquet_prewarm_ms, row_count, result_format, \
+          arrow_ipc_bytes, repeat_count, timeout_s, max_rows, error, cache, tables, metadata) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
+                 $19, $20, $21, $22, $23, $24::text::jsonb, $25::text::jsonb, $26::text::jsonb)",
+    )?;
+    for event in batch {
+        tx.execute(
+            &stmt,
+            &[
+                &config.instance_id,
+                &config.hostname,
+                &config.node_id,
+                &config.pid,
+                &config.mode,
+                &config.engine,
+                &config.layout,
+                &event.worker_id,
+                &event.command,
+                &event.query_hash,
+                &event.status,
+                &event.queue_wait_ms,
+                &event.elapsed_ms,
+                &event.execute_ms,
+                &event.route_safety_ms,
+                &event.parquet_prewarm_ms,
+                &event.row_count,
+                &event.result_format,
+                &event.arrow_ipc_bytes,
+                &event.repeat_count,
+                &event.timeout_s,
+                &event.max_rows,
+                &event.error,
+                &event.cache_json,
+                &event.tables_json,
+                &event.metadata_json,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn process_rss_bytes() -> Option<i64> {
+    let statm = fs::read_to_string("/proc/self/statm").ok()?;
+    let rss_pages = statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<i64>().ok())?;
+    Some(rss_pages.saturating_mul(4096))
+}
+
+fn local_hostname() -> String {
+    env::var("RVBBIT_HOSTNAME")
+        .or_else(|_| env::var("HOSTNAME"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn stable_hash_hex(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn json_string<T: Serialize>(value: &T, fallback: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| fallback.to_string())
 }
 
 fn run_once_from_args(args: &Args) -> Result<QuerySummary> {
@@ -709,6 +1220,8 @@ struct ServerState {
     footer_cache: ParquetFooterCache,
     route_safety_cache: RouteSafetyCache,
     threads: usize,
+    telemetry: Option<Arc<TelemetrySink>>,
+    worker_id: Option<i32>,
 }
 
 enum ServerExecutor {
@@ -720,7 +1233,7 @@ enum ServerExecutor {
 }
 
 impl ServerState {
-    fn new(args: &Args) -> Result<Self> {
+    fn new(args: &Args, worker_id: Option<usize>) -> Result<Self> {
         let pg = connect_pg(args)?;
         Ok(Self {
             pg,
@@ -731,7 +1244,15 @@ impl ServerState {
             footer_cache: ParquetFooterCache::default(),
             route_safety_cache: RouteSafetyCache::default(),
             threads: args.threads.max(1),
+            telemetry: telemetry_sink(args),
+            worker_id: worker_id.map(|value| value as i32),
         })
+    }
+
+    fn record_query_telemetry(&self, event: QueryTelemetryEvent) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record(event);
+        }
     }
 
     fn execute(&mut self, args: &Args, req: ServerRequest) -> Result<QuerySummary> {
@@ -975,7 +1496,7 @@ impl ServerState {
 }
 
 fn run_server(args: Args) -> Result<()> {
-    let mut state = ServerState::new(&args)?;
+    let mut state = ServerState::new(&args, None)?;
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     for line in stdin.lock().lines() {
@@ -983,7 +1504,11 @@ fn run_server(args: Args) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        writeln!(stdout, "{}", server_response_json(&mut state, &args, &line))?;
+        writeln!(
+            stdout,
+            "{}",
+            server_response_json(&mut state, &args, &line, None)
+        )?;
         stdout.flush()?;
     }
     Ok(())
@@ -991,6 +1516,7 @@ fn run_server(args: Args) -> Result<()> {
 
 struct SocketJob {
     line: String,
+    received_at: Instant,
     respond: mpsc::Sender<String>,
 }
 
@@ -1018,7 +1544,7 @@ fn run_socket_server(args: Args) -> Result<()> {
         thread::Builder::new()
             .name(format!("rvbbit-duck-worker-{idx}"))
             .spawn(move || {
-                let mut state = match ServerState::new(&worker_args) {
+                let mut state = match ServerState::new(&worker_args, Some(idx)) {
                     Ok(state) => state,
                     Err(err) => {
                         eprintln!("rvbbit-duck worker startup failed: {err:#}");
@@ -1035,8 +1561,16 @@ fn run_socket_server(args: Args) -> Result<()> {
                     };
                     match job {
                         Ok(job) => {
-                            let response =
-                                server_response_json(&mut state, &worker_args, &job.line);
+                            BROKER_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                            BROKER_ACTIVE_WORKERS.fetch_add(1, Ordering::Relaxed);
+                            let queue_wait_ms = job.received_at.elapsed().as_secs_f64() * 1000.0;
+                            let response = server_response_json(
+                                &mut state,
+                                &worker_args,
+                                &job.line,
+                                Some(queue_wait_ms),
+                            );
+                            BROKER_ACTIVE_WORKERS.fetch_sub(1, Ordering::Relaxed);
                             let _ = job.respond.send(response);
                         }
                         Err(_) => return,
@@ -1071,8 +1605,15 @@ fn handle_socket_client(mut stream: UnixStream, tx: mpsc::Sender<SocketJob>) -> 
         return Ok(());
     }
     let (respond, response_rx) = mpsc::channel();
-    tx.send(SocketJob { line, respond })
-        .context("dispatching socket request")?;
+    BROKER_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
+    if let Err(err) = tx.send(SocketJob {
+        line,
+        received_at: Instant::now(),
+        respond,
+    }) {
+        BROKER_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        return Err(anyhow!("dispatching socket request: {err}"));
+    }
     let response = response_rx.recv().context("waiting for socket response")?;
     stream
         .write_all(response.as_bytes())
@@ -1084,15 +1625,103 @@ fn handle_socket_client(mut stream: UnixStream, tx: mpsc::Sender<SocketJob>) -> 
     Ok(())
 }
 
-fn server_response_json(state: &mut ServerState, args: &Args, line: &str) -> String {
+fn server_response_json(
+    state: &mut ServerState,
+    args: &Args,
+    line: &str,
+    queue_wait_ms: Option<f64>,
+) -> String {
+    let request_started = Instant::now();
     let response = match serde_json::from_str::<ServerRequest>(line) {
-        Ok(req) => match state.execute(args, req) {
-            Ok(summary) => serde_json::to_value(summary)
-                .unwrap_or_else(|err| json!({"status": "fallback", "error": err.to_string()})),
-            Err(err) => json!({"status": "fallback", "error": format_error_chain(&err)}),
-        },
+        Ok(req) => {
+            let command = req.command.clone();
+            let query_hash = req.sql.as_deref().map(stable_hash_hex);
+            let repeat_count = req.repeat.unwrap_or(args.repeat).max(1) as i32;
+            let timeout_s = req.timeout_s.unwrap_or(args.timeout_s) as i32;
+            let max_rows = req.max_rows.unwrap_or(args.max_rows) as i32;
+            let metadata_json = json!({
+                "explain_only": req.explain_only.unwrap_or(args.explain_only),
+                "requested_threads": req.threads.unwrap_or(args.threads),
+            })
+            .to_string();
+            match state.execute(args, req) {
+                Ok(summary) => {
+                    state.record_query_telemetry(QueryTelemetryEvent {
+                        worker_id: state.worker_id,
+                        command,
+                        query_hash,
+                        status: summary.status.clone(),
+                        queue_wait_ms,
+                        elapsed_ms: request_started.elapsed().as_secs_f64() * 1000.0,
+                        execute_ms: Some(summary.elapsed_ms),
+                        route_safety_ms: Some(summary.cache.route_safety_check_ms),
+                        parquet_prewarm_ms: Some(summary.cache.parquet_prewarm_ms),
+                        row_count: Some(summary.row_count as i64),
+                        result_format: Some(summary.result_format.clone()),
+                        arrow_ipc_bytes: summary.arrow_ipc_bytes.map(|value| value as i64),
+                        repeat_count: Some(repeat_count),
+                        timeout_s: Some(timeout_s),
+                        max_rows: Some(max_rows),
+                        error: None,
+                        cache_json: json_string(&summary.cache, "{}"),
+                        tables_json: json_string(&summary.tables, "[]"),
+                        metadata_json,
+                    });
+                    serde_json::to_value(summary).unwrap_or_else(
+                        |err| json!({"status": "fallback", "error": err.to_string()}),
+                    )
+                }
+                Err(err) => {
+                    let error = format_error_chain(&err);
+                    state.record_query_telemetry(QueryTelemetryEvent {
+                        worker_id: state.worker_id,
+                        command,
+                        query_hash,
+                        status: "fallback".to_string(),
+                        queue_wait_ms,
+                        elapsed_ms: request_started.elapsed().as_secs_f64() * 1000.0,
+                        execute_ms: None,
+                        route_safety_ms: None,
+                        parquet_prewarm_ms: None,
+                        row_count: None,
+                        result_format: None,
+                        arrow_ipc_bytes: None,
+                        repeat_count: Some(repeat_count),
+                        timeout_s: Some(timeout_s),
+                        max_rows: Some(max_rows),
+                        error: Some(error.clone()),
+                        cache_json: "{}".to_string(),
+                        tables_json: "[]".to_string(),
+                        metadata_json,
+                    });
+                    json!({"status": "fallback", "error": error})
+                }
+            }
+        }
         Err(err) => {
-            json!({"status": "fallback", "error": format!("invalid request JSON: {err}")})
+            let error = format!("invalid request JSON: {err}");
+            state.record_query_telemetry(QueryTelemetryEvent {
+                worker_id: state.worker_id,
+                command: None,
+                query_hash: None,
+                status: "fallback".to_string(),
+                queue_wait_ms,
+                elapsed_ms: request_started.elapsed().as_secs_f64() * 1000.0,
+                execute_ms: None,
+                route_safety_ms: None,
+                parquet_prewarm_ms: None,
+                row_count: None,
+                result_format: None,
+                arrow_ipc_bytes: None,
+                repeat_count: None,
+                timeout_s: None,
+                max_rows: None,
+                error: Some(error.clone()),
+                cache_json: "{}".to_string(),
+                tables_json: "[]".to_string(),
+                metadata_json: "{}".to_string(),
+            });
+            json!({"status": "fallback", "error": error})
         }
     };
     serde_json::to_string(&response)

@@ -25,6 +25,7 @@ mod custom_scan;
 mod delete_log;
 mod df;
 mod duck_backend;
+mod duck_telemetry;
 mod embeddings;
 mod evidence;
 mod explain;

@@ -333,6 +333,12 @@ Unix socket. A TCP broker would need authentication and transport hardening.
 | `rvbbit.duck_arrow_ipc` / `RVBBIT_DUCK_ARROW_IPC` | `on` | Use Arrow IPC file transport for sidecar results. |
 | `rvbbit.duck_arrow_ipc_fallback` / `RVBBIT_DUCK_ARROW_IPC_FALLBACK` | `on` | Retry JSON transport if Arrow IPC decode fails. |
 | `rvbbit.duck_backend_fail_open` / `RVBBIT_DUCK_BACKEND_FAIL_OPEN` | `on` | Non-Vortex failures can fall back to native execution. |
+| `RVBBIT_NODE_ID` / `RVBBIT_DUCK_NODE_ID` | hostname | Logical node identity recorded in sidecar telemetry. |
+| `RVBBIT_DUCK_TELEMETRY` | `on` | Enables best-effort sidecar telemetry writes. |
+| `RVBBIT_DUCK_TELEMETRY_QUEUE` | `8192` | Bounded sidecar telemetry event queue. |
+| `RVBBIT_DUCK_TELEMETRY_BATCH` | `64` | Query events written per telemetry batch. |
+| `RVBBIT_DUCK_TELEMETRY_FLUSH_MS` | `250` | Maximum query-event flush delay. |
+| `RVBBIT_DUCK_TELEMETRY_HEARTBEAT_MS` | `5000` | Broker/local sidecar heartbeat cadence. |
 
 ### Broker Flags
 
@@ -346,6 +352,78 @@ Unix socket. A TCP broker would need authentication and transport hardening.
 | `--threads N` | DuckDB/DataFusion threads per worker. |
 | `--pgdata-prefix PATH` | Path prefix stored in Rvbbit metadata. |
 | `--visible-pgdata-prefix PATH` | Path prefix visible to the broker. |
+
+## SQL Observability
+
+`rvbbit-duck` writes low-overhead, best-effort telemetry back into the Rvbbit
+schema. The writer is async for persistent sidecars and shared brokers: query
+execution enqueues compact events into a bounded in-process queue, while a
+background telemetry connection writes batches and heartbeats.
+
+For the UI-facing table contract, field semantics, polling recipes, and
+dashboard layout guidance, see [RVBBIT_DUCK_UI_CONTRACT.md](RVBBIT_DUCK_UI_CONTRACT.md).
+
+The tables are intentionally node-aware:
+
+```text
+hostname  = physical/container host name
+node_id   = logical node name, from RVBBIT_NODE_ID or RVBBIT_DUCK_NODE_ID
+```
+
+That lets a UI group today by one local sidecar and later by multiple broker
+nodes reading shared Parquet/Vortex storage.
+
+### Tables and Views
+
+| Object | Purpose |
+|---|---|
+| `rvbbit.duck_sidecar_instances` | One row per sidecar/broker process instance. |
+| `rvbbit.duck_sidecar_heartbeats` | Periodic liveness, RSS, queue depth, active workers, and telemetry counters. |
+| `rvbbit.duck_sidecar_query_events` | Per-query sidecar execution events with timings, rows, status, cache metadata, and table summaries. |
+| `rvbbit.duck_sidecar_fallback_events` | Extension-side records when shared broker mode falls back to local sidecars. |
+| `rvbbit.duck_sidecar_latest` | Latest instance state joined to its newest heartbeat. |
+| `rvbbit.duck_sidecar_query_summary` | Minute-level rollup by host/node/mode/engine/layout/status. |
+
+Example UI queries:
+
+```sql
+SELECT *
+FROM rvbbit.duck_sidecar_latest
+ORDER BY node_id, mode, engine, layout;
+
+SELECT minute, node_id, mode, engine, layout, status, calls,
+       round(p50_elapsed_ms::numeric, 1) AS p50_ms,
+       round(p95_elapsed_ms::numeric, 1) AS p95_ms
+FROM rvbbit.duck_sidecar_query_summary
+ORDER BY minute DESC, calls DESC
+LIMIT 50;
+
+SELECT observed_at, node_id, engine, layout, fallback_mode, reason
+FROM rvbbit.duck_sidecar_fallback_events
+ORDER BY observed_at DESC
+LIMIT 20;
+```
+
+Raw SQL text is not stored. Query events store `query_hash` so the UI can group
+repeated shapes without copying user query text into telemetry tables. Cache and
+table details are stored as JSONB for inspection without schema churn.
+
+### Telemetry Cost Model
+
+Persistent/shared modes use:
+
+```text
+one telemetry writer thread per rvbbit-duck process
+one extra PostgreSQL connection named rvbbit-duck-telemetry
+bounded in-process queue; overflow drops telemetry, not queries
+```
+
+Local one-shot mode writes telemetry synchronously at process exit because the
+process is about to disappear. That path is already the slow/debug path, so the
+extra write is acceptable and keeps observations complete.
+
+Telemetry is best-effort by design. If the extension schema has not been
+upgraded or the telemetry connection cannot write, queries still run.
 
 ## Sizing
 

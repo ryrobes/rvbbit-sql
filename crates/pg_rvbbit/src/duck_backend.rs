@@ -792,7 +792,16 @@ fn run_engine_query(
             pgrx::warning!(
                 "rvbbit.{engine}_query_json: shared rvbbit-duck failed ({shared_err}); falling back to per-backend sidecar"
             );
+            let socket_path = shared_socket_hint(binary, dsn, engine, layout, threads).ok();
             if persistent_enabled() {
+                crate::duck_telemetry::record_shared_fallback(
+                    engine,
+                    layout,
+                    socket_path.as_deref(),
+                    &shared_err,
+                    "local_persistent_or_oneshot",
+                    query,
+                );
                 execute_persistent(
                     engine,
                     layout,
@@ -818,6 +827,14 @@ fn run_engine_query(
                     )
                 })
             } else {
+                crate::duck_telemetry::record_shared_fallback(
+                    engine,
+                    layout,
+                    socket_path.as_deref(),
+                    &shared_err,
+                    "local_oneshot",
+                    query,
+                );
                 execute_engine_oneshot(
                     engine,
                     layout,
@@ -869,6 +886,26 @@ fn run_engine_query(
             result_format,
         )
     }
+}
+
+fn shared_socket_hint(
+    binary: &str,
+    dsn: &str,
+    engine: &str,
+    layout: &str,
+    threads: usize,
+) -> Result<String, String> {
+    let key = DuckSharedKey {
+        binary: binary.to_string(),
+        dsn: dsn.to_string(),
+        engine: engine.to_string(),
+        layout: layout.to_string(),
+        threads,
+        workers: shared_workers(),
+        pgdata_prefix: pgdata_prefix(),
+        visible_pgdata_prefix: visible_pgdata_prefix(),
+    };
+    shared_socket_path(&key)
 }
 
 fn execute_shared(
