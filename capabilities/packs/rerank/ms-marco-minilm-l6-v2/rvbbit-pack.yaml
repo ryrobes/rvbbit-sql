@@ -20,6 +20,14 @@ runtime:
   template: hf-rvbbit-fastapi
   handler: sequence_classification
   device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 90870598
+    vram_required_bytes: 113588248
+    headroom_pct: 25
+    estimate_source: huggingface_weights
 exports:
   backend: rerank_ms_marco_minilm
   operators:

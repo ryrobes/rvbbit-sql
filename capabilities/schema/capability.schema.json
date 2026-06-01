@@ -103,6 +103,25 @@
         }
       }
     },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gpu": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "required": { "type": "boolean" },
+            "placement": { "type": "string", "enum": ["single_gpu"] },
+            "model_size_bytes": { "type": "integer", "minimum": 0 },
+            "vram_required_bytes": { "type": "integer", "minimum": 0 },
+            "headroom_pct": { "type": "number", "minimum": 0 },
+            "estimate_source": { "type": "string" },
+            "notes": { "type": "string" }
+          }
+        }
+      }
+    },
     "runtime_registration": {
       "type": "object",
       "required": ["name", "language"],

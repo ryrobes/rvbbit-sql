@@ -191,7 +191,10 @@ def runtime_endpoint_path(manifest: dict[str, Any]) -> str:
     return path if str(path).startswith("/") else f"/{path}"
 
 
-def install_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+def install_manifest(
+    manifest: dict[str, Any],
+    resources: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     keep = {
         key: manifest[key]
         for key in [
@@ -208,12 +211,15 @@ def install_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             "backend",
             "operators",
             "warren",
+            "resources",
             "system_runtime",
             "capability_role",
             "smoke",
         ]
         if key in manifest
     }
+    if resources and "resources" not in keep:
+        keep["resources"] = resources
     return keep
 
 
@@ -708,6 +714,7 @@ def catalog_entry(
     pack_exports = (pack or {}).get("exports") or {}
     pack_install = (pack or {}).get("install") or {}
     pack_acceptance = (pack or {}).get("acceptance") or {}
+    resources = (pack or {}).get("resources") or manifest.get("resources") or {}
     acceptance_tests = [
         test.get("name")
         for test in pack_acceptance.get("tests") or []
@@ -762,6 +769,7 @@ def catalog_entry(
         "runtime_handler": pack_runtime.get("handler") or runtime.get("handler", "custom"),
         "runtime_port": pack_runtime.get("port") or runtime.get("port"),
         "health_path": pack_runtime.get("health_path") or runtime.get("health_path"),
+        "resources": resources,
         "install_mode": runtime_mode,
         "install_warren": pack_install.get("warren"),
         "install_docker": pack_install.get("docker"),
@@ -837,7 +845,7 @@ def catalog_seed_doc(root: Path, source: str) -> dict[str, Any]:
         entries.append(
             {
                 "catalog_entry": entry,
-                "capability_manifest": install_manifest(manifest),
+                "capability_manifest": install_manifest(manifest, entry.get("resources")),
             }
         )
     return {
@@ -1352,7 +1360,7 @@ def render_catalog_publish_sql(root: Path, source: str, prune: bool) -> tuple[st
             [
                 "SELECT rvbbit.upsert_capability_catalog_entry(",
                 f"  catalog_entry       => {sql_json(entry)},",
-                f"  capability_manifest => {sql_json(install_manifest(manifest))},",
+                f"  capability_manifest => {sql_json(install_manifest(manifest, entry.get('resources')))},",
                 f"  catalog_source      => {sql_lit(source)},",
                 "  entry_active        => true",
                 ");",

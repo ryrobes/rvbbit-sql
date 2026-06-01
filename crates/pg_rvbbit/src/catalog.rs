@@ -2437,6 +2437,12 @@ CREATE TABLE rvbbit.capability_catalog (
     health_path        text,
     endpoint_path      text,
     device             text,
+    resource_profile   jsonb NOT NULL DEFAULT '{}'::jsonb,
+    gpu_required       boolean NOT NULL DEFAULT false,
+    gpu_placement      text,
+    model_size_bytes   bigint,
+    vram_required_bytes bigint,
+    vram_headroom_pct  numeric,
     operators          text[] NOT NULL DEFAULT ARRAY[]::text[],
     manifest           jsonb NOT NULL,
     catalog_entry      jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -2448,6 +2454,9 @@ CREATE TABLE rvbbit.capability_catalog (
     CONSTRAINT capability_catalog_id_check CHECK (id ~ '^[A-Za-z0-9_./-]+$'),
     CONSTRAINT capability_catalog_kind_check CHECK (kind <> ''),
     CONSTRAINT capability_catalog_manifest_is_object CHECK (jsonb_typeof(manifest) = 'object'),
+    CONSTRAINT capability_catalog_resource_profile_is_object CHECK (jsonb_typeof(resource_profile) = 'object'),
+    CONSTRAINT capability_catalog_model_size_nonnegative CHECK (model_size_bytes IS NULL OR model_size_bytes >= 0),
+    CONSTRAINT capability_catalog_vram_required_nonnegative CHECK (vram_required_bytes IS NULL OR vram_required_bytes >= 0),
     CONSTRAINT capability_catalog_entry_is_object CHECK (jsonb_typeof(catalog_entry) = 'object')
 );
 
@@ -2458,6 +2467,9 @@ CREATE INDEX capability_catalog_backend_idx ON rvbbit.capability_catalog (backen
     WHERE backend_name IS NOT NULL;
 CREATE INDEX capability_catalog_runtime_idx ON rvbbit.capability_catalog (runtime_name)
     WHERE runtime_name IS NOT NULL;
+CREATE INDEX capability_catalog_resource_idx ON rvbbit.capability_catalog
+    (gpu_required, vram_required_bytes)
+    WHERE gpu_required OR vram_required_bytes IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION rvbbit.touch_capability_catalog_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$
@@ -2469,6 +2481,43 @@ END $$;
 CREATE TRIGGER capability_catalog_touch_updated_at
     BEFORE UPDATE ON rvbbit.capability_catalog
     FOR EACH ROW EXECUTE FUNCTION rvbbit.touch_capability_catalog_updated_at();
+
+CREATE OR REPLACE FUNCTION rvbbit.normalize_capability_catalog_resources()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    resource_doc jsonb;
+    gpu_doc jsonb;
+BEGIN
+    resource_doc := coalesce(
+        CASE WHEN jsonb_typeof(NEW.resource_profile) = 'object'
+                  AND NEW.resource_profile <> '{}'::jsonb
+             THEN NEW.resource_profile END,
+        CASE WHEN jsonb_typeof(NEW.catalog_entry->'resources') = 'object'
+             THEN NEW.catalog_entry->'resources' END,
+        CASE WHEN jsonb_typeof(NEW.manifest->'resources') = 'object'
+             THEN NEW.manifest->'resources' END,
+        '{}'::jsonb
+    );
+    gpu_doc := CASE
+        WHEN jsonb_typeof(resource_doc->'gpu') = 'object' THEN resource_doc->'gpu'
+        ELSE '{}'::jsonb
+    END;
+
+    NEW.resource_profile := resource_doc;
+    NEW.gpu_required := CASE
+        WHEN gpu_doc ? 'required' THEN coalesce((gpu_doc->>'required')::boolean, false)
+        ELSE false
+    END;
+    NEW.gpu_placement := nullif(gpu_doc->>'placement', '');
+    NEW.model_size_bytes := nullif(gpu_doc->>'model_size_bytes', '')::bigint;
+    NEW.vram_required_bytes := nullif(gpu_doc->>'vram_required_bytes', '')::bigint;
+    NEW.vram_headroom_pct := nullif(gpu_doc->>'headroom_pct', '')::numeric;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER capability_catalog_normalize_resources
+    BEFORE INSERT OR UPDATE ON rvbbit.capability_catalog
+    FOR EACH ROW EXECUTE FUNCTION rvbbit.normalize_capability_catalog_resources();
 
 CREATE OR REPLACE FUNCTION rvbbit.require_capability_catalog_admin()
 RETURNS void
@@ -2499,6 +2548,8 @@ DECLARE
     normalized_source text := coalesce(nullif(btrim(catalog_source), ''), 'curated');
     entry_tags text[] := ARRAY[]::text[];
     entry_operators text[] := ARRAY[]::text[];
+    resource_doc jsonb := '{}'::jsonb;
+    gpu_doc jsonb := '{}'::jsonb;
     row_doc jsonb;
 BEGIN
     PERFORM rvbbit.require_capability_catalog_admin();
@@ -2533,13 +2584,28 @@ BEGIN
         FROM jsonb_array_elements_text(normalized_entry->'operators') AS o(op);
     END IF;
 
+    resource_doc := coalesce(
+        CASE WHEN jsonb_typeof(normalized_entry->'resources') = 'object'
+             THEN normalized_entry->'resources' END,
+        CASE WHEN jsonb_typeof(normalized_manifest->'resources') = 'object'
+             THEN normalized_manifest->'resources' END,
+        '{}'::jsonb
+    );
+    gpu_doc := CASE
+        WHEN jsonb_typeof(resource_doc->'gpu') = 'object' THEN resource_doc->'gpu'
+        ELSE '{}'::jsonb
+    END;
+
     INSERT INTO rvbbit.capability_catalog
         (id, manifest_path, name, title, description, tags, kind,
          system_runtime, capability_role, license,
          source_provider, source_model, source_revision,
          backend_name, backend_transport,
          runtime_name, runtime_language, runtime_template, runtime_handler,
-         runtime_port, health_path, endpoint_path, device, operators, manifest, catalog_entry,
+         runtime_port, health_path, endpoint_path, device,
+         resource_profile, gpu_required, gpu_placement, model_size_bytes,
+         vram_required_bytes, vram_headroom_pct,
+         operators, manifest, catalog_entry,
          catalog_source, active)
     VALUES
         (normalized_id,
@@ -2573,6 +2639,15 @@ BEGIN
          coalesce(normalized_entry->>'endpoint_path', normalized_manifest #>> '{warren,endpoint_path}',
                   normalized_manifest #>> '{runtime_registration,endpoint_path}'),
          coalesce(normalized_entry->>'device', normalized_manifest #>> '{runtime,device}'),
+         resource_doc,
+         CASE
+             WHEN gpu_doc ? 'required' THEN coalesce((gpu_doc->>'required')::boolean, false)
+             ELSE false
+         END,
+         nullif(gpu_doc->>'placement', ''),
+         nullif(gpu_doc->>'model_size_bytes', '')::bigint,
+         nullif(gpu_doc->>'vram_required_bytes', '')::bigint,
+         nullif(gpu_doc->>'headroom_pct', '')::numeric,
          entry_operators,
          normalized_manifest,
          normalized_entry,
@@ -2601,6 +2676,12 @@ BEGIN
         health_path = EXCLUDED.health_path,
         endpoint_path = EXCLUDED.endpoint_path,
         device = EXCLUDED.device,
+        resource_profile = EXCLUDED.resource_profile,
+        gpu_required = EXCLUDED.gpu_required,
+        gpu_placement = EXCLUDED.gpu_placement,
+        model_size_bytes = EXCLUDED.model_size_bytes,
+        vram_required_bytes = EXCLUDED.vram_required_bytes,
+        vram_headroom_pct = EXCLUDED.vram_headroom_pct,
         operators = EXCLUDED.operators,
         manifest = EXCLUDED.manifest,
         catalog_entry = EXCLUDED.catalog_entry,
@@ -2771,6 +2852,9 @@ CREATE TABLE rvbbit.warren_deployments (
 CREATE INDEX warren_deployments_node_idx ON rvbbit.warren_deployments (node_name, status);
 CREATE INDEX warren_deployments_backend_idx ON rvbbit.warren_deployments (backend_name)
     WHERE backend_name IS NOT NULL;
+CREATE UNIQUE INDEX warren_deployments_active_unique_idx ON rvbbit.warren_deployments
+    (node_name, kind, name)
+    WHERE status IN ('starting', 'running');
 
 CREATE TABLE rvbbit.warren_node_metrics (
     metric_id             bigserial PRIMARY KEY,
@@ -2816,6 +2900,108 @@ SELECT DISTINCT ON (node_name)
 FROM rvbbit.warren_node_metrics
 ORDER BY node_name, collected_at DESC;
 
+CREATE OR REPLACE FUNCTION rvbbit.capability_gpu_required(
+    capability_manifest jsonb
+) RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+BEGIN
+    RETURN coalesce(NULLIF(capability_manifest #>> '{resources,gpu,required}', '')::boolean, false)
+        OR coalesce(capability_manifest #>> '{runtime,device}', '') = 'cuda';
+END
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.capability_vram_required_bytes(
+    capability_manifest jsonb
+) RETURNS bigint
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+BEGIN
+    RETURN coalesce(
+        NULLIF(capability_manifest #>> '{resources,gpu,vram_required_bytes}', '')::bigint,
+        NULLIF(capability_manifest #>> '{resource_profile,gpu,vram_required_bytes}', '')::bigint,
+        NULLIF(capability_manifest #>> '{resources,vram_required_bytes}', '')::bigint
+    );
+END
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.capability_gpu_reserved(
+    capability_manifest jsonb
+) RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+BEGIN
+    RETURN rvbbit.capability_gpu_required(capability_manifest)
+        OR coalesce(NULLIF(capability_manifest #>> '{resources,gpu,reserved}', '')::boolean, false);
+END
+$$;
+
+CREATE OR REPLACE VIEW rvbbit.warren_gpu_capacity AS
+WITH gpu_rows AS (
+    SELECT
+        n.node_id,
+        n.name AS node_name,
+        n.capacity,
+        n.inventory,
+        coalesce(NULLIF(n.capacity #>> '{gpu,vram_usable_ratio}', '')::numeric, 0.90) AS vram_usable_ratio,
+        g.elem AS gpu
+    FROM rvbbit.warren_nodes n
+    LEFT JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(n.inventory) = 'array' THEN n.inventory ELSE '[]'::jsonb END
+    ) AS g(elem) ON true
+),
+provisioned AS (
+    SELECT
+        d.node_id,
+        coalesce(sum(rvbbit.capability_vram_required_bytes(d.manifest)), 0)::bigint
+            AS gpu_provisioned_bytes
+    FROM rvbbit.warren_deployments d
+    WHERE d.status IN ('starting', 'running')
+      AND rvbbit.capability_gpu_reserved(d.manifest)
+      AND rvbbit.capability_vram_required_bytes(d.manifest) IS NOT NULL
+    GROUP BY d.node_id
+)
+SELECT
+    n.node_id,
+    n.name AS node_name,
+    n.capacity,
+    n.inventory AS gpu_inventory,
+    coalesce(NULLIF(n.capacity #>> '{gpu,vram_usable_ratio}', '')::numeric, 0.90)
+        AS vram_usable_ratio,
+    count(g.gpu)::int AS gpu_count,
+    coalesce(
+        array_remove(array_agg(DISTINCT g.gpu->>'name') FILTER (WHERE g.gpu ? 'name'), NULL),
+        ARRAY[]::text[]
+    ) AS gpu_names,
+    coalesce(sum(NULLIF(g.gpu->>'memory_total_bytes', '')::numeric), 0)::bigint
+        AS gpu_mem_total_bytes,
+    coalesce(
+        floor(sum(NULLIF(g.gpu->>'memory_total_bytes', '')::numeric)
+            * coalesce(NULLIF(n.capacity #>> '{gpu,vram_usable_ratio}', '')::numeric, 0.90)),
+        0
+    )::bigint AS gpu_mem_usable_bytes,
+    coalesce(
+        max(floor(NULLIF(g.gpu->>'memory_total_bytes', '')::numeric
+            * coalesce(NULLIF(n.capacity #>> '{gpu,vram_usable_ratio}', '')::numeric, 0.90))),
+        0
+    )::bigint AS single_gpu_mem_usable_bytes,
+    coalesce(p.gpu_provisioned_bytes, 0)::bigint AS gpu_provisioned_bytes,
+    greatest(
+        coalesce(
+            floor(sum(NULLIF(g.gpu->>'memory_total_bytes', '')::numeric)
+                * coalesce(NULLIF(n.capacity #>> '{gpu,vram_usable_ratio}', '')::numeric, 0.90)),
+            0
+        )::bigint - coalesce(p.gpu_provisioned_bytes, 0)::bigint,
+        0
+    )::bigint AS gpu_available_bytes
+FROM rvbbit.warren_nodes n
+LEFT JOIN gpu_rows g ON g.node_id = n.node_id
+LEFT JOIN provisioned p ON p.node_id = n.node_id
+GROUP BY n.node_id, n.name, n.capacity, n.inventory, p.gpu_provisioned_bytes;
+
 CREATE OR REPLACE FUNCTION rvbbit.touch_warren_deployments_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -2857,10 +3043,18 @@ SELECT
     d.runtime_name,
     d.health,
     d.error,
-    d.updated_at AS deployment_updated_at
+    d.updated_at AS deployment_updated_at,
+    cap.gpu_names,
+    cap.vram_usable_ratio,
+    cap.gpu_mem_usable_bytes,
+    cap.single_gpu_mem_usable_bytes,
+    cap.gpu_provisioned_bytes,
+    cap.gpu_available_bytes
 FROM rvbbit.warren_nodes n
 LEFT JOIN rvbbit.warren_node_latest_metrics lm
   ON lm.node_id = n.node_id
+LEFT JOIN rvbbit.warren_gpu_capacity cap
+  ON cap.node_id = n.node_id
 LEFT JOIN rvbbit.warren_deployments d
   ON d.node_id = n.node_id
  AND d.status IN ('starting', 'running', 'failed');
@@ -3087,6 +3281,7 @@ DECLARE
     catalog_backend_name text;
     catalog_runtime_name text;
     catalog_operator_name text;
+    catalog_resource_doc jsonb;
     queued_job_id uuid;
 BEGIN
     IF catalog_id IS NULL OR btrim(catalog_id) = '' THEN
@@ -3096,14 +3291,20 @@ BEGIN
         RAISE EXCEPTION 'target_selector must be a JSON object';
     END IF;
 
-    SELECT manifest, name, backend_name, runtime_name, operators[1]
-    INTO catalog_manifest, catalog_name, catalog_backend_name, catalog_runtime_name, catalog_operator_name
+    SELECT manifest, name, backend_name, runtime_name, operators[1], resource_profile
+    INTO catalog_manifest, catalog_name, catalog_backend_name, catalog_runtime_name,
+         catalog_operator_name, catalog_resource_doc
     FROM rvbbit.capability_catalog
     WHERE id = btrim(catalog_id)
       AND active;
 
     IF catalog_manifest IS NULL THEN
         RAISE EXCEPTION 'active capability catalog entry % not found', catalog_id;
+    END IF;
+    IF jsonb_typeof(catalog_manifest->'resources') IS DISTINCT FROM 'object'
+       AND jsonb_typeof(catalog_resource_doc) = 'object'
+       AND catalog_resource_doc <> '{}'::jsonb THEN
+        catalog_manifest := catalog_manifest || jsonb_build_object('resources', catalog_resource_doc);
     END IF;
 
     queued_job_id := rvbbit.deploy_capability(
@@ -3141,20 +3342,54 @@ BEGIN
         WHERE n.name = claim_warren_job.node_name
           AND n.status IN ('ready', 'busy')
     ),
-    picked AS (
-        SELECT j.job_id
-        FROM rvbbit.warren_jobs j
-        CROSS JOIN node n
+	    picked AS (
+	        SELECT
+	            j.job_id,
+	            req.gpu_reservation_required,
+	            req.vram_required_bytes,
+	            req.gpu_placement,
+	            cap.gpu_available_bytes,
+	            cap.single_gpu_mem_usable_bytes
+	        FROM rvbbit.warren_jobs j
+	        CROSS JOIN node n
+	        LEFT JOIN rvbbit.warren_gpu_capacity cap
+	          ON cap.node_id = n.node_id
+	        CROSS JOIN LATERAL (
+	            SELECT
+	                (
+	                    rvbbit.capability_gpu_required(j.manifest)
+	                    OR coalesce(NULLIF(j.target_selector->>'gpu', '')::boolean, false)
+	                ) AS gpu_reservation_required,
+	                rvbbit.capability_vram_required_bytes(j.manifest) AS vram_required_bytes,
+	                coalesce(NULLIF(j.manifest #>> '{resources,gpu,placement}', ''), 'single_gpu') AS gpu_placement
+	        ) req
         WHERE j.status = 'queued'
           AND n.labels @> j.target_selector
+	          AND (
+	              NOT req.gpu_reservation_required
+	              OR req.vram_required_bytes IS NULL
+	              OR (
+	                  req.vram_required_bytes <= coalesce(cap.gpu_available_bytes, 0)
+	                  AND (
+	                      req.gpu_placement <> 'single_gpu'
+	                      OR req.vram_required_bytes <= coalesce(cap.single_gpu_mem_usable_bytes, 0)
+	                  )
+	              )
+	          )
         ORDER BY j.created_at
         LIMIT 1
-        FOR UPDATE SKIP LOCKED
+        FOR UPDATE OF j SKIP LOCKED
     ),
     updated AS (
         UPDATE rvbbit.warren_jobs j
         SET status = 'running',
             phase = 'claimed',
+            manifest = CASE
+                WHEN picked.gpu_reservation_required
+                     AND picked.vram_required_bytes IS NOT NULL
+                THEN jsonb_set(j.manifest, '{resources,gpu,reserved}', 'true'::jsonb, true)
+                ELSE j.manifest
+            END,
             claimed_by = claim_warren_job.node_name,
             claimed_at = clock_timestamp(),
             started_at = COALESCE(started_at, clock_timestamp()),
@@ -3162,8 +3397,13 @@ BEGIN
             progress = progress || jsonb_build_object(
                 'phase', 'claimed',
                 'node_name', claim_warren_job.node_name,
-                'claimed_at', clock_timestamp()
-            )
+                'claimed_at', clock_timestamp(),
+	                'gpu_reserved', picked.gpu_reservation_required,
+	                'gpu_placement', picked.gpu_placement,
+	                'vram_required_bytes', picked.vram_required_bytes,
+	                'gpu_available_bytes', picked.gpu_available_bytes,
+	                'single_gpu_mem_usable_bytes', picked.single_gpu_mem_usable_bytes
+	            )
         FROM picked
         WHERE j.job_id = picked.job_id
         RETURNING j.job_id, j.kind, j.desired_state, j.name, j.manifest,
@@ -3277,28 +3517,56 @@ BEGIN
         finished_at = clock_timestamp()
     WHERE warren_jobs.job_id = complete_warren_job.job_id;
 
-    INSERT INTO rvbbit.warren_deployments
-        (job_id, node_id, node_name, kind, name, status, endpoint_url,
-         backend_name, operator_name, runtime_name, manifest, compose_project, work_dir,
-         health, error)
-    VALUES
-        (complete_warren_job.job_id, actual_node_id, complete_warren_job.node_name,
-         actual_kind, actual_name, deployment_status, endpoint_url,
-         backend_name, operator_name, runtime_name, deploy_manifest, compose_project, work_dir,
-         health, NULL)
-    ON CONFLICT ON CONSTRAINT warren_deployments_job_id_key DO UPDATE SET
-        node_id = EXCLUDED.node_id,
-        node_name = EXCLUDED.node_name,
-        status = EXCLUDED.status,
-        endpoint_url = EXCLUDED.endpoint_url,
-        backend_name = EXCLUDED.backend_name,
-        operator_name = EXCLUDED.operator_name,
-        runtime_name = EXCLUDED.runtime_name,
-        manifest = EXCLUDED.manifest,
-        compose_project = EXCLUDED.compose_project,
-        work_dir = EXCLUDED.work_dir,
-        health = EXCLUDED.health,
-        error = NULL;
+    UPDATE rvbbit.warren_deployments AS d
+    SET job_id = complete_warren_job.job_id,
+        node_id = actual_node_id,
+        status = deployment_status,
+        endpoint_url = complete_warren_job.endpoint_url,
+        backend_name = complete_warren_job.backend_name,
+        operator_name = complete_warren_job.operator_name,
+        runtime_name = complete_warren_job.runtime_name,
+        manifest = complete_warren_job.deploy_manifest,
+        compose_project = complete_warren_job.compose_project,
+        work_dir = complete_warren_job.work_dir,
+        health = complete_warren_job.health,
+        error = NULL,
+        stopped_at = CASE
+            WHEN deployment_status IN ('starting', 'running') THEN NULL
+            ELSE coalesce(d.stopped_at, clock_timestamp())
+        END
+    WHERE d.node_name = complete_warren_job.node_name
+      AND d.kind = actual_kind
+      AND d.name = actual_name
+      AND d.status IN ('starting', 'running');
+
+    IF NOT FOUND THEN
+        INSERT INTO rvbbit.warren_deployments
+            (job_id, node_id, node_name, kind, name, status, endpoint_url,
+             backend_name, operator_name, runtime_name, manifest, compose_project, work_dir,
+             health, error)
+        VALUES
+            (complete_warren_job.job_id, actual_node_id, complete_warren_job.node_name,
+             actual_kind, actual_name, deployment_status, endpoint_url,
+             backend_name, operator_name, runtime_name, deploy_manifest, compose_project, work_dir,
+             health, NULL)
+        ON CONFLICT ON CONSTRAINT warren_deployments_job_id_key DO UPDATE SET
+            node_id = EXCLUDED.node_id,
+            node_name = EXCLUDED.node_name,
+            status = EXCLUDED.status,
+            endpoint_url = EXCLUDED.endpoint_url,
+            backend_name = EXCLUDED.backend_name,
+            operator_name = EXCLUDED.operator_name,
+            runtime_name = EXCLUDED.runtime_name,
+            manifest = EXCLUDED.manifest,
+            compose_project = EXCLUDED.compose_project,
+            work_dir = EXCLUDED.work_dir,
+            health = EXCLUDED.health,
+            error = NULL,
+            stopped_at = CASE
+                WHEN EXCLUDED.status IN ('starting', 'running') THEN NULL
+                ELSE coalesce(rvbbit.warren_deployments.stopped_at, clock_timestamp())
+            END;
+    END IF;
 END
 $cwjd$;
 

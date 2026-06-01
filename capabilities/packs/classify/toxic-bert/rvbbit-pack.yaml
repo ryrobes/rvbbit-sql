@@ -21,6 +21,14 @@ runtime:
   template: hf-rvbbit-fastapi
   handler: sequence_classification
   device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 437975136
+    vram_required_bytes: 547468920
+    headroom_pct: 25
+    estimate_source: huggingface_weights
 exports:
   backend: classify_toxic_bert
   operators:

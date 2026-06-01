@@ -15,6 +15,8 @@ services, and report endpoint/backend/runtime state back to the database.
 - Warren agents register themselves with labels such as `{"gpu": true}`.
 - SQL queues a deployment job with a target selector.
 - A matching Warren claims the job using `FOR UPDATE SKIP LOCKED`.
+- GPU-targeted jobs are admitted only when the node has enough unreserved VRAM
+  for the capability's `resources.gpu.vram_required_bytes` reservation.
 - The Warren builds from trusted local templates for bundled V1 packs, or
   pulls/runs a declared sidecar image when `runtime.image` is present.
 - Model capabilities call `rvbbit.register_backend(...)`,
@@ -102,6 +104,25 @@ SELECT rvbbit.record_warren_metrics(
 
 SELECT rvbbit.prune_warren_metrics('7 days'::interval);
 ```
+
+GPU capacity is exposed through:
+
+```sql
+SELECT
+  node_name,
+  gpu_names,
+  gpu_mem_usable_bytes,
+  gpu_provisioned_bytes,
+  gpu_available_bytes
+FROM rvbbit.warren_gpu_capacity;
+```
+
+The V1 scheduler uses a conservative VRAM yardstick. The agent reports GPU
+inventory from `nvidia-smi`; the database treats roughly 90% of each node's GPU
+memory as usable unless `warren_nodes.capacity.gpu.vram_usable_ratio` overrides
+it. Active deployments reserve their declared VRAM. For now the fit check is
+single-GPU conservative; multi-GPU packing can become more precise without
+changing the catalog-facing resource fields.
 
 Lower-level queue functions are available for custom flows:
 
@@ -321,8 +342,9 @@ has room for stronger policies:
 - `warren_nodes.shared_key_hash`: shared-secret or API-key verification later.
 - `warren_nodes.auth_config`: JSON policy/config surface for future mTLS,
   signed jobs, scoped node tokens, or per-tenant authorization.
-- `target_selector`: scheduling policy can grow from label matching to
-  resource-aware or tenant-aware matching without changing job shape.
+- `target_selector`: scheduling policy can grow beyond label matching and the
+  V1 VRAM reservation check into richer tenant or placement policy without
+  changing job shape.
 
 Do not expose Warren agents or generated model containers directly to the
 public internet in this prerelease shape.

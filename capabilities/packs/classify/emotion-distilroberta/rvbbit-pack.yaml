@@ -20,6 +20,14 @@ runtime:
   template: hf-rvbbit-fastapi
   handler: sequence_classification
   device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 328544361
+    vram_required_bytes: 410680452
+    headroom_pct: 25
+    estimate_source: huggingface_weights
 exports:
   backend: classify_emotion_distilroberta
   operators:

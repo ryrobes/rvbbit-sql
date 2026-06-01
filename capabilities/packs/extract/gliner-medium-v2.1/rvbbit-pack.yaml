@@ -22,6 +22,14 @@ runtime:
   template: hf-rvbbit-fastapi
   handler: gliner
   device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 780735696
+    vram_required_bytes: 975919620
+    headroom_pct: 25
+    estimate_source: huggingface_weights
 exports:
   backend: extract_gliner
   operators:

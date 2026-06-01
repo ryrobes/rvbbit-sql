@@ -19,6 +19,14 @@ runtime:
   template: hf-rvbbit-fastapi
   handler: zero_shot_classification
   device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 870182606
+    vram_required_bytes: 1087728258
+    headroom_pct: 25
+    estimate_source: huggingface_weights
 exports:
   backend: classify_deberta_zero_shot
   operators:

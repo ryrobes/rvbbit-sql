@@ -19,6 +19,14 @@ runtime:
   template: hf-rvbbit-fastapi
   handler: embedding
   device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 2273250020
+    vram_required_bytes: 2841562525
+    headroom_pct: 25
+    estimate_source: huggingface_weights
 exports:
   backend: embed_bge_m3
   operators:

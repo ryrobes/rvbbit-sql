@@ -51,6 +51,12 @@ SELECT
   gpu_util_pct,
   gpu_mem_used_bytes,
   gpu_mem_total_bytes,
+  gpu_names,
+  vram_usable_ratio,
+  gpu_mem_usable_bytes,
+  single_gpu_mem_usable_bytes,
+  gpu_provisioned_bytes,
+  gpu_available_bytes,
   deployment_id,
   kind,
   deployment_name,
@@ -80,7 +86,12 @@ Recommended node cards:
 | `capacity` | Human-readable resource summary when known. |
 | `cpu_pct`, `load1` | Small utilization indicators. |
 | `mem_used_bytes`, `mem_total_bytes` | Memory bar. |
-| `gpu_count`, `gpu_util_pct`, `gpu_mem_*` | GPU summary; hide or gray out when `gpu_count` is `0` or null. |
+| `gpu_count`, `gpu_util_pct`, `gpu_mem_*` | Live GPU summary; hide or gray out when `gpu_count` is `0` or null. |
+| `gpu_names` | GPU model names from `nvidia-smi`; show as tooltip or compact text. |
+| `gpu_mem_usable_bytes` | Usable VRAM after the node safety ratio, defaulting to 90%. |
+| `single_gpu_mem_usable_bytes` | Largest single-GPU slot after safety ratio; V1 placement is conservative single-GPU. |
+| `gpu_provisioned_bytes` | VRAM reserved by active Warren deployments on the node. |
+| `gpu_available_bytes` | Remaining VRAM available for new GPU-targeted capability claims. |
 | `deployment_*` | Active deployment rows under the node. |
 
 Heartbeat staleness is a UI policy. A practical default is:
@@ -142,17 +153,43 @@ Example GPU labels:
 {"capability": true, "docker": true, "gpu": true, "cuda": true, "region": "lab"}
 ```
 
-`capacity` is informational in v0. It is still useful for UI display and future
-placement features.
+`capacity` carries node-level capacity policy. For GPU Warrens, the agent
+reports GPU inventory through metrics; the database exposes a conservative
+provisioned-capacity view using a default 90% usable VRAM ratio. Override the
+ratio per node with `capacity.gpu.vram_usable_ratio`.
 
 Example capacity:
 
 ```json
-{"vram_gb": 24, "slots": 2, "disk_gb": 500}
+{"gpu": {"vram_usable_ratio": 0.9}, "disk_gb": 500}
 ```
 
 `inventory` is updated from metrics when GPU data is available. It is an array
 so multiple GPUs can be represented.
+
+Use `rvbbit.warren_gpu_capacity` for a compact node-level capacity table:
+
+```sql
+SELECT
+  node_name,
+  gpu_count,
+  gpu_names,
+  gpu_mem_total_bytes,
+  gpu_mem_usable_bytes,
+  single_gpu_mem_usable_bytes,
+  gpu_provisioned_bytes,
+  gpu_available_bytes
+FROM rvbbit.warren_gpu_capacity
+ORDER BY node_name;
+```
+
+For V1, admission control is intentionally VRAM-only. A capability reserves
+VRAM when `manifest.resources.gpu.required = true` or the deploy target
+selector contains `"gpu": true`. If `vram_required_bytes` is present, a Warren
+only claims the job when `gpu_available_bytes` can fit it. For
+`resources.gpu.placement = "single_gpu"` (the default), the claim also requires
+the estimate to fit inside `single_gpu_mem_usable_bytes`, so a dual-GPU node is
+not treated as one larger card.
 
 ## Job Queue
 

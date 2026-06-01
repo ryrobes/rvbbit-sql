@@ -48,6 +48,16 @@
       "pack_manifest_path": "capabilities/packs/classify/deberta-v3-base-zero-shot/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/classify/deberta-v3-base-zero-shot",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 368871908,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 461089885
+        }
+      },
       "runtime_handler": "zero_shot_classification",
       "runtime_image": null,
       "runtime_language": null,
@@ -125,6 +135,16 @@
       "pack_manifest_path": "capabilities/packs/classify/deberta-v3-zero-shot/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/classify/deberta-v3-zero-shot",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 870182606,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 1087728258
+        }
+      },
       "runtime_handler": "zero_shot_classification",
       "runtime_image": null,
       "runtime_language": null,
@@ -191,6 +211,16 @@
       "pack_manifest_path": "capabilities/packs/classify/emotion-distilroberta/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/classify/emotion-distilroberta",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 328544361,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 410680452
+        }
+      },
       "runtime_handler": "sequence_classification",
       "runtime_image": null,
       "runtime_language": null,
@@ -256,6 +286,16 @@
       "pack_manifest_path": "capabilities/packs/classify/language-detection-xlm-roberta/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/classify/language-detection-xlm-roberta",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 1112264584,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 1390330730
+        }
+      },
       "runtime_handler": "sequence_classification",
       "runtime_image": null,
       "runtime_language": null,
@@ -323,6 +363,16 @@
       "pack_manifest_path": "capabilities/packs/classify/toxic-bert/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/classify/toxic-bert",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 437975136,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 547468920
+        }
+      },
       "runtime_handler": "sequence_classification",
       "runtime_image": null,
       "runtime_language": null,
@@ -391,6 +441,16 @@
       "pack_manifest_path": "capabilities/packs/classify/twitter-roberta-sentiment/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/classify/twitter-roberta-sentiment",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 501045531,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 626306914
+        }
+      },
       "runtime_handler": "sequence_classification",
       "runtime_image": null,
       "runtime_language": null,
@@ -457,6 +517,16 @@
       "pack_manifest_path": "capabilities/packs/embeddings/bge-m3/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/embeddings/bge-m3",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 2273250020,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 2841562525
+        }
+      },
       "runtime_handler": "embedding",
       "runtime_image": null,
       "runtime_language": null,
@@ -522,6 +592,16 @@
       "pack_manifest_path": "capabilities/packs/embeddings/bge-small-en-v1.5/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/embeddings/bge-small-en-v1.5",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 133466304,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 166832880
+        }
+      },
       "runtime_handler": "embedding",
       "runtime_image": null,
       "runtime_language": null,
@@ -586,6 +666,16 @@
       "pack_manifest_path": "capabilities/packs/embeddings/e5-small-v2/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/embeddings/e5-small-v2",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 133466304,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 166832880
+        }
+      },
       "runtime_handler": "embedding",
       "runtime_image": null,
       "runtime_language": null,
@@ -655,6 +745,16 @@
       "pack_manifest_path": "capabilities/packs/extract/gliner-medium-v2.1/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/extract/gliner-medium-v2.1",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 780735696,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 975919620
+        }
+      },
       "runtime_handler": "gliner",
       "runtime_image": null,
       "runtime_language": null,
@@ -726,6 +826,16 @@
       "pack_manifest_path": "capabilities/packs/rerank/bge-reranker-base/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/rerank/bge-reranker-base",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 1112206140,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 1390257675
+        }
+      },
       "runtime_handler": "sequence_classification",
       "runtime_image": null,
       "runtime_language": null,
@@ -795,6 +905,16 @@
       "pack_manifest_path": "capabilities/packs/rerank/bge-reranker-v2-m3/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/rerank/bge-reranker-v2-m3",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 2271071852,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 2838839815
+        }
+      },
       "runtime_handler": "sequence_classification",
       "runtime_image": null,
       "runtime_language": null,
@@ -864,6 +984,16 @@
       "pack_manifest_path": "capabilities/packs/rerank/ms-marco-minilm-l6-v2/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/rerank/ms-marco-minilm-l6-v2",
       "repo_url": null,
+      "resources": {
+        "gpu": {
+          "estimate_source": "huggingface_weights",
+          "headroom_pct": 25,
+          "model_size_bytes": 90870598,
+          "placement": "single_gpu",
+          "required": false,
+          "vram_required_bytes": 113588248
+        }
+      },
       "runtime_handler": "sequence_classification",
       "runtime_image": null,
       "runtime_language": null,
@@ -943,6 +1073,7 @@
       "pack_manifest_path": "capabilities/packs/runtimes/mcp-gateway/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/runtimes/mcp-gateway",
       "repo_url": null,
+      "resources": {},
       "runtime_handler": "mcp_gateway",
       "runtime_image": null,
       "runtime_language": "mcp",
@@ -1019,6 +1150,7 @@
       "pack_manifest_path": "capabilities/packs/runtimes/python-runtime/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/runtimes/python-runtime",
       "repo_url": null,
+      "resources": {},
       "runtime_handler": "python_runtime",
       "runtime_image": null,
       "runtime_language": "python",
@@ -1092,6 +1224,7 @@
       "pack_manifest_path": "capabilities/packs/smoke/warren-echo/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/smoke/warren-echo",
       "repo_url": null,
+      "resources": {},
       "runtime_handler": "echo",
       "runtime_image": null,
       "runtime_language": null,
@@ -1157,6 +1290,7 @@
       "pack_manifest_path": "capabilities/packs/tabular/california-housing-sklearn/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/tabular/california-housing-sklearn",
       "repo_url": null,
+      "resources": {},
       "runtime_handler": "tabular_regression",
       "runtime_image": null,
       "runtime_language": null,
@@ -1225,6 +1359,7 @@
       "pack_manifest_path": "capabilities/packs/tabular/wine-quality-sklearn/rvbbit-pack.yaml",
       "pack_path": "capabilities/packs/tabular/wine-quality-sklearn",
       "repo_url": null,
+      "resources": {},
       "runtime_handler": "tabular_classification",
       "runtime_image": null,
       "runtime_language": null,

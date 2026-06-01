@@ -202,6 +202,29 @@ def test_operator_runtime_packs_are_flagged():
     assert not bad, "operator runtime packs missing system-runtime metadata: " + ", ".join(bad)
 
 
+def test_huggingface_model_packs_publish_gpu_weight_estimates():
+    missing: list[str] = []
+    invalid: list[str] = []
+    for path, pack in _pack_docs():
+        source = pack.get("source") or {}
+        runtime = pack.get("runtime") or {}
+        if source.get("provider") != "huggingface" or runtime.get("device") == "cpu":
+            continue
+        gpu = ((pack.get("resources") or {}).get("gpu") or {})
+        if not gpu:
+            missing.append(str(path.relative_to(PACKS.parent.parent)))
+            continue
+        if (
+            gpu.get("placement") != "single_gpu"
+            or int(gpu.get("model_size_bytes") or 0) <= 0
+            or int(gpu.get("vram_required_bytes") or 0) <= int(gpu.get("model_size_bytes") or 0)
+        ):
+            invalid.append(str(path.relative_to(PACKS.parent.parent)))
+
+    assert not missing, "HF model packs missing resources.gpu estimates: " + ", ".join(missing)
+    assert not invalid, "invalid resources.gpu estimates: " + ", ".join(invalid)
+
+
 def test_mcp_gateway_pack_is_self_contained():
     pack_dir = PACKS / "runtimes" / "mcp-gateway"
     required = {
