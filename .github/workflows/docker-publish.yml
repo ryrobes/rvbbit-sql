@@ -1,9 +1,9 @@
-name: Publish pg_rvbbit image
+name: Publish Rvbbit images
 
-# Builds the postgres:18 + pg_rvbbit extension image and pushes it to GHCR.
+# Builds Rvbbit images and pushes them to GHCR.
 # Tags:
 #   - push to main           -> ghcr.io/<owner>/rvbbit-postgres:main, :sha-<short>
-#   - push of git tag vX.Y.Z -> ghcr.io/<owner>/rvbbit-postgres:vX.Y.Z, :X.Y, :X, :latest, :pg18-X.Y.Z
+#   - push of git tag vX.Y.Z -> full release image set via scripts/release/build-and-push.sh
 
 on:
   push:
@@ -50,6 +50,7 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -66,13 +67,29 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Install release script dependencies
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python -m pip install PyYAML
+
+      - name: Build and push release image set
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          scripts/release/build-and-push.sh \
+            --version "$VERSION" \
+            --namespace "${{ github.repository_owner }}" \
+            --push \
+            --tag-latest \
+            --skip-lens
+
       # On tag pushes, also produce the standalone install tarball and
       # attach it to the GitHub Release. We pull the just-pushed image and
       # tag it with the name `make package` expects, then run packaging.
       - name: Build release tarball
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          IMG="$(echo "${{ steps.meta.outputs.tags }}" | head -n1)"
+          VERSION="${GITHUB_REF_NAME#v}"
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}"
           docker pull "$IMG"
           docker tag "$IMG" docker-pg-rvbbit:latest
           make package-extract PG_VERSION=18

@@ -26,6 +26,26 @@ pre-configured. The published tags follow `vMAJOR.MINOR.PATCH`,
 
 To pin a version: `ghcr.io/ryrobes/rvbbit-postgres:0.56.0`.
 
+### Full clean-slate stack
+
+For a single-host install that includes Postgres, Lens, and a Warren agent:
+
+```bash
+RVBBIT_VERSION=1.0.0 \
+docker compose -f docker/docker-compose.release.yml up -d
+```
+
+This uses published images only:
+
+- `ghcr.io/ryrobes/rvbbit-postgres:<version>`
+- `ghcr.io/ryrobes/rvbbit-lens:<version>`
+- `ghcr.io/ryrobes/rvbbit-warren-agent:<version>`
+- one versioned image per built-in Warren capability
+
+The Warren service mounts `/var/run/docker.sock` so it can launch capability
+containers on the local Docker host. See `docs/RELEASE_IMAGES.md` for the full
+image matrix and release script.
+
 ## 2. Release tarball (for installing into existing PG18 hosts)
 
 Download a release archive from

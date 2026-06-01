@@ -7,6 +7,7 @@ JSON pack/manifests work with the Python standard library.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import json
 import os
@@ -732,6 +733,60 @@ def gpu_resource_fields(resources: dict[str, Any], device: str | None) -> dict[s
     }
 
 
+def capability_image_name(entry: dict[str, Any]) -> str:
+    catalog_id = str(entry.get("id") or "")
+    if catalog_id == "runtimes/python-runtime":
+        return "rvbbit-python-runtime"
+    if catalog_id == "runtimes/mcp-gateway":
+        return "rvbbit-mcp-gateway"
+    if catalog_id == "smoke/warren-echo":
+        return "rvbbit-warren-smoke-echo"
+    name = str(entry.get("name") or catalog_id).strip().lower()
+    name = re.sub(r"[^a-z0-9]+", "-", name).strip("-")
+    if not name:
+        name = "capability"
+    return f"rvbbit-capability-{name}"
+
+
+def capability_image_ref(
+    entry: dict[str, Any],
+    image_prefix: str | None,
+    image_tag: str | None,
+) -> str | None:
+    if not image_prefix:
+        return None
+    prefix = image_prefix.rstrip("/")
+    tag = image_tag or "latest"
+    return f"{prefix}/{capability_image_name(entry)}:{tag}"
+
+
+def image_release_entry_manifest(
+    entry: dict[str, Any],
+    manifest: dict[str, Any],
+    image_prefix: str | None,
+    image_tag: str | None,
+    pull_policy: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    image = capability_image_ref(entry, image_prefix, image_tag)
+    if not image:
+        return entry, manifest
+    release_entry = copy.deepcopy(entry)
+    release_manifest = copy.deepcopy(manifest)
+
+    runtime = release_manifest.setdefault("runtime", {})
+    if not isinstance(runtime, dict):
+        runtime = {}
+        release_manifest["runtime"] = runtime
+    runtime["mode"] = "image"
+    runtime["image"] = image
+    runtime["pull_policy"] = pull_policy
+
+    release_entry["runtime_mode"] = "image"
+    release_entry["install_mode"] = "image"
+    release_entry["runtime_image"] = image
+    return release_entry, release_manifest
+
+
 def catalog_entry(
     path: Path,
     root: Path,
@@ -858,18 +913,32 @@ def iter_catalog_manifests(root: Path):
         yield path, manifest, catalog_entry(path, root, manifest)
 
 
-def load_catalog(root: Path) -> list[dict[str, Any]]:
+def load_catalog(
+    root: Path,
+    image_prefix: str | None = None,
+    image_tag: str | None = None,
+    image_pull_policy: str = "missing",
+) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
-    for _path, _manifest, entry in iter_catalog_manifests(root):
+    for _path, manifest, entry in iter_catalog_manifests(root):
+        entry, _manifest = image_release_entry_manifest(
+            entry, manifest, image_prefix, image_tag, image_pull_policy
+        )
         entries.append(entry)
     return entries
 
 
-def catalog_doc(root: Path, include_timestamp: bool = False) -> dict[str, Any]:
+def catalog_doc(
+    root: Path,
+    include_timestamp: bool = False,
+    image_prefix: str | None = None,
+    image_tag: str | None = None,
+    image_pull_policy: str = "missing",
+) -> dict[str, Any]:
     doc: dict[str, Any] = {
         "schema_version": 1,
         "catalog_layout": "rvbbit.pack/v1",
-        "capabilities": load_catalog(root),
+        "capabilities": load_catalog(root, image_prefix, image_tag, image_pull_policy),
     }
     if include_timestamp:
         from datetime import datetime, timezone
@@ -878,9 +947,18 @@ def catalog_doc(root: Path, include_timestamp: bool = False) -> dict[str, Any]:
     return doc
 
 
-def catalog_seed_doc(root: Path, source: str) -> dict[str, Any]:
+def catalog_seed_doc(
+    root: Path,
+    source: str,
+    image_prefix: str | None = None,
+    image_tag: str | None = None,
+    image_pull_policy: str = "missing",
+) -> dict[str, Any]:
     entries = []
     for _path, manifest, entry in iter_catalog_manifests(root):
+        entry, manifest = image_release_entry_manifest(
+            entry, manifest, image_prefix, image_tag, image_pull_policy
+        )
         entries.append(
             {
                 "catalog_entry": entry,
@@ -1360,7 +1438,13 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 def cmd_catalog_build(args: argparse.Namespace) -> None:
-    doc = catalog_doc(Path(args.root), include_timestamp=args.timestamp)
+    doc = catalog_doc(
+        Path(args.root),
+        include_timestamp=args.timestamp,
+        image_prefix=args.image_prefix,
+        image_tag=args.image_tag,
+        image_pull_policy=args.image_pull_policy,
+    )
     text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     if args.output:
         Path(args.output).write_text(text)
@@ -1369,7 +1453,13 @@ def cmd_catalog_build(args: argparse.Namespace) -> None:
 
 
 def cmd_catalog_seed_json(args: argparse.Namespace) -> None:
-    doc = catalog_seed_doc(Path(args.root), args.source)
+    doc = catalog_seed_doc(
+        Path(args.root),
+        args.source,
+        image_prefix=args.image_prefix,
+        image_tag=args.image_tag,
+        image_pull_policy=args.image_pull_policy,
+    )
     text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     if args.output:
         Path(args.output).write_text(text)
@@ -1598,6 +1688,12 @@ def main(argv: list[str]) -> int:
     p_catalog_build.add_argument("--root", default=str(PACKS))
     p_catalog_build.add_argument("--output", "-o")
     p_catalog_build.add_argument("--timestamp", action="store_true")
+    p_catalog_build.add_argument(
+        "--image-prefix",
+        help="emit image-mode runtime refs with this registry namespace, e.g. ghcr.io/ryrobes",
+    )
+    p_catalog_build.add_argument("--image-tag", default="latest")
+    p_catalog_build.add_argument("--image-pull-policy", default="missing")
     p_catalog_build.set_defaults(func=cmd_catalog_build)
 
     p_catalog_search = catalog_sub.add_parser("search", help="search curated manifests")
@@ -1609,6 +1705,12 @@ def main(argv: list[str]) -> int:
     p_catalog_seed.add_argument("--root", default=str(PACKS))
     p_catalog_seed.add_argument("--source", default="curated")
     p_catalog_seed.add_argument("--output")
+    p_catalog_seed.add_argument(
+        "--image-prefix",
+        help="emit image-mode runtime refs with this registry namespace, e.g. ghcr.io/ryrobes",
+    )
+    p_catalog_seed.add_argument("--image-tag", default="latest")
+    p_catalog_seed.add_argument("--image-pull-policy", default="missing")
     p_catalog_seed.set_defaults(func=cmd_catalog_seed_json)
 
     p_catalog_publish = catalog_sub.add_parser("publish", help="publish catalog into Postgres")

@@ -1,0 +1,51 @@
+FROM rust:1.95-bookworm AS builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/pg_rvbbit/Cargo.toml crates/pg_rvbbit/Cargo.toml
+COPY crates/rvbbit_storage/Cargo.toml crates/rvbbit_storage/Cargo.toml
+COPY warren/agent/Cargo.toml warren/agent/Cargo.toml
+RUN mkdir -p crates/pg_rvbbit/src crates/rvbbit_storage/src warren/agent/src \
+    && echo 'fn main() {}' > warren/agent/src/main.rs \
+    && echo 'fn _stub() {}' > crates/rvbbit_storage/src/lib.rs \
+    && echo 'use pgrx::prelude::*; ::pgrx::pg_module_magic!();' > crates/pg_rvbbit/src/lib.rs
+COPY warren/agent/src warren/agent/src
+RUN cargo build --release --locked -p warren-agent
+
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive
+ENV WARREN_TEMPLATE_DIR=/usr/share/rvbbit/capabilities/templates
+ENV WARREN_WORK_DIR=/var/lib/rvbbit/warren
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg \
+        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && arch="$TARGETARCH"; \
+       case "$arch" in \
+         amd64) deb_arch=amd64 ;; \
+         arm64) deb_arch=arm64 ;; \
+         *) deb_arch="$(dpkg --print-architecture)" ;; \
+       esac; \
+       echo "deb [arch=${deb_arch} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        docker-ce-cli \
+        docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --home-dir /var/lib/rvbbit/warren --shell /usr/sbin/nologin warren \
+    && install -d -o warren -g warren -m 0750 /var/lib/rvbbit/warren \
+    && install -d -m 0755 /usr/share/rvbbit/capabilities/templates
+
+COPY --from=builder /build/target/release/warren-agent /usr/local/bin/warren-agent
+COPY capabilities/templates/ /usr/share/rvbbit/capabilities/templates/
+
+WORKDIR /var/lib/rvbbit/warren
+ENTRYPOINT ["warren-agent"]

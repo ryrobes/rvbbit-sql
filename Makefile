@@ -1,6 +1,8 @@
 COMPOSE := docker compose -f docker/docker-compose.yml
 COMPOSE_SIDECARS := docker compose -f docker/docker-compose.yml -f docker/docker-compose.sidecars.yml
 RVBBIT_VERSION ?= $(shell awk -F'"' '/^version[[:space:]]*=/ {print $$2; exit}' Cargo.toml)
+RELEASE_VERSION ?= $(RVBBIT_VERSION)
+IMAGE_NAMESPACE ?= ryrobes
 PYTHON_RUNTIME_IMAGE ?= rvbbit/python-runtime:local
 MCP_GATEWAY_IMAGE ?= rvbbit/mcp-gateway:local
 
@@ -12,7 +14,8 @@ MCP_GATEWAY_IMAGE ?= rvbbit/mcp-gateway:local
         bigfoot-kg-demo capabilities-list capability-render capability-catalog \
         capability-catalog-seed capability-catalog-db \
         capability-scaffold capability-install capability-deploy capability-test \
-        capability-test-all warren-agent warren-once
+        capability-test-all warren-agent warren-once \
+        release-bump release-build release-push release-compose-up
 
 RVBBIT_DSN ?= postgresql://postgres:rvbbit@localhost:55433/bench
 WARREN_NODE ?= local-warren
@@ -286,6 +289,24 @@ warren-once: ## Claim at most one Warren job, useful for smoke/debug
 	  --capacity '$(WARREN_CAPACITY)' \
 	  --metrics-ms '$(WARREN_METRICS_MS)' \
 	  --once
+
+release-bump: ## Bump Cargo/control/Lens versions (RELEASE_VERSION=x.y.z)
+	scripts/release/bump-version.py '$(RELEASE_VERSION)'
+
+release-build: ## Build release images locally (RELEASE_VERSION=x.y.z)
+	scripts/release/build-and-push.sh \
+	  --version '$(RELEASE_VERSION)' \
+	  --namespace '$(IMAGE_NAMESPACE)'
+
+release-push: ## Build and push release images to GHCR (RELEASE_VERSION=x.y.z)
+	scripts/release/build-and-push.sh \
+	  --version '$(RELEASE_VERSION)' \
+	  --namespace '$(IMAGE_NAMESPACE)' \
+	  --push \
+	  --tag-latest
+
+release-compose-up: ## Start the published-image clean-slate stack
+	RVBBIT_VERSION='$(RELEASE_VERSION)' docker compose -f docker/docker-compose.release.yml up -d
 
 clean:           ## Remove built artifacts
 	cargo clean

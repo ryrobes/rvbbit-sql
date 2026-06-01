@@ -266,6 +266,45 @@ def test_catalog_json_flattens_gpu_weight_estimates():
     assert not bad, "catalog JSON must expose flattened GPU weight estimates: " + "; ".join(bad)
 
 
+def test_release_catalog_can_emit_image_mode_runtimes():
+    proc = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "catalog",
+            "seed-json",
+            "--root",
+            str(PACKS),
+            "--image-prefix",
+            "ghcr.io/ryrobes",
+            "--image-tag",
+            "9.9.9",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    doc = json.loads(proc.stdout)
+    by_id = {entry["catalog_entry"]["id"]: entry for entry in doc["capabilities"]}
+
+    python_runtime = by_id["runtimes/python-runtime"]
+    assert python_runtime["catalog_entry"]["runtime_mode"] == "image"
+    assert python_runtime["catalog_entry"]["runtime_image"] == (
+        "ghcr.io/ryrobes/rvbbit-python-runtime:9.9.9"
+    )
+    assert python_runtime["capability_manifest"]["runtime"]["mode"] == "image"
+    assert python_runtime["capability_manifest"]["runtime"]["image"] == (
+        "ghcr.io/ryrobes/rvbbit-python-runtime:9.9.9"
+    )
+
+    reranker = by_id["rerank/bge-reranker-base"]
+    assert reranker["catalog_entry"]["runtime_image"] == (
+        "ghcr.io/ryrobes/rvbbit-capability-bge-reranker-base:9.9.9"
+    )
+    assert reranker["capability_manifest"]["runtime"]["image"] == (
+        "ghcr.io/ryrobes/rvbbit-capability-bge-reranker-base:9.9.9"
+    )
+
+
 def test_mcp_gateway_pack_is_self_contained():
     pack_dir = PACKS / "runtimes" / "mcp-gateway"
     required = {
