@@ -23,6 +23,8 @@ exports:
   backend: embed_bge_m3
   operators:
   - embed_bge_m3
+  - semantic_embed
+  - similar_to
 install:
   mode: build
   warren: true
@@ -38,6 +40,7 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          score float8;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -51,6 +54,19 @@ acceptance:
 
           IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN
               RAISE EXCEPTION 'unexpected BGE-M3 embedding shape: %', left(result::text, 200);
+          END IF;
+
+          SELECT rvbbit.semantic_embed('query: suspicious movement near a wooded creek') INTO result;
+          IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN
+              RAISE EXCEPTION 'unexpected semantic_embed BGE-M3 shape: %', left(result::text, 200);
+          END IF;
+
+          SELECT rvbbit.similar_to(
+              'refund request from angry customer',
+              'customer wants money back after duplicate charge'
+          ) INTO score;
+          IF score < 0 OR score > 1 THEN
+              RAISE EXCEPTION 'bundled similar_to score out of range: %', score;
           END IF;
       END
       $$;

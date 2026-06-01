@@ -24,6 +24,18 @@ exports:
   operators:
   - classify_zero_shot
   - classify_row_zero_shot
+  - classify
+  - semantic_classify
+  - bucket
+  - intent
+  - audience
+  - domain
+  - formality
+  - complexity
+  - stance
+  - looks_like
+  - contradicts
+  - implies
 install:
   mode: build
   warren: true
@@ -39,6 +51,8 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          label text;
+          flag bool;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -61,6 +75,92 @@ acceptance:
           END IF;
           IF NOT (result->>'label' = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN
               RAISE EXCEPTION 'zero-shot label was outside candidate set: %', result;
+          END IF;
+
+          SELECT rvbbit.classify(
+              'the delivery arrived late and the customer wants a refund',
+              'billing,shipping,product_quality,cancellation'
+          ) INTO label;
+          IF NOT (label = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN
+              RAISE EXCEPTION 'bundled classify label was outside candidate set: %', label;
+          END IF;
+
+          SELECT rvbbit.intent('the delivery arrived late and the customer wants a refund') INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'bundled intent operator returned empty label';
+          END IF;
+
+          SELECT rvbbit.classify_row_zero_shot(
+              '{"ticket":"the delivery arrived late and the customer wants a refund","channel":"email"}'::jsonb,
+              'billing,shipping,product_quality,cancellation'
+          ) INTO result;
+          IF jsonb_typeof(result) <> 'object'
+             OR NOT (result ? 'label')
+             OR NOT (result ? 'score')
+             OR NOT (result ? 'scores') THEN
+              RAISE EXCEPTION 'unexpected row zero-shot result shape: %', result;
+          END IF;
+          IF NOT (result->>'label' = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN
+              RAISE EXCEPTION 'row zero-shot label was outside candidate set: %', result;
+          END IF;
+
+          SELECT rvbbit.semantic_classify(
+              'the delivery arrived late and the customer wants a refund',
+              'billing,shipping,product_quality,cancellation'
+          ) INTO label;
+          IF NOT (label = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN
+              RAISE EXCEPTION 'bundled semantic_classify label was outside candidate set: %', label;
+          END IF;
+
+          SELECT rvbbit.bucket(
+              'the delivery arrived late and the customer wants a refund',
+              'billing,shipping,product_quality,cancellation'
+          ) INTO label;
+          IF NOT (label = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN
+              RAISE EXCEPTION 'bundled bucket label was outside candidate set: %', label;
+          END IF;
+
+          SELECT rvbbit.audience('This executive summary recommends a warehouse staffing change.') INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'bundled audience operator returned empty label';
+          END IF;
+
+          SELECT rvbbit.domain('The patient portal failed to send lab-result notifications.') INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'bundled domain operator returned empty label';
+          END IF;
+
+          SELECT rvbbit.formality('Could you please review the attached contract amendment?') INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'bundled formality operator returned empty label';
+          END IF;
+
+          SELECT rvbbit.complexity('The retry queue drains messages once downstream latency recovers.') INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'bundled complexity operator returned empty label';
+          END IF;
+
+          SELECT rvbbit.stance(
+              'The memo recommends approving the data-retention policy.',
+              'data-retention policy'
+          ) INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'bundled stance operator returned empty label';
+          END IF;
+
+          SELECT rvbbit.looks_like('support ticket: customer asks for refund', 'customer support ticket') INTO flag;
+          IF flag IS NULL THEN
+              RAISE EXCEPTION 'bundled looks_like operator returned NULL';
+          END IF;
+
+          SELECT rvbbit.contradicts('The order shipped Monday.', 'The order never shipped.') INTO flag;
+          IF flag IS NULL THEN
+              RAISE EXCEPTION 'bundled contradicts operator returned NULL';
+          END IF;
+
+          SELECT rvbbit.implies('The invoice is overdue by 45 days.', 'The invoice is late.') INTO flag;
+          IF flag IS NULL THEN
+              RAISE EXCEPTION 'bundled implies operator returned NULL';
           END IF;
       END
       $$;

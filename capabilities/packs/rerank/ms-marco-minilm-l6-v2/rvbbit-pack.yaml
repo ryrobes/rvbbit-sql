@@ -25,6 +25,10 @@ exports:
   operators:
   - rerank_ms_marco_score
   - rerank_ms_marco_row
+  - about
+  - semantic_score
+  - means
+  - semantic_matches
 install:
   mode: build
   warren: true
@@ -40,6 +44,8 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          score float8;
+          matched bool;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -59,6 +65,50 @@ acceptance:
           END IF;
           IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
               RAISE EXCEPTION 'reranker score out of range: %', result;
+          END IF;
+
+          SELECT rvbbit.rerank_ms_marco_row(
+              'billing refund',
+              '{"ticket":"customer was charged twice and asks for their money back","queue":"billing"}'::jsonb
+          ) INTO result;
+          IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN
+              RAISE EXCEPTION 'unexpected MS MARCO reranker row result shape: %', result;
+          END IF;
+          IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
+              RAISE EXCEPTION 'reranker row score out of range: %', result;
+          END IF;
+
+          SELECT rvbbit.about(
+              'customer was charged twice and asks for their money back',
+              'billing refund'
+          ) INTO score;
+          IF score < 0 OR score > 1 THEN
+              RAISE EXCEPTION 'bundled about operator score out of range: %', score;
+          END IF;
+
+          SELECT rvbbit.semantic_score(
+              'customer was charged twice and asks for their money back',
+              'billing refund'
+          ) INTO score;
+          IF score < 0 OR score > 1 THEN
+              RAISE EXCEPTION 'bundled semantic_score out of range: %', score;
+          END IF;
+
+          SELECT rvbbit.means(
+              'customer was charged twice and asks for their money back',
+              'billing refund'
+          ) INTO matched;
+          IF matched IS NULL THEN
+              RAISE EXCEPTION 'bundled means operator returned NULL';
+          END IF;
+
+          SELECT rvbbit.semantic_matches(
+              'customer was charged twice and asks for their money back',
+              'billing refund',
+              '{"threshold":0.1}'::jsonb
+          ) INTO matched;
+          IF matched IS NULL THEN
+              RAISE EXCEPTION 'bundled semantic_matches operator returned NULL';
           END IF;
       END
       $$;

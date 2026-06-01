@@ -5,6 +5,7 @@ title: Wine Quality Classifier
 description: Scikit-learn tabular classification example that predicts red wine quality classes from numeric
   row features.
 license: unknown
+catalog_visibility: example
 tags:
 - tabular
 - classify
@@ -26,6 +27,8 @@ exports:
   backend: predict_wine_quality_sklearn
   operators:
   - predict_wine_quality
+  - wine_quality
+  - wine_quality_confidence
 install:
   mode: build
   warren: true
@@ -41,6 +44,8 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          label text;
+          score float8;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -58,6 +63,20 @@ acceptance:
              OR NOT (result ? 'label')
              OR NOT (result ? 'prediction') THEN
               RAISE EXCEPTION 'unexpected wine prediction shape: %', result;
+          END IF;
+
+          SELECT rvbbit.wine_quality(
+              '{"fixed acidity":7.4,"volatile acidity":0.7,"citric acid":0.0,"residual sugar":1.9,"chlorides":0.076,"free sulfur dioxide":11,"total sulfur dioxide":34,"density":0.9978,"pH":3.51,"sulphates":0.56,"alcohol":9.4}'::jsonb
+          ) INTO label;
+          IF label IS NULL OR label = '' THEN
+              RAISE EXCEPTION 'bundled wine_quality operator returned empty label';
+          END IF;
+
+          SELECT rvbbit.wine_quality_confidence(
+              '{"fixed acidity":7.4,"volatile acidity":0.7,"citric acid":0.0,"residual sugar":1.9,"chlorides":0.076,"free sulfur dioxide":11,"total sulfur dioxide":34,"density":0.9978,"pH":3.51,"sulphates":0.56,"alcohol":9.4}'::jsonb
+          ) INTO score;
+          IF score < 0 OR score > 1 THEN
+              RAISE EXCEPTION 'bundled wine_quality_confidence out of range: %', score;
           END IF;
       END
       $$;

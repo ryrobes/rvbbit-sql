@@ -28,6 +28,7 @@ SEQUENCE_MODE = os.environ.get("RVBBIT_SEQUENCE_MODE", "auto").lower()
 EAGER = os.environ.get("RVBBIT_CAPABILITY_EAGER", "1") == "1"
 
 _loaded: dict[str, Any] = {}
+_startup_error: str | None = None
 
 
 class PredictRequest(BaseModel):
@@ -462,10 +463,12 @@ def predict_batch(inputs: list[dict[str, Any]]) -> list[Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _startup_error
     if EAGER:
         try:
             predict_batch([{"text": "warmup", "labels": ["entity"]}])
         except Exception as exc:
+            _startup_error = repr(exc)
             print(f"[rvbbit-capability] eager warmup failed: {exc}", flush=True)
     yield
 
@@ -486,6 +489,17 @@ def predict(
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    if _startup_error:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "ok": False,
+                "error": _startup_error,
+                "model": MODEL_NAME,
+                "revision": MODEL_REVISION,
+                "handler": HANDLER,
+            },
+        )
     return {
         "ok": True,
         "model": MODEL_NAME,

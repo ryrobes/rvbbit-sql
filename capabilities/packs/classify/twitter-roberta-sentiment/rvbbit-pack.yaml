@@ -26,6 +26,8 @@ exports:
   operators:
   - classify_sentiment
   - classify_row_sentiment
+  - sentiment
+  - sentiment_confidence
 install:
   mode: build
   warren: true
@@ -41,6 +43,8 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          label text;
+          score float8;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -59,6 +63,28 @@ acceptance:
           END IF;
           IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
               RAISE EXCEPTION 'sentiment score out of range: %', result;
+          END IF;
+
+          SELECT rvbbit.classify_row_sentiment(
+              '{"review":"the setup was simple and the dashboard is fantastic","stars":5,"plan":"pro"}'::jsonb
+          ) INTO result;
+          IF jsonb_typeof(result) <> 'object'
+             OR NOT (result ? 'label')
+             OR NOT (result ? 'score') THEN
+              RAISE EXCEPTION 'unexpected row sentiment result shape: %', result;
+          END IF;
+          IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
+              RAISE EXCEPTION 'row sentiment score out of range: %', result;
+          END IF;
+
+          SELECT rvbbit.sentiment('the setup was simple and the dashboard is fantastic') INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'bundled sentiment operator returned empty label';
+          END IF;
+
+          SELECT rvbbit.sentiment_confidence('the setup was simple and the dashboard is fantastic') INTO score;
+          IF score < 0 OR score > 1 THEN
+              RAISE EXCEPTION 'bundled sentiment_confidence out of range: %', score;
           END IF;
       END
       $$;

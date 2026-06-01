@@ -281,6 +281,7 @@ SELECT
   kind,
   source_provider,
   source_model,
+  coalesce(catalog_entry->>'catalog_visibility', 'public') AS catalog_visibility,
   catalog_entry->>'pack_path' AS pack_path,
   catalog_entry->>'runtime_mode' AS runtime_mode,
   backend_name,
@@ -295,6 +296,7 @@ SELECT
   updated_at
 FROM rvbbit.capability_catalog
 WHERE active
+  AND coalesce(catalog_entry->>'catalog_visibility', 'public') = 'public'
 ORDER BY title;
 ```
 
@@ -336,6 +338,7 @@ Each `capabilities[]` entry has these fields:
 | `pack_path` | string/null | Repo-relative pack root. |
 | `pack_manifest_path` | string/null | Repo-relative `rvbbit-pack.yaml` path. |
 | `manifest_path` | string | Repo-relative path to the full manifest. |
+| `catalog_visibility` | string | `public`, `example`, or `internal`; default user browse should filter to `public`. |
 | `name` | string | Capability pack name. |
 | `title` | string | Human-readable title. |
 | `description` | string/null | Short description. |
@@ -364,13 +367,23 @@ Each `capabilities[]` entry has these fields:
 | `health_path` | string/null | HTTP path Warren should poll for sidecar health; defaults to `/health`. |
 | `endpoint_path` | string/null | Warren registration path such as `/predict` or `/run`. |
 | `device` | string | Manifest preference: `auto`, `cpu`, or `cuda`. |
-| `operators` | string[] | SQL operator functions created by `operator.sql`. |
+| `operators` | string[] | SQL operator functions created by `operator.sql`; includes both raw model wrappers and bundled higher-level child operators. |
 
 The UI can filter by `tags`, `kind`, `runtime_handler`, `source_provider`,
 `source_model`, `license`, and `system_runtime`. Use `backend_name` to join
 model entries to installed backend rows. Use `runtime_name` to join runtime
 entries to runtime catalogs such as `rvbbit.python_runtimes` and
 `rvbbit.mcp_gateways`.
+
+Model packs may intentionally export multiple operators from one installed
+Warren capability. For example, a reranker pack can install raw JSON wrappers
+plus `about`, `semantic_score`, `means`, and `semantic_matches`; an embedding
+pack can install `semantic_embed` and `similar_to`; an extraction pack can
+replace the LLM fallback `extract(text, what)` with a specialist-backed
+workflow. Treat `operators` as the user-facing capability surface, not merely
+debug helpers. The full `manifest->'operators'` array contains signatures,
+return types, parser hints, infix metadata, and multi-step wiring for detail
+views.
 
 ### Manifest Shape
 
@@ -457,8 +470,6 @@ source:
   provider: builtin
   model: rvbbit/python-runtime
 runtime:
-  image: ghcr.io/rvbbit/python-runtime:0.60.4
-  pull_policy: missing
   template: python-runtime
   language: python
   handler: python_runtime
@@ -481,11 +492,11 @@ The built-ins are `runtimes/python-runtime` for `kind: python` operator nodes
 and `runtimes/mcp-gateway` for `kind: mcp` nodes and SQL MCP calls. Treat them
 as higher-level runtime primitives in the UI rather than ordinary model cards.
 
-`runtime.image` is the preferred deployment shape. Warren can run these
-manifests without a source checkout: it writes a tiny compose project, pulls the
-image if missing, starts the container, probes it, and registers SQL state.
-`runtime.template` remains a trusted local-build fallback for development and
-custom packs that have not been published as images yet.
+For V1, bundled runtime sidecars are source-build packs by default. Warren
+builds them from trusted local templates, starts the container, probes it, and
+registers SQL state. Published OCI images can be added later by setting
+`runtime.image`; the catalog table contract already exposes both `runtime_mode`
+and nullable `runtime_image`.
 
 ### Tabular Handler Shape
 
@@ -939,7 +950,8 @@ After scaffold/install, the output directory contains:
 | `register.sql` | SQL preview before registration. |
 | `operator.sql` | SQL operator preview. |
 | `smoke.sql` | Smoke commands preview/run. |
-| `compose.yaml` | CPU/local sidecar deployment. |
+| `compose.yaml` | CPU/local sidecar deployment, Docker-network only by default. |
+| `compose.host-ports.yaml` | Optional overlay for publishing a host port when Postgres cannot reach the Docker network directly. |
 | `compose.gpu.yaml` | NVIDIA GPU overlay. |
 | `Dockerfile` | Advanced runtime inspection. |
 | `main.py` | Advanced custom handler inspection/editing. |
@@ -952,7 +964,7 @@ After scaffold/install, the output directory contains:
 |---|---|
 | `RVBBIT_DSN` | Postgres DSN used by install and generated `psql` examples. |
 | `RVBBIT_DOCKER_NETWORK` | Docker network joined by generated sidecars. Defaults to `docker_default`. |
-| `RVBBIT_CAPABILITY_PORT` | Host port for generated sidecar. Defaults to the manifest runtime port, usually `8080` or `9100` for MCP gateway. |
+| `RVBBIT_CAPABILITY_PORT` | Host port used only with `compose.host-ports.yaml` or Warren `--advertise-base-url`. Defaults to Docker-assigned random port in the optional overlay. |
 | `RVBBIT_CAPABILITY_DEVICE` | Runtime device inside sidecar. GPU overlay sets `cuda`. |
 
 GPU install should be exposed as an option, not forced. The generated GPU
@@ -964,8 +976,8 @@ overlay assumes Docker has NVIDIA GPU support configured.
   tags, provider, runtime handler, device, and installed state.
 - Capability detail: manifest summary, model/source link, operators, runtime
   settings, generated SQL preview.
-- Install wizard: choose CPU/GPU, output directory, Docker network, host port,
-  and whether to apply SQL immediately.
+- Install wizard: choose CPU/GPU, output directory, Docker network, optional
+  host-port publishing, and whether to apply SQL immediately.
 - Installed backends: table from `rvbbit.backend_health` with call counts,
   error counts, latency metrics, endpoint, source model, and install source.
 - Trained models: table from `rvbbit.ml_model_status` with state, latest run,

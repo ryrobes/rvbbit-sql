@@ -39,6 +39,44 @@ operators:
     parser: json
     inputs:
       text: "{{ inputs.row }}"
+  - name: toxicity
+    description: Canonical toxicity label backed by toxic-bert.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: classify
+        kind: specialist
+        specialist: classify_toxic_bert
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.classify.output }}"
+          path: label
+          default: non-toxic
+  - name: toxicity_score
+    description: Confidence score for the top toxicity category.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: float8
+    parser: score_0_1
+    steps:
+      - name: classify
+        kind: specialist
+        specialist: classify_toxic_bert
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: score
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.classify.output }}"
+          path: score
+          default: 0
 smoke:
   inputs:
     - text: you are awful and nobody wants you here

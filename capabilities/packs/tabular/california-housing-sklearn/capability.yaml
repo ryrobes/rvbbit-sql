@@ -33,6 +33,25 @@ operators:
     parser: json
     inputs:
       row: "{{ inputs.row }}"
+  - name: house_value
+    description: Return the numeric California housing value prediction for a JSONB feature row.
+    arg_names: [row]
+    arg_types: [jsonb]
+    return_type: float8
+    parser: raw_text
+    steps:
+      - name: raw
+        kind: specialist
+        specialist: predict_california_housing_sklearn
+        inputs:
+          row: "{{ inputs.row }}"
+      - name: value
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.raw.output }}"
+          path: value
+          default: 0
 smoke:
   inputs:
     - row: '{"MedInc":8.3252,"HouseAge":41.0,"AveRooms":6.984127,"AveBedrms":1.02381,"Population":322.0,"AveOccup":2.555556,"Latitude":37.88,"Longitude":-122.23}'

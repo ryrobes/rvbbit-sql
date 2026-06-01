@@ -7,7 +7,7 @@ Duck/Vortex execution, and shared-broker fallback events.
 The UI talks to Postgres with SQL. There is no separate sidecar REST API for
 the dashboard. Treat the `rvbbit` schema as the contract surface.
 
-This contract targets Rvbbit extension version `0.60.5`.
+This contract targets Rvbbit extension version `1.0.0`.
 
 ## Product Shape
 
@@ -583,7 +583,7 @@ SELECT
 If any field is false, show:
 
 ```text
-Duck sidecar telemetry requires pg_rvbbit 0.60.5 or newer.
+Duck sidecar telemetry requires pg_rvbbit 1.0.0 or newer.
 ```
 
 Version check:
@@ -621,7 +621,7 @@ Avoid full-table scans:
 | No query events | `No Duck sidecar queries recorded in this window.` |
 | No shared brokers | `Shared broker mode is not currently observed.` |
 | No fallbacks | `No shared broker fallback events in this window.` |
-| Objects missing | `Duck sidecar telemetry requires pg_rvbbit 0.60.5 or newer.` |
+| Objects missing | `Duck sidecar telemetry requires pg_rvbbit 1.0.0 or newer.` |
 
 ## Safety Rules For UI Agents
 

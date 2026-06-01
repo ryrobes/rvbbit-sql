@@ -1,17 +1,18 @@
 COMPOSE := docker compose -f docker/docker-compose.yml
 COMPOSE_SIDECARS := docker compose -f docker/docker-compose.yml -f docker/docker-compose.sidecars.yml
 RVBBIT_VERSION ?= $(shell awk -F'"' '/^version[[:space:]]*=/ {print $$2; exit}' Cargo.toml)
-PYTHON_RUNTIME_IMAGE ?= ghcr.io/rvbbit/python-runtime:$(RVBBIT_VERSION)
+PYTHON_RUNTIME_IMAGE ?= rvbbit/python-runtime:local
+MCP_GATEWAY_IMAGE ?= rvbbit/mcp-gateway:local
 
 .PHONY: help build up down logs psql-heap psql-rvbbit bench-shell info clean \
         reload-extension e2e-realworld e2e-realworld-fresh e2e-realworld-live \
         e2e-realworld-warren \
         gpu-up gpu-down register-specialists \
-        python-runtime-image python-runtime-up restore-local-embed gpu-status \
+        python-runtime-image python-runtime-up mcp-gateway-image mcp-gateway-up restore-local-embed gpu-status \
         bigfoot-kg-demo capabilities-list capability-render capability-catalog \
         capability-catalog-seed capability-catalog-db \
         capability-scaffold capability-install capability-deploy capability-test \
-        warren-agent warren-once
+        capability-test-all warren-agent warren-once
 
 RVBBIT_DSN ?= postgresql://postgres:rvbbit@localhost:55433/bench
 WARREN_NODE ?= local-warren
@@ -20,6 +21,8 @@ WARREN_LABELS ?= {"capability":true,"docker":true,"gpu":false}
 WARREN_CAPACITY ?= {}
 WARREN_DOCKER_NETWORK ?= docker_default
 WARREN_METRICS_MS ?= 10000
+CAPABILITY_TEST_VISIBILITY ?= public
+CAPABILITY_TEST_OUT ?= .rvbbit/capability-acceptance
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -69,15 +72,18 @@ query-llm:       ## Pair-wise compare heap vs rvbbit on the LLM query set
 
 test:            ## Run E2E tests (skips live-LLM ones; cheap & deterministic)
 	$(MAKE) --no-print-directory python-runtime-up
+	$(MAKE) --no-print-directory mcp-gateway-up
 	$(COMPOSE) exec -T bench pytest /tests -x
 
 test-live:       ## Run E2E tests INCLUDING live LLM calls (costs $$)
 	$(MAKE) --no-print-directory python-runtime-up
+	$(MAKE) --no-print-directory mcp-gateway-up
 	$(COMPOSE) exec -T -e RUN_LLM_TESTS=1 bench pytest /tests
 
 e2e-realworld:   ## Run the real-world acceptance harness (deterministic/default)
-	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench echo echo-openai-embed
 	$(MAKE) --no-print-directory python-runtime-up
+	$(MAKE) --no-print-directory mcp-gateway-up
 	$(COMPOSE) exec -T bench python /bench/e2e_realworld.py
 
 e2e-realworld-fresh: ## Destructive fresh acceptance run (deletes Docker volumes)
@@ -85,12 +91,13 @@ e2e-realworld-fresh: ## Destructive fresh acceptance run (deletes Docker volumes
 	$(MAKE) --no-print-directory e2e-realworld
 
 e2e-realworld-live: ## Run acceptance harness with live provider calls enabled
-	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench echo echo-openai-embed
 	$(MAKE) --no-print-directory python-runtime-up
+	$(MAKE) --no-print-directory mcp-gateway-up
 	$(COMPOSE) exec -T -e RVBBIT_E2E_LIVE_LLM=1 bench python /bench/e2e_realworld.py
 
 e2e-realworld-warren: ## Run real Warren deploy/probe/operator acceptance smoke
-	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench mcp-gateway echo echo-openai-embed
+	$(COMPOSE_SIDECARS) up -d --build pg-rvbbit pg-heap bench echo echo-openai-embed
 	$(MAKE) --no-print-directory reload-extension
 	@JOB_NAME=e2e-warren-smoke-$$(date +%Y%m%d%H%M%S); \
 	  echo "queueing $$JOB_NAME"; \
@@ -158,13 +165,12 @@ wire-specialists:  ## (Re)wire the LLM operators to route through the GPU specia
 	  -v ON_ERROR_STOP=1 \
 	  < docker/sql/wire-operators-to-specialists.sql
 
-python-runtime-image: ## Build the built-in Python runtime OCI image for local Warren deploys
+python-runtime-image: ## Build an optional local Python runtime OCI image
 	docker build -t '$(PYTHON_RUNTIME_IMAGE)' sidecars/python-runtime
 
 python-runtime-up: ## Deploy/register the built-in Python runtime through Warren
 	$(COMPOSE) up -d --build pg-rvbbit pg-heap bench
 	$(MAKE) --no-print-directory reload-extension
-	$(MAKE) --no-print-directory python-runtime-image
 	@docker rm -f rvbbit-python-runtime >/dev/null 2>&1 || true
 	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench \
 	  -v ON_ERROR_STOP=1 \
@@ -173,6 +179,21 @@ python-runtime-up: ## Deploy/register the built-in Python runtime through Warren
 	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench -P pager=off \
 	  -v ON_ERROR_STOP=1 \
 	  -c "SELECT name, endpoint_url, status, runtime_source FROM rvbbit.python_runtimes WHERE name = 'python_default';"
+
+mcp-gateway-image: ## Build an optional local MCP Gateway OCI image
+	docker build -t '$(MCP_GATEWAY_IMAGE)' capabilities/packs/runtimes/mcp-gateway
+
+mcp-gateway-up: ## Deploy/register the built-in MCP Gateway runtime through Warren
+	$(COMPOSE) up -d --build pg-rvbbit pg-heap bench
+	$(MAKE) --no-print-directory reload-extension
+	@docker rm -f rvbbit-mcp-gateway >/dev/null 2>&1 || true
+	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench \
+	  -v ON_ERROR_STOP=1 \
+	  < docker/sql/deploy-mcp-gateway.sql
+	$(MAKE) --no-print-directory warren-once
+	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench -P pager=off \
+	  -v ON_ERROR_STOP=1 \
+	  -c "SELECT name, endpoint_url, status, gateway_source FROM rvbbit.mcp_gateways WHERE name = 'mcp_default';"
 
 bigfoot-demo:    ## Run the bigfoot demo (self-registers + wires specialists; only needs `make gpu-up` + `make bigfoot-load` first)
 	cat docker/sql/register-gpu-specialists.sql \
@@ -228,6 +249,22 @@ capability-test: ## Deploy a capability pack through Warren and run its acceptan
 	  --labels '$(WARREN_LABELS)' \
 	  --capacity '{"capability_test":true}' \
 	  --metrics-ms 1000
+
+capability-test-all: ## Sweep selected capability packs through Warren acceptance tests
+	capabilities/tools/rvbbit-capability test-all \
+	  --dsn '$(RVBBIT_DSN)' \
+	  --visibility '$(CAPABILITY_TEST_VISIBILITY)' \
+	  --out-dir '$(CAPABILITY_TEST_OUT)' \
+	  --node 'capability-test-warren' \
+	  --work-dir '.rvbbit/warren-capability-test-all' \
+	  --docker-network '$(WARREN_DOCKER_NETWORK)' \
+	  --labels '$(WARREN_LABELS)' \
+	  --capacity '{"capability_test_all":true}' \
+	  --metrics-ms 1000 \
+	  $(if $(INCLUDE_GPU),--include-gpu,) \
+	  $(if $(ONLY),--only '$(ONLY)',) \
+	  $(if $(SKIP),--skip '$(SKIP)',) \
+	  $(if $(FAIL_FAST),--fail-fast,)
 
 warren-agent: ## Run a local Warren deployment agent
 	cargo run -p warren-agent -- \

@@ -88,7 +88,13 @@ The scaffold writes:
 - `operator.sql`
 - `smoke.sql`
 - `compose.yaml`
+- `compose.host-ports.yaml`
 - `compose.gpu.yaml`
+
+`compose.yaml` only exposes the container port on the Docker network by
+default, so multiple capabilities can all listen on container port `8080`
+without host-port conflicts. Use `compose.host-ports.yaml` only when Postgres
+cannot reach the sidecar through the Docker network.
 
 ## Acceptance Tests
 

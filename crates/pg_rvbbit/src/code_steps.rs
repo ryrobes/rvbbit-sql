@@ -29,6 +29,12 @@ pub fn registry() -> &'static HashMap<String, CodeFn> {
         m.insert("validate_one_of".into(), validate_one_of_fn);
         m.insert("char_count".into(), char_count_fn);
         m.insert("json_parse".into(), json_parse_fn);
+        m.insert("json_get".into(), json_get_fn);
+        m.insert("json_length".into(), json_length_fn);
+        m.insert("json_length_gte".into(), json_length_gte_fn);
+        m.insert("number_gte".into(), number_gte_fn);
+        m.insert("string_eq".into(), string_eq_fn);
+        m.insert("cosine_similarity".into(), cosine_similarity_fn);
         m
     })
 }
@@ -161,4 +167,130 @@ fn char_count_fn(inputs: &Value) -> Result<Value, String> {
 fn json_parse_fn(inputs: &Value) -> Result<Value, String> {
     let s = str_input(inputs, "text")?;
     serde_json::from_str(&s).map_err(|e| format!("invalid JSON: {e}"))
+}
+
+fn json_get_fn(inputs: &Value) -> Result<Value, String> {
+    let mut cur = inputs.get("value").cloned().unwrap_or(Value::Null);
+    let path = inputs
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if !path.is_empty() {
+        for part in path.split('.').filter(|p| !p.is_empty()) {
+            cur = if let Ok(idx) = part.parse::<usize>() {
+                cur.get(idx).cloned().unwrap_or(Value::Null)
+            } else {
+                cur.get(part).cloned().unwrap_or(Value::Null)
+            };
+        }
+    }
+    if cur.is_null() {
+        Ok(inputs.get("default").cloned().unwrap_or(Value::Null))
+    } else {
+        Ok(cur)
+    }
+}
+
+fn json_length_value(value: &Value) -> usize {
+    match value {
+        Value::Array(values) => values.len(),
+        Value::Object(values) => values.len(),
+        Value::String(value) => value.chars().count(),
+        Value::Null => 0,
+        _ => 1,
+    }
+}
+
+fn json_length_fn(inputs: &Value) -> Result<Value, String> {
+    let len = json_length_value(inputs.get("value").unwrap_or(&Value::Null));
+    Ok(Value::Number((len as i64).into()))
+}
+
+fn value_as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_length_gte_fn(inputs: &Value) -> Result<Value, String> {
+    let len = json_length_value(inputs.get("value").unwrap_or(&Value::Null)) as f64;
+    let threshold = inputs
+        .get("threshold")
+        .or_else(|| inputs.get("min"))
+        .and_then(value_as_f64)
+        .unwrap_or(1.0);
+    Ok(Value::Bool(len >= threshold))
+}
+
+fn number_gte_fn(inputs: &Value) -> Result<Value, String> {
+    let value = value_as_f64(inputs.get("value").unwrap_or(&Value::Null)).unwrap_or(0.0);
+    let threshold = value_as_f64(inputs.get("threshold").unwrap_or(&Value::Null)).unwrap_or(0.5);
+    Ok(Value::Bool(value >= threshold))
+}
+
+fn string_eq_fn(inputs: &Value) -> Result<Value, String> {
+    let value = inputs
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let expected = inputs
+        .get("expected")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let case_sensitive = inputs
+        .get("case_sensitive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let matched = if case_sensitive {
+        value == expected
+    } else {
+        value.eq_ignore_ascii_case(expected)
+    };
+    Ok(Value::Bool(matched))
+}
+
+fn number_array(v: &Value, key: &str) -> Result<Vec<f64>, String> {
+    let Some(arr) = v.get(key).and_then(|value| value.as_array()) else {
+        return Err(format!("missing or non-array input '{key}'"));
+    };
+    arr.iter()
+        .map(|value| value_as_f64(value).ok_or_else(|| format!("non-numeric value in '{key}'")))
+        .collect()
+}
+
+fn cosine_similarity_fn(inputs: &Value) -> Result<Value, String> {
+    let left = number_array(inputs, "left")?;
+    let right = number_array(inputs, "right")?;
+    if left.len() != right.len() {
+        return Err(format!(
+            "vector length mismatch: left={} right={}",
+            left.len(),
+            right.len()
+        ));
+    }
+    if left.is_empty() {
+        return Ok(Value::Number(serde_json::Number::from(0)));
+    }
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    for (a, b) in left.iter().zip(right.iter()) {
+        dot += a * b;
+        left_norm += a * a;
+        right_norm += b * b;
+    }
+    let denom = left_norm.sqrt() * right_norm.sqrt();
+    let score = if denom > 0.0 {
+        (dot / denom).clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    serde_json::Number::from_f64(score)
+        .map(Value::Number)
+        .ok_or_else(|| "cosine similarity produced a non-finite score".to_string())
 }

@@ -5,6 +5,7 @@ title: Warren Smoke Echo
 description: Deterministic no-model sidecar for validating Warren deployment, backend registration, probing,
   and operator wiring.
 license: apache-2.0
+catalog_visibility: internal
 tags:
 - smoke
 - warren

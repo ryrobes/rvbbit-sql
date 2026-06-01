@@ -59,8 +59,68 @@ operators:
     inputs:
       text: "{{ inputs.row }}"
       labels: "{{ inputs.labels }}"
+  - name: extract
+    description: Extract the first entity matching a requested label from text.
+    arg_names: [text, what]
+    arg_types: [text, text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: entities
+        kind: specialist
+        specialist: extract_gliner
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: "{{ inputs.what }}"
+      - name: first_value
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.entities.output }}"
+          path: 0.text
+          default: "NULL"
+  - name: contains_entity
+    description: True when GLiNER finds at least one span for the requested entity label.
+    arg_names: [text, label]
+    arg_types: [text, text]
+    return_type: bool
+    parser: yes_no
+    steps:
+      - name: entities
+        kind: specialist
+        specialist: extract_gliner
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: "{{ inputs.label }}"
+      - name: present
+        kind: code
+        fn: json_length_gte
+        inputs:
+          value: "{{ steps.entities.output }}"
+          threshold: 1
+  - name: has_pii
+    description: True when GLiNER finds likely PII spans in text.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: bool
+    parser: yes_no
+    steps:
+      - name: entities
+        kind: specialist
+        specialist: extract_gliner
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: person, email, phone number, address, credit card, bank account, ssn, date of birth, username, password
+      - name: present
+        kind: code
+        fn: json_length_gte
+        inputs:
+          value: "{{ steps.entities.output }}"
+          threshold: 1
 smoke:
   inputs:
     - text: A witness saw a large figure near Mount Hood outside Portland.
       labels: person, location, animal, organization
+      what: location
+      label: location
       row: '{"note":"A witness saw a large figure near Mount Hood outside Portland.","county":"Clackamas"}'

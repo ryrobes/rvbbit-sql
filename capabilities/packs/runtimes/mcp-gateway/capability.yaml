@@ -11,8 +11,6 @@ source:
   provider: builtin
   model: rvbbit/mcp-gateway
 runtime:
-  image: ghcr.io/rvbbit/mcp-gateway:0.60.4
-  pull_policy: missing
   template: mcp-gateway
   language: mcp
   handler: mcp_gateway

@@ -39,8 +39,253 @@ operators:
     inputs:
       text: "{{ inputs.row }}"
       labels: "{{ inputs.categories }}"
+  - name: classify
+    description: Canonical semantic classifier. Returns the selected category label as text.
+    arg_names: [text, categories]
+    arg_types: [text, text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: "{{ inputs.categories }}"
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.nli.output }}"
+          path: label
+          default: ""
+  - name: semantic_classify
+    description: Alias-style semantic classifier returning one caller-provided label.
+    arg_names: [text, categories]
+    arg_types: [text, text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: "{{ inputs.categories }}"
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.nli.output }}"
+          path: label
+          default: ""
+  - name: bucket
+    description: Bucket text into one of the caller-provided labels.
+    arg_names: [text, buckets]
+    arg_types: [text, text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: "{{ inputs.buckets }}"
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.nli.output }}"
+          path: label
+          default: ""
+  - name: intent
+    description: Classify communicative intent for support, CRM, social, and notes.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    inputs:
+      text: "{{ inputs.text }}"
+      labels: request, question, complaint, praise, cancellation, refund, bug report, sales inquiry, other
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: request, question, complaint, praise, cancellation, refund, bug report, sales inquiry, other
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.nli.output }}"
+          path: label
+          default: other
+  - name: audience
+    description: Identify the likely intended audience for a text value.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: general public, experts and academics, beginners and novices, industry professionals, decision makers, students, children, casual readers
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.nli.output }}"
+          path: label
+          default: general public
+  - name: domain
+    description: Classify the subject-matter domain of text.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: technology, finance, healthcare, legal, education, retail, operations, science, politics, entertainment, sports, other
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.nli.output }}"
+          path: label
+          default: other
+  - name: formality
+    description: Bucket text by formality level.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: very informal, informal, neutral, formal, very formal
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.nli.output }}"
+          path: label
+          default: neutral
+  - name: complexity
+    description: Bucket text by conceptual complexity.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "{{ inputs.text }}"
+          labels: simple, moderate, complex, expert
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.nli.output }}"
+          path: label
+          default: moderate
+  - name: stance
+    description: Classify stance toward a supplied topic.
+    arg_names: [text, topic]
+    arg_types: [text, text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "Topic: {{ inputs.topic }}\n\nText: {{ inputs.text }}"
+          labels: supports, opposes, neutral, mixed, unclear
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.nli.output }}"
+          path: label
+          default: unclear
+  - name: looks_like
+    description: Return true when a value appears to match the requested type or category.
+    arg_names: [text, type_name]
+    arg_types: [text, text]
+    return_type: bool
+    parser: yes_no
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "Value: {{ inputs.text }}\n\nRequested type: {{ inputs.type_name }}"
+          labels: matches type, does not match type
+      - name: is_match
+        kind: code
+        fn: string_eq
+        inputs:
+          value: "{{ steps.nli.output.label }}"
+          expected: matches type
+  - name: contradicts
+    description: Return true when statement A contradicts statement B.
+    arg_names: [a, b]
+    arg_types: [text, text]
+    return_type: bool
+    parser: yes_no
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "Premise: {{ inputs.a }}\n\nHypothesis: {{ inputs.b }}"
+          labels: contradiction, entailment, neutral
+      - name: is_contradiction
+        kind: code
+        fn: string_eq
+        inputs:
+          value: "{{ steps.nli.output.label }}"
+          expected: contradiction
+  - name: implies
+    description: Return true when statement A entails statement B.
+    arg_names: [a, b]
+    arg_types: [text, text]
+    return_type: bool
+    parser: yes_no
+    steps:
+      - name: nli
+        kind: specialist
+        specialist: classify_deberta_zero_shot
+        inputs:
+          text: "Premise: {{ inputs.a }}\n\nHypothesis: {{ inputs.b }}"
+          labels: entailment, contradiction, neutral
+      - name: is_entailment
+        kind: code
+        fn: string_eq
+        inputs:
+          value: "{{ steps.nli.output.label }}"
+          expected: entailment
 smoke:
   inputs:
     - text: the delivery arrived late and the customer wants a refund
       categories: billing, shipping, product_quality, cancellation
+      buckets: billing, shipping, product_quality, cancellation
+      topic: refund request
+      type_name: support ticket
+      a: The package arrived three days late.
+      b: The shipment was delayed.
       row: '{"ticket":"delivery arrived late","customer_tone":"angry","requested_action":"refund"}'

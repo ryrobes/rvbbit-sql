@@ -257,6 +257,136 @@ def test_validate_one_of_with_comma_string(rvbbit):
         rvbbit.execute(f"DROP FUNCTION IF EXISTS rvbbit.{name}(text, text, jsonb)")
 
 
+def test_json_get_and_number_gte_code_steps(rvbbit):
+    """Capability packs use these small code steps to unwrap specialist JSON."""
+    name = f"json_gate_{uuid.uuid4().hex[:8]}"
+    try:
+        rvbbit.execute(
+            "SELECT rvbbit.create_operator("
+            "  op_name => %s, op_shape => 'scalar', "
+            "  op_arg_names => ARRAY['payload'], op_arg_types => ARRAY['jsonb'], "
+            "  op_return_type => 'bool', op_parser => 'yes_no', "
+            "  op_system => 'unused', op_user => 'unused', "
+            "  op_steps => %s::jsonb)",
+            (
+                name,
+                """[
+                    {"name": "score", "kind": "code", "fn": "json_get",
+                     "inputs": {"value": "{{ inputs.payload }}",
+                                "path": "nested.score",
+                                "default": 0}},
+                    {"name": "gate", "kind": "code", "fn": "number_gte",
+                     "inputs": {"value": "{{ steps.score.output }}",
+                                "threshold": 0.75}}
+                ]""",
+            ),
+        )
+        assert rvbbit.execute(
+            f"SELECT rvbbit.{name}('{{\"nested\":{{\"score\":0.9}}}}'::jsonb)"
+        ).fetchone()[0] is True
+        assert rvbbit.execute(
+            f"SELECT rvbbit.{name}('{{\"nested\":{{\"score\":0.4}}}}'::jsonb)"
+        ).fetchone()[0] is False
+    finally:
+        rvbbit.execute(f"DELETE FROM rvbbit.operators WHERE name = '{name}'")
+        rvbbit.execute(f"DROP FUNCTION IF EXISTS rvbbit.{name}(jsonb, jsonb)")
+
+
+def test_json_length_gte_code_step(rvbbit):
+    """Extraction packs use this as a deterministic presence validator."""
+    name = f"json_len_gate_{uuid.uuid4().hex[:8]}"
+    try:
+        rvbbit.execute(
+            "SELECT rvbbit.create_operator("
+            "  op_name => %s, op_shape => 'scalar', "
+            "  op_arg_names => ARRAY['payload'], op_arg_types => ARRAY['jsonb'], "
+            "  op_return_type => 'bool', op_parser => 'yes_no', "
+            "  op_system => 'unused', op_user => 'unused', "
+            "  op_steps => %s::jsonb)",
+            (
+                name,
+                """[
+                    {"name": "gate", "kind": "code", "fn": "json_length_gte",
+                     "inputs": {"value": "{{ inputs.payload }}",
+                                "threshold": 1}}
+                ]""",
+            ),
+        )
+        assert rvbbit.execute(
+            f"SELECT rvbbit.{name}('[{{\"text\":\"Acme\"}}]'::jsonb)"
+        ).fetchone()[0] is True
+        assert rvbbit.execute(f"SELECT rvbbit.{name}('[]'::jsonb)").fetchone()[0] is False
+    finally:
+        rvbbit.execute(f"DELETE FROM rvbbit.operators WHERE name = '{name}'")
+        rvbbit.execute(f"DROP FUNCTION IF EXISTS rvbbit.{name}(jsonb, jsonb)")
+
+
+def test_nested_step_output_template_path(rvbbit):
+    """Capability packs address raw specialist fields with steps.X.output.path."""
+    name = f"nested_step_{uuid.uuid4().hex[:8]}"
+    try:
+        rvbbit.execute(
+            "SELECT rvbbit.create_operator("
+            "  op_name => %s, op_shape => 'scalar', "
+            "  op_arg_names => ARRAY['payload'], "
+            "  op_return_type => 'bool', op_parser => 'yes_no', "
+            "  op_system => 'unused', op_user => 'unused', "
+            "  op_steps => %s::jsonb)",
+            (
+                name,
+                """[
+                    {"name": "raw", "kind": "code", "fn": "json_parse",
+                     "inputs": {"text": "{{ inputs.payload }}"}},
+                    {"name": "gate", "kind": "code", "fn": "number_gte",
+                     "inputs": {"value": "{{ steps.raw.output.score }}",
+                                "threshold": 0.75}}
+                ]""",
+            ),
+        )
+        assert rvbbit.execute(
+            f"SELECT rvbbit.{name}('{{\"score\":0.9}}')"
+        ).fetchone()[0] is True
+        assert rvbbit.execute(
+            f"SELECT rvbbit.{name}('{{\"score\":0.4}}')"
+        ).fetchone()[0] is False
+    finally:
+        rvbbit.execute(f"DELETE FROM rvbbit.operators WHERE name = '{name}'")
+        rvbbit.execute(f"DROP FUNCTION IF EXISTS rvbbit.{name}(text, jsonb)")
+
+
+def test_cosine_similarity_code_step(rvbbit):
+    name = f"cosine_{uuid.uuid4().hex[:8]}"
+    try:
+        rvbbit.execute(
+            "SELECT rvbbit.create_operator("
+            "  op_name => %s, op_shape => 'scalar', "
+            "  op_arg_names => ARRAY['left_vec', 'right_vec'], "
+            "  op_arg_types => ARRAY['jsonb', 'jsonb'], "
+            "  op_return_type => 'float8', op_parser => 'score_0_1', "
+            "  op_system => 'unused', op_user => 'unused', "
+            "  op_steps => %s::jsonb)",
+            (
+                name,
+                """[
+                    {"name": "score", "kind": "code", "fn": "cosine_similarity",
+                     "inputs": {"left": "{{ inputs.left_vec }}",
+                                "right": "{{ inputs.right_vec }}"}}
+                ]""",
+            ),
+        )
+        score = rvbbit.execute(
+            f"SELECT rvbbit.{name}('[1,0]'::jsonb, '[1,0]'::jsonb)"
+        ).fetchone()[0]
+        assert score == 1.0
+        score = rvbbit.execute(
+            f"SELECT rvbbit.{name}('[1,0]'::jsonb, '[0,1]'::jsonb)"
+        ).fetchone()[0]
+        assert score == 0.0
+    finally:
+        rvbbit.execute(f"DELETE FROM rvbbit.operators WHERE name = '{name}'")
+        rvbbit.execute(f"DROP FUNCTION IF EXISTS rvbbit.{name}(jsonb, jsonb, jsonb)")
+
+
 def test_specialist_step_errors_cleanly(rvbbit):
     """Step kind='specialist' is accepted in catalog but executor errors
     clearly (no working specialist sidecar this session)."""

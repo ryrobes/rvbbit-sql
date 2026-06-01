@@ -10,6 +10,8 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -208,6 +210,7 @@ def install_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             "warren",
             "system_runtime",
             "capability_role",
+            "smoke",
         ]
         if key in manifest
     }
@@ -322,6 +325,17 @@ def render_operator_sql(manifest: dict[str, Any]) -> str:
     for op in manifest.get("operators") or []:
         steps = op.get("steps") or [default_step(manifest, op)]
         arg_types = op.get("arg_types") or ["text" for _ in op["arg_names"]]
+        infix_symbol_sql = sql_lit(op.get("infix_symbol"))
+        if op.get("infix_symbol") and len(arg_types) == 2:
+            infix_symbol_sql = (
+                "(CASE WHEN EXISTS ("
+                "SELECT 1 FROM pg_operator op "
+                "WHERE op.oprnamespace = 'rvbbit'::regnamespace "
+                f"AND op.oprname = {sql_lit(op['infix_symbol'])} "
+                f"AND op.oprleft = {sql_lit(arg_types[0])}::regtype "
+                f"AND op.oprright = {sql_lit(arg_types[1])}::regtype"
+                f") THEN NULL ELSE {sql_lit(op['infix_symbol'])} END)"
+            )
         chunks.extend(
             [
                 "",
@@ -333,11 +347,22 @@ def render_operator_sql(manifest: dict[str, Any]) -> str:
                 f"  op_parser      => {sql_lit(op.get('parser'))},",
                 f"  op_shape       => {sql_lit(op.get('shape', 'scalar'))},",
                 f"  op_description => {sql_lit(op.get('description') or manifest.get('description'))},",
+                f"  op_infix_symbol => {infix_symbol_sql},",
+                f"  op_infix_word   => {sql_lit(op.get('infix_word'))},",
                 f"  op_tests       => {sql_json(op['tests']) if op.get('tests') else 'NULL'},",
                 f"  op_steps       => {sql_json(steps)}",
                 ");",
             ]
         )
+        if op.get("infix_symbol") and len(arg_types) == 2:
+            chunks.extend(
+                [
+                    "UPDATE rvbbit.operators",
+                    f"SET infix_symbol = {sql_lit(op.get('infix_symbol'))},",
+                    f"    infix_word = {sql_lit(op.get('infix_word'))}",
+                    f"WHERE name = {sql_lit(op['name'])};",
+                ]
+            )
     chunks.append("")
     return "\n".join(chunks)
 
@@ -399,8 +424,8 @@ def render_compose(manifest: dict[str, Any]) -> str:
     return f"""services:
   {service}:
 {runtime_source}    container_name: rvbbit-{service}
-    ports:
-      - "${{RVBBIT_CAPABILITY_PORT:-{container_port}}}:{container_port}"
+    expose:
+      - "{container_port}"
     environment:
 {env_lines}
     volumes:
@@ -420,6 +445,16 @@ networks:
 
 volumes:
 {volume_defs}
+"""
+
+
+def render_host_ports_compose(manifest: dict[str, Any]) -> str:
+    service = manifest["name"].replace("_", "-")
+    container_port = runtime_container_port(manifest)
+    return f"""services:
+  {service}:
+    ports:
+      - "${{RVBBIT_CAPABILITY_PORT:-0}}:{container_port}"
 """
 
 
@@ -487,10 +522,13 @@ def handler_requirements(handler: str) -> list[str]:
         "zero_shot_classification",
         "gliner",
     }:
-        return [
+        requirements = [
             "transformers==4.46.3",
             "sentencepiece==0.2.0",
         ]
+        if handler == "gliner":
+            requirements.append("gliner==0.2.16")
+        return requirements
     if handler in {"tabular_classification", "tabular_regression"}:
         return [
             "huggingface_hub==0.26.5",
@@ -524,10 +562,19 @@ def scaffold(manifest: dict[str, Any], out_dir: Path, force: bool = False) -> No
             "device": runtime.get("device", "auto"),
         }
 
-        for path in template_dir.iterdir():
-            if path.is_file():
+        for path in template_dir.rglob("*"):
+            if path.is_dir():
+                continue
+            if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+                continue
+            rel = path.relative_to(template_dir)
+            target = out_dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
                 text = replace_tokens(path.read_text(), values)
-                target = out_dir / path.name
+            except UnicodeDecodeError:
+                shutil.copy2(path, target)
+            else:
                 target.write_text(text)
 
         extra = handler_requirements(runtime.get("handler", "custom"))
@@ -553,6 +600,7 @@ def scaffold(manifest: dict[str, Any], out_dir: Path, force: bool = False) -> No
     (out_dir / "operator.sql").write_text(render_operator_sql(manifest))
     (out_dir / "smoke.sql").write_text(render_smoke_sql(manifest))
     (out_dir / "compose.yaml").write_text(render_compose(manifest))
+    (out_dir / "compose.host-ports.yaml").write_text(render_host_ports_compose(manifest))
     (out_dir / "compose.gpu.yaml").write_text(render_gpu_compose(manifest))
     (out_dir / "README.md").write_text(scaffold_readme(manifest))
 
@@ -590,8 +638,10 @@ psql "$RVBBIT_DSN" -f smoke.sql
 The generated service joins `${{RVBBIT_DOCKER_NETWORK:-docker_default}}` so
 the default endpoint `http://{service}:{container_port}{endpoint_path}` is reachable from
 the Rvbbit Postgres container. The runtime is registered as `{runtime_name}`.
-Adjust `register.sql` if your database is outside Docker or the sidecar is
-reachable at a different hostname.
+The service does not publish a host port by default. If your database is outside
+Docker and cannot reach that network URL, run with
+`docker compose -f compose.yaml -f compose.host-ports.yaml up -d` and adjust
+`register.sql` to the reachable host URL.
 """
     return f"""# {manifest.get('title') or manifest['name']}
 
@@ -619,8 +669,10 @@ psql "$RVBBIT_DSN" -f smoke.sql
 
 The generated service joins `${{RVBBIT_DOCKER_NETWORK:-docker_default}}` so
 the default endpoint `http://{service}:8080/predict` is reachable from the
-Rvbbit Postgres container. Adjust `register.sql` if your database is outside
-Docker or the sidecar is reachable at a different hostname.
+Rvbbit Postgres container. The service does not publish a host port by default.
+If your database is outside Docker and cannot reach that network URL, run with
+`docker compose -f compose.yaml -f compose.host-ports.yaml up -d` and adjust
+`register.sql` to the reachable host URL.
 """
 
 
@@ -684,6 +736,7 @@ def catalog_entry(
         "pack_path": repo_relpath(pack_path.parent) if pack_path else None,
         "pack_manifest_path": repo_relpath(pack_path) if pack_path else None,
         "pack_api_version": (pack or {}).get("api_version"),
+        "catalog_visibility": (pack or {}).get("catalog_visibility") or "public",
         "name": (pack or {}).get("name") or manifest["name"],
         "title": (pack or {}).get("title") or manifest.get("title") or manifest["name"],
         "description": (pack or {}).get("description") or manifest.get("description"),
@@ -846,6 +899,33 @@ def psql_capture_sql(dsn: str, sql: str) -> str:
     return output
 
 
+def warren_job_result(dsn: str, job_id: str) -> dict[str, Any]:
+    text = psql_scalar(
+        dsn,
+        "\n".join(
+            [
+                "SELECT jsonb_build_object(",
+                "  'job_id', job_id::text,",
+                "  'status', status,",
+                "  'phase', phase,",
+                "  'error', error,",
+                "  'backend_name', backend_name,",
+                "  'operator_name', operator_name,",
+                "  'runtime_name', runtime_name,",
+                "  'endpoint_url', endpoint_url,",
+                "  'progress', progress,",
+                "  'logs', logs",
+                ")::text",
+                "FROM rvbbit.warren_jobs",
+                f"WHERE job_id = {sql_lit(job_id)}::uuid",
+            ]
+        ),
+    )
+    if not text:
+        return {"job_id": job_id, "status": "missing", "error": "job row not found"}
+    return json.loads(text)
+
+
 def run_warren_once(args: argparse.Namespace) -> None:
     command = [
         "cargo",
@@ -907,8 +987,24 @@ def cmd_test(args: argparse.Namespace) -> None:
         job_id = psql_scalar(dsn, sql)
         event("deploy", "ok", job_id=job_id, job_name=job_name, target_selector=target)
         if not args.no_warren:
-            run_warren_once(args)
-            event("warren_once", "ok", node=args.node, work_dir=args.work_dir)
+            try:
+                run_warren_once(args)
+            except subprocess.CalledProcessError as exc:
+                job_doc = warren_job_result(dsn, job_id)
+                event(
+                    "warren_once",
+                    "fail",
+                    node=args.node,
+                    work_dir=args.work_dir,
+                    job=job_doc,
+                    returncode=exc.returncode,
+                )
+                raise SystemExit(exc.returncode) from exc
+            job_doc = warren_job_result(dsn, job_id)
+            if job_doc.get("status") != "completed":
+                event("warren_once", "fail", node=args.node, work_dir=args.work_dir, job=job_doc)
+                raise SystemExit(1)
+            event("warren_once", "ok", node=args.node, work_dir=args.work_dir, job=job_doc)
 
     for idx, sql in enumerate(acceptance.get("setup_sql") or [], start=1):
         output = psql_capture_sql(dsn, sql)
@@ -956,6 +1052,226 @@ def cmd_test(args: argparse.Namespace) -> None:
         "failures": failures,
     }
     event("summary", "fail" if failures else "ok", **summary)
+    if failures:
+        raise SystemExit(1)
+
+
+def safe_slug(value: str) -> str:
+    return "".join(c if c.isalnum() else "-" for c in value).strip("-").lower() or "capability"
+
+
+def pack_operator_coverage(pack: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+    operators = (pack.get("exports") or {}).get("operators") or [
+        op.get("name") for op in manifest.get("operators") or [] if op.get("name")
+    ]
+    acceptance = pack.get("acceptance") or {}
+    sql_parts: list[str] = []
+    sql_parts.extend(
+        str(test.get("sql"))
+        for test in acceptance.get("tests") or []
+        if isinstance(test, dict) and test.get("sql")
+    )
+    haystack = "\n".join(sql_parts)
+    covered = []
+    for op in operators:
+        op = str(op)
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_])(?:rvbbit\.)?{re.escape(op)}\s*\(",
+            re.IGNORECASE,
+        )
+        if pattern.search(haystack):
+            covered.append(op)
+    return {
+        "operators": operators,
+        "covered_operators": sorted(set(covered)),
+        "uncovered_operators": sorted(set(map(str, operators)) - set(covered)),
+    }
+
+
+def pack_requires_gpu(pack: dict[str, Any], manifest: dict[str, Any]) -> bool:
+    acceptance = pack.get("acceptance") or {}
+    target = acceptance.get("target_selector") or {}
+    runtime = manifest.get("runtime") or {}
+    return target.get("gpu") is True or runtime.get("device") == "cuda"
+
+
+def cmd_test_all(args: argparse.Namespace) -> None:
+    dsn = args.dsn or os.environ.get("RVBBIT_DSN")
+    if not dsn:
+        raise SystemExit("set --dsn or RVBBIT_DSN")
+
+    root = Path(args.root)
+    visibilities = {v.strip() for v in args.visibility.split(",") if v.strip()}
+    only_terms = [term.lower() for term in (args.only or [])]
+    skip_terms = [term.lower() for term in (args.skip or [])]
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    started = dt.datetime.now(dt.timezone.utc)
+    run_id = started.strftime("capability_acceptance_%Y%m%dT%H%M%SZ")
+    jsonl_path = out_dir / f"{run_id}.jsonl"
+    summary_path = out_dir / f"{run_id}.summary.json"
+    report_path = out_dir / f"{run_id}.md"
+    results: list[dict[str, Any]] = []
+
+    def write_result(result: dict[str, Any]) -> None:
+        results.append(result)
+        with jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(result, sort_keys=True) + "\n")
+        print(json.dumps(result, sort_keys=True), flush=True)
+
+    for pack_path in discover_pack_manifests(root):
+        pack = load_pack_metadata(pack_path)
+        manifest_path = pack_capability_path(pack_path, pack)
+        manifest = load_manifest(manifest_path)
+        pack_id = str(pack.get("id") or manifest.get("name") or pack_path.parent.name)
+        searchable = " ".join(
+            [
+                pack_id,
+                str(pack.get("name") or ""),
+                str(pack.get("title") or ""),
+                str(pack_path.parent),
+            ]
+        ).lower()
+        visibility = str(pack.get("catalog_visibility") or "public")
+        acceptance = pack.get("acceptance") or {}
+        tests = acceptance.get("tests") or []
+        coverage = pack_operator_coverage(pack, manifest)
+        base = {
+            "pack": pack_id,
+            "pack_path": repo_relpath(pack_path.parent),
+            "visibility": visibility,
+            "target_selector": acceptance.get("target_selector") or {},
+            "operator_coverage": coverage,
+        }
+        if visibility not in visibilities:
+            write_result({**base, "status": "skip", "reason": f"visibility {visibility} not selected"})
+            continue
+        if only_terms and not all(term in searchable for term in only_terms):
+            write_result({**base, "status": "skip", "reason": "--only filter"})
+            continue
+        if skip_terms and any(term in searchable for term in skip_terms):
+            write_result({**base, "status": "skip", "reason": "--skip filter"})
+            continue
+        if pack_requires_gpu(pack, manifest) and not args.include_gpu:
+            write_result({**base, "status": "skip", "reason": "requires gpu; pass --include-gpu"})
+            continue
+        if not isinstance(tests, list) or not tests:
+            write_result({**base, "status": "skip", "reason": "no acceptance.tests"})
+            continue
+
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "test",
+            str(pack_path.parent),
+            "--dsn",
+            dsn,
+            "--node",
+            args.node,
+            "--work-dir",
+            str(Path(args.work_dir) / safe_slug(pack_id)),
+            "--docker-network",
+            args.docker_network,
+            "--labels",
+            args.labels,
+            "--capacity",
+            args.capacity,
+            "--metrics-ms",
+            str(args.metrics_ms),
+        ]
+        if args.target:
+            command.extend(["--target", args.target])
+        if args.no_deploy:
+            command.append("--no-deploy")
+        if args.no_warren:
+            command.append("--no-warren")
+
+        t0 = dt.datetime.now(dt.timezone.utc)
+        proc = subprocess.run(command, text=True, capture_output=True, check=False)
+        duration_ms = int((dt.datetime.now(dt.timezone.utc) - t0).total_seconds() * 1000)
+        events: list[dict[str, Any]] = []
+        for line in (proc.stdout or "").splitlines():
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                events.append({"step": "stdout", "status": "info", "line": line})
+        result = {
+            **base,
+            "status": "ok" if proc.returncode == 0 else "fail",
+            "duration_ms": duration_ms,
+            "returncode": proc.returncode,
+            "events": events,
+            "stderr_tail": (proc.stderr or "")[-4000:],
+        }
+        write_result(result)
+        if proc.returncode != 0 and args.fail_fast:
+            break
+
+    failures = [r for r in results if r["status"] == "fail"]
+    skipped = [r for r in results if r["status"] == "skip"]
+    ok = [r for r in results if r["status"] == "ok"]
+    uncovered = [
+        {
+            "pack": r["pack"],
+            "uncovered_operators": r["operator_coverage"]["uncovered_operators"],
+        }
+        for r in results
+        if r["status"] != "skip" and r["operator_coverage"]["uncovered_operators"]
+    ]
+    summary = {
+        "run_id": run_id,
+        "started_at": started.isoformat(),
+        "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "root": str(root),
+        "ok": len(ok),
+        "failed": len(failures),
+        "skipped": len(skipped),
+        "total": len(results),
+        "jsonl": str(jsonl_path),
+        "report": str(report_path),
+        "operator_coverage_gaps": uncovered,
+    }
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    lines = [
+        f"# Capability Acceptance Sweep `{run_id}`",
+        "",
+        f"- ok: `{len(ok)}`",
+        f"- failed: `{len(failures)}`",
+        f"- skipped: `{len(skipped)}`",
+        f"- jsonl: `{jsonl_path}`",
+        "",
+        "| Status | Pack | ms | Tests | Operator Coverage | Notes |",
+        "|---|---|---:|---:|---|---|",
+    ]
+    for r in results:
+        events = r.get("events") or []
+        test_events = [
+            e
+            for e in events
+            if e.get("step") not in {"deploy", "warren_once", "summary"}
+            and not str(e.get("step", "")).startswith("setup_")
+            and not str(e.get("step", "")).startswith("teardown_")
+        ]
+        coverage = r["operator_coverage"]
+        covered = len(coverage["covered_operators"])
+        total_ops = len(coverage["operators"])
+        note = r.get("reason") or (r.get("stderr_tail") or "").splitlines()[-1:] or [""]
+        if isinstance(note, list):
+            note = note[0] if note else ""
+        note = str(note).replace("|", "\\|")[:180]
+        lines.append(
+            f"| `{r['status']}` | `{r['pack']}` | {r.get('duration_ms', 0)} | "
+            f"{len(test_events)} | `{covered}/{total_ops}` | {note} |"
+        )
+    if uncovered:
+        lines.extend(["", "## Operator Coverage Gaps", ""])
+        for item in uncovered:
+            lines.append(
+                f"- `{item['pack']}`: {', '.join(f'`{op}`' for op in item['uncovered_operators'])}"
+            )
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"summary: {summary_path}", file=sys.stderr)
+    print(f"report: {report_path}", file=sys.stderr)
     if failures:
         raise SystemExit(1)
 
@@ -1188,6 +1504,41 @@ def main(argv: list[str]) -> int:
     p_test.add_argument("--capacity", default=os.environ.get("WARREN_CAPACITY", "{}"))
     p_test.add_argument("--metrics-ms", type=int, default=int(os.environ.get("WARREN_METRICS_MS", "1000")))
     p_test.set_defaults(func=cmd_test)
+
+    p_test_all = sub.add_parser(
+        "test-all",
+        help="run Warren acceptance SQL for every selected capability pack",
+    )
+    p_test_all.add_argument("--root", default=str(PACKS))
+    p_test_all.add_argument("--dsn")
+    p_test_all.add_argument(
+        "--visibility",
+        default="public",
+        help="comma-separated catalog_visibility values to include",
+    )
+    p_test_all.add_argument("--include-gpu", action="store_true")
+    p_test_all.add_argument("--only", action="append", help="require substring in pack id/name/path")
+    p_test_all.add_argument("--skip", action="append", help="skip substring in pack id/name/path")
+    p_test_all.add_argument("--target", help="override all pack acceptance target selectors")
+    p_test_all.add_argument("--no-deploy", action="store_true")
+    p_test_all.add_argument("--no-warren", action="store_true")
+    p_test_all.add_argument("--fail-fast", action="store_true")
+    p_test_all.add_argument("--out-dir", default=".rvbbit/capability-acceptance")
+    p_test_all.add_argument("--node", default=os.environ.get("WARREN_NODE", "capability-test-warren"))
+    p_test_all.add_argument("--work-dir", default=os.environ.get("WARREN_WORK_DIR", ".rvbbit/warren-test-all"))
+    p_test_all.add_argument(
+        "--docker-network",
+        default=os.environ.get("RVBBIT_DOCKER_NETWORK", "docker_default"),
+    )
+    p_test_all.add_argument(
+        "--labels",
+        default=os.environ.get(
+            "WARREN_LABELS", '{"capability":true,"docker":true,"gpu":false}'
+        ),
+    )
+    p_test_all.add_argument("--capacity", default=os.environ.get("WARREN_CAPACITY", "{}"))
+    p_test_all.add_argument("--metrics-ms", type=int, default=int(os.environ.get("WARREN_METRICS_MS", "1000")))
+    p_test_all.set_defaults(func=cmd_test_all)
 
     p_list = sub.add_parser("list", help="list curated packs")
     p_list.add_argument("--root", default=str(PACKS))

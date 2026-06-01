@@ -19,15 +19,14 @@ source:
   provider: builtin
   model: rvbbit/python-runtime
 runtime:
-  mode: image
-  image: ghcr.io/rvbbit/python-runtime:0.60.4
+  mode: build
   template: python-runtime
   handler: python_runtime
   device: cpu
 exports:
   runtime: python_default
 install:
-  mode: image
+  mode: build
   warren: true
   docker: true
 acceptance:

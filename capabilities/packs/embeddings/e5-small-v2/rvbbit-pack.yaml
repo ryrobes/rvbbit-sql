@@ -24,6 +24,8 @@ exports:
   backend: embed_e5_small
   operators:
   - embed_e5_small
+  - semantic_embed
+  - similar_to
 install:
   mode: build
   warren: true
@@ -39,6 +41,7 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          score float8;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -52,6 +55,19 @@ acceptance:
 
           IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN
               RAISE EXCEPTION 'unexpected E5 embedding shape: %', left(result::text, 200);
+          END IF;
+
+          SELECT rvbbit.semantic_embed('query: refund request from angry customer') INTO result;
+          IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN
+              RAISE EXCEPTION 'unexpected semantic_embed E5 shape: %', left(result::text, 200);
+          END IF;
+
+          SELECT rvbbit.similar_to(
+              'refund request from angry customer',
+              'customer asking for money back after duplicate charge'
+          ) INTO score;
+          IF score < 0 OR score > 1 THEN
+              RAISE EXCEPTION 'bundled similar_to score out of range: %', score;
           END IF;
       END
       $$;

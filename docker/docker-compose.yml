@@ -135,7 +135,11 @@ services:
       timeout: 3s
       retries: 20
 
+  # Legacy dev-only gateway. V1 installs MCP through the Warren catalog
+  # (`make mcp-gateway-up`) so a plain `make up` does not start this service.
   mcp-gateway:
+    profiles:
+      - legacy-mcp-gateway
     build:
       context: ../capabilities/packs/runtimes/mcp-gateway
     container_name: rvbbit-mcp-gateway

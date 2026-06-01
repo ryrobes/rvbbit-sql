@@ -166,6 +166,7 @@ SELECT
   name,
   target_selector,
   status,
+  phase,
   claimed_by,
   claimed_at,
   attempts,
@@ -174,8 +175,10 @@ SELECT
   operator_name,
   runtime_name,
   error,
+  progress,
   logs,
   created_at,
+  updated_at,
   started_at,
   finished_at,
   manifest
@@ -211,6 +214,29 @@ Job statuses:
 | `completed` | Warren finished and registered the deployment. |
 | `failed` | Warren failed the job and wrote `error`/`logs`. |
 | `cancelled` | Reserved for future cancellation. |
+
+Job phases:
+
+`phase` is the UI-facing install progress label within the broader job status.
+Treat it as an extensible text value. Current Warren agents use:
+
+| Phase | Meaning |
+|---|---|
+| `queued` | Job is waiting for a matching node. |
+| `claimed` | A Warren node has claimed the job. |
+| `preparing` | The agent is preparing the local deployment workspace. |
+| `scaffolding` | The agent is writing compose/template artifacts. |
+| `starting` | Docker image pull/build/run has started. |
+| `waiting_health` | Container or published health probe is being waited on. |
+| `registering_backend` | Backend/operator SQL registration is in progress. |
+| `registering_runtime` | Runtime catalog registration is in progress. |
+| `probing_backend` | SQL backend probe is running. |
+| `probing_runtime` | Runtime-specific probe is running. |
+| `ready` | Warren completed the deployment. |
+| `failed` | Warren failed the job. |
+
+`progress` is structured JSON for the current or latest phase. Render it in an
+expandable detail panel; do not assume every phase includes the same keys.
 
 Recommended job filters:
 
@@ -502,6 +528,7 @@ SELECT
   capability_role,
   source_provider,
   source_model,
+  coalesce(catalog_entry->>'catalog_visibility', 'public') AS catalog_visibility,
   catalog_entry->>'pack_path' AS pack_path,
   catalog_entry->>'runtime_mode' AS runtime_mode,
   catalog_entry->'acceptance_tests' AS acceptance_tests,
@@ -521,6 +548,7 @@ SELECT
   updated_at
 FROM rvbbit.capability_catalog
 WHERE active
+  AND coalesce(catalog_entry->>'catalog_visibility', 'public') = 'public'
 ORDER BY title;
 ```
 
@@ -538,6 +566,7 @@ SELECT
   c.capability_role,
   c.source_provider,
   c.source_model,
+  coalesce(c.catalog_entry->>'catalog_visibility', 'public') AS catalog_visibility,
   c.catalog_entry->>'pack_path' AS pack_path,
   c.catalog_entry->>'runtime_mode' AS runtime_mode,
   c.catalog_entry->'acceptance_tests' AS acceptance_tests,
@@ -571,6 +600,7 @@ LEFT JOIN rvbbit.python_runtimes r
 LEFT JOIN rvbbit.mcp_gateways m
   ON m.name = c.runtime_name
 WHERE c.active
+  AND coalesce(c.catalog_entry->>'catalog_visibility', 'public') = 'public'
 ORDER BY c.title;
 ```
 
@@ -590,8 +620,21 @@ Detail panels should read these fields from the selected row:
 | `manifest_path` | Provenance/debug only. Do not require the UI to load this file. |
 | `catalog_entry.acceptance_tests` | Compact list of named pack acceptance tests for badges and search. |
 | `catalog_entry.acceptance` | Runnable acceptance test contract: optional `target_selector`, `setup_sql[]`, `tests[{name, description, sql}]`, and `teardown_sql[]`. UIs may execute this SQL after Warren deploys a pack. |
+| `catalog_entry.catalog_visibility` | `public`, `example`, or `internal`; default browse views should show `public` and hide examples/internal smoke packs unless the user asks for them. |
 | `tags`, `kind`, `system_runtime`, `capability_role`, `device`, `runtime_*`, `manifest.runtime.image`, `catalog_entry.runtime_mode` | Filters and deployment badges. |
-| `backend_name`, `runtime_name`, `operators` | Install-state joins and post-deploy navigation. |
+| `backend_name`, `runtime_name`, `operators` | Install-state joins and post-deploy navigation. `operators` includes raw wrappers plus bundled high-level child operators. |
+
+For V1 built-ins, both runtime sidecars use `catalog_entry.runtime_mode =
+'build'` and have no `manifest.runtime.image`. The UI should render that as a
+normal Warren install path, not as missing metadata; Warren builds from its
+trusted local templates.
+
+For model capability rows, prefer rendering `operators` as the installed user
+surface. A single Warren capability may install several SQL operators: a
+reranker can provide `about`/`means`, an embedding model can provide
+`semantic_embed`/`similar_to`, and an extractor can provide both raw JSON
+entity output and workflow-friendly predicates. Use `manifest->'operators'`
+for signatures, return types, infix metadata, and multi-step detail views.
 
 Recommended deploy flow:
 
@@ -659,6 +702,9 @@ Warren-installable system runtime capability with catalog id
 `runtimes/mcp-gateway`, similar to the CPython runtime and model sidecars.
 Treat it as a prerequisite runtime for the MCP UI, SQL MCP calls, and
 `kind: mcp` operator nodes.
+
+In the built-in catalog this row is source-buildable (`runtime_mode = 'build'`)
+rather than an image pull. Show `runtime_image` as optional/blank.
 
 Recommended UI gate:
 
@@ -824,6 +870,8 @@ Show these fields prominently when present:
 | Field | Source | Meaning |
 |---|---|---|
 | `warren_jobs.error` | Job row | Deployment failure summary. |
+| `warren_jobs.phase` | Job row | Current install progress label. |
+| `warren_jobs.progress` | Job row | Structured phase details such as port, container, endpoint, node, or error. |
 | `warren_jobs.logs` | Job row | Agent-provided diagnostics JSON. |
 | `warren_deployments.error` | Deployment row | Last deployment-level error. |
 | `warren_deployments.health` | Deployment row | Sidecar health/probe details or failure details. |
@@ -923,7 +971,7 @@ Expected runtime sequence:
 
 ## Version Notes
 
-This contract targets Rvbbit extension version `0.60.4` and the Rust
+This contract targets Rvbbit extension version `1.0.0` and the Rust
 `warren-agent`. Future scheduling policies should preserve the current SQL
 surfaces where possible and extend JSON fields rather than replacing table
 shapes.

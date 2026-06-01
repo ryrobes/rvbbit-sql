@@ -12,7 +12,7 @@
           {
             "description": "Classify support tickets into caller-provided labels and assert the zero-shot JSON shape.",
             "name": "zero_shot_support_triage",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_zero_shot_base(\n            'customer cannot log in after the MFA reset',\n            'auth,billing,shipping,fraud'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_zero_shot_base returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score')\n       OR NOT (result ? 'scores') THEN\n        RAISE EXCEPTION 'unexpected zero-shot result shape: %', result;\n    END IF;\n    IF NOT (result->>'label' = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN\n        RAISE EXCEPTION 'zero-shot label was outside candidate set: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    label text;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_zero_shot_base(\n            'customer cannot log in after the MFA reset',\n            'auth,billing,shipping,fraud'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_zero_shot_base returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score')\n       OR NOT (result ? 'scores') THEN\n        RAISE EXCEPTION 'unexpected zero-shot result shape: %', result;\n    END IF;\n    IF NOT (result->>'label' = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN\n        RAISE EXCEPTION 'zero-shot label was outside candidate set: %', result;\n    END IF;\n\n    SELECT rvbbit.classify(\n        'customer cannot log in after the MFA reset',\n        'auth,billing,shipping,fraud'\n    ) INTO label;\n    IF NOT (label = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN\n        RAISE EXCEPTION 'bundled classify label was outside candidate set: %', label;\n    END IF;\n\n    SELECT rvbbit.classify_row_zero_shot_base(\n        '{\"ticket\":\"customer cannot log in after the MFA reset\",\"plan\":\"enterprise\"}'::jsonb,\n        'auth,billing,shipping,fraud'\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score')\n       OR NOT (result ? 'scores') THEN\n        RAISE EXCEPTION 'unexpected row zero-shot result shape: %', result;\n    END IF;\n    IF NOT (result->>'label' = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN\n        RAISE EXCEPTION 'row zero-shot label was outside candidate set: %', result;\n    END IF;\n\n    SELECT rvbbit.semantic_classify(\n        'customer cannot log in after the MFA reset',\n        'auth,billing,shipping,fraud'\n    ) INTO label;\n    IF NOT (label = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN\n        RAISE EXCEPTION 'bundled semantic_classify label was outside candidate set: %', label;\n    END IF;\n\n    SELECT rvbbit.bucket(\n        'customer cannot log in after the MFA reset',\n        'auth,billing,shipping,fraud'\n    ) INTO label;\n    IF NOT (label = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN\n        RAISE EXCEPTION 'bundled bucket label was outside candidate set: %', label;\n    END IF;\n\n    SELECT rvbbit.intent('customer cannot log in after the MFA reset') INTO label;\n    IF coalesce(btrim(label), '') = '' THEN\n        RAISE EXCEPTION 'bundled intent operator returned empty label';\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -22,6 +22,7 @@
       "backend_name": "classify_deberta_base_zero_shot",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "Smaller NLI zero-shot classifier for classifying text or JSONB rows into caller-provided labels.",
       "device": "auto",
       "endpoint_path": null,
@@ -36,7 +37,11 @@
       "name": "deberta_v3_base_zero_shot",
       "operators": [
         "classify_zero_shot_base",
-        "classify_row_zero_shot_base"
+        "classify_row_zero_shot_base",
+        "classify",
+        "semantic_classify",
+        "bucket",
+        "intent"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "classify/deberta-v3-base-zero-shot",
@@ -76,7 +81,7 @@
           {
             "description": "Classify a refund-oriented ticket into a caller-provided taxonomy and assert candidate-safe output.",
             "name": "zero_shot_refund_triage",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_zero_shot(\n            'the delivery arrived late and the customer wants a refund',\n            'billing,shipping,product_quality,cancellation'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_zero_shot returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score')\n       OR NOT (result ? 'scores') THEN\n        RAISE EXCEPTION 'unexpected zero-shot result shape: %', result;\n    END IF;\n    IF NOT (result->>'label' = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN\n        RAISE EXCEPTION 'zero-shot label was outside candidate set: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    label text;\n    flag bool;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_zero_shot(\n            'the delivery arrived late and the customer wants a refund',\n            'billing,shipping,product_quality,cancellation'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_zero_shot returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score')\n       OR NOT (result ? 'scores') THEN\n        RAISE EXCEPTION 'unexpected zero-shot result shape: %', result;\n    END IF;\n    IF NOT (result->>'label' = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN\n        RAISE EXCEPTION 'zero-shot label was outside candidate set: %', result;\n    END IF;\n\n    SELECT rvbbit.classify(\n        'the delivery arrived late and the customer wants a refund',\n        'billing,shipping,product_quality,cancellation'\n    ) INTO label;\n    IF NOT (label = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN\n        RAISE EXCEPTION 'bundled classify label was outside candidate set: %', label;\n    END IF;\n\n    SELECT rvbbit.intent('the delivery arrived late and the customer wants a refund') INTO label;\n    IF coalesce(btrim(label), '') = '' THEN\n        RAISE EXCEPTION 'bundled intent operator returned empty label';\n    END IF;\n\n    SELECT rvbbit.classify_row_zero_shot(\n        '{\"ticket\":\"the delivery arrived late and the customer wants a refund\",\"channel\":\"email\"}'::jsonb,\n        'billing,shipping,product_quality,cancellation'\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score')\n       OR NOT (result ? 'scores') THEN\n        RAISE EXCEPTION 'unexpected row zero-shot result shape: %', result;\n    END IF;\n    IF NOT (result->>'label' = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN\n        RAISE EXCEPTION 'row zero-shot label was outside candidate set: %', result;\n    END IF;\n\n    SELECT rvbbit.semantic_classify(\n        'the delivery arrived late and the customer wants a refund',\n        'billing,shipping,product_quality,cancellation'\n    ) INTO label;\n    IF NOT (label = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN\n        RAISE EXCEPTION 'bundled semantic_classify label was outside candidate set: %', label;\n    END IF;\n\n    SELECT rvbbit.bucket(\n        'the delivery arrived late and the customer wants a refund',\n        'billing,shipping,product_quality,cancellation'\n    ) INTO label;\n    IF NOT (label = ANY (ARRAY['billing','shipping','product_quality','cancellation'])) THEN\n        RAISE EXCEPTION 'bundled bucket label was outside candidate set: %', label;\n    END IF;\n\n    SELECT rvbbit.audience('This executive summary recommends a warehouse staffing change.') INTO label;\n    IF coalesce(btrim(label), '') = '' THEN\n        RAISE EXCEPTION 'bundled audience operator returned empty label';\n    END IF;\n\n    SELECT rvbbit.domain('The patient portal failed to send lab-result notifications.') INTO label;\n    IF coalesce(btrim(label), '') = '' THEN\n        RAISE EXCEPTION 'bundled domain operator returned empty label';\n    END IF;\n\n    SELECT rvbbit.formality('Could you please review the attached contract amendment?') INTO label;\n    IF coalesce(btrim(label), '') = '' THEN\n        RAISE EXCEPTION 'bundled formality operator returned empty label';\n    END IF;\n\n    SELECT rvbbit.complexity('The retry queue drains messages once downstream latency recovers.') INTO label;\n    IF coalesce(btrim(label), '') = '' THEN\n        RAISE EXCEPTION 'bundled complexity operator returned empty label';\n    END IF;\n\n    SELECT rvbbit.stance(\n        'The memo recommends approving the data-retention policy.',\n        'data-retention policy'\n    ) INTO label;\n    IF coalesce(btrim(label), '') = '' THEN\n        RAISE EXCEPTION 'bundled stance operator returned empty label';\n    END IF;\n\n    SELECT rvbbit.looks_like('support ticket: customer asks for refund', 'customer support ticket') INTO flag;\n    IF flag IS NULL THEN\n        RAISE EXCEPTION 'bundled looks_like operator returned NULL';\n    END IF;\n\n    SELECT rvbbit.contradicts('The order shipped Monday.', 'The order never shipped.') INTO flag;\n    IF flag IS NULL THEN\n        RAISE EXCEPTION 'bundled contradicts operator returned NULL';\n    END IF;\n\n    SELECT rvbbit.implies('The invoice is overdue by 45 days.', 'The invoice is late.') INTO flag;\n    IF flag IS NULL THEN\n        RAISE EXCEPTION 'bundled implies operator returned NULL';\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -86,6 +91,7 @@
       "backend_name": "classify_deberta_zero_shot",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "NLI-based zero-shot classification over caller-provided labels.",
       "device": "auto",
       "endpoint_path": null,
@@ -100,7 +106,19 @@
       "name": "deberta_v3_zero_shot",
       "operators": [
         "classify_zero_shot",
-        "classify_row_zero_shot"
+        "classify_row_zero_shot",
+        "classify",
+        "semantic_classify",
+        "bucket",
+        "intent",
+        "audience",
+        "domain",
+        "formality",
+        "complexity",
+        "stance",
+        "looks_like",
+        "contradicts",
+        "implies"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "classify/deberta-v3-zero-shot",
@@ -139,7 +157,7 @@
           {
             "description": "Classify an unambiguous customer-success note and assert classifier JSON shape.",
             "name": "emotion_ticket_sample",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_emotion('I am thrilled that the replacement arrived early') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_emotion returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected emotion result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'emotion score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    label text;\n    score float8;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_emotion('I am thrilled that the replacement arrived early') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_emotion returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected emotion result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'emotion score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.classify_row_emotion(\n        '{\"note\":\"I am thrilled that the replacement arrived early\",\"account\":\"enterprise\"}'::jsonb\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected row emotion result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'row emotion score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.emotion('I am thrilled that the replacement arrived early') INTO label;\n    IF label IS NULL OR label = '' THEN\n        RAISE EXCEPTION 'bundled emotion operator returned an empty label';\n    END IF;\n\n    SELECT rvbbit.emotion_confidence('I am thrilled that the replacement arrived early') INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled emotion_confidence out of range: %', score;\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -149,6 +167,7 @@
       "backend_name": "classify_emotion_distilroberta",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "Classify text into emotion labels for support, survey, content, and conversation analytics.",
       "device": "auto",
       "endpoint_path": null,
@@ -163,7 +182,9 @@
       "name": "emotion_distilroberta",
       "operators": [
         "classify_emotion",
-        "classify_row_emotion"
+        "classify_row_emotion",
+        "emotion",
+        "emotion_confidence"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "classify/emotion-distilroberta",
@@ -203,7 +224,7 @@
           {
             "description": "Detect language on a multilingual support note and assert classifier JSON shape.",
             "name": "language_routing_sample",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.detect_language('el pedido llego tarde y necesito ayuda') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'detect_language returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected language result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'language score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    label text;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.detect_language('el pedido llego tarde y necesito ayuda') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'detect_language returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected language result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'language score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.language('el pedido llego tarde y necesito ayuda') INTO label;\n    IF coalesce(btrim(label), '') = '' THEN\n        RAISE EXCEPTION 'bundled language operator returned empty label';\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -213,6 +234,7 @@
       "backend_name": "detect_language_xlm_roberta",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "Detect the language of text for routing, normalization, and multilingual analytics.",
       "device": "auto",
       "endpoint_path": null,
@@ -226,7 +248,8 @@
       "manifest_path": "capabilities/packs/classify/language-detection-xlm-roberta/capability.yaml",
       "name": "language_detection_xlm_roberta",
       "operators": [
-        "detect_language"
+        "detect_language",
+        "language"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "classify/language-detection-xlm-roberta",
@@ -266,7 +289,7 @@
           {
             "description": "Run a moderation-oriented comment through toxic-bert and assert score-bearing JSON.",
             "name": "moderation_sample_shape",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_toxicity('you are awful and nobody wants you here') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_toxicity returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected toxicity result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'toxicity score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    label text;\n    score float8;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_toxicity('you are awful and nobody wants you here') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_toxicity returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected toxicity result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'toxicity score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.classify_row_toxicity(\n        '{\"comment\":\"you are awful and nobody wants you here\",\"channel\":\"support_chat\"}'::jsonb\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected row toxicity result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'row toxicity score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.toxicity('you are awful and nobody wants you here') INTO label;\n    IF coalesce(btrim(label), '') = '' THEN\n        RAISE EXCEPTION 'bundled toxicity operator returned empty label';\n    END IF;\n\n    SELECT rvbbit.toxicity_score('you are awful and nobody wants you here') INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled toxicity_score out of range: %', score;\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -276,6 +299,7 @@
       "backend_name": "classify_toxic_bert",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "Multi-label toxicity classifier for moderation, support triage, and data quality workflows.",
       "device": "auto",
       "endpoint_path": null,
@@ -290,7 +314,9 @@
       "name": "toxic_bert",
       "operators": [
         "classify_toxicity",
-        "classify_row_toxicity"
+        "classify_row_toxicity",
+        "toxicity",
+        "toxicity_score"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "classify/toxic-bert",
@@ -331,7 +357,7 @@
           {
             "description": "Classify a product-review style note and assert sentiment JSON shape.",
             "name": "sentiment_review_sample",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_sentiment('the setup was simple and the dashboard is fantastic') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_sentiment returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected sentiment result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'sentiment score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    label text;\n    score float8;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.classify_sentiment('the setup was simple and the dashboard is fantastic') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'classify_sentiment returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected sentiment result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'sentiment score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.classify_row_sentiment(\n        '{\"review\":\"the setup was simple and the dashboard is fantastic\",\"stars\":5,\"plan\":\"pro\"}'::jsonb\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected row sentiment result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'row sentiment score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.sentiment('the setup was simple and the dashboard is fantastic') INTO label;\n    IF coalesce(btrim(label), '') = '' THEN\n        RAISE EXCEPTION 'bundled sentiment operator returned empty label';\n    END IF;\n\n    SELECT rvbbit.sentiment_confidence('the setup was simple and the dashboard is fantastic') INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled sentiment_confidence out of range: %', score;\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -341,6 +367,7 @@
       "backend_name": "classify_twitter_roberta_sentiment",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "Practical positive/neutral/negative sentiment classifier for reviews, tickets, social text, and notes.",
       "device": "auto",
       "endpoint_path": null,
@@ -355,7 +382,9 @@
       "name": "twitter_roberta_sentiment",
       "operators": [
         "classify_sentiment",
-        "classify_row_sentiment"
+        "classify_row_sentiment",
+        "sentiment",
+        "sentiment_confidence"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "classify/twitter-roberta-sentiment",
@@ -395,7 +424,7 @@
           {
             "description": "Embed realistic retrieval text and assert a non-empty vector payload.",
             "name": "embedding_vector_shape",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.embed_bge_m3('query: suspicious movement near a wooded creek') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'embed_bge_m3 returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected BGE-M3 embedding shape: %', left(result::text, 200);\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    score float8;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.embed_bge_m3('query: suspicious movement near a wooded creek') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'embed_bge_m3 returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected BGE-M3 embedding shape: %', left(result::text, 200);\n    END IF;\n\n    SELECT rvbbit.semantic_embed('query: suspicious movement near a wooded creek') INTO result;\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected semantic_embed BGE-M3 shape: %', left(result::text, 200);\n    END IF;\n\n    SELECT rvbbit.similar_to(\n        'refund request from angry customer',\n        'customer wants money back after duplicate charge'\n    ) INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled similar_to score out of range: %', score;\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -405,6 +434,7 @@
       "backend_name": "embed_bge_m3",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "High-quality multilingual BGE-M3 sentence embeddings for retrieval and semantic search.",
       "device": "auto",
       "endpoint_path": null,
@@ -418,7 +448,9 @@
       "manifest_path": "capabilities/packs/embeddings/bge-m3/capability.yaml",
       "name": "bge_m3",
       "operators": [
-        "embed_bge_m3"
+        "embed_bge_m3",
+        "semantic_embed",
+        "similar_to"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "embeddings/bge-m3",
@@ -457,7 +489,7 @@
           {
             "description": "Embed a support-search phrase and assert a non-empty vector payload.",
             "name": "embedding_vector_shape",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.embed_bge_small('refund request from angry customer') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'embed_bge_small returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected BGE-small embedding shape: %', left(result::text, 200);\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    score float8;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.embed_bge_small('refund request from angry customer') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'embed_bge_small returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected BGE-small embedding shape: %', left(result::text, 200);\n    END IF;\n\n    SELECT rvbbit.semantic_embed('refund request from angry customer') INTO result;\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected semantic_embed BGE-small shape: %', left(result::text, 200);\n    END IF;\n\n    SELECT rvbbit.similar_to(\n        'refund request from angry customer',\n        'customer asking for money back after duplicate charge'\n    ) INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled similar_to score out of range: %', score;\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -467,6 +499,7 @@
       "backend_name": "embed_bge_small",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "CPU-friendly English sentence embeddings exposed as an Rvbbit backend.",
       "device": "auto",
       "endpoint_path": null,
@@ -480,7 +513,9 @@
       "manifest_path": "capabilities/packs/embeddings/bge-small-en-v1.5/capability.yaml",
       "name": "bge_small_en_v1_5",
       "operators": [
-        "embed_bge_small"
+        "embed_bge_small",
+        "semantic_embed",
+        "similar_to"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "embeddings/bge-small-en-v1.5",
@@ -518,7 +553,7 @@
           {
             "description": "Embed an E5-formatted query and assert a non-empty vector payload.",
             "name": "embedding_vector_shape",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.embed_e5_small('query: refund request from angry customer') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'embed_e5_small returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected E5 embedding shape: %', left(result::text, 200);\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    score float8;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.embed_e5_small('query: refund request from angry customer') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'embed_e5_small returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected E5 embedding shape: %', left(result::text, 200);\n    END IF;\n\n    SELECT rvbbit.semantic_embed('query: refund request from angry customer') INTO result;\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected semantic_embed E5 shape: %', left(result::text, 200);\n    END IF;\n\n    SELECT rvbbit.similar_to(\n        'refund request from angry customer',\n        'customer asking for money back after duplicate charge'\n    ) INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled similar_to score out of range: %', score;\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -528,6 +563,7 @@
       "backend_name": "embed_e5_small",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "Small, fast E5 embeddings useful for CPU-friendly retrieval experiments and lightweight semantic joins.",
       "device": "auto",
       "endpoint_path": null,
@@ -541,7 +577,9 @@
       "manifest_path": "capabilities/packs/embeddings/e5-small-v2/capability.yaml",
       "name": "e5_small_v2",
       "operators": [
-        "embed_e5_small"
+        "embed_e5_small",
+        "semantic_embed",
+        "similar_to"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "embeddings/e5-small-v2",
@@ -580,7 +618,7 @@
           {
             "description": "Extract business entities from an operations note and assert array output.",
             "name": "entity_extraction_shape",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.extract_entities(\n            'Invoice INV-1042 for Acme Corp is due Friday in Portland.',\n            'organization, invoice number, date, location'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'extract_entities returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' THEN\n        RAISE EXCEPTION 'unexpected GLiNER extraction shape: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    first_value text;\n    present bool;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.extract_entities(\n            'Invoice INV-1042 for Acme Corp is due Friday in Portland.',\n            'organization, invoice number, date, location'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'extract_entities returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' THEN\n        RAISE EXCEPTION 'unexpected GLiNER extraction shape: %', result;\n    END IF;\n\n    SELECT rvbbit.extract_business_entities(\n        'Invoice INV-1042 for Acme Corp is due Friday in Portland.'\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'array' THEN\n        RAISE EXCEPTION 'unexpected business entity extraction shape: %', result;\n    END IF;\n\n    SELECT rvbbit.extract_pii(\n        'Jane Doe can be reached at jane@example.com or 415-555-0101.'\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'array' THEN\n        RAISE EXCEPTION 'unexpected PII extraction shape: %', result;\n    END IF;\n\n    SELECT rvbbit.extract_row_entities(\n        '{\"note\":\"Invoice INV-1042 for Acme Corp is due Friday in Portland.\",\"county\":\"Clackamas\"}'::jsonb,\n        'organization, invoice number, date, location'\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'array' THEN\n        RAISE EXCEPTION 'unexpected row entity extraction shape: %', result;\n    END IF;\n\n    SELECT rvbbit.extract(\n        'Invoice INV-1042 for Acme Corp is due Friday in Portland.',\n        'organization'\n    ) INTO first_value;\n    IF first_value IS NULL THEN\n        RAISE EXCEPTION 'bundled extract operator returned NULL';\n    END IF;\n\n    SELECT rvbbit.contains_entity(\n        'Invoice INV-1042 for Acme Corp is due Friday in Portland.',\n        'organization'\n    ) INTO present;\n    IF present IS NULL THEN\n        RAISE EXCEPTION 'bundled contains_entity operator returned NULL';\n    END IF;\n\n    SELECT rvbbit.has_pii('Jane Doe can be reached at jane@example.com or 415-555-0101.') INTO present;\n    IF present IS NULL THEN\n        RAISE EXCEPTION 'bundled has_pii operator returned NULL';\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -590,6 +628,7 @@
       "backend_name": "extract_gliner",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "Zero-shot entity extraction over arbitrary user-provided labels.",
       "device": "auto",
       "endpoint_path": null,
@@ -606,7 +645,10 @@
         "extract_entities",
         "extract_pii",
         "extract_business_entities",
-        "extract_row_entities"
+        "extract_row_entities",
+        "extract",
+        "contains_entity",
+        "has_pii"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "extract/gliner-medium-v2.1",
@@ -648,7 +690,7 @@
           {
             "description": "Score query/document relevance and assert a bounded score.",
             "name": "rerank_score_shape",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.rerank_bge_base_score(\n            'suspicious login',\n            'user had twelve failed logins from a new country'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rerank_bge_base_score returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected BGE reranker result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    score float8;\n    matched bool;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.rerank_bge_base_score(\n            'suspicious login',\n            'user had twelve failed logins from a new country'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rerank_bge_base_score returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected BGE reranker result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.rerank_bge_base_row(\n        'suspicious login',\n        '{\"event\":\"login_failed\",\"count\":12,\"country\":\"new\",\"risk\":\"high\"}'::jsonb\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected BGE reranker row result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker row score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.about(\n        'user had twelve failed logins from a new country',\n        'account takeover risk'\n    ) INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled about operator score out of range: %', score;\n    END IF;\n\n    SELECT rvbbit.semantic_score(\n        'user had twelve failed logins from a new country',\n        'account takeover risk'\n    ) INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled semantic_score out of range: %', score;\n    END IF;\n\n    SELECT rvbbit.means(\n        'user had twelve failed logins from a new country',\n        'account takeover risk'\n    ) INTO matched;\n    IF matched IS NULL THEN\n        RAISE EXCEPTION 'bundled means operator returned NULL';\n    END IF;\n\n    SELECT rvbbit.semantic_matches(\n        'user had twelve failed logins from a new country',\n        'account takeover risk',\n        '{\"threshold\":0.1}'::jsonb\n    ) INTO matched;\n    IF matched IS NULL THEN\n        RAISE EXCEPTION 'bundled semantic_matches operator returned NULL';\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -658,6 +700,7 @@
       "backend_name": "rerank_bge_base",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "Smaller BGE cross-encoder reranker for query/document scoring and row ranking.",
       "device": "auto",
       "endpoint_path": null,
@@ -672,7 +715,11 @@
       "name": "bge_reranker_base",
       "operators": [
         "rerank_bge_base_score",
-        "rerank_bge_base_row"
+        "rerank_bge_base_row",
+        "about",
+        "semantic_score",
+        "means",
+        "semantic_matches"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "rerank/bge-reranker-base",
@@ -712,7 +759,7 @@
           {
             "description": "Score refund-query relevance and assert a bounded score.",
             "name": "rerank_score_shape",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.rerank_score(\n            'refund request',\n            'customer says they were charged twice and wants money back'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rerank_score returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected BGE-M3 reranker result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    score float8;\n    matched bool;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.rerank_score(\n            'refund request',\n            'customer says they were charged twice and wants money back'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rerank_score returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected BGE-M3 reranker result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.rerank_row(\n        'refund request',\n        '{\"ticket\":\"customer says they were charged twice and wants money back\",\"queue\":\"billing\"}'::jsonb\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected BGE-M3 reranker row result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker row score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.about(\n        'customer says they were charged twice and wants money back',\n        'refund request'\n    ) INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled about score out of range: %', score;\n    END IF;\n\n    SELECT rvbbit.semantic_score(\n        'customer says they were charged twice and wants money back',\n        'refund request'\n    ) INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled semantic_score out of range: %', score;\n    END IF;\n\n    SELECT rvbbit.means(\n        'customer says they were charged twice and wants money back',\n        'refund request'\n    ) INTO matched;\n    IF matched IS NULL THEN\n        RAISE EXCEPTION 'bundled means operator returned NULL';\n    END IF;\n\n    SELECT rvbbit.semantic_matches(\n        'customer says they were charged twice and wants money back',\n        'refund request',\n        '{\"threshold\":0.1}'::jsonb\n    ) INTO matched;\n    IF matched IS NULL THEN\n        RAISE EXCEPTION 'bundled semantic_matches operator returned NULL';\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -722,6 +769,7 @@
       "backend_name": "rerank_bge_m3",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "Cross-encoder relevance scoring for query/document pairs.",
       "device": "auto",
       "endpoint_path": null,
@@ -736,7 +784,11 @@
       "name": "bge_reranker_v2_m3",
       "operators": [
         "rerank_score",
-        "rerank_row"
+        "rerank_row",
+        "about",
+        "semantic_score",
+        "means",
+        "semantic_matches"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "rerank/bge-reranker-v2-m3",
@@ -776,7 +828,7 @@
           {
             "description": "Score billing-query relevance and assert a bounded score.",
             "name": "rerank_score_shape",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.rerank_ms_marco_score(\n            'billing refund',\n            'customer was charged twice and asks for their money back'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rerank_ms_marco_score returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected MS MARCO reranker result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker score out of range: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    score float8;\n    matched bool;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.rerank_ms_marco_score(\n            'billing refund',\n            'customer was charged twice and asks for their money back'\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rerank_ms_marco_score returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected MS MARCO reranker result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.rerank_ms_marco_row(\n        'billing refund',\n        '{\"ticket\":\"customer was charged twice and asks for their money back\",\"queue\":\"billing\"}'::jsonb\n    ) INTO result;\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'score') THEN\n        RAISE EXCEPTION 'unexpected MS MARCO reranker row result shape: %', result;\n    END IF;\n    IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN\n        RAISE EXCEPTION 'reranker row score out of range: %', result;\n    END IF;\n\n    SELECT rvbbit.about(\n        'customer was charged twice and asks for their money back',\n        'billing refund'\n    ) INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled about operator score out of range: %', score;\n    END IF;\n\n    SELECT rvbbit.semantic_score(\n        'customer was charged twice and asks for their money back',\n        'billing refund'\n    ) INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled semantic_score out of range: %', score;\n    END IF;\n\n    SELECT rvbbit.means(\n        'customer was charged twice and asks for their money back',\n        'billing refund'\n    ) INTO matched;\n    IF matched IS NULL THEN\n        RAISE EXCEPTION 'bundled means operator returned NULL';\n    END IF;\n\n    SELECT rvbbit.semantic_matches(\n        'customer was charged twice and asks for their money back',\n        'billing refund',\n        '{\"threshold\":0.1}'::jsonb\n    ) INTO matched;\n    IF matched IS NULL THEN\n        RAISE EXCEPTION 'bundled semantic_matches operator returned NULL';\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -786,6 +838,7 @@
       "backend_name": "rerank_ms_marco_minilm",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "public",
       "description": "Lightweight cross-encoder reranker for query/document scoring and ranking table rows by relevance.",
       "device": "auto",
       "endpoint_path": null,
@@ -800,7 +853,11 @@
       "name": "ms_marco_minilm_l6_v2",
       "operators": [
         "rerank_ms_marco_score",
-        "rerank_ms_marco_row"
+        "rerank_ms_marco_row",
+        "about",
+        "semantic_score",
+        "means",
+        "semantic_matches"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "rerank/ms-marco-minilm-l6-v2",
@@ -867,13 +924,14 @@
       "backend_name": null,
       "backend_transport": "rvbbit",
       "capability_role": "operator_runtime",
+      "catalog_visibility": "public",
       "description": "Warren-managed MCP gateway for rvbbit operator `kind: mcp` nodes and SQL MCP calls.",
       "device": "cpu",
       "endpoint_path": "/",
       "health_path": "/health",
       "id": "runtimes/mcp-gateway",
       "install_docker": true,
-      "install_mode": "image",
+      "install_mode": "build",
       "install_warren": true,
       "kind": "runtime_sidecar",
       "license": "apache-2.0",
@@ -886,9 +944,9 @@
       "pack_path": "capabilities/packs/runtimes/mcp-gateway",
       "repo_url": null,
       "runtime_handler": "mcp_gateway",
-      "runtime_image": "ghcr.io/rvbbit/mcp-gateway:0.60.4",
+      "runtime_image": null,
       "runtime_language": "mcp",
-      "runtime_mode": "image",
+      "runtime_mode": "build",
       "runtime_name": "mcp_default",
       "runtime_port": 9100,
       "runtime_template": "mcp-gateway",
@@ -942,13 +1000,14 @@
       "backend_name": null,
       "backend_transport": "rvbbit",
       "capability_role": "operator_runtime",
+      "catalog_visibility": "public",
       "description": "Warren-managed CPython runtime for rvbbit operator `kind: python` nodes.",
       "device": "cpu",
       "endpoint_path": "/run",
       "health_path": null,
       "id": "runtimes/python-runtime",
       "install_docker": true,
-      "install_mode": "image",
+      "install_mode": "build",
       "install_warren": true,
       "kind": "runtime_sidecar",
       "license": "apache-2.0",
@@ -961,9 +1020,9 @@
       "pack_path": "capabilities/packs/runtimes/python-runtime",
       "repo_url": null,
       "runtime_handler": "python_runtime",
-      "runtime_image": "ghcr.io/rvbbit/python-runtime:0.60.4",
+      "runtime_image": null,
       "runtime_language": "python",
-      "runtime_mode": "image",
+      "runtime_mode": "build",
       "runtime_name": "python_default",
       "runtime_port": null,
       "runtime_template": "python-runtime",
@@ -1012,6 +1071,7 @@
       "backend_name": "warren_smoke_echo",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "internal",
       "description": "Deterministic no-model sidecar for validating Warren deployment, backend registration, probing, and operator wiring.",
       "device": "cpu",
       "endpoint_path": null,
@@ -1065,7 +1125,7 @@
           {
             "description": "Predict a California housing row and assert numeric regression output.",
             "name": "housing_prediction_shape",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.predict_house_value(\n            '{\"MedInc\":8.3252,\"HouseAge\":41.0,\"AveRooms\":6.984127,\"AveBedrms\":1.02381,\"Population\":322.0,\"AveOccup\":2.555556,\"Latitude\":37.88,\"Longitude\":-122.23}'::jsonb\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'predict_house_value returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'value') THEN\n        RAISE EXCEPTION 'unexpected housing prediction shape: %', result;\n    END IF;\n    IF (result->>'value')::float8 <= 0 THEN\n        RAISE EXCEPTION 'housing prediction should be positive: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    value float8;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.predict_house_value(\n            '{\"MedInc\":8.3252,\"HouseAge\":41.0,\"AveRooms\":6.984127,\"AveBedrms\":1.02381,\"Population\":322.0,\"AveOccup\":2.555556,\"Latitude\":37.88,\"Longitude\":-122.23}'::jsonb\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'predict_house_value returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'value') THEN\n        RAISE EXCEPTION 'unexpected housing prediction shape: %', result;\n    END IF;\n    IF (result->>'value')::float8 <= 0 THEN\n        RAISE EXCEPTION 'housing prediction should be positive: %', result;\n    END IF;\n\n    SELECT rvbbit.house_value(\n        '{\"MedInc\":8.3252,\"HouseAge\":41.0,\"AveRooms\":6.984127,\"AveBedrms\":1.02381,\"Population\":322.0,\"AveOccup\":2.555556,\"Latitude\":37.88,\"Longitude\":-122.23}'::jsonb\n    ) INTO value;\n    IF value <= 0 THEN\n        RAISE EXCEPTION 'bundled house_value should be positive: %', value;\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -1075,6 +1135,7 @@
       "backend_name": "predict_california_housing_sklearn",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "example",
       "description": "Scikit-learn tabular regression example that predicts median house value from California housing row features.",
       "device": "cpu",
       "endpoint_path": null,
@@ -1088,7 +1149,8 @@
       "manifest_path": "capabilities/packs/tabular/california-housing-sklearn/capability.yaml",
       "name": "california_housing_sklearn",
       "operators": [
-        "predict_house_value"
+        "predict_house_value",
+        "house_value"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "tabular/california-housing-sklearn",
@@ -1130,7 +1192,7 @@
           {
             "description": "Predict a red-wine feature row and assert classifier JSON output.",
             "name": "wine_quality_prediction_shape",
-            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.predict_wine_quality(\n            '{\"fixed acidity\":7.4,\"volatile acidity\":0.7,\"citric acid\":0.0,\"residual sugar\":1.9,\"chlorides\":0.076,\"free sulfur dioxide\":11,\"total sulfur dioxide\":34,\"density\":0.9978,\"pH\":3.51,\"sulphates\":0.56,\"alcohol\":9.4}'::jsonb\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'predict_wine_quality returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'prediction') THEN\n        RAISE EXCEPTION 'unexpected wine prediction shape: %', result;\n    END IF;\nEND\n$$;\n"
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    label text;\n    score float8;\n    started timestamptz := clock_timestamp();\nBEGIN\n    LOOP\n        SELECT rvbbit.predict_wine_quality(\n            '{\"fixed acidity\":7.4,\"volatile acidity\":0.7,\"citric acid\":0.0,\"residual sugar\":1.9,\"chlorides\":0.076,\"free sulfur dioxide\":11,\"total sulfur dioxide\":34,\"density\":0.9978,\"pH\":3.51,\"sulphates\":0.56,\"alcohol\":9.4}'::jsonb\n        ) INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'predict_wine_quality returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'object'\n       OR NOT (result ? 'label')\n       OR NOT (result ? 'prediction') THEN\n        RAISE EXCEPTION 'unexpected wine prediction shape: %', result;\n    END IF;\n\n    SELECT rvbbit.wine_quality(\n        '{\"fixed acidity\":7.4,\"volatile acidity\":0.7,\"citric acid\":0.0,\"residual sugar\":1.9,\"chlorides\":0.076,\"free sulfur dioxide\":11,\"total sulfur dioxide\":34,\"density\":0.9978,\"pH\":3.51,\"sulphates\":0.56,\"alcohol\":9.4}'::jsonb\n    ) INTO label;\n    IF label IS NULL OR label = '' THEN\n        RAISE EXCEPTION 'bundled wine_quality operator returned empty label';\n    END IF;\n\n    SELECT rvbbit.wine_quality_confidence(\n        '{\"fixed acidity\":7.4,\"volatile acidity\":0.7,\"citric acid\":0.0,\"residual sugar\":1.9,\"chlorides\":0.076,\"free sulfur dioxide\":11,\"total sulfur dioxide\":34,\"density\":0.9978,\"pH\":3.51,\"sulphates\":0.56,\"alcohol\":9.4}'::jsonb\n    ) INTO score;\n    IF score < 0 OR score > 1 THEN\n        RAISE EXCEPTION 'bundled wine_quality_confidence out of range: %', score;\n    END IF;\nEND\n$$;\n"
           }
         ]
       },
@@ -1140,6 +1202,7 @@
       "backend_name": "predict_wine_quality_sklearn",
       "backend_transport": "rvbbit",
       "capability_role": null,
+      "catalog_visibility": "example",
       "description": "Scikit-learn tabular classification example that predicts red wine quality classes from numeric row features.",
       "device": "cpu",
       "endpoint_path": null,
@@ -1153,7 +1216,9 @@
       "manifest_path": "capabilities/packs/tabular/wine-quality-sklearn/capability.yaml",
       "name": "wine_quality_sklearn",
       "operators": [
-        "predict_wine_quality"
+        "predict_wine_quality",
+        "wine_quality",
+        "wine_quality_confidence"
       ],
       "pack_api_version": "rvbbit.pack/v1",
       "pack_id": "tabular/wine-quality-sklearn",

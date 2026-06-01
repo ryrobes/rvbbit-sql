@@ -24,6 +24,7 @@ exports:
   backend: detect_language_xlm_roberta
   operators:
   - detect_language
+  - language
 install:
   mode: build
   warren: true
@@ -39,6 +40,7 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          label text;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -57,6 +59,11 @@ acceptance:
           END IF;
           IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
               RAISE EXCEPTION 'language score out of range: %', result;
+          END IF;
+
+          SELECT rvbbit.language('el pedido llego tarde y necesito ayuda') INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'bundled language operator returned empty label';
           END IF;
       END
       $$;

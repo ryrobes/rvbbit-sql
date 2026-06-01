@@ -5,6 +5,7 @@ title: California Housing Regressor
 description: Scikit-learn tabular regression example that predicts median house value from California
   housing row features.
 license: unknown
+catalog_visibility: example
 tags:
 - tabular
 - regression
@@ -27,6 +28,7 @@ exports:
   backend: predict_california_housing_sklearn
   operators:
   - predict_house_value
+  - house_value
 install:
   mode: build
   warren: true
@@ -42,6 +44,7 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          value float8;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -60,6 +63,13 @@ acceptance:
           END IF;
           IF (result->>'value')::float8 <= 0 THEN
               RAISE EXCEPTION 'housing prediction should be positive: %', result;
+          END IF;
+
+          SELECT rvbbit.house_value(
+              '{"MedInc":8.3252,"HouseAge":41.0,"AveRooms":6.984127,"AveBedrms":1.02381,"Population":322.0,"AveOccup":2.555556,"Latitude":37.88,"Longitude":-122.23}'::jsonb
+          ) INTO value;
+          IF value <= 0 THEN
+              RAISE EXCEPTION 'bundled house_value should be positive: %', value;
           END IF;
       END
       $$;

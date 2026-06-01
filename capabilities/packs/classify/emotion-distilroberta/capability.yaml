@@ -37,6 +37,44 @@ operators:
     parser: json
     inputs:
       text: "{{ inputs.row }}"
+  - name: emotion
+    description: Return the top emotion label for free text.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: raw
+        kind: specialist
+        specialist: classify_emotion_distilroberta
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.raw.output }}"
+          path: label
+          default: neutral
+  - name: emotion_confidence
+    description: Return the confidence score for the top emotion label.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: float8
+    parser: score_0_1
+    steps:
+      - name: raw
+        kind: specialist
+        specialist: classify_emotion_distilroberta
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: score
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.raw.output }}"
+          path: score
+          default: 0
 smoke:
   inputs:
     - text: I am thrilled that the replacement arrived early

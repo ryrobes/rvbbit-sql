@@ -37,6 +37,44 @@ operators:
     parser: json
     inputs:
       text: "{{ inputs.row }}"
+  - name: sentiment
+    description: Canonical sentiment label backed by the RoBERTa sentiment Warren.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: classify
+        kind: specialist
+        specialist: classify_twitter_roberta_sentiment
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.classify.output }}"
+          path: label
+          default: neutral
+  - name: sentiment_confidence
+    description: Confidence score for the top sentiment label.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: float8
+    parser: score_0_1
+    steps:
+      - name: classify
+        kind: specialist
+        specialist: classify_twitter_roberta_sentiment
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: score
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.classify.output }}"
+          path: score
+          default: 0
 smoke:
   inputs:
     - text: the setup was simple and the dashboard is fantastic

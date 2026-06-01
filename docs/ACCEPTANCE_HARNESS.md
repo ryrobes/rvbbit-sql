@@ -12,7 +12,8 @@ make e2e-realworld
 ```
 
 Starts the core stack plus deterministic sidecars, reloads the extension
-non-destructively, and runs the harness.
+non-destructively, deploys the CPython and MCP Gateway runtime capabilities
+through Warren, and runs the harness.
 
 ```bash
 make e2e-realworld-fresh
@@ -58,6 +59,24 @@ named SQL assertions. Use this for tiny realistic samples that validate the
 sidecar build/image, Warren registration, generated operators, and
 observability rows together.
 
+To sweep the selected built-in catalog:
+
+```bash
+make capability-test-all
+```
+
+That runs every selected pack's `acceptance.tests` through Warren, writes JSONL
+and Markdown reports under `.rvbbit/capability-acceptance/`, and reports how
+many exported operators were directly exercised by the pack acceptance SQL.
+Examples and internal smoke packs are excluded by default; include them with:
+
+```bash
+make capability-test-all CAPABILITY_TEST_VISIBILITY=public,example,internal
+```
+
+Set `CAPABILITY_TEST_OUT=...` if CI wants the reports under a different
+artifact directory.
+
 ## Environment
 
 | Variable | Default | Meaning |
@@ -88,6 +107,7 @@ The current harness checks these user-facing surfaces:
 | `ml` | SQL-backed model training lifecycle: `rvbbit.train_model`, external `rvbbit-trainer`, generated tabular sidecar, `rvbbit.complete_model_training`, `ml_model_status`, and generated `predict_*` SQL operator. |
 | `semantic` | Dynamic backend/operator registration, implicit prewarm with `WHERE`/`ORDER BY`/`LIMIT`, explicit batch prewarm, cache-hit behavior, high-volume scalar batching/receipt stress, and intentional backend-failure receipt audit. |
 | `embeddings` | Stub embedding backend, `rvbbit.embed`, materialized embedding cache, `rvbbit.knn_text`, and optional default local CPU `embed` backend smoke coverage when it is registered. |
+| `python` | Warren-registered `python_default`, runtime endpoint setting, SQL-managed env/handler DDL, SQL step feeding a `kind: python` workflow node, post-ward validation, and receipt sub-call audit. |
 | `mcp` | MCP server registration, tool refresh, `rvbbit.mcp_call`, `rvbbit.mcp_rows`, invocation `query_id` audit, intentional tool-error audit, MCP-as-operator flow, and an `mcp -> code -> specialist` operator chain with receipt sub-call audit. |
 | `kg` | Deterministic triples JSON, `rvbbit.kg_ingest_triples`, graph traversal, evidence `query_id`, plus a deterministic KG built from imported free-form text with context/evidence traversal. |
 | `warren` | Warren node catalog, metrics ingest, capability deploy job, job claim, inventory view, and runtime-capability catalog shape. The separate `make e2e-realworld-warren` target also runs the host-Docker sidecar lifecycle. |
@@ -105,10 +125,18 @@ exactly one receipt with the query id for that SQL statement and exactly one cos
 audit event. Live provider cost settlement is still covered separately by
 `make e2e-realworld-live`.
 
-The default Python harness does not start Docker-managed Warren sidecars. Use
-`make e2e-realworld-warren` when you want the full deployment path because that
-must run `warren-agent` from the host with access to Docker. The Python runtime
-sidecar still has sidecar-level tests independent of Warren.
+The default Make targets now install the system runtime sidecars used by the
+harness (`runtimes/python-runtime` and `runtimes/mcp-gateway`) through Warren
+before the Python runner starts. Use `make e2e-realworld-warren` when you want
+the additional model-backend deployment smoke for `smoke/warren-echo`.
+
+The catalog sweep is intentionally separate from `make e2e-realworld`: it can
+download/build many model images and may be slow. It is the release-style
+answer to "does every installed capability pack deploy and do its documented
+SQL assertions pass?" The report's operator coverage column is conservative:
+`3/6` means three exported SQL operators were directly called by the acceptance
+SQL. Operators that are only indirectly covered or missing example assertions
+remain visible as coverage gaps.
 
 ## Artifacts
 

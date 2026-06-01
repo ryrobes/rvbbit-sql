@@ -26,6 +26,10 @@ exports:
   operators:
   - classify_zero_shot_base
   - classify_row_zero_shot_base
+  - classify
+  - semantic_classify
+  - bucket
+  - intent
 install:
   mode: build
   warren: true
@@ -41,6 +45,7 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          label text;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -63,6 +68,49 @@ acceptance:
           END IF;
           IF NOT (result->>'label' = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN
               RAISE EXCEPTION 'zero-shot label was outside candidate set: %', result;
+          END IF;
+
+          SELECT rvbbit.classify(
+              'customer cannot log in after the MFA reset',
+              'auth,billing,shipping,fraud'
+          ) INTO label;
+          IF NOT (label = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN
+              RAISE EXCEPTION 'bundled classify label was outside candidate set: %', label;
+          END IF;
+
+          SELECT rvbbit.classify_row_zero_shot_base(
+              '{"ticket":"customer cannot log in after the MFA reset","plan":"enterprise"}'::jsonb,
+              'auth,billing,shipping,fraud'
+          ) INTO result;
+          IF jsonb_typeof(result) <> 'object'
+             OR NOT (result ? 'label')
+             OR NOT (result ? 'score')
+             OR NOT (result ? 'scores') THEN
+              RAISE EXCEPTION 'unexpected row zero-shot result shape: %', result;
+          END IF;
+          IF NOT (result->>'label' = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN
+              RAISE EXCEPTION 'row zero-shot label was outside candidate set: %', result;
+          END IF;
+
+          SELECT rvbbit.semantic_classify(
+              'customer cannot log in after the MFA reset',
+              'auth,billing,shipping,fraud'
+          ) INTO label;
+          IF NOT (label = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN
+              RAISE EXCEPTION 'bundled semantic_classify label was outside candidate set: %', label;
+          END IF;
+
+          SELECT rvbbit.bucket(
+              'customer cannot log in after the MFA reset',
+              'auth,billing,shipping,fraud'
+          ) INTO label;
+          IF NOT (label = ANY (ARRAY['auth','billing','shipping','fraud'])) THEN
+              RAISE EXCEPTION 'bundled bucket label was outside candidate set: %', label;
+          END IF;
+
+          SELECT rvbbit.intent('customer cannot log in after the MFA reset') INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'bundled intent operator returned empty label';
           END IF;
       END
       $$;

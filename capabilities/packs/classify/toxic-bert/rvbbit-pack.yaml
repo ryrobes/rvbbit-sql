@@ -26,6 +26,8 @@ exports:
   operators:
   - classify_toxicity
   - classify_row_toxicity
+  - toxicity
+  - toxicity_score
 install:
   mode: build
   warren: true
@@ -41,6 +43,8 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          label text;
+          score float8;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -58,6 +62,27 @@ acceptance:
           END IF;
           IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
               RAISE EXCEPTION 'toxicity score out of range: %', result;
+          END IF;
+
+          SELECT rvbbit.classify_row_toxicity(
+              '{"comment":"you are awful and nobody wants you here","channel":"support_chat"}'::jsonb
+          ) INTO result;
+          IF jsonb_typeof(result) <> 'object'
+             OR NOT (result ? 'score') THEN
+              RAISE EXCEPTION 'unexpected row toxicity result shape: %', result;
+          END IF;
+          IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
+              RAISE EXCEPTION 'row toxicity score out of range: %', result;
+          END IF;
+
+          SELECT rvbbit.toxicity('you are awful and nobody wants you here') INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'bundled toxicity operator returned empty label';
+          END IF;
+
+          SELECT rvbbit.toxicity_score('you are awful and nobody wants you here') INTO score;
+          IF score < 0 OR score > 1 THEN
+              RAISE EXCEPTION 'bundled toxicity_score out of range: %', score;
           END IF;
       END
       $$;

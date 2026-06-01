@@ -29,6 +29,25 @@ operators:
     parser: json
     inputs:
       text: "{{ inputs.text }}"
+  - name: language
+    description: Canonical language label backed by the XLM-R language-detection Warren.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: detect
+        kind: specialist
+        specialist: detect_language_xlm_roberta
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.detect.output }}"
+          path: label
+          default: unknown
 smoke:
   inputs:
     - text: el pedido llegó tarde y necesito ayuda

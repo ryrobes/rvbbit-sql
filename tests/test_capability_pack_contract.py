@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import subprocess
 
 import pytest
 
@@ -10,12 +12,114 @@ yaml = pytest.importorskip("yaml")
 
 
 PACKS = Path(__file__).resolve().parents[1] / "capabilities" / "packs"
+ROOT = PACKS.parent.parent
 
 
 def _pack_docs():
     for path in sorted(PACKS.rglob("rvbbit-pack.yaml")):
         with path.open(encoding="utf-8") as fh:
             yield path, yaml.safe_load(fh)
+
+
+def _capability_doc(path: Path):
+    with (path.parent / "capability.yaml").open(encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def test_pack_exports_include_manifest_operators():
+    bad: list[str] = []
+    for path, pack in _pack_docs():
+        capability_path = path.parent / "capability.yaml"
+        if not capability_path.exists():
+            continue
+        manifest = _capability_doc(path)
+        manifest_ops = {op["name"] for op in manifest.get("operators") or []}
+        if not manifest_ops:
+            continue
+        exported_ops = set((pack.get("exports") or {}).get("operators") or [])
+        missing = sorted(manifest_ops - exported_ops)
+        extra = sorted(exported_ops - manifest_ops)
+        if missing or extra:
+            bad.append(
+                f"{path.relative_to(PACKS.parent.parent)} "
+                f"missing={missing} extra={extra}"
+            )
+
+    assert not bad, "pack exports.operators must mirror capability operators: " + "; ".join(bad)
+
+
+def test_generated_compose_does_not_publish_default_host_port():
+    pack = PACKS / "rerank" / "bge-reranker-base"
+    proc = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "compose",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert "expose:" in proc.stdout
+    assert "ports:" not in proc.stdout
+
+
+def test_generated_operator_sql_replaces_infix_bindings():
+    pack = PACKS / "rerank" / "bge-reranker-base"
+    proc = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "operators",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert "op.oprname = '~~%'" in proc.stdout
+    assert "op.oprname = '~~?'" in proc.stdout
+    assert "SET infix_symbol = '~~%'" in proc.stdout
+    assert "SET infix_symbol = '~~?'" in proc.stdout
+
+
+def test_deploy_manifest_preserves_smoke_probe_inputs():
+    pack = PACKS / "tabular" / "wine-quality-sklearn"
+    proc = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "deploy",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert '"smoke"' in proc.stdout
+    assert "fixed acidity" in proc.stdout
+
+
+def test_scaffold_includes_handler_extra_requirements(tmp_path):
+    pack = PACKS / "extract" / "gliner-medium-v2.1"
+    out = tmp_path / "gliner"
+    subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "scaffold",
+            str(pack),
+            str(out),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    requirements = (out / "requirements.txt").read_text(encoding="utf-8")
+    assert "gliner==0.2.16" in requirements
 
 
 def test_builtin_packs_have_acceptance_sql():
@@ -35,6 +139,32 @@ def test_builtin_packs_have_acceptance_sql():
 
     assert not missing, "built-in packs without acceptance.tests: " + ", ".join(missing)
     assert not invalid, "invalid acceptance tests: " + ", ".join(invalid)
+
+
+def test_acceptance_sql_covers_exported_operators():
+    gaps: list[str] = []
+    for path, pack in _pack_docs():
+        operators = (pack.get("exports") or {}).get("operators") or []
+        if not operators:
+            continue
+        acceptance = pack.get("acceptance") or {}
+        haystack = "\n".join(
+            test.get("sql", "")
+            for test in acceptance.get("tests") or []
+            if isinstance(test, dict)
+        )
+        missing = []
+        for op in operators:
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9_])(?:rvbbit\.)?{re.escape(op)}\s*\(",
+                re.IGNORECASE,
+            )
+            if not pattern.search(haystack):
+                missing.append(op)
+        if missing:
+            gaps.append(f"{path.relative_to(PACKS.parent.parent)} missing={missing}")
+
+    assert not gaps, "acceptance SQL should call every exported operator: " + "; ".join(gaps)
 
 
 def test_acceptance_targets_are_warren_selectors():

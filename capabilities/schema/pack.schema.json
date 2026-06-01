@@ -34,6 +34,11 @@
     "repo_url": {
       "type": "string"
     },
+    "catalog_visibility": {
+      "type": "string",
+      "enum": ["public", "example", "internal"],
+      "default": "public"
+    },
     "system_runtime": {
       "type": "boolean",
       "default": false

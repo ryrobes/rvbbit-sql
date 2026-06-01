@@ -4,8 +4,9 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,8 @@ struct WarrenJob {
 struct DeploymentResult {
     endpoint_url: String,
     probe_url: String,
+    container_name: String,
+    published_host_port: bool,
     backend_name: Option<String>,
     operator_name: Option<String>,
     runtime_name: Option<String>,
@@ -70,6 +73,7 @@ fn main() -> Result<()> {
     loop {
         heartbeat(&mut db, &config, "ready")?;
         maybe_record_metrics(&mut db, &config, &mut metrics, &mut last_metrics_at);
+        let mut failed_once_job: Option<String> = None;
         match claim_job(&mut db, &config)? {
             Some(job) => {
                 println!(
@@ -80,11 +84,28 @@ fn main() -> Result<()> {
                 maybe_record_metrics(&mut db, &config, &mut metrics, &mut last_metrics_at);
                 if let Err(err) = process_job(&mut db, &config, &job) {
                     eprintln!("job {} failed: {err:#}", job.job_id);
-                    let logs = json!({"error": err.to_string(), "agent": "warren-agent"});
-                    fail_job(&mut db, &config, &job, &err.to_string(), &logs)?;
+                    let error = format!("{err:#}");
+                    let logs = json!({
+                        "agent": "warren-agent",
+                        "error": error,
+                        "job": {
+                            "id": job.job_id,
+                            "kind": job.kind,
+                            "name": job.name,
+                            "target_selector": job.target_selector,
+                        }
+                    });
+                    fail_job(&mut db, &config, &job, &error, &logs)?;
+                    failed_once_job = Some(format!("job {} failed: {err:#}", job.job_id));
                 }
                 try_record_metrics(&mut db, &config, &mut metrics);
                 last_metrics_at = Instant::now();
+                if config.once {
+                    if let Some(message) = failed_once_job {
+                        bail!(message);
+                    }
+                    break;
+                }
             }
             None if config.once => {
                 println!("no queued Warren jobs");
@@ -584,12 +605,19 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
     }
 
     let mut result = match job.kind.as_str() {
-        "capability" | "trained_model" => deploy_capability(config, job)?,
+        "capability" | "trained_model" => deploy_capability(db, config, job)?,
         other => bail!("Warren job kind {other:?} is not implemented yet"),
     };
 
     if is_runtime_sidecar(&job.manifest) {
         if !config.dry_run {
+            try_update_job_progress(
+                db,
+                config,
+                job,
+                "probing_runtime",
+                json!({"probe_url": result.probe_url}),
+            );
             let probe = probe_runtime(&job.manifest, &result)?;
             if !probe.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                 bail!("runtime probe failed after deployment: {probe}");
@@ -598,10 +626,35 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
                 obj.insert("runtime_probe".into(), probe);
             }
         }
+        try_update_job_progress(
+            db,
+            config,
+            job,
+            "registering_runtime",
+            json!({"runtime_name": result.runtime_name}),
+        );
         register_runtime(db, &job.manifest, &result)?;
     } else {
+        try_update_job_progress(
+            db,
+            config,
+            job,
+            "registering_backend",
+            json!({
+                "backend_name": result.backend_name,
+                "operator_name": result.operator_name,
+                "endpoint_url": result.endpoint_url,
+            }),
+        );
         register_backend_and_operators(db, &job.manifest, &result)?;
         if !config.dry_run {
+            try_update_job_progress(
+                db,
+                config,
+                job,
+                "probing_backend",
+                json!({"backend_name": result.backend_name}),
+            );
             let probe = probe_backend(db, &job.manifest)?;
             if !probe.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                 bail!("backend probe failed after deployment: {probe}");
@@ -623,7 +676,7 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
     Ok(())
 }
 
-fn deploy_capability(config: &Config, job: &WarrenJob) -> Result<DeploymentResult> {
+fn deploy_capability(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<DeploymentResult> {
     let manifest = &job.manifest;
     let pack_name = manifest
         .get("name")
@@ -631,6 +684,13 @@ fn deploy_capability(config: &Config, job: &WarrenJob) -> Result<DeploymentResul
         .unwrap_or(&job.name);
     let safe_name = slugify(pack_name);
     let project_dir = config.work_dir.join(&safe_name);
+    try_update_job_progress(
+        db,
+        config,
+        job,
+        "preparing",
+        json!({"compose_project": safe_name, "work_dir": project_dir.display().to_string()}),
+    );
     if project_dir.exists() {
         if !config.dry_run && project_dir.join("compose.yaml").exists() {
             docker_compose_down(&project_dir)?;
@@ -641,8 +701,16 @@ fn deploy_capability(config: &Config, job: &WarrenJob) -> Result<DeploymentResul
     fs::create_dir_all(&project_dir)
         .with_context(|| format!("creating {}", project_dir.display()))?;
 
+    try_update_job_progress(
+        db,
+        config,
+        job,
+        "scaffolding",
+        json!({"work_dir": project_dir.display().to_string()}),
+    );
     scaffold_project(config, manifest, &project_dir, &safe_name)?;
 
+    let publish_host_port = should_publish_host_port(config, manifest);
     let port = manifest
         .pointer("/warren/port")
         .and_then(Value::as_u64)
@@ -662,23 +730,64 @@ fn deploy_capability(config: &Config, job: &WarrenJob) -> Result<DeploymentResul
         );
     } else {
         let should_build = manifest.get("runtime").and_then(runtime_image).is_none();
-        docker_compose_up(&project_dir, port, &config.docker_network, should_build)?;
-        wait_for_health(
+        try_update_job_progress(
+            db,
+            config,
+            job,
+            "starting",
+            json!({
+                "compose_project": safe_name,
+                "container_name": container_name(&safe_name),
+                "port": port,
+                "published_host_port": publish_host_port,
+                "build": should_build,
+            }),
+        );
+        docker_compose_up(
+            &project_dir,
             port,
-            runtime_health_path(manifest),
-            Duration::from_secs(180),
+            &config.docker_network,
+            should_build,
+            publish_host_port,
         )?;
+        if publish_host_port {
+            try_update_job_progress(
+                db,
+                config,
+                job,
+                "waiting_health",
+                json!({"health_url": format!("http://127.0.0.1:{port}{}", runtime_health_path(manifest))}),
+            );
+            wait_for_health(
+                port,
+                runtime_health_path(manifest),
+                Duration::from_secs(180),
+            )?;
+        } else {
+            let container = container_name(&safe_name);
+            try_update_job_progress(
+                db,
+                config,
+                job,
+                "waiting_health",
+                json!({"container_name": container}),
+            );
+            wait_for_container_health(&container, Duration::from_secs(180))?;
+        }
     }
 
     let health = json!({
         "ok": !config.dry_run,
         "dry_run": config.dry_run,
         "port": port,
+        "published_host_port": publish_host_port,
         "target_selector": job.target_selector,
     });
     Ok(DeploymentResult {
         endpoint_url,
         probe_url,
+        container_name: container_name(&safe_name),
+        published_host_port: publish_host_port,
         backend_name: manifest
             .pointer("/backend/name")
             .and_then(Value::as_str)
@@ -717,6 +826,10 @@ fn scaffold_project(
             out_dir.join("compose.yaml"),
             render_compose(manifest, safe_name)?,
         )?;
+        fs::write(
+            out_dir.join("compose.host-ports.yaml"),
+            render_host_ports_compose(manifest, safe_name)?,
+        )?;
         return Ok(());
     }
 
@@ -748,26 +861,13 @@ fn scaffold_project(
         ("handler", handler),
         ("device", device),
     ];
-    for entry in fs::read_dir(&template_dir)
-        .with_context(|| format!("reading template dir {}", template_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let text = render_tokens(
-            &fs::read_to_string(&path)
-                .with_context(|| format!("reading template file {}", path.display()))?,
-            &values,
-        );
-        fs::write(out_dir.join(entry.file_name()), text)?;
-    }
+    copy_template_files(&template_dir, &template_dir, out_dir, &values)?;
     let requirements_path = out_dir.join("requirements.txt");
     if requirements_path.exists() {
         let requirements = render_requirements(
             &fs::read_to_string(&requirements_path).context("reading rendered requirements")?,
             handler,
+            runtime,
         );
         fs::write(requirements_path, requirements)?;
     }
@@ -779,6 +879,56 @@ fn scaffold_project(
         out_dir.join("compose.yaml"),
         render_compose(manifest, safe_name)?,
     )?;
+    fs::write(
+        out_dir.join("compose.host-ports.yaml"),
+        render_host_ports_compose(manifest, safe_name)?,
+    )?;
+    Ok(())
+}
+
+fn copy_template_files(
+    root: &Path,
+    current: &Path,
+    out_dir: &Path,
+    values: &[(&str, &str)],
+) -> Result<()> {
+    for entry in
+        fs::read_dir(current).with_context(|| format!("reading template dir {}", current.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("__pycache__") {
+                continue;
+            }
+            copy_template_files(root, &path, out_dir, values)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("pyc" | "pyo")
+        ) {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .with_context(|| format!("computing template path for {}", path.display()))?;
+        let target = out_dir.join(rel);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let text = render_tokens(
+            &fs::read_to_string(&path)
+                .with_context(|| format!("reading template file {}", path.display()))?,
+            values,
+        );
+        fs::write(&target, text).with_context(|| format!("writing {}", target.display()))?;
+    }
     Ok(())
 }
 
@@ -807,7 +957,7 @@ fn render_tokens(input: &str, values: &[(&str, &str)]) -> String {
     out
 }
 
-fn render_requirements(base: &str, handler: &str) -> String {
+fn render_requirements(base: &str, handler: &str, runtime: &Value) -> String {
     let mut lines: Vec<String> = base.lines().map(str::to_string).collect();
     if matches!(
         handler,
@@ -817,6 +967,9 @@ fn render_requirements(base: &str, handler: &str) -> String {
             if !lines.iter().any(|line| line == dep) {
                 lines.push(dep.into());
             }
+        }
+        if handler == "gliner" && !lines.iter().any(|line| line == "gliner==0.2.16") {
+            lines.push("gliner==0.2.16".into());
         }
     }
     if matches!(handler, "tabular_classification" | "tabular_regression") {
@@ -828,6 +981,13 @@ fn render_requirements(base: &str, handler: &str) -> String {
             "scikit-learn==1.5.2",
         ] {
             if !lines.iter().any(|line| line == dep) {
+                lines.push(dep.into());
+            }
+        }
+    }
+    if let Some(extra) = runtime.get("extra_requirements").and_then(Value::as_array) {
+        for dep in extra.iter().filter_map(Value::as_str).map(str::trim) {
+            if !dep.is_empty() && !lines.iter().any(|line| line == dep) {
                 lines.push(dep.into());
             }
         }
@@ -885,7 +1045,15 @@ fn render_compose(manifest: &Value, safe_name: &str) -> Result<String> {
     let runtime_source = render_runtime_source(runtime);
 
     Ok(format!(
-        "services:\n  {service}:\n{runtime_source}    container_name: rvbbit-{service}\n    ports:\n      - \"${{RVBBIT_CAPABILITY_PORT:-{container_port}}}:{container_port}\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:{container_port}{health_path}').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
+        "services:\n  {service}:\n{runtime_source}    container_name: rvbbit-{service}\n    expose:\n      - \"{container_port}\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:{container_port}{health_path}').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
+    ))
+}
+
+fn render_host_ports_compose(manifest: &Value, safe_name: &str) -> Result<String> {
+    let service = safe_name.replace('_', "-");
+    let container_port = runtime_container_port(manifest);
+    Ok(format!(
+        "services:\n  {service}:\n    ports:\n      - \"${{RVBBIT_CAPABILITY_PORT:-0}}:{container_port}\"\n"
     ))
 }
 
@@ -964,9 +1132,19 @@ fn render_runtime_volumes(runtime: &Value) -> (String, String) {
     (mounts.join("\n"), defs.join("\n"))
 }
 
-fn docker_compose_up(project_dir: &Path, port: u16, network: &str, build: bool) -> Result<()> {
+fn docker_compose_up(
+    project_dir: &Path,
+    port: u16,
+    network: &str,
+    build: bool,
+    publish_host_port: bool,
+) -> Result<()> {
     let mut command = Command::new("docker");
-    command.arg("compose").arg("up").arg("-d");
+    command.arg("compose").arg("-f").arg("compose.yaml");
+    if publish_host_port {
+        command.arg("-f").arg("compose.host-ports.yaml");
+    }
+    command.arg("up").arg("-d");
     if build {
         command.arg("--build");
     }
@@ -980,6 +1158,30 @@ fn docker_compose_up(project_dir: &Path, port: u16, network: &str, build: bool) 
         bail!("docker compose up failed with status {status}");
     }
     Ok(())
+}
+
+fn wait_for_container_health(container_name: &str, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    let mut last_status = String::new();
+    while start.elapsed() < timeout {
+        let output = Command::new("docker")
+            .arg("inspect")
+            .arg("--format")
+            .arg("{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}")
+            .arg(container_name)
+            .output()
+            .with_context(|| format!("inspecting container {container_name}"))?;
+        if output.status.success() {
+            last_status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if last_status == "healthy" || last_status == "running" {
+                return Ok(());
+            }
+        } else {
+            last_status = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    bail!("container {container_name} did not become healthy: {last_status}");
 }
 
 fn docker_compose_down(project_dir: &Path) -> Result<()> {
@@ -1223,28 +1425,22 @@ fn register_runtime(db: &mut Client, manifest: &Value, result: &DeploymentResult
 fn probe_runtime(manifest: &Value, result: &DeploymentResult) -> Result<Value> {
     let language = runtime_language(manifest);
     if matches!(language.as_str(), "mcp" | "mcp_gateway") {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
-        let resp = client
-            .get(&result.probe_url)
-            .send()
-            .with_context(|| format!("probing MCP gateway {}", result.probe_url))?;
-        let status = resp.status();
-        let body = resp.text().context("reading MCP gateway probe response")?;
-        if !status.is_success() {
-            bail!(
-                "MCP gateway probe returned HTTP {}: {}",
-                status.as_u16(),
-                body
+        let parsed = if result.published_host_port {
+            http_get_json(&result.probe_url)
+                .with_context(|| format!("probing MCP gateway {}", result.probe_url))?
+        } else {
+            let url = format!(
+                "http://127.0.0.1:{}{}",
+                runtime_container_port(manifest),
+                normalized_endpoint_path(runtime_health_path(manifest))
             );
-        }
-        let parsed =
-            serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({ "body": body }));
+            container_http_get_json(&result.container_name, &url)
+                .with_context(|| format!("probing MCP gateway in {}", result.container_name))?
+        };
         return Ok(json!({
             "ok": parsed.get("status").and_then(Value::as_str) == Some("ok")
                 || parsed.get("ok").and_then(Value::as_bool).unwrap_or(false)
-                || status.is_success(),
+                || parsed.get("body").is_some(),
             "runtime": "mcp",
             "health": parsed,
         }));
@@ -1272,20 +1468,112 @@ fn probe_runtime(manifest: &Value, result: &DeploymentResult) -> Result<Value> {
         "inputs": {"ok": true},
         "timeout_ms": 5000
     });
+    if result.published_host_port {
+        return http_post_json(&result.probe_url, &payload)
+            .with_context(|| format!("probing runtime {}", result.probe_url));
+    }
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        runtime_container_port(manifest),
+        normalized_endpoint_path(
+            manifest
+                .pointer("/warren/endpoint_path")
+                .or_else(|| manifest.pointer("/runtime_registration/endpoint_path"))
+                .and_then(Value::as_str)
+                .unwrap_or("/run")
+        )
+    );
+    container_http_post_json(&result.container_name, &url, &payload)
+        .with_context(|| format!("probing runtime in {}", result.container_name))
+}
+
+fn http_get_json(url: &str) -> Result<Value> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
-    let resp = client
-        .post(&result.probe_url)
-        .json(&payload)
-        .send()
-        .with_context(|| format!("probing runtime {}", result.probe_url))?;
+    let resp = client.get(url).send()?;
     let status = resp.status();
-    let body = resp.text().context("reading runtime probe response")?;
+    let body = resp.text().context("reading HTTP response")?;
     if !status.is_success() {
-        bail!("runtime probe returned HTTP {}: {}", status.as_u16(), body);
+        bail!("HTTP GET returned {}: {}", status.as_u16(), body);
     }
-    serde_json::from_str(&body).context("parsing runtime probe response")
+    serde_json::from_str(&body).or_else(|_| Ok(json!({ "body": body })))
+}
+
+fn http_post_json(url: &str, payload: &Value) -> Result<Value> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let resp = client.post(url).json(payload).send()?;
+    let status = resp.status();
+    let body = resp.text().context("reading HTTP response")?;
+    if !status.is_success() {
+        bail!("HTTP POST returned {}: {}", status.as_u16(), body);
+    }
+    serde_json::from_str(&body).context("parsing HTTP JSON response")
+}
+
+fn container_http_get_json(container_name: &str, url: &str) -> Result<Value> {
+    let input = json!({ "url": url }).to_string();
+    let script = r#"
+import json, sys, urllib.request
+doc = json.load(sys.stdin)
+with urllib.request.urlopen(doc["url"], timeout=10) as response:
+    sys.stdout.write(response.read().decode())
+"#;
+    let body = docker_exec_python(container_name, script, &input)?;
+    serde_json::from_str(&body).or_else(|_| Ok(json!({ "body": body })))
+}
+
+fn container_http_post_json(container_name: &str, url: &str, payload: &Value) -> Result<Value> {
+    let input = json!({ "url": url, "payload": payload }).to_string();
+    let script = r#"
+import json, sys, urllib.request
+doc = json.load(sys.stdin)
+data = json.dumps(doc["payload"]).encode()
+request = urllib.request.Request(
+    doc["url"],
+    data=data,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=10) as response:
+    sys.stdout.write(response.read().decode())
+"#;
+    let body = docker_exec_python(container_name, script, &input)?;
+    serde_json::from_str(&body).context("parsing container HTTP JSON response")
+}
+
+fn docker_exec_python(container_name: &str, script: &str, stdin: &str) -> Result<String> {
+    let mut child = Command::new("docker")
+        .arg("exec")
+        .arg("-i")
+        .arg(container_name)
+        .arg("python")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting docker exec in {container_name}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| anyhow!("docker exec stdin unavailable"))?
+        .write_all(stdin.as_bytes())
+        .context("writing docker exec stdin")?;
+    let output = child
+        .wait_with_output()
+        .context("waiting for docker exec")?;
+    if !output.status.success() {
+        bail!(
+            "docker exec in {} failed: {}",
+            container_name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn register_operator(
@@ -1331,6 +1619,16 @@ fn register_operator(
         .get("description")
         .and_then(Value::as_str)
         .or_else(|| manifest.get("description").and_then(Value::as_str));
+    let infix_symbol: Option<String> = op
+        .get("infix_symbol")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let infix_word: Option<String> = op
+        .get("infix_word")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let inputs = op
         .get("inputs")
         .cloned()
@@ -1351,11 +1649,23 @@ fn register_operator(
         Some(tests.to_string())
     };
 
+    let infix_exists = if let Some(symbol) = infix_symbol.as_deref() {
+        arg_types.len() == 2 && infix_operator_exists(db, symbol, &arg_types[0], &arg_types[1])?
+    } else {
+        false
+    };
+    let create_infix_symbol = if infix_exists {
+        None
+    } else {
+        infix_symbol.clone()
+    };
+
     db.execute(
         "SELECT rvbbit.create_operator(\
          op_name => $1, op_arg_names => $2, op_arg_types => $3, \
          op_return_type => $4, op_parser => $5, op_shape => $6, \
-         op_description => $7, op_tests => $8::text::jsonb, op_steps => $9::text::jsonb)",
+         op_description => $7, op_infix_symbol => $8, op_infix_word => $9, \
+         op_tests => $10::text::jsonb, op_steps => $11::text::jsonb)",
         &[
             &op_name,
             &arg_names,
@@ -1364,12 +1674,40 @@ fn register_operator(
             &parser,
             &shape,
             &description,
+            &create_infix_symbol,
+            &infix_word,
             &tests_json,
             &steps_json,
         ],
     )
     .with_context(|| format!("registering operator {op_name}"))?;
+    if infix_exists {
+        db.execute(
+            "UPDATE rvbbit.operators SET infix_symbol = $1, infix_word = $2 WHERE name = $3",
+            &[&infix_symbol, &infix_word, &op_name],
+        )
+        .with_context(|| format!("preserving infix metadata for operator {op_name}"))?;
+    }
     Ok(())
+}
+
+fn infix_operator_exists(
+    db: &mut Client,
+    symbol: &str,
+    left_type: &str,
+    right_type: &str,
+) -> Result<bool> {
+    let row = db
+        .query_opt(
+            "SELECT 1 FROM pg_operator op \
+         WHERE op.oprnamespace = 'rvbbit'::regnamespace \
+           AND op.oprname = $1 \
+           AND op.oprleft = $2::text::regtype \
+           AND op.oprright = $3::text::regtype",
+            &[&symbol, &left_type, &right_type],
+        )
+        .with_context(|| format!("checking existing infix operator {symbol}"))?;
+    Ok(row.is_some())
 }
 
 fn default_step_inputs(arg_names: &[String]) -> Value {
@@ -1391,7 +1729,19 @@ fn complete_job(
 ) -> Result<()> {
     let manifest = job.manifest.to_string();
     let health = result.health.to_string();
-    let logs = json!({"agent": "warren-agent"}).to_string();
+    let logs = json!({
+        "agent": "warren-agent",
+        "compose_project": result.compose_project,
+        "work_dir": result.work_dir.display().to_string(),
+        "container_name": result.container_name,
+        "endpoint_url": result.endpoint_url,
+        "probe_url": result.probe_url,
+        "published_host_port": result.published_host_port,
+        "backend_name": result.backend_name,
+        "operator_name": result.operator_name,
+        "runtime_name": result.runtime_name,
+    })
+    .to_string();
     db.execute(
         "SELECT rvbbit.complete_warren_job(\
          job_id => $1::text::uuid, node_name => $2, deployment_status => 'running', \
@@ -1413,6 +1763,37 @@ fn complete_job(
         ],
     )
     .context("marking Warren job complete")?;
+    Ok(())
+}
+
+fn try_update_job_progress(
+    db: &mut Client,
+    config: &Config,
+    job: &WarrenJob,
+    phase: &str,
+    progress: Value,
+) {
+    if let Err(err) = update_job_progress(db, config, job, phase, &progress) {
+        eprintln!(
+            "warning: failed to update Warren job progress job={} phase={}: {err:#}",
+            job.job_id, phase
+        );
+    }
+}
+
+fn update_job_progress(
+    db: &mut Client,
+    config: &Config,
+    job: &WarrenJob,
+    phase: &str,
+    progress: &Value,
+) -> Result<()> {
+    let progress = progress.to_string();
+    db.execute(
+        "SELECT rvbbit.update_warren_job_progress($1::text::uuid, $2, $3, $4::text::jsonb)",
+        &[&job.job_id, &config.node_name, &phase, &progress],
+    )
+    .with_context(|| format!("updating Warren job progress phase={phase}"))?;
     Ok(())
 }
 
@@ -1458,6 +1839,15 @@ fn deterministic_port(seed: &str, base: u16) -> u16 {
     let digest = hasher.finalize();
     let offset = u16::from_be_bytes([digest[0], digest[1]]) % 1000;
     base + offset
+}
+
+fn container_name(safe_name: &str) -> String {
+    let service = safe_name.replace('_', "-");
+    format!("rvbbit-{}", service.trim_matches('-'))
+}
+
+fn should_publish_host_port(config: &Config, manifest: &Value) -> bool {
+    config.advertise_base_url.is_some() || manifest.pointer("/warren/port").is_some()
 }
 
 fn endpoint_for(config: &Config, manifest: &Value, port: u16, safe_name: &str) -> String {

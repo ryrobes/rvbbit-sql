@@ -141,6 +141,8 @@
         "properties": {
           "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
           "description": { "type": "string" },
+          "infix_symbol": { "type": ["string", "null"] },
+          "infix_word": { "type": ["string", "null"] },
           "arg_names": {
             "type": "array",
             "items": { "type": "string" },

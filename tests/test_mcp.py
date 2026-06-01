@@ -42,6 +42,21 @@ def test_server(rvbbit):
 # ---- catalog -------------------------------------------------------------
 
 
+def test_gateway_runtime_registered_ready(rvbbit):
+    row = rvbbit.execute(
+        """
+        SELECT name, endpoint_url, status
+        FROM rvbbit.mcp_gateways
+        WHERE status = 'ready'
+        ORDER BY (name = 'mcp_default') DESC, updated_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row is not None, "expected a ready MCP Gateway runtime"
+    configured = rvbbit.execute("SELECT rvbbit.mcp_gateway_endpoint()").fetchone()[0]
+    assert configured.rstrip("/") == row[1].rstrip("/")
+
+
 def test_server_registered(rvbbit, test_server):
     row = rvbbit.execute(
         "SELECT transport, command FROM rvbbit.mcp_servers WHERE name = %s",

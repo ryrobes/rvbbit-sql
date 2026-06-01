@@ -29,8 +29,41 @@ operators:
     parser: json
     inputs:
       text: "{{ inputs.text }}"
+  - name: semantic_embed
+    description: Canonical semantic embedding operator backed by BGE-M3.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+  - name: similar_to
+    description: Cosine similarity between two text values using BGE-M3 embeddings.
+    arg_names: [left_text, right_text]
+    arg_types: [text, text]
+    return_type: float8
+    parser: score_0_1
+    steps:
+      - name: left_embed
+        kind: specialist
+        specialist: embed_bge_m3
+        inputs:
+          text: "{{ inputs.left_text }}"
+      - name: right_embed
+        kind: specialist
+        specialist: embed_bge_m3
+        inputs:
+          text: "{{ inputs.right_text }}"
+      - name: score
+        kind: code
+        fn: cosine_similarity
+        inputs:
+          left: "{{ steps.left_embed.output }}"
+          right: "{{ steps.right_embed.output }}"
 smoke:
   inputs:
     - text: suspicious movement near a wooded creek
+      left_text: refund request from angry customer
+      right_text: customer wants money back after duplicate charge
   sql:
     - "SELECT jsonb_array_length(rvbbit.embed_bge_m3('hello world'));"

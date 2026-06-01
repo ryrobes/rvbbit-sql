@@ -20,8 +20,7 @@ source:
   provider: builtin
   model: rvbbit/mcp-gateway
 runtime:
-  mode: image
-  image: ghcr.io/rvbbit/mcp-gateway:0.60.4
+  mode: build
   template: mcp-gateway
   handler: mcp_gateway
   device: cpu
@@ -30,7 +29,7 @@ runtime:
 exports:
   runtime: mcp_default
 install:
-  mode: image
+  mode: build
   warren: true
   docker: true
 acceptance:

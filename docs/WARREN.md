@@ -6,8 +6,8 @@ any host with the right resources, polls Postgres for deployment jobs, starts
 the requested service, then registers the resulting endpoint back into Rvbbit.
 
 The first agent is Rust (`warren-agent`). Its steady-state job is small:
-communicate with Postgres, pull/run Docker images, probe deployed services, and
-report endpoint/backend/runtime state back to the database.
+communicate with Postgres, build or pull Docker sidecars, probe deployed
+services, and report endpoint/backend/runtime state back to the database.
 
 ## Shape
 
@@ -15,8 +15,8 @@ report endpoint/backend/runtime state back to the database.
 - Warren agents register themselves with labels such as `{"gpu": true}`.
 - SQL queues a deployment job with a target selector.
 - A matching Warren claims the job using `FOR UPDATE SKIP LOCKED`.
-- The Warren pulls/runs the declared sidecar image. Local template scaffolding
-  remains a development fallback for manifests that have no `runtime.image`.
+- The Warren builds from trusted local templates for bundled V1 packs, or
+  pulls/runs a declared sidecar image when `runtime.image` is present.
 - Model capabilities call `rvbbit.register_backend(...)`,
   `rvbbit.create_operator(...)`, and `rvbbit.reload_backends()`.
 - Runtime capabilities call runtime-specific registration functions such as
@@ -61,7 +61,8 @@ Core tables and view:
 
 - `rvbbit.warren_nodes`: registered agent hosts, labels, capacity, heartbeat,
   inventory, and future auth metadata.
-- `rvbbit.warren_jobs`: queued/running/completed deployment requests.
+- `rvbbit.warren_jobs`: queued/running/completed deployment requests, plus
+  `phase` and `progress` for UI-visible install progress.
 - `rvbbit.warren_deployments`: materialized deployment records tied to nodes
   and backend/operator/runtime names.
 - `rvbbit.warren_node_metrics`: append-only node telemetry snapshots.
@@ -233,8 +234,12 @@ cargo run -p warren-agent -- \
 If `--advertise-base-url` is omitted, Warren registers a Docker-network URL
 such as `http://rvbbit-<service>:8080/predict` for model backends or
 `http://rvbbit-<service>:8080/run` for runtime sidecars. That is correct when
-the generated sidecar and `pg-rvbbit` are on the same Docker network. If Warren
-runs on a different box, pass the URL that the Postgres host can reach.
+the generated sidecar and `pg-rvbbit` are on the same Docker network. In this
+default mode generated sidecars use Docker `expose` only and do not publish a
+host port, so many capabilities can all listen on container port `8080` without
+colliding on the Warren host. If Warren runs on a different box, pass the URL
+that the Postgres host can reach; in that mode Warren also applies the generated
+`compose.host-ports.yaml` overlay and publishes the selected host port.
 
 Useful environment variables mirror the CLI:
 
@@ -330,7 +335,8 @@ field-level contract lives in [WARREN_UI_CONTRACT.md](WARREN_UI_CONTRACT.md).
 At a high level:
 
 - Show `rvbbit.warren_inventory` grouped by node.
-- Show queued/running/failed jobs from `rvbbit.warren_jobs`.
+- Show queued/running/failed jobs from `rvbbit.warren_jobs`, using `phase` and
+  `progress` for install progress and troubleshooting detail.
 - Show latest node telemetry from `rvbbit.warren_node_latest_metrics`.
 - Chart node telemetry history from `rvbbit.warren_node_metrics`.
 - Surface node label and capacity JSON as filters/placement hints.

@@ -211,6 +211,8 @@ class E2EHarness:
         self.created_backends: list[str] = []
         self.created_ops: list[str] = []
         self.created_mcp_servers: list[str] = []
+        self.created_python_envs: list[str] = []
+        self.created_python_handlers: list[str] = []
         self.created_route_profiles: list[str] = []
         self.created_stub_embeds: list[str] = []
         self.created_warren_nodes: list[str] = []
@@ -447,6 +449,15 @@ class E2EHarness:
         for server in reversed(self.created_mcp_servers):
             with contextlib.suppress(Exception):
                 self.conn.execute("SELECT rvbbit.drop_mcp_server(%s)", (server,))
+        for handler in reversed(self.created_python_handlers):
+            with contextlib.suppress(Exception):
+                self.conn.execute("DELETE FROM rvbbit.python_handlers WHERE name = %s", (handler,))
+        for env in reversed(self.created_python_envs):
+            with contextlib.suppress(Exception):
+                self.conn.execute("DELETE FROM rvbbit.python_envs WHERE name = %s", (env,))
+        if self.created_python_envs or self.created_python_handlers:
+            with contextlib.suppress(Exception):
+                self.conn.execute("SELECT rvbbit.reload_python_runtime()")
         for table in reversed(self.created_tables):
             with contextlib.suppress(Exception):
                 self.conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
@@ -487,6 +498,20 @@ class E2EHarness:
                     (profile,),
                 )
         for op in reversed(self.created_ops):
+            with contextlib.suppress(Exception):
+                rows = self.sql(
+                    """
+                    SELECT pg_get_function_identity_arguments(p.oid)
+                    FROM pg_proc p
+                    WHERE p.pronamespace = 'rvbbit'::regnamespace
+                      AND p.proname = %s
+                    """,
+                    (op,),
+                )
+                for (identity_args,) in rows:
+                    self.conn.execute(
+                        f"DROP FUNCTION IF EXISTS rvbbit.{sql_ident(op)}({identity_args})"
+                    )
             with contextlib.suppress(Exception):
                 self.conn.execute("DELETE FROM rvbbit.operators WHERE name = %s", (op,))
             with contextlib.suppress(Exception):
@@ -1175,6 +1200,19 @@ def phase_model_training(h: E2EHarness, imported: dict[str, str | None]) -> None
 
         sidecar_log = h.artifact_dir / f"{operator_name}.log"
         log_fh = sidecar_log.open("ab")
+        manifest = json.loads((out_dir / "rvbbit.backend.yaml").read_text())
+        runtime = manifest.get("runtime") or {}
+        source = manifest.get("source") or {}
+        sidecar_env = env.copy()
+        sidecar_env.update({str(k): str(v) for k, v in (runtime.get("env") or {}).items()})
+        if runtime.get("handler"):
+            sidecar_env["RVBBIT_CAPABILITY_HANDLER"] = str(runtime["handler"])
+        if runtime.get("device"):
+            sidecar_env["RVBBIT_CAPABILITY_DEVICE"] = str(runtime["device"])
+        if source.get("model"):
+            sidecar_env["RVBBIT_CAPABILITY_MODEL"] = str(source["model"])
+        if source.get("revision"):
+            sidecar_env["RVBBIT_CAPABILITY_REVISION"] = str(source["revision"])
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -1187,7 +1225,7 @@ def phase_model_training(h: E2EHarness, imported: dict[str, str | None]) -> None
                 str(endpoint_port),
             ],
             cwd=out_dir,
-            env=env,
+            env=sidecar_env,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
         )
@@ -1704,6 +1742,180 @@ def phase_embeddings(h: E2EHarness, imported: dict[str, str | None]) -> None:
         )
 
 
+def phase_python(h: E2EHarness) -> None:
+    """Managed CPython runtime as a first-class operator workflow node."""
+
+    with h.step("python", "runtime_registered_ready") as d:
+        rows = h.sql(
+            """
+            SELECT name, endpoint_url, status, runtime_source
+            FROM rvbbit.python_runtimes
+            WHERE name = 'python_default'
+            """
+        )
+        d["python_default"] = rows[0] if rows else None
+        require(rows, "python_default runtime is not registered")
+        name, endpoint_url, status, source = rows[0]
+        require(name == "python_default", f"unexpected runtime row: {rows[0]}")
+        require(status == "ready", f"python_default is not ready: {rows[0]}")
+        require(source == "warren", f"python_default was not installed by Warren: {rows[0]}")
+        configured = h.scalar("SELECT rvbbit.python_runtime_endpoint()")
+        d["configured_endpoint"] = configured
+        require(
+            str(configured).rstrip("/") == str(endpoint_url).rstrip("/"),
+            f"python runtime endpoint setting {configured!r} does not match registered {endpoint_url!r}",
+        )
+
+    suffix = short_id()
+    table = f"public.e2e_customer_dim_{suffix}"
+    env = f"e2e_pyenv_{suffix}"
+    handler = f"e2e_sla_score_{suffix}"
+    op = f"e2e_ticket_sla_{suffix}"
+    h.created_tables.append(table)
+    h.created_python_envs.append(env)
+    h.created_python_handlers.append(handler)
+    h.created_ops.append(op)
+
+    code = r'''
+import re
+
+def run(inputs):
+    message = str(inputs.get("message") or "")
+    tier = str(inputs.get("tier") or "standard").lower()
+    revenue = float(inputs.get("annual_revenue") or 0)
+    open_tickets = int(inputs.get("open_tickets") or 0)
+    outage = re.search(r"\b(outage|down|cannot access|can't access|checkout)\b", message, re.I) is not None
+    score = 0.0
+    flags = []
+    if tier in {"enterprise", "strategic"}:
+        score += 0.35
+        flags.append("high_value_account")
+    if revenue >= 1000000:
+        score += 0.25
+        flags.append("revenue_risk")
+    if open_tickets >= 3:
+        score += 0.20
+        flags.append("repeat_contact")
+    if outage:
+        score += 0.35
+        flags.append("possible_outage")
+    priority = "urgent" if score >= 0.70 else "elevated" if score >= 0.35 else "standard"
+    return {
+        "priority": priority,
+        "score": round(min(score, 1.0), 3),
+        "flags": flags,
+        "normalized_message": " ".join(message.lower().split()),
+    }
+'''
+
+    with h.step("python", "sql_lookup_python_operator_with_ward") as d:
+        h.sql(f"CREATE TABLE {table} (id int PRIMARY KEY, tier text, annual_revenue float8)")
+        h.sql(
+            f"""
+            INSERT INTO {table}
+            VALUES (101, 'enterprise', 2400000), (202, 'standard', 12000)
+            """
+        )
+        h.sql(
+            """
+            SELECT rvbbit.create_python_env(
+              env_name => %s,
+              python_version => '3.12',
+              requirements => ARRAY[]::text[],
+              runtime_name => 'python_default',
+              timeout_ms => 3000
+            )
+            """,
+            (env,),
+        )
+        h.sql(
+            """
+            SELECT rvbbit.create_python_handler(
+              handler_name => %s,
+              env_name => %s,
+              code => %s,
+              entrypoint => 'run',
+              description => 'E2E deterministic SLA scorer'
+            )
+            """,
+            (handler, env, code),
+        )
+        steps = [
+            {
+                "name": "cust",
+                "kind": "sql",
+                "sql": f"SELECT tier, annual_revenue FROM {table} WHERE id = $1::int",
+                "params": ["{{ inputs.customer_id }}"],
+            },
+            {
+                "name": "score",
+                "kind": "python",
+                "env": env,
+                "handler": handler,
+                "inputs": {
+                    "message": "{{ inputs.message }}",
+                    "open_tickets": "{{ inputs.open_tickets }}",
+                    "tier": "{{ steps.cust.output.tier }}",
+                    "annual_revenue": "{{ steps.cust.output.annual_revenue }}",
+                },
+            },
+        ]
+        h.sql(
+            """
+            SELECT rvbbit.create_operator(
+              op_name => %s,
+              op_arg_names => ARRAY['customer_id','message','open_tickets'],
+              op_arg_types => ARRAY['text','text','text'],
+              op_return_type => 'jsonb',
+              op_parser => 'json',
+              op_steps => %s::jsonb
+            )
+            """,
+            (op, json.dumps(steps)),
+        )
+        h.sql(
+            "SELECT rvbbit.set_operator_wards(%s, %s::jsonb)",
+            (
+                op,
+                json.dumps(
+                    {
+                        "post": [
+                            {
+                                "validator": {
+                                    "sql": "($output::jsonb ? 'priority') AND (($output::jsonb->>'priority') IN ('standard','elevated','urgent'))"
+                                },
+                                "mode": "blocking",
+                            }
+                        ]
+                    }
+                ),
+            ),
+        )
+        h.sql("SELECT rvbbit.flush_cache()")
+        h.sql("DELETE FROM rvbbit.receipts WHERE operator = %s", (op,))
+        out = h.scalar(
+            f"SELECT rvbbit.{sql_ident(op)}(%s, %s, %s)",
+            ("101", "Checkout is down and our team cannot access invoices", "4"),
+        )
+        d["output"] = out
+        require(isinstance(out, dict), f"python operator returned non-json object: {out}")
+        require(out.get("priority") == "urgent", f"unexpected Python priority: {out}")
+        require("high_value_account" in (out.get("flags") or []), f"missing account flag: {out}")
+        require("possible_outage" in (out.get("flags") or []), f"missing outage flag: {out}")
+        kinds = h.scalar(
+            """
+            SELECT jsonb_path_query_array(sub_calls, '$[*].kind')
+            FROM rvbbit.receipts
+            WHERE operator = %s
+            ORDER BY invocation_at DESC
+            LIMIT 1
+            """,
+            (op,),
+        )
+        d["sub_call_kinds"] = kinds
+        require(kinds == ["sql", "python"], f"bad Python operator sub-call audit: {kinds}")
+
+
 def phase_mcp(h: E2EHarness) -> None:
     server = f"e2e_mcp_{short_id()}"
     op = f"e2e_mcp_search_{short_id()}"
@@ -1713,7 +1925,35 @@ def phase_mcp(h: E2EHarness) -> None:
     h.created_ops.append(op)
     h.created_ops.append(chained_op)
     h.created_backends.append(chain_backend)
-    with h.step("mcp", "register_refresh_call_and_audit", optional=True) as d:
+    with h.step("mcp", "gateway_runtime_ready") as d:
+        rows = h.sql(
+            """
+            SELECT name, endpoint_url, status, gateway_source, health
+            FROM rvbbit.mcp_gateways
+            WHERE status = 'ready'
+            ORDER BY (name = 'mcp_default') DESC, updated_at DESC
+            LIMIT 1
+            """
+        )
+        require(rows, "no ready MCP Gateway runtime registered")
+        name, endpoint_url, status, source, health = rows[0]
+        d["gateway"] = {
+            "name": name,
+            "endpoint_url": endpoint_url,
+            "status": status,
+            "gateway_source": source,
+            "health": health,
+        }
+        require(name == "mcp_default", f"unexpected MCP gateway runtime: {rows[0]}")
+        require(source == "warren", f"MCP gateway was not installed by Warren: {rows[0]}")
+        configured = h.scalar("SELECT rvbbit.mcp_gateway_endpoint()")
+        d["configured_endpoint"] = configured
+        require(
+            str(configured).rstrip("/") == str(endpoint_url).rstrip("/"),
+            f"MCP gateway endpoint setting {configured!r} does not match registered {endpoint_url!r}",
+        )
+
+    with h.step("mcp", "register_refresh_call_and_audit") as d:
         h.sql(
             """
             SELECT rvbbit.register_mcp_server(
@@ -1751,7 +1991,7 @@ def phase_mcp(h: E2EHarness) -> None:
         d["last_invocation"] = {"tool": row[0], "query_id": str(row[1])}
         require(str(row[1]) == str(query_id), f"MCP query_id mismatch: {row}")
 
-    with h.step("mcp", "rows_surface_and_error_audit", optional=True) as d:
+    with h.step("mcp", "rows_surface_and_error_audit") as d:
         rows = h.sql(
             f"""
             SELECT row->>'name'
@@ -1809,7 +2049,7 @@ def phase_mcp(h: E2EHarness) -> None:
         require(audit and audit[0][1], f"MCP failure was not audited: {audit}")
         require(str(audit[0][2]) == str(query_id), f"MCP failure query_id mismatch: {audit}")
 
-    with h.step("mcp", "operator_node_flow", optional=True) as d:
+    with h.step("mcp", "operator_node_flow") as d:
         steps = [
             {
                 "name": "fetch",
@@ -1861,7 +2101,7 @@ def phase_mcp(h: E2EHarness) -> None:
         require(receipt[0][2] == f"{server}.search", f"MCP operator receipt model mismatch: {receipt}")
         require(receipt[0][3] is None, f"MCP operator receipt has error: {receipt}")
 
-    with h.step("mcp", "operator_chain_mcp_code_specialist", optional=True) as d:
+    with h.step("mcp", "operator_chain_mcp_code_specialist") as d:
         if not service_alive(f"{ECHO_BASE}/health"):
             raise SkipStep(f"echo sidecar not reachable at {ECHO_BASE}")
         h.sql(
@@ -2991,6 +3231,7 @@ def main() -> int:
         stress_op = phase_semantic_stress(h)
         phase_backend_failure_audit(h)
         phase_embeddings(h, imported)
+        phase_python(h)
         phase_mcp(h)
         phase_kg(h)
         phase_kg_imported_text(h, imported)

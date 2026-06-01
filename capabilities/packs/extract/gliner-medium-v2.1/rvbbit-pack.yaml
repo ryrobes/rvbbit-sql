@@ -29,6 +29,9 @@ exports:
   - extract_pii
   - extract_business_entities
   - extract_row_entities
+  - extract
+  - contains_entity
+  - has_pii
 install:
   mode: build
   warren: true
@@ -44,6 +47,8 @@ acceptance:
       DO $$
       DECLARE
           result jsonb;
+          first_value text;
+          present bool;
           started timestamptz := clock_timestamp();
       BEGIN
           LOOP
@@ -60,6 +65,49 @@ acceptance:
 
           IF jsonb_typeof(result) <> 'array' THEN
               RAISE EXCEPTION 'unexpected GLiNER extraction shape: %', result;
+          END IF;
+
+          SELECT rvbbit.extract_business_entities(
+              'Invoice INV-1042 for Acme Corp is due Friday in Portland.'
+          ) INTO result;
+          IF jsonb_typeof(result) <> 'array' THEN
+              RAISE EXCEPTION 'unexpected business entity extraction shape: %', result;
+          END IF;
+
+          SELECT rvbbit.extract_pii(
+              'Jane Doe can be reached at jane@example.com or 415-555-0101.'
+          ) INTO result;
+          IF jsonb_typeof(result) <> 'array' THEN
+              RAISE EXCEPTION 'unexpected PII extraction shape: %', result;
+          END IF;
+
+          SELECT rvbbit.extract_row_entities(
+              '{"note":"Invoice INV-1042 for Acme Corp is due Friday in Portland.","county":"Clackamas"}'::jsonb,
+              'organization, invoice number, date, location'
+          ) INTO result;
+          IF jsonb_typeof(result) <> 'array' THEN
+              RAISE EXCEPTION 'unexpected row entity extraction shape: %', result;
+          END IF;
+
+          SELECT rvbbit.extract(
+              'Invoice INV-1042 for Acme Corp is due Friday in Portland.',
+              'organization'
+          ) INTO first_value;
+          IF first_value IS NULL THEN
+              RAISE EXCEPTION 'bundled extract operator returned NULL';
+          END IF;
+
+          SELECT rvbbit.contains_entity(
+              'Invoice INV-1042 for Acme Corp is due Friday in Portland.',
+              'organization'
+          ) INTO present;
+          IF present IS NULL THEN
+              RAISE EXCEPTION 'bundled contains_entity operator returned NULL';
+          END IF;
+
+          SELECT rvbbit.has_pii('Jane Doe can be reached at jane@example.com or 415-555-0101.') INTO present;
+          IF present IS NULL THEN
+              RAISE EXCEPTION 'bundled has_pii operator returned NULL';
           END IF;
       END
       $$;

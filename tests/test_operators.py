@@ -138,6 +138,48 @@ def test_create_operator_with_infix_symbol(rvbbit, temp_operator):
     rvbbit.execute("DROP OPERATOR IF EXISTS rvbbit.#? (text, text)")
 
 
+def test_create_operator_reuses_existing_infix_binding(rvbbit):
+    name1 = f"test_op_{uuid.uuid4().hex[:8]}"
+    name2 = f"test_op_{uuid.uuid4().hex[:8]}"
+    symbol = "#~"
+    try:
+        for name in (name1, name2):
+            rvbbit.execute(f"""
+                SELECT rvbbit.create_operator(
+                    op_name => '{name}',
+                    op_arg_names => ARRAY['text', 'rhs'],
+                    op_return_type => 'bool',
+                    op_system => 'sys',
+                    op_user => 'a={{{{ text }}}} b={{{{ rhs }}}}',
+                    op_infix_symbol => '{symbol}'
+                )
+            """)
+
+        row = rvbbit.execute(
+            "SELECT count(*) "
+            "FROM pg_operator op "
+            "WHERE op.oprnamespace = 'rvbbit'::regnamespace "
+            "  AND op.oprname = %s",
+            (symbol,),
+        ).fetchone()
+        assert row[0] == 1
+        rows = rvbbit.execute(
+            "SELECT name, infix_symbol FROM rvbbit.operators WHERE name IN (%s, %s)",
+            (name1, name2),
+        ).fetchall()
+        assert {row[0]: row[1] for row in rows} == {name1: symbol, name2: symbol}
+    finally:
+        rvbbit.execute(f"DROP OPERATOR IF EXISTS rvbbit.{symbol} (text, text)")
+        for name in (name1, name2):
+            rvbbit.execute("DELETE FROM rvbbit.operators WHERE name = %s", (name,))
+            for sig in [
+                f"rvbbit.{name}(text, text)",
+                f"rvbbit.{name}(text, text, jsonb)",
+                f"rvbbit._op_{name}(text, text)",
+            ]:
+                rvbbit.execute(f"DROP FUNCTION IF EXISTS {sig}")
+
+
 def test_update_operator_prompt(rvbbit):
     """A SQL UPDATE on rvbbit.operators is sufficient to change prompt
     behavior on the next call — no DDL/recompile needed."""

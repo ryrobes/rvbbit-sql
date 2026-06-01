@@ -1114,11 +1114,20 @@ BEGIN
         );
 
         IF op_infix_symbol IS NOT NULL THEN
-            EXECUTE format(
-                'CREATE OPERATOR rvbbit.%s (LEFTARG = %s, RIGHTARG = %s, FUNCTION = rvbbit.%I)',
-                op_infix_symbol, actual_arg_types[1], actual_arg_types[2],
-                '_op_' || op_name
-            );
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_operator op
+                WHERE op.oprnamespace = 'rvbbit'::regnamespace
+                  AND op.oprname = op_infix_symbol
+                  AND op.oprleft = actual_arg_types[1]::regtype
+                  AND op.oprright = actual_arg_types[2]::regtype
+            ) THEN
+                EXECUTE format(
+                    'CREATE OPERATOR rvbbit.%s (LEFTARG = %s, RIGHTARG = %s, FUNCTION = rvbbit.%I)',
+                    op_infix_symbol, actual_arg_types[1], actual_arg_types[2],
+                    '_op_' || op_name
+                );
+            END IF;
         END IF;
     END IF;
 END $$;
@@ -2682,6 +2691,7 @@ CREATE TABLE rvbbit.warren_jobs (
     manifest         jsonb NOT NULL,
     target_selector  jsonb NOT NULL DEFAULT '{}'::jsonb,
     status           text NOT NULL DEFAULT 'queued',
+    phase            text NOT NULL DEFAULT 'queued',
     claimed_by       text,
     claimed_at       timestamptz,
     attempts         int NOT NULL DEFAULT 0,
@@ -2690,8 +2700,10 @@ CREATE TABLE rvbbit.warren_jobs (
     operator_name    text,
     runtime_name     text,
     error            text,
+    progress         jsonb NOT NULL DEFAULT '{}'::jsonb,
     logs             jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
     started_at       timestamptz,
     finished_at      timestamptz,
     CONSTRAINT warren_jobs_kind_check CHECK (
@@ -2703,8 +2715,10 @@ CREATE TABLE rvbbit.warren_jobs (
     CONSTRAINT warren_jobs_status_check CHECK (
         status IN ('queued', 'running', 'completed', 'failed', 'cancelled')
     ),
+    CONSTRAINT warren_jobs_phase_check CHECK (phase <> ''),
     CONSTRAINT warren_jobs_manifest_is_object CHECK (jsonb_typeof(manifest) = 'object'),
     CONSTRAINT warren_jobs_target_selector_is_object CHECK (jsonb_typeof(target_selector) = 'object'),
+    CONSTRAINT warren_jobs_progress_is_object CHECK (jsonb_typeof(progress) = 'object'),
     CONSTRAINT warren_jobs_logs_is_object CHECK (jsonb_typeof(logs) = 'object')
 );
 
@@ -2712,6 +2726,17 @@ CREATE INDEX warren_jobs_queue_idx
     ON rvbbit.warren_jobs (status, created_at)
     WHERE status IN ('queued', 'running');
 CREATE INDEX warren_jobs_target_selector_idx ON rvbbit.warren_jobs USING gin (target_selector);
+
+CREATE OR REPLACE FUNCTION rvbbit.touch_warren_jobs_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at := clock_timestamp();
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER warren_jobs_touch_updated_at
+    BEFORE UPDATE ON rvbbit.warren_jobs
+    FOR EACH ROW EXECUTE FUNCTION rvbbit.touch_warren_jobs_updated_at();
 
 CREATE TABLE rvbbit.warren_deployments (
     deployment_id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -3129,10 +3154,16 @@ BEGIN
     updated AS (
         UPDATE rvbbit.warren_jobs j
         SET status = 'running',
+            phase = 'claimed',
             claimed_by = claim_warren_job.node_name,
             claimed_at = clock_timestamp(),
             started_at = COALESCE(started_at, clock_timestamp()),
-            attempts = attempts + 1
+            attempts = attempts + 1,
+            progress = progress || jsonb_build_object(
+                'phase', 'claimed',
+                'node_name', claim_warren_job.node_name,
+                'claimed_at', clock_timestamp()
+            )
         FROM picked
         WHERE j.job_id = picked.job_id
         RETURNING j.job_id, j.kind, j.desired_state, j.name, j.manifest,
@@ -3143,6 +3174,50 @@ BEGIN
     FROM updated u;
 END
 $cwj$;
+
+CREATE OR REPLACE FUNCTION rvbbit.update_warren_job_progress(
+    job_id       uuid,
+    node_name    text,
+    job_phase    text,
+    progress_doc jsonb DEFAULT '{}'::jsonb
+) RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+AS $uwjp$
+DECLARE
+    normalized_phase text := nullif(btrim(job_phase), '');
+    normalized_doc jsonb := coalesce(progress_doc, '{}'::jsonb);
+BEGIN
+    IF normalized_phase IS NULL THEN
+        RAISE EXCEPTION 'job_phase is required';
+    END IF;
+    IF jsonb_typeof(normalized_doc) <> 'object' THEN
+        RAISE EXCEPTION 'progress_doc must be a JSON object';
+    END IF;
+
+    UPDATE rvbbit.warren_jobs j
+    SET phase = normalized_phase,
+        progress = j.progress
+            || normalized_doc
+            || jsonb_build_object(
+                'phase', normalized_phase,
+                'node_name', update_warren_job_progress.node_name,
+                'updated_at', clock_timestamp()
+            ),
+        logs = j.logs || jsonb_build_object(
+            'last_phase', normalized_phase,
+            'last_phase_at', clock_timestamp()
+        )
+    WHERE j.job_id = update_warren_job_progress.job_id
+      AND j.status = 'running'
+      AND j.claimed_by = update_warren_job_progress.node_name;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'running Warren job % is not claimed by node %',
+            job_id, node_name;
+    END IF;
+END
+$uwjp$;
 
 CREATE OR REPLACE FUNCTION rvbbit.complete_warren_job(
     job_id            uuid,
@@ -3184,10 +3259,19 @@ BEGIN
 
     UPDATE rvbbit.warren_jobs
     SET status = 'completed',
+        phase = 'ready',
         endpoint_url = complete_warren_job.endpoint_url,
         backend_name = complete_warren_job.backend_name,
         operator_name = complete_warren_job.operator_name,
         runtime_name = complete_warren_job.runtime_name,
+        progress = progress || jsonb_build_object(
+            'phase', 'ready',
+            'endpoint_url', complete_warren_job.endpoint_url,
+            'backend_name', complete_warren_job.backend_name,
+            'operator_name', complete_warren_job.operator_name,
+            'runtime_name', complete_warren_job.runtime_name,
+            'finished_at', clock_timestamp()
+        ),
         logs = complete_warren_job.logs,
         error = NULL,
         finished_at = clock_timestamp()
@@ -3242,7 +3326,14 @@ BEGIN
 
     UPDATE rvbbit.warren_jobs
     SET status = 'failed',
+        phase = 'failed',
         error = fail_warren_job.error,
+        progress = progress || jsonb_build_object(
+            'phase', 'failed',
+            'error', fail_warren_job.error,
+            'failed_at', clock_timestamp(),
+            'node_name', fail_warren_job.node_name
+        ),
         logs = fail_warren_job.logs,
         finished_at = clock_timestamp()
     WHERE warren_jobs.job_id = fail_warren_job.job_id;
