@@ -178,8 +178,11 @@ AS $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_roles WHERE rolname = current_user AND rolsuper
+    ) AND NOT (
+        EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rvbbit_warren')
+        AND pg_has_role(current_user, 'rvbbit_warren', 'member')
     ) THEN
-        RAISE EXCEPTION 'rvbbit Python runtime DDL requires a superuser in this release';
+        RAISE EXCEPTION 'rvbbit Python runtime DDL requires a superuser or rvbbit_warren role membership in this release';
     END IF;
 END
 $$;

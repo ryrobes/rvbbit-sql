@@ -212,6 +212,357 @@ def test_warren_job_progress_contract(rvbbit):
         rvbbit.execute("DELETE FROM rvbbit.warren_nodes WHERE name = %s", (node_name,))
 
 
+def test_warren_deployment_stop_lifecycle_and_drift(rvbbit):
+    node_name = f"test-warren-life-{uuid.uuid4().hex[:8]}"
+    other_node_name = f"test-warren-life-other-{uuid.uuid4().hex[:8]}"
+    job_name = f"test-runtime-{uuid.uuid4().hex[:8]}"
+    runtime_name = f"test_runtime_{uuid.uuid4().hex[:8]}"
+    deploy_job_id = None
+    stop_job_id = None
+    deployment_id = None
+    try:
+        for name in [node_name, other_node_name]:
+            rvbbit.execute(
+                "SELECT rvbbit.register_warren_node(%s, NULL, '{}'::jsonb, '{}'::jsonb, 'test')",
+                (name,),
+            )
+        deploy_job_id = rvbbit.execute(
+            """
+            SELECT rvbbit.enqueue_warren_job(
+              'capability',
+              %s,
+              '{"name":"test-runtime"}'::jsonb,
+              '{}'::jsonb,
+              'running'
+            )
+            """,
+            (job_name,),
+        ).fetchone()[0]
+        claimed = rvbbit.execute(
+            "SELECT job_id FROM rvbbit.claim_warren_job(%s)",
+            (node_name,),
+        ).fetchone()
+        assert claimed[0] == deploy_job_id
+        rvbbit.execute(
+            """
+            SELECT rvbbit.complete_warren_job(
+              job_id => %s,
+              node_name => %s,
+              endpoint_url => 'http://rvbbit-test-runtime:8080/run',
+              deploy_manifest => '{"name":"test-runtime"}'::jsonb,
+              compose_project => 'test_runtime_project',
+              work_dir => '/tmp/rvbbit-test-runtime',
+              health => '{"ok": true}'::jsonb,
+              runtime_name => %s
+            )
+            """,
+            (deploy_job_id, node_name, runtime_name),
+        )
+        deployment_id = rvbbit.execute(
+            """
+            SELECT deployment_id
+            FROM rvbbit.warren_deployments
+            WHERE job_id = %s
+            """,
+            (deploy_job_id,),
+        ).fetchone()[0]
+        rvbbit.execute(
+            """
+            SELECT rvbbit.register_python_runtime(
+              runtime_name => %s,
+              endpoint_url => 'http://rvbbit-test-runtime:8080/run',
+              runtime_source => 'warren',
+              set_default => false
+            )
+            """,
+            (runtime_name,),
+        )
+
+        stop_job_id = rvbbit.execute(
+            "SELECT rvbbit.request_warren_deployment_stop(%s)",
+            (deployment_id,),
+        ).fetchone()[0]
+        queued = rvbbit.execute(
+            """
+            SELECT desired_state, status, progress->>'deployment_id'
+            FROM rvbbit.warren_jobs
+            WHERE job_id = %s
+            """,
+            (stop_job_id,),
+        ).fetchone()
+        assert queued == ("stopped", "queued", str(deployment_id))
+        stopping = rvbbit.execute(
+            "SELECT status FROM rvbbit.warren_deployments WHERE deployment_id = %s",
+            (deployment_id,),
+        ).fetchone()
+        assert stopping[0] == "stopping"
+
+        assert (
+            rvbbit.execute(
+                "SELECT job_id FROM rvbbit.claim_warren_job(%s)",
+                (other_node_name,),
+            ).fetchone()
+            is None
+        )
+        claimed = rvbbit.execute(
+            """
+            SELECT job_id, desired_state, manifest #>> '{warren_deployment,node_name}'
+            FROM rvbbit.claim_warren_job(%s)
+            """,
+            (node_name,),
+        ).fetchone()
+        assert claimed == (stop_job_id, "stopped", node_name)
+        rvbbit.execute(
+            """
+            SELECT rvbbit.complete_warren_job(
+              job_id => %s,
+              node_name => %s,
+              deployment_status => 'stopped',
+              endpoint_url => 'http://rvbbit-test-runtime:8080/run',
+              deploy_manifest => '{"name":"test-runtime"}'::jsonb,
+              compose_project => 'test_runtime_project',
+              work_dir => '/tmp/rvbbit-test-runtime',
+              health => '{"ok": true, "action":"stopped"}'::jsonb,
+              runtime_name => %s
+            )
+            """,
+            (stop_job_id, node_name, runtime_name),
+        )
+        stopped = rvbbit.execute(
+            """
+            SELECT d.status, j.phase, r.status
+            FROM rvbbit.warren_deployments d
+            JOIN rvbbit.warren_jobs j ON j.job_id = %s
+            LEFT JOIN rvbbit.python_runtimes r ON r.name = %s
+            WHERE d.deployment_id = %s
+            """,
+            (stop_job_id, runtime_name, deployment_id),
+        ).fetchone()
+        assert stopped == ("stopped", "stopped", "disabled")
+
+        drifted = rvbbit.execute(
+            """
+            SELECT rvbbit.report_warren_deployment_observation(
+              %s, %s, 'running', '{"container":"rvbbit-test-runtime"}'::jsonb
+            )
+            """,
+            (deployment_id, node_name),
+        ).fetchone()
+        assert drifted[0] == "orphaned"
+        recovered = rvbbit.execute(
+            """
+            SELECT rvbbit.report_warren_deployment_observation(
+              %s, %s, 'missing', '{"container":"rvbbit-test-runtime"}'::jsonb
+            )
+            """,
+            (deployment_id, node_name),
+        ).fetchone()
+        assert recovered[0] == "stopped"
+    finally:
+        rvbbit.execute("DELETE FROM rvbbit.python_runtimes WHERE name = %s", (runtime_name,))
+        if deployment_id is not None:
+            rvbbit.execute(
+                "DELETE FROM rvbbit.warren_deployments WHERE deployment_id = %s",
+                (deployment_id,),
+            )
+        for cleanup_job_id in [stop_job_id, deploy_job_id]:
+            if cleanup_job_id is not None:
+                rvbbit.execute(
+                    "DELETE FROM rvbbit.warren_jobs WHERE job_id = %s",
+                    (cleanup_job_id,),
+                )
+        rvbbit.execute(
+            "DELETE FROM rvbbit.warren_nodes WHERE name IN (%s, %s)",
+            (node_name, other_node_name),
+        )
+
+
+def test_warren_effective_status_backend_callable_and_redeploy(rvbbit):
+    node_name = f"test-warren-state-{uuid.uuid4().hex[:8]}"
+    job_name = f"test-backend-{uuid.uuid4().hex[:8]}"
+    backend_name = f"test_backend_{uuid.uuid4().hex[:8]}"
+    deploy_job_id = None
+    stop_job_id = None
+    redeploy_job_id = None
+    deployment_id = None
+    manifest = {
+        "name": job_name,
+        "backend": {
+            "name": backend_name,
+            "transport": "stub",
+        },
+    }
+    try:
+        rvbbit.execute(
+            "SELECT rvbbit.register_warren_node(%s, NULL, '{}'::jsonb, '{}'::jsonb, 'test')",
+            (node_name,),
+        )
+        state = rvbbit.execute(
+            """
+            SELECT effective_status, heartbeat_state, is_eligible
+            FROM rvbbit.warren_node_effective_status
+            WHERE name = %s
+            """,
+            (node_name,),
+        ).fetchone()
+        assert state == ("ready", "fresh", True)
+
+        deploy_job_id = rvbbit.execute(
+            """
+            SELECT rvbbit.enqueue_warren_job(
+              'capability',
+              %s,
+              %s::jsonb,
+              '{}'::jsonb,
+              'running'
+            )
+            """,
+            (job_name, json.dumps(manifest)),
+        ).fetchone()[0]
+        claimed = rvbbit.execute(
+            "SELECT job_id FROM rvbbit.claim_warren_job(%s)",
+            (node_name,),
+        ).fetchone()
+        assert claimed[0] == deploy_job_id
+        rvbbit.execute(
+            """
+            SELECT rvbbit.complete_warren_job(
+              job_id => %s,
+              node_name => %s,
+              endpoint_url => 'http://rvbbit-test-backend:8080/predict',
+              backend_name => %s,
+              deploy_manifest => %s::jsonb,
+              health => '{"ok": true}'::jsonb,
+              logs => '{"agent":"test"}'::jsonb
+            )
+            """,
+            (deploy_job_id, node_name, backend_name, json.dumps(manifest)),
+        )
+        deployment_id = rvbbit.execute(
+            """
+            SELECT deployment_id
+            FROM rvbbit.warren_deployments
+            WHERE job_id = %s
+            """,
+            (deploy_job_id,),
+        ).fetchone()[0]
+        rvbbit.execute(
+            """
+            SELECT rvbbit.register_backend(
+              backend_name => %s,
+              backend_endpoint => 'http://rvbbit-test-backend:8080/predict',
+              backend_transport => 'stub',
+              backend_install_manifest => %s::jsonb
+            )
+            """,
+            (backend_name, json.dumps(manifest)),
+        )
+        rvbbit.execute("SELECT rvbbit.reload_backends()")
+        callable_state = rvbbit.execute(
+            """
+            SELECT deployment_status, serving_status, callable
+            FROM rvbbit.warren_backend_status
+            WHERE name = %s
+            """,
+            (backend_name,),
+        ).fetchone()
+        assert callable_state == ("running", "running", True)
+
+        stop_job_id = rvbbit.execute(
+            "SELECT rvbbit.request_warren_deployment_stop(%s)",
+            (deployment_id,),
+        ).fetchone()[0]
+        claimed = rvbbit.execute(
+            "SELECT job_id FROM rvbbit.claim_warren_job(%s)",
+            (node_name,),
+        ).fetchone()
+        assert claimed[0] == stop_job_id
+        rvbbit.execute(
+            """
+            SELECT rvbbit.complete_warren_job(
+              job_id => %s,
+              node_name => %s,
+              deployment_status => 'stopped',
+              endpoint_url => 'http://rvbbit-test-backend:8080/predict',
+              backend_name => %s,
+              deploy_manifest => %s::jsonb,
+              health => '{"ok": true, "action":"stopped"}'::jsonb,
+              logs => '{"agent":"test"}'::jsonb
+            )
+            """,
+            (stop_job_id, node_name, backend_name, json.dumps(manifest)),
+        )
+        stopped_state = rvbbit.execute(
+            """
+            SELECT deployment_status, serving_status, callable
+            FROM rvbbit.warren_backend_status
+            WHERE name = %s
+            """,
+            (backend_name,),
+        ).fetchone()
+        assert stopped_state == ("stopped", "unavailable", False)
+        probe = rvbbit.execute(
+            "SELECT rvbbit.backend_probe(%s)",
+            (backend_name,),
+        ).fetchone()[0]
+        assert probe["ok"] is False
+        assert "not callable" in probe["error"]
+
+        redeploy_job_id = rvbbit.execute(
+            "SELECT rvbbit.request_warren_deployment_redeploy(%s)",
+            (deployment_id,),
+        ).fetchone()[0]
+        redeploy = rvbbit.execute(
+            """
+            SELECT desired_state, status, progress->>'redeploy_of'
+            FROM rvbbit.warren_jobs
+            WHERE job_id = %s
+            """,
+            (redeploy_job_id,),
+        ).fetchone()
+        assert redeploy == ("running", "queued", str(deployment_id))
+
+        rvbbit.execute(
+            """
+            UPDATE rvbbit.warren_nodes
+            SET last_heartbeat = clock_timestamp() - interval '3 minutes'
+            WHERE name = %s
+            """,
+            (node_name,),
+        )
+        offline_state = rvbbit.execute(
+            """
+            SELECT effective_status, heartbeat_state, is_eligible
+            FROM rvbbit.warren_node_effective_status
+            WHERE name = %s
+            """,
+            (node_name,),
+        ).fetchone()
+        assert offline_state == ("offline", "offline", False)
+        assert (
+            rvbbit.execute(
+                "SELECT job_id FROM rvbbit.claim_warren_job(%s)",
+                (node_name,),
+            ).fetchone()
+            is None
+        )
+    finally:
+        rvbbit.execute("DELETE FROM rvbbit.backends WHERE name = %s", (backend_name,))
+        if deployment_id is not None:
+            rvbbit.execute(
+                "DELETE FROM rvbbit.warren_deployments WHERE deployment_id = %s",
+                (deployment_id,),
+            )
+        for cleanup_job_id in [redeploy_job_id, stop_job_id, deploy_job_id]:
+            if cleanup_job_id is not None:
+                rvbbit.execute(
+                    "DELETE FROM rvbbit.warren_jobs WHERE job_id = %s",
+                    (cleanup_job_id,),
+                )
+        rvbbit.execute("DELETE FROM rvbbit.warren_nodes WHERE name = %s", (node_name,))
+        rvbbit.execute("SELECT rvbbit.reload_backends()")
+
+
 def test_warren_gpu_capacity_gates_claims(rvbbit):
     node_name = f"test-gpu-warren-{uuid.uuid4().hex[:8]}"
     jobs: list[str] = []

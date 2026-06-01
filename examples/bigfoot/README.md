@@ -21,6 +21,9 @@ Defaults:
 - `BIGFOOT_CLASSIFY_ROWS=250`
 - `BIGFOOT_EXTRACT_ROWS=12`
 - `BIGFOOT_KG_ROWS=250`
+- `BIGFOOT_CAPABILITY_ENTITY_ROWS=8`
+- `BIGFOOT_CAPABILITY_RERANK_CANDIDATES=24`
+- `BIGFOOT_CAPABILITY_CLASSIFY_ROWS=8`
 
 The live triples/receipt section calls the configured model provider. It is
 opt-in:
@@ -38,7 +41,8 @@ BIGFOOT_LIVE=1 examples/bigfoot/run_all.sh
 | `02_retrieval.sql` | Materialize embeddings, run KNN search, and show evidence snippets. |
 | `03_semantic_map.sql` | Build semantic classifications, topics, outliers, diff, dedupe, extraction. |
 | `04_knowledge_graph.sql` | Build a deterministic KG from report metadata and lexical clues. |
-| `05_live_triples_receipts.sql` | Optional live model triples and receipt/cost inspection. |
+| `06_capability_operators.sql` | Use Warren capability operators for GLiNER spans, rerank, classification, and emotion/sentiment rollups. |
+| `07_live_triples_receipts.sql` | Optional live model triples and receipt/cost inspection. |
 
 Current note: `00_load.sql` uses `psql \copy` with the local path
 `/home/ryanr/csv-files/bigfoot_sightings.csv`. If this demo needs to run on

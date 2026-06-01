@@ -9,7 +9,7 @@
 
 \echo
 \echo ====================================================================
-\echo 05. Optional live model section: triples_rows + receipts/costs
+\echo 07. Optional live model section: triples_rows + receipts/costs
 \echo ====================================================================
 \echo Live rows: :live_rows
 

@@ -15,7 +15,7 @@ A useful first UI should expose six views:
 
 | View | Primary source | Purpose |
 |---|---|---|
-| Inventory | `rvbbit.warren_inventory` | Node list with latest metrics and active deployments. |
+| Inventory | `rvbbit.warren_inventory` | Node list with latest metrics and known non-removed deployments. |
 | Jobs | `rvbbit.warren_jobs` | Deployment queue, running jobs, failures, and history. |
 | Deployments | `rvbbit.warren_deployments` | Sidecars currently known to Warren, linked to backend/operator/runtime names. |
 | Metrics | `rvbbit.warren_node_latest_metrics`, `rvbbit.warren_node_metrics` | CPU, memory, disk, and GPU observability. |
@@ -29,7 +29,7 @@ this document.
 ## Inventory View
 
 Use `rvbbit.warren_inventory` for the default dashboard. It intentionally joins
-nodes, latest metrics, and active deployments so the UI can render a useful
+nodes, latest metrics, and known non-removed deployments so the UI can render a useful
 overview with one query.
 
 ```sql
@@ -40,6 +40,9 @@ SELECT
   labels,
   capacity,
   node_status,
+  node_effective_status,
+  heartbeat_state,
+  is_eligible,
   version,
   last_heartbeat,
   latest_metrics_at,
@@ -80,8 +83,11 @@ Recommended node cards:
 | Field | UI treatment |
 |---|---|
 | `node_name` | Primary node label. |
-| `node_status` | Status pill. |
-| `last_heartbeat` | Relative age; warn if stale. |
+| `node_status` | Raw agent-reported status; show only as secondary detail when it differs from `node_effective_status`. |
+| `node_effective_status` | Primary status pill for placement and operator decision-making. |
+| `heartbeat_state` | Fresh/stale/offline pill. |
+| `is_eligible` | Whether this node can currently claim a matching running job. |
+| `last_heartbeat` | Relative age. |
 | `labels` | Filter chips and placement hints. |
 | `capacity` | Human-readable resource summary when known. |
 | `cpu_pct`, `load1` | Small utilization indicators. |
@@ -92,18 +98,23 @@ Recommended node cards:
 | `single_gpu_mem_usable_bytes` | Largest single-GPU slot after safety ratio; V1 placement is conservative single-GPU. |
 | `gpu_provisioned_bytes` | VRAM reserved by active Warren deployments on the node. |
 | `gpu_available_bytes` | Remaining VRAM available for new GPU-targeted capability claims. |
-| `deployment_*` | Active deployment rows under the node. |
+| `deployment_*` | Non-removed deployment rows under the node. |
 
-Heartbeat staleness is a UI policy. A practical default is:
+Heartbeat staleness is derived by the database in
+`rvbbit.warren_node_effective_status` and copied into
+`rvbbit.warren_inventory`:
 
 | Condition | Suggested UI state |
 |---|---|
 | `last_heartbeat IS NULL` | `unknown` |
 | `now() - last_heartbeat < interval '30 seconds'` | `fresh` |
 | `now() - last_heartbeat < interval '2 minutes'` | `stale` |
-| otherwise | `offline_or_blocked` |
+| otherwise | `offline` |
 
-The database currently does not mark stale nodes offline automatically.
+Use `is_eligible` for install/placement counts. It is true only when the raw
+node status is `ready` or `busy` and the heartbeat is newer than two minutes.
+Older extension versions may not expose these fields; in that case the UI can
+fall back to the same heartbeat window client-side.
 
 ## Node Registry
 
@@ -139,7 +150,15 @@ Node statuses:
 | `error` | Reserved for node-level error state. |
 
 `labels` are used for placement. A queued job can be claimed when
-`warren_nodes.labels @> warren_jobs.target_selector`.
+`warren_nodes.labels @> warren_jobs.target_selector` and the node is eligible.
+For user-facing placement previews, prefer:
+
+```sql
+SELECT *
+FROM rvbbit.warren_node_effective_status
+WHERE is_eligible
+ORDER BY name;
+```
 
 Example labels:
 
@@ -239,8 +258,8 @@ Desired states:
 | Desired state | Meaning |
 |---|---|
 | `running` | Deploy or keep service running. |
-| `stopped` | Reserved for future stop workflow. |
-| `removed` | Reserved for future teardown workflow. |
+| `stopped` | Stop the sidecar on the node that owns the deployment. |
+| `removed` | Stop the sidecar and remove the generated Warren work directory. |
 
 Job statuses:
 
@@ -270,6 +289,9 @@ Treat it as an extensible text value. Current Warren agents use:
 | `probing_backend` | SQL backend probe is running. |
 | `probing_runtime` | Runtime-specific probe is running. |
 | `ready` | Warren completed the deployment. |
+| `stopping` | Docker teardown is in progress for a lifecycle job. |
+| `stopped` | Warren completed a stop lifecycle job. |
+| `removed` | Warren completed a remove lifecycle job. |
 | `failed` | Warren failed the job. |
 
 `progress` is structured JSON for the current or latest phase. Render it in an
@@ -299,8 +321,8 @@ FROM rvbbit.warren_jobs j
 WHERE j.status = 'queued'
   AND NOT EXISTS (
     SELECT 1
-    FROM rvbbit.warren_nodes n
-    WHERE n.status IN ('ready', 'busy')
+    FROM rvbbit.warren_node_effective_status n
+    WHERE n.is_eligible
       AND n.labels @> j.target_selector
   )
 ORDER BY j.created_at;
@@ -342,33 +364,34 @@ Deployment statuses:
 |---|---|
 | `starting` | Reserved for deployments not yet fully registered. |
 | `running` | Registered and expected to serve traffic. |
-| `stopped` | Reserved for future stopped state. |
+| `stopping` | A stop/remove lifecycle job has been queued or claimed. |
+| `stopped` | Warren stopped the sidecar. Runtime rows sourced from this deployment are disabled. |
 | `failed` | Deployment job failed or final probe failed. |
-| `removed` | Reserved for future teardown state. |
+| `removed` | Warren stopped the sidecar and removed the generated work directory. |
+| `drifted` | Reconciliation expected the service to be running, but Docker reported it missing or stopped. |
+| `orphaned` | Reconciliation expected the service to be stopped/removed, but Docker reported it running. |
 
-For model backend health, join to `rvbbit.backend_health` on `backend_name`.
-For execution runtime health, join to the runtime catalog, currently
-`rvbbit.python_runtimes` on `runtime_name`. `warren_deployments.status =
-'running'` means Warren completed the deployment workflow. It does not replace
-backend probes or runtime health checks.
+For model backend health, use `rvbbit.warren_backend_status`. It joins
+`rvbbit.backends` to the latest Warren deployment for each backend and exposes
+`serving_status` plus `callable`. For execution runtime health, join to the
+runtime catalog, currently `rvbbit.python_runtimes` on `runtime_name`.
+`warren_deployments.status = 'running'` means Warren completed the deployment
+workflow. It does not replace backend probes or runtime health checks.
 
 ```sql
 SELECT
-  d.deployment_id,
-  d.node_name,
-  d.name AS deployment_name,
-  d.status AS deployment_status,
-  d.backend_name,
-  d.runtime_name,
-  h.n_calls,
-  h.n_errors,
-  h.avg_latency_ms,
-  h.p95_latency_ms,
-  h.last_call_at
-FROM rvbbit.warren_deployments d
-LEFT JOIN rvbbit.backend_health h
-  ON h.name = d.backend_name
-ORDER BY d.updated_at DESC;
+  name AS backend_name,
+  endpoint_url,
+  deployment_id,
+  node_name,
+  deployment_name,
+  deployment_status,
+  serving_status,
+  callable,
+  deployment_error,
+  deployment_updated_at
+FROM rvbbit.warren_backend_status
+ORDER BY name;
 ```
 
 Runtime deployment state:
@@ -395,6 +418,46 @@ ORDER BY d.updated_at DESC;
 The `health` JSON can include agent-written details such as sidecar health and
 backend probe output. Treat it as arbitrary JSON and render it in an expandable
 details panel.
+
+### Deployment Lifecycle Actions
+
+The UI can request stop/remove through SQL. Do not call Docker or the Warren
+agent directly from the UI.
+
+```sql
+SELECT rvbbit.request_warren_deployment_stop($1::uuid);
+SELECT rvbbit.request_warren_deployment_remove($1::uuid);
+SELECT rvbbit.request_warren_deployment_redeploy($1::uuid);
+
+-- generic form
+SELECT rvbbit.request_warren_deployment_state($1::uuid, 'stopped');
+SELECT rvbbit.request_warren_deployment_state($1::uuid, 'removed');
+```
+
+These functions return a `job_id`. They set the deployment row to `stopping`
+immediately and enqueue a lifecycle job targeted at the original `node_name`.
+Only that node can claim the job. The Warren agent then runs `docker compose
+down` from the deployment work directory and completes the job as `stopped` or
+`removed`.
+
+Recommended UI actions:
+
+| Current deployment status | Suggested action |
+|---|---|
+| `running` | Show Stop. |
+| `drifted` | Show Redeploy, Stop, and Remove, with warning styling. |
+| `orphaned` | Show Redeploy, Stop, and Remove, with warning styling. |
+| `stopped` | Show Redeploy and Remove. |
+| `failed` | Show Redeploy and Remove when `work_dir` is known. |
+| `starting`, `stopping`, `removed` | Hide lifecycle action buttons or show disabled progress. |
+
+Stopping/removing a runtime sidecar disables its Warren-sourced
+`rvbbit.python_runtimes` or `rvbbit.mcp_gateways` row. Model backend/operator
+catalog rows are not deleted in V1. Instead, `rvbbit.warren_backend_status`
+sets `callable = false` for stopped, failed, drifted, and orphaned
+Warren-served backends. Capability cards should show these as installed but
+not callable, and offer Redeploy rather than silently treating the backend as
+healthy.
 
 ## Python Runtimes
 
@@ -622,6 +685,10 @@ SELECT
   c.active,
   c.updated_at,
   b.name IS NOT NULL AS backend_registered,
+  w.deployment_status,
+  w.serving_status AS deployment_serving_status,
+  w.callable AS deployment_callable,
+  w.deployment_error,
   b.n_calls,
   b.n_errors,
   b.avg_latency_ms,
@@ -632,6 +699,8 @@ SELECT
 FROM rvbbit.capability_catalog c
 LEFT JOIN rvbbit.backend_health b
   ON b.name = c.backend_name
+LEFT JOIN rvbbit.warren_backend_status w
+  ON w.name = c.backend_name
 LEFT JOIN rvbbit.python_runtimes r
   ON r.name = c.runtime_name
 LEFT JOIN rvbbit.mcp_gateways m
@@ -660,6 +729,7 @@ Detail panels should read these fields from the selected row:
 | `catalog_entry.catalog_visibility` | `public`, `example`, or `internal`; default browse views should show `public` and hide examples/internal smoke packs unless the user asks for them. |
 | `tags`, `kind`, `system_runtime`, `capability_role`, `device`, `runtime_*`, `manifest.runtime.image`, `catalog_entry.runtime_mode` | Filters and deployment badges. |
 | `backend_name`, `runtime_name`, `operators` | Install-state joins and post-deploy navigation. `operators` includes raw wrappers plus bundled high-level child operators. |
+| `deployment_callable`, `deployment_serving_status`, `deployment_error` | For backend cards, distinguish registered-but-stopped Warren backends from healthy installed backends. |
 
 For V1 built-ins, both runtime sidecars use `catalog_entry.runtime_mode =
 'build'` and have no `manifest.runtime.image`. The UI should render that as a
@@ -846,7 +916,8 @@ If a selector is empty (`{}`), any ready/busy node can claim the job.
 A completed Warren deployment registers either model backend/operator plumbing
 or an execution runtime:
 
-- `backend_name`: row in `rvbbit.backends` and `rvbbit.backend_health`.
+- `backend_name`: row in `rvbbit.backends`, `rvbbit.backend_health`, and
+  `rvbbit.warren_backend_status`.
 - `operator_name`: SQL operator created by `rvbbit.create_operator(...)`.
 - `runtime_name`: runtime row such as `rvbbit.python_runtimes.name`.
 
@@ -854,7 +925,7 @@ Useful checks:
 
 ```sql
 SELECT *
-FROM rvbbit.backend_health
+FROM rvbbit.warren_backend_status
 WHERE name = $1;
 
 SELECT jsonb_pretty(rvbbit.backend_probe($1));
@@ -867,7 +938,7 @@ separate:
 |---|---|---|
 | Job status | `rvbbit.warren_jobs.status` | Whether Warren completed the requested action. |
 | Deployment status | `rvbbit.warren_deployments.status` | Warren's remembered service state. |
-| Backend health | `rvbbit.backend_health` and `rvbbit.backend_probe(...)` | Whether Rvbbit can call the backend successfully. |
+| Backend health | `rvbbit.warren_backend_status`, `rvbbit.backend_health`, and `rvbbit.backend_probe(...)` | Whether Rvbbit can call the backend successfully. |
 | Runtime health | `rvbbit.python_runtimes` / `rvbbit.mcp_gateways` status and `health` | Whether an execution runtime endpoint is registered and ready. |
 
 For a runtime deployment, `backend_name` and `operator_name` are expected to be
@@ -892,13 +963,10 @@ Write actions available in v0:
 
 - Queue a catalog deployment with `rvbbit.deploy_catalog_capability(...)`.
 - Queue an ad hoc manifest deployment with `rvbbit.deploy_capability(...)`.
+- Request deployment stop/remove with
+  `rvbbit.request_warren_deployment_state(...)` or the stop/remove wrappers.
 - Register/update a node manually with `rvbbit.register_warren_node(...)`.
 - Prune old metrics with `rvbbit.prune_warren_metrics(...)`.
-
-Avoid adding destructive UI actions until the stop/remove job semantics are
-implemented. The catalog already reserves `desired_state = 'stopped'` and
-`desired_state = 'removed'`, but the current agent path is focused on starting
-services.
 
 ## Error Surfaces
 

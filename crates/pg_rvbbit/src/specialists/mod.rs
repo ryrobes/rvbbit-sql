@@ -289,7 +289,11 @@ fn load_all_names() -> Result<Vec<String>, ProviderError> {
     use pgrx::Spi;
     let mut names = Vec::new();
     let _: Result<(), pgrx::spi::Error> = Spi::connect(|client| {
-        let table = client.select("SELECT name FROM rvbbit.backends ORDER BY name", None, &[])?;
+        let table = client.select(
+            "SELECT name FROM rvbbit.warren_backend_status WHERE callable ORDER BY name",
+            None,
+            &[],
+        )?;
         for row in table {
             if let Some(n) = row.get::<String>(1)? {
                 names.push(n);
@@ -306,7 +310,7 @@ fn load_spec_from_spi(name: &str) -> Result<SpecialistSpec, ProviderError> {
     let sql = format!(
         "SELECT transport, endpoint_url, batch_size, max_concurrent, \
                 timeout_ms, auth_header_env, transport_opts \
-         FROM rvbbit.backends WHERE name = '{escaped}'"
+         FROM rvbbit.warren_backend_status WHERE name = '{escaped}' AND callable"
     );
     let mut result: Option<SpecialistSpec> = None;
     let _: Result<(), pgrx::spi::Error> = Spi::connect(|client| {
@@ -336,7 +340,12 @@ fn load_spec_from_spi(name: &str) -> Result<SpecialistSpec, ProviderError> {
         }
         Ok(())
     });
-    result.ok_or_else(|| ProviderError::Config(format!("specialist '{}' not registered", name)))
+    result.ok_or_else(|| {
+        ProviderError::Config(format!(
+            "specialist '{}' not registered or Warren deployment is not callable",
+            name
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------

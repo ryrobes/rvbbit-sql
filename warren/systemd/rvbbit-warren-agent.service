@@ -1,0 +1,26 @@
+[Unit]
+Description=Rvbbit Warren Agent
+Documentation=https://github.com/ryanr/rvbbit-sql
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/rvbbit/warren-agent.env
+ExecStart=/usr/local/bin/warren-agent
+Restart=always
+RestartSec=5
+User=rvbbit-warren
+Group=rvbbit-warren
+WorkingDirectory=/var/lib/rvbbit/warren
+StateDirectory=rvbbit
+LogsDirectory=rvbbit
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/rvbbit/warren
+SupplementaryGroups=docker
+
+[Install]
+WantedBy=multi-user.target

@@ -15,6 +15,8 @@ services, and report endpoint/backend/runtime state back to the database.
 - Warren agents register themselves with labels such as `{"gpu": true}`.
 - SQL queues a deployment job with a target selector.
 - A matching Warren claims the job using `FOR UPDATE SKIP LOCKED`.
+- Stop/remove requests are also queued as jobs, but they are targeted back to
+  the node that owns the original deployment.
 - GPU-targeted jobs are admitted only when the node has enough unreserved VRAM
   for the capability's `resources.gpu.vram_required_bytes` reservation.
 - The Warren builds from trusted local templates for bundled V1 packs, or
@@ -69,7 +71,11 @@ Core tables and view:
   and backend/operator/runtime names.
 - `rvbbit.warren_node_metrics`: append-only node telemetry snapshots.
 - `rvbbit.warren_node_latest_metrics`: latest telemetry row per node.
+- `rvbbit.warren_node_effective_status`: node heartbeat and claim eligibility
+  derived from reported status plus recency.
 - `rvbbit.warren_inventory`: UI-friendly node plus active deployment view.
+- `rvbbit.warren_backend_status`: backend registry rows annotated with the
+  latest Warren deployment state and `callable` flag.
 
 Primary functions:
 
@@ -130,11 +136,86 @@ Lower-level queue functions are available for custom flows:
 - `rvbbit.claim_warren_job(node_name)`
 - `rvbbit.complete_warren_job(...)`
 - `rvbbit.fail_warren_job(...)`
+- `rvbbit.request_warren_deployment_state(deployment_id, desired_state)`
+- `rvbbit.request_warren_deployment_stop(deployment_id)`
+- `rvbbit.request_warren_deployment_remove(deployment_id)`
+- `rvbbit.request_warren_deployment_redeploy(deployment_id)`
+- `rvbbit.report_warren_deployment_observation(...)`
 - `rvbbit.warren_heartbeat(...)`
 - `rvbbit.record_warren_metrics(...)`
 - `rvbbit.prune_warren_metrics(...)`
 
+Lifecycle requests return a new `job_id` and immediately mark the deployment
+`stopping`. The owning Warren agent claims the job, runs `docker compose down`
+from the deployment work directory, and completes it as `stopped` or `removed`.
+For `removed`, the generated Warren work directory is deleted as well. Runtime
+sidecars disable their Warren-sourced `python_runtimes` or `mcp_gateways` row;
+model backend/operator rows are retained for audit/history in V1. Stopped or
+failed Warren-served backends are exposed as `callable = false` through
+`rvbbit.warren_backend_status`, and `rvbbit.reload_backends()` excludes them
+from the runtime backend cache.
+
+The agent also reconciles remembered deployment state against Docker inspect on
+an interval. If a service expected to be `running` disappears, the deployment
+is marked `drifted`. If a service expected to be `stopped` or `removed` is
+still running, the deployment is marked `orphaned`.
+
+`request_warren_deployment_redeploy(deployment_id)` reuses the deployment
+manifest and enqueues a fresh `running` job. Use it for stopped, failed,
+drifted, or orphaned deployments after the operator has reviewed the
+deployment health/logs.
+
 ## Running An Agent
+
+### Production Host Service
+
+For V1, Warren should be installed as a normal host service on a machine with
+Docker. The installer is intentionally inspectable: it downloads the release
+binary, creates a dedicated `rvbbit-warren` user, writes
+`/etc/rvbbit/warren-agent.env` with mode `0600`, installs a systemd unit, and
+starts `rvbbit-warren-agent.service`.
+
+Example:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/rvbbit/rvbbit-sql/v1.0.0/warren/install-warren-agent.sh \
+  -o install-warren-agent.sh
+
+sudo env \
+  RVBBIT_DSN='postgresql://rvbbit_warren:...@db-host:5432/bench' \
+  WARREN_NODE='gpu-1' \
+  WARREN_LABELS='{"capability":true,"docker":true,"gpu":true,"cuda":true}' \
+  WARREN_CAPACITY='{"gpu":{"vram_usable_ratio":0.9}}' \
+  bash install-warren-agent.sh
+```
+
+The installer does not edit Postgres. Provision database access explicitly:
+
+```sql
+CREATE ROLE rvbbit_warren LOGIN PASSWORD '<strong password>';
+GRANT USAGE ON SCHEMA rvbbit TO rvbbit_warren;
+GRANT CREATE ON SCHEMA rvbbit TO rvbbit_warren;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA rvbbit TO rvbbit_warren;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA rvbbit TO rvbbit_warren;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA rvbbit TO rvbbit_warren;
+```
+
+Then allow the Warren host in `pg_hba.conf` using your normal production
+authentication policy, preferably TLS/SCRAM rather than `trust`. The Warren
+host can control Docker and can register endpoints/operators in Rvbbit, so
+treat it as trusted infrastructure and keep generated sidecars on a private
+network reachable by Postgres.
+
+Useful service commands:
+
+```bash
+systemctl status rvbbit-warren-agent
+journalctl -u rvbbit-warren-agent -f
+systemctl restart rvbbit-warren-agent
+```
+
+### Local Development
 
 Local dev stack, using Docker DNS as the registered endpoint:
 
@@ -144,7 +225,8 @@ make warren-agent
 
 The Makefile target expands to `cargo run -p warren-agent` with sensible dev
 defaults. Override `WARREN_NODE`, `WARREN_LABELS`, `WARREN_CAPACITY`,
-`WARREN_WORK_DIR`, `WARREN_DOCKER_NETWORK`, or `RVBBIT_DSN` as needed.
+`WARREN_WORK_DIR`, `RVBBIT_DOCKER_NETWORK`, `WARREN_RECONCILE_MS`, or
+`RVBBIT_DSN` as needed.
 
 Queue a capability for the agent:
 
@@ -266,6 +348,8 @@ Useful environment variables mirror the CLI:
 
 - `RVBBIT_DSN`
 - `WARREN_NODE`
+- `WARREN_LABELS`
+- `WARREN_CAPACITY`
 - `WARREN_WORK_DIR`
 - `WARREN_TEMPLATE_DIR`: template root such as `capabilities/templates`, or a
   specific legacy template directory.
@@ -274,6 +358,8 @@ Useful environment variables mirror the CLI:
 - `WARREN_POLL_MS`
 - `WARREN_METRICS_MS`: telemetry interval in milliseconds; `0` disables
   metrics writes.
+- `WARREN_RECONCILE_MS`: Docker reconciliation interval in milliseconds; `0`
+  disables reconciliation.
 - `WARREN_PORT_BASE`
 - `WARREN_DRY_RUN`
 
@@ -366,7 +452,8 @@ At a high level:
   `rvbbit.deploy_catalog_capability(...)`.
 - Let advanced users choose a target selector, for example `{"gpu":true}` or
   `{"region":"lab"}`.
-- Link deployed `backend_name` to `rvbbit.backend_health`.
+- Link deployed `backend_name` to `rvbbit.warren_backend_status` and
+  `rvbbit.backend_health`.
 - Link deployed `runtime_name` to runtime catalogs such as
   `rvbbit.python_runtimes`.
 

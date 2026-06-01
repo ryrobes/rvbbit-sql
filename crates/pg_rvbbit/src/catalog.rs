@@ -2764,6 +2764,47 @@ CREATE TRIGGER warren_nodes_touch_updated_at
     BEFORE UPDATE ON rvbbit.warren_nodes
     FOR EACH ROW EXECUTE FUNCTION rvbbit.touch_warren_nodes_updated_at();
 
+CREATE OR REPLACE VIEW rvbbit.warren_node_effective_status AS
+WITH heartbeat AS (
+    SELECT
+        n.*,
+        CASE
+            WHEN n.last_heartbeat IS NULL THEN 'unknown'
+            WHEN clock_timestamp() - n.last_heartbeat < interval '30 seconds' THEN 'fresh'
+            WHEN clock_timestamp() - n.last_heartbeat < interval '2 minutes' THEN 'stale'
+            ELSE 'offline'
+        END AS heartbeat_state
+    FROM rvbbit.warren_nodes n
+)
+SELECT
+    h.node_id,
+    h.name,
+    h.base_url,
+    h.labels,
+    h.capacity,
+    h.inventory,
+    h.status AS reported_status,
+    h.heartbeat_state,
+    CASE
+        WHEN h.status = 'error' THEN 'error'
+        WHEN h.status = 'draining' THEN 'draining'
+        WHEN h.heartbeat_state = 'offline' THEN 'offline'
+        WHEN h.heartbeat_state = 'unknown' THEN 'registered'
+        WHEN h.heartbeat_state = 'stale' AND h.status IN ('ready', 'busy') THEN 'stale'
+        ELSE h.status
+    END AS effective_status,
+    h.status IN ('ready', 'busy')
+        AND h.heartbeat_state IN ('fresh', 'stale') AS is_eligible,
+    h.version,
+    h.last_heartbeat,
+    CASE
+        WHEN h.last_heartbeat IS NULL THEN NULL::interval
+        ELSE clock_timestamp() - h.last_heartbeat
+    END AS heartbeat_age,
+    h.created_at,
+    h.updated_at
+FROM heartbeat h;
+
 CREATE TABLE rvbbit.warren_jobs (
     job_id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     kind             text NOT NULL,
@@ -2843,7 +2884,8 @@ CREATE TABLE rvbbit.warren_deployments (
         kind IN ('capability', 'trained_model', 'mcp_server', 'compose', 'custom')
     ),
     CONSTRAINT warren_deployments_status_check CHECK (
-        status IN ('starting', 'running', 'stopped', 'failed', 'removed')
+        status IN ('starting', 'running', 'stopping', 'stopped', 'failed', 'removed',
+                   'drifted', 'orphaned')
     ),
     CONSTRAINT warren_deployments_manifest_is_object CHECK (jsonb_typeof(manifest) = 'object'),
     CONSTRAINT warren_deployments_health_is_object CHECK (jsonb_typeof(health) = 'object')
@@ -2854,7 +2896,7 @@ CREATE INDEX warren_deployments_backend_idx ON rvbbit.warren_deployments (backen
     WHERE backend_name IS NOT NULL;
 CREATE UNIQUE INDEX warren_deployments_active_unique_idx ON rvbbit.warren_deployments
     (node_name, kind, name)
-    WHERE status IN ('starting', 'running');
+    WHERE status IN ('starting', 'running', 'stopping');
 
 CREATE TABLE rvbbit.warren_node_metrics (
     metric_id             bigserial PRIMARY KEY,
@@ -2959,7 +3001,7 @@ provisioned AS (
         coalesce(sum(rvbbit.capability_vram_required_bytes(d.manifest)), 0)::bigint
             AS gpu_provisioned_bytes
     FROM rvbbit.warren_deployments d
-    WHERE d.status IN ('starting', 'running')
+    WHERE d.status IN ('starting', 'running', 'stopping')
       AND rvbbit.capability_gpu_reserved(d.manifest)
       AND rvbbit.capability_vram_required_bytes(d.manifest) IS NOT NULL
     GROUP BY d.node_id
@@ -3020,7 +3062,10 @@ SELECT
     n.base_url,
     n.labels,
     n.capacity,
-    n.status AS node_status,
+    n.reported_status AS node_status,
+    n.effective_status AS node_effective_status,
+    n.heartbeat_state,
+    n.is_eligible,
     n.version,
     n.last_heartbeat,
     lm.collected_at AS latest_metrics_at,
@@ -3050,14 +3095,61 @@ SELECT
     cap.single_gpu_mem_usable_bytes,
     cap.gpu_provisioned_bytes,
     cap.gpu_available_bytes
-FROM rvbbit.warren_nodes n
+FROM rvbbit.warren_node_effective_status n
 LEFT JOIN rvbbit.warren_node_latest_metrics lm
   ON lm.node_id = n.node_id
 LEFT JOIN rvbbit.warren_gpu_capacity cap
   ON cap.node_id = n.node_id
 LEFT JOIN rvbbit.warren_deployments d
   ON d.node_id = n.node_id
- AND d.status IN ('starting', 'running', 'failed');
+ AND d.status IN ('starting', 'running', 'stopping', 'stopped', 'failed', 'drifted', 'orphaned');
+
+CREATE OR REPLACE VIEW rvbbit.warren_backend_status AS
+WITH ranked AS (
+    SELECT
+        d.*,
+        row_number() OVER (
+            PARTITION BY d.backend_name
+            ORDER BY d.updated_at DESC, d.created_at DESC, d.deployment_id DESC
+        ) AS rn
+    FROM rvbbit.warren_deployments d
+    WHERE d.backend_name IS NOT NULL
+)
+SELECT
+    b.name,
+    b.transport,
+    b.endpoint_url,
+    b.batch_size,
+    b.max_concurrent,
+    b.timeout_ms,
+    b.auth_header_env,
+    b.transport_opts,
+    b.description,
+    b.source_provider,
+    b.source_model,
+    b.source_revision,
+    b.install_manifest,
+    b.created_at,
+    d.deployment_id,
+    d.node_name,
+    d.kind AS deployment_kind,
+    d.name AS deployment_name,
+    d.status AS deployment_status,
+    CASE
+        WHEN d.deployment_id IS NULL THEN 'external'
+        WHEN d.status = 'running' THEN 'running'
+        WHEN d.status IN ('starting', 'stopping') THEN d.status
+        ELSE 'unavailable'
+    END AS serving_status,
+    (d.deployment_id IS NULL OR d.status = 'running') AS callable,
+    d.error AS deployment_error,
+    d.health AS deployment_health,
+    d.updated_at AS deployment_updated_at,
+    d.stopped_at
+FROM rvbbit.backends b
+LEFT JOIN ranked d
+  ON d.backend_name = b.name
+ AND d.rn = 1;
 
 CREATE OR REPLACE FUNCTION rvbbit.register_warren_node(
     node_name        text,
@@ -3321,6 +3413,285 @@ BEGIN
 END
 $dcc$;
 
+CREATE OR REPLACE FUNCTION rvbbit.request_warren_deployment_state(
+    deployment_id uuid,
+    desired_state text
+) RETURNS uuid
+LANGUAGE plpgsql
+VOLATILE
+AS $rwds$
+DECLARE
+    d rvbbit.warren_deployments%ROWTYPE;
+    normalized_state text := nullif(btrim(desired_state), '');
+    lifecycle_manifest jsonb;
+    queued_job_id uuid;
+BEGIN
+    IF normalized_state NOT IN ('stopped', 'removed') THEN
+        RAISE EXCEPTION 'desired_state must be stopped or removed';
+    END IF;
+
+    SELECT * INTO d
+    FROM rvbbit.warren_deployments
+    WHERE warren_deployments.deployment_id = request_warren_deployment_state.deployment_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Warren deployment % not found', deployment_id;
+    END IF;
+    IF d.status = 'removed' THEN
+        RAISE EXCEPTION 'Warren deployment % is already removed', deployment_id;
+    END IF;
+    IF d.status = 'stopped' AND normalized_state = 'stopped' THEN
+        RAISE EXCEPTION 'Warren deployment % is already stopped', deployment_id;
+    END IF;
+    IF d.status = 'stopping' THEN
+        RAISE EXCEPTION 'Warren deployment % already has a lifecycle request in progress',
+            deployment_id;
+    END IF;
+
+    lifecycle_manifest := coalesce(d.manifest, '{}'::jsonb)
+        || jsonb_build_object(
+            'warren_deployment',
+            jsonb_build_object(
+                'deployment_id', d.deployment_id,
+                'node_id', d.node_id,
+                'node_name', d.node_name,
+                'kind', d.kind,
+                'name', d.name,
+                'status', d.status,
+                'endpoint_url', d.endpoint_url,
+                'backend_name', d.backend_name,
+                'operator_name', d.operator_name,
+                'runtime_name', d.runtime_name,
+                'compose_project', d.compose_project,
+                'work_dir', d.work_dir
+            )
+        );
+
+    queued_job_id := rvbbit.enqueue_warren_job(
+        d.kind,
+        d.name,
+        lifecycle_manifest,
+        '{}'::jsonb,
+        normalized_state
+    );
+
+    UPDATE rvbbit.warren_jobs AS j
+    SET backend_name = d.backend_name,
+        operator_name = d.operator_name,
+        runtime_name = d.runtime_name,
+        endpoint_url = d.endpoint_url,
+        progress = jsonb_build_object(
+            'phase', 'queued',
+            'desired_state', normalized_state,
+            'deployment_id', d.deployment_id,
+            'node_name', d.node_name,
+            'queued_at', clock_timestamp()
+        )
+    WHERE j.job_id = queued_job_id;
+
+    UPDATE rvbbit.warren_deployments AS existing
+    SET status = 'stopping',
+        error = NULL,
+        health = existing.health || jsonb_build_object(
+            'lifecycle_request',
+            jsonb_build_object(
+                'desired_state', normalized_state,
+                'job_id', queued_job_id,
+                'requested_at', clock_timestamp()
+            )
+        )
+    WHERE existing.deployment_id = d.deployment_id;
+
+    RETURN queued_job_id;
+END
+$rwds$;
+
+CREATE OR REPLACE FUNCTION rvbbit.request_warren_deployment_stop(
+    deployment_id uuid
+) RETURNS uuid
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    RETURN rvbbit.request_warren_deployment_state(deployment_id, 'stopped');
+END
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.request_warren_deployment_remove(
+    deployment_id uuid
+) RETURNS uuid
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    RETURN rvbbit.request_warren_deployment_state(deployment_id, 'removed');
+END
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.request_warren_deployment_redeploy(
+    deployment_id uuid,
+    target_selector jsonb DEFAULT NULL,
+    job_name text DEFAULT NULL
+) RETURNS uuid
+LANGUAGE plpgsql
+VOLATILE
+AS $rwdr$
+DECLARE
+    d rvbbit.warren_deployments%ROWTYPE;
+    source_job rvbbit.warren_jobs%ROWTYPE;
+    redeploy_manifest jsonb;
+    redeploy_selector jsonb;
+    queued_job_id uuid;
+    actual_job_name text;
+BEGIN
+    IF target_selector IS NOT NULL AND jsonb_typeof(target_selector) <> 'object' THEN
+        RAISE EXCEPTION 'target_selector must be a JSON object';
+    END IF;
+
+    SELECT * INTO d
+    FROM rvbbit.warren_deployments
+    WHERE warren_deployments.deployment_id = request_warren_deployment_redeploy.deployment_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Warren deployment % not found', deployment_id;
+    END IF;
+
+    IF d.job_id IS NOT NULL THEN
+        SELECT * INTO source_job
+        FROM rvbbit.warren_jobs
+        WHERE warren_jobs.job_id = d.job_id;
+    END IF;
+
+    redeploy_manifest := coalesce(
+        NULLIF(d.manifest - 'warren_deployment', '{}'::jsonb),
+        NULLIF(source_job.manifest - 'warren_deployment', '{}'::jsonb)
+    );
+    IF redeploy_manifest IS NULL OR jsonb_typeof(redeploy_manifest) <> 'object' THEN
+        RAISE EXCEPTION 'Warren deployment % has no reusable manifest', deployment_id;
+    END IF;
+
+    redeploy_selector := coalesce(
+        target_selector,
+        source_job.target_selector,
+        CASE
+            WHEN jsonb_typeof(d.health->'target_selector') = 'object'
+            THEN d.health->'target_selector'
+            ELSE NULL
+        END,
+        '{}'::jsonb
+    );
+
+    actual_job_name := coalesce(nullif(btrim(job_name), ''), d.name);
+    queued_job_id := rvbbit.enqueue_warren_job(
+        d.kind,
+        actual_job_name,
+        redeploy_manifest,
+        redeploy_selector,
+        'running'
+    );
+
+    UPDATE rvbbit.warren_jobs AS j
+    SET backend_name = d.backend_name,
+        operator_name = d.operator_name,
+        runtime_name = d.runtime_name,
+        progress = jsonb_build_object(
+            'phase', 'queued',
+            'desired_state', 'running',
+            'redeploy_of', d.deployment_id,
+            'previous_status', d.status,
+            'queued_at', clock_timestamp()
+        )
+    WHERE j.job_id = queued_job_id;
+
+    UPDATE rvbbit.warren_deployments AS existing
+    SET health = existing.health || jsonb_build_object(
+            'redeploy_request',
+            jsonb_build_object(
+                'job_id', queued_job_id,
+                'requested_at', clock_timestamp()
+            )
+        )
+    WHERE existing.deployment_id = d.deployment_id;
+
+    RETURN queued_job_id;
+END
+$rwdr$;
+
+CREATE OR REPLACE FUNCTION rvbbit.report_warren_deployment_observation(
+    deployment_id uuid,
+    node_name text,
+    observed_state text,
+    observation jsonb DEFAULT '{}'::jsonb,
+    observation_error text DEFAULT NULL
+) RETURNS text
+LANGUAGE plpgsql
+VOLATILE
+AS $rwdo$
+DECLARE
+    normalized_observed text := coalesce(nullif(btrim(observed_state), ''), 'unknown');
+    normalized_observation jsonb := coalesce(observation, '{}'::jsonb);
+    current_status text;
+    current_desired_state text;
+    next_status text;
+BEGIN
+    IF jsonb_typeof(normalized_observation) <> 'object' THEN
+        RAISE EXCEPTION 'observation must be a JSON object';
+    END IF;
+
+    SELECT status, health #>> '{lifecycle_request,desired_state}'
+    INTO current_status, current_desired_state
+    FROM rvbbit.warren_deployments AS d
+    WHERE d.deployment_id = report_warren_deployment_observation.deployment_id
+      AND d.node_name = report_warren_deployment_observation.node_name
+    FOR UPDATE;
+
+    IF current_status IS NULL THEN
+        RAISE EXCEPTION 'Warren deployment % not found for node %',
+            deployment_id, node_name;
+    END IF;
+
+    next_status := CASE
+        WHEN current_status IN ('starting', 'running', 'drifted')
+             AND normalized_observed IN ('running', 'healthy') THEN 'running'
+        WHEN current_status IN ('starting', 'running', 'drifted')
+             AND normalized_observed IN ('missing', 'exited', 'dead', 'stopped') THEN 'drifted'
+        WHEN current_status IN ('stopped', 'removed', 'orphaned')
+             AND normalized_observed IN ('running', 'healthy') THEN 'orphaned'
+        WHEN current_status = 'orphaned'
+             AND normalized_observed IN ('missing', 'exited', 'dead', 'stopped')
+        THEN CASE WHEN current_desired_state = 'removed' THEN 'removed' ELSE 'stopped' END
+        ELSE current_status
+    END;
+
+    UPDATE rvbbit.warren_deployments AS d
+    SET status = next_status,
+        health = d.health || jsonb_build_object(
+            'last_reconcile',
+            normalized_observation || jsonb_build_object(
+                'observed_state', normalized_observed,
+                'observed_at', clock_timestamp()
+            )
+        ),
+        error = CASE
+            WHEN next_status IN ('drifted', 'orphaned')
+            THEN coalesce(observation_error, 'Warren deployment state drift detected')
+            WHEN d.status IN ('drifted', 'orphaned') AND next_status = 'running'
+            THEN NULL
+            ELSE d.error
+        END,
+        stopped_at = CASE
+            WHEN next_status IN ('stopped', 'removed') THEN coalesce(d.stopped_at, clock_timestamp())
+            WHEN next_status = 'running' THEN NULL
+            ELSE d.stopped_at
+        END
+    WHERE d.deployment_id = report_warren_deployment_observation.deployment_id;
+
+    RETURN next_status;
+END
+$rwdo$;
+
 CREATE OR REPLACE FUNCTION rvbbit.claim_warren_job(
     node_name text
 ) RETURNS TABLE (
@@ -3341,41 +3712,52 @@ BEGIN
         FROM rvbbit.warren_nodes n
         WHERE n.name = claim_warren_job.node_name
           AND n.status IN ('ready', 'busy')
+          AND n.last_heartbeat IS NOT NULL
+          AND clock_timestamp() - n.last_heartbeat < interval '2 minutes'
     ),
-	    picked AS (
-	        SELECT
-	            j.job_id,
-	            req.gpu_reservation_required,
-	            req.vram_required_bytes,
-	            req.gpu_placement,
-	            cap.gpu_available_bytes,
-	            cap.single_gpu_mem_usable_bytes
-	        FROM rvbbit.warren_jobs j
-	        CROSS JOIN node n
-	        LEFT JOIN rvbbit.warren_gpu_capacity cap
-	          ON cap.node_id = n.node_id
-	        CROSS JOIN LATERAL (
-	            SELECT
-	                (
-	                    rvbbit.capability_gpu_required(j.manifest)
-	                    OR coalesce(NULLIF(j.target_selector->>'gpu', '')::boolean, false)
-	                ) AS gpu_reservation_required,
-	                rvbbit.capability_vram_required_bytes(j.manifest) AS vram_required_bytes,
-	                coalesce(NULLIF(j.manifest #>> '{resources,gpu,placement}', ''), 'single_gpu') AS gpu_placement
-	        ) req
+    picked AS (
+        SELECT
+            j.job_id,
+            req.gpu_reservation_required,
+            req.vram_required_bytes,
+            req.gpu_placement,
+            cap.gpu_available_bytes,
+            cap.single_gpu_mem_usable_bytes
+        FROM rvbbit.warren_jobs j
+        CROSS JOIN node n
+        LEFT JOIN rvbbit.warren_gpu_capacity cap
+          ON cap.node_id = n.node_id
+        CROSS JOIN LATERAL (
+            SELECT
+                CASE WHEN j.desired_state = 'running' THEN (
+                    rvbbit.capability_gpu_required(j.manifest)
+                    OR coalesce(NULLIF(j.target_selector->>'gpu', '')::boolean, false)
+                ) ELSE false END AS gpu_reservation_required,
+                CASE WHEN j.desired_state = 'running'
+                     THEN rvbbit.capability_vram_required_bytes(j.manifest)
+                     ELSE NULL::bigint
+                END AS vram_required_bytes,
+                coalesce(NULLIF(j.manifest #>> '{resources,gpu,placement}', ''), 'single_gpu') AS gpu_placement
+        ) req
         WHERE j.status = 'queued'
-          AND n.labels @> j.target_selector
-	          AND (
-	              NOT req.gpu_reservation_required
-	              OR req.vram_required_bytes IS NULL
-	              OR (
-	                  req.vram_required_bytes <= coalesce(cap.gpu_available_bytes, 0)
-	                  AND (
-	                      req.gpu_placement <> 'single_gpu'
-	                      OR req.vram_required_bytes <= coalesce(cap.single_gpu_mem_usable_bytes, 0)
-	                  )
-	              )
-	          )
+          AND (
+              (j.desired_state = 'running' AND n.labels @> j.target_selector)
+              OR (
+                  j.desired_state IN ('stopped', 'removed')
+                  AND j.manifest #>> '{warren_deployment,node_name}' = n.name
+              )
+          )
+          AND (
+              NOT req.gpu_reservation_required
+              OR req.vram_required_bytes IS NULL
+              OR (
+                  req.vram_required_bytes <= coalesce(cap.gpu_available_bytes, 0)
+                  AND (
+                      req.gpu_placement <> 'single_gpu'
+                      OR req.vram_required_bytes <= coalesce(cap.single_gpu_mem_usable_bytes, 0)
+                  )
+              )
+          )
         ORDER BY j.created_at
         LIMIT 1
         FOR UPDATE OF j SKIP LOCKED
@@ -3396,14 +3778,15 @@ BEGIN
             attempts = attempts + 1,
             progress = progress || jsonb_build_object(
                 'phase', 'claimed',
+                'desired_state', j.desired_state,
                 'node_name', claim_warren_job.node_name,
                 'claimed_at', clock_timestamp(),
-	                'gpu_reserved', picked.gpu_reservation_required,
-	                'gpu_placement', picked.gpu_placement,
-	                'vram_required_bytes', picked.vram_required_bytes,
-	                'gpu_available_bytes', picked.gpu_available_bytes,
-	                'single_gpu_mem_usable_bytes', picked.single_gpu_mem_usable_bytes
-	            )
+                'gpu_reserved', picked.gpu_reservation_required,
+                'gpu_placement', picked.gpu_placement,
+                'vram_required_bytes', picked.vram_required_bytes,
+                'gpu_available_bytes', picked.gpu_available_bytes,
+                'single_gpu_mem_usable_bytes', picked.single_gpu_mem_usable_bytes
+            )
         FROM picked
         WHERE j.job_id = picked.job_id
         RETURNING j.job_id, j.kind, j.desired_state, j.name, j.manifest,
@@ -3480,6 +3863,8 @@ DECLARE
     actual_node_id uuid;
     actual_kind text;
     actual_name text;
+    actual_desired_state text;
+    completion_phase text;
 BEGIN
     SELECT node_id INTO actual_node_id
     FROM rvbbit.warren_nodes
@@ -3489,7 +3874,13 @@ BEGIN
         RAISE EXCEPTION 'warren node % is not registered', node_name;
     END IF;
 
-    SELECT kind, name INTO actual_kind, actual_name
+    IF deployment_status NOT IN ('starting', 'running', 'stopping', 'stopped',
+                                 'failed', 'removed', 'drifted', 'orphaned') THEN
+        RAISE EXCEPTION 'unsupported Warren deployment status %', deployment_status;
+    END IF;
+
+    SELECT kind, name, desired_state
+    INTO actual_kind, actual_name, actual_desired_state
     FROM rvbbit.warren_jobs
     WHERE warren_jobs.job_id = complete_warren_job.job_id;
 
@@ -3497,15 +3888,22 @@ BEGIN
         RAISE EXCEPTION 'warren job % not found', job_id;
     END IF;
 
+    completion_phase := CASE
+        WHEN deployment_status = 'running' THEN 'ready'
+        ELSE deployment_status
+    END;
+
     UPDATE rvbbit.warren_jobs
     SET status = 'completed',
-        phase = 'ready',
+        phase = completion_phase,
         endpoint_url = complete_warren_job.endpoint_url,
         backend_name = complete_warren_job.backend_name,
         operator_name = complete_warren_job.operator_name,
         runtime_name = complete_warren_job.runtime_name,
         progress = progress || jsonb_build_object(
-            'phase', 'ready',
+            'phase', completion_phase,
+            'desired_state', actual_desired_state,
+            'deployment_status', deployment_status,
             'endpoint_url', complete_warren_job.endpoint_url,
             'backend_name', complete_warren_job.backend_name,
             'operator_name', complete_warren_job.operator_name,
@@ -3531,13 +3929,14 @@ BEGIN
         health = complete_warren_job.health,
         error = NULL,
         stopped_at = CASE
-            WHEN deployment_status IN ('starting', 'running') THEN NULL
+            WHEN deployment_status IN ('starting', 'running', 'stopping') THEN NULL
             ELSE coalesce(d.stopped_at, clock_timestamp())
         END
     WHERE d.node_name = complete_warren_job.node_name
       AND d.kind = actual_kind
       AND d.name = actual_name
-      AND d.status IN ('starting', 'running');
+      AND d.status IN ('starting', 'running', 'stopping', 'stopped',
+                       'failed', 'removed', 'drifted', 'orphaned');
 
     IF NOT FOUND THEN
         INSERT INTO rvbbit.warren_deployments
@@ -3563,9 +3962,38 @@ BEGIN
             health = EXCLUDED.health,
             error = NULL,
             stopped_at = CASE
-                WHEN EXCLUDED.status IN ('starting', 'running') THEN NULL
+                WHEN EXCLUDED.status IN ('starting', 'running', 'stopping') THEN NULL
                 ELSE coalesce(rvbbit.warren_deployments.stopped_at, clock_timestamp())
             END;
+    END IF;
+
+    IF deployment_status IN ('stopped', 'removed') AND complete_warren_job.runtime_name IS NOT NULL THEN
+        IF to_regclass('rvbbit.python_runtimes') IS NOT NULL THEN
+            UPDATE rvbbit.python_runtimes AS r
+            SET status = 'disabled',
+                health = r.health || jsonb_build_object(
+                    'warren_lifecycle', deployment_status,
+                    'warren_job_id', complete_warren_job.job_id,
+                    'updated_at', clock_timestamp()
+                )
+            WHERE r.name = complete_warren_job.runtime_name
+              AND r.runtime_source = 'warren';
+        END IF;
+        IF to_regclass('rvbbit.mcp_gateways') IS NOT NULL THEN
+            UPDATE rvbbit.mcp_gateways AS g
+            SET status = 'disabled',
+                health = g.health || jsonb_build_object(
+                    'warren_lifecycle', deployment_status,
+                    'warren_job_id', complete_warren_job.job_id,
+                    'updated_at', clock_timestamp()
+                )
+            WHERE g.name = complete_warren_job.runtime_name
+              AND g.gateway_source = 'warren';
+        END IF;
+    END IF;
+
+    IF deployment_status IN ('stopped', 'removed') AND complete_warren_job.backend_name IS NOT NULL THEN
+        PERFORM rvbbit.reload_backends();
     END IF;
 END
 $cwjd$;
@@ -3583,12 +4011,13 @@ DECLARE
     actual_node_id uuid;
     actual_kind text;
     actual_name text;
+    actual_manifest jsonb;
 BEGIN
     SELECT node_id INTO actual_node_id
     FROM rvbbit.warren_nodes
     WHERE name = fail_warren_job.node_name;
 
-    SELECT kind, name INTO actual_kind, actual_name
+    SELECT kind, name, manifest INTO actual_kind, actual_name, actual_manifest
     FROM rvbbit.warren_jobs
     WHERE warren_jobs.job_id = fail_warren_job.job_id;
 
@@ -3612,10 +4041,11 @@ BEGIN
              health)
         VALUES
             (fail_warren_job.job_id, actual_node_id, fail_warren_job.node_name,
-             actual_kind, actual_name, 'failed', '{}'::jsonb,
+             actual_kind, actual_name, 'failed', coalesce(actual_manifest, '{}'::jsonb),
              fail_warren_job.error, fail_warren_job.logs)
         ON CONFLICT ON CONSTRAINT warren_deployments_job_id_key DO UPDATE SET
             status = 'failed',
+            manifest = EXCLUDED.manifest,
             error = EXCLUDED.error,
             health = EXCLUDED.health;
     END IF;
@@ -3723,8 +4153,11 @@ AS $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_roles WHERE rolname = current_user AND rolsuper
+    ) AND NOT (
+        EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rvbbit_warren')
+        AND pg_has_role(current_user, 'rvbbit_warren', 'member')
     ) THEN
-        RAISE EXCEPTION 'rvbbit MCP gateway DDL requires a superuser in this release';
+        RAISE EXCEPTION 'rvbbit MCP gateway DDL requires a superuser or rvbbit_warren role membership in this release';
     END IF;
 END
 $$;

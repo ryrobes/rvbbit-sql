@@ -27,6 +27,7 @@ struct Config {
     capacity: Value,
     port_base: u16,
     metrics_ms: u64,
+    reconcile_ms: u64,
 }
 
 #[derive(Debug)]
@@ -53,6 +54,36 @@ struct DeploymentResult {
     health: Value,
 }
 
+#[derive(Debug)]
+struct LifecycleDeploymentMetadata {
+    deployment_id: String,
+    node_name: String,
+    name: String,
+    status: String,
+    endpoint_url: Option<String>,
+    backend_name: Option<String>,
+    operator_name: Option<String>,
+    runtime_name: Option<String>,
+    compose_project: Option<String>,
+    work_dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct DeploymentObservationTarget {
+    deployment_id: String,
+    name: String,
+    status: String,
+    compose_project: Option<String>,
+    work_dir: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct DockerObservation {
+    observed_state: String,
+    observation: Value,
+    error: Option<String>,
+}
+
 fn main() -> Result<()> {
     let config = Config::from_env_args()?;
     fs::create_dir_all(&config.work_dir)
@@ -63,6 +94,7 @@ fn main() -> Result<()> {
     let mut metrics = MetricsSampler::default();
     try_record_metrics(&mut db, &config, &mut metrics);
     let mut last_metrics_at = Instant::now();
+    let mut last_reconcile_at = Instant::now();
     println!(
         "warren-agent {} registered node={} work_dir={}",
         VERSION,
@@ -73,6 +105,7 @@ fn main() -> Result<()> {
     loop {
         heartbeat(&mut db, &config, "ready")?;
         maybe_record_metrics(&mut db, &config, &mut metrics, &mut last_metrics_at);
+        maybe_reconcile_deployments(&mut db, &config, &mut last_reconcile_at);
         let mut failed_once_job: Option<String> = None;
         match claim_job(&mut db, &config)? {
             Some(job) => {
@@ -82,6 +115,7 @@ fn main() -> Result<()> {
                 );
                 heartbeat(&mut db, &config, "busy")?;
                 maybe_record_metrics(&mut db, &config, &mut metrics, &mut last_metrics_at);
+                maybe_reconcile_deployments(&mut db, &config, &mut last_reconcile_at);
                 if let Err(err) = process_job(&mut db, &config, &job) {
                     eprintln!("job {} failed: {err:#}", job.job_id);
                     let error = format!("{err:#}");
@@ -141,8 +175,8 @@ impl Config {
             dry_run: env::var("WARREN_DRY_RUN")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            labels: json!({"docker": true, "capability": true}),
-            capacity: json!({}),
+            labels: env_json_object("WARREN_LABELS", json!({"docker": true, "capability": true}))?,
+            capacity: env_json_object("WARREN_CAPACITY", json!({}))?,
             port_base: env::var("WARREN_PORT_BASE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -151,6 +185,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
+            reconcile_ms: env::var("WARREN_RECONCILE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15_000),
         };
 
         let mut args = env::args().skip(1);
@@ -172,6 +210,9 @@ impl Config {
                 "--port-base" => config.port_base = take_arg(&mut args, "--port-base")?.parse()?,
                 "--metrics-ms" => {
                     config.metrics_ms = take_arg(&mut args, "--metrics-ms")?.parse()?
+                }
+                "--reconcile-ms" => {
+                    config.reconcile_ms = take_arg(&mut args, "--reconcile-ms")?.parse()?
                 }
                 "--labels" => {
                     config.labels = serde_json::from_str(&take_arg(&mut args, "--labels")?)?
@@ -199,6 +240,18 @@ impl Config {
     }
 }
 
+fn env_json_object(name: &str, default: Value) -> Result<Value> {
+    let Ok(raw) = env::var(name) else {
+        return Ok(default);
+    };
+    let value: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {name} as JSON"))?;
+    if !value.is_object() {
+        bail!("{name} must be a JSON object");
+    }
+    Ok(value)
+}
+
 fn print_help() {
     println!(
         "warren-agent\n\n\
@@ -213,6 +266,7 @@ fn print_help() {
            --capacity <json>                  Informational capacity document\n\
            --port-base <port>                 Deterministic port range base\n\
            --metrics-ms <ms>                  Metrics interval, 0 disables\n\
+           --reconcile-ms <ms>                Deployment reconciliation interval, 0 disables\n\
            --poll-ms <ms>                     Poll interval\n\
            --once                             Claim at most one job\n\
            --dry-run                          Scaffold/register without starting Docker"
@@ -596,12 +650,194 @@ fn claim_job(db: &mut Client, config: &Config) -> Result<Option<WarrenJob>> {
     }))
 }
 
+fn maybe_reconcile_deployments(db: &mut Client, config: &Config, last_reconcile_at: &mut Instant) {
+    if config.reconcile_ms == 0 {
+        return;
+    }
+    if last_reconcile_at.elapsed() < Duration::from_millis(config.reconcile_ms) {
+        return;
+    }
+    *last_reconcile_at = Instant::now();
+    if let Err(err) = reconcile_deployments(db, config) {
+        eprintln!("warning: Warren deployment reconciliation failed: {err:#}");
+    }
+}
+
+fn reconcile_deployments(db: &mut Client, config: &Config) -> Result<()> {
+    if config.dry_run {
+        return Ok(());
+    }
+    let rows = db
+        .query(
+            "SELECT deployment_id::text, name, status, compose_project, work_dir \
+             FROM rvbbit.warren_deployments \
+             WHERE node_name = $1 \
+               AND status IN ('starting', 'running', 'stopping', 'stopped', \
+                              'removed', 'drifted', 'orphaned') \
+             ORDER BY created_at",
+            &[&config.node_name],
+        )
+        .context("loading Warren deployments for reconciliation")?;
+
+    for row in rows {
+        let target = DeploymentObservationTarget {
+            deployment_id: row.get(0),
+            name: row.get(1),
+            status: row.get(2),
+            compose_project: row.get(3),
+            work_dir: row.get::<_, Option<String>>(4).map(PathBuf::from),
+        };
+        let project = target
+            .compose_project
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| slugify(&target.name));
+        let container = container_name(&project);
+        let observed = docker_observation(&container);
+        let observation = merge_observation_context(&target, &container, observed.observation);
+        let observation_json = observation.to_string();
+        let next_status: String = db
+            .query_one(
+                "SELECT rvbbit.report_warren_deployment_observation(\
+                 $1::text::uuid, $2, $3, $4::text::jsonb, $5)",
+                &[
+                    &target.deployment_id,
+                    &config.node_name,
+                    &observed.observed_state,
+                    &observation_json,
+                    &observed.error,
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "reporting Warren deployment observation for {}",
+                    target.deployment_id
+                )
+            })?
+            .get(0);
+        if next_status != target.status {
+            println!(
+                "reconciled deployment={} {} -> {} observed={}",
+                target.deployment_id, target.status, next_status, observed.observed_state
+            );
+        }
+    }
+    Ok(())
+}
+
+fn merge_observation_context(
+    target: &DeploymentObservationTarget,
+    container_name: &str,
+    observation: Value,
+) -> Value {
+    let mut doc = match observation {
+        Value::Object(obj) => obj,
+        other => {
+            let mut obj = Map::new();
+            obj.insert("raw".into(), other);
+            obj
+        }
+    };
+    doc.insert("container_name".into(), json!(container_name));
+    doc.insert("deployment_name".into(), json!(target.name));
+    doc.insert("deployment_status".into(), json!(target.status));
+    if let Some(compose_project) = &target.compose_project {
+        doc.insert("compose_project".into(), json!(compose_project));
+    }
+    if let Some(work_dir) = &target.work_dir {
+        doc.insert("work_dir".into(), json!(work_dir.display().to_string()));
+    }
+    Value::Object(doc)
+}
+
+fn docker_observation(container_name: &str) -> DockerObservation {
+    let output = match Command::new("docker")
+        .arg("inspect")
+        .arg("--format")
+        .arg("{{json .State}}")
+        .arg(container_name)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            let error = format!("docker inspect failed: {err}");
+            return DockerObservation {
+                observed_state: "unknown".into(),
+                observation: json!({"ok": false, "error": error}),
+                error: Some(error),
+            };
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let observed_state = if stderr.contains("No such object") {
+            "missing"
+        } else {
+            "unknown"
+        };
+        return DockerObservation {
+            observed_state: observed_state.into(),
+            observation: json!({
+                "ok": observed_state == "missing",
+                "stderr": stderr,
+            }),
+            error: if observed_state == "missing" {
+                None
+            } else {
+                Some(stderr)
+            },
+        };
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let state = match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(state) => state,
+        Err(err) => {
+            let error = format!("docker inspect returned invalid state JSON: {err}");
+            return DockerObservation {
+                observed_state: "unknown".into(),
+                observation: json!({"ok": false, "error": error}),
+                error: Some(error),
+            };
+        }
+    };
+    let status = state
+        .get("Status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let health = state
+        .pointer("/Health/Status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let observed_state = if health == "healthy" {
+        "healthy"
+    } else if matches!(status, "running" | "exited" | "dead") {
+        status
+    } else {
+        "unknown"
+    };
+    let error = if observed_state == "unknown" {
+        Some(format!("unexpected Docker state {status:?}"))
+    } else {
+        None
+    };
+    DockerObservation {
+        observed_state: observed_state.into(),
+        observation: json!({
+            "ok": matches!(observed_state, "healthy" | "running"),
+            "docker_state": state,
+        }),
+        error,
+    }
+}
+
 fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> {
+    if matches!(job.desired_state.as_str(), "stopped" | "removed") {
+        return stop_or_remove_deployment(db, config, job);
+    }
     if job.desired_state != "running" {
-        bail!(
-            "desired_state {:?} is not implemented yet",
-            job.desired_state
-        );
+        bail!("desired_state {:?} is not supported", job.desired_state);
     }
 
     let mut result = match job.kind.as_str() {
@@ -676,7 +912,147 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
     Ok(())
 }
 
-fn deploy_capability(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<DeploymentResult> {
+fn stop_or_remove_deployment(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> {
+    let metadata = lifecycle_deployment_metadata(config, job)?;
+    if metadata.node_name != config.node_name {
+        bail!(
+            "lifecycle job targets node {:?}, but this agent is {:?}",
+            metadata.node_name,
+            config.node_name
+        );
+    }
+
+    let remove_work_dir = job.desired_state == "removed";
+    try_update_job_progress(
+        db,
+        config,
+        job,
+        "stopping",
+        json!({
+            "deployment_id": metadata.deployment_id,
+            "compose_project": metadata.compose_project,
+            "work_dir": metadata.work_dir.display().to_string(),
+            "remove_work_dir": remove_work_dir,
+        }),
+    );
+
+    let compose_file = metadata.work_dir.join("compose.yaml");
+    let mut compose_down = false;
+    let mut removed_work_dir = false;
+    if config.dry_run {
+        println!(
+            "dry-run: not stopping Docker project {}",
+            metadata
+                .compose_project
+                .as_deref()
+                .unwrap_or(metadata.name.as_str())
+        );
+    } else if compose_file.exists() {
+        docker_compose_down(&metadata.work_dir)?;
+        compose_down = true;
+    }
+
+    if remove_work_dir && !config.dry_run && metadata.work_dir.exists() {
+        fs::remove_dir_all(&metadata.work_dir)
+            .with_context(|| format!("removing {}", metadata.work_dir.display()))?;
+        removed_work_dir = true;
+    }
+
+    let health = json!({
+        "ok": !config.dry_run,
+        "dry_run": config.dry_run,
+        "action": job.desired_state,
+        "compose_down": compose_down,
+        "compose_file": compose_file.display().to_string(),
+        "work_dir_removed": removed_work_dir,
+    });
+    complete_lifecycle_job(db, config, job, &metadata, &health)?;
+    println!(
+        "completed lifecycle job={} deployment={} desired={}",
+        job.job_id, metadata.deployment_id, job.desired_state
+    );
+    Ok(())
+}
+
+fn lifecycle_deployment_metadata(
+    config: &Config,
+    job: &WarrenJob,
+) -> Result<LifecycleDeploymentMetadata> {
+    let deployment = job
+        .manifest
+        .pointer("/warren_deployment")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("lifecycle job manifest missing warren_deployment object"))?;
+    let deployment_id = deployment
+        .get("deployment_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("lifecycle job manifest missing warren_deployment.deployment_id"))?
+        .to_string();
+    let node_name = deployment
+        .get("node_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("lifecycle job manifest missing warren_deployment.node_name"))?
+        .to_string();
+    let name = deployment
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(&job.name)
+        .to_string();
+    let status = deployment
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let compose_project = deployment
+        .get("compose_project")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_string);
+    let work_dir = deployment
+        .get("work_dir")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            config.work_dir.join(
+                compose_project
+                    .as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| slugify(&name)),
+            )
+        });
+
+    Ok(LifecycleDeploymentMetadata {
+        deployment_id,
+        node_name,
+        name,
+        status,
+        endpoint_url: deployment
+            .get("endpoint_url")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        backend_name: deployment
+            .get("backend_name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        operator_name: deployment
+            .get("operator_name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        runtime_name: deployment
+            .get("runtime_name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        compose_project,
+        work_dir,
+    })
+}
+
+fn deploy_capability(
+    db: &mut Client,
+    config: &Config,
+    job: &WarrenJob,
+) -> Result<DeploymentResult> {
     let manifest = &job.manifest;
     let pack_name = manifest
         .get("name")
@@ -892,8 +1268,8 @@ fn copy_template_files(
     out_dir: &Path,
     values: &[(&str, &str)],
 ) -> Result<()> {
-    for entry in
-        fs::read_dir(current).with_context(|| format!("reading template dir {}", current.display()))?
+    for entry in fs::read_dir(current)
+        .with_context(|| format!("reading template dir {}", current.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -919,8 +1295,7 @@ fn copy_template_files(
             .with_context(|| format!("computing template path for {}", path.display()))?;
         let target = out_dir.join(rel);
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let text = render_tokens(
             &fs::read_to_string(&path)
@@ -1763,6 +2138,54 @@ fn complete_job(
         ],
     )
     .context("marking Warren job complete")?;
+    Ok(())
+}
+
+fn complete_lifecycle_job(
+    db: &mut Client,
+    config: &Config,
+    job: &WarrenJob,
+    metadata: &LifecycleDeploymentMetadata,
+    health: &Value,
+) -> Result<()> {
+    let manifest = job.manifest.to_string();
+    let health = health.to_string();
+    let work_dir = metadata.work_dir.display().to_string();
+    let logs = json!({
+        "agent": "warren-agent",
+        "action": job.desired_state,
+        "deployment_id": metadata.deployment_id,
+        "previous_status": metadata.status,
+        "compose_project": metadata.compose_project,
+        "work_dir": work_dir,
+        "endpoint_url": metadata.endpoint_url,
+        "backend_name": metadata.backend_name,
+        "operator_name": metadata.operator_name,
+        "runtime_name": metadata.runtime_name,
+    })
+    .to_string();
+    db.execute(
+        "SELECT rvbbit.complete_warren_job(\
+         job_id => $1::text::uuid, node_name => $2, deployment_status => $3, \
+         endpoint_url => $4, backend_name => $5, operator_name => $6, \
+         deploy_manifest => $7::text::jsonb, compose_project => $8, work_dir => $9, \
+         health => $10::text::jsonb, logs => $11::text::jsonb, runtime_name => $12)",
+        &[
+            &job.job_id,
+            &config.node_name,
+            &job.desired_state,
+            &metadata.endpoint_url,
+            &metadata.backend_name,
+            &metadata.operator_name,
+            &manifest,
+            &metadata.compose_project,
+            &work_dir,
+            &health,
+            &logs,
+            &metadata.runtime_name,
+        ],
+    )
+    .context("marking Warren lifecycle job complete")?;
     Ok(())
 }
 
