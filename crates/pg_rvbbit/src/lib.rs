@@ -14,6 +14,7 @@ use std::time::Instant;
 mod bitmap;
 mod cache;
 mod catalog;
+mod catalog_kg;
 mod catcher;
 mod cluster;
 mod code_steps;
