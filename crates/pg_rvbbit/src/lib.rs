@@ -35,6 +35,7 @@ mod fast_hash;
 mod flow;
 mod kg;
 mod lance;
+mod model_studio;
 mod mv;
 mod operators;
 mod planner;
