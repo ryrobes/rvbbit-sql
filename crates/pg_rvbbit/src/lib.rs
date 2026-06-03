@@ -15,6 +15,7 @@ mod bitmap;
 mod cache;
 mod catalog;
 mod catalog_kg;
+mod catalog_drift;
 mod catcher;
 mod cluster;
 mod code_steps;

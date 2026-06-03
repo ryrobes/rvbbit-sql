@@ -258,3 +258,88 @@ SELECT count(*) FROM rvbbit.kg_nodes WHERE graph_id = 'db_catalog';
 - **Embedding dependency:** search requires an `embed` specialist; crawler and
   `data_search` degrade gracefully (NULL embeddings / ILIKE fallback) without one.
 - **Freshness:** re-crawl merges, never deletes; Phase 5 adds prune + incremental.
+
+---
+
+## 11. Drift / change tracking (built on crawl snapshots)
+
+The crawl already computes a full per-object fingerprint *and* an embedding every
+run — it just discarded the history (node properties merge, `catalog_docs`
+upserts, `catalog_runs` keeps only aggregate counts). Drift retains that history
+in an **append-only snapshot table** and diffs any two runs. Zero extra scraping:
+we persist what we already produce.
+
+### Data model
+
+`rvbbit.catalog_snapshots(snapshot_id, run_id, graph_id, node_id, kind,
+schema_name, rel_name, col_name, obj_key, fingerprint jsonb, embedding real[],
+captured_at)` — one row per table and per column, per run. `obj_key` is the
+fully-qualified label (`schema.rel` / `schema.rel.col`) and is the stable
+identity diffed across runs. `fingerprint` is the full per-object profile;
+`embedding` is the same doc embedding used for search (no extra embed cost).
+
+The KG nodes stay **current-state** (lean fingerprint, value distributions
+stripped); snapshots are the **history layer**. Clean separation, no node
+versioning.
+
+### Fingerprint enrichments (for nuanced drift)
+
+Added to the same single scan in `catalog_fingerprint_table`:
+- **`value_dist`** — value→count map for up to `distinct_cap` (256) distinct
+  values, with `value_dist_complete` when `ndv ≤ cap`. Powers *exact* new/lost
+  categorical value detection and PSI/JSD. `example_values` (for the search doc)
+  is derived from the top of this map — no second scan.
+- **`quantiles`** — p05/p25/p50/p75/p95 for numeric columns (`percentile_cont`),
+  guarded for non-numeric types. Enables distribution drift beyond min/max.
+
+### Drift signals (coarse → nuanced)
+
+- **Schema**: added / dropped objects, `data_type`, `nullable`, `is_pk`,
+  `is_fk`/`fk_target`, `comment` changes.
+- **Volume / cardinality**: `n_rows` Δ (abs + %), `ndv` Δ, **`null_frac` Δ**
+  (a `null_spike` flag when it jumps ≥ 0.1).
+- **Distribution / content**: **new/lost categorical values** (exact when
+  `value_dist_complete`), **PSI** over `value_dist` (`dist_shift` flag at
+  ≥ 0.25), min/max range shift.
+- **Semantic**: **embedding drift** = `1 − cosine(emb_a, emb_b)` per object — a
+  threshold-free "how much did this change in character" score (`embed_drift`
+  flag at ≥ 0.12). When Phase 4 lands, semantic-type / PII changes join here.
+
+Each diff row carries a `change_type` (added/dropped/changed), a `severity`
+(0–1, weighted max of the signals), a `flags text[]`, and a structured `diff
+jsonb` (before/after per changed facet + value drift + embed drift).
+
+### Read surface (SQL)
+
+- `rvbbit.catalog_runs_list(graph, limit)` — runs for the picker (+ snapshot count).
+- `rvbbit.catalog_run_at(graph, ts)` — nearest run at-or-before a timestamp
+  (powers **date-vs-date**, not just run-vs-run).
+- `rvbbit.catalog_value_drift(dist_a, dist_b)` — `{new_values, lost_values, psi}`.
+- `rvbbit.catalog_drift(run_a, run_b, graph, only_changed)` — per-object diff
+  rows (change_type, severity, flags, diff).
+- `rvbbit.catalog_drift_summary(run_a, run_b, graph)` — rollup counts by
+  change_type + flag tally for the summary band.
+- `rvbbit.catalog_object_history(graph, obj_key)` — metric time series across all
+  runs (for sparklines).
+
+### Drift window (rvbbit-lens)
+
+A dedicated desktop app: a **run-pair picker** (two run selectors / date pair over
+a run strip), a **summary band** (change counts + severity colors), a **diff tree**
+(schema → table → column) of drift cards (metric deltas, new/lost value chips, a
+PSI/range bar, an embedding-drift badge, type-change flag), and **per-column
+history sparklines** (reusing `sparkline.tsx`) on expand.
+
+### Gotchas (carried forward)
+
+- **Sampling noise** is the main one: NDV / `value_dist` / `null_frac` come from a
+  `TABLESAMPLE` on large tables, so some run-to-run wiggle is sampling, not drift.
+  Snapshots record `sampled`/`n_sampled`; the UI should de-emphasize
+  low-confidence diffs. Exact-mode crawl (no sampling) is the clean baseline.
+- **Top-k blindness** is solved for low-NDV columns by `value_dist`; rare new
+  values in high-NDV columns still won't surface as discrete values (embedding
+  drift partially covers them).
+- **Storage**: one row per object per run; embeddings dominate size — a retention
+  policy / thinning is future work. Drift needs ≥ 2 runs (first = baseline).
+- **Cadence**: drift quality tracks crawl frequency → ties into Phase 5
+  (pg_cron / generation-bump incremental).

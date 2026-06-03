@@ -56,6 +56,30 @@ CREATE TABLE IF NOT EXISTS rvbbit.catalog_docs (
 CREATE INDEX IF NOT EXISTS catalog_docs_kind_idx
     ON rvbbit.catalog_docs (graph_id, kind);
 
+-- Append-only fingerprint history: one row per object (table/column) per crawl
+-- run. The KG nodes hold current state; these snapshots are the drift history
+-- layer. obj_key is the fully-qualified label and is the stable cross-run
+-- identity (see docs/CATALOG_KG_PLAN.md §11).
+CREATE TABLE IF NOT EXISTS rvbbit.catalog_snapshots (
+    snapshot_id  bigserial PRIMARY KEY,
+    run_id       bigint NOT NULL,
+    graph_id     text NOT NULL,
+    node_id      bigint,
+    kind         text NOT NULL,        -- db_table | db_column
+    schema_name  text,
+    rel_name     text,
+    col_name     text,
+    obj_key      text NOT NULL,        -- schema.rel  or  schema.rel.col
+    fingerprint  jsonb NOT NULL,
+    embedding    real[],
+    captured_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS catalog_snapshots_obj_idx
+    ON rvbbit.catalog_snapshots (graph_id, obj_key, run_id);
+CREATE INDEX IF NOT EXISTS catalog_snapshots_run_idx
+    ON rvbbit.catalog_snapshots (run_id);
+
 -- ---------------------------------------------------------------------
 -- Fingerprint document builders (deterministic, no LLM)
 -- ---------------------------------------------------------------------
@@ -127,6 +151,9 @@ DECLARE
     v_min      text;
     v_max      text;
     v_examples jsonb;
+    v_dist     jsonb;
+    v_quantiles jsonb;
+    distinct_cap int := 256;
 BEGIN
     SELECT n.nspname, c.relname, c.relkind,
            obj_description(c.oid, 'pg_class'),
@@ -189,14 +216,43 @@ BEGIN
                            rc.attname, rc.attname, v_src) INTO v_min, v_max;
         EXCEPTION WHEN others THEN v_min := NULL; v_max := NULL; END;
 
+        -- Value distribution: value -> count for up to distinct_cap values.
+        -- Complete (every distinct value present) when ndv <= cap; powers exact
+        -- new/lost value detection + PSI drift. example_values is derived from
+        -- this so we scan once.
+        v_dist := NULL;
         BEGIN
             EXECUTE format(
-                $q$SELECT jsonb_agg(jsonb_build_object('value', t.v, 'n', t.c) ORDER BY t.c DESC, t.v)
+                $q$SELECT jsonb_object_agg(t.v, t.c)
                      FROM (SELECT %I::text AS v, count(*) AS c
                              FROM %s WHERE %I IS NOT NULL
-                            GROUP BY 1 ORDER BY c DESC, 1 LIMIT %s) t$q$,
-                rc.attname, v_src, rc.attname, examples_k) INTO v_examples;
-        EXCEPTION WHEN others THEN v_examples := NULL; END;
+                            GROUP BY 1 ORDER BY count(*) DESC, 1 LIMIT %s) t$q$,
+                rc.attname, v_src, rc.attname, distinct_cap) INTO v_dist;
+        EXCEPTION WHEN others THEN v_dist := NULL; END;
+
+        SELECT COALESCE(
+                 jsonb_agg(jsonb_build_object('value', s.k, 'n', s.n) ORDER BY s.n DESC, s.k),
+                 '[]'::jsonb)
+          INTO v_examples
+          FROM (SELECT d.key AS k, (d.value)::bigint AS n
+                  FROM jsonb_each_text(COALESCE(v_dist, '{}'::jsonb)) AS d(key, value)
+                 ORDER BY (d.value)::bigint DESC, d.key
+                 LIMIT examples_k) s;
+
+        -- Quantiles for numeric columns (non-numeric types raise -> NULL).
+        v_quantiles := NULL;
+        BEGIN
+            EXECUTE format(
+                $q$SELECT jsonb_build_object(
+                      'p05', percentile_cont(0.05) WITHIN GROUP (ORDER BY %I),
+                      'p25', percentile_cont(0.25) WITHIN GROUP (ORDER BY %I),
+                      'p50', percentile_cont(0.50) WITHIN GROUP (ORDER BY %I),
+                      'p75', percentile_cont(0.75) WITHIN GROUP (ORDER BY %I),
+                      'p95', percentile_cont(0.95) WITHIN GROUP (ORDER BY %I))
+                     FROM %s WHERE %I IS NOT NULL$q$,
+                rc.attname, rc.attname, rc.attname, rc.attname, rc.attname, v_src, rc.attname)
+                INTO v_quantiles;
+        EXCEPTION WHEN others THEN v_quantiles := NULL; END;
 
         v_columns := v_columns || jsonb_build_object(
             'name',          rc.attname,
@@ -215,7 +271,10 @@ BEGIN
             'ndv_method',    CASE WHEN v_sampled THEN 'sampled' ELSE 'exact' END,
             'min',           v_min,
             'max',           v_max,
-            'example_values', COALESCE(v_examples, '[]'::jsonb));
+            'example_values', COALESCE(v_examples, '[]'::jsonb),
+            'value_dist',     v_dist,
+            'value_dist_complete', (v_ndv IS NOT NULL AND v_ndv <= distinct_cap),
+            'quantiles',      v_quantiles);
     END LOOP;
 
     RETURN jsonb_build_object(
@@ -344,13 +403,21 @@ BEGIN
             embedded_at = EXCLUDED.embedded_at, updated_at = now();
         IF v_vec IS NOT NULL THEN v_emb := v_emb + 1; END IF;
 
+        -- table drift snapshot (table-level summary, columns array stripped)
+        INSERT INTO rvbbit.catalog_snapshots
+            (run_id, graph_id, node_id, kind, schema_name, rel_name, col_name, obj_key, fingerprint, embedding)
+        VALUES (v_run, v_graph, v_tnode, 'db_table', v_schema, v_table, NULL, v_tlabel,
+                fp - 'columns', v_vec);
+
         -- columns
         FOR v_col IN SELECT e FROM jsonb_array_elements(fp->'columns') AS e
         LOOP
             v_clabel := v_tlabel || '.' || (v_col->>'name');
             v_doc := rvbbit.catalog_column_doc(v_schema, v_table, v_comment, v_col);
+            -- Node properties stay lean: the bulky value_dist / quantiles live
+            -- only in the drift snapshot, not in kg_nodes.
             v_cnode := rvbbit.kg_assert_node('db_column', v_clabel,
-                        jsonb_strip_nulls(v_col || jsonb_build_object(
+                        jsonb_strip_nulls((v_col - 'value_dist' - 'quantiles') || jsonb_build_object(
                             'schema',     v_schema,
                             'table',      v_table,
                             'table_oid',  fp->>'oid',
@@ -394,6 +461,12 @@ BEGIN
                 doc = EXCLUDED.doc, embedding = EXCLUDED.embedding,
                 embedded_at = EXCLUDED.embedded_at, updated_at = now();
             IF v_vec IS NOT NULL THEN v_emb := v_emb + 1; END IF;
+
+            -- column drift snapshot (full fingerprint incl. value_dist/quantiles)
+            INSERT INTO rvbbit.catalog_snapshots
+                (run_id, graph_id, node_id, kind, schema_name, rel_name, col_name, obj_key, fingerprint, embedding)
+            VALUES (v_run, v_graph, v_cnode, 'db_column', v_schema, v_table, v_col->>'name', v_clabel,
+                    v_col, v_vec);
         END LOOP;
     END LOOP;
 
