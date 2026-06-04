@@ -92,9 +92,9 @@ If a previous attempt failed, this is the Postgres error to fix (empty on the fi
 BEGIN
     FOR r IN SELECT * FROM (VALUES
         ('pivot',  'Crosstab/pivot a resultset using conditional aggregation.'),
-        ('grouped','Group and aggregate a resultset.'),
+        ('group',  'Group and aggregate a resultset.'),
         ('top',    'Order a resultset and keep the top rows.'),
-        ('winnow', 'Filter a resultset to matching rows, same columns.')
+        ('filter', 'Filter a resultset to matching rows, same columns.')
     ) AS t(nm, descr) LOOP
         PERFORM rvbbit.create_operator(
             op_name        => r.nm,
@@ -109,3 +109,18 @@ BEGIN
         );
     END LOOP;
 END $seed$;
+
+-- ENRICH: LLM value-mode rowset operator (ported from larsql). The model sees
+-- the whole table and returns it with new computed columns added per row, the
+-- originals preserved. parser='json' -> the value path parses {"data":[...]}.
+SELECT rvbbit.create_operator(
+    op_name        => 'enrich',
+    op_arg_names   => ARRAY['prompt'],
+    op_return_type => 'jsonb',
+    op_shape       => 'rowset',
+    op_parser      => 'json',
+    op_system      => 'You are a data enrichment specialist: add new computed columns to each row of a table. Respond with STRICT JSON of the form {"data": [ { ...all original columns preserved exactly..., "new_column": <value>, ... }, ... ]} and nothing else. Preserve every original column and value; add columns per the request using snake_case names; keep column names and value types consistent across all rows; new values must be strings, numbers, or booleans (no nested objects).',
+    op_user        => E'ENRICHMENT REQUEST: {{ prompt }}\n\nDATA ({{ _table_row_count }} rows; columns: {{ _table_columns }}):\n{{ _table }}\n\nReturn ONLY the JSON object described above.',
+    op_max_tokens  => 2048,
+    op_description => 'Pipeline rowset stage: add LLM-computed columns to each row.'
+);

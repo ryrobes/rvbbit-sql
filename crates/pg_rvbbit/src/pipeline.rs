@@ -340,6 +340,28 @@ fn take_rows(rows: &[Value], n: usize) -> Vec<Value> {
     rows.iter().take(n).cloned().collect()
 }
 
+/// First numeric arg of a stage (limit/sample), with a default.
+fn stage_n(stage: &Stage, default: usize) -> usize {
+    match stage.args.first() {
+        Some(StageArg::Num(n)) => *n as usize,
+        Some(StageArg::Str(s)) => s.trim().parse::<usize>().unwrap_or(default),
+        None => default,
+    }
+}
+
+/// Deterministic systematic sample: n rows spread evenly across the rowset (a
+/// representative subset, e.g. to bound the cost of a downstream model stage).
+fn stride_sample(rows: &[Value], n: usize) -> Vec<Value> {
+    let len = rows.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n >= len {
+        return rows.to_vec();
+    }
+    (0..n).map(|i| rows[(i * len) / n].clone()).collect()
+}
+
 /// Run one stage against the current rowset. Returns the new rowset plus, for
 /// synth-sql stages, the SQL the model authored (recorded for the inspector).
 /// Inline builtins are deterministic (no model call).
@@ -348,12 +370,12 @@ fn run_stage(stage: &Stage, rows: &[Value]) -> Result<(Vec<Value>, Option<String
         "pass" => Ok((rows.to_vec(), None)),
         "count" => Ok((vec![json!({ "n": rows.len() })], None)),
         "limit" | "head" => {
-            let n = match stage.args.first() {
-                Some(StageArg::Num(n)) => *n as usize,
-                Some(StageArg::Str(s)) => s.trim().parse::<usize>().unwrap_or(10),
-                None => 10,
-            };
+            let n = stage_n(stage, 10);
             Ok((take_rows(rows, n), None))
+        }
+        "sample" => {
+            let n = stage_n(stage, 10);
+            Ok((stride_sample(rows, n), None))
         }
         _ => {
             let pos_args: Vec<Value> = stage.args.iter().map(StageArg::to_value).collect();
@@ -651,14 +673,38 @@ mod tests {
     }
 
     #[pg_test]
-    fn synth_operators_are_seeded() {
-        let n: i64 = Spi::get_one(
+    fn rowset_operators_are_seeded() {
+        let synth: i64 = Spi::get_one(
             "SELECT count(*)::bigint FROM rvbbit.operators \
-             WHERE name IN ('pivot','grouped','top','winnow') AND shape='rowset' AND parser='sql'",
+             WHERE name IN ('pivot','group','top','filter') AND shape='rowset' AND parser='sql'",
         )
         .unwrap()
         .unwrap();
-        assert_eq!(n, 4);
+        assert_eq!(synth, 4, "synth-sql rowset operators");
+        let value: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.operators \
+             WHERE name IN ('analyze','enrich') AND shape='rowset' AND parser='json'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(value, 2, "value-mode rowset operators");
+    }
+
+    #[pg_test]
+    fn flow_sample_spreads_rows() {
+        // sample(3) of 9 rows -> 3 evenly-spread rows (indices 0,3,6 -> g 1,4,7)
+        let n: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.flow($q$ select g from generate_series(1,9) g then sample(3) $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 3);
+        let first: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ select g from generate_series(1,9) g then sample(3) $q$) ORDER BY (value->>'g')::int LIMIT 1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.0.get("g").and_then(|x| x.as_i64()), Some(1));
     }
 
     #[pg_test]

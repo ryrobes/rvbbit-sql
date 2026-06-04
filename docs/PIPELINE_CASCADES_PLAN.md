@@ -164,7 +164,7 @@ compiled code is cached and executed in-engine.
   over the rowset registered as `_input` (jsonb_to_recordset) — isolated by
   `PgTryBuilder` so a bad generation fails the stage, not the surrounding query.
 - Operators marked by `parser='sql'` (the synth strategy) vs `'json'` (value mode);
-  seeded `pivot` / `grouped` / `top` / `winnow` (`shape='rowset'`, `parser='sql'`).
+  seeded `pivot` / `group` / `top` / `filter` (synth-sql), `analyze` / `enrich` (LLM value-mode), and `sample` builtin.
 - `rvbbit.flow_shape(rows)` (inspect the fingerprint) + `rvbbit.synth_put(op,
   prompt, sample_rows, sql)` (author/pin a snippet by hand — also the audit knob).
 - Verified live (`cargo pgrx test`): fingerprint determinism/order-independence/
