@@ -173,12 +173,20 @@ compiled code is cached and executed in-engine.
 - TODO (Phase 2.5): validate-on-sample with error-feedback retry; `synth_cache`
   admin surface (list/edit/unpin).
 
-**Phase 3 — lens ergonomics.**
-- `runSql` detects a top-level `THEN` → wraps as `rvbbit.flow($$…$$)` before fetch.
-- DataGrid per-step tab strip reading `flow_steps` (step 0 base, step 1 pivot, …);
-  show the generated SQL + receipt cost/latency per step.
-- Verify (Playwright): bare `select … then pivot(…) then analyze(…)` in the editor
-  renders the final grid + per-step tabs.
+**Phase 3 — lens ergonomics. LANDED** (rvbbit-lens `6149fe7`).
+- `lib/sql/then-rewrite.ts`: `hasTopLevelThen()` (token-aware detector mirroring the
+  Rust splitter — leaves `CASE…THEN`/strings/comments untouched) + `wrapFlow()` +
+  `expandFlowResult()` (flow's single jsonb column → real grid columns).
+- `data-grid-window`: `runSql` detects a top-level `THEN` and wraps as
+  `SELECT * FROM rvbbit.flow($$…$$)` before sending; expands the result; tracks
+  `isPipelineRun`. New **Steps** tab (`FlowStepsView`) reads `rvbbit.flow_steps` and
+  shows each stage's rowset (step chips + table).
+- Verified live (Playwright, against the 1.1.0 DB): bare
+  `select … then pivot('counts by class')` runs through `rvbbit.flow`, the grid shows
+  the synthesized crosstab, and the Steps inspector shows base(4) → pivot(1: a=3,b=1).
+- TODO: show the generated SQL + receipt cost/latency per step in the inspector;
+  tie the Steps query to the exact run_id (currently "latest run" — fine for the
+  single-user desktop).
 
 **Phase 4 — persistence/observability polish.**
 - `flow_steps(run_id)` / `flow_step(run_id, idx)` SRFs; `reap_flow_steps(interval)`;
