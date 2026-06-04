@@ -124,3 +124,20 @@ SELECT rvbbit.create_operator(
     op_max_tokens  => 2048,
     op_description => 'Pipeline rowset stage: add LLM-computed columns to each row.'
 );
+
+-- RESHAPE: scalar synth-sql operator (Phase 5). The model authors ONE PostgreSQL
+-- expression over a text input `x` per distinct value-shape (digits->d, letters->a),
+-- cached in rvbbit.synth_cache and applied natively. So reshaping 50M values of
+-- ~50 formats costs ~50 model calls, then deterministic SQL.
+SELECT rvbbit.create_operator(
+    op_name        => 'reshape',
+    op_arg_names   => ARRAY['value', 'intent'],
+    op_arg_types   => ARRAY['text', 'text'],
+    op_return_type => 'text',
+    op_shape       => 'scalar',
+    op_parser      => 'sql',
+    op_system      => 'You write ONE PostgreSQL scalar expression that transforms a text input named x according to the request. Reference only x. Use standard PostgreSQL (regexp_replace, substring, ||, lower, upper, CASE, etc.); no subqueries, no semicolons, no function definitions. Return STRICT JSON {"sql": "<expression over x>"} and nothing else.',
+    op_user        => E'REQUEST: {{ intent }}\nINPUT SHAPE (each d = a digit, a = a letter, other characters are literal): {{ shape }}\nA representative input of this shape: {{ example }}\n\nWrite the expression over x that performs the request for inputs of this exact shape.\nIf a previous attempt failed, fix this Postgres error (empty on the first try): {{ _last_sql_error }}\n\nReturn ONLY {"sql": "<expression over x>"}.',
+    op_max_tokens  => 400,
+    op_description => 'Scalar synth-sql: reshape/format a text value; the model writes one expression per value-shape, cached and reused.'
+);

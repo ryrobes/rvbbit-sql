@@ -24,6 +24,7 @@ use crate::unit_of_work::{self, OpDef, SubCall, WorkResult};
 #[pg_extern(volatile, parallel_safe)]
 fn flush_cache() {
     crate::cache::flush();
+    crate::synth::clear_scalar_cache();
 }
 
 #[pg_extern(stable, parallel_safe)]
@@ -172,6 +173,11 @@ fn _exec_op_text(op_name: &str, inputs: JsonB, opts: JsonB) -> String {
             op.return_type
         );
         return String::new();
+    }
+    // Scalar synth-sql: the model authors one expression per value-shape, cached
+    // and applied natively (Phase 5). The operator's args are value + intent.
+    if op.parser == "sql" {
+        return crate::synth::run_synth_sql_scalar(&op, &inputs.0, &opts.0);
     }
     match invoke_with_cache(&op, &inputs.0, &opts.0) {
         Ok(s) => parse_text(&s, &op.parser),

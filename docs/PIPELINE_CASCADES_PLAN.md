@@ -202,13 +202,20 @@ compiled code is cached and executed in-engine.
   pivot. (TODO: per-step receipt cost/latency; tie the Steps query to the exact
   run_id rather than "latest run".)
 
-**Phase 5 (later — your shape-keyed scalar idea, near-free on the Phase-2 core).**
-- Scalar `synth-sql` operators reusing the same primitive: `reshape(col, intent)`
-  / `format_as(col, intent)`. Shape function = value-pattern; application =
-  expression bound per row, one snippet per shape across the whole relation.
-- The 50M-rows / ~50-shapes phone-format case: ~50 LLM calls to author the
-  snippets, then deterministic SQL. Add `synth_cache` admin (list / pin / edit /
-  freeze per-shape snippets).
+**Phase 5 — scalar shape-keyed reshaping. LANDED.**
+- `rvbbit.reshape(value, intent)` — a scalar operator (`shape='scalar'`,
+  `parser='sql'`). `scalar_shape(value)` maps each digit→`d`, letter→`a` (other
+  chars kept), so values with the same format share a shape; the model authors ONE
+  expression over `x` per shape (validated on a canonical example + the real value,
+  with error-feedback retry), cached in `synth_cache` + an in-memory L1, applied
+  natively. `_exec_op_text` routes `parser='sql'` scalar ops here.
+- `rvbbit.value_shape(text)` inspects the shape; `rvbbit.synth_put_scalar(op, intent,
+  example, expr)` pins a hand-written snippet; `flush_cache()` clears the L1.
+- Verified live: mixed-format phone numbers → E.164 with exactly **one cached
+  expression per value-shape** (the 50M-rows / ~50-shapes case = ~50 model calls).
+- TODO: set-based application (rewrite `reshape(col)` to a single `CASE`-by-shape
+  expression) to avoid per-row expression eval at very large scale; richer
+  `synth_cache` admin.
 
 ## Risks / open decisions
 

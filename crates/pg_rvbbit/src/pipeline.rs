@@ -794,4 +794,29 @@ mod tests {
         .unwrap();
         assert_eq!(n, 2, "flow should return the base rowset when a stage fails");
     }
+
+    #[pg_test]
+    fn value_shape_groups_by_format() {
+        let a: String = Spi::get_one("SELECT rvbbit.value_shape('(303) 555-1234')").unwrap().unwrap();
+        let b: String = Spi::get_one("SELECT rvbbit.value_shape('(720) 867-5309')").unwrap().unwrap();
+        assert_eq!(a, b, "same format -> same shape");
+        assert_eq!(a, "(ddd) ddd-dddd");
+        let c: String = Spi::get_one("SELECT rvbbit.value_shape('303-555-1234')").unwrap().unwrap();
+        assert_ne!(a, c, "different format -> different shape");
+    }
+
+    #[pg_test]
+    fn reshape_uses_cached_expression_per_shape_no_model() {
+        // Pin an expression for the (ddd) ddd-dddd phone shape.
+        Spi::run(
+            "SELECT rvbbit.synth_put_scalar('reshape', 'digits only', '(303) 555-1234', \
+             'regexp_replace(x, ''[^0-9]'', '''', ''g'')')",
+        )
+        .unwrap();
+        // A different value of the SAME shape -> cache hit -> deterministic apply.
+        let out: String = Spi::get_one("SELECT rvbbit.reshape('(720) 867-5309', 'digits only')")
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, "7208675309");
+    }
 }
