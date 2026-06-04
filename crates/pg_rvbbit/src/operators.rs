@@ -379,7 +379,7 @@ pub(crate) fn run_rowset_op(
     rows: &[serde_json::Value],
     pos_args: &[serde_json::Value],
     opts: &serde_json::Value,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
     let op = load_op(op_name).ok_or_else(|| format!("unknown operator '{op_name}'"))?;
     if op.shape != "rowset" {
         return Err(format!(
@@ -410,7 +410,7 @@ pub(crate) fn run_rowset_op(
     let inputs_v = serde_json::Value::Object(inputs);
     let raw = invoke_with_cache(&op, &inputs_v, opts)
         .map_err(|_| format!("operator '{op_name}' invocation failed"))?;
-    Ok(parse_rowset_output(&raw))
+    Ok((parse_rowset_output(&raw), None))
 }
 
 #[pg_extern(parallel_safe)]
@@ -423,7 +423,7 @@ fn _exec_op_rowset(
     let rows_vec = rows.0.as_array().cloned().unwrap_or_default();
     let pos_args = args.0.as_array().cloned().unwrap_or_default();
     match run_rowset_op(op_name, &rows_vec, &pos_args, &opts.0) {
-        Ok(out) => {
+        Ok((out, _generated_sql)) => {
             let mapped: Vec<(JsonB,)> = out.into_iter().map(|v| (JsonB(v),)).collect();
             TableIterator::new(mapped.into_iter())
         }

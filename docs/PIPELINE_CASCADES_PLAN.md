@@ -170,8 +170,11 @@ compiled code is cached and executed in-engine.
 - Verified live (`cargo pgrx test`): fingerprint determinism/order-independence/
   schema-sensitivity; the synth_put → matching pipeline stage executes the cached
   SQL natively with no model call. (LLM-gen miss path is live-only.)
-- TODO (Phase 2.5): validate-on-sample with error-feedback retry; `synth_cache`
-  admin surface (list/edit/unpin).
+- **Phase 2.5 LANDED**: `run_synth_sql_op` now validates each generated SQL on a
+  sample (first 200 rows) and feeds the Postgres error back to the model for up to
+  3 attempts before caching; the synth seed prompt carries `{{ _last_sql_error }}`.
+  Bad cached SQL fails the stage gracefully (PgTry subtransaction) without poisoning
+  the query. (TODO: `synth_cache` admin surface — list/edit/unpin.)
 
 **Phase 3 — lens ergonomics. LANDED** (rvbbit-lens `6149fe7`).
 - `lib/sql/then-rewrite.ts`: `hasTopLevelThen()` (token-aware detector mirroring the
@@ -188,12 +191,16 @@ compiled code is cached and executed in-engine.
   tie the Steps query to the exact run_id (currently "latest run" — fine for the
   single-user desktop).
 
-**Phase 4 — persistence/observability polish.**
-- `flow_steps(run_id)` / `flow_step(run_id, idx)` SRFs; `reap_flow_steps(interval)`;
-  row-cap + sampling for large steps.
-- e2e harness step `pipeline/flow_cascade` (head → synth-sql pivot → value analyze;
-  asserts rows, cache hit on rerun, flow_steps, no side-effect SQL escaped the
-  sandbox). Per standing convention, add to `bench/e2e_realworld.py`.
+**Phase 4 — persistence/observability polish. LANDED.**
+- `flow_steps` gained a `generated_sql` column — synth stages record the SQL the
+  model authored; `persist_step` caps the stored rowset at 500 (a sample) while
+  `n_rows` keeps the true count. `flow_step(run_id, idx)` SRF + `reap_flow_steps`
+  already shipped (Phase 0).
+- Lens Steps inspector shows the generated SQL per stage + a "showing first N of M"
+  note for capped steps (rvbbit-lens). Verified through the lens API on a 1.1.1 DB.
+- e2e `pipeline/flow_cascade` covers the deterministic builtins + the synth cache-hit
+  pivot. (TODO: per-step receipt cost/latency; tie the Steps query to the exact
+  run_id rather than "latest run".)
 
 **Phase 5 (later — your shape-keyed scalar idea, near-free on the Phase-2 core).**
 - Scalar `synth-sql` operators reusing the same primitive: `reshape(col, intent)`

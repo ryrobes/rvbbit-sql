@@ -340,19 +340,20 @@ fn take_rows(rows: &[Value], n: usize) -> Vec<Value> {
     rows.iter().take(n).cloned().collect()
 }
 
-/// Run one stage against the current rowset. Inline builtins are deterministic
-/// (no model call); everything else dispatches to a `shape='rowset'` operator.
-fn run_stage(stage: &Stage, rows: &[Value]) -> Result<Vec<Value>, String> {
+/// Run one stage against the current rowset. Returns the new rowset plus, for
+/// synth-sql stages, the SQL the model authored (recorded for the inspector).
+/// Inline builtins are deterministic (no model call).
+fn run_stage(stage: &Stage, rows: &[Value]) -> Result<(Vec<Value>, Option<String>), String> {
     match stage.name.as_str() {
-        "pass" => Ok(rows.to_vec()),
-        "count" => Ok(vec![json!({ "n": rows.len() })]),
+        "pass" => Ok((rows.to_vec(), None)),
+        "count" => Ok((vec![json!({ "n": rows.len() })], None)),
         "limit" | "head" => {
             let n = match stage.args.first() {
                 Some(StageArg::Num(n)) => *n as usize,
                 Some(StageArg::Str(s)) => s.trim().parse::<usize>().unwrap_or(10),
                 None => 10,
             };
-            Ok(take_rows(rows, n))
+            Ok((take_rows(rows, n), None))
         }
         _ => {
             let pos_args: Vec<Value> = stage.args.iter().map(StageArg::to_value).collect();
@@ -368,19 +369,36 @@ fn new_run_id() -> String {
         .unwrap_or_default()
 }
 
-/// Best-effort persistence of one step's rowset to rvbbit.flow_steps.
-fn persist_step(run_id: &str, step_idx: i32, stage: &str, spec: &str, rows: &[Value]) {
+/// Cap on the rowset sample stored per step (n_rows keeps the true count).
+const MAX_STORED_STEP_ROWS: usize = 500;
+
+/// Best-effort persistence of one step's rowset to rvbbit.flow_steps. Stores at
+/// most MAX_STORED_STEP_ROWS rows (a sample); n_rows is the true count.
+fn persist_step(
+    run_id: &str,
+    step_idx: i32,
+    stage: &str,
+    spec: &str,
+    generated_sql: Option<&str>,
+    rows: &[Value],
+) {
     if run_id.is_empty() {
         return;
     }
     let esc = |s: &str| s.replace('\'', "''");
-    let rows_str = esc(&Value::Array(rows.to_vec()).to_string());
+    let stored: Vec<Value> = rows.iter().take(MAX_STORED_STEP_ROWS).cloned().collect();
+    let rows_str = esc(&Value::Array(stored).to_string());
+    let gsql = match generated_sql {
+        Some(s) => format!("'{}'", esc(s)),
+        None => "NULL".to_string(),
+    };
     let sql = format!(
-        "INSERT INTO rvbbit.flow_steps (run_id, step_idx, stage, spec, rows, n_rows) \
-         VALUES ('{run_id}'::uuid, {step_idx}, '{}', '{}', '{}'::jsonb, {}) \
+        "INSERT INTO rvbbit.flow_steps (run_id, step_idx, stage, spec, generated_sql, rows, n_rows) \
+         VALUES ('{run_id}'::uuid, {step_idx}, '{}', '{}', {}, '{}'::jsonb, {}) \
          ON CONFLICT (run_id, step_idx) DO NOTHING",
         esc(stage),
         esc(spec),
+        gsql,
         rows_str,
         rows.len()
     );
@@ -430,13 +448,20 @@ fn flow(spec: &str) -> TableIterator<'static, (name!(value, JsonB),)> {
     };
 
     let run_id = new_run_id();
-    persist_step(&run_id, 0, "base", &pipeline.head, &rows);
+    persist_step(&run_id, 0, "base", &pipeline.head, None, &rows);
 
     for (idx, stage) in pipeline.stages.iter().enumerate() {
         match run_stage(stage, &rows) {
-            Ok(next) => {
+            Ok((next, generated_sql)) => {
                 rows = next;
-                persist_step(&run_id, (idx + 1) as i32, &stage.name, &stage_spec(stage), &rows);
+                persist_step(
+                    &run_id,
+                    (idx + 1) as i32,
+                    &stage.name,
+                    &stage_spec(stage),
+                    generated_sql.as_deref(),
+                    &rows,
+                );
             }
             Err(e) => {
                 pgrx::warning!("rvbbit.flow: stage '{}' failed: {e}", stage.name);
@@ -684,5 +709,43 @@ mod tests {
         .unwrap();
         assert_eq!(first.0.get("class").and_then(|x| x.as_str()), Some("A"));
         assert_eq!(first.0.get("n").and_then(|x| x.as_i64()), Some(2));
+    }
+
+    #[pg_test]
+    fn synth_generated_sql_is_recorded_per_step() {
+        Spi::run(
+            "SELECT rvbbit.synth_put('pivot', 'rc2', '[{\"class\":\"A\"},{\"class\":\"B\"}]'::jsonb, \
+             'SELECT class, count(*) AS n FROM _input GROUP BY class')",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT count(*) FROM rvbbit.flow($q$ select class from (values ('A'),('A'),('B')) v(class) then pivot('rc2') $q$)",
+        )
+        .unwrap();
+        let gsql: String = Spi::get_one(
+            "SELECT generated_sql FROM rvbbit.flow_steps \
+             WHERE stage = 'pivot' AND run_id = (SELECT run_id FROM rvbbit.flow_steps ORDER BY created_at DESC LIMIT 1)",
+        )
+        .unwrap()
+        .unwrap_or_default();
+        assert!(gsql.contains("GROUP BY class"), "generated_sql not recorded: {gsql}");
+    }
+
+    #[pg_test]
+    fn synth_bad_cached_sql_fails_stage_gracefully() {
+        // A cached SQL that references a missing column must fail the stage (via
+        // the PgTry subtransaction) without poisoning the surrounding query: flow
+        // returns the prior (base) rowset.
+        Spi::run(
+            "SELECT rvbbit.synth_put('pivot', 'oops', '[{\"class\":\"A\"},{\"class\":\"B\"}]'::jsonb, \
+             'SELECT nonexistent_col FROM _input')",
+        )
+        .unwrap();
+        let n: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.flow($q$ select class from (values ('A'),('B')) v(class) then pivot('oops') $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 2, "flow should return the base rowset when a stage fails");
     }
 }

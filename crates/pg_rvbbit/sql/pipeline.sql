@@ -6,13 +6,14 @@
 -- by rvbbit.flow(); inspect with rvbbit.flow_step(run_id, idx) or by querying
 -- this table directly. Reap with rvbbit.reap_flow_steps(interval).
 CREATE TABLE IF NOT EXISTS rvbbit.flow_steps (
-    run_id     uuid        NOT NULL,
-    step_idx   int         NOT NULL,
-    stage      text        NOT NULL,
-    spec       text,
-    rows       jsonb       NOT NULL DEFAULT '[]'::jsonb,
-    n_rows     int         NOT NULL DEFAULT 0,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    run_id        uuid        NOT NULL,
+    step_idx      int         NOT NULL,
+    stage         text        NOT NULL,
+    spec          text,
+    generated_sql text,                                  -- synth-sql stages: the SQL the model authored
+    rows          jsonb       NOT NULL DEFAULT '[]'::jsonb,  -- capped sample; n_rows is the true count
+    n_rows        int         NOT NULL DEFAULT 0,
+    created_at    timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (run_id, step_idx)
 );
 CREATE INDEX IF NOT EXISTS flow_steps_created_at_idx ON rvbbit.flow_steps (created_at);
@@ -83,7 +84,10 @@ Rules:
 - Write exactly ONE standard PostgreSQL SELECT over _input.
 - Use ONLY _input and the columns listed above. No DuckDB syntax, no PIVOT keyword, no semicolons, no WITH/CTE.
 - For a crosstab/pivot, use conditional aggregation: count(*) FILTER (WHERE col = 'value') AS alias (one column per distinct value listed above).
-- Return STRICT JSON and nothing else: {"sql": "<the SELECT statement>"}.$tmpl$;
+- Return STRICT JSON and nothing else: {"sql": "<the SELECT statement>"}.
+
+If a previous attempt failed, this is the Postgres error to fix (empty on the first try):
+{{ _last_sql_error }}$tmpl$;
     r record;
 BEGIN
     FOR r IN SELECT * FROM (VALUES

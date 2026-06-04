@@ -222,15 +222,20 @@ fn extract_sql(raw: &str) -> Option<String> {
     }
 }
 
+const MAX_SYNTH_ATTEMPTS: usize = 3;
+const SYNTH_SAMPLE_ROWS: usize = 200;
+
 /// The synth-sql strategy for a rowset operator: shape-fingerprint the rowset,
-/// reuse cached SQL if present, otherwise synthesize via the model, validate by
-/// executing, cache, and return the new rowset.
+/// reuse cached SQL if present, otherwise synthesize via the model — validating
+/// each attempt on a sample and feeding the Postgres error back for up to
+/// MAX_SYNTH_ATTEMPTS — then run on the full rowset and cache. Returns the new
+/// rowset plus the SQL that produced it (for the step inspector).
 pub(crate) fn run_synth_sql_op(
     op: &OpDef,
     prompt: &str,
     rows: &[Value],
     opts: &Value,
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, Option<String>), String> {
     let schema = infer_schema(rows);
     if schema.is_empty() {
         return Err("synth: rowset has no columns".into());
@@ -239,8 +244,10 @@ pub(crate) fn run_synth_sql_op(
     let shape_fp = fingerprint(&schema, &distinct);
     let p_hash = prompt_key(&op.name, prompt);
 
+    // Cache hit: execute the stored SQL directly (no model call).
     if let Some(sql) = synth_cache_get(&op.name, &shape_fp, &p_hash) {
-        return execute_over_input(rows, &schema, &sql);
+        let out = execute_over_input(rows, &schema, &sql)?;
+        return Ok((out, Some(sql)));
     }
 
     // Cache miss: synthesize. The model sees only schema + distinct values.
@@ -248,26 +255,50 @@ pub(crate) fn run_synth_sql_op(
         .iter()
         .map(|(c, t)| json!({ "column": c, "type": t }))
         .collect();
-    let mut inputs = serde_json::Map::new();
-    inputs.insert("prompt".into(), json!(prompt));
-    inputs.insert("_table_schema".into(), json!(profile_cols));
-    inputs.insert("_table_distinct".into(), Value::Object(distinct));
-    inputs.insert("_table_row_count".into(), json!(rows.len()));
-    let inputs_v = Value::Object(inputs);
+    let sample: Vec<Value> = rows.iter().take(SYNTH_SAMPLE_ROWS).cloned().collect();
+    let mut last_err = String::new();
 
-    let raw = crate::operators::invoke_with_cache(op, &inputs_v, opts)
-        .map_err(|_| format!("synth: operator '{}' invocation failed", op.name))?;
-    let gen_sql =
-        extract_sql(&raw).ok_or_else(|| format!("synth: model did not return SQL: {raw}"))?;
+    for attempt in 0..MAX_SYNTH_ATTEMPTS {
+        let mut inputs = serde_json::Map::new();
+        inputs.insert("prompt".into(), json!(prompt));
+        inputs.insert("_table_schema".into(), json!(profile_cols));
+        inputs.insert("_table_distinct".into(), Value::Object(distinct.clone()));
+        inputs.insert("_table_row_count".into(), json!(rows.len()));
+        inputs.insert(
+            "_last_sql_error".into(),
+            json!(if attempt == 0 { String::new() } else { last_err.clone() }),
+        );
+        let inputs_v = Value::Object(inputs);
 
-    match execute_over_input(rows, &schema, &gen_sql) {
-        Ok(out) => {
-            let sample = json!({ "schema": schema.iter().map(|(c,t)| json!([c,t])).collect::<Vec<_>>() });
-            synth_cache_put(&op.name, &shape_fp, &p_hash, &gen_sql, &sample, false);
-            Ok(out)
+        let raw = crate::operators::invoke_with_cache(op, &inputs_v, opts)
+            .map_err(|_| format!("synth: operator '{}' invocation failed", op.name))?;
+        let gen_sql = match extract_sql(&raw) {
+            Some(s) => s,
+            None => {
+                last_err = format!("the model did not return SQL (got: {raw})");
+                continue;
+            }
+        };
+        // Validate on a sample (cheap); on success, run on the full rowset.
+        match execute_over_input(&sample, &schema, &gen_sql) {
+            Ok(_) => {
+                let out = execute_over_input(rows, &schema, &gen_sql)?;
+                let meta = json!({
+                    "schema": schema.iter().map(|(c, t)| json!([c, t])).collect::<Vec<_>>(),
+                    "attempts": attempt + 1,
+                });
+                synth_cache_put(&op.name, &shape_fp, &p_hash, &gen_sql, &meta, false);
+                return Ok((out, Some(gen_sql)));
+            }
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
         }
-        Err(e) => Err(format!("synth: generated SQL failed ({e}); sql: {gen_sql}")),
     }
+    Err(format!(
+        "synth: no valid SQL after {MAX_SYNTH_ATTEMPTS} attempts; last error: {last_err}"
+    ))
 }
 
 // ---------------------------------------------------------------------------
