@@ -74,6 +74,7 @@ mod router;
 mod scan;
 mod sketches;
 mod specialists;
+mod synth;
 mod takes;
 mod tam;
 mod telemetry;

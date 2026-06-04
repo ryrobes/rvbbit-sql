@@ -3665,6 +3665,27 @@ def phase_pipeline(h: E2EHarness) -> None:
         steps = h.scalar("SELECT count(*)::int FROM rvbbit.flow_steps WHERE run_id = %s", (rid,))
         require(steps is not None and int(steps) >= 2, f"flow_steps not persisted: {steps}")
         d["steps_persisted"] = int(steps)
+
+        # synth-sql shape-keyed cache (Phase 2): pin a generated snippet for a
+        # shape + prompt, then a matching pipeline stage executes it natively
+        # (deterministic, no model call).
+        if h.scalar(
+            "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE p.proname = 'synth_put' AND n.nspname = 'rvbbit'"
+        ):
+            h.scalar(
+                "SELECT rvbbit.synth_put('pivot', 'rowcounts by class', "
+                "$j$[{\"class\":\"A\"},{\"class\":\"B\"}]$j$::jsonb, "
+                "'SELECT class, count(*) AS n FROM _input GROUP BY class ORDER BY class')"
+            )
+            piv = h.scalar(
+                "SELECT (value->>'n')::int FROM rvbbit.flow("
+                "$q$ select class from (values ('A'),('A'),('B')) v(class) then pivot('rowcounts by class') $q$) "
+                "ORDER BY value->>'class' LIMIT 1"
+            )
+            require(piv == 2, f"synth pivot cache-hit returned {piv}, expected 2")
+            d["synth_cache_hit"] = True
+
         d["ok"] = True
 
 

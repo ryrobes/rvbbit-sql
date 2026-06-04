@@ -387,6 +387,12 @@ pub(crate) fn run_rowset_op(
             op.shape
         ));
     }
+    // parser='sql' selects the synth-sql strategy: the model authors SQL keyed by
+    // the rowset's structural shape, cached and executed natively.
+    if op.parser == "sql" {
+        let prompt = pos_args.first().and_then(|v| v.as_str()).unwrap_or("");
+        return crate::synth::run_synth_sql_op(&op, prompt, rows, opts);
+    }
     let arg_names = load_arg_names(op_name);
     let mut inputs = serde_json::Map::new();
     for (i, name) in arg_names.iter().enumerate() {
@@ -608,7 +614,7 @@ fn load_op(name: &str) -> Option<OpDef> {
 
 // ---- The cached invoke ---------------------------------------------------
 
-fn invoke_with_cache(
+pub(crate) fn invoke_with_cache(
     op: &OpDef,
     inputs: &serde_json::Value,
     opts: &serde_json::Value,

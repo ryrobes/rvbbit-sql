@@ -624,4 +624,65 @@ mod tests {
                 .unwrap();
         assert_eq!(shape, "rowset");
     }
+
+    #[pg_test]
+    fn synth_operators_are_seeded() {
+        let n: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.operators \
+             WHERE name IN ('pivot','grouped','top','winnow') AND shape='rowset' AND parser='sql'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 4);
+    }
+
+    #[pg_test]
+    fn shape_fingerprint_is_order_independent() {
+        let a: String = Spi::get_one(
+            "SELECT rvbbit.flow_shape('[{\"class\":\"A\"},{\"class\":\"B\"}]'::jsonb)",
+        )
+        .unwrap()
+        .unwrap();
+        let b: String = Spi::get_one(
+            "SELECT rvbbit.flow_shape('[{\"class\":\"B\"},{\"class\":\"A\"}]'::jsonb)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(a, b, "fingerprint must be independent of row/value order");
+    }
+
+    #[pg_test]
+    fn shape_fingerprint_differs_by_schema() {
+        let a: String =
+            Spi::get_one("SELECT rvbbit.flow_shape('[{\"class\":\"A\"}]'::jsonb)")
+                .unwrap()
+                .unwrap();
+        let b: String = Spi::get_one(
+            "SELECT rvbbit.flow_shape('[{\"class\":\"A\",\"season\":\"Spring\"}]'::jsonb)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(a, b, "different schema must give a different fingerprint");
+    }
+
+    #[pg_test]
+    fn synth_put_then_flow_uses_cached_sql_no_model() {
+        // Pin a generated snippet for the shape {class text; distinct A,B} + prompt.
+        Spi::run(
+            "SELECT rvbbit.synth_put('pivot', 'rowcounts by class', \
+             '[{\"class\":\"A\"},{\"class\":\"B\"}]'::jsonb, \
+             'SELECT class, count(*) AS n FROM _input GROUP BY class ORDER BY class')",
+        )
+        .unwrap();
+        // A flow whose rowset has the SAME shape hits the cache and runs the SQL
+        // deterministically (no model call).
+        let first: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ select class from (values ('A'),('A'),('B')) v(class) then pivot('rowcounts by class') $q$) \
+             ORDER BY value->>'class' LIMIT 1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.0.get("class").and_then(|x| x.as_str()), Some("A"));
+        assert_eq!(first.0.get("n").and_then(|x| x.as_i64()), Some(2));
+    }
 }

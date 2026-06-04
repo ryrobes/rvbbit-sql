@@ -63,3 +63,45 @@ SELECT rvbbit.create_operator(
     op_max_tokens  => 1024,
     op_description => 'Pipeline rowset stage: analyze the whole resultset and return a findings table.'
 );
+
+-- Structural synth-sql rowset operators (Phase 2). parser='sql' selects the
+-- shape-keyed synthesis strategy: the model authors ONE standard-PostgreSQL
+-- SELECT over a table named _input, keyed/cached by the rowset's structural
+-- shape, then executed natively (rvbbit.synth_cache). Seeded with one shared
+-- template; the user's prompt arg drives the actual transform.
+DO $seed$
+DECLARE
+    v_user text := $tmpl$REQUEST: {{ prompt }}
+
+The data is a table named _input with these columns:
+{{ _table_schema }}
+
+Distinct values of low-cardinality text columns:
+{{ _table_distinct }}
+
+Rules:
+- Write exactly ONE standard PostgreSQL SELECT over _input.
+- Use ONLY _input and the columns listed above. No DuckDB syntax, no PIVOT keyword, no semicolons, no WITH/CTE.
+- For a crosstab/pivot, use conditional aggregation: count(*) FILTER (WHERE col = 'value') AS alias (one column per distinct value listed above).
+- Return STRICT JSON and nothing else: {"sql": "<the SELECT statement>"}.$tmpl$;
+    r record;
+BEGIN
+    FOR r IN SELECT * FROM (VALUES
+        ('pivot',  'Crosstab/pivot a resultset using conditional aggregation.'),
+        ('grouped','Group and aggregate a resultset.'),
+        ('top',    'Order a resultset and keep the top rows.'),
+        ('winnow', 'Filter a resultset to matching rows, same columns.')
+    ) AS t(nm, descr) LOOP
+        PERFORM rvbbit.create_operator(
+            op_name        => r.nm,
+            op_arg_names   => ARRAY['prompt'],
+            op_return_type => 'jsonb',
+            op_shape       => 'rowset',
+            op_parser      => 'sql',
+            op_system      => 'You translate a request into ONE standard PostgreSQL SELECT over a table named _input, returning only SQL via JSON. Intent: ' || r.descr,
+            op_user        => v_user,
+            op_max_tokens  => 1200,
+            op_description => 'Pipeline rowset stage (synth-sql): ' || r.descr
+        );
+    END LOOP;
+END $seed$;

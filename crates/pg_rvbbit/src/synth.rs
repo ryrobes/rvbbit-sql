@@ -1,0 +1,298 @@
+//! synth.rs — shape-keyed SQL synthesis for rowset (pipeline) operators.
+//!
+//! The high-leverage idea from larsql, generalized: the model is a compiler from
+//! (natural-language intent + the rowset's *structural shape*) to a SQL statement,
+//! invoked once per distinct shape; the compiled SQL is cached and executed
+//! natively. The cache is keyed on STRUCTURE, not content — so 50M rows of ~50
+//! shapes cost ~50 model calls, then deterministic in-engine SQL.
+//!
+//! A synth operator (shape='rowset', parser='sql') sees only the schema + the
+//! distinct values of low-cardinality text columns (never the data), and returns
+//! `{"sql": "<one SELECT over _input>"}`. We register the rowset as `_input`
+//! (jsonb_to_recordset) and run the SQL, isolated by a subtransaction so a bad
+//! generation fails the stage without poisoning the surrounding query.
+//!
+//! See docs/PIPELINE_CASCADES_PLAN.md.
+
+use pgrx::prelude::*;
+use pgrx::JsonB;
+use serde_json::{json, Value};
+
+use crate::unit_of_work::OpDef;
+
+const LOW_CARD_MAX: usize = 30;
+
+fn esc(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+fn hash_hex(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Infer the (column, pg-type) schema of a jsonb rowset. Column order comes from
+/// the first object row; the type is the widest seen (mixed → text).
+fn infer_schema(rows: &[Value]) -> Vec<(String, String)> {
+    let mut cols: Vec<String> = Vec::new();
+    for r in rows {
+        if let Some(o) = r.as_object() {
+            cols = o.keys().cloned().collect();
+            break;
+        }
+    }
+    cols.into_iter()
+        .map(|c| {
+            let mut seen_num = false;
+            let mut seen_bool = false;
+            let mut seen_str = false;
+            for r in rows {
+                match r.get(&c) {
+                    Some(Value::Number(_)) => seen_num = true,
+                    Some(Value::Bool(_)) => seen_bool = true,
+                    Some(Value::Null) | None => {}
+                    Some(_) => seen_str = true,
+                }
+            }
+            let ty = if seen_str {
+                "text"
+            } else if seen_bool && !seen_num {
+                "boolean"
+            } else if seen_num && !seen_bool {
+                "numeric"
+            } else {
+                "text"
+            };
+            (c, ty.to_string())
+        })
+        .collect()
+}
+
+/// Distinct values of low-cardinality text columns (sorted), for the prompt and
+/// the shape key. Columns with > LOW_CARD_MAX distinct values are omitted.
+fn distinct_profile(
+    rows: &[Value],
+    schema: &[(String, String)],
+) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for (col, ty) in schema {
+        if ty != "text" {
+            continue;
+        }
+        let mut set = std::collections::BTreeSet::new();
+        let mut overflow = false;
+        for r in rows {
+            if let Some(Value::String(s)) = r.get(col) {
+                set.insert(s.clone());
+                if set.len() > LOW_CARD_MAX {
+                    overflow = true;
+                    break;
+                }
+            }
+        }
+        if !overflow && !set.is_empty() {
+            out.insert(col.clone(), json!(set.into_iter().collect::<Vec<_>>()));
+        }
+    }
+    out
+}
+
+/// Deterministic structural fingerprint: schema (cols+types) + the sorted
+/// distinct-value sets of low-cardinality text columns.
+fn fingerprint(schema: &[(String, String)], distinct: &serde_json::Map<String, Value>) -> String {
+    let canon = json!({
+        "schema": schema.iter().map(|(c, t)| json!([c, t])).collect::<Vec<_>>(),
+        "distinct": distinct,
+    });
+    hash_hex(&canon.to_string())
+}
+
+fn prompt_key(operator: &str, prompt: &str) -> String {
+    hash_hex(&format!("{}\u{0}{}", operator, prompt.trim()))
+}
+
+fn coldefs(schema: &[(String, String)]) -> String {
+    schema
+        .iter()
+        .map(|(c, t)| format!("{} {}", quote_ident(c), t))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Run a generated SELECT over the rowset registered as `_input`, isolated so a
+/// bad generation returns Err instead of aborting the surrounding statement.
+fn execute_over_input(
+    rows: &[Value],
+    schema: &[(String, String)],
+    generated_sql: &str,
+) -> Result<Vec<Value>, String> {
+    let rows_json = Value::Array(rows.to_vec()).to_string();
+    let sql = format!(
+        "WITH _input AS (SELECT * FROM jsonb_to_recordset('{}'::jsonb) AS _t({})) \
+         SELECT to_jsonb(q) FROM ({}) q",
+        esc(&rows_json),
+        coldefs(schema),
+        generated_sql
+    );
+    pgrx::PgTryBuilder::new(move || -> Result<Vec<Value>, String> {
+        let mut out = Vec::new();
+        let r: Result<(), pgrx::spi::Error> = Spi::connect(|client| {
+            let table = client.select(&sql, None, &[])?;
+            for row in table {
+                if let Some(j) = row.get::<JsonB>(1)? {
+                    out.push(j.0);
+                }
+            }
+            Ok(())
+        });
+        r.map_err(|e| format!("{e:?}"))?;
+        Ok(out)
+    })
+    .catch_others(|caught| Err(format!("{caught:?}")))
+    .execute()
+}
+
+fn synth_cache_get(operator: &str, shape_fp: &str, prompt_hash: &str) -> Option<String> {
+    let sql = format!(
+        "SELECT generated_sql FROM rvbbit.synth_cache \
+         WHERE operator = '{}' AND shape_fingerprint = '{}' AND prompt_hash = '{}' \
+           AND status = 'valid'",
+        esc(operator),
+        esc(shape_fp),
+        esc(prompt_hash)
+    );
+    Spi::get_one::<String>(&sql).ok().flatten()
+}
+
+fn synth_cache_put(
+    operator: &str,
+    shape_fp: &str,
+    prompt_hash: &str,
+    generated_sql: &str,
+    sample: &Value,
+    pinned: bool,
+) {
+    let sql = format!(
+        "INSERT INTO rvbbit.synth_cache \
+           (operator, shape_fingerprint, prompt_hash, generated_sql, status, sample, pinned, updated_at) \
+         VALUES ('{}', '{}', '{}', '{}', 'valid', '{}'::jsonb, {}, clock_timestamp()) \
+         ON CONFLICT (operator, shape_fingerprint, prompt_hash) DO UPDATE SET \
+           generated_sql = CASE WHEN rvbbit.synth_cache.pinned THEN rvbbit.synth_cache.generated_sql \
+                                ELSE EXCLUDED.generated_sql END, \
+           status = 'valid', sample = EXCLUDED.sample, \
+           pinned = rvbbit.synth_cache.pinned OR EXCLUDED.pinned, \
+           updated_at = clock_timestamp()",
+        esc(operator),
+        esc(shape_fp),
+        esc(prompt_hash),
+        esc(generated_sql),
+        esc(&sample.to_string()),
+        pinned
+    );
+    let _ = Spi::run(&sql);
+}
+
+/// Extract a SQL statement from the model output: `{"sql": "..."}`, or a bare
+/// statement (markdown fences stripped).
+fn extract_sql(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(Value::String(s)) = o.get("sql") {
+            return Some(s.trim().trim_end_matches(';').to_string());
+        }
+    }
+    let mut s = trimmed;
+    if s.starts_with("```") {
+        s = s.trim_start_matches("```sql").trim_start_matches("```").trim();
+        if let Some(idx) = s.rfind("```") {
+            s = s[..idx].trim();
+        }
+    }
+    let up = s.trim_start().to_ascii_uppercase();
+    if up.starts_with("SELECT") || up.starts_with("WITH") {
+        Some(s.trim().trim_end_matches(';').to_string())
+    } else {
+        None
+    }
+}
+
+/// The synth-sql strategy for a rowset operator: shape-fingerprint the rowset,
+/// reuse cached SQL if present, otherwise synthesize via the model, validate by
+/// executing, cache, and return the new rowset.
+pub(crate) fn run_synth_sql_op(
+    op: &OpDef,
+    prompt: &str,
+    rows: &[Value],
+    opts: &Value,
+) -> Result<Vec<Value>, String> {
+    let schema = infer_schema(rows);
+    if schema.is_empty() {
+        return Err("synth: rowset has no columns".into());
+    }
+    let distinct = distinct_profile(rows, &schema);
+    let shape_fp = fingerprint(&schema, &distinct);
+    let p_hash = prompt_key(&op.name, prompt);
+
+    if let Some(sql) = synth_cache_get(&op.name, &shape_fp, &p_hash) {
+        return execute_over_input(rows, &schema, &sql);
+    }
+
+    // Cache miss: synthesize. The model sees only schema + distinct values.
+    let profile_cols: Vec<Value> = schema
+        .iter()
+        .map(|(c, t)| json!({ "column": c, "type": t }))
+        .collect();
+    let mut inputs = serde_json::Map::new();
+    inputs.insert("prompt".into(), json!(prompt));
+    inputs.insert("_table_schema".into(), json!(profile_cols));
+    inputs.insert("_table_distinct".into(), Value::Object(distinct));
+    inputs.insert("_table_row_count".into(), json!(rows.len()));
+    let inputs_v = Value::Object(inputs);
+
+    let raw = crate::operators::invoke_with_cache(op, &inputs_v, opts)
+        .map_err(|_| format!("synth: operator '{}' invocation failed", op.name))?;
+    let gen_sql =
+        extract_sql(&raw).ok_or_else(|| format!("synth: model did not return SQL: {raw}"))?;
+
+    match execute_over_input(rows, &schema, &gen_sql) {
+        Ok(out) => {
+            let sample = json!({ "schema": schema.iter().map(|(c,t)| json!([c,t])).collect::<Vec<_>>() });
+            synth_cache_put(&op.name, &shape_fp, &p_hash, &gen_sql, &sample, false);
+            Ok(out)
+        }
+        Err(e) => Err(format!("synth: generated SQL failed ({e}); sql: {gen_sql}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQL-facing helpers (inspection + manual snippet authoring/pinning)
+// ---------------------------------------------------------------------------
+
+/// The structural shape fingerprint of a rowset — the synth_cache key component.
+#[pg_extern(stable, parallel_safe)]
+fn flow_shape(rows: JsonB) -> String {
+    let r = rows.0.as_array().cloned().unwrap_or_default();
+    let schema = infer_schema(&r);
+    let distinct = distinct_profile(&r, &schema);
+    fingerprint(&schema, &distinct)
+}
+
+/// Pin a SQL snippet for the shape of `sample_rows` + `prompt` under `operator`.
+/// Lets you author / freeze the generated SQL by hand (and is how a reviewer
+/// locks the ~K snippets). Returns the shape fingerprint it was stored under.
+#[pg_extern(volatile)]
+fn synth_put(operator: &str, prompt: &str, sample_rows: JsonB, generated_sql: &str) -> String {
+    let r = sample_rows.0.as_array().cloned().unwrap_or_default();
+    let schema = infer_schema(&r);
+    let distinct = distinct_profile(&r, &schema);
+    let shape_fp = fingerprint(&schema, &distinct);
+    let p_hash = prompt_key(operator, prompt);
+    synth_cache_put(operator, &shape_fp, &p_hash, generated_sql, &json!({}), true);
+    shape_fp
+}

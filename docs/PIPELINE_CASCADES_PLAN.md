@@ -157,14 +157,21 @@ compiled code is cached and executed in-engine.
 - Verify (psql): `SELECT * FROM rvbbit.flow($$ select … then analyze('…') $$)`
   returns rows; receipts + flow_steps populated.
 
-**Phase 2 — the `synth_sql` primitive + structural rowset stages (the core).**
-- `synth_sql` core: shape function (rowset = schema fingerprint + profile),
-  `synth_cache` lookup, LLM synth on miss (→ receipt), validate-on-sample +
-  error-feedback retry, execute generated statement over `_input` via SPI.
-- Seed `pivot` / `group` / `top` / `filter` as `rowset` + `synth-sql`.
-- Verify (psql): `select … then pivot('rowcounts by class and season')` works;
-  second run with the same shape+prompt is a `synth_cache` hit (no LLM call —
-  assert via receipts); the generated SQL is inspectable.
+**Phase 2 — the `synth_sql` primitive + structural rowset stages (the core). LANDED.**
+- `synth_sql` core (`src/synth.rs`): shape fingerprint (schema cols+types + sorted
+  distinct-value sets of low-cardinality text cols), `synth_cache` lookup, model
+  synth on miss (→ receipt via invoke_with_cache), execute the generated statement
+  over the rowset registered as `_input` (jsonb_to_recordset) — isolated by
+  `PgTryBuilder` so a bad generation fails the stage, not the surrounding query.
+- Operators marked by `parser='sql'` (the synth strategy) vs `'json'` (value mode);
+  seeded `pivot` / `grouped` / `top` / `winnow` (`shape='rowset'`, `parser='sql'`).
+- `rvbbit.flow_shape(rows)` (inspect the fingerprint) + `rvbbit.synth_put(op,
+  prompt, sample_rows, sql)` (author/pin a snippet by hand — also the audit knob).
+- Verified live (`cargo pgrx test`): fingerprint determinism/order-independence/
+  schema-sensitivity; the synth_put → matching pipeline stage executes the cached
+  SQL natively with no model call. (LLM-gen miss path is live-only.)
+- TODO (Phase 2.5): validate-on-sample with error-feedback retry; `synth_cache`
+  admin surface (list/edit/unpin).
 
 **Phase 3 — lens ergonomics.**
 - `runSql` detects a top-level `THEN` → wraps as `rvbbit.flow($$…$$)` before fetch.

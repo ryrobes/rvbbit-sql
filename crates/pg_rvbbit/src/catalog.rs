@@ -888,7 +888,7 @@ CREATE TABLE rvbbit.operators (
     CHECK (shape IN ('scalar', 'aggregate', 'dimension', 'rowset')),
     CHECK (cardinality(arg_names) = cardinality(arg_types)),
     CHECK (return_type IN ('bool', 'text', 'float8', 'jsonb')),
-    CHECK (parser IN ('yes_no', 'score_0_1', 'raw_text', 'strip', 'json')),
+    CHECK (parser IN ('yes_no', 'score_0_1', 'raw_text', 'strip', 'json', 'sql')),
     CHECK (infix_symbol IS NULL OR cardinality(arg_names) = 2),
     -- Infix only makes sense for per-row evaluation.
     CHECK (infix_symbol IS NULL OR shape = 'scalar')
