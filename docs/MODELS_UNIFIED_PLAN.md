@@ -25,10 +25,16 @@ e2e `ml/closed_loop_watch` passes). (2) a `tabular_foundation` handler in
 `predict_tabular` end-to-end (verified live; CPU reference handler — swap for a
 real TabPFN forward pass on a GPU host). The lens Model Studio gained a **Deploy
 serving** action, a **Managed (train+deploy)** toggle, and **live run-status**.
-**Still optional:** the existing Warren *agent* (Rust) also claims
-`model_training` jobs but has no fit handler — either give it one or have it skip
-`model_training` so the trainer worker owns training (it currently races; the
-demo used the unmanaged path to avoid it).
+**Race fixed (2026-06-04):** the deploy agent used to also claim `model_training`
+jobs (it calls `claim_warren_job`, which filtered by node, not kind) but has no
+fit handler — racing the trainer worker. Fix: `claim_warren_job` now excludes
+`kind = 'model_training'`, so the deploy agent only takes deployment jobs and the
+trainer worker owns training via `claim_model_training_job`. Verified: the deploy
+claim returns 0 model_training / 1 deploy job, and the **managed** loop
+(`train_model_managed` → `rvbbit-trainer watch` → `predict`) runs end-to-end
+(batch 20/20; e2e `ml/closed_loop_watch` uses the managed path and doubles as the
+race regression test). One SQL-line change; no Rust rebuild needed (the running
+agent calls the patched function each poll).
 
 A synthesis plan for pulling rvbbit's predictive-model system together with the
 rest of the inference machinery (specialists, capabilities, Warren, semantic +

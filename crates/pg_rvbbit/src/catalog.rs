@@ -3740,6 +3740,10 @@ BEGIN
                 coalesce(NULLIF(j.manifest #>> '{resources,gpu,placement}', ''), 'single_gpu') AS gpu_placement
         ) req
         WHERE j.status = 'queued'
+          -- model_training jobs are compute, not deployment: they are claimed by
+          -- a trainer worker via rvbbit.claim_model_training_job, never by the
+          -- deploy agent. Excluding them here prevents the deploy/train race.
+          AND j.kind <> 'model_training'
           AND (
               (j.desired_state = 'running' AND n.labels @> j.target_selector)
               OR (

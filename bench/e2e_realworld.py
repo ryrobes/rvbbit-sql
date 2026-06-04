@@ -1494,9 +1494,13 @@ def phase_model_training(h: E2EHarness, imported: dict[str, str | None]) -> None
             f"SELECT g, mod(g, 7), CASE WHEN mod(g, 2) = 0 THEN 'hi' ELSE 'lo' END "
             f"FROM generate_series(1, 120) g"
         )
-        # Unmanaged queue (no Warren job -> no live-agent race in the harness).
+        # Managed queue: a run + a model_training Warren job. The deploy agent must
+        # NOT claim it (race fix in claim_warren_job); the trainer worker claims it
+        # via claim_model_training_job. If the race regressed, the watch below would
+        # find no job, the model would stay queued, and the active-status assertion
+        # would fail — so this doubles as the race regression test.
         h.scalar(
-            f"""SELECT rvbbit.train_model('{model}', 'SELECT a, b, label FROM {schema}.t', 'label',
+            f"""SELECT rvbbit.train_model_managed('{model}', 'SELECT a, b, label FROM {schema}.t', 'label',
                 'classification',
                 feature_schema => '[{{"name":"a","type":"float8"}},{{"name":"b","type":"float8"}}]'::jsonb,
                 training_opts => '{{"estimator":"random_forest","n_estimators":16,"test_size":0.25,"min_holdout_rows":10}}'::jsonb)"""
@@ -1505,7 +1509,7 @@ def phase_model_training(h: E2EHarness, imported: dict[str, str | None]) -> None
         out_root = h.artifact_dir / "watch-models"
         proc = subprocess.run(
             [
-                sys.executable, str(trainer), "watch", "--once", "--include-unmanaged",
+                sys.executable, str(trainer), "watch", "--once",
                 "--dsn", RVBBIT_DSN, "--output-root", str(out_root), "--force",
                 "--serve-local", "--serve-host", serve_host,
             ],
@@ -1542,6 +1546,7 @@ def phase_model_training(h: E2EHarness, imported: dict[str, str | None]) -> None
             if port.isdigit():
                 with contextlib.suppress(Exception):
                     subprocess.run(["pkill", "-f", f"main:app --host 0.0.0.0 --port {port}"], check=False)
+        h.sql(f"DELETE FROM rvbbit.warren_jobs WHERE name = 'train:{model}'")
         h.sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         d["ok"] = True
 
