@@ -308,6 +308,127 @@ fn _dim_exec_text(
 }
 
 // ---------------------------------------------------------------------------
+// Rowset shape: a whole resultset in, a whole resultset out. Used by pipeline
+// cascades (rvbbit.flow). The table travels in inputs as `_table` (a JSON array
+// of row objects) alongside `_table_columns` / `_table_row_count`; positional
+// stage args bind to the operator's arg_names. The model output is parsed
+// permissively back into a rowset.
+// ---------------------------------------------------------------------------
+
+fn load_arg_names(op_name: &str) -> Vec<String> {
+    let escaped = op_name.replace('\'', "''");
+    let sql = format!("SELECT arg_names FROM rvbbit.operators WHERE name = '{escaped}'");
+    let mut names = Vec::new();
+    let _: Result<(), pgrx::spi::Error> = Spi::connect(|client| {
+        let table = client.select(&sql, Some(1), &[])?;
+        for row in table {
+            if let Some(arr) = row.get::<Vec<String>>(1)? {
+                names = arr;
+            }
+        }
+        Ok(())
+    });
+    names
+}
+
+fn infer_columns(rows: &[serde_json::Value]) -> Vec<String> {
+    for r in rows {
+        if let Some(obj) = r.as_object() {
+            return obj.keys().cloned().collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Parse a model's rowset output permissively into a JSON array of row objects.
+/// Accepts {data|rows|table|_table|records|results:[...]}, a bare array, or a
+/// single object (one row). Non-object array elements become {"value": elem}.
+pub(crate) fn parse_rowset_output(raw: &str) -> Vec<serde_json::Value> {
+    let trimmed = raw.trim();
+    let v: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return vec![serde_json::json!({ "value": trimmed })],
+    };
+    let arr = match v {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(ref o) => {
+            let mut found = None;
+            for key in ["data", "rows", "table", "_table", "records", "results"] {
+                if let Some(serde_json::Value::Array(a)) = o.get(key) {
+                    found = Some(a.clone());
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| vec![v])
+        }
+        other => vec![other],
+    };
+    arr.into_iter()
+        .map(|e| match e {
+            serde_json::Value::Object(_) => e,
+            other => serde_json::json!({ "value": other }),
+        })
+        .collect()
+}
+
+/// Dispatch a `shape='rowset'` operator: serialize the rowset + bind positional
+/// args, invoke through the cached operator path (logging a receipt), and parse
+/// the output back into a rowset.
+pub(crate) fn run_rowset_op(
+    op_name: &str,
+    rows: &[serde_json::Value],
+    pos_args: &[serde_json::Value],
+    opts: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>, String> {
+    let op = load_op(op_name).ok_or_else(|| format!("unknown operator '{op_name}'"))?;
+    if op.shape != "rowset" {
+        return Err(format!(
+            "operator '{op_name}' is not rowset shape (got '{}')",
+            op.shape
+        ));
+    }
+    let arg_names = load_arg_names(op_name);
+    let mut inputs = serde_json::Map::new();
+    for (i, name) in arg_names.iter().enumerate() {
+        inputs.insert(
+            name.clone(),
+            pos_args.get(i).cloned().unwrap_or(serde_json::Value::Null),
+        );
+    }
+    inputs.insert(
+        "_table_columns".to_string(),
+        serde_json::json!(infer_columns(rows)),
+    );
+    inputs.insert("_table_row_count".to_string(), serde_json::json!(rows.len()));
+    inputs.insert("_table".to_string(), serde_json::Value::Array(rows.to_vec()));
+    let inputs_v = serde_json::Value::Object(inputs);
+    let raw = invoke_with_cache(&op, &inputs_v, opts)
+        .map_err(|_| format!("operator '{op_name}' invocation failed"))?;
+    Ok(parse_rowset_output(&raw))
+}
+
+#[pg_extern(parallel_safe)]
+fn _exec_op_rowset(
+    op_name: &str,
+    rows: JsonB,
+    args: JsonB,
+    opts: JsonB,
+) -> TableIterator<'static, (name!(value, JsonB),)> {
+    let rows_vec = rows.0.as_array().cloned().unwrap_or_default();
+    let pos_args = args.0.as_array().cloned().unwrap_or_default();
+    match run_rowset_op(op_name, &rows_vec, &pos_args, &opts.0) {
+        Ok(out) => {
+            let mapped: Vec<(JsonB,)> = out.into_iter().map(|v| (JsonB(v),)).collect();
+            TableIterator::new(mapped.into_iter())
+        }
+        Err(e) => {
+            pgrx::warning!("rvbbit._exec_op_rowset: {e}");
+            TableIterator::new(Vec::<(JsonB,)>::new().into_iter())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Aggregate shape: CREATE AGGREGATE driven by these generic helpers.
 //   _agg_append_state(state, row_inputs) — SFUNC, runs per row
 //   _agg_run_op_<type>(op_name, state) — FFUNC, runs once per group

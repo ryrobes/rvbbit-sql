@@ -3624,6 +3624,50 @@ def phase_live_llm(h: E2EHarness) -> None:
         require(receipt and receipt[0][2] is None and receipt[0][3] >= 1, f"missing/bad triples receipt: {receipt}")
 
 
+def phase_pipeline(h: E2EHarness) -> None:
+    # Pipeline cascades: rvbbit.flow(spec) runs a base query then pipes the rowset
+    # through chained stages. The deterministic builtins (pass / limit / count)
+    # need no model, so this is a cheap, live regression test of the whole
+    # machinery: the THEN splitter, base-query execution, stage chaining, and
+    # per-step persistence. (Skips until the extension exposing rvbbit.flow is
+    # installed in this database.)
+    with h.step("pipeline", "flow_cascade", optional=True) as d:
+        has_flow = h.scalar(
+            "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE p.proname = 'flow' AND n.nspname = 'rvbbit'"
+        )
+        if not has_flow or int(has_flow) == 0:
+            raise SkipStep("rvbbit.flow not present (extension predates pipeline cascades)")
+
+        # split + base query + limit + count (count reports the post-limit count)
+        n = h.scalar(
+            "SELECT (value->>'n')::int FROM rvbbit.flow("
+            "$q$ select g from generate_series(1,20) g then limit(7) then count $q$)"
+        )
+        require(n == 7, f"flow limit/count returned {n}, expected 7")
+
+        # passthrough preserves the base rowset
+        cnt = h.scalar(
+            "SELECT count(*)::int FROM rvbbit.flow("
+            "$q$ select g from generate_series(1,5) g then pass $q$)"
+        )
+        require(cnt == 5, f"flow pass returned {cnt} rows, expected 5")
+
+        # a THEN inside CASE must NOT be treated as a pipeline split
+        nocase = h.scalar(
+            "SELECT count(*)::int FROM rvbbit.flow("
+            "$q$ select case when g > 2 then 'hi' else 'lo' end as b from generate_series(1,4) g $q$)"
+        )
+        require(nocase == 4, f"CASE-THEN wrongly split: got {nocase} rows, expected 4")
+
+        # each step is persisted for inspection
+        rid = h.scalar("SELECT run_id FROM rvbbit.flow_steps ORDER BY created_at DESC LIMIT 1")
+        steps = h.scalar("SELECT count(*)::int FROM rvbbit.flow_steps WHERE run_id = %s", (rid,))
+        require(steps is not None and int(steps) >= 2, f"flow_steps not persisted: {steps}")
+        d["steps_persisted"] = int(steps)
+        d["ok"] = True
+
+
 def main() -> int:
     h = E2EHarness()
     print(f"rvbbit acceptance run: {h.run_id}")
@@ -3648,6 +3692,7 @@ def main() -> int:
         phase_kg_imported_text(h, imported)
         phase_warren(h)
         phase_costs(h, stress_op or semantic_op)
+        phase_pipeline(h)
         phase_diagnostics(h)
         phase_live_llm(h)
         return h.finish()

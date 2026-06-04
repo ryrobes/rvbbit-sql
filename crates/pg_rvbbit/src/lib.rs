@@ -39,6 +39,7 @@ mod model_orchestration;
 mod model_studio;
 mod mv;
 mod operators;
+mod pipeline;
 mod planner;
 mod prewarm;
 mod probe;

@@ -885,7 +885,7 @@ CREATE TABLE rvbbit.operators (
     description    text,                            -- human-readable docs
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
-    CHECK (shape IN ('scalar', 'aggregate', 'dimension')),
+    CHECK (shape IN ('scalar', 'aggregate', 'dimension', 'rowset')),
     CHECK (cardinality(arg_names) = cardinality(arg_types)),
     CHECK (return_type IN ('bool', 'text', 'float8', 'jsonb')),
     CHECK (parser IN ('yes_no', 'score_0_1', 'raw_text', 'strip', 'json')),
@@ -918,7 +918,7 @@ CREATE OR REPLACE FUNCTION rvbbit.create_operator(
     -- op_steps is NULL (the single-LLM-call path).
     op_system      text DEFAULT '',
     op_user        text DEFAULT '',
-    op_shape       text DEFAULT 'scalar',         -- scalar | aggregate | dimension
+    op_shape       text DEFAULT 'scalar',         -- scalar | aggregate | dimension | rowset
     op_model       text DEFAULT 'openai/gpt-5.4-mini',
     op_parser      text DEFAULT NULL,            -- auto: yes_no/strip/score_0_1 by return_type
     op_max_tokens  int  DEFAULT 256,
@@ -1000,6 +1000,14 @@ BEGIN
             op_name, wrapper_args_with_opts, op_return_type,
             exec_fn, op_name, wrapper_inputs, n_args + 1
         );
+        RETURN;
+    END IF;
+
+    IF op_shape = 'rowset' THEN
+        -- Rowset operators (pipeline cascade stages) take a whole resultset and
+        -- return a new one. They are dispatched by rvbbit.flow() through the Rust
+        -- run_rowset_op path (or rvbbit._exec_op_rowset directly), so the catalog
+        -- row inserted above is all that's needed -- no per-operator SQL wrapper.
         RETURN;
     END IF;
 
