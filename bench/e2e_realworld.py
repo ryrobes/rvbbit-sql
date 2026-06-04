@@ -3660,10 +3660,13 @@ def phase_pipeline(h: E2EHarness) -> None:
         )
         require(nocase == 4, f"CASE-THEN wrongly split: got {nocase} rows, expected 4")
 
-        # each step is persisted for inspection
-        rid = h.scalar("SELECT run_id FROM rvbbit.flow_steps ORDER BY created_at DESC LIMIT 1")
-        steps = h.scalar("SELECT count(*)::int FROM rvbbit.flow_steps WHERE run_id = %s", (rid,))
-        require(steps is not None and int(steps) >= 2, f"flow_steps not persisted: {steps}")
+        # each step is persisted for inspection: the limit->count run above has
+        # base + limit + count = 3 steps (check the max across runs, since other
+        # runs in this phase have fewer stages).
+        steps = h.scalar(
+            "SELECT max(c)::int FROM (SELECT count(*) c FROM rvbbit.flow_steps GROUP BY run_id) s"
+        )
+        require(steps is not None and int(steps) >= 3, f"flow_steps not persisted: {steps}")
         d["steps_persisted"] = int(steps)
 
         # synth-sql shape-keyed cache (Phase 2): pin a generated snippet for a
