@@ -3919,6 +3919,14 @@ BEGIN
         finished_at = clock_timestamp()
     WHERE warren_jobs.job_id = complete_warren_job.job_id;
 
+    -- model_training jobs are compute, not managed serving deployments: the
+    -- warren job is now marked completed, but we do not create a
+    -- warren_deployments row for it (the reconciler must not try to manage a
+    -- training run, and 'model_training' is not a deployment kind).
+    IF actual_kind = 'model_training' THEN
+        RETURN;
+    END IF;
+
     UPDATE rvbbit.warren_deployments AS d
     SET job_id = complete_warren_job.job_id,
         node_id = actual_node_id,
@@ -4052,7 +4060,10 @@ BEGIN
         finished_at = clock_timestamp()
     WHERE warren_jobs.job_id = fail_warren_job.job_id;
 
-    IF actual_kind IS NOT NULL THEN
+    -- model_training jobs are compute, not managed serving deployments: do not
+    -- record them in warren_deployments (the reconciler must not manage a
+    -- training run, and 'model_training' is not a deployment kind).
+    IF actual_kind IS NOT NULL AND actual_kind <> 'model_training' THEN
         INSERT INTO rvbbit.warren_deployments
             (job_id, node_id, node_name, kind, name, status, manifest, error,
              health)

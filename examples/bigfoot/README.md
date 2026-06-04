@@ -69,6 +69,17 @@ Training defaults:
 - `BIGFOOT_TRAIN_SEED=13`
 - `BIGFOOT_TRAIN_WAIT=180`
 
+### No-CLI alternative (managed training)
+
+`08_predict_class.sql` uses the bring-your-own-worker flow (`train_model` plus a
+running `rvbbit-trainer`) so it is fully reproducible from `psql`. If a standing
+Warren agent is deployed, there is a SQL-only path that needs no worker command
+at all — `rvbbit.train_model_managed(...)` queues the run and a `model_training`
+Warren job, the agent claims it (matched to the node's labels), trains, serves,
+and registers the operator, and you watch progress with `rvbbit.training_queue`
+/ `rvbbit.training_status(model)`. See the Predictive Models doc and
+`docs/MODELS_UNIFIED_PLAN.md` for that path.
+
 ## Scripts
 
 | Script | Purpose |

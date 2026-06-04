@@ -28,6 +28,20 @@ struct Config {
     port_base: u16,
     metrics_ms: u64,
     reconcile_ms: u64,
+    /// Command (argv) used to invoke the trainer for `model_training` jobs.
+    /// Default `["rvbbit-trainer"]`; override e.g. to exec into a worker
+    /// container (`docker compose exec -T bench python /.../rvbbit-trainer`).
+    trainer_cmd: Vec<String>,
+    /// DSN the trainer uses to reach Postgres. Defaults to the agent's DSN, but
+    /// can differ when the trainer runs in a different network context (e.g. the
+    /// agent is on a control host and the trainer execs into a worker container).
+    trainer_dsn: Option<String>,
+    /// Hostname Postgres uses to reach a locally-served sidecar the trainer
+    /// stands up (`--serve-host`). Defaults to the node name.
+    trainer_serve_host: Option<String>,
+    /// Output root the trainer writes model bundles to (must be valid in the
+    /// trainer's environment). Defaults to `<work_dir>/trained-models`.
+    trainer_output_root: Option<String>,
 }
 
 #[derive(Debug)]
@@ -107,7 +121,7 @@ fn main() -> Result<()> {
         maybe_record_metrics(&mut db, &config, &mut metrics, &mut last_metrics_at);
         maybe_reconcile_deployments(&mut db, &config, &mut last_reconcile_at);
         let mut failed_once_job: Option<String> = None;
-        match claim_job(&mut db, &config)? {
+        match claim_next(&mut db, &config)? {
             Some(job) => {
                 println!(
                     "claimed job={} kind={} name={} desired={}",
@@ -189,6 +203,14 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(15_000),
+            trainer_cmd: env::var("WARREN_TRAINER_CMD")
+                .ok()
+                .map(|v| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| vec!["rvbbit-trainer".to_string()]),
+            trainer_dsn: env::var("WARREN_TRAINER_DSN").ok(),
+            trainer_serve_host: env::var("WARREN_TRAINER_SERVE_HOST").ok(),
+            trainer_output_root: env::var("WARREN_TRAINER_OUTPUT_ROOT").ok(),
         };
 
         let mut args = env::args().skip(1);
@@ -220,6 +242,21 @@ impl Config {
                 "--capacity" => {
                     config.capacity = serde_json::from_str(&take_arg(&mut args, "--capacity")?)?
                 }
+                "--trainer-cmd" => {
+                    config.trainer_cmd = take_arg(&mut args, "--trainer-cmd")?
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect();
+                }
+                "--trainer-dsn" => {
+                    config.trainer_dsn = Some(take_arg(&mut args, "--trainer-dsn")?)
+                }
+                "--trainer-serve-host" => {
+                    config.trainer_serve_host = Some(take_arg(&mut args, "--trainer-serve-host")?)
+                }
+                "--trainer-output-root" => {
+                    config.trainer_output_root = Some(take_arg(&mut args, "--trainer-output-root")?)
+                }
                 "--once" => config.once = true,
                 "--dry-run" => config.dry_run = true,
                 "--help" | "-h" => {
@@ -228,6 +265,10 @@ impl Config {
                 }
                 other => bail!("unknown argument {other:?}; pass --help"),
             }
+        }
+
+        if config.trainer_cmd.is_empty() {
+            config.trainer_cmd = vec!["rvbbit-trainer".to_string()];
         }
 
         if !config.labels.is_object() {
@@ -268,6 +309,11 @@ fn print_help() {
            --metrics-ms <ms>                  Metrics interval, 0 disables\n\
            --reconcile-ms <ms>                Deployment reconciliation interval, 0 disables\n\
            --poll-ms <ms>                     Poll interval\n\
+           --trainer-cmd <argv>               Command to run the trainer for model_training jobs\n\
+                                              (or WARREN_TRAINER_CMD; default 'rvbbit-trainer')\n\
+           --trainer-dsn <postgres-url>       DSN the trainer uses (or WARREN_TRAINER_DSN; default --dsn)\n\
+           --trainer-serve-host <host>        Host Postgres uses to reach a served sidecar (default --node)\n\
+           --trainer-output-root <dir>        Trainer model-bundle output root (default <work-dir>/trained-models)\n\
            --once                             Claim at most one job\n\
            --dry-run                          Scaffold/register without starting Docker"
     );
@@ -650,6 +696,56 @@ fn claim_job(db: &mut Client, config: &Config) -> Result<Option<WarrenJob>> {
     }))
 }
 
+/// Claim a queued `model_training` job this node is eligible for (target_selector
+/// matched against the node's labels). Mapped into the same `WarrenJob` shape so
+/// the main loop and the complete/fail helpers work uniformly; run_id, model, and
+/// the deploy flag travel in the manifest. This is what makes the standing agent
+/// the training executor -- the user only runs SQL (`train_model_managed`).
+fn claim_training_job(db: &mut Client, config: &Config) -> Result<Option<WarrenJob>> {
+    let row = db
+        .query_opt(
+            "SELECT job_id::text, run_id::text, model_name, task, deploy, target_selector::text \
+             FROM rvbbit.claim_model_training_job_for_node($1)",
+            &[&config.node_name],
+        )
+        .context("claiming model_training job")?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let job_id: String = row.get(0);
+    let run_id: String = row.get(1);
+    let model_name: String = row.get(2);
+    let task: String = row.get(3);
+    let deploy: bool = row.get(4);
+    let selector: String = row.get(5);
+    Ok(Some(WarrenJob {
+        job_id,
+        kind: "model_training".to_string(),
+        desired_state: "running".to_string(),
+        name: format!("train:{model_name}"),
+        manifest: json!({
+            "subkind": "model_training",
+            "run_id": run_id,
+            "model_name": model_name,
+            "task": task,
+            "deploy": deploy,
+        }),
+        target_selector: serde_json::from_str(&selector)
+            .context("parsing training target selector")?,
+    }))
+}
+
+/// One claim entry point for the main loop: a deploy job first, then a training
+/// job, so both families are drained by the same standing agent.
+fn claim_next(db: &mut Client, config: &Config) -> Result<Option<WarrenJob>> {
+    if let Some(job) = claim_job(db, config)? {
+        return Ok(Some(job));
+    }
+    claim_training_job(db, config)
+}
+
 fn maybe_reconcile_deployments(db: &mut Client, config: &Config, last_reconcile_at: &mut Instant) {
     if config.reconcile_ms == 0 {
         return;
@@ -840,6 +936,10 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
         bail!("desired_state {:?} is not supported", job.desired_state);
     }
 
+    if job.kind == "model_training" {
+        return process_training_job(db, config, job);
+    }
+
     let mut result = match job.kind.as_str() {
         "capability" | "trained_model" => deploy_capability(db, config, job)?,
         other => bail!("Warren job kind {other:?} is not implemented yet"),
@@ -909,6 +1009,209 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
         result.operator_name,
         result.runtime_name
     );
+    Ok(())
+}
+
+/// Execute a `model_training` job. The run row is already 'running' (flipped
+/// atomically by claim_model_training_job_for_node). We shell out to the trainer
+/// exactly like `docker compose` for deploys; the trainer fits the model and
+/// registers the backend + `predict_<model>` operator via complete_model_training.
+/// We then mark the Warren job complete. The user only ever ran SQL.
+fn process_training_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> {
+    let run_id = job
+        .manifest
+        .get("run_id")
+        .and_then(Value::as_str)
+        .context("model_training job manifest missing run_id")?
+        .to_string();
+    let model_name = job
+        .manifest
+        .get("model_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let deploy = job
+        .manifest
+        .get("deploy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    try_update_job_progress(
+        db,
+        config,
+        job,
+        "training",
+        json!({"run_id": run_id, "model_name": model_name, "deploy": deploy}),
+    );
+
+    if config.dry_run {
+        println!("dry-run: not training run {run_id} for model {model_name}");
+        // The claim already flipped the run/model to 'running'; since no training
+        // happens, cancel the run so the model lands in a terminal state
+        // ('registered') instead of being stuck 'running'.
+        if let Err(e) = cancel_model_training(db, &run_id) {
+            eprintln!("warning: dry-run could not cancel run {run_id}: {e:#}");
+        }
+        let result = training_dry_run_result(config, &model_name);
+        complete_job(db, config, job, &result)?;
+        return Ok(());
+    }
+
+    let output_root = config.trainer_output_root.clone().unwrap_or_else(|| {
+        config
+            .work_dir
+            .join("trained-models")
+            .display()
+            .to_string()
+    });
+    let serve_host = config
+        .trainer_serve_host
+        .clone()
+        .unwrap_or_else(|| config.node_name.clone());
+    let trainer_dsn = config.trainer_dsn.as_deref().unwrap_or(&config.dsn);
+
+    let (program, base_args) = config
+        .trainer_cmd
+        .split_first()
+        .context("trainer_cmd is empty")?;
+    let mut command = Command::new(program);
+    command.args(base_args);
+    command
+        .arg("train-run")
+        .arg(&run_id)
+        .arg("--dsn")
+        .arg(trainer_dsn)
+        .arg("--output-root")
+        .arg(&output_root)
+        .arg("--docker-network")
+        .arg(&config.docker_network)
+        .arg("--port-base")
+        .arg(config.port_base.to_string())
+        .arg("--force");
+    if deploy {
+        command
+            .arg("--serve-local")
+            .arg("--serve-host")
+            .arg(&serve_host);
+    }
+
+    println!(
+        "training run {run_id} for model {model_name} via {:?} (deploy={deploy})",
+        config.trainer_cmd
+    );
+    let output = command
+        .output()
+        .with_context(|| format!("running trainer {:?}", config.trainer_cmd))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = format!(
+            "trainer exited {}: {}",
+            output.status,
+            if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            }
+        );
+        if let Err(e) = fail_model_training(db, &run_id, &detail) {
+            eprintln!("warning: could not mark training run {run_id} failed: {e:#}");
+        }
+        bail!(detail);
+    }
+
+    // The trainer registered the model via complete_model_training; read back the
+    // serving details to complete the Warren job (and confirm it activated).
+    let row = db
+        .query_opt(
+            "SELECT m.backend_name, m.operator_name, \
+                    COALESCE(b.endpoint_url, '') AS endpoint, m.status \
+             FROM rvbbit.ml_models m \
+             LEFT JOIN rvbbit.backends b ON b.name = m.backend_name \
+             WHERE m.name = $1",
+            &[&model_name],
+        )
+        .context("reading trained model registration")?;
+    let Some(row) = row else {
+        let detail = format!("model {model_name} not found after training run {run_id}");
+        if let Err(e) = fail_model_training(db, &run_id, &detail) {
+            eprintln!("warning: could not mark training run {run_id} failed: {e:#}");
+        }
+        bail!(detail);
+    };
+    let backend_name: Option<String> = row.get(0);
+    let operator_name: Option<String> = row.get(1);
+    let endpoint_url: String = row.get(2);
+    let status: String = row.get(3);
+    if status != "active" {
+        let detail =
+            format!("model {model_name} status is {status:?} (expected active) after training");
+        if let Err(e) = fail_model_training(db, &run_id, &detail) {
+            eprintln!("warning: could not mark training run {run_id} failed: {e:#}");
+        }
+        bail!(detail);
+    }
+
+    let stdout_tail = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .last()
+        .unwrap_or("")
+        .to_string();
+    let result = DeploymentResult {
+        endpoint_url,
+        probe_url: String::new(),
+        container_name: String::new(),
+        published_host_port: false,
+        backend_name,
+        operator_name,
+        runtime_name: None,
+        compose_project: String::new(),
+        work_dir: PathBuf::from(&output_root),
+        health: json!({
+            "trained": true,
+            "deploy": deploy,
+            "run_id": run_id,
+            "stdout_tail": stdout_tail,
+        }),
+    };
+    complete_job(db, config, job, &result)?;
+    println!(
+        "completed training job={} model={} run={} backend={:?} operator={:?}",
+        job.job_id, model_name, run_id, result.backend_name, result.operator_name
+    );
+    Ok(())
+}
+
+fn training_dry_run_result(config: &Config, model_name: &str) -> DeploymentResult {
+    DeploymentResult {
+        endpoint_url: String::new(),
+        probe_url: String::new(),
+        container_name: String::new(),
+        published_host_port: false,
+        backend_name: Some(format!("predict_{model_name}_backend")),
+        operator_name: Some(format!("predict_{model_name}")),
+        runtime_name: None,
+        compose_project: String::new(),
+        work_dir: config.work_dir.clone(),
+        health: json!({"trained": false, "dry_run": true}),
+    }
+}
+
+fn fail_model_training(db: &mut Client, run_id: &str, error: &str) -> Result<()> {
+    db.execute(
+        "SELECT rvbbit.fail_model_training($1::text::uuid, $2)",
+        &[&run_id, &error],
+    )
+    .context("marking model training run failed")?;
+    Ok(())
+}
+
+fn cancel_model_training(db: &mut Client, run_id: &str) -> Result<()> {
+    db.execute(
+        "SELECT rvbbit.cancel_model_training($1::text::uuid)",
+        &[&run_id],
+    )
+    .context("cancelling model training run")?;
     Ok(())
 }
 

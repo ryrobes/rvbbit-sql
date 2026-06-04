@@ -1550,6 +1550,182 @@ def phase_model_training(h: E2EHarness, imported: dict[str, str | None]) -> None
         h.sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         d["ok"] = True
 
+    # Fully SQL-driven managed training: the user only runs train_model_managed();
+    # the standing Warren agent drains the queue. Here we exercise the exact SQL
+    # contract the agent uses (node-aware claim -> trainer -> complete_warren_job)
+    # plus the SQL observability surface, without needing the Rust binary running.
+    with h.step("ml", "managed_training_via_node", optional=True) as d:
+        trainer = Path(RVBBIT_TRAINER)
+        if not trainer.exists():
+            raise SkipStep(f"rvbbit-trainer not found at {trainer}")
+        try:
+            import sklearn  # noqa: F401
+            import uvicorn  # noqa: F401
+        except Exception as exc:  # noqa: BLE001
+            raise SkipStep(f"trainer deps unavailable: {exc}")
+
+        suffix = short_id()
+        schema = f"e2e_managed_{suffix}"
+        model = f"e2e_managed_{suffix}"
+        node = f"e2e_train_node_{suffix}"
+        serve_host = os.environ.get("RVBBIT_E2E_SERVE_HOST", "bench")
+        h.created_ml_models.append(model)
+        h.created_schemas.append(schema)
+        h.created_warren_nodes.append(node)
+
+        h.sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        h.sql(f"CREATE SCHEMA {schema}")
+        h.sql(f"CREATE TABLE {schema}.t (a float8, b float8, label text)")
+        h.sql(
+            f"INSERT INTO {schema}.t "
+            f"SELECT g, mod(g, 7), CASE WHEN mod(g, 2) = 0 THEN 'hi' ELSE 'lo' END "
+            f"FROM generate_series(1, 120) g"
+        )
+
+        # The agent's placement target: a gpu:false CPU node.
+        h.scalar(
+            """SELECT rvbbit.register_warren_node(%s, 'http://127.0.0.1:0',
+               '{"capability":true,"docker":true,"gpu":false}'::jsonb,
+               '{"cpu":4,"memory_gb":16}'::jsonb, 'e2e')""",
+            (node,),
+        )
+
+        # Placement (checked without claiming, so no side effects): a gpu-targeted
+        # job must not be eligible for a gpu:false node -- the same predicate the
+        # agent's node-aware claim uses (n.labels @> j.target_selector).
+        h.scalar(
+            f"""SELECT rvbbit.train_model_managed('{model}_gpu', 'SELECT a, b, label FROM {schema}.t', 'label',
+                'classification',
+                feature_schema => '[{{"name":"a","type":"float8"}},{{"name":"b","type":"float8"}}]'::jsonb,
+                target => '{{"gpu": true}}'::jsonb)"""
+        )
+        h.created_ml_models.append(f"{model}_gpu")
+        gpu_job = h.scalar(
+            "SELECT job_id::text FROM rvbbit.warren_jobs WHERE name = %s AND status = 'queued'",
+            (f"train:{model}_gpu",),
+        )
+        eligible = h.scalar(
+            """SELECT EXISTS(
+                 SELECT 1 FROM rvbbit.warren_jobs j
+                 JOIN rvbbit.warren_nodes n ON n.name = %s AND n.labels @> j.target_selector
+                 WHERE j.job_id = %s::uuid)""",
+            (node, gpu_job),
+        )
+        # delete the gpu probe job before asserting so a failure cannot leak a
+        # queued job that would poison sibling steps' claims.
+        h.sql(f"DELETE FROM rvbbit.warren_jobs WHERE name = 'train:{model}_gpu'")
+        require(eligible is False, "gpu-targeted job wrongly eligible for a non-gpu node")
+
+        # SQL-only user surface: queue the (cpu) run + model_training Warren job.
+        h.scalar(
+            f"""SELECT rvbbit.train_model_managed('{model}', 'SELECT a, b, label FROM {schema}.t', 'label',
+                'classification',
+                feature_schema => '[{{"name":"a","type":"float8"}},{{"name":"b","type":"float8"}}]'::jsonb,
+                training_opts => '{{"estimator":"random_forest","n_estimators":16,"test_size":0.25,"min_holdout_rows":10}}'::jsonb)"""
+        )
+
+        # The Warren agent's node-aware claim: atomic job+run+model -> running.
+        claim = h.sql(
+            "SELECT job_id::text, run_id::text FROM rvbbit.claim_model_training_job_for_node(%s)",
+            (node,),
+        )
+        require(len(claim) == 1, "node-aware claim returned no job")
+        job_id, run_id = claim[0]
+        d["job_id"], d["run_id"] = job_id, run_id
+        require(
+            h.scalar("SELECT run_status FROM rvbbit.training_queue WHERE run_id = %s", (run_id,)) == "running",
+            "run not flipped to running by claim",
+        )
+
+        # The agent shells the trainer for the claimed run (train + serve + register).
+        out_root = h.artifact_dir / "managed-models"
+        proc = subprocess.run(
+            [
+                sys.executable, str(trainer), "train-run", run_id,
+                "--dsn", RVBBIT_DSN, "--output-root", str(out_root), "--force",
+                "--serve-local", "--serve-host", serve_host,
+            ],
+            text=True, capture_output=True, timeout=240, check=False,
+            env={**os.environ, "RVBBIT_DSN": RVBBIT_DSN},
+        )
+        d["trainer_returncode"] = proc.returncode
+        d["trainer_stderr"] = proc.stderr[-2000:]
+        require(proc.returncode == 0, f"trainer train-run failed: {proc.stderr[-400:]}")
+
+        backend = h.scalar(f"SELECT backend_name FROM rvbbit.ml_models WHERE name = '{model}'")
+        if backend:
+            h.created_backends.append(backend)
+        op = h.scalar(f"SELECT operator_name FROM rvbbit.ml_models WHERE name = '{model}'")
+        endpoint = h.scalar("SELECT endpoint_url FROM rvbbit.backends WHERE name = %s", (backend,)) if backend else None
+
+        # The agent completes the Warren job (what process_training_job does).
+        h.sql(
+            """SELECT rvbbit.complete_warren_job(job_id => %s::uuid, node_name => %s,
+               deployment_status => 'running', endpoint_url => %s,
+               backend_name => %s, operator_name => %s)""",
+            (job_id, node, endpoint, backend, op),
+        )
+
+        # SQL-only observability: the whole lifecycle is now completed/active.
+        ts = h.sql(
+            "SELECT model_status, run_status, job_status, node FROM rvbbit.training_status(%s)",
+            (model,),
+        )
+        require(len(ts) == 1, "training_status returned nothing")
+        model_status, rstat, jstat, claimed_node = ts[0]
+        require(model_status == "active", f"model not active: {model_status}")
+        require(rstat == "completed", f"run not completed: {rstat}")
+        require(jstat == "completed", f"warren job not completed: {jstat}")
+        require(claimed_node == node, f"unexpected claim node: {claimed_node}")
+
+        # model_training is compute, not a managed deployment: it must NOT create a
+        # warren_deployments row (the warren_deployments_kind_check fix).
+        dep = h.scalar("SELECT count(*) FROM rvbbit.warren_deployments WHERE job_id = %s::uuid", (job_id,))
+        require(int(dep) == 0, f"model_training wrongly recorded a deployment row: {dep}")
+
+        pred = h.scalar(f"""SELECT rvbbit.{op}('{{"a": 4, "b": 3}}'::jsonb)""")
+        d["prediction"] = pred
+        require(isinstance(pred, dict) and pred.get("label") in {"hi", "lo"}, f"bad live prediction: {pred}")
+
+        # Failure path: a failed training job must be marked failed and must NOT
+        # leave a warren_deployments row (fail_warren_job's model_training skip --
+        # the warren_deployments_kind_check fix, on the failure side).
+        fail_model = f"{model}_fail"
+        h.created_ml_models.append(fail_model)
+        h.scalar(
+            f"""SELECT rvbbit.train_model_managed('{fail_model}', 'SELECT a, b, label FROM {schema}.t', 'label',
+                'classification',
+                feature_schema => '[{{"name":"a","type":"float8"}},{{"name":"b","type":"float8"}}]'::jsonb)"""
+        )
+        fclaim = h.sql(
+            "SELECT job_id::text, run_id::text FROM rvbbit.claim_model_training_job_for_node(%s)",
+            (node,),
+        )
+        require(len(fclaim) == 1, "node-aware claim returned no job for the failure case")
+        fjob, frun = fclaim[0]
+        h.sql("SELECT rvbbit.fail_model_training(%s::uuid, %s)", (frun, "simulated trainer crash"))
+        h.sql("SELECT rvbbit.fail_warren_job(%s::uuid, %s, %s, '{}'::jsonb)", (fjob, node, "simulated trainer crash"))
+        require(
+            h.scalar("SELECT status FROM rvbbit.warren_jobs WHERE job_id = %s::uuid", (fjob,)) == "failed",
+            "failed training job not marked failed",
+        )
+        require(
+            h.scalar("SELECT run_status FROM rvbbit.training_queue WHERE run_id = %s", (frun,)) == "failed",
+            "failed training run not marked failed",
+        )
+        fdep = h.scalar("SELECT count(*) FROM rvbbit.warren_deployments WHERE job_id = %s::uuid", (fjob,))
+        require(int(fdep) == 0, f"failed model_training wrongly recorded a deployment row: {fdep}")
+        h.sql(f"DELETE FROM rvbbit.warren_jobs WHERE name = 'train:{fail_model}'")
+
+        if endpoint:
+            port = str(endpoint).rsplit(":", 1)[-1].split("/", 1)[0]
+            if port.isdigit():
+                with contextlib.suppress(Exception):
+                    subprocess.run(["pkill", "-f", f"main:app --host 0.0.0.0 --port {port}"], check=False)
+        h.sql(f"DELETE FROM rvbbit.warren_jobs WHERE name = 'train:{model}'")
+        h.sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        d["ok"] = True
+
 
 def phase_semantic_echo(h: E2EHarness) -> str | None:
     with h.step("semantic", "echo_sidecar_available", optional=True) as d:

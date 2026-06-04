@@ -1,7 +1,25 @@
 # The Unified Inference Plane
 
-Status: **SQL surface + lens UI + e2e landed**; foundation-model GPU run + Warren
-agent trainer-handler are the remaining executors. Date: 2026-06-04.
+Status: **SQL surface + lens UI + e2e landed**; the Warren agent now executes
+training (managed path is fully SQL-only, no CLI). Foundation-model GPU run is the
+remaining executor. Date: 2026-06-04.
+
+**Warren agent is the training executor (2026-06-04).** The `warren-agent` daemon
+now handles the `model_training` job kind, so `SELECT rvbbit.train_model_managed(...)`
+is fully hands-off: the standing agent claims the job, runs the trainer, serves,
+and registers — no user terminal. New SQL `claim_model_training_job_for_node(node)`
+is the agent's atomic claim (job + run + model → running) **with node placement**
+(`n.labels @> j.target_selector`), so a GPU-targeted job is only picked up by a GPU
+node; `claim_warren_job` keeps excluding `model_training` (deploy-only), and
+`complete_warren_job` / `fail_warren_job` skip the `warren_deployments` record for
+training jobs (compute, not a managed serving deployment). SQL observability:
+`rvbbit.training_queue` (view: run ⨝ Warren job ⨝ model) and
+`rvbbit.training_status(model)`. The agent's trainer invocation is configurable
+(`--trainer-cmd` / `--trainer-dsn` / `--trainer-serve-host` / `--trainer-output-root`)
+so it works whether the trainer is local or in a worker container. Verified live
+(agent `--once` drains a queued bigfoot classifier → active + live predict) and in
+e2e `ml/managed_training_via_node` (passes). The standalone `rvbbit-trainer watch`
+remains as a bring-your-own-worker option.
 
 **Implemented** (`sql/model_orchestration.sql`, `src/model_orchestration.rs`):
 lifecycle (`cancel_model_training` / `disable_model` / `enable_model` /

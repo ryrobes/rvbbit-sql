@@ -311,6 +311,132 @@ BEGIN
     RETURN rvbbit.enqueue_warren_job('trained_model', 'serve:' || p_model, v_manifest, COALESCE(target, '{}'::jsonb));
 END $fn$;
 
+-- Node-aware claim of a training job for the standing Warren agent. Same atomic
+-- three-table flip as claim_model_training_job (job + run + model -> running),
+-- but only claims jobs this node is eligible for: target_selector is matched
+-- against the node's labels (n.labels @> j.target_selector), so a job targeted
+-- at e.g. {"gpu": true} is only picked up by a GPU node. This is what lets the
+-- always-on agent be the training executor with no separate trainer daemon and
+-- no user CLI -- the user only runs SQL (train_model_managed) and the agent
+-- drains the queue. claim_warren_job still excludes 'model_training' (it stays a
+-- deploy-only claim), so there is no deploy/train race; SKIP LOCKED keeps this
+-- safe even if an old rvbbit-trainer 'watch' is also running.
+CREATE OR REPLACE FUNCTION rvbbit.claim_model_training_job_for_node(node_name text)
+RETURNS TABLE (
+    job_id          uuid,
+    run_id          uuid,
+    model_name      text,
+    task            text,
+    source_sql      text,
+    target_column   text,
+    feature_schema  jsonb,
+    training_opts   jsonb,
+    deploy          boolean,
+    target_selector jsonb)
+LANGUAGE plpgsql VOLATILE AS $fn$
+DECLARE v_node text := claim_model_training_job_for_node.node_name;
+BEGIN
+    RETURN QUERY
+    WITH picked AS (
+        SELECT j.job_id, j.manifest, j.target_selector
+        FROM rvbbit.warren_jobs j
+        JOIN rvbbit.warren_nodes n
+          ON n.name = v_node
+         -- only a live node may claim (mirrors claim_warren_job): a stale/dead
+         -- node must not pick up training jobs.
+         AND n.status IN ('ready', 'busy')
+         AND n.last_heartbeat IS NOT NULL
+         AND clock_timestamp() - n.last_heartbeat < interval '2 minutes'
+         AND n.labels @> j.target_selector
+        WHERE j.kind = 'model_training' AND j.status = 'queued'
+        ORDER BY j.created_at
+        LIMIT 1
+        FOR UPDATE OF j SKIP LOCKED
+    ),
+    upd_job AS (
+        UPDATE rvbbit.warren_jobs j
+           SET status = 'running', phase = 'training',
+               claimed_by = v_node, claimed_at = clock_timestamp(), started_at = clock_timestamp()
+          FROM picked WHERE j.job_id = picked.job_id
+        RETURNING j.job_id, j.manifest, j.target_selector
+    ),
+    upd_run AS (
+        UPDATE rvbbit.ml_training_runs r
+           SET status = 'running', worker_id = v_node, started_at = clock_timestamp()
+          FROM upd_job u
+         WHERE r.run_id = (u.manifest->>'run_id')::uuid AND r.status = 'queued'
+        RETURNING r.run_id, r.model_name, r.task, r.source_sql, r.target_column, r.feature_schema, r.training_opts
+    ),
+    upd_model AS (
+        UPDATE rvbbit.ml_models m SET status = 'running'
+          FROM upd_run ur WHERE m.name = ur.model_name
+        RETURNING m.name
+    )
+    SELECT u.job_id, ur.run_id, ur.model_name, ur.task, ur.source_sql, ur.target_column,
+           ur.feature_schema, ur.training_opts,
+           COALESCE((u.manifest->>'deploy')::boolean, false), u.target_selector
+    FROM upd_job u JOIN upd_run ur ON true;
+END $fn$;
+
+-- ---------------------------------------------------------------------
+-- SQL-native observability for the training queue
+-- ---------------------------------------------------------------------
+
+-- One row per training run with its Warren job placement + serving state, so
+-- the whole "train from SQL" lifecycle (queued -> running -> completed, on which
+-- node, with what metrics) is watchable without leaving SQL.
+CREATE OR REPLACE VIEW rvbbit.training_queue AS
+SELECT
+    r.run_id,
+    r.model_name,
+    r.task,
+    r.status                          AS run_status,
+    j.job_id                          AS training_job_id,
+    j.status                          AS job_status,
+    j.phase                           AS job_phase,
+    j.claimed_by                      AS node,
+    j.target_selector,
+    (j.manifest->>'deploy')::boolean  AS deploy,
+    m.status                          AS model_status,
+    m.operator_name,
+    m.backend_name,
+    r.metrics,
+    r.error,
+    r.created_at,
+    r.started_at,
+    r.finished_at
+FROM rvbbit.ml_training_runs r
+LEFT JOIN rvbbit.warren_jobs j
+       ON j.kind = 'model_training'
+      AND j.manifest->>'run_id' = r.run_id::text
+LEFT JOIN rvbbit.ml_models m ON m.name = r.model_name;
+
+-- Latest training run + serving state for one model -- the quick "is it ready?"
+-- companion to train_model_managed.
+CREATE OR REPLACE FUNCTION rvbbit.training_status(p_model text)
+RETURNS TABLE (
+    model_name     text,
+    model_status   text,
+    run_id         uuid,
+    run_status     text,
+    job_status     text,
+    job_phase      text,
+    node           text,
+    operator_name  text,
+    metrics        jsonb,
+    error          text,
+    created_at     timestamptz,
+    finished_at    timestamptz)
+LANGUAGE sql STABLE AS $fn$
+    SELECT q.model_name, q.model_status, q.run_id, q.run_status, q.job_status,
+           q.job_phase, q.node, q.operator_name, q.metrics, q.error,
+           q.created_at, q.finished_at
+    FROM rvbbit.training_queue q
+    WHERE q.model_name = p_model
+    ORDER BY q.created_at DESC
+    LIMIT 1;
+$fn$;
+
 -- ---------------------------------------------------------------------
 -- Step 4 — LLM/operator distillation (label a sample -> train a cheap model)
 -- ---------------------------------------------------------------------
