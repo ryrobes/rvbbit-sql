@@ -13,9 +13,22 @@ carrying a host/GPU `target_selector`); distillation (`distill_model`); foundati
 surface (`predict_tabular` + `capabilities/packs/tabular/tabpfn-foundation`,
 dry-run verified, live path gated). Lens Model Studio gained a **Monitor** tab
 (accuracy-over-time + versions + diff) and lifecycle controls. The e2e harness
-gained `ml/orchestration_surface` (passes). **Deferred executors:** the Warren
-agent's trainer handler (Rust) that runs `rvbbit-trainer` on claim, and a live
-TabPFN GPU sidecar (`tabular_foundation` handler).
+gained `ml/orchestration_surface` (passes).
+
+**Loops closed (2026-06-04):** both executors are now SQL-bound binaries.
+(1) `rvbbit-trainer watch` polls `claim_model_training_job` (managed) /
+`claim_model_training_run`, fits, serves (`--serve-local` launches the uvicorn
+sidecar, detached), and registers — so `train_model` → worker →
+`predict_<model>(row)` returns live predictions (verified: batch 20/20 correct;
+e2e `ml/closed_loop_watch` passes). (2) a `tabular_foundation` handler in
+`hf-rvbbit-fastapi` does in-context fit-on-support → predict-queries, powering
+`predict_tabular` end-to-end (verified live; CPU reference handler — swap for a
+real TabPFN forward pass on a GPU host). The lens Model Studio gained a **Deploy
+serving** action, a **Managed (train+deploy)** toggle, and **live run-status**.
+**Still optional:** the existing Warren *agent* (Rust) also claims
+`model_training` jobs but has no fit handler — either give it one or have it skip
+`model_training` so the trainer worker owns training (it currently races; the
+demo used the unmanaged path to avoid it).
 
 A synthesis plan for pulling rvbbit's predictive-model system together with the
 rest of the inference machinery (specialists, capabilities, Warren, semantic +

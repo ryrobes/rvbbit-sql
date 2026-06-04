@@ -624,14 +624,163 @@ def fail_run(dsn: str, run_id: str, error: str) -> None:
             )
 
 
+# --- Managed (Warren-job) training: claim the warren_jobs row + its run --------
+
+def claim_job_run(dsn: str, worker_id: str) -> dict[str, Any] | None:
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT job_id::text, run_id::text, model_name, task, source_sql,
+                       target_column, feature_schema, training_opts, deploy, target_selector
+                FROM rvbbit.claim_model_training_job(%s)
+                """,
+                (worker_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    run = ClaimedRun(
+        run_id=row[1],
+        model_name=row[2],
+        task=row[3],
+        source_sql=row[4],
+        target_column=row[5],
+        feature_schema=normalize_json(row[6], []),
+        training_opts=normalize_json(row[7], {}),
+    )
+    return {"job_id": row[0], "run": run, "deploy": bool(row[8]), "target": normalize_json(row[9], {})}
+
+
+def complete_job(
+    dsn: str,
+    job_id: str,
+    *,
+    status: str = "completed",
+    phase: str = "ready",
+    endpoint: str | None = None,
+    backend: str | None = None,
+    operator: str | None = None,
+    error: str | None = None,
+) -> None:
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE rvbbit.warren_jobs
+                   SET status = %s, phase = %s,
+                       endpoint_url = COALESCE(%s, endpoint_url),
+                       backend_name = COALESCE(%s, backend_name),
+                       operator_name = COALESCE(%s, operator_name),
+                       error = %s,
+                       finished_at = clock_timestamp(), updated_at = clock_timestamp()
+                 WHERE job_id = %s
+                """,
+                (status, phase, endpoint, backend, operator, error, job_id),
+            )
+
+
+def serve_local(out_dir: Path, manifest: dict[str, Any], host: str, port: int) -> tuple[Any, str]:
+    """Launch the scaffolded fastapi sidecar with uvicorn, detached so it
+    outlives this trainer process. Returns (proc, endpoint_url reachable as host)."""
+    runtime = manifest.get("runtime") or {}
+    env = os.environ.copy()
+    env.update({str(k): str(v) for k, v in (runtime.get("env") or {}).items()})
+    if runtime.get("handler"):
+        env["RVBBIT_CAPABILITY_HANDLER"] = str(runtime["handler"])
+    if runtime.get("device"):
+        env["RVBBIT_CAPABILITY_DEVICE"] = str(runtime["device"])
+    log = open(out_dir / "sidecar.log", "ab")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", str(port)],
+        cwd=out_dir,
+        env=env,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2).read()
+            break
+        except Exception:
+            time.sleep(0.5)
+    return proc, f"http://{host}:{port}/predict"
+
+
 def process_run(run: ClaimedRun, args: argparse.Namespace) -> TrainResult:
     result = train_and_scaffold(run, args)
-    if args.start_sidecar:
+    if getattr(args, "serve_local", False):
+        port = int(args.port or docker_port_for_model(run.model_name, int(args.port_base)))
+        serve_local(result.output_dir, result.manifest, args.serve_host, port)
+        result.backend_endpoint = f"http://{args.serve_host}:{port}/predict"
+    elif args.start_sidecar:
         port = int(args.port or docker_port_for_model(run.model_name, int(args.port_base)))
         start_sidecar(result.output_dir, port, args.docker_network, int(args.wait_seconds))
     if not args.no_complete:
         complete_run(args.dsn, run, result, args)
     return result
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Poll for queued managed training jobs (and optionally plain runs), train,
+    serve, and register each. The SQL-bound trainer worker that closes the loop."""
+    deadline = time.time() + args.max_seconds if args.max_seconds else None
+    while True:
+        claimed = claim_job_run(args.dsn, args.worker_id)
+        job_id = claimed["job_id"] if claimed else None
+        if claimed is None and args.include_unmanaged:
+            run = claim_run(args.dsn, args.worker_id)
+            claimed = {"job_id": None, "run": run} if run else None
+        if claimed is None:
+            if args.once:
+                print("no queued training jobs")
+                return 2
+            if deadline and time.time() > deadline:
+                return 0
+            time.sleep(args.poll_ms / 1000.0)
+            continue
+        run = claimed["run"]
+        try:
+            result = process_run(run, args)
+        except Exception as exc:  # noqa: BLE001
+            fail_run(args.dsn, run.run_id, str(exc))
+            if job_id:
+                complete_job(args.dsn, job_id, status="failed", phase="failed", error=str(exc))
+            if args.once:
+                raise
+            time.sleep(args.poll_ms / 1000.0)
+            continue
+        if job_id:
+            complete_job(
+                args.dsn,
+                job_id,
+                endpoint=result.backend_endpoint,
+                backend=result.backend_name,
+                operator=result.operator_name,
+            )
+        print(
+            json.dumps(
+                {
+                    "run_id": run.run_id,
+                    "model": run.model_name,
+                    "endpoint": result.backend_endpoint,
+                    "operator": result.operator_name,
+                    "metrics": result.metrics,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        if args.once:
+            return 0
+        if deadline and time.time() > deadline:
+            return 0
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -656,6 +805,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--endpoint-url", help="Override backend endpoint registered in Rvbbit")
     parser.add_argument("--sample-json", help="Optional sample row JSON for generated smoke.sql")
     parser.add_argument("--no-complete", action="store_true", help="Train/scaffold but do not call complete_model_training")
+    parser.add_argument(
+        "--serve-local",
+        action="store_true",
+        help="Launch the serving sidecar locally (uvicorn) instead of Docker; survives this process",
+    )
+    parser.add_argument(
+        "--serve-host",
+        default=os.environ.get("RVBBIT_TRAINER_SERVE_HOST", "127.0.0.1"),
+        help="Hostname other services (e.g. Postgres) use to reach the local sidecar",
+    )
 
 
 def cmd_run_once(args: argparse.Namespace) -> int:
@@ -724,6 +883,19 @@ def main(argv: list[str] | None = None) -> int:
     add_common_args(p_run)
     p_run.add_argument("run_id")
     p_run.set_defaults(func=cmd_train_run)
+
+    p_watch = sub.add_parser("watch", help="poll for and process queued (managed) training jobs")
+    add_common_args(p_watch)
+    p_watch.add_argument("--worker-id", default=os.environ.get("RVBBIT_TRAINER_WORKER", "rvbbit-trainer"))
+    p_watch.add_argument("--poll-ms", type=int, default=2000)
+    p_watch.add_argument("--once", action="store_true", help="process at most one job, then exit")
+    p_watch.add_argument("--max-seconds", type=int, default=0, help="exit after N seconds (0 = run forever)")
+    p_watch.add_argument(
+        "--include-unmanaged",
+        action="store_true",
+        help="also claim plain queued runs that have no Warren job",
+    )
+    p_watch.set_defaults(func=cmd_watch)
 
     p_query = sub.add_parser("train-query", help="train directly from SQL without claiming a queued run")
     add_common_args(p_query)

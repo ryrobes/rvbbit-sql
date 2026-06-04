@@ -409,5 +409,6 @@ BEGIN
     END IF;
 
     EXECUTE format('SELECT rvbbit.%I($1)', foundation_operator) USING v_bundle INTO v_result;
-    RETURN jsonb_build_object('n_queries', v_n_q, 'predictions', v_result);
+    RETURN jsonb_build_object('n_queries', v_n_q,
+        'predictions', COALESCE(v_result->'predictions', v_result));
 END $fn$;

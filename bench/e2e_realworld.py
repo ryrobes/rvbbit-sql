@@ -1466,6 +1466,85 @@ def phase_model_training(h: E2EHarness, imported: dict[str, str | None]) -> None
         h.sql(f"DROP SCHEMA IF EXISTS {schema}_d CASCADE")
         d["ok"] = True
 
+    # ----- Closed loop: train_model -> trainer `watch --serve-local` -> live
+    # predict. The SQL-bound trainer worker that closes the loop. Optional:
+    # needs the rvbbit-trainer + sklearn/uvicorn. -----
+    with h.step("ml", "closed_loop_watch", optional=True) as d:
+        trainer = Path(RVBBIT_TRAINER)
+        if not trainer.exists():
+            raise SkipStep(f"rvbbit-trainer not found at {trainer}")
+        try:
+            import sklearn  # noqa: F401
+            import uvicorn  # noqa: F401
+        except Exception as exc:  # noqa: BLE001
+            raise SkipStep(f"trainer deps unavailable: {exc}")
+
+        suffix = short_id()
+        schema = f"e2e_loop_{suffix}"
+        model = f"e2e_loop_{suffix}"
+        serve_host = os.environ.get("RVBBIT_E2E_SERVE_HOST", "bench")
+        h.created_ml_models.append(model)
+        h.created_schemas.append(schema)
+
+        h.sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        h.sql(f"CREATE SCHEMA {schema}")
+        h.sql(f"CREATE TABLE {schema}.t (a float8, b float8, label text)")
+        h.sql(
+            f"INSERT INTO {schema}.t "
+            f"SELECT g, mod(g, 7), CASE WHEN mod(g, 2) = 0 THEN 'hi' ELSE 'lo' END "
+            f"FROM generate_series(1, 120) g"
+        )
+        # Unmanaged queue (no Warren job -> no live-agent race in the harness).
+        h.scalar(
+            f"""SELECT rvbbit.train_model('{model}', 'SELECT a, b, label FROM {schema}.t', 'label',
+                'classification',
+                feature_schema => '[{{"name":"a","type":"float8"}},{{"name":"b","type":"float8"}}]'::jsonb,
+                training_opts => '{{"estimator":"random_forest","n_estimators":16,"test_size":0.25,"min_holdout_rows":10}}'::jsonb)"""
+        )
+
+        out_root = h.artifact_dir / "watch-models"
+        proc = subprocess.run(
+            [
+                sys.executable, str(trainer), "watch", "--once", "--include-unmanaged",
+                "--dsn", RVBBIT_DSN, "--output-root", str(out_root), "--force",
+                "--serve-local", "--serve-host", serve_host,
+            ],
+            text=True, capture_output=True, timeout=240, check=False,
+            env={**os.environ, "RVBBIT_DSN": RVBBIT_DSN},
+        )
+        d["trainer_returncode"] = proc.returncode
+        d["trainer_stdout"] = proc.stdout[-3000:]
+        d["trainer_stderr"] = proc.stderr[-3000:]
+        require(proc.returncode == 0, f"trainer watch failed: {proc.stderr[-400:]}")
+
+        status = h.scalar(f"SELECT status FROM rvbbit.ml_model_status WHERE name = '{model}'")
+        require(status == "active", f"model not active after watch: {status}")
+        backend = h.scalar(f"SELECT backend_name FROM rvbbit.ml_models WHERE name = '{model}'")
+        if backend:
+            h.created_backends.append(backend)
+        endpoint = h.scalar(f"SELECT endpoint_url FROM rvbbit.backends WHERE name = %s", (backend,)) if backend else None
+        op = h.scalar(f"SELECT operator_name FROM rvbbit.ml_models WHERE name = '{model}'")
+
+        pred = h.scalar(f"""SELECT rvbbit.{op}('{{"a": 4, "b": 3}}'::jsonb)""")
+        d["prediction"] = pred
+        require(isinstance(pred, dict) and pred.get("label") in {"hi", "lo"}, f"bad live prediction: {pred}")
+        # batch predict round-trips through the served sidecar
+        match = h.scalar(
+            f"""SELECT count(*) FILTER (WHERE label = rvbbit.{op}(to_jsonb(t))->>'label')
+                FROM (SELECT a, b, label FROM {schema}.t LIMIT 20) t"""
+        )
+        d["batch_correct_of_20"] = match
+        require(match is not None and int(match) >= 14, f"served model accuracy too low: {match}/20")
+
+        # stop the detached local sidecar (precisely, by its port)
+        if endpoint:
+            port = str(endpoint).rsplit(":", 1)[-1].split("/", 1)[0]
+            if port.isdigit():
+                with contextlib.suppress(Exception):
+                    subprocess.run(["pkill", "-f", f"main:app --host 0.0.0.0 --port {port}"], check=False)
+        h.sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        d["ok"] = True
+
 
 def phase_semantic_echo(h: E2EHarness) -> str | None:
     with h.step("semantic", "echo_sidecar_available", optional=True) as d:

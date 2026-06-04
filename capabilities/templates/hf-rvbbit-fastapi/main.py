@@ -424,6 +424,73 @@ def _predict_tabular_regression(inputs: list[dict[str, Any]]) -> list[Any]:
     return [{"value": float(_json_scalar(value))} for value in predictions]
 
 
+def _predict_tabular_foundation(inputs: list[dict[str, Any]]) -> list[Any]:
+    """In-context tabular prediction: per request bundle {task, target, support,
+    queries}, predict the queries from the labeled support set with NO persisted
+    model / training run. This reference handler fits a small model per request
+    (CPU). Swap the fit for a TabPFN-class forward pass when a GPU model is
+    available — the request/response contract is unchanged."""
+    import pandas as pd
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+
+    outputs: list[Any] = []
+    for item in inputs:
+        bundle = item.get("bundle") if isinstance(item, dict) and "bundle" in item else item
+        if not isinstance(bundle, dict):
+            outputs.append({"predictions": [], "error": "bundle not an object"})
+            continue
+        task = str(bundle.get("task") or "classification")
+        target = bundle.get("target")
+        support = bundle.get("support") or []
+        queries = bundle.get("queries") or []
+        if not support or target is None:
+            outputs.append({"predictions": [], "error": "empty support or missing target"})
+            continue
+
+        sdf = pd.DataFrame(support)
+        qdf = pd.DataFrame(queries)
+        feat_cols = [c for c in sdf.columns if c != target]
+        for c in feat_cols:
+            if c not in qdf.columns:
+                qdf[c] = None
+        # consistent encoding across support + query
+        combined = pd.concat([sdf[feat_cols], qdf[feat_cols]], keys=["s", "q"])
+        enc = pd.get_dummies(combined, dummy_na=True).fillna(0)
+        x_s, x_q = enc.xs("s"), enc.xs("q")
+        y = sdf[target]
+
+        is_class = task.endswith("classification") or task == "classification"
+        if not is_class:
+            try:
+                y = y.astype(float)
+            except Exception:
+                is_class = True
+        model = (
+            RandomForestClassifier(n_estimators=64, random_state=0)
+            if is_class
+            else RandomForestRegressor(n_estimators=64, random_state=0)
+        )
+        model.fit(x_s, y)
+        preds = model.predict(x_q)
+
+        if is_class:
+            proba = model.predict_proba(x_q) if hasattr(model, "predict_proba") else None
+            classes = list(getattr(model, "classes_", []))
+            plist: list[Any] = []
+            for i, p in enumerate(preds):
+                d: dict[str, Any] = {"label": str(p), "prediction": _json_scalar(p)}
+                if proba is not None:
+                    d["scores"] = [{"label": str(c), "score": float(s)} for c, s in zip(classes, proba[i])]
+                    if d["scores"]:
+                        best = max(d["scores"], key=lambda r: r["score"])
+                        d["label"], d["score"] = best["label"], best["score"]
+                plist.append(d)
+        else:
+            plist = [{"value": float(_json_scalar(v))} for v in preds]
+        outputs.append({"predictions": plist, "n_support": len(support), "n_queries": len(queries)})
+    return outputs
+
+
 def _predict_echo(inputs: list[dict[str, Any]]) -> list[Any]:
     outputs = []
     for item in inputs:
@@ -455,6 +522,8 @@ def predict_batch(inputs: list[dict[str, Any]]) -> list[Any]:
         return _predict_tabular_classification(inputs)
     if HANDLER == "tabular_regression":
         return _predict_tabular_regression(inputs)
+    if HANDLER == "tabular_foundation":
+        return _predict_tabular_foundation(inputs)
     raise HTTPException(
         status_code=501,
         detail=f"handler {HANDLER!r} needs custom predict_batch implementation",
