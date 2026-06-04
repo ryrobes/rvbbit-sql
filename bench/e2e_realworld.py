@@ -1315,6 +1315,157 @@ def phase_model_training(h: E2EHarness, imported: dict[str, str | None]) -> None
         d["prediction_matches"] = matches
         require(matches >= 1, f"trained classifier did not match any sample rows: {rows}")
 
+    # ----- Unified inference plane: orchestration surface (self-contained; no
+    # trainer/sidecar required; see docs/MODELS_UNIFIED_PLAN.md) -----
+    with h.step("ml", "orchestration_surface") as d:
+        suffix = short_id()
+        schema = f"e2e_ml_{suffix}"
+        m_q = f"e2e_orch_q_{suffix}"
+        m_mg = f"e2e_orch_mg_{suffix}"
+        m_d = f"e2e_orch_d_{suffix}"
+        for nm in (m_q, m_mg, m_d):
+            h.created_ml_models.append(nm)
+        h.created_schemas.extend([schema, f"{schema}_d"])
+
+        h.sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        h.sql(f"CREATE SCHEMA {schema}")
+        h.sql(f"CREATE TABLE {schema}.t (a float8, b float8, label text)")
+        h.sql(
+            f"INSERT INTO {schema}.t "
+            f"SELECT g, g * 2.0, CASE WHEN mod(g, 2) = 0 THEN 'even' ELSE 'odd' END "
+            f"FROM generate_series(1, 40) g"
+        )
+        src = f"SELECT a, b, label FROM {schema}.t"
+
+        # Step 2 — ergonomics: validate + infer
+        val = h.scalar(f"SELECT rvbbit.validate_training_sql('{src}', 'label')")
+        require(
+            isinstance(val, dict) and val.get("ok") is True and val.get("n_features") == 2,
+            f"validate_training_sql (good) unexpected: {val}",
+        )
+        bad = h.scalar(f"SELECT rvbbit.validate_training_sql('SELECT a, b FROM {schema}.t', 'label')")
+        require(
+            isinstance(bad, dict) and bad.get("ok") is False,
+            f"validate_training_sql (missing target) should be ok=false: {bad}",
+        )
+        d["validate"] = val
+
+        # train_model -> queued; ml_model_status
+        rid = h.scalar(f"SELECT rvbbit.train_model('{m_q}', '{src}', 'label', 'classification')")
+        require(
+            h.scalar(f"SELECT status FROM rvbbit.ml_model_status WHERE name = '{m_q}'") == "queued",
+            "train_model should queue the model",
+        )
+
+        # Step 3 (A1) — managed train -> model_training Warren job (target_selector)
+        # + claim. Wrapped in a transaction so the live Warren agent never sees it.
+        with h.conn.transaction():
+            mg = h.scalar(
+                f"""SELECT rvbbit.train_model_managed('{m_mg}', '{src}', 'label', 'classification',
+                    target => '{{"gpu": true, "host": "e2e-gpu"}}'::jsonb)"""
+            )
+            require(isinstance(mg, dict) and mg.get("training_job_id"), f"train_model_managed: {mg}")
+            jrow = h.sql(
+                f"SELECT kind, target_selector->>'gpu' FROM rvbbit.warren_jobs WHERE name = 'train:{m_mg}'"
+            )
+            require(
+                bool(jrow) and jrow[0][0] == "model_training" and jrow[0][1] == "true",
+                f"model_training job not enqueued with target_selector: {jrow}",
+            )
+            claimed = h.scalar(f"SELECT model_name FROM rvbbit.claim_model_training_job('e2e-trainer-{suffix}')")
+            require(claimed == m_mg, f"claim_model_training_job returned {claimed}")
+            require(
+                h.scalar(f"SELECT status FROM rvbbit.warren_jobs WHERE name = 'train:{m_mg}'") == "running",
+                "claimed training job should be running",
+            )
+            h.sql(f"DELETE FROM rvbbit.warren_jobs WHERE name = 'train:{m_mg}'")
+        d["managed_train"] = mg
+
+        # Step 4 (C) — distillation (deterministic labeler; real use passes an operator)
+        dz = h.scalar(
+            f"""SELECT rvbbit.distill_model('{m_d}', 'SELECT a, b FROM {schema}.t',
+                $$CASE WHEN a > 20 THEN 'hi' ELSE 'lo' END$$,
+                n_label => 40, label_column => 'bucket', staging_schema => '{schema}_d')"""
+        )
+        require(isinstance(dz, dict) and dz.get("n_labeled") == 40, f"distill_model: {dz}")
+        d["distill"] = dz
+
+        # Step 5 (B) — foundation predict_tabular dry-run (no GPU needed)
+        pt = h.scalar(
+            f"""SELECT rvbbit.predict_tabular('{src}', 'SELECT a, b FROM {schema}.t LIMIT 3',
+                'label', 'classification', dry_run => true)"""
+        )
+        require(
+            isinstance(pt, dict) and pt.get("n_support") == 40 and pt.get("n_queries") == 3,
+            f"predict_tabular dry_run: {pt}",
+        )
+
+        # versioning + accuracy series are callable
+        h.scalar(f"SELECT count(*) FROM rvbbit.ml_model_versions WHERE model_name = '{m_d}'")
+        h.scalar(f"SELECT count(*) FROM rvbbit.ml_accuracy_series('{m_d}')")
+
+        # Step 1 — reaper (controlled stuck run, 1h lease; no collateral)
+        h.sql(
+            f"""INSERT INTO rvbbit.ml_training_runs(model_name, status, task, source_sql, started_at)
+                VALUES ('{m_q}', 'running', 'classification', 'SELECT 1', now() - interval '3 hours')"""
+        )
+        h.scalar("SELECT rvbbit.reap_stale_training_runs(interval '1 hour')")
+        require(
+            h.scalar(
+                f"SELECT count(*) FROM rvbbit.ml_training_runs "
+                f"WHERE model_name = '{m_q}' AND status = 'failed' AND error LIKE 'reaped:%'"
+            )
+            >= 1,
+            "reaper did not fail the stuck run",
+        )
+
+        # Step 1 — lifecycle: disable / enable / cancel / drop
+        h.sql(f"SELECT rvbbit.disable_model('{m_q}')")
+        require(
+            h.scalar(f"SELECT status FROM rvbbit.ml_models WHERE name = '{m_q}'") == "disabled",
+            "disable_model",
+        )
+        h.sql(f"SELECT rvbbit.enable_model('{m_q}')")
+        h.sql(f"SELECT rvbbit.cancel_model_training('{rid}'::uuid)")
+        for nm in (m_q, m_mg, m_d):
+            h.sql(f"SELECT rvbbit.drop_model('{nm}', true)")
+        require(
+            h.scalar(f"SELECT count(*) FROM rvbbit.ml_models WHERE name IN ('{m_q}', '{m_mg}', '{m_d}')") == 0,
+            "drop_model left rows",
+        )
+
+        # evaluate_model end-to-end (records metrics; gated on the wine pack op).
+        # Direct ml_models insert avoids mutating the shared pack backend.
+        wine_present = h.scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'rvbbit' AND p.proname = 'predict_wine_quality')"
+        )
+        if wine_present:
+            wname = f"e2e_orch_wine_{suffix}"
+            h.created_ml_models.append(wname)
+            h.sql(
+                f"""INSERT INTO rvbbit.ml_models(name, task, status, target_column, operator_name, feature_schema)
+                    VALUES ('{wname}', 'classification', 'active', 'quality', 'predict_wine_quality',
+                            '[{{"name": "alcohol", "type": "float8"}}]'::jsonb)"""
+            )
+            ev = h.scalar(
+                f"""SELECT rvbbit.evaluate_model('{wname}',
+                    $$SELECT 7.4 AS "fixed acidity", 0.7 AS "volatile acidity", 0.0 AS "citric acid",
+                      1.9 AS "residual sugar", 0.076 AS chlorides, 11 AS "free sulfur dioxide",
+                      34 AS "total sulfur dioxide", 0.9978 AS density, 3.51 AS "pH", 0.56 AS sulphates,
+                      9.4 AS alcohol, '5' AS quality$$, 'quality', 'e2e-eval')"""
+            )
+            require(
+                h.scalar(f"SELECT n_rows FROM rvbbit.ml_evaluations WHERE eval_id = '{ev}'") == 1,
+                "evaluate_model should record 1 row",
+            )
+            h.sql(f"SELECT rvbbit.drop_model('{wname}')")
+            d["evaluate_ok"] = True
+
+        h.sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        h.sql(f"DROP SCHEMA IF EXISTS {schema}_d CASCADE")
+        d["ok"] = True
+
 
 def phase_semantic_echo(h: E2EHarness) -> str | None:
     with h.step("semantic", "echo_sidecar_available", optional=True) as d:

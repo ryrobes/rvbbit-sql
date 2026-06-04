@@ -1,0 +1,47 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: tabpfn_foundation
+title: Tabular Foundation Model (in-context, training-free)
+description: >
+  A TabPFN-class tabular foundation model served as a GPU specialist. Predicts a
+  target column for query rows IN CONTEXT from a labeled support set — no
+  per-dataset training step. The serving shape is identical to the sklearn
+  tabular packs (hf-rvbbit-fastapi sidecar + 'rvbbit' backend + jsonb operator);
+  only the handler and the request payload differ. See docs/MODELS_UNIFIED_PLAN.md
+  (Track B) and rvbbit.predict_tabular(support_sql, predict_sql, target, task).
+license: unknown
+tags: [tabular, foundation, in-context, prediction, gpu, tabpfn]
+source:
+  provider: huggingface
+  model: Prior-Labs/TabPFN-v2
+  url: https://huggingface.co/Prior-Labs
+runtime:
+  template: hf-rvbbit-fastapi
+  # NOTE: `tabular_foundation` is a NEW handler to add to the fastapi template —
+  # it accepts {task, target, support:[...], queries:[...]} and returns
+  # {predictions:[...]} (in-context), rather than the per-row predict of the
+  # existing tabular_classification/tabular_regression handlers.
+  handler: tabular_foundation
+  device: gpu
+  env:
+    RVBBIT_CAPABILITY_EAGER: "0"
+    RVBBIT_TABULAR_FOUNDATION_MAX_SUPPORT: "10000"
+backend:
+  name: predict_tabular_foundation
+  transport: rvbbit
+  batch_size: 1          # one in-context bundle per request (support + queries)
+  max_concurrent: 1
+  timeout_ms: 300000
+  description: In-context tabular foundation predictor (support set + query rows).
+operators:
+  - name: predict_tabular_foundation
+    description: >
+      Predict a target for query rows in-context from a labeled support set.
+      Input is a single jsonb bundle {task, target, support, queries}; output is
+      {predictions:[...]} aligned to queries. Invoked by rvbbit.predict_tabular.
+    arg_names: [bundle]
+    arg_types: [jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      bundle: "{{ inputs.bundle }}"
