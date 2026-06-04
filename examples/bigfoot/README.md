@@ -32,6 +32,43 @@ opt-in:
 BIGFOOT_LIVE=1 examples/bigfoot/run_all.sh
 ```
 
+The training section (`08_predict_class.sql`) trains a scikit-learn classifier
+from a SQL `SELECT`. Fitting is done by the external `rvbbit-trainer` worker, so
+a worker must be running. Start one in another shell, then opt in:
+
+```bash
+# 1. start a worker that claims queued runs, fits them, and serves locally
+rvbbit-trainer watch --include-unmanaged --serve-local --serve-host <db-reachable-host>
+
+# 2. run the notebook including the training section
+BIGFOOT_TRAIN=1 examples/bigfoot/run_all.sh
+```
+
+In the Docker dev stack the worker lives in the `bench` container and Postgres
+reaches it as host `bench`:
+
+```bash
+docker compose -f docker/docker-compose.yml exec -T bench \
+  python /capabilities/tools/rvbbit-trainer \
+  watch --include-unmanaged --serve-local --serve-host bench
+```
+
+`08_predict_class.sql` queues the run, waits up to `BIGFOOT_TRAIN_WAIT` seconds
+for the worker to bring the model online, then predicts and evaluates. If no
+worker fits it in time, it prints the command and skips the prediction step.
+
+Re-running is supported (the script drops the prior model and clears its cached
+predictions first), but a locally served sidecar uses a deterministic port per
+model name (`8200 + hash(model_name)`). If you re-run before the previous
+sidecar has shut down, the new worker cannot bind that port. Let the prior run
+finish, or stop the old worker/sidecar, before re-running.
+
+Training defaults:
+
+- `BIGFOOT_TRAIN_ESTIMATORS=64`
+- `BIGFOOT_TRAIN_SEED=13`
+- `BIGFOOT_TRAIN_WAIT=180`
+
 ## Scripts
 
 | Script | Purpose |
@@ -43,6 +80,7 @@ BIGFOOT_LIVE=1 examples/bigfoot/run_all.sh
 | `04_knowledge_graph.sql` | Build a deterministic KG from report metadata and lexical clues. |
 | `06_capability_operators.sql` | Use Warren capability operators for GLiNER spans, rerank, classification, and emotion/sentiment rollups. |
 | `07_live_triples_receipts.sql` | Optional live model triples and receipt/cost inspection. |
+| `08_predict_class.sql` | Optional: train a tabular classifier from SQL (needs an `rvbbit-trainer` worker), then predict and evaluate on a holdout. |
 
 Current note: `00_load.sql` uses `psql \copy` with the local path
 `/home/ryanr/csv-files/bigfoot_sightings.csv`. If this demo needs to run on
