@@ -1409,6 +1409,9 @@ fn deploy_capability(
         );
     } else {
         let should_build = manifest.get("runtime").and_then(runtime_image).is_none();
+        // Resolve "auto" device server-side: apply the GPU overlay only when the
+        // manifest wants the GPU AND this host actually has one.
+        let use_gpu = resolve_gpu_overlay(manifest, &project_dir);
         try_update_job_progress(
             db,
             config,
@@ -1420,6 +1423,7 @@ fn deploy_capability(
                 "port": port,
                 "published_host_port": publish_host_port,
                 "build": should_build,
+                "gpu": use_gpu,
             }),
         );
         docker_compose_up(
@@ -1428,6 +1432,7 @@ fn deploy_capability(
             &config.docker_network,
             should_build,
             publish_host_port,
+            use_gpu,
         )?;
         if publish_host_port {
             try_update_job_progress(
@@ -1810,17 +1815,88 @@ fn render_runtime_volumes(runtime: &Value) -> (String, String) {
     (mounts.join("\n"), defs.join("\n"))
 }
 
+/// True when this host has a usable NVIDIA GPU (driver + `nvidia-smi`). This is
+/// the signal that resolves a capability's "auto" device safely: `gpus: all`
+/// hard-fails on a host without the GPU/runtime, so we only apply the GPU
+/// overlay when the card is actually present.
+fn host_has_gpu() -> bool {
+    Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .map(|o| {
+            o.status.success()
+                && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a capability manifest wants the GPU. `device: cpu` never; `cuda`
+/// always; `auto`/unset only when the pack declares a GPU placement or
+/// requirement (so plain CPU models aren't forced onto the card).
+fn manifest_wants_gpu(manifest: &Value) -> bool {
+    let device = manifest
+        .get("runtime")
+        .and_then(|r| r.get("device"))
+        .and_then(Value::as_str)
+        .unwrap_or("auto")
+        .to_ascii_lowercase();
+    if device == "cpu" {
+        return false;
+    }
+    if device == "cuda" {
+        return true;
+    }
+    // device == "auto" (or unset): opt in only when the pack declares GPU intent.
+    let gpu = manifest.get("resources").and_then(|r| r.get("gpu"));
+    let required = gpu
+        .and_then(|g| g.get("required"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let placement = gpu
+        .and_then(|g| g.get("placement"))
+        .and_then(Value::as_str)
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false);
+    required || placement
+}
+
+/// Resolve whether to apply the GPU compose overlay for a deploy: the manifest
+/// must want the GPU, the host must have one, and the overlay file must exist.
+fn resolve_gpu_overlay(manifest: &Value, project_dir: &Path) -> bool {
+    if !manifest_wants_gpu(manifest) {
+        return false;
+    }
+    if !project_dir.join("compose.gpu.yaml").exists() {
+        return false;
+    }
+    if !host_has_gpu() {
+        eprintln!(
+            "warren-agent: capability wants the GPU but no NVIDIA GPU was detected on this \
+             host (nvidia-smi) — deploying on CPU. Set device=cpu in the manifest to silence."
+        );
+        return false;
+    }
+    true
+}
+
 fn docker_compose_up(
     project_dir: &Path,
     port: u16,
     network: &str,
     build: bool,
     publish_host_port: bool,
+    gpu: bool,
 ) -> Result<()> {
     let mut command = Command::new("docker");
     command.arg("compose").arg("-f").arg("compose.yaml");
     if publish_host_port {
         command.arg("-f").arg("compose.host-ports.yaml");
+    }
+    // GPU overlay last so its `gpus: all` + device=cuda win. Only applied when
+    // the caller resolved Auto to "use the GPU" AND the overlay exists, so a
+    // GPU-less host (where `gpus: all` would hard-fail) stays on the CPU base.
+    if gpu {
+        command.arg("-f").arg("compose.gpu.yaml");
     }
     command.arg("up").arg("-d");
     if build {
@@ -2639,5 +2715,34 @@ fn normalized_endpoint_path(path: &str) -> String {
         trimmed.to_string()
     } else {
         format!("/{trimmed}")
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::manifest_wants_gpu;
+    use serde_json::json;
+
+    #[test]
+    fn wants_gpu_resolution() {
+        // bge-reranker-v2-m3 shape: device auto + gpu placement declared -> wants GPU.
+        assert!(manifest_wants_gpu(&json!({
+            "runtime": {"device": "auto"},
+            "resources": {"gpu": {"required": false, "placement": "single_gpu"}}
+        })));
+        // Explicit cuda -> wants GPU regardless of resources.
+        assert!(manifest_wants_gpu(&json!({"runtime": {"device": "cuda"}})));
+        // Explicit cpu -> never, even with a placement.
+        assert!(!manifest_wants_gpu(&json!({
+            "runtime": {"device": "cpu"},
+            "resources": {"gpu": {"placement": "single_gpu"}}
+        })));
+        // auto with no GPU intent declared -> CPU model, don't force the card.
+        assert!(!manifest_wants_gpu(&json!({"runtime": {"device": "auto"}})));
+        assert!(!manifest_wants_gpu(&json!({})));
+        // required: true alone is enough.
+        assert!(manifest_wants_gpu(&json!({
+            "resources": {"gpu": {"required": true}}
+        })));
     }
 }
