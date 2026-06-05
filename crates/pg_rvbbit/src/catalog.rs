@@ -1697,7 +1697,13 @@ BEGIN
     END IF;
 
     next_query_id := gen_random_uuid();
-    PERFORM set_config('rvbbit.query_id', next_query_id::text, false);
+    -- is_local = true: scope the id to the current transaction so each
+    -- autocommit statement gets a fresh query_id (per-query telemetry). With
+    -- false it persisted for the whole session, so every query on a pooled
+    -- connection reused one id and "distinct query_id" counted connections, not
+    -- queries. A prewarm's SPI + the execution share the user's txn, so they
+    -- still group under one id; an explicit BEGIN..COMMIT groups as one unit.
+    PERFORM set_config('rvbbit.query_id', next_query_id::text, true);
     RETURN next_query_id;
 END $$;
 
@@ -1709,7 +1715,13 @@ AS $$
 DECLARE
     next_query_id uuid := gen_random_uuid();
 BEGIN
-    PERFORM set_config('rvbbit.query_id', next_query_id::text, false);
+    -- is_local = true: scope the id to the current transaction so each
+    -- autocommit statement gets a fresh query_id (per-query telemetry). With
+    -- false it persisted for the whole session, so every query on a pooled
+    -- connection reused one id and "distinct query_id" counted connections, not
+    -- queries. A prewarm's SPI + the execution share the user's txn, so they
+    -- still group under one id; an explicit BEGIN..COMMIT groups as one unit.
+    PERFORM set_config('rvbbit.query_id', next_query_id::text, true);
     RETURN next_query_id;
 END $$;
 
