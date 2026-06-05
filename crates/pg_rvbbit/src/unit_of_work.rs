@@ -252,6 +252,33 @@ fn run_single_llm(op: &OpDef, scope: &mut Scope, feedback: Option<&str>) -> Work
 // ---------------------------------------------------------------------------
 
 fn run_multi_step(op: &OpDef, steps: &[Value], scope: &mut Scope) -> WorkResult {
+    run_multi_step_inner(op, steps, scope, None)
+}
+
+/// Run a multi-step pipeline with one step pre-computed and skipped. The named
+/// step's output must already be in `scope.steps`, its execution is skipped, and
+/// `seed_sub` is recorded in its place. prewarm uses this to batch a specialist
+/// step across rows and then run only the remaining (local) steps per row.
+pub fn run_multistep_seeded(
+    op: &OpDef,
+    steps: &[Value],
+    inputs: &Value,
+    opts: &Value,
+    seed_step: &str,
+    seed_output: Value,
+    seed_sub: SubCall,
+) -> WorkResult {
+    let mut scope = Scope::new(inputs.clone(), opts.clone());
+    scope.steps.insert(seed_step.to_string(), seed_output);
+    run_multi_step_inner(op, steps, &mut scope, Some((seed_step.to_string(), seed_sub)))
+}
+
+fn run_multi_step_inner(
+    op: &OpDef,
+    steps: &[Value],
+    scope: &mut Scope,
+    mut seeded: Option<(String, SubCall)>,
+) -> WorkResult {
     let mut sub_calls: Vec<SubCall> = Vec::with_capacity(steps.len());
     let mut total_tokens_in: i32 = 0;
     let mut total_tokens_out: i32 = 0;
@@ -264,6 +291,26 @@ fn run_multi_step(op: &OpDef, steps: &[Value], scope: &mut Scope) -> WorkResult 
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("step_{i}"));
+
+        // A pre-seeded step (batched elsewhere): its output is already in
+        // scope; record the supplied sub_call in order and skip execution.
+        if seeded.as_ref().is_some_and(|(name, _)| name == &step_name) {
+            let (_, sub) = seeded.take().unwrap();
+            total_tokens_in += sub.tokens_in;
+            total_tokens_out += sub.tokens_out;
+            last_output_text = scope
+                .steps
+                .get(&step_name)
+                .and_then(|s| s.get("output"))
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            sub_calls.push(sub);
+            continue;
+        }
+
         let kind = step.get("kind").and_then(|v| v.as_str()).unwrap_or("");
 
         let (sub, step_output, output_text) = match kind {

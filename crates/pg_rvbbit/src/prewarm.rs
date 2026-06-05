@@ -92,6 +92,13 @@ pub fn warm(op: &Arc<OpDef>, opts: &Value, inputs: Vec<Value>) -> WarmStats {
     let pool = flow::pool();
     let executed: Vec<(Value, WorkResult)> = if let Some(spec_name) = single_specialist_name(op) {
         dispatch_batched_specialist(op, &spec_name, to_run, opts, pool)
+    } else if let Some((step_name, spec_name)) =
+        batchable_specialist_step(op).filter(|(_, spec)| spec_client_batches(spec))
+    {
+        // Multi-step op whose one heavy step is a batch-capable specialist
+        // (e.g. rvbbit.about -> rerank specialist + a local code step): batch
+        // that step across rows, then run the cheap steps per row.
+        dispatch_batched_multistep_specialist(op, &step_name, &spec_name, to_run, opts, pool)
     } else {
         dispatch_per_row(op, to_run, opts, pool)
     };
@@ -409,6 +416,166 @@ fn single_specialist_name(op: &OpDef) -> Option<String> {
     step.get("specialist")?.as_str().map(|s| s.to_string())
 }
 
+/// True when the specialist's transport actually client-batches, so folding N
+/// rows into one call is a real win (not N serial calls server-side).
+fn spec_client_batches(spec_name: &str) -> bool {
+    let spec = match crate::specialists::get_cached_spec(spec_name)
+        .or_else(|| crate::specialists::load_spec(spec_name).ok())
+    {
+        Some(s) => s,
+        None => return false,
+    };
+    crate::specialists::transport_for(&spec.transport)
+        .map(|t| t.client_batches())
+        .unwrap_or(false)
+}
+
+/// Detect a multi-step op whose single heavy step is a specialist and whose
+/// other steps are local `code` (e.g. rvbbit.about = rerank specialist +
+/// json_get code). Returns (step_name, specialist_name). The specialist step's
+/// `inputs` must reference only op inputs/opts (not earlier step outputs), so it
+/// can be rendered and batched across rows independently.
+fn batchable_specialist_step(op: &OpDef) -> Option<(String, String)> {
+    let arr = op.steps.as_ref()?.as_array()?;
+    if arr.len() < 2 {
+        return None; // single-step specialist is handled by single_specialist_name
+    }
+    let mut found: Option<(String, String)> = None;
+    for (i, step) in arr.iter().enumerate() {
+        match step.get("kind").and_then(|v| v.as_str()).unwrap_or("") {
+            "specialist" => {
+                if found.is_some() {
+                    return None; // more than one specialist — not the simple shape
+                }
+                let name = step
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("step_{i}"));
+                let spec = step.get("specialist")?.as_str()?.to_string();
+                let tmpl = step.get("inputs").map(|v| v.to_string()).unwrap_or_default();
+                if tmpl.contains("steps.") {
+                    return None; // depends on a prior step — can't pre-batch
+                }
+                found = Some((name, spec));
+            }
+            "code" => {}            // local, runs per-row after the batch
+            _ => return None,        // llm / python / sql / mcp — leave to per-row
+        }
+    }
+    found
+}
+
+/// Batch the one specialist step of a multi-step op across rows, then finish
+/// each row's cheap (code) steps locally with the specialist output seeded.
+/// Produces the same final output + op input_hash as the per-row path, so the
+/// subsequent per-row query resolves entirely from cache.
+fn dispatch_batched_multistep_specialist(
+    op: &Arc<OpDef>,
+    step_name: &str,
+    spec_name: &str,
+    to_run: Vec<(usize, Value)>,
+    opts: &Value,
+    pool: &flow::Pool,
+) -> Vec<(Value, WorkResult)> {
+    let spec = match crate::specialists::load_spec(spec_name) {
+        Ok(s) => s,
+        Err(e) => {
+            return to_run
+                .into_iter()
+                .map(|(_, inputs)| (inputs, fail_work(&format!("specialist load: {e}"))))
+                .collect();
+        }
+    };
+
+    let inputs_template = op
+        .steps
+        .as_ref()
+        .and_then(|s| s.as_array())
+        .and_then(|a| {
+            a.iter()
+                .find(|s| s.get("name").and_then(|v| v.as_str()) == Some(step_name))
+        })
+        .and_then(|s| s.get("inputs").cloned())
+        .unwrap_or(Value::Object(Default::default()));
+
+    let mut per_row_payloads: Vec<(Value, Value)> = Vec::with_capacity(to_run.len());
+    for (_, inputs) in to_run {
+        let scope = unit_of_work::Scope::new(inputs.clone(), opts.clone());
+        let rendered = unit_of_work::render_value_templates(&inputs_template, &scope);
+        per_row_payloads.push((inputs, rendered));
+    }
+
+    let batch_size = if crate::specialists::transport_for(&spec.transport)
+        .map(|t| t.client_batches())
+        .unwrap_or(false)
+    {
+        spec.batch_size.max(1)
+    } else {
+        1
+    };
+
+    type ChunkResult = (Vec<Value>, Result<Vec<Value>, String>, i32);
+    let sem = crate::flow::Semaphore::new(spec.max_concurrent.max(1));
+    let mut receivers: Vec<crossbeam_channel::Receiver<ChunkResult>> = Vec::new();
+    for chunk in per_row_payloads.chunks(batch_size) {
+        let chunk_inputs: Vec<Value> = chunk.iter().map(|(i, _)| i.clone()).collect();
+        let payloads: Vec<Value> = chunk.iter().map(|(_, p)| p.clone()).collect();
+        let spec_arc = spec.clone();
+        let sem = sem.clone();
+        let rx = pool.submit(move || {
+            let _permit = sem.acquire();
+            let t0 = std::time::Instant::now();
+            let res = crate::specialists::predict_batch(&spec_arc, &payloads);
+            let latency = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
+            match res {
+                Ok(resp) => (chunk_inputs, Ok(resp.outputs), latency),
+                Err(e) => (chunk_inputs, Err(e.to_string()), latency),
+            }
+        });
+        receivers.push(rx);
+    }
+
+    let steps = op
+        .steps
+        .as_ref()
+        .and_then(|s| s.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out: Vec<(Value, WorkResult)> = Vec::new();
+    for rx in receivers {
+        let (chunk_inputs, outputs, latency) = rx.recv().unwrap();
+        match outputs {
+            Ok(outs) => {
+                for (inputs, value) in chunk_inputs.into_iter().zip(outs.into_iter()) {
+                    // Mirror run_step_specialist exactly: step output is
+                    // {"output": value}, so {{ steps.<name>.output }} resolves.
+                    let seed_output = serde_json::json!({ "output": value });
+                    let seed_sub = unit_of_work::SubCall {
+                        step: step_name.to_string(),
+                        kind: "specialist".into(),
+                        model: Some(spec_name.to_string()),
+                        backend: Some(spec.name.clone()),
+                        transport: Some(spec.transport.clone()),
+                        latency_ms: latency,
+                        ..Default::default()
+                    };
+                    let result = unit_of_work::run_multistep_seeded(
+                        op, &steps, &inputs, opts, step_name, seed_output, seed_sub,
+                    );
+                    out.push((inputs, result));
+                }
+            }
+            Err(e) => {
+                for inputs in chunk_inputs {
+                    out.push((inputs, fail_work(&format!("specialist '{spec_name}': {e}"))));
+                }
+            }
+        }
+    }
+    out
+}
+
 // ---- Semantic-MV pre-warm ------------------------------------------------
 
 /// Pre-warm the operator cache for a semantic MV refresh.
@@ -709,3 +876,66 @@ fn bytes_to_hex(b: &[u8]) -> String {
 // the symbol in scope documents the dependency.
 #[allow(dead_code)]
 fn _silence(_: ChatRequest) {}
+
+#[cfg(test)]
+mod phase4_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn op_with_steps(steps: serde_json::Value) -> OpDef {
+        OpDef {
+            name: "t".into(),
+            shape: "scalar".into(),
+            return_type: "float8".into(),
+            model: "m".into(),
+            system_prompt: String::new(),
+            user_prompt: String::new(),
+            parser: "json".into(),
+            max_tokens: 0,
+            temperature: None,
+            steps: Some(steps),
+            retry: None,
+            wards: None,
+            takes: None,
+        }
+    }
+
+    #[test]
+    fn detects_about_shape() {
+        // about: rerank specialist (inputs from op inputs) + json_get code.
+        let op = op_with_steps(json!([
+            {"kind":"specialist","name":"rerank","specialist":"rerank_bge_m3",
+             "inputs":{"text":"{{ inputs.text }}","query":"{{ inputs.topic }}"}},
+            {"kind":"code","name":"score","fn":"json_get",
+             "inputs":{"value":"{{ steps.rerank.output }}","path":"score"}}
+        ]));
+        assert_eq!(
+            batchable_specialist_step(&op),
+            Some(("rerank".to_string(), "rerank_bge_m3".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_non_batchable_shapes() {
+        // single-step specialist -> handled elsewhere, not here.
+        assert!(batchable_specialist_step(&op_with_steps(json!([
+            {"kind":"specialist","name":"r","specialist":"x","inputs":{}}
+        ]))).is_none());
+        // specialist whose inputs depend on a prior step -> can't pre-batch.
+        assert!(batchable_specialist_step(&op_with_steps(json!([
+            {"kind":"code","name":"pre","fn":"trim","inputs":{"text":"{{ inputs.text }}"}},
+            {"kind":"specialist","name":"r","specialist":"x",
+             "inputs":{"text":"{{ steps.pre.output }}"}}
+        ]))).is_none());
+        // two specialists -> not the simple shape.
+        assert!(batchable_specialist_step(&op_with_steps(json!([
+            {"kind":"specialist","name":"a","specialist":"x","inputs":{}},
+            {"kind":"specialist","name":"b","specialist":"y","inputs":{}}
+        ]))).is_none());
+        // an llm step present -> leave to per-row.
+        assert!(batchable_specialist_step(&op_with_steps(json!([
+            {"kind":"specialist","name":"a","specialist":"x","inputs":{}},
+            {"kind":"llm","name":"b","user":"{{ steps.a.output }}"}
+        ]))).is_none());
+    }
+}
