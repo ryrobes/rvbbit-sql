@@ -33,6 +33,7 @@ mod evidence;
 mod explain;
 mod fast_hash;
 mod flow;
+mod freshness;
 mod kg;
 mod lance;
 mod model_orchestration;

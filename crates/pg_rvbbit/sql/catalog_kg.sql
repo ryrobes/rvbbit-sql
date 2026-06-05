@@ -485,9 +485,147 @@ EXCEPTION WHEN others THEN
 END $fn$;
 
 -- ---------------------------------------------------------------------
--- Free-text data search (brute-force cosine; ILIKE fallback)
+-- Free-text data search — HYBRID (dense + lexical, fused by Reciprocal
+-- Rank Fusion).  Two ranker "seams" produce scored candidate lists; the
+-- fusion is rank-based, so it never has to calibrate the squished cosine
+-- band against the lexical scale, and irrelevant queries collapse to
+-- nothing instead of returning everything at a flat 50%.
+--
+-- The seams (rvbbit.catalog_dense_knn / rvbbit.catalog_lexical_knn) are the
+-- swap points: today the dense seam is mean-centered brute-force cosine over
+-- real[]; later it can dispatch to pgvector HNSW / Lance with no change to
+-- the fusion below.
+--
+-- Tunable via session settings (no rebuild):
+--   SET rvbbit.search_query_prefix = 'Represent this sentence for searching relevant passages: ';
+--       -- BGE/Nomic-style query instruction; default '' (no prefix)
+--   SET rvbbit.search_dense_floor  = '0.10';   -- centered-cosine floor; raise to be stricter
 -- ---------------------------------------------------------------------
 
+-- Dense ranker seam: mean-centered cosine over the stored real[] embeddings.
+-- Subtracting the corpus mean removes the anisotropy common-mode that pins raw
+-- cosines into a narrow high band, so an unrelated query's scores collapse
+-- toward 0 (and are dropped by min_score) while real matches stay positive.
+-- Returns the top-k candidates ABOVE the floor, scored by centered cosine.
+CREATE OR REPLACE FUNCTION rvbbit.catalog_dense_knn(
+    q_vec     real[],
+    graph     text,
+    kinds     text[],
+    k         int,
+    min_score float8 DEFAULT 0.10)
+RETURNS TABLE (node_id bigint, score float8)
+LANGUAGE plpgsql STABLE AS $fn$
+DECLARE
+    v_mu  real[];
+    v_qc  real[];
+    v_cnt bigint;
+    -- Brute-force mean+cosine is O(N*D) per call (recomputed every search). Above
+    -- this many same-dim embedded docs the dense path degrades to empty so the
+    -- lexical ranker still answers fast — until a cached-mean / ANN tier
+    -- (pgvector / Lance) lands behind this seam (Track B). Generous for catalogs.
+    v_max constant int := 10000;
+BEGIN
+    IF q_vec IS NULL OR array_length(q_vec, 1) IS NULL THEN RETURN; END IF;
+
+    SELECT count(*) INTO v_cnt
+      FROM rvbbit.catalog_docs d
+     WHERE d.graph_id = graph
+       AND (kinds IS NULL OR d.kind = ANY (kinds))
+       AND d.embedding IS NOT NULL
+       AND array_length(d.embedding, 1) = array_length(q_vec, 1);
+    IF v_cnt = 0 OR v_cnt > v_max THEN RETURN; END IF;
+
+    -- corpus mean embedding over the candidate set (one element per dimension).
+    -- Restrict to docs whose embedding dimensionality matches the query, so a
+    -- mixed-dimension corpus (model swap / partial re-embed) can't skew the mean
+    -- or misalign the parallel unnest below — the dense path simply returns empty
+    -- (graceful degrade to lexical-only) if nothing matches the query dim.
+    SELECT array_agg(m ORDER BY i) INTO v_mu
+      FROM (SELECT t.i, avg(t.e)::real AS m
+              FROM rvbbit.catalog_docs d
+                   CROSS JOIN LATERAL unnest(d.embedding) WITH ORDINALITY AS t(e, i)
+             WHERE d.graph_id = graph
+               AND (kinds IS NULL OR d.kind = ANY (kinds))
+               AND d.embedding IS NOT NULL
+               AND array_length(d.embedding, 1) = array_length(q_vec, 1)
+             GROUP BY t.i) z;
+
+    IF v_mu IS NULL THEN RETURN; END IF;
+
+    -- center the query once: q - mu
+    SELECT array_agg(u.qe - u.me ORDER BY u.i) INTO v_qc
+      FROM unnest(q_vec, v_mu) WITH ORDINALITY AS u(qe, me, i);
+
+    RETURN QUERY
+        WITH scored AS (
+            SELECT d.node_id,
+                   (SELECT sum((x.de - x.me) * x.qc)
+                           / NULLIF(sqrt(sum((x.de - x.me) * (x.de - x.me)))
+                                    * sqrt(sum(x.qc * x.qc)), 0)
+                      FROM unnest(d.embedding, v_mu, v_qc) AS x(de, me, qc)) AS cos
+              FROM rvbbit.catalog_docs d
+             WHERE d.graph_id = graph
+               AND (kinds IS NULL OR d.kind = ANY (kinds))
+               AND d.embedding IS NOT NULL
+               AND array_length(d.embedding, 1) = array_length(q_vec, 1)
+        )
+        SELECT s.node_id, s.cos
+          FROM scored s
+         WHERE s.cos IS NOT NULL AND s.cos > min_score
+         ORDER BY s.cos DESC
+         LIMIT k;
+END $fn$;
+
+-- Lexical ranker seam: exact identifier/substring + Postgres FTS. Identifiers
+-- (schema/rel/col) get their `_` and `.` flattened to spaces so the text-search
+-- parser tokenizes snake_case names; a literal substring hit on the qualified
+-- name is weighted highest (catches `npi`, `feet`, codes the dense model misses).
+-- Returns only rows with SOME lexical signal.
+CREATE OR REPLACE FUNCTION rvbbit.catalog_lexical_knn(
+    query text,
+    graph text,
+    kinds text[],
+    k     int)
+RETURNS TABLE (node_id bigint, score float8)
+LANGUAGE plpgsql STABLE AS $fn$
+DECLARE
+    v_q text := btrim(COALESCE(query, ''));
+BEGIN
+    IF v_q = '' THEN RETURN; END IF;
+    RETURN QUERY
+        WITH lex AS (
+            SELECT d.node_id,
+                   ts_rank_cd(
+                       to_tsvector('english',
+                           d.doc || ' ' ||
+                           replace(replace(
+                               COALESCE(d.schema_name, '') || ' ' || COALESCE(d.rel_name, '') || ' '
+                                 || COALESCE(d.col_name, ''),
+                               '_', ' '), '.', ' ')),
+                       websearch_to_tsquery('english', v_q)) AS fts,
+                   -- position() = LITERAL substring (no LIKE wildcard interpretation), so an
+                   -- identifier query like 'patient_id' can't have its '_' match any char.
+                   (position(lower(v_q) IN
+                       lower(COALESCE(d.schema_name, '') || '.' || COALESCE(d.rel_name, '') || '.'
+                             || COALESCE(d.col_name, ''))) > 0)::int AS name_hit,
+                   (position(lower(v_q) IN lower(d.doc)) > 0)::int    AS doc_hit
+              FROM rvbbit.catalog_docs d
+             WHERE d.graph_id = graph
+               AND (kinds IS NULL OR d.kind = ANY (kinds))
+        )
+        SELECT lex.node_id,
+               (2.0 * lex.name_hit + 1.0 * lex.doc_hit + lex.fts)::float8 AS sc
+          FROM lex
+         WHERE lex.fts > 0 OR lex.name_hit > 0 OR lex.doc_hit > 0
+         ORDER BY sc DESC
+         LIMIT k;
+END $fn$;
+
+-- Hybrid free-text search: fuse the two seams with Reciprocal Rank Fusion
+-- (score = Σ 1/(C + rank)) and return the top-k by fused relevance. The
+-- returned `score` is normalized to [0,1] (top hit = 1.0) so the UI shows a
+-- relative match strength, not a raw cosine.  A query with no lexical signal
+-- AND no above-floor dense match returns nothing.
 CREATE OR REPLACE FUNCTION rvbbit.data_search(
     query  text,
     k      int    DEFAULT 20,
@@ -503,41 +641,46 @@ RETURNS TABLE (
     doc         text)
 LANGUAGE plpgsql STABLE AS $fn$
 DECLARE
-    v_graph text := COALESCE(NULLIF(btrim(graph), ''), 'db_catalog');
-    v_q     real[];
+    v_graph  text   := COALESCE(NULLIF(btrim(graph), ''), 'db_catalog');
+    v_prefix text   := COALESCE(current_setting('rvbbit.search_query_prefix', true), '');
+    v_floor  float8 := 0.10;
+    v_q      real[];
+    v_pool   int    := GREATEST(k * 4, 50);  -- candidate pool per ranker
+    v_rrf    float8 := 60;                    -- RRF damping constant
 BEGIN
-    BEGIN v_q := rvbbit.embed(query, '');
+    -- Read the floor GUC defensively: DECLARE initializers run before any
+    -- handler is established, so a non-numeric value (e.g. SET ... = 'high')
+    -- must be caught HERE or it kills data_search outright.
+    BEGIN v_floor := COALESCE(NULLIF(current_setting('rvbbit.search_dense_floor', true), '')::float8, 0.10);
+    EXCEPTION WHEN others THEN v_floor := 0.10; END;
+
+    BEGIN v_q := rvbbit.embed(v_prefix || query, '');
     EXCEPTION WHEN others THEN v_q := NULL; END;
 
-    IF v_q IS NULL OR array_length(v_q, 1) IS NULL THEN
-        -- No embedder available: degrade to substring ranking over the doc.
-        RETURN QUERY
-            SELECT d.node_id, d.kind, d.schema_name, d.rel_name, d.col_name,
-                   NULL::float8 AS score, d.doc
-              FROM rvbbit.catalog_docs d
-             WHERE d.graph_id = v_graph
-               AND (kinds IS NULL OR d.kind = ANY (kinds))
-               AND d.doc ILIKE '%' || query || '%'
-             ORDER BY length(d.doc)
-             LIMIT k;
-        RETURN;
-    END IF;
-
     RETURN QUERY
-        WITH scored AS (
-            SELECT d.node_id, d.kind, d.schema_name, d.rel_name, d.col_name, d.doc,
-                   CASE WHEN d.embedding IS NULL THEN NULL::float8
-                        ELSE (SELECT sum(u.de * u.qe)
-                                     / NULLIF(sqrt(sum(u.de * u.de)) * sqrt(sum(u.qe * u.qe)), 0)
-                                FROM unnest(d.embedding, v_q) AS u(de, qe))
-                   END AS score
-              FROM rvbbit.catalog_docs d
-             WHERE d.graph_id = v_graph
-               AND (kinds IS NULL OR d.kind = ANY (kinds))
+        WITH d AS (   -- dense ranker (empty when no embedder)
+            SELECT dk.node_id, row_number() OVER (ORDER BY dk.score DESC) AS r
+              FROM rvbbit.catalog_dense_knn(v_q, v_graph, kinds, v_pool, v_floor) dk
+        ),
+        l AS (        -- lexical ranker
+            SELECT lk.node_id, row_number() OVER (ORDER BY lk.score DESC) AS r
+              FROM rvbbit.catalog_lexical_knn(query, v_graph, kinds, v_pool) lk
+        ),
+        fused AS (    -- Reciprocal Rank Fusion over the union of both rankers
+            SELECT COALESCE(d.node_id, l.node_id) AS node_id,
+                   COALESCE(1.0 / (v_rrf + d.r), 0) + COALESCE(1.0 / (v_rrf + l.r), 0) AS rrf
+              FROM d FULL OUTER JOIN l ON d.node_id = l.node_id
+        ),
+        ranked AS (
+            SELECT f.node_id, f.rrf, max(f.rrf) OVER () AS top
+              FROM fused f
         )
-        SELECT s.node_id, s.kind, s.schema_name, s.rel_name, s.col_name, s.score, s.doc
-          FROM scored s
-         WHERE s.score IS NOT NULL
-         ORDER BY s.score DESC
+        SELECT dd.node_id, dd.kind, dd.schema_name, dd.rel_name, dd.col_name,
+               (r.rrf / NULLIF(r.top, 0))::float8 AS score,
+               dd.doc
+          FROM ranked r
+          JOIN rvbbit.catalog_docs dd
+            ON dd.graph_id = v_graph AND dd.node_id = r.node_id
+         ORDER BY r.rrf DESC
          LIMIT k;
 END $fn$;

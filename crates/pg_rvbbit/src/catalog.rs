@@ -37,6 +37,14 @@ CREATE TABLE rvbbit.tables (
     lance_url            text,
     lance_vector_column  text,
     lance_dim            int,
+    -- Freshness control plane (Layer 1). last_write_at is bumped by the
+    -- shadow-heap dirty trigger on every DML statement; dirty_since is
+    -- stamped only on the clean->dirty transition so we can age how long a
+    -- table has been stale. Both are NULL until the first write after a
+    -- refresh. rvbbit.accel_freshness reads them (and NULLs dirty_since when
+    -- the table is clean, so the clear-sites in refresh/rebuild need no edit).
+    dirty_since          timestamptz,
+    last_write_at        timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
@@ -4539,7 +4547,15 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     UPDATE rvbbit.tables
-    SET shadow_heap_dirty = true
+    SET shadow_heap_dirty = true,
+        -- clock_timestamp() (real wall-clock per statement), not now()
+        -- (transaction start), so last_write_at reflects the actual write
+        -- time and a long writer txn doesn't backdate it.
+        last_write_at = clock_timestamp(),
+        -- Stamp the onset only on the clean->dirty edge; keep it stable
+        -- across subsequent writes so seconds_dirty measures the whole
+        -- stale window, not just the last statement.
+        dirty_since = CASE WHEN shadow_heap_dirty THEN dirty_since ELSE clock_timestamp() END
     WHERE table_oid = TG_RELID
       AND shadow_heap_retained;
     RETURN NULL;
