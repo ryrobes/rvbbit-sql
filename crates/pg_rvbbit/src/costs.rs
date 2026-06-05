@@ -583,6 +583,23 @@ pub(crate) fn flush_receipt_queue_best_effort(limit: usize) {
     let _ = flush_receipt_queue_impl(limit);
 }
 
+/// Number of receipts currently waiting in the on-disk audit queue. This is a
+/// LIVE, cross-connection signal of in-flight semantic-operator work: every
+/// completed operator call enqueues one file here before it is flushed into
+/// rvbbit.receipts. A separate connection can poll this WHILE a query runs to
+/// show progress — unlike rvbbit.receipts / rvbbit.cost_events, which are
+/// transaction-isolated and invisible until the running query commits.
+#[pgrx::pg_extern]
+fn receipt_queue_depth() -> i64 {
+    match fs::read_dir(queue_dir()) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .count() as i64,
+        Err(_) => 0,
+    }
+}
+
 fn flush_receipt_queue_impl(limit: usize) -> i64 {
     let dir = queue_dir();
     let Ok(entries) = fs::read_dir(&dir) else {

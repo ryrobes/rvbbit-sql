@@ -8962,7 +8962,7 @@ thread_local! {
 /// call without a user-asked cap would burn hours of provider time and
 /// dollars — refuse to auto-trigger past this. Users with bigger
 /// tables call rvbbit.prewarm_operator() explicitly.
-const DEFAULT_IMPLICIT_PREWARM_MAX_ROWS: i64 = 100_000;
+const DEFAULT_IMPLICIT_PREWARM_MAX_ROWS: i64 = 250_000;
 
 fn implicit_prewarm_max_rows() -> i64 {
     std::env::var("RVBBIT_IMPLICIT_PREWARM_MAX_ROWS")
@@ -9101,9 +9101,14 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
         return;
     }
     if effective_rows > cap {
-        pgrx::debug1!(
-            "rvbbit: skipping implicit prewarm — estimated {effective_rows} rows > cap {cap}. \
-             Call rvbbit.prewarm_operator(...) explicitly with a tighter SELECT."
+        // Visible (not debug1) so a slow large query explains itself: this is the
+        // common "why is this timing out" case — prewarm is skipped and the
+        // operator runs per-row. Raise the cap or pre-filter to a smaller set.
+        pgrx::notice!(
+            "rvbbit: semantic prewarm skipped — estimated {effective_rows} rows exceeds cap {cap}; \
+             running per-row (slow). Raise rvbbit.implicit_prewarm cap via \
+             RVBBIT_IMPLICIT_PREWARM_MAX_ROWS, pre-filter to fewer rows, or call \
+             rvbbit.prewarm_operator(...) explicitly."
         );
         return;
     }
