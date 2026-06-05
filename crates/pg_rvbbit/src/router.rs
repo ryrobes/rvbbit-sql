@@ -727,6 +727,32 @@ impl Candidate {
             _ => None,
         }
     }
+
+    /// Execution engine family — the unit a per-table policy denies. native and
+    /// pg_rowstore are the correctness floor and are never gated.
+    fn engine(self) -> &'static str {
+        match self {
+            Candidate::DuckVector | Candidate::DuckHive | Candidate::DuckVortex => "duck",
+            Candidate::DataFusionMem
+            | Candidate::DataFusionVector
+            | Candidate::DataFusionHive
+            | Candidate::DataFusionVortex => "datafusion",
+            Candidate::RvbbitNative => "native",
+            Candidate::PgRowstore => "pg_rowstore",
+        }
+    }
+
+    /// Physical layout this candidate reads. Empty for the row-oriented paths
+    /// (native / pg_rowstore), which have no columnar layout to deny.
+    fn layout(self) -> &'static str {
+        match self {
+            Candidate::DuckVector | Candidate::DataFusionVector => "vector",
+            Candidate::DuckHive | Candidate::DataFusionHive => "hive",
+            Candidate::DuckVortex | Candidate::DataFusionVortex => "vortex",
+            Candidate::DataFusionMem => "mem",
+            Candidate::RvbbitNative | Candidate::PgRowstore => "",
+        }
+    }
 }
 
 thread_local! {
@@ -755,6 +781,11 @@ struct RvbbitTableMetric {
     delete_count: i64,
     text_columns: Vec<String>,
     temporal_columns: Vec<String>,
+    /// Per-table engine/layout deny-sets from rvbbit.accel_policy. A candidate is
+    /// gated out for this table if its engine() ∈ denied_engines or its layout()
+    /// ∈ denied_layouts. Empty for tables with no policy row.
+    denied_engines: Vec<String>,
+    denied_layouts: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3688,14 +3719,18 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
                               'time without time zone'::regtype, \
                               'time with time zone'::regtype \
                           ) \
-                    ), '') \
+                    ), ''), \
+                    array_to_string(coalesce(p.denied_engines, '{}'), ','), \
+                    array_to_string(coalesce(p.denied_layouts, '{}'), ',') \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_am am ON am.oid = c.relam \
              LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid \
+             LEFT JOIN rvbbit.accel_policy p ON p.table_oid = c.oid \
              LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = c.oid \
              WHERE am.amname = 'rvbbit' \
-             GROUP BY n.nspname, c.relname, c.oid, t.shadow_heap_retained, t.shadow_heap_dirty",
+             GROUP BY n.nspname, c.relname, c.oid, t.shadow_heap_retained, t.shadow_heap_dirty, \
+                      p.denied_engines, p.denied_layouts",
             None,
             &[],
         )?;
@@ -3737,6 +3772,22 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
                     .split(',')
                     .map(str::trim)
                     .filter(|col| !col.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                denied_engines: row
+                    .get::<String>(13)?
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                denied_layouts: row
+                    .get::<String>(14)?
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
                     .map(str::to_string)
                     .collect(),
             });
@@ -4466,6 +4517,42 @@ fn guc_setting(name: &str) -> Option<String> {
     }
 }
 
+/// Per-table engine/layout policy (rvbbit.accel_policy deny-sets). Any touched
+/// table can veto a candidate — most-restrictive wins for multi-table queries.
+/// native + pg_rowstore are the correctness floor and are never gated, so a
+/// fully-denied table simply downgrades to the native path.
+fn candidate_denied_by_table_policy(
+    candidate: Candidate,
+    tables: &[RvbbitTableMetric],
+) -> Option<String> {
+    if matches!(candidate, Candidate::RvbbitNative | Candidate::PgRowstore) {
+        return None;
+    }
+    let engine = candidate.engine();
+    let layout = candidate.layout();
+    for t in tables {
+        if t.denied_engines.iter().any(|e| e == engine) {
+            return Some(format!(
+                "{} disabled for {}.{} (engine '{}' denied by table policy)",
+                candidate.as_str(),
+                t.schema,
+                t.relname,
+                engine
+            ));
+        }
+        if !layout.is_empty() && t.denied_layouts.iter().any(|l| l == layout) {
+            return Some(format!(
+                "{} disabled for {}.{} (layout '{}' denied by table policy)",
+                candidate.as_str(),
+                t.schema,
+                t.relname,
+                layout
+            ));
+        }
+    }
+    None
+}
+
 fn candidate_availability(
     candidate: Candidate,
     features: &RouteFeatures,
@@ -4476,6 +4563,9 @@ fn candidate_availability(
             false,
             format!("{} route disabled by configuration", candidate.as_str()),
         );
+    }
+    if let Some(reason) = candidate_denied_by_table_policy(candidate, tables) {
+        return (false, reason);
     }
     match candidate {
         Candidate::DuckVector => vector_availability("DuckDB", features, tables),
@@ -6525,7 +6615,40 @@ mod route_unit_tests {
             delete_count: 0,
             text_columns: Vec::new(),
             temporal_columns: Vec::new(),
+            denied_engines: Vec::new(),
+            denied_layouts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn table_policy_denies_engine_and_layout() {
+        let mut t = test_table(1_000_000);
+        t.denied_engines = vec!["duck".to_string()];
+        t.denied_layouts = vec!["vortex".to_string()];
+        let tables = [t];
+        // duck_* gated by the engine deny
+        assert!(candidate_denied_by_table_policy(Candidate::DuckVector, &tables).is_some());
+        assert!(candidate_denied_by_table_policy(Candidate::DuckVortex, &tables).is_some());
+        // datafusion_vortex gated by the layout deny (engine is fine)
+        assert!(candidate_denied_by_table_policy(Candidate::DataFusionVortex, &tables).is_some());
+        // datafusion_vector survives (datafusion engine ok, vector layout ok)
+        assert!(candidate_denied_by_table_policy(Candidate::DataFusionVector, &tables).is_none());
+        // the correctness floor is never gated
+        assert!(candidate_denied_by_table_policy(Candidate::RvbbitNative, &tables).is_none());
+        assert!(candidate_denied_by_table_policy(Candidate::PgRowstore, &tables).is_none());
+    }
+
+    #[test]
+    fn table_policy_multi_table_is_most_restrictive() {
+        let a = test_table(1_000_000);
+        let mut b = test_table(1_000_000);
+        b.relname = "b".to_string();
+        b.denied_layouts = vec!["vortex".to_string()];
+        let tables = [a, b];
+        // b vetoes vortex even though a allows it
+        assert!(candidate_denied_by_table_policy(Candidate::DataFusionVortex, &tables).is_some());
+        // vector is allowed by both
+        assert!(candidate_denied_by_table_policy(Candidate::DataFusionVector, &tables).is_none());
     }
 
     fn test_features(sql: &str, rows: i64) -> RouteFeatures {

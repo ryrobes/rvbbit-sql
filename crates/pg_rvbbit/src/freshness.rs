@@ -146,6 +146,14 @@ CREATE TABLE rvbbit.accel_policy (
     -- executor refreshes them under a stricter, separate sub-budget.
     lance_separate           boolean NOT NULL DEFAULT true,
     active                   boolean NOT NULL DEFAULT true,
+    -- Per-table engine / layout gating. A candidate is denied for this table if
+    -- its engine is in denied_engines OR its layout is in denied_layouts. This
+    -- reduces the router's pathways (and stops the rebuilder materializing the
+    -- denied layouts) without touching the global GUCs. native + pg_rowstore are
+    -- the correctness floor and are never gated. Empty = nothing denied.
+    --   engines: duck, datafusion        layouts: vortex, hive, vector, mem, cluster
+    denied_engines           text[] NOT NULL DEFAULT '{}',
+    denied_layouts           text[] NOT NULL DEFAULT '{}',
     note                     text,
     updated_at               timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT accel_policy_strategy_check
@@ -159,6 +167,16 @@ CREATE TABLE rvbbit.accel_policy (
 COMMENT ON TABLE rvbbit.accel_policy IS
     'Per-table accelerator refresh policy (Layer 2). Absent row = manual. A policy expresses '
     'a freshness target + a budget; rvbbit.accel_tick (Layer 3) turns it into delta/full/skip actions.';
+
+-- Idempotent column adds: patch an accel_policy that predates the engine/layout
+-- deny-sets so the router metric query + rvbbit.set_table_engine /
+-- table_denies_layout don't reference missing columns on an upgraded install.
+-- Matches the route_* table convention (ALTER ... ADD COLUMN IF NOT EXISTS). On
+-- a fresh install the CREATE TABLE above already added them, so these are no-ops.
+ALTER TABLE IF EXISTS rvbbit.accel_policy
+    ADD COLUMN IF NOT EXISTS denied_engines text[] NOT NULL DEFAULT '{}';
+ALTER TABLE IF EXISTS rvbbit.accel_policy
+    ADD COLUMN IF NOT EXISTS denied_layouts text[] NOT NULL DEFAULT '{}';
 
 -- Effective policy: every registered table, with the manual fallback applied for
 -- tables that have no explicit row. `explicit` distinguishes a real policy from
@@ -174,6 +192,8 @@ SELECT
     coalesce(p.full_rebuild_drift_ratio, 0.5)      AS full_rebuild_drift_ratio,
     coalesce(p.lance_separate, true)               AS lance_separate,
     coalesce(p.active, true)                       AS active,
+    coalesce(p.denied_engines, '{}')               AS denied_engines,
+    coalesce(p.denied_layouts, '{}')               AS denied_layouts,
     (p.table_oid IS NOT NULL)                      AS explicit,
     p.note,
     p.updated_at
@@ -235,6 +255,63 @@ BEGIN
     DELETE FROM rvbbit.accel_policy WHERE table_oid = rel;
     GET DIAGNOSTICS n_deleted = ROW_COUNT;
     RETURN n_deleted > 0;
+END;
+$$;
+
+-- UI-friendly single toggle: enable/disable one engine or layout for a table.
+-- target is an engine (duck, datafusion) or a layout (vortex, hive, vector, mem,
+-- cluster). enabled=false adds it to the matching deny-set; enabled=true removes
+-- it. native + pg_rowstore are the correctness floor and cannot be disabled. The
+-- router re-checks availability on every decision, so the effect is immediate;
+-- the next rebuild stops materializing a denied build-layout (vortex/hive/cluster).
+CREATE OR REPLACE FUNCTION rvbbit.set_table_engine(
+    rel     regclass,
+    target  text,
+    enabled boolean
+) RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+    tgt       text := lower(trim(target));
+    is_engine boolean;
+    result    jsonb;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM rvbbit.tables WHERE table_oid = rel) THEN
+        RAISE EXCEPTION '% is not a registered rvbbit table', rel;
+    END IF;
+    is_engine := tgt IN ('duck', 'datafusion');
+    IF tgt IN ('native', 'pg_rowstore', 'rvbbit_native') THEN
+        RAISE EXCEPTION 'native / pg_rowstore is the fallback engine and cannot be disabled';
+    END IF;
+    IF NOT is_engine AND tgt NOT IN ('vortex', 'hive', 'vector', 'mem', 'cluster') THEN
+        RAISE EXCEPTION 'unknown engine/layout target %; expected duck, datafusion, vortex, hive, vector, mem, cluster', target;
+    END IF;
+
+    INSERT INTO rvbbit.accel_policy (table_oid) VALUES (rel)
+    ON CONFLICT (table_oid) DO NOTHING;
+
+    IF is_engine THEN
+        UPDATE rvbbit.accel_policy
+           SET denied_engines = CASE WHEN enabled
+                   THEN array_remove(denied_engines, tgt)
+                   ELSE coalesce((SELECT array_agg(DISTINCT v ORDER BY v)
+                                    FROM unnest(denied_engines || ARRAY[tgt]) v), '{}')
+               END,
+               updated_at = now()
+         WHERE table_oid = rel;
+    ELSE
+        UPDATE rvbbit.accel_policy
+           SET denied_layouts = CASE WHEN enabled
+                   THEN array_remove(denied_layouts, tgt)
+                   ELSE coalesce((SELECT array_agg(DISTINCT v ORDER BY v)
+                                    FROM unnest(denied_layouts || ARRAY[tgt]) v), '{}')
+               END,
+               updated_at = now()
+         WHERE table_oid = rel;
+    END IF;
+
+    SELECT to_jsonb(e) INTO result
+      FROM rvbbit.accel_policy_effective e
+     WHERE e.table_oid = rel;
+    RETURN result;
 END;
 $$;
 "#,
@@ -751,6 +828,46 @@ mod tests {
         register("pol_bad");
         // Violates the CHECK on strategy.
         Spi::run("SELECT rvbbit.set_accel_policy('pol_bad'::regclass, 'turbo')").unwrap();
+    }
+
+    #[pg_test]
+    fn set_table_engine_toggles_deny_sets() {
+        register("eng_demo");
+
+        // Disable the duck engine and the vortex layout.
+        Spi::run("SELECT rvbbit.set_table_engine('eng_demo'::regclass, 'duck', false)").unwrap();
+        Spi::run("SELECT rvbbit.set_table_engine('eng_demo'::regclass, 'vortex', false)").unwrap();
+        // Idempotent: disabling vortex again must not duplicate.
+        Spi::run("SELECT rvbbit.set_table_engine('eng_demo'::regclass, 'vortex', false)").unwrap();
+
+        let de: Vec<String> = Spi::get_one(
+            "SELECT denied_engines FROM rvbbit.accel_policy_effective WHERE table_name = 'eng_demo'",
+        )
+        .unwrap()
+        .unwrap();
+        let dl: Vec<String> = Spi::get_one(
+            "SELECT denied_layouts FROM rvbbit.accel_policy_effective WHERE table_name = 'eng_demo'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(de, vec!["duck".to_string()], "duck engine denied");
+        assert_eq!(dl, vec!["vortex".to_string()], "vortex layout denied, no dup");
+
+        // Re-enable duck -> removed from the deny-set.
+        Spi::run("SELECT rvbbit.set_table_engine('eng_demo'::regclass, 'duck', true)").unwrap();
+        let de2: Vec<String> = Spi::get_one(
+            "SELECT denied_engines FROM rvbbit.accel_policy_effective WHERE table_name = 'eng_demo'",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(de2.is_empty(), "duck re-enabled, deny-set empty: {de2:?}");
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "cannot be disabled")]
+    fn set_table_engine_rejects_native() {
+        register("eng_native");
+        Spi::run("SELECT rvbbit.set_table_engine('eng_native'::regclass, 'native', false)").unwrap();
     }
 
     // --- Layer 3 (executor) decision-logic tests. All dry_run, so deterministic

@@ -271,7 +271,10 @@ fn scan_chunk_rows_setting() -> usize {
         .unwrap_or(1_048_576)
 }
 
-fn dual_layout_enabled() -> bool {
+fn dual_layout_enabled(rel_oid: u32) -> bool {
+    if table_denies_layout(rel_oid, "cluster") {
+        return false;
+    }
     matches!(
         std::env::var("RVBBIT_COMPACT_DUAL_LAYOUT")
             .unwrap_or_else(|_| "off".to_string())
@@ -323,7 +326,10 @@ fn cluster_layout_for_key(key: &str) -> String {
     format!("{CLUSTER_LAYOUT_PREFIX}{key}")
 }
 
-fn hive_layout_enabled() -> bool {
+fn hive_layout_enabled(rel_oid: u32) -> bool {
+    if table_denies_layout(rel_oid, "hive") {
+        return false;
+    }
     matches!(
         compact_setting("RVBBIT_COMPACT_HIVE_LAYOUT", "rvbbit.compact_hive_layout")
             .unwrap_or_else(|| "off".to_string())
@@ -367,7 +373,23 @@ fn hive_layout_for_key(key: &str) -> String {
     format!("{HIVE_LAYOUT_PREFIX}{key}")
 }
 
-fn vortex_layout_enabled() -> bool {
+/// True when this table has an explicit per-table deny for `layout`
+/// (rvbbit.accel_policy.denied_layouts). Lets the UI/SQL stop the rebuilder from
+/// materializing a layout for one table while the global default stays on.
+fn table_denies_layout(rel_oid: u32, layout: &str) -> bool {
+    Spi::get_one::<bool>(&format!(
+        "SELECT coalesce('{layout}' = ANY(denied_layouts), false) \
+         FROM rvbbit.accel_policy WHERE table_oid = {rel_oid}::oid"
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+fn vortex_layout_enabled(rel_oid: u32) -> bool {
+    if table_denies_layout(rel_oid, "vortex") {
+        return false;
+    }
     // Default ON. Vortex is generally the fastest scan layout on large tables,
     // and the router only *uses* it when vortex files are present + authoritative
     // (vortex_availability) — otherwise it transparently falls back to the
@@ -565,7 +587,7 @@ fn auto_hive_partition_keys(rel_oid: u32, plans: &[ColumnPlan]) -> Vec<String> {
     if let Some(keys) = override_hive_keys(plans) {
         return keys.into_iter().take(hive_variant_limit()).collect();
     }
-    if !hive_layout_enabled() {
+    if !hive_layout_enabled(rel_oid) {
         return Vec::new();
     }
 
@@ -1060,7 +1082,7 @@ fn refresh_layout_variants_impl(
     let hive_metadata_profile = hive_variant_metadata_profile();
     let mut rows_written = 0_i64;
 
-    if dual_layout_enabled() && !cluster_keys.is_empty() {
+    if dual_layout_enabled(rel_oid) && !cluster_keys.is_empty() {
         for cluster_key in cluster_keys.iter().take(cluster_variant_limit()) {
             let layout = cluster_layout_for_key(cluster_key);
             let phase_id = start_acceleration_phase(
@@ -1132,7 +1154,7 @@ fn refresh_layout_variants_impl(
         }
     }
 
-    if hive_layout_enabled() && !hive_keys.is_empty() {
+    if hive_layout_enabled(rel_oid) && !hive_keys.is_empty() {
         for hive_key in hive_keys.iter().take(hive_variant_limit()) {
             let layout = hive_layout_for_key(hive_key);
             let phase_id = start_acceleration_phase(
@@ -1225,7 +1247,7 @@ fn refresh_layout_variants_impl(
         }
     }
 
-    if vortex_layout_enabled() {
+    if vortex_layout_enabled(rel_oid) {
         let layout = VORTEX_SCAN_LAYOUT;
         let phase_id = start_acceleration_phase(
             rel_oid,
@@ -1311,15 +1333,15 @@ fn refresh_layout_variants_delta_impl(
     schema: &Arc<Schema>,
     path_root: &PathBuf,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    if dual_layout_enabled() {
+    if dual_layout_enabled(rel_oid) {
         return refresh_layout_variants_impl(rel_oid, qualified, plans, schema, path_root);
     }
 
     let chunk_rows = chunk_rows_setting();
     let hive_keys = auto_hive_partition_keys(rel_oid, plans);
     let hive_metadata_profile = hive_variant_metadata_profile();
-    if !hive_layout_enabled() || hive_keys.is_empty() {
-        if vortex_layout_enabled() {
+    if !hive_layout_enabled(rel_oid) || hive_keys.is_empty() {
+        if vortex_layout_enabled(rel_oid) {
             return refresh_vortex_scan_delta_impl(rel_oid, qualified, path_root);
         }
         return Ok(0);
@@ -1437,7 +1459,7 @@ fn refresh_layout_variants_delta_impl(
         )?;
     }
 
-    if vortex_layout_enabled() {
+    if vortex_layout_enabled(rel_oid) {
         rows_written += refresh_vortex_scan_delta_impl(rel_oid, qualified, path_root)?;
     }
 
