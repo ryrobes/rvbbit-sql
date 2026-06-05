@@ -122,50 +122,93 @@ def _load_sequence_classifier() -> None:
     _loaded.update({"tokenizer": tokenizer, "model": model, "device": device, "loaded_at": time.time(), "load_seconds": round(time.time() - t0, 3)})
 
 
+def _score_seq_logits(logits, problem_type, id2label):
+    """Turn one row's logits into the output dict — shared by the batched and
+    per-row (mixed-mode) paths so they stay byte-for-byte identical."""
+    import torch
+
+    sequence_mode = SEQUENCE_MODE
+    if sequence_mode == "auto":
+        sequence_mode = (
+            "sigmoid"
+            if problem_type == "multi_label_classification" or logits.numel() == 1
+            else "softmax"
+        )
+    if logits.numel() == 1:
+        return {"score": torch.sigmoid(logits[0]).item()}
+    probs = (
+        torch.sigmoid(logits)
+        if sequence_mode == "sigmoid"
+        else torch.softmax(logits, dim=-1)
+    )
+    scores = [
+        {"label": str(id2label.get(i, id2label.get(str(i), i))), "score": probs[i].item()}
+        for i in range(probs.numel())
+    ]
+    best = max(scores, key=lambda row: row["score"]) if scores else {}
+    return {"label": best.get("label"), "score": best.get("score"), "scores": scores}
+
+
 def _predict_sequence_classification(inputs: list[dict[str, Any]]) -> list[Any]:
+    """Batched cross-encoder / sequence-classification scoring (the reranker
+    path). Previously this looped one forward pass per row, so a 16-pair request
+    was 16 sequential GPU calls — the GPU sat idle between tiny calls. Now the
+    whole request is tokenized and run as a single batched forward pass, which
+    is what actually keeps the GPU busy (10x+ for cross-encoder rerank)."""
     import torch
 
     _load_sequence_classifier()
     tokenizer = _loaded["tokenizer"]
     model = _loaded["model"]
     device = _loaded["device"]
-    outputs = []
-    for item in inputs:
-        text = str(item.get("text") or "")
-        query = item.get("query")
-        if query is None:
-            enc = tokenizer(text, truncation=True, max_length=512, return_tensors="pt")
-        else:
+    if not inputs:
+        return []
+
+    texts = [str(item.get("text") or "") for item in inputs]
+    queries = [item.get("query") for item in inputs]
+    problem_type = getattr(model.config, "problem_type", None)
+    id2label = getattr(model.config, "id2label", {}) or {}
+
+    # Batch when every row shares a mode (all query/text pairs — the reranker
+    # case — or all single texts). Mixed query/no-query requests are rare and
+    # fall back to per-row encodes (still correct, just not batched).
+    all_pairs = all(q is not None for q in queries)
+    all_single = all(q is None for q in queries)
+
+    # Cap the forward batch so a pathologically large request can't OOM the GPU;
+    # the client already chunks by batch_size, so this is just a safety net.
+    forward_batch = 64
+    outputs: list[Any] = []
+    for start in range(0, len(inputs), forward_batch):
+        end = min(start + forward_batch, len(inputs))
+        chunk_texts = texts[start:end]
+        chunk_queries = queries[start:end]
+        if all_pairs:
             enc = tokenizer(
-                str(query), text, truncation=True, max_length=512, return_tensors="pt"
+                [str(q) for q in chunk_queries], chunk_texts,
+                padding=True, truncation=True, max_length=512, return_tensors="pt",
             )
+        elif all_single:
+            enc = tokenizer(
+                chunk_texts, padding=True, truncation=True, max_length=512, return_tensors="pt",
+            )
+        else:
+            for q, t in zip(chunk_queries, chunk_texts):
+                enc1 = (
+                    tokenizer(str(q), t, truncation=True, max_length=512, return_tensors="pt")
+                    if q is not None
+                    else tokenizer(t, truncation=True, max_length=512, return_tensors="pt")
+                )
+                enc1 = {key: value.to(device) for key, value in enc1.items()}
+                with torch.no_grad():
+                    logits = model(**enc1).logits[0].float().cpu()
+                outputs.append(_score_seq_logits(logits, problem_type, id2label))
+            continue
         enc = {key: value.to(device) for key, value in enc.items()}
         with torch.no_grad():
-            logits = model(**enc).logits[0].float().cpu()
-        problem_type = getattr(model.config, "problem_type", None)
-        sequence_mode = SEQUENCE_MODE
-        if sequence_mode == "auto":
-            sequence_mode = (
-                "sigmoid"
-                if problem_type == "multi_label_classification" or logits.numel() == 1
-                else "softmax"
-            )
-        if logits.numel() == 1:
-            score = torch.sigmoid(logits[0]).item()
-            outputs.append({"score": score})
-            continue
-        probs = (
-            torch.sigmoid(logits)
-            if sequence_mode == "sigmoid"
-            else torch.softmax(logits, dim=-1)
-        )
-        id2label = getattr(model.config, "id2label", {}) or {}
-        scores = [
-            {"label": str(id2label.get(i, id2label.get(str(i), i))), "score": probs[i].item()}
-            for i in range(probs.numel())
-        ]
-        best = max(scores, key=lambda row: row["score"]) if scores else {}
-        outputs.append({"label": best.get("label"), "score": best.get("score"), "scores": scores})
+            logits_batch = model(**enc).logits.float().cpu()
+        for i in range(logits_batch.shape[0]):
+            outputs.append(_score_seq_logits(logits_batch[i], problem_type, id2label))
     return outputs
 
 
