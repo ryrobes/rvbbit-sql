@@ -564,7 +564,7 @@ fn agg_run_inner(op_name: &str, state: Option<JsonB>, expected_return: &str) -> 
 
 // ---- Loaded operator definition -----------------------------------------
 
-fn load_op(name: &str) -> Option<OpDef> {
+pub(crate) fn load_op(name: &str) -> Option<OpDef> {
     let escaped = name.replace('\'', "''");
     let sql = format!(
         "SELECT shape, return_type, model, system_prompt, user_prompt, parser, \

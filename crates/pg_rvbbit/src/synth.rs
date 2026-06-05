@@ -521,3 +521,379 @@ fn synth_put_scalar(operator: &str, intent: &str, example_value: &str, expr: &st
     clear_scalar_cache();
     shape
 }
+
+// ---------------------------------------------------------------------------
+// Query synth-sql: table-shaped text-to-SQL (Phase 1 — generation only).
+//
+// A query operator (shape='query', parser='sql') turns a natural-language intent
+// into ONE read-only SELECT over the *live database* — the same model-as-compiler
+// machinery as the rowset/scalar synths, with the scope widened from `_input` to
+// real tables. The schema is grounded by catalog retrieval (rvbbit.data_search),
+// so the model sees the relevant tables/columns (types, example values, FKs) and
+// nothing else.
+//
+// `rvbbit.synth_sql(intent)` returns the generated SQL. It is validated by
+// rvbbit._synth_validate: PREPARE (parse + analyze only — resolves tables/columns/
+// types, no planning so no const-fold/execution and no EXPLAIN-of-WITH quirks),
+// then a rolled-back EXPLAIN of the prepared plan that rejects any ModifyTable node
+// so only read-only SELECTs pass. Validated SQL is cached in rvbbit.synth_cache, so
+// it is inspectable/pinnable in the Cache app like any other synth snippet.
+// Executing the SQL is Phase 2 (`rvbbit.synth` + a parse-tree read-only wrapper
+// that also closes the residual non-transactional const-fold window).
+// ---------------------------------------------------------------------------
+
+const MAX_QUERY_ATTEMPTS: usize = 3;
+const DEFAULT_RETRIEVE_K: i32 = 16;
+const FALLBACK_MAX_TABLES: i32 = 60;
+
+/// One read-only statement only. The generated SQL is handed to EXPLAIN, and
+/// `EXPLAIN SELECT 1; DROP TABLE x` would parse as TWO statements and run the
+/// second — so a semicolon anywhere is rejected (extract_sql already stripped a
+/// single trailing one). The shared safety net before any DB contact.
+pub(crate) fn is_single_statement(sql: &str) -> bool {
+    !sql.contains(';')
+}
+
+/// Retrieve the most relevant table/column fingerprint docs for an intent from the
+/// crawled catalog. Delegated to the plpgsql helper rvbbit._synth_retrieve, whose
+/// EXCEPTION block gives a real subtransaction (a data_search failure rolls back
+/// cleanly instead of aborting the surrounding transaction) and whose aggregation
+/// order is deterministic (node_id tiebreaker), so the same intent produces the
+/// same context — and thus the same synth_cache key. Returns "" when the catalog is
+/// absent/empty (caller falls back to information_schema).
+fn retrieve_catalog_context(intent: &str, k: i32) -> String {
+    let sql = format!("SELECT rvbbit._synth_retrieve('{}', {})", esc(intent), k.max(1));
+    Spi::get_one::<String>(&sql).ok().flatten().unwrap_or_default()
+}
+
+/// Fallback schema context when the catalog has not been crawled: one compact line
+/// per user table — `schema.table(col type, col type, …)` — from information_schema.
+/// Less grounded than the catalog (no example values / FK hints), but makes synth
+/// work out of the box. Capped to `max_tables`.
+pub(crate) fn information_schema_context(max_tables: i32) -> String {
+    let sql = format!(
+        "SELECT string_agg(line, E'\\n') FROM ( \
+           SELECT format('%I.%I(%s)', table_schema, table_name, \
+                         string_agg(column_name || ' ' || data_type, ', ' ORDER BY ordinal_position)) AS line \
+             FROM information_schema.columns \
+            WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'rvbbit') \
+              AND table_schema NOT LIKE 'pg\\_%' \
+            GROUP BY table_schema, table_name \
+            ORDER BY table_schema, table_name \
+            LIMIT {max_tables} \
+         ) s",
+    );
+    pgrx::PgTryBuilder::new(move || Spi::get_one::<String>(&sql).ok().flatten().unwrap_or_default())
+        .catch_others(|_| String::new())
+        .execute()
+}
+
+/// Assemble the schema context for a prompt. Prefers the crawled catalog
+/// (rvbbit.data_search, intent-relevant); falls back to information_schema.
+/// Returns (context, grounded) where grounded=true means it came from the catalog.
+fn build_schema_context(intent: &str, k: i32) -> (String, bool) {
+    let cat = retrieve_catalog_context(intent, k);
+    if !cat.trim().is_empty() {
+        return (cat, true);
+    }
+    (information_schema_context(FALLBACK_MAX_TABLES), false)
+}
+
+/// Cheap read-only prefix gate. The authoritative read-only check is
+/// validate_sql's ModifyTable plan inspection; this closes the extract_sql
+/// JSON-branch gap (which does not enforce SELECT/WITH) before any DB contact.
+fn looks_read_only(sql: &str) -> bool {
+    let up = sql.trim_start().to_ascii_uppercase();
+    up.starts_with("SELECT") || up.starts_with("WITH")
+}
+
+/// Validate a generated statement via rvbbit._synth_validate — PREPARE (parse +
+/// analyze, so a bad column/table/type is caught without planning or executing)
+/// followed by a rolled-back EXPLAIN of the prepared plan that rejects any
+/// statement that writes (a ModifyTable node), so only read-only SELECTs pass.
+/// Returns Ok(()) if valid, Err(reason) otherwise. Because the plpgsql helper
+/// handles its own exceptions and returns normally, the surrounding transaction is
+/// never left aborted (so the retry loop is safe). Callers MUST gate with
+/// `is_single_statement` first. (Residual: non-transactional effects — e.g. nextval
+/// — of a deliberately mislabeled IMMUTABLE function are not fully prevented until
+/// Phase 2's parse-tree wrapper.)
+pub(crate) fn validate_sql(sql: &str) -> Result<(), String> {
+    let q = format!("SELECT rvbbit._synth_validate('{}')", esc(sql));
+    match Spi::get_one::<String>(&q) {
+        Ok(Some(err)) => Err(err),
+        Ok(None) => Ok(()),
+        Err(e) => Err(format!("{e:?}")),
+    }
+}
+
+/// Generate a read-only SELECT for `intent`, grounded by retrieved schema, with the
+/// same validate + error-feedback retry loop as the rowset synth (EXPLAIN instead
+/// of execute). Validated SQL is cached under (operator, schema-fingerprint,
+/// intent-hash). Does NOT execute the query.
+pub(crate) fn run_synth_query_sql(op: &OpDef, intent: &str, opts: &Value) -> Result<String, String> {
+    if intent.trim().is_empty() {
+        return Err("synth: empty intent".into());
+    }
+    let k = (opts
+        .get("k")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(DEFAULT_RETRIEVE_K as i64) as i32)
+        .max(1);
+    let validate = opts.get("validate").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let (schema_context, grounded) = build_schema_context(intent, k);
+    if schema_context.trim().is_empty() {
+        return Err(
+            "synth: no schema available — run rvbbit.catalog_crawl(), or the database has no user tables"
+                .into(),
+        );
+    }
+
+    // Cache key: shape = the retrieved schema scope; prompt = the intent. A schema
+    // change shifts the retrieved docs → new fingerprint → regenerate (auto-stale).
+    let shape_fp = hash_hex(&schema_context);
+    let p_hash = prompt_key(&op.name, intent);
+    if let Some(sql) = synth_cache_get(&op.name, &shape_fp, &p_hash) {
+        return Ok(sql);
+    }
+
+    let mut last_err = String::new();
+    let mut last_sql = String::new();
+    for attempt in 0..MAX_QUERY_ATTEMPTS {
+        let mut inputs = serde_json::Map::new();
+        inputs.insert("intent".into(), json!(intent));
+        inputs.insert("_schema_context".into(), json!(schema_context));
+        inputs.insert(
+            "_last_sql_error".into(),
+            json!(if attempt == 0 { String::new() } else { last_err.clone() }),
+        );
+        let inputs_v = Value::Object(inputs);
+
+        let raw = crate::operators::invoke_with_cache(op, &inputs_v, opts)
+            .map_err(|_| format!("synth: operator '{}' invocation failed", op.name))?;
+        let gen_sql = match extract_sql(&raw) {
+            Some(s) => s,
+            None => {
+                last_err = format!("the model did not return SQL (got: {raw})");
+                continue;
+            }
+        };
+        if !is_single_statement(&gen_sql) {
+            last_err = "the SQL must be a single statement (no semicolons)".into();
+            continue;
+        }
+        if !looks_read_only(&gen_sql) {
+            last_err = "the SQL must be a read-only SELECT".into();
+            continue;
+        }
+        last_sql = gen_sql.clone();
+        if !validate {
+            // Preview mode (opts.validate=false): no DB validation, and we do NOT
+            // write an unvalidated statement into the cache's 'valid' slot — return
+            // it ephemerally so it cannot be mistaken for a blessed snippet.
+            return Ok(gen_sql);
+        }
+        if let Err(e) = validate_sql(&gen_sql) {
+            last_err = e;
+            continue;
+        }
+        let sample = json!({
+            "kind": "query",
+            "intent": intent,
+            "grounded": grounded,
+            "attempts": attempt + 1,
+        });
+        synth_cache_put(&op.name, &shape_fp, &p_hash, &gen_sql, &sample, false);
+        return Ok(gen_sql);
+    }
+
+    // Validation never passed: hand back the best-effort generation (visibly marked,
+    // NOT cached) so the user can see and fix it, rather than nothing.
+    if !last_sql.is_empty() {
+        Ok(format!("-- synth: unvalidated ({last_err})\n{last_sql}"))
+    } else {
+        Err(format!(
+            "synth: no SQL after {MAX_QUERY_ATTEMPTS} attempts: {last_err}"
+        ))
+    }
+}
+
+/// Generate (but do not run) a read-only SELECT for a natural-language intent,
+/// grounded by the crawled catalog (rvbbit.data_search; falls back to
+/// information_schema). Returns the SQL text and caches validated SQL in
+/// rvbbit.synth_cache (inspectable/pinnable in the Cache app). `operator` points at
+/// the built-in 'synth' or any custom shape='query', parser='sql' operator.
+#[pg_extern(volatile)]
+fn synth_sql(
+    intent: &str,
+    operator: default!(&str, "'synth'"),
+    opts: default!(JsonB, "'{}'::jsonb"),
+) -> Option<String> {
+    let op = match crate::operators::load_op(operator) {
+        Some(o) => o,
+        None => {
+            pgrx::warning!("rvbbit.synth_sql: unknown operator '{}'", operator);
+            return None;
+        }
+    };
+    if op.parser != "sql" {
+        pgrx::warning!(
+            "rvbbit.synth_sql: operator '{}' is not a synth operator (parser must be 'sql')",
+            operator
+        );
+        return None;
+    }
+    match run_synth_query_sql(&op, intent, &opts.0) {
+        Ok(sql) => Some(sql),
+        Err(e) => {
+            pgrx::warning!("rvbbit.synth_sql: {}", e);
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Executing form (Phase 2): rvbbit.synth(intent) RETURNS SETOF jsonb.
+//
+// Generates SQL exactly like synth_sql, then runs it behind a read-only guard
+// (rvbbit._synth_execute: statement timeout + READ ONLY transaction + row cap), and
+// returns each result row as jsonb — the same SETOF jsonb shape as rvbbit.flow().
+// Executing model-authored SQL is opt-in: gated behind `rvbbit.synth_enabled`
+// (default off). synth_sql (which never executes) is always available.
+// ---------------------------------------------------------------------------
+
+const SYNTH_EXEC_MAX_ROWS: i64 = 1000;
+const SYNTH_EXEC_TIMEOUT_MS: i64 = 10_000;
+
+/// Whether executing generated SQL is enabled. Placeholder GUC read via
+/// GetConfigOption; default OFF (opt in with `SET rvbbit.synth_enabled = on`).
+fn synth_enabled() -> bool {
+    let name = match std::ffi::CString::new("rvbbit.synth_enabled") {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let ptr = unsafe { pgrx::pg_sys::GetConfigOption(name.as_ptr(), true, false) };
+    if ptr.is_null() {
+        return false;
+    }
+    let v = unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy() };
+    !matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off" | "disabled"
+    )
+}
+
+fn rows_to_iter(rows: Vec<Value>) -> TableIterator<'static, (name!(value, JsonB),)> {
+    let mapped: Vec<(JsonB,)> = rows.into_iter().map(|v| (JsonB(v),)).collect();
+    TableIterator::new(mapped.into_iter())
+}
+
+/// Run a validated SELECT through the guard-railed plpgsql executor and collect the
+/// jsonb result rows. The executor handles its own errors (returns empty + WARNING),
+/// so the surrounding statement is not aborted.
+fn synth_execute(sql: &str, max_rows: i64, timeout_ms: i64) -> Vec<Value> {
+    let q = format!(
+        "SELECT v FROM rvbbit._synth_execute('{}', {}, {}) AS v",
+        esc(sql),
+        max_rows,
+        timeout_ms
+    );
+    let mut out = Vec::new();
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(&q, None, &[])?;
+        for row in table {
+            if let Some(j) = row.get::<JsonB>(1)? {
+                out.push(j.0);
+            }
+        }
+        Ok(())
+    });
+    out
+}
+
+/// Generate a read-only SELECT for `intent` (grounded by the catalog) and RUN it,
+/// returning rows as SETOF jsonb. Gated behind `rvbbit.synth_enabled` (default off).
+/// The generated SQL is cached/inspectable exactly like rvbbit.synth_sql.
+#[pg_extern(volatile)]
+fn synth(
+    intent: &str,
+    operator: default!(&str, "'synth'"),
+    opts: default!(JsonB, "'{}'::jsonb"),
+) -> TableIterator<'static, (name!(value, JsonB),)> {
+    if !synth_enabled() {
+        pgrx::warning!(
+            "rvbbit.synth is disabled; run `SET rvbbit.synth_enabled = on` to execute generated SQL \
+             (rvbbit.synth_sql returns the SQL without running it)"
+        );
+        return rows_to_iter(Vec::new());
+    }
+    let op = match crate::operators::load_op(operator) {
+        Some(o) => o,
+        None => {
+            pgrx::warning!("rvbbit.synth: unknown operator '{}'", operator);
+            return rows_to_iter(Vec::new());
+        }
+    };
+    if op.parser != "sql" {
+        pgrx::warning!(
+            "rvbbit.synth: operator '{}' is not a synth operator (parser must be 'sql')",
+            operator
+        );
+        return rows_to_iter(Vec::new());
+    }
+    let sql = match run_synth_query_sql(&op, intent, &opts.0) {
+        Ok(s) => s,
+        Err(e) => {
+            pgrx::warning!("rvbbit.synth: {}", e);
+            return rows_to_iter(Vec::new());
+        }
+    };
+    // Only execute a validated single read-only statement. run_synth_query_sql
+    // guarantees this for cached/fresh SQL; reject the best-effort "-- synth: …"
+    // unvalidated comment that it returns when validation never passed.
+    if sql.trim_start().starts_with("--") || !is_single_statement(&sql) || !looks_read_only(&sql) {
+        pgrx::warning!(
+            "rvbbit.synth: generated SQL did not validate as a single read-only SELECT; not executing"
+        );
+        return rows_to_iter(Vec::new());
+    }
+    let max_rows = opts
+        .0
+        .get("max_rows")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(SYNTH_EXEC_MAX_ROWS)
+        .max(0);
+    let timeout_ms = opts
+        .0
+        .get("timeout_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(SYNTH_EXEC_TIMEOUT_MS)
+        .max(100);
+    rows_to_iter(synth_execute(&sql, max_rows, timeout_ms))
+}
+
+#[cfg(test)]
+mod synth_query_unit {
+    use super::*;
+
+    #[test]
+    fn single_statement_guard_rejects_semicolons() {
+        assert!(is_single_statement("SELECT a FROM t WHERE b > 1"));
+        assert!(!is_single_statement("SELECT 1; DROP TABLE t"));
+        assert!(!is_single_statement("SELECT a FROM t; SELECT b FROM u"));
+    }
+
+    #[test]
+    fn extract_sql_pulls_select_from_json_and_fences() {
+        assert_eq!(
+            extract_sql(r#"{"sql": "SELECT 1"}"#).as_deref(),
+            Some("SELECT 1")
+        );
+        assert_eq!(
+            extract_sql("```sql\nSELECT a FROM t\n```").as_deref(),
+            Some("SELECT a FROM t")
+        );
+        // Not a SELECT/WITH → rejected.
+        assert!(extract_sql("DELETE FROM t").is_none());
+    }
+}

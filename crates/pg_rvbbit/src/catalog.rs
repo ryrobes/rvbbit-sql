@@ -885,7 +885,7 @@ CREATE TABLE rvbbit.operators (
     description    text,                            -- human-readable docs
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
-    CHECK (shape IN ('scalar', 'aggregate', 'dimension', 'rowset')),
+    CHECK (shape IN ('scalar', 'aggregate', 'dimension', 'rowset', 'query')),
     CHECK (cardinality(arg_names) = cardinality(arg_types)),
     CHECK (return_type IN ('bool', 'text', 'float8', 'jsonb')),
     CHECK (parser IN ('yes_no', 'score_0_1', 'raw_text', 'strip', 'json', 'sql')),
@@ -1003,10 +1003,11 @@ BEGIN
         RETURN;
     END IF;
 
-    IF op_shape = 'rowset' THEN
+    IF op_shape IN ('rowset', 'query') THEN
         -- Rowset operators (pipeline cascade stages) take a whole resultset and
-        -- return a new one. They are dispatched by rvbbit.flow() through the Rust
-        -- run_rowset_op path (or rvbbit._exec_op_rowset directly), so the catalog
+        -- return a new one; query operators (shape='query', parser='sql') take a
+        -- natural-language intent and author a SELECT over the live DB. Both are
+        -- dispatched through Rust (run_rowset_op / rvbbit.synth_sql), so the catalog
         -- row inserted above is all that's needed -- no per-operator SQL wrapper.
         RETURN;
     END IF;

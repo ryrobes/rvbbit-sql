@@ -141,3 +141,120 @@ SELECT rvbbit.create_operator(
     op_max_tokens  => 400,
     op_description => 'Scalar synth-sql: reshape/format a text value; the model writes one expression per value-shape, cached and reused.'
 );
+
+-- Query synth-sql helpers. These run inside plpgsql EXCEPTION blocks, which open a
+-- REAL Postgres subtransaction (pgrx's PgTryBuilder does not) — so a caught error
+-- is rolled back cleanly instead of leaving the surrounding transaction aborted.
+
+-- Retrieve intent-relevant schema docs from the crawled catalog. The EXCEPTION
+-- block isolates any data_search failure (returns '' so the caller falls back to
+-- information_schema). The aggregation order has a node_id tiebreaker so the SAME
+-- intent yields the SAME context string -> stable synth_cache key -> cache hits.
+CREATE OR REPLACE FUNCTION rvbbit._synth_retrieve(p_intent text, p_k int)
+RETURNS text LANGUAGE plpgsql STABLE AS $fn$
+DECLARE
+    v_ctx text;
+BEGIN
+    BEGIN
+        SELECT string_agg(doc, E'\n' ORDER BY score DESC NULLS LAST, node_id)
+          INTO v_ctx
+          FROM rvbbit.data_search(p_intent, greatest(coalesce(p_k, 16), 1),
+                                  ARRAY['db_table', 'db_column'], 'db_catalog');
+    EXCEPTION WHEN OTHERS THEN
+        v_ctx := NULL;
+    END;
+    RETURN coalesce(v_ctx, '');
+END $fn$;
+
+-- Validate a generated statement. Returns NULL when it is a valid read-only
+-- SELECT, else an error message. Two stages, both side-effect-free for the common
+-- case:
+--   1. PREPARE — parse + analyze ONLY (resolves tables/columns/types, raising on a
+--      bad generation). PREPARE does not plan, so it never const-folds/executes a
+--      function and avoids the EXPLAIN-of-WITH grammar quirks.
+--   2. EXPLAIN (FORMAT JSON) EXECUTE — plan the prepared statement (clean grammar)
+--      inside a subtransaction that is ALWAYS rolled back, and reject any
+--      ModifyTable node so only read-only SELECTs pass (this covers data-modifying
+--      CTEs, which a prefix check cannot). The rollback undoes any transactional
+--      plan-time side effect; a deliberately mislabeled IMMUTABLE function's
+--      non-transactional effects (e.g. nextval) are the only residual, closed by
+--      Phase 2's parse-tree wrapper.
+CREATE OR REPLACE FUNCTION rvbbit._synth_validate(p_sql text)
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_plan   json;
+    v_result text;
+BEGIN
+    -- Clear any prepared statement leaked by a prior crashed call.
+    BEGIN EXECUTE 'DEALLOCATE _rvbbit_synth_chk'; EXCEPTION WHEN OTHERS THEN NULL; END;
+
+    BEGIN
+        EXECUTE 'PREPARE _rvbbit_synth_chk AS ' || p_sql;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN SQLERRM;                              -- bad column/table/syntax
+    END;
+
+    BEGIN
+        EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE _rvbbit_synth_chk' INTO v_plan;
+        IF jsonb_path_exists(v_plan::jsonb, '$.** ? (@."Node Type" == "ModifyTable")')
+        THEN v_result := 'not read-only: the statement writes data';
+        ELSE v_result := NULL; END IF;
+        RAISE EXCEPTION 'rvbbit_synth_validated' USING ERRCODE = 'RV000';
+    EXCEPTION
+        WHEN SQLSTATE 'RV000' THEN NULL;            -- planned OK; rolled back
+        WHEN OTHERS          THEN v_result := SQLERRM;
+    END;
+
+    EXECUTE 'DEALLOCATE _rvbbit_synth_chk';
+    RETURN v_result;
+END $fn$;
+
+-- Execute a validated synth SELECT with guard rails (Phase 2). The statement has
+-- already been validated as a single read-only SELECT by rvbbit._synth_validate;
+-- this is the execution-time defense-in-depth. The guards (a statement timeout, a
+-- READ ONLY transaction so any write a mislabeled IMMUTABLE function attempts errors
+-- out, and a hard row cap) are set inside a subtransaction that is ALWAYS rolled
+-- back — which reverts the SET LOCALs (Postgres forbids turning transaction_read_only
+-- back off after a query, so a rollback is the only way to restore it). The result
+-- rows are captured into a plpgsql array, which survives the rollback, and returned.
+-- Wrapping p_sql as a subquery also rejects data-modifying CTEs ("must be at top
+-- level"). So `SELECT * FROM rvbbit.synth(...)` never leaves the caller read-only.
+CREATE OR REPLACE FUNCTION rvbbit._synth_execute(p_sql text, p_max_rows int, p_timeout_ms int)
+RETURNS SETOF jsonb LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_rows jsonb[];
+BEGIN
+    BEGIN
+        PERFORM set_config('statement_timeout', greatest(p_timeout_ms, 100)::text, true);
+        PERFORM set_config('transaction_read_only', 'on', true);
+        EXECUTE format(
+            'SELECT array_agg(to_jsonb(q)) FROM (SELECT * FROM (%s) s LIMIT %s) q',
+            p_sql, greatest(p_max_rows, 0)
+        ) INTO v_rows;
+        RAISE EXCEPTION 'rvbbit_synth_executed' USING ERRCODE = 'RV000';
+    EXCEPTION
+        WHEN SQLSTATE 'RV000' THEN NULL;       -- ran OK; the rollback reverted the guards
+        WHEN OTHERS THEN
+            RAISE WARNING 'rvbbit.synth: execution failed: %', SQLERRM;
+            v_rows := NULL;
+    END;
+    RETURN QUERY SELECT unnest(coalesce(v_rows, ARRAY[]::jsonb[]));
+END $fn$;
+
+-- SYNTH: query synth-sql operator (shape='query', parser='sql'). The widest scope
+-- of the same model-as-compiler idea: a natural-language intent + the relevant
+-- catalog metadata ({{ _schema_context }}, retrieved by rvbbit.data_search) -> ONE
+-- read-only SELECT over the live database, cached in rvbbit.synth_cache. Invoked
+-- via rvbbit.synth_sql(intent) (Phase 1: generates SQL, does not run it). Users can
+-- create their own shape='query' operators with house-style prompts the same way.
+SELECT rvbbit.create_operator(
+    op_name        => 'synth',
+    op_arg_names   => ARRAY['intent'],
+    op_return_type => 'text',
+    op_shape       => 'query',
+    op_parser      => 'sql',
+    op_system      => 'You translate a request into ONE read-only standard PostgreSQL SELECT against the user''s database, returning only SQL via JSON. You never invent tables or columns.',
+    op_user        => E'REQUEST: {{ intent }}\n\nYou may use ONLY the tables and columns described below (exact schema-qualified names, types, example values, and foreign keys). Do not reference anything not listed.\n{{ _schema_context }}\n\nRules:\n- Write exactly ONE standard PostgreSQL SELECT (a single statement; WITH/CTEs are allowed).\n- Read-only only: no INSERT/UPDATE/DELETE/DDL, no semicolons, no multiple statements.\n- Schema-qualify table names and use only the columns listed above. Add a sensible LIMIT when the result could be large.\n- Return STRICT JSON and nothing else: {"sql": "<the SELECT statement>"}.\n\nIf a previous attempt failed, fix this Postgres error (empty on the first try):\n{{ _last_sql_error }}',
+    op_max_tokens  => 1200,
+    op_description => 'Query synth-sql: natural-language intent -> one read-only SELECT over the live DB, grounded by catalog retrieval. Invoked via rvbbit.synth_sql().'
+);

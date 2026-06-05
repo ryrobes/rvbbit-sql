@@ -819,4 +819,85 @@ mod tests {
             .unwrap();
         assert_eq!(out, "7208675309");
     }
+
+    // ---- Query synth-sql (table-shaped text-to-SQL, Phase 1) ----
+
+    #[pg_test]
+    fn synth_validate_accepts_select_rejects_bad_and_writes() {
+        Spi::run("CREATE TABLE synth_demo_t (id int, label text)").unwrap();
+        Spi::run("INSERT INTO synth_demo_t VALUES (1, 'a'), (2, 'b')").unwrap();
+        // A valid read-only SELECT passes; an unknown column is rejected.
+        assert!(crate::synth::validate_sql("SELECT id, label FROM synth_demo_t").is_ok());
+        assert!(crate::synth::validate_sql("SELECT nope FROM synth_demo_t").is_err());
+        // Writes are rejected (read-only only) — including data-modifying CTEs —
+        // and validation rolls back, so the rows are untouched.
+        assert!(crate::synth::validate_sql("DELETE FROM synth_demo_t").is_err());
+        assert!(crate::synth::validate_sql(
+            "WITH t AS (DELETE FROM synth_demo_t RETURNING *) SELECT * FROM t"
+        )
+        .is_err());
+        let n: i64 = Spi::get_one("SELECT count(*)::bigint FROM synth_demo_t")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 2, "validation must not execute writes");
+    }
+
+    #[pg_test]
+    fn information_schema_context_lists_user_tables() {
+        Spi::run("CREATE TABLE synth_ctx_t (a int, b text)").unwrap();
+        let ctx = crate::synth::information_schema_context(200);
+        assert!(
+            ctx.contains("synth_ctx_t"),
+            "fallback context should list the user table; got: {ctx}"
+        );
+        assert!(
+            ctx.contains("a integer"),
+            "fallback context should include column types; got: {ctx}"
+        );
+    }
+
+    #[pg_test]
+    fn synth_execute_runs_select_and_caps_rows() {
+        Spi::run("CREATE TABLE synth_exec_t (a int)").unwrap();
+        Spi::run("INSERT INTO synth_exec_t SELECT g FROM generate_series(1, 5) g").unwrap();
+        let n: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit._synth_execute('SELECT a FROM synth_exec_t', 3, 5000)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 3, "row cap should apply");
+        let v: pgrx::JsonB = Spi::get_one(
+            "SELECT v FROM rvbbit._synth_execute('SELECT a FROM synth_exec_t ORDER BY a', 1, 5000) AS v",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(v.0.get("a").and_then(|x| x.as_i64()), Some(1), "rows come back as jsonb");
+    }
+
+    #[pg_test]
+    fn synth_execute_blocks_writes_read_only() {
+        Spi::run("CREATE TABLE synth_exec_w (a int)").unwrap();
+        Spi::run("INSERT INTO synth_exec_w VALUES (1), (2), (3)").unwrap();
+        // A write that reaches execution is blocked by the read-only guard → no rows,
+        // and the table is untouched.
+        let n: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit._synth_execute('WITH d AS (DELETE FROM synth_exec_w RETURNING *) SELECT * FROM d', 100, 5000)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 0, "a write must produce no rows under the read-only guard");
+        let left: i64 = Spi::get_one("SELECT count(*)::bigint FROM synth_exec_w")
+            .unwrap()
+            .unwrap();
+        assert_eq!(left, 3, "the read-only guard must prevent the delete");
+    }
+
+    #[pg_test]
+    fn synth_disabled_returns_no_rows() {
+        // rvbbit.synth_enabled defaults off → synth() is a no-op (and makes no model call).
+        let n: i64 = Spi::get_one("SELECT count(*)::bigint FROM rvbbit.synth('anything at all')")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0, "synth must be a no-op while rvbbit.synth_enabled is off");
+    }
 }
