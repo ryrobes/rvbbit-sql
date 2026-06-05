@@ -8978,6 +8978,29 @@ fn implicit_prewarm_max_concurrent() -> i32 {
         .unwrap_or(32)
 }
 
+/// Runtime kill-switch for the implicit prewarm rewrite. Default ON.
+/// Disable per-session with `SET rvbbit.implicit_prewarm = off`, or globally
+/// with the RVBBIT_IMPLICIT_PREWARM=off env var (for shared_preload contexts).
+/// Only consulted once we know a query actually has semantic ops to warm, so
+/// non-semantic queries never pay for it.
+fn implicit_prewarm_enabled() -> bool {
+    if matches!(
+        std::env::var("RVBBIT_IMPLICIT_PREWARM")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "off" | "false" | "no"
+    ) {
+        return false;
+    }
+    match pgrx::Spi::get_one::<String>(
+        "SELECT nullif(current_setting('rvbbit.implicit_prewarm', true), '')",
+    ) {
+        Ok(Some(v)) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+        _ => true,
+    }
+}
+
 unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
     if (*query).commandType != pg_sys::CmdType::CMD_SELECT {
         return;
@@ -9012,19 +9035,19 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
     let table_oid = (*rte).relid.to_u32();
 
     let calls = collect_rvbbit_op_calls(query, table_oid);
-    if calls.is_empty() {
+    // Phase 1: collect semantic ops in the WHERE quals too. Previously this was
+    // a hard bail ("not prewarmed yet"); now we warm them over the relation so
+    // the per-row filter Postgres applies resolves from cache instead of
+    // calling the backend per row (the about()-in-WHERE timeout).
+    let mut where_calls: Vec<(String, Vec<String>)> = Vec::new();
+    if !(*jt).quals.is_null() {
+        walk_for_op_calls(query, table_oid, (*jt).quals, &mut where_calls);
+    }
+    if calls.is_empty() && where_calls.is_empty() {
         return;
     }
-    if !(*jt).quals.is_null() {
-        let mut qual_calls = Vec::new();
-        walk_for_op_calls(query, table_oid, (*jt).quals, &mut qual_calls);
-        if !qual_calls.is_empty() {
-            pgrx::debug1!(
-                "rvbbit: skipping implicit prewarm — semantic operators in WHERE are not \
-                 prewarmed yet"
-            );
-            return;
-        }
+    if !implicit_prewarm_enabled() {
+        return;
     }
     if sort_clause_contains_rvbbit_op(query, table_oid) {
         pgrx::debug1!(
@@ -9045,25 +9068,34 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
     // and let explicit prewarm handle the user's chosen bound.
     let est_rows = estimate_relation_rows(table_oid);
     let cap = implicit_prewarm_max_rows();
-    let limit_clause = implicit_prewarm_limit_clause(query);
-    let (effective_rows, from_tail) = if let Some(limit_clause) = limit_clause {
-        let effective_rows = limit_clause.effective_rows(est_rows);
-        let from_tail = implicit_prewarm_from_tail(query)
-            .unwrap_or_else(|| format!("FROM {table_name}{}", limit_clause.sql_suffix()));
-        (effective_rows, from_tail)
-    } else {
-        if !(*jt).quals.is_null() {
-            pgrx::debug1!(
-                "rvbbit: skipping implicit prewarm — non-constant LIMIT/OFFSET with WHERE \
-                 cannot be safely replayed without bound parameters"
-            );
-            return;
-        }
-        pgrx::debug1!(
-            "rvbbit: implicit prewarm using full relation estimate because LIMIT/OFFSET \
-             is not a constant expression"
-        );
+    let (effective_rows, from_tail) = if !where_calls.is_empty() {
+        // A semantic operator in WHERE must be evaluated on every scanned row,
+        // so warm the whole relation (capped) and strip the WHERE from the
+        // prewarm query — including the original WHERE would re-trigger the
+        // operator and recurse through this very parse hook. LIMIT is post-
+        // filter here so it can't bound the warm set; rely on the row cap.
         (est_rows, format!("FROM {table_name}"))
+    } else {
+        let limit_clause = implicit_prewarm_limit_clause(query);
+        if let Some(limit_clause) = limit_clause {
+            let effective_rows = limit_clause.effective_rows(est_rows);
+            let from_tail = implicit_prewarm_from_tail(query)
+                .unwrap_or_else(|| format!("FROM {table_name}{}", limit_clause.sql_suffix()));
+            (effective_rows, from_tail)
+        } else {
+            if !(*jt).quals.is_null() {
+                pgrx::debug1!(
+                    "rvbbit: skipping implicit prewarm — non-constant LIMIT/OFFSET with WHERE \
+                     cannot be safely replayed without bound parameters"
+                );
+                return;
+            }
+            pgrx::debug1!(
+                "rvbbit: implicit prewarm using full relation estimate because LIMIT/OFFSET \
+                 is not a constant expression"
+            );
+            (est_rows, format!("FROM {table_name}"))
+        }
     };
     if effective_rows == 0 {
         return;
@@ -9081,24 +9113,24 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
     // Dedupe — multiple identical calls (e.g. rvbbit.foo(x), rvbbit.foo(x))
     // only need one prewarm.
     let mut seen: HashSet<(String, Vec<String>)> = HashSet::new();
-    for (op_name, col_names) in calls {
-        if !seen.insert((op_name.clone(), col_names.clone())) {
+    for (op_name, arg_frags) in calls.into_iter().chain(where_calls.into_iter()) {
+        if !seen.insert((op_name.clone(), arg_frags.clone())) {
             continue;
         }
-        // Each input column projected with the column name rvbbit expects
-        // (the operator's arg_name). For a simple rvbbit.foo(col) call
-        // where the op was created with op_arg_names => ARRAY['text'],
-        // col_names is ['<the parquet column>']. We need to alias it to
-        // 'text' so prewarm sees inputs.text matching the operator's
-        // template. Look up arg_names for the operator.
+        // arg_frags are ready-to-use SQL expressions, one per operator input:
+        // a quoted column ident for a Var arg, a typed literal for a Const arg
+        // (e.g. rvbbit.about(observed, 'topic') -> ["observed", 'topic'::text]).
+        // Each is aliased to the operator's arg_name so prewarm_operator builds
+        // the same inputs.<arg> jsonb (and thus the same input_hash) the per-row
+        // call would, guaranteeing the L2 cache hit.
         let arg_names = match fetch_op_arg_names(&op_name) {
-            Some(n) if n.len() == col_names.len() => n,
+            Some(n) if n.len() == arg_frags.len() => n,
             _ => continue,
         };
-        let select_cols = col_names
+        let select_cols = arg_frags
             .iter()
             .zip(arg_names.iter())
-            .map(|(col, name)| format!("\"{col}\" AS \"{name}\""))
+            .map(|(frag, name)| format!("{frag} AS \"{name}\""))
             .collect::<Vec<_>>()
             .join(", ");
         let op_literal = sql_literal(&op_name);
@@ -9359,34 +9391,108 @@ unsafe fn classify_op_call(
         return None;
     }
 
-    let mut col_names: Vec<String> = Vec::with_capacity(arg_count);
+    let mut arg_frags: Vec<String> = Vec::with_capacity(arg_count);
     for i in 0..arg_count {
         let arg = pg_sys::list_nth(args, i as i32) as *mut pg_sys::Node;
         if arg.is_null() {
             return None;
         }
-        // Allow RelabelType wrappers around the Var (PG often inserts these
-        // for implicit casts during parse-analyze).
-        let var = unwrap_relabel_to_var(arg)?;
-        let varno = (*var).varno as i32;
-        let rtable = (*query).rtable;
-        if rtable.is_null() || varno < 1 || varno > (*rtable).length {
-            return None;
-        }
-        let rte = pg_sys::list_nth(rtable, varno - 1) as *mut pg_sys::RangeTblEntry;
-        if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
-            return None;
-        }
-        if (*rte).relid.to_u32() != table_oid {
-            return None;
-        }
-        let attno = (*var).varattno as i32;
-        if attno < 1 {
-            return None;
-        }
-        col_names.push(fetch_attname(table_oid, attno)?);
+        arg_frags.push(render_op_arg(query, table_oid, arg)?);
     }
-    Some((op_name, col_names))
+    Some((op_name, arg_frags))
+}
+
+/// Render one operator-input argument to a SQL fragment usable in the prewarm
+/// SELECT: a quoted column ident for a Var on the driving relation, or a typed
+/// literal for a Const. Returns None for anything else (the op is then skipped,
+/// matching the prior column-only behavior). Const support is what lets
+/// operators with constant args (rvbbit.about(col, 'topic')) prewarm at all.
+unsafe fn render_op_arg(
+    query: *mut pg_sys::Query,
+    table_oid: u32,
+    node: *mut pg_sys::Node,
+) -> Option<String> {
+    let inner = peel_casts(node);
+    if inner.is_null() {
+        return None;
+    }
+    match (*inner).type_ {
+        pg_sys::NodeTag::T_Var => {
+            let var = inner as *mut pg_sys::Var;
+            let varno = (*var).varno as i32;
+            let rtable = (*query).rtable;
+            if rtable.is_null() || varno < 1 || varno > (*rtable).length {
+                return None;
+            }
+            let rte = pg_sys::list_nth(rtable, varno - 1) as *mut pg_sys::RangeTblEntry;
+            if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+                return None;
+            }
+            if (*rte).relid.to_u32() != table_oid {
+                return None;
+            }
+            let attno = (*var).varattno as i32;
+            if attno < 1 {
+                return None;
+            }
+            Some(format!("\"{}\"", fetch_attname(table_oid, attno)?))
+        }
+        pg_sys::NodeTag::T_Const => {
+            let c = inner as *mut pg_sys::Const;
+            if (*c).constisnull {
+                return Some("NULL".to_string());
+            }
+            let typ = (*c).consttype;
+            let text = const_output_text((*c).constvalue, typ);
+            let typename = const_type_name(typ)?;
+            // Typed literal so the prewarm projection serializes to the same
+            // jsonb value (and input_hash) the per-row call produces.
+            Some(format!("{}::{}", sql_literal(&text), typename))
+        }
+        _ => None,
+    }
+}
+
+/// Peel implicit-cast wrappers (RelabelType / CoerceViaIO) to reach the inner
+/// Var or Const that parse-analyze wrapped.
+unsafe fn peel_casts(mut node: *mut pg_sys::Node) -> *mut pg_sys::Node {
+    loop {
+        if node.is_null() {
+            return node;
+        }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_RelabelType => {
+                node = (*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node;
+            }
+            pg_sys::NodeTag::T_CoerceViaIO => {
+                node = (*(node as *mut pg_sys::CoerceViaIO)).arg as *mut pg_sys::Node;
+            }
+            _ => return node,
+        }
+    }
+}
+
+unsafe fn const_output_text(datum: pg_sys::Datum, typoid: pg_sys::Oid) -> String {
+    let mut typoutput = pg_sys::InvalidOid;
+    let mut typisvarlena = false;
+    pg_sys::getTypeOutputInfo(typoid, &mut typoutput, &mut typisvarlena);
+    let cstr = pg_sys::OidOutputFunctionCall(typoutput, datum);
+    if cstr.is_null() {
+        return String::new();
+    }
+    let out = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+    pg_sys::pfree(cstr as *mut std::ffi::c_void);
+    out
+}
+
+unsafe fn const_type_name(typoid: pg_sys::Oid) -> Option<String> {
+    let cstr = pg_sys::format_type_be(typoid);
+    if cstr.is_null() {
+        return None;
+    }
+    let name = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+    pg_sys::pfree(cstr as *mut std::ffi::c_void);
+    Some(name)
 }
 
 unsafe fn unwrap_relabel_to_var(node: *mut pg_sys::Node) -> Option<*mut pg_sys::Var> {
