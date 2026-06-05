@@ -157,6 +157,14 @@ unsafe extern "C-unwind" fn rvbbit_post_parse_analyze_hook(
     if IN_REWRITER.with(|f| f.get()) {
         return;
     }
+    // Dynamic/prepared queries carry external ($n) params (EXECUTE ... USING,
+    // PREPARE, SPI with argtypes). The rewriter re-parses source SQL with fixed
+    // ZERO params (parse_to_query), which ereports "there is no parameter $1" and
+    // would abort the user's statement. Such queries are never rewrite targets —
+    // skip them so dynamic parameter binding keeps working.
+    if query_has_extern_params(query) {
+        return;
+    }
     let previous_source = CURRENT_SOURCE_SQL.with(|cell| {
         let mut slot = cell.borrow_mut();
         let previous = slot.take();
@@ -196,6 +204,49 @@ unsafe fn source_sql_from_parse_state(pstate: *mut pg_sys::ParseState) -> Option
             .to_string_lossy()
             .into_owned(),
     )
+}
+
+/// Tree walker that flags any external ($n) Param. Stops on the first hit.
+unsafe extern "C-unwind" fn rvbbit_extern_param_walker(
+    node: *mut pg_sys::Node,
+    context: *mut core::ffi::c_void,
+) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if (*node).type_ == pg_sys::NodeTag::T_Param {
+        let p = node as *mut pg_sys::Param;
+        if (*p).paramkind == pg_sys::ParamKind::PARAM_EXTERN {
+            *(context as *mut bool) = true;
+            return true; // found one — stop walking
+        }
+    }
+    if (*node).type_ == pg_sys::NodeTag::T_Query {
+        return pg_sys::query_tree_walker_impl(
+            node as *mut pg_sys::Query,
+            Some(rvbbit_extern_param_walker),
+            context,
+            0,
+        );
+    }
+    pg_sys::expression_tree_walker_impl(node, Some(rvbbit_extern_param_walker), context)
+}
+
+/// True iff the analyzed query references any external ($n) parameters anywhere
+/// (including sublinks / subquery RTEs). Used to keep the rewriter's hands off
+/// dynamic/prepared statements, whose source re-parse would fail on the params.
+unsafe fn query_has_extern_params(query: *mut pg_sys::Query) -> bool {
+    if query.is_null() {
+        return false;
+    }
+    let mut found: bool = false;
+    pg_sys::query_tree_walker_impl(
+        query,
+        Some(rvbbit_extern_param_walker),
+        (&mut found as *mut bool).cast::<core::ffi::c_void>(),
+        0,
+    );
+    found
 }
 
 /// Diagnostic — parse a SQL string and return a description of its

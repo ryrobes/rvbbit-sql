@@ -1734,3 +1734,31 @@
 [ 9245088ms] [WARNING] WARN Infinite extent for field "cost_end": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
 [ 9594790ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
 [ 9594796ms] [LOG] [Fast Refresh] done in 106ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14215820ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14215858ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14216450ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14216550ms] [LOG] [Fast Refresh] done in 207ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14266430ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14266515ms] [LOG] [Fast Refresh] done in 185ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14316418ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14316492ms] [LOG] [Fast Refresh] done in 175ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14346431ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14346575ms] [LOG] [Fast Refresh] done in 244ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14761419ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14761506ms] [LOG] [Fast Refresh] done in 187ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14801123ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14801149ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14881714ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14881795ms] [LOG] [Fast Refresh] done in 181ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14920255ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14920289ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14920974ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14921110ms] [LOG] [Fast Refresh] done in 270ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14930838ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[14930948ms] [LOG] [Fast Refresh] done in 210ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[15010837ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[15010846ms] [LOG] [Fast Refresh] done in 109ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[15200838ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[15200849ms] [LOG] [Fast Refresh] done in 112ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[15230839ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[15230842ms] [LOG] [Fast Refresh] done in 104ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477

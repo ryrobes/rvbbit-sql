@@ -1,0 +1,2654 @@
+[     118ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[     165ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[     975ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[     976ms] [LOG] [Fast Refresh] done in 178ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[   75775ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[   75783ms] [LOG] [Fast Refresh] done in 108ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  160775ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  160846ms] [LOG] [Fast Refresh] done in 171ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  315777ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  315858ms] [LOG] [Fast Refresh] done in 182ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  350775ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  350856ms] [LOG] [Fast Refresh] done in 182ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  415778ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  415883ms] [LOG] [Fast Refresh] done in 209ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  565775ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  565850ms] [LOG] [Fast Refresh] done in 175ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  585808ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  585851ms] [LOG] [Fast Refresh] done in 174ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  720791ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  720894ms] [LOG] [Fast Refresh] done in 219ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  755775ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  755850ms] [LOG] [Fast Refresh] done in 175ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  940775ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[  940854ms] [LOG] [Fast Refresh] done in 179ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1020782ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1020783ms] [LOG] [Fast Refresh] done in 108ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1065774ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1065881ms] [LOG] [Fast Refresh] done in 206ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1095784ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1095788ms] [LOG] [Fast Refresh] done in 113ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1130775ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1130859ms] [LOG] [Fast Refresh] done in 184ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1200775ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1200783ms] [LOG] [Fast Refresh] done in 108ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1255775ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1255847ms] [LOG] [Fast Refresh] done in 172ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1260783ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1260783ms] [LOG] [Fast Refresh] done in 109ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1335777ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1335777ms] [LOG] [Fast Refresh] done in 103ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1365783ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1365791ms] [LOG] [Fast Refresh] done in 114ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1375776ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1375871ms] [LOG] [Fast Refresh] done in 194ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1495786ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1495874ms] [LOG] [Fast Refresh] done in 199ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1562034ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1562291ms] [LOG] [Fast Refresh] done in 91ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1569515ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1569797ms] [LOG] [Fast Refresh] done in 57ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1578898ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1579169ms] [LOG] [Fast Refresh] done in 94ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1593981ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1594246ms] [LOG] [Fast Refresh] done in 68ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1614942ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1615228ms] [LOG] [Fast Refresh] done in 84ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1643519ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1643541ms] [LOG] [Fast Refresh] done in 68ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1652286ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1652305ms] [LOG] [Fast Refresh] done in 81ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1670786ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1670873ms] [LOG] [Fast Refresh] done in 188ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1675253ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1675872ms] [LOG] [Fast Refresh] done in 373ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1683198ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1683224ms] [LOG] [Fast Refresh] done in 91ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1692898ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1692924ms] [LOG] [Fast Refresh] done in 85ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1711694ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1712236ms] [LOG] [Fast Refresh] done in 251ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1746894ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1746913ms] [LOG] [Fast Refresh] done in 65ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1791934ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1792293ms] [LOG] [Fast Refresh] done in 239ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1806128ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1806421ms] [LOG] [Fast Refresh] done in 195ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1822072ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1822767ms] [LOG] [Fast Refresh] done in 720ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1823478ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1823554ms] [LOG] [Fast Refresh] done in 195ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1836916ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1837320ms] [LOG] [Fast Refresh] done in 264ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1837852ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1838084ms] [LOG] [Fast Refresh] done in 333ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1852685ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1852735ms] [LOG] [Fast Refresh] done in 151ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1858834ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1859329ms] [LOG] [Fast Refresh] done in 190ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1859810ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1859917ms] [LOG] [Fast Refresh] done in 263ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1864675ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1865011ms] [LOG] [Fast Refresh] done in 199ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1902398ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1902512ms] [LOG] [Fast Refresh] done in 154ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1907756ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1907897ms] [LOG] [Fast Refresh] done in 127ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1914390ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1914504ms] [LOG] [Fast Refresh] done in 121ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1928076ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1928179ms] [LOG] [Fast Refresh] done in 133ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1952137ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1952243ms] [LOG] [Fast Refresh] done in 153ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1958024ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1958124ms] [LOG] [Fast Refresh] done in 113ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1982718ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 1982737ms] [LOG] [Fast Refresh] done in 64ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2009689ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2009702ms] [LOG] [Fast Refresh] done in 113ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2050498ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2050533ms] [ERROR] The final argument passed to %s changed size between renders. The order and size of this array must remain constant.
+
+Previous: %s
+Incoming: %s useEffect [SELECT *
+FROM public.traffic_violations
+LIMIT 200;, SELECT *
+FROM public.traffic_violations
+LIMIT 200;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }] [SELECT *
+FROM public.traffic_violations
+LIMIT 200;, SELECT *
+FROM public.traffic_violations
+LIMIT 200;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }, false] @ http://localhost:3000/pre-hydration.js:57
+[ 2050538ms] [ERROR] The final argument passed to %s changed size between renders. The order and size of this array must remain constant.
+
+Previous: %s
+Incoming: %s useEffect [SELECT
+  agency,
+  description,
+  location,
+  count(1) AS row_count
+FROM {public_traffic_violations}
+GROUP BY agency, description, location
+ORDER BY row_count DESC;, SELECT
+  agency,
+  description,
+  location,
+  count(1) AS row_count
+FROM (
+  SELECT *
+  FROM public.traffic_violations
+) AS public_traffic_violations
+GROUP BY agency, description, location
+ORDER BY row_count DESC;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }] [SELECT
+  agency,
+  description,
+  location,
+  count(1) AS row_count
+FROM {public_traffic_violations}
+GROUP BY agency, description, location
+ORDER BY row_count DESC;, SELECT
+  agency,
+  description,
+  location,
+  count(1) AS row_count
+FROM (
+  SELECT *
+  FROM public.traffic_violations
+) AS public_traffic_violations
+GROUP BY agency, description, location
+ORDER BY row_count DESC;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }, false] @ http://localhost:3000/pre-hydration.js:57
+[ 2050545ms] [ERROR] The final argument passed to %s changed size between renders. The order and size of this array must remain constant.
+
+Previous: %s
+Incoming: %s useEffect [SELECT
+  subagency,
+  description,
+  location,
+  count(1) AS row_count
+FROM {public_traffic_violations}
+GROUP BY subagency, description, location
+ORDER BY row_count DESC;, SELECT
+  subagency,
+  description,
+  location,
+  count(1) AS row_count
+FROM (
+  SELECT *
+  FROM public.traffic_violations
+) AS public_traffic_violations
+GROUP BY subagency, description, location
+ORDER BY row_count DESC;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }] [SELECT
+  subagency,
+  description,
+  location,
+  count(1) AS row_count
+FROM {public_traffic_violations}
+GROUP BY subagency, description, location
+ORDER BY row_count DESC;, SELECT
+  subagency,
+  description,
+  location,
+  count(1) AS row_count
+FROM (
+  SELECT *
+  FROM public.traffic_violations
+) AS public_traffic_violations
+GROUP BY subagency, description, location
+ORDER BY row_count DESC;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }, false] @ http://localhost:3000/pre-hydration.js:57
+[ 2050551ms] [ERROR] The final argument passed to %s changed size between renders. The order and size of this array must remain constant.
+
+Previous: %s
+Incoming: %s useEffect [SELECT
+  sum(row_count) AS sum_row_count
+FROM {public_traffic_violations_subagency_counts}
+ORDER BY sum_row_count DESC;, SELECT
+  sum(row_count) AS sum_row_count
+FROM (
+  SELECT
+    subagency,
+    description,
+    location,
+    count(1) AS row_count
+  FROM (
+    SELECT *
+    FROM public.traffic_violations
+  ) AS public_traffic_violations
+  GROUP BY subagency, description, location
+  ORDER BY row_count DESC
+) AS public_traffic_violations_subagency_counts
+ORDER BY sum_row_count DESC;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }] [SELECT
+  sum(row_count) AS sum_row_count
+FROM {public_traffic_violations_subagency_counts}
+ORDER BY sum_row_count DESC;, SELECT
+  sum(row_count) AS sum_row_count
+FROM (
+  SELECT
+    subagency,
+    description,
+    location,
+    count(1) AS row_count
+  FROM (
+    SELECT *
+    FROM public.traffic_violations
+  ) AS public_traffic_violations
+  GROUP BY subagency, description, location
+  ORDER BY row_count DESC
+) AS public_traffic_violations_subagency_counts
+ORDER BY sum_row_count DESC;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }, false] @ http://localhost:3000/pre-hydration.js:57
+[ 2050557ms] [ERROR] The final argument passed to %s changed size between renders. The order and size of this array must remain constant.
+
+Previous: %s
+Incoming: %s useEffect [SELECT rvbbit.summarize(title) as tt, 
+  rvbbit.about(observed, 
+  'strange sounds') as danger,
+  *
+FROM (select * from  
+  public.bigfoot_sightings limit 1550) s
+  where rvbbit.about(observed, 
+  'strange sounds') >= 0.5
+  order by submitted desc;, SELECT rvbbit.summarize(title) as tt, 
+  rvbbit.about(observed, 
+  'strange sounds') as danger,
+  *
+FROM (select * from  
+  public.bigfoot_sightings limit 1550) s
+  where rvbbit.about(observed, 
+  'strange sounds') >= 0.5
+  order by submitted desc;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }] [SELECT rvbbit.summarize(title) as tt, 
+  rvbbit.about(observed, 
+  'strange sounds') as danger,
+  *
+FROM (select * from  
+  public.bigfoot_sightings limit 1550) s
+  where rvbbit.about(observed, 
+  'strange sounds') >= 0.5
+  order by submitted desc;, SELECT rvbbit.summarize(title) as tt, 
+  rvbbit.about(observed, 
+  'strange sounds') as danger,
+  *
+FROM (select * from  
+  public.bigfoot_sightings limit 1550) s
+  where rvbbit.about(observed, 
+  'strange sounds') >= 0.5
+  order by submitted desc;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }, false] @ http://localhost:3000/pre-hydration.js:57
+[ 2050607ms] [ERROR] The final argument passed to %s changed size between renders. The order and size of this array must remain constant.
+
+Previous: %s
+Incoming: %s useEffect [SELECT
+  tt,
+  class,
+  count(1) AS row_count
+FROM {public_bigfoot_sightings}
+GROUP BY tt, class
+ORDER BY row_count DESC;, SELECT
+  tt,
+  class,
+  count(1) AS row_count
+FROM (
+  SELECT rvbbit.summarize(title) as tt, 
+    rvbbit.about(observed, 
+    'strange sounds') as danger,
+    *
+  FROM (select * from  
+    public.bigfoot_sightings limit 1550) s
+    where rvbbit.about(observed, 
+    'strange sounds') >= 0.5
+    order by submitted desc
+) AS public_bigfoot_sightings
+GROUP BY tt, class
+ORDER BY row_count DESC;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }] [SELECT
+  tt,
+  class,
+  count(1) AS row_count
+FROM {public_bigfoot_sightings}
+GROUP BY tt, class
+ORDER BY row_count DESC;, SELECT
+  tt,
+  class,
+  count(1) AS row_count
+FROM (
+  SELECT rvbbit.summarize(title) as tt, 
+    rvbbit.about(observed, 
+    'strange sounds') as danger,
+    *
+  FROM (select * from  
+    public.bigfoot_sightings limit 1550) s
+    where rvbbit.about(observed, 
+    'strange sounds') >= 0.5
+    order by submitted desc
+) AS public_bigfoot_sightings
+GROUP BY tt, class
+ORDER BY row_count DESC;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }, false] @ http://localhost:3000/pre-hydration.js:57
+[ 2050624ms] [ERROR] The final argument passed to %s changed size between renders. The order and size of this array must remain constant.
+
+Previous: %s
+Incoming: %s useEffect [SELECT
+  sum(row_count) AS sum_row_count
+FROM {public_bigfoot_sightings_tt_counts}
+ORDER BY sum_row_count DESC;, SELECT
+  sum(row_count) AS sum_row_count
+FROM (
+  SELECT
+    tt,
+    class,
+    count(1) AS row_count
+  FROM (
+    SELECT rvbbit.summarize(title) as tt, 
+      rvbbit.about(observed, 
+      'strange sounds') as danger,
+      *
+    FROM (select * from  
+      public.bigfoot_sightings limit 1550) s
+      where rvbbit.about(observed, 
+      'strange sounds') >= 0.5
+      order by submitted desc
+  ) AS public_bigfoot_sightings
+  GROUP BY tt, class
+  ORDER BY row_count DESC
+) AS public_bigfoot_sightings_tt_counts
+ORDER BY sum_row_count DESC;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }] [SELECT
+  sum(row_count) AS sum_row_count
+FROM {public_bigfoot_sightings_tt_counts}
+ORDER BY sum_row_count DESC;, SELECT
+  sum(row_count) AS sum_row_count
+FROM (
+  SELECT
+    tt,
+    class,
+    count(1) AS row_count
+  FROM (
+    SELECT rvbbit.summarize(title) as tt, 
+      rvbbit.about(observed, 
+      'strange sounds') as danger,
+      *
+    FROM (select * from  
+      public.bigfoot_sightings limit 1550) s
+      where rvbbit.about(observed, 
+      'strange sounds') >= 0.5
+      order by submitted desc
+  ) AS public_bigfoot_sightings
+  GROUP BY tt, class
+  ORDER BY row_count DESC
+) AS public_bigfoot_sightings_tt_counts
+ORDER BY sum_row_count DESC;, async (sourceSql)=>{
+            if (!activeConnectionId) return;
+            const trimmedSource = sourceSql.trim();
+            if (!trimmedSource) return;
+            const myNonce = ++runNonceRef.current;
+            // Compile *this draft* against the runtime graph by patching the
+            // window's source SQL into the graph build. The simpler path: build
+            // the graph against the live windows array, swap the active window's
+            // source for the draft, and pull the compiled SQL.
+            const graph = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$reactive$2d$sql$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["buildDesktopRuntimeGraph"])(allWindows.map({
+                "DataGridWindow.useCallback[runSql].graph": (win)=>win.id === w.id && win.kind === "data" ? {
+                        ...win,
+                        payload: {
+                            ...win.payload,
+                            reactive: {
+                                ...win.payload.reactive ?? {
+                                    blockName,
+                                    paramSubscriptions: subscriptions,
+                                    version: 1
+                                },
+                                sourceSql: trimmedSource,
+                                blockName
+                            }
+                        }
+                    } : win
+            }["DataGridWindow.useCallback[runSql].graph"]), params);
+            const compiled = graph.blocks.get(w.id)?.compiledSql ?? trimmedSource;
+            // Pipeline cascade sugar: a bare `select … then op(…)` is wrapped as
+            // rvbbit.flow($$…$$) so the THENs never hit the PG parser. Detection mirrors
+            // the engine splitter (CASE…THEN / strings / comments are left untouched).
+            const isPipeline = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["hasTopLevelThen"])(compiled);
+            const toRun = isPipeline ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["wrapFlow"])(compiled) : compiled;
+            // rvbbit.synth(…) is a text-to-SQL source returning one jsonb column per row;
+            // expand those into real grid columns like a pipeline (but it isn't wrapped and
+            // has no Steps tab).
+            const isSynth = !isPipeline && (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["isSynthQuery"])(compiled);
+            if (isPipeline) {
+                setFlowSteps(null);
+                setFlowStepsError(null);
+                setActiveStep(0);
+            }
+            setProgress(null);
+            setRunState({
+                kind: "running",
+                sql: compiled,
+                startedAt: Date.now()
+            });
+            try {
+                const res = await fetch("/api/db/query", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        connectionId: activeConnectionId,
+                        sql: toRun,
+                        rowLimit: 5000,
+                        readOnly: false
+                    })
+                });
+                const body = await res.json();
+                // A newer run started while this fetch was in flight — drop the
+                // result so it doesn't overwrite state owned by the later run.
+                if (runNonceRef.current !== myNonce) return;
+                if (body.ok === false) {
+                    setRunState({
+                        kind: "error",
+                        error: body.error,
+                        code: body.code,
+                        detail: body.detail,
+                        hint: body.hint
+                    });
+                    setIsPipelineRun(false);
+                } else {
+                    // For a rvbbit.synth() block, ask the compiler for the AUTHORITATIVE column
+                    // schema (synth_schema — exact Postgres types, captured at compile time) so
+                    // the grid types and the projection casts are precise instead of guessed from
+                    // sampled rows. Falls back to inference if it can't be fetched.
+                    let synthCols;
+                    if (isSynth) {
+                        const intent = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["extractSynthIntent"])(compiled);
+                        if (intent) {
+                            try {
+                                const sres = await fetch("/api/db/query", {
+                                    method: "POST",
+                                    headers: {
+                                        "content-type": "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        connectionId: activeConnectionId,
+                                        sql: `SELECT column_name, data_type FROM rvbbit.synth_schema('${intent.replace(/'/g, "''")}')`,
+                                        rowLimit: 500,
+                                        readOnly: false
+                                    })
+                                });
+                                const sbody = await sres.json();
+                                if (runNonceRef.current !== myNonce) return;
+                                if (sbody.ok && sbody.rows && sbody.rows.length > 0) {
+                                    synthCols = (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["columnsFromServerSchema"])(sbody.rows);
+                                }
+                            } catch  {
+                            /* fall back to inference */ }
+                        }
+                    }
+                    // flow() / synth() return a single jsonb column per row; expand into columns
+                    // (using the authoritative synth schema when we have it).
+                    const finalResult = isPipeline || isSynth ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["expandFlowResult"])(body, synthCols) : body;
+                    // Record the column shape so the reactive graph can wrap *references* to this
+                    // block in a typed projection (drag-out rollups / block.<name> refs see real
+                    // columns, not jsonb). Synth-only: a bare-`then` pipeline's compiledSql is not
+                    // valid SQL as a subquery, so projecting over it would be unparseable. Prefer
+                    // the authoritative schema; fall back to inference. Cleared for ordinary
+                    // queries.
+                    const jsonbProjection = isSynth && finalResult !== body ? synthCols ?? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$sql$2f$then$2d$rewrite$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["inferJsonbColumns"])(finalResult.rows) : undefined;
+                    setIsPipelineRun(isPipeline);
+                    setRunState({
+                        kind: "done",
+                        result: finalResult
+                    });
+                    // Record the compiled SQL that just succeeded, so the auto-rerun
+                    // effect treats *this* as the baseline (not the unfiltered first
+                    // render).
+                    prevCompiledRef.current = compiled;
+                    onChangePayload({
+                        "DataGridWindow.useCallback[runSql]": (p)=>({
+                                ...p,
+                                sql: trimmedSource,
+                                jsonbProjection,
+                                // Keep the rollup shelf in sync with hand-edited SQL: re-parse the
+                                // run SQL back into a spec where we can, else detach the shelf.
+                                lineage: p.lineage ? (0, __TURBOPACK__imported__module__$5b$project$5d2f$repos2026$2f$rvbbit$2d$lens$2f$src$2f$lib$2f$desktop$2f$rollup$2d$sql$2d$parse$2e$ts__$5b$app$2d$client$5d$__$28$ecmascript$29$__["reconcileRollupLineage"])(p.lineage, trimmedSource) : p.lineage,
+                                reactive: {
+                                    blockName,
+                                    sourceSql: trimmedSource,
+                                    paramSubscriptions: subscriptions,
+                                    version: (p.reactive?.version ?? 1) + 1
+                                }
+                            })
+                    }["DataGridWindow.useCallback[runSql]"]);
+                    if (activeTab === "sql") setActiveTab("rows");
+                }
+            } catch (e) {
+                if (runNonceRef.current !== myNonce) return;
+                setRunState({
+                    kind: "error",
+                    error: e instanceof Error ? e.message : String(e)
+                });
+            }
+        }, false] @ http://localhost:3000/pre-hydration.js:57
+[ 2050662ms] [LOG] [Fast Refresh] done in 137ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2189689ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2189697ms] [LOG] [Fast Refresh] done in 108ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2459694ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2459694ms] [LOG] [Fast Refresh] done in 106ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2504695ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2504703ms] [LOG] [Fast Refresh] done in 114ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2639690ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2639698ms] [LOG] [Fast Refresh] done in 108ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2864712ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2864714ms] [LOG] [Fast Refresh] done in 124ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2879690ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2879696ms] [LOG] [Fast Refresh] done in 106ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2894691ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2894700ms] [LOG] [Fast Refresh] done in 110ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2909696ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2909710ms] [LOG] [Fast Refresh] done in 119ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2964898ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2965314ms] [LOG] [Fast Refresh] done in 516ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2965709ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2965748ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2967149ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 2967152ms] [LOG] [Fast Refresh] done in 518ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3329178ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3329707ms] [LOG] [Fast Refresh] done in 128ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3335926ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3335942ms] [LOG] [Fast Refresh] done in 88ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3341627ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3341644ms] [LOG] [Fast Refresh] done in 59ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3346022ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3346040ms] [LOG] [Fast Refresh] done in 78ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3352765ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3352803ms] ReferenceError: dropGlow is not defined
+    at DesktopWindow (http://localhost:3000/_next/static/chunks/repos2026_rvbbit-lens_src_components_desktop_0lan14z._.js?id=%255Bproject%255D%252Frepos2026%252Frvbbit-lens%252Fsrc%252Fcomponents%252Fdesktop%252Fdesktop-window.tsx+%255Bapp-client%255D+%2528ecmascript%2529:286:29)
+    at Object.react_stack_bottom_frame (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:15037:24)
+    at renderWithHooks (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:4620:24)
+    at updateFunctionComponent (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:6081:21)
+    at beginWork (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:6691:24)
+    at runWithFiberInDEV (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:965:74)
+    at performUnitOfWork (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9555:97)
+    at workLoopSync (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9449:40)
+    at renderRootSync (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9433:13)
+    at performWorkOnRoot (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9098:47)
+    at performSyncWorkOnRoot (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:10263:9)
+    at flushSyncWorkAcrossRoots_impl (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:10179:316)
+    at flushSyncWork$1 (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9230:86)
+    at Object.scheduleRefresh (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:299:13)
+    at http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_0tl-3s0._.js:391:33
+    at Set.forEach (<anonymous>)
+    at Object.performReactRefresh (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_0tl-3s0._.js:384:38)
+    at applyUpdate (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_0tl-3s0._.js:878:31)
+    at http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_0tl-3s0._.js:886:13
+[ 3352815ms] [LOG] [Fast Refresh] done in 87ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3357025ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3357034ms] [WARNING] [Fast Refresh] performing full reload because your application had an unrecoverable error @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3357038ms] [ERROR] Encountered a script tag while rendering React component. Scripts inside React components are never executed when rendering on the client. Consider using template tag instead (https://developer.mozilla.org/en-US/docs/Web/HTML/Element/template). @ http://localhost:3000/pre-hydration.js:57
+[ 3357126ms] ReferenceError: dropGlow is not defined
+    at DesktopWindow (http://localhost:3000/_next/static/chunks/repos2026_rvbbit-lens_src_components_desktop_0lan14z._.js?id=%255Bproject%255D%252Frepos2026%252Frvbbit-lens%252Fsrc%252Fcomponents%252Fdesktop%252Fdesktop-window.tsx+%255Bapp-client%255D+%2528ecmascript%2529:300:241)
+    at Object.react_stack_bottom_frame (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:15037:24)
+    at renderWithHooks (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:4620:24)
+    at updateFunctionComponent (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:6081:21)
+    at beginWork (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:6691:24)
+    at runWithFiberInDEV (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:965:74)
+    at performUnitOfWork (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9555:97)
+    at workLoopSync (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9449:40)
+    at renderRootSync (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9433:13)
+    at performWorkOnRoot (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9098:47)
+    at performWorkOnRootViaSchedulerTask (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:10255:9)
+    at MessagePort.performWorkUntilDeadline (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_0tl-3s0._.js:2647:64)
+[ 3357127ms] [LOG] [Fast Refresh] done in 85ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3357227ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3357447ms] [LOG] [Fast Refresh] done in 320ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3357790ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3357835ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3358408ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3358415ms] [LOG] [Fast Refresh] done in 107ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3358628ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3358630ms] [LOG] [Fast Refresh] done in 101ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3371253ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3371272ms] [LOG] [Fast Refresh] done in 74ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3382598ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3382626ms] [LOG] [Fast Refresh] done in 57ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3392283ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3392303ms] [LOG] [Fast Refresh] done in 76ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3437494ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3437526ms] [LOG] [Fast Refresh] done in 95ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3443267ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3443372ms] [LOG] [Fast Refresh] done in 174ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3450550ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3450703ms] [LOG] [Fast Refresh] done in 179ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3457996ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3458681ms] [LOG] [Fast Refresh] done in 706ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3459026ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3459033ms] [LOG] [Fast Refresh] done in 108ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3577824ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3578122ms] [LOG] [Fast Refresh] done in 398ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3578228ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3578367ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3623671ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3623722ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3623974ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 3623983ms] [LOG] [Fast Refresh] done in 111ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 4029407ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 4029676ms] [LOG] [Fast Refresh] done in 55ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 4035943ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 4036207ms] [LOG] [Fast Refresh] done in 184ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5097107ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5097185ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5781685ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5781772ms] [LOG] [Fast Refresh] done in 158ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5792107ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5792136ms] [LOG] [Fast Refresh] done in 79ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5796971ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5796990ms] [LOG] [Fast Refresh] done in 88ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5801480ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5801497ms] [LOG] [Fast Refresh] done in 81ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5807785ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5808335ms] [LOG] [Fast Refresh] done in 594ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5824316ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5824918ms] [LOG] [Fast Refresh] done in 658ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5828977ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5828993ms] [LOG] [Fast Refresh] done in 76ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5839427ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5839442ms] [LOG] [Fast Refresh] done in 57ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5858573ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5858842ms] [LOG] [Fast Refresh] done in 200ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5863352ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5863726ms] [LOG] [Fast Refresh] done in 422ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5869329ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 5869727ms] [LOG] [Fast Refresh] done in 496ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 6531073ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 6531324ms] [LOG] [Fast Refresh] done in 352ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 6531527ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 6531560ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 6827078ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 6827451ms] [LOG] [Fast Refresh] done in 182ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 8356679ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 8356714ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 8819445ms] [WARNING] WARN Infinite extent for field "bucket": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 8819446ms] [WARNING] WARN Infinite extent for field "cost_start": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 8819446ms] [WARNING] WARN Infinite extent for field "cost_end": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 8819462ms] [WARNING] WARN Infinite extent for field "bucket": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 8819463ms] [WARNING] WARN Infinite extent for field "cost_start": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 8819463ms] [WARNING] WARN Infinite extent for field "cost_end": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9370600ms] [WARNING] WARN Infinite extent for field "bucket": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9370601ms] [WARNING] WARN Infinite extent for field "cost_start": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9370601ms] [WARNING] WARN Infinite extent for field "cost_end": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9370610ms] [WARNING] WARN Infinite extent for field "bucket": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9370610ms] [WARNING] WARN Infinite extent for field "cost_start": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9370610ms] [WARNING] WARN Infinite extent for field "cost_end": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9504697ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9505190ms] [LOG] [Fast Refresh] done in 85ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9524616ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9525021ms] [LOG] [Fast Refresh] done in 84ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9562202ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9562464ms] [LOG] [Fast Refresh] done in 89ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9628668ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9628685ms] [LOG] [Fast Refresh] done in 113ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9637476ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9637509ms] ReferenceError: SemanticPill is not defined
+    at eval (http://localhost:3000/_next/static/chunks/repos2026_rvbbit-lens_src_components_desktop_0sfda4t._.js?id=%255Bproject%255D%252Frepos2026%252Frvbbit-lens%252Fsrc%252Fcomponents%252Fdesktop%252Frollup-shelf.tsx+%255Bapp-client%255D+%2528ecmascript%2529:147:266)
+    at Array.map (<anonymous>)
+    at RollupShelf (http://localhost:3000/_next/static/chunks/repos2026_rvbbit-lens_src_components_desktop_0sfda4t._.js?id=%255Bproject%255D%252Frepos2026%252Frvbbit-lens%252Fsrc%252Fcomponents%252Fdesktop%252Frollup-shelf.tsx+%255Bapp-client%255D+%2528ecmascript%2529:145:46)
+    at Object.react_stack_bottom_frame (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:15037:24)
+    at renderWithHooks (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:4620:24)
+    at updateFunctionComponent (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:6081:21)
+    at beginWork (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:6691:24)
+    at runWithFiberInDEV (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:965:74)
+    at performUnitOfWork (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9555:97)
+    at workLoopSync (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9449:40)
+    at renderRootSync (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9433:13)
+    at performWorkOnRoot (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9098:47)
+    at performSyncWorkOnRoot (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:10263:9)
+    at flushSyncWorkAcrossRoots_impl (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:10179:316)
+    at flushSyncWork$1 (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:9230:86)
+    at Object.scheduleRefresh (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_react-dom_0x7zk2j._.js:299:13)
+    at http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_0tl-3s0._.js:391:33
+    at Set.forEach (<anonymous>)
+    at Object.performReactRefresh (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_0tl-3s0._.js:384:38)
+    at applyUpdate (http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_0tl-3s0._.js:878:31)
+    at http://localhost:3000/_next/static/chunks/0o.g_next_dist_compiled_0tl-3s0._.js:886:13
+[ 9637519ms] [LOG] [Fast Refresh] done in 103ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9672829ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9672849ms] [WARNING] [Fast Refresh] performing full reload because your application had an unrecoverable error @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9672862ms] [ERROR] Encountered a script tag while rendering React component. Scripts inside React components are never executed when rendering on the client. Consider using template tag instead (https://developer.mozilla.org/en-US/docs/Web/HTML/Element/template). @ http://localhost:3000/pre-hydration.js:57
+[ 9672888ms] [LOG] [Fast Refresh] done in 119ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673040ms] [WARNING] WARN Infinite extent for field "bucket": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673042ms] [WARNING] WARN Infinite extent for field "cost_start": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673042ms] [WARNING] WARN Infinite extent for field "cost_end": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673050ms] [WARNING] WARN Infinite extent for field "bucket": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673050ms] [WARNING] WARN Infinite extent for field "cost_start": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673050ms] [WARNING] WARN Infinite extent for field "cost_end": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673061ms] [WARNING] [rvbbit-lens] no scalar semantic operators for this connection — rvbbit.operators is empty or this isn't a rvbbit database. Semantic drop tiles are hidden. @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673218ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673264ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673608ms] [WARNING] WARN Infinite extent for field "bucket": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673610ms] [WARNING] WARN Infinite extent for field "cost_start": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673610ms] [WARNING] WARN Infinite extent for field "cost_end": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673619ms] [WARNING] WARN Infinite extent for field "bucket": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673619ms] [WARNING] WARN Infinite extent for field "cost_start": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9673619ms] [WARNING] WARN Infinite extent for field "cost_end": [Infinity, -Infinity] @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9724124ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9724509ms] [LOG] [Fast Refresh] done in 63ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9950779ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[ 9951084ms] [LOG] [Fast Refresh] done in 84ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[10003537ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[10003844ms] [LOG] [Fast Refresh] done in 109ms @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[10777970ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
+[10778133ms] [LOG] [HMR] connected @ http://localhost:3000/_next/static/chunks/0o.g_next_dist_12tw8g6._.js:2477
