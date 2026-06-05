@@ -9005,18 +9005,18 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
     if (*query).commandType != pg_sys::CmdType::CMD_SELECT {
         return;
     }
-    if !(*query).groupClause.is_null()
-        || !(*query).havingQual.is_null()
-        || !(*query).distinctClause.is_null()
-        || !(*query).cteList.is_null()
-    {
-        return;
-    }
-    if (*query).hasAggs
-        || (*query).hasWindowFuncs
-        || (*query).hasSubLinks
+    // Bail only on shapes where a semantic op's inputs can't be safely warmed
+    // over a single base relation: CTEs, sub-selects in expressions, set-ops,
+    // window functions, row locking. Aggregates / GROUP BY / DISTINCT / HAVING
+    // are fine — the operator is evaluated per base row *before* any of those
+    // apply, so we warm it over the relation regardless of the outer shape
+    // (e.g. `SELECT count(*) FROM t WHERE about(x)>0.5`,
+    //  `SELECT region, avg(about(blurb,'t')) FROM t GROUP BY region`).
+    if !(*query).cteList.is_null()
         || !(*query).setOperations.is_null()
         || !(*query).rowMarks.is_null()
+        || (*query).hasWindowFuncs
+        || (*query).hasSubLinks
     {
         return;
     }
@@ -9024,15 +9024,33 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
     if jt.is_null() {
         return;
     }
+    // Require exactly one base relation. A GROUP BY query also carries an
+    // RTE_GROUP entry (PG16+) which we skip; a join (>1 RTE_RELATION) or any
+    // subquery / function / VALUES scan bails.
     let rtable = (*query).rtable;
-    if rtable.is_null() || (*rtable).length != 1 {
+    if rtable.is_null() {
         return;
     }
-    let rte = (*(*rtable).elements).ptr_value as *mut pg_sys::RangeTblEntry;
-    if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
-        return;
+    let mut found_oid: Option<u32> = None;
+    for i in 0..(*rtable).length {
+        let rte = (*(*rtable).elements.add(i as usize)).ptr_value as *mut pg_sys::RangeTblEntry;
+        if rte.is_null() {
+            continue;
+        }
+        match (*rte).rtekind {
+            pg_sys::RTEKind::RTE_RELATION => {
+                if found_oid.replace((*rte).relid.to_u32()).is_some() {
+                    return;
+                }
+            }
+            pg_sys::RTEKind::RTE_GROUP => {}
+            _ => return,
+        }
     }
-    let table_oid = (*rte).relid.to_u32();
+    let table_oid = match found_oid {
+        Some(oid) => oid,
+        None => return,
+    };
 
     let calls = collect_rvbbit_op_calls(query, table_oid);
     // Phase 1: collect semantic ops in the WHERE quals too. Previously this was
@@ -9068,12 +9086,18 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
     // and let explicit prewarm handle the user's chosen bound.
     let est_rows = estimate_relation_rows(table_oid);
     let cap = implicit_prewarm_max_rows();
-    let (effective_rows, from_tail) = if !where_calls.is_empty() {
-        // A semantic operator in WHERE must be evaluated on every scanned row,
-        // so warm the whole relation (capped) and strip the WHERE from the
-        // prewarm query — including the original WHERE would re-trigger the
-        // operator and recurse through this very parse hook. LIMIT is post-
-        // filter here so it can't bound the warm set; rely on the row cap.
+    // Warm the whole relation (capped) when the warm set can't be bounded by a
+    // constant LIMIT on the base rows: a semantic op in WHERE runs on every
+    // scanned row, and under aggregation / GROUP BY / DISTINCT the LIMIT bounds
+    // grouped/distinct *output*, not the base rows the operator evaluates over.
+    let warm_whole_relation = !where_calls.is_empty()
+        || (*query).hasAggs
+        || !(*query).groupClause.is_null()
+        || !(*query).distinctClause.is_null();
+    let (effective_rows, from_tail) = if warm_whole_relation {
+        // Strip the WHERE/grouping from the prewarm query — including the
+        // original WHERE would re-trigger the operator and recurse through this
+        // very parse hook. Rely on the row cap to bound the warm set.
         (est_rows, format!("FROM {table_name}"))
     } else {
         let limit_clause = implicit_prewarm_limit_clause(query);
@@ -9352,6 +9376,24 @@ unsafe fn walk_for_op_calls(
             walk_for_op_calls(query, table_oid, (*ce).arg as *mut pg_sys::Node, out);
             walk_list_for_op_calls(query, table_oid, (*ce).args, out);
             walk_for_op_calls(query, table_oid, (*ce).defresult as *mut pg_sys::Node, out);
+        }
+        pg_sys::NodeTag::T_Aggref => {
+            // Aggref.args is a List of TargetEntry (e.g. avg(rvbbit.about(x,'t'))).
+            // Descend into each entry's expr so a semantic op nested in an
+            // aggregate is found — the op runs per base row before the aggregate
+            // applies, so it warms over the relation just like a bare SELECT op.
+            let agg = node as *mut pg_sys::Aggref;
+            let args = (*agg).args;
+            if !args.is_null() {
+                let n = (*args).length;
+                let cell = (*args).elements;
+                for i in 0..n {
+                    let tle = (*cell.add(i as usize)).ptr_value as *mut pg_sys::TargetEntry;
+                    if !tle.is_null() {
+                        walk_for_op_calls(query, table_oid, (*tle).expr as *mut pg_sys::Node, out);
+                    }
+                }
+            }
         }
         _ => { /* unknown node — stop descending */ }
     }
