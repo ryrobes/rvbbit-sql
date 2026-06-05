@@ -832,7 +832,9 @@ fn kg_lance_resolve_nodes_impl(
         return Ok(Value::Array(Vec::new()));
     };
 
-    let query = crate::embeddings::embed_one(node_label, &spec.name)?;
+    // mode="" preserves prior behavior for the KG node-label search (this path's
+    // stored embeddings are bare); it can adopt "query" alongside a doc-side bump.
+    let query = crate::embeddings::embed_one(node_label, &spec.name, "")?;
     let candidates = knn_text_dataset_with_ids(&path, &query, limit_count.max(1) as usize)?;
     if candidates.is_empty() {
         return Ok(Value::Array(Vec::new()));

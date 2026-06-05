@@ -97,6 +97,9 @@ impl LocalEmbedOptions {
             .transport_opts
             .get("model")
             .and_then(|v| v.as_str())
+            // An explicit empty model string must NOT bypass the default into
+            // parse_model("") (which maps to bge-small-384) — treat it as unset.
+            .filter(|s| !s.trim().is_empty())
             .map(str::to_string)
             .or_else(|| {
                 std::env::var("RVBBIT_LOCAL_EMBED_MODEL")
@@ -104,7 +107,13 @@ impl LocalEmbedOptions {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
             })
-            .unwrap_or_else(|| "bge-small-en-v1.5".to_string());
+            // Default local CPU model. nomic-embed-text-v1.5 (768d) is stronger
+            // than bge-small (384d) and uses search_query:/search_document:
+            // instruction prefixes (applied by embeddings::apply_mode_prefix).
+            // Heavier download/slower CPU; set RVBBIT_LOCAL_EMBED_MODEL or the
+            // 'embed' backend's transport_opts.model to override (e.g. back to
+            // bge-small-en-v1.5, or nomic-embed-text-v1.5-q for a faster CPU path).
+            .unwrap_or_else(|| "nomic-embed-text-v1.5".to_string());
         let model = parse_model(&model_name).map_err(|e| {
             ProviderError::Config(format!(
                 "specialist '{}': invalid local_embed model '{}': {e}",

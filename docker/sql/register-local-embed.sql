@@ -11,8 +11,8 @@ SELECT rvbbit.register_backend(
     backend_batch_size  => 128,
     backend_max_concur  => 1,
     backend_timeout_ms  => 120000,
-    backend_opts        => '{"model":"bge-small-en-v1.5"}'::jsonb,
-    backend_description => 'Default local CPU text embedding backend.'
+    backend_opts        => '{"model":"nomic-embed-text-v1.5"}'::jsonb,
+    backend_description => 'Default local CPU text embedding backend (nomic-embed-text-v1.5, 768d).'
 );
 
 SELECT rvbbit.reload_backends();

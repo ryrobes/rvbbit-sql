@@ -389,7 +389,7 @@ BEGIN
 
         v_vec := NULL;
         IF v_embed_ok THEN
-            BEGIN v_vec := rvbbit.embed(v_doc, embed_specialist);
+            BEGIN v_vec := rvbbit.embed(v_doc, embed_specialist, 'document');
             EXCEPTION WHEN others THEN v_vec := NULL; v_embed_ok := false; END;
         END IF;
         INSERT INTO rvbbit.catalog_docs
@@ -448,7 +448,7 @@ BEGIN
 
             v_vec := NULL;
             IF v_embed_ok THEN
-                BEGIN v_vec := rvbbit.embed(v_doc, embed_specialist);
+                BEGIN v_vec := rvbbit.embed(v_doc, embed_specialist, 'document');
                 EXCEPTION WHEN others THEN v_vec := NULL; v_embed_ok := false; END;
             END IF;
             INSERT INTO rvbbit.catalog_docs
@@ -576,6 +576,34 @@ BEGIN
          LIMIT k;
 END $fn$;
 
+-- Dense ranker DISPATCH SEAM (Track B): pick the fastest available dense tier
+-- without any caller edit. Tier-1 = pgvector HNSW (when the `vector` type AND
+-- the pgvector tier function both exist — added in P4); Tier-3 = the
+-- mean-centered brute force above (always present). A Lance tier can slot in
+-- the same way. Identical signature to catalog_dense_knn so it is a drop-in.
+-- The reference to catalog_dense_knn_pgvector is late-bound (plpgsql plans each
+-- statement on first execution) and guarded by to_regprocedure, so this is safe
+-- to create and run on a box where that function does not exist yet.
+CREATE OR REPLACE FUNCTION rvbbit.dense_knn_tiered(
+    q_vec     real[],
+    graph     text,
+    kinds     text[],
+    k         int,
+    min_score float8 DEFAULT 0.10)
+RETURNS TABLE (node_id bigint, score float8)
+LANGUAGE plpgsql STABLE AS $fn$
+BEGIN
+    IF to_regtype('vector') IS NOT NULL
+       AND to_regprocedure(
+             'rvbbit.catalog_dense_knn_pgvector(real[],text,text[],integer,double precision)'
+           ) IS NOT NULL
+    THEN
+        RETURN QUERY SELECT * FROM rvbbit.catalog_dense_knn_pgvector(q_vec, graph, kinds, k, min_score);
+        RETURN;
+    END IF;
+    RETURN QUERY SELECT * FROM rvbbit.catalog_dense_knn(q_vec, graph, kinds, k, min_score);
+END $fn$;
+
 -- Lexical ranker seam: exact identifier/substring + Postgres FTS. Identifiers
 -- (schema/rel/col) get their `_` and `.` flattened to spaces so the text-search
 -- parser tokenizes snake_case names; a literal substring hit on the qualified
@@ -654,13 +682,15 @@ BEGIN
     BEGIN v_floor := COALESCE(NULLIF(current_setting('rvbbit.search_dense_floor', true), '')::float8, 0.10);
     EXCEPTION WHEN others THEN v_floor := 0.10; END;
 
-    BEGIN v_q := rvbbit.embed(v_prefix || query, '');
+    -- mode='query' → retrieval models get their query instruction automatically;
+    -- v_prefix (the search_query_prefix GUC) stays as an optional extra override.
+    BEGIN v_q := rvbbit.embed(v_prefix || query, '', 'query');
     EXCEPTION WHEN others THEN v_q := NULL; END;
 
     RETURN QUERY
-        WITH d AS (   -- dense ranker (empty when no embedder)
+        WITH d AS (   -- dense ranker via the tier seam (empty when no embedder)
             SELECT dk.node_id, row_number() OVER (ORDER BY dk.score DESC) AS r
-              FROM rvbbit.catalog_dense_knn(v_q, v_graph, kinds, v_pool, v_floor) dk
+              FROM rvbbit.dense_knn_tiered(v_q, v_graph, kinds, v_pool, v_floor) dk
         ),
         l AS (        -- lexical ranker
             SELECT lk.node_id, row_number() OVER (ORDER BY lk.score DESC) AS r

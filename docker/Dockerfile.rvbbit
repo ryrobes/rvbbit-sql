@@ -74,6 +74,7 @@ FROM postgres:18
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libzstd1 \
         postgresql-18-cron \
+        postgresql-18-pgvector \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/share/postgresql/18/extension/pg_rvbbit* \

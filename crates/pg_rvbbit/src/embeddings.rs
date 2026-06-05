@@ -204,14 +204,39 @@ pub(crate) fn parse_embedding_value(v: &JsonValue) -> Result<Vec<f32>, String> {
 // ---------------------------------------------------------------------------
 // Core embed path (single-text)
 
-pub(crate) fn embed_one(text: &str, specialist_name_arg: &str) -> Result<Vec<f32>, String> {
+/// Mode-aware instruction prefix for retrieval models. Empty mode (or an
+/// unrecognized model) returns the text unchanged, so default callers are
+/// byte-identical to before. The prefix is baked into the text BEFORE hashing
+/// (see embed_one), so a query- vs document-embedding of the same text get
+/// DISTINCT cache keys (no silent collision) and the model sees its expected
+/// instruction. NOTE: the document side of nomic/e5 ("search_document:" /
+/// "passage:") is only applied where a caller passes mode="document"; today the
+/// query sites pass "query" and document sites stay bare (correct for BGE).
+fn apply_mode_prefix(text: &str, mode: &str, model: &str) -> String {
+    let m = model.to_ascii_lowercase();
+    let prefix: &str = match mode.trim().to_ascii_lowercase().as_str() {
+        "query" if m.contains("nomic") => "search_query: ",
+        "document" | "doc" if m.contains("nomic") => "search_document: ",
+        "query" if m.contains("e5") => "query: ",
+        "document" | "doc" if m.contains("e5") => "passage: ",
+        "query" if m.contains("bge") => "Represent this sentence for searching relevant passages: ",
+        // BGE document side is bare; unknown model / empty mode => no prefix.
+        _ => return text.to_string(),
+    };
+    format!("{prefix}{text}")
+}
+
+pub(crate) fn embed_one(text: &str, specialist_name_arg: &str, mode: &str) -> Result<Vec<f32>, String> {
     let spec = resolve_specialist(specialist_name_arg)?;
     let model = spec_model(&spec);
-    let h = text_hash(&spec.name, text);
+    // Prefix BEFORE hashing: the cache key and the bytes sent to the model agree,
+    // and query vs document of the same text can never collide on the cache PK.
+    let prefixed = apply_mode_prefix(text, mode, &model);
+    let h = text_hash(&spec.name, &prefixed);
     if let Some(cached) = cache_lookup(&h, &spec.name) {
         return Ok(cached);
     }
-    let input = serde_json::json!({"text": text});
+    let input = serde_json::json!({ "text": prefixed });
     let result = crate::specialists::predict_one(&spec, &input)
         .map_err(|e| format!("rvbbit.embed: specialist call failed: {e}"))?;
     let vec = parse_embedding_value(&result)?;
@@ -223,8 +248,8 @@ pub(crate) fn embed_one(text: &str, specialist_name_arg: &str) -> Result<Vec<f32
 // User-facing UDFs
 
 #[pg_extern(stable, parallel_safe)]
-fn embed(text: &str, specialist: default!(&str, "''")) -> Vec<f32> {
-    match embed_one(text, specialist) {
+fn embed(text: &str, specialist: default!(&str, "''"), mode: default!(&str, "''")) -> Vec<f32> {
+    match embed_one(text, specialist, mode) {
         Ok(v) => v,
         Err(e) => pgrx::error!("{e}"),
     }
@@ -257,11 +282,12 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 /// queries are essentially free.
 #[pg_extern(stable, parallel_safe)]
 fn similarity(a: &str, b: &str, specialist: default!(&str, "''")) -> f64 {
-    let va = match embed_one(a, specialist) {
+    // Pairwise similarity is symmetric — no query/document asymmetry, so no prefix.
+    let va = match embed_one(a, specialist, "") {
         Ok(v) => v,
         Err(e) => pgrx::error!("{e}"),
     };
-    let vb = match embed_one(b, specialist) {
+    let vb = match embed_one(b, specialist, "") {
         Ok(v) => v,
         Err(e) => pgrx::error!("{e}"),
     };
@@ -349,7 +375,8 @@ fn materialize_embeddings(rel: pg_sys::Oid, col: &str, specialist: default!(&str
         Ok(())
     });
 
-    // Bulk-lookup so we don't do N SPI calls on a fresh table.
+    // Bulk-lookup so we don't do N SPI calls on a fresh table. Raw hash — matches
+    // knn_text's generic batch path (shared cache, one consistent space).
     let cache_map = bulk_cache_lookup(&spec.name);
     let mut to_embed: Vec<String> = Vec::new();
     for t in &distinct_texts {
@@ -494,8 +521,14 @@ fn knn_text(
     };
     let model = spec_model(&spec);
 
-    // Embed the query first (also caches under the same specialist).
-    let q_vec = match embed_one(query, &spec.name) {
+    // Embed the query RAW (no mode) for parity with the document side below. The
+    // generic batch paths (knn_text / materialize / composites / lance / cluster)
+    // share one specialist cache and all embed RAW, so they stay in a single
+    // consistent vector space. (Per-mode query/document prefixing for the generic
+    // path is a tracked follow-up — it must be threaded through ALL of those sites
+    // at once, via one shared helper, or the cache namespace splits. The CATALOG
+    // path already gets full query/document asymmetry via rvbbit.embed/embed_one.)
+    let q_vec = match embed_one(query, &spec.name, "") {
         Ok(v) => v,
         Err(e) => pgrx::error!("rvbbit.knn_text: query embed: {e}"),
     };
@@ -581,7 +614,8 @@ fn knn_text(
         }
     }
 
-    // Top-k by cosine. Bounded heap so memory is k * (text + 384*f32 ptr).
+    // Top-k by cosine. Bounded heap so memory is k * (text + D*f32 ptr), where
+    // D is the embedding dim (768 for the nomic default, 384 for bge-small).
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
 
