@@ -1683,27 +1683,28 @@ LANGUAGE plpgsql
 VOLATILE
 AS $$
 DECLARE
-    raw_query_id text;
-    next_query_id uuid;
+    cur_txid       text := txid_current()::text;
+    stored_txid    text := NULLIF(current_setting('rvbbit.query_txid', true), '');
+    raw_query_id   text := NULLIF(current_setting('rvbbit.query_id', true), '');
+    next_query_id  uuid;
 BEGIN
-    raw_query_id := NULLIF(current_setting('rvbbit.query_id', true), '');
-    IF raw_query_id IS NOT NULL THEN
+    -- One id per top-level transaction = one per query. We KEY the stored id to
+    -- txid_current() rather than relying on GUC lifetime: a pooled connection
+    -- can carry a stale session-level rvbbit.query_id from an earlier query, so
+    -- we only reuse the stored id when it belongs to *this* transaction.
+    -- Multiple receipt writes in one query (and a prewarm's SPI, same txn) all
+    -- see the same txid and share the id; the next query is a new txn -> new id.
+    IF stored_txid IS NOT NULL AND stored_txid = cur_txid AND raw_query_id IS NOT NULL THEN
         BEGIN
             RETURN raw_query_id::uuid;
         EXCEPTION WHEN OTHERS THEN
-            -- A bad manually-set value should not poison the session.
-            NULL;
+            NULL;  -- a bad manually-set value falls through to a fresh id
         END;
     END IF;
 
     next_query_id := gen_random_uuid();
-    -- is_local = true: scope the id to the current transaction so each
-    -- autocommit statement gets a fresh query_id (per-query telemetry). With
-    -- false it persisted for the whole session, so every query on a pooled
-    -- connection reused one id and "distinct query_id" counted connections, not
-    -- queries. A prewarm's SPI + the execution share the user's txn, so they
-    -- still group under one id; an explicit BEGIN..COMMIT groups as one unit.
-    PERFORM set_config('rvbbit.query_id', next_query_id::text, true);
+    PERFORM set_config('rvbbit.query_id', next_query_id::text, false);
+    PERFORM set_config('rvbbit.query_txid', cur_txid, false);
     RETURN next_query_id;
 END $$;
 
@@ -1715,13 +1716,10 @@ AS $$
 DECLARE
     next_query_id uuid := gen_random_uuid();
 BEGIN
-    -- is_local = true: scope the id to the current transaction so each
-    -- autocommit statement gets a fresh query_id (per-query telemetry). With
-    -- false it persisted for the whole session, so every query on a pooled
-    -- connection reused one id and "distinct query_id" counted connections, not
-    -- queries. A prewarm's SPI + the execution share the user's txn, so they
-    -- still group under one id; an explicit BEGIN..COMMIT groups as one unit.
-    PERFORM set_config('rvbbit.query_id', next_query_id::text, true);
+    -- Force a fresh id for the current transaction, keyed to its txid so
+    -- current_query_id() reuses it for the rest of this query.
+    PERFORM set_config('rvbbit.query_id', next_query_id::text, false);
+    PERFORM set_config('rvbbit.query_txid', txid_current()::text, false);
     RETURN next_query_id;
 END $$;
 
