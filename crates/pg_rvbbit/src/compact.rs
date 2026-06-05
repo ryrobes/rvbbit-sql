@@ -282,12 +282,18 @@ fn dual_layout_enabled() -> bool {
 }
 
 fn sync_variant_layouts_enabled() -> bool {
+    // Default ON so the legacy compact(rel, keep_heap) path also syncs layout
+    // variants (matching refresh_acceleration / rebuild_acceleration, which call
+    // the variant builders directly without this gate). Only the per-layout
+    // gates that are ON actually build — by default that's vortex alone (hive +
+    // cluster stay opt-in). Disable with RVBBIT_COMPACT_VARIANTS_SYNC=off or
+    // rvbbit.compact_variants_sync=off.
     matches!(
         compact_setting(
             "RVBBIT_COMPACT_VARIANTS_SYNC",
             "rvbbit.compact_variants_sync"
         )
-        .unwrap_or_else(|| "off".to_string())
+        .unwrap_or_else(|| "on".to_string())
         .to_ascii_lowercase()
         .as_str(),
         "1" | "on" | "true" | "yes"
@@ -362,12 +368,18 @@ fn hive_layout_for_key(key: &str) -> String {
 }
 
 fn vortex_layout_enabled() -> bool {
+    // Default ON. Vortex is generally the fastest scan layout on large tables,
+    // and the router only *uses* it when vortex files are present + authoritative
+    // (vortex_availability) — otherwise it transparently falls back to the
+    // canonical parquet vector path. Building it by default means the
+    // datafusion_vortex / duck_vortex candidates are actually selectable.
+    // Disable with RVBBIT_COMPACT_VORTEX_LAYOUT=off or rvbbit.compact_vortex_layout=off.
     matches!(
         compact_setting(
             "RVBBIT_COMPACT_VORTEX_LAYOUT",
             "rvbbit.compact_vortex_layout"
         )
-        .unwrap_or_else(|| "off".to_string())
+        .unwrap_or_else(|| "on".to_string())
         .to_ascii_lowercase()
         .as_str(),
         "1" | "on" | "true" | "yes"
