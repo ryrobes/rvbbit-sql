@@ -27,6 +27,11 @@ CREATE TABLE IF NOT EXISTS rvbbit.synth_cache (
     generated_sql     text        NOT NULL,
     status            text        NOT NULL DEFAULT 'unverified',
     sample            jsonb,
+    -- The authoritative result shape of generated_sql, captured at compile time:
+    -- [{"name","type","oid"}, …]. For query synth this is the column list the
+    -- downstream re-materializers (lens projection, flow head-unwrap) consume
+    -- instead of re-inferring types from sampled rows. NULL for scalar/rowset.
+    result_schema     jsonb,
     pinned            boolean     NOT NULL DEFAULT false,
     created_at        timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at        timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -241,6 +246,37 @@ BEGIN
     RETURN QUERY SELECT unnest(coalesce(v_rows, ARRAY[]::jsonb[]));
 END $fn$;
 
+-- Capture the authoritative result shape of a generated SELECT — column names +
+-- Postgres types — WITHOUT executing it. CREATE TEMP VIEW parse-analyzes the body
+-- (resolving the output column list) but never plans/runs it, so there is no
+-- const-fold side effect; pg_attribute over the view is the exact tuple descriptor.
+-- This is the "compiler emits the schema" primitive: it is captured once at compile
+-- time so the lens projection, flow head-unwrap, and base-SQL composition consume
+-- one truth instead of re-inferring types from sampled rows. Returns
+-- [{"name","type","oid"}, …], or [] if anything fails.
+CREATE OR REPLACE FUNCTION rvbbit._synth_schema(p_sql text)
+RETURNS jsonb LANGUAGE plpgsql
+SET client_min_messages = warning   -- silence the first-call "pg_temp does not exist" NOTICE
+AS $fn$
+DECLARE v_schema jsonb;
+BEGIN
+    BEGIN EXECUTE 'DROP VIEW IF EXISTS pg_temp._rvbbit_synth_probe'; EXCEPTION WHEN OTHERS THEN NULL; END;
+    BEGIN
+        EXECUTE 'CREATE TEMP VIEW _rvbbit_synth_probe AS ' || p_sql;
+        SELECT jsonb_agg(
+                 jsonb_build_object('name', attname, 'type', atttypid::regtype::text, 'oid', atttypid::int)
+                 ORDER BY attnum)
+          INTO v_schema
+          FROM pg_attribute
+         WHERE attrelid = 'pg_temp._rvbbit_synth_probe'::regclass
+           AND attnum > 0 AND NOT attisdropped;
+        EXECUTE 'DROP VIEW pg_temp._rvbbit_synth_probe';
+    EXCEPTION WHEN OTHERS THEN
+        v_schema := NULL;
+    END;
+    RETURN coalesce(v_schema, '[]'::jsonb);
+END $fn$;
+
 -- SYNTH: query synth-sql operator (shape='query', parser='sql'). The widest scope
 -- of the same model-as-compiler idea: a natural-language intent + the relevant
 -- catalog metadata ({{ _schema_context }}, retrieved by rvbbit.data_search) -> ONE
@@ -258,3 +294,75 @@ SELECT rvbbit.create_operator(
     op_max_tokens  => 1200,
     op_description => 'Query synth-sql: natural-language intent -> one read-only SELECT over the live DB, grounded by catalog retrieval. Invoked via rvbbit.synth_sql().'
 );
+
+-- ── Phase C: typed synth relations ──────────────────────────────────────────
+-- Plain SQL can't reference dynamic columns from a SETOF jsonb function (the shape
+-- isn't known at parse time). These surfaces use the compiler-captured schema
+-- (synth_cache.result_schema / synth_schema) to expose REAL typed columns you can
+-- CTE / JOIN / aggregate natively — materializing the late-bound shape into an
+-- early-bound relation.
+
+-- Format a result_schema array into a SQL column-definition list, e.g.
+--   [{"name":"season","type":"text"},{"name":"n","type":"bigint"}] -> "season" text, "n" bigint
+CREATE OR REPLACE FUNCTION rvbbit._synth_coldef_from_schema(p_schema jsonb)
+RETURNS text LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT string_agg(quote_ident(c->>'name') || ' ' || (c->>'type'), ', ' ORDER BY ord)
+    FROM jsonb_array_elements(coalesce(p_schema, '[]'::jsonb)) WITH ORDINALITY AS t(c, ord);
+$fn$;
+
+-- Execute a validated read-only SELECT and return its rows as records (the caller
+-- supplies the column list via AS). Guard rails: statement timeout + a READ ONLY
+-- transaction (so a mislabeled writer function can't write). Like synth(), this
+-- leaves the surrounding transaction read-only (records can't be captured-and-rolled
+-- back the way jsonb rows can) — use it as a standalone read / CTE source.
+CREATE OR REPLACE FUNCTION rvbbit._synth_exec_record(p_sql text)
+RETURNS SETOF record LANGUAGE plpgsql AS $fn$
+BEGIN
+    PERFORM set_config('statement_timeout', '10000', true);
+    PERFORM set_config('transaction_read_only', 'on', true);
+    RETURN QUERY EXECUTE p_sql;
+END $fn$;
+
+-- The column-definition list for synth_record's AS clause (from the cached schema).
+CREATE OR REPLACE FUNCTION rvbbit.synth_coldef(intent text, operator text DEFAULT 'synth', opts jsonb DEFAULT '{}')
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE v_schema jsonb;
+BEGIN
+    SELECT jsonb_agg(jsonb_build_object('name', column_name, 'type', data_type))
+      INTO v_schema FROM rvbbit.synth_schema(intent, operator, opts);
+    RETURN rvbbit._synth_coldef_from_schema(v_schema);
+END $fn$;
+
+-- Typed synth relation: SELECT * FROM rvbbit.synth_record('intent') AS t(col type, …)
+-- Get the AS list from rvbbit.synth_coldef(intent). Gated behind rvbbit.synth_enabled.
+CREATE OR REPLACE FUNCTION rvbbit.synth_record(intent text, operator text DEFAULT 'synth', opts jsonb DEFAULT '{}')
+RETURNS SETOF record LANGUAGE plpgsql AS $fn$
+DECLARE v_sql text;
+BEGIN
+    IF coalesce(current_setting('rvbbit.synth_enabled', true), 'off') NOT IN ('on','true','1','yes') THEN
+        RAISE EXCEPTION 'rvbbit.synth_record is disabled; run: SET rvbbit.synth_enabled = on';
+    END IF;
+    v_sql := rvbbit.synth_sql(intent, operator, opts);
+    IF v_sql IS NULL OR left(btrim(v_sql), 2) = '--' THEN
+        RETURN;  -- generation failed / unvalidated
+    END IF;
+    PERFORM set_config('statement_timeout', '10000', true);
+    PERFORM set_config('transaction_read_only', 'on', true);
+    RETURN QUERY EXECUTE v_sql;
+END $fn$;
+
+-- Materialize a synth query as a typed VIEW you can query directly:
+--   SELECT rvbbit.synth_view('sightings_by_region', 'number of sightings per region');
+--   SELECT region, sum(...) FROM sightings_by_region GROUP BY region;   -- real columns
+CREATE OR REPLACE FUNCTION rvbbit.synth_view(view_name text, intent text, operator text DEFAULT 'synth', opts jsonb DEFAULT '{}')
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE v_coldef text;
+BEGIN
+    v_coldef := rvbbit.synth_coldef(intent, operator, opts);
+    IF v_coldef IS NULL OR v_coldef = '' THEN
+        RAISE EXCEPTION 'rvbbit.synth_view: no schema for intent (generation failed?)';
+    END IF;
+    EXECUTE format('CREATE OR REPLACE VIEW %I AS SELECT * FROM rvbbit.synth_record(%L, %L, %L::jsonb) AS _t(%s)',
+                   view_name, intent, operator, opts, v_coldef);
+    RETURN view_name;
+END $fn$;

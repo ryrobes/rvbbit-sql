@@ -627,10 +627,16 @@ pub(crate) fn validate_sql(sql: &str) -> Result<(), String> {
 }
 
 /// Generate a read-only SELECT for `intent`, grounded by retrieved schema, with the
-/// same validate + error-feedback retry loop as the rowset synth (EXPLAIN instead
-/// of execute). Validated SQL is cached under (operator, schema-fingerprint,
-/// intent-hash). Does NOT execute the query.
-pub(crate) fn run_synth_query_sql(op: &OpDef, intent: &str, opts: &Value) -> Result<String, String> {
+/// same validate + error-feedback retry loop as the rowset synth. Validated SQL is
+/// cached under (operator, schema-fingerprint, intent-hash), along with its
+/// authoritative result schema (column names + types, captured at compile time).
+/// Returns (sql, result_schema) where result_schema is a jsonb array
+/// [{"name","type","oid"}, …] (empty array when unavailable). Does NOT execute.
+pub(crate) fn run_synth_query_sql(
+    op: &OpDef,
+    intent: &str,
+    opts: &Value,
+) -> Result<(String, Value), String> {
     if intent.trim().is_empty() {
         return Err("synth: empty intent".into());
     }
@@ -653,8 +659,8 @@ pub(crate) fn run_synth_query_sql(op: &OpDef, intent: &str, opts: &Value) -> Res
     // change shifts the retrieved docs → new fingerprint → regenerate (auto-stale).
     let shape_fp = hash_hex(&schema_context);
     let p_hash = prompt_key(&op.name, intent);
-    if let Some(sql) = synth_cache_get(&op.name, &shape_fp, &p_hash) {
-        return Ok(sql);
+    if let Some((sql, schema)) = synth_cache_get_query(&op.name, &shape_fp, &p_hash) {
+        return Ok((sql, schema));
     }
 
     let mut last_err = String::new();
@@ -691,12 +697,15 @@ pub(crate) fn run_synth_query_sql(op: &OpDef, intent: &str, opts: &Value) -> Res
             // Preview mode (opts.validate=false): no DB validation, and we do NOT
             // write an unvalidated statement into the cache's 'valid' slot — return
             // it ephemerally so it cannot be mistaken for a blessed snippet.
-            return Ok(gen_sql);
+            return Ok((gen_sql, json!([])));
         }
         if let Err(e) = validate_sql(&gen_sql) {
             last_err = e;
             continue;
         }
+        // Capture the authoritative result schema at compile time (column names +
+        // Postgres types, via a parse-only temp view — no execution).
+        let result_schema = capture_schema(&gen_sql);
         let sample = json!({
             "kind": "query",
             "intent": intent,
@@ -704,18 +713,67 @@ pub(crate) fn run_synth_query_sql(op: &OpDef, intent: &str, opts: &Value) -> Res
             "attempts": attempt + 1,
         });
         synth_cache_put(&op.name, &shape_fp, &p_hash, &gen_sql, &sample, false);
-        return Ok(gen_sql);
+        synth_cache_set_schema(&op.name, &shape_fp, &p_hash, &result_schema);
+        return Ok((gen_sql, result_schema));
     }
 
     // Validation never passed: hand back the best-effort generation (visibly marked,
     // NOT cached) so the user can see and fix it, rather than nothing.
     if !last_sql.is_empty() {
-        Ok(format!("-- synth: unvalidated ({last_err})\n{last_sql}"))
+        Ok((format!("-- synth: unvalidated ({last_err})\n{last_sql}"), json!([])))
     } else {
         Err(format!(
             "synth: no SQL after {MAX_QUERY_ATTEMPTS} attempts: {last_err}"
         ))
     }
+}
+
+/// Capture the authoritative result shape of a generated SELECT (column names +
+/// Postgres types) without executing it — delegated to rvbbit._synth_schema (a
+/// parse-only temp view). Returns a jsonb array; [] on any failure.
+fn capture_schema(sql: &str) -> Value {
+    let q = format!("SELECT rvbbit._synth_schema('{}')", esc(sql));
+    Spi::get_one::<JsonB>(&q)
+        .ok()
+        .flatten()
+        .map(|j| j.0)
+        .unwrap_or_else(|| json!([]))
+}
+
+/// Read the cached generated SQL + its result schema for a query-synth key.
+fn synth_cache_get_query(operator: &str, shape_fp: &str, prompt_hash: &str) -> Option<(String, Value)> {
+    let sql = format!(
+        "SELECT generated_sql, coalesce(result_schema, '[]'::jsonb) FROM rvbbit.synth_cache \
+         WHERE operator = '{}' AND shape_fingerprint = '{}' AND prompt_hash = '{}' AND status = 'valid'",
+        esc(operator),
+        esc(shape_fp),
+        esc(prompt_hash)
+    );
+    let mut out: Option<(String, Value)> = None;
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        if let Some(row) = client.select(&sql, Some(1), &[])?.into_iter().next() {
+            let gen: Option<String> = row.get(1)?;
+            let sch: Option<JsonB> = row.get(2)?;
+            if let Some(g) = gen {
+                out = Some((g, sch.map(|j| j.0).unwrap_or_else(|| json!([]))));
+            }
+        }
+        Ok(())
+    });
+    out
+}
+
+/// Store the captured result schema on an existing synth_cache row.
+fn synth_cache_set_schema(operator: &str, shape_fp: &str, prompt_hash: &str, schema: &Value) {
+    let sql = format!(
+        "UPDATE rvbbit.synth_cache SET result_schema = '{}'::jsonb \
+         WHERE operator = '{}' AND shape_fingerprint = '{}' AND prompt_hash = '{}'",
+        esc(&schema.to_string()),
+        esc(operator),
+        esc(shape_fp),
+        esc(prompt_hash)
+    );
+    let _ = Spi::run(&sql);
 }
 
 /// Generate (but do not run) a read-only SELECT for a natural-language intent,
@@ -744,12 +802,55 @@ fn synth_sql(
         return None;
     }
     match run_synth_query_sql(&op, intent, &opts.0) {
-        Ok(sql) => Some(sql),
+        Ok((sql, _schema)) => Some(sql),
         Err(e) => {
             pgrx::warning!("rvbbit.synth_sql: {}", e);
             None
         }
     }
+}
+
+/// The authoritative result schema (column names + Postgres types) of the SELECT
+/// `rvbbit.synth_sql(intent)` would generate — captured at compile time, without
+/// executing. Generates+caches on first call like synth_sql. Lets the lens (and
+/// plain SQL) know the shape before running anything.
+#[pg_extern(volatile)]
+fn synth_schema(
+    intent: &str,
+    operator: default!(&str, "'synth'"),
+    opts: default!(JsonB, "'{}'::jsonb"),
+) -> TableIterator<'static, (name!(column_name, String), name!(data_type, String))> {
+    let empty = || TableIterator::new(Vec::<(String, String)>::new().into_iter());
+    let op = match crate::operators::load_op(operator) {
+        Some(o) => o,
+        None => {
+            pgrx::warning!("rvbbit.synth_schema: unknown operator '{}'", operator);
+            return empty();
+        }
+    };
+    if op.parser != "sql" {
+        return empty();
+    }
+    let schema = match run_synth_query_sql(&op, intent, &opts.0) {
+        Ok((_sql, schema)) => schema,
+        Err(e) => {
+            pgrx::warning!("rvbbit.synth_schema: {}", e);
+            return empty();
+        }
+    };
+    let rows: Vec<(String, String)> = schema
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let name = c.get("name")?.as_str()?.to_string();
+                    let ty = c.get("type")?.as_str()?.to_string();
+                    Some((name, ty))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    TableIterator::new(rows.into_iter())
 }
 
 // ---------------------------------------------------------------------------
@@ -842,7 +943,7 @@ fn synth(
         return rows_to_iter(Vec::new());
     }
     let sql = match run_synth_query_sql(&op, intent, &opts.0) {
-        Ok(s) => s,
+        Ok((s, _schema)) => s,
         Err(e) => {
             pgrx::warning!("rvbbit.synth: {}", e);
             return rows_to_iter(Vec::new());

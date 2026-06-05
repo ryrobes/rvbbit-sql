@@ -69,9 +69,11 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # Runtime stage: clean PG18 image with the extension files dropped in.
 FROM postgres:18
 
-# zstd runtime (compression library used by parquet writes)
+# zstd runtime (parquet writes) + pg_cron (scheduled jobs; the Scheduler UI
+# manages it, preconfigured so catalog_crawl() etc. can be scheduled out of the box)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libzstd1 \
+        postgresql-18-cron \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/share/postgresql/18/extension/pg_rvbbit* \
@@ -92,5 +94,5 @@ COPY docker/config/rvbbit-tuning.conf /etc/rvbbit/tuning.conf
 # Belt-and-suspenders: also stamp shared_preload_libraries into the
 # stock conf sample. Only kicks in if someone runs the image without
 # `-c config_file=...` (in which case the data-dir conf is read).
-RUN echo "shared_preload_libraries = 'pg_rvbbit'" \
+RUN echo "shared_preload_libraries = 'pg_rvbbit,pg_cron'" \
         >> /usr/share/postgresql/postgresql.conf.sample

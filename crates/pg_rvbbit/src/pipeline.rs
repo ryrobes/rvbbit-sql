@@ -333,7 +333,30 @@ fn run_query_to_rows(head: &str) -> Result<Vec<Value>, String> {
         Ok(())
     });
     r.map_err(|e| format!("{e:?}"))?;
-    Ok(out)
+    Ok(unwrap_single_jsonb_column(out))
+}
+
+/// If a head produced exactly one column whose every value is a jsonb OBJECT — e.g.
+/// `select * from rvbbit.synth(...)` (one jsonb column) or any `… returns jsonb …` —
+/// unwrap each row to that inner object so downstream stages see the real fields
+/// instead of a single wrapper column. Only fires when ALL rows match (single key,
+/// object value), so ordinary multi-column or scalar-valued rows are untouched. This
+/// is what makes `synth(…) then group(…)` pipe real columns to the stages.
+fn unwrap_single_jsonb_column(rows: Vec<Value>) -> Vec<Value> {
+    if rows.is_empty() {
+        return rows;
+    }
+    let all_single_obj = rows.iter().all(|r| {
+        r.as_object()
+            .map(|o| o.len() == 1 && o.values().next().map(|v| v.is_object()).unwrap_or(false))
+            .unwrap_or(false)
+    });
+    if !all_single_obj {
+        return rows;
+    }
+    rows.into_iter()
+        .map(|r| r.as_object().and_then(|o| o.values().next().cloned()).unwrap_or(r))
+        .collect()
 }
 
 fn take_rows(rows: &[Value], n: usize) -> Vec<Value> {
@@ -899,5 +922,103 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(n, 0, "synth must be a no-op while rvbbit.synth_enabled is off");
+    }
+
+    #[pg_test]
+    fn synth_schema_captures_authoritative_types() {
+        Spi::run("CREATE TABLE ss_t (id int, label text)").unwrap();
+        Spi::run("INSERT INTO ss_t VALUES (1, 'a')").unwrap();
+        // Parse-only capture: names + Postgres types, no execution.
+        let schema: pgrx::JsonB = Spi::get_one(
+            "SELECT rvbbit._synth_schema('SELECT id, label, count(*) AS n FROM ss_t GROUP BY id, label')",
+        )
+        .unwrap()
+        .unwrap();
+        let arr = schema.0.as_array().cloned().unwrap_or_default();
+        let names: Vec<String> = arr
+            .iter()
+            .filter_map(|c| c.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert_eq!(names, vec!["id", "label", "n"]);
+        let n_type = arr
+            .iter()
+            .find(|c| c.get("name").and_then(|v| v.as_str()) == Some("n"))
+            .and_then(|c| c.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(n_type, "bigint", "count(*) result type is authoritative bigint");
+        // Bad SQL → empty array, gracefully.
+        let bad: pgrx::JsonB =
+            Spi::get_one("SELECT rvbbit._synth_schema('SELECT nope FROM nowhere')").unwrap().unwrap();
+        assert_eq!(bad.0.as_array().map(|a| a.len()), Some(0));
+    }
+
+    // ---- Phase C: typed synth relations ----
+
+    #[pg_test]
+    fn synth_coldef_formats_schema() {
+        // quote_ident leaves simple lowercase identifiers unquoted; both forms are
+        // valid in an AS column list. A name needing quoting (e.g. a space) is quoted.
+        let cd: String = Spi::get_one(
+            r#"SELECT rvbbit._synth_coldef_from_schema('[{"name":"season","type":"text"},{"name":"n","type":"bigint"}]'::jsonb)"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cd, "season text, n bigint");
+        let cd2: String = Spi::get_one(
+            r#"SELECT rvbbit._synth_coldef_from_schema('[{"name":"my col","type":"numeric"}]'::jsonb)"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cd2, "\"my col\" numeric");
+    }
+
+    #[pg_test]
+    fn synth_exec_record_returns_typed_columns() {
+        // The read-only record executor yields real typed columns (caller supplies AS).
+        let a: i32 = Spi::get_one(
+            "SELECT a FROM rvbbit._synth_exec_record('SELECT 7 AS a, ''hi''::text AS b') AS r(a int, b text)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(a, 7);
+        let b: String = Spi::get_one(
+            "SELECT b FROM rvbbit._synth_exec_record('SELECT 7 AS a, ''hi''::text AS b') AS r(a int, b text)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(b, "hi");
+    }
+
+    // ---- Phase D: flow single-jsonb-head unwrap ----
+
+    #[pg_test]
+    fn flow_unwraps_single_jsonb_head() {
+        // A head yielding ONE jsonb-object column (like synth) is unwrapped so stages
+        // see the inner fields. Here the head is `select to_jsonb(v) AS value …`, one
+        // jsonb column of {"class": …} objects — flow must surface 'class', not 'value'.
+        let n: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.flow($q$ select to_jsonb(v) AS value from (values ('A'),('B')) v(class) $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 2);
+        let saw_class: bool = Spi::get_one(
+            "SELECT bool_and((value->>'class') IS NOT NULL) FROM rvbbit.flow($q$ select to_jsonb(v) AS value from (values ('A'),('B')) v(class) $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(saw_class, "the single-jsonb head must be unwrapped to its inner fields");
+    }
+
+    #[pg_test]
+    fn flow_leaves_multicolumn_head_untouched() {
+        // A normal multi-column head is NOT unwrapped — rows keep their columns.
+        let saw_g: bool = Spi::get_one(
+            "SELECT bool_and((value->>'g') IS NOT NULL) FROM rvbbit.flow($q$ select g, g*2 AS d from generate_series(1,3) g $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(saw_g, "ordinary multi-column heads must be left as-is");
     }
 }
