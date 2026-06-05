@@ -676,6 +676,10 @@ pub(crate) fn invoke_with_cache(
     // they cannot look up handler code or package lists through SPI.
     crate::python_runtime::warm_operator_specs(op.steps.as_ref(), op.takes.as_ref());
 
+    // Leader-side live progress: a genuine per-row call (cache missed both
+    // tiers above, so prewarmed rows — which return at the L1/L2 hits — are not
+    // double-counted). Covers the per-row / over-cap path that skips prewarm.
+    crate::live_counters::tick(&op.name, 1);
     let result: WorkResult = crate::takes::execute_attempt(op, inputs, opts, None);
     // Validators + retry: if the operator carries a retry plan and the
     // output fails its validator, re-run with feedback. No-op otherwise.

@@ -36,6 +36,7 @@ mod flow;
 mod freshness;
 mod kg;
 mod lance;
+mod live_counters;
 mod model_orchestration;
 mod model_studio;
 mod mv;
@@ -187,6 +188,9 @@ fn normalize_probe_sample(spec: &specialists::SpecialistSpec, sample: Value) -> 
 #[pgrx::pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn _PG_init() {
+    // Shared-memory live call counters — must register its shmem request +
+    // startup hooks at preload time (in the postmaster) before shmem is sized.
+    live_counters::register_shmem();
     unsafe {
         planner::register_hooks();
         rewriter::register_hooks();

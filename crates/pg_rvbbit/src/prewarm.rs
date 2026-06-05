@@ -250,7 +250,15 @@ fn dispatch_per_row(
         });
         receivers.push(rx);
     }
-    receivers.into_iter().map(|rx| rx.recv().unwrap()).collect()
+    receivers
+        .into_iter()
+        .map(|rx| {
+            let row = rx.recv().unwrap();
+            // Leader-side live progress: one operator call resolved.
+            crate::live_counters::tick(&op.name, 1);
+            row
+        })
+        .collect()
 }
 
 /// Batched specialist dispatch — chunk rows by spec.batch_size and send
@@ -346,6 +354,8 @@ fn dispatch_batched_specialist(
     let mut out: Vec<(Value, WorkResult)> = Vec::new();
     for rx in receivers {
         let (chunk_inputs, outputs, latency, spec_name) = rx.recv().unwrap();
+        // Leader-side live progress: a batch of `chunk_inputs.len()` calls landed.
+        crate::live_counters::tick(&op.name, chunk_inputs.len() as u64);
         match outputs {
             Ok(outs) => {
                 for (inputs, value) in chunk_inputs.into_iter().zip(outs.into_iter()) {
@@ -545,6 +555,8 @@ fn dispatch_batched_multistep_specialist(
     let mut out: Vec<(Value, WorkResult)> = Vec::new();
     for rx in receivers {
         let (chunk_inputs, outputs, latency) = rx.recv().unwrap();
+        // Leader-side live progress: a batch of `chunk_inputs.len()` calls landed.
+        crate::live_counters::tick(&op.name, chunk_inputs.len() as u64);
         match outputs {
             Ok(outs) => {
                 for (inputs, value) in chunk_inputs.into_iter().zip(outs.into_iter()) {
