@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_observations (
     candidate     text NOT NULL,
     elapsed_ms    double precision NOT NULL,
     status        text NOT NULL DEFAULT 'ok',
-    CHECK (candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore')),
     CHECK (elapsed_ms >= 0)
 );
 
@@ -146,7 +146,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_training_results (
     validation_status  text NOT NULL DEFAULT 'unknown',
     error              text,
     route_doc          jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore')),
     CHECK (elapsed_ms IS NULL OR elapsed_ms >= 0),
     CHECK (rows_returned IS NULL OR rows_returned >= 0),
     CHECK (repeat_idx > 0)
@@ -205,7 +205,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_decisions (
     rewritten     boolean NOT NULL DEFAULT false,
     features      jsonb NOT NULL DEFAULT '{}'::jsonb,
     route_doc     jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore')),
     CHECK (confidence IS NULL OR confidence >= 0)
 );
 
@@ -250,7 +250,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_executions (
     status        text NOT NULL DEFAULT 'ok',
     features      jsonb NOT NULL DEFAULT '{}'::jsonb,
     route_doc     jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore')),
     CHECK (confidence IS NULL OR confidence >= 0),
     CHECK (elapsed_ms >= 0),
     CHECK (rows_returned >= 0)
@@ -278,25 +278,25 @@ ALTER TABLE IF EXISTS rvbbit.route_observations
     DROP CONSTRAINT IF EXISTS route_observations_candidate_check;
 ALTER TABLE IF EXISTS rvbbit.route_observations
     ADD CONSTRAINT route_observations_candidate_check
-    CHECK (candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore'));
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore'));
 
 ALTER TABLE IF EXISTS rvbbit.route_training_results
     DROP CONSTRAINT IF EXISTS route_training_results_candidate_check;
 ALTER TABLE IF EXISTS rvbbit.route_training_results
     ADD CONSTRAINT route_training_results_candidate_check
-    CHECK (candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore'));
+    CHECK (candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore'));
 
 ALTER TABLE IF EXISTS rvbbit.route_decisions
     DROP CONSTRAINT IF EXISTS route_decisions_candidate_check;
 ALTER TABLE IF EXISTS rvbbit.route_decisions
     ADD CONSTRAINT route_decisions_candidate_check
-    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore'));
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore'));
 
 ALTER TABLE IF EXISTS rvbbit.route_executions
     DROP CONSTRAINT IF EXISTS route_executions_candidate_check;
 ALTER TABLE IF EXISTS rvbbit.route_executions
     ADD CONSTRAINT route_executions_candidate_check
-    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore'));
+    CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS route_profiles_one_active_idx
     ON rvbbit.route_profiles ((active))
@@ -310,6 +310,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_profile_entries (
     reason        text NOT NULL DEFAULT '',
     observations  bigint NOT NULL DEFAULT 0,
     native_ms     double precision,
+    native_vortex_ms double precision,
     duck_ms       double precision,
     duck_hive_ms  double precision,
     duck_vortex_ms double precision,
@@ -320,7 +321,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_profile_entries (
     created_at    timestamptz NOT NULL DEFAULT now(),
     updated_at    timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (profile_name, shape_key),
-    CHECK (choice IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore')),
+    CHECK (choice IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore')),
     CHECK (confidence >= 0)
 );
 
@@ -333,6 +334,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_profile_points (
     shape_family  text NOT NULL,
     table_rows    bigint NOT NULL,
     native_ms     double precision NOT NULL,
+    native_vortex_ms double precision,
     duck_ms       double precision NOT NULL,
     duck_hive_ms  double precision,
     duck_vortex_ms double precision,
@@ -343,6 +345,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_profile_points (
     created_at    timestamptz NOT NULL DEFAULT now(),
     CHECK (table_rows >= 0),
     CHECK (native_ms > 0),
+    CHECK (native_vortex_ms IS NULL OR native_vortex_ms > 0),
     CHECK (duck_ms > 0),
     CHECK (duck_hive_ms IS NULL OR duck_hive_ms > 0),
     CHECK (duck_vortex_ms IS NULL OR duck_vortex_ms > 0),
@@ -350,6 +353,12 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_profile_points (
     CHECK (datafusion_hive_ms IS NULL OR datafusion_hive_ms > 0),
     CHECK (pg_ms IS NULL OR pg_ms > 0)
 );
+
+ALTER TABLE IF EXISTS rvbbit.route_profile_entries
+    ADD COLUMN IF NOT EXISTS native_vortex_ms double precision;
+
+ALTER TABLE IF EXISTS rvbbit.route_profile_points
+    ADD COLUMN IF NOT EXISTS native_vortex_ms double precision;
 
 ALTER TABLE IF EXISTS rvbbit.route_profile_entries
     ADD COLUMN IF NOT EXISTS duck_hive_ms double precision;
@@ -376,7 +385,7 @@ ALTER TABLE IF EXISTS rvbbit.route_profile_entries
     DROP CONSTRAINT IF EXISTS route_profile_entries_choice_check;
 ALTER TABLE IF EXISTS rvbbit.route_profile_entries
     ADD CONSTRAINT route_profile_entries_choice_check
-    CHECK (choice IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'pg_rowstore'));
+    CHECK (choice IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore'));
 
 CREATE INDEX IF NOT EXISTS route_profile_points_family_idx
     ON rvbbit.route_profile_points (profile_name, shape_family, table_rows);
@@ -491,7 +500,7 @@ CREATE OR REPLACE VIEW rvbbit.route_shape_summary AS
 WITH candidate_stats AS (
     SELECT *
     FROM rvbbit.route_observation_summary
-    WHERE candidate IN ('rvbbit_native', 'duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'pg_rowstore')
+    WHERE candidate IN ('rvbbit_native', 'rvbbit_native_vortex', 'duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'pg_rowstore')
 ),
 shape_stats AS (
     SELECT
@@ -665,11 +674,12 @@ enum Candidate {
     DataFusionHive,
     DataFusionVortex,
     RvbbitNative,
+    RvbbitNativeVortex,
     PgRowstore,
 }
 
 impl Candidate {
-    fn all() -> [Self; 9] {
+    fn all() -> [Self; 10] {
         [
             Candidate::DuckVector,
             Candidate::DuckHive,
@@ -679,6 +689,7 @@ impl Candidate {
             Candidate::DataFusionHive,
             Candidate::DataFusionVortex,
             Candidate::RvbbitNative,
+            Candidate::RvbbitNativeVortex,
             Candidate::PgRowstore,
         ]
     }
@@ -693,6 +704,7 @@ impl Candidate {
             Candidate::DataFusionHive => "datafusion_hive",
             Candidate::DataFusionVortex => "datafusion_vortex",
             Candidate::RvbbitNative => "rvbbit_native",
+            Candidate::RvbbitNativeVortex => "rvbbit_native_vortex",
             Candidate::PgRowstore => "pg_rowstore",
         }
     }
@@ -707,6 +719,9 @@ impl Candidate {
             Candidate::DataFusionHive => "datafusion_hive",
             Candidate::DataFusionVortex => "datafusion_vortex",
             Candidate::RvbbitNative => "native",
+            // Falls through to the native CustomScan like RvbbitNative; the
+            // NATIVE_VORTEX_ROUTE_SELECTED flag tells the scan to read vortex.
+            Candidate::RvbbitNativeVortex => "native",
             Candidate::PgRowstore => "postgres_rowstore",
         }
     }
@@ -723,6 +738,7 @@ impl Candidate {
                 Some(Candidate::DataFusionVortex)
             }
             "rvbbit_native" | "native" => Some(Candidate::RvbbitNative),
+            "rvbbit_native_vortex" | "native_vortex" => Some(Candidate::RvbbitNativeVortex),
             "pg_rowstore" | "postgres_rowstore" => Some(Candidate::PgRowstore),
             _ => None,
         }
@@ -738,6 +754,7 @@ impl Candidate {
             | Candidate::DataFusionHive
             | Candidate::DataFusionVortex => "datafusion",
             Candidate::RvbbitNative => "native",
+            Candidate::RvbbitNativeVortex => "native",
             Candidate::PgRowstore => "pg_rowstore",
         }
     }
@@ -748,7 +765,9 @@ impl Candidate {
         match self {
             Candidate::DuckVector | Candidate::DataFusionVector => "vector",
             Candidate::DuckHive | Candidate::DataFusionHive => "hive",
-            Candidate::DuckVortex | Candidate::DataFusionVortex => "vortex",
+            Candidate::DuckVortex
+            | Candidate::DataFusionVortex
+            | Candidate::RvbbitNativeVortex => "vortex",
             Candidate::DataFusionMem => "mem",
             Candidate::RvbbitNative | Candidate::PgRowstore => "",
         }
@@ -765,6 +784,45 @@ pub(crate) fn set_pg_rowstore_route_selected(selected: bool) {
 
 pub(crate) fn pg_rowstore_route_selected() -> bool {
     PG_ROWSTORE_ROUTE_SELECTED.with(|flag| flag.get())
+}
+
+thread_local! {
+    /// Set by the rewriter when the router chooses `RvbbitNativeVortex` for this
+    /// query, read by custom_scan's `fetch_best_row_group_paths` to read the
+    /// vortex layout instead of canonical parquet — the per-query analogue of the
+    /// global `rvbbit.native_vortex` GUC. Mirrors `PG_ROWSTORE_ROUTE_SELECTED`.
+    static NATIVE_VORTEX_ROUTE_SELECTED: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn set_native_vortex_route_selected(selected: bool) {
+    NATIVE_VORTEX_ROUTE_SELECTED.with(|flag| flag.set(selected));
+}
+
+pub(crate) fn native_vortex_route_selected() -> bool {
+    // The rewriter sets the thread-local flag for profile/observation-driven
+    // selection. We ALSO honor route_force_candidate directly here because (a) the
+    // training harness forces each candidate via that GUC (execute_candidate_once),
+    // and (b) it's a stable session GUC immune to the parse/plan re-computation that
+    // can clobber the thread-local before the scan opens.
+    NATIVE_VORTEX_ROUTE_SELECTED.with(|flag| flag.get())
+        || forced_candidate_setting() == Some(Candidate::RvbbitNativeVortex)
+}
+
+thread_local! {
+    /// Snapshot of NATIVE_VORTEX_ROUTE_SELECTED taken at planner-hook entry. The
+    /// rewriter's flag survives parse but can be clobbered by route re-computation
+    /// inside standard_planner before the CustomScan path is built; capturing into
+    /// this separate cell at planner entry (then stashing into the scan node) is
+    /// immune to those mid-plan resets.
+    static NATIVE_VORTEX_PLAN_CAPTURED: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn set_native_vortex_plan_captured(selected: bool) {
+    NATIVE_VORTEX_PLAN_CAPTURED.with(|flag| flag.set(selected));
+}
+
+pub(crate) fn native_vortex_plan_captured() -> bool {
+    NATIVE_VORTEX_PLAN_CAPTURED.with(|flag| flag.get())
 }
 
 #[derive(Clone, Debug)]
@@ -880,6 +938,7 @@ struct RouteProfileSelection {
 #[derive(Clone, Copy, Debug, Default)]
 struct RouteCurveSample {
     native_ms: Option<f64>,
+    native_vortex_ms: Option<f64>,
     duck_ms: Option<f64>,
     duck_hive_ms: Option<f64>,
     duck_vortex_ms: Option<f64>,
@@ -891,6 +950,7 @@ struct RouteCurveSample {
 #[derive(Default)]
 struct CandidateBuckets {
     native: Vec<f64>,
+    native_vortex: Vec<f64>,
     duck: Vec<f64>,
     duck_hive: Vec<f64>,
     duck_vortex: Vec<f64>,
@@ -933,6 +993,7 @@ impl RouteCurveSample {
     fn has_at_least_two(self) -> bool {
         [
             self.native_ms,
+            self.native_vortex_ms,
             self.duck_ms,
             self.duck_hive_ms,
             self.duck_vortex_ms,
@@ -2350,6 +2411,7 @@ fn choose_from_profile_curve(
         let rows = obs_features.get("table_rows").and_then(Value::as_i64)?;
         let sample = RouteCurveSample {
             native_ms: positive_f64(obs.get("native_ms")),
+            native_vortex_ms: positive_f64(obs.get("native_vortex_ms")),
             duck_ms: positive_f64(obs.get("duck_ms")),
             duck_hive_ms: positive_f64(obs.get("duck_hive_ms")),
             duck_vortex_ms: positive_f64(obs.get("duck_vortex_ms")),
@@ -2380,7 +2442,7 @@ fn choose_from_profile_points(
     let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let table = client.select(
             &format!(
-                "SELECT p.table_rows, p.native_ms, p.duck_ms, p.duck_hive_ms, \
+                "SELECT p.table_rows, p.native_ms, p.native_vortex_ms, p.duck_ms, p.duck_hive_ms, \
                         p.duck_vortex_ms, p.datafusion_ms, p.datafusion_hive_ms, p.pg_ms \
                  FROM rvbbit.route_profiles rp \
                  JOIN rvbbit.route_profile_points p ON p.profile_name = rp.name \
@@ -2395,14 +2457,16 @@ fn choose_from_profile_points(
         for row in table {
             let rows: i64 = row.get(1)?.unwrap_or_default();
             let native: f64 = row.get(2)?.unwrap_or_default();
-            let duck: f64 = row.get(3)?.unwrap_or_default();
-            let duck_hive: f64 = row.get(4)?.unwrap_or_default();
-            let duck_vortex: f64 = row.get(5)?.unwrap_or_default();
-            let datafusion: f64 = row.get(6)?.unwrap_or_default();
-            let datafusion_hive: f64 = row.get(7)?.unwrap_or_default();
-            let pg: f64 = row.get(8)?.unwrap_or_default();
+            let native_vortex: f64 = row.get(3)?.unwrap_or_default();
+            let duck: f64 = row.get(4)?.unwrap_or_default();
+            let duck_hive: f64 = row.get(5)?.unwrap_or_default();
+            let duck_vortex: f64 = row.get(6)?.unwrap_or_default();
+            let datafusion: f64 = row.get(7)?.unwrap_or_default();
+            let datafusion_hive: f64 = row.get(8)?.unwrap_or_default();
+            let pg: f64 = row.get(9)?.unwrap_or_default();
             let sample = RouteCurveSample {
                 native_ms: (native > 0.0).then_some(native),
+                native_vortex_ms: (native_vortex > 0.0).then_some(native_vortex),
                 duck_ms: (duck > 0.0).then_some(duck),
                 duck_hive_ms: (duck_hive > 0.0).then_some(duck_hive),
                 duck_vortex_ms: (duck_vortex > 0.0).then_some(duck_vortex),
@@ -2527,7 +2591,7 @@ fn choose_from_observation_curve(
                  FROM rvbbit.route_observations \
                  WHERE shape_family IN ({family_lit}, {legacy_family_lit}) \
                    AND status = 'ok' \
-                   AND candidate IN ('rvbbit_native', 'duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'pg_rowstore') \
+                   AND candidate IN ('rvbbit_native', 'rvbbit_native_vortex', 'duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'pg_rowstore') \
                    AND features ? 'table_rows' \
                  ORDER BY observed_at DESC \
                  LIMIT 2000"
@@ -2545,6 +2609,7 @@ fn choose_from_observation_curve(
             let entry = by_rows.entry(rows).or_default();
             match candidate.as_str() {
                 "rvbbit_native" => entry.native.push(elapsed_ms),
+                "rvbbit_native_vortex" => entry.native_vortex.push(elapsed_ms),
                 "duck_vector" => entry.duck.push(elapsed_ms),
                 "duck_hive" => entry.duck_hive.push(elapsed_ms),
                 "duck_vortex" => entry.duck_vortex.push(elapsed_ms),
@@ -2560,6 +2625,8 @@ fn choose_from_observation_curve(
     for (rows, values) in by_rows {
         let sample = RouteCurveSample {
             native_ms: (!values.native.is_empty()).then(|| median_f64(values.native)),
+            native_vortex_ms: (!values.native_vortex.is_empty())
+                .then(|| median_f64(values.native_vortex)),
             duck_ms: (!values.duck.is_empty()).then(|| median_f64(values.duck)),
             duck_hive_ms: (!values.duck_hive.is_empty()).then(|| median_f64(values.duck_hive)),
             duck_vortex_ms: (!values.duck_vortex.is_empty())
@@ -2592,6 +2659,9 @@ fn route_curve_from_anchors(
         .map(|(rows, vals)| {
             let sample = RouteCurveSample {
                 native_ms: median_option(vals.iter().filter_map(|v| v.native_ms).collect()),
+                native_vortex_ms: median_option(
+                    vals.iter().filter_map(|v| v.native_vortex_ms).collect(),
+                ),
                 duck_ms: median_option(vals.iter().filter_map(|v| v.duck_ms).collect()),
                 duck_hive_ms: median_option(vals.iter().filter_map(|v| v.duck_hive_ms).collect()),
                 duck_vortex_ms: median_option(
@@ -3008,6 +3078,7 @@ fn profile_point_from_medians(
         "shape_family": shape_family,
         "table_rows": table_rows,
         "native_ms": native_ms,
+        "native_vortex_ms": get(Candidate::RvbbitNativeVortex),
         "duck_ms": duck_ms,
         "duck_hive_ms": get(Candidate::DuckHive),
         "duck_vortex_ms": get(Candidate::DuckVortex),
@@ -3028,6 +3099,7 @@ fn profile_point_from_medians(
 fn candidate_median_field(candidate: &str) -> Option<&'static str> {
     match Candidate::from_str(candidate)? {
         Candidate::RvbbitNative => Some("native_ms_median"),
+        Candidate::RvbbitNativeVortex => Some("native_vortex_ms_median"),
         Candidate::DuckVector => Some("duck_ms_median"),
         Candidate::DuckHive => Some("duck_hive_ms_median"),
         Candidate::DuckVortex => Some("duck_vortex_ms_median"),
@@ -3045,6 +3117,7 @@ fn parse_training_candidates(value: &str, caller: &str) -> Vec<Candidate> {
     let raw = if requested.eq_ignore_ascii_case("all") {
         vec![
             Candidate::RvbbitNative,
+            Candidate::RvbbitNativeVortex,
             Candidate::DataFusionMem,
             Candidate::DataFusionVector,
             Candidate::DuckVector,
@@ -4342,6 +4415,52 @@ fn duck_vortex_availability(
     )
 }
 
+/// Native CustomScan reading the vortex columnar variant. Mirrors
+/// `duck_vortex_availability`: parquet must be authoritative (which also means no
+/// pending deletes — so the scan's tombstone→parquet fallback never triggers), no
+/// AS OF (vortex variants carry no per-rg generations), and a ready `vortex_scan`
+/// variant for every referenced table. Shares the "native" engine family but the
+/// "vortex" layout, so a per-table vortex-layout deny still gates it.
+fn native_vortex_candidate_availability(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> (bool, String) {
+    let (base_available, base_reason) = duck_availability(features, tables);
+    if !base_available {
+        return (false, base_reason);
+    }
+    if crate::time_travel::active_as_of_enabled() {
+        return (
+            false,
+            "Native Vortex accelerator is not used for AS OF queries".to_string(),
+        );
+    }
+    if !relations_present(&["rvbbit.row_group_variants", "rvbbit.layout_variant_status"]) {
+        return (
+            false,
+            "Vortex accelerator catalog is not available".to_string(),
+        );
+    }
+    let missing = tables
+        .iter()
+        .filter(|table| !table_has_vortex_scan(table.oid))
+        .map(|table| format!("{}.{}", table.schema, table.relname))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return (
+            false,
+            format!(
+                "Native Vortex accelerator is missing for {}",
+                missing.join(", ")
+            ),
+        );
+    }
+    (
+        true,
+        "Native CustomScan Vortex accelerator files available and authoritative".to_string(),
+    )
+}
+
 fn vortex_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> (bool, String) {
     let (base_available, base_reason) = duck_availability(features, tables);
     if !base_available {
@@ -4469,6 +4588,11 @@ fn candidate_gate_enabled(candidate: Candidate) -> bool {
             "rvbbit.route_rvbbit_native",
             true,
         ),
+        Candidate::RvbbitNativeVortex => route_enabled(
+            "RVBBIT_ROUTE_NATIVE_VORTEX",
+            "rvbbit.route_native_vortex",
+            true,
+        ),
         Candidate::PgRowstore => {
             route_enabled("RVBBIT_ROUTE_PG_ROWSTORE", "rvbbit.route_pg_rowstore", true)
         }
@@ -4575,6 +4699,7 @@ fn candidate_availability(
         Candidate::DuckVortex => duck_vortex_availability(features, tables),
         Candidate::DataFusionVortex => vortex_availability(features, tables),
         Candidate::RvbbitNative => (true, "Rvbbit native PostgreSQL path available".to_string()),
+        Candidate::RvbbitNativeVortex => native_vortex_candidate_availability(features, tables),
         Candidate::PgRowstore => pg_rowstore_availability(tables),
     }
 }
@@ -5469,6 +5594,7 @@ fn export_route_profile_value(profile_name: &str, caller: &str) -> Value {
                            'shape_family', shape_family,
                            'table_rows', table_rows,
                            'native_ms', native_ms,
+                           'native_vortex_ms', native_vortex_ms,
                            'duck_ms', duck_ms,
                            'duck_hive_ms', duck_hive_ms,
                            'duck_vortex_ms', duck_vortex_ms,
@@ -5518,7 +5644,7 @@ fn persist_profile_tables(
         r#"
         INSERT INTO rvbbit.route_profile_entries
             (profile_name, shape_key, choice, confidence, reason, observations,
-             native_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, entry)
+             native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, entry)
         SELECT {name_lit},
                e.key,
                CASE e.value->>'choice'
@@ -5537,6 +5663,12 @@ fn persist_profile_tables(
                    SELECT nullif(m->>'median_ms', '')::double precision
                    FROM jsonb_array_elements(coalesce(e.value->'candidate_medians', '[]'::jsonb)) AS m
                    WHERE m->>'candidate' = 'rvbbit_native'
+                   LIMIT 1
+               )),
+               coalesce(nullif(e.value->>'native_vortex_ms_median', '')::double precision, (
+                   SELECT nullif(m->>'median_ms', '')::double precision
+                   FROM jsonb_array_elements(coalesce(e.value->'candidate_medians', '[]'::jsonb)) AS m
+                   WHERE m->>'candidate' = 'rvbbit_native_vortex'
                    LIMIT 1
                )),
                coalesce(nullif(e.value->>'duck_ms_median', '')::double precision, (
@@ -5578,13 +5710,13 @@ fn persist_profile_tables(
                e.value
         FROM jsonb_each(coalesce({profile_lit}::jsonb->'entries', '{{}}'::jsonb)) AS e(key, value)
         WHERE e.value ? 'choice'
-          AND e.value->>'choice' IN ('duck', 'duck_hive', 'duck_vortex', 'native', 'datafusion_mem', 'df_mem', 'datafusion', 'datafusion_hive', 'datafusion_vortex', 'df_hive', 'pg_heap', 'duck_vector', 'datafusion_vector', 'rvbbit_native', 'pg_rowstore')
+          AND e.value->>'choice' IN ('duck', 'duck_hive', 'duck_vortex', 'native', 'datafusion_mem', 'df_mem', 'datafusion', 'datafusion_hive', 'datafusion_vortex', 'df_hive', 'pg_heap', 'duck_vector', 'datafusion_vector', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore')
         "#
     ))?;
     Spi::run(&format!(
         r#"
         INSERT INTO rvbbit.route_profile_points
-            (profile_name, shape_family, table_rows, native_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point)
+            (profile_name, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point)
         SELECT {name_lit},
                regexp_replace(
                    regexp_replace(coalesce(obs->'features'->>'shape_key', ''),
@@ -5593,6 +5725,7 @@ fn persist_profile_tables(
                ),
                coalesce(nullif(obs->'features'->>'table_rows', '')::bigint, 0),
                nullif(obs->>'native_ms', '')::double precision,
+               nullif(obs->>'native_vortex_ms', '')::double precision,
                nullif(obs->>'duck_ms', '')::double precision,
                nullif(obs->>'duck_hive_ms', '')::double precision,
                nullif(obs->>'duck_vortex_ms', '')::double precision,
@@ -5612,11 +5745,12 @@ fn persist_profile_tables(
     Spi::run(&format!(
         r#"
         INSERT INTO rvbbit.route_profile_points
-            (profile_name, shape_family, table_rows, native_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point)
+            (profile_name, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point)
         SELECT {name_lit},
                shape_family,
                table_rows,
                native_ms,
+               native_vortex_ms,
                duck_ms,
                duck_hive_ms,
                duck_vortex_ms,
@@ -5647,6 +5781,10 @@ fn persist_profile_tables(
                        nullif(pp->>'native_ms', '')::double precision,
                        nullif(pp->'point'->>'native_ms', '')::double precision
                    ) AS native_ms,
+                   coalesce(
+                       nullif(pp->>'native_vortex_ms', '')::double precision,
+                       nullif(pp->'point'->>'native_vortex_ms', '')::double precision
+                   ) AS native_vortex_ms,
                    coalesce(
                        nullif(pp->>'duck_ms', '')::double precision,
                        nullif(pp->'point'->>'duck_ms', '')::double precision
@@ -5776,9 +5914,9 @@ fn copy_profile_entries(target_profile: &str, source_profile: &str, caller: &str
         r#"
         INSERT INTO rvbbit.route_profile_entries
             (profile_name, shape_key, choice, confidence, reason, observations,
-             native_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, entry)
+             native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, entry)
         SELECT {target_lit}, shape_key, choice, confidence, reason, observations,
-               native_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, entry
+               native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, entry
         FROM rvbbit.route_profile_entries
         WHERE profile_name = {source_lit}
         ON CONFLICT (profile_name, shape_key) DO UPDATE SET
@@ -5787,6 +5925,7 @@ fn copy_profile_entries(target_profile: &str, source_profile: &str, caller: &str
             reason = EXCLUDED.reason,
             observations = EXCLUDED.observations,
             native_ms = EXCLUDED.native_ms,
+            native_vortex_ms = EXCLUDED.native_vortex_ms,
             duck_ms = EXCLUDED.duck_ms,
             duck_hive_ms = EXCLUDED.duck_hive_ms,
             duck_vortex_ms = EXCLUDED.duck_vortex_ms,
@@ -5805,8 +5944,8 @@ fn copy_profile_points(target_profile: &str, source_profile: &str, caller: &str)
     Spi::run(&format!(
         r#"
         INSERT INTO rvbbit.route_profile_points
-            (profile_name, shape_family, table_rows, native_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point)
-        SELECT {target_lit}, shape_family, table_rows, native_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point
+            (profile_name, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point)
+        SELECT {target_lit}, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point
         FROM rvbbit.route_profile_points
         WHERE profile_name = {source_lit}
         "#
@@ -6482,6 +6621,11 @@ fn interpolate_predictions(
 ) -> Vec<(Candidate, f64)> {
     [
         (Candidate::RvbbitNative, lower.native_ms, upper.native_ms),
+        (
+            Candidate::RvbbitNativeVortex,
+            lower.native_vortex_ms,
+            upper.native_vortex_ms,
+        ),
         (Candidate::DuckVector, lower.duck_ms, upper.duck_ms),
         (Candidate::DuckHive, lower.duck_hive_ms, upper.duck_hive_ms),
         (

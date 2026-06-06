@@ -103,6 +103,10 @@ unsafe extern "C-unwind" fn rvbbit_planner_hook(
     bound_params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
     let _asof_scope = crate::time_travel::planner_scope(query_string);
+    // Snapshot the native+vortex route selection at planner entry, before
+    // standard_planner's internal route re-computation can clobber the global flag.
+    // add_rvbbit_path reads this captured value to stash into the scan node.
+    router::set_native_vortex_plan_captured(router::native_vortex_route_selected());
     if force_heap_scan_enabled() {
         return call_next_planner(parse, query_string, cursor_options, bound_params);
     }
@@ -313,10 +317,14 @@ unsafe fn add_rvbbit_path(
     // attribute 1 regardless of what was requested.
     path.flags = 0x0004;
     path.custom_paths = std::ptr::null_mut();
-    // Stash the table OID in custom_private as a single-element List of
-    // Integer so PlanCustomPath can recover it. `list_make1_int` is a C
-    // macro; `lappend_int(NIL, x)` is the function-call equivalent.
+    // Stash the table OID in custom_private as a List of Integer so
+    // PlanCustomPath can recover it. Element 1 carries the native+vortex route
+    // selection captured HERE at plan time (where the rewriter's flag is still
+    // reliably set) — it then rides the plan node into begin_custom_scan, immune
+    // to the execution-time route re-computation that clobbers the global flag.
+    let native_vortex = crate::router::native_vortex_plan_captured() as i32;
     let oid_list = pg_sys::lappend_int(std::ptr::null_mut(), table_oid as i32);
+    let oid_list = pg_sys::lappend_int(oid_list, native_vortex);
     path.custom_private = oid_list;
     path.methods = &RVBBIT_PATH_METHODS.0;
 

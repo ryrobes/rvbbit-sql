@@ -155,6 +155,7 @@ unsafe extern "C-unwind" fn rvbbit_post_parse_analyze_hook(
         return;
     }
     router::set_pg_rowstore_route_selected(false);
+    router::set_native_vortex_route_selected(false);
     if (*query).commandType != pg_sys::CmdType::CMD_SELECT {
         return;
     }
@@ -181,13 +182,21 @@ unsafe extern "C-unwind" fn rvbbit_post_parse_analyze_hook(
     IN_REWRITER.with(|f| f.set(true));
     let duck_rewritten = try_duck_backend_rewrite(pstate, query);
     let pg_rowstore_selected = router::pg_rowstore_route_selected();
-    let native_cache_rewritten = if !duck_rewritten && !pg_rowstore_selected {
-        try_apply_native_rewrite_cache(query)
-    } else {
-        false
-    };
+    // When the router picks native+vortex, skip ALL the native SQL rewrites (the
+    // projected-aggregate rules + native cache) so the query falls through to the
+    // native CustomScan, which reads the vortex layout via the route flag. Mirrors
+    // pg_rowstore_selected — otherwise a projected-aggregate rewrite would hijack the
+    // query to the parquet path and the vortex flag would never take effect.
+    let native_vortex_selected = router::native_vortex_route_selected();
+    let native_cache_rewritten =
+        if !duck_rewritten && !pg_rowstore_selected && !native_vortex_selected {
+            try_apply_native_rewrite_cache(query)
+        } else {
+            false
+        };
     if !duck_rewritten
         && !pg_rowstore_selected
+        && !native_vortex_selected
         && !native_cache_rewritten
         && !try_source_correlated_scalar_agg_rule(pstate, query)
         && !try_source_exclusive_member_semijoin_rule(pstate, query)
@@ -686,6 +695,14 @@ unsafe fn try_duck_backend_rewrite(
     };
     if chosen_candidate == "pg_rowstore" {
         router::set_pg_rowstore_route_selected(true);
+        log_route_probe(query_source, route_doc, route_probe.cache_hit, false);
+        return false;
+    }
+    if chosen_candidate == "rvbbit_native_vortex" {
+        // Falls through to the native CustomScan (no SQL rewrite); the flag is read
+        // by the planner (add_rvbbit_path) and stashed in the scan node, so it
+        // survives the execution-time route re-computation to fetch_best_row_group_paths.
+        router::set_native_vortex_route_selected(true);
         log_route_probe(query_source, route_doc, route_probe.cache_hit, false);
         return false;
     }

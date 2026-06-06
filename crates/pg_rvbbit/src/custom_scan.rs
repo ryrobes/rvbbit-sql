@@ -429,6 +429,13 @@ unsafe extern "C-unwind" fn begin_custom_scan(
     }
     let table_oid = pg_sys::list_nth_int(oid_list, 0) as u32;
 
+    // Re-assert the native+vortex route selection from the plan node (captured at
+    // plan time, immune to the execution-time route re-computation that clobbers the
+    // global flag). fetch_best_row_group_paths below reads the global flag.
+    if pg_sys::list_length(oid_list) >= 2 && pg_sys::list_nth_int(oid_list, 1) != 0 {
+        crate::router::set_native_vortex_route_selected(true);
+    }
+
     // Extract the tuple descriptor — tells us what columns PG expects.
     let slot = (*node).ss.ss_ScanTupleSlot;
     let tupdesc = (*slot).tts_tupleDescriptor;
@@ -3088,7 +3095,10 @@ fn fetch_best_row_group_paths(
     // asof.is_none() — vortex variants don't carry per-rg generations (same caveat as
     // cluster variants). `include_stats` is threaded through so the variant rows carry
     // Phase-1 per-column stats whenever the predicate can use them for zone pruning.
-    if asof.is_none() && crate::duck_backend::native_vortex_enabled() {
+    if asof.is_none()
+        && (crate::duck_backend::native_vortex_enabled()
+            || crate::router::native_vortex_route_selected())
+    {
         let vortex_rgs =
             fetch_row_group_paths(table_oid, include_stats, Some(VORTEX_SCAN_LAYOUT), asof)?;
         if !vortex_rgs.is_empty() {
