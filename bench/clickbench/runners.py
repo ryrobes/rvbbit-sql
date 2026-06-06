@@ -28,7 +28,8 @@ PG_DSNS = {
     "alloydb":     "postgresql://postgres:bench@bench-alloydb:5432/postgres",
     "rvbbit":      "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench",
     "rvbbit_native": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff",
-    "rvbbit_native_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Drvbbit_native",
+    "rvbbit_native_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Drvbbit_native%20-c%20rvbbit.native_vortex%3Doff",
+    "rvbbit_native_vortex": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Drvbbit_native%20-c%20rvbbit.native_vortex%3Don",
     "rvbbit_duck_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Dduck_vector",
     "rvbbit_duck_hive_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Dduck_hive",
     "rvbbit_duck_vortex_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Dduck_vortex",
@@ -51,6 +52,11 @@ FORCED_SQL_CANDIDATES = {
     "rvbbit_datafusion_hive_forced": "datafusion_hive",
     "rvbbit_datafusion_mem_forced": "datafusion_mem",
     "rvbbit_datafusion_vortex_forced": "datafusion_vortex",
+    # Native engine, vortex columnar layout. Same router Candidate as
+    # rvbbit_native (no separate candidate until Phase 4) — the route assertion
+    # confirms native was chosen; the native_vortex=on GUC in the DSN makes it
+    # read .vortex. run_one intercepts this name to skip route-observation logging.
+    "rvbbit_native_vortex": "rvbbit_native",
 }
 
 
@@ -135,6 +141,7 @@ def run_pg(
     timeout_s: int = 300,
     capture_route: bool = False,
     expect_candidate: str | None = None,
+    expect_layout: str | None = None,
 ) -> float:
     times: list[float] = []
     route_doc = None
@@ -156,6 +163,24 @@ def run_pg(
                         raise RuntimeError(
                             f"route {chosen or 'none'} != {expect_candidate}: {reason}"
                         )
+            if expect_layout is not None:
+                # Integrity guard: prove the scan actually used `expect_layout`
+                # (e.g. vortex_scan), not a silent fallback to parquet. EXPLAIN runs
+                # on this already-forced connection, before timing. Soft-skips plans
+                # with no rvbbit custom scan (metadata count(*) short-circuits).
+                try:
+                    cur.execute(("EXPLAIN (COSTS off) " + sql).encode())  # type: ignore[arg-type]
+                    layout_lines = [r[0] for r in cur.fetchall() if "Rvbbit Layout:" in r[0]]
+                except Exception:
+                    cur.connection.rollback()
+                    cur.execute(f"SET statement_timeout = {timeout_s * 1000}".encode())  # type: ignore[arg-type]
+                    _apply_route_gucs(cur)
+                    layout_lines = []
+                if layout_lines and all(expect_layout not in line for line in layout_lines):
+                    raise RuntimeError(
+                        f"expected layout {expect_layout!r} not used: {layout_lines[0].strip()!r} "
+                        "(vortex variant missing? load via run_offline.sh so .vortex is built)"
+                    )
             for _ in range(repeat):
                 t0 = time.perf_counter()
                 cur.execute(sql.encode())  # type: ignore[arg-type]

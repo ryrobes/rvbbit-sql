@@ -16,9 +16,13 @@
 //! embedded read path compiles AND runs against a real `.vortex` file via the
 //! `rvbbit.vortex_native_probe(path)` smoke function.
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use arrow::array::{Array, StructArray};
+use arrow::compute::cast;
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use pgrx::prelude::*;
 
@@ -46,10 +50,24 @@ pub(crate) struct VortexRgReader {
 
 /// Open a `.vortex` row-group file and prepare it for reading.
 ///
-/// Phase 0 reads ALL columns (no projection/filter pushdown yet — the native scan
-/// still projects via its existing needed-attnums path). Runs the async Vortex open
-/// + scan on rvbbit's shared runtime.
-pub(crate) fn open_vortex_projected(path: &Path) -> Result<VortexRgReader, String> {
+/// `projection` lists the top-level column names to read (output columns + WHERE/qual
+/// columns — the native scan's `needed_attnums` set). When non-empty it is pushed into
+/// Vortex's `ScanBuilder::with_projection` via `select(names, root())`, so only those
+/// columns are decoded — matching parquet's `open_projected`. Empty = read all columns.
+/// The native tuple-fill matches batch columns by NAME, so projection order is irrelevant.
+///
+/// `timestamp_cols` lists the columns the native scan expects as PG timestamp/timestamptz
+/// (typoid 1114/1184). Vortex stores those as Int64 unix-epoch micros; the conversion
+/// re-casts them to Arrow `Timestamp(Microsecond, UTC)` so the native tuple-fill
+/// (`ColumnReader::Int64`-vs-Timestamp dispatch) sees the type it expects.
+///
+/// Runs the async Vortex open + scan on rvbbit's shared runtime.
+pub(crate) fn open_vortex_for_scan(
+    path: &Path,
+    projection: &[String],
+    timestamp_cols: &[String],
+) -> Result<VortexRgReader, String> {
+    let ts: HashSet<&str> = timestamp_cols.iter().map(String::as_str).collect();
     crate::df::with_lance_runtime(|rt| {
         rt.block_on(async {
             let session = VortexSession::default().with_tokio();
@@ -58,15 +76,22 @@ pub(crate) fn open_vortex_projected(path: &Path) -> Result<VortexRgReader, Strin
                 .open_path(path)
                 .await
                 .map_err(|e| format!("vortex open {}: {e}", path.display()))?;
-            let array: ArrayRef = file
+            let mut scan = file
                 .scan()
-                .map_err(|e| format!("vortex scan {}: {e}", path.display()))?
+                .map_err(|e| format!("vortex scan {}: {e}", path.display()))?;
+            if !projection.is_empty() {
+                // Projection pushdown: decode only the requested top-level fields,
+                // expressed as `select([names], root())` over the file's struct root.
+                let names: Vec<&str> = projection.iter().map(String::as_str).collect();
+                scan = scan.with_projection(expr::select(names, expr::root()));
+            }
+            let array: ArrayRef = scan
                 .into_array_stream()
                 .map_err(|e| format!("vortex stream {}: {e}", path.display()))?
                 .read_all()
                 .await
                 .map_err(|e| format!("vortex read_all {}: {e}", path.display()))?;
-            let batch = vortex_array_to_record_batch(array)?;
+            let batch = vortex_array_to_record_batch(array, &ts)?;
             Ok::<_, String>(VortexRgReader { batch: Some(batch) })
         })
     })
@@ -77,11 +102,40 @@ pub(crate) fn next_batch(reader: &mut VortexRgReader) -> Option<Result<RecordBat
     reader.batch.take().map(Ok)
 }
 
-/// Canonicalize a Vortex (struct) array into an Arrow `RecordBatch`.
+/// Map a Vortex-preferred Arrow encoding to the plain type the native reader
+/// (`make_reader_for`) can downcast, or `None` if it's already plain. View strings
+/// and `LargeUtf8` decode to `Utf8`; view/large binary to `Binary`; a dictionary
+/// decodes to (the canonical form of) its value type. Returns `None` for everything
+/// `make_reader_for` already handles, so the column passes through untouched.
+fn canonical_native_type(dt: &DataType) -> Option<DataType> {
+    match dt {
+        DataType::Utf8View | DataType::LargeUtf8 => Some(DataType::Utf8),
+        DataType::BinaryView | DataType::LargeBinary => Some(DataType::Binary),
+        DataType::Dictionary(_, value) => {
+            Some(canonical_native_type(value).unwrap_or_else(|| value.as_ref().clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Canonicalize a Vortex (struct) array into an Arrow `RecordBatch` whose column
+/// types match what the native tuple-fill (`ColumnReader`) expects.
 ///
-/// TODO(Phase 3): handle `Utf8View -> Utf8` and the `Int64 -> Timestamp` re-cast
-/// here so the native tuple-fill (`ColumnReader`) sees the types it expects.
-fn vortex_array_to_record_batch(array: ArrayRef) -> Result<RecordBatch, String> {
+/// Two re-casts (the Phase 3 gotchas):
+///   * Vortex's preferred string encoding is `Utf8View`/`LargeUtf8`; the native
+///     reader only handles `StringArray` (`Utf8`), so view/large strings are cast
+///     down to `Utf8`.
+///   * Timestamp columns come back as `Int64` (unix-epoch micros). For each column
+///     named in `timestamp_cols` we cast `Int64 -> Timestamp(Microsecond, UTC)` so
+///     the native reader hits its Timestamp arm (the epoch handling lives there,
+///     identical to the parquet path — no offset math here).
+///
+/// All other columns pass through untouched. Casts are zero-copy where Arrow allows
+/// it and only run on the columns that need them.
+fn vortex_array_to_record_batch(
+    array: ArrayRef,
+    timestamp_cols: &HashSet<&str>,
+) -> Result<RecordBatch, String> {
     #[allow(deprecated)]
     let arrow = array
         .into_arrow_preferred()
@@ -91,7 +145,46 @@ fn vortex_array_to_record_batch(array: ArrayRef) -> Result<RecordBatch, String> 
         .downcast_ref::<StructArray>()
         .ok_or_else(|| "vortex root array is not a struct".to_string())?
         .clone();
-    Ok(RecordBatch::from(sa))
+    let batch = RecordBatch::from(sa);
+    let schema = batch.schema();
+
+    let mut fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
+    let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut changed = false;
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(idx);
+        let target: Option<DataType> = if let Some(t) = canonical_native_type(field.data_type()) {
+            // Vortex's preferred encodings (view strings/binary, dictionary) that
+            // the native reader doesn't downcast — decode them to the plain type.
+            Some(t)
+        } else if matches!(field.data_type(), DataType::Int64)
+            && timestamp_cols.contains(field.name().as_str())
+        {
+            // Vortex stores timestamps as Int64 unix-epoch micros; native expects
+            // a TimestampMicrosecondArray (epoch handling lives in its Timestamp arm).
+            Some(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
+        } else {
+            None
+        };
+        match target {
+            Some(dt) => {
+                let casted = cast(col, &dt)
+                    .map_err(|e| format!("vortex canonicalize column {}: {e}", field.name()))?;
+                fields.push(Field::new(field.name(), dt, field.is_nullable()));
+                columns.push(casted);
+                changed = true;
+            }
+            None => {
+                fields.push(field.as_ref().clone());
+                columns.push(col.clone());
+            }
+        }
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("vortex canonicalized batch: {e}"))
 }
 
 /// Phase 0 smoke probe (exit criterion): open a `.vortex` file via the embedded
@@ -99,7 +192,7 @@ fn vortex_array_to_record_batch(array: ArrayRef) -> Result<RecordBatch, String> 
 /// in-process read path works against a real compacted `.vortex` row group.
 #[pg_extern]
 fn vortex_native_probe(path: &str) -> pgrx::JsonB {
-    let mut reader = match open_vortex_projected(Path::new(path)) {
+    let mut reader = match open_vortex_for_scan(Path::new(path), &[], &[]) {
         Ok(r) => r,
         Err(e) => return pgrx::JsonB(serde_json::json!({ "ok": false, "error": e })),
     };

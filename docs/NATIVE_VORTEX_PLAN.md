@@ -162,9 +162,37 @@ let a pushed filter be the *only* correctness gate.
 
 ---
 
-### Phase 3 — ScanBuilder-driven native reader (the core seam)  · effort **L** · GUC-gated
+### Phase 3 — ScanBuilder-driven native reader (the core seam)  · effort **L** · GUC-gated · ✅ READ-SWAP IMPLEMENTED + LIVE-VALIDATED 2026-06-06 (uncommitted) · PUSHDOWN deferred
 **Goal:** when activated, open the vortex variant via `vortex_adapter` instead of the parquet
 reader, materialize through the **existing** `fill_slot_from_batch` path. Handle all gotchas.
+
+> **AS BUILT (read-swap milestone).** Rather than gate per-`rg_id` at the open site, `fetch_best_row_group_paths`
+> returns the **`vortex_scan` variant** rows (path + Phase-1 stats) when `rvbbit.native_vortex` is on + a
+> ready variant exists + `asof.is_none()` — so the whole hot loop (pruning, `rg_id`, tombstones) is reused
+> unchanged and the open site just branches on `row_group_layout == "vortex_scan"`. **The vortex check must
+> precede the `if !include_stats { return }` early-return** (else predicate-free scans never use vortex —
+> caught live). Canonicalization (`canonical_native_type`) decodes view/large strings+binary AND
+> dictionary-encoded columns (not just `Utf8View`), because `make_reader_for` hard-errors on any unhandled
+> arrow type. Timestamp Int64→`Timestamp(µs,UTC)` re-cast keyed by column name. Native projects by **name**
+> (`schema.index_of`), so reading ALL vortex columns (no projection pushdown) is correct. Batch-cache
+> bypass (`current_cache_key=None`) + exhaust/rescan clears done. Tombstone V1 guard: `layout==vortex_scan
+> && !delete_bitmaps.is_empty()` → refetch parquet. **Validated** byte-identical on `hits` (5M×105) +
+> tombstone-fallback proven via injected `delete_log` rows (`deleted_xid` is `xid8`). Repro:
+> `docker/sql/native-vortex-verify.sql`.
+>
+> **PROJECTION PUSHDOWN DONE (2026-06-06):** `open_vortex_for_scan` now takes a `projection: &[String]`
+> and pushes `scan.with_projection(select(col_names, root()))`, decoding only the columns the query touches
+> (`needed_attnums` = targetlist ∪ qual cols, shared with the parquet branch). Proven: byte-identical A/B
+> still passes; narrow(1-col) vs wide(10-col) under native+vortex = 1.5ms vs 156ms (104×) → columns are
+> genuinely pruned; native+vortex is now at parity with native+parquet (was ~100× handicapped on narrow
+> ClickBench queries). This removes the dominant benchmark confound — the `rvbbit_native_vortex` bench
+> target is now a fair comparison.
+>
+> **STILL deferred — filter pushdown (the second half of the perf win):** `ScanBuilder::with_filter` +
+> the Phase-2 `vortex_adapter::translate`/`VortexPushedFilter` (still `#[allow(dead_code)]`) + the lowering
+> `custom_scan` `PushedQual`→`FilterRepr`. That is zone-map pruning + compute-over-compressed at the source —
+> where native+vortex should *beat* native+parquet on selective scans (today they're comparable on full
+> decodes). Low-row-count floor skipped (no `n_rows` on `RowGroupEntry`; GUC is off-by-default).
 
 - **3a.** `open_vortex_projected` + `VortexRgReader` + `next_batch` in `vortex_adapter.rs`
   (`with_projection` + `with_filter` + `into_record_batch_reader|stream` inside `with_lance_runtime`).

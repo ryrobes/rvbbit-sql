@@ -20,7 +20,7 @@ SCALE="${TPCDS_SCALE:-0.1}"
 SCALE_LABEL="${SCALE//./_}"
 SYSTEMS="${BENCH_SYSTEMS:-rvbbit,duckdb,pg_baseline,citus,hydra,alloydb}"
 RVBBIT_SELECTED=0
-if [[ ",${SYSTEMS}," == *",rvbbit,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hot,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_auto,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_mem_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",pg_heap,"* ]]; then
+if [[ ",${SYSTEMS}," == *",rvbbit,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hot,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_auto,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_mem_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_vortex,"* ]]; then
     RVBBIT_SELECTED=1
 fi
 HIVE_FORCED_SELECTED=0
@@ -28,7 +28,7 @@ if [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," ==
     HIVE_FORCED_SELECTED=1
 fi
 VORTEX_FORCED_SELECTED=0
-if [[ ",${SYSTEMS}," == *",rvbbit_datafusion_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_vortex_forced,"* ]]; then
+if [[ ",${SYSTEMS}," == *",rvbbit_datafusion_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_vortex,"* ]]; then
     VORTEX_FORCED_SELECTED=1
 fi
 VORTEX_AUTO_SELECTED=0

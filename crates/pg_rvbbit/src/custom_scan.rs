@@ -45,6 +45,11 @@ use rvbbit_storage::row_group::RowGroupReader;
 
 const SCAN_LAYOUT: &str = "scan";
 const CLUSTER_LAYOUT_PREFIX: &str = "cluster:";
+/// The columnar Vortex variant layout name (mirrors compact.rs `VORTEX_SCAN_LAYOUT`).
+/// When `rvbbit.native_vortex` is on and a ready variant exists, the native scan
+/// reads these `.vortex` files instead of canonical parquet (Phase 3 of
+/// `docs/NATIVE_VORTEX_PLAN.md`).
+const VORTEX_SCAN_LAYOUT: &str = "vortex_scan";
 
 thread_local! {
     static SCAN_BATCH_CACHE: RefCell<ScanBatchCache> =
@@ -138,6 +143,11 @@ struct RustScanState {
     pruned_row_groups: usize,
     /// Current reader iterating batches within the current row group.
     current_reader: Option<ParquetRecordBatchReader>,
+    /// Phase 3 (native+vortex): when `row_group_layout == VORTEX_SCAN_LAYOUT`, the
+    /// active row group is read from a `.vortex` file via this reader instead of
+    /// `current_reader`. Mutually exclusive with `current_reader`. Bypasses the
+    /// parquet-keyed `ScanBatchCache` (its batches aren't parquet-decoded).
+    current_vortex_reader: Option<crate::vortex_adapter::VortexRgReader>,
     /// Decoded batches served from the per-backend scan cache for the current
     /// row group/projection.
     current_cached_batches: Option<Vec<RecordBatch>>,
@@ -514,6 +524,23 @@ unsafe extern "C-unwind" fn begin_custom_scan(
         Ok(m) => m,
         Err(_) => HashMap::new(),
     };
+
+    // Phase 3: native+vortex can't faithfully apply per-row tombstones to the
+    // columnar variant (multi-chunk vortex uses synthetic rg_ids that don't line
+    // up with the delete log's per-rg bitmaps), so when there are deletes visible
+    // at this snapshot we fall back to reading canonical parquet for correctness.
+    let (row_groups, row_group_layout) =
+        if row_group_layout == VORTEX_SCAN_LAYOUT && !delete_bitmaps.is_empty() {
+            match fetch_row_group_paths(table_oid, needs_row_group_stats, None, asof) {
+                Ok(parquet_rgs) => (parquet_rgs, SCAN_LAYOUT.to_string()),
+                Err(e) => {
+                    pgrx::error!("rvbbit custom scan: vortex tombstone fallback failed: {}", e)
+                }
+            }
+        } else {
+            (row_groups, row_group_layout)
+        };
+
     let current_rg_id = row_groups.first().map(|rg| rg.rg_id).unwrap_or(0);
 
     let rust_state = Box::new(RustScanState {
@@ -522,6 +549,7 @@ unsafe extern "C-unwind" fn begin_custom_scan(
         rg_idx: 0,
         pruned_row_groups: 0,
         current_reader: None,
+        current_vortex_reader: None,
         // Cold-tier batches (if any) feed the hot loop via the same
         // current_cached_batches mechanism the rest of the scan uses.
         // When row_groups is non-empty (hot path), this stays None and
@@ -2784,6 +2812,11 @@ unsafe extern "C-unwind" fn exec_custom_scan(
             } else {
                 None
             }
+        } else if let Some(reader) = state.current_vortex_reader.as_mut() {
+            // Unify with the parquet reader's error type (ArrowError) so both
+            // branches yield the same Option<Result<_, ArrowError>>.
+            crate::vortex_adapter::next_batch(reader)
+                .map(|r| r.map_err(arrow::error::ArrowError::ComputeError))
         } else if let Some(reader) = state.current_reader.as_mut() {
             reader.next()
         } else {
@@ -2813,6 +2846,7 @@ unsafe extern "C-unwind" fn exec_custom_scan(
                 // Current reader exhausted: open the next row group.
                 state.current_batch = None;
                 state.current_reader = None;
+                state.current_vortex_reader = None;
                 state.current_cached_batches = None;
                 state.current_cached_batch_idx = 0;
                 while state.dynamic_quals.is_empty()
@@ -2842,12 +2876,51 @@ unsafe extern "C-unwind" fn exec_custom_scan(
                 state.current_rg_id = state.row_groups[state.rg_idx].rg_id;
                 let path_str = state.row_groups[state.rg_idx].path.clone();
                 let path = std::path::Path::new(&path_str);
-                // Projection pushdown: only read columns the query touches.
+
+                // Projection: read only the columns the query touches (output columns
+                // + WHERE/qual columns — collect_needed_attnums pulls varattnos from
+                // both the targetlist and the qual). Shared by the vortex and parquet
+                // open paths below.
                 let col_names: Vec<String> = state
                     .needed_attnums
                     .iter()
                     .map(|&attnum| state.pg_attrs[(attnum - 1) as usize].name.clone())
                     .collect();
+
+                // Phase 3: native+vortex. Read the columnar `.vortex` variant for this
+                // row group, pushing the same projection into Vortex's ScanBuilder so
+                // only the needed columns are decoded. Native matches batch columns by
+                // name, and the parquet-keyed batch cache is bypassed. Timestamp columns
+                // need an Int64 -> Timestamp re-cast in the reader.
+                if state.row_group_layout == VORTEX_SCAN_LAYOUT {
+                    let timestamp_cols: Vec<String> = state
+                        .needed_attnums
+                        .iter()
+                        .filter_map(|&attnum| {
+                            let attr = &state.pg_attrs[(attnum - 1) as usize];
+                            if attr.typoid == pg_sys::TIMESTAMPOID
+                                || attr.typoid == pg_sys::TIMESTAMPTZOID
+                            {
+                                Some(attr.name.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let reader = match crate::vortex_adapter::open_vortex_for_scan(
+                        path,
+                        &col_names,
+                        &timestamp_cols,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => pgrx::error!("rvbbit: opening vortex {}: {}", path.display(), e),
+                    };
+                    state.current_vortex_reader = Some(reader);
+                    state.current_cache_key = None;
+                    state.rg_idx += 1;
+                    continue;
+                }
+
                 let cache_key = batch_cache_key(&path_str, &col_names);
                 if let Some(batches) = batch_cache_get(&cache_key) {
                     state.current_cached_batches = Some(batches);
@@ -2876,6 +2949,21 @@ fn fetch_best_row_group_paths(
     include_stats: bool,
     asof: Option<i64>,
 ) -> Result<(Vec<RowGroupEntry>, String), String> {
+    // Phase 3 (opt-in): when rvbbit.native_vortex is on and a ready vortex_scan
+    // variant exists, read the columnar Vortex copy through the native scan instead
+    // of canonical parquet. Checked BEFORE the cheap-path early return so it applies
+    // to pure scans too (not only scans with a prunable predicate). Gated to
+    // asof.is_none() — vortex variants don't carry per-rg generations (same caveat as
+    // cluster variants). `include_stats` is threaded through so the variant rows carry
+    // Phase-1 per-column stats whenever the predicate can use them for zone pruning.
+    if asof.is_none() && crate::duck_backend::native_vortex_enabled() {
+        let vortex_rgs =
+            fetch_row_group_paths(table_oid, include_stats, Some(VORTEX_SCAN_LAYOUT), asof)?;
+        if !vortex_rgs.is_empty() {
+            return Ok((vortex_rgs, VORTEX_SCAN_LAYOUT.to_string()));
+        }
+    }
+
     if !include_stats {
         return Ok((
             fetch_row_group_paths(table_oid, include_stats, None, asof)?,
@@ -3566,6 +3654,7 @@ unsafe extern "C-unwind" fn rescan_custom_scan(node: *mut pg_sys::CustomScanStat
     state.pruned_row_groups = 0;
     state.current_rg_id = state.row_groups.first().map(|rg| rg.rg_id).unwrap_or(0);
     state.current_reader = None;
+    state.current_vortex_reader = None;
     state.current_cached_batches = None;
     state.current_cached_batch_idx = 0;
     state.current_cache_key = None;

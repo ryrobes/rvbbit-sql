@@ -108,6 +108,22 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
         if system == "rvbbit_duck_auto":
             ms = run_rvbbit_duck_hot(sql, REPEATS, TIMEOUT_S, mode="auto", label=qid, suite="tpcds")
             return ms, rvbbit_duck_hot_status()
+        if system == "rvbbit_native_vortex":
+            # Native engine reading the vortex columnar layout. Route-assert it
+            # landed on native; deliberately DO NOT record a route observation —
+            # native+vortex is not a distinct router Candidate yet (Phase 4), so
+            # logging it as 'rvbbit_native' would pollute native's learned cost
+            # curve with current no-pushdown (all-columns) timings.
+            ms = run_pg(
+                PG_DSNS[system],
+                sql,
+                REPEATS,
+                TIMEOUT_S,
+                capture_route=True,
+                expect_candidate="rvbbit_native",
+                expect_layout="vortex_scan",
+            )
+            return ms, "ok"
         if system in FORCED_SQL_CANDIDATES:
             candidate = FORCED_SQL_CANDIDATES[system]
             ms = run_pg(
