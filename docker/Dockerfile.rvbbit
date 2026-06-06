@@ -91,6 +91,8 @@ COPY docker/init/ /docker-entrypoint-initdb.d/
 # primary postgresql.conf. See the file header for rationale on each
 # setting; bump or override per service.
 COPY docker/config/rvbbit-tuning.conf /etc/rvbbit/tuning.conf
+COPY docker/uber/bootstrap.sh /usr/local/bin/rvbbit-uber-bootstrap
+RUN chmod 0755 /usr/local/bin/rvbbit-uber-bootstrap
 
 # Belt-and-suspenders: also stamp shared_preload_libraries into the
 # stock conf sample. Only kicks in if someone runs the image without

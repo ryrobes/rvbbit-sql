@@ -1,0 +1,81 @@
+api_version: rvbbit.pack/v1
+id: qa/roberta-base-squad2
+name: roberta_base_squad2
+title: RoBERTa SQuAD2 Extractive QA
+description: Extractive question answering over a supplied context paragraph.
+license: apache-2.0
+tags:
+- qa
+- question-answering
+- extract
+- context
+- document
+- row
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: deepset/roberta-base-squad2
+  url: https://huggingface.co/deepset/roberta-base-squad2
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: question_answering
+  device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 496000000
+    vram_required_bytes: 620000000
+    headroom_pct: 25
+    estimate_source: huggingface_weights
+exports:
+  backend: qa_roberta_squad2
+  operators:
+  - answer_from_context
+  - answer_text
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: extractive_qa_shape
+    description: Ask a factoid question over a short context and assert answer shape.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          answer text;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.answer_from_context(
+                  'Where is the operations center?',
+                  'The Rvbbit operations center is in Portland. The finance team is in Austin.'
+              ) INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'answer_from_context returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object'
+             OR NOT (result ? 'answer')
+             OR NOT (result ? 'score') THEN
+              RAISE EXCEPTION 'unexpected QA result shape: %', result;
+          END IF;
+
+          SELECT rvbbit.answer_text(
+              'Where is the operations center?',
+              'The Rvbbit operations center is in Portland. The finance team is in Austin.'
+          ) INTO answer;
+          IF coalesce(btrim(answer), '') = '' THEN
+              RAISE EXCEPTION 'answer_text returned an empty answer';
+          END IF;
+      END
+      $$;

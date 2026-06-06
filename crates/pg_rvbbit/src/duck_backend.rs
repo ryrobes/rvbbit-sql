@@ -254,6 +254,16 @@ fn df_inprocess_enabled() -> bool {
         .unwrap_or_else(|| env_enabled("RVBBIT_DF_INPROCESS", true))
 }
 
+/// Phase 0 of NATIVE_VORTEX_PLAN: gate for the in-process native+vortex reader
+/// (rvbbit's CustomScan reading `.vortex` row groups via `crate::vortex_adapter`
+/// instead of parquet). Default **off** — ships dark. A later phase adds a
+/// per-query router decision that additionally gates activation.
+pub(crate) fn native_vortex_enabled() -> bool {
+    guc_setting("rvbbit.native_vortex")
+        .map(|value| setting_enabled(&value, false))
+        .unwrap_or_else(|| env_enabled("RVBBIT_NATIVE_VORTEX", false))
+}
+
 fn env_enabled(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(value) => setting_enabled(&value, default),

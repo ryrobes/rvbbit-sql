@@ -46,6 +46,37 @@ The Warren service mounts `/var/run/docker.sock` so it can launch capability
 containers on the local Docker host. See `docs/RELEASE_IMAGES.md` for the full
 image matrix and release script.
 
+### Turnkey uber stack
+
+For the easiest first-run path, use the uber compose file. It starts Postgres,
+Lens, Warren, then runs a one-shot bootstrap container that deploys and verifies
+the baseline Warren capabilities:
+
+- `smoke/warren-echo`
+- `runtimes/python-runtime`
+- `runtimes/mcp-gateway`
+
+```bash
+RVBBIT_VERSION=1.0.0 \
+docker compose -f docker/docker-compose.uber.yml up -d
+```
+
+If the GHCR images are private, create a simple Docker auth config and point the
+stack at it so Warren can pull capability images:
+
+```bash
+export RVBBIT_DOCKER_CONFIG=/tmp/rvbbit-ghcr-auth
+mkdir -p "$RVBBIT_DOCKER_CONFIG"
+echo "$CR_PAT" | docker --config "$RVBBIT_DOCKER_CONFIG" login ghcr.io -u "$GH_USER" --password-stdin
+
+RVBBIT_VERSION=1.0.0 \
+RVBBIT_DOCKER_CONFIG="$RVBBIT_DOCKER_CONFIG" \
+docker compose -f docker/docker-compose.uber.yml up -d
+```
+
+If the GHCR packages have been made public, no Docker login or
+`RVBBIT_DOCKER_CONFIG` is needed for this compose path.
+
 ## 2. Release tarball (for installing into existing PG18 hosts)
 
 Download a release archive from

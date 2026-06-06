@@ -16,3 +16,5 @@ bench/**/*.parquet
 bench/**/*.db
 bench/**/_SUCCESS
 test_runs
+# Playwright MCP test artifacts (screenshots / page snapshots / console logs)
+.playwright-mcp/

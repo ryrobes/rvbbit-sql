@@ -1,0 +1,97 @@
+name: rvbbit-uber
+
+services:
+  postgres:
+    image: ${RVBBIT_POSTGRES_IMAGE:-ghcr.io/ryrobes/rvbbit-postgres:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-postgres
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rvbbit}
+      POSTGRES_DB: ${POSTGRES_DB:-rvbbit}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_QUOTA_PROJECT: ${GOOGLE_CLOUD_QUOTA_PROJECT:-}
+      RVBBIT_DUCK_BACKEND: ${RVBBIT_DUCK_BACKEND:-true}
+    ports:
+      - "${RVBBIT_POSTGRES_PORT:-55433}:5432"
+    volumes:
+      - rvbbit_pgdata:/var/lib/postgresql
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/rvbbit/tuning.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-rvbbit}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  lens:
+    image: ${RVBBIT_LENS_IMAGE:-ghcr.io/ryrobes/rvbbit-lens:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-lens
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RVBBIT_LENS_HOME: /data
+    ports:
+      - "${RVBBIT_LENS_PORT:-3000}:3000"
+    volumes:
+      - rvbbit_lens:/data
+    restart: unless-stopped
+
+  warren:
+    image: ${RVBBIT_WARREN_AGENT_IMAGE:-ghcr.io/ryrobes/rvbbit-warren-agent:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-warren
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RVBBIT_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}
+      WARREN_NODE: ${WARREN_NODE:-compose-warren}
+      WARREN_WORK_DIR: /var/lib/rvbbit/warren
+      RVBBIT_DOCKER_NETWORK: ${RVBBIT_DOCKER_NETWORK:-rvbbit_uber}
+      WARREN_LABELS: '${WARREN_LABELS:-{"capability":true,"docker":true,"gpu":false}}'
+      WARREN_CAPACITY: '${WARREN_CAPACITY:-{}}'
+      WARREN_METRICS_MS: ${WARREN_METRICS_MS:-10000}
+      WARREN_RECONCILE_MS: ${WARREN_RECONCILE_MS:-15000}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${RVBBIT_DOCKER_CONFIG:-$HOME/.docker}:/root/.docker:ro
+      - rvbbit_warren:/var/lib/rvbbit/warren
+    restart: unless-stopped
+
+  bootstrap:
+    image: ${RVBBIT_POSTGRES_IMAGE:-ghcr.io/ryrobes/rvbbit-postgres:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-bootstrap
+    depends_on:
+      postgres:
+        condition: service_healthy
+      warren:
+        condition: service_started
+    environment:
+      RVBBIT_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}
+      WARREN_NODE: ${WARREN_NODE:-compose-warren}
+      RVBBIT_UBER_TARGET_SELECTOR: '${RVBBIT_UBER_TARGET_SELECTOR:-{"capability":true,"docker":true,"gpu":false}}'
+      RVBBIT_UBER_BOOTSTRAP_CAPABILITIES: ${RVBBIT_UBER_BOOTSTRAP_CAPABILITIES:-smoke/warren-echo,runtimes/python-runtime,runtimes/mcp-gateway}
+      RVBBIT_UBER_BOOTSTRAP_TIMEOUT_SECONDS: ${RVBBIT_UBER_BOOTSTRAP_TIMEOUT_SECONDS:-600}
+      RVBBIT_UBER_BOOTSTRAP_POLL_SECONDS: ${RVBBIT_UBER_BOOTSTRAP_POLL_SECONDS:-2}
+      RVBBIT_UBER_SKIP_BOOTSTRAP: ${RVBBIT_UBER_SKIP_BOOTSTRAP:-false}
+    command: ["rvbbit-uber-bootstrap"]
+    restart: "no"
+
+networks:
+  default:
+    name: ${RVBBIT_DOCKER_NETWORK:-rvbbit_uber}
+
+volumes:
+  rvbbit_pgdata:
+    name: ${RVBBIT_PGDATA_VOLUME:-rvbbit_uber_pgdata}
+  rvbbit_lens:
+    name: ${RVBBIT_LENS_VOLUME:-rvbbit_uber_lens}
+  rvbbit_warren:
+    name: ${RVBBIT_WARREN_VOLUME:-rvbbit_uber_warren}

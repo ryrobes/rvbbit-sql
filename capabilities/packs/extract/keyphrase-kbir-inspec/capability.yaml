@@ -1,0 +1,62 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: keyphrase_kbir_inspec
+title: KBIR Keyphrase Extraction
+description: Local keyphrase extraction for abstracts, research notes, docs, and analyst narratives.
+license: mit
+tags: [extract, keyphrases, tags, documents, research, row]
+source:
+  provider: huggingface
+  model: ml6team/keyphrase-extraction-kbir-inspec
+  url: https://huggingface.co/ml6team/keyphrase-extraction-kbir-inspec
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: token_classification
+  device: auto
+backend:
+  name: extract_keyphrase_kbir
+  transport: rvbbit
+  batch_size: 16
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: KBIR token-classification keyphrase extractor.
+operators:
+  - name: extract_keyphrases
+    description: Extract keyphrases from text and return token-classification spans.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+  - name: top_keyphrase
+    description: Return the first extracted keyphrase from text.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: phrases
+        kind: specialist
+        specialist: extract_keyphrase_kbir
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: top
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.phrases.output }}"
+          path: 0.text
+          default: ""
+  - name: extract_row_keyphrases
+    description: Extract keyphrases from a JSONB row serialized as text.
+    arg_names: [row]
+    arg_types: [jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.row }}"
+smoke:
+  inputs:
+    - text: Semantic caching and vector indexes improve retrieval quality for customer support analytics.
+      row: '{"note":"Semantic caching and vector indexes improve retrieval quality.","team":"support analytics"}'

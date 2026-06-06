@@ -29,6 +29,7 @@ SKIP_LENS=0
 SKIP_WARREN=0
 SKIP_CAPABILITIES=0
 DRY_RUN=0
+CHECK_PUBLIC=0
 
 usage() {
     cat >&2 <<EOF
@@ -53,6 +54,7 @@ Options:
   --skip-lens
   --skip-warren
   --skip-capabilities
+  --check-public          After push, verify anonymous pull access with a clean Docker config.
   --dry-run                Print commands without running Docker builds.
 EOF
 }
@@ -72,6 +74,7 @@ while [[ $# -gt 0 ]]; do
         --skip-lens) SKIP_LENS=1; shift ;;
         --skip-warren) SKIP_WARREN=1; shift ;;
         --skip-capabilities) SKIP_CAPABILITIES=1; shift ;;
+        --check-public) CHECK_PUBLIC=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -209,6 +212,23 @@ if [[ "$SKIP_CAPABILITIES" -eq 0 ]]; then
     run "${cap_args[@]}"
 fi
 
+if [[ "$CHECK_PUBLIC" -eq 1 ]]; then
+    if [[ "$PUSH" -eq 0 ]]; then
+        echo "--check-public requires --push; images must exist in the registry" >&2
+        exit 2
+    fi
+    public_args=(
+        "$ROOT/scripts/release/check-public-images.py"
+        --image-prefix "$IMAGE_PREFIX"
+        --version "$VERSION"
+    )
+    [[ "$SKIP_DB" -eq 1 ]] && public_args+=(--skip-db)
+    [[ "$SKIP_LENS" -eq 1 ]] && public_args+=(--skip-lens)
+    [[ "$SKIP_WARREN" -eq 1 ]] && public_args+=(--skip-warren)
+    [[ "$SKIP_CAPABILITIES" -eq 1 ]] && public_args+=(--skip-capabilities)
+    run "${public_args[@]}"
+fi
+
 cat <<EOF
 
 Release artifacts staged in:
@@ -223,4 +243,7 @@ Release catalog:
 
 Clean-slate compose:
   RVBBIT_VERSION=$VERSION docker compose -f docker/docker-compose.release.yml up -d
+
+Turnkey uber compose:
+  RVBBIT_VERSION=$VERSION docker compose -f docker/docker-compose.uber.yml up -d
 EOF

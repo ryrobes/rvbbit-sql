@@ -1,0 +1,86 @@
+api_version: rvbbit.capability/v1
+kind: llm_provider
+name: sqlcoder_7b_vllm
+title: SQLCoder 7B via vLLM
+description: Warren-deployed local text-to-SQL provider with a Postgres SQL drafting operator.
+license: cc-by-sa-4.0
+tags: [llm, sql, text-to-sql, data-engineering, analytics, vllm, gpu]
+source:
+  provider: huggingface
+  model: defog/sqlcoder-7b-2
+  url: https://huggingface.co/defog/sqlcoder-7b-2
+runtime:
+  mode: image
+  image: vllm/vllm-openai:latest
+  pull_policy: missing
+  handler: vllm_openai
+  device: cuda
+  port: 8080
+  health_path: /health
+  ipc: host
+  env:
+    HF_TOKEN: "${HF_TOKEN:-}"
+    HUGGING_FACE_HUB_TOKEN: "${HUGGING_FACE_HUB_TOKEN:-}"
+  volumes:
+    - name: hf_cache
+      mount: /root/.cache/huggingface
+  args:
+    - --model
+    - defog/sqlcoder-7b-2
+    - --served-model-name
+    - defog/sqlcoder-7b-2
+    - --host
+    - 0.0.0.0
+    - --port
+    - "8080"
+    - --dtype
+    - auto
+backend:
+  name: sqlcoder_7b
+  transport: openai_chat
+  batch_size: 1
+  max_concurrent: 2
+  timeout_ms: 300000
+  opts:
+    model: defog/sqlcoder-7b-2
+  description: Local SQLCoder 7B text-to-SQL provider served by vLLM.
+provider_registration:
+  provider: sqlcoder_7b
+  model: defog/sqlcoder-7b-2
+  backend_name: sqlcoder_7b
+  display_name: SQLCoder 7B on local vLLM
+  family: sqlcoder
+  capabilities: [chat, text-to-sql]
+  context_window: 16384
+  output_token_limit: 2048
+  cost_policy: free
+  set_default: false
+  raw:
+    serving_runtime: vllm
+    openai_compatible: true
+operators:
+  - name: draft_postgres_sql
+    description: Draft a Postgres SQL query from table/schema context and a business question.
+    arg_names: [schema, question]
+    arg_types: [text, text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: sql
+        kind: llm
+        provider: sqlcoder_7b
+        model: defog/sqlcoder-7b-2
+        system: "You write PostgreSQL queries. Return only SQL, with no markdown and no explanation."
+        user: "Schema:\n{{ inputs.schema }}\n\nQuestion:\n{{ inputs.question }}\n\nPostgreSQL SQL:"
+        max_tokens: 512
+        temperature: 0
+warren:
+  endpoint_path: /v1/chat/completions
+  health_path: /health
+  container_port: 8080
+smoke:
+  inputs:
+    - model: defog/sqlcoder-7b-2
+      user: "Schema: orders(id bigint, region text, revenue numeric). Question: total revenue by region. SQL:"
+      max_tokens: 128
+      temperature: 0

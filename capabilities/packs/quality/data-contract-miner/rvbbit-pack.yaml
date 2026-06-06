@@ -1,0 +1,81 @@
+api_version: rvbbit.pack/v1
+id: quality/data-contract-miner
+name: data_contract_miner
+title: Data Contract Miner
+description: Infer practical data quality checks from table samples or grouped column values.
+license: apache-2.0
+tags:
+- quality
+- contract
+- profiling
+- validation
+- aggregate
+- full-table
+- data-engineering
+- cpu
+capability: capability.yaml
+source:
+  provider: builtin
+  model: rvbbit/data-contract-miner
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: data_contract_miner
+  device: cpu
+exports:
+  backend: mine_data_contract
+  operators:
+  - infer_table_contract
+  - infer_column_contract
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  tests:
+  - name: contract_shapes
+    description: Infer table and aggregate-column contracts from small warehouse-like samples.
+    sql: |
+      DO $$
+      DECLARE
+          table_result jsonb;
+          column_result jsonb;
+          rows jsonb := '[
+            {"order_id":"o1","status":"paid","amount":42.5,"customer_email":"a@example.com"},
+            {"order_id":"o2","status":"paid","amount":64.0,"customer_email":"b@example.com"},
+            {"order_id":"o3","status":"failed","amount":13.0,"customer_email":"c@example.com"}
+          ]'::jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.infer_table_contract(rows) INTO table_result;
+              EXIT WHEN table_result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'infer_table_contract returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(table_result) <> 'object'
+             OR jsonb_typeof(table_result->'columns') <> 'array'
+             OR jsonb_array_length(table_result->'columns') < 3 THEN
+              RAISE EXCEPTION 'unexpected table contract shape: %', table_result;
+          END IF;
+
+          WITH t(value) AS (
+            VALUES ('paid'::text), ('paid'::text), ('failed'::text), ('refunded'::text)
+          )
+          SELECT rvbbit.infer_column_contract(value) INTO column_result
+          FROM t;
+
+          IF jsonb_typeof(column_result) <> 'object'
+             OR jsonb_typeof(column_result->'columns') <> 'array'
+             OR jsonb_array_length(column_result->'suggested_checks') = 0 THEN
+              RAISE EXCEPTION 'unexpected aggregate column contract: %', column_result;
+          END IF;
+      END
+      $$;

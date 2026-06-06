@@ -1,0 +1,87 @@
+api_version: rvbbit.pack/v1
+id: forecast/seasonal-trend-baseline
+name: seasonal_trend_forecast
+title: Seasonal Trend Forecast
+description: Lightweight local forecasting Warren for JSONB series produced by SQL aggregates.
+license: apache-2.0
+tags:
+- forecasting
+- time-series
+- analytics
+- bi
+- jsonb
+- full-table
+- pipeline
+- cpu
+capability: capability.yaml
+source:
+  provider: builtin
+  model: rvbbit/seasonal-trend-baseline
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: time_series_forecast
+  device: cpu
+exports:
+  backend: forecast_seasonal_trend
+  operators:
+  - forecast_series
+  - forecast_next_value
+  - forecast_values
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  tests:
+  - name: forecast_jsonb_series_contract
+    description: Forecast from a JSONB full-table series and assert JSON/scalar operator outputs.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          next_value float8;
+          series jsonb := '[
+            {"ds": "2026-01-01", "value": 100},
+            {"ds": "2026-02-01", "value": 108},
+            {"ds": "2026-03-01", "value": 115},
+            {"ds": "2026-04-01", "value": 123}
+          ]'::jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.forecast_series(series, '3') INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'forecast_series returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object'
+             OR jsonb_typeof(result->'forecast') <> 'array'
+             OR jsonb_array_length(result->'forecast') <> 3 THEN
+              RAISE EXCEPTION 'unexpected forecast result: %', result;
+          END IF;
+
+          SELECT rvbbit.forecast_next_value(series) INTO next_value;
+          IF next_value <= 0 THEN
+              RAISE EXCEPTION 'forecast_next_value should be positive: %', next_value;
+          END IF;
+
+          WITH t(value) AS (
+            VALUES (100::float8), (108::float8), (115::float8), (123::float8)
+          )
+          SELECT rvbbit.forecast_values(value) INTO result
+          FROM t;
+          IF jsonb_typeof(result) <> 'object'
+             OR jsonb_typeof(result->'forecast') <> 'array'
+             OR jsonb_array_length(result->'forecast') <> 1 THEN
+              RAISE EXCEPTION 'unexpected aggregate forecast result: %', result;
+          END IF;
+      END
+      $$;

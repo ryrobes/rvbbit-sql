@@ -714,3 +714,76 @@ BEGIN
          ORDER BY r.rrf DESC
          LIMIT k;
 END $fn$;
+
+-- ════════════════════════════════════════════════════════════════════════
+-- data_crawl — the DATA-graph crawler (sibling of catalog_crawl)
+-- ════════════════════════════════════════════════════════════════════════
+-- Where catalog_crawl maps a database's STRUCTURE (schema/fingerprints) into the
+-- db_catalog KG, data_crawl mines its CONTENT: it samples rows, extracts
+-- entity/relationship triples from each row's text (via rvbbit.triples_row), and
+-- asserts them as edges into a separate graph (default 'data_kg') with built-in
+-- embedding entity-resolution (kg_assert_edge match_threshold). The resulting
+-- entities are mirrored into catalog_docs so data_search()/Scry's "data" layer
+-- can semantically search and spider them — a meaning graph over arbitrary tables.
+--
+-- Noise controls (arbitrary user tables have no curated text): a generic-role
+-- stoplist drops pronoun/reporter/filler "entities" (i, we, narrator, witness,…),
+-- pure-numeric subjects/objects are skipped, and `where_sql` lets the caller
+-- restrict the sampled rows. `reset` clears the prior graph for a clean rebuild.
+CREATE OR REPLACE FUNCTION rvbbit.data_crawl(
+    rel regclass,
+    sample_size integer DEFAULT 50,
+    focus text DEFAULT 'all',
+    graph text DEFAULT 'data_kg',
+    match_threshold double precision DEFAULT 0.92,
+    specialist text DEFAULT '',
+    where_sql text DEFAULT NULL,
+    reset boolean DEFAULT true,
+    pk_expr text DEFAULT NULL)
+RETURNS jsonb
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_graph text := rvbbit.kg_normalize_graph(COALESCE(NULLIF(btrim(graph),''),'data_kg'));
+    v_rel text := rel::text;
+    v_where text := COALESCE(NULLIF(btrim(where_sql),''), 'true');
+    -- per-row provenance key: a real column (e.g. a report id) when the caller names
+    -- one, else a content hash. NEVER ctid — over rvbbit-AM tables ctid is invalid
+    -- (InvalidBlockNumber), collapsing all evidence to one sentinel source_pk and
+    -- destroying the cross-row "frequency" signal.
+    v_pk text := COALESCE(NULLIF(btrim(pk_expr),''), 'md5(to_jsonb(t)::text)');
+    -- generic pronouns / reporter-roles / fillers — high-frequency, low-signal "entities"
+    v_stop text[] := ARRAY['i','we','you','he','she','it','they','them','us','me','one',
+        'narrator','observer','observers','speaker','speakers','witness','witnesses',
+        'reporter','reporting person','author','person','people','someone','somebody',
+        'true','false','none','n/a','na','unknown','yes','no','this','that','here','there',
+        'this area','the area','the witness','the observer','the narrator','the speaker'];
+    rec record; trip record; s text; p text; o text; edge_id bigint;
+    v_rows int := 0; v_triples int := 0; v_nodes int := 0;
+BEGIN
+    IF reset THEN
+        DELETE FROM rvbbit.kg_nodes WHERE graph_id = v_graph;
+        DELETE FROM rvbbit.catalog_docs WHERE graph_id = v_graph;
+    END IF;
+    FOR rec IN EXECUTE format(
+        'SELECT to_jsonb(t) AS rd, (%s)::text AS pk FROM %s t WHERE %s ORDER BY random() LIMIT %s',
+        v_pk, v_rel, v_where, GREATEST(1, sample_size))
+    LOOP
+        v_rows := v_rows + 1;
+        FOR trip IN SELECT subject, predicate, object FROM rvbbit.triples_row(rec.rd, focus) LOOP
+            s := NULLIF(btrim(trip.subject),''); p := NULLIF(btrim(trip.predicate),''); o := NULLIF(btrim(trip.object),'');
+            IF s IS NULL OR p IS NULL OR o IS NULL THEN CONTINUE; END IF;
+            IF s ~ '^[-+]?[0-9]+(\.[0-9]+)?$' OR o ~ '^[-+]?[0-9]+(\.[0-9]+)?$' THEN CONTINUE; END IF;
+            IF lower(s) = ANY(v_stop) OR lower(o) = ANY(v_stop) THEN CONTINUE; END IF;  -- specificity filter
+            edge_id := rvbbit.kg_assert_edge('entity', s, p, 'entity', o, 1.0, '{}'::jsonb, '{}'::jsonb, specialist, match_threshold, v_graph);
+            PERFORM rvbbit.kg_link_evidence(target_edge_id => edge_id, source_table => rel, source_pk => rec.pk,
+                source_column => NULL, evidence_text => NULL, confidence => 1.0, properties => rec.rd, graph => v_graph);
+            v_triples := v_triples + 1;
+        END LOOP;
+    END LOOP;
+    INSERT INTO rvbbit.catalog_docs (node_id, graph_id, kind, schema_name, rel_name, col_name, doc, embedding, embedded_at, updated_at)
+    SELECT n.node_id, v_graph, n.kind, 'data', n.label, NULL, n.label, rvbbit.embed(n.label,'','document'), now(), now()
+    FROM rvbbit.kg_nodes n WHERE n.graph_id = v_graph AND COALESCE(NULLIF(btrim(n.label),''),'') <> ''
+    ON CONFLICT (graph_id, node_id) DO UPDATE SET doc=EXCLUDED.doc, embedding=EXCLUDED.embedding, updated_at=now();
+    GET DIAGNOSTICS v_nodes = ROW_COUNT;
+    RETURN jsonb_build_object('rows', v_rows, 'triples', v_triples, 'nodes', v_nodes, 'graph', v_graph, 'table', v_rel);
+END $fn$;

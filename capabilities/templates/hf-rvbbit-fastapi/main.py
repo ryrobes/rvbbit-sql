@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 import json
 import os
+import re
 import time
 
 from fastapi import FastAPI, Header, HTTPException
@@ -254,6 +255,184 @@ def _predict_zero_shot(inputs: list[dict[str, Any]]) -> list[Any]:
         ]
         best = pairs[0] if pairs else {"label": None, "score": 0.0}
         outputs.append({"label": best["label"], "score": best["score"], "scores": pairs})
+    return outputs
+
+
+def _load_question_answering() -> None:
+    if _loaded:
+        return
+    from transformers import pipeline
+
+    device = 0 if _device() == "cuda" else -1
+    t0 = time.time()
+    pipe = pipeline(
+        "question-answering",
+        model=MODEL_NAME,
+        revision=MODEL_REVISION,
+        device=device,
+    )
+    _loaded.update({"pipeline": pipe, "device": device, "loaded_at": time.time(), "load_seconds": round(time.time() - t0, 3)})
+
+
+def _predict_question_answering(inputs: list[dict[str, Any]]) -> list[Any]:
+    _load_question_answering()
+    pipe = _loaded["pipeline"]
+    outputs = []
+    for item in inputs:
+        question = str(item.get("question") or item.get("query") or "What is the answer?")
+        context = str(item.get("context") or item.get("text") or "")
+        if not context.strip():
+            outputs.append({"answer": "", "score": 0.0, "start": None, "end": None})
+            continue
+        result = pipe(question=question, context=context)
+        outputs.append(
+            {
+                "answer": result.get("answer", ""),
+                "score": float(result.get("score", 0.0) or 0.0),
+                "start": result.get("start"),
+                "end": result.get("end"),
+            }
+        )
+    return outputs
+
+
+def _load_summarization() -> None:
+    if _loaded:
+        return
+    from transformers import pipeline
+
+    device = 0 if _device() == "cuda" else -1
+    t0 = time.time()
+    pipe = pipeline(
+        "summarization",
+        model=MODEL_NAME,
+        revision=MODEL_REVISION,
+        device=device,
+    )
+    _loaded.update({"pipeline": pipe, "device": device, "loaded_at": time.time(), "load_seconds": round(time.time() - t0, 3)})
+
+
+def _predict_summarization(inputs: list[dict[str, Any]]) -> list[Any]:
+    _load_summarization()
+    pipe = _loaded["pipeline"]
+    outputs = []
+    for item in inputs:
+        text = str(item.get("text") or item.get("row") or "")
+        if not text.strip():
+            outputs.append({"summary_text": ""})
+            continue
+        max_length = int(item.get("max_length") or 160)
+        min_length = int(item.get("min_length") or 20)
+        result = pipe(
+            text,
+            max_length=max_length,
+            min_length=min_length,
+            do_sample=False,
+            truncation=True,
+        )
+        first = result[0] if result else {}
+        outputs.append({"summary_text": str(first.get("summary_text") or "")})
+    return outputs
+
+
+def _load_token_classification() -> None:
+    if _loaded:
+        return
+    from transformers import pipeline
+
+    device = 0 if _device() == "cuda" else -1
+    t0 = time.time()
+    pipe = pipeline(
+        "token-classification",
+        model=MODEL_NAME,
+        revision=MODEL_REVISION,
+        device=device,
+        aggregation_strategy="simple",
+    )
+    _loaded.update({"pipeline": pipe, "device": device, "loaded_at": time.time(), "load_seconds": round(time.time() - t0, 3)})
+
+
+def _predict_token_classification(inputs: list[dict[str, Any]]) -> list[Any]:
+    _load_token_classification()
+    pipe = _loaded["pipeline"]
+    outputs = []
+    for item in inputs:
+        text = str(item.get("text") or item.get("row") or "")
+        if not text.strip():
+            outputs.append([])
+            continue
+        result = pipe(text)
+        rows = []
+        for entity in result:
+            phrase = str(entity.get("word") or entity.get("text") or "").strip()
+            rows.append(
+                {
+                    "text": phrase,
+                    "label": str(entity.get("entity_group") or entity.get("entity") or ""),
+                    "score": float(entity.get("score", 0.0) or 0.0),
+                    "start": entity.get("start"),
+                    "end": entity.get("end"),
+                }
+            )
+        outputs.append(rows)
+    return outputs
+
+
+def _table_frame(value: Any):
+    import pandas as pd
+
+    if isinstance(value, list):
+        rows = value
+    elif isinstance(value, dict):
+        if all(isinstance(v, list) for v in value.values()):
+            return pd.DataFrame(value).astype(str)
+        rows = [value]
+    elif isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return _table_frame(parsed)
+        except Exception:
+            rows = []
+    else:
+        rows = []
+    return pd.DataFrame(rows).astype(str)
+
+
+def _load_table_question_answering() -> None:
+    if _loaded:
+        return
+    from transformers import pipeline
+
+    device = 0 if _device() == "cuda" else -1
+    t0 = time.time()
+    pipe = pipeline(
+        "table-question-answering",
+        model=MODEL_NAME,
+        revision=MODEL_REVISION,
+        device=device,
+    )
+    _loaded.update({"pipeline": pipe, "device": device, "loaded_at": time.time(), "load_seconds": round(time.time() - t0, 3)})
+
+
+def _predict_table_question_answering(inputs: list[dict[str, Any]]) -> list[Any]:
+    _load_table_question_answering()
+    pipe = _loaded["pipeline"]
+    outputs = []
+    for item in inputs:
+        question = str(item.get("question") or item.get("query") or "")
+        table = _table_frame(item.get("table", item.get("rows", item.get("data", []))))
+        if table.empty or not question.strip():
+            outputs.append({"answer": "", "coordinates": [], "cells": [], "aggregator": None})
+            continue
+        result = pipe(table=table, query=question)
+        outputs.append(
+            {
+                "answer": str(result.get("answer") or ""),
+                "coordinates": result.get("coordinates") or [],
+                "cells": [str(cell) for cell in (result.get("cells") or [])],
+                "aggregator": result.get("aggregator"),
+            }
+        )
     return outputs
 
 
@@ -534,6 +713,478 @@ def _predict_tabular_foundation(inputs: list[dict[str, Any]]) -> list[Any]:
     return outputs
 
 
+def _series_values(value: Any) -> list[float]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("[") or stripped.startswith("{"):
+            try:
+                return _series_values(json.loads(stripped))
+            except Exception:
+                return []
+        values = []
+        for token in stripped.split(","):
+            try:
+                values.append(float(token.strip()))
+            except Exception:
+                pass
+        return values
+    if isinstance(value, dict):
+        for key in ("series", "values", "data", "rows"):
+            if key in value:
+                return _series_values(value[key])
+        for key in ("value", "y", "target", "amount", "metric"):
+            if key in value:
+                try:
+                    return [float(value[key])]
+                except Exception:
+                    return []
+        return []
+    if not isinstance(value, list):
+        try:
+            return [float(value)]
+        except Exception:
+            return []
+
+    values: list[float] = []
+    for row in value:
+        if isinstance(row, dict):
+            candidate = None
+            for key in ("value", "y", "target", "amount", "metric"):
+                if key in row:
+                    candidate = row[key]
+                    break
+        else:
+            candidate = row
+        try:
+            values.append(float(candidate))
+        except Exception:
+            continue
+    return values
+
+
+def _positive_int(value: Any, default: int, maximum: int) -> int:
+    try:
+        parsed = int(float(value))
+    except Exception:
+        parsed = default
+    return max(1, min(maximum, parsed))
+
+
+def _predict_time_series_forecast(inputs: list[dict[str, Any]]) -> list[Any]:
+    """Small seasonal-trend baseline for BI pipelines."""
+    import math
+
+    outputs: list[Any] = []
+    for item in inputs:
+        values = _series_values(item.get("series", item.get("values", item.get("data", item))))
+        horizon = _positive_int(item.get("horizon", item.get("steps", 1)), 1, 365)
+        season_length = _positive_int(item.get("season_length", 1), 1, 365)
+        if len(values) < 1:
+            outputs.append({"forecast": [], "error": "empty series", "method": "seasonal_trend_baseline"})
+            continue
+
+        diffs = [values[i] - values[i - 1] for i in range(1, len(values))]
+        trend_window = diffs[-min(len(diffs), 12):] if diffs else []
+        trend = sum(trend_window) / len(trend_window) if trend_window else 0.0
+        last = values[-1]
+
+        use_season = season_length > 1 and len(values) >= season_length
+        last_cycle = values[-season_length:] if use_season else []
+        cycle_mean = sum(last_cycle) / len(last_cycle) if last_cycle else 0.0
+
+        residuals = [diff - trend for diff in trend_window]
+        variance = (
+            sum(residual * residual for residual in residuals) / len(residuals)
+            if residuals
+            else 0.0
+        )
+        sigma = math.sqrt(variance)
+
+        forecast = []
+        for step in range(1, horizon + 1):
+            seasonal = (
+                last_cycle[(step - 1) % len(last_cycle)] - cycle_mean
+                if last_cycle
+                else 0.0
+            )
+            value = last + trend * step + seasonal
+            interval = 1.96 * sigma * math.sqrt(step)
+            forecast.append(
+                {
+                    "step": step,
+                    "value": float(value),
+                    "lower": float(value - interval),
+                    "upper": float(value + interval),
+                }
+            )
+        outputs.append(
+            {
+                "forecast": forecast,
+                "horizon": horizon,
+                "n_observations": len(values),
+                "season_length": season_length if use_season else None,
+                "trend": float(trend),
+                "method": "seasonal_trend_baseline",
+            }
+        )
+    return outputs
+
+
+def _jsonish(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                return json.loads(stripped)
+            except Exception:
+                return value
+    return value
+
+
+def _rows_from_payload(value: Any) -> list[dict[str, Any]]:
+    value = _jsonish(value)
+    if isinstance(value, dict):
+        for key in ("rows", "table", "data", "_table", "collection", "records", "results"):
+            if key in value:
+                return _rows_from_payload(value[key])
+        return [value]
+    if isinstance(value, list):
+        rows: list[dict[str, Any]] = []
+        for row in value:
+            row = _jsonish(row)
+            if isinstance(row, dict):
+                rows.append(row)
+            else:
+                rows.append({"value": row})
+        return rows
+    if value is None:
+        return []
+    return [{"value": value}]
+
+
+def _values_from_payload(value: Any, preferred_key: str = "value") -> list[Any]:
+    value = _jsonish(value)
+    if isinstance(value, dict):
+        for key in ("values", "series", "collection", "rows", "data", "records"):
+            if key in value:
+                return _values_from_payload(value[key], preferred_key)
+        if preferred_key in value:
+            return [value.get(preferred_key)]
+        if len(value) == 1:
+            return [next(iter(value.values()))]
+        return [value]
+    if isinstance(value, list):
+        values: list[Any] = []
+        for item in value:
+            item = _jsonish(item)
+            if isinstance(item, dict):
+                if preferred_key in item:
+                    values.append(item.get(preferred_key))
+                elif len(item) == 1:
+                    values.append(next(iter(item.values())))
+                else:
+                    values.append(item)
+            else:
+                values.append(item)
+        return values
+    return [] if value is None else [value]
+
+
+def _missing(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _to_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    text = re.sub(r"[$,%]", "", text)
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def _semantic_kind(value: Any, column: str = "") -> str:
+    if _missing(value):
+        return "null"
+    text = str(value).strip()
+    lowered = text.lower()
+    col = column.lower()
+    if lowered in {"true", "false", "t", "f", "yes", "no", "y", "n", "0", "1"} and (
+        col.startswith("is_") or col.startswith("has_") or col.endswith("_flag") or len(text) <= 5
+    ):
+        return "boolean"
+    if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", text):
+        return "email"
+    if re.fullmatch(r"https?://\S+", text):
+        return "url"
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", text):
+        return "uuid"
+    if re.fullmatch(r"(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}", text):
+        return "phone"
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", text):
+        return "ip_address"
+    if ("zip" in col or "postal" in col) and re.fullmatch(r"\d{5}(?:-\d{4})?", text):
+        return "postal_code"
+    if re.fullmatch(r"[$]?\d+(?:,\d{3})*(?:\.\d+)?%?", text):
+        return "integer" if re.fullmatch(r"\d+", text) else "number"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T].*)?", text) or re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", text):
+        return "date"
+    return "string"
+
+
+def _profile_values(values: list[Any], column: str = "") -> dict[str, Any]:
+    count = len(values)
+    non_null = [value for value in values if not _missing(value)]
+    kind_counts: dict[str, int] = {}
+    for value in non_null:
+        kind = _semantic_kind(value, column)
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+    distinct_values = sorted({str(value) for value in non_null})[:50]
+    primary_kind = max(kind_counts.items(), key=lambda row: row[1])[0] if kind_counts else "unknown"
+    numbers = [_to_number(value) for value in non_null]
+    numbers = [value for value in numbers if value is not None]
+    avg_len = (
+        sum(len(str(value)) for value in non_null) / len(non_null)
+        if non_null
+        else 0.0
+    )
+    distinct_count = len({str(value) for value in non_null})
+    distinct_ratio = distinct_count / len(non_null) if non_null else 0.0
+    semantic_type = primary_kind
+    if primary_kind == "string" and non_null:
+        if distinct_count <= min(25, max(3, int(len(non_null) * 0.25))):
+            semantic_type = "enum"
+        elif avg_len >= 80:
+            semantic_type = "long_text"
+        else:
+            semantic_type = "text"
+    pii_types = {"email", "phone", "ip_address"}
+    risk = "high" if primary_kind in pii_types else "low"
+    return {
+        "count": count,
+        "non_null_count": len(non_null),
+        "null_count": count - len(non_null),
+        "null_pct": round(((count - len(non_null)) / count) if count else 0.0, 4),
+        "distinct_count": distinct_count,
+        "distinct_ratio": round(distinct_ratio, 4),
+        "semantic_type": semantic_type,
+        "kind_counts": kind_counts,
+        "examples": distinct_values[:5],
+        "min": min(numbers) if numbers else None,
+        "max": max(numbers) if numbers else None,
+        "avg_length": round(avg_len, 2),
+        "pii_risk": risk,
+    }
+
+
+def _contract_for_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    columns = sorted({key for row in rows for key in row.keys()})
+    column_profiles = []
+    checks = []
+    for column in columns:
+        values = [row.get(column) for row in rows]
+        profile = _profile_values(values, column)
+        column_checks = []
+        if rows and profile["null_count"] == 0:
+            column_checks.append({"type": "not_null"})
+        if profile["non_null_count"] > 1 and profile["distinct_count"] == profile["non_null_count"]:
+            column_checks.append({"type": "unique"})
+        if profile["semantic_type"] in {"email", "phone", "url", "uuid", "postal_code"}:
+            column_checks.append({"type": "format", "format": profile["semantic_type"]})
+        if profile["semantic_type"] == "enum" and profile["distinct_count"] <= 25:
+            column_checks.append({"type": "accepted_values", "values": profile["examples"]})
+        if profile["min"] is not None and profile["max"] is not None:
+            column_checks.append({"type": "range", "min": profile["min"], "max": profile["max"]})
+        column_profiles.append({"column": column, **profile, "suggested_checks": column_checks})
+        for check in column_checks:
+            checks.append({"column": column, **check})
+    return {
+        "row_count": len(rows),
+        "column_count": len(columns),
+        "columns": column_profiles,
+        "suggested_checks": checks,
+    }
+
+
+def _predict_data_contract_miner(inputs: list[dict[str, Any]]) -> list[Any]:
+    outputs = []
+    for item in inputs:
+        if "value" in item and "rows" not in item and "table" not in item:
+            values = _values_from_payload(item.get("value"))
+            outputs.append({"column": _profile_values(values), "suggested_checks": _contract_for_rows([{"value": v} for v in values])["suggested_checks"]})
+            continue
+        rows = _rows_from_payload(item.get("rows", item.get("table", item.get("data", item.get("collection", item)))))
+        outputs.append(_contract_for_rows(rows))
+    return outputs
+
+
+def _redact_text(text: str, entities: list[dict[str, Any]]) -> str:
+    redacted = text
+    for entity in sorted(entities, key=lambda row: row.get("start", 0), reverse=True):
+        start = entity.get("start")
+        end = entity.get("end")
+        label = entity.get("label", "PII")
+        if isinstance(start, int) and isinstance(end, int):
+            redacted = redacted[:start] + f"[{label}]" + redacted[end:]
+    return redacted
+
+
+def _detect_pii_entities(text: str) -> list[dict[str, Any]]:
+    patterns = [
+        ("EMAIL", r"[^@\s]+@[^@\s]+\.[^@\s]+"),
+        ("PHONE", r"(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}"),
+        ("SSN", r"\b\d{3}-\d{2}-\d{4}\b"),
+        ("CREDIT_CARD", r"\b(?:\d[ -]*?){13,16}\b"),
+        ("IP_ADDRESS", r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),
+    ]
+    entities = []
+    for label, pattern in patterns:
+        for match in re.finditer(pattern, text):
+            entities.append(
+                {
+                    "label": label,
+                    "text": match.group(0),
+                    "start": match.start(),
+                    "end": match.end(),
+                    "score": 1.0,
+                }
+            )
+    return sorted(entities, key=lambda row: row["start"])
+
+
+def _predict_semantic_column_type(inputs: list[dict[str, Any]]) -> list[Any]:
+    outputs = []
+    for item in inputs:
+        if "text" in item and not any(key in item for key in ("values", "rows", "collection")):
+            text = str(item.get("text") or "")
+            entities = _detect_pii_entities(text)
+            outputs.append(
+                {
+                    "entities": entities,
+                    "redacted": _redact_text(text, entities),
+                    "pii_risk": "high" if entities else "low",
+                }
+            )
+            continue
+        values = _values_from_payload(item.get("values", item.get("collection", item.get("rows", item))))
+        column = str(item.get("column") or "")
+        profile = _profile_values(values, column)
+        outputs.append(
+            {
+                "semantic_type": profile["semantic_type"],
+                "pii_risk": profile["pii_risk"],
+                "profile": profile,
+            }
+        )
+    return outputs
+
+
+def _normalize_key(value: Any) -> str:
+    return str(value).strip().lower()
+
+
+def _column_values(rows: list[dict[str, Any]], column: str) -> list[str]:
+    return [_normalize_key(row.get(column)) for row in rows if not _missing(row.get(column))]
+
+
+def _column_name_score(left: str, right: str) -> float:
+    def norm(name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", name.lower())
+
+    l_norm, r_norm = norm(left), norm(right)
+    if left.lower() == right.lower():
+        return 1.0
+    if l_norm == r_norm:
+        return 0.95
+    if l_norm.endswith("id") and r_norm.endswith("id") and (l_norm in r_norm or r_norm in l_norm):
+        return 0.85
+    l_tokens = {token for token in re.split(r"[^a-z0-9]+", left.lower()) if token}
+    r_tokens = {token for token in re.split(r"[^a-z0-9]+", right.lower()) if token}
+    if l_tokens and r_tokens:
+        return len(l_tokens & r_tokens) / len(l_tokens | r_tokens)
+    return 0.0
+
+
+def _join_score(left_values: list[Any], right_values: list[Any], left_name: str = "", right_name: str = "") -> dict[str, Any]:
+    left = [_normalize_key(value) for value in left_values if not _missing(value)]
+    right = [_normalize_key(value) for value in right_values if not _missing(value)]
+    if not left or not right:
+        return {"score": 0.0, "overlap_ratio": 0.0, "left_coverage": 0.0, "right_coverage": 0.0}
+    l_set, r_set = set(left), set(right)
+    overlap = l_set & r_set
+    overlap_ratio = len(overlap) / max(1, min(len(l_set), len(r_set)))
+    left_coverage = sum(1 for value in left if value in r_set) / len(left)
+    right_coverage = sum(1 for value in right if value in l_set) / len(right)
+    left_unique = len(l_set) / len(left)
+    right_unique = len(r_set) / len(right)
+    name_score = _column_name_score(left_name, right_name)
+    score = (
+        0.5 * overlap_ratio
+        + 0.2 * min(left_coverage, right_coverage)
+        + 0.15 * min(left_unique, right_unique)
+        + 0.15 * name_score
+    )
+    return {
+        "score": round(min(1.0, score), 4),
+        "overlap_ratio": round(overlap_ratio, 4),
+        "left_coverage": round(left_coverage, 4),
+        "right_coverage": round(right_coverage, 4),
+        "left_unique_ratio": round(left_unique, 4),
+        "right_unique_ratio": round(right_unique, 4),
+        "name_score": round(name_score, 4),
+        "examples": sorted(overlap)[:5],
+    }
+
+
+def _predict_join_detective(inputs: list[dict[str, Any]]) -> list[Any]:
+    outputs = []
+    for item in inputs:
+        if "left_values" in item or "right_values" in item:
+            left_values = _values_from_payload(item.get("left_values", []))
+            right_values = _values_from_payload(item.get("right_values", []))
+            outputs.append(_join_score(left_values, right_values))
+            continue
+        left_rows = _rows_from_payload(item.get("left_rows", item.get("left", [])))
+        right_rows = _rows_from_payload(item.get("right_rows", item.get("right", [])))
+        left_cols = sorted({key for row in left_rows for key in row.keys()})
+        right_cols = sorted({key for row in right_rows for key in row.keys()})
+        candidates = []
+        for left_col in left_cols:
+            l_values = _column_values(left_rows, left_col)
+            for right_col in right_cols:
+                r_values = _column_values(right_rows, right_col)
+                stats = _join_score(l_values, r_values, left_col, right_col)
+                if stats["score"] <= 0:
+                    continue
+                candidates.append(
+                    {
+                        "left_column": left_col,
+                        "right_column": right_col,
+                        "condition": f"{left_col} = {right_col}",
+                        **stats,
+                    }
+                )
+        candidates.sort(key=lambda row: row["score"], reverse=True)
+        outputs.append(
+            {
+                "candidates": candidates[:10],
+                "left_columns": left_cols,
+                "right_columns": right_cols,
+                "left_row_count": len(left_rows),
+                "right_row_count": len(right_rows),
+            }
+        )
+    return outputs
+
+
 def _predict_echo(inputs: list[dict[str, Any]]) -> list[Any]:
     outputs = []
     for item in inputs:
@@ -559,6 +1210,14 @@ def predict_batch(inputs: list[dict[str, Any]]) -> list[Any]:
         return _predict_sequence_classification(inputs)
     if HANDLER == "zero_shot_classification":
         return _predict_zero_shot(inputs)
+    if HANDLER == "question_answering":
+        return _predict_question_answering(inputs)
+    if HANDLER == "summarization":
+        return _predict_summarization(inputs)
+    if HANDLER == "token_classification":
+        return _predict_token_classification(inputs)
+    if HANDLER == "table_question_answering":
+        return _predict_table_question_answering(inputs)
     if HANDLER == "gliner":
         return _predict_gliner(inputs)
     if HANDLER == "tabular_classification":
@@ -567,6 +1226,14 @@ def predict_batch(inputs: list[dict[str, Any]]) -> list[Any]:
         return _predict_tabular_regression(inputs)
     if HANDLER == "tabular_foundation":
         return _predict_tabular_foundation(inputs)
+    if HANDLER == "time_series_forecast":
+        return _predict_time_series_forecast(inputs)
+    if HANDLER == "data_contract_miner":
+        return _predict_data_contract_miner(inputs)
+    if HANDLER == "semantic_column_type":
+        return _predict_semantic_column_type(inputs)
+    if HANDLER == "join_detective":
+        return _predict_join_detective(inputs)
     raise HTTPException(
         status_code=501,
         detail=f"handler {HANDLER!r} needs custom predict_batch implementation",

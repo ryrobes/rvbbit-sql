@@ -1,0 +1,81 @@
+api_version: rvbbit.pack/v1
+id: llm/gemma-4-12b-it-vllm
+name: gemma_4_12b_it_vllm
+title: Gemma 4 12B IT via vLLM
+description: Warren-deployed local Gemma chat provider served through vLLM's OpenAI-compatible API.
+license: apache-2.0
+tags:
+- llm
+- chat
+- local
+- vllm
+- gemma
+- gpu
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: google/gemma-4-12B-it
+  url: https://huggingface.co/google/gemma-4-12B-it
+runtime:
+  mode: image
+  image: vllm/vllm-openai:latest
+  handler: vllm_openai
+  device: cuda
+  port: 8080
+  health_path: /health
+resources:
+  gpu:
+    required: true
+    placement: single_gpu
+    model_size_bytes: 24000000000
+    vram_required_bytes: 48000000000
+    headroom_pct: 100
+    estimate_source: fp16_weights_plus_kv_cache_allowance
+    notes: Gemma 4 12B local serving is GPU-oriented; reduce vLLM max model length or use quantization for smaller cards.
+exports:
+  backend: gemma_4_12b_it
+install:
+  mode: image
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: true
+  tests:
+  - name: gemma_vllm_provider_registered
+    description: Assert the Gemma vLLM Warren registered a chat backend and provider-model catalog entry.
+    sql: |
+      DO $$
+      BEGIN
+          IF NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.backends
+              WHERE name = 'gemma_4_12b_it'
+                AND transport = 'openai_chat'
+                AND endpoint_url LIKE '%/v1/chat/completions'
+          ) THEN
+              RAISE EXCEPTION 'gemma_4_12b_it openai_chat backend is not registered';
+          END IF;
+
+          IF NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.provider_model_catalog
+              WHERE provider = 'gemma_4_12b_it'
+                AND model = 'google/gemma-4-12B-it'
+                AND available
+          ) THEN
+              RAISE EXCEPTION 'Gemma provider model catalog row is not available';
+          END IF;
+
+          IF NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.warren_inventory
+              WHERE backend_name = 'gemma_4_12b_it'
+                AND deployment_status = 'running'
+          ) THEN
+              RAISE EXCEPTION 'gemma_4_12b_it deployment is not running in Warren inventory';
+          END IF;
+      END
+      $$;

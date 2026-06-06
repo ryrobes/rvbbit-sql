@@ -1,0 +1,85 @@
+api_version: rvbbit.pack/v1
+id: summarize/bart-large-cnn
+name: bart_large_cnn_summarizer
+title: BART Large CNN Summarizer
+description: Local abstractive summarization for long notes, reports, tickets, and JSONB rows.
+license: mit
+tags:
+- summarize
+- text
+- reports
+- tickets
+- bi
+- row
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: facebook/bart-large-cnn
+  url: https://huggingface.co/facebook/bart-large-cnn
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: summarization
+  device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 1620000000
+    vram_required_bytes: 2025000000
+    headroom_pct: 25
+    estimate_source: huggingface_model_card_params
+exports:
+  backend: summarize_bart_cnn
+  operators:
+  - summarize_bart
+  - summarize_text_local
+  - summarize_row_local
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: summarization_contract
+    description: Summarize a business incident note and assert JSON/text operator shapes.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          summary text;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.summarize_bart(
+                  'A regional warehouse delayed three outbound shipments after a scanner outage. Operations rerouted urgent orders, restored scanning after two hours, and opened a follow-up ticket for device maintenance.'
+              ) INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'summarize_bart returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'summary_text') THEN
+              RAISE EXCEPTION 'unexpected summarization shape: %', result;
+          END IF;
+
+          SELECT rvbbit.summarize_text_local(
+              'A regional warehouse delayed three outbound shipments after a scanner outage. Operations rerouted urgent orders, restored scanning after two hours, and opened a follow-up ticket for device maintenance.'
+          ) INTO summary;
+          IF coalesce(btrim(summary), '') = '' THEN
+              RAISE EXCEPTION 'summarize_text_local returned an empty summary';
+          END IF;
+
+          SELECT rvbbit.summarize_row_local(
+              '{"incident":"scanner outage","impact":"three delayed outbound shipments","action":"rerouted urgent orders and opened maintenance ticket"}'::jsonb
+          ) INTO summary;
+          IF coalesce(btrim(summary), '') = '' THEN
+              RAISE EXCEPTION 'summarize_row_local returned an empty summary';
+          END IF;
+      END
+      $$;

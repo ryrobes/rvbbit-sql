@@ -1,28 +1,23 @@
 api_version: rvbbit.capability/v1
 kind: hf_backend
 name: tabpfn_foundation
-title: Tabular Foundation Model (in-context, training-free)
+title: TabPFN-style In-Context Tabular Predictor
 description: >
-  A TabPFN-class tabular foundation model served as a GPU specialist. Predicts a
-  target column for query rows IN CONTEXT from a labeled support set — no
-  per-dataset training step. The serving shape is identical to the sklearn
-  tabular packs (hf-rvbbit-fastapi sidecar + 'rvbbit' backend + jsonb operator);
-  only the handler and the request payload differ. See docs/MODELS_UNIFIED_PLAN.md
-  (Track B) and rvbbit.predict_tabular(support_sql, predict_sql, target, task).
-license: unknown
+  TabPFN-shaped in-context tabular prediction for labeled support rows and
+  query rows. The current sidecar handler is a deterministic CPU reference
+  implementation with the same SQL/request contract expected by a true TabPFN
+  GPU forward pass, so the package can prove the operator shape before the
+  heavier model runtime is swapped in.
+license: prior-labs
 tags: [tabular, foundation, in-context, prediction, gpu, tabpfn]
 source:
   provider: huggingface
-  model: Prior-Labs/TabPFN-v2
-  url: https://huggingface.co/Prior-Labs
+  model: Prior-Labs/TabPFN-v2-clf
+  url: https://huggingface.co/Prior-Labs/TabPFN-v2-clf
 runtime:
   template: hf-rvbbit-fastapi
-  # NOTE: `tabular_foundation` is a NEW handler to add to the fastapi template —
-  # it accepts {task, target, support:[...], queries:[...]} and returns
-  # {predictions:[...]} (in-context), rather than the per-row predict of the
-  # existing tabular_classification/tabular_regression handlers.
   handler: tabular_foundation
-  device: gpu
+  device: auto
   env:
     RVBBIT_CAPABILITY_EAGER: "0"
     RVBBIT_TABULAR_FOUNDATION_MAX_SUPPORT: "10000"
@@ -45,3 +40,6 @@ operators:
     parser: json
     inputs:
       bundle: "{{ inputs.bundle }}"
+smoke:
+  inputs:
+    - bundle: '{"task":"classification","target":"churn","support":[{"tenure":1,"plan":"basic","churn":"yes"},{"tenure":24,"plan":"enterprise","churn":"no"},{"tenure":3,"plan":"basic","churn":"yes"}],"queries":[{"tenure":18,"plan":"enterprise"}]}'

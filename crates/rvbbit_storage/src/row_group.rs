@@ -389,7 +389,10 @@ fn compact_text_dictionary_max_bytes() -> usize {
     )
 }
 
-fn compute_arrow_stats(batch: &RecordBatch, text_stats_enabled: bool) -> Vec<ColumnStats> {
+/// Per-column min/max/null-count (+ optional text sketches) from an Arrow batch.
+/// Reused by the Vortex write path (`pg_rvbbit::compact::write_vortex_record_batch`)
+/// so `.vortex` variants carry the SAME stats as canonical parquet — keep this `pub`.
+pub fn compute_arrow_stats(batch: &RecordBatch, text_stats_enabled: bool) -> Vec<ColumnStats> {
     use serde_json::json;
     let schema = batch.schema();
     schema

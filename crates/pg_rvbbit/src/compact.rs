@@ -2439,6 +2439,14 @@ fn write_vortex_record_batch(
     }
     let n_rows = batch.num_rows() as i64;
     let schema = batch.schema();
+    // Phase 1 (NATIVE_VORTEX_PLAN): compute per-column min/max/null-count from the
+    // batch BEFORE it's moved into the Vortex writer, reusing the parquet stats fn so
+    // the values are byte-identical to the canonical parquet stats. Timestamp columns
+    // arrive here as Int64 unix-epoch micros (post `vortex_record_batch_for_plans`
+    // cast) → the Int64 arm yields the same unix-epoch micros parquet stores; the
+    // stats-pruning path applies NO epoch offset, so no adjustment is needed. Text
+    // sketches are skipped (false) — irrelevant to vortex pruning + expensive.
+    let column_stats = rvbbit_storage::row_group::compute_arrow_stats(&batch, false);
     rt.block_on(async {
         let array = session
             .arrow()
@@ -2464,7 +2472,7 @@ fn write_vortex_record_batch(
         n_bytes,
         min_xid: None,
         max_xid: None,
-        column_stats: Vec::new(),
+        column_stats,
         per_group_stats: Vec::new(),
         column_bitmaps: Vec::new(),
         text_dictionaries: Vec::new(),

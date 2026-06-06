@@ -1,0 +1,84 @@
+api_version: rvbbit.pack/v1
+id: tabular/tabpfn-foundation
+name: tabpfn_foundation
+title: TabPFN-style In-Context Tabular Predictor
+description: TabPFN-shaped support/query tabular prediction for data science workflows.
+license: prior-labs
+catalog_visibility: example
+tags:
+- tabular
+- foundation
+- in-context
+- prediction
+- classification
+- data-science
+- tabpfn
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: Prior-Labs/TabPFN-v2-clf
+  url: https://huggingface.co/Prior-Labs/TabPFN-v2-clf
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: tabular_foundation
+  device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 50000000
+    vram_required_bytes: 256000000
+    headroom_pct: 400
+    estimate_source: tabpfn_v2_classifier_checkpoint_estimate
+exports:
+  backend: predict_tabular_foundation
+  operators:
+  - predict_tabular_foundation
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  tests:
+  - name: tabpfn_bundle_contract
+    description: Predict query rows from a labeled support set and assert the in-context JSON shape.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          bundle jsonb := '{
+            "task": "classification",
+            "target": "churn",
+            "support": [
+              {"tenure": 1, "plan": "basic", "tickets": 5, "churn": "yes"},
+              {"tenure": 24, "plan": "enterprise", "tickets": 1, "churn": "no"},
+              {"tenure": 3, "plan": "basic", "tickets": 4, "churn": "yes"},
+              {"tenure": 18, "plan": "enterprise", "tickets": 2, "churn": "no"}
+            ],
+            "queries": [
+              {"tenure": 20, "plan": "enterprise", "tickets": 1}
+            ]
+          }'::jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.predict_tabular_foundation(bundle) INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'predict_tabular_foundation returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object'
+             OR jsonb_typeof(result->'predictions') <> 'array'
+             OR jsonb_array_length(result->'predictions') <> 1 THEN
+              RAISE EXCEPTION 'unexpected TabPFN bundle result: %', result;
+          END IF;
+      END
+      $$;

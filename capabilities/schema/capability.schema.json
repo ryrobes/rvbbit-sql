@@ -12,7 +12,7 @@
     },
     "kind": {
       "type": "string",
-      "enum": ["hf_backend", "runtime_sidecar"]
+      "enum": ["hf_backend", "runtime_sidecar", "llm_provider"]
     },
     "name": {
       "type": "string",
@@ -54,6 +54,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "mode": { "type": "string", "enum": ["image", "build", "external"] },
         "image": { "type": "string" },
         "image_digest": { "type": "string" },
         "pull_policy": {
@@ -66,10 +67,20 @@
           "enum": [
             "embedding",
             "sequence_classification",
+            "question_answering",
+            "summarization",
+            "token_classification",
+            "table_question_answering",
             "zero_shot_classification",
             "gliner",
             "tabular_classification",
             "tabular_regression",
+            "tabular_foundation",
+            "time_series_forecast",
+            "data_contract_miner",
+            "semantic_column_type",
+            "join_detective",
+            "vllm_openai",
             "python_runtime",
             "mcp_gateway",
             "custom"
@@ -93,6 +104,19 @@
           }
         },
         "base_image": { "type": "string" },
+        "command": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "args": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "ipc": { "type": "string" },
         "extra_requirements": {
           "type": "array",
           "items": { "type": "string" }
@@ -151,6 +175,33 @@
         "description": { "type": "string" }
       }
     },
+    "provider_registration": {
+      "type": "object",
+      "required": ["provider", "model"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "pattern": "^[a-z][a-z0-9_\\-]*$" },
+        "model": { "type": "string" },
+        "backend_name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "display_name": { "type": "string" },
+        "family": { "type": "string" },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "context_window": { "type": "integer", "minimum": 1 },
+        "output_token_limit": { "type": "integer", "minimum": 1 },
+        "input_per_mtok": { "type": "number", "minimum": 0 },
+        "output_per_mtok": { "type": "number", "minimum": 0 },
+        "currency": { "type": "string" },
+        "cost_policy": {
+          "type": "string",
+          "enum": ["free", "fixed", "model_rate", "provider_settled", "unknown"]
+        },
+        "set_default": { "type": "boolean", "default": false },
+        "raw": { "type": "object" }
+      }
+    },
     "operators": {
       "type": "array",
       "items": {
@@ -182,7 +233,7 @@
           },
           "shape": {
             "type": "string",
-            "enum": ["scalar", "aggregate", "dimension"],
+            "enum": ["scalar", "aggregate", "dimension", "rowset", "query"],
             "default": "scalar"
           },
           "inputs": {

@@ -1,0 +1,56 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: roberta_base_squad2
+title: RoBERTa SQuAD2 Extractive QA
+description: Extractive question answering over a supplied context paragraph.
+license: apache-2.0
+tags: [qa, question-answering, extract, context, document, row]
+source:
+  provider: huggingface
+  model: deepset/roberta-base-squad2
+  url: https://huggingface.co/deepset/roberta-base-squad2
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: question_answering
+  device: auto
+backend:
+  name: qa_roberta_squad2
+  transport: rvbbit
+  batch_size: 16
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: RoBERTa SQuAD2 extractive question-answering backend.
+operators:
+  - name: answer_from_context
+    description: Answer a question using only the supplied context text.
+    arg_names: [question, context]
+    arg_types: [text, text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      question: "{{ inputs.question }}"
+      context: "{{ inputs.context }}"
+  - name: answer_text
+    description: Return only the answer span for a question over supplied context.
+    arg_names: [question, context]
+    arg_types: [text, text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: qa
+        kind: specialist
+        specialist: qa_roberta_squad2
+        inputs:
+          question: "{{ inputs.question }}"
+          context: "{{ inputs.context }}"
+      - name: answer
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.qa.output }}"
+          path: answer
+          default: ""
+smoke:
+  inputs:
+    - question: Where is the operations center?
+      context: The Rvbbit operations center is in Portland. The finance team is in Austin.

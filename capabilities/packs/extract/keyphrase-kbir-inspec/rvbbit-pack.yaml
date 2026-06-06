@@ -1,0 +1,85 @@
+api_version: rvbbit.pack/v1
+id: extract/keyphrase-kbir-inspec
+name: keyphrase_kbir_inspec
+title: KBIR Keyphrase Extraction
+description: Local keyphrase extraction for abstracts, research notes, docs, and analyst narratives.
+license: mit
+tags:
+- extract
+- keyphrases
+- tags
+- documents
+- research
+- row
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: ml6team/keyphrase-extraction-kbir-inspec
+  url: https://huggingface.co/ml6team/keyphrase-extraction-kbir-inspec
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: token_classification
+  device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 500000000
+    vram_required_bytes: 625000000
+    headroom_pct: 25
+    estimate_source: roberta_base_estimate
+exports:
+  backend: extract_keyphrase_kbir
+  operators:
+  - extract_keyphrases
+  - top_keyphrase
+  - extract_row_keyphrases
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: keyphrase_extraction_contract
+    description: Extract keyphrases from an analytics note and assert array/text operator shapes.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          phrase text;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.extract_keyphrases(
+                  'Semantic caching and vector indexes improve retrieval quality for customer support analytics.'
+              ) INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'extract_keyphrases returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'array' THEN
+              RAISE EXCEPTION 'unexpected keyphrase result shape: %', result;
+          END IF;
+
+          SELECT rvbbit.top_keyphrase(
+              'Semantic caching and vector indexes improve retrieval quality for customer support analytics.'
+          ) INTO phrase;
+          IF phrase IS NULL THEN
+              RAISE EXCEPTION 'top_keyphrase returned NULL';
+          END IF;
+
+          SELECT rvbbit.extract_row_keyphrases(
+              '{"note":"Semantic caching and vector indexes improve retrieval quality.","team":"support analytics"}'::jsonb
+          ) INTO result;
+          IF jsonb_typeof(result) <> 'array' THEN
+              RAISE EXCEPTION 'unexpected row keyphrase result shape: %', result;
+          END IF;
+      END
+      $$;

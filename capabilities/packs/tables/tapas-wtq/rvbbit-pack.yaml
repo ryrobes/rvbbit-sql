@@ -1,0 +1,74 @@
+api_version: rvbbit.pack/v1
+id: tables/tapas-wtq
+name: tapas_wtq_table_qa
+title: TAPAS Table Question Answering
+description: Local question answering over small JSONB tables for BI-style table exploration.
+license: apache-2.0
+tags:
+- tables
+- qa
+- bi
+- analytics
+- jsonb
+- row
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: google/tapas-base-finetuned-wtq
+  url: https://huggingface.co/google/tapas-base-finetuned-wtq
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: table_question_answering
+  device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 440000000
+    vram_required_bytes: 550000000
+    headroom_pct: 25
+    estimate_source: tapas_base_estimate
+exports:
+  backend: table_qa_tapas
+  operators:
+  - answer_table_question
+  - table_answer_text
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: table_qa_contract
+    description: Ask a question over a small revenue table and assert JSON/text operator shapes.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          answer text;
+          sample_table jsonb := '[{"region":"West","revenue":"120"},{"region":"East","revenue":"80"}]'::jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.answer_table_question(sample_table, 'Which region has revenue 120?') INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'answer_table_question returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object' OR NOT (result ? 'answer') THEN
+              RAISE EXCEPTION 'unexpected TAPAS result shape: %', result;
+          END IF;
+
+          SELECT rvbbit.table_answer_text(sample_table, 'Which region has revenue 120?') INTO answer;
+          IF answer IS NULL THEN
+              RAISE EXCEPTION 'table_answer_text returned NULL';
+          END IF;
+      END
+      $$;

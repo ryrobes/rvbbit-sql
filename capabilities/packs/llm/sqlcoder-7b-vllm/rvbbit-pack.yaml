@@ -1,0 +1,72 @@
+api_version: rvbbit.pack/v1
+id: llm/sqlcoder-7b-vllm
+name: sqlcoder_7b_vllm
+title: SQLCoder 7B via vLLM
+description: Warren-deployed local text-to-SQL provider with a Postgres SQL drafting operator.
+license: cc-by-sa-4.0
+tags:
+- llm
+- sql
+- text-to-sql
+- data-engineering
+- analytics
+- vllm
+- gpu
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: defog/sqlcoder-7b-2
+  url: https://huggingface.co/defog/sqlcoder-7b-2
+runtime:
+  mode: image
+  image: vllm/vllm-openai:latest
+  handler: vllm_openai
+  device: cuda
+  port: 8080
+  health_path: /health
+resources:
+  gpu:
+    required: true
+    placement: single_gpu
+    model_size_bytes: 14000000000
+    vram_required_bytes: 28000000000
+    headroom_pct: 100
+    estimate_source: fp16_weights_plus_kv_cache_allowance
+exports:
+  backend: sqlcoder_7b
+  operators:
+  - draft_postgres_sql
+install:
+  mode: image
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: true
+  tests:
+  - name: sqlcoder_operator_contract
+    description: Draft SQL from a schema and assert non-empty text output.
+    sql: |
+      DO $$
+      DECLARE
+          sql_text text;
+      BEGIN
+          IF NOT EXISTS (
+              SELECT 1 FROM rvbbit.backends
+              WHERE name = 'sqlcoder_7b'
+                AND transport = 'openai_chat'
+          ) THEN
+              RAISE EXCEPTION 'sqlcoder_7b backend is not registered';
+          END IF;
+
+          SELECT rvbbit.draft_postgres_sql(
+              'orders(id bigint, region text, revenue numeric, created_at date)',
+              'total revenue by region for 2025'
+          ) INTO sql_text;
+          IF coalesce(btrim(sql_text), '') = '' THEN
+              RAISE EXCEPTION 'draft_postgres_sql returned an empty SQL draft';
+          END IF;
+      END
+      $$;

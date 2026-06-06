@@ -1,0 +1,73 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: bart_large_cnn_summarizer
+title: BART Large CNN Summarizer
+description: Local abstractive summarization for long notes, reports, tickets, and JSONB rows.
+license: mit
+tags: [summarize, text, reports, tickets, bi, row]
+source:
+  provider: huggingface
+  model: facebook/bart-large-cnn
+  url: https://huggingface.co/facebook/bart-large-cnn
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: summarization
+  device: auto
+backend:
+  name: summarize_bart_cnn
+  transport: rvbbit
+  batch_size: 8
+  max_concurrent: 2
+  timeout_ms: 180000
+  description: BART large CNN/DailyMail summarization backend.
+operators:
+  - name: summarize_bart
+    description: Summarize text with local BART and return the raw JSON result.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+  - name: summarize_text_local
+    description: Summarize text with local BART and return only the summary text.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: summary
+        kind: specialist
+        specialist: summarize_bart_cnn
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: text
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.summary.output }}"
+          path: summary_text
+          default: ""
+  - name: summarize_row_local
+    description: Summarize a JSONB row with local BART and return summary text.
+    arg_names: [row]
+    arg_types: [jsonb]
+    return_type: text
+    parser: strip
+    steps:
+      - name: summary
+        kind: specialist
+        specialist: summarize_bart_cnn
+        inputs:
+          text: "{{ inputs.row }}"
+      - name: text
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.summary.output }}"
+          path: summary_text
+          default: ""
+smoke:
+  inputs:
+    - text: A regional warehouse delayed three outbound shipments after a scanner outage. Operations rerouted urgent orders, restored scanning after two hours, and opened a follow-up ticket for device maintenance.
+      row: '{"incident":"scanner outage","impact":"three delayed outbound shipments","action":"rerouted urgent orders and opened maintenance ticket"}'

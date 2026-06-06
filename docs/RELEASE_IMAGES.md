@@ -93,6 +93,46 @@ scripts/release/build-and-push.sh --version 1.0.1 --bump --push --tag-latest
 `--platform` controls product images; `--capability-platform` controls model
 capability images. V1 defaults both to `linux/amd64`.
 
+## Public GHCR Pulls
+
+GitHub creates newly pushed container packages as private by default. Docker
+pushes cannot set package visibility. To test on fresh machines without GHCR
+login, make each package public from GitHub's package settings:
+
+1. Open the package URL.
+2. Click **Package settings**.
+3. Under **Danger Zone**, click **Change visibility**.
+4. Select **Public**.
+
+Once public, GHCR container images can be pulled anonymously. No
+`docker login ghcr.io` is required on the test machine.
+
+List the release package URLs:
+
+```bash
+scripts/release/check-public-images.py \
+  --image-prefix ghcr.io/ryrobes \
+  --version 1.0.0 \
+  --list-only
+```
+
+After changing visibility, verify anonymous access with a clean Docker config:
+
+```bash
+make release-public-check RELEASE_VERSION=1.0.0 IMAGE_NAMESPACE=ryrobes
+```
+
+Or as a release gate after a push:
+
+```bash
+scripts/release/build-and-push.sh \
+  --version 1.0.0 \
+  --namespace ryrobes \
+  --push \
+  --tag-latest \
+  --check-public
+```
+
 ## Clean-Slate Compose
 
 ```bash
@@ -114,3 +154,51 @@ volumes:
 
 That is intentional for the V1 single-host Warren model: Warren manages local
 Docker capability containers on behalf of the database.
+
+## Turnkey Uber Compose
+
+For first-run QA, demos, and the easiest local install, use:
+
+```bash
+RVBBIT_VERSION=1.0.0 docker compose -f docker/docker-compose.uber.yml up -d
+```
+
+This starts the same Postgres, Lens, and Warren services, plus a one-shot
+`bootstrap` service from the Postgres image. The bootstrap waits for Warren to
+register, then deploys and verifies:
+
+- `smoke/warren-echo`
+- `runtimes/python-runtime`
+- `runtimes/mcp-gateway`
+
+The bootstrap container exits successfully when the baseline is ready. Inspect
+it with:
+
+```bash
+docker logs rvbbit-bootstrap
+```
+
+Override the baseline list with:
+
+```bash
+RVBBIT_UBER_BOOTSTRAP_CAPABILITIES=smoke/warren-echo,runtimes/python-runtime
+```
+
+For private GHCR packages, Warren also needs Docker registry credentials because
+it pulls child capability images from inside the `rvbbit-warren-agent`
+container. Use a plain Docker auth config:
+
+```bash
+export RVBBIT_DOCKER_CONFIG=/tmp/rvbbit-ghcr-auth
+mkdir -p "$RVBBIT_DOCKER_CONFIG"
+echo "$CR_PAT" | docker --config "$RVBBIT_DOCKER_CONFIG" login ghcr.io -u "$GH_USER" --password-stdin
+
+RVBBIT_VERSION=1.0.0 \
+RVBBIT_DOCKER_CONFIG="$RVBBIT_DOCKER_CONFIG" \
+docker compose -f docker/docker-compose.uber.yml up -d
+```
+
+The default Warren auth mount is
+`${RVBBIT_DOCKER_CONFIG:-$HOME/.docker}:/root/.docker:ro`. If your normal
+Docker config uses a platform credential helper that is not available inside
+the Warren container, use the dedicated `RVBBIT_DOCKER_CONFIG` flow above.

@@ -354,7 +354,7 @@ Each `capabilities[]` entry has these fields:
 | `title` | string | Human-readable title. |
 | `description` | string/null | Short description. |
 | `tags` | string[] | UI filters such as `embedding`, `extract`, `gpu`. |
-| `kind` | string | `hf_backend` or `runtime_sidecar`. |
+| `kind` | string | `hf_backend`, `runtime_sidecar`, or `llm_provider`. |
 | `system_runtime` | boolean | True for operator-runtime capabilities that unlock broader workflow primitives instead of a single model specialist. |
 | `capability_role` | string/null | Role hint such as `operator_runtime`. |
 | `license` | string/null | Model or pack license hint. |
@@ -362,7 +362,10 @@ Each `capabilities[]` entry has these fields:
 | `source_model` | string/null | Hugging Face model id or bundled capability id. |
 | `source_revision` | string/null | Optional pinned model revision. |
 | `backend_name` | string/null | Name registered in `rvbbit.backends`; null for runtime sidecars. |
-| `backend_transport` | string/null | Usually `rvbbit` for generated model sidecars. |
+| `backend_transport` | string/null | Usually `rvbbit` for generated model sidecars or `openai_chat` for local LLM providers. |
+| `provider_name` | string/null | Provider catalog name for `llm_provider` packs. |
+| `provider_model` | string/null | Model id registered in `rvbbit.provider_models` for `llm_provider` packs. |
+| `provider_set_default` | boolean | True only when an LLM provider pack should make itself the default provider during install. |
 | `runtime_name` | string/null | Name registered in a runtime catalog such as `rvbbit.python_runtimes`. |
 | `runtime_language` | string/null | Runtime language, currently `python` or `mcp` for runtime sidecars. |
 | `runtime_image` | string/null | OCI image Warren should run when the capability is image-based. |
@@ -373,7 +376,7 @@ Each `capabilities[]` entry has these fields:
 | `acceptance_tests` | string[] | Named pack acceptance SQL tests, if present. |
 | `acceptance` | object/null | Runnable pack acceptance SQL: optional `target_selector`, `setup_sql[]`, `tests[{name, description, sql}]`, and `teardown_sql[]`. |
 | `runtime_template` | string | Generated runtime template. |
-| `runtime_handler` | string | Handler such as `echo`, `embedding`, `gliner`, `sequence_classification`, `tabular_classification`, `tabular_regression`, `python_runtime`, or `mcp_gateway`. |
+| `runtime_handler` | string | Handler such as `echo`, `embedding`, `gliner`, `sequence_classification`, `summarization`, `token_classification`, `table_question_answering`, `tabular_classification`, `tabular_regression`, `tabular_foundation`, `time_series_forecast`, `data_contract_miner`, `semantic_column_type`, `join_detective`, `python_runtime`, `mcp_gateway`, or `vllm_openai`. |
 | `runtime_port` | integer/null | Container port exposed by this runtime; defaults to `8080` when absent. |
 | `health_path` | string/null | HTTP path Warren should poll for sidecar health; defaults to `/health`. |
 | `endpoint_path` | string/null | Warren registration path such as `/predict` or `/run`. |
@@ -471,8 +474,42 @@ operators:
 ```
 
 The UI should treat unknown manifest keys as pass-through data. V1 supports
-`kind: hf_backend` and `kind: runtime_sidecar` in the CLI, but future pack
-kinds should not break catalog rendering.
+`kind: hf_backend`, `kind: runtime_sidecar`, and `kind: llm_provider` in the
+CLI, but future pack kinds should not break catalog rendering.
+
+Local LLM provider example:
+
+```yaml
+api_version: rvbbit.capability/v1
+kind: llm_provider
+name: gemma_4_12b_it_vllm
+source:
+  provider: huggingface
+  model: google/gemma-4-12B-it
+runtime:
+  image: vllm/vllm-openai:latest
+  handler: vllm_openai
+  device: cuda
+  args: [--model, google/gemma-4-12B-it, --port, "8080"]
+backend:
+  name: gemma_4_12b_it
+  transport: openai_chat
+  opts:
+    model: google/gemma-4-12B-it
+provider_registration:
+  provider: gemma_4_12b_it
+  model: google/gemma-4-12B-it
+  capabilities: [chat]
+  cost_policy: free
+  set_default: false
+warren:
+  endpoint_path: /v1/chat/completions
+```
+
+An `llm_provider` pack does not need to export operators. It installs a normal
+chat backend/provider target, so `kind: llm` operator steps can reference
+`"provider": "gemma_4_12b_it"` directly; users may still opt in to
+`rvbbit.set_default_provider(...)` later.
 
 Runtime sidecar example:
 
@@ -543,6 +580,7 @@ Supported v0 tabular handlers:
 |---|---|---|
 | `tabular_classification` | one JSONB row per input | `{label, prediction, scores?}` |
 | `tabular_regression` | one JSONB row per input | `{value}` |
+| `tabular_foundation` | one JSONB bundle `{task,target,support,queries}` per input | `{predictions:[...], n_support, n_queries}` |
 
 Tabular handlers currently load trusted model artifacts from Hugging Face with
 `joblib`. Manifests can provide these runtime env values:
@@ -558,6 +596,74 @@ Tabular handlers currently load trusted model artifacts from Hugging Face with
 
 Because pickle/joblib model files are executable Python object graphs, a UI
 should treat tabular packs as trusted-code installs and make that visible.
+
+### Forecast Handler Shape
+
+Forecast packs are also normal Warren capabilities, but their operator input is
+usually the output of a SQL aggregate rather than a scalar row value:
+
+```sql
+WITH monthly AS (
+  SELECT date_trunc('month', created_at)::date AS ds, sum(revenue) AS value
+  FROM invoices
+  GROUP BY 1
+)
+SELECT rvbbit.forecast_series(
+  jsonb_agg(jsonb_build_object('ds', ds, 'value', value) ORDER BY ds),
+  '6'
+)
+FROM monthly;
+```
+
+The baseline `time_series_forecast` handler accepts a JSONB array of numbers,
+an array of `{ds,value}` rows, or a wrapper with `series`, `values`, `data`, or
+`rows`. It returns `{forecast:[{step,value,lower,upper}], horizon,
+n_observations, trend, method}`. This makes it useful as a full-table pipeline
+step: aggregate in SQL, forecast locally, then feed the result to another
+operator for explanation, alerting, or dashboard annotations.
+
+### Data Utility Handler Shapes
+
+Some catalog packs are not model checkpoints. They are lightweight Warren
+specialists that solve common data engineering chores with structured JSON
+contracts and aggregate/full-table operator shapes:
+
+| Handler | Input | Output |
+|---|---|---|
+| `data_contract_miner` | JSONB table sample or aggregate `value` collection | column profiles plus suggested checks |
+| `semantic_column_type` | JSONB values, aggregate `value` collection, or text | semantic type profile or PII spans/redaction |
+| `join_detective` | two JSONB table samples or two JSONB value arrays | join candidates, best condition, or confidence score |
+
+Example aggregate usage:
+
+```sql
+SELECT rvbbit.classify_column_type(email)
+FROM customers;
+
+SELECT region, rvbbit.infer_column_contract(status)
+FROM orders
+GROUP BY region;
+```
+
+Example full-table sample usage:
+
+```sql
+WITH sample_orders AS (
+  SELECT jsonb_agg(to_jsonb(t)) AS rows
+  FROM (
+    SELECT order_id, customer_id, status, amount
+    FROM orders
+    ORDER BY created_at DESC
+    LIMIT 500
+  ) t
+)
+SELECT rvbbit.infer_table_contract(rows)
+FROM sample_orders;
+```
+
+These packs are intentionally deterministic first-pass specialists. Their SQL
+operator contracts are stable enough to chain into LLM explanation, dashboard
+annotation, catalog enrichment, or later model-backed replacements.
 
 ### Trained Model Lifecycle
 

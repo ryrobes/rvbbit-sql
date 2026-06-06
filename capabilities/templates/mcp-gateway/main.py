@@ -134,12 +134,28 @@ class MCPServerProcess:
         self.config = config
         self.lock = asyncio.Lock()
         self.session: ClientSession | None = None
-        self._stack: AsyncExitStack | None = None
         self._tools_cache: list | None = None
+        # Lifecycle of the session's async-context stack is owned by a single
+        # dedicated task (`_run`); see the comment there for why.
+        self._runner: asyncio.Task | None = None
+        self._ready: asyncio.Event | None = None
+        self._shutdown: asyncio.Event | None = None
+        self._error: BaseException | None = None
 
-    async def ensure_started(self) -> None:
-        if self.session is not None:
-            return
+    async def _run(self) -> None:
+        # Own the session's async-context lifecycle ENTIRELY within this one
+        # task — enter AND exit here, never from a caller's task.
+        #
+        # The MCP SDK builds on anyio cancel scopes, which may only be exited
+        # from the same task that entered them. The previous design entered the
+        # stdio_client/ClientSession stack inside whichever HTTP-request task
+        # first touched the server, then closed it from a *different* request
+        # task during /refresh or an error reset. That cross-task teardown
+        # fails to cancel the subprocess reader task, which is then orphaned and
+        # busy-loops on the EOF pipe forever — pinning a full vCPU even while
+        # the gateway is otherwise idle. (Reproduced: a single /refresh ->
+        # permanent 100% CPU.) Doing enter+exit in this one task makes the
+        # cancel scopes unwind cleanly.
         stack = AsyncExitStack()
         try:
             if self.config.transport == "stdio":
@@ -164,15 +180,45 @@ class MCPServerProcess:
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
             self.session = session
-            self._stack = stack
             log.info("started mcp server %r (transport=%s)",
                      self.config.name, self.config.transport)
-        except Exception:
+        except BaseException as e:
+            # Startup failed — report it to ensure_started() and unwind here.
+            self._error = e
+            if self._ready is not None:
+                self._ready.set()
             try:
                 await stack.aclose()
             except Exception:
                 pass
-            raise
+            return
+        # Ready; park until reset()/shutdown asks us to tear down. The aclose()
+        # in the finally runs in THIS task, so teardown is clean.
+        if self._ready is not None:
+            self._ready.set()
+        try:
+            if self._shutdown is not None:
+                await self._shutdown.wait()
+        finally:
+            self.session = None
+            try:
+                await stack.aclose()
+            except Exception as e:
+                log.warning("error closing mcp server %r: %s",
+                            self.config.name, e)
+
+    async def ensure_started(self) -> None:
+        if self.session is not None:
+            return
+        self._error = None
+        self._ready = asyncio.Event()
+        self._shutdown = asyncio.Event()
+        self._runner = asyncio.create_task(self._run())
+        await self._ready.wait()
+        if self._error is not None:
+            err = self._error
+            await self._reset_locked()
+            raise err
 
     async def call_tool(self, name: str, arguments: dict) -> Any:
         async with self.lock:
@@ -225,13 +271,22 @@ class MCPServerProcess:
 
     async def _reset_locked(self) -> None:
         self._tools_cache = None
-        if self._stack is not None:
-            try:
-                await self._stack.aclose()
-            except Exception as e:
-                log.warning("error closing mcp server %r: %s", self.config.name, e)
         self.session = None
-        self._stack = None
+        runner = self._runner
+        if runner is not None and not runner.done():
+            # Ask _run to unwind, then wait for it to tear down in its own task.
+            if self._shutdown is not None:
+                self._shutdown.set()
+            try:
+                await asyncio.wait_for(runner, timeout=15)
+            except asyncio.TimeoutError:
+                # wait_for already cancelled the task; log and move on.
+                log.warning("mcp server %r teardown timed out", self.config.name)
+            except BaseException:
+                pass
+        self._runner = None
+        self._ready = None
+        self._shutdown = None
 
 
 async def get_server(name: str) -> MCPServerProcess:

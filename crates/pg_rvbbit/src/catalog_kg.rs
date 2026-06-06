@@ -15,5 +15,6 @@ use pgrx::extension_sql_file;
 extension_sql_file!(
     "../sql/catalog_kg.sql",
     name = "catalog_kg",
-    requires = ["rvbbit_bootstrap", "kg_bootstrap", "create_embedding_cache"]
+    // triples_bootstrap: data_crawl() calls rvbbit.triples_row() from that block.
+    requires = ["rvbbit_bootstrap", "kg_bootstrap", "create_embedding_cache", "triples_bootstrap"]
 );

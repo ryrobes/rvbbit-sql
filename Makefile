@@ -15,7 +15,8 @@ MCP_GATEWAY_IMAGE ?= rvbbit/mcp-gateway:local
         capability-catalog-seed capability-catalog-db \
         capability-scaffold capability-install capability-deploy capability-test \
         capability-test-all warren-agent warren-once \
-        release-bump release-build release-push release-compose-up
+        release-bump release-build release-push release-public-check \
+        release-compose-up release-uber-up
 
 RVBBIT_DSN ?= postgresql://postgres:rvbbit@localhost:55433/bench
 WARREN_NODE ?= local-warren
@@ -305,8 +306,16 @@ release-push: ## Build and push release images to GHCR (RELEASE_VERSION=x.y.z)
 	  --push \
 	  --tag-latest
 
+release-public-check: ## Verify published release images are anonymously pullable
+	scripts/release/check-public-images.py \
+	  --image-prefix 'ghcr.io/$(IMAGE_NAMESPACE)' \
+	  --version '$(RELEASE_VERSION)'
+
 release-compose-up: ## Start the published-image clean-slate stack
 	RVBBIT_VERSION='$(RELEASE_VERSION)' docker compose -f docker/docker-compose.release.yml up -d
+
+release-uber-up: ## Start the turnkey stack and bootstrap baseline Warren capabilities
+	RVBBIT_VERSION='$(RELEASE_VERSION)' docker compose -f docker/docker-compose.uber.yml up -d
 
 clean:           ## Remove built artifacts
 	cargo clean

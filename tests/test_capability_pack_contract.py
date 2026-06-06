@@ -87,6 +87,46 @@ def test_generated_operator_sql_replaces_infix_bindings():
     assert "SET infix_symbol = '~~?'" in proc.stdout
 
 
+def test_llm_provider_pack_renders_chat_backend_and_provider_registration():
+    pack = PACKS / "llm" / "gemma-4-12b-it-vllm"
+    register = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "register",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    assert "backend_transport        => 'openai_chat'" in register
+    assert "rvbbit.register_self_hosted_model" in register
+    assert "provider           => 'gemma_4_12b_it'" in register
+    assert "model              => 'google/gemma-4-12B-it'" in register
+    assert "rvbbit.set_default_provider" not in register
+
+    compose = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "compose",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    assert 'image: "vllm/vllm-openai:latest"' in compose
+    assert "command:" in compose
+    assert '      - "--model"' in compose
+    assert '      - "google/gemma-4-12B-it"' in compose
+    assert 'ipc: "host"' in compose
+    assert "ports:" not in compose
+
+
 def test_deploy_manifest_preserves_smoke_probe_inputs():
     pack = PACKS / "tabular" / "wine-quality-sklearn"
     proc = subprocess.run(
@@ -304,6 +344,12 @@ def test_release_catalog_can_emit_image_mode_runtimes():
         "ghcr.io/ryrobes/rvbbit-capability-bge-reranker-base:9.9.9"
     )
 
+    gemma = by_id["llm/gemma-4-12b-it-vllm"]
+    assert gemma["catalog_entry"]["runtime_image"] == "vllm/vllm-openai:latest"
+    assert gemma["capability_manifest"]["runtime"]["image"] == "vllm/vllm-openai:latest"
+    assert gemma["catalog_entry"]["provider_name"] == "gemma_4_12b_it"
+    assert gemma["catalog_entry"]["provider_model"] == "google/gemma-4-12B-it"
+
 
 def test_mcp_gateway_pack_is_self_contained():
     pack_dir = PACKS / "runtimes" / "mcp-gateway"
@@ -321,3 +367,27 @@ def test_mcp_gateway_pack_is_self_contained():
         if not (pack_dir / rel).exists()
     ]
     assert not missing, "mcp-gateway pack is missing files: " + ", ".join(missing)
+
+
+def test_uber_compose_bootstraps_baseline_capabilities():
+    compose_path = ROOT / "docker" / "docker-compose.uber.yml"
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    services = compose["services"]
+
+    assert {"postgres", "lens", "warren", "bootstrap"} <= set(services)
+    bootstrap_env = services["bootstrap"]["environment"]
+    assert bootstrap_env["RVBBIT_UBER_BOOTSTRAP_CAPABILITIES"] == (
+        "${RVBBIT_UBER_BOOTSTRAP_CAPABILITIES:-"
+        "smoke/warren-echo,runtimes/python-runtime,runtimes/mcp-gateway}"
+    )
+    assert services["bootstrap"]["command"] == ["rvbbit-uber-bootstrap"]
+
+    warren_volumes = services["warren"]["volumes"]
+    assert "/var/run/docker.sock:/var/run/docker.sock" in warren_volumes
+    assert (
+        "${RVBBIT_DOCKER_CONFIG:-$HOME/.docker}:/root/.docker:ro"
+        in warren_volumes
+    )
+
+    dockerfile = (ROOT / "docker" / "Dockerfile.rvbbit").read_text(encoding="utf-8")
+    assert "docker/uber/bootstrap.sh /usr/local/bin/rvbbit-uber-bootstrap" in dockerfile

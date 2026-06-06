@@ -147,6 +147,13 @@ unsafe extern "C-unwind" fn rvbbit_post_parse_analyze_hook(
     if query.is_null() {
         return;
     }
+    // Never rewrite queries issued *during* CREATE/ALTER EXTENSION: the rvbbit
+    // catalog (e.g. rvbbit.accel_policy, which the rewrite rules look up) isn't
+    // fully built yet at that point, so the lookup would fail and abort the
+    // install with "relation rvbbit.accel_policy does not exist".
+    if core::ptr::addr_of!(pg_sys::creating_extension).read() {
+        return;
+    }
     router::set_pg_rowstore_route_selected(false);
     if (*query).commandType != pg_sys::CmdType::CMD_SELECT {
         return;

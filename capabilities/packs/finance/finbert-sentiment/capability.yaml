@@ -1,0 +1,72 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: finbert_sentiment
+title: FinBERT Financial Sentiment
+description: Financial-domain sentiment classifier for filings, news, analyst notes, and customer finance text.
+license: apache-2.0
+tags: [finance, sentiment, classify, news, risk, row]
+source:
+  provider: huggingface
+  model: ProsusAI/finbert
+  url: https://huggingface.co/ProsusAI/finbert
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+backend:
+  name: finance_finbert
+  transport: rvbbit
+  batch_size: 32
+  max_concurrent: 4
+  timeout_ms: 120000
+  description: FinBERT financial sentiment classifier.
+operators:
+  - name: finance_sentiment
+    description: Classify finance-domain text as positive, neutral, or negative.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+  - name: finance_sentiment_label
+    description: Return the top FinBERT sentiment label for finance-domain text.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: text
+    parser: strip
+    steps:
+      - name: classify
+        kind: specialist
+        specialist: finance_finbert
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: label
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.classify.output }}"
+          path: label
+          default: neutral
+  - name: finance_bearish
+    description: True when FinBERT labels the finance-domain text as negative.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: bool
+    parser: yes_no
+    steps:
+      - name: classify
+        kind: specialist
+        specialist: finance_finbert
+        inputs:
+          text: "{{ inputs.text }}"
+      - name: bearish
+        kind: code
+        fn: string_eq
+        inputs:
+          value: "{{ steps.classify.output.label }}"
+          expected: negative
+          case_sensitive: false
+smoke:
+  inputs:
+    - text: Margins improved after strong demand and lower credit losses.

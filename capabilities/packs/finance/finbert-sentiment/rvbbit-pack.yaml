@@ -1,0 +1,91 @@
+api_version: rvbbit.pack/v1
+id: finance/finbert-sentiment
+name: finbert_sentiment
+title: FinBERT Financial Sentiment
+description: Financial-domain sentiment classifier for filings, news, analyst notes, and customer finance text.
+license: apache-2.0
+tags:
+- finance
+- sentiment
+- classify
+- news
+- risk
+- row
+capability: capability.yaml
+source:
+  provider: huggingface
+  model: ProsusAI/finbert
+  url: https://huggingface.co/ProsusAI/finbert
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: sequence_classification
+  device: auto
+resources:
+  gpu:
+    required: false
+    placement: single_gpu
+    model_size_bytes: 438000000
+    vram_required_bytes: 547500000
+    headroom_pct: 25
+    estimate_source: model_card_architecture_estimate
+exports:
+  backend: finance_finbert
+  operators:
+  - finance_sentiment
+  - finance_sentiment_label
+  - finance_bearish
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+  tests:
+  - name: finbert_sentiment_shape
+    description: Classify finance-domain text and assert JSON, label, and boolean operator contracts.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          label text;
+          bearish bool;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.finance_sentiment(
+                  'Margins improved after strong demand and lower credit losses.'
+              ) INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'finance_sentiment returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'object'
+             OR NOT (result ? 'label')
+             OR NOT (result ? 'score') THEN
+              RAISE EXCEPTION 'unexpected FinBERT result shape: %', result;
+          END IF;
+          IF (result->>'score')::float8 < 0 OR (result->>'score')::float8 > 1 THEN
+              RAISE EXCEPTION 'FinBERT score out of range: %', result;
+          END IF;
+
+          SELECT rvbbit.finance_sentiment_label(
+              'Margins improved after strong demand and lower credit losses.'
+          ) INTO label;
+          IF coalesce(btrim(label), '') = '' THEN
+              RAISE EXCEPTION 'finance_sentiment_label returned an empty label';
+          END IF;
+
+          SELECT rvbbit.finance_bearish(
+              'The company warned that losses widened and liquidity deteriorated.'
+          ) INTO bearish;
+          IF bearish IS NULL THEN
+              RAISE EXCEPTION 'finance_bearish returned NULL';
+          END IF;
+      END
+      $$;

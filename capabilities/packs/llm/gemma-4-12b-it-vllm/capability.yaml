@@ -1,0 +1,71 @@
+api_version: rvbbit.capability/v1
+kind: llm_provider
+name: gemma_4_12b_it_vllm
+title: Gemma 4 12B IT via vLLM
+description: Warren-deployed local Gemma chat provider served through vLLM's OpenAI-compatible API.
+license: apache-2.0
+tags: [llm, chat, local, vllm, gemma, gpu]
+source:
+  provider: huggingface
+  model: google/gemma-4-12B-it
+  url: https://huggingface.co/google/gemma-4-12B-it
+runtime:
+  mode: image
+  image: vllm/vllm-openai:latest
+  pull_policy: missing
+  handler: vllm_openai
+  device: cuda
+  port: 8080
+  health_path: /health
+  ipc: host
+  env:
+    HF_TOKEN: "${HF_TOKEN:-}"
+    HUGGING_FACE_HUB_TOKEN: "${HUGGING_FACE_HUB_TOKEN:-}"
+  volumes:
+    - name: hf_cache
+      mount: /root/.cache/huggingface
+  args:
+    - --model
+    - google/gemma-4-12B-it
+    - --served-model-name
+    - google/gemma-4-12B-it
+    - --host
+    - 0.0.0.0
+    - --port
+    - "8080"
+    - --dtype
+    - auto
+backend:
+  name: gemma_4_12b_it
+  transport: openai_chat
+  batch_size: 1
+  max_concurrent: 2
+  timeout_ms: 300000
+  opts:
+    model: google/gemma-4-12B-it
+  description: Local Gemma 4 12B instruction-tuned chat provider served by vLLM.
+provider_registration:
+  provider: gemma_4_12b_it
+  model: google/gemma-4-12B-it
+  backend_name: gemma_4_12b_it
+  display_name: Gemma 4 12B IT on local vLLM
+  family: gemma
+  capabilities: [chat]
+  context_window: 256000
+  output_token_limit: 8192
+  cost_policy: free
+  set_default: false
+  raw:
+    serving_runtime: vllm
+    openai_compatible: true
+    multimodal_deferred: true
+warren:
+  endpoint_path: /v1/chat/completions
+  health_path: /health
+  container_port: 8080
+smoke:
+  inputs:
+    - model: google/gemma-4-12B-it
+      user: Reply with only OK.
+      max_tokens: 16
+      temperature: 0

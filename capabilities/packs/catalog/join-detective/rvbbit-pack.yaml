@@ -1,0 +1,85 @@
+api_version: rvbbit.pack/v1
+id: catalog/join-detective
+name: join_detective
+title: Join Detective
+description: Suggest join keys from two table samples by combining name and value overlap evidence.
+license: apache-2.0
+tags:
+- catalog
+- joins
+- schema
+- reverse-engineering
+- full-table
+- data-engineering
+- pipeline
+- cpu
+capability: capability.yaml
+source:
+  provider: builtin
+  model: rvbbit/join-detective
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: join_detective
+  device: cpu
+exports:
+  backend: detect_join_keys
+  operators:
+  - suggest_join_keys
+  - best_join_condition
+  - join_key_confidence
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  tests:
+  - name: join_detection_contract
+    description: Suggest customer joins from two table samples and expose JSON/text/score operators.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          condition text;
+          score float8;
+          left_rows jsonb := '[
+            {"customer_id":"c1","email":"a@example.com","amount":42},
+            {"customer_id":"c2","email":"b@example.com","amount":64},
+            {"customer_id":"c3","email":"c@example.com","amount":13}
+          ]'::jsonb;
+          right_rows jsonb := '[
+            {"customer_id":"c1","region":"west"},
+            {"customer_id":"c2","region":"east"},
+            {"customer_id":"c4","region":"north"}
+          ]'::jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.suggest_join_keys(left_rows, right_rows) INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'suggest_join_keys returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result->'candidates') <> 'array'
+             OR jsonb_array_length(result->'candidates') = 0 THEN
+              RAISE EXCEPTION 'unexpected join candidate shape: %', result;
+          END IF;
+
+          SELECT rvbbit.best_join_condition(left_rows, right_rows) INTO condition;
+          IF condition IS NULL OR position('customer_id' in condition) = 0 THEN
+              RAISE EXCEPTION 'unexpected best join condition: %', condition;
+          END IF;
+
+          SELECT rvbbit.join_key_confidence('["c1","c2","c3"]'::jsonb, '["c1","c2","c4"]'::jsonb) INTO score;
+          IF score < 0.5 THEN
+              RAISE EXCEPTION 'expected useful join confidence, got %', score;
+          END IF;
+      END
+      $$;

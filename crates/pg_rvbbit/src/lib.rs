@@ -76,6 +76,7 @@ mod route_log {
 mod mcp;
 mod router;
 mod scan;
+mod scan_types;
 mod sketches;
 mod specialists;
 mod synth;
@@ -88,6 +89,7 @@ mod triples;
 mod unit_of_work;
 mod validator;
 mod vector;
+mod vortex_adapter;
 
 /// Force the backend registry to reload from rvbbit.backends. Call after
 /// registering new backends in a long-lived session so the thread-safe

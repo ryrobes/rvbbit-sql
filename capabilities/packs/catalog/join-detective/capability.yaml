@@ -1,0 +1,77 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: join_detective
+title: Join Detective
+description: Suggest join keys from two table samples by combining name and value overlap evidence.
+license: apache-2.0
+tags: [catalog, joins, schema, reverse-engineering, full-table, data-engineering, pipeline, cpu]
+source:
+  provider: builtin
+  model: rvbbit/join-detective
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: join_detective
+  device: cpu
+  env:
+    RVBBIT_CAPABILITY_EAGER: "0"
+backend:
+  name: detect_join_keys
+  transport: rvbbit
+  batch_size: 16
+  max_concurrent: 4
+  timeout_ms: 60000
+  description: Join key suggestion backend for sampled SQL tables.
+operators:
+  - name: suggest_join_keys
+    description: Suggest candidate join keys from two JSONB table samples.
+    arg_names: [left_rows, right_rows]
+    arg_types: [jsonb, jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      left_rows: "{{ inputs.left_rows }}"
+      right_rows: "{{ inputs.right_rows }}"
+  - name: best_join_condition
+    description: Return the highest-scoring join condition from two JSONB table samples.
+    arg_names: [left_rows, right_rows]
+    arg_types: [jsonb, jsonb]
+    return_type: text
+    parser: strip
+    steps:
+      - name: candidates
+        kind: specialist
+        specialist: detect_join_keys
+        inputs:
+          left_rows: "{{ inputs.left_rows }}"
+          right_rows: "{{ inputs.right_rows }}"
+      - name: condition
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.candidates.output }}"
+          path: candidates.0.condition
+          default: ""
+  - name: join_key_confidence
+    description: Score whether two JSONB arrays of sampled key values are likely join-compatible.
+    arg_names: [left_values, right_values]
+    arg_types: [jsonb, jsonb]
+    return_type: float8
+    parser: raw_text
+    steps:
+      - name: score
+        kind: specialist
+        specialist: detect_join_keys
+        inputs:
+          left_values: "{{ inputs.left_values }}"
+          right_values: "{{ inputs.right_values }}"
+      - name: value
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.score.output }}"
+          path: score
+          default: 0
+smoke:
+  inputs:
+    - left_rows: '[{"customer_id":"c1"},{"customer_id":"c2"}]'
+      right_rows: '[{"customer_id":"c1"},{"customer_id":"c3"}]'

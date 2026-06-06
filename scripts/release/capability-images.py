@@ -43,6 +43,8 @@ def included(entry: dict, visibilities: set[str], only: set[str], skip: set[str]
         return False
     if entry.get("install_warren") is not True or entry.get("install_docker") is not True:
         return False
+    if entry.get("runtime_image"):
+        return False
     return True
 
 

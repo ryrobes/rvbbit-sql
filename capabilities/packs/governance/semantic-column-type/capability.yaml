@@ -1,0 +1,56 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: semantic_column_type
+title: Semantic Column Type and PII Scanner
+description: Classify column samples and redact obvious sensitive values from text.
+license: apache-2.0
+tags: [governance, pii, semantic-type, profiling, aggregate, redaction, data-catalog, cpu]
+source:
+  provider: builtin
+  model: rvbbit/semantic-column-type
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: semantic_column_type
+  device: cpu
+  env:
+    RVBBIT_CAPABILITY_EAGER: "0"
+backend:
+  name: classify_semantic_column
+  transport: rvbbit
+  batch_size: 32
+  max_concurrent: 4
+  timeout_ms: 60000
+  description: Semantic type and lightweight PII detection backend.
+operators:
+  - name: classify_column_sample
+    description: Classify a JSONB array of sampled column values.
+    arg_names: [values]
+    arg_types: [jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      values: "{{ inputs.values }}"
+  - name: classify_column_type
+    description: Aggregate values from one SQL group and infer the semantic column type.
+    shape: aggregate
+    arg_names: [value]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    steps:
+      - name: classify
+        kind: specialist
+        specialist: classify_semantic_column
+        inputs:
+          values: "{{ inputs.collection }}"
+  - name: detect_pii_text
+    description: Detect and redact obvious PII-like spans in a text value.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+smoke:
+  inputs:
+    - values: '["alice@example.com","bob@example.com"]'

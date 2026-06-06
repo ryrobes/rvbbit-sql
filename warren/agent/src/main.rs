@@ -248,9 +248,7 @@ impl Config {
                         .map(str::to_string)
                         .collect();
                 }
-                "--trainer-dsn" => {
-                    config.trainer_dsn = Some(take_arg(&mut args, "--trainer-dsn")?)
-                }
+                "--trainer-dsn" => config.trainer_dsn = Some(take_arg(&mut args, "--trainer-dsn")?),
                 "--trainer-serve-host" => {
                     config.trainer_serve_host = Some(take_arg(&mut args, "--trainer-serve-host")?)
                 }
@@ -1057,13 +1055,10 @@ fn process_training_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Re
         return Ok(());
     }
 
-    let output_root = config.trainer_output_root.clone().unwrap_or_else(|| {
-        config
-            .work_dir
-            .join("trained-models")
-            .display()
-            .to_string()
-    });
+    let output_root = config
+        .trainer_output_root
+        .clone()
+        .unwrap_or_else(|| config.work_dir.join("trained-models").display().to_string());
     let serve_host = config
         .trainer_serve_host
         .clone()
@@ -1514,6 +1509,10 @@ fn scaffold_project(
             out_dir.join("compose.host-ports.yaml"),
             render_host_ports_compose(manifest, safe_name)?,
         )?;
+        fs::write(
+            out_dir.join("compose.gpu.yaml"),
+            render_gpu_compose(safe_name)?,
+        )?;
         return Ok(());
     }
 
@@ -1566,6 +1565,10 @@ fn scaffold_project(
     fs::write(
         out_dir.join("compose.host-ports.yaml"),
         render_host_ports_compose(manifest, safe_name)?,
+    )?;
+    fs::write(
+        out_dir.join("compose.gpu.yaml"),
+        render_gpu_compose(safe_name)?,
     )?;
     Ok(())
 }
@@ -1644,7 +1647,14 @@ fn render_requirements(base: &str, handler: &str, runtime: &Value) -> String {
     let mut lines: Vec<String> = base.lines().map(str::to_string).collect();
     if matches!(
         handler,
-        "embedding" | "sequence_classification" | "zero_shot_classification" | "gliner"
+        "embedding"
+            | "sequence_classification"
+            | "question_answering"
+            | "summarization"
+            | "token_classification"
+            | "table_question_answering"
+            | "zero_shot_classification"
+            | "gliner"
     ) {
         for dep in ["transformers==4.46.3", "sentencepiece==0.2.0"] {
             if !lines.iter().any(|line| line == dep) {
@@ -1654,8 +1664,16 @@ fn render_requirements(base: &str, handler: &str, runtime: &Value) -> String {
         if handler == "gliner" && !lines.iter().any(|line| line == "gliner==0.2.16") {
             lines.push("gliner==0.2.16".into());
         }
+        if handler == "table_question_answering"
+            && !lines.iter().any(|line| line == "pandas==2.2.3")
+        {
+            lines.push("pandas==2.2.3".into());
+        }
     }
-    if matches!(handler, "tabular_classification" | "tabular_regression") {
+    if matches!(
+        handler,
+        "tabular_classification" | "tabular_regression" | "tabular_foundation"
+    ) {
         for dep in [
             "huggingface_hub==0.26.5",
             "joblib==1.4.2",
@@ -1726,9 +1744,11 @@ fn render_compose(manifest: &Value, safe_name: &str) -> Result<String> {
         .join("\n");
     let (volume_mounts, volume_defs) = render_runtime_volumes(runtime);
     let runtime_source = render_runtime_source(runtime);
+    let runtime_command = render_runtime_command(runtime);
+    let runtime_ipc = render_runtime_ipc(runtime);
 
     Ok(format!(
-        "services:\n  {service}:\n{runtime_source}    container_name: rvbbit-{service}\n    expose:\n      - \"{container_port}\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:{container_port}{health_path}').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
+        "services:\n  {service}:\n{runtime_source}{runtime_command}{runtime_ipc}    container_name: rvbbit-{service}\n    expose:\n      - \"{container_port}\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:{container_port}{health_path}').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
     ))
 }
 
@@ -1737,6 +1757,13 @@ fn render_host_ports_compose(manifest: &Value, safe_name: &str) -> Result<String
     let container_port = runtime_container_port(manifest);
     Ok(format!(
         "services:\n  {service}:\n    ports:\n      - \"${{RVBBIT_CAPABILITY_PORT:-0}}:{container_port}\"\n"
+    ))
+}
+
+fn render_gpu_compose(safe_name: &str) -> Result<String> {
+    let service = safe_name.replace('_', "-");
+    Ok(format!(
+        "services:\n  {service}:\n    gpus: all\n    environment:\n      RVBBIT_CAPABILITY_DEVICE: \"cuda\"\n"
     ))
 }
 
@@ -1789,6 +1816,47 @@ fn render_runtime_source(runtime: &Value) -> String {
     "    build: .\n".into()
 }
 
+fn runtime_argv(runtime: &Value) -> Vec<String> {
+    let mut argv = Vec::new();
+    match runtime.get("command") {
+        Some(Value::Array(items)) => {
+            argv.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+        Some(Value::String(value)) if !value.trim().is_empty() => argv.push(value.to_string()),
+        _ => {}
+    }
+    match runtime.get("args") {
+        Some(Value::Array(items)) => {
+            argv.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+        Some(Value::String(value)) if !value.trim().is_empty() => argv.push(value.to_string()),
+        _ => {}
+    }
+    argv
+}
+
+fn render_runtime_command(runtime: &Value) -> String {
+    let argv = runtime_argv(runtime);
+    if argv.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["    command:".to_string()];
+    lines.extend(
+        argv.iter()
+            .map(|arg| format!("      - {}", serde_json::to_string(arg).unwrap())),
+    );
+    format!("{}\n", lines.join("\n"))
+}
+
+fn render_runtime_ipc(runtime: &Value) -> String {
+    runtime
+        .get("ipc")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("    ipc: {}\n", serde_json::to_string(value).unwrap()))
+        .unwrap_or_default()
+}
+
 fn render_runtime_volumes(runtime: &Value) -> (String, String) {
     let specs = runtime
         .get("volumes")
@@ -1823,10 +1891,7 @@ fn host_has_gpu() -> bool {
     Command::new("nvidia-smi")
         .arg("-L")
         .output()
-        .map(|o| {
-            o.status.success()
-                && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
-        })
+        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
         .unwrap_or(false)
 }
 
@@ -2054,6 +2119,10 @@ fn register_backend_and_operators(
     )
     .context("registering backend")?;
 
+    if manifest.get("kind").and_then(Value::as_str) == Some("llm_provider") {
+        register_self_hosted_provider(db, manifest, backend_name)?;
+    }
+
     if let Some(operators) = manifest.get("operators").and_then(Value::as_array) {
         for op in operators {
             register_operator(db, manifest, backend_name, op)?;
@@ -2062,6 +2131,111 @@ fn register_backend_and_operators(
 
     db.execute("SELECT rvbbit.reload_backends()", &[])
         .context("reloading backend cache")?;
+    Ok(())
+}
+
+fn register_self_hosted_provider(
+    db: &mut Client,
+    manifest: &Value,
+    backend_name: &str,
+) -> Result<()> {
+    let registration = manifest
+        .get("provider_registration")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("llm_provider manifest missing provider_registration object"))?;
+    let provider = registration
+        .get("provider")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("provider_registration.provider is required"))?;
+    let source = manifest.get("source").unwrap_or(&Value::Null);
+    let model = registration
+        .get("model")
+        .and_then(Value::as_str)
+        .or_else(|| source.get("model").and_then(Value::as_str))
+        .ok_or_else(|| anyhow!("provider_registration.model is required"))?;
+    let display_name = registration
+        .get("display_name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let family = registration
+        .get("family")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let capabilities = registration
+        .get("capabilities")
+        .cloned()
+        .unwrap_or_else(|| json!(["chat"]))
+        .to_string();
+    let context_window = registration.get("context_window").and_then(Value::as_i64);
+    let output_token_limit = registration
+        .get("output_token_limit")
+        .and_then(Value::as_i64);
+    let input_per_mtok = registration.get("input_per_mtok").and_then(|v| {
+        v.as_f64()
+            .map(|n| n.to_string())
+            .or_else(|| v.as_str().map(str::to_string))
+    });
+    let output_per_mtok = registration.get("output_per_mtok").and_then(|v| {
+        v.as_f64()
+            .map(|n| n.to_string())
+            .or_else(|| v.as_str().map(str::to_string))
+    });
+    let currency = registration
+        .get("currency")
+        .and_then(Value::as_str)
+        .unwrap_or("USD")
+        .to_string();
+    let cost_policy = registration
+        .get("cost_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("free")
+        .to_string();
+    let mut raw = registration
+        .get("raw")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    raw.entry("capability")
+        .or_insert_with(|| json!(manifest.get("name").and_then(Value::as_str).unwrap_or("")));
+    raw.entry("source_model")
+        .or_insert_with(|| json!(source.get("model").and_then(Value::as_str).unwrap_or("")));
+    raw.entry("source_url")
+        .or_insert_with(|| json!(source.get("url").and_then(Value::as_str).unwrap_or("")));
+    let raw = Value::Object(raw).to_string();
+
+    db.execute(
+        "SELECT rvbbit.register_self_hosted_model(\
+         provider => $1, model => $2, backend_name => $3, display_name => $4, \
+         family => $5, capabilities => $6::text::jsonb, context_window => $7::bigint, \
+         output_token_limit => $8::bigint, input_per_mtok => ($9::text)::numeric, \
+         output_per_mtok => ($10::text)::numeric, currency => $11, cost_policy => $12, \
+         raw => $13::text::jsonb)",
+        &[
+            &provider,
+            &model,
+            &backend_name,
+            &display_name,
+            &family,
+            &capabilities,
+            &context_window,
+            &output_token_limit,
+            &input_per_mtok,
+            &output_per_mtok,
+            &currency,
+            &cost_policy,
+            &raw,
+        ],
+    )
+    .context("registering self-hosted LLM provider")?;
+
+    if registration
+        .get("set_default")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        db.execute("SELECT rvbbit.set_default_provider($1)", &[&backend_name])
+            .context("setting default LLM provider")?;
+    }
     Ok(())
 }
 

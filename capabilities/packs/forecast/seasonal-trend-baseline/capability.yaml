@@ -1,0 +1,71 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: seasonal_trend_forecast
+title: Seasonal Trend Forecast
+description: Lightweight local forecasting Warren for JSONB series produced by SQL aggregates.
+license: apache-2.0
+tags: [forecasting, time-series, analytics, bi, jsonb, full-table, pipeline, cpu]
+source:
+  provider: builtin
+  model: rvbbit/seasonal-trend-baseline
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: time_series_forecast
+  device: cpu
+  env:
+    RVBBIT_CAPABILITY_EAGER: "0"
+backend:
+  name: forecast_seasonal_trend
+  transport: rvbbit
+  batch_size: 32
+  max_concurrent: 4
+  timeout_ms: 60000
+  description: Deterministic seasonal-trend forecasting baseline for SQL-produced series.
+operators:
+  - name: forecast_series
+    description: Forecast a JSONB series for a requested horizon.
+    arg_names: [series, horizon]
+    arg_types: [jsonb, text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      series: "{{ inputs.series }}"
+      horizon: "{{ inputs.horizon }}"
+  - name: forecast_next_value
+    description: Return the next forecasted numeric value for a JSONB series.
+    arg_names: [series]
+    arg_types: [jsonb]
+    return_type: float8
+    parser: raw_text
+    steps:
+      - name: forecast
+        kind: specialist
+        specialist: forecast_seasonal_trend
+        inputs:
+          series: "{{ inputs.series }}"
+          horizon: "1"
+      - name: first_value
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.forecast.output }}"
+          path: forecast.0.value
+          default: 0
+  - name: forecast_values
+    description: Aggregate numeric rows and forecast the next value for each SQL group.
+    shape: aggregate
+    arg_names: [value]
+    arg_types: [float8]
+    return_type: jsonb
+    parser: json
+    steps:
+      - name: forecast
+        kind: specialist
+        specialist: forecast_seasonal_trend
+        inputs:
+          series: "{{ inputs.collection }}"
+          horizon: "1"
+smoke:
+  inputs:
+    - series: '[{"ds":"2026-01-01","value":100},{"ds":"2026-02-01","value":108},{"ds":"2026-03-01","value":115}]'
+      horizon: "2"

@@ -1,0 +1,79 @@
+api_version: rvbbit.pack/v1
+id: governance/semantic-column-type
+name: semantic_column_type
+title: Semantic Column Type and PII Scanner
+description: Classify column samples and redact obvious sensitive values from text.
+license: apache-2.0
+tags:
+- governance
+- pii
+- semantic-type
+- profiling
+- aggregate
+- redaction
+- data-catalog
+- cpu
+capability: capability.yaml
+source:
+  provider: builtin
+  model: rvbbit/semantic-column-type
+runtime:
+  mode: build
+  template: hf-rvbbit-fastapi
+  handler: semantic_column_type
+  device: cpu
+exports:
+  backend: classify_semantic_column
+  operators:
+  - classify_column_sample
+  - classify_column_type
+  - detect_pii_text
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  tests:
+  - name: semantic_type_and_pii_contract
+    description: Classify email-like values, aggregate column values, and redact PII spans.
+    sql: |
+      DO $$
+      DECLARE
+          sample_result jsonb;
+          aggregate_result jsonb;
+          pii_result jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          LOOP
+              SELECT rvbbit.classify_column_sample('["alice@example.com","bob@example.com"]'::jsonb) INTO sample_result;
+              EXIT WHEN sample_result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'classify_column_sample returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF sample_result->>'semantic_type' <> 'email' THEN
+              RAISE EXCEPTION 'expected email semantic type: %', sample_result;
+          END IF;
+
+          WITH t(value) AS (
+            VALUES ('alice@example.com'::text), ('bob@example.com'::text), ('carol@example.com'::text)
+          )
+          SELECT rvbbit.classify_column_type(value) INTO aggregate_result
+          FROM t;
+
+          IF aggregate_result->>'semantic_type' <> 'email' THEN
+              RAISE EXCEPTION 'expected aggregate email semantic type: %', aggregate_result;
+          END IF;
+
+          SELECT rvbbit.detect_pii_text('Contact Alice at alice@example.com or 415-555-1212') INTO pii_result;
+          IF jsonb_array_length(pii_result->'entities') < 2 THEN
+              RAISE EXCEPTION 'expected email and phone entities: %', pii_result;
+          END IF;
+      END
+      $$;

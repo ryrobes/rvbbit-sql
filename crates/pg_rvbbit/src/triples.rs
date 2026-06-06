@@ -194,6 +194,34 @@ AS $$
     )
 $$;
 
+-- ── Row-context triple extraction ──────────────────────────────────────
+-- Flatten a whole row (as jsonb) into ONE natural-language doc, then extract
+-- entity/relationship triples from it. This is the substrate for data_crawl():
+-- arbitrary user tables have no inherent "text column", so we synthesize one
+-- from the row's own fields, dropping low-signal cells (ids/urls/pure numbers/
+-- near-empty) so the LLM sees only descriptive content. The per-field 600-char
+-- clamp bounds prompt size on wide rows.
+CREATE OR REPLACE FUNCTION rvbbit.triples_row(
+    row_doc jsonb,
+    focus text DEFAULT 'all',
+    opts jsonb DEFAULT '{}'::jsonb
+) RETURNS TABLE (subject text, predicate text, object text)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT t.subject, t.predicate, t.object
+    FROM rvbbit.triples_json_rows(
+        rvbbit.triples(
+            (SELECT string_agg(key || ': ' || left(value, 600), E'\n' ORDER BY key)
+               FROM jsonb_each_text(row_doc)
+              WHERE value IS NOT NULL
+                AND length(btrim(value)) >= 3
+                AND value !~ '^[-+]?[0-9]+(\.[0-9]+)?$'
+                AND value !~* '^https?://'
+                AND lower(key) !~ '(_id$|^id$|uuid|guid|url)'),
+            COALESCE(focus, 'all'), COALESCE(opts, '{}'::jsonb))) t;
+$$;
+
 CREATE OR REPLACE FUNCTION rvbbit.kg_ingest_triples(
     triples_sql text,
     source_table regclass DEFAULT NULL,

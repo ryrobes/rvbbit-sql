@@ -1,0 +1,48 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: data_contract_miner
+title: Data Contract Miner
+description: Infer practical data quality checks from table samples or grouped column values.
+license: apache-2.0
+tags: [quality, contract, profiling, validation, aggregate, full-table, data-engineering, cpu]
+source:
+  provider: builtin
+  model: rvbbit/data-contract-miner
+runtime:
+  template: hf-rvbbit-fastapi
+  handler: data_contract_miner
+  device: cpu
+  env:
+    RVBBIT_CAPABILITY_EAGER: "0"
+backend:
+  name: mine_data_contract
+  transport: rvbbit
+  batch_size: 16
+  max_concurrent: 4
+  timeout_ms: 60000
+  description: Lightweight contract inference backend for SQL samples.
+operators:
+  - name: infer_table_contract
+    description: Infer column profiles and suggested quality checks from a JSONB table sample.
+    arg_names: [rows]
+    arg_types: [jsonb]
+    return_type: jsonb
+    parser: json
+    inputs:
+      rows: "{{ inputs.rows }}"
+  - name: infer_column_contract
+    description: Aggregate values from one SQL group and infer quality checks for that column.
+    shape: aggregate
+    arg_names: [value]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    steps:
+      - name: contract
+        kind: specialist
+        specialist: mine_data_contract
+        inputs:
+          rows: "{{ inputs.collection }}"
+smoke:
+  inputs:
+    - rows: '[{"order_id":"o1","status":"paid","amount":42.5},{"order_id":"o2","status":"failed","amount":13.0}]'
