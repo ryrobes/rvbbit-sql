@@ -29,15 +29,28 @@ pub(crate) enum CmpOp {
     Like,
 }
 
+/// Width of an integer column. The emitted Vortex literal must match the column's
+/// DType width — Vortex rejects cross-width comparisons (e.g. an i32 column vs an
+/// i64 literal: "Cannot compare different DTypes i32? and i64"). The lowering only
+/// tags a value with a width once it has confirmed the value fits that width, so the
+/// `as i16`/`as i32` narrowing in the translator is lossless.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IntWidth {
+    I16,
+    I32,
+    I64,
+}
+
 /// A pushable literal. Sets back `IN`; scalars back the comparisons / `LIKE`.
 /// (PG NULL, bool-set, and column refs are not pushable → omitted.)
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum LitRepr {
-    I64(i64),
+    /// Integer literal tagged with the target column's width (smallint/int/bigint).
+    Int(i64, IntWidth),
     F64(f64),
     Bool(bool),
     Text(String),
-    I64Set(Vec<i64>),
+    IntSet(Vec<i64>, IntWidth),
     F64Set(Vec<f64>),
     TextSet(Vec<String>),
 }

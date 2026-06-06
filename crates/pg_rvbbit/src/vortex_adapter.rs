@@ -40,7 +40,7 @@ use vortex::VortexSessionDefault;
 
 use vortex::expr::{self, Expression};
 
-use crate::scan_types::{CmpOp, FilterRepr, LitRepr, QualRepr};
+use crate::scan_types::{CmpOp, FilterRepr, IntWidth, LitRepr, QualRepr};
 
 /// A single `.vortex` row-group reader. Phase 0 materializes the whole row group
 /// into one batch up front; `next_batch` yields it once, then `None`.
@@ -61,15 +61,21 @@ pub(crate) struct VortexRgReader {
 /// re-casts them to Arrow `Timestamp(Microsecond, UTC)` so the native tuple-fill
 /// (`ColumnReader::Int64`-vs-Timestamp dispatch) sees the type it expects.
 ///
+/// `filter`, when present, is pushed into `ScanBuilder::with_filter` so Vortex evaluates
+/// the predicate at the source (zone-map pruning + compute-over-compressed). It is always
+/// safe because the native scan re-applies the full `pushed_quals` to the returned batch —
+/// the pushed filter only needs to be *implied by* those quals (it returns a row superset).
+///
 /// Runs the async Vortex open + scan on rvbbit's shared runtime.
 pub(crate) fn open_vortex_for_scan(
     path: &Path,
     projection: &[String],
     timestamp_cols: &[String],
+    filter: Option<VortexPushedFilter>,
 ) -> Result<VortexRgReader, String> {
     let ts: HashSet<&str> = timestamp_cols.iter().map(String::as_str).collect();
-    crate::df::with_lance_runtime(|rt| {
-        rt.block_on(async {
+    crate::df::with_lance_runtime(move |rt| {
+        rt.block_on(async move {
             let session = VortexSession::default().with_tokio();
             let file = session
                 .open_options()
@@ -84,6 +90,12 @@ pub(crate) fn open_vortex_for_scan(
                 // expressed as `select([names], root())` over the file's struct root.
                 let names: Vec<&str> = projection.iter().map(String::as_str).collect();
                 scan = scan.with_projection(expr::select(names, expr::root()));
+            }
+            if let Some(f) = filter {
+                // Filter pushdown: Vortex evaluates the predicate at the source
+                // (zone-map prune + compute-over-compressed). The native scan still
+                // re-applies pushed_quals, so this only needs to be a row superset.
+                scan = scan.with_filter(f.expr);
             }
             let array: ArrayRef = scan
                 .into_array_stream()
@@ -192,7 +204,7 @@ fn vortex_array_to_record_batch(
 /// in-process read path works against a real compacted `.vortex` row group.
 #[pg_extern]
 fn vortex_native_probe(path: &str) -> pgrx::JsonB {
-    let mut reader = match open_vortex_for_scan(Path::new(path), &[], &[]) {
+    let mut reader = match open_vortex_for_scan(Path::new(path), &[], &[], None) {
         Ok(r) => r,
         Err(e) => return pgrx::JsonB(serde_json::json!({ "ok": false, "error": e })),
     };
@@ -220,14 +232,12 @@ fn vortex_native_probe(path: &str) -> pgrx::JsonB {
 // gate). Mirrors what `vortex-datafusion`'s convert/exprs.rs does.
 
 /// A pushable filter ready to hand to Vortex's `ScanBuilder::with_filter`.
-#[allow(dead_code)] // consumed by the native+vortex reader in Phase 3
 pub(crate) struct VortexPushedFilter {
     pub(crate) expr: Expression,
 }
 
 /// Translate a lowered `FilterRepr` into a Vortex filter expression, or `None` if any
 /// node can't be faithfully expressed (→ no pushdown; PG residual quals remain).
-#[allow(dead_code)] // consumed by the native+vortex reader in Phase 3
 pub(crate) fn translate(filter: &FilterRepr) -> Option<VortexPushedFilter> {
     filter_to_expr(filter).map(|expr| VortexPushedFilter { expr })
 }
@@ -269,18 +279,31 @@ fn qual_to_expr(q: &QualRepr) -> Option<Expression> {
 
 fn scalar_lit(v: &LitRepr) -> Option<Expression> {
     match v {
-        LitRepr::I64(x) => Some(expr::lit(*x)),
+        LitRepr::Int(x, w) => Some(int_lit(*x, *w)),
         LitRepr::F64(x) => Some(expr::lit(*x)),
         LitRepr::Bool(x) => Some(expr::lit(*x)),
         LitRepr::Text(s) => Some(expr::lit(s.as_str())),
-        LitRepr::I64Set(_) | LitRepr::F64Set(_) | LitRepr::TextSet(_) => None,
+        LitRepr::IntSet(..) | LitRepr::F64Set(_) | LitRepr::TextSet(_) => None,
+    }
+}
+
+/// Build a width-matched Vortex integer literal. The lowering guarantees the value
+/// fits the width, so the `as` narrowing is lossless and avoids the i32/i64 DType clash.
+fn int_lit(x: i64, w: IntWidth) -> Expression {
+    match w {
+        IntWidth::I16 => expr::lit(x as i16),
+        IntWidth::I32 => expr::lit(x as i32),
+        IntWidth::I64 => expr::lit(x),
     }
 }
 
 /// `col IN (a,b,...)` → `eq OR eq OR ...` (Vortex has no native IN). Empty set → None.
 fn set_membership(q: &QualRepr) -> Option<Expression> {
     let eqs: Vec<Expression> = match &q.val {
-        LitRepr::I64Set(xs) => xs.iter().map(|x| expr::eq(expr::col(q.col.as_str()), expr::lit(*x))).collect(),
+        LitRepr::IntSet(xs, w) => xs
+            .iter()
+            .map(|x| expr::eq(expr::col(q.col.as_str()), int_lit(*x, *w)))
+            .collect(),
         LitRepr::F64Set(xs) => xs.iter().map(|x| expr::eq(expr::col(q.col.as_str()), expr::lit(*x))).collect(),
         LitRepr::TextSet(xs) => xs.iter().map(|x| expr::eq(expr::col(q.col.as_str()), expr::lit(x.as_str()))).collect(),
         _ => return None,
@@ -291,35 +314,41 @@ fn set_membership(q: &QualRepr) -> Option<Expression> {
 #[cfg(test)]
 mod tests {
     use super::translate;
-    use crate::scan_types::{CmpOp, FilterRepr, LitRepr, QualRepr};
+    use crate::scan_types::{CmpOp, FilterRepr, IntWidth, LitRepr, QualRepr};
 
     fn qual(col: &str, op: CmpOp, val: LitRepr) -> FilterRepr {
         FilterRepr::Qual(QualRepr { col: col.into(), op, val })
     }
 
     #[test]
-    fn eq_i64_pushes() {
-        assert!(translate(&qual("a", CmpOp::Eq, LitRepr::I64(5))).is_some());
+    fn eq_int_pushes() {
+        assert!(translate(&qual("a", CmpOp::Eq, LitRepr::Int(5, IntWidth::I32))).is_some());
+        assert!(translate(&qual("a", CmpOp::Eq, LitRepr::Int(5, IntWidth::I64))).is_some());
     }
 
     #[test]
     fn range_between_via_and_pushes() {
         let f = FilterRepr::And(vec![
-            qual("a", CmpOp::Ge, LitRepr::I64(1)),
-            qual("a", CmpOp::Lt, LitRepr::I64(9)),
+            qual("a", CmpOp::Ge, LitRepr::Int(1, IntWidth::I32)),
+            qual("a", CmpOp::Lt, LitRepr::Int(9, IntWidth::I32)),
         ]);
         assert!(translate(&f).is_some());
     }
 
     #[test]
     fn in_set_and_like_push() {
-        assert!(translate(&qual("a", CmpOp::In, LitRepr::I64Set(vec![1, 2, 3]))).is_some());
+        assert!(
+            translate(&qual("a", CmpOp::In, LitRepr::IntSet(vec![1, 2, 3], IntWidth::I16)))
+                .is_some()
+        );
         assert!(translate(&qual("s", CmpOp::Like, LitRepr::Text("foo%".into()))).is_some());
     }
 
     #[test]
     fn empty_in_does_not_push() {
-        assert!(translate(&qual("a", CmpOp::In, LitRepr::I64Set(vec![]))).is_none());
+        assert!(
+            translate(&qual("a", CmpOp::In, LitRepr::IntSet(vec![], IntWidth::I64))).is_none()
+        );
     }
 
     #[test]

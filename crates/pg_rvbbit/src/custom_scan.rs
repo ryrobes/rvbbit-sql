@@ -646,6 +646,120 @@ fn pushed_qual_can_prune_row_group(q: &PushedQual) -> bool {
     !matches!(q.op, PushOp::NotLike | PushOp::NotILike)
 }
 
+/// Lower the native scan's pushable predicate tree into the PG-free `FilterRepr`
+/// that `vortex_adapter::translate` maps to a Vortex scan filter. The result is a
+/// filter IMPLIED BY `pushed_expr` (it may drop conjuncts/quals it can't faithfully
+/// express), which is always safe: Vortex returns a row superset and the native scan
+/// re-applies the full `pushed_quals` to the returned batch. Returns None when nothing
+/// pushable remains. Only call when there are no dynamic (correlated) quals — their RHS
+/// changes per outer row and can't be baked into a per-row-group scan filter.
+fn lower_pushed_expr_to_filter(
+    expr: &PushExpr,
+    quals: &[PushedQual],
+    pg_attrs: &[PgAttr],
+) -> Option<crate::scan_types::FilterRepr> {
+    use crate::scan_types::FilterRepr;
+    match expr {
+        PushExpr::Qual(idx) => quals
+            .get(*idx)
+            .and_then(|q| lower_pushed_qual(q, pg_attrs))
+            .map(FilterRepr::Qual),
+        PushExpr::And(children) => {
+            // AND: keep the pushable children. Dropping a non-pushable conjunct makes
+            // the filter LESS restrictive (a row superset) — safe; native re-filters.
+            let kept: Vec<FilterRepr> = children
+                .iter()
+                .filter_map(|c| lower_pushed_expr_to_filter(c, quals, pg_attrs))
+                .collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.into_iter().next(),
+                _ => Some(FilterRepr::And(kept)),
+            }
+        }
+        PushExpr::Or(children) => {
+            // OR: every disjunct must translate — dropping one would make the filter
+            // MORE restrictive (drop matching rows) → unsafe. All-or-nothing.
+            let mut out = Vec::with_capacity(children.len());
+            for c in children {
+                out.push(lower_pushed_expr_to_filter(c, quals, pg_attrs)?);
+            }
+            Some(FilterRepr::Or(out))
+        }
+    }
+}
+
+/// Lower a single `Var <op> Const` qual to a `QualRepr`, or None if not faithfully
+/// pushable. Only numeric/text/bool columns with a matching literal type are pushed;
+/// DATE/TIMESTAMP/NUMERIC etc. stay residual to avoid a Vortex literal/column type
+/// mismatch (the native scan still evaluates them).
+fn lower_pushed_qual(q: &PushedQual, pg_attrs: &[PgAttr]) -> Option<crate::scan_types::QualRepr> {
+    use crate::scan_types::{CmpOp, IntWidth, LitRepr, QualRepr};
+    let attr = pg_attrs.get((q.attnum - 1) as usize)?;
+    let op = match q.op {
+        PushOp::Lt => CmpOp::Lt,
+        PushOp::Le => CmpOp::Le,
+        PushOp::Gt => CmpOp::Gt,
+        PushOp::Ge => CmpOp::Ge,
+        PushOp::Eq => CmpOp::Eq,
+        PushOp::In => CmpOp::In,
+        PushOp::Like => CmpOp::Like,
+        // NOT LIKE / ILIKE / NOT ILIKE have no faithful Vortex form → residual.
+        PushOp::NotLike | PushOp::ILike | PushOp::NotILike => return None,
+    };
+    let t = attr.typoid;
+    // Integer column width: the Vortex literal must match the column DType width, and
+    // the value must fit it — an out-of-range narrowing on an inequality could wrongly
+    // drop rows. Out-of-range or non-int → not pushed here (handled below / residual).
+    let int_width = if t == pg_sys::INT2OID {
+        Some(IntWidth::I16)
+    } else if t == pg_sys::INT4OID {
+        Some(IntWidth::I32)
+    } else if t == pg_sys::INT8OID {
+        Some(IntWidth::I64)
+    } else {
+        None
+    };
+    let fits = |x: i64, w: IntWidth| match w {
+        IntWidth::I16 => i16::try_from(x).is_ok(),
+        IntWidth::I32 => i32::try_from(x).is_ok(),
+        IntWidth::I64 => true,
+    };
+    let is_text = t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID;
+    let val = match &q.value {
+        PushVal::I64(x) => {
+            let w = int_width?;
+            if !fits(*x, w) {
+                return None;
+            }
+            LitRepr::Int(*x, w)
+        }
+        PushVal::I64Set(xs) if !xs.is_empty() => {
+            let w = int_width?;
+            if xs.iter().any(|x| !fits(*x, w)) {
+                return None;
+            }
+            LitRepr::IntSet(xs.clone(), w)
+        }
+        // FLOAT8/double only — a FLOAT4 column is f32 in Vortex and would clash with
+        // an f64 literal (and f64→f32 narrowing is lossy), so FLOAT4 stays residual.
+        PushVal::F64(x) if t == pg_sys::FLOAT8OID => LitRepr::F64(*x),
+        PushVal::F64Set(xs) if t == pg_sys::FLOAT8OID && !xs.is_empty() => {
+            LitRepr::F64Set(xs.clone())
+        }
+        PushVal::Bool(x) if t == pg_sys::BOOLOID => LitRepr::Bool(*x),
+        PushVal::Text(s) if is_text => LitRepr::Text(s.clone()),
+        PushVal::TextSet(xs) if is_text && !xs.is_empty() => LitRepr::TextSet(xs.clone()),
+        // Null, BoolSet, Column, type-mismatched, or out-of-range → not pushed.
+        _ => return None,
+    };
+    Some(QualRepr {
+        col: attr.name.clone(),
+        op,
+        val,
+    })
+}
+
 unsafe fn recognize_push_expr(
     node: *mut pg_sys::Node,
     scan_varno: pg_sys::Index,
@@ -2907,10 +3021,28 @@ unsafe extern "C-unwind" fn exec_custom_scan(
                             }
                         })
                         .collect();
+                    // Filter pushdown: lower the pushable predicate to a Vortex scan
+                    // filter (zone-map pruning + compute-over-compressed at the source).
+                    // Safe — the native scan re-applies pushed_quals to the result, so a
+                    // row superset is fine. Skipped when correlated (dynamic) quals are
+                    // present: their RHS varies per outer row and can't be baked into a
+                    // per-row-group scan filter.
+                    let vortex_filter = if state.dynamic_quals.is_empty() {
+                        state
+                            .pushed_expr
+                            .as_ref()
+                            .and_then(|e| {
+                                lower_pushed_expr_to_filter(e, &state.pushed_quals, &state.pg_attrs)
+                            })
+                            .and_then(|fr| crate::vortex_adapter::translate(&fr))
+                    } else {
+                        None
+                    };
                     let reader = match crate::vortex_adapter::open_vortex_for_scan(
                         path,
                         &col_names,
                         &timestamp_cols,
+                        vortex_filter,
                     ) {
                         Ok(r) => r,
                         Err(e) => pgrx::error!("rvbbit: opening vortex {}: {}", path.display(), e),
