@@ -3703,6 +3703,32 @@ fn selected_profile(profile: &RouteProfileSelection) -> Option<Value> {
     .map(|j| j.0)
 }
 
+thread_local! {
+    /// Per-backend memo of the EXPENSIVE half of the route runtime stamp — the
+    /// full-catalog `string_agg` over every rvbbit table's size/rows/bytes/deletes.
+    /// The cheap half (route_force_candidate + active profile) is recomputed fresh on
+    /// every call so explicit control — including the training harness's per-candidate
+    /// `route_force_candidate` — takes effect immediately. The stamp is used ONLY as the
+    /// route-cache key (rewriter::duck_route_doc_for_probe); the aggregation ran on every
+    /// routable query, BEFORE the cache lookup, so even cache hits paid for it (and
+    /// embedding it in the key thrashed the cache on any data change). Memoizing it with a
+    /// short TTL collapses that cost for long-lived/pooled connections. Routing is
+    /// correctness-neutral (never changes query results), so a <=TTL-stale table
+    /// fingerprint at worst delays a re-route by TTL after a data-size change.
+    static ROUTE_TABLE_STATE_MEMO: std::cell::RefCell<Option<(Instant, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// TTL for the table-state memo. `RVBBIT_ROUTE_STAMP_TTL_MS` overrides the 1000ms
+/// default; `0` disables memoization (recompute every call) for strict freshness.
+fn route_stamp_ttl() -> std::time::Duration {
+    let ms = std::env::var("RVBBIT_ROUTE_STAMP_TTL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1000);
+    std::time::Duration::from_millis(ms)
+}
+
 pub(crate) fn route_runtime_stamp() -> String {
     if !relations_present(&[
         "rvbbit.route_profiles",
@@ -3711,6 +3737,8 @@ pub(crate) fn route_runtime_stamp() -> String {
     ]) {
         return "route-runtime-stamp-unavailable".to_string();
     }
+    // Fresh every call (cheap, no big SPI) so route_force_candidate (set per-candidate by
+    // the training harness) and the active profile take effect immediately.
     let profile = route_profile_selection();
     let profile_stamp = format!(
         "profile:{}:{}@{}|force:{}",
@@ -3721,38 +3749,55 @@ pub(crate) fn route_runtime_stamp() -> String {
             .map(|v| v.trim().to_ascii_lowercase())
             .unwrap_or_default()
     );
-    let profile_stamp_lit = sql_lit(&profile_stamp);
-    Spi::get_one::<String>(&format!(
-        "WITH table_state AS ( \
-             SELECT string_agg( \
-                        c.oid::text || ':' || pg_relation_size(c.oid)::text || ':' || \
-                        coalesce(rg.rows, 0)::text || ':' || coalesce(rg.bytes, 0)::text || ':' || \
-                        coalesce(dl.deletes, 0)::text || ':' || \
-                        coalesce(t.shadow_heap_retained, false)::text || ':' || \
-                        coalesce(t.shadow_heap_dirty, false)::text, \
-                        ',' ORDER BY c.oid \
-                    ) AS stamp \
-             FROM pg_class c \
-             JOIN pg_am am ON am.oid = c.relam \
-             LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid \
-             LEFT JOIN ( \
-                 SELECT table_oid, sum(n_rows)::bigint AS rows, sum(n_bytes)::bigint AS bytes \
-                 FROM rvbbit.row_groups \
-                 GROUP BY table_oid \
-             ) rg ON rg.table_oid = c.oid \
-             LEFT JOIN ( \
-                 SELECT table_oid, count(*)::bigint AS deletes \
-                 FROM rvbbit.delete_log \
-                 GROUP BY table_oid \
-             ) dl ON dl.table_oid = c.oid \
-             WHERE am.amname = 'rvbbit' \
-         ) \
-         SELECT {profile_stamp_lit} || \
-                '|tables=' || coalesce((SELECT stamp FROM table_state), 'none')"
-    ))
+    format!("{profile_stamp}|tables={}", route_table_state_stamp())
+}
+
+/// The expensive full-catalog table-state aggregation, memoized per-backend with a TTL.
+/// Identical output to the inline form it replaced (`string_agg(...)` or `none`).
+fn route_table_state_stamp() -> String {
+    let ttl = route_stamp_ttl();
+    if !ttl.is_zero() {
+        if let Some(cached) = ROUTE_TABLE_STATE_MEMO.with(|memo| {
+            memo.borrow()
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < ttl)
+                .map(|(_, ts)| ts.clone())
+        }) {
+            return cached;
+        }
+    }
+    let table_state = Spi::get_one::<String>(
+        "SELECT coalesce(string_agg( \
+                    c.oid::text || ':' || pg_relation_size(c.oid)::text || ':' || \
+                    coalesce(rg.rows, 0)::text || ':' || coalesce(rg.bytes, 0)::text || ':' || \
+                    coalesce(dl.deletes, 0)::text || ':' || \
+                    coalesce(t.shadow_heap_retained, false)::text || ':' || \
+                    coalesce(t.shadow_heap_dirty, false)::text, \
+                    ',' ORDER BY c.oid \
+                ), 'none') \
+         FROM pg_class c \
+         JOIN pg_am am ON am.oid = c.relam \
+         LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid \
+         LEFT JOIN ( \
+             SELECT table_oid, sum(n_rows)::bigint AS rows, sum(n_bytes)::bigint AS bytes \
+             FROM rvbbit.row_groups \
+             GROUP BY table_oid \
+         ) rg ON rg.table_oid = c.oid \
+         LEFT JOIN ( \
+             SELECT table_oid, count(*)::bigint AS deletes \
+             FROM rvbbit.delete_log \
+             GROUP BY table_oid \
+         ) dl ON dl.table_oid = c.oid \
+         WHERE am.amname = 'rvbbit'",
+    )
     .ok()
     .flatten()
-    .unwrap_or_else(|| "route-runtime-stamp-unavailable".to_string())
+    .unwrap_or_else(|| "none".to_string());
+    if !ttl.is_zero() {
+        ROUTE_TABLE_STATE_MEMO
+            .with(|memo| *memo.borrow_mut() = Some((Instant::now(), table_state.clone())));
+    }
+    table_state
 }
 
 fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTableMetric> {
