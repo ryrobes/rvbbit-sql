@@ -3233,11 +3233,23 @@ fn fetch_row_group_paths(
 ) -> Result<Vec<RowGroupEntry>, String> {
     let mut out = Vec::new();
     // Phase 2 slice 3: when AS OF is set, narrow row groups to those at
-    // generation <= asof. Variant layouts (hive/cluster) don't carry
-    // per-rg generations and can't honor this; routes will fall back to
-    // canonical scan when AS OF is active.
+    // generation <= asof. With no AS OF (latest view), apply the snapshot
+    // visibility floor (generation >= min_visible_generation) so a
+    // snapshot-load workflow shows only the newest full snapshot instead of
+    // the union of every retained generation; floor defaults to 0 (no-op) for
+    // ordinary tables. Variant layouts (hive/cluster) don't carry per-rg
+    // generations and can't honor either; routes fall back to canonical scan.
+    //
+    // Cache note: this predicate reads min_visible_generation, which only ever
+    // changes inside compact()/snapshot_load() — both of which call
+    // invalidate_scan_metadata() — so the asof=None cache entry is always
+    // cleared in-backend when the floor moves. (Cross-backend staleness after
+    // compact is the pre-existing rvbbit model and is unchanged here.)
     let asof_predicate = match (asof, variant_layout.is_some()) {
         (Some(g), false) => format!("AND generation <= {g}"),
+        (None, false) => {
+            crate::time_travel::min_visible_floor_predicate(&format!("{table_oid}::oid"), "generation")
+        }
         _ => String::new(),
     };
     // Backend-local cache: same (table_oid, variant_layout, asof,

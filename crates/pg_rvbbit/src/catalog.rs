@@ -27,6 +27,14 @@ CREATE TABLE rvbbit.tables (
     -- with the OLD value. Reads see the latest generation by default;
     -- AS OF queries (future) can narrow to `generation <= asof`.
     next_generation bigint NOT NULL DEFAULT 1,
+    -- Snapshot visibility floor. When > 0, the "latest" (non-AS-OF) scan
+    -- shows only row groups at generation >= this value, hiding older
+    -- retained generations. Used by the snapshot-load sync workflow, where
+    -- each run writes one full-table snapshot generation and bumps the floor
+    -- to it, so the current view is the newest snapshot (not the union of all
+    -- snapshots) while AS OF still reads the full history. Default 0 = no-op
+    -- (generations start at 1), so ordinary append tables are unaffected.
+    min_visible_generation bigint NOT NULL DEFAULT 0,
     -- Phase 4 Lance auto-refresh. When lance_url IS NOT NULL, compact()
     -- mirrors the named vector column into a Lance dataset at this URL
     -- (overwriting per compact), so rvbbit.knn() can do indexed KNN
@@ -5107,6 +5115,42 @@ BEGIN
           AND rg.rg_id > max_rg_id_pre
         ORDER BY rg.rg_id DESC
         ;
+END;
+$$;
+
+-- Set the snapshot visibility floor for a table: the "latest" (non-AS-OF)
+-- view will show only row groups at generation >= the floor, hiding older
+-- retained snapshots. gen => NULL floors to the current newest generation
+-- that has row groups (the just-written snapshot); pass an explicit
+-- generation for the empty-snapshot case (0 rows => no row groups written, so
+-- max() would pick the prior generation). Returns the floor that was set.
+--
+-- Cache: callers must ensure the per-backend scan cache is invalidated for
+-- this table after the floor moves. In the snapshot-load workflow this is
+-- automatic because compact() runs first and calls invalidate_scan_metadata();
+-- a standalone caller that changes the floor without a preceding compact in
+-- the same backend should not expect the change to be visible until the next
+-- compact/invalidation.
+CREATE OR REPLACE FUNCTION rvbbit.set_visible_floor(rel regclass, gen bigint DEFAULT NULL)
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    target bigint;
+BEGIN
+    IF NOT rvbbit.is_rvbbit_table(rel) THEN
+        RAISE EXCEPTION '% is not an rvbbit table', rel;
+    END IF;
+    IF gen IS NULL THEN
+        SELECT coalesce(max(rg.generation), 0)
+        INTO target
+        FROM rvbbit.row_groups rg
+        WHERE rg.table_oid = rel;
+    ELSE
+        target := gen;
+    END IF;
+    UPDATE rvbbit.tables SET min_visible_generation = target WHERE table_oid = rel;
+    RETURN target;
 END;
 $$;
 

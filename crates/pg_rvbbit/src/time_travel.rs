@@ -109,6 +109,25 @@ pub(crate) fn row_group_predicate(
     }
 }
 
+/// Latest-view floor (NOT for AS OF). Restricts a "latest" scan to row groups
+/// at or above the table's `min_visible_generation`, so a snapshot-load
+/// workflow (each run = one full-table snapshot generation) shows only the
+/// newest snapshot instead of the union of every retained generation. Both
+/// read engines (custom_scan + df) call this so they can't diverge.
+///
+/// Default floor is 0, so for ordinary append-style tables (and any table the
+/// sync workflow never touches) this is a no-op — generations start at 1.
+/// AS OF reads MUST NOT apply this (they want history); call it only when
+/// `active_as_of()` is None.
+pub(crate) fn min_visible_floor_predicate(table_oid_expr: &str, generation_expr: &str) -> String {
+    format!(
+        "AND {generation_expr} >= coalesce(\
+         (SELECT t.min_visible_generation \
+            FROM rvbbit.tables t \
+           WHERE t.table_oid = {table_oid_expr}), 0)"
+    )
+}
+
 pub(crate) fn tombstone_predicate(
     asof: &AsOf,
     table_oid_expr: &str,

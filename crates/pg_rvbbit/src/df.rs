@@ -436,9 +436,14 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
         deletes: i64,
     }
     let mut rows: Vec<Row> = Vec::new();
+    // AS OF → generation <= asof; latest (no AS OF) → apply the snapshot
+    // visibility floor (generation >= min_visible_generation) so the
+    // in-process DataFusion path agrees with the native custom_scan path and
+    // a snapshot-load table shows only its newest snapshot. (`t` is the
+    // rvbbit.tables LEFT JOIN already in the query below.)
     let asof_predicate = match asof.as_ref() {
         Some(asof) => crate::time_travel::row_group_predicate(asof, "c.oid", "rg.generation"),
-        None => String::new(),
+        None => crate::time_travel::min_visible_floor_predicate("c.oid", "rg.generation"),
     };
     let tombstone_predicate = match asof.as_ref() {
         Some(asof) => crate::time_travel::tombstone_predicate(asof, "c.oid", "deleted_generation"),
