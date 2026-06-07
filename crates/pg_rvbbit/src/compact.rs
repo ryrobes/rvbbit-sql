@@ -1001,6 +1001,17 @@ fn export_to_parquet_impl(
 
     register_legacy_llm_shreds_if_present(rel_oid, &plans)?;
 
+    // Row groups (and possibly the snapshot visibility floor) just changed.
+    // Drop backend-local caches so the same session re-plans from the new
+    // state instead of serving a stale file list / registration. The variant
+    // refresh paths invalidate too, but a plain compact (e.g. snapshot_load's
+    // two-arg compact, no variant rebuild) ends here — and a rapid
+    // snapshot_load loop in one session would otherwise read stale.
+    crate::custom_scan::invalidate_scan_metadata(rel_oid);
+    crate::planner::invalidate_planner_aggregates(rel_oid);
+    crate::columnar_cache::invalidate_table(rel_oid);
+    crate::df::invalidate_registration();
+
     Ok(total_rows)
 }
 

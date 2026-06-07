@@ -101,6 +101,15 @@ thread_local! {
     static REG_CACHE: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
 }
 
+/// Drop the DataFusion registration cache for this backend, forcing the next
+/// query to re-discover every table's file set. Called from the compaction
+/// path so a snapshot_load (which changes row groups AND the visibility floor)
+/// can't be served a stale registration in the same session. The signature
+/// alone doesn't capture min_visible_generation, so we clear unconditionally.
+pub fn invalidate_registration() {
+    REG_CACHE.with(|c| c.borrow_mut().clear());
+}
+
 #[derive(Clone, Debug)]
 struct HotTableState {
     schema: String,
@@ -443,7 +452,7 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
     // rvbbit.tables LEFT JOIN already in the query below.)
     let asof_predicate = match asof.as_ref() {
         Some(asof) => crate::time_travel::row_group_predicate(asof, "c.oid", "rg.generation"),
-        None => crate::time_travel::min_visible_floor_predicate("c.oid", "rg.generation"),
+        None => crate::time_travel::latest_predicate("c.oid", "rg.generation"),
     };
     let tombstone_predicate = match asof.as_ref() {
         Some(asof) => crate::time_travel::tombstone_predicate(asof, "c.oid", "deleted_generation"),

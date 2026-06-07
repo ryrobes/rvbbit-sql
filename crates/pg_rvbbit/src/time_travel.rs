@@ -89,43 +89,67 @@ pub(crate) fn generation_for_table(
     }
 }
 
+/// SQL fragment that is true exactly for SNAPSHOT-mode tables. A table is in
+/// snapshot mode iff `min_visible_generation > 0` — only `rvbbit.snapshot_load`
+/// sets that, and it means each generation is a COMPLETE table snapshot (full
+/// trunc+load) rather than an append/delta. Snapshot mode flips time-travel
+/// from cumulative `<= G` to exact `= G` (you want the snapshot in effect at G,
+/// not the union of every prior snapshot).
+fn is_snapshot_expr(table_oid_expr: &str) -> String {
+    format!(
+        "coalesce((SELECT t.min_visible_generation FROM rvbbit.tables t \
+                     WHERE t.table_oid = {table_oid_expr}), 0) > 0"
+    )
+}
+
+/// AS-OF row-group predicate for a resolved generation expression `g_expr`.
+/// Append tables: `generation <= g` (cumulative). Snapshot tables: `= g`
+/// (exact — each generation is a full snapshot). Used by both read engines.
+pub(crate) fn asof_gen_predicate(
+    g_expr: &str,
+    table_oid_expr: &str,
+    generation_expr: &str,
+) -> String {
+    let is_snap = is_snapshot_expr(table_oid_expr);
+    format!(
+        "AND {generation_expr} <= {g_expr} \
+         AND (NOT ({is_snap}) OR {generation_expr} = {g_expr})"
+    )
+}
+
 pub(crate) fn row_group_predicate(
     asof: &AsOf,
     table_oid_expr: &str,
     generation_expr: &str,
 ) -> String {
     match asof {
-        AsOf::Generation(g) => format!("AND {generation_expr} <= {g}"),
+        AsOf::Generation(g) => asof_gen_predicate(&g.to_string(), table_oid_expr, generation_expr),
         AsOf::Timestamp(ts) => {
             let lit = sql_text_literal(ts);
-            format!(
-                "AND {generation_expr} <= coalesce(\
-                 (SELECT max(g.generation)::bigint \
+            let g_expr = format!(
+                "coalesce((SELECT max(g.generation)::bigint \
                     FROM rvbbit.generations g \
                    WHERE g.table_oid = {table_oid_expr} \
                      AND g.committed_at <= {lit}::timestamptz), 0)"
-            )
+            );
+            asof_gen_predicate(&g_expr, table_oid_expr, generation_expr)
         }
     }
 }
 
-/// Latest-view floor (NOT for AS OF). Restricts a "latest" scan to row groups
-/// at or above the table's `min_visible_generation`, so a snapshot-load
-/// workflow (each run = one full-table snapshot generation) shows only the
-/// newest snapshot instead of the union of every retained generation. Both
-/// read engines (custom_scan + df) call this so they can't diverge.
-///
-/// Default floor is 0, so for ordinary append-style tables (and any table the
-/// sync workflow never touches) this is a no-op — generations start at 1.
-/// AS OF reads MUST NOT apply this (they want history); call it only when
-/// `active_as_of()` is None.
-pub(crate) fn min_visible_floor_predicate(table_oid_expr: &str, generation_expr: &str) -> String {
-    format!(
-        "AND {generation_expr} >= coalesce(\
-         (SELECT t.min_visible_generation \
-            FROM rvbbit.tables t \
-           WHERE t.table_oid = {table_oid_expr}), 0)"
-    )
+/// Latest-view (no AS OF) predicate. Append tables: all generations (no
+/// restriction). Snapshot tables: ONLY the current snapshot generation
+/// (`generation = min_visible_generation`), so the latest view is the newest
+/// snapshot, not the union of every retained one. Both read engines call this
+/// when `active_as_of()` is None so they can't diverge. The floor pointer is
+/// set even for an empty (0-row) snapshot, so an emptied source correctly shows
+/// nothing at latest.
+pub(crate) fn latest_predicate(table_oid_expr: &str, generation_expr: &str) -> String {
+    let floor = format!(
+        "coalesce((SELECT t.min_visible_generation FROM rvbbit.tables t \
+                     WHERE t.table_oid = {table_oid_expr}), 0)"
+    );
+    format!("AND ({floor} = 0 OR {generation_expr} = {floor})")
 }
 
 pub(crate) fn tombstone_predicate(

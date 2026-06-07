@@ -5154,6 +5154,69 @@ BEGIN
 END;
 $$;
 
+-- Gap-free snapshot load: replace a destination rvbbit table's contents with a
+-- fresh full snapshot from `source_query`, recording it as one immutable
+-- generation so the latest view is the new snapshot while AS OF still reads the
+-- prior ones (append/update/delete history falls out of the generation diff —
+-- no row-level merge, no PK, no tombstones). This is the core primitive behind
+-- the Postgres->rvbbit table-sync workflow.
+--
+--   * TRUNCATE clears the heap only (parquet/generations history is untouched).
+--   * compact(keep_heap=>true) full-scans the reloaded heap into a new
+--     generation and keeps the heap retained+clean (gold-source fallback;
+--     parquet stays authoritative).
+--   * For an EMPTY snapshot, compact() writes no rvbbit.generations row, so we
+--     add a synthetic zero-row one — otherwise AS OF would resolve to the prior
+--     (stale) snapshot instead of "empty here".
+--   * set_visible_floor pins the latest view to this generation.
+--
+-- Runs in the caller's (sub)transaction, so wrapping it in one txn (or a
+-- per-table SAVEPOINT in the sync executor) makes the whole swap atomic — a
+-- concurrent reader never sees the half-loaded heap. `source_query` is
+-- operator-authored (sync config), not end-user input.
+CREATE OR REPLACE FUNCTION rvbbit.snapshot_load(dest regclass, source_query text)
+RETURNS TABLE (generation bigint, rows_loaded bigint, action text)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    g bigint;
+    n bigint;
+BEGIN
+    IF NOT rvbbit.is_rvbbit_table(dest) THEN
+        RAISE EXCEPTION '% is not an rvbbit table', dest;
+    END IF;
+
+    EXECUTE format('TRUNCATE TABLE %s', dest);
+    EXECUTE format('INSERT INTO %s %s', dest, source_query);
+
+    PERFORM rvbbit.compact(dest, keep_heap => true);
+
+    -- The generation compact just allocated. The generation advisory lock is
+    -- xact-scoped (held to txn end), so no concurrent compact can interleave
+    -- between the compact above and this read.
+    SELECT t.next_generation - 1 INTO g FROM rvbbit.tables t WHERE t.table_oid = dest;
+
+    SELECT count(*) INTO n
+    FROM rvbbit.generations gg
+    WHERE gg.table_oid = dest AND gg.generation = g;
+    IF n = 0 THEN
+        INSERT INTO rvbbit.generations (table_oid, generation, n_rows, n_row_groups)
+        VALUES (dest, g, 0, 0);
+    END IF;
+
+    PERFORM rvbbit.set_visible_floor(dest, g);
+
+    SELECT gg.n_rows INTO n
+    FROM rvbbit.generations gg
+    WHERE gg.table_oid = dest AND gg.generation = g;
+
+    RETURN QUERY
+        SELECT g,
+               coalesce(n, 0),
+               CASE WHEN coalesce(n, 0) = 0 THEN 'empty' ELSE 'snapshot' END;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION rvbbit.compact(rel regclass)
 RETURNS TABLE (rg_id bigint, n_rows bigint, n_bytes bigint, heap_freed_bytes bigint)
 LANGUAGE plpgsql

@@ -3245,11 +3245,14 @@ fn fetch_row_group_paths(
     // invalidate_scan_metadata() — so the asof=None cache entry is always
     // cleared in-backend when the floor moves. (Cross-backend staleness after
     // compact is the pre-existing rvbbit model and is unchanged here.)
+    let oid_expr = format!("{table_oid}::oid");
     let asof_predicate = match (asof, variant_layout.is_some()) {
-        (Some(g), false) => format!("AND generation <= {g}"),
-        (None, false) => {
-            crate::time_travel::min_visible_floor_predicate(&format!("{table_oid}::oid"), "generation")
+        // Snapshot-aware: append tables get `<= g` / all; snapshot tables (a
+        // sync dest, min_visible_generation > 0) get exact `= g` / current.
+        (Some(g), false) => {
+            crate::time_travel::asof_gen_predicate(&g.to_string(), &oid_expr, "generation")
         }
+        (None, false) => crate::time_travel::latest_predicate(&oid_expr, "generation"),
         _ => String::new(),
     };
     // Backend-local cache: same (table_oid, variant_layout, asof,
