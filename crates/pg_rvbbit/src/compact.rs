@@ -1015,6 +1015,23 @@ fn export_to_parquet_impl(
     Ok(total_rows)
 }
 
+/// Unlink a batch of row-group files from disk. Used by rvbbit.reap_generations
+/// AFTER the corresponding catalog rows are deleted, so the unlink is
+/// orphan-safe (nothing references the files). Missing files are ignored;
+/// returns the count actually removed.
+#[pgrx::pg_extern]
+fn reap_unlink_files(paths: Option<Vec<Option<String>>>) -> i32 {
+    let mut n = 0i32;
+    if let Some(ps) = paths {
+        for p in ps.into_iter().flatten() {
+            if std::fs::remove_file(&p).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 #[pg_extern]
 fn refresh_layout_variants(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>> {
     let rel_oid = rel.to_u32();
