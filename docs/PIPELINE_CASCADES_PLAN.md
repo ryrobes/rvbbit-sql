@@ -72,11 +72,12 @@ A stage operator declares two independent things:
 
 |                 | value-llm                         | synth-sql                                              |
 |-----------------|-----------------------------------|--------------------------------------------------------|
-| **scalar**      | `summarize`, `classify` (today)   | `reshape(col, 'E.164 phone')` — 50M rows / ~50 shapes  |
-| **rowset**      | `analyze`, `summarize`            | `pivot`, `group`, `top`, `filter`                      |
+| **scalar**      | `summarize`, `classify` (today)   | `reshape`, `parse`, `normalize_value` — 50M rows / ~50 shapes |
+| **rowset**      | `analyze`, `summarize`            | `pivot`, `group`, `top`, `filter`, `normalize`         |
 
-`synth-sql` is the unifying primitive: the rowset `pivot` (shape = table schema,
-application = statement over `_input`) and the scalar `reshape` (shape = value
+`synth-sql` is the unifying primitive: rowset stages such as `pivot` and
+`normalize` (shape = table schema, application = statement over `_input`) and
+scalar stages such as `reshape`, `parse`, and `normalize_value` (shape = value
 pattern, application = expression bound per row) are the **same machine** with a
 different shape-function and application mode.
 
@@ -164,7 +165,8 @@ compiled code is cached and executed in-engine.
   over the rowset registered as `_input` (jsonb_to_recordset) — isolated by
   `PgTryBuilder` so a bad generation fails the stage, not the surrounding query.
 - Operators marked by `parser='sql'` (the synth strategy) vs `'json'` (value mode);
-  seeded `pivot` / `group` / `top` / `filter` (synth-sql), `analyze` / `enrich` (LLM value-mode), and `sample` builtin.
+  seeded `pivot` / `group` / `top` / `filter` / `normalize` (synth-sql),
+  `analyze` / `enrich` (LLM value-mode), and `sample` builtin.
 - `rvbbit.flow_shape(rows)` (inspect the fingerprint) + `rvbbit.synth_put(op,
   prompt, sample_rows, sql)` (author/pin a snippet by hand — also the audit knob).
 - Verified live (`cargo pgrx test`): fingerprint determinism/order-independence/
@@ -209,6 +211,10 @@ compiled code is cached and executed in-engine.
   expression over `x` per shape (validated on a canonical example + the real value,
   with error-feedback retry), cached in `synth_cache` + an in-memory L1, applied
   natively. `_exec_op_text` routes `parser='sql'` scalar ops here.
+- `rvbbit.parse(value, instruction)` and `rvbbit.normalize_value(value, instruction)`
+  are named scalar entry points for extraction/cleaning tasks. They use the same
+  shape-keyed compiler path as `reshape`, but their prompts steer toward parsing a
+  requested value or canonicalizing a messy one.
 - `rvbbit.value_shape(text)` inspects the shape; `rvbbit.synth_put_scalar(op, intent,
   example, expr)` pins a hand-written snippet; `flush_cache()` clears the L1.
 - Verified live: mixed-format phone numbers → E.164 with exactly **one cached

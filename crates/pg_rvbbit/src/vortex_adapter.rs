@@ -354,8 +354,12 @@ mod tests {
     #[test]
     fn mismatched_op_value_does_not_push() {
         // Eq with a set value is not expressible → None (and an empty And → None).
-        assert!(translate(&qual("a", CmpOp::Eq, LitRepr::I64Set(vec![1]))).is_none());
+        assert!(translate(&qual(
+            "a",
+            CmpOp::Eq,
+            LitRepr::IntSet(vec![1], IntWidth::I64)
+        ))
+        .is_none());
         assert!(translate(&FilterRepr::And(vec![])).is_none());
     }
 }
-

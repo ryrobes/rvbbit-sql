@@ -99,7 +99,8 @@ BEGIN
         ('pivot',  'Crosstab/pivot a resultset using conditional aggregation.'),
         ('group',  'Group and aggregate a resultset.'),
         ('top',    'Order a resultset and keep the top rows.'),
-        ('filter', 'Filter a resultset to matching rows, same columns.')
+        ('filter', 'Filter a resultset to matching rows, same columns.'),
+        ('normalize', 'Normalize, repair, or add derived columns across a resultset.')
     ) AS t(nm, descr) LOOP
         PERFORM rvbbit.create_operator(
             op_name        => r.nm,
@@ -145,6 +146,36 @@ SELECT rvbbit.create_operator(
     op_user        => E'REQUEST: {{ intent }}\nINPUT SHAPE (each d = a digit, a = a letter, other characters are literal): {{ shape }}\nA representative input of this shape: {{ example }}\n\nWrite the expression over x that performs the request for inputs of this exact shape.\nIf a previous attempt failed, fix this Postgres error (empty on the first try): {{ _last_sql_error }}\n\nReturn ONLY {"sql": "<expression over x>"}.',
     op_max_tokens  => 400,
     op_description => 'Scalar synth-sql: reshape/format a text value; the model writes one expression per value-shape, cached and reused.'
+);
+
+-- PARSE / NORMALIZE_VALUE: friendlier scalar synth-sql entry points for data
+-- cleaning. These share the same shape-keyed compiler path as reshape: the
+-- model writes one PostgreSQL expression over x per value format, and that
+-- expression is cached/reused for every value with the same structural shape.
+SELECT rvbbit.create_operator(
+    op_name        => 'parse',
+    op_arg_names   => ARRAY['value', 'instruction'],
+    op_arg_types   => ARRAY['text', 'text'],
+    op_return_type => 'text',
+    op_shape       => 'scalar',
+    op_parser      => 'sql',
+    op_system      => 'You write ONE PostgreSQL scalar expression that parses a text input named x according to the instruction. Reference only x. Use standard PostgreSQL (regexp_replace, substring, ||, lower, upper, CASE, etc.); no subqueries, no semicolons, no function definitions. Return STRICT JSON {"sql": "<expression over x>"} and nothing else.',
+    op_user        => E'INSTRUCTION: {{ instruction }}\nINPUT SHAPE (each d = a digit, a = a letter, other characters are literal): {{ shape }}\nA representative input of this shape: {{ example }}\n\nWrite the expression over x that parses/extracts the requested value for inputs of this exact shape.\nIf a previous attempt failed, fix this Postgres error (empty on the first try): {{ _last_sql_error }}\n\nReturn ONLY {"sql": "<expression over x>"}.',
+    op_max_tokens  => 400,
+    op_description => 'Scalar synth-sql: parse/extract a clean value from messy text; one cached SQL expression per value-shape.'
+);
+
+SELECT rvbbit.create_operator(
+    op_name        => 'normalize_value',
+    op_arg_names   => ARRAY['value', 'instruction'],
+    op_arg_types   => ARRAY['text', 'text'],
+    op_return_type => 'text',
+    op_shape       => 'scalar',
+    op_parser      => 'sql',
+    op_system      => 'You write ONE PostgreSQL scalar expression that normalizes a text input named x according to the instruction. Reference only x. Use standard PostgreSQL (regexp_replace, substring, ||, lower, upper, CASE, etc.); no subqueries, no semicolons, no function definitions. Return STRICT JSON {"sql": "<expression over x>"} and nothing else.',
+    op_user        => E'INSTRUCTION: {{ instruction }}\nINPUT SHAPE (each d = a digit, a = a letter, other characters are literal): {{ shape }}\nA representative input of this shape: {{ example }}\n\nWrite the expression over x that normalizes values of this exact shape.\nIf a previous attempt failed, fix this Postgres error (empty on the first try): {{ _last_sql_error }}\n\nReturn ONLY {"sql": "<expression over x>"}.',
+    op_max_tokens  => 400,
+    op_description => 'Scalar synth-sql: normalize a messy value; one cached SQL expression per value-shape.'
 );
 
 -- Query synth-sql helpers. These run inside plpgsql EXCEPTION blocks, which open a

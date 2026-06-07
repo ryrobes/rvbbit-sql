@@ -436,11 +436,16 @@ fn apply_scalar(expr: &str, value: &str) -> Result<String, String> {
 }
 
 /// Scalar synth-sql dispatch (from `_exec_op_text` when parser='sql', shape scalar).
-/// `inputs` is the operator's arg map: `value` (the text to transform) + `intent`
-/// (the request). On any failure the original value passes through.
+/// `inputs` is the operator's arg map: `value` (the text to transform) plus an
+/// instruction field. `reshape` uses `intent`; parse-style operators may use
+/// `instruction`. On any failure the original value passes through.
 pub(crate) fn run_synth_sql_scalar(op: &OpDef, inputs: &Value, opts: &Value) -> String {
     let value = inputs.get("value").and_then(|v| v.as_str()).unwrap_or("");
-    let intent = inputs.get("intent").and_then(|v| v.as_str()).unwrap_or("");
+    let intent = inputs
+        .get("intent")
+        .or_else(|| inputs.get("instruction"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if value.is_empty() {
         return String::new();
     }
@@ -466,6 +471,7 @@ pub(crate) fn run_synth_sql_scalar(op: &OpDef, inputs: &Value, opts: &Value) -> 
     for attempt in 0..MAX_SCALAR_ATTEMPTS {
         let mut llm = serde_json::Map::new();
         llm.insert("intent".into(), json!(intent));
+        llm.insert("instruction".into(), json!(intent));
         llm.insert("shape".into(), json!(shape));
         llm.insert("example".into(), json!(example));
         llm.insert(

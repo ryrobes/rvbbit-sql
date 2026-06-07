@@ -699,11 +699,11 @@ mod tests {
     fn rowset_operators_are_seeded() {
         let synth: i64 = Spi::get_one(
             "SELECT count(*)::bigint FROM rvbbit.operators \
-             WHERE name IN ('pivot','group','top','filter') AND shape='rowset' AND parser='sql'",
+             WHERE name IN ('pivot','group','top','filter','normalize') AND shape='rowset' AND parser='sql'",
         )
         .unwrap()
         .unwrap();
-        assert_eq!(synth, 4, "synth-sql rowset operators");
+        assert_eq!(synth, 5, "synth-sql rowset operators");
         let value: i64 = Spi::get_one(
             "SELECT count(*)::bigint FROM rvbbit.operators \
              WHERE name IN ('analyze','enrich') AND shape='rowset' AND parser='json'",
@@ -841,6 +841,61 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(out, "7208675309");
+    }
+
+    #[pg_test]
+    fn parse_and_normalize_value_use_cached_expression_per_shape_no_model() {
+        Spi::run(
+            "SELECT rvbbit.synth_put_scalar('parse', 'extract phone digits', '(303) 555-1234', \
+             'regexp_replace(x, ''[^0-9]'', '''', ''g'')')",
+        )
+        .unwrap();
+        let parsed: String =
+            Spi::get_one("SELECT rvbbit.parse('(720) 867-5309', 'extract phone digits')")
+                .unwrap()
+                .unwrap();
+        assert_eq!(parsed, "7208675309");
+
+        Spi::run(
+            "SELECT rvbbit.synth_put_scalar('normalize_value', 'lowercase and trim', '  ACME  ', \
+             'lower(btrim(x))')",
+        )
+        .unwrap();
+        let normalized: String =
+            Spi::get_one("SELECT rvbbit.normalize_value('  BETA  ', 'lowercase and trim')")
+                .unwrap()
+                .unwrap();
+        assert_eq!(normalized, "beta");
+    }
+
+    #[pg_test]
+    fn normalize_rowset_stage_uses_cached_sql_no_model() {
+        Spi::run(
+            "SELECT rvbbit.synth_put('normalize', 'phone digits', \
+             '[{\"id\":1,\"phone\":\"(303) 555-1234\"},{\"id\":2,\"phone\":\"(720) 867-5309\"}]'::jsonb, \
+             'SELECT id, regexp_replace(phone, ''[^0-9]'', '''', ''g'') AS phone_digits FROM _input ORDER BY id')",
+        )
+        .unwrap();
+        let first: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ select * from (values (1, '(303) 555-1234'), (2, '(720) 867-5309')) v(id, phone) then normalize('phone digits') $q$) \
+             ORDER BY (value->>'id')::int LIMIT 1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first.0.get("phone_digits").and_then(|x| x.as_str()),
+            Some("3035551234")
+        );
+        let gsql: String = Spi::get_one(
+            "SELECT generated_sql FROM rvbbit.flow_steps \
+             WHERE stage = 'normalize' AND run_id = (SELECT run_id FROM rvbbit.flow_steps ORDER BY created_at DESC LIMIT 1)",
+        )
+        .unwrap()
+        .unwrap_or_default();
+        assert!(
+            gsql.contains("regexp_replace"),
+            "generated_sql not recorded: {gsql}"
+        );
     }
 
     // ---- Query synth-sql (table-shaped text-to-SQL, Phase 1) ----

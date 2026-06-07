@@ -95,7 +95,7 @@ SELECT * FROM rvbbit.operators WHERE name = 'classify';
 | column | type | meaning |
 |---|---|---|
 | `name` | text (PK) | operator name; also the SQL function name `rvbbit.<name>` |
-| `shape` | text | `scalar` (one call per row — the usual case), `aggregate` (one call sees a whole group), `dimension` (one call returns per-input assignments) |
+| `shape` | text | `scalar` (one call per row — the usual case), `aggregate` (one call sees a whole group), `dimension` (one call returns per-input assignments), `rowset` (one call sees a full resultset), or `query` (one call synthesizes SQL from an intent) |
 | `arg_names` | text[] | the argument names, e.g. `{text,criterion}`. These become the wrapper's parameters, the keys of the `inputs` JSON, and the template variables |
 | `arg_types` | text[] | SQL types of the args, e.g. `{text,text}`. Same length as `arg_names` |
 | `return_type` | text | `bool` \| `text` \| `float8` \| `jsonb` |
@@ -925,6 +925,48 @@ database instance.
 - **Need rows, not a blob?** Use `rvbbit.mcp_rows(server, tool, args)` at
   the SQL level — it auto-unwraps `items` / `results` / `data` arrays and
   returns `SETOF jsonb` so you can `JOIN` / `WHERE` against the result.
+
+### Shape-keyed SQL operators
+
+Some operators use an LLM as a small SQL compiler instead of materializing one
+LLM answer per row. These operators are stored with `parser='sql'`: on a cache
+miss, the model writes PostgreSQL for the current structural shape; on a hit,
+rvbbit executes the cached SQL natively.
+
+Scalar helpers:
+
+```sql
+SELECT rvbbit.reshape('(303) 555-1234', 'E.164 US phone');
+SELECT rvbbit.parse('(303) 555-1234', 'extract phone number digits');
+SELECT rvbbit.normalize_value('  Acme, Inc. ', 'canonical company display name');
+```
+
+- `reshape(value, intent)` is for formatting the whole value.
+- `parse(value, instruction)` is for extracting a clean value from messy text.
+- `normalize_value(value, instruction)` is for canonicalizing one value.
+- `value_shape(text)` shows the scalar fingerprint, and
+  `synth_put_scalar(op, intent, example, expr)` pins a trusted expression by
+  hand.
+
+The full-resultset version is a rowset stage inside `flow(...)`:
+
+```sql
+SELECT *
+FROM rvbbit.flow($$
+  SELECT id, phone, company FROM raw_contacts
+  THEN normalize('add phone_digits and canonical_company columns')
+$$);
+```
+
+Rowset `normalize` compiles one `SELECT ... FROM _input` for the table shape,
+then records that SQL in `rvbbit.flow_steps.generated_sql`. Use
+`synth_put(op, prompt, sample_rows, sql)` to pin rowset SQL manually.
+
+This is different from `extract(text, what)`: `extract` is semantic extraction
+through the normal LLM/specialist path and materializes an answer for each
+call. `parse` and `normalize_value` are better when the task can become a
+repeatable SQL expression, such as phone cleanup, invoice-number parsing, SKU
+normalization, date repair, or ID canonicalization.
 
 ### Model backends — `rvbbit.backends`
 
