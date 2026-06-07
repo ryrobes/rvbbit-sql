@@ -113,8 +113,13 @@ LANGUAGE sql IMMUTABLE AS $fn$
         || CASE WHEN (col->>'null_frac') IS NOT NULL
                 THEN ' ' || round((col->>'null_frac')::numeric * 100, 1)::text || '% null.'
                 ELSE '' END
+        -- Cap each example to 200 chars: a jsonb/text column's example_values
+        -- can each be a multi-KB (here: multi-MB) blob, and concatenating them
+        -- raw produced a 28 MB fingerprint doc that made lexical search crawl.
+        -- A 200-char prefix keeps examples useful for embedding/keyword signal
+        -- without unbounded growth. (Re-crawl to regenerate existing docs.)
         || COALESCE(' Examples: ' || NULLIF((
-                SELECT string_agg(e->>'value', ', ')
+                SELECT string_agg(left(e->>'value', 200), ', ')
                 FROM jsonb_array_elements(col->'example_values') e), '') || '.', '')
         || COALESCE(' Table comment: ' || NULLIF(btrim(p_table_comment), '') || '.', '')
         || ' In table ' || p_schema || '.' || p_rel || '.'
@@ -621,7 +626,20 @@ DECLARE
 BEGIN
     IF v_q = '' THEN RETURN; END IF;
     RETURN QUERY
-        WITH lex AS (
+        WITH src AS (
+            -- Cap the doc fed to to_tsvector/position. A jsonb/text column can
+            -- fingerprint into a multi-MB "Examples:" blob (seen: 28 MB), and
+            -- re-tokenizing it per query costs seconds (and can blow the 1 MB
+            -- tsvector limit). 32 KB keeps every legitimate fingerprint whole
+            -- while making the pathological outlier a non-event. (Root fix is
+            -- bounding doc length in the crawler; this is the search-side guard.)
+            SELECT d.node_id, d.schema_name, d.rel_name, d.col_name,
+                   left(d.doc, 32768) AS doc
+              FROM rvbbit.catalog_docs d
+             WHERE d.graph_id = graph
+               AND (kinds IS NULL OR d.kind = ANY (kinds))
+        ),
+        lex AS (
             SELECT d.node_id,
                    ts_rank_cd(
                        to_tsvector('english',
@@ -637,9 +655,7 @@ BEGIN
                        lower(COALESCE(d.schema_name, '') || '.' || COALESCE(d.rel_name, '') || '.'
                              || COALESCE(d.col_name, ''))) > 0)::int AS name_hit,
                    (position(lower(v_q) IN lower(d.doc)) > 0)::int    AS doc_hit
-              FROM rvbbit.catalog_docs d
-             WHERE d.graph_id = graph
-               AND (kinds IS NULL OR d.kind = ANY (kinds))
+              FROM src d
         )
         SELECT lex.node_id,
                (2.0 * lex.name_hit + 1.0 * lex.doc_hit + lex.fts)::float8 AS sc
