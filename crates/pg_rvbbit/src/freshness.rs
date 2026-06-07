@@ -576,18 +576,30 @@ CREATE OR REPLACE FUNCTION rvbbit.schedule_accel_tick(
     budget        integer DEFAULT 4
 ) RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
-    jobid bigint;
+    jobid     bigint;
+    cron_home text := current_setting('cron.database_name', true);
+    this_db   text := current_database();
+    command   text := format('SELECT rvbbit.accel_tick(%s)', budget);
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
-        RAISE EXCEPTION 'pg_cron is not installed; cannot schedule the accelerator heartbeat. '
-            'Install pg_cron (shared_preload_libraries) then retry, or call rvbbit.accel_tick() manually.';
+    -- pg_cron's cron.* functions live only in its home database (cron.database_name).
+    -- If that is a DIFFERENT database than this one (e.g. the recommended
+    -- cron.database_name='postgres'), cron.* is not callable here at all — point the
+    -- caller at the home db / Scheduler UI with the exact schedule_in_database SQL.
+    IF cron_home IS NOT NULL AND cron_home <> '' AND cron_home <> this_db THEN
+        RAISE EXCEPTION 'pg_cron home database is %, not %; cron.* is not callable here.',
+            cron_home, this_db
+            USING HINT = format(
+                'Use the Scheduler UI, or connect to %L and run: '
+                'SELECT cron.schedule_in_database(%L, %L, %L, %L);',
+                cron_home, 'rvbbit_accel_tick', cron_schedule, command, this_db);
     END IF;
-    EXECUTE format(
-        'SELECT cron.schedule(%L, %L, %L)',
-        'rvbbit_accel_tick',
-        cron_schedule,
-        format('SELECT rvbbit.accel_tick(%s)', budget)
-    ) INTO jobid;
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        RAISE EXCEPTION 'pg_cron is not installed; cannot schedule the accelerator heartbeat.'
+            USING HINT = 'Add pg_cron to shared_preload_libraries and CREATE EXTENSION pg_cron, '
+                         'or call rvbbit.accel_tick() manually.';
+    END IF;
+    EXECUTE format('SELECT cron.schedule(%L, %L, %L)', 'rvbbit_accel_tick', cron_schedule, command)
+        INTO jobid;
     RETURN jobid;
 END;
 $$;

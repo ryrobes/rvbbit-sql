@@ -1672,6 +1672,136 @@ BEGIN
     );
     PERFORM rvbbit.set_operator_takes('headline',
         $cfg${"factor":3,"reduce":"evaluator","evaluator":{"instructions":"Pick the headline that is the most vivid and specific while staying accurate to the text. Reply with only its number."}}$cfg$::jsonb);
+
+    -- Dimension (fan-out) operators: one text -> a SET of canonical labels
+    -- (themes/tags/aspects/entities/keyphrases). The SETOF wrapper + per-row
+    -- output split make them GROUP-BY dimensions. Base-LLM (default model),
+    -- no sidecar/Warren model required.
+    PERFORM rvbbit.create_operator(
+        op_name => 'themes',
+        op_shape => 'dimension',
+        op_arg_names => ARRAY['text'],
+        op_return_type => 'text',
+        op_max_tokens => 128,
+        op_system => $sys$You are a literary/narrative theme analyst. Given a single text, identify the recurring THEMES it touches — the higher-level narrative threads, underlying tensions, and human preoccupations it explores (e.g. "Loss And Grief", "Found Family", "Corporate Greed", "Coming Of Age", "Betrayal Of Trust"). Themes are NOT the literal subject matter or topics; they are the deeper ideas and emotional/moral throughlines the text is really about.
+
+Output ONLY a JSON array of short string labels — nothing else. No prose, no explanation, no markdown, no code fences.
+
+Rules for the labels:
+- Output between 1 and 5 themes; pick only ones genuinely present, most central first.
+- Each label is 1–3 words, Title Case (e.g. "Loss And Grief", "Power And Control").
+- Use CANONICAL, reusable theme names from a stable shared vocabulary so identical themes bucket together across many texts — prefer the common phrasing over a hyper-specific one (use "Found Family", not "The Crew Becomes Her Family").
+- Deduplicate; do not emit near-synonyms.
+- If the text is too thin or generic to carry a real theme, return [].$sys$,
+        op_user => $usr$TEXT:
+{{ text }}
+
+Return ONLY a JSON array of canonical theme labels (1–5, Title Case, most central first), e.g. ["Loss And Grief", "Found Family", "Corporate Greed"].$usr$,
+        op_description => $dsc$DIMENSION: Fans one text out into a small set of canonical, higher-level narrative THEMES it touches (the recurring threads / underlying preoccupations, e.g. "Loss And Grief", "Found Family", "Corporate Greed") — distinct from topics, which name literal subject matter. Returns SETOF text (1–5 short Title Case labels), so Postgres expands each row into one row per theme. GROUP BY the resulting label to count how many texts share a theme, build theme-frequency charts, or cross-tab themes against other columns across a corpus.$dsc$
+    );
+    PERFORM rvbbit.create_operator(
+        op_name => 'tags',
+        op_shape => 'dimension',
+        op_arg_names => ARRAY['text'],
+        op_return_type => 'text',
+        op_max_tokens => 128,
+        op_system => $sys$You are a precise content tagger. Given a single piece of text, you produce short, hashtag-style TOPICAL TAGS — the kind of labels you would file or filter the text under in a content library or feed.
+
+Output contract (follow EXACTLY):
+- Output ONLY a raw JSON array of strings. No prose, no explanation, no markdown, no code fences, no keys.
+- Produce 3 to 5 tags. Never zero; if the text is thin, give the 1-3 most defensible tags.
+- Each tag is a SHORT canonical keyword: 1-2 words, Title Case (e.g. "Machine Learning", "Privacy"). No leading '#', no punctuation, no hashtags glyphs, no emojis.
+- Tags must be CANONICAL and reusable so the same concept always gets the same tag across rows. Prefer a stable shared vocabulary ("Machine Learning", not "ML models in production"). Generalize hyper-specific phrasings to their common filing term.
+- Deduplicate. No two tags that mean the same thing. No tag that is a substring synonym of another.
+- Order by centrality: the most defining tag first.
+- Tags describe the SUBJECT/topic for filing — not sentiment, tone, format, or length.
+
+Example shape (format only, not real content): ["Machine Learning", "Healthcare", "Privacy", "Regulation"]$sys$,
+        op_user => $usr$Read the text and return its filing/filter tags as a JSON array of short Title Case keywords (3-5 tags, most defining first). Output ONLY the JSON array.
+
+TEXT:
+{{ text }}
+
+TAGS (JSON array):$usr$,
+        op_description => $dsc$DIMENSION: per-row fan-out of one text value into a SET of short hashtag-style topical tags (Title Case, 1-2 words, canonical and deduplicated) for filing/filtering. Postgres expands each input row into one row per tag, so you GROUP BY the tag to count or aggregate how many rows fall under each tag (a one-to-many tag dimension). Distinct from topics() in that tags are terse, filter-shelf-style keywords drawn from a stable shared vocabulary rather than descriptive topic phrases.$dsc$
+    );
+    PERFORM rvbbit.create_operator(
+        op_name => 'aspects',
+        op_shape => 'dimension',
+        op_arg_names => ARRAY['text'],
+        op_return_type => 'text',
+        op_max_tokens => 128,
+        op_system => $sys$You are an aspect-based opinion mining engine for reviews and customer feedback. Given one piece of text (a review, survey response, support ticket, or comment), you identify the distinct ASPECTS — the concrete features, attributes, or subjects of the product/service/experience that the writer actually discusses or evaluates.
+
+An aspect is WHAT is being talked about, not the sentiment about it. "The battery dies in two hours" → aspect "Battery Life". "Shipped late and the box was crushed" → aspects "Shipping", "Packaging".
+
+Output contract (STRICT):
+- Output ONLY a JSON array of short string labels. Nothing else — no prose, no explanation, no keys, no markdown, no code fences.
+- Each label is a CANONICAL aspect name in Title Case, 1-3 words, chosen from a stable shared vocabulary so the same aspect always gets the same label across rows (e.g. always "Customer Support", never "support team" or "the support people"; always "Price", never "cost" or "how much it costs"; always "Battery Life", "Shipping", "Build Quality", "Ease Of Use", "Sound Quality", "Packaging", "Delivery Speed", "Comfort", "Reliability", "Screen Quality").
+- Return only aspects the text genuinely addresses. Most-central / most-emphasized aspect first.
+- Deduplicate. Return between 1 and 5 labels. If the text discusses no identifiable aspect (e.g. pure greeting or noise), return [].
+- Labels are nouns/noun-phrases naming a subject, never sentiment words ("Good", "Disappointing") and never full sentences.
+
+Example: "Love the camera and the screen is gorgeous, but it's overpriced and the battery barely lasts a day." → ["Camera Quality","Screen Quality","Price","Battery Life"]$sys$,
+        op_user => $usr$Identify the canonical aspects discussed in the text below.
+
+TEXT:
+{{ text }}
+
+Aspects (JSON array of 1-5 short Title-Case labels, ONLY the raw array):$usr$,
+        op_description => $dsc$DIMENSION: aspects(text) fans one review/feedback text out into a SET of canonical aspect labels (the features/subjects discussed, e.g. "Battery Life", "Price", "Shipping", "Customer Support"). Each input row expands to one row per aspect, so GROUP BY the label to count how many rows mention each aspect or to aggregate sentiment/ratings per aspect. Returns SETOF text; labels are Title Case, 1-3 words, deduplicated, most-central first, capped at 5, drawn from a stable shared vocabulary so buckets group cleanly.$dsc$
+    );
+    PERFORM rvbbit.create_operator(
+        op_name => 'entities',
+        op_shape => 'dimension',
+        op_arg_names => ARRAY['text'],
+        op_return_type => 'text',
+        op_max_tokens => 128,
+        op_system => $sys$You are a precise named-entity extractor for a SQL GROUP BY dimension. From a single text value, identify the salient NAMED ENTITIES that are actually mentioned — real people, organizations/companies, places (cities, countries, regions, landmarks), and products/brands. Proper nouns only; never invent entities that are not in the text.
+
+Output contract — follow EXACTLY:
+- Output ONLY a JSON array of short string labels. No prose, no explanation, no markdown, no code fences.
+- Each label is a single CANONICAL entity name in Title Case, normally 1-3 words.
+- Canonicalize to the standard, reusable form so the same entity buckets cleanly across rows: drop legal suffixes and honorifics (e.g. "Apple Inc." → "Apple", "Dr. Jane Doe" → "Jane Doe"), expand to the common full name when clear, resolve aliases/abbreviations to one canonical name (e.g. "the EU" → "European Union", "NYC" → "New York"), and use each entity's most recognizable name.
+- Deduplicate: list each distinct real-world entity at most once.
+- Order by salience: most central/frequently-referenced entity first.
+- Return at most 5 labels — the genuinely salient ones, not every passing mention.
+- Exclude generic nouns, roles, dates, quantities, and concepts (e.g. "the company", "Tuesday", "privacy", "the team") — only concrete named entities.
+- If the text contains no named entities, return an empty array: []
+
+Shape example (illustrative only, do not echo): ["Apple", "Tim Cook", "Cupertino", "iPhone"]$sys$,
+        op_user => $usr$TEXT:
+{{ text }}
+
+Salient named entities (people, organizations, places, products), canonicalized — JSON array only:$usr$,
+        op_description => $dsc$DIMENSION: fans one text value out into a set of canonical NAMED ENTITY labels (people, organizations, places, products), one row per entity. The model is called once per row and its JSON-array output is expanded into label rows, so you GROUP BY the entity to count mentions, find co-occurrence, or aggregate metrics per entity across a text column — turning a free-text column into a queryable entity dimension.$dsc$
+    );
+    PERFORM rvbbit.create_operator(
+        op_name => 'keyphrases',
+        op_shape => 'dimension',
+        op_arg_names => ARRAY['text'],
+        op_return_type => 'text',
+        op_max_tokens => 128,
+        op_system => $sys$You are a precise keyphrase extractor for a SQL semantic engine. Given a single text value, you identify the most salient KEY PHRASES — the concise noun phrases that capture what the text is actually about (its core subjects, entities, and concepts).
+
+Output contract (follow EXACTLY):
+- Output ONLY a JSON array of strings. No prose, no explanation, no markdown, no code fences. The first character must be `[` and the last must be `]`.
+- Each element is a short noun phrase: 1-3 words, in Title Case (e.g. "Cloud Migration", "Customer Churn", "Patient Privacy").
+- Extract 1-5 phrases. Fewer is fine for short or thin text; never pad with filler.
+- Make phrases CANONICAL and reusable so they bucket cleanly when grouped: prefer a stable, generalized term over a hyper-specific verbatim quote (e.g. "Battery Life" not "the phone's battery only lasting four hours").
+- Prefer noun phrases; strip leading articles ("the", "a"), verbs, and adjectives that don't add identity.
+- Deduplicate (no two phrases meaning the same thing) and order by centrality — the most defining phrase first.
+- If the text is empty or has no extractable subject, output [].
+
+Example: text "The new pricing tier upset long-time subscribers who feel nickel-and-dimed by add-on fees." → ["Pricing Tier","Subscriber Backlash","Add-On Fees"]$sys$,
+        op_user => $usr$Extract the most salient key phrases (concise noun phrases) describing what this text is about. Return ONLY a JSON array of 1-5 Title Case strings, most central first. No prose, no code fences.
+
+TEXT:
+{{ text }}
+
+key phrases (JSON array):$usr$,
+        op_description => $dsc$DIMENSION: per-row keyphrase fan-out. rvbbit.keyphrases(text) reads one text value and returns SETOF text — a small set (1-5) of canonical, Title Case noun phrases capturing what the text is about. Postgres expands each input row into one row per phrase (one-to-many), so you GROUP BY the phrase to count documents per concept, find the most-mentioned topics across a column, or build a keyphrase frequency / co-occurrence breakdown. Use it like a content tag dimension: SELECT kp, COUNT(*) FROM docs, LATERAL rvbbit.keyphrases(docs.body) AS kp GROUP BY kp ORDER BY 2 DESC.$dsc$
+    );
 END $$;
 
 -- Per-call audit + cache. Every LLM invocation by a semantic operator

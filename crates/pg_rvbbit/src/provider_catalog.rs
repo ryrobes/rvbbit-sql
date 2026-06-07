@@ -495,6 +495,53 @@ fn install_maintenance_jobs(
     .ok()
     .flatten()
     .unwrap_or(false);
+    // pg_cron's cron.* functions live only in its home database (cron.database_name,
+    // default 'postgres'). When that differs from THIS database, cron.* is not callable
+    // here and CREATE EXTENSION pg_cron hard-errors ("can only create extension in
+    // database <home>"). Detect that up front — BEFORE attempting CREATE EXTENSION —
+    // and return the exact cron.schedule_in_database SQL to run from the home db (or via
+    // the Scheduler UI), so this stays non-destructive instead of throwing.
+    let cron_home = Spi::get_one::<String>("SELECT current_setting('cron.database_name', true)")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    // current_database() returns `name`, which pgrx's get_one::<String> can't decode;
+    // cast to text so this_db is populated (not the empty string).
+    let this_db = Spi::get_one::<String>("SELECT current_database()::text")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !cron_home.is_empty() && cron_home != this_db {
+        let maintain_cmd = format!(
+            "SELECT cron.schedule_in_database('rvbbit-maintain', {}, 'SELECT rvbbit.maintain();', {});",
+            sql_lit(maintenance_schedule),
+            sql_lit(&this_db),
+        );
+        let storage_cmd = format!(
+            "SELECT cron.schedule_in_database('rvbbit-storage-maintain', {}, {}, {});",
+            sql_lit(storage_schedule),
+            sql_lit(&format!(
+                "SELECT rvbbit.maintain(storage_tables => {});",
+                storage_tables.max(0)
+            )),
+            sql_lit(&this_db),
+        );
+        return JsonB(json!({
+            "ok": false,
+            "status": "pg_cron_not_home_db",
+            "cron_home": cron_home,
+            "this_db": this_db,
+            "message": format!(
+                "pg_cron's home database is '{cron_home}'; cron.* is only callable there. \
+                 Use the Scheduler UI, or connect to '{cron_home}' and run the SQL in 'schedule_sql' \
+                 to schedule jobs that run in '{this_db}'."
+            ),
+            "schedule_sql": [maintain_cmd, storage_cmd],
+            "manual_maintenance_sql": "SELECT rvbbit.maintain();"
+        }));
+    }
+
+    // Home db == this db (or cron.database_name unset): safe to create + schedule here.
     if cron_available && cron_preloaded {
         let _ = Spi::run("CREATE EXTENSION IF NOT EXISTS pg_cron");
     }

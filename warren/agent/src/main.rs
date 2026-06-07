@@ -1762,8 +1762,14 @@ fn render_host_ports_compose(manifest: &Value, safe_name: &str) -> Result<String
 
 fn render_gpu_compose(safe_name: &str) -> Result<String> {
     let service = safe_name.replace('_', "-");
+    // Request the GPU via `deploy.resources.reservations.devices` — the form
+    // honoured across Docker Compose versions. The newer top-level `gpus: all`
+    // is silently ignored by older compose, leaving the container with no GPU
+    // ("0 active drivers / No CUDA runtime"), which makes vLLM fail device
+    // inference. Also pin NVIDIA_DRIVER_CAPABILITIES so images that don't set
+    // it themselves (e.g. vllm/vllm-openai) still get the CUDA runtime mounted.
     Ok(format!(
-        "services:\n  {service}:\n    gpus: all\n    environment:\n      RVBBIT_CAPABILITY_DEVICE: \"cuda\"\n"
+        "services:\n  {service}:\n    environment:\n      RVBBIT_CAPABILITY_DEVICE: \"cuda\"\n      NVIDIA_VISIBLE_DEVICES: \"all\"\n      NVIDIA_DRIVER_CAPABILITIES: \"all\"\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - driver: nvidia\n              count: all\n              capabilities: [gpu]\n"
     ))
 }
 
@@ -1884,9 +1890,9 @@ fn render_runtime_volumes(runtime: &Value) -> (String, String) {
 }
 
 /// True when this host has a usable NVIDIA GPU (driver + `nvidia-smi`). This is
-/// the signal that resolves a capability's "auto" device safely: `gpus: all`
-/// hard-fails on a host without the GPU/runtime, so we only apply the GPU
-/// overlay when the card is actually present.
+/// the signal that resolves a capability's "auto" device safely: the GPU
+/// reservation hard-fails on a host without the GPU/runtime, so we only apply
+/// the GPU overlay when the card is actually present.
 fn host_has_gpu() -> bool {
     Command::new("nvidia-smi")
         .arg("-L")
@@ -1957,9 +1963,10 @@ fn docker_compose_up(
     if publish_host_port {
         command.arg("-f").arg("compose.host-ports.yaml");
     }
-    // GPU overlay last so its `gpus: all` + device=cuda win. Only applied when
-    // the caller resolved Auto to "use the GPU" AND the overlay exists, so a
-    // GPU-less host (where `gpus: all` would hard-fail) stays on the CPU base.
+    // GPU overlay last so its device reservation + device=cuda win. Only
+    // applied when the caller resolved Auto to "use the GPU" AND the overlay
+    // exists, so a GPU-less host (where the reservation would hard-fail) stays
+    // on the CPU base.
     if gpu {
         command.arg("-f").arg("compose.gpu.yaml");
     }
