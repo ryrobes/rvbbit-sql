@@ -432,6 +432,8 @@ fn guc_setting(name: &str) -> Option<String> {
 /// Returns BTreeMap so iteration order is deterministic across calls (helps
 /// when registering many tables — DataFusion order can shift planning).
 fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTable>, String> {
+    // Cross-backend: flush stale caches if another backend compacted.
+    crate::custom_scan::refresh_caches_if_stale();
     // SPI returns plain Datums; we copy into a Vec so the borrow ends before
     // we leave the SPI scope.
     struct Row {

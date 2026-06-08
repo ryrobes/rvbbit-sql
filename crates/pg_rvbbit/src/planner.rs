@@ -61,6 +61,11 @@ pub fn invalidate_planner_aggregates(oid: u32) {
     AGG_CACHE.with(|c| c.borrow_mut().remove(&oid));
 }
 
+/// Drop ALL cached aggregate estimates (cross-backend epoch flush).
+pub fn invalidate_planner_aggregates_all() {
+    AGG_CACHE.with(|c| c.borrow_mut().clear());
+}
+
 /// Wrapper to make `CustomPathMethods` (which contains raw fn pointers)
 /// usable in a `static`. Static items in Rust must be `Sync`; raw pointers
 /// aren't `Sync` by default. The methods table is read-only after init
@@ -440,6 +445,7 @@ fn sum_row_group_bytes(oid: u32) -> f64 {
 /// always asks for both on the same plan, and one SPI returning two
 /// columns is meaningfully cheaper than two SPIs.
 fn aggregate_for_oid(oid: u32) -> (f64, f64) {
+    crate::custom_scan::refresh_caches_if_stale();
     if let Some(cached) = AGG_CACHE.with(|c| c.borrow().get(&oid).copied()) {
         return cached;
     }

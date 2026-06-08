@@ -3231,6 +3231,7 @@ fn fetch_row_group_paths(
     variant_layout: Option<&str>,
     asof: Option<i64>,
 ) -> Result<Vec<RowGroupEntry>, String> {
+    refresh_caches_if_stale();
     let mut out = Vec::new();
     // Phase 2 slice 3: when AS OF is set, narrow row groups to those at
     // generation <= asof. With no AS OF (latest view), apply the snapshot
@@ -3379,6 +3380,30 @@ pub fn invalidate_scan_metadata(oid: u32) {
         let mut cache = c.borrow_mut();
         cache.retain(|key, _| key.table_oid != oid);
     });
+}
+
+thread_local! {
+    /// Highest scan epoch this backend has reconciled against. Compared to the
+    /// shmem global epoch at scan setup to detect compactions in OTHER backends.
+    static LAST_SCAN_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Cross-backend cache coherence: if ANY backend has compacted since we last
+/// checked, flush this backend's per-backend scan caches (row-group paths,
+/// variant layouts, planner aggregates, df registration) so a pooled connection
+/// (e.g. the UI) doesn't keep serving the pre-compact view. Cheap — one shared
+/// atomic load; a no-op when the epoch is unchanged. Columnar batch caches are
+/// content-addressed by path+mtime, so they stay valid and aren't flushed.
+pub fn refresh_caches_if_stale() {
+    let cur = crate::live_counters::scan_epoch();
+    if LAST_SCAN_EPOCH.with(|c| c.get()) == cur {
+        return;
+    }
+    VARIANT_LAYOUTS_CACHE.with(|c| c.borrow_mut().clear());
+    ROW_GROUP_PATHS_CACHE.with(|c| c.borrow_mut().clear());
+    crate::planner::invalidate_planner_aggregates_all();
+    crate::df::invalidate_registration();
+    LAST_SCAN_EPOCH.with(|c| c.set(cur));
 }
 
 /// Per-backend cache statistics. Surface this from SQL via

@@ -1011,6 +1011,9 @@ fn export_to_parquet_impl(
     crate::planner::invalidate_planner_aggregates(rel_oid);
     crate::columnar_cache::invalidate_table(rel_oid);
     crate::df::invalidate_registration();
+    // Cross-backend: tell OTHER backends (e.g. pooled UI connections) their scan
+    // caches are stale so they don't keep serving the pre-compact row groups.
+    crate::live_counters::bump_scan_epoch();
 
     Ok(total_rows)
 }
@@ -1349,6 +1352,7 @@ fn refresh_layout_variants_impl(
     crate::planner::invalidate_planner_aggregates(rel_oid);
     crate::custom_scan::invalidate_scan_metadata(rel_oid);
     crate::columnar_cache::invalidate_table(rel_oid);
+    crate::live_counters::bump_scan_epoch();
 
     Ok(rows_written)
 }
@@ -1494,6 +1498,7 @@ fn refresh_layout_variants_delta_impl(
     crate::planner::invalidate_planner_aggregates(rel_oid);
     crate::custom_scan::invalidate_scan_metadata(rel_oid);
     crate::columnar_cache::invalidate_table(rel_oid);
+    crate::live_counters::bump_scan_epoch();
 
     Ok(rows_written)
 }

@@ -21,9 +21,10 @@
 //! Requires `pg_rvbbit` in `shared_preload_libraries` (it is) so `_PG_init`
 //! runs in the postmaster and the shmem segment is actually allocated.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use pgrx::prelude::*;
+use pgrx::atomics::PgAtomic;
 use pgrx::lwlock::PgLwLock;
 use pgrx::shmem::PGRXSharedMemory;
 
@@ -61,6 +62,17 @@ const EMPTY_SLOT: Slot = Slot { pid: 0, stmt_start: 0, ops: [EMPTY_OP; NOPS] };
 
 static LIVE: PgLwLock<[Slot; NSLOTS]> = unsafe { PgLwLock::new(c"rvbbit_live_call_counts") };
 
+/// Cross-backend scan-cache epoch. Any backend that mutates a table's row groups
+/// (compact / snapshot_load) bumps this; every backend cheaply compares it to its
+/// last-seen value at scan setup and flushes its per-backend scan caches when it
+/// moved. Without this, a long-lived pooled connection (e.g. the UI) keeps
+/// serving stale row-group paths after a sync runs in a *different* backend —
+/// the per-backend `invalidate_scan_metadata` only reaches the backend that did
+/// the compaction. A global counter (not per-table) keeps it lock-free + simple;
+/// the cost is that any compaction flushes other backends' whole path cache,
+/// which repopulates on the next query.
+static SCAN_EPOCH: PgAtomic<AtomicU64> = unsafe { PgAtomic::new(c"rvbbit_scan_epoch") };
+
 /// True only once the shmem startup hook has actually run (i.e. the extension
 /// was preloaded so the segment exists). When false — e.g. a non-preloaded test
 /// instance — `tick`/`live_call_counts` no-op instead of panicking on an
@@ -72,12 +84,30 @@ static SHMEM_READY: AtomicBool = AtomicBool::new(false);
 /// the shmem *startup* hook, so it fires only when the segment is truly
 /// allocated — exactly when it's safe to flip `SHMEM_READY`.
 pub fn register_shmem() {
+    pgrx::pg_shmem_init!(SCAN_EPOCH);
     pgrx::pg_shmem_init!(
         LIVE = {
             SHMEM_READY.store(true, Ordering::SeqCst);
             [EMPTY_SLOT; NSLOTS]
         }
     );
+}
+
+/// Bump the cross-backend scan epoch (call after row groups change). No-op until
+/// shmem is ready (non-preloaded test instances).
+pub fn bump_scan_epoch() {
+    if !SHMEM_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    SCAN_EPOCH.get().fetch_add(1, Ordering::SeqCst);
+}
+
+/// Current cross-backend scan epoch (0 when shmem isn't ready).
+pub fn scan_epoch() -> u64 {
+    if !SHMEM_READY.load(Ordering::Relaxed) {
+        return 0;
+    }
+    SCAN_EPOCH.get().load(Ordering::SeqCst)
 }
 
 /// Fixed-width key for an operator name (truncated to NAMELEN, NUL-padded).
