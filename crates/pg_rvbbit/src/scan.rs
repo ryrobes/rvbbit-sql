@@ -146,7 +146,7 @@ fn lookup_paths_for_oid(rel_oid: u32) -> Result<Vec<PathBuf>, String> {
         let table = client
             .select(
                 &format!(
-                    "SELECT path FROM rvbbit.row_groups \
+                    "SELECT path FROM rvbbit.row_groups_visible \
                      WHERE table_oid = {rel_oid}::oid \
                      ORDER BY rg_id"
                 ),
@@ -172,7 +172,7 @@ fn lookup_paths_for_oid_with_ids(rel_oid: u32) -> Result<Vec<IndexedRowGroupPath
         let table = client
             .select(
                 &format!(
-                    "SELECT rg_id, path, n_rows FROM rvbbit.row_groups \
+                    "SELECT rg_id, path, n_rows FROM rvbbit.row_groups_visible \
                      WHERE table_oid = {rel_oid}::oid \
                      ORDER BY rg_id"
                 ),
@@ -344,7 +344,7 @@ fn int_column_range_width(rel_oid: u32, col: &str) -> Option<i64> {
     let col_esc = col.replace('\'', "''");
     let sql = format!(
         "SELECT min((s->>'min')::bigint), max((s->>'max')::bigint) \
-         FROM rvbbit.row_groups, jsonb_array_elements(stats) AS s \
+         FROM rvbbit.row_groups_visible, jsonb_array_elements(stats) AS s \
          WHERE table_oid = {rel_oid}::oid AND s->>'name' = '{col_esc}' \
            AND s->>'min' IS NOT NULL AND s->>'max' IS NOT NULL"
     );
