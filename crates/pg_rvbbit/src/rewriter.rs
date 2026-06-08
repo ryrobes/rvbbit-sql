@@ -583,6 +583,9 @@ fn native_rewrite_table_signature(table_oid: u32) -> Option<NativeRewriteTableSi
             return None;
         }
     }
+    if guc_setting("rvbbit.as_of_timestamp").is_some_and(|v| !v.trim().is_empty()) {
+        return None;
+    }
     let sql = format!(
         "SELECT rg.row_group_count, rg.max_rg_id, rg.max_generation, \
                 rg.total_rows, rg.total_bytes, \
@@ -9842,6 +9845,9 @@ fn metadata_rewrites_unsafe_for_correctness() -> bool {
                 return true;
             }
         }
+    }
+    if guc_setting("rvbbit.as_of_timestamp").is_some_and(|v| !v.trim().is_empty()) {
+        return true;
     }
     // Existence guard: PG parses BOTH branches of a CASE at plan time, so
     // a single CASE-guarded EXISTS still fails when rvbbit.delete_log

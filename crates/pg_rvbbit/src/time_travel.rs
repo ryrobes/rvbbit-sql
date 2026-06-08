@@ -71,6 +71,14 @@ pub(crate) fn active_as_of() -> Option<AsOf> {
     if let Some(ts) = STATEMENT_AS_OF_TIMESTAMP.with(|slot| slot.borrow().clone()) {
         return Some(AsOf::Timestamp(ts));
     }
+    // The `rvbbit.as_of_timestamp` GUC (settable via SET LOCAL) is the
+    // statement-comment's session/txn-scoped twin — it survives into NESTED
+    // execution (the comment directive only reaches the outermost statement), so
+    // rvbbit.metric() and the lens can pin data-time around dynamic SQL. Resolved
+    // per-table like the comment.
+    if let Some(ts) = read_timestamp_guc() {
+        return Some(AsOf::Timestamp(ts));
+    }
     read_generation_guc().map(AsOf::Generation)
 }
 
@@ -191,6 +199,20 @@ fn read_generation_guc() -> Option<i64> {
         return None;
     }
     trimmed.parse::<i64>().ok().filter(|&g| g > 0)
+}
+
+fn read_timestamp_guc() -> Option<String> {
+    let cname = CString::new("rvbbit.as_of_timestamp").ok()?;
+    let ptr = unsafe { pg_sys::GetConfigOption(cname.as_ptr(), true, false) };
+    if ptr.is_null() {
+        return None;
+    }
+    let trimmed = unsafe { CStr::from_ptr(ptr).to_string_lossy() }.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn query_string_asof_timestamp(query_string: *const std::ffi::c_char) -> Option<String> {
