@@ -5830,6 +5830,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.metric_defs (
     description  text,
     owner        text,
     labels       jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    check_sql    text,
     created_at   timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (name, version)
 );
@@ -5839,7 +5840,7 @@ CREATE INDEX IF NOT EXISTS metric_defs_name_created_idx
 
 CREATE OR REPLACE VIEW rvbbit.metric_catalog AS
 SELECT DISTINCT ON (name)
-    name, version, sql, params, grain, description, owner, labels, created_at
+    name, version, sql, params, grain, description, owner, labels, check_sql, created_at
 FROM rvbbit.metric_defs
 ORDER BY name, created_at DESC, version DESC;
 
@@ -5850,7 +5851,8 @@ CREATE OR REPLACE FUNCTION rvbbit.define_metric(
     p_grain       text  DEFAULT NULL,
     p_description text  DEFAULT NULL,
     p_owner       text  DEFAULT NULL,
-    p_labels      jsonb DEFAULT '{}'::jsonb
+    p_labels      jsonb DEFAULT '{}'::jsonb,
+    p_check       text  DEFAULT NULL
 ) RETURNS integer
 LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -5866,10 +5868,11 @@ BEGIN
     SELECT coalesce(max(version), 0) + 1 INTO v_version
     FROM rvbbit.metric_defs WHERE name = p_name;
     INSERT INTO rvbbit.metric_defs
-        (name, version, sql, params, grain, description, owner, labels)
+        (name, version, sql, params, grain, description, owner, labels, check_sql)
     VALUES
         (p_name, v_version, p_sql, coalesce(p_params, '{}'::jsonb), p_grain,
-         p_description, p_owner, coalesce(p_labels, '{}'::jsonb));
+         p_description, p_owner, coalesce(p_labels, '{}'::jsonb),
+         CASE WHEN btrim(coalesce(p_check, '')) = '' THEN NULL ELSE p_check END);
     RETURN v_version;
 END;
 $fn$;
@@ -5964,9 +5967,14 @@ DECLARE
 BEGIN
     v_sql := rvbbit.metric_sql(p_name, p_params, p_def_as_of);
 
+    -- Pin an EXPLICIT instant for "latest" (now()) rather than leaving it empty:
+    -- the implicit latest-snapshot floor is only applied to top-level scans, but
+    -- a metric body runs nested in a subquery. An explicit AS OF is read by every
+    -- scan via the GUC, so the floor reaches the nested table. now() == latest for
+    -- both snapshot (= latest gen) and append (<= now() = cumulative) tables.
     v_saved := current_setting('rvbbit.as_of_timestamp', true);
     PERFORM set_config('rvbbit.as_of_timestamp',
-                       coalesce(p_data_as_of::text, ''), true);
+                       coalesce(p_data_as_of::text, now()::text), true);
 
     BEGIN
         RETURN QUERY EXECUTE 'SELECT to_jsonb(t) FROM (' || v_sql || ') AS t';
@@ -5982,9 +5990,9 @@ $fn$;
 
 CREATE OR REPLACE FUNCTION rvbbit.metric_versions(p_name text)
 RETURNS TABLE(version integer, created_at timestamptz, sql text, params jsonb,
-              grain text, description text, owner text)
+              grain text, description text, owner text, check_sql text)
 LANGUAGE sql STABLE AS $fn$
-    SELECT version, created_at, sql, params, grain, description, owner
+    SELECT version, created_at, sql, params, grain, description, owner, check_sql
     FROM rvbbit.metric_defs
     WHERE name = p_name
     ORDER BY version DESC;
@@ -6036,6 +6044,131 @@ BEGIN
     END IF;
 
     RETURN v_sql;
+END;
+$fn$;
+
+-- =====================================================================
+-- KPI checks: a metric becomes a KPI when its def carries a `check_sql`.
+-- The check runs against the metric's result exposed as a CTE named `metric`
+-- and must reduce to exactly ONE verdict row yielding an `ok` boolean (and
+-- optionally status/value/target/...). Thresholds are {param} tokens — versioned
+-- defaults, overridable per call. Because check_sql lives on the versioned def
+-- row, the threshold is bitemporal: def_as_of pins the metric+check+threshold,
+-- data_as_of pins the data.
+-- =====================================================================
+
+-- Compose + evaluate an already-resolved metric body + check body. Returns the
+-- single verdict jsonb (NULL when there is no check).
+CREATE OR REPLACE FUNCTION rvbbit._run_check(
+    p_metric_sql text,
+    p_check_sql  text,
+    p_data_as_of timestamptz
+) RETURNS jsonb
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_full    text;
+    v_verdict jsonb;
+    v_saved   text;
+BEGIN
+    IF p_check_sql IS NULL OR btrim(p_check_sql) = '' THEN
+        RETURN NULL;
+    END IF;
+
+    v_full := 'WITH metric AS (' || p_metric_sql || E'\n) ' || p_check_sql;
+
+    -- Explicit instant for "latest" (now()) so the snapshot floor reaches the
+    -- nested `metric` CTE — see rvbbit.metric() for why empty doesn't suffice.
+    v_saved := current_setting('rvbbit.as_of_timestamp', true);
+    PERFORM set_config('rvbbit.as_of_timestamp', coalesce(p_data_as_of::text, now()::text), true);
+
+    BEGIN
+        EXECUTE 'SELECT to_jsonb(t) FROM (' || v_full || ') t' INTO STRICT v_verdict;
+    EXCEPTION
+        WHEN TOO_MANY_ROWS THEN
+            PERFORM set_config('rvbbit.as_of_timestamp', coalesce(v_saved, ''), true);
+            RAISE EXCEPTION 'rvbbit check returned more than one row; reduce the metric CTE to a single verdict row. | SQL: %', v_full;
+        WHEN NO_DATA_FOUND THEN
+            PERFORM set_config('rvbbit.as_of_timestamp', coalesce(v_saved, ''), true);
+            RAISE EXCEPTION 'rvbbit check returned no rows. | SQL: %', v_full;
+        WHEN OTHERS THEN
+            PERFORM set_config('rvbbit.as_of_timestamp', coalesce(v_saved, ''), true);
+            RAISE EXCEPTION 'rvbbit check failed: % | SQL: %', SQLERRM, v_full;
+    END;
+
+    PERFORM set_config('rvbbit.as_of_timestamp', coalesce(v_saved, ''), true);
+
+    IF v_verdict IS NULL OR NOT (v_verdict ? 'ok') THEN
+        RAISE EXCEPTION 'rvbbit check must yield an "ok" boolean column (got: %)',
+            coalesce(v_verdict::text, 'no row');
+    END IF;
+
+    -- A NULL ok is never "pass"; attach a default pass/fail status if absent.
+    IF NOT (v_verdict ? 'status') THEN
+        v_verdict := v_verdict || jsonb_build_object(
+            'status', CASE WHEN (v_verdict->>'ok')::boolean IS TRUE THEN 'pass' ELSE 'fail' END);
+    END IF;
+
+    RETURN v_verdict;
+END;
+$fn$;
+
+-- Evaluate a SAVED metric's KPI check across the bitemporal axes. def_as_of pins
+-- the metric+check+threshold version; data_as_of pins the data. Returns NULL when
+-- the metric has no check at that def-time (i.e. it is not a KPI).
+CREATE OR REPLACE FUNCTION rvbbit.check_metric(
+    p_name       text,
+    p_params     jsonb DEFAULT '{}'::jsonb,
+    p_def_as_of  timestamptz DEFAULT now(),
+    p_data_as_of timestamptz DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_check    text;
+    v_defaults jsonb;
+    v_eff      jsonb;
+    v_msql     text;
+    v_csql     text;
+BEGIN
+    SELECT check_sql, coalesce(params, '{}'::jsonb)
+      INTO v_check, v_defaults
+    FROM rvbbit.metric_defs
+    WHERE name = p_name AND created_at <= p_def_as_of
+    ORDER BY created_at DESC, version DESC
+    LIMIT 1;
+
+    IF v_check IS NULL OR btrim(v_check) = '' THEN
+        RETURN NULL;
+    END IF;
+
+    -- The threshold defaults live in the metric def's params; merge them under
+    -- the caller's overrides so {target} etc. resolve in the check too.
+    v_eff := v_defaults || coalesce(p_params, '{}'::jsonb);
+    v_msql := rvbbit.metric_sql(p_name, v_eff, p_def_as_of);
+    v_csql := rvbbit.preview_metric_sql(v_check, v_eff, p_def_as_of);
+    RETURN rvbbit._run_check(v_msql, v_csql, p_data_as_of);
+END;
+$fn$;
+
+-- Preview a DRAFT check (Creator): inline metric + check bodies, resolve tokens
+-- against the saved catalog, evaluate. data_as_of defaults to latest.
+CREATE OR REPLACE FUNCTION rvbbit.preview_check_sql(
+    p_metric_sql text,
+    p_check_sql  text,
+    p_params     jsonb DEFAULT '{}'::jsonb,
+    p_def_as_of  timestamptz DEFAULT now(),
+    p_data_as_of timestamptz DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_msql text;
+    v_csql text;
+BEGIN
+    IF p_check_sql IS NULL OR btrim(p_check_sql) = '' THEN
+        RETURN NULL;
+    END IF;
+    v_msql := rvbbit.preview_metric_sql(p_metric_sql, p_params, p_def_as_of);
+    v_csql := rvbbit.preview_metric_sql(p_check_sql, p_params, p_def_as_of);
+    RETURN rvbbit._run_check(v_msql, v_csql, p_data_as_of);
 END;
 $fn$;
 "#,
