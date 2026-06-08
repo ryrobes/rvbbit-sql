@@ -5509,12 +5509,19 @@ DECLARE
     v_action     text;
     v_job_ok     boolean;
 BEGIN
-    -- Self-healing singleton: steal a lock not heartbeated in > 1h (crashed run).
+    -- Self-healing singleton lock. Steal it when the holder is provably gone —
+    -- its backend pid is no longer active, or the lock predates this server's
+    -- start (a restart killed the holder mid-sync, e.g. a deploy) — or, as a last
+    -- resort, when it hasn't heartbeated in > 1h. Without the first two checks a
+    -- crashed/killed run wedged every subsequent run for a full hour.
     INSERT INTO rvbbit.sync_lock (id, acquired_at, pid)
     VALUES (1, clock_timestamp(), pg_backend_pid())
     ON CONFLICT (id) DO UPDATE
         SET acquired_at = clock_timestamp(), pid = pg_backend_pid()
         WHERE rvbbit.sync_lock.acquired_at < clock_timestamp() - interval '1 hour'
+           OR rvbbit.sync_lock.acquired_at <= pg_postmaster_start_time()
+           OR NOT EXISTS (SELECT 1 FROM pg_stat_activity a
+                          WHERE a.pid = rvbbit.sync_lock.pid)
     RETURNING pid INTO v_lock_pid;
     IF v_lock_pid IS DISTINCT FROM pg_backend_pid() THEN
         RAISE NOTICE 'rvbbit.run_sync is already running; skipping';
