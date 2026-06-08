@@ -3659,7 +3659,7 @@ fn numeric_stats_cache_key(table_oid: u32) -> Option<NumericStatsCacheKey> {
         "SELECT count(*)::bigint, \
                 COALESCE(max(rg_id), -1)::bigint, \
                 COALESCE(sum(n_rows), 0)::bigint \
-         FROM rvbbit.row_groups \
+         FROM rvbbit.row_groups_visible \
          WHERE table_oid = {table_oid}::oid"
     );
     let mut key = None;
@@ -3689,7 +3689,7 @@ fn load_numeric_stats_for_table(
     let att_types = fetch_att_type_map(table_oid)?;
     let sql = format!(
         "SELECT n_rows::bigint, stats::text \
-         FROM rvbbit.row_groups \
+         FROM rvbbit.row_groups_visible \
          WHERE table_oid = {table_oid}::oid \
          ORDER BY rg_id"
     );
@@ -3968,7 +3968,7 @@ fn fetch_i64_stat_aggregate(
     let sql = format!(
         "WITH vals AS ( \
              SELECT (s->>'{stat_name}')::bigint AS v \
-             FROM rvbbit.row_groups, jsonb_array_elements(stats) AS s \
+             FROM rvbbit.row_groups_visible, jsonb_array_elements(stats) AS s \
              WHERE table_oid = {table_oid}::oid AND s->>'name' = '{col_esc}' \
                    AND s->'{stat_name}' IS NOT NULL \
                    AND jsonb_typeof(s->'{stat_name}') <> 'null' \
@@ -9713,7 +9713,7 @@ fn estimate_relation_rows(table_oid: u32) -> i64 {
     // For rvbbit tables, prefer the exact row count from row_groups.
     let from_rg = format!(
         "SELECT coalesce(sum(n_rows), 0)::bigint \
-         FROM rvbbit.row_groups WHERE table_oid = {table_oid}::oid"
+         FROM rvbbit.row_groups_visible WHERE table_oid = {table_oid}::oid"
     );
     if let Ok(Some(n)) = pgrx::Spi::get_one::<i64>(&from_rg) {
         if n > 0 {
@@ -9799,7 +9799,7 @@ fn fetch_row_group_row_count(table_oid: u32) -> Option<i64> {
     }
     let sql = format!(
         "SELECT coalesce(sum(n_rows), 0)::bigint \
-         FROM rvbbit.row_groups WHERE table_oid = {table_oid}::oid"
+         FROM rvbbit.row_groups_visible WHERE table_oid = {table_oid}::oid"
     );
     let result: Result<Option<i64>, _> = pgrx::Spi::get_one(&sql);
     let n = result.ok().flatten().unwrap_or(0);

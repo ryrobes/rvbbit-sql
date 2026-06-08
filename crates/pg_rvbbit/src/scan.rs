@@ -1275,7 +1275,7 @@ pub(crate) fn group_count_map(
 
     let sql = format!(
         "SELECT per_group_stats::text \
-         FROM rvbbit.row_groups \
+         FROM rvbbit.row_groups_visible \
          WHERE table_oid = {rel_oid}::oid"
     );
     let mut out: HashMap<Option<String>, i64> = HashMap::default();
@@ -5938,7 +5938,7 @@ fn group_count_cache_key(
         "SELECT count(*)::bigint, \
                 COALESCE(max(rg_id), -1)::bigint, \
                 COALESCE(sum(n_rows), 0)::bigint \
-         FROM rvbbit.row_groups \
+         FROM rvbbit.row_groups_visible \
          WHERE table_oid = {rel_oid}::oid"
     );
     let mut key = None;
@@ -6118,7 +6118,7 @@ fn rg_count_stop_reasons(
 fn agg_count(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>> {
     let rel_oid = rel.to_u32();
     let n: Option<i64> = Spi::get_one(&format!(
-        "SELECT sum(n_rows)::bigint FROM rvbbit.row_groups WHERE table_oid = {rel_oid}::oid"
+        "SELECT sum(n_rows)::bigint FROM rvbbit.row_groups_visible WHERE table_oid = {rel_oid}::oid"
     ))?;
     Ok(n.unwrap_or(0))
 }
@@ -6136,7 +6136,7 @@ fn agg_count_nonnull(rel: pg_sys::Oid, col: &str) -> Result<i64, Box<dyn std::er
                  WHERE s->>'name' = '{col_esc}'\
              )), 0) \
          )::bigint \
-         FROM rvbbit.row_groups WHERE table_oid = {rel_oid}::oid"
+         FROM rvbbit.row_groups_visible WHERE table_oid = {rel_oid}::oid"
     ))?;
     Ok(n.unwrap_or(0))
 }
@@ -6152,7 +6152,7 @@ fn agg_min(rel: pg_sys::Oid, col: &str) -> Result<Option<pgrx::JsonB>, Box<dyn s
     let sql = format!(
         "WITH vals AS ( \
              SELECT (s->'min') AS v \
-             FROM rvbbit.row_groups, jsonb_array_elements(stats) AS s \
+             FROM rvbbit.row_groups_visible, jsonb_array_elements(stats) AS s \
              WHERE table_oid = {rel_oid}::oid AND s->>'name' = '{col_esc}' \
                    AND s->'min' IS NOT NULL AND jsonb_typeof(s->'min') <> 'null' \
          ) \
@@ -6170,7 +6170,7 @@ fn agg_max(rel: pg_sys::Oid, col: &str) -> Result<Option<pgrx::JsonB>, Box<dyn s
     let sql = format!(
         "WITH vals AS ( \
              SELECT (s->'max') AS v \
-             FROM rvbbit.row_groups, jsonb_array_elements(stats) AS s \
+             FROM rvbbit.row_groups_visible, jsonb_array_elements(stats) AS s \
              WHERE table_oid = {rel_oid}::oid AND s->>'name' = '{col_esc}' \
                    AND s->'max' IS NOT NULL AND jsonb_typeof(s->'max') <> 'null' \
          ) \
@@ -6248,7 +6248,7 @@ fn agg_groupby_sum(
         "SELECT \
              COALESCE(b->>'value', NULL) AS gv, \
              sum(((b->'agg'->'{a_esc}'->>'sum')::float8))::float8 AS s \
-         FROM rvbbit.row_groups, \
+         FROM rvbbit.row_groups_visible, \
               jsonb_array_elements(per_group_stats) AS blk, \
               jsonb_array_elements(blk->'groups') AS b \
          WHERE table_oid = {rel_oid}::oid \
@@ -6290,7 +6290,7 @@ fn agg_groupby_avg(
                   THEN sum(((b->'agg'->'{a_esc}'->>'sum')::float8)) \
                        / sum(((b->'agg'->'{a_esc}'->>'count_nonnull')::bigint))::float8 \
                   ELSE NULL END AS a \
-         FROM rvbbit.row_groups, \
+         FROM rvbbit.row_groups_visible, \
               jsonb_array_elements(per_group_stats) AS blk, \
               jsonb_array_elements(blk->'groups') AS b \
          WHERE table_oid = {rel_oid}::oid \

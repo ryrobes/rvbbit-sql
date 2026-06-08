@@ -106,6 +106,18 @@ CREATE TABLE rvbbit.row_groups (
 	CREATE INDEX row_groups_table_generation_idx
 	    ON rvbbit.row_groups (table_oid, generation);
 
+	-- Floor-aware view: only generations visible under each table's snapshot floor
+	-- (min_visible_generation). SNAPSHOT table => just the latest generation;
+	-- APPEND table (floor 0) => every generation. The metadata fast paths
+	-- (count/sum/min/max/groupby answered from row-group stats without scanning)
+	-- read THIS instead of rvbbit.row_groups, so they never sum across hidden
+	-- generations. Diagnostic/maintenance queries keep using rvbbit.row_groups.
+	CREATE OR REPLACE VIEW rvbbit.row_groups_visible AS
+	SELECT rg.*
+	FROM rvbbit.row_groups rg
+	JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
+	WHERE rg.generation >= t.min_visible_generation;
+
 	CREATE TABLE rvbbit.group_stats (
 	    table_oid        oid NOT NULL,
 	    rg_id            bigint NOT NULL,
