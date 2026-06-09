@@ -10915,6 +10915,2770 @@
         "manifest_path": "mcp/github",
         "catalog_visibility": "public"
       }
+    },
+    {
+      "capability_manifest": {
+        "kind": "mcp",
+        "name": "apollo",
+        "tools": [
+          {
+            "name": "apollo_bulk_enrich_organizations",
+            "cacheable": false,
+            "description": "Bulk enrich multiple organizations using Apollo match. Provide an array of organizations with domain or name.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "organizations"
+              ],
+              "properties": {
+                "organizations": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "domain": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "name": "apollo_bulk_enrich_people",
+            "cacheable": false,
+            "description": "Bulk enrich multiple people using Apollo match. Provide an array of people with email, linkedin_url, name, or company.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "people"
+              ],
+              "properties": {
+                "people": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "email": {
+                        "type": "string",
+                        "format": "email",
+                        "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+                      },
+                      "company": {
+                        "type": "string"
+                      },
+                      "linkedin_url": {
+                        "type": "string",
+                        "format": "uri"
+                      }
+                    }
+                  }
+                },
+                "reveal_phone_number": {
+                  "type": "boolean",
+                  "description": "Reveal phone numbers (default: false)"
+                },
+                "reveal_personal_emails": {
+                  "type": "boolean",
+                  "description": "Reveal personal emails (default: false)"
+                }
+              }
+            }
+          },
+          {
+            "name": "apollo_enrich_company",
+            "cacheable": false,
+            "description": "Enrich a company/organization by domain or name using Apollo match.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "domain": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "name": "apollo_enrich_person",
+            "cacheable": false,
+            "description": "Enrich a person by email, linkedin_url, or name+company using Apollo match.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "email": {
+                  "type": "string",
+                  "format": "email",
+                  "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+                },
+                "company": {
+                  "type": "string"
+                },
+                "linkedin_url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "reveal_phone_number": {
+                  "type": "boolean",
+                  "description": "Reveal phone numbers (default: false)"
+                },
+                "reveal_personal_emails": {
+                  "type": "boolean",
+                  "description": "Reveal personal emails (default: false)"
+                }
+              }
+            }
+          },
+          {
+            "name": "apollo_get_complete_organization_info",
+            "cacheable": false,
+            "description": "Get complete information for a specific organization by organization ID.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "organization_id"
+              ],
+              "properties": {
+                "organization_id": {
+                  "type": "string",
+                  "description": "The Apollo organization ID"
+                }
+              }
+            }
+          },
+          {
+            "name": "apollo_get_organization_job_postings",
+            "cacheable": false,
+            "description": "Get job postings for a specific organization by organization ID.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "organization_id"
+              ],
+              "properties": {
+                "organization_id": {
+                  "type": "string",
+                  "description": "The Apollo organization ID"
+                }
+              }
+            }
+          },
+          {
+            "name": "apollo_search_companies",
+            "cacheable": false,
+            "description": "Search for companies/organizations in Apollo with comprehensive filtering options. Use filters to target specific company types, locations, sizes, and industries.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "page": {
+                  "type": "number",
+                  "description": "Page number (default: 1)"
+                },
+                "query": {
+                  "type": "string",
+                  "description": "Search query for company names, industries, or keywords"
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "revenue_range": {
+                      "type": "object",
+                      "properties": {
+                        "max": {
+                          "type": "number"
+                        },
+                        "min": {
+                          "type": "number"
+                        }
+                      },
+                      "description": "Revenue range in dollars (no commas/symbols)"
+                    },
+                    "q_organization_name": {
+                      "type": "string",
+                      "description": "Specific company name filter"
+                    },
+                    "total_funding_range": {
+                      "type": "object",
+                      "properties": {
+                        "max": {
+                          "type": "number"
+                        },
+                        "min": {
+                          "type": "number"
+                        }
+                      },
+                      "description": "Total funding amount range"
+                    },
+                    "organization_locations": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Company locations (cities, states, countries). Most effective filter for narrowing results."
+                    },
+                    "q_organization_job_titles": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Job titles in active postings"
+                    },
+                    "organization_job_locations": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Job posting locations"
+                    },
+                    "organization_not_locations": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Exclude companies from specific locations"
+                    },
+                    "latest_funding_amount_range": {
+                      "type": "object",
+                      "properties": {
+                        "max": {
+                          "type": "number"
+                        },
+                        "min": {
+                          "type": "number"
+                        }
+                      },
+                      "description": "Latest funding round amount range"
+                    },
+                    "organization_num_jobs_range": {
+                      "type": "object",
+                      "properties": {
+                        "max": {
+                          "type": "number"
+                        },
+                        "min": {
+                          "type": "number"
+                        }
+                      },
+                      "description": "Number of active job postings range"
+                    },
+                    "q_organization_keyword_tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Industry keywords for filtering (e.g., ['edtech', 'saas', 'fintech']). Essential for industry targeting."
+                    },
+                    "organization_num_employees_ranges": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Employee count ranges in comma format (e.g., ['11,20', '21,50']). Very restrictive - may return 0 results if too narrow."
+                    },
+                    "currently_using_any_of_technology_uids": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Technologies companies use (e.g., ['salesforce', 'aws', 'react'])"
+                    }
+                  },
+                  "description": "Advanced filtering options. Start with location + keywords for best results."
+                },
+                "per_page": {
+                  "type": "number",
+                  "description": "Results per page (1-200, default: 25)"
+                }
+              }
+            }
+          },
+          {
+            "name": "apollo_search_news_articles",
+            "cacheable": false,
+            "description": "Search for news articles related to companies in Apollo. Supports 'query', 'filters', pagination.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "page": {
+                  "type": "number"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "filters": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                },
+                "per_page": {
+                  "type": "number"
+                }
+              }
+            }
+          },
+          {
+            "name": "apollo_search_people",
+            "cacheable": false,
+            "description": "Search for people in Apollo with advanced filtering options. Use filters to target specific roles, locations, seniority levels, and companies.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "page": {
+                  "type": "number",
+                  "description": "Page number (default: 1)"
+                },
+                "query": {
+                  "type": "string",
+                  "description": "Search query for names, titles, or keywords"
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "titles": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Job titles (e.g., ['CEO', 'CTO', 'Sales Manager'])"
+                    },
+                    "locations": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Person locations (cities, states, countries)"
+                    },
+                    "seniority": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Seniority levels (e.g., ['C-Level', 'VP', 'Director'])"
+                    },
+                    "industries": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Industries (e.g., ['Software', 'Healthcare', 'Finance'])"
+                    },
+                    "departments": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Departments (e.g., ['Engineering', 'Sales', 'Marketing'])"
+                    },
+                    "technologies": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Technologies they use (e.g., ['python', 'react', 'salesforce'])"
+                    },
+                    "company_names": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Company names"
+                    },
+                    "company_domains": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Company domains (e.g., ['google.com', 'microsoft.com'])"
+                    },
+                    "education_degrees": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Education degrees (e.g., ['MBA', 'PhD', 'Bachelor'])"
+                    },
+                    "education_schools": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Education institutions"
+                    },
+                    "years_of_experience": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Experience ranges (e.g., ['1-3', '4-6', '7-10'])"
+                    }
+                  },
+                  "description": "Advanced filtering options for targeting specific people"
+                },
+                "per_page": {
+                  "type": "number",
+                  "description": "Results per page (1-200, default: 25)"
+                }
+              }
+            }
+          }
+        ],
+        "secrets": [
+          {
+            "help": "",
+            "link": "",
+            "name": "APOLLO_API_KEY",
+            "label": "APOLLO_API_KEY",
+            "secret": true,
+            "env_var": "APOLLO_API_KEY",
+            "required": true
+          }
+        ],
+        "surface": {
+          "n_tools": 9,
+          "n_resources": 0
+        },
+        "operators": [
+          {
+            "name": "apollo_bulk_enrich_organizations",
+            "shape": "scalar",
+            "arg_names": [
+              "organizations"
+            ],
+            "arg_types": [
+              "jsonb"
+            ],
+            "description": "Bulk enrich multiple organizations using Apollo match. Provide an array of organizations with domain or name.",
+            "return_type": "text"
+          },
+          {
+            "name": "apollo_bulk_enrich_people",
+            "shape": "scalar",
+            "arg_names": [
+              "people",
+              "reveal_personal_emails",
+              "reveal_phone_number"
+            ],
+            "arg_types": [
+              "jsonb",
+              "boolean",
+              "boolean"
+            ],
+            "description": "Bulk enrich multiple people using Apollo match. Provide an array of people with email, linkedin_url, name, or company.",
+            "return_type": "text"
+          },
+          {
+            "name": "apollo_enrich_company",
+            "shape": "scalar",
+            "arg_names": [
+              "domain",
+              "name"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Enrich a company/organization by domain or name using Apollo match.",
+            "return_type": "text"
+          },
+          {
+            "name": "apollo_enrich_person",
+            "shape": "scalar",
+            "arg_names": [
+              "company",
+              "email",
+              "linkedin_url",
+              "name",
+              "reveal_personal_emails",
+              "reveal_phone_number"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "boolean",
+              "boolean"
+            ],
+            "description": "Enrich a person by email, linkedin_url, or name+company using Apollo match.",
+            "return_type": "text"
+          },
+          {
+            "name": "apollo_get_complete_organization_info",
+            "shape": "scalar",
+            "arg_names": [
+              "organization_id"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get complete information for a specific organization by organization ID.",
+            "return_type": "text"
+          },
+          {
+            "name": "apollo_get_organization_job_postings",
+            "shape": "scalar",
+            "arg_names": [
+              "organization_id"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get job postings for a specific organization by organization ID.",
+            "return_type": "text"
+          },
+          {
+            "name": "apollo_search_companies",
+            "shape": "scalar",
+            "arg_names": [
+              "filters",
+              "page",
+              "per_page",
+              "query"
+            ],
+            "arg_types": [
+              "jsonb",
+              "double precision",
+              "double precision",
+              "text"
+            ],
+            "description": "Search for companies/organizations in Apollo with comprehensive filtering options. Use filters to target specific company types, locations, sizes, and industries.",
+            "return_type": "text"
+          },
+          {
+            "name": "apollo_search_news_articles",
+            "shape": "scalar",
+            "arg_names": [
+              "filters",
+              "page",
+              "per_page",
+              "query"
+            ],
+            "arg_types": [
+              "jsonb",
+              "double precision",
+              "double precision",
+              "text"
+            ],
+            "description": "Search for news articles related to companies in Apollo. Supports 'query', 'filters', pagination.",
+            "return_type": "text"
+          },
+          {
+            "name": "apollo_search_people",
+            "shape": "scalar",
+            "arg_names": [
+              "filters",
+              "page",
+              "per_page",
+              "query"
+            ],
+            "arg_types": [
+              "jsonb",
+              "double precision",
+              "double precision",
+              "text"
+            ],
+            "description": "Search for people in Apollo with advanced filtering options. Use filters to target specific roles, locations, seniority levels, and companies.",
+            "return_type": "text"
+          }
+        ],
+        "resources": [],
+        "connection": {
+          "env": {
+            "APOLLO_API_KEY": "${APOLLO_API_KEY}"
+          },
+          "args": [
+            "-y",
+            "@thevgergroup/apollo-io-mcp"
+          ],
+          "command": "npx",
+          "transport": "stdio",
+          "timeout_ms": 60000
+        },
+        "scanned_at": "2026-06-09T23:13:35.906286+00:00",
+        "description": "Apollo.io — B2B people/company search + firmographic enrichment. Needs APOLLO_API_KEY (paid plan)."
+      },
+      "catalog_entry": {
+        "id": "mcp/apollo",
+        "kind": "mcp",
+        "name": "apollo",
+        "tags": [
+          "mcp",
+          "sales",
+          "enrichment",
+          "firmographics",
+          "crm"
+        ],
+        "title": "Apollo.io (B2B Enrichment)",
+        "operators": [
+          "apollo_bulk_enrich_organizations",
+          "apollo_bulk_enrich_people",
+          "apollo_enrich_company",
+          "apollo_enrich_person",
+          "apollo_get_complete_organization_info",
+          "apollo_get_organization_job_postings",
+          "apollo_search_companies",
+          "apollo_search_news_articles",
+          "apollo_search_people"
+        ],
+        "description": "Apollo.io — B2B people/company search + firmographic enrichment. Needs APOLLO_API_KEY (paid plan).",
+        "manifest_path": "mcp/apollo",
+        "catalog_visibility": "public"
+      }
+    },
+    {
+      "capability_manifest": {
+        "kind": "mcp",
+        "name": "exa",
+        "tools": [
+          {
+            "name": "web_fetch_exa",
+            "cacheable": false,
+            "description": "Read a webpage's full content as clean markdown. Use after web_search_exa when highlights are insufficient or to read any URL.\n\nBest for: Extracting full content from known URLs. Batch multiple URLs in one call.\nReturns: Clean text content and metadata from the page(s).",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "urls"
+              ],
+              "properties": {
+                "urls": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "URLs to read. Batch multiple URLs in one call."
+                },
+                "maxCharacters": {
+                  "type": "number",
+                  "minimum": 1,
+                  "description": "Maximum characters to extract per page (must be a positive number, default: 3000)"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "web_search_exa",
+            "cacheable": false,
+            "description": "Search the web for any topic and get clean, ready-to-use content.\n\n      Best for: Finding current information, news, facts, people, companies, or answering questions about any topic.\n      Returns: Clean text content from top search results.\n\n      Query tips: \n      describe the ideal page, not keywords. \"blog post comparing React and Vue performance\" not \"React vs Vue\".\n      Use category:people / category:company to search through Linkedin profiles / companies respectively.\n      If highlights are insufficient, follow up with web_fetch_exa on the best URLs.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "query": {
+                  "type": "string",
+                  "description": "Natural language search query. Should be a semantically rich description of the ideal page, not just keywords. Optionally include category:<type> (company, people) to focus results — e.g. 'category:people John Doe software engineer'."
+                },
+                "numResults": {
+                  "type": "number",
+                  "maximum": 100,
+                  "minimum": 1,
+                  "description": "Number of search results to return (must be a number, default: 10)."
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "secrets": [
+          {
+            "help": "",
+            "link": "",
+            "name": "EXA_API_KEY",
+            "label": "EXA_API_KEY",
+            "secret": true,
+            "env_var": "EXA_API_KEY",
+            "required": true
+          }
+        ],
+        "surface": {
+          "n_tools": 2,
+          "n_resources": 1
+        },
+        "operators": [
+          {
+            "name": "exa_web_fetch_exa",
+            "shape": "scalar",
+            "arg_names": [
+              "maxCharacters",
+              "urls"
+            ],
+            "arg_types": [
+              "double precision",
+              "jsonb"
+            ],
+            "description": "Read a webpage's full content as clean markdown. Use after web_search_exa when highlights are insufficient or to read any URL.\n\nBest for: Extracting full content from known URLs. Batch multiple URLs in one call.\nReturns: Clean text content and metadata from the page(s).",
+            "return_type": "text"
+          },
+          {
+            "name": "exa_web_search_exa",
+            "shape": "scalar",
+            "arg_names": [
+              "numResults",
+              "query"
+            ],
+            "arg_types": [
+              "double precision",
+              "text"
+            ],
+            "description": "Search the web for any topic and get clean, ready-to-use content.\n\n      Best for: Finding current information, news, facts, people, companies, or answering questions about any topic.\n      Returns: Clean text content from top search results.\n\n      Query tips: \n      describe the ideal page, not keywords. \"blog post comparing React and Vue performance\" not \"React vs Vue\".\n      Use category:people / category:company to search through Linkedin profiles / companies respectively.\n      If highlights are insufficient, follow up with web_fetch_exa on the best URLs.",
+            "return_type": "text"
+          }
+        ],
+        "resources": [
+          {
+            "uri": "exa://tools/list",
+            "name": "tools_list",
+            "mime_type": "application/json",
+            "description": "List of available Exa tools and their descriptions"
+          }
+        ],
+        "connection": {
+          "env": {
+            "EXA_API_KEY": "${EXA_API_KEY}"
+          },
+          "args": [
+            "-y",
+            "exa-mcp-server"
+          ],
+          "command": "npx",
+          "transport": "stdio",
+          "timeout_ms": 60000
+        },
+        "scanned_at": "2026-06-09T23:13:35.902245+00:00",
+        "description": "Exa — neural/semantic web search + fetch; composes with embed() for KNN. Needs EXA_API_KEY."
+      },
+      "catalog_entry": {
+        "id": "mcp/exa",
+        "kind": "mcp",
+        "name": "exa",
+        "tags": [
+          "mcp",
+          "web",
+          "search",
+          "semantic",
+          "research"
+        ],
+        "title": "Exa (Neural Search)",
+        "operators": [
+          "exa_web_fetch_exa",
+          "exa_web_search_exa"
+        ],
+        "description": "Exa — neural/semantic web search + fetch; composes with embed() for KNN. Needs EXA_API_KEY.",
+        "manifest_path": "mcp/exa",
+        "catalog_visibility": "public"
+      }
+    },
+    {
+      "capability_manifest": {
+        "kind": "mcp",
+        "name": "ipgeo",
+        "tools": [
+          {
+            "name": "bulk_lookup_ip",
+            "cacheable": false,
+            "description": "Bulk IP lookup via POST /v3/ipgeo-bulk. Paid only. Cost: 1 credit per IP for base geolocation. This MCP server accepts up to 1,000 IPs per request.\n\nUse it when multiple IPs need location or mixed IP domains. Include modules such as security or abuse add their normal per-IP credit costs. For bulk security-only checks, prefer bulk_security_check.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "ips"
+              ],
+              "properties": {
+                "ips": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 1000,
+                  "minItems": 1,
+                  "description": "Array of IPv4 and/or IPv6 addresses to look up. Minimum 1, maximum 1,000 in this MCP server. Domain names are also accepted."
+                },
+                "lang": {
+                  "type": "string",
+                  "description": "Response language code (en, de, ru, ja, fr, cn, es, cs, it, ko, fa, pt). Defaults to en."
+                },
+                "fields": {
+                  "type": "string",
+                  "description": "Comma-separated dot-path fields to return per IP (e.g. location.city,asn.organization). Reduces response size and can reduce credit cost when combined with include. If fields reference include-only modules (for example security.* or abuse.*), this server auto-adds required include modules."
+                },
+                "include": {
+                  "type": "string",
+                  "description": "Comma-separated extra modules to include per IP. Options: security (+2 credits/IP), abuse (+1 credit/IP), hostname, liveHostname, hostnameFallbackLive, user_agent, geo_accuracy, dma_code, or * for all (4 credits/IP total)."
+                },
+                "excludes": {
+                  "type": "string",
+                  "description": "Comma-separated dot-path fields to exclude per IP (e.g. currency,time_zone)."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "bulk_parse_user_agent",
+            "cacheable": false,
+            "description": "Bulk user-agent parsing via POST /v3/user-agent-bulk for up to 1,000 strings per MCP request. Paid only. Cost: 1 credit per string.\n\nUse this tool for multiple user-agent strings. For a single string, use parse_user_agent.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "uaStrings"
+              ],
+              "properties": {
+                "uaStrings": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 1000,
+                  "minItems": 1,
+                  "description": "Array of user-agent strings to parse. Minimum 1, maximum 1,000 in this MCP server."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "bulk_security_check",
+            "cacheable": false,
+            "description": "Decision policy: this is a single-domain bulk tool. Use it only when the user asks for security/threat data only. If each IP request also needs other domains (ownership, location, network, timezone, currency, or abuse), call bulk_lookup_ip once with include and targeted fields/excludes.\n\nBulk IP security lookup via POST /v3/security-bulk for up to 1,000 IPs per MCP request. Paid only. Cost: 2 credits per valid IP.\n\nUse bulk_lookup_ip with include=security when the same batch also needs geolocation or other IP domains. Tool selection rule: call this tool once per IP batch and post-process locally. Do not re-call bulk_security_check for the same batch only to change fields/excludes or output shape.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "ips"
+              ],
+              "properties": {
+                "ips": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 1000,
+                  "minItems": 1,
+                  "description": "Array of IPv4 and/or IPv6 addresses to check. Minimum 1, maximum 1,000 in this MCP server."
+                },
+                "fields": {
+                  "type": "string",
+                  "description": "Comma-separated dot-path fields to return per IP (e.g. security.threat_score,security.is_vpn). Reduces response size."
+                },
+                "excludes": {
+                  "type": "string",
+                  "description": "Comma-separated dot-path fields to exclude per IP (e.g. security.is_tor,security.is_cloud_provider)."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "check_security",
+            "cacheable": false,
+            "description": "Decision policy: this is a single-domain tool. Use it only when the user asks for security/threat data only. If the same IP request also needs ownership/company/ASN, location/city, network, timezone, currency, or abuse data, call lookup_ip once with include and targeted fields/excludes instead of chaining tools.\n\nDedicated IP security lookup via GET /v3/security. Paid only. Cost: 2 credits. Returns threat score plus VPN, proxy, Tor, bot, spam, attacker, relay, anonymity, and cloud-provider indicators.\n\nUse lookup_ip with include=security when the same request also needs other IP domains. Tool selection rule: if this tool is used, call it once per IP target and post-process locally. Do not re-call check_security for the same IP just to change fields/excludes or to reformat output.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to check. Omit to check the caller's IP."
+                },
+                "fields": {
+                  "type": "string",
+                  "description": "Comma-separated dot-path fields to return (e.g. security.threat_score,security.is_vpn). Reduces response size."
+                },
+                "excludes": {
+                  "type": "string",
+                  "description": "Comma-separated dot-path fields to exclude (e.g. security.is_tor,security.is_cloud_provider)."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "convert_timezone",
+            "cacheable": false,
+            "description": "Convert time between two locations via GET /v3/timezone/convert. Works on free and paid plans. Cost: 1 credit.\n\nSpecify source and destination by IANA timezone, coordinates, location, airport code, or UN/LOCODE. Returns original time, converted time, diff_hour, and diff_min.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "time": {
+                  "type": "string",
+                  "description": "Time to convert in yyyy-MM-dd HH:mm or yyyy-MM-dd HH:mm:ss format. Defaults to current time."
+                },
+                "tz_to": {
+                  "type": "string",
+                  "description": "Destination IANA timezone name (e.g. Asia/Tokyo)."
+                },
+                "lat_to": {
+                  "type": "string",
+                  "description": "Destination latitude. Use with long_to."
+                },
+                "iata_to": {
+                  "type": "string",
+                  "description": "Destination 3-letter IATA airport code."
+                },
+                "icao_to": {
+                  "type": "string",
+                  "description": "Destination 4-letter ICAO airport code."
+                },
+                "long_to": {
+                  "type": "string",
+                  "description": "Destination longitude. Use with lat_to."
+                },
+                "tz_from": {
+                  "type": "string",
+                  "description": "Source IANA timezone name (e.g. America/New_York)."
+                },
+                "lat_from": {
+                  "type": "string",
+                  "description": "Source latitude. Use with long_from."
+                },
+                "iata_from": {
+                  "type": "string",
+                  "description": "Source 3-letter IATA airport code."
+                },
+                "icao_from": {
+                  "type": "string",
+                  "description": "Source 4-letter ICAO airport code."
+                },
+                "locode_to": {
+                  "type": "string",
+                  "description": "Destination 5-character UN/LOCODE."
+                },
+                "long_from": {
+                  "type": "string",
+                  "description": "Source longitude. Use with lat_from."
+                },
+                "location_to": {
+                  "type": "string",
+                  "description": "Destination city or address string."
+                },
+                "locode_from": {
+                  "type": "string",
+                  "description": "Source 5-character UN/LOCODE."
+                },
+                "location_from": {
+                  "type": "string",
+                  "description": "Source city or address string."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get_abuse_contact",
+            "cacheable": false,
+            "description": "Decision policy: this is a single-domain tool. Use it only when the user asks for abuse contact data only. If the same IP request also needs security, ownership/company/ASN, location/city, timezone, network, or currency data, call lookup_ip once with include and targeted fields/excludes instead of chaining tools.\n\nDedicated abuse lookup via GET /v3/abuse. Paid only. Cost: 1 credit. Returns route, country, organization, address, emails, and phone numbers for reporting abuse.\n\nUse lookup_ip with include=abuse when the same request also needs geolocation or other IP domains. Tool selection rule: if this tool is used, call it once per IP target and post-process locally. Do not re-call get_abuse_contact for the same IP just to change fields/excludes or to reformat output.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to get abuse contact for. Omit to use the caller's IP."
+                },
+                "fields": {
+                  "type": "string",
+                  "description": "Comma-separated fields to return (e.g. emails,organization). Reduces response size. Works on all plans."
+                },
+                "excludes": {
+                  "type": "string",
+                  "description": "Comma-separated fields to exclude from response (e.g. phone_numbers,address)."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get_astronomy",
+            "cacheable": false,
+            "description": "Astronomy lookup via GET /v3/astronomy. Works on free and paid plans. Cost: 1 credit. Look up by coordinates, location, or IP, with optional date and elevation.\n\nReturns location details plus astronomy data such as sunrise, sunset, moonrise, moonset, morning and evening twilight blocks, day length, sun and moon status, positions, and moon phase fields.\n\nThe lang parameter for non-English location field responses is available on paid plans only. On free plans, using a non-English lang value returns 401 Unauthorized.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to get astronomy data for that IP's location."
+                },
+                "lat": {
+                  "type": "string",
+                  "description": "Latitude coordinate. Highest priority. Must be used with long."
+                },
+                "date": {
+                  "type": "string",
+                  "description": "Date in YYYY-MM-DD format. Defaults to today."
+                },
+                "lang": {
+                  "type": "string",
+                  "description": "Response language for location fields in IP-based lookups (en, de, ru, ja, fr, cn, es, cs, it, ko, fa, pt). Paid plans only. Free plan returns 401 for non-English language values."
+                },
+                "long": {
+                  "type": "string",
+                  "description": "Longitude coordinate. Must be used with lat."
+                },
+                "location": {
+                  "type": "string",
+                  "description": "City or address string (e.g. San Francisco, CA)."
+                },
+                "elevation": {
+                  "type": "string",
+                  "description": "Elevation in meters above sea level (0-10000). Affects sunrise/sunset calculations for higher accuracy."
+                },
+                "time_zone": {
+                  "type": "string",
+                  "description": "IANA timezone name to express times in (e.g. America/New_York). If set, time fields include full date instead of just time."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get_astronomy_time_series",
+            "cacheable": false,
+            "description": "Daily astronomy time series via GET /v3/astronomy/timeSeries for up to 90 days. Works on free and paid plans. Cost: 1 credit per request.\n\nReturns location details plus an astronomy array with one daily entry per date. Use get_astronomy instead when you need real-time positional fields such as sun or moon altitude and azimuth.\n\nLocation can be specified by coordinates, city/address, or IP. If no location is given, uses the caller's IP.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "dateStart",
+                "dateEnd"
+              ],
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to get astronomy data for that IP's location."
+                },
+                "lat": {
+                  "type": "string",
+                  "description": "Latitude coordinate. Highest priority. Must be used with long."
+                },
+                "lang": {
+                  "type": "string",
+                  "description": "Response language for location fields in IP-based lookups (en, de, ru, ja, fr, cn, es, cs, it, ko, fa, pt). Paid plans only. Free plan returns 401 for non-English languages."
+                },
+                "long": {
+                  "type": "string",
+                  "description": "Longitude coordinate. Must be used with lat."
+                },
+                "dateEnd": {
+                  "type": "string",
+                  "description": "End date in YYYY-MM-DD format. Required. Maximum range between dateStart and dateEnd is 90 days."
+                },
+                "location": {
+                  "type": "string",
+                  "description": "City or address string (e.g. San Francisco, CA)."
+                },
+                "dateStart": {
+                  "type": "string",
+                  "description": "Start date in YYYY-MM-DD format. Required. Maximum range between dateStart and dateEnd is 90 days."
+                },
+                "elevation": {
+                  "type": "string",
+                  "description": "Elevation in meters above sea level (0-10000). Affects sunrise/sunset calculations."
+                },
+                "time_zone": {
+                  "type": "string",
+                  "description": "IANA timezone name to express times in (e.g. America/New_York). If set, time fields include full date instead of just time."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get_my_ip",
+            "cacheable": false,
+            "description": "Return the public IP address of the machine running this MCP server via /v3/getip. No API key or credits required.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {}
+            }
+          },
+          {
+            "name": "get_timezone",
+            "cacheable": false,
+            "description": "Timezone lookup via GET /v3/timezone. Works on free and paid plans. Cost: 1 credit. Look up by IANA timezone, coordinates, location, IP, airport code, or UN/LOCODE.\n\nReturns location details plus a time_zone object with offsets, current time values, date/time variants, abbreviations, DST status, and transition dates. Airport lookups also include airport details.\n\nThe lang parameter for non-English responses is available on paid plans only. On free plans, using a non-English lang value returns 401 Unauthorized.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to get timezone for."
+                },
+                "tz": {
+                  "type": "string",
+                  "description": "IANA timezone name (e.g. America/New_York, Europe/London). Highest priority if multiple params provided."
+                },
+                "lat": {
+                  "type": "string",
+                  "description": "Latitude coordinate. Must be used together with long."
+                },
+                "lang": {
+                  "type": "string",
+                  "description": "Response language for location fields in IP-based lookups (en, de, ru, ja, fr, cn, es, cs, it, ko, fa, pt). Paid plans only. Free plan returns 401 for non-English language values."
+                },
+                "long": {
+                  "type": "string",
+                  "description": "Longitude coordinate. Must be used together with lat."
+                },
+                "lo_code": {
+                  "type": "string",
+                  "description": "5-character UN/LOCODE (e.g. DEBER, USNYC)."
+                },
+                "location": {
+                  "type": "string",
+                  "description": "City or address string (e.g. London, UK)."
+                },
+                "iata_code": {
+                  "type": "string",
+                  "description": "3-letter IATA airport code (e.g. JFK, LHR). Returns airport details in the response."
+                },
+                "icao_code": {
+                  "type": "string",
+                  "description": "4-letter ICAO airport code (e.g. KJFK, EGLL). Returns airport details in the response."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "lookup_asn",
+            "cacheable": false,
+            "description": "Decision policy: call lookup_asn once per ASN/IP target with required include values decided up front. Hard rule: do not call lookup_asn a second time for the same target in the same answer unless the first call failed or required data is truly missing.\n\nIf the first response already contains a superset of needed data, extract the requested subset locally and do not call lookup_asn again just to trim output.\n\nDetailed ASN lookup via GET /v3/asn. Paid only. Cost: 1 credit. Query by AS number or IP. Returns core ASN details and can include peers, downstreams, upstreams, routes, and WHOIS.\n\nUse lookup_ip for basic ASN data. Use this tool only when you need extended ASN datasets.\n\nTool selection rule: if this tool is used, call it once per ASN/IP target and include set, then post-process locally. Do not re-call lookup_asn for the same target only to change fields/excludes or output shape.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to find the ASN for. Used only if asn is not provided."
+                },
+                "asn": {
+                  "type": "string",
+                  "description": "AS number to look up (e.g. AS13335 or just 13335). Takes priority over ip if both are provided."
+                },
+                "fields": {
+                  "type": "string",
+                  "description": "Comma-separated dot-path fields to return (e.g. asn.as_number,asn.organization or upstreams.as_number). Paths can be full (asn.upstreams.as_number) or relative to the asn root (upstreams.as_number). Use include for optional datasets (peers/downstreams/upstreams/routes/whois_response), then use fields to keep only required paths."
+                },
+                "include": {
+                  "type": "string",
+                  "description": "Comma-separated extra data to include: peers, downstreams, upstreams, routes, whois_response. No additional credit cost."
+                },
+                "excludes": {
+                  "type": "string",
+                  "description": "Comma-separated dot-path fields to exclude (e.g. asn.date_allocated,asn.rir or upstreams.description). Paths can be full or relative to the asn root."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "lookup_company",
+            "cacheable": false,
+            "description": "Decision policy: this is a single-domain tool. Use it only when the user asks for ownership data (company/ASN) only. If the same IP request also needs security, abuse, location/city, timezone, network, or currency data, call lookup_ip once with include and targeted fields/excludes instead of chaining tools.\n\nOwnership lookup via GET /v3/ipgeo with company and ASN only. Paid only. Cost: 1 credit. Returns the company using the IP and the ASN holder routing it.\n\nTool selection rule: if this tool is used, call it once per IP target and post-process locally. Do not re-call lookup_company for the same IP just to change output shape.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to look up. Omit to check the caller's IP."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "lookup_currency",
+            "cacheable": false,
+            "description": "Currency and country metadata lookup via GET /v3/ipgeo with currency and country_metadata only. Works on free and paid plans. Cost: 1 credit.\n\nTool selection rule: use this tool for currency-only or country-metadata-only requests. If the request needs more IP data, prefer one lookup_ip call with targeted fields/excludes.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to look up. Omit to check the caller's IP."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "lookup_ip",
+            "cacheable": false,
+            "description": "Unified IP lookup via GET /v3/ipgeo. Cost: 1 credit. Use this first when one IP request needs multiple domains such as location, company/ASN, network, timezone, currency, security, or abuse.\n\nFree plan supports core location data, country metadata, currency, time_zone, basic ASN, and fields/excludes. Paid plan adds domain lookup, company, network, extended ASN, non-English lang, and include modules such as security or abuse. If fields reference an include-only module, this server infers the required include automatically.\n\nOmit ip to use the caller's IP. Use lookup_asn only for peers, upstreams, downstreams, routes, or WHOIS. Use check_security or get_abuse_contact only for single-domain lookups.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 address, IPv6 address, or domain name to look up. Domain lookups require a paid plan. Omit to use the caller's IP."
+                },
+                "lang": {
+                  "type": "string",
+                  "description": "Response language code (en, de, ru, ja, fr, cn, es, cs, it, ko, fa, pt). Paid plans only. Free plan returns a 401 error if you pass any value other than en. Defaults to en."
+                },
+                "fields": {
+                  "type": "string",
+                  "description": "Comma-separated dot-path fields to return (e.g. location.city,asn.organization). Works on all plans including free. Reduces response size and can reduce credit cost when combined with include. If a field references an include-only module (for example security.* or abuse.*), this server auto-adds the required include module."
+                },
+                "include": {
+                  "type": "string",
+                  "description": "Comma-separated extra modules to include in the response. Paid plans only. Options: security (+2 credits), abuse (+1 credit), hostname, liveHostname, hostnameFallbackLive, user_agent, geo_accuracy, dma_code, or * for all (4 credits total). Free plan cannot use this parameter."
+                },
+                "excludes": {
+                  "type": "string",
+                  "description": "Comma-separated dot-path fields to exclude from response (e.g. currency,location.continent_code). Works on all plans including free."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "lookup_network",
+            "cacheable": false,
+            "description": "Network lookup via GET /v3/ipgeo with network only. Paid only. Cost: 1 credit. Returns route prefix, connection type, and anycast status.\n\nTool selection rule: use this tool for network-only requests. If the request also needs other IP domains, prefer one lookup_ip call with include plus targeted fields/excludes.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to look up. Omit to check the caller's IP."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "parse_user_agent",
+            "cacheable": false,
+            "description": "Parse an explicit user-agent string via POST /v3/user-agent. Paid only. Cost: 1 credit. Returns browser, device, OS, and engine details.\n\nThis MCP tool parses only the uaString you pass. It does not infer a caller user-agent from the MCP transport. For multiple strings, use bulk_parse_user_agent.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "uaString"
+              ],
+              "properties": {
+                "uaString": {
+                  "type": "string",
+                  "description": "The user-agent string to parse (e.g. Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36)."
+                },
+                "force_refresh": {
+                  "type": "boolean",
+                  "description": "Default false. Leave unset unless the user asks to refresh or rerun."
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "secrets": [
+          {
+            "help": "",
+            "link": "",
+            "name": "IPGEOLOCATION_API_KEY",
+            "label": "IPGEOLOCATION_API_KEY",
+            "secret": true,
+            "env_var": "IPGEOLOCATION_API_KEY",
+            "required": true
+          }
+        ],
+        "surface": {
+          "n_tools": 16,
+          "n_resources": 0
+        },
+        "operators": [
+          {
+            "name": "ipgeo_bulk_lookup_ip",
+            "shape": "scalar",
+            "arg_names": [
+              "excludes",
+              "fields",
+              "force_refresh",
+              "include",
+              "ips",
+              "lang"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "boolean",
+              "text",
+              "jsonb",
+              "text"
+            ],
+            "description": "Bulk IP lookup via POST /v3/ipgeo-bulk. Paid only. Cost: 1 credit per IP for base geolocation. This MCP server accepts up to 1,000 IPs per request.\n\nUse it when multiple IPs need location or mixed IP domains. Include modules such as security or abuse add their normal per-IP credit costs. For bulk security-only checks, prefer bulk_security_check.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_bulk_parse_user_agent",
+            "shape": "scalar",
+            "arg_names": [
+              "force_refresh",
+              "uaStrings"
+            ],
+            "arg_types": [
+              "boolean",
+              "jsonb"
+            ],
+            "description": "Bulk user-agent parsing via POST /v3/user-agent-bulk for up to 1,000 strings per MCP request. Paid only. Cost: 1 credit per string.\n\nUse this tool for multiple user-agent strings. For a single string, use parse_user_agent.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_bulk_security_check",
+            "shape": "scalar",
+            "arg_names": [
+              "excludes",
+              "fields",
+              "force_refresh",
+              "ips"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "boolean",
+              "jsonb"
+            ],
+            "description": "Decision policy: this is a single-domain bulk tool. Use it only when the user asks for security/threat data only. If each IP request also needs other domains (ownership, location, network, timezone, currency, or abuse), call bulk_lookup_ip once with include and targeted fields/excludes.\n\nBulk IP security lookup via POST /v3/security-bulk for up to 1,000 IPs per MCP request. Paid only. Cost: 2 credits per valid IP.\n\nUse bulk_lookup_ip with include=security when the same batch also needs geolocation or other IP domains. Tool selection rule: call this tool once per IP batch and post-process locally. Do not re-call bulk_security_check for the same batch only to change fields/excludes or output shape.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_check_security",
+            "shape": "scalar",
+            "arg_names": [
+              "excludes",
+              "fields",
+              "force_refresh",
+              "ip"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "boolean",
+              "text"
+            ],
+            "description": "Decision policy: this is a single-domain tool. Use it only when the user asks for security/threat data only. If the same IP request also needs ownership/company/ASN, location/city, network, timezone, currency, or abuse data, call lookup_ip once with include and targeted fields/excludes instead of chaining tools.\n\nDedicated IP security lookup via GET /v3/security. Paid only. Cost: 2 credits. Returns threat score plus VPN, proxy, Tor, bot, spam, attacker, relay, anonymity, and cloud-provider indicators.\n\nUse lookup_ip with include=security when the same request also needs other IP domains. Tool selection rule: if this tool is used, call it once per IP target and post-process locally. Do not re-call check_security for the same IP just to change fields/excludes or to reformat output.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_convert_timezone",
+            "shape": "scalar",
+            "arg_names": [
+              "iata_from",
+              "iata_to",
+              "icao_from",
+              "icao_to",
+              "lat_from",
+              "lat_to",
+              "location_from",
+              "location_to",
+              "locode_from",
+              "locode_to",
+              "long_from",
+              "long_to",
+              "time",
+              "tz_from",
+              "tz_to"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Convert time between two locations via GET /v3/timezone/convert. Works on free and paid plans. Cost: 1 credit.\n\nSpecify source and destination by IANA timezone, coordinates, location, airport code, or UN/LOCODE. Returns original time, converted time, diff_hour, and diff_min.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_get_abuse_contact",
+            "shape": "scalar",
+            "arg_names": [
+              "excludes",
+              "fields",
+              "force_refresh",
+              "ip"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "boolean",
+              "text"
+            ],
+            "description": "Decision policy: this is a single-domain tool. Use it only when the user asks for abuse contact data only. If the same IP request also needs security, ownership/company/ASN, location/city, timezone, network, or currency data, call lookup_ip once with include and targeted fields/excludes instead of chaining tools.\n\nDedicated abuse lookup via GET /v3/abuse. Paid only. Cost: 1 credit. Returns route, country, organization, address, emails, and phone numbers for reporting abuse.\n\nUse lookup_ip with include=abuse when the same request also needs geolocation or other IP domains. Tool selection rule: if this tool is used, call it once per IP target and post-process locally. Do not re-call get_abuse_contact for the same IP just to change fields/excludes or to reformat output.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_get_astronomy",
+            "shape": "scalar",
+            "arg_names": [
+              "date",
+              "elevation",
+              "ip",
+              "lang",
+              "lat",
+              "location",
+              "long",
+              "time_zone"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Astronomy lookup via GET /v3/astronomy. Works on free and paid plans. Cost: 1 credit. Look up by coordinates, location, or IP, with optional date and elevation.\n\nReturns location details plus astronomy data such as sunrise, sunset, moonrise, moonset, morning and evening twilight blocks, day length, sun and moon status, positions, and moon phase fields.\n\nThe lang parameter for non-English location field responses is available on paid plans only. On free plans, using a non-English lang value returns 401 Unauthorized.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_get_astronomy_time_series",
+            "shape": "scalar",
+            "arg_names": [
+              "dateEnd",
+              "dateStart",
+              "elevation",
+              "force_refresh",
+              "ip",
+              "lang",
+              "lat",
+              "location",
+              "long",
+              "time_zone"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "boolean",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Daily astronomy time series via GET /v3/astronomy/timeSeries for up to 90 days. Works on free and paid plans. Cost: 1 credit per request.\n\nReturns location details plus an astronomy array with one daily entry per date. Use get_astronomy instead when you need real-time positional fields such as sun or moon altitude and azimuth.\n\nLocation can be specified by coordinates, city/address, or IP. If no location is given, uses the caller's IP.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_get_my_ip",
+            "shape": "scalar",
+            "arg_names": [],
+            "arg_types": [],
+            "description": "Return the public IP address of the machine running this MCP server via /v3/getip. No API key or credits required.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_get_timezone",
+            "shape": "scalar",
+            "arg_names": [
+              "iata_code",
+              "icao_code",
+              "ip",
+              "lang",
+              "lat",
+              "location",
+              "lo_code",
+              "long",
+              "tz"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Timezone lookup via GET /v3/timezone. Works on free and paid plans. Cost: 1 credit. Look up by IANA timezone, coordinates, location, IP, airport code, or UN/LOCODE.\n\nReturns location details plus a time_zone object with offsets, current time values, date/time variants, abbreviations, DST status, and transition dates. Airport lookups also include airport details.\n\nThe lang parameter for non-English responses is available on paid plans only. On free plans, using a non-English lang value returns 401 Unauthorized.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_lookup_asn",
+            "shape": "scalar",
+            "arg_names": [
+              "asn",
+              "excludes",
+              "fields",
+              "force_refresh",
+              "include",
+              "ip"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "boolean",
+              "text",
+              "text"
+            ],
+            "description": "Decision policy: call lookup_asn once per ASN/IP target with required include values decided up front. Hard rule: do not call lookup_asn a second time for the same target in the same answer unless the first call failed or required data is truly missing.\n\nIf the first response already contains a superset of needed data, extract the requested subset locally and do not call lookup_asn again just to trim output.\n\nDetailed ASN lookup via GET /v3/asn. Paid only. Cost: 1 credit. Query by AS number or IP. Returns core ASN details and can include peers, downstreams, upstreams, routes, and WHOIS.\n\nUse lookup_ip for basic ASN data. Use this tool only when you need extended ASN datasets.\n\nTool selection rule: if this tool is used, call it once per ASN/IP target and include set, then post-process locally. Do not re-call lookup_asn for the same target only to change fields/excludes or output shape.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_lookup_company",
+            "shape": "scalar",
+            "arg_names": [
+              "force_refresh",
+              "ip"
+            ],
+            "arg_types": [
+              "boolean",
+              "text"
+            ],
+            "description": "Decision policy: this is a single-domain tool. Use it only when the user asks for ownership data (company/ASN) only. If the same IP request also needs security, abuse, location/city, timezone, network, or currency data, call lookup_ip once with include and targeted fields/excludes instead of chaining tools.\n\nOwnership lookup via GET /v3/ipgeo with company and ASN only. Paid only. Cost: 1 credit. Returns the company using the IP and the ASN holder routing it.\n\nTool selection rule: if this tool is used, call it once per IP target and post-process locally. Do not re-call lookup_company for the same IP just to change output shape.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_lookup_currency",
+            "shape": "scalar",
+            "arg_names": [
+              "force_refresh",
+              "ip"
+            ],
+            "arg_types": [
+              "boolean",
+              "text"
+            ],
+            "description": "Currency and country metadata lookup via GET /v3/ipgeo with currency and country_metadata only. Works on free and paid plans. Cost: 1 credit.\n\nTool selection rule: use this tool for currency-only or country-metadata-only requests. If the request needs more IP data, prefer one lookup_ip call with targeted fields/excludes.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_lookup_ip",
+            "shape": "scalar",
+            "arg_names": [
+              "excludes",
+              "fields",
+              "force_refresh",
+              "include",
+              "ip",
+              "lang"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "boolean",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Unified IP lookup via GET /v3/ipgeo. Cost: 1 credit. Use this first when one IP request needs multiple domains such as location, company/ASN, network, timezone, currency, security, or abuse.\n\nFree plan supports core location data, country metadata, currency, time_zone, basic ASN, and fields/excludes. Paid plan adds domain lookup, company, network, extended ASN, non-English lang, and include modules such as security or abuse. If fields reference an include-only module, this server infers the required include automatically.\n\nOmit ip to use the caller's IP. Use lookup_asn only for peers, upstreams, downstreams, routes, or WHOIS. Use check_security or get_abuse_contact only for single-domain lookups.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_lookup_network",
+            "shape": "scalar",
+            "arg_names": [
+              "force_refresh",
+              "ip"
+            ],
+            "arg_types": [
+              "boolean",
+              "text"
+            ],
+            "description": "Network lookup via GET /v3/ipgeo with network only. Paid only. Cost: 1 credit. Returns route prefix, connection type, and anycast status.\n\nTool selection rule: use this tool for network-only requests. If the request also needs other IP domains, prefer one lookup_ip call with include plus targeted fields/excludes.",
+            "return_type": "text"
+          },
+          {
+            "name": "ipgeo_parse_user_agent",
+            "shape": "scalar",
+            "arg_names": [
+              "force_refresh",
+              "uaString"
+            ],
+            "arg_types": [
+              "boolean",
+              "text"
+            ],
+            "description": "Parse an explicit user-agent string via POST /v3/user-agent. Paid only. Cost: 1 credit. Returns browser, device, OS, and engine details.\n\nThis MCP tool parses only the uaString you pass. It does not infer a caller user-agent from the MCP transport. For multiple strings, use bulk_parse_user_agent.",
+            "return_type": "text"
+          }
+        ],
+        "resources": [],
+        "connection": {
+          "env": {
+            "IPGEOLOCATION_API_KEY": "${IPGEOLOCATION_API_KEY}"
+          },
+          "args": [
+            "-y",
+            "ipgeolocation-io-mcp"
+          ],
+          "command": "npx",
+          "transport": "stdio",
+          "timeout_ms": 60000
+        },
+        "scanned_at": "2026-06-09T23:13:35.910536+00:00",
+        "description": "ipgeolocation.io — IP geolocation + timezone + VPN/security + currency + ASN. Needs IPGEOLOCATION_API_KEY."
+      },
+      "catalog_entry": {
+        "id": "mcp/ipgeo",
+        "kind": "mcp",
+        "name": "ipgeo",
+        "tags": [
+          "mcp",
+          "ip",
+          "geolocation",
+          "timezone",
+          "security"
+        ],
+        "title": "ipgeolocation.io",
+        "operators": [
+          "ipgeo_bulk_lookup_ip",
+          "ipgeo_bulk_parse_user_agent",
+          "ipgeo_bulk_security_check",
+          "ipgeo_check_security",
+          "ipgeo_convert_timezone",
+          "ipgeo_get_abuse_contact",
+          "ipgeo_get_astronomy",
+          "ipgeo_get_astronomy_time_series",
+          "ipgeo_get_my_ip",
+          "ipgeo_get_timezone",
+          "ipgeo_lookup_asn",
+          "ipgeo_lookup_company",
+          "ipgeo_lookup_currency",
+          "ipgeo_lookup_ip",
+          "ipgeo_lookup_network",
+          "ipgeo_parse_user_agent"
+        ],
+        "description": "ipgeolocation.io — IP geolocation + timezone + VPN/security + currency + ASN. Needs IPGEOLOCATION_API_KEY.",
+        "manifest_path": "mcp/ipgeo",
+        "catalog_visibility": "public"
+      }
+    },
+    {
+      "capability_manifest": {
+        "kind": "mcp",
+        "name": "iplocate",
+        "tools": [
+          {
+            "name": "lookup_ip_address_abuse_contacts",
+            "cacheable": false,
+            "description": "Get abuse contact information for an IP address to report malicious activity. Includes email, phone, and address of the network administrator. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to look up. If not provided, returns information about the caller's IP address."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "lookup_ip_address_company",
+            "cacheable": false,
+            "description": "Get company/organization information for an IP address including the company name, domain, and type of organization. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to look up. If not provided, returns information about the caller's IP address."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "lookup_ip_address_details",
+            "cacheable": false,
+            "description": "Get comprehensive information about an IP address including geolocation, network details, privacy/security information, company data, and abuse contacts. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to look up. If not provided, returns information about the caller's IP address."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "lookup_ip_address_location",
+            "cacheable": false,
+            "description": "Get geographic location information for an IP address including country, city, coordinates, timezone, and postal code. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to look up. If not provided, returns information about the caller's IP address."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "lookup_ip_address_network",
+            "cacheable": false,
+            "description": "Get network and ASN (Autonomous System Number) information for an IP address including the network operator, route, and regional registry. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to look up. If not provided, returns information about the caller's IP address."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "lookup_ip_address_privacy",
+            "cacheable": false,
+            "description": "Get privacy and security information for an IP address including VPN, proxy, Tor, hosting, and abuse detection. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "ip": {
+                  "type": "string",
+                  "description": "IPv4 or IPv6 address to look up. If not provided, returns information about the caller's IP address."
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "secrets": [],
+        "surface": {
+          "n_tools": 6,
+          "n_resources": 0
+        },
+        "operators": [
+          {
+            "name": "iplocate_lookup_ip_address_abuse_contacts",
+            "shape": "scalar",
+            "arg_names": [
+              "ip"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get abuse contact information for an IP address to report malicious activity. Includes email, phone, and address of the network administrator. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "return_type": "text"
+          },
+          {
+            "name": "iplocate_lookup_ip_address_company",
+            "shape": "scalar",
+            "arg_names": [
+              "ip"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get company/organization information for an IP address including the company name, domain, and type of organization. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "return_type": "text"
+          },
+          {
+            "name": "iplocate_lookup_ip_address_details",
+            "shape": "scalar",
+            "arg_names": [
+              "ip"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get comprehensive information about an IP address including geolocation, network details, privacy/security information, company data, and abuse contacts. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "return_type": "text"
+          },
+          {
+            "name": "iplocate_lookup_ip_address_location",
+            "shape": "scalar",
+            "arg_names": [
+              "ip"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get geographic location information for an IP address including country, city, coordinates, timezone, and postal code. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "return_type": "text"
+          },
+          {
+            "name": "iplocate_lookup_ip_address_network",
+            "shape": "scalar",
+            "arg_names": [
+              "ip"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get network and ASN (Autonomous System Number) information for an IP address including the network operator, route, and regional registry. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "return_type": "text"
+          },
+          {
+            "name": "iplocate_lookup_ip_address_privacy",
+            "shape": "scalar",
+            "arg_names": [
+              "ip"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get privacy and security information for an IP address including VPN, proxy, Tor, hosting, and abuse detection. Can look up any IPv4 or IPv6 address, or your own IP if no address is provided.",
+            "return_type": "text"
+          }
+        ],
+        "resources": [],
+        "connection": {
+          "args": [
+            "-y",
+            "@iplocate/mcp-server"
+          ],
+          "command": "npx",
+          "transport": "stdio",
+          "timeout_ms": 30000
+        },
+        "scanned_at": "2026-06-09T23:12:25.751647+00:00",
+        "description": "IPLocate.io — read-only IP geolocation/privacy(VPN)/network/company/abuse lookups. Works keyless at low quota; set IPLOCATE_API_KEY for volume."
+      },
+      "catalog_entry": {
+        "id": "mcp/iplocate",
+        "kind": "mcp",
+        "name": "iplocate",
+        "tags": [
+          "mcp",
+          "ip",
+          "geolocation",
+          "enrichment",
+          "fraud"
+        ],
+        "title": "IPLocate (IP Geolocation)",
+        "operators": [
+          "iplocate_lookup_ip_address_abuse_contacts",
+          "iplocate_lookup_ip_address_company",
+          "iplocate_lookup_ip_address_details",
+          "iplocate_lookup_ip_address_location",
+          "iplocate_lookup_ip_address_network",
+          "iplocate_lookup_ip_address_privacy"
+        ],
+        "description": "IPLocate.io — read-only IP geolocation/privacy(VPN)/network/company/abuse lookups. Works keyless at low quota; set IPLOCATE_API_KEY for volume.",
+        "manifest_path": "mcp/iplocate",
+        "catalog_visibility": "public"
+      }
+    },
+    {
+      "capability_manifest": {
+        "kind": "mcp",
+        "name": "tavily",
+        "tools": [
+          {
+            "name": "tavily_crawl",
+            "cacheable": false,
+            "description": "Crawl a website starting from a URL. Extracts content from pages with configurable depth and breadth.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "required": [
+                "url"
+              ],
+              "properties": {
+                "url": {
+                  "type": "string",
+                  "description": "The root URL to begin the crawl"
+                },
+                "limit": {
+                  "type": "integer",
+                  "default": 50,
+                  "minimum": 1,
+                  "description": "Total number of links the crawler will process before stopping"
+                },
+                "format": {
+                  "enum": [
+                    "markdown",
+                    "text"
+                  ],
+                  "type": "string",
+                  "default": "markdown",
+                  "description": "The format of the extracted web page content. markdown returns content in markdown format. text returns plain text and may increase latency."
+                },
+                "max_depth": {
+                  "type": "integer",
+                  "default": 1,
+                  "minimum": 1,
+                  "description": "Max depth of the crawl. Defines how far from the base URL the crawler can explore."
+                },
+                "max_breadth": {
+                  "type": "integer",
+                  "default": 20,
+                  "minimum": 1,
+                  "description": "Max number of links to follow per level of the tree (i.e., per page)"
+                },
+                "instructions": {
+                  "type": "string",
+                  "description": "Natural language instructions for the crawler. Instructions specify which types of pages the crawler should return."
+                },
+                "select_paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "default": [],
+                  "description": "Regex patterns to select only URLs with specific path patterns (e.g., /docs/.*, /api/v1.*)"
+                },
+                "extract_depth": {
+                  "enum": [
+                    "basic",
+                    "advanced"
+                  ],
+                  "type": "string",
+                  "default": "basic",
+                  "description": "Advanced extraction retrieves more data, including tables and embedded content, with higher success but may increase latency"
+                },
+                "allow_external": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Whether to return external links in the final response"
+                },
+                "select_domains": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "default": [],
+                  "description": "Regex patterns to restrict crawling to specific domains or subdomains (e.g., ^docs\\.example\\.com$)"
+                },
+                "include_favicon": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Whether to include the favicon URL for each result"
+                }
+              }
+            }
+          },
+          {
+            "name": "tavily_extract",
+            "cacheable": false,
+            "description": "Extract content from URLs. Returns raw page content in markdown or text format.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "required": [
+                "urls"
+              ],
+              "properties": {
+                "urls": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "List of URLs to extract content from"
+                },
+                "query": {
+                  "type": "string",
+                  "description": "Query to rerank content chunks by relevance"
+                },
+                "format": {
+                  "enum": [
+                    "markdown",
+                    "text"
+                  ],
+                  "type": "string",
+                  "default": "markdown",
+                  "description": "Output format"
+                },
+                "extract_depth": {
+                  "enum": [
+                    "basic",
+                    "advanced"
+                  ],
+                  "type": "string",
+                  "default": "basic",
+                  "description": "Use 'advanced' for LinkedIn, protected sites, or tables/embedded content"
+                },
+                "include_images": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Include images from pages"
+                },
+                "include_favicon": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Include favicon URLs"
+                }
+              }
+            }
+          },
+          {
+            "name": "tavily_map",
+            "cacheable": false,
+            "description": "Map a website's structure. Returns a list of URLs found starting from the base URL.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "required": [
+                "url"
+              ],
+              "properties": {
+                "url": {
+                  "type": "string",
+                  "description": "The root URL to begin the mapping"
+                },
+                "limit": {
+                  "type": "integer",
+                  "default": 50,
+                  "minimum": 1,
+                  "description": "Total number of links the crawler will process before stopping"
+                },
+                "max_depth": {
+                  "type": "integer",
+                  "default": 1,
+                  "minimum": 1,
+                  "description": "Max depth of the mapping. Defines how far from the base URL the crawler can explore"
+                },
+                "max_breadth": {
+                  "type": "integer",
+                  "default": 20,
+                  "minimum": 1,
+                  "description": "Max number of links to follow per level of the tree (i.e., per page)"
+                },
+                "instructions": {
+                  "type": "string",
+                  "description": "Natural language instructions for the crawler"
+                },
+                "select_paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "default": [],
+                  "description": "Regex patterns to select only URLs with specific path patterns (e.g., /docs/.*, /api/v1.*)"
+                },
+                "allow_external": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Whether to return external links in the final response"
+                },
+                "select_domains": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "default": [],
+                  "description": "Regex patterns to restrict crawling to specific domains or subdomains (e.g., ^docs\\.example\\.com$)"
+                }
+              }
+            }
+          },
+          {
+            "name": "tavily_research",
+            "cacheable": false,
+            "description": "Perform comprehensive research on a given topic or question. Use this tool when you need to gather information from multiple sources to answer a question or complete a task. Returns a detailed response based on the research findings. Rate limit: 20 requests per minute.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "required": [
+                "input"
+              ],
+              "properties": {
+                "input": {
+                  "type": "string",
+                  "description": "A comprehensive description of the research task"
+                },
+                "model": {
+                  "enum": [
+                    "mini",
+                    "pro",
+                    "auto"
+                  ],
+                  "type": "string",
+                  "default": "auto",
+                  "description": "Defines the degree of depth of the research. 'mini' is good for narrow tasks with few subtopics. 'pro' is good for broad tasks with many subtopics. 'auto' automatically selects the best model."
+                }
+              }
+            }
+          },
+          {
+            "name": "tavily_search",
+            "cacheable": false,
+            "description": "Search the web for current information on any topic. Use for news, facts, or data beyond your knowledge cutoff. Returns snippets and source URLs.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "query": {
+                  "type": "string",
+                  "description": "Search query"
+                },
+                "topic": {
+                  "enum": [
+                    "general"
+                  ],
+                  "type": "string",
+                  "default": "general",
+                  "description": "The category of the search. This will determine which of our agents will be used for the search"
+                },
+                "country": {
+                  "type": "string",
+                  "default": "",
+                  "description": "Boost search results from a specific country. Must be a full country name (e.g., 'United States', 'Japan', 'Germany'). ISO country codes (e.g., 'us', 'jp') are not supported. Available only if topic is general. See https://docs.tavily.com/documentation/api-reference/search for the full list of supported countries."
+                },
+                "end_date": {
+                  "type": "string",
+                  "default": "",
+                  "description": "Will return all results before the specified end date. Required to be written in the format YYYY-MM-DD"
+                },
+                "start_date": {
+                  "type": "string",
+                  "default": "",
+                  "description": "Will return all results after the specified start date. Required to be written in the format YYYY-MM-DD."
+                },
+                "time_range": {
+                  "enum": [
+                    "day",
+                    "week",
+                    "month",
+                    "year"
+                  ],
+                  "type": "string",
+                  "description": "The time range back from the current date to include in the search results"
+                },
+                "exact_match": {
+                  "type": "boolean",
+                  "description": "Only return results containing the exact phrase(s) in quotes in your query"
+                },
+                "max_results": {
+                  "type": "number",
+                  "default": 5,
+                  "maximum": 20,
+                  "minimum": 5,
+                  "description": "The maximum number of search results to return"
+                },
+                "search_depth": {
+                  "enum": [
+                    "basic",
+                    "advanced",
+                    "fast",
+                    "ultra-fast"
+                  ],
+                  "type": "string",
+                  "default": "basic",
+                  "description": "The depth of the search. 'basic' for generic results, 'advanced' for more thorough search, 'fast' for optimized low latency with high relevance, 'ultra-fast' for prioritizing latency above all else"
+                },
+                "include_images": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Include a list of query-related images in the response"
+                },
+                "exclude_domains": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "default": [],
+                  "description": "List of domains to specifically exclude, if the user asks to exclude a domain set this to the domain of the site"
+                },
+                "include_domains": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "default": [],
+                  "description": "A list of domains to specifically include in the search results, if the user asks to search on specific sites set this to the domain of the site"
+                },
+                "include_favicon": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Whether to include the favicon URL for each result"
+                },
+                "include_raw_content": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Include the cleaned and parsed HTML content of each search result"
+                },
+                "include_image_descriptions": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Include a list of query-related images and their descriptions in the response"
+                }
+              }
+            }
+          }
+        ],
+        "secrets": [
+          {
+            "help": "",
+            "link": "",
+            "name": "TAVILY_API_KEY",
+            "label": "TAVILY_API_KEY",
+            "secret": true,
+            "env_var": "TAVILY_API_KEY",
+            "required": true
+          }
+        ],
+        "surface": {
+          "n_tools": 5,
+          "n_resources": 0
+        },
+        "operators": [
+          {
+            "name": "tavily_crawl",
+            "shape": "scalar",
+            "arg_names": [
+              "allow_external",
+              "extract_depth",
+              "format",
+              "include_favicon",
+              "instructions",
+              "limit",
+              "max_breadth",
+              "max_depth",
+              "select_domains",
+              "select_paths",
+              "url"
+            ],
+            "arg_types": [
+              "boolean",
+              "text",
+              "text",
+              "boolean",
+              "text",
+              "bigint",
+              "bigint",
+              "bigint",
+              "jsonb",
+              "jsonb",
+              "text"
+            ],
+            "description": "Crawl a website starting from a URL. Extracts content from pages with configurable depth and breadth.",
+            "return_type": "text"
+          },
+          {
+            "name": "tavily_extract",
+            "shape": "scalar",
+            "arg_names": [
+              "extract_depth",
+              "format",
+              "include_favicon",
+              "include_images",
+              "query",
+              "urls"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "boolean",
+              "boolean",
+              "text",
+              "jsonb"
+            ],
+            "description": "Extract content from URLs. Returns raw page content in markdown or text format.",
+            "return_type": "text"
+          },
+          {
+            "name": "tavily_map",
+            "shape": "scalar",
+            "arg_names": [
+              "allow_external",
+              "instructions",
+              "limit",
+              "max_breadth",
+              "max_depth",
+              "select_domains",
+              "select_paths",
+              "url"
+            ],
+            "arg_types": [
+              "boolean",
+              "text",
+              "bigint",
+              "bigint",
+              "bigint",
+              "jsonb",
+              "jsonb",
+              "text"
+            ],
+            "description": "Map a website's structure. Returns a list of URLs found starting from the base URL.",
+            "return_type": "text"
+          },
+          {
+            "name": "tavily_research",
+            "shape": "scalar",
+            "arg_names": [
+              "input",
+              "model"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Perform comprehensive research on a given topic or question. Use this tool when you need to gather information from multiple sources to answer a question or complete a task. Returns a detailed response based on the research findings. Rate limit: 20 requests per minute.",
+            "return_type": "text"
+          },
+          {
+            "name": "tavily_search",
+            "shape": "scalar",
+            "arg_names": [
+              "country",
+              "end_date",
+              "exact_match",
+              "exclude_domains",
+              "include_domains",
+              "include_favicon",
+              "include_image_descriptions",
+              "include_images",
+              "include_raw_content",
+              "max_results",
+              "query",
+              "search_depth",
+              "start_date",
+              "time_range",
+              "topic"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "boolean",
+              "jsonb",
+              "jsonb",
+              "boolean",
+              "boolean",
+              "boolean",
+              "boolean",
+              "double precision",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Search the web for current information on any topic. Use for news, facts, or data beyond your knowledge cutoff. Returns snippets and source URLs.",
+            "return_type": "text"
+          }
+        ],
+        "resources": [],
+        "connection": {
+          "env": {
+            "TAVILY_API_KEY": "${TAVILY_API_KEY}"
+          },
+          "args": [
+            "-y",
+            "tavily-mcp"
+          ],
+          "command": "npx",
+          "transport": "stdio",
+          "timeout_ms": 60000
+        },
+        "scanned_at": "2026-06-09T23:13:35.889698+00:00",
+        "description": "Tavily — web search / extract / crawl / map as read-only enrichment operators. Needs TAVILY_API_KEY."
+      },
+      "catalog_entry": {
+        "id": "mcp/tavily",
+        "kind": "mcp",
+        "name": "tavily",
+        "tags": [
+          "mcp",
+          "web",
+          "search",
+          "research",
+          "enrichment"
+        ],
+        "title": "Tavily (Web Search)",
+        "operators": [
+          "tavily_crawl",
+          "tavily_extract",
+          "tavily_map",
+          "tavily_research",
+          "tavily_search"
+        ],
+        "description": "Tavily — web search / extract / crawl / map as read-only enrichment operators. Needs TAVILY_API_KEY.",
+        "manifest_path": "mcp/tavily",
+        "catalog_visibility": "public"
+      }
+    },
+    {
+      "capability_manifest": {
+        "kind": "mcp",
+        "name": "time",
+        "tools": [
+          {
+            "name": "convert_time",
+            "cacheable": false,
+            "description": "Convert time between timezones.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "sourceTimezone",
+                "targetTimezone",
+                "time"
+              ],
+              "properties": {
+                "time": {
+                  "type": "string",
+                  "description": "Date and time in 24-hour format. e.g. 2025-03-23 12:30:00"
+                },
+                "sourceTimezone": {
+                  "type": "string",
+                  "description": "The source timezone. IANA timezone name, e.g. Asia/Shanghai"
+                },
+                "targetTimezone": {
+                  "type": "string",
+                  "description": "The target timezone. IANA timezone name, e.g. Europe/London"
+                }
+              }
+            }
+          },
+          {
+            "name": "current_time",
+            "cacheable": false,
+            "description": "Get the current date and time.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "format": {
+                  "enum": [
+                    "h:mm A",
+                    "h:mm:ss A",
+                    "YYYY-MM-DD HH:mm:ss",
+                    "YYYY-MM-DD",
+                    "YYYY-MM",
+                    "MM/DD/YYYY",
+                    "MM/DD/YY",
+                    "YYYY/MM/DD",
+                    "YYYY/MM"
+                  ],
+                  "type": "string",
+                  "default": "YYYY-MM-DD HH:mm:ss",
+                  "description": "The format of the time"
+                },
+                "timezone": {
+                  "type": "string",
+                  "description": "The timezone of the time, IANA timezone name, e.g. Asia/Shanghai"
+                }
+              }
+            }
+          },
+          {
+            "name": "days_in_month",
+            "cacheable": false,
+            "description": "Get the number of days in a month. If no date is provided, get the number of days in the current month.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "date": {
+                  "type": "string",
+                  "description": "The date to get the days in month. Format: YYYY-MM-DD"
+                }
+              }
+            }
+          },
+          {
+            "name": "get_timestamp",
+            "cacheable": false,
+            "description": "Get the timestamp for the time.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "time": {
+                  "type": "string",
+                  "description": "The time to get the timestamp. Format: YYYY-MM-DD HH:mm:ss.SSS"
+                }
+              }
+            }
+          },
+          {
+            "name": "get_week_year",
+            "cacheable": false,
+            "description": "Get the week and isoWeek of the year.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "date": {
+                  "type": "string",
+                  "description": "The date to get the week and isoWeek of the year. e.g. 2025-03-23"
+                }
+              }
+            }
+          },
+          {
+            "name": "relative_time",
+            "cacheable": false,
+            "description": "Get the relative time from now.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "time"
+              ],
+              "properties": {
+                "time": {
+                  "type": "string",
+                  "description": "The time to get the relative time from now. Format: YYYY-MM-DD HH:mm:ss"
+                }
+              }
+            }
+          }
+        ],
+        "secrets": [],
+        "surface": {
+          "n_tools": 6,
+          "n_resources": 0
+        },
+        "operators": [
+          {
+            "name": "time_convert_time",
+            "shape": "scalar",
+            "arg_names": [
+              "sourceTimezone",
+              "targetTimezone",
+              "time"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Convert time between timezones.",
+            "return_type": "text"
+          },
+          {
+            "name": "time_current_time",
+            "shape": "scalar",
+            "arg_names": [
+              "format",
+              "timezone"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Get the current date and time.",
+            "return_type": "text"
+          },
+          {
+            "name": "time_days_in_month",
+            "shape": "scalar",
+            "arg_names": [
+              "date"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get the number of days in a month. If no date is provided, get the number of days in the current month.",
+            "return_type": "text"
+          },
+          {
+            "name": "time_get_timestamp",
+            "shape": "scalar",
+            "arg_names": [
+              "time"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get the timestamp for the time.",
+            "return_type": "text"
+          },
+          {
+            "name": "time_get_week_year",
+            "shape": "scalar",
+            "arg_names": [
+              "date"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get the week and isoWeek of the year.",
+            "return_type": "text"
+          },
+          {
+            "name": "time_relative_time",
+            "shape": "scalar",
+            "arg_names": [
+              "time"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get the relative time from now.",
+            "return_type": "text"
+          }
+        ],
+        "resources": [],
+        "connection": {
+          "args": [
+            "-y",
+            "time-mcp"
+          ],
+          "command": "npx",
+          "transport": "stdio",
+          "timeout_ms": 30000
+        },
+        "scanned_at": "2026-06-09T23:12:25.735799+00:00",
+        "description": "time-mcp — timezone conversion, relative time, week-of-year, days-in-month. Deterministic local clock + IANA tz DB, no API key."
+      },
+      "catalog_entry": {
+        "id": "mcp/time",
+        "kind": "mcp",
+        "name": "time",
+        "tags": [
+          "mcp",
+          "time",
+          "timezone",
+          "utility"
+        ],
+        "title": "Time / Timezone",
+        "operators": [
+          "time_convert_time",
+          "time_current_time",
+          "time_days_in_month",
+          "time_get_timestamp",
+          "time_get_week_year",
+          "time_relative_time"
+        ],
+        "description": "time-mcp — timezone conversion, relative time, week-of-year, days-in-month. Deterministic local clock + IANA tz DB, no API key.",
+        "manifest_path": "mcp/time",
+        "catalog_visibility": "public"
+      }
     }
   ],
   "catalog_layout": "rvbbit.pack/v1",
