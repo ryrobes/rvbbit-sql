@@ -1,21 +1,25 @@
 # Rvbbit Release Images
 
-Rvbbit ships three product images plus one image per built-in Warren
-capability. GHCR is the canonical registry for V1; GitHub Releases hold native
-tarballs and Warren agent binaries.
+Rvbbit ships three product images plus the deterministic Warren smoke
+capability image. The rest of the built-in Warren capability images can also be
+built, but they are opt-in because the full catalog build is expensive. GHCR is
+the canonical registry for V1; GitHub Releases hold native tarballs and Warren
+agent binaries.
 
 ## Product Images
 
 | Image | Purpose |
 |---|---|
 | `ghcr.io/ryrobes/rvbbit-postgres:<version>` | PostgreSQL 18 with `pg_rvbbit`, `rvbbit-duck`, first-boot catalog seed, and tuned config. |
-| `ghcr.io/ryrobes/rvbbit-lens:<version>` | Standalone Lens SQL desktop. Persist `/data` for `RVBBIT_LENS_HOME`. |
-| `ghcr.io/ryrobes/rvbbit-warren-agent:<version>` | Warren deployment agent with Docker CLI and Compose plugin. Mount `/var/run/docker.sock`. |
+| `ghcr.io/ryrobes/rvbbit-lens:<version>` | Standalone Lens SQL desktop with local capability scaffold/build support. Persist `/data` for `RVBBIT_LENS_HOME`. |
+| `ghcr.io/ryrobes/rvbbit-warren-agent:<version>` | Warren deployment agent with Docker CLI and Compose plugin. Mount the host Docker socket. |
 
 ## Capability Images
 
-The release script builds every built-in Warren capability as a separate image.
-Runtime/system capabilities get short names:
+The release script always builds `smoke/warren-echo` with the core release so a
+fresh Warren install has a deterministic backend for smoke tests. Pass
+`--with-capabilities` to build every built-in Warren capability as a separate
+image. Runtime/system capabilities get short names:
 
 | Catalog id | Image |
 |---|---|
@@ -48,7 +52,9 @@ overridden.
 
 Images include runtime dependencies and handler code. Hugging Face model
 weights are not baked into the image; they download into the Warren-managed
-container volume on first use.
+container volume on first use. V1 catalog entries also include source-build
+metadata, so Warren can build a capability from its packaged manifest/source
+when a prebuilt capability image is not available.
 
 ## Build Locally
 
@@ -63,9 +69,13 @@ This builds images locally and stages:
 - `dist/release/<version>/capability-images.<version>.json`
 - `dist/release/<version>/warren-agent-linux-<arch>`
 
+By default, `capability-images.<version>.json` contains only
+`smoke/warren-echo`. If `--with-capabilities` is used, it contains the full
+built-in capability image set.
+
 The Postgres image is built from a temporary release context whose embedded
-catalog seed points at the versioned capability images. The working tree stays
-in normal source/build mode.
+catalog seed points at the release image namespace/tag and includes source-build
+metadata for capabilities. The working tree stays in normal source/build mode.
 
 ## Publish
 
@@ -82,6 +92,17 @@ scripts/release/build-and-push.sh \
   --namespace ryrobes \
   --push \
   --tag-latest
+```
+
+Build and push the full catalog image set only when needed:
+
+```bash
+scripts/release/build-and-push.sh \
+  --version 1.0.0 \
+  --namespace ryrobes \
+  --push \
+  --tag-latest \
+  --with-capabilities
 ```
 
 Use `--bump` to update version files first:
@@ -122,6 +143,10 @@ After changing visibility, verify anonymous access with a clean Docker config:
 make release-public-check RELEASE_VERSION=1.0.0 IMAGE_NAMESPACE=ryrobes
 ```
 
+The default public check covers the three product images plus
+`rvbbit-warren-smoke-echo`. To verify the full catalog after a
+`--with-capabilities` release, run the checker with `--with-capabilities`.
+
 Or as a release gate after a push:
 
 ```bash
@@ -149,11 +174,46 @@ The Warren container needs the Docker socket:
 
 ```yaml
 volumes:
-  - /var/run/docker.sock:/var/run/docker.sock
+  - ${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
 ```
 
 That is intentional for the V1 single-host Warren model: Warren manages local
 Docker capability containers on behalf of the database.
+
+Lens also mounts the same socket in the packaged compose files. That makes the
+Capability UI's `Local` install target work from inside the Lens container
+against the same Docker daemon. The Lens image includes Docker CLI + Compose
+plugin and drops privileges after adding its runtime user to the mounted socket
+group. Local scaffold/build output is written under `RVBBIT_LOCAL_WORK_ROOT`,
+which defaults to `/data`, so generated capability projects persist in the Lens
+volume instead of the immutable app directory.
+
+On rootful Docker hosts, including hosts where the login user must run
+`sudo docker compose ...`, the default socket path is correct:
+
+```bash
+sudo env RVBBIT_VERSION=1.0.0 docker compose -f docker/docker-compose.release.yml up -d
+```
+
+Once the Warren container is running with the socket mounted, it manages
+capability containers through the Docker daemon. It does not need to run sudo
+inside the container.
+
+On rootless/user Docker hosts, point `RVBBIT_DOCKER_SOCKET` at the user Docker
+socket and launch with that same user-level Docker daemon:
+
+```bash
+export RVBBIT_DOCKER_SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+RVBBIT_VERSION=1.0.0 docker compose -f docker/docker-compose.release.yml up -d
+```
+
+The socket is mounted into Warren at `/var/run/docker.sock`, and
+`DOCKER_HOST` inside the Warren and Lens containers defaults to
+`unix:///var/run/docker.sock`.
+For a host-installed Warren service, use the installer in
+[WARREN_END_USER_INSTALL.md](WARREN_END_USER_INSTALL.md); it grants the service
+user Docker group access or can be run with `WARREN_SERVICE_USER=root` for
+root-only Docker sockets.
 
 ## Turnkey Uber Compose
 
@@ -162,6 +222,11 @@ For first-run QA, demos, and the easiest local install, use:
 ```bash
 RVBBIT_VERSION=1.0.0 docker compose -f docker/docker-compose.uber.yml up -d
 ```
+
+Use the same Docker socket rules as the release compose stack: rootful/sudo
+Docker can use `sudo env RVBBIT_VERSION=... docker compose ...`, and
+rootless/user Docker should set `RVBBIT_DOCKER_SOCKET` to the user Docker
+socket before launching.
 
 This starts the same Postgres, Lens, and Warren services, plus a one-shot
 `bootstrap` service from the Postgres image. The bootstrap waits for Warren to

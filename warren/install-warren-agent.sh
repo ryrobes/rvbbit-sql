@@ -14,6 +14,8 @@
 #   WARREN_CAPACITY='{}'
 #   WARREN_WORK_DIR=/var/lib/rvbbit/warren
 #   RVBBIT_DOCKER_NETWORK=docker_default
+#   WARREN_SERVICE_USER=rvbbit-warren   # set to root for root-only Docker sockets
+#   WARREN_DOCKER_HOST=unix:///run/user/1000/docker.sock
 #   WARREN_AGENT_URL=https://.../warren-agent-linux-amd64
 
 set -euo pipefail
@@ -42,6 +44,10 @@ WARREN_WORK_DIR="${WARREN_WORK_DIR:-/var/lib/rvbbit/warren}"
 RVBBIT_DOCKER_NETWORK="${RVBBIT_DOCKER_NETWORK:-docker_default}"
 WARREN_METRICS_MS="${WARREN_METRICS_MS:-10000}"
 WARREN_RECONCILE_MS="${WARREN_RECONCILE_MS:-15000}"
+WARREN_SERVICE_USER="${WARREN_SERVICE_USER:-rvbbit-warren}"
+WARREN_SERVICE_GROUP="${WARREN_SERVICE_GROUP:-$WARREN_SERVICE_USER}"
+WARREN_DOCKER_GROUP="${WARREN_DOCKER_GROUP:-docker}"
+WARREN_DOCKER_HOST="${WARREN_DOCKER_HOST:-}"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -57,20 +63,29 @@ command -v systemctl >/dev/null || die "systemctl not found; this installer targ
 command -v curl >/dev/null || die "curl not found"
 command -v docker >/dev/null || die "docker not found; install Docker before installing Warren"
 
-if ! getent group rvbbit-warren >/dev/null; then
-    groupadd --system rvbbit-warren
-fi
-if ! id -u rvbbit-warren >/dev/null 2>&1; then
-    useradd --system --gid rvbbit-warren --home-dir "$WARREN_WORK_DIR" \
-        --shell /usr/sbin/nologin rvbbit-warren
-fi
-if getent group docker >/dev/null; then
-    usermod -aG docker rvbbit-warren
+if [[ "$WARREN_SERVICE_USER" != "root" ]]; then
+    if ! getent group "$WARREN_SERVICE_GROUP" >/dev/null; then
+        groupadd --system "$WARREN_SERVICE_GROUP"
+    fi
+    if ! id -u "$WARREN_SERVICE_USER" >/dev/null 2>&1; then
+        useradd --system --gid "$WARREN_SERVICE_GROUP" --home-dir "$WARREN_WORK_DIR" \
+            --shell /usr/sbin/nologin "$WARREN_SERVICE_USER"
+    fi
+    if getent group "$WARREN_DOCKER_GROUP" >/dev/null; then
+        usermod -aG "$WARREN_DOCKER_GROUP" "$WARREN_SERVICE_USER"
+    elif [[ -n "$WARREN_DOCKER_HOST" ]]; then
+        info "Docker group '$WARREN_DOCKER_GROUP' not found; using WARREN_DOCKER_HOST=$WARREN_DOCKER_HOST"
+    else
+        die "Docker group '$WARREN_DOCKER_GROUP' not found. Create it/grant socket access, set WARREN_DOCKER_HOST for rootless Docker, or rerun with WARREN_SERVICE_USER=root for root-only Docker hosts."
+    fi
+else
+    WARREN_SERVICE_GROUP="${WARREN_SERVICE_GROUP:-root}"
+    info "WARREN_SERVICE_USER=root: Warren will run with root-equivalent Docker control"
 fi
 
 install -d -m 0755 /etc/rvbbit
 install -d -m 0755 /usr/local/bin
-install -d -o rvbbit-warren -g rvbbit-warren -m 0750 "$WARREN_WORK_DIR"
+install -d -o "$WARREN_SERVICE_USER" -g "$WARREN_SERVICE_GROUP" -m 0750 "$WARREN_WORK_DIR"
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
@@ -87,11 +102,14 @@ install -m 0755 "$tmp" /usr/local/bin/warren-agent
     write_env_var WARREN_CAPACITY "$WARREN_CAPACITY"
     write_env_var WARREN_METRICS_MS "$WARREN_METRICS_MS"
     write_env_var WARREN_RECONCILE_MS "$WARREN_RECONCILE_MS"
+    if [[ -n "$WARREN_DOCKER_HOST" ]]; then
+        write_env_var DOCKER_HOST "$WARREN_DOCKER_HOST"
+    fi
 } >/etc/rvbbit/warren-agent.env
 chmod 0600 /etc/rvbbit/warren-agent.env
 chown root:root /etc/rvbbit/warren-agent.env
 
-cat >/etc/systemd/system/rvbbit-warren-agent.service <<'EOF'
+cat >/etc/systemd/system/rvbbit-warren-agent.service <<EOF
 [Unit]
 Description=Rvbbit Warren Agent
 After=network-online.target docker.service
@@ -103,17 +121,17 @@ EnvironmentFile=/etc/rvbbit/warren-agent.env
 ExecStart=/usr/local/bin/warren-agent
 Restart=always
 RestartSec=5
-User=rvbbit-warren
-Group=rvbbit-warren
-WorkingDirectory=/var/lib/rvbbit/warren
+User=$WARREN_SERVICE_USER
+Group=$WARREN_SERVICE_GROUP
+WorkingDirectory=$WARREN_WORK_DIR
 StateDirectory=rvbbit
 LogsDirectory=rvbbit
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/var/lib/rvbbit/warren
-SupplementaryGroups=docker
+ReadWritePaths=$WARREN_WORK_DIR
+$(if [[ "$WARREN_SERVICE_USER" != "root" ]]; then printf 'SupplementaryGroups=%s\n' "$WARREN_DOCKER_GROUP"; fi)
 
 [Install]
 WantedBy=multi-user.target

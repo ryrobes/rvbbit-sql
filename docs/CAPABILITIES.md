@@ -1046,6 +1046,23 @@ capabilities/tools/rvbbit-capability install \
   --force
 ```
 
+The Lens local install path runs `docker compose` from the Lens server process.
+In packaged uber/release compose, Lens receives the same configurable Docker
+socket as Warren, so local mode works against the Docker daemon that launched
+the stack. Rootful/sudo Docker uses `/var/run/docker.sock`; rootless/user Docker
+sets `RVBBIT_DOCKER_SOCKET` to the user Docker socket before launching compose.
+Relative local output directories such as `.rvbbit/capabilities/<name>` are
+resolved under `RVBBIT_LOCAL_WORK_ROOT`, which defaults to the persisted Lens
+home `/data` in packaged compose. Absolute local output directories must also
+live under that root.
+
+When running Lens directly on a host rather than in the packaged container, the
+Lens server process must be able to run Docker without an interactive password.
+For local/dev Lens only, `RVBBIT_DOCKER_SUDO=true` makes the route invoke
+`sudo -n docker ...`; this requires passwordless sudo for the Docker command and
+fails fast otherwise. Set `RVBBIT_DOCKER_BIN` if the Docker CLI is installed at
+a non-standard path.
+
 Install without running Docker or SQL, useful for preview:
 
 ```bash

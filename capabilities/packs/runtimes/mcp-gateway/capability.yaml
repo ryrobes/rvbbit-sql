@@ -18,7 +18,7 @@ runtime:
   port: 9100
   health_path: /health
   env:
-    RVBBIT_DSN: postgresql://postgres:rvbbit@pg-rvbbit:5432/bench
+    RVBBIT_DSN: postgresql://postgres:rvbbit@postgres:5432/rvbbit
     GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     GITHUB_USERNAME: ${GITHUB_USERNAME:-}
     OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Build the complete Rvbbit Docker release set and optionally push it to GHCR.
+# Build the core Rvbbit Docker release set and optionally push it to GHCR.
 #
 # Local build:
 #   scripts/release/build-and-push.sh --version 1.0.0
 #
 # Publish:
 #   scripts/release/build-and-push.sh --version 1.0.0 --push --tag-latest
+#
+# Include all catalog capability images, beyond the core smoke image:
+#   scripts/release/build-and-push.sh --version 1.0.0 --with-capabilities
 #
 # Mutate version files first:
 #   scripts/release/build-and-push.sh --version 1.0.1 --bump
@@ -27,18 +30,20 @@ TAG_LATEST=0
 SKIP_DB=0
 SKIP_LENS=0
 SKIP_WARREN=0
-SKIP_CAPABILITIES=0
+BUILD_CAPABILITIES=0
 DRY_RUN=0
 CHECK_PUBLIC=0
+CORE_CAPABILITY_IDS=("smoke/warren-echo")
 
 usage() {
     cat >&2 <<EOF
-Build the complete Rvbbit Docker release set and optionally push it to GHCR.
+Build the core Rvbbit Docker release set and optionally push it to GHCR.
 
 Examples:
   scripts/release/build-and-push.sh --version 1.0.0
   scripts/release/build-and-push.sh --version 1.0.0 --push --tag-latest
   scripts/release/build-and-push.sh --version 1.0.1 --bump
+  scripts/release/build-and-push.sh --version 1.0.0 --with-capabilities
 
 Options:
   --version X.Y.Z          Required release version.
@@ -53,7 +58,8 @@ Options:
   --skip-db
   --skip-lens
   --skip-warren
-  --skip-capabilities
+  --with-capabilities      Also build/push all catalog capability images.
+  --skip-capabilities      Deprecated no-op; full catalog images are skipped by default.
   --check-public          After push, verify anonymous pull access with a clean Docker config.
   --dry-run                Print commands without running Docker builds.
 EOF
@@ -73,7 +79,8 @@ while [[ $# -gt 0 ]]; do
         --skip-db) SKIP_DB=1; shift ;;
         --skip-lens) SKIP_LENS=1; shift ;;
         --skip-warren) SKIP_WARREN=1; shift ;;
-        --skip-capabilities) SKIP_CAPABILITIES=1; shift ;;
+        --with-capabilities) BUILD_CAPABILITIES=1; shift ;;
+        --skip-capabilities) BUILD_CAPABILITIES=0; shift ;;
         --check-public) CHECK_PUBLIC=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -86,6 +93,7 @@ VERSION="${VERSION#v}"
 IMAGE_PREFIX="${REGISTRY%/}/${NAMESPACE}"
 RELEASE_DIR="$ROOT/dist/release/$VERSION"
 CONTEXT_DIR="$RELEASE_DIR/context/rvbbit-sql"
+LENS_CONTEXT_DIR="$RELEASE_DIR/context/rvbbit-lens"
 CATALOG_JSON="$RELEASE_DIR/capabilities.catalog.$VERSION.json"
 SEED_JSON="$RELEASE_DIR/capability_catalog_seed.$VERSION.json"
 CAPABILITY_PLAN="$RELEASE_DIR/capability-images.$VERSION.json"
@@ -136,6 +144,24 @@ build_image() {
     run "${cmd[@]}"
 }
 
+build_capability_images() {
+    local plan_output="$1"
+    shift
+    local cap_args=(
+        "$ROOT/scripts/release/capability-images.py"
+        --image-prefix "$IMAGE_PREFIX"
+        --version "$VERSION"
+        --out-dir "$RELEASE_DIR/capability-builds"
+        --platform "$CAPABILITY_PLATFORM"
+        --plan-output "$plan_output"
+    )
+    [[ "$PUSH" -eq 1 ]] && cap_args+=(--push)
+    [[ "$TAG_LATEST" -eq 1 ]] && cap_args+=(--tag-latest)
+    [[ "$DRY_RUN" -eq 1 ]] && cap_args+=(--dry-run)
+    cap_args+=("$@")
+    run "${cap_args[@]}"
+}
+
 if [[ "$BUMP" -eq 1 ]]; then
     run "$ROOT/scripts/release/bump-version.py" "$VERSION" --lens-dir "$LENS_DIR"
 fi
@@ -170,6 +196,26 @@ if [[ "$SKIP_DB" -eq 0 || "$SKIP_WARREN" -eq 0 ]]; then
         --exclude '*.pyc' \
         ./ "$CONTEXT_DIR"/
     run cp "$SEED_JSON" "$CONTEXT_DIR/crates/pg_rvbbit/src/capability_catalog_seed.json"
+    run cp "$CATALOG_JSON" "$CONTEXT_DIR/capabilities/catalog.json"
+fi
+
+if [[ "$SKIP_LENS" -eq 0 ]]; then
+    [[ -d "$LENS_DIR" ]] || { echo "Lens dir not found: $LENS_DIR" >&2; exit 2; }
+    run rm -rf "$LENS_CONTEXT_DIR"
+    run mkdir -p "$LENS_CONTEXT_DIR/rvbbit-capabilities"
+    run rsync -a --delete \
+        --exclude .git \
+        --exclude node_modules \
+        --exclude .next \
+        --exclude .playwright-mcp \
+        --exclude '*.log' \
+        "$LENS_DIR"/ "$LENS_CONTEXT_DIR"/
+    run rsync -a --delete \
+        "$ROOT/capabilities/packs" \
+        "$ROOT/capabilities/templates" \
+        "$ROOT/capabilities/tools" \
+        "$LENS_CONTEXT_DIR/rvbbit-capabilities"/
+    run cp "$CATALOG_JSON" "$LENS_CONTEXT_DIR/rvbbit-capabilities/catalog.json"
 fi
 
 if [[ "$SKIP_DB" -eq 0 ]]; then
@@ -192,24 +238,18 @@ if [[ "$SKIP_WARREN" -eq 0 ]]; then
 fi
 
 if [[ "$SKIP_LENS" -eq 0 ]]; then
-    [[ -d "$LENS_DIR" ]] || { echo "Lens dir not found: $LENS_DIR" >&2; exit 2; }
-    build_image rvbbit-lens "$LENS_DIR/Dockerfile" "$LENS_DIR" "$PLATFORM" \
+    build_image rvbbit-lens "$LENS_CONTEXT_DIR/Dockerfile" "$LENS_CONTEXT_DIR" "$PLATFORM" \
         --label "org.opencontainers.image.title=rvbbit-lens"
 fi
 
-if [[ "$SKIP_CAPABILITIES" -eq 0 ]]; then
-    cap_args=(
-        "$ROOT/scripts/release/capability-images.py"
-        --image-prefix "$IMAGE_PREFIX"
-        --version "$VERSION"
-        --out-dir "$RELEASE_DIR/capability-builds"
-        --platform "$CAPABILITY_PLATFORM"
-        --plan-output "$CAPABILITY_PLAN"
-    )
-    [[ "$PUSH" -eq 1 ]] && cap_args+=(--push)
-    [[ "$TAG_LATEST" -eq 1 ]] && cap_args+=(--tag-latest)
-    [[ "$DRY_RUN" -eq 1 ]] && cap_args+=(--dry-run)
-    run "${cap_args[@]}"
+if [[ "$BUILD_CAPABILITIES" -eq 1 ]]; then
+    build_capability_images "$CAPABILITY_PLAN"
+else
+    core_capability_args=()
+    for capability_id in "${CORE_CAPABILITY_IDS[@]}"; do
+        core_capability_args+=(--only "$capability_id")
+    done
+    build_capability_images "$CAPABILITY_PLAN" "${core_capability_args[@]}"
 fi
 
 if [[ "$CHECK_PUBLIC" -eq 1 ]]; then
@@ -225,7 +265,7 @@ if [[ "$CHECK_PUBLIC" -eq 1 ]]; then
     [[ "$SKIP_DB" -eq 1 ]] && public_args+=(--skip-db)
     [[ "$SKIP_LENS" -eq 1 ]] && public_args+=(--skip-lens)
     [[ "$SKIP_WARREN" -eq 1 ]] && public_args+=(--skip-warren)
-    [[ "$SKIP_CAPABILITIES" -eq 1 ]] && public_args+=(--skip-capabilities)
+    [[ "$BUILD_CAPABILITIES" -eq 1 ]] && public_args+=(--with-capabilities)
     run "${public_args[@]}"
 fi
 
@@ -240,6 +280,10 @@ Image prefix:
 Release catalog:
   $CATALOG_JSON
   $SEED_JSON
+
+Capability images:
+  core: ${CORE_CAPABILITY_IDS[*]}
+  full catalog: $(if [[ "$BUILD_CAPABILITIES" -eq 1 ]]; then printf 'included'; else printf 'skipped (use --with-capabilities to build it)'; fi)
 
 Clean-slate compose:
   RVBBIT_VERSION=$VERSION docker compose -f docker/docker-compose.release.yml up -d

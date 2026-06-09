@@ -6520,6 +6520,46 @@ LANGUAGE sql STABLE AS $fn$
     LIMIT greatest(p_limit, 1);
 $fn$;
 
+-- ---------------------------------------------------------------------
+-- KPI board: pivot the observation log into a (metric x data-time) grid.
+-- One row per (metric, data-time bucket) = the latest observation that
+-- landed in that bucket. The board reads this for the fast historical
+-- matrix; live recompute (restatement, def-time scrub, threshold what-if)
+-- layers on top via metric()/check_metric()/metric_sql().
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION rvbbit.metric_board(
+    p_metrics text[]      DEFAULT NULL,
+    p_from    timestamptz DEFAULT (now() - interval '30 days'),
+    p_to      timestamptz DEFAULT now(),
+    p_bucket  text        DEFAULT 'day'
+) RETURNS SETOF jsonb
+LANGUAGE sql STABLE AS $fn$
+    SELECT to_jsonb(c)
+    FROM (
+        SELECT DISTINCT ON (o.metric_name, date_trunc(p_bucket, COALESCE(o.data_as_of, o.observed_at)))
+            o.metric_name                                              AS metric,
+            date_trunc(p_bucket, COALESCE(o.data_as_of, o.observed_at)) AS bucket,
+            COALESCE(o.data_as_of, o.observed_at)                       AS data_as_of,
+            o.def_as_of,
+            o.params,
+            o.data_generation,
+            o.metric_version,
+            o.value,
+            o.verdict,
+            o.status,
+            o.trigger,
+            o.observed_at
+        FROM rvbbit.metric_observations o
+        WHERE COALESCE(o.data_as_of, o.observed_at) >= p_from
+          AND COALESCE(o.data_as_of, o.observed_at) <= p_to
+          AND (p_metrics IS NULL OR o.metric_name = ANY(p_metrics))
+        ORDER BY o.metric_name,
+                 date_trunc(p_bucket, COALESCE(o.data_as_of, o.observed_at)),
+                 COALESCE(o.data_as_of, o.observed_at) DESC,
+                 o.observed_at DESC
+    ) c;
+$fn$;
+
 CREATE OR REPLACE FUNCTION rvbbit.schedule_materialize_tick(
     cron_schedule text DEFAULT '* * * * *',
     budget        integer DEFAULT 200

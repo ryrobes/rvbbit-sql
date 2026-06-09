@@ -86,8 +86,12 @@ CREATE OR REPLACE FUNCTION rvbbit.catalog_value_drift(
     dist_b jsonb)
 RETURNS jsonb
 LANGUAGE sql IMMUTABLE AS $fn$
-    WITH a AS (SELECT key, (value)::numeric AS n FROM jsonb_each_text(COALESCE(dist_a, '{}'::jsonb))),
-         b AS (SELECT key, (value)::numeric AS n FROM jsonb_each_text(COALESCE(dist_b, '{}'::jsonb))),
+    -- Guard on jsonb_typeof, not COALESCE: value_dist can be JSON `null` (or an
+    -- array/scalar) even when value_dist_complete is true — e.g. an all-NULL,
+    -- low-NDV column. COALESCE only catches SQL NULL, so a JSON `null` would
+    -- still reach jsonb_each_text and raise "cannot call ... on a non-object".
+    WITH a AS (SELECT key, (value)::numeric AS n FROM jsonb_each_text(CASE WHEN jsonb_typeof(dist_a) = 'object' THEN dist_a ELSE '{}'::jsonb END)),
+         b AS (SELECT key, (value)::numeric AS n FROM jsonb_each_text(CASE WHEN jsonb_typeof(dist_b) = 'object' THEN dist_b ELSE '{}'::jsonb END)),
          ta AS (SELECT NULLIF(COALESCE(sum(n), 0), 0) AS t FROM a),
          tb AS (SELECT NULLIF(COALESCE(sum(n), 0), 0) AS t FROM b),
          keys AS (SELECT key FROM a UNION SELECT key FROM b),

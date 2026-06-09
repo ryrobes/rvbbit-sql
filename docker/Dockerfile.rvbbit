@@ -56,7 +56,9 @@ COPY crates/ crates/
 # mount persists the compiled crate graph across rebuilds, so iterating on
 # extension source only recompiles the changed crates (minutes -> seconds).
 RUN --mount=type=cache,target=/build/target \
-    cargo pgrx install --release --pg-config $(which pg_config)
+    cargo pgrx install --release --pg-config $(which pg_config) \
+    && find /usr/lib/postgresql/18/lib -maxdepth 1 -type f -name 'pg_rvbbit*.so' \
+        -exec strip --strip-unneeded {} +
 
 # Backend Duck routing uses a small native Rust sidecar from inside the
 # PostgreSQL container. It is guarded by the router and optional at runtime,
@@ -64,10 +66,14 @@ RUN --mount=type=cache,target=/build/target \
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/build/crates/rvbbit_duck/target \
     cargo build --release --locked --manifest-path crates/rvbbit_duck/Cargo.toml \
-    && cp crates/rvbbit_duck/target/release/rvbbit-duck /build/rvbbit-duck
+    && cp crates/rvbbit_duck/target/release/rvbbit-duck /build/rvbbit-duck \
+    && strip --strip-unneeded /build/rvbbit-duck
 
 # Runtime stage: clean PG18 image with the extension files dropped in.
 FROM postgres:18
+
+ENV RVBBIT_CAPABILITY_ROOT=/usr/share/rvbbit/capabilities
+ENV RVBBIT_CAPABILITY_PACKS_DIR=/usr/share/rvbbit/capabilities/packs
 
 # zstd runtime (parquet writes) + pg_cron (scheduled jobs; the Scheduler UI
 # manages it, preconfigured so catalog_crawl() etc. can be scheduled out of the box)
@@ -82,6 +88,14 @@ COPY --from=builder /usr/share/postgresql/18/extension/pg_rvbbit* \
 COPY --from=builder /usr/lib/postgresql/18/lib/pg_rvbbit* \
         /usr/lib/postgresql/18/lib/
 COPY --from=builder /build/rvbbit-duck /usr/local/bin/rvbbit-duck
+
+# Ship the built-in capability source packs alongside the catalog seed. The
+# database stores deploy manifests inline, but these files give packaged
+# installs a stable provenance/inspection root instead of a developer checkout.
+COPY capabilities/catalog.json /usr/share/rvbbit/capabilities/catalog.json
+COPY capabilities/packs/ /usr/share/rvbbit/capabilities/packs/
+COPY capabilities/templates/ /usr/share/rvbbit/capabilities/templates/
+COPY capabilities/tools/ /usr/share/rvbbit/capabilities/tools/
 
 # Pre-load extension on first boot.
 COPY docker/init/ /docker-entrypoint-initdb.d/

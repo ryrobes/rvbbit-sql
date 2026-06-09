@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and optionally push all Warren capability images."""
+"""Build and optionally push selected Warren capability images."""
 from __future__ import annotations
 
 import argparse

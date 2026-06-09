@@ -50,7 +50,7 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
 DSN = os.environ.get(
-    "RVBBIT_DSN", "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench"
+    "RVBBIT_DSN", "postgresql://postgres:rvbbit@postgres:5432/rvbbit"
 )
 
 pool: dict[str, "MCPServerProcess"] = {}

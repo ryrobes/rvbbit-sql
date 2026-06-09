@@ -16,6 +16,8 @@ FROM debian:bookworm-slim
 
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
+ENV RVBBIT_CAPABILITY_ROOT=/usr/share/rvbbit/capabilities
+ENV RVBBIT_CAPABILITY_PACKS_DIR=/usr/share/rvbbit/capabilities/packs
 ENV WARREN_TEMPLATE_DIR=/usr/share/rvbbit/capabilities/templates
 ENV WARREN_WORK_DIR=/var/lib/rvbbit/warren
 
@@ -42,10 +44,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN useradd --system --home-dir /var/lib/rvbbit/warren --shell /usr/sbin/nologin warren \
     && install -d -o warren -g warren -m 0750 /var/lib/rvbbit/warren \
+    && install -d -m 0755 /usr/share/rvbbit/capabilities/packs \
     && install -d -m 0755 /usr/share/rvbbit/capabilities/templates
 
 COPY --from=builder /build/target/release/warren-agent /usr/local/bin/warren-agent
+COPY capabilities/catalog.json /usr/share/rvbbit/capabilities/catalog.json
+COPY capabilities/packs/ /usr/share/rvbbit/capabilities/packs/
 COPY capabilities/templates/ /usr/share/rvbbit/capabilities/templates/
+COPY capabilities/tools/ /usr/share/rvbbit/capabilities/tools/
 
 WORKDIR /var/lib/rvbbit/warren
 ENTRYPOINT ["warren-agent"]

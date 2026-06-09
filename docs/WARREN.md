@@ -210,6 +210,29 @@ host can control Docker and can register endpoints/operators in Rvbbit, so
 treat it as trusted infrastructure and keep generated sidecars on a private
 network reachable by Postgres.
 
+On hosts where `docker ps` only works through `sudo`, prefer granting the
+Warren service user access to the Docker socket via the Docker group. The
+installer does this automatically when the group exists. If the host has a
+root-only Docker socket, install with `WARREN_SERVICE_USER=root`; Docker daemon
+control is root-equivalent either way, and Warren must not depend on
+interactive sudo prompts.
+
+For containerized Warren, the compose files use a stable in-container socket
+path and a configurable host socket:
+
+```bash
+# rootful Docker
+sudo env RVBBIT_VERSION=1.0.0 docker compose -f docker/docker-compose.release.yml up -d
+
+# rootless Docker
+export RVBBIT_DOCKER_SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+RVBBIT_VERSION=1.0.0 docker compose -f docker/docker-compose.release.yml up -d
+```
+
+For a host-installed Warren service using rootless Docker, set
+`WARREN_SERVICE_USER` to the user that owns the rootless daemon and set
+`WARREN_DOCKER_HOST=unix:///run/user/<uid>/docker.sock` during install.
+
 Useful service commands:
 
 ```bash

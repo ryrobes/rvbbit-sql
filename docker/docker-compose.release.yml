@@ -35,10 +35,17 @@ services:
         condition: service_healthy
     environment:
       RVBBIT_LENS_HOME: /data
+      RVBBIT_LOCAL_WORK_ROOT: ${RVBBIT_LOCAL_WORK_ROOT:-/data}
+      RVBBIT_CAPABILITY_ROOT: ${RVBBIT_CAPABILITY_ROOT:-/usr/share/rvbbit/capabilities}
+      RVBBIT_CAPABILITY_CLI: ${RVBBIT_CAPABILITY_CLI:-/usr/share/rvbbit/capabilities/tools/rvbbit-capability}
+      DOCKER_HOST: ${RVBBIT_DOCKER_HOST:-unix:///var/run/docker.sock}
+      DOCKER_CONFIG: /docker-config
     ports:
       - "${RVBBIT_LENS_PORT:-3000}:3000"
     volumes:
       - rvbbit_lens:/data
+      - ${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      - ${RVBBIT_DOCKER_CONFIG:-$HOME/.docker}:/docker-config:ro
     restart: unless-stopped
 
   warren:
@@ -56,8 +63,9 @@ services:
       WARREN_CAPACITY: '${WARREN_CAPACITY:-{}}'
       WARREN_METRICS_MS: ${WARREN_METRICS_MS:-10000}
       WARREN_RECONCILE_MS: ${WARREN_RECONCILE_MS:-15000}
+      DOCKER_HOST: ${RVBBIT_DOCKER_HOST:-unix:///var/run/docker.sock}
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
       - rvbbit_warren:/var/lib/rvbbit/warren
     restart: unless-stopped
 

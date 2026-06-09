@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CLI = ROOT / "capabilities" / "tools" / "rvbbit-capability"
 PACKS = ROOT / "capabilities" / "packs"
+CORE_CAPABILITY_IDS = {"smoke/warren-echo"}
 
 
 def capture_json(cmd: list[str]) -> dict:
@@ -26,7 +27,12 @@ def capture_json(cmd: list[str]) -> dict:
     return json.loads(result.stdout)
 
 
-def release_capability_images(image_prefix: str, version: str) -> list[str]:
+def release_capability_images(
+    image_prefix: str,
+    version: str,
+    *,
+    include_all: bool,
+) -> list[str]:
     doc = capture_json(
         [
             str(CLI),
@@ -43,6 +49,8 @@ def release_capability_images(image_prefix: str, version: str) -> list[str]:
     images: set[str] = set()
     prefix = image_prefix.rstrip("/") + "/"
     for entry in doc["capabilities"]:
+        if not include_all and entry.get("id") not in CORE_CAPABILITY_IDS:
+            continue
         image = entry.get("runtime_image")
         if isinstance(image, str) and image.startswith(prefix):
             images.add(image)
@@ -88,7 +96,16 @@ def main() -> None:
     parser.add_argument("--skip-db", action="store_true")
     parser.add_argument("--skip-lens", action="store_true")
     parser.add_argument("--skip-warren", action="store_true")
-    parser.add_argument("--skip-capabilities", action="store_true")
+    parser.add_argument(
+        "--with-capabilities",
+        action="store_true",
+        help="also verify every built-in capability image, not just core smoke",
+    )
+    parser.add_argument(
+        "--skip-capabilities",
+        action="store_true",
+        help="verify only product images; normally core smoke is included",
+    )
     parser.add_argument(
         "--list-only",
         action="store_true",
@@ -98,7 +115,13 @@ def main() -> None:
 
     images = product_images(args.image_prefix, args.version, args)
     if not args.skip_capabilities:
-        images.extend(release_capability_images(args.image_prefix, args.version))
+        images.extend(
+            release_capability_images(
+                args.image_prefix,
+                args.version,
+                include_all=args.with_capabilities,
+            )
+        )
     images = sorted(set(images))
 
     owner = args.image_prefix.rstrip("/").rsplit("/", 1)[-1]

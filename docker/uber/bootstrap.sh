@@ -3,10 +3,25 @@ set -euo pipefail
 
 dsn="${RVBBIT_DSN:-postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}}"
 warren_node="${WARREN_NODE:-compose-warren}"
-target_selector="${RVBBIT_UBER_TARGET_SELECTOR:-{\"capability\":true,\"docker\":true,\"gpu\":false}}"
+target_selector="${RVBBIT_UBER_TARGET_SELECTOR:-}"
+if [[ -z "$target_selector" ]]; then
+    target_selector='{"capability":true,"docker":true,"gpu":false}'
+fi
 capabilities_csv="${RVBBIT_UBER_BOOTSTRAP_CAPABILITIES:-smoke/warren-echo,runtimes/python-runtime,runtimes/mcp-gateway}"
 timeout_seconds="${RVBBIT_UBER_BOOTSTRAP_TIMEOUT_SECONDS:-600}"
 poll_seconds="${RVBBIT_UBER_BOOTSTRAP_POLL_SECONDS:-2}"
+lens_connections_path="${RVBBIT_LENS_CONNECTIONS_PATH:-}"
+lens_bootstrap_connection="${RVBBIT_LENS_BOOTSTRAP_CONNECTION:-true}"
+lens_connection_id="${RVBBIT_LENS_CONNECTION_ID:-rvbbit-uber}"
+lens_connection_label="${RVBBIT_LENS_CONNECTION_LABEL:-Rvbbit Uber}"
+lens_connection_host="${RVBBIT_LENS_CONNECTION_HOST:-postgres}"
+lens_connection_port="${RVBBIT_LENS_CONNECTION_PORT:-5432}"
+lens_connection_database="${RVBBIT_LENS_CONNECTION_DATABASE:-${POSTGRES_DB:-rvbbit}}"
+lens_connection_user="${RVBBIT_LENS_CONNECTION_USER:-postgres}"
+lens_connection_password="${RVBBIT_LENS_CONNECTION_PASSWORD:-${POSTGRES_PASSWORD:-rvbbit}}"
+lens_connection_ssl_mode="${RVBBIT_LENS_CONNECTION_SSL_MODE:-disable}"
+lens_connection_file_uid="${RVBBIT_LENS_CONNECTION_FILE_UID:-1001}"
+lens_connection_file_gid="${RVBBIT_LENS_CONNECTION_FILE_GID:-1001}"
 
 log() {
     printf '[rvbbit-uber-bootstrap] %s\n' "$*"
@@ -58,6 +73,65 @@ trim() {
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
     printf '%s' "$value"
+}
+
+is_true() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+bootstrap_lens_connection() {
+    if ! is_true "$lens_bootstrap_connection"; then
+        log "Lens default connection bootstrap disabled"
+        return 0
+    fi
+    if [[ -z "$lens_connections_path" ]]; then
+        return 0
+    fi
+    if [[ -s "$lens_connections_path" ]]; then
+        log "Lens connections file already exists; skipping default connection seed"
+        return 0
+    fi
+
+    log "seeding Lens default connection"
+    mkdir -p "$(dirname "$lens_connections_path")"
+    local tmp="${lens_connections_path}.tmp"
+    local now
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    psql "$dsn" -X -v ON_ERROR_STOP=1 -Atq \
+        -v conn_id="$lens_connection_id" \
+        -v conn_label="$lens_connection_label" \
+        -v conn_host="$lens_connection_host" \
+        -v conn_port="$lens_connection_port" \
+        -v conn_database="$lens_connection_database" \
+        -v conn_user="$lens_connection_user" \
+        -v conn_password="$lens_connection_password" \
+        -v conn_ssl_mode="$lens_connection_ssl_mode" \
+        -v conn_now="$now" <<'SQL' > "$tmp"
+SELECT jsonb_pretty(jsonb_build_object(
+  'version', 1,
+  'connections', jsonb_build_array(jsonb_build_object(
+    'id', :'conn_id',
+    'label', :'conn_label',
+    'host', :'conn_host',
+    'port', :'conn_port'::int,
+    'database', :'conn_database',
+    'user', :'conn_user',
+    'password', :'conn_password',
+    'sslMode', :'conn_ssl_mode',
+    'isDefault', true,
+    'createdAt', :'conn_now',
+    'updatedAt', :'conn_now'
+  ))
+));
+SQL
+    chmod 0600 "$tmp"
+    chown "${lens_connection_file_uid}:${lens_connection_file_gid}" "$tmp" 2>/dev/null || true
+    mv "$tmp" "$lens_connections_path"
+    log "Lens default connection seeded"
 }
 
 capability_ready_sql() {
@@ -209,6 +283,7 @@ wait_sql_true "database" "SELECT true;"
 
 log "seeding capability catalog"
 psql_scalar -c "SELECT rvbbit.seed_capability_catalog();" >/dev/null
+bootstrap_lens_connection
 
 log "waiting for Warren node '$warren_node'"
 wait_warren_node
