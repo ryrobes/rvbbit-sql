@@ -4625,6 +4625,7 @@ RETURNS jsonb LANGUAGE plpgsql STABLE AS $emm$
 DECLARE
     s rvbbit.mcp_servers%ROWTYPE;
     v_secrets jsonb; v_tools jsonb; v_resources jsonb; v_operators text[];
+    v_op_defs jsonb;
     v_n_tools int; v_n_res int; v_manifest jsonb; v_entry jsonb;
 BEGIN
     SELECT * INTO s FROM rvbbit.mcp_servers WHERE name = server_name;
@@ -4664,12 +4665,41 @@ BEGIN
         ORDER BY t.name), ARRAY[]::text[])
     INTO v_operators FROM rvbbit.mcp_tools t WHERE t.server = server_name;
 
+    -- Rich operator defs (name + typed arg signature + doc) so the UI can show
+    -- the call signature in operator tooltips BEFORE install — the args are
+    -- otherwise only knowable from the live rvbbit.operators row post-install.
+    -- Arg names/types mirror generate_mcp_operators exactly (sorted by key,
+    -- same JSON-Schema -> PG type mapping), so the displayed def matches the
+    -- function that install actually creates.
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+        'name', server_name || '_' ||
+            CASE WHEN left(t.name, length(server_name) + 1) = server_name || '_'
+                 THEN substr(t.name, length(server_name) + 2) ELSE t.name END,
+        'description', coalesce(t.description, ''),
+        'arg_names', coalesce(a.names, '[]'::jsonb),
+        'arg_types', coalesce(a.types, '[]'::jsonb),
+        'return_type', 'text', 'shape', 'scalar'
+    ) ORDER BY t.name), '[]'::jsonb)
+    INTO v_op_defs
+    FROM rvbbit.mcp_tools t
+    LEFT JOIN LATERAL (
+        SELECT jsonb_agg(p.key ORDER BY p.key) AS names,
+               jsonb_agg(CASE p.value->>'type'
+                   WHEN 'integer' THEN 'bigint' WHEN 'number' THEN 'double precision'
+                   WHEN 'boolean' THEN 'boolean' WHEN 'object' THEN 'jsonb'
+                   WHEN 'array' THEN 'jsonb' ELSE 'text' END ORDER BY p.key) AS types
+        FROM jsonb_each(CASE WHEN jsonb_typeof(t.input_schema->'properties') = 'object'
+                             THEN t.input_schema->'properties' ELSE '{}'::jsonb END) AS p
+    ) a ON true
+    WHERE t.server = server_name;
+
     v_manifest := jsonb_build_object('name', server_name, 'kind', 'mcp',
         'description', coalesce(s.description, ''),
         'connection', jsonb_strip_nulls(jsonb_build_object('transport', s.transport,
             'command', s.command, 'args', to_jsonb(s.args), 'env', s.env, 'url', s.url,
             'auth_header_env', s.auth_header_env, 'timeout_ms', s.timeout_ms)),
         'secrets', v_secrets, 'tools', v_tools, 'resources', v_resources,
+        'operators', v_op_defs,
         'surface', jsonb_build_object('n_tools', v_n_tools, 'n_resources', v_n_res),
         'scanned_at', to_jsonb(clock_timestamp()));
     v_entry := jsonb_build_object('id', 'mcp/' || server_name, 'kind', 'mcp',
