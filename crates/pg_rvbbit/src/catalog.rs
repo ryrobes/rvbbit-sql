@@ -4655,8 +4655,13 @@ BEGIN
     INTO v_resources, v_n_res FROM rvbbit.mcp_resources r WHERE r.server = server_name;
 
     -- Each tool becomes a server-namespaced operator (avoids cross-server
-    -- collisions on common names like `search`).
-    SELECT coalesce(array_agg(server_name || '_' || t.name ORDER BY t.name), ARRAY[]::text[])
+    -- collisions on common names like `search`). Tools that already
+    -- self-namespace (e.g. firecrawl's `firecrawl_scrape`) keep their name
+    -- rather than getting a doubled `firecrawl_firecrawl_` prefix.
+    SELECT coalesce(array_agg(server_name || '_' ||
+        CASE WHEN left(t.name, length(server_name) + 1) = server_name || '_'
+             THEN substr(t.name, length(server_name) + 2) ELSE t.name END
+        ORDER BY t.name), ARRAY[]::text[])
     INTO v_operators FROM rvbbit.mcp_tools t WHERE t.server = server_name;
 
     v_manifest := jsonb_build_object('name', server_name, 'kind', 'mcp',
@@ -4702,7 +4707,11 @@ DECLARE
     v_op text; v_args text[]; v_types text[]; v_inputs jsonb; v_steps jsonb; v_n int := 0;
 BEGIN
     FOR t IN SELECT name, description, input_schema FROM rvbbit.mcp_tools WHERE server = server_name LOOP
-        v_op := server_name || '_' || t.name;
+        -- Tools that already self-namespace (e.g. firecrawl's `firecrawl_scrape`)
+        -- must not get a doubled `firecrawl_firecrawl_` prefix.
+        v_op := server_name || '_' ||
+            CASE WHEN left(t.name, length(server_name) + 1) = server_name || '_'
+                 THEN substr(t.name, length(server_name) + 2) ELSE t.name END;
         -- Drop prior wrapper(s) — return type / signature may change between scans.
         FOR r IN SELECT oid::regprocedure AS sig FROM pg_proc
                  WHERE proname IN (v_op, '_op_' || v_op) AND pronamespace = 'rvbbit'::regnamespace LOOP
