@@ -1299,9 +1299,13 @@ the install flow calls. Prefer it.
 
 ### Servers shipped in the seed today
 
-`github`, `firecrawl`, `time`, `iplocate`, `tavily`, `exa`, `apollo`, `ipgeo` —
-browse them in the Capabilities catalog. `time` and `iplocate` are keyless and
-work immediately; the rest declare a single API key supplied at install.
+`github`, `firecrawl`, `time`, `iplocate`, `tavily`, `exa`, `apollo`, `ipgeo`,
+`maps` (Google Maps), `brave`, `openweather` — browse them in the Capabilities
+catalog. `time` and `iplocate` are keyless and work immediately; the rest
+declare a single API key supplied at install. Two carry capture notes baked
+into their `connection`: `maps` is launched with `--stdio`, and `openweather`
+pins `@modelcontextprotocol/sdk@1.12.1` in its `args` (the floating SDK 1.29
+crashes its FastMCP build).
 
 ---
 
