@@ -13679,6 +13679,3384 @@
         "manifest_path": "mcp/time",
         "catalog_visibility": "public"
       }
+    },
+    {
+      "capability_manifest": {
+        "kind": "mcp",
+        "name": "brave",
+        "tools": [
+          {
+            "name": "brave_image_search",
+            "cacheable": false,
+            "description": "\n    Performs an image search using the Brave Search API. Helpful for when you need pictures of people, places, things, graphic design ideas, art inspiration, and more. When relaying results in a markdown environment, it may be helpful to include images in the results (e.g., ![image.title](image.properties.url)).\n",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "default": 50,
+                  "maximum": 200,
+                  "minimum": 1,
+                  "description": "Number of results (1-200, default 50). Combine this parameter with `offset` to paginate search results."
+                },
+                "query": {
+                  "type": "string",
+                  "maxLength": 400,
+                  "minLength": 1,
+                  "description": "The user's search query. Query cannot be empty. Limited to 400 characters and 50 words."
+                },
+                "country": {
+                  "type": "string",
+                  "default": "US",
+                  "description": "Search query country, where the results come from. The country string is limited to 2 character country codes of supported countries."
+                },
+                "safesearch": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "const": "off"
+                    },
+                    {
+                      "type": "string",
+                      "const": "strict"
+                    }
+                  ],
+                  "default": "strict",
+                  "description": "Filters search results for adult content. The following values are supported: 'off' - No filtering. 'strict' - Drops all adult content from search results."
+                },
+                "spellcheck": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Whether to spellcheck provided query."
+                },
+                "search_lang": {
+                  "type": "string",
+                  "default": "en",
+                  "description": "Search language preference. The 2 or more character language code for which the search results are provided."
+                }
+              }
+            }
+          },
+          {
+            "name": "brave_llm_context",
+            "cacheable": false,
+            "description": "Retrieves pre-extracted, relevance-ranked web content using Brave's LLM Context API, optimized for AI agents, LLM grounding, and RAG pipelines. Unlike a traditional web search that returns links and short descriptions, this tool returns the actual substance of matching pages — text chunks, tables, code blocks, and structured data — so the model can reason over it directly.\n\n    When to use:\n        - Grounding answers in fresh, relevant web content (RAG)\n        - Giving an AI agent ready-to-use page content from a single search call\n        - Question answering and fact-checking against current sources\n        - Gathering source material for research without manually fetching pages\n        - When you need the contents of pages, not just titles, descriptions, and URLs\n\n    When relaying results in markdown-supporting environments, cite the source URLs from the \"sources\" map.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "maximum": 50,
+                  "minimum": 1,
+                  "description": "The maximum number of search results considered to select the LLM context data. The default is 20 and the maximum is 50."
+                },
+                "query": {
+                  "type": "string",
+                  "maxLength": 400,
+                  "minLength": 1,
+                  "description": "The user's search query term. Query can not be empty. Maximum of 400 characters and 50 words in the query."
+                },
+                "accept": {
+                  "enum": [
+                    "application/json",
+                    "*/*"
+                  ],
+                  "type": "string",
+                  "description": "The default supported media type is application/json."
+                },
+                "country": {
+                  "enum": [
+                    "AR",
+                    "AU",
+                    "AT",
+                    "BE",
+                    "BR",
+                    "CA",
+                    "CL",
+                    "DK",
+                    "FI",
+                    "FR",
+                    "DE",
+                    "GR",
+                    "HK",
+                    "IN",
+                    "ID",
+                    "IT",
+                    "JP",
+                    "KR",
+                    "MY",
+                    "MX",
+                    "NL",
+                    "NZ",
+                    "NO",
+                    "CN",
+                    "PL",
+                    "PT",
+                    "PH",
+                    "RU",
+                    "SA",
+                    "ZA",
+                    "ES",
+                    "SE",
+                    "CH",
+                    "TW",
+                    "TR",
+                    "GB",
+                    "US",
+                    "ALL"
+                  ],
+                  "type": "string",
+                  "description": "The search query country, where the results come from. The country string is limited to 2 character country codes of supported countries."
+                },
+                "goggles": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ],
+                  "description": "Goggles act as a custom re-ranking on top of Brave's search index. The parameter supports both a url where the Goggle is hosted or the definition of the Goggle. Multiple goggle URLs and/or definitions can be provided in an array. For more details, refer to the Goggles repository (i.e., https://github.com/brave/goggles-quickstart)."
+                },
+                "freshness": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "pd",
+                        "pw",
+                        "pm",
+                        "py"
+                      ],
+                      "type": "string"
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^\\d{4}-\\d{2}-\\d{2}to\\d{4}-\\d{2}-\\d{2}$"
+                    }
+                  ],
+                  "description": "Filters search results by when they were discovered. The following values are supported: 'pd' - Discovered within the last 24 hours. 'pw' - Discovered within the last 7 days. 'pm' - Discovered within the last 31 days. 'py' - Discovered within the last 365 days. 'YYYY-MM-DDtoYYYY-MM-DD' - Timeframe is also supported by specifying the date range e.g. 2022-04-01to2022-07-30."
+                },
+                "x-loc-lat": {
+                  "type": "number",
+                  "maximum": 90,
+                  "minimum": -90,
+                  "description": "The latitude of the client's geographical location in degrees, to provide relevant local results. The latitude must be greater than or equal to -90.0 degrees and less than or equal to +90.0 degrees."
+                },
+                "spellcheck": {
+                  "type": "boolean",
+                  "description": "Whether to enable spellcheck on the query."
+                },
+                "user-agent": {
+                  "type": "string",
+                  "description": "The user agent originating the request. Brave search can utilize the user agent to provide a different experience depending on the device as described by the string. The user agent should follow the commonly used browser agent strings on each platform. For more information on curating user agents, see RFC 9110."
+                },
+                "x-loc-city": {
+                  "type": "string",
+                  "description": "The generic name of the client city"
+                },
+                "x-loc-long": {
+                  "type": "number",
+                  "maximum": 180,
+                  "minimum": -180,
+                  "description": "The longitude of the client's geographical location in degrees, to provide relevant local results. The longitude must be greater than or equal to -180.0 and less than or equal to +180.0 degrees."
+                },
+                "api-version": {
+                  "type": "string",
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                  "description": "The API version to use. This is denoted by the format YYYY-MM-DD. Default is the latest that is available. Read more about API versioning at https://api-dashboard.search.brave.com/documentation/guides/versioning."
+                },
+                "search_lang": {
+                  "enum": [
+                    "ar",
+                    "eu",
+                    "bn",
+                    "bg",
+                    "ca",
+                    "zh-hans",
+                    "zh-hant",
+                    "hr",
+                    "cs",
+                    "da",
+                    "nl",
+                    "en",
+                    "en-gb",
+                    "et",
+                    "fi",
+                    "fr",
+                    "gl",
+                    "de",
+                    "el",
+                    "gu",
+                    "he",
+                    "hi",
+                    "hu",
+                    "is",
+                    "it",
+                    "jp",
+                    "kn",
+                    "ko",
+                    "lv",
+                    "lt",
+                    "ms",
+                    "ml",
+                    "mr",
+                    "nb",
+                    "pl",
+                    "pt-br",
+                    "pt-pt",
+                    "pa",
+                    "ro",
+                    "ru",
+                    "sr",
+                    "sk",
+                    "sl",
+                    "es",
+                    "sv",
+                    "ta",
+                    "te",
+                    "th",
+                    "tr",
+                    "uk",
+                    "vi"
+                  ],
+                  "type": "string",
+                  "description": "The search language preference. The 2 or more character language code for which the search results are provided."
+                },
+                "x-loc-state": {
+                  "type": "string",
+                  "maxLength": 3,
+                  "description": "A code which could be up to three characters, that represent the client's state/region. The region is the first-level subdivision (the broadest or least specific) of the ISO 3166-2 code."
+                },
+                "enable_local": {
+                  "type": "boolean",
+                  "description": "Whether to enable local recall. Not setting this value means auto-detect and uses local recall if any of the localization headers are provided."
+                },
+                "cache-control": {
+                  "type": "string",
+                  "const": "no-cache",
+                  "description": "Brave Search will return cached content by default. To prevent caching set the Cache-Control header to no-cache. This is currently done as best effort."
+                },
+                "x-loc-country": {
+                  "type": "string",
+                  "maxLength": 2,
+                  "minLength": 2,
+                  "description": "The two letter country code for the client’s country. For a list of country codes, see ISO 3166-1 alpha-2"
+                },
+                "x-loc-state-name": {
+                  "type": "string",
+                  "description": "The name of the client’s state/region. The region is the first-level subdivision (the broadest or least specific) of the ISO 3166-2 code."
+                },
+                "x-loc-postal-code": {
+                  "type": "string",
+                  "description": "The client’s postal code"
+                },
+                "context_threshold_mode": {
+                  "enum": [
+                    "disabled",
+                    "strict",
+                    "lenient",
+                    "balanced"
+                  ],
+                  "type": "string",
+                  "description": "The mode to use to determine the threshold for including content in context. Default is balanced."
+                },
+                "enable_source_metadata": {
+                  "type": "boolean",
+                  "description": "Enable source metadata enrichment (site_name, favicon) in the sources attribute of the response."
+                },
+                "maximum_number_of_urls": {
+                  "type": "integer",
+                  "maximum": 50,
+                  "minimum": 1,
+                  "description": "Maximum number of different URLs to include in LLM context."
+                },
+                "maximum_number_of_tokens": {
+                  "type": "integer",
+                  "maximum": 32768,
+                  "minimum": 1024,
+                  "description": "Approximate maximum number of tokens to include in context. The default is 8192 and maximum is 32768."
+                },
+                "maximum_number_of_snippets": {
+                  "type": "integer",
+                  "maximum": 256,
+                  "minimum": 1,
+                  "description": "Maximum number of different snippets (or chunks of text) to include in LLM context. The default is 50 and maximum is 256."
+                },
+                "maximum_number_of_tokens_per_url": {
+                  "type": "integer",
+                  "maximum": 8192,
+                  "minimum": 512,
+                  "description": "Maximum number of tokens to include per URL. The default is 4096 and maximum is 8192."
+                },
+                "maximum_number_of_snippets_per_url": {
+                  "type": "integer",
+                  "maximum": 100,
+                  "minimum": 1,
+                  "description": "Maximum number of snippets to include per URL. The default is 50 and maximum is 100."
+                }
+              }
+            }
+          },
+          {
+            "name": "brave_local_search",
+            "cacheable": false,
+            "description": "Brave Local Search API provides enrichments for location search results. Access to this API is available only through the Brave Search API Pro plans; confirm the user's plan before using this tool (if the user does not have a Pro plan, use the brave_web_search tool). Searches for local businesses and places using Brave's Local Search API. Best for queries related to physical locations, businesses, restaurants, services, etc.\n    \n    Returns detailed information including:\n        - Business names and addresses\n        - Ratings and review counts\n        - Phone numbers and opening hours\n\n    Use this when the query implies 'near me', 'in my area', or mentions specific locations (e.g., 'in San Francisco'). This tool automatically falls back to brave_web_search if no local results are found.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "default": 10,
+                  "maximum": 20,
+                  "minimum": 1,
+                  "description": "Number of results (1-20, default 10). Applies only to web search results (i.e., has no effect on locations, news, videos, etc.)"
+                },
+                "query": {
+                  "type": "string",
+                  "maxLength": 400,
+                  "description": "Search query (max 400 chars, 50 words)"
+                },
+                "units": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "const": "metric"
+                    },
+                    {
+                      "type": "string",
+                      "const": "imperial"
+                    }
+                  ],
+                  "description": "The measurement units. If not provided, units are derived from search country."
+                },
+                "offset": {
+                  "type": "integer",
+                  "default": 0,
+                  "maximum": 9,
+                  "minimum": 0,
+                  "description": "Pagination offset (max 9, default 0)"
+                },
+                "country": {
+                  "enum": [
+                    "ALL",
+                    "AR",
+                    "AU",
+                    "AT",
+                    "BE",
+                    "BR",
+                    "CA",
+                    "CL",
+                    "DK",
+                    "FI",
+                    "FR",
+                    "DE",
+                    "HK",
+                    "IN",
+                    "ID",
+                    "IT",
+                    "JP",
+                    "KR",
+                    "MY",
+                    "MX",
+                    "NL",
+                    "NZ",
+                    "NO",
+                    "CN",
+                    "PL",
+                    "PT",
+                    "PH",
+                    "RU",
+                    "SA",
+                    "ZA",
+                    "ES",
+                    "SE",
+                    "CH",
+                    "TW",
+                    "TR",
+                    "GB",
+                    "US"
+                  ],
+                  "type": "string",
+                  "default": "US",
+                  "description": "Search query country, where the results come from. The country string is limited to 2 character country codes of supported countries."
+                },
+                "goggles": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ],
+                  "description": "Goggles act as a custom re-ranking on top of Brave's search index. The parameter supports both a url where the Goggle is hosted or the definition of the Goggle. Multiple goggle URLs and/or definitions can be provided in an array. For more details, refer to the Goggles repository (i.e., https://github.com/brave/goggles-quickstart)."
+                },
+                "summary": {
+                  "type": "boolean",
+                  "description": "This parameter enables summary key generation in web search results. This is required for summarizer to be enabled."
+                },
+                "ui_lang": {
+                  "enum": [
+                    "es-AR",
+                    "en-AU",
+                    "de-AT",
+                    "nl-BE",
+                    "fr-BE",
+                    "pt-BR",
+                    "en-CA",
+                    "fr-CA",
+                    "es-CL",
+                    "da-DK",
+                    "fi-FI",
+                    "fr-FR",
+                    "de-DE",
+                    "zh-HK",
+                    "en-IN",
+                    "en-ID",
+                    "it-IT",
+                    "ja-JP",
+                    "ko-KR",
+                    "en-MY",
+                    "es-MX",
+                    "nl-NL",
+                    "en-NZ",
+                    "no-NO",
+                    "zh-CN",
+                    "pl-PL",
+                    "en-PH",
+                    "ru-RU",
+                    "en-ZA",
+                    "es-ES",
+                    "sv-SE",
+                    "fr-CH",
+                    "de-CH",
+                    "zh-TW",
+                    "tr-TR",
+                    "en-GB",
+                    "en-US",
+                    "es-US"
+                  ],
+                  "type": "string",
+                  "default": "en-US",
+                  "description": "The language of the UI. The 2 or more character language code for which the search results are provided."
+                },
+                "freshness": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "pd",
+                        "pw",
+                        "pm",
+                        "py"
+                      ],
+                      "type": "string"
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^\\d{4}-\\d{2}-\\d{2}to\\d{4}-\\d{2}-\\d{2}$"
+                    }
+                  ],
+                  "description": "Filters search results by when they were discovered. The following values are supported: 'pd' - Discovered within the last 24 hours. 'pw' - Discovered within the last 7 days. 'pm' - Discovered within the last 31 days. 'py' - Discovered within the last 365 days. 'YYYY-MM-DDtoYYYY-MM-DD' - Timeframe is also supported by specifying the date range e.g. 2022-04-01to2022-07-30."
+                },
+                "safesearch": {
+                  "enum": [
+                    "off",
+                    "moderate",
+                    "strict"
+                  ],
+                  "type": "string",
+                  "default": "moderate",
+                  "description": "Filters search results for adult content. The following values are supported: 'off' - No filtering. 'moderate' - Filters explicit content (e.g., images and videos), but allows adult domains in search results. 'strict' - Drops all adult content from search results. The default value is 'moderate'."
+                },
+                "spellcheck": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Whether to spellcheck the provided query."
+                },
+                "search_lang": {
+                  "enum": [
+                    "ar",
+                    "eu",
+                    "bn",
+                    "bg",
+                    "ca",
+                    "zh-hans",
+                    "zh-hant",
+                    "hr",
+                    "cs",
+                    "da",
+                    "nl",
+                    "en",
+                    "en-gb",
+                    "et",
+                    "fi",
+                    "fr",
+                    "gl",
+                    "de",
+                    "gu",
+                    "he",
+                    "hi",
+                    "hu",
+                    "is",
+                    "it",
+                    "jp",
+                    "kn",
+                    "ko",
+                    "lv",
+                    "lt",
+                    "ms",
+                    "ml",
+                    "mr",
+                    "nb",
+                    "pl",
+                    "pt-br",
+                    "pt-pt",
+                    "pa",
+                    "ro",
+                    "ru",
+                    "sr",
+                    "sk",
+                    "sl",
+                    "es",
+                    "sv",
+                    "ta",
+                    "te",
+                    "th",
+                    "tr",
+                    "uk",
+                    "vi"
+                  ],
+                  "type": "string",
+                  "default": "en",
+                  "description": "Search language preference. The 2 or more character language code for which the search results are provided."
+                },
+                "result_filter": {
+                  "type": "array",
+                  "items": {
+                    "enum": [
+                      "discussions",
+                      "faq",
+                      "infobox",
+                      "news",
+                      "query",
+                      "summarizer",
+                      "videos",
+                      "web",
+                      "locations",
+                      "rich"
+                    ],
+                    "type": "string"
+                  },
+                  "default": [
+                    "web",
+                    "query"
+                  ],
+                  "description": "Result filter (default ['web', 'query'])"
+                },
+                "extra_snippets": {
+                  "type": "boolean",
+                  "description": "A snippet is an excerpt from a page you get as a result of the query, and extra_snippets allow you to get up to 5 additional, alternative excerpts. Only available under Free AI, Base AI, Pro AI, Base Data, Pro Data and Custom plans."
+                },
+                "text_decorations": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Whether display strings (e.g. result snippets) should include decoration markers (e.g. highlighting characters)."
+                }
+              }
+            }
+          },
+          {
+            "name": "brave_news_search",
+            "cacheable": false,
+            "description": "This tool searches for news articles using Brave's News Search API based on the user's query. Use it when you need current news information, breaking news updates, or articles about specific topics, events, or entities.\n    \n    When to use:\n        - Finding recent news articles on specific topics\n        - Getting breaking news updates\n        - Researching current events or trending stories\n        - Gathering news sources and headlines for analysis\n\n    Returns a JSON list of news-related results with title, url, and description. Some results may contain snippets of text from the article.\n    \n    When relaying results in markdown-supporting environments, always cite sources with hyperlinks.\n    \n    Examples:\n        - \"According to [Reuters](https://www.reuters.com/technology/china-bans/), China bans uncertified and recalled power banks on planes\".\n        - \"The [New York Times](https://www.nytimes.com/2025/06/27/us/technology/ev-sales.html) reports that Tesla's EV sales have increased by 20%\".\n        - \"According to [BBC News](https://www.bbc.com/news/world-europe-65910000), the UK government has announced a new policy to support renewable energy\".",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "default": 20,
+                  "maximum": 50,
+                  "minimum": 1,
+                  "description": "Number of results (1-50, default 20)"
+                },
+                "query": {
+                  "type": "string",
+                  "maxLength": 400,
+                  "description": "Search query (max 400 chars, 50 words)"
+                },
+                "offset": {
+                  "type": "integer",
+                  "default": 0,
+                  "maximum": 9,
+                  "minimum": 0,
+                  "description": "Pagination offset (max 9, default 0)"
+                },
+                "country": {
+                  "type": "string",
+                  "default": "US",
+                  "description": "Search query country, where the results come from. The country string is limited to 2 character country codes of supported countries."
+                },
+                "goggles": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ],
+                  "description": "Goggles act as a custom re-ranking on top of Brave's search index. The parameter supports both a url where the Goggle is hosted or the definition of the Goggle. Multiple goggle URLs and/or definitions can be provided in an array. For more details, refer to the Goggles repository (i.e., https://github.com/brave/goggles-quickstart)."
+                },
+                "ui_lang": {
+                  "type": "string",
+                  "default": "en-US",
+                  "description": "User interface language preferred in response. Usually of the format <language_code>-<country_code>. For more, see RFC 9110."
+                },
+                "freshness": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "pd",
+                        "pw",
+                        "pm",
+                        "py"
+                      ],
+                      "type": "string"
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^\\d{4}-\\d{2}-\\d{2}to\\d{4}-\\d{2}-\\d{2}$"
+                    }
+                  ],
+                  "description": "Filters search results by when they were discovered. The following values are supported: 'pd' - Discovered within the last 24 hours. 'pw' - Discovered within the last 7 Days. 'pm' - Discovered within the last 31 Days. 'py' - Discovered within the last 365 Days. 'YYYY-MM-DDtoYYYY-MM-DD' - Timeframe is also supported by specifying the date range e.g. 2022-04-01to2022-07-30."
+                },
+                "safesearch": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "const": "off"
+                    },
+                    {
+                      "type": "string",
+                      "const": "moderate"
+                    },
+                    {
+                      "type": "string",
+                      "const": "strict"
+                    }
+                  ],
+                  "default": "moderate",
+                  "description": "Filters search results for adult content. The following values are supported: 'off' - No filtering. 'moderate' - Filter out explicit content. 'strict' - Filter out explicit and suggestive content. The default value is 'moderate'."
+                },
+                "spellcheck": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Whether to spellcheck provided query."
+                },
+                "search_lang": {
+                  "type": "string",
+                  "default": "en",
+                  "description": "Search language preference. The 2 or more character language code for which the search results are provided."
+                },
+                "extra_snippets": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "A snippet is an excerpt from a page you get as a result of the query, and extra_snippets allow you to get up to 5 additional, alternative excerpts. Only available under Free AI, Base AI, Pro AI, Base Data, Pro Data and Custom plans."
+                }
+              }
+            }
+          },
+          {
+            "name": "brave_place_search",
+            "cacheable": false,
+            "description": "Searches Brave's Place Search API. A single call may populate any combination of 'results' (POIs), 'cities', 'addresses', 'streets', and 'location' (the resolved search area), depending on the query's shape.\n\n    When to use:\n        - POIs near coordinates or a named area (e.g. \"coffee shops in Paris\") -> 'results', each with structured business data (postal address, hours, contact, ratings, photos, categories, timezone).\n        - Browsing general POIs (omit 'query'; supply 'latitude'+'longitude' or 'location').\n        - Disambiguating a bare city name (e.g. \"springfield\") -> 'cities'.\n        - Resolving a specific address (e.g. \"350 5th avenue\" with NYC coords) -> 'addresses' (often plus 'streets').\n        - Looking up a street by name (e.g. \"michigan avenue\" with Chicago coords) -> 'streets'.\n\n    Inputs:\n        - Anchor the search via 'latitude'+'longitude' or 'location' (or both). With neither, 'query' is required.\n        - 'addresses' / 'streets' only surface when the query is address-/street-shaped AND geographically anchored.\n        - 'location' format: US -- '<city> <state> <country>' (e.g. 'san francisco ca united states'); non-US -- '<city> <country>' (e.g. 'tokyo japan'). Capitalization and commas don't matter.\n        - 'count' caps results (max 50, default 20). 'radius' (meters) biases toward closer results; it does NOT hard-limit the search area.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "maximum": 50,
+                  "minimum": 1,
+                  "description": "Number of results to return. Maximum is 50. Default is 20."
+                },
+                "query": {
+                  "type": "string",
+                  "maxLength": 400,
+                  "description": "Query string. Shape influences the response: POI-like queries -> `results`; bare/ambiguous city names -> `cities`; address- or street-shaped queries with a geographic anchor -> `addresses` and/or `streets`. If omitted, returns general POIs in the supplied area."
+                },
+                "units": {
+                  "enum": [
+                    "metric",
+                    "imperial"
+                  ],
+                  "type": "string",
+                  "description": "Units of measurement for distance values. Defaults to 'metric'."
+                },
+                "accept": {
+                  "enum": [
+                    "application/json",
+                    "*/*"
+                  ],
+                  "type": "string",
+                  "description": "The default supported media type is application/json."
+                },
+                "geoloc": {
+                  "type": "string",
+                  "description": "Optional geolocation token used to refine results."
+                },
+                "radius": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Bias toward results closer to the supplied coordinates, in meters. NOT a hard cutoff -- the API may still return more distant results. If omitted, the search is performed globally."
+                },
+                "country": {
+                  "enum": [
+                    "AR",
+                    "AU",
+                    "AT",
+                    "BE",
+                    "BR",
+                    "CA",
+                    "CL",
+                    "DK",
+                    "FI",
+                    "FR",
+                    "DE",
+                    "GR",
+                    "HK",
+                    "IN",
+                    "ID",
+                    "IT",
+                    "JP",
+                    "KR",
+                    "MY",
+                    "MX",
+                    "NL",
+                    "NZ",
+                    "NO",
+                    "CN",
+                    "PL",
+                    "PT",
+                    "PH",
+                    "RU",
+                    "SA",
+                    "ZA",
+                    "ES",
+                    "SE",
+                    "CH",
+                    "TW",
+                    "TR",
+                    "GB",
+                    "US"
+                  ],
+                  "type": "string",
+                  "description": "Two-letter country code (ISO 3166-1 alpha-2) used to scope the search. Defaults to 'US'."
+                },
+                "ui_lang": {
+                  "enum": [
+                    "es-AR",
+                    "en-AU",
+                    "de-AT",
+                    "nl-BE",
+                    "fr-BE",
+                    "pt-BR",
+                    "en-CA",
+                    "fr-CA",
+                    "es-CL",
+                    "da-DK",
+                    "fi-FI",
+                    "fr-FR",
+                    "de-DE",
+                    "zh-HK",
+                    "en-IN",
+                    "en-ID",
+                    "it-IT",
+                    "ja-JP",
+                    "ko-KR",
+                    "en-MY",
+                    "es-MX",
+                    "nl-NL",
+                    "en-NZ",
+                    "no-NO",
+                    "zh-CN",
+                    "pl-PL",
+                    "en-PH",
+                    "ru-RU",
+                    "en-ZA",
+                    "es-ES",
+                    "sv-SE",
+                    "fr-CH",
+                    "de-CH",
+                    "zh-TW",
+                    "tr-TR",
+                    "en-GB",
+                    "en-US",
+                    "es-US"
+                  ],
+                  "type": "string",
+                  "description": "User interface language for the response, usually of the form '<language>-<region>'. Defaults to 'en-US'."
+                },
+                "latitude": {
+                  "type": "number",
+                  "maximum": 90,
+                  "minimum": -90,
+                  "description": "Latitude of the geographical coordinates around which to search, in degrees (-90 to 90). Typically paired with `longitude`."
+                },
+                "location": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Location string to search around, used as an alternative to `latitude` and `longitude`. For US locations prefer the form '<city> <state> <country name>' (e.g. 'san francisco ca united states'); for non-US locations use '<city> <country name>' (e.g. 'tokyo japan'). No commas or special characters needed; capitalization does not matter."
+                },
+                "longitude": {
+                  "type": "number",
+                  "maximum": 180,
+                  "minimum": -180,
+                  "description": "Longitude of the geographical coordinates around which to search, in degrees (-180 to 180). Typically paired with `latitude`."
+                },
+                "safesearch": {
+                  "enum": [
+                    "off",
+                    "moderate",
+                    "strict"
+                  ],
+                  "type": "string",
+                  "description": "Safe search level for the query results. 'off' - No filtering. 'moderate' - Filter out explicit content. 'strict' - Filter out explicit and suggestive content. Defaults to 'strict'."
+                },
+                "spellcheck": {
+                  "type": "boolean",
+                  "description": "Whether to apply spellcheck before executing the search. Defaults to true."
+                },
+                "user-agent": {
+                  "type": "string",
+                  "description": "The user agent originating the request. Brave Search can utilize the user agent to provide a different experience depending on the device as described by the string. The user agent should follow the commonly used browser agent strings on each platform. For more information on curating user agents, see RFC 9110."
+                },
+                "api-version": {
+                  "type": "string",
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                  "description": "The API version to use. This is denoted by the format YYYY-MM-DD. Default is the latest that is available. Read more about API versioning at https://api-dashboard.search.brave.com/documentation/guides/versioning."
+                },
+                "search_lang": {
+                  "enum": [
+                    "ar",
+                    "eu",
+                    "bn",
+                    "bg",
+                    "ca",
+                    "zh-hans",
+                    "zh-hant",
+                    "hr",
+                    "cs",
+                    "da",
+                    "nl",
+                    "en",
+                    "en-gb",
+                    "et",
+                    "fi",
+                    "fr",
+                    "gl",
+                    "de",
+                    "el",
+                    "gu",
+                    "he",
+                    "hi",
+                    "hu",
+                    "is",
+                    "it",
+                    "jp",
+                    "kn",
+                    "ko",
+                    "lv",
+                    "lt",
+                    "ms",
+                    "ml",
+                    "mr",
+                    "nb",
+                    "pl",
+                    "pt-br",
+                    "pt-pt",
+                    "pa",
+                    "ro",
+                    "ru",
+                    "sr",
+                    "sk",
+                    "sl",
+                    "es",
+                    "sv",
+                    "ta",
+                    "te",
+                    "th",
+                    "tr",
+                    "uk",
+                    "vi"
+                  ],
+                  "type": "string",
+                  "description": "Language for the search results. Defaults to 'en'."
+                },
+                "cache-control": {
+                  "type": "string",
+                  "const": "no-cache",
+                  "description": "Brave Search will return cached content by default. To prevent caching set the Cache-Control header to no-cache. This is currently done as best effort."
+                }
+              }
+            }
+          },
+          {
+            "name": "brave_summarizer",
+            "cacheable": false,
+            "description": "Retrieves AI-generated summaries of web search results using Brave's Summarizer API. This tool processes search results to create concise, coherent summaries of information gathered from multiple sources.\n\n    When to use:\n\n    - When you need a concise overview of complex topics from multiple sources\n    - For quick fact-checking or getting key points without reading full articles\n    - When providing users with summarized information that synthesizes various perspectives\n    - For research tasks requiring distilled information from web searches\n\n    Returns a text summary that consolidates information from the search results. Optional features include inline references to source URLs and additional entity information.\n\n    Requirements: Must first perform a web search using brave_web_search with summary=true parameter. Requires a Pro AI subscription to access the summarizer functionality.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "key"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "description": "The key is equal to value of field key as part of the Summarizer response model."
+                },
+                "entity_info": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Returns extra entities info with the summary response."
+                },
+                "inline_references": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Adds inline references to the summary response."
+                }
+              }
+            }
+          },
+          {
+            "name": "brave_video_search",
+            "cacheable": false,
+            "description": "Searches for videos using Brave's Video Search API and returns structured video results with metadata.\n\n    When to use:\n        - When you need to find videos related to a specific topic, keyword, or query.\n        - Useful for discovering video content, getting video metadata, or finding videos from specific creators/publishers.\n\n    Returns a JSON list of video-related results with title, url, description, duration, and thumbnail_url.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "default": 20,
+                  "maximum": 50,
+                  "minimum": 1,
+                  "description": "Number of results (1-50, default 20). Combine this parameter with `offset` to paginate search results."
+                },
+                "query": {
+                  "type": "string",
+                  "maxLength": 400,
+                  "minLength": 1,
+                  "description": "The user's search query. Query cannot be empty. Limited to 400 characters and 50 words."
+                },
+                "offset": {
+                  "type": "integer",
+                  "default": 0,
+                  "maximum": 9,
+                  "minimum": 0,
+                  "description": "Pagination offset (max 9, default 0). Combine this parameter with `count` to paginate search results."
+                },
+                "country": {
+                  "type": "string",
+                  "default": "US",
+                  "description": "Search query country, where the results come from. The country string is limited to 2 character country codes of supported countries."
+                },
+                "ui_lang": {
+                  "type": "string",
+                  "default": "en-US",
+                  "description": "User interface language preferred in response. Usually of the format <language_code>-<country_code>. For more, see RFC 9110."
+                },
+                "freshness": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "pd",
+                        "pw",
+                        "pm",
+                        "py"
+                      ],
+                      "type": "string"
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^\\d{4}-\\d{2}-\\d{2}to\\d{4}-\\d{2}-\\d{2}$"
+                    }
+                  ],
+                  "description": "Filters search results by when they were discovered. The following values are supported: 'pd' - Discovered within the last 24 hours. 'pw' - Discovered within the last 7 days. 'pm' - Discovered within the last 31 days. 'py' - Discovered within the last 365 days. 'YYYY-MM-DDtoYYYY-MM-DD' - timeframe is also supported by specifying the date range (e.g. '2022-04-01to2022-07-30')."
+                },
+                "safesearch": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "const": "off"
+                    },
+                    {
+                      "type": "string",
+                      "const": "moderate"
+                    },
+                    {
+                      "type": "string",
+                      "const": "strict"
+                    }
+                  ],
+                  "default": "moderate",
+                  "description": "Filters search results for adult content. The following values are supported: 'off' - No filtering. 'moderate' - Filter out explicit content. 'strict' - Filter out explicit and suggestive content. The default value is 'moderate'."
+                },
+                "spellcheck": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Whether to spellcheck provided query."
+                },
+                "search_lang": {
+                  "type": "string",
+                  "default": "en",
+                  "description": "Search language preference. The 2 or more character language code for which the search results are provided."
+                }
+              }
+            }
+          },
+          {
+            "name": "brave_web_search",
+            "cacheable": false,
+            "description": "Performs web searches using the Brave Search API and returns comprehensive search results with rich metadata.\n\n    When to use:\n        - General web searches for information, facts, or current topics\n        - Location-based queries (restaurants, businesses, points of interest)\n        - News searches for recent events or breaking stories\n        - Finding videos, discussions, or FAQ content\n        - Research requiring diverse result types (web pages, images, reviews, etc.)\n\n    Returns a JSON list of web results with title, description, and URL.\n    \n    When the \"results_filter\" parameter is empty, JSON results may also contain FAQ, Discussions, News, and Video results.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "default": 10,
+                  "maximum": 20,
+                  "minimum": 1,
+                  "description": "Number of results (1-20, default 10). Applies only to web search results (i.e., has no effect on locations, news, videos, etc.)"
+                },
+                "query": {
+                  "type": "string",
+                  "maxLength": 400,
+                  "description": "Search query (max 400 chars, 50 words)"
+                },
+                "units": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "const": "metric"
+                    },
+                    {
+                      "type": "string",
+                      "const": "imperial"
+                    }
+                  ],
+                  "description": "The measurement units. If not provided, units are derived from search country."
+                },
+                "offset": {
+                  "type": "integer",
+                  "default": 0,
+                  "maximum": 9,
+                  "minimum": 0,
+                  "description": "Pagination offset (max 9, default 0)"
+                },
+                "country": {
+                  "enum": [
+                    "ALL",
+                    "AR",
+                    "AU",
+                    "AT",
+                    "BE",
+                    "BR",
+                    "CA",
+                    "CL",
+                    "DK",
+                    "FI",
+                    "FR",
+                    "DE",
+                    "HK",
+                    "IN",
+                    "ID",
+                    "IT",
+                    "JP",
+                    "KR",
+                    "MY",
+                    "MX",
+                    "NL",
+                    "NZ",
+                    "NO",
+                    "CN",
+                    "PL",
+                    "PT",
+                    "PH",
+                    "RU",
+                    "SA",
+                    "ZA",
+                    "ES",
+                    "SE",
+                    "CH",
+                    "TW",
+                    "TR",
+                    "GB",
+                    "US"
+                  ],
+                  "type": "string",
+                  "default": "US",
+                  "description": "Search query country, where the results come from. The country string is limited to 2 character country codes of supported countries."
+                },
+                "goggles": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ],
+                  "description": "Goggles act as a custom re-ranking on top of Brave's search index. The parameter supports both a url where the Goggle is hosted or the definition of the Goggle. Multiple goggle URLs and/or definitions can be provided in an array. For more details, refer to the Goggles repository (i.e., https://github.com/brave/goggles-quickstart)."
+                },
+                "summary": {
+                  "type": "boolean",
+                  "description": "This parameter enables summary key generation in web search results. This is required for summarizer to be enabled."
+                },
+                "ui_lang": {
+                  "enum": [
+                    "es-AR",
+                    "en-AU",
+                    "de-AT",
+                    "nl-BE",
+                    "fr-BE",
+                    "pt-BR",
+                    "en-CA",
+                    "fr-CA",
+                    "es-CL",
+                    "da-DK",
+                    "fi-FI",
+                    "fr-FR",
+                    "de-DE",
+                    "zh-HK",
+                    "en-IN",
+                    "en-ID",
+                    "it-IT",
+                    "ja-JP",
+                    "ko-KR",
+                    "en-MY",
+                    "es-MX",
+                    "nl-NL",
+                    "en-NZ",
+                    "no-NO",
+                    "zh-CN",
+                    "pl-PL",
+                    "en-PH",
+                    "ru-RU",
+                    "en-ZA",
+                    "es-ES",
+                    "sv-SE",
+                    "fr-CH",
+                    "de-CH",
+                    "zh-TW",
+                    "tr-TR",
+                    "en-GB",
+                    "en-US",
+                    "es-US"
+                  ],
+                  "type": "string",
+                  "default": "en-US",
+                  "description": "The language of the UI. The 2 or more character language code for which the search results are provided."
+                },
+                "freshness": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "pd",
+                        "pw",
+                        "pm",
+                        "py"
+                      ],
+                      "type": "string"
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^\\d{4}-\\d{2}-\\d{2}to\\d{4}-\\d{2}-\\d{2}$"
+                    }
+                  ],
+                  "description": "Filters search results by when they were discovered. The following values are supported: 'pd' - Discovered within the last 24 hours. 'pw' - Discovered within the last 7 days. 'pm' - Discovered within the last 31 days. 'py' - Discovered within the last 365 days. 'YYYY-MM-DDtoYYYY-MM-DD' - Timeframe is also supported by specifying the date range e.g. 2022-04-01to2022-07-30."
+                },
+                "safesearch": {
+                  "enum": [
+                    "off",
+                    "moderate",
+                    "strict"
+                  ],
+                  "type": "string",
+                  "default": "moderate",
+                  "description": "Filters search results for adult content. The following values are supported: 'off' - No filtering. 'moderate' - Filters explicit content (e.g., images and videos), but allows adult domains in search results. 'strict' - Drops all adult content from search results. The default value is 'moderate'."
+                },
+                "spellcheck": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Whether to spellcheck the provided query."
+                },
+                "search_lang": {
+                  "enum": [
+                    "ar",
+                    "eu",
+                    "bn",
+                    "bg",
+                    "ca",
+                    "zh-hans",
+                    "zh-hant",
+                    "hr",
+                    "cs",
+                    "da",
+                    "nl",
+                    "en",
+                    "en-gb",
+                    "et",
+                    "fi",
+                    "fr",
+                    "gl",
+                    "de",
+                    "gu",
+                    "he",
+                    "hi",
+                    "hu",
+                    "is",
+                    "it",
+                    "jp",
+                    "kn",
+                    "ko",
+                    "lv",
+                    "lt",
+                    "ms",
+                    "ml",
+                    "mr",
+                    "nb",
+                    "pl",
+                    "pt-br",
+                    "pt-pt",
+                    "pa",
+                    "ro",
+                    "ru",
+                    "sr",
+                    "sk",
+                    "sl",
+                    "es",
+                    "sv",
+                    "ta",
+                    "te",
+                    "th",
+                    "tr",
+                    "uk",
+                    "vi"
+                  ],
+                  "type": "string",
+                  "default": "en",
+                  "description": "Search language preference. The 2 or more character language code for which the search results are provided."
+                },
+                "result_filter": {
+                  "type": "array",
+                  "items": {
+                    "enum": [
+                      "discussions",
+                      "faq",
+                      "infobox",
+                      "news",
+                      "query",
+                      "summarizer",
+                      "videos",
+                      "web",
+                      "locations",
+                      "rich"
+                    ],
+                    "type": "string"
+                  },
+                  "default": [
+                    "web",
+                    "query"
+                  ],
+                  "description": "Result filter (default ['web', 'query'])"
+                },
+                "extra_snippets": {
+                  "type": "boolean",
+                  "description": "A snippet is an excerpt from a page you get as a result of the query, and extra_snippets allow you to get up to 5 additional, alternative excerpts. Only available under Free AI, Base AI, Pro AI, Base Data, Pro Data and Custom plans."
+                },
+                "text_decorations": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Whether display strings (e.g. result snippets) should include decoration markers (e.g. highlighting characters)."
+                }
+              }
+            }
+          }
+        ],
+        "secrets": [
+          {
+            "help": "",
+            "link": "",
+            "name": "BRAVE_API_KEY",
+            "label": "BRAVE_API_KEY",
+            "secret": true,
+            "env_var": "BRAVE_API_KEY",
+            "required": true
+          }
+        ],
+        "surface": {
+          "n_tools": 8,
+          "n_resources": 0
+        },
+        "operators": [
+          {
+            "name": "brave_image_search",
+            "shape": "scalar",
+            "arg_names": [
+              "count",
+              "country",
+              "query",
+              "safesearch",
+              "search_lang",
+              "spellcheck"
+            ],
+            "arg_types": [
+              "bigint",
+              "text",
+              "text",
+              "text",
+              "text",
+              "boolean"
+            ],
+            "description": "\n    Performs an image search using the Brave Search API. Helpful for when you need pictures of people, places, things, graphic design ideas, art inspiration, and more. When relaying results in a markdown environment, it may be helpful to include images in the results (e.g., ![image.title](image.properties.url)).\n",
+            "return_type": "text"
+          },
+          {
+            "name": "brave_llm_context",
+            "shape": "scalar",
+            "arg_names": [
+              "accept",
+              "api-version",
+              "cache-control",
+              "context_threshold_mode",
+              "count",
+              "country",
+              "enable_local",
+              "enable_source_metadata",
+              "freshness",
+              "goggles",
+              "maximum_number_of_snippets",
+              "maximum_number_of_snippets_per_url",
+              "maximum_number_of_tokens",
+              "maximum_number_of_tokens_per_url",
+              "maximum_number_of_urls",
+              "query",
+              "search_lang",
+              "spellcheck",
+              "user-agent",
+              "x-loc-city",
+              "x-loc-country",
+              "x-loc-lat",
+              "x-loc-long",
+              "x-loc-postal-code",
+              "x-loc-state",
+              "x-loc-state-name"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "boolean",
+              "boolean",
+              "text",
+              "text",
+              "bigint",
+              "bigint",
+              "bigint",
+              "bigint",
+              "bigint",
+              "text",
+              "text",
+              "boolean",
+              "text",
+              "text",
+              "text",
+              "double precision",
+              "double precision",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Retrieves pre-extracted, relevance-ranked web content using Brave's LLM Context API, optimized for AI agents, LLM grounding, and RAG pipelines. Unlike a traditional web search that returns links and short descriptions, this tool returns the actual substance of matching pages — text chunks, tables, code blocks, and structured data — so the model can reason over it directly.\n\n    When to use:\n        - Grounding answers in fresh, relevant web content (RAG)\n        - Giving an AI agent ready-to-use page content from a single search call\n        - Question answering and fact-checking against current sources\n        - Gathering source material for research without manually fetching pages\n        - When you need the contents of pages, not just titles, descriptions, and URLs\n\n    When relaying results in markdown-supporting environments, cite the source URLs from the \"sources\" map.",
+            "return_type": "text"
+          },
+          {
+            "name": "brave_local_search",
+            "shape": "scalar",
+            "arg_names": [
+              "count",
+              "country",
+              "extra_snippets",
+              "freshness",
+              "goggles",
+              "offset",
+              "query",
+              "result_filter",
+              "safesearch",
+              "search_lang",
+              "spellcheck",
+              "summary",
+              "text_decorations",
+              "ui_lang",
+              "units"
+            ],
+            "arg_types": [
+              "bigint",
+              "text",
+              "boolean",
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "jsonb",
+              "text",
+              "text",
+              "boolean",
+              "boolean",
+              "boolean",
+              "text",
+              "text"
+            ],
+            "description": "Brave Local Search API provides enrichments for location search results. Access to this API is available only through the Brave Search API Pro plans; confirm the user's plan before using this tool (if the user does not have a Pro plan, use the brave_web_search tool). Searches for local businesses and places using Brave's Local Search API. Best for queries related to physical locations, businesses, restaurants, services, etc.\n    \n    Returns detailed information including:\n        - Business names and addresses\n        - Ratings and review counts\n        - Phone numbers and opening hours\n\n    Use this when the query implies 'near me', 'in my area', or mentions specific locations (e.g., 'in San Francisco'). This tool automatically falls back to brave_web_search if no local results are found.",
+            "return_type": "text"
+          },
+          {
+            "name": "brave_news_search",
+            "shape": "scalar",
+            "arg_names": [
+              "count",
+              "country",
+              "extra_snippets",
+              "freshness",
+              "goggles",
+              "offset",
+              "query",
+              "safesearch",
+              "search_lang",
+              "spellcheck",
+              "ui_lang"
+            ],
+            "arg_types": [
+              "bigint",
+              "text",
+              "boolean",
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text",
+              "boolean",
+              "text"
+            ],
+            "description": "This tool searches for news articles using Brave's News Search API based on the user's query. Use it when you need current news information, breaking news updates, or articles about specific topics, events, or entities.\n    \n    When to use:\n        - Finding recent news articles on specific topics\n        - Getting breaking news updates\n        - Researching current events or trending stories\n        - Gathering news sources and headlines for analysis\n\n    Returns a JSON list of news-related results with title, url, and description. Some results may contain snippets of text from the article.\n    \n    When relaying results in markdown-supporting environments, always cite sources with hyperlinks.\n    \n    Examples:\n        - \"According to [Reuters](https://www.reuters.com/technology/china-bans/), China bans uncertified and recalled power banks on planes\".\n        - \"The [New York Times](https://www.nytimes.com/2025/06/27/us/technology/ev-sales.html) reports that Tesla's EV sales have increased by 20%\".\n        - \"According to [BBC News](https://www.bbc.com/news/world-europe-65910000), the UK government has announced a new policy to support renewable energy\".",
+            "return_type": "text"
+          },
+          {
+            "name": "brave_place_search",
+            "shape": "scalar",
+            "arg_names": [
+              "accept",
+              "api-version",
+              "cache-control",
+              "count",
+              "country",
+              "geoloc",
+              "latitude",
+              "location",
+              "longitude",
+              "query",
+              "radius",
+              "safesearch",
+              "search_lang",
+              "spellcheck",
+              "ui_lang",
+              "units",
+              "user-agent"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "double precision",
+              "text",
+              "double precision",
+              "text",
+              "double precision",
+              "text",
+              "text",
+              "boolean",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Searches Brave's Place Search API. A single call may populate any combination of 'results' (POIs), 'cities', 'addresses', 'streets', and 'location' (the resolved search area), depending on the query's shape.\n\n    When to use:\n        - POIs near coordinates or a named area (e.g. \"coffee shops in Paris\") -> 'results', each with structured business data (postal address, hours, contact, ratings, photos, categories, timezone).\n        - Browsing general POIs (omit 'query'; supply 'latitude'+'longitude' or 'location').\n        - Disambiguating a bare city name (e.g. \"springfield\") -> 'cities'.\n        - Resolving a specific address (e.g. \"350 5th avenue\" with NYC coords) -> 'addresses' (often plus 'streets').\n        - Looking up a street by name (e.g. \"michigan avenue\" with Chicago coords) -> 'streets'.\n\n    Inputs:\n        - Anchor the search via 'latitude'+'longitude' or 'location' (or both). With neither, 'query' is required.\n        - 'addresses' / 'streets' only surface when the query is address-/street-shaped AND geographically anchored.\n        - 'location' format: US -- '<city> <state> <country>' (e.g. 'san francisco ca united states'); non-US -- '<city> <country>' (e.g. 'tokyo japan'). Capitalization and commas don't matter.\n        - 'count' caps results (max 50, default 20). 'radius' (meters) biases toward closer results; it does NOT hard-limit the search area.",
+            "return_type": "text"
+          },
+          {
+            "name": "brave_summarizer",
+            "shape": "scalar",
+            "arg_names": [
+              "entity_info",
+              "inline_references",
+              "key"
+            ],
+            "arg_types": [
+              "boolean",
+              "boolean",
+              "text"
+            ],
+            "description": "Retrieves AI-generated summaries of web search results using Brave's Summarizer API. This tool processes search results to create concise, coherent summaries of information gathered from multiple sources.\n\n    When to use:\n\n    - When you need a concise overview of complex topics from multiple sources\n    - For quick fact-checking or getting key points without reading full articles\n    - When providing users with summarized information that synthesizes various perspectives\n    - For research tasks requiring distilled information from web searches\n\n    Returns a text summary that consolidates information from the search results. Optional features include inline references to source URLs and additional entity information.\n\n    Requirements: Must first perform a web search using brave_web_search with summary=true parameter. Requires a Pro AI subscription to access the summarizer functionality.",
+            "return_type": "text"
+          },
+          {
+            "name": "brave_video_search",
+            "shape": "scalar",
+            "arg_names": [
+              "count",
+              "country",
+              "freshness",
+              "offset",
+              "query",
+              "safesearch",
+              "search_lang",
+              "spellcheck",
+              "ui_lang"
+            ],
+            "arg_types": [
+              "bigint",
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text",
+              "boolean",
+              "text"
+            ],
+            "description": "Searches for videos using Brave's Video Search API and returns structured video results with metadata.\n\n    When to use:\n        - When you need to find videos related to a specific topic, keyword, or query.\n        - Useful for discovering video content, getting video metadata, or finding videos from specific creators/publishers.\n\n    Returns a JSON list of video-related results with title, url, description, duration, and thumbnail_url.",
+            "return_type": "text"
+          },
+          {
+            "name": "brave_web_search",
+            "shape": "scalar",
+            "arg_names": [
+              "count",
+              "country",
+              "extra_snippets",
+              "freshness",
+              "goggles",
+              "offset",
+              "query",
+              "result_filter",
+              "safesearch",
+              "search_lang",
+              "spellcheck",
+              "summary",
+              "text_decorations",
+              "ui_lang",
+              "units"
+            ],
+            "arg_types": [
+              "bigint",
+              "text",
+              "boolean",
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "jsonb",
+              "text",
+              "text",
+              "boolean",
+              "boolean",
+              "boolean",
+              "text",
+              "text"
+            ],
+            "description": "Performs web searches using the Brave Search API and returns comprehensive search results with rich metadata.\n\n    When to use:\n        - General web searches for information, facts, or current topics\n        - Location-based queries (restaurants, businesses, points of interest)\n        - News searches for recent events or breaking stories\n        - Finding videos, discussions, or FAQ content\n        - Research requiring diverse result types (web pages, images, reviews, etc.)\n\n    Returns a JSON list of web results with title, description, and URL.\n    \n    When the \"results_filter\" parameter is empty, JSON results may also contain FAQ, Discussions, News, and Video results.",
+            "return_type": "text"
+          }
+        ],
+        "resources": [],
+        "connection": {
+          "env": {
+            "BRAVE_API_KEY": "${BRAVE_API_KEY}"
+          },
+          "args": [
+            "-y",
+            "@brave/brave-search-mcp-server"
+          ],
+          "command": "npx",
+          "transport": "stdio",
+          "timeout_ms": 60000
+        },
+        "scanned_at": "2026-06-09T23:41:44.448867+00:00",
+        "description": "Brave Search (official) — web/news/image/video/local search + AI summarizer. Needs BRAVE_API_KEY (free tier ~2k/mo)."
+      },
+      "catalog_entry": {
+        "id": "mcp/brave",
+        "kind": "mcp",
+        "name": "brave",
+        "tags": [
+          "mcp",
+          "web",
+          "search",
+          "news"
+        ],
+        "title": "Brave Search",
+        "operators": [
+          "brave_image_search",
+          "brave_llm_context",
+          "brave_local_search",
+          "brave_news_search",
+          "brave_place_search",
+          "brave_summarizer",
+          "brave_video_search",
+          "brave_web_search"
+        ],
+        "description": "Brave Search (official) — web/news/image/video/local search + AI summarizer. Needs BRAVE_API_KEY (free tier ~2k/mo).",
+        "manifest_path": "mcp/brave",
+        "catalog_visibility": "public"
+      }
+    },
+    {
+      "capability_manifest": {
+        "kind": "mcp",
+        "name": "maps",
+        "tools": [
+          {
+            "name": "maps_air_quality",
+            "cacheable": false,
+            "description": "Get air quality for a location — AQI index, pollutant concentrations, and health recommendations by demographic group (elderly, children, athletes, pregnant women, etc.). Use when the user asks 'is the air safe', 'should I wear a mask', 'good for outdoor exercise', or is planning travel for someone with respiratory/heart conditions. Coverage: global including Japan (unlike weather). Returns both universal AQI and local index (EPA for US, AEROS for Japan, etc.).",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "latitude",
+                "longitude"
+              ],
+              "properties": {
+                "latitude": {
+                  "type": "number",
+                  "description": "Latitude coordinate"
+                },
+                "longitude": {
+                  "type": "number",
+                  "description": "Longitude coordinate"
+                },
+                "includePollutants": {
+                  "type": "boolean",
+                  "description": "Include individual pollutant concentrations — PM2.5, PM10, NO2, O3, CO, SO2 (default: false)"
+                },
+                "includeHealthRecommendations": {
+                  "type": "boolean",
+                  "description": "Include health advice per demographic group (default: true)"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_batch_geocode",
+            "cacheable": false,
+            "description": "Geocode multiple addresses in one call — up to 50 addresses, returns coordinates for each. Use when the user provides a list of addresses and needs all their coordinates, e.g. 'geocode these 10 offices' or 'get coordinates for all these restaurants'. For more than 50, use the CLI batch-geocode command instead.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "addresses"
+              ],
+              "properties": {
+                "addresses": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 50,
+                  "minItems": 1,
+                  "description": "List of addresses or landmark names to geocode (max 50)"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_compare_places",
+            "cacheable": false,
+            "description": "Compare multiple places side-by-side in one call — searches by query, gets details for each result, and optionally calculates distance from your location. Use when the user asks 'which restaurant should I pick', 'compare these hotels', or needs a decision table. Replaces the manual chain of search-places → place-details → distance-matrix.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "limit": {
+                  "type": "number",
+                  "description": "Max places to compare (default: 5)"
+                },
+                "query": {
+                  "type": "string",
+                  "description": "Search query (e.g., 'ramen near Shibuya', 'hotels in Taipei')"
+                },
+                "userLocation": {
+                  "type": "object",
+                  "required": [
+                    "latitude",
+                    "longitude"
+                  ],
+                  "properties": {
+                    "latitude": {
+                      "type": "number",
+                      "description": "Your latitude"
+                    },
+                    "longitude": {
+                      "type": "number",
+                      "description": "Your longitude"
+                    }
+                  },
+                  "description": "Your current location — if provided, adds distance and drive time to each result",
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_directions",
+            "cacheable": false,
+            "description": "Get step-by-step navigation directions between two points with route details. Use when the user asks 'how do I get from A to B?' and needs the route summary, total distance, estimated travel time, or turn-by-turn instructions. Supports departure/arrival times and multiple travel modes.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "origin",
+                "destination"
+              ],
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "driving",
+                    "walking",
+                    "bicycling",
+                    "transit"
+                  ],
+                  "type": "string",
+                  "default": "driving",
+                  "description": "Travel mode for directions"
+                },
+                "origin": {
+                  "type": "string",
+                  "description": "Starting point address or coordinates"
+                },
+                "destination": {
+                  "type": "string",
+                  "description": "Destination address or coordinates"
+                },
+                "arrival_time": {
+                  "type": "string",
+                  "description": "Arrival time (ISO string format)"
+                },
+                "departure_time": {
+                  "type": "string",
+                  "description": "Departure time (ISO string format)"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_distance_matrix",
+            "cacheable": false,
+            "description": "Calculate travel distances and durations between multiple origins and destinations in a single request. Use for comparing travel options — e.g., 'which hotel is closest to the office?' or batch distance calculations. Supports driving, walking, bicycling, and transit modes.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "origins",
+                "destinations"
+              ],
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "driving",
+                    "walking",
+                    "bicycling",
+                    "transit"
+                  ],
+                  "type": "string",
+                  "default": "driving",
+                  "description": "Travel mode for calculation"
+                },
+                "origins": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "List of origin addresses or coordinates"
+                },
+                "destinations": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "List of destination addresses or coordinates"
+                },
+                "departure_time": {
+                  "type": "string",
+                  "description": "Departure time in ISO 8601 format (e.g. 2026-03-21T09:00:00Z). Enables traffic-aware duration estimates."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_elevation",
+            "cacheable": false,
+            "description": "Get elevation (meters above sea level) for geographic coordinates. Use when the user asks 'how high is this place', 'is this area flood-prone', or needs altitude for hiking/cycling route profiles. Also useful for real estate risk assessment — low elevation near water suggests flood risk.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "locations"
+              ],
+              "properties": {
+                "locations": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "latitude",
+                      "longitude"
+                    ],
+                    "properties": {
+                      "latitude": {
+                        "type": "number",
+                        "description": "Latitude coordinate"
+                      },
+                      "longitude": {
+                        "type": "number",
+                        "description": "Longitude coordinate"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "description": "List of locations to get elevation data for"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_explore_area",
+            "cacheable": false,
+            "description": "Explore what's around a location in one call — searches multiple place types, gets details for the top results, and returns a categorized summary. Use when the user asks 'what's around here', 'explore the area near my hotel', or needs a quick overview of a neighborhood. Replaces the manual chain of geocode → search-nearby → place-details. For trip planning: use search_places first to get geographically spread anchor points, then call this tool around each anchor (e.g. 'Gion, Kyoto') — never pass just the city name, as it clusters all results in one area. After results, call static_map to visualize.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "location"
+              ],
+              "properties": {
+                "topN": {
+                  "type": "number",
+                  "description": "Number of top results per type to get details for (default: 3)"
+                },
+                "types": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Place types to search (default: restaurant, cafe, attraction). Examples: hotel, bar, park, museum"
+                },
+                "radius": {
+                  "type": "number",
+                  "description": "Search radius in meters (default: 1000)"
+                },
+                "location": {
+                  "type": "string",
+                  "description": "Address or landmark to explore around"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_geocode",
+            "cacheable": false,
+            "description": "Convert an address, city name, or landmark into GPS coordinates (latitude/longitude). Use when you need coordinates for a location described in text — for example, to provide a center point for search_nearby or a starting point for maps_directions.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "address"
+              ],
+              "properties": {
+                "address": {
+                  "type": "string",
+                  "description": "Address or place name to convert to coordinates"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_local_rank_tracker",
+            "cacheable": false,
+            "description": "Track a business's local search ranking across a geographic grid (like LocalFalcon). Searches the same keyword(s) from multiple coordinates around a center point to see how rank varies by location. Supports up to 3 keywords for batch scanning. Returns rank at each grid point, top-3 competitors per point, and summary metrics (ARP, ATRP, SoLV). Useful for local SEO analysis.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "placeId",
+                "center"
+              ],
+              "properties": {
+                "center": {
+                  "type": "object",
+                  "required": [
+                    "latitude",
+                    "longitude"
+                  ],
+                  "properties": {
+                    "latitude": {
+                      "type": "number",
+                      "description": "Center latitude of the grid"
+                    },
+                    "longitude": {
+                      "type": "number",
+                      "description": "Center longitude of the grid"
+                    }
+                  },
+                  "description": "Center coordinate for the grid (typically the business location)",
+                  "additionalProperties": false
+                },
+                "keyword": {
+                  "type": "string",
+                  "description": "Single search keyword (e.g., 'dentist'). Use 'keywords' for multi-keyword scanning."
+                },
+                "placeId": {
+                  "type": "string",
+                  "description": "Google Maps place_id of the target business to track"
+                },
+                "gridSize": {
+                  "type": "integer",
+                  "maximum": 7,
+                  "minimum": 3,
+                  "description": "Grid dimension (3 = 3×3 = 9 points, 5 = 5×5 = 25 points, 7 = 7×7 = 49 points). Default: 3"
+                },
+                "keywords": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 3,
+                  "minItems": 1,
+                  "description": "Array of 1-3 keywords to scan (e.g., ['dentist', 'dental clinic', 'teeth cleaning']). Overrides 'keyword'."
+                },
+                "gridSpacing": {
+                  "type": "number",
+                  "maximum": 10000,
+                  "minimum": 100,
+                  "description": "Distance between grid points in meters (100-10000). Default: 1000"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_place_details",
+            "cacheable": false,
+            "description": "Get comprehensive details for a specific place using its Google Maps place_id. Use after search_nearby or maps_search_places to get full information including reviews, phone number, website, and opening hours. Set maxPhotos (1-10) to include photo URLs — omit or set to 0 for no photos (saves tokens).",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "placeId"
+              ],
+              "properties": {
+                "placeId": {
+                  "type": "string",
+                  "description": "Google Maps place ID"
+                },
+                "maxPhotos": {
+                  "type": "integer",
+                  "maximum": 10,
+                  "minimum": 0,
+                  "description": "Number of photo URLs to include (0 = none, max 10). Omit to skip photos and save tokens."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_plan_route",
+            "cacheable": false,
+            "description": "Plan an optimized multi-stop route in one call — geocodes all stops, uses Routes API waypoint optimization (up to 25 intermediate stops) to find the most efficient visit order, and returns directions for each leg. Use when the user says 'visit these 5 places efficiently', 'plan a route through A, B, C', or needs a multi-stop itinerary. Replaces the manual chain of geocode → distance-matrix → directions. For multi-day trips: create one plan_route call per day with stops that follow a geographic arc (e.g. east→west) rather than mixing distant areas. After results, call static_map to visualize the route.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "stops"
+              ],
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "driving",
+                    "walking",
+                    "bicycling",
+                    "transit"
+                  ],
+                  "type": "string",
+                  "description": "Travel mode (default: driving)"
+                },
+                "stops": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "minItems": 2,
+                  "description": "List of addresses or landmarks to visit (minimum 2)"
+                },
+                "optimize": {
+                  "type": "boolean",
+                  "description": "Auto-optimize visit order via Routes API waypoint optimization (default: true). Set false to keep original order. Not available for transit mode."
+                },
+                "departure_time": {
+                  "type": "string",
+                  "description": "Departure time in ISO 8601 format (e.g. 2026-03-21T09:00:00Z). Enables traffic-aware routing."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_reverse_geocode",
+            "cacheable": false,
+            "description": "Convert GPS coordinates (latitude/longitude) into a human-readable street address. Use when you have coordinates from another tool's output or a user's shared location and need the actual address.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "latitude",
+                "longitude"
+              ],
+              "properties": {
+                "latitude": {
+                  "type": "number",
+                  "description": "Latitude coordinate"
+                },
+                "longitude": {
+                  "type": "number",
+                  "description": "Longitude coordinate"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_search_along_route",
+            "cacheable": false,
+            "description": "Search for places along a route between two points — restaurants, cafes, gas stations, etc. ranked by minimal detour time. Use for trip planning to find meals, rest stops, or attractions between landmarks without backtracking. Internally computes the route, then searches along it. Essential for building itineraries where stops should feel 'on the way' rather than 'detour to'.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "textQuery",
+                "origin",
+                "destination"
+              ],
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "driving",
+                    "walking",
+                    "bicycling",
+                    "transit"
+                  ],
+                  "type": "string",
+                  "description": "Travel mode for the route (default: walking)"
+                },
+                "origin": {
+                  "type": "string",
+                  "description": "Route start point — address or landmark name"
+                },
+                "textQuery": {
+                  "type": "string",
+                  "description": "What to search for along the route (e.g. 'restaurant', 'coffee shop', 'temple')"
+                },
+                "maxResults": {
+                  "type": "number",
+                  "description": "Max results to return (default: 5, max: 20)"
+                },
+                "destination": {
+                  "type": "string",
+                  "description": "Route end point — address or landmark name"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_search_nearby",
+            "cacheable": false,
+            "description": "Find places near a specific location by type (e.g., restaurants, cafes, hotels). Use when the user wants to discover what's around a given address or coordinates, such as 'find coffee shops near Times Square' or 'what hotels are near the airport'. Supports filtering by place type, search radius, minimum rating, and whether currently open.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "center"
+              ],
+              "properties": {
+                "center": {
+                  "type": "object",
+                  "required": [
+                    "value"
+                  ],
+                  "properties": {
+                    "value": {
+                      "type": "string",
+                      "description": "Address, landmark name, or coordinates (coordinate format: lat,lng)"
+                    },
+                    "isCoordinates": {
+                      "type": "boolean",
+                      "default": false,
+                      "description": "Whether the value is coordinates"
+                    }
+                  },
+                  "description": "Search center point (e.g. value: 49.3268778,-123.0585982, isCoordinates: true)",
+                  "additionalProperties": false
+                },
+                "radius": {
+                  "type": "number",
+                  "default": 1000,
+                  "description": "Search radius in meters"
+                },
+                "keyword": {
+                  "type": "string",
+                  "description": "Place type to search for (e.g., restaurant, cafe, hotel, gas_station, hospital)"
+                },
+                "openNow": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Only show places that are currently open"
+                },
+                "minRating": {
+                  "type": "number",
+                  "maximum": 5,
+                  "minimum": 0,
+                  "description": "Minimum rating requirement (0-5)"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_search_places",
+            "cacheable": false,
+            "description": "Search for places using a free-text query like 'sushi restaurants in Tokyo' or 'best coffee shops near Central Park'. More flexible than search_nearby — supports natural language queries, optional location bias, rating filters, and open-now filtering. Use when the user describes what they're looking for in words rather than by type and coordinates.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "query": {
+                  "type": "string",
+                  "description": "Text search query (e.g., 'Italian restaurants in Manhattan', 'hotels near Taipei 101')"
+                },
+                "openNow": {
+                  "type": "boolean",
+                  "description": "Only return places that are currently open"
+                },
+                "minRating": {
+                  "type": "number",
+                  "description": "Minimum rating filter (1.0 - 5.0)"
+                },
+                "includedType": {
+                  "type": "string",
+                  "description": "Filter by place type (e.g., restaurant, cafe, hotel)"
+                },
+                "locationBias": {
+                  "type": "object",
+                  "required": [
+                    "latitude",
+                    "longitude"
+                  ],
+                  "properties": {
+                    "radius": {
+                      "type": "number",
+                      "description": "Bias radius in meters (default: 5000)"
+                    },
+                    "latitude": {
+                      "type": "number",
+                      "description": "Latitude to bias results toward"
+                    },
+                    "longitude": {
+                      "type": "number",
+                      "description": "Longitude to bias results toward"
+                    }
+                  },
+                  "description": "Optional location to bias results toward",
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_static_map",
+            "cacheable": false,
+            "description": "Generate a map image with markers, paths, or routes — returned as an inline image the user can see directly in chat. PROACTIVELY call this tool after explore_area, plan_route, search_nearby, or directions to visualize results on a map — don't wait for the user to ask. Use markers from search results and path from route data. Supports roadmap, satellite, terrain, and hybrid views. Max 640x640 pixels.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {
+                "path": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Path descriptors. Each string: \"color:0x0000ff|weight:3|lat1,lng1|lat2,lng2|...\" to draw lines/routes on the map."
+                },
+                "size": {
+                  "type": "string",
+                  "description": "Image size \"WxH\" in pixels. Default: \"600x400\". Max: \"640x640\"."
+                },
+                "zoom": {
+                  "type": "number",
+                  "description": "Zoom level 0-21 (0 = world, 15 = streets, 21 = buildings). Default: auto-fit."
+                },
+                "center": {
+                  "type": "string",
+                  "description": "Map center — \"lat,lng\" or address. Optional if markers or path are provided."
+                },
+                "maptype": {
+                  "enum": [
+                    "roadmap",
+                    "satellite",
+                    "terrain",
+                    "hybrid"
+                  ],
+                  "type": "string",
+                  "description": "Map style. Default: roadmap."
+                },
+                "markers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Marker descriptors. Each string: \"color:red|label:A|lat,lng\" or \"color:blue|address\". Multiple markers per string separated by |."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_timezone",
+            "cacheable": false,
+            "description": "Get the timezone and current local time for a location. Use when the user asks 'what time is it in Tokyo', needs to coordinate a meeting across timezones, or is planning travel across timezone boundaries. Returns timezone ID, UTC/DST offsets, and computed local time.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "latitude",
+                "longitude"
+              ],
+              "properties": {
+                "latitude": {
+                  "type": "number",
+                  "description": "Latitude coordinate"
+                },
+                "longitude": {
+                  "type": "number",
+                  "description": "Longitude coordinate"
+                },
+                "timestamp": {
+                  "type": "number",
+                  "description": "Unix timestamp in ms to query timezone at a specific moment (defaults to now)"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "maps_weather",
+            "cacheable": false,
+            "description": "Get weather for a location — current conditions, daily forecast (10 days), or hourly forecast (240 hours). Use when the user asks 'what's the weather in Paris', is planning outdoor activities, or needs to pack for a trip. Coverage: most regions supported, but China, Japan, South Korea, Cuba, Iran, North Korea, Syria are unavailable.",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "latitude",
+                "longitude"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "current",
+                    "forecast_daily",
+                    "forecast_hourly"
+                  ],
+                  "type": "string",
+                  "description": "current = right now, forecast_daily = multi-day outlook, forecast_hourly = hour-by-hour"
+                },
+                "latitude": {
+                  "type": "number",
+                  "description": "Latitude coordinate"
+                },
+                "longitude": {
+                  "type": "number",
+                  "description": "Longitude coordinate"
+                },
+                "forecastDays": {
+                  "type": "number",
+                  "description": "Number of forecast days (1-10, only for forecast_daily, default: 5)"
+                },
+                "forecastHours": {
+                  "type": "number",
+                  "description": "Number of forecast hours (1-240, only for forecast_hourly, default: 24)"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "secrets": [
+          {
+            "help": "",
+            "link": "",
+            "name": "GOOGLE_MAPS_API_KEY",
+            "label": "GOOGLE_MAPS_API_KEY",
+            "secret": true,
+            "env_var": "GOOGLE_MAPS_API_KEY",
+            "required": true
+          }
+        ],
+        "surface": {
+          "n_tools": 18,
+          "n_resources": 0
+        },
+        "operators": [
+          {
+            "name": "maps_air_quality",
+            "shape": "scalar",
+            "arg_names": [
+              "includeHealthRecommendations",
+              "includePollutants",
+              "latitude",
+              "longitude"
+            ],
+            "arg_types": [
+              "boolean",
+              "boolean",
+              "double precision",
+              "double precision"
+            ],
+            "description": "Get air quality for a location — AQI index, pollutant concentrations, and health recommendations by demographic group (elderly, children, athletes, pregnant women, etc.). Use when the user asks 'is the air safe', 'should I wear a mask', 'good for outdoor exercise', or is planning travel for someone with respiratory/heart conditions. Coverage: global including Japan (unlike weather). Returns both universal AQI and local index (EPA for US, AEROS for Japan, etc.).",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_batch_geocode",
+            "shape": "scalar",
+            "arg_names": [
+              "addresses"
+            ],
+            "arg_types": [
+              "jsonb"
+            ],
+            "description": "Geocode multiple addresses in one call — up to 50 addresses, returns coordinates for each. Use when the user provides a list of addresses and needs all their coordinates, e.g. 'geocode these 10 offices' or 'get coordinates for all these restaurants'. For more than 50, use the CLI batch-geocode command instead.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_compare_places",
+            "shape": "scalar",
+            "arg_names": [
+              "limit",
+              "query",
+              "userLocation"
+            ],
+            "arg_types": [
+              "double precision",
+              "text",
+              "jsonb"
+            ],
+            "description": "Compare multiple places side-by-side in one call — searches by query, gets details for each result, and optionally calculates distance from your location. Use when the user asks 'which restaurant should I pick', 'compare these hotels', or needs a decision table. Replaces the manual chain of search-places → place-details → distance-matrix.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_directions",
+            "shape": "scalar",
+            "arg_names": [
+              "arrival_time",
+              "departure_time",
+              "destination",
+              "mode",
+              "origin"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get step-by-step navigation directions between two points with route details. Use when the user asks 'how do I get from A to B?' and needs the route summary, total distance, estimated travel time, or turn-by-turn instructions. Supports departure/arrival times and multiple travel modes.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_distance_matrix",
+            "shape": "scalar",
+            "arg_names": [
+              "departure_time",
+              "destinations",
+              "mode",
+              "origins"
+            ],
+            "arg_types": [
+              "text",
+              "jsonb",
+              "text",
+              "jsonb"
+            ],
+            "description": "Calculate travel distances and durations between multiple origins and destinations in a single request. Use for comparing travel options — e.g., 'which hotel is closest to the office?' or batch distance calculations. Supports driving, walking, bicycling, and transit modes.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_elevation",
+            "shape": "scalar",
+            "arg_names": [
+              "locations"
+            ],
+            "arg_types": [
+              "jsonb"
+            ],
+            "description": "Get elevation (meters above sea level) for geographic coordinates. Use when the user asks 'how high is this place', 'is this area flood-prone', or needs altitude for hiking/cycling route profiles. Also useful for real estate risk assessment — low elevation near water suggests flood risk.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_explore_area",
+            "shape": "scalar",
+            "arg_names": [
+              "location",
+              "radius",
+              "topN",
+              "types"
+            ],
+            "arg_types": [
+              "text",
+              "double precision",
+              "double precision",
+              "jsonb"
+            ],
+            "description": "Explore what's around a location in one call — searches multiple place types, gets details for the top results, and returns a categorized summary. Use when the user asks 'what's around here', 'explore the area near my hotel', or needs a quick overview of a neighborhood. Replaces the manual chain of geocode → search-nearby → place-details. For trip planning: use search_places first to get geographically spread anchor points, then call this tool around each anchor (e.g. 'Gion, Kyoto') — never pass just the city name, as it clusters all results in one area. After results, call static_map to visualize.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_geocode",
+            "shape": "scalar",
+            "arg_names": [
+              "address"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Convert an address, city name, or landmark into GPS coordinates (latitude/longitude). Use when you need coordinates for a location described in text — for example, to provide a center point for search_nearby or a starting point for maps_directions.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_local_rank_tracker",
+            "shape": "scalar",
+            "arg_names": [
+              "center",
+              "gridSize",
+              "gridSpacing",
+              "keyword",
+              "keywords",
+              "placeId"
+            ],
+            "arg_types": [
+              "jsonb",
+              "bigint",
+              "double precision",
+              "text",
+              "jsonb",
+              "text"
+            ],
+            "description": "Track a business's local search ranking across a geographic grid (like LocalFalcon). Searches the same keyword(s) from multiple coordinates around a center point to see how rank varies by location. Supports up to 3 keywords for batch scanning. Returns rank at each grid point, top-3 competitors per point, and summary metrics (ARP, ATRP, SoLV). Useful for local SEO analysis.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_place_details",
+            "shape": "scalar",
+            "arg_names": [
+              "maxPhotos",
+              "placeId"
+            ],
+            "arg_types": [
+              "bigint",
+              "text"
+            ],
+            "description": "Get comprehensive details for a specific place using its Google Maps place_id. Use after search_nearby or maps_search_places to get full information including reviews, phone number, website, and opening hours. Set maxPhotos (1-10) to include photo URLs — omit or set to 0 for no photos (saves tokens).",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_plan_route",
+            "shape": "scalar",
+            "arg_names": [
+              "departure_time",
+              "mode",
+              "optimize",
+              "stops"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "boolean",
+              "jsonb"
+            ],
+            "description": "Plan an optimized multi-stop route in one call — geocodes all stops, uses Routes API waypoint optimization (up to 25 intermediate stops) to find the most efficient visit order, and returns directions for each leg. Use when the user says 'visit these 5 places efficiently', 'plan a route through A, B, C', or needs a multi-stop itinerary. Replaces the manual chain of geocode → distance-matrix → directions. For multi-day trips: create one plan_route call per day with stops that follow a geographic arc (e.g. east→west) rather than mixing distant areas. After results, call static_map to visualize the route.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_reverse_geocode",
+            "shape": "scalar",
+            "arg_names": [
+              "latitude",
+              "longitude"
+            ],
+            "arg_types": [
+              "double precision",
+              "double precision"
+            ],
+            "description": "Convert GPS coordinates (latitude/longitude) into a human-readable street address. Use when you have coordinates from another tool's output or a user's shared location and need the actual address.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_search_along_route",
+            "shape": "scalar",
+            "arg_names": [
+              "destination",
+              "maxResults",
+              "mode",
+              "origin",
+              "textQuery"
+            ],
+            "arg_types": [
+              "text",
+              "double precision",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Search for places along a route between two points — restaurants, cafes, gas stations, etc. ranked by minimal detour time. Use for trip planning to find meals, rest stops, or attractions between landmarks without backtracking. Internally computes the route, then searches along it. Essential for building itineraries where stops should feel 'on the way' rather than 'detour to'.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_search_nearby",
+            "shape": "scalar",
+            "arg_names": [
+              "center",
+              "keyword",
+              "minRating",
+              "openNow",
+              "radius"
+            ],
+            "arg_types": [
+              "jsonb",
+              "text",
+              "double precision",
+              "boolean",
+              "double precision"
+            ],
+            "description": "Find places near a specific location by type (e.g., restaurants, cafes, hotels). Use when the user wants to discover what's around a given address or coordinates, such as 'find coffee shops near Times Square' or 'what hotels are near the airport'. Supports filtering by place type, search radius, minimum rating, and whether currently open.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_search_places",
+            "shape": "scalar",
+            "arg_names": [
+              "includedType",
+              "locationBias",
+              "minRating",
+              "openNow",
+              "query"
+            ],
+            "arg_types": [
+              "text",
+              "jsonb",
+              "double precision",
+              "boolean",
+              "text"
+            ],
+            "description": "Search for places using a free-text query like 'sushi restaurants in Tokyo' or 'best coffee shops near Central Park'. More flexible than search_nearby — supports natural language queries, optional location bias, rating filters, and open-now filtering. Use when the user describes what they're looking for in words rather than by type and coordinates.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_static_map",
+            "shape": "scalar",
+            "arg_names": [
+              "center",
+              "maptype",
+              "markers",
+              "path",
+              "size",
+              "zoom"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "jsonb",
+              "jsonb",
+              "text",
+              "double precision"
+            ],
+            "description": "Generate a map image with markers, paths, or routes — returned as an inline image the user can see directly in chat. PROACTIVELY call this tool after explore_area, plan_route, search_nearby, or directions to visualize results on a map — don't wait for the user to ask. Use markers from search results and path from route data. Supports roadmap, satellite, terrain, and hybrid views. Max 640x640 pixels.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_timezone",
+            "shape": "scalar",
+            "arg_names": [
+              "latitude",
+              "longitude",
+              "timestamp"
+            ],
+            "arg_types": [
+              "double precision",
+              "double precision",
+              "double precision"
+            ],
+            "description": "Get the timezone and current local time for a location. Use when the user asks 'what time is it in Tokyo', needs to coordinate a meeting across timezones, or is planning travel across timezone boundaries. Returns timezone ID, UTC/DST offsets, and computed local time.",
+            "return_type": "text"
+          },
+          {
+            "name": "maps_weather",
+            "shape": "scalar",
+            "arg_names": [
+              "forecastDays",
+              "forecastHours",
+              "latitude",
+              "longitude",
+              "type"
+            ],
+            "arg_types": [
+              "double precision",
+              "double precision",
+              "double precision",
+              "double precision",
+              "text"
+            ],
+            "description": "Get weather for a location — current conditions, daily forecast (10 days), or hourly forecast (240 hours). Use when the user asks 'what's the weather in Paris', is planning outdoor activities, or needs to pack for a trip. Coverage: most regions supported, but China, Japan, South Korea, Cuba, Iran, North Korea, Syria are unavailable.",
+            "return_type": "text"
+          }
+        ],
+        "resources": [],
+        "connection": {
+          "env": {
+            "GOOGLE_MAPS_API_KEY": "${GOOGLE_MAPS_API_KEY}"
+          },
+          "args": [
+            "-y",
+            "@cablate/mcp-google-map",
+            "--stdio"
+          ],
+          "command": "npx",
+          "transport": "stdio",
+          "timeout_ms": 60000
+        },
+        "scanned_at": "2026-06-09T23:41:44.435766+00:00",
+        "description": "Google Maps Platform — geocode/reverse-geocode/places/distance-matrix/directions/timezone/elevation/weather (read-only). Needs GOOGLE_MAPS_API_KEY."
+      },
+      "catalog_entry": {
+        "id": "mcp/maps",
+        "kind": "mcp",
+        "name": "maps",
+        "tags": [
+          "mcp",
+          "maps",
+          "geocoding",
+          "location",
+          "places"
+        ],
+        "title": "Google Maps",
+        "operators": [
+          "maps_air_quality",
+          "maps_batch_geocode",
+          "maps_compare_places",
+          "maps_directions",
+          "maps_distance_matrix",
+          "maps_elevation",
+          "maps_explore_area",
+          "maps_geocode",
+          "maps_local_rank_tracker",
+          "maps_place_details",
+          "maps_plan_route",
+          "maps_reverse_geocode",
+          "maps_search_along_route",
+          "maps_search_nearby",
+          "maps_search_places",
+          "maps_static_map",
+          "maps_timezone",
+          "maps_weather"
+        ],
+        "description": "Google Maps Platform — geocode/reverse-geocode/places/distance-matrix/directions/timezone/elevation/weather (read-only). Needs GOOGLE_MAPS_API_KEY.",
+        "manifest_path": "mcp/maps",
+        "catalog_visibility": "public"
+      }
+    },
+    {
+      "capability_manifest": {
+        "kind": "mcp",
+        "name": "openweather",
+        "tools": [
+          {
+            "name": "geocode-location",
+            "cacheable": false,
+            "description": "Convert location name to coordinates or vice versa",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "query"
+              ],
+              "properties": {
+                "limit": {
+                  "type": "number",
+                  "maximum": 10,
+                  "minimum": 1,
+                  "description": "Maximum number of results to return (default: 5)"
+                },
+                "query": {
+                  "type": "string",
+                  "description": "Location name, zip code, or address to geocode"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get-air-pollution",
+            "cacheable": false,
+            "description": "Get air quality index and pollution data",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "latitude",
+                "longitude"
+              ],
+              "properties": {
+                "latitude": {
+                  "type": "number",
+                  "maximum": 90,
+                  "minimum": -90,
+                  "description": "Latitude coordinate"
+                },
+                "longitude": {
+                  "type": "number",
+                  "maximum": 180,
+                  "minimum": -180,
+                  "description": "Longitude coordinate"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get-current-air-pollution",
+            "cacheable": false,
+            "description": "Get current air quality data",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "location"
+              ],
+              "properties": {
+                "location": {
+                  "type": "string",
+                  "description": "City name (e.g., 'New York') or coordinates (e.g., 'lat,lon')"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get-current-weather",
+            "cacheable": false,
+            "description": "Get current weather conditions for a location",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "location"
+              ],
+              "properties": {
+                "units": {
+                  "enum": [
+                    "metric",
+                    "imperial",
+                    "standard"
+                  ],
+                  "type": "string",
+                  "description": "Temperature units: metric (Celsius), imperial (Fahrenheit), or standard (Kelvin)"
+                },
+                "location": {
+                  "type": "string",
+                  "description": "City name (e.g., 'New York') or coordinates (e.g., 'lat,lon')"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get-daily-forecast",
+            "cacheable": false,
+            "description": "Get daily weather forecast for up to 8 days",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "location"
+              ],
+              "properties": {
+                "days": {
+                  "type": "number",
+                  "maximum": 8,
+                  "minimum": 1,
+                  "description": "Number of days to forecast (1-8, default: 8)"
+                },
+                "units": {
+                  "enum": [
+                    "metric",
+                    "imperial",
+                    "standard"
+                  ],
+                  "type": "string",
+                  "description": "Temperature units: metric (Celsius), imperial (Fahrenheit), or standard (Kelvin)"
+                },
+                "location": {
+                  "type": "string",
+                  "description": "City name (e.g., 'New York') or coordinates (e.g., 'lat,lon')"
+                },
+                "include_today": {
+                  "type": "boolean",
+                  "description": "Include today's forecast (default: false)"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get-hourly-forecast",
+            "cacheable": false,
+            "description": "Get hourly weather forecast for up to 48 hours",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "location"
+              ],
+              "properties": {
+                "hours": {
+                  "type": "number",
+                  "maximum": 48,
+                  "minimum": 1,
+                  "description": "Number of hours to forecast (1-48, default: 48)"
+                },
+                "units": {
+                  "enum": [
+                    "metric",
+                    "imperial",
+                    "standard"
+                  ],
+                  "type": "string",
+                  "description": "Temperature units: metric (Celsius), imperial (Fahrenheit), or standard (Kelvin)"
+                },
+                "location": {
+                  "type": "string",
+                  "description": "City name (e.g., 'New York') or coordinates (e.g., 'lat,lon')"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get-location-info",
+            "cacheable": false,
+            "description": "Get location information from coordinates (reverse geocoding)",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "latitude",
+                "longitude"
+              ],
+              "properties": {
+                "latitude": {
+                  "type": "number",
+                  "maximum": 90,
+                  "minimum": -90,
+                  "description": "Latitude coordinate"
+                },
+                "longitude": {
+                  "type": "number",
+                  "maximum": 180,
+                  "minimum": -180,
+                  "description": "Longitude coordinate"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get-minutely-forecast",
+            "cacheable": false,
+            "description": "Get minute-by-minute precipitation forecast for next hour",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "location"
+              ],
+              "properties": {
+                "limit": {
+                  "type": "number",
+                  "maximum": 60,
+                  "minimum": 1,
+                  "description": "Number of minutes to forecast (1-60, default: 60)"
+                },
+                "location": {
+                  "type": "string",
+                  "description": "City name (e.g., 'New York') or coordinates (e.g., 'lat,lon')"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get-onecall-weather",
+            "cacheable": false,
+            "description": "Get comprehensive weather data (current + 7-day forecast)",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "latitude",
+                "longitude"
+              ],
+              "properties": {
+                "units": {
+                  "enum": [
+                    "metric",
+                    "imperial",
+                    "standard"
+                  ],
+                  "type": "string",
+                  "description": "Temperature units: metric (Celsius), imperial (Fahrenheit), or standard (Kelvin)"
+                },
+                "exclude": {
+                  "type": "array",
+                  "items": {
+                    "enum": [
+                      "current",
+                      "minutely",
+                      "hourly",
+                      "daily",
+                      "alerts"
+                    ],
+                    "type": "string"
+                  },
+                  "description": "Parts of weather data to exclude from the response"
+                },
+                "latitude": {
+                  "type": "number",
+                  "maximum": 90,
+                  "minimum": -90,
+                  "description": "Latitude coordinate"
+                },
+                "longitude": {
+                  "type": "number",
+                  "maximum": 180,
+                  "minimum": -180,
+                  "description": "Longitude coordinate"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get-weather-alerts",
+            "cacheable": false,
+            "description": "Get active weather alerts and warnings",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "location"
+              ],
+              "properties": {
+                "location": {
+                  "type": "string",
+                  "description": "City name (e.g., 'New York') or coordinates (e.g., 'lat,lon')"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "get-weather-forecast",
+            "cacheable": false,
+            "description": "Get weather forecast for up to 5 days",
+            "ttl_seconds": null,
+            "input_schema": {
+              "type": "object",
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "required": [
+                "location"
+              ],
+              "properties": {
+                "days": {
+                  "type": "number",
+                  "maximum": 5,
+                  "minimum": 1,
+                  "description": "Number of days to forecast (1-5, default: 5)"
+                },
+                "units": {
+                  "enum": [
+                    "metric",
+                    "imperial",
+                    "standard"
+                  ],
+                  "type": "string",
+                  "description": "Temperature units: metric (Celsius), imperial (Fahrenheit), or standard (Kelvin)"
+                },
+                "location": {
+                  "type": "string",
+                  "description": "City name (e.g., 'New York') or coordinates (e.g., 'lat,lon')"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "secrets": [
+          {
+            "help": "",
+            "link": "",
+            "name": "OPENWEATHER_API_KEY",
+            "label": "OPENWEATHER_API_KEY",
+            "secret": true,
+            "env_var": "OPENWEATHER_API_KEY",
+            "required": true
+          }
+        ],
+        "surface": {
+          "n_tools": 11,
+          "n_resources": 1
+        },
+        "operators": [
+          {
+            "name": "openweather_geocode-location",
+            "shape": "scalar",
+            "arg_names": [
+              "limit",
+              "query"
+            ],
+            "arg_types": [
+              "double precision",
+              "text"
+            ],
+            "description": "Convert location name to coordinates or vice versa",
+            "return_type": "text"
+          },
+          {
+            "name": "openweather_get-air-pollution",
+            "shape": "scalar",
+            "arg_names": [
+              "latitude",
+              "longitude"
+            ],
+            "arg_types": [
+              "double precision",
+              "double precision"
+            ],
+            "description": "Get air quality index and pollution data",
+            "return_type": "text"
+          },
+          {
+            "name": "openweather_get-current-air-pollution",
+            "shape": "scalar",
+            "arg_names": [
+              "location"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get current air quality data",
+            "return_type": "text"
+          },
+          {
+            "name": "openweather_get-current-weather",
+            "shape": "scalar",
+            "arg_names": [
+              "location",
+              "units"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Get current weather conditions for a location",
+            "return_type": "text"
+          },
+          {
+            "name": "openweather_get-daily-forecast",
+            "shape": "scalar",
+            "arg_names": [
+              "days",
+              "include_today",
+              "location",
+              "units"
+            ],
+            "arg_types": [
+              "double precision",
+              "boolean",
+              "text",
+              "text"
+            ],
+            "description": "Get daily weather forecast for up to 8 days",
+            "return_type": "text"
+          },
+          {
+            "name": "openweather_get-hourly-forecast",
+            "shape": "scalar",
+            "arg_names": [
+              "hours",
+              "location",
+              "units"
+            ],
+            "arg_types": [
+              "double precision",
+              "text",
+              "text"
+            ],
+            "description": "Get hourly weather forecast for up to 48 hours",
+            "return_type": "text"
+          },
+          {
+            "name": "openweather_get-location-info",
+            "shape": "scalar",
+            "arg_names": [
+              "latitude",
+              "longitude"
+            ],
+            "arg_types": [
+              "double precision",
+              "double precision"
+            ],
+            "description": "Get location information from coordinates (reverse geocoding)",
+            "return_type": "text"
+          },
+          {
+            "name": "openweather_get-minutely-forecast",
+            "shape": "scalar",
+            "arg_names": [
+              "limit",
+              "location"
+            ],
+            "arg_types": [
+              "double precision",
+              "text"
+            ],
+            "description": "Get minute-by-minute precipitation forecast for next hour",
+            "return_type": "text"
+          },
+          {
+            "name": "openweather_get-onecall-weather",
+            "shape": "scalar",
+            "arg_names": [
+              "exclude",
+              "latitude",
+              "longitude",
+              "units"
+            ],
+            "arg_types": [
+              "jsonb",
+              "double precision",
+              "double precision",
+              "text"
+            ],
+            "description": "Get comprehensive weather data (current + 7-day forecast)",
+            "return_type": "text"
+          },
+          {
+            "name": "openweather_get-weather-alerts",
+            "shape": "scalar",
+            "arg_names": [
+              "location"
+            ],
+            "arg_types": [
+              "text"
+            ],
+            "description": "Get active weather alerts and warnings",
+            "return_type": "text"
+          },
+          {
+            "name": "openweather_get-weather-forecast",
+            "shape": "scalar",
+            "arg_names": [
+              "days",
+              "location",
+              "units"
+            ],
+            "arg_types": [
+              "double precision",
+              "text",
+              "text"
+            ],
+            "description": "Get weather forecast for up to 5 days",
+            "return_type": "text"
+          }
+        ],
+        "resources": [
+          {
+            "uri": "openweather://api/docs",
+            "name": "OpenWeatherMap API Documentation",
+            "mime_type": "text/markdown",
+            "description": null
+          }
+        ],
+        "connection": {
+          "env": {
+            "OPENWEATHER_API_KEY": "${OPENWEATHER_API_KEY}"
+          },
+          "args": [
+            "-y",
+            "-p",
+            "mcp-openweathermap",
+            "-p",
+            "@modelcontextprotocol/sdk@1.12.1",
+            "mcp-openweathermap"
+          ],
+          "command": "npx",
+          "transport": "stdio",
+          "timeout_ms": 60000
+        },
+        "scanned_at": "2026-06-09T23:41:44.453623+00:00",
+        "description": "OpenWeatherMap — current/forecast/hourly/daily/alerts/air-pollution + geocoding. Needs OPENWEATHER_API_KEY (32-hex). SDK pinned to 1.12.1 in args (avoids a FastMCP completions crash with sdk 1.29)."
+      },
+      "catalog_entry": {
+        "id": "mcp/openweather",
+        "kind": "mcp",
+        "name": "openweather",
+        "tags": [
+          "mcp",
+          "weather",
+          "forecast",
+          "geocoding"
+        ],
+        "title": "OpenWeatherMap",
+        "operators": [
+          "openweather_geocode-location",
+          "openweather_get-air-pollution",
+          "openweather_get-current-air-pollution",
+          "openweather_get-current-weather",
+          "openweather_get-daily-forecast",
+          "openweather_get-hourly-forecast",
+          "openweather_get-location-info",
+          "openweather_get-minutely-forecast",
+          "openweather_get-onecall-weather",
+          "openweather_get-weather-alerts",
+          "openweather_get-weather-forecast"
+        ],
+        "description": "OpenWeatherMap — current/forecast/hourly/daily/alerts/air-pollution + geocoding. Needs OPENWEATHER_API_KEY (32-hex). SDK pinned to 1.12.1 in args (avoids a FastMCP completions crash with sdk 1.29).",
+        "manifest_path": "mcp/openweather",
+        "catalog_visibility": "public"
+      }
     }
   ],
   "catalog_layout": "rvbbit.pack/v1",
