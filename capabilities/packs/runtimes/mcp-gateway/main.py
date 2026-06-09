@@ -30,7 +30,7 @@ from contextlib import AsyncExitStack
 from typing import Any
 
 import asyncpg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import AnyUrl, BaseModel
 
 from mcp import ClientSession, StdioServerParameters
@@ -64,19 +64,127 @@ db_pool: asyncpg.Pool | None = None
 _ENV_REF = re.compile(r"\$\{(\w+)\}")
 
 
-def resolve_env(env_template: dict[str, Any] | None) -> dict[str, str]:
-    """Expand ${VAR} refs in env values against the gateway's environment.
+# ---- secret store ---------------------------------------------------------
+#
+# Install-time secrets (API keys entered in the UI) are POSTed to /secrets and
+# held HERE, by the gateway — never persisted in Postgres, which only stores
+# ${VAR} references in mcp_servers.env. resolve_env() checks this store
+# (scoped per server) BEFORE the gateway's own process env, so a server
+# registered with env {"GITHUB_TOKEN": "${GITHUB_TOKEN}"} picks up whatever the
+# installer entered. Encrypted at rest with Fernet when `cryptography` + a key
+# are available; degrades to plaintext-in-file (gateway is already an isolation
+# boundary) with a warning otherwise.
 
-    Lets users register an MCP server with `env => {"GITHUB_TOKEN":
-    "${GITHUB_TOKEN}"}` and the actual token is pulled from the gateway's
-    runtime env at spawn time (never persisted in the DB).
+SECRETS_PATH = os.environ.get("RVBBIT_GATEWAY_SECRETS_PATH", "/app/data/mcp-secrets.bin")
+GATEWAY_TOKEN = os.environ.get("RVBBIT_GATEWAY_TOKEN") or None
+
+try:
+    from cryptography.fernet import Fernet
+    _HAS_CRYPTO = True
+except ImportError:
+    _HAS_CRYPTO = False
+
+
+def _load_fernet():
+    if not _HAS_CRYPTO:
+        log.warning("mcp-gateway: `cryptography` not installed; secret store is UNENCRYPTED")
+        return None
+    key = os.environ.get("RVBBIT_GATEWAY_SECRET_KEY")
+    if key:
+        return Fernet(key.encode() if isinstance(key, str) else key)
+    # No explicit key: generate + persist one beside the store so restarts can
+    # still decrypt. A mounted/explicit RVBBIT_GATEWAY_SECRET_KEY is recommended
+    # for production (a rebuilt container without a volume loses the key file).
+    key_path = SECRETS_PATH + ".key"
+    try:
+        if os.path.exists(key_path):
+            with open(key_path, "rb") as f:
+                return Fernet(f.read().strip())
+        os.makedirs(os.path.dirname(key_path) or ".", exist_ok=True)
+        k = Fernet.generate_key()
+        with open(key_path, "wb") as f:
+            f.write(k)
+        log.warning("mcp-gateway: generated a secret-store key at %s; set "
+                    "RVBBIT_GATEWAY_SECRET_KEY (mounted) for durable production use", key_path)
+        return Fernet(k)
+    except Exception as e:
+        log.warning("mcp-gateway: encryption setup failed (%s); secrets UNENCRYPTED", e)
+        return None
+
+
+class SecretStore:
+    def __init__(self):
+        self._data: dict[str, dict[str, str]] = {}
+        self._fernet = _load_fernet()
+        self._load()
+
+    def _load(self):
+        try:
+            if not os.path.exists(SECRETS_PATH):
+                return
+            with open(SECRETS_PATH, "rb") as f:
+                raw = f.read()
+            if not raw:
+                return
+            if self._fernet is not None:
+                raw = self._fernet.decrypt(raw)
+            self._data = json.loads(raw.decode("utf-8"))
+            log.info("mcp-gateway: loaded secrets for %d server(s)", len(self._data))
+        except Exception as e:
+            log.warning("mcp-gateway: could not load secret store (%s); starting empty", e)
+            self._data = {}
+
+    def _persist(self):
+        try:
+            os.makedirs(os.path.dirname(SECRETS_PATH) or ".", exist_ok=True)
+            raw = json.dumps(self._data).encode("utf-8")
+            if self._fernet is not None:
+                raw = self._fernet.encrypt(raw)
+            tmp = SECRETS_PATH + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            os.replace(tmp, SECRETS_PATH)
+        except Exception as e:
+            log.warning("mcp-gateway: could not persist secret store: %s", e)
+
+    def for_server(self, server: str) -> dict[str, str]:
+        return dict(self._data.get(server, {}))
+
+    def set(self, server: str, name: str, value: str):
+        self._data.setdefault(server, {})[name] = value
+        self._persist()
+
+    def delete(self, server: str, name: str):
+        if name in self._data.get(server, {}):
+            del self._data[server][name]
+            if not self._data[server]:
+                del self._data[server]
+            self._persist()
+
+    def names(self, server: str) -> list[str]:
+        return sorted(self._data.get(server, {}).keys())
+
+
+secrets = SecretStore()
+
+
+def resolve_env(env_template: dict[str, Any] | None, server_name: str | None = None) -> dict[str, str]:
+    """Expand ${VAR} refs in env values. Resolution order, highest first:
+    the per-server secret store (UI-entered keys), then the gateway's own
+    process env. Keys never round-trip through Postgres.
     """
     if not env_template:
         return {}
+    store = secrets.for_server(server_name) if server_name else {}
+
+    def _sub(m):
+        var = m.group(1)
+        return store[var] if var in store else os.environ.get(var, "")
+
     out: dict[str, str] = {}
     for k, v in env_template.items():
         if isinstance(v, str):
-            v = _ENV_REF.sub(lambda m: os.environ.get(m.group(1), ""), v)
+            v = _ENV_REF.sub(_sub, v)
         out[k] = str(v)
     return out
 
@@ -162,7 +270,7 @@ class MCPServerProcess:
                 params = StdioServerParameters(
                     command=self.config.command,
                     args=self.config.args,
-                    env={**os.environ, **resolve_env(self.config.env)},
+                    env={**os.environ, **resolve_env(self.config.env, self.config.name)},
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
             elif self.config.transport == "http":
@@ -463,6 +571,54 @@ async def probe(server: str):
             "n_tools": 0,
             "error": f"{type(e).__name__}: {e}",
         }
+
+
+# ---- secrets API ----------------------------------------------------------
+#
+# The install UI pushes API keys here (not to Postgres). Guarded by a shared
+# bearer token when RVBBIT_GATEWAY_TOKEN is set; open (with a log note) in dev.
+
+
+def _check_token(authorization: str | None) -> None:
+    if GATEWAY_TOKEN is None:
+        return
+    if authorization != f"Bearer {GATEWAY_TOKEN}":
+        raise HTTPException(401, "invalid or missing gateway token")
+
+
+class SecretRequest(BaseModel):
+    server: str
+    name: str
+    value: str
+
+
+class SecretRef(BaseModel):
+    server: str
+    name: str
+
+
+@app.post("/secrets")
+async def set_secret(req: SecretRequest, authorization: str | None = Header(default=None)):
+    _check_token(authorization)
+    secrets.set(req.server, req.name, req.value)
+    # Respawn on next call so the new secret is picked up.
+    await evict_server(req.server)
+    return {"ok": True, "server": req.server, "name": req.name}
+
+
+@app.delete("/secrets")
+async def delete_secret(req: SecretRef, authorization: str | None = Header(default=None)):
+    _check_token(authorization)
+    secrets.delete(req.server, req.name)
+    await evict_server(req.server)
+    return {"ok": True, "server": req.server, "name": req.name}
+
+
+@app.get("/secrets/{server}")
+async def secret_status(server: str, authorization: str | None = Header(default=None)):
+    """Which secret names are set for a server (values are never returned)."""
+    _check_token(authorization)
+    return {"server": server, "set": secrets.names(server)}
 
 
 @app.get("/health")

@@ -324,7 +324,11 @@ most important values into `gpu_required`, `model_size_bytes`, and
 `vram_required_bytes` for UI cards and Warren admission checks. V1 treats this
 as a VRAM reservation yardstick only; it does not model GPU compute throughput.
 For `device: auto` packs, Warren reserves VRAM when the deploy selector targets
-a GPU node, for example `{"gpu": true}`.
+a GPU node, for example `{"gpu": true}`. Warren and local installs both apply
+`compose.gpu.yaml` automatically when the selected device is `auto`, the
+manifest declares GPU resources, and the host exposes NVIDIA GPU support. Set
+the device to `cpu` to opt out; direct CLI installs can also pass
+`--no-gpu-auto`.
 
 ### Catalog JSON Fallback Shape
 
@@ -368,7 +372,8 @@ Each `capabilities[]` entry has these fields:
 | `provider_set_default` | boolean | True only when an LLM provider pack should make itself the default provider during install. |
 | `runtime_name` | string/null | Name registered in a runtime catalog such as `rvbbit.python_runtimes`. |
 | `runtime_language` | string/null | Runtime language, currently `python` or `mcp` for runtime sidecars. |
-| `runtime_image` | string/null | OCI image Warren should run when the capability is image-based. |
+| `runtime_image` | string/null | OCI image for image-native packs or optional prebuilt release artifact for build-mode packs. |
+| `prebuilt_runtime_image` | string/null | Optional release image that may be used when a caller explicitly requests image mode. |
 | `runtime_mode` | string | `image` for pull/run packs, `build` for local build/template packs. |
 | `install_mode` | string | Pack install mode, currently usually the same as `runtime_mode`. |
 | `install_warren` | boolean/null | Whether the pack metadata declares Warren install support. |
@@ -546,9 +551,9 @@ as higher-level runtime primitives in the UI rather than ordinary model cards.
 
 For V1, bundled runtime sidecars are source-build packs by default. Warren
 builds them from trusted local templates, starts the container, probes it, and
-registers SQL state. Published OCI images can be added later by setting
-`runtime.image`; the catalog table contract already exposes both `runtime_mode`
-and nullable `runtime_image`.
+registers SQL state. Release catalogs may also advertise
+`prebuilt_runtime.image`; callers can opt into that fast path with
+`install_mode => 'image'`, but the default remains source build.
 
 ### Tabular Handler Shape
 
@@ -1042,19 +1047,41 @@ RVBBIT_DSN=postgresql://postgres:rvbbit@localhost:55433/bench \
 capabilities/tools/rvbbit-capability install \
   capabilities/packs/embeddings/bge-small-en-v1.5 \
   --out-dir .rvbbit/capabilities/bge_small_en_v1_5 \
-  --gpu \
   --force
 ```
 
-The Lens local install path runs `docker compose` from the Lens server process.
-In packaged uber/release compose, Lens receives the same configurable Docker
-socket as Warren, so local mode works against the Docker daemon that launched
-the stack. Rootful/sudo Docker uses `/var/run/docker.sock`; rootless/user Docker
-sets `RVBBIT_DOCKER_SOCKET` to the user Docker socket before launching compose.
+The Lens local install path runs Docker Compose from the Lens server process,
+using `docker compose` when the Compose v2 plugin is available and falling back
+to `docker-compose` when needed. In packaged uber/release compose, Lens
+receives the same configurable Docker socket as Warren, so local mode works
+against the Docker daemon that launched the stack. Rootful/sudo Docker uses
+`/var/run/docker.sock`; rootless/user Docker sets `RVBBIT_DOCKER_SOCKET` to the
+user Docker socket before launching compose.
+Packaged Lens also receives `RVBBIT_DOCKER_NETWORK`, matching the compose
+network that Postgres is attached to (`rvbbit_uber` or `rvbbit_release` by
+default). Generated local capability compose files join that external network;
+without it Docker reports `network docker_default declared as external, but
+could not be found`. Direct CLI installs can pass `--docker-network <name>` or
+set `RVBBIT_DOCKER_NETWORK`.
+Packaged Lens and Warren also receive provider secret refs such as
+`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+`GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, and
+`GOOGLE_CLOUD_QUOTA_PROJECT`. The database stores env-var names in provider and
+capability metadata; these process env values are what generated child
+sidecars interpolate at launch time.
+Warren catalog deploys are build-first by default. Release catalogs may include
+`prebuilt_runtime.image` metadata for fast-path installs, but
+`runtime.image` is only stamped into the deploy manifest when the caller
+explicitly requests image mode.
 Relative local output directories such as `.rvbbit/capabilities/<name>` are
 resolved under `RVBBIT_LOCAL_WORK_ROOT`, which defaults to the persisted Lens
 home `/data` in packaged compose. Absolute local output directories must also
 live under that root.
+
+For GPU-capable packs, local Lens installs resolve `device: auto` on the server
+side. If Lens detects `nvidia-smi` or Docker reports an NVIDIA runtime, it adds
+`compose.gpu.yaml`; otherwise it leaves the base compose file on CPU. The UI
+checkbox forces the GPU overlay, while selecting `cpu` is the explicit opt-out.
 
 When running Lens directly on a host rather than in the packaged container, the
 Lens server process must be able to run Docker without an interactive password.
@@ -1105,8 +1132,9 @@ After scaffold/install, the output directory contains:
 | `RVBBIT_CAPABILITY_PORT` | Host port used only with `compose.host-ports.yaml` or Warren `--advertise-base-url`. Defaults to Docker-assigned random port in the optional overlay. |
 | `RVBBIT_CAPABILITY_DEVICE` | Runtime device inside sidecar. GPU overlay sets `cuda`. |
 
-GPU install should be exposed as an option, not forced. The generated GPU
-overlay assumes Docker has NVIDIA GPU support configured.
+GPU install should be exposed as an option with automatic resolution for
+GPU-capable `device: auto` manifests. The generated GPU overlay assumes Docker
+has NVIDIA GPU support configured.
 
 ### Suggested V0 UI
 

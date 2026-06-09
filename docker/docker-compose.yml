@@ -159,11 +159,17 @@ services:
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
       GOOGLE_CLOUD_QUOTA_PROJECT: ${GOOGLE_CLOUD_QUOTA_PROJECT:-}
-    # Internal-only (pg-rvbbit and bench reach it via docker DNS as
-    # mcp-gateway:9100). Add a host port mapping if you need to poke it
-    # directly with curl/postman.
+    # pg-rvbbit and bench reach it via docker DNS as mcp-gateway:9100. The
+    # localhost-bound host port lets the lens dev server POST install-time
+    # secrets to the gateway; in prod the lens runs in this network and reaches
+    # mcp-gateway:9100 directly.
+    ports:
+      - "127.0.0.1:9100:9100"
     expose:
       - "9100"
+    # Persist the encrypted secret store + its key across rebuilds/recreates.
+    volumes:
+      - mcp_gateway_data:/app/data
     restart: unless-stopped
 
   bench:
@@ -204,3 +210,4 @@ services:
 volumes:
   heap_data:
   rvbbit_data:
+  mcp_gateway_data:

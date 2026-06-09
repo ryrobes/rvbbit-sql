@@ -7,7 +7,7 @@
 # Publish:
 #   scripts/release/build-and-push.sh --version 1.0.0 --push --tag-latest
 #
-# Include all catalog capability images, beyond the core smoke image:
+# Include all catalog capability images, beyond the core runtime/smoke images:
 #   scripts/release/build-and-push.sh --version 1.0.0 --with-capabilities
 #
 # Mutate version files first:
@@ -33,7 +33,7 @@ SKIP_WARREN=0
 BUILD_CAPABILITIES=0
 DRY_RUN=0
 CHECK_PUBLIC=0
-CORE_CAPABILITY_IDS=("smoke/warren-echo")
+CORE_CAPABILITY_IDS=("runtimes/python-runtime" "runtimes/mcp-gateway" "smoke/warren-echo")
 
 usage() {
     cat >&2 <<EOF

@@ -1120,11 +1120,17 @@ BEGIN
         ', '
     ) || ')';
 
-    -- Args list WITH trailing opts JSONB (user-facing variant).
-    wrapper_args_with_opts := array_to_string(
+    -- Args list WITH trailing opts JSONB (user-facing variant). Guard the
+    -- zero-arg case (e.g. an MCP tool that takes no inputs) so we don't emit a
+    -- leading comma: "(, opts jsonb …)".
+    wrapper_args_with_opts := nullif(array_to_string(
         ARRAY(SELECT format('%I %s', a, t) FROM unnest(op_arg_names, actual_arg_types) AS u(a,t)),
         ', '
-    ) || ', opts jsonb DEFAULT ''{}''::jsonb';
+    ), '');
+    wrapper_args_with_opts := CASE
+        WHEN wrapper_args_with_opts IS NULL THEN 'opts jsonb DEFAULT ''{}''::jsonb'
+        ELSE wrapper_args_with_opts || ', opts jsonb DEFAULT ''{}''::jsonb'
+    END;
 
     -- (n_args+1)-arg wrapper: full opts surface.
     -- PARALLEL SAFE on the SQL wrapper is what makes PG actually consider
@@ -3536,10 +3542,12 @@ BEGIN
 END
 $dcap$;
 
+DROP FUNCTION IF EXISTS rvbbit.deploy_catalog_capability(text, jsonb, text);
 CREATE OR REPLACE FUNCTION rvbbit.deploy_catalog_capability(
     catalog_id      text,
     target_selector jsonb DEFAULT '{}'::jsonb,
-    job_name        text DEFAULT NULL
+    job_name        text DEFAULT NULL,
+    install_mode    text DEFAULT 'build'
 ) RETURNS uuid
 LANGUAGE plpgsql
 VOLATILE
@@ -3552,12 +3560,18 @@ DECLARE
     catalog_operator_name text;
     catalog_resource_doc jsonb;
     queued_job_id uuid;
+    normalized_install_mode text := lower(coalesce(nullif(btrim(install_mode), ''), 'build'));
+    prebuilt_runtime_doc jsonb;
+    runtime_doc jsonb;
 BEGIN
     IF catalog_id IS NULL OR btrim(catalog_id) = '' THEN
         RAISE EXCEPTION 'catalog_id is required';
     END IF;
     IF jsonb_typeof(target_selector) <> 'object' THEN
         RAISE EXCEPTION 'target_selector must be a JSON object';
+    END IF;
+    IF normalized_install_mode NOT IN ('build', 'image') THEN
+        RAISE EXCEPTION 'install_mode must be build or image';
     END IF;
 
     SELECT manifest, name, backend_name, runtime_name, operators[1], resource_profile
@@ -3574,6 +3588,27 @@ BEGIN
        AND jsonb_typeof(catalog_resource_doc) = 'object'
        AND catalog_resource_doc <> '{}'::jsonb THEN
         catalog_manifest := catalog_manifest || jsonb_build_object('resources', catalog_resource_doc);
+    END IF;
+    prebuilt_runtime_doc := catalog_manifest->'prebuilt_runtime';
+    IF normalized_install_mode = 'image' THEN
+        IF jsonb_typeof(prebuilt_runtime_doc) = 'object'
+           AND nullif(prebuilt_runtime_doc->>'image', '') IS NOT NULL THEN
+            runtime_doc := coalesce(catalog_manifest->'runtime', '{}'::jsonb)
+                || jsonb_build_object(
+                    'mode', 'image',
+                    'image', prebuilt_runtime_doc->>'image',
+                    'pull_policy', coalesce(nullif(prebuilt_runtime_doc->>'pull_policy', ''), 'missing')
+                );
+            catalog_manifest := jsonb_set(catalog_manifest, '{runtime}', runtime_doc, true);
+        ELSIF nullif(catalog_manifest #>> '{runtime,image}', '') IS NULL THEN
+            RAISE EXCEPTION 'catalog entry % has no prebuilt runtime image', catalog_id;
+        END IF;
+    ELSIF jsonb_typeof(prebuilt_runtime_doc) = 'object'
+          AND catalog_manifest #>> '{runtime,image}' = prebuilt_runtime_doc->>'image' THEN
+        runtime_doc := (coalesce(catalog_manifest->'runtime', '{}'::jsonb)
+            - 'image' - 'image_digest' - 'pull_policy')
+            || jsonb_build_object('mode', 'build');
+        catalog_manifest := jsonb_set(catalog_manifest, '{runtime}', runtime_doc, true);
     END IF;
 
     queued_job_id := rvbbit.deploy_capability(
@@ -4573,6 +4608,173 @@ BEGIN
     DELETE FROM rvbbit.mcp_servers WHERE name = server_name;
 END
 $rm$;
+
+-- ---------------------------------------------------------------------------
+-- Package a registered + introspected MCP server as a publishable catalog
+-- entry. Reads mcp_servers/mcp_tools/mcp_resources and returns
+-- { catalog_entry, manifest } — the connection spec with secret VALUES stripped
+-- to *declared* inputs (every ${VAR} env ref + the http auth-header env var),
+-- plus the tool surface (-> namespaced operators) and resource surface
+-- (-> table-functions). So a published entry shows "adds N operators + M
+-- tables" and the required keys with NONE of the publisher's secrets. Review /
+-- annotate the result, then publish via rvbbit.upsert_capability_catalog_entry,
+-- or use rvbbit.publish_mcp_capability() to scan + publish in one shot.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION rvbbit.export_mcp_manifest(server_name text)
+RETURNS jsonb LANGUAGE plpgsql STABLE AS $emm$
+DECLARE
+    s rvbbit.mcp_servers%ROWTYPE;
+    v_secrets jsonb; v_tools jsonb; v_resources jsonb; v_operators text[];
+    v_n_tools int; v_n_res int; v_manifest jsonb; v_entry jsonb;
+BEGIN
+    SELECT * INTO s FROM rvbbit.mcp_servers WHERE name = server_name;
+    IF NOT FOUND THEN RAISE EXCEPTION 'mcp server % is not registered', server_name; END IF;
+
+    -- Declared secrets: every ${VAR} referenced in env values, plus the http
+    -- auth-header env var. Values are NEVER included — only the names, which
+    -- the installer fills in at install time (pushed to the gateway, not PG).
+    WITH vars AS (
+        SELECT DISTINCT m[1] AS var
+        FROM jsonb_each_text(coalesce(s.env, '{}'::jsonb)) e,
+             LATERAL regexp_matches(e.value, '\$\{(\w+)\}', 'g') AS m
+        UNION
+        SELECT s.auth_header_env WHERE s.auth_header_env IS NOT NULL
+    )
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+        'name', var, 'env_var', var, 'required', true, 'secret', true,
+        'label', var, 'help', '', 'link', '') ORDER BY var), '[]'::jsonb)
+    INTO v_secrets FROM vars WHERE var IS NOT NULL;
+
+    SELECT coalesce(jsonb_agg(jsonb_build_object('name', t.name, 'description', t.description,
+        'input_schema', coalesce(t.input_schema, '{}'::jsonb), 'cacheable', t.cacheable,
+        'ttl_seconds', t.ttl_seconds) ORDER BY t.name), '[]'::jsonb), count(*)
+    INTO v_tools, v_n_tools FROM rvbbit.mcp_tools t WHERE t.server = server_name;
+
+    SELECT coalesce(jsonb_agg(jsonb_build_object('uri', r.uri, 'name', r.name,
+        'description', r.description, 'mime_type', r.mime_type) ORDER BY r.uri), '[]'::jsonb), count(*)
+    INTO v_resources, v_n_res FROM rvbbit.mcp_resources r WHERE r.server = server_name;
+
+    -- Each tool becomes a server-namespaced operator (avoids cross-server
+    -- collisions on common names like `search`).
+    SELECT coalesce(array_agg(server_name || '_' || t.name ORDER BY t.name), ARRAY[]::text[])
+    INTO v_operators FROM rvbbit.mcp_tools t WHERE t.server = server_name;
+
+    v_manifest := jsonb_build_object('name', server_name, 'kind', 'mcp',
+        'description', coalesce(s.description, ''),
+        'connection', jsonb_strip_nulls(jsonb_build_object('transport', s.transport,
+            'command', s.command, 'args', to_jsonb(s.args), 'env', s.env, 'url', s.url,
+            'auth_header_env', s.auth_header_env, 'timeout_ms', s.timeout_ms)),
+        'secrets', v_secrets, 'tools', v_tools, 'resources', v_resources,
+        'surface', jsonb_build_object('n_tools', v_n_tools, 'n_resources', v_n_res),
+        'scanned_at', to_jsonb(clock_timestamp()));
+    v_entry := jsonb_build_object('id', 'mcp/' || server_name, 'kind', 'mcp',
+        'name', server_name, 'title', server_name, 'description', coalesce(s.description, ''),
+        'tags', jsonb_build_array('mcp'), 'operators', to_jsonb(v_operators),
+        'manifest_path', 'mcp/' || server_name);
+    RETURN jsonb_build_object('catalog_entry', v_entry, 'manifest', v_manifest);
+END $emm$;
+
+-- Scan + publish in one call (export_mcp_manifest -> upsert_capability_catalog_entry).
+CREATE OR REPLACE FUNCTION rvbbit.publish_mcp_capability(
+    server_name text, p_title text DEFAULT NULL, p_tags text[] DEFAULT NULL, p_active boolean DEFAULT true)
+RETURNS jsonb LANGUAGE plpgsql VOLATILE AS $pmc$
+DECLARE
+    pkg jsonb := rvbbit.export_mcp_manifest(server_name);
+    v_entry jsonb := pkg->'catalog_entry'; v_manifest jsonb := pkg->'manifest';
+BEGIN
+    IF p_title IS NOT NULL THEN v_entry := jsonb_set(v_entry, '{title}', to_jsonb(p_title)); END IF;
+    IF p_tags IS NOT NULL THEN v_entry := jsonb_set(v_entry, '{tags}', to_jsonb(p_tags)); END IF;
+    RETURN rvbbit.upsert_capability_catalog_entry(v_entry, v_manifest, 'mcp-scan', p_active);
+END $pmc$;
+
+-- ---------------------------------------------------------------------------
+-- Generate one scalar operator per tool of an MCP server: a single `mcp` step
+-- routing to the gateway. Typed args come from the tool's input_schema; the
+-- return is text (the tool's result body — JSON for structured tools, castable
+-- with ::jsonb). Drop-first so a re-scan with changed signatures is idempotent.
+-- They land in rvbbit.operators -> appear in the Operators window / Scry / SQL
+-- exactly like specialist or semantic operators.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION rvbbit.generate_mcp_operators(server_name text)
+RETURNS int LANGUAGE plpgsql AS $gmo$
+DECLARE
+    t record; prop record; r record;
+    v_op text; v_args text[]; v_types text[]; v_inputs jsonb; v_steps jsonb; v_n int := 0;
+BEGIN
+    FOR t IN SELECT name, description, input_schema FROM rvbbit.mcp_tools WHERE server = server_name LOOP
+        v_op := server_name || '_' || t.name;
+        -- Drop prior wrapper(s) — return type / signature may change between scans.
+        FOR r IN SELECT oid::regprocedure AS sig FROM pg_proc
+                 WHERE proname IN (v_op, '_op_' || v_op) AND pronamespace = 'rvbbit'::regnamespace LOOP
+            EXECUTE 'DROP FUNCTION IF EXISTS ' || r.sig::text || ' CASCADE';
+        END LOOP;
+        DELETE FROM rvbbit.operators WHERE name = v_op;
+        v_args := ARRAY[]::text[]; v_types := ARRAY[]::text[]; v_inputs := '{}'::jsonb;
+        IF jsonb_typeof(t.input_schema->'properties') = 'object' THEN
+            FOR prop IN SELECT key, value FROM jsonb_each(t.input_schema->'properties') ORDER BY key LOOP
+                v_args := v_args || prop.key;
+                v_types := v_types || CASE prop.value->>'type'
+                    WHEN 'integer' THEN 'bigint' WHEN 'number' THEN 'double precision'
+                    WHEN 'boolean' THEN 'boolean' WHEN 'object' THEN 'jsonb'
+                    WHEN 'array' THEN 'jsonb' ELSE 'text' END;
+                v_inputs := v_inputs || jsonb_build_object(prop.key, '{{ inputs.' || prop.key || ' }}');
+            END LOOP;
+        END IF;
+        v_steps := jsonb_build_array(jsonb_build_object(
+            'name','call','kind','mcp','server',server_name,'tool',t.name,'inputs',v_inputs));
+        PERFORM rvbbit.create_operator(
+            op_name => v_op, op_arg_names => v_args, op_return_type => 'text',
+            op_shape => 'scalar', op_arg_types => v_types,
+            op_description => coalesce(t.description,'') || ' [MCP ' || server_name || '.' || t.name || ']',
+            op_steps => v_steps);
+        v_n := v_n + 1;
+    END LOOP;
+    RETURN v_n;
+END $gmo$;
+
+-- Install step 1 (lens-orchestrated): register an mcp_servers row from a
+-- published mcp capability's connection spec. Returns the server name. Runs as
+-- its own statement so the row commits before the gateway (a separate
+-- connection) is asked to refresh; the lens pushes secrets to the gateway in
+-- between (they never transit Postgres).
+CREATE OR REPLACE FUNCTION rvbbit.install_mcp_register(catalog_id text, p_server_name text DEFAULT NULL)
+RETURNS text LANGUAGE plpgsql AS $imr$
+DECLARE c rvbbit.capability_catalog%ROWTYPE; m jsonb; conn jsonb; v_server text;
+BEGIN
+    SELECT * INTO c FROM rvbbit.capability_catalog WHERE id = catalog_id AND kind = 'mcp';
+    IF NOT FOUND THEN RAISE EXCEPTION 'mcp capability % not found', catalog_id; END IF;
+    m := c.manifest; conn := coalesce(m->'connection', '{}'::jsonb);
+    v_server := coalesce(nullif(btrim(p_server_name), ''), m->>'name');
+    PERFORM rvbbit.register_mcp_server(
+        server_name => v_server, server_transport => coalesce(conn->>'transport','stdio'),
+        server_command => conn->>'command',
+        server_args => CASE WHEN jsonb_typeof(conn->'args')='array' THEN ARRAY(SELECT jsonb_array_elements_text(conn->'args')) ELSE NULL END,
+        server_env => conn->'env', server_url => conn->>'url', server_auth_env => conn->>'auth_header_env',
+        server_timeout_ms => coalesce((conn->>'timeout_ms')::int, 30000), server_description => m->>'description');
+    RETURN v_server;
+END $imr$;
+
+-- Install step 2: after secrets are set on the gateway, re-introspect the live
+-- server, reconcile its surface against the published manifest (drift), and
+-- generate operators. Returns { server, operators_created, tools, drift }.
+CREATE OR REPLACE FUNCTION rvbbit.install_mcp_finalize(catalog_id text, p_server_name text DEFAULT NULL)
+RETURNS jsonb LANGUAGE plpgsql AS $imf$
+DECLARE c rvbbit.capability_catalog%ROWTYPE; m jsonb; v_server text;
+    v_baked text[]; v_live text[]; v_added text[]; v_removed text[]; v_n int;
+BEGIN
+    SELECT * INTO c FROM rvbbit.capability_catalog WHERE id = catalog_id AND kind = 'mcp';
+    IF NOT FOUND THEN RAISE EXCEPTION 'mcp capability % not found', catalog_id; END IF;
+    m := c.manifest; v_server := coalesce(nullif(btrim(p_server_name), ''), m->>'name');
+    PERFORM rvbbit.refresh_mcp_server(v_server);
+    SELECT coalesce(array_agg(t->>'name'), '{}') INTO v_baked FROM jsonb_array_elements(coalesce(m->'tools','[]'::jsonb)) t;
+    SELECT coalesce(array_agg(name), '{}') INTO v_live FROM rvbbit.mcp_tools WHERE server = v_server;
+    SELECT coalesce(array_agg(x), '{}') INTO v_added FROM unnest(v_live) x WHERE x <> ALL(v_baked);
+    SELECT coalesce(array_agg(x), '{}') INTO v_removed FROM unnest(v_baked) x WHERE x <> ALL(v_live);
+    v_n := rvbbit.generate_mcp_operators(v_server);
+    RETURN jsonb_build_object('server', v_server, 'operators_created', v_n, 'tools', to_jsonb(v_live),
+        'drift', jsonb_build_object('added', to_jsonb(v_added), 'removed', to_jsonb(v_removed),
+                 'changed', (cardinality(v_added) > 0 OR cardinality(v_removed) > 0)));
+END $imf$;
 
 -- Phase 4 — opt a tool into result caching. `t` (ttl_seconds) NULL =
 -- cache forever. Re-running with a different `t` updates the policy.

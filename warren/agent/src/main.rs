@@ -4,7 +4,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -96,6 +96,12 @@ struct DockerObservation {
     observed_state: String,
     observation: Value,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DockerComposeFrontend {
+    Plugin,
+    Standalone,
 }
 
 fn main() -> Result<()> {
@@ -844,8 +850,147 @@ fn merge_observation_context(
     Value::Object(doc)
 }
 
+fn docker_bin() -> String {
+    env::var("RVBBIT_DOCKER_BIN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "docker".into())
+}
+
+fn docker_compose_bin() -> String {
+    env::var("RVBBIT_DOCKER_COMPOSE_BIN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "docker-compose".into())
+}
+
+fn docker_config_has_permission_problem(config_dir: &Path) -> bool {
+    let config_json = config_dir.join("config.json");
+    match fs::File::open(&config_json) {
+        Ok(_) => false,
+        Err(err) if err.kind() == ErrorKind::NotFound => false,
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => true,
+        Err(_) => false,
+    }
+}
+
+fn clean_docker_config_dir() -> Option<PathBuf> {
+    let dir = env::temp_dir().join("rvbbit-empty-docker-config");
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn apply_docker_env(command: &mut Command) {
+    let explicit_config = env::var_os("DOCKER_CONFIG").map(PathBuf::from);
+    let default_config = env::var_os("HOME").map(|home| PathBuf::from(home).join(".docker"));
+    let candidate = explicit_config.as_deref().or(default_config.as_deref());
+    if let Some(config_dir) = candidate {
+        if docker_config_has_permission_problem(config_dir) {
+            if let Some(clean_dir) = clean_docker_config_dir() {
+                command.env("DOCKER_CONFIG", clean_dir);
+            } else {
+                command.env_remove("DOCKER_CONFIG");
+            }
+        }
+    }
+}
+
+fn docker_command() -> Command {
+    let mut command = Command::new(docker_bin());
+    apply_docker_env(&mut command);
+    command
+}
+
+fn command_failure(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn docker_compose_frontend() -> Result<DockerComposeFrontend> {
+    let mut plugin = docker_command();
+    plugin.arg("compose").arg("version");
+    match plugin.output() {
+        Ok(output) if output.status.success() => return Ok(DockerComposeFrontend::Plugin),
+        Ok(output) => {
+            let plugin_error = command_failure(&output);
+            let standalone_bin = docker_compose_bin();
+            let mut standalone = Command::new(&standalone_bin);
+            apply_docker_env(&mut standalone);
+            standalone.arg("version");
+            match standalone.output() {
+                Ok(output) if output.status.success() => Ok(DockerComposeFrontend::Standalone),
+                Ok(output) => bail!(
+                    "Docker Compose is required for Warren deploys, but neither `{} compose` nor `{}` is usable. `{} compose version` failed: {}; `{}` version failed: {}",
+                    docker_bin(),
+                    standalone_bin,
+                    docker_bin(),
+                    plugin_error,
+                    standalone_bin,
+                    command_failure(&output)
+                ),
+                Err(err) => bail!(
+                    "Docker Compose is required for Warren deploys, but neither `{} compose` nor `{}` is usable. `{} compose version` failed: {}; starting `{}` failed: {}",
+                    docker_bin(),
+                    standalone_bin,
+                    docker_bin(),
+                    plugin_error,
+                    standalone_bin,
+                    err
+                ),
+            }
+        }
+        Err(err) => {
+            let standalone_bin = docker_compose_bin();
+            let mut standalone = Command::new(&standalone_bin);
+            apply_docker_env(&mut standalone);
+            standalone.arg("version");
+            match standalone.output() {
+                Ok(output) if output.status.success() => Ok(DockerComposeFrontend::Standalone),
+                Ok(output) => bail!(
+                    "Docker Compose is required for Warren deploys, but neither `{} compose` nor `{}` is usable. starting `{}` failed: {}; `{}` version failed: {}",
+                    docker_bin(),
+                    standalone_bin,
+                    docker_bin(),
+                    err,
+                    standalone_bin,
+                    command_failure(&output)
+                ),
+                Err(standalone_err) => bail!(
+                    "Docker Compose is required for Warren deploys, but neither `{} compose` nor `{}` is usable. starting `{}` failed: {}; starting `{}` failed: {}",
+                    docker_bin(),
+                    standalone_bin,
+                    docker_bin(),
+                    err,
+                    standalone_bin,
+                    standalone_err
+                ),
+            }
+        }
+    }
+}
+
+fn docker_compose_command() -> Result<Command> {
+    match docker_compose_frontend()? {
+        DockerComposeFrontend::Plugin => {
+            let mut command = docker_command();
+            command.arg("compose");
+            Ok(command)
+        }
+        DockerComposeFrontend::Standalone => {
+            let mut command = Command::new(docker_compose_bin());
+            apply_docker_env(&mut command);
+            Ok(command)
+        }
+    }
+}
+
 fn docker_observation(container_name: &str) -> DockerObservation {
-    let output = match Command::new("docker")
+    let output = match docker_command()
         .arg("inspect")
         .arg("--format")
         .arg("{{json .State}}")
@@ -1889,15 +2034,31 @@ fn render_runtime_volumes(runtime: &Value) -> (String, String) {
     (mounts.join("\n"), defs.join("\n"))
 }
 
-/// True when this host has a usable NVIDIA GPU (driver + `nvidia-smi`). This is
-/// the signal that resolves a capability's "auto" device safely: the GPU
-/// reservation hard-fails on a host without the GPU/runtime, so we only apply
-/// the GPU overlay when the card is actually present.
+/// True when this host appears able to expose an NVIDIA GPU to sidecar
+/// containers. `nvidia-smi` is the strongest bare-host signal; Docker runtime
+/// metadata covers packaged Warren managers that can talk to the host Docker
+/// daemon but do not have the GPU mounted into the manager container itself.
 fn host_has_gpu() -> bool {
-    Command::new("nvidia-smi")
+    if Command::new("nvidia-smi")
         .arg("-L")
         .output()
         .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    docker_command()
+        .arg("info")
+        .arg("--format")
+        .arg("{{json .Runtimes}} {{json .DefaultRuntime}}")
+        .output()
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .to_ascii_lowercase()
+                    .contains("nvidia")
+        })
         .unwrap_or(false)
 }
 
@@ -1942,8 +2103,8 @@ fn resolve_gpu_overlay(manifest: &Value, project_dir: &Path) -> bool {
     }
     if !host_has_gpu() {
         eprintln!(
-            "warren-agent: capability wants the GPU but no NVIDIA GPU was detected on this \
-             host (nvidia-smi) — deploying on CPU. Set device=cpu in the manifest to silence."
+            "warren-agent: capability wants the GPU but no NVIDIA GPU/runtime was detected \
+             on this host — deploying on CPU. Set device=cpu in the manifest to silence."
         );
         return false;
     }
@@ -1958,8 +2119,8 @@ fn docker_compose_up(
     publish_host_port: bool,
     gpu: bool,
 ) -> Result<()> {
-    let mut command = Command::new("docker");
-    command.arg("compose").arg("-f").arg("compose.yaml");
+    let mut command = docker_compose_command()?;
+    command.arg("-f").arg("compose.yaml");
     if publish_host_port {
         command.arg("-f").arg("compose.host-ports.yaml");
     }
@@ -1990,7 +2151,7 @@ fn wait_for_container_health(container_name: &str, timeout: Duration) -> Result<
     let start = Instant::now();
     let mut last_status = String::new();
     while start.elapsed() < timeout {
-        let output = Command::new("docker")
+        let output = docker_command()
             .arg("inspect")
             .arg("--format")
             .arg("{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}")
@@ -2011,8 +2172,7 @@ fn wait_for_container_health(container_name: &str, timeout: Duration) -> Result<
 }
 
 fn docker_compose_down(project_dir: &Path) -> Result<()> {
-    let status = Command::new("docker")
-        .arg("compose")
+    let status = docker_compose_command()?
         .arg("down")
         .current_dir(project_dir)
         .status()
@@ -2480,7 +2640,7 @@ with urllib.request.urlopen(request, timeout=10) as response:
 }
 
 fn docker_exec_python(container_name: &str, script: &str, stdin: &str) -> Result<String> {
-    let mut child = Command::new("docker")
+    let mut child = docker_command()
         .arg("exec")
         .arg("-i")
         .arg(container_name)

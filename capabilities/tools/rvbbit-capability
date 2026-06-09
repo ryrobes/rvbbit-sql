@@ -225,6 +225,7 @@ def install_manifest(
             "provider_registration",
             "warren",
             "resources",
+            "prebuilt_runtime",
             "system_runtime",
             "capability_role",
             "smoke",
@@ -842,12 +843,21 @@ def capability_image_ref(
     return f"{prefix}/{capability_image_name(entry)}:{tag}"
 
 
+def prebuilt_runtime_doc(image: str, pull_policy: str) -> dict[str, Any]:
+    return {
+        "image": image,
+        "pull_policy": pull_policy,
+        "source": "rvbbit_release",
+    }
+
+
 def image_release_entry_manifest(
     entry: dict[str, Any],
     manifest: dict[str, Any],
     image_prefix: str | None,
     image_tag: str | None,
     pull_policy: str,
+    default_install_mode: str = "build",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if runtime_image(manifest.get("runtime") or {}):
         return entry, manifest
@@ -856,18 +866,23 @@ def image_release_entry_manifest(
         return entry, manifest
     release_entry = copy.deepcopy(entry)
     release_manifest = copy.deepcopy(manifest)
+    prebuilt = prebuilt_runtime_doc(image, pull_policy)
 
-    runtime = release_manifest.setdefault("runtime", {})
-    if not isinstance(runtime, dict):
-        runtime = {}
-        release_manifest["runtime"] = runtime
-    runtime["mode"] = "image"
-    runtime["image"] = image
-    runtime["pull_policy"] = pull_policy
-
-    release_entry["runtime_mode"] = "image"
-    release_entry["install_mode"] = "image"
+    release_entry["prebuilt_runtime"] = prebuilt
+    release_entry["prebuilt_runtime_image"] = image
     release_entry["runtime_image"] = image
+    release_manifest["prebuilt_runtime"] = prebuilt
+
+    if default_install_mode == "image":
+        runtime = release_manifest.setdefault("runtime", {})
+        if not isinstance(runtime, dict):
+            runtime = {}
+            release_manifest["runtime"] = runtime
+        runtime["mode"] = "image"
+        runtime["image"] = image
+        runtime["pull_policy"] = pull_policy
+        release_entry["runtime_mode"] = "image"
+        release_entry["install_mode"] = "image"
     return release_entry, release_manifest
 
 
@@ -1006,11 +1021,12 @@ def load_catalog(
     image_prefix: str | None = None,
     image_tag: str | None = None,
     image_pull_policy: str = "missing",
+    default_install_mode: str = "build",
 ) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for _path, manifest, entry in iter_catalog_manifests(root):
         entry, _manifest = image_release_entry_manifest(
-            entry, manifest, image_prefix, image_tag, image_pull_policy
+            entry, manifest, image_prefix, image_tag, image_pull_policy, default_install_mode
         )
         entries.append(entry)
     return entries
@@ -1022,11 +1038,18 @@ def catalog_doc(
     image_prefix: str | None = None,
     image_tag: str | None = None,
     image_pull_policy: str = "missing",
+    default_install_mode: str = "build",
 ) -> dict[str, Any]:
     doc: dict[str, Any] = {
         "schema_version": 1,
         "catalog_layout": "rvbbit.pack/v1",
-        "capabilities": load_catalog(root, image_prefix, image_tag, image_pull_policy),
+        "capabilities": load_catalog(
+            root,
+            image_prefix,
+            image_tag,
+            image_pull_policy,
+            default_install_mode,
+        ),
     }
     if include_timestamp:
         from datetime import datetime, timezone
@@ -1041,11 +1064,12 @@ def catalog_seed_doc(
     image_prefix: str | None = None,
     image_tag: str | None = None,
     image_pull_policy: str = "missing",
+    default_install_mode: str = "build",
 ) -> dict[str, Any]:
     entries = []
     for _path, manifest, entry in iter_catalog_manifests(root):
         entry, manifest = image_release_entry_manifest(
-            entry, manifest, image_prefix, image_tag, image_pull_policy
+            entry, manifest, image_prefix, image_tag, image_pull_policy, default_install_mode
         )
         entries.append(
             {
@@ -1068,7 +1092,120 @@ def matches_entry(entry: dict[str, Any], terms: list[str]) -> bool:
 
 def run_command(cmd: list[str], cwd: Path | None = None) -> None:
     print("+ " + " ".join(cmd), file=sys.stderr)
-    subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
+    subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        check=True,
+        env=docker_command_env() if cmd and Path(cmd[0]).name in {"docker", "docker-compose"} else None,
+    )
+
+
+def docker_config_has_permission_problem(config_dir: Path) -> bool:
+    try:
+        (config_dir / "config.json").open("rb").close()
+        return False
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def docker_command_env() -> dict[str, str]:
+    env = os.environ.copy()
+    explicit = env.get("DOCKER_CONFIG")
+    home = env.get("HOME")
+    candidate = Path(explicit) if explicit else (Path(home) / ".docker" if home else None)
+    if candidate and docker_config_has_permission_problem(candidate):
+        clean = Path(os.environ.get("TMPDIR") or "/tmp") / "rvbbit-empty-docker-config"
+        clean.mkdir(parents=True, exist_ok=True)
+        env["DOCKER_CONFIG"] = str(clean)
+    return env
+
+
+def host_has_gpu() -> bool:
+    try:
+        smi = subprocess.run(
+            ["nvidia-smi", "-L"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=docker_command_env(),
+            check=False,
+        )
+        if smi.returncode == 0 and smi.stdout.strip():
+            return True
+    except OSError:
+        pass
+
+    docker_bin = os.environ.get("RVBBIT_DOCKER_BIN", "docker").strip() or "docker"
+    try:
+        docker_info = subprocess.run(
+            [docker_bin, "info", "--format", "{{json .Runtimes}} {{json .DefaultRuntime}}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=docker_command_env(),
+            check=False,
+        )
+    except OSError:
+        return False
+    return docker_info.returncode == 0 and "nvidia" in docker_info.stdout.lower()
+
+
+def manifest_wants_gpu(manifest: dict[str, Any]) -> bool:
+    runtime = manifest.get("runtime") or {}
+    device = str(runtime.get("device") or "auto").strip().lower()
+    if device == "cpu":
+        return False
+    if device == "cuda":
+        return True
+    resources = manifest.get("resources") or {}
+    gpu = resources.get("gpu") if isinstance(resources, dict) else None
+    if not isinstance(gpu, dict):
+        return False
+    placement = str(gpu.get("placement") or "").strip()
+    return bool(gpu.get("required")) or bool(placement)
+
+
+def command_error(proc: subprocess.CompletedProcess[str]) -> str:
+    return (proc.stderr or proc.stdout or "").strip()
+
+
+def command_available(cmd: list[str]) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=docker_command_env(),
+            check=False,
+        )
+    except OSError as exc:
+        return False, str(exc)
+    return proc.returncode == 0, command_error(proc)
+
+
+def docker_compose_command(args: list[str]) -> list[str]:
+    docker_bin = os.environ.get("RVBBIT_DOCKER_BIN", "docker").strip() or "docker"
+    docker_compose_bin = (
+        os.environ.get("RVBBIT_DOCKER_COMPOSE_BIN", "docker-compose").strip()
+        or "docker-compose"
+    )
+    ok, docker_error = command_available([docker_bin, "compose", "version"])
+    if ok:
+        return [docker_bin, "compose", *args]
+    ok, compose_error = command_available([docker_compose_bin, "version"])
+    if ok:
+        return [docker_compose_bin, *args]
+    raise SystemExit(
+        "Docker Compose is required for capability installs, but neither "
+        f"`{docker_bin} compose` nor `{docker_compose_bin}` is usable. "
+        f"`{docker_bin} compose version` failed: {docker_error}; "
+        f"`{docker_compose_bin} version` failed: {compose_error}"
+    )
 
 
 def psql_apply(dsn: str, sql_file: Path) -> None:
@@ -1532,6 +1669,7 @@ def cmd_catalog_build(args: argparse.Namespace) -> None:
         image_prefix=args.image_prefix,
         image_tag=args.image_tag,
         image_pull_policy=args.image_pull_policy,
+        default_install_mode=args.default_install_mode,
     )
     text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     if args.output:
@@ -1547,6 +1685,7 @@ def cmd_catalog_seed_json(args: argparse.Namespace) -> None:
         image_prefix=args.image_prefix,
         image_tag=args.image_tag,
         image_pull_policy=args.image_pull_policy,
+        default_install_mode=args.default_install_mode,
     )
     text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     if args.output:
@@ -1618,12 +1757,23 @@ def cmd_install(args: argparse.Namespace) -> None:
     print(f"wrote {out_dir}")
 
     if not args.no_compose:
-        compose_cmd = ["docker", "compose", "-f", "compose.yaml"]
-        if args.gpu:
-            compose_cmd.extend(["-f", "compose.gpu.yaml"])
-        compose_cmd.extend(["up", "-d"])
+        if args.docker_network:
+            os.environ["RVBBIT_DOCKER_NETWORK"] = args.docker_network
+        wants_gpu = manifest_wants_gpu(manifest)
+        use_gpu = args.gpu or (wants_gpu and not args.no_gpu_auto and host_has_gpu())
+        if wants_gpu and not use_gpu and not args.no_gpu_auto:
+            print(
+                "rvbbit-capability: capability is GPU-capable but no NVIDIA GPU/runtime "
+                "was detected; deploying without compose.gpu.yaml",
+                file=sys.stderr,
+            )
+        compose_args = ["-f", "compose.yaml"]
+        if use_gpu:
+            compose_args.extend(["-f", "compose.gpu.yaml"])
+        compose_args.extend(["up", "-d"])
         if not runtime_image(manifest.get("runtime") or {}):
-            compose_cmd.append("--build")
+            compose_args.append("--build")
+        compose_cmd = docker_compose_command(compose_args)
         run_command(compose_cmd, cwd=out_dir)
 
     if args.no_sql:
@@ -1693,7 +1843,17 @@ def main(argv: list[str]) -> int:
     p_install.add_argument("--out-dir")
     p_install.add_argument("--dsn")
     p_install.add_argument("--force", action="store_true")
-    p_install.add_argument("--gpu", action="store_true")
+    p_install.add_argument("--gpu", action="store_true", help="force compose.gpu.yaml")
+    p_install.add_argument(
+        "--no-gpu-auto",
+        action="store_true",
+        help="do not auto-enable compose.gpu.yaml for device=auto GPU-capable manifests",
+    )
+    p_install.add_argument(
+        "--docker-network",
+        default=os.environ.get("RVBBIT_DOCKER_NETWORK"),
+        help="Docker network that the sidecar should join; defaults to RVBBIT_DOCKER_NETWORK or compose fallback",
+    )
     p_install.add_argument("--no-compose", action="store_true")
     p_install.add_argument("--no-sql", action="store_true")
     p_install.add_argument("--no-smoke", action="store_true")
@@ -1778,10 +1938,16 @@ def main(argv: list[str]) -> int:
     p_catalog_build.add_argument("--timestamp", action="store_true")
     p_catalog_build.add_argument(
         "--image-prefix",
-        help="emit image-mode runtime refs with this registry namespace, e.g. ghcr.io/ryrobes",
+        help="emit optional prebuilt runtime refs with this registry namespace, e.g. ghcr.io/ryrobes",
     )
     p_catalog_build.add_argument("--image-tag", default="latest")
     p_catalog_build.add_argument("--image-pull-policy", default="missing")
+    p_catalog_build.add_argument(
+        "--default-install-mode",
+        choices=["build", "image"],
+        default="build",
+        help="default deploy manifest mode when --image-prefix is set. Default: build",
+    )
     p_catalog_build.set_defaults(func=cmd_catalog_build)
 
     p_catalog_search = catalog_sub.add_parser("search", help="search curated manifests")
@@ -1795,10 +1961,16 @@ def main(argv: list[str]) -> int:
     p_catalog_seed.add_argument("--output")
     p_catalog_seed.add_argument(
         "--image-prefix",
-        help="emit image-mode runtime refs with this registry namespace, e.g. ghcr.io/ryrobes",
+        help="emit optional prebuilt runtime refs with this registry namespace, e.g. ghcr.io/ryrobes",
     )
     p_catalog_seed.add_argument("--image-tag", default="latest")
     p_catalog_seed.add_argument("--image-pull-policy", default="missing")
+    p_catalog_seed.add_argument(
+        "--default-install-mode",
+        choices=["build", "image"],
+        default="build",
+        help="default deploy manifest mode when --image-prefix is set. Default: build",
+    )
     p_catalog_seed.set_defaults(func=cmd_catalog_seed_json)
 
     p_catalog_publish = catalog_sub.add_parser("publish", help="publish catalog into Postgres")

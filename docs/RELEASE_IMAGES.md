@@ -1,9 +1,9 @@
 # Rvbbit Release Images
 
-Rvbbit ships three product images plus the deterministic Warren smoke
-capability image. The rest of the built-in Warren capability images can also be
-built, but they are opt-in because the full catalog build is expensive. GHCR is
-the canonical registry for V1; GitHub Releases hold native tarballs and Warren
+Rvbbit ships three product images plus the core Warren runtime/smoke capability
+images. The rest of the built-in Warren capability images can also be built,
+but they are opt-in because the full catalog build is expensive. GHCR is the
+canonical registry for V1; GitHub Releases hold native tarballs and Warren
 agent binaries.
 
 ## Product Images
@@ -16,10 +16,13 @@ agent binaries.
 
 ## Capability Images
 
-The release script always builds `smoke/warren-echo` with the core release so a
-fresh Warren install has a deterministic backend for smoke tests. Pass
-`--with-capabilities` to build every built-in Warren capability as a separate
-image. Runtime/system capabilities get short names:
+The release script always builds `runtimes/python-runtime`,
+`runtimes/mcp-gateway`, and `smoke/warren-echo` with the core release so
+prebuilt artifacts are available for fast-path installs. Warren deployment is
+still build-first by default: catalog manifests keep `runtime.image` unset and
+carry the release image under `prebuilt_runtime`. Pass `--with-capabilities` to
+build every built-in Warren capability as a separate optional image.
+Runtime/system capabilities get short names:
 
 | Catalog id | Image |
 |---|---|
@@ -69,9 +72,12 @@ This builds images locally and stages:
 - `dist/release/<version>/capability-images.<version>.json`
 - `dist/release/<version>/warren-agent-linux-<arch>`
 
-By default, `capability-images.<version>.json` contains only
-`smoke/warren-echo`. If `--with-capabilities` is used, it contains the full
-built-in capability image set.
+By default, `capability-images.<version>.json` contains
+`runtimes/python-runtime`, `runtimes/mcp-gateway`, and `smoke/warren-echo`. If
+`--with-capabilities` is used, it contains the full built-in capability image
+set. These images are optional prebuilt artifacts; the seeded catalog deploys by
+building from the packaged capability source unless the caller explicitly
+requests image mode.
 
 The Postgres image is built from a temporary release context whose embedded
 catalog seed points at the release image namespace/tag and includes source-build
@@ -144,6 +150,7 @@ make release-public-check RELEASE_VERSION=1.0.0 IMAGE_NAMESPACE=ryrobes
 ```
 
 The default public check covers the three product images plus
+`rvbbit-python-runtime`, `rvbbit-mcp-gateway`, and
 `rvbbit-warren-smoke-echo`. To verify the full catalog after a
 `--with-capabilities` release, run the checker with `--with-capabilities`.
 
@@ -187,6 +194,16 @@ plugin and drops privileges after adding its runtime user to the mounted socket
 group. Local scaffold/build output is written under `RVBBIT_LOCAL_WORK_ROOT`,
 which defaults to `/data`, so generated capability projects persist in the Lens
 volume instead of the immutable app directory.
+Lens also receives `RVBBIT_DOCKER_NETWORK`, the same network used by Postgres
+and Warren. Generated local capability compose files attach sidecars to that
+external network so SQL can reach them by container name.
+Provider credentials and provider-adjacent refs such as `OPENROUTER_API_KEY`,
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+`GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, and
+`GOOGLE_CLOUD_QUOTA_PROJECT` are forwarded to Postgres, Lens, and Warren.
+Postgres uses them for SQL-side provider calls; Lens and Warren need them so
+generated capability compose files can interpolate the same secret refs when
+they launch child sidecars.
 
 On rootful Docker hosts, including hosts where the login user must run
 `sudo docker compose ...`, the default socket path is correct:
@@ -249,21 +266,37 @@ Override the baseline list with:
 RVBBIT_UBER_BOOTSTRAP_CAPABILITIES=smoke/warren-echo,runtimes/python-runtime
 ```
 
-For private GHCR packages, Warren also needs Docker registry credentials because
-it pulls child capability images from inside the `rvbbit-warren-agent`
-container. Use a plain Docker auth config:
+The packaged compose files do not mount host Docker registry credentials by
+default. That keeps fresh installs from inheriting unreadable desktop/rootless
+Docker config files. Public release images need no Docker auth inside Lens or
+Warren.
+
+For private GHCR packages, either make the packages public before clean-slate
+testing or add an explicit compose override that mounts a plain Docker auth
+config readable by the container runtime user. Example auth config creation:
 
 ```bash
 export RVBBIT_DOCKER_CONFIG=/tmp/rvbbit-ghcr-auth
 mkdir -p "$RVBBIT_DOCKER_CONFIG"
 echo "$CR_PAT" | docker --config "$RVBBIT_DOCKER_CONFIG" login ghcr.io -u "$GH_USER" --password-stdin
-
-RVBBIT_VERSION=1.0.0 \
-RVBBIT_DOCKER_CONFIG="$RVBBIT_DOCKER_CONFIG" \
-docker compose -f docker/docker-compose.uber.yml up -d
 ```
 
-The default Warren auth mount is
-`${RVBBIT_DOCKER_CONFIG:-$HOME/.docker}:/root/.docker:ro`. If your normal
-Docker config uses a platform credential helper that is not available inside
-the Warren container, use the dedicated `RVBBIT_DOCKER_CONFIG` flow above.
+Then mount that directory with a local override only for environments that need
+private pulls. Avoid mounting a normal desktop Docker config when it uses a
+credential helper that is unavailable inside the container.
+The mounted config must be readable by the service user; Lens runs as a
+non-root user in the packaged image.
+
+```yaml
+services:
+  warren:
+    environment:
+      DOCKER_CONFIG: /docker-auth
+    volumes:
+      - ${RVBBIT_DOCKER_CONFIG}:/docker-auth:ro
+  lens:
+    environment:
+      DOCKER_CONFIG: /docker-auth
+    volumes:
+      - ${RVBBIT_DOCKER_CONFIG}:/docker-auth:ro
+```

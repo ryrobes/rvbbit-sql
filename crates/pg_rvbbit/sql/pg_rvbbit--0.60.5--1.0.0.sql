@@ -1079,10 +1079,12 @@ BEGIN
 END
 $fwj$;
 
+DROP FUNCTION IF EXISTS rvbbit.deploy_catalog_capability(text, jsonb, text);
 CREATE OR REPLACE FUNCTION rvbbit.deploy_catalog_capability(
     catalog_id      text,
     target_selector jsonb DEFAULT '{}'::jsonb,
-    job_name        text DEFAULT NULL
+    job_name        text DEFAULT NULL,
+    install_mode    text DEFAULT 'build'
 ) RETURNS uuid
 LANGUAGE plpgsql
 VOLATILE
@@ -1095,12 +1097,18 @@ DECLARE
     catalog_operator_name text;
     catalog_resource_doc jsonb;
     queued_job_id uuid;
+    normalized_install_mode text := lower(coalesce(nullif(btrim(install_mode), ''), 'build'));
+    prebuilt_runtime_doc jsonb;
+    runtime_doc jsonb;
 BEGIN
     IF catalog_id IS NULL OR btrim(catalog_id) = '' THEN
         RAISE EXCEPTION 'catalog_id is required';
     END IF;
     IF jsonb_typeof(target_selector) <> 'object' THEN
         RAISE EXCEPTION 'target_selector must be a JSON object';
+    END IF;
+    IF normalized_install_mode NOT IN ('build', 'image') THEN
+        RAISE EXCEPTION 'install_mode must be build or image';
     END IF;
 
     SELECT manifest, name, backend_name, runtime_name, operators[1], resource_profile
@@ -1117,6 +1125,27 @@ BEGIN
        AND jsonb_typeof(catalog_resource_doc) = 'object'
        AND catalog_resource_doc <> '{}'::jsonb THEN
         catalog_manifest := catalog_manifest || jsonb_build_object('resources', catalog_resource_doc);
+    END IF;
+    prebuilt_runtime_doc := catalog_manifest->'prebuilt_runtime';
+    IF normalized_install_mode = 'image' THEN
+        IF jsonb_typeof(prebuilt_runtime_doc) = 'object'
+           AND nullif(prebuilt_runtime_doc->>'image', '') IS NOT NULL THEN
+            runtime_doc := coalesce(catalog_manifest->'runtime', '{}'::jsonb)
+                || jsonb_build_object(
+                    'mode', 'image',
+                    'image', prebuilt_runtime_doc->>'image',
+                    'pull_policy', coalesce(nullif(prebuilt_runtime_doc->>'pull_policy', ''), 'missing')
+                );
+            catalog_manifest := jsonb_set(catalog_manifest, '{runtime}', runtime_doc, true);
+        ELSIF nullif(catalog_manifest #>> '{runtime,image}', '') IS NULL THEN
+            RAISE EXCEPTION 'catalog entry % has no prebuilt runtime image', catalog_id;
+        END IF;
+    ELSIF jsonb_typeof(prebuilt_runtime_doc) = 'object'
+          AND catalog_manifest #>> '{runtime,image}' = prebuilt_runtime_doc->>'image' THEN
+        runtime_doc := (coalesce(catalog_manifest->'runtime', '{}'::jsonb)
+            - 'image' - 'image_digest' - 'pull_policy')
+            || jsonb_build_object('mode', 'build');
+        catalog_manifest := jsonb_set(catalog_manifest, '{runtime}', runtime_doc, true);
     END IF;
 
     queued_job_id := rvbbit.deploy_capability(

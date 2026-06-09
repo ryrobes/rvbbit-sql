@@ -633,7 +633,8 @@ SELECT
   catalog_entry->>'runtime_mode' AS runtime_mode,
   catalog_entry->'acceptance_tests' AS acceptance_tests,
   catalog_entry->'acceptance' AS acceptance,
-  manifest #>> '{runtime,image}' AS runtime_image,
+  coalesce(catalog_entry->>'prebuilt_runtime_image', manifest #>> '{runtime,image}') AS runtime_image,
+  manifest #>> '{prebuilt_runtime,image}' AS prebuilt_runtime_image,
   backend_name,
   runtime_name,
   runtime_language,
@@ -671,7 +672,8 @@ SELECT
   c.catalog_entry->>'runtime_mode' AS runtime_mode,
   c.catalog_entry->'acceptance_tests' AS acceptance_tests,
   c.catalog_entry->'acceptance' AS acceptance,
-  c.manifest #>> '{runtime,image}' AS runtime_image,
+  coalesce(c.catalog_entry->>'prebuilt_runtime_image', c.manifest #>> '{runtime,image}') AS runtime_image,
+  c.manifest #>> '{prebuilt_runtime,image}' AS prebuilt_runtime_image,
   c.backend_name,
   c.runtime_name,
   c.runtime_language,
@@ -720,21 +722,23 @@ Detail panels should read these fields from the selected row:
 
 | Field | UI Use |
 |---|---|
-| `manifest` | Exact Warren deploy payload used by `deploy_catalog_capability`. Show as advanced JSON detail. |
+| `manifest` | Default Warren deploy payload used by `deploy_catalog_capability`. Show as advanced JSON detail. |
 | `catalog_entry` | Generated browse entry from the CLI. Useful for compatibility with old card rendering. |
 | `catalog_entry.pack_path` / `catalog_entry.pack_manifest_path` | Source pack location for inspect/provenance views. |
 | `manifest_path` | Provenance/debug only. Do not require the UI to load this file. |
 | `catalog_entry.acceptance_tests` | Compact list of named pack acceptance tests for badges and search. |
 | `catalog_entry.acceptance` | Runnable acceptance test contract: optional `target_selector`, `setup_sql[]`, `tests[{name, description, sql}]`, and `teardown_sql[]`. UIs may execute this SQL after Warren deploys a pack. |
 | `catalog_entry.catalog_visibility` | `public`, `example`, or `internal`; default browse views should show `public` and hide examples/internal smoke packs unless the user asks for them. |
-| `tags`, `kind`, `system_runtime`, `capability_role`, `device`, `runtime_*`, `manifest.runtime.image`, `catalog_entry.runtime_mode` | Filters and deployment badges. |
+| `tags`, `kind`, `system_runtime`, `capability_role`, `device`, `runtime_*`, `manifest.runtime.image`, `manifest.prebuilt_runtime.image`, `catalog_entry.runtime_mode` | Filters and deployment badges. |
 | `backend_name`, `runtime_name`, `operators` | Install-state joins and post-deploy navigation. `operators` includes raw wrappers plus bundled high-level child operators. |
 | `deployment_callable`, `deployment_serving_status`, `deployment_error` | For backend cards, distinguish registered-but-stopped Warren backends from healthy installed backends. |
 
-For V1 built-ins, both runtime sidecars use `catalog_entry.runtime_mode =
-'build'` and have no `manifest.runtime.image`. The UI should render that as a
-normal Warren install path, not as missing metadata; Warren builds from its
-trusted local templates.
+For V1 built-ins, runtime sidecars use `catalog_entry.runtime_mode = 'build'`
+and have no `manifest.runtime.image` in the default deploy manifest. The UI
+should render that as the normal Warren install path; Warren builds from its
+trusted local templates. If `manifest.prebuilt_runtime.image` is present, the UI
+may expose a secondary prebuilt-image option that calls
+`rvbbit.deploy_catalog_capability(..., install_mode => 'image')`.
 
 For model capability rows, prefer rendering `operators` as the installed user
 surface. A single Warren capability may install several SQL operators: a
@@ -757,7 +761,8 @@ SQL shape:
 SELECT rvbbit.deploy_catalog_capability(
   catalog_id => 'runtimes/python-runtime',
   target_selector => '{"docker":true}'::jsonb,
-  job_name => NULL
+  job_name => NULL,
+  install_mode => 'build'
 );
 ```
 
@@ -811,7 +816,8 @@ Treat it as a prerequisite runtime for the MCP UI, SQL MCP calls, and
 `kind: mcp` operator nodes.
 
 In the built-in catalog this row is source-buildable (`runtime_mode = 'build'`)
-rather than an image pull. Show `runtime_image` as optional/blank.
+rather than an image pull. Show `prebuilt_runtime_image` as an optional fast
+path, not the default deploy path.
 
 Recommended UI gate:
 
@@ -910,6 +916,11 @@ Recommended default selectors:
 | Region/host pool | Add custom labels such as `{"region":"lab"}`. |
 
 If a selector is empty (`{}`), any ready/busy node can claim the job.
+For local Lens installs, send the selected `device` and whether the manifest
+declares GPU resources to `/api/rvbbit/capabilities/compose-up`. The server
+then applies `compose.gpu.yaml` automatically for GPU-capable `device: auto`
+packs when the Docker host exposes NVIDIA support. The local GPU checkbox is a
+force override; selecting `cpu` is the opt-out.
 
 ## Backend, Operator, And Runtime Links
 

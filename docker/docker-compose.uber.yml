@@ -1,19 +1,22 @@
 name: rvbbit-uber
 
+x-rvbbit-secret-env: &rvbbit-secret-env
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+  GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+  GOOGLE_CLOUD_QUOTA_PROJECT: ${GOOGLE_CLOUD_QUOTA_PROJECT:-}
+
 services:
   postgres:
     image: ${RVBBIT_POSTGRES_IMAGE:-ghcr.io/ryrobes/rvbbit-postgres:${RVBBIT_VERSION:-latest}}
     container_name: rvbbit-postgres
     environment:
+      <<: *rvbbit-secret-env
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rvbbit}
       POSTGRES_DB: ${POSTGRES_DB:-rvbbit}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
-      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
-      GOOGLE_CLOUD_QUOTA_PROJECT: ${GOOGLE_CLOUD_QUOTA_PROJECT:-}
       RVBBIT_DUCK_BACKEND: ${RVBBIT_DUCK_BACKEND:-true}
     ports:
       - "${RVBBIT_POSTGRES_PORT:-55433}:5432"
@@ -37,18 +40,18 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      <<: *rvbbit-secret-env
       RVBBIT_LENS_HOME: /data
       RVBBIT_LOCAL_WORK_ROOT: ${RVBBIT_LOCAL_WORK_ROOT:-/data}
       RVBBIT_CAPABILITY_ROOT: ${RVBBIT_CAPABILITY_ROOT:-/usr/share/rvbbit/capabilities}
       RVBBIT_CAPABILITY_CLI: ${RVBBIT_CAPABILITY_CLI:-/usr/share/rvbbit/capabilities/tools/rvbbit-capability}
       DOCKER_HOST: ${RVBBIT_DOCKER_HOST:-unix:///var/run/docker.sock}
-      DOCKER_CONFIG: /docker-config
+      RVBBIT_DOCKER_NETWORK: ${RVBBIT_DOCKER_NETWORK:-rvbbit_uber}
     ports:
       - "${RVBBIT_LENS_PORT:-3000}:3000"
     volumes:
       - rvbbit_lens:/data
       - ${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
-      - ${RVBBIT_DOCKER_CONFIG:-$HOME/.docker}:/docker-config:ro
     restart: unless-stopped
 
   warren:
@@ -58,6 +61,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      <<: *rvbbit-secret-env
       RVBBIT_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}
       WARREN_NODE: ${WARREN_NODE:-compose-warren}
       WARREN_WORK_DIR: /var/lib/rvbbit/warren
@@ -69,7 +73,6 @@ services:
       DOCKER_HOST: ${RVBBIT_DOCKER_HOST:-unix:///var/run/docker.sock}
     volumes:
       - ${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
-      - ${RVBBIT_DOCKER_CONFIG:-$HOME/.docker}:/root/.docker:ro
       - rvbbit_warren:/var/lib/rvbbit/warren
     restart: unless-stopped
 

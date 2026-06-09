@@ -506,8 +506,10 @@ inspectable:
   backend/runtime/operator names, and install mode.
 - `capability.yaml` with `api_version: rvbbit.capability/v1`, `kind`,
   `runtime`, backend/runtime registration, operators, and smoke checks.
-- Prebuilt-image packs should set `runtime.image`; production catalogs should
-  also pin `runtime.image_digest`.
+- Image-native packs should set `runtime.image`; production catalogs should
+  also pin `runtime.image_digest`. Build-mode packs that merely have an
+  optional release image should keep `runtime.image` unset and advertise that
+  image via `prebuilt_runtime.image`.
 - Build-mode packs should include or reference the runtime source/template that
   Warren is expected to build.
 - `acceptance.tests` may define small SQL blocks for pack-level tests. The

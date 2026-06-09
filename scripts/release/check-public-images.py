@@ -13,7 +13,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CLI = ROOT / "capabilities" / "tools" / "rvbbit-capability"
 PACKS = ROOT / "capabilities" / "packs"
-CORE_CAPABILITY_IDS = {"smoke/warren-echo"}
+CORE_CAPABILITY_IDS = {
+    "runtimes/python-runtime",
+    "runtimes/mcp-gateway",
+    "smoke/warren-echo",
+}
 
 
 def capture_json(cmd: list[str]) -> dict:
@@ -99,12 +103,12 @@ def main() -> None:
     parser.add_argument(
         "--with-capabilities",
         action="store_true",
-        help="also verify every built-in capability image, not just core smoke",
+        help="also verify every built-in capability image, not just core runtime/smoke images",
     )
     parser.add_argument(
         "--skip-capabilities",
         action="store_true",
-        help="verify only product images; normally core smoke is included",
+        help="verify only product images; normally core runtime/smoke images are included",
     )
     parser.add_argument(
         "--list-only",
