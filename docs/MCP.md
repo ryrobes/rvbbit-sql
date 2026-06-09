@@ -26,6 +26,7 @@ is no separate REST API; the UI generates and runs SQL.
 11. [Gotchas & edge cases](#11-gotchas--edge-cases)
 12. [SQL generation cheatsheet](#12-sql-generation-cheatsheet)
 13. [What's deliberately not implemented](#13-what-isnt-implemented)
+14. [Capability catalog — capture, ship & install](#14-capability-catalog--capture-ship--install)
 
 ---
 
@@ -1145,6 +1146,162 @@ Deliberately out of scope (see commit history for rationale):
 
 If a user need surfaces for any of these, the natural extensions are
 straightforward — they're deferred, not blocked.
+
+---
+
+## 14. Capability catalog — capture, ship & install
+
+Registering and refreshing a server (§2, §4) gets you a *working* MCP server
+on one database. The capability layer turns that working server into a
+**portable, shippable catalog entry** in the same `rvbbit.capability_catalog`
+that holds model and runtime capabilities — so an MCP server can be browsed in
+the Capabilities UI, installed (with its keys) on any database, and even baked
+into the extension so it ships out of the box.
+
+### The shape
+
+An MCP capability is a `rvbbit.capability_catalog` row with `kind = 'mcp'` and
+id `mcp/<server>`. It carries two JSON documents:
+
+- **`manifest`** — `{kind:'mcp', connection, secrets[], tools[], resources[],
+  operators[], surface}`. `connection` is the registration (transport /
+  command / args / env, or url / auth_header_env); `secrets[]` are the declared
+  `${VAR}` names the installer must supply; `operators[]` are per-tool operator
+  definitions (name + typed signature) the UI renders in operator tooltips.
+- **`catalog_entry`** — the browsable row: `id`, `title`, `tags`, the
+  `operators` name list, `manifest_path`.
+
+### The secret model (read this)
+
+**Keys never live in Postgres.** `rvbbit.mcp_servers.env` and the shipped
+manifest only ever store `${VAR}` *references*. The real values live in the
+gateway:
+
+1. The gateway resolves `${VAR}` at **spawn** time from (a) a per-server
+   **encrypted secret store** (Fernet, on the gateway's disk), checked first,
+   then (b) its own process environment.
+2. The lens UI pushes install-time keys straight to that store via
+   `POST /api/mcp/secret` → gateway `POST /secrets`. They transit the lens
+   server once and are never written to PG, the catalog, or the seed.
+3. `export_mcp_manifest` strips secret *values* and emits only the declared
+   `${VAR}` names, so a published or shipped entry is commit-safe.
+
+This is why you can capture GitHub with a `ghp_…` in the gateway env, or
+Firecrawl with a key in the encrypted store, and the resulting catalog entry
+contains zero credential material.
+
+### Capture → publish → ship
+
+Once a server is registered + refreshed and you've confirmed it works
+(`mcp_call`), turn it into a catalog entry:
+
+```sql
+-- 1. publish: scan the live server into a kind='mcp' catalog row.
+SELECT rvbbit.publish_mcp_capability(
+  'firecrawl',                  -- a registered + refreshed server
+  'Firecrawl (MCP)',            -- title  (optional)
+  ARRAY['mcp','web','scrape'],  -- tags   (optional)
+  true);                        -- active
+
+-- 2. (optional) inspect the shippable artifact directly — secret-free.
+SELECT rvbbit.export_mcp_manifest('firecrawl');   -- {catalog_entry, manifest}
+```
+
+`publish_mcp_capability` calls `export_mcp_manifest` internally and upserts via
+`upsert_capability_catalog_entry(..., 'mcp-scan', active)`. The entry is now
+browsable in the Capabilities catalog.
+
+**To ship it with the extension**, append the `{capability_manifest,
+catalog_entry}` element to
+`crates/pg_rvbbit/src/capability_catalog_seed.json` (it is `include_str!`'d as
+`CAPABILITY_CATALOG_SEED` and replayed by `seed_capability_catalog()` on every
+install). Build the element straight from the published row:
+
+```sql
+SELECT jsonb_build_object(
+  'capability_manifest', manifest,
+  'catalog_entry', catalog_entry || jsonb_build_object('catalog_visibility','public'))
+FROM rvbbit.capability_catalog WHERE id = 'mcp/firecrawl';
+```
+
+Seeded entries replay with `catalog_source = 'curated'`, so once baked they
+must stay in the seed list — `prune_capability_catalog('curated', keep_ids)`
+deactivates any curated row that isn't.
+
+### Install (the UI flow)
+
+A published or shipped entry is installed — on any database — by supplying its
+keys. The lens "Capabilities" window renders the declared `secrets[]` as key
+inputs (not the model "install knobs"). Installing runs:
+
+```sql
+-- 1. register the server from the catalog manifest.
+SELECT rvbbit.install_mcp_register('mcp/firecrawl');
+-- 2. the lens pushes the user's key to the gateway secret store here (never PG).
+-- 3. finalize: live refresh + drift-reconcile + operator generation.
+SELECT rvbbit.install_mcp_finalize('mcp/firecrawl');
+```
+
+`install_mcp_finalize` re-refreshes against the **real** key, diffs the live
+tool surface against the baked manifest (drift is advisory), and calls
+`generate_mcp_operators`.
+
+### Operators per tool
+
+`generate_mcp_operators('<server>')` creates one **scalar SQL operator per
+tool**, named `<server>_<tool>`, with a single `mcp` step routed to the gateway
+and typed args lifted from the tool's `input_schema` (`integer→bigint`,
+`number→double precision`, `boolean`, `object`/`array→jsonb`, else `text`).
+They land in `rvbbit.operators` and appear in the Operators window / Scry / SQL
+exactly like semantic operators.
+
+```sql
+SELECT rvbbit.iplocate_lookup_ip_address_location(ip => '1.1.1.1');  -- Sydney, AU
+```
+
+Operator naming de-dups a redundant server prefix: a tool already named
+`firecrawl_scrape` becomes the operator `firecrawl_scrape`, **not**
+`firecrawl_firecrawl_scrape`. The same de-dup runs in `export_mcp_manifest`, so
+baked names match generated functions.
+
+> **Operator ergonomics.** Generated wrappers are `LANGUAGE sql STRICT` with no
+> per-arg defaults, so high-arity tools (e.g. `firecrawl_scrape` has 23 optional
+> args) can't be called with a subset — use `mcp_call(server, tool, jsonb)` for
+> those. Low-arity tools (`iplocate_lookup_ip_address_location(ip => …)`) call
+> cleanly by name. `manifest.operators` carries each operator's full signature
+> so the UI shows it in the operator tooltip before install.
+
+### `generate_mcp_operators` vs `generate_mcp_wrappers`
+
+`generate_mcp_wrappers` (§10) is the older per-tool *typed-wrapper* generator.
+`generate_mcp_operators` is the capability-era generator: it writes proper
+`rvbbit.operators` rows (first-class operators with an `mcp` step) and is what
+the install flow calls. Prefer it.
+
+### Capturing an external server — the gotchas
+
+- **The tool surface is introspected through the gateway**, so the server must
+  spawn successfully *before* you refresh. For a real server that means the
+  key must already be resolvable by the gateway (in its env or the secret
+  store) — some servers (e.g. GitHub) return an empty/auth-error tool list
+  until authenticated, so `export_mcp_manifest` would bake an incomplete
+  `tools[]` if you scan token-less. You can introspect the *surface* (tool
+  names + schemas are static) with a throwaway key, then publish; the real key
+  is supplied at install.
+- **Always use `${VAR}` form in `env`.** A raw inline token
+  (`env => '{"GITHUB_TOKEN":"ghp_…"}'`) would bake the secret into
+  `connection.env` and never appear in `secrets[]`.
+- **Self-namespaced tools** (Firecrawl's `firecrawl_scrape`) — see the operator
+  de-dup above.
+- **stdio is host-relative.** A shipped `command: npx` pack only installs where
+  node/npx exist in the gateway image; HTTP-transport servers (static bearer via
+  `auth_header_env`) are more portable.
+
+### Servers shipped in the seed today
+
+`github`, `firecrawl`, `time`, `iplocate`, `tavily`, `exa`, `apollo`, `ipgeo` —
+browse them in the Capabilities catalog. `time` and `iplocate` are keyless and
+work immediately; the rest declare a single API key supplied at install.
 
 ---
 
