@@ -4723,6 +4723,34 @@ BEGIN
 END $pmc$;
 
 -- ---------------------------------------------------------------------------
+-- Semantic capability search (Tier A): a def-doc view + a ranking function.
+-- No stored vector and no trigger — rvbbit.knn_text embeds the query, batch-
+-- embeds the def docs (cached by text_hash, so unchanged defs are free), and
+-- ranks. A def only changes via upsert_capability_catalog_entry, which changes
+-- its doc text -> new hash -> re-embedded on the next search. Promote to a
+-- stored def_vec computed in that upsert (+ Lance index) only if the catalog
+-- ever grows into the thousands.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE VIEW rvbbit.capability_search_doc AS
+SELECT id,
+  concat_ws(' ',
+    title, name, coalesce(description, ''),
+    array_to_string(tags, ' '),
+    array_to_string(operators, ' ')
+  ) AS doc
+FROM rvbbit.capability_catalog
+WHERE active;
+
+CREATE OR REPLACE FUNCTION rvbbit.search_capabilities(p_query text, p_k int DEFAULT 24)
+RETURNS TABLE(id text, score double precision)
+LANGUAGE sql VOLATILE AS $scap$
+  SELECT c.id, kt.score
+  FROM rvbbit.knn_text('rvbbit.capability_search_doc'::regclass, 'doc', p_query, p_k) kt
+  JOIN rvbbit.capability_search_doc c ON c.doc = kt.value
+  ORDER BY kt.score DESC;
+$scap$;
+
+-- ---------------------------------------------------------------------------
 -- Generate one scalar operator per tool of an MCP server: a single `mcp` step
 -- routing to the gateway. Typed args come from the tool's input_schema; the
 -- return is text (the tool's result body — JSON for structured tools, castable
