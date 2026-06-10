@@ -168,13 +168,21 @@ fi
 
 mkdir -p "$RELEASE_DIR"
 
+# Captured MCP servers live only in the committed extension seed (no on-disk
+# pack), so carry their kind=mcp entries through the packs-only regeneration —
+# otherwise the release would silently drop every MCP server from the catalog.
+COMMITTED_SEED="$ROOT/crates/pg_rvbbit/src/capability_catalog_seed.json"
 run_always "$ROOT/capabilities/tools/rvbbit-capability" catalog build \
     --image-prefix "$IMAGE_PREFIX" \
     --image-tag "$VERSION" \
+    --carry-from "$COMMITTED_SEED" \
+    --carry-kinds mcp \
     --output "$CATALOG_JSON"
 run_always "$ROOT/capabilities/tools/rvbbit-capability" catalog seed-json \
     --image-prefix "$IMAGE_PREFIX" \
     --image-tag "$VERSION" \
+    --carry-from "$COMMITTED_SEED" \
+    --carry-kinds mcp \
     --output "$SEED_JSON"
 
 if [[ "$SKIP_DB" -eq 0 || "$SKIP_WARREN" -eq 0 ]]; then

@@ -1662,6 +1662,32 @@ def cmd_list(args: argparse.Namespace) -> None:
         )
 
 
+def load_carry_entries(path: str | None, kinds: list[str]) -> list[dict[str, Any]]:
+    """Read an existing seed/catalog JSON and return entries whose kind is in
+    `kinds`, normalized to {"catalog_entry": <bare>, "capability_manifest": <or None>}.
+
+    Carries forward non-pack capabilities — captured MCP servers in particular,
+    which live only in the committed extension seed and have no on-disk pack — so
+    a packs-only regeneration of the seed/catalog doesn't silently drop them.
+    """
+    wanted = set(kinds or [])
+    if not wanted or not path:
+        return []
+    doc = json.loads(Path(path).read_text())
+    out: list[dict[str, Any]] = []
+    for item in doc.get("capabilities", []):
+        if isinstance(item, dict) and "catalog_entry" in item:
+            entry = item.get("catalog_entry") or {}
+            manifest = item.get("capability_manifest")
+        else:
+            entry = item
+            manifest = None
+        if isinstance(entry, dict) and entry.get("kind") in wanted:
+            out.append({"catalog_entry": entry, "capability_manifest": manifest})
+    out.sort(key=lambda e: str(e["catalog_entry"].get("id") or ""))
+    return out
+
+
 def cmd_catalog_build(args: argparse.Namespace) -> None:
     doc = catalog_doc(
         Path(args.root),
@@ -1671,6 +1697,20 @@ def cmd_catalog_build(args: argparse.Namespace) -> None:
         image_pull_policy=args.image_pull_policy,
         default_install_mode=args.default_install_mode,
     )
+    carried = load_carry_entries(args.carry_from, args.carry_kinds)
+    if carried:
+        existing = {e.get("id") for e in doc["capabilities"]}
+        added = 0
+        for c in carried:
+            entry = c["catalog_entry"]
+            if entry.get("id") in existing:
+                continue
+            doc["capabilities"].append(entry)
+            added += 1
+        print(
+            f"carried {added} {','.join(args.carry_kinds)} entries into catalog from {args.carry_from}",
+            file=sys.stderr,
+        )
     text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     if args.output:
         Path(args.output).write_text(text)
@@ -1687,6 +1727,24 @@ def cmd_catalog_seed_json(args: argparse.Namespace) -> None:
         image_pull_policy=args.image_pull_policy,
         default_install_mode=args.default_install_mode,
     )
+    carried = load_carry_entries(args.carry_from, args.carry_kinds)
+    if carried:
+        existing = {e["catalog_entry"].get("id") for e in doc["capabilities"]}
+        added = 0
+        for c in carried:
+            if c["catalog_entry"].get("id") in existing:
+                continue
+            doc["capabilities"].append(
+                {
+                    "catalog_entry": c["catalog_entry"],
+                    "capability_manifest": c.get("capability_manifest") or {},
+                }
+            )
+            added += 1
+        print(
+            f"carried {added} {','.join(args.carry_kinds)} entries into seed from {args.carry_from}",
+            file=sys.stderr,
+        )
     text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     if args.output:
         Path(args.output).write_text(text)
@@ -1948,6 +2006,17 @@ def main(argv: list[str]) -> int:
         default="build",
         help="default deploy manifest mode when --image-prefix is set. Default: build",
     )
+    p_catalog_build.add_argument(
+        "--carry-from",
+        help="path to an existing seed/catalog JSON; entries of --carry-kinds are merged "
+        "in (for non-pack capabilities like captured MCP servers that have no on-disk pack)",
+    )
+    p_catalog_build.add_argument(
+        "--carry-kinds",
+        nargs="*",
+        default=[],
+        help="entry kinds to carry from --carry-from, e.g. mcp",
+    )
     p_catalog_build.set_defaults(func=cmd_catalog_build)
 
     p_catalog_search = catalog_sub.add_parser("search", help="search curated manifests")
@@ -1970,6 +2039,17 @@ def main(argv: list[str]) -> int:
         choices=["build", "image"],
         default="build",
         help="default deploy manifest mode when --image-prefix is set. Default: build",
+    )
+    p_catalog_seed.add_argument(
+        "--carry-from",
+        help="path to an existing seed/catalog JSON; entries of --carry-kinds are merged "
+        "in (for non-pack capabilities like captured MCP servers that have no on-disk pack)",
+    )
+    p_catalog_seed.add_argument(
+        "--carry-kinds",
+        nargs="*",
+        default=[],
+        help="entry kinds to carry from --carry-from, e.g. mcp",
     )
     p_catalog_seed.set_defaults(func=cmd_catalog_seed_json)
 

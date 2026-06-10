@@ -217,9 +217,9 @@ capability-render: ## Render a capability pack or manifest (MANIFEST=capabilitie
 	@test -n "$${MANIFEST:-}" || (echo "set MANIFEST=capabilities/packs/..." >&2; exit 2)
 	capabilities/tools/rvbbit-capability render "$${MANIFEST}"
 
-capability-catalog: ## Rebuild capabilities/catalog.json for UI browsing
-	capabilities/tools/rvbbit-capability catalog build --output capabilities/catalog.json
-	capabilities/tools/rvbbit-capability catalog seed-json --output crates/pg_rvbbit/src/capability_catalog_seed.json
+capability-catalog: ## Rebuild capabilities/catalog.json + extension seed (carries captured MCP servers through the packs-only regen)
+	capabilities/tools/rvbbit-capability catalog build --carry-from crates/pg_rvbbit/src/capability_catalog_seed.json --carry-kinds mcp --output capabilities/catalog.json
+	capabilities/tools/rvbbit-capability catalog seed-json --carry-from crates/pg_rvbbit/src/capability_catalog_seed.json --carry-kinds mcp --output crates/pg_rvbbit/src/capability_catalog_seed.json
 
 capability-catalog-seed: ## Rebuild extension install seed JSON for rvbbit.capability_catalog
 	capabilities/tools/rvbbit-capability catalog seed-json --output crates/pg_rvbbit/src/capability_catalog_seed.json
