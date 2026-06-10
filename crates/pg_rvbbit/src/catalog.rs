@@ -7704,6 +7704,90 @@ $fn$;
     requires = ["rvbbit_bootstrap", "rvbbit_metrics"],
 );
 
+// ---- Cross-cutting org taxonomy (metrics + alerts share one category tree) ----
+// A mutable, per-entity 2-level category that lives APART from the versioned defs,
+// so re-categorizing is an in-place "move to a folder" — not a new definition
+// version. Both catalogs LEFT JOIN it, so the taxonomy + lookup are unified.
+extension_sql!(
+    r#"
+CREATE TABLE IF NOT EXISTS rvbbit.entity_categories (
+    entity_kind  text NOT NULL,            -- 'metric' | 'alert'
+    entity_name  text NOT NULL,
+    category     text,
+    subcategory  text,
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (entity_kind, entity_name),
+    CONSTRAINT entity_categories_subcat_requires_cat
+        CHECK (subcategory IS NULL OR category IS NOT NULL)
+);
+
+-- Set (or clear) an entity's category. Empty strings normalize to NULL; clearing
+-- the category removes the row. A subcategory requires a category.
+CREATE OR REPLACE FUNCTION rvbbit.set_category(
+    p_kind text, p_name text, p_category text DEFAULT NULL, p_subcategory text DEFAULT NULL
+) RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_cat text := nullif(btrim(coalesce(p_category, '')), '');
+    v_sub text := nullif(btrim(coalesce(p_subcategory, '')), '');
+BEGIN
+    IF p_kind NOT IN ('metric', 'alert') THEN
+        RAISE EXCEPTION 'rvbbit.set_category: kind must be metric or alert (got %)', p_kind;
+    END IF;
+    IF v_sub IS NOT NULL AND v_cat IS NULL THEN
+        RAISE EXCEPTION 'rvbbit.set_category: subcategory requires a category';
+    END IF;
+    IF v_cat IS NULL THEN
+        DELETE FROM rvbbit.entity_categories WHERE entity_kind = p_kind AND entity_name = p_name;
+        RETURN;
+    END IF;
+    INSERT INTO rvbbit.entity_categories (entity_kind, entity_name, category, subcategory, updated_at)
+    VALUES (p_kind, p_name, v_cat, v_sub, now())
+    ON CONFLICT (entity_kind, entity_name) DO UPDATE
+       SET category = EXCLUDED.category, subcategory = EXCLUDED.subcategory, updated_at = now();
+END;
+$fn$;
+
+-- Distinct (category, subcategory) pairs in use — the reusable lookup. Unified
+-- across kinds by default (pass a kind to scope it).
+CREATE OR REPLACE FUNCTION rvbbit.category_options(p_kind text DEFAULT NULL)
+RETURNS TABLE(category text, subcategory text)
+LANGUAGE sql STABLE AS $fn$
+    SELECT DISTINCT category, subcategory
+    FROM rvbbit.entity_categories
+    WHERE category IS NOT NULL
+      AND (p_kind IS NULL OR entity_kind = p_kind)
+    ORDER BY category, subcategory NULLS FIRST;
+$fn$;
+
+-- Re-project both catalogs with the joined category (append-only columns, so
+-- CREATE OR REPLACE VIEW is allowed).
+CREATE OR REPLACE VIEW rvbbit.metric_catalog AS
+SELECT DISTINCT ON (m.name)
+    m.name, m.version, m.sql, m.params, m.grain, m.description, m.owner, m.labels, m.check_sql, m.created_at,
+    ec.category, ec.subcategory
+FROM rvbbit.metric_defs m
+LEFT JOIN rvbbit.entity_categories ec ON ec.entity_kind = 'metric' AND ec.entity_name = m.name
+ORDER BY m.name, m.created_at DESC, m.version DESC;
+
+CREATE OR REPLACE VIEW rvbbit.alert_catalog AS
+SELECT DISTINCT ON (r.name)
+    r.name, r.version, r.condition_spec, r.fire_policy, r.action_spec,
+    r.cardinality, r.fan_out_cap, r.description, r.owner, r.labels, r.created_at,
+    coalesce(c.enabled, true)                             AS enabled,
+    c.muted_until,
+    (c.muted_until IS NOT NULL AND c.muted_until > now()) AS muted,
+    coalesce(c.cadence_tier, 'normal')                    AS cadence_tier,
+    ec.category, ec.subcategory
+FROM rvbbit.alert_rules r
+LEFT JOIN rvbbit.alert_control c ON c.name = r.name
+LEFT JOIN rvbbit.entity_categories ec ON ec.entity_kind = 'alert' AND ec.entity_name = r.name
+ORDER BY r.name, r.created_at DESC, r.version DESC;
+"#,
+    name = "rvbbit_categories",
+    requires = ["rvbbit_bootstrap", "rvbbit_metrics", "rvbbit_alerts"],
+);
+
 const CAPABILITY_CATALOG_SEED: &str = include_str!("capability_catalog_seed.json");
 
 fn seed_sql_lit(value: &str) -> String {
@@ -8353,5 +8437,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(errors >= 1, "a non-boolean expr (n + 1) surfaces as a sweep error");
+    }
+
+    #[pg_test]
+    fn entity_categories_set_clear_and_join() {
+        Spi::run("SELECT rvbbit.define_metric('cat_m', 'SELECT 1 AS value')").unwrap();
+        Spi::run("SELECT rvbbit.set_category('metric','cat_m','Marketing','Data Health')").unwrap();
+        let cat: String = Spi::get_one("SELECT category || '/' || subcategory FROM rvbbit.metric_catalog WHERE name='cat_m'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cat, "Marketing/Data Health", "the category joins onto the metric catalog");
+        // category alone (no subcategory) is valid
+        Spi::run("SELECT rvbbit.set_category('metric','cat_m','Finance')").unwrap();
+        let sub: Option<String> = Spi::get_one("SELECT subcategory FROM rvbbit.metric_catalog WHERE name='cat_m'").unwrap();
+        assert!(sub.is_none(), "a category without a subcategory is allowed");
+        // clearing removes the assignment
+        Spi::run("SELECT rvbbit.set_category('metric','cat_m', NULL)").unwrap();
+        let cleared: Option<String> = Spi::get_one("SELECT category FROM rvbbit.metric_catalog WHERE name='cat_m'").unwrap();
+        assert!(cleared.is_none(), "clearing nulls the category in the catalog");
+        // the lookup is unified across kinds
+        Spi::run("SELECT rvbbit.set_category('alert','cat_a','Ops','Latency')").unwrap();
+        let opts: i64 = Spi::get_one("SELECT count(*)::bigint FROM rvbbit.category_options() WHERE category='Ops'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(opts, 1, "category_options surfaces the distinct pair across kinds");
+    }
+
+    #[pg_test(error = "rvbbit.set_category: subcategory requires a category")]
+    fn set_category_subcategory_requires_category() {
+        Spi::run("SELECT rvbbit.set_category('metric','x', NULL, 'orphan')").unwrap();
     }
 }
