@@ -6959,6 +6959,559 @@ $fn$;
     requires = ["rvbbit_bootstrap"],
 );
 
+// ===========================================================================
+// Alerts — reactive condition -> operator automation (P0: schema + rule DDL).
+//
+// A rule is a versioned, immutable DEFINITION (alert_rules, mirrors metric_defs)
+// plus a small MUTABLE control row (alert_control, mirrors metric_materialize)
+// holding enabled/muted/cadence. The reconciler (P1) reads rules, diffs against
+// alert_state, and enqueues transitions to alert_queue; a worker (P2) drains it
+// and logs to alert_events; alert_sweep_runs is the sweep heartbeat.
+//
+// KEEP IN SYNC with crates/pg_rvbbit/sql/pg_rvbbit--A--B.sql (the upgrade edge).
+// ===========================================================================
+extension_sql!(
+    r#"
+-- Versioned, immutable rule definition (def-time axis = created_at).
+CREATE TABLE IF NOT EXISTS rvbbit.alert_rules (
+    alert_rule_id  bigint GENERATED ALWAYS AS IDENTITY,
+    name           text        NOT NULL,
+    version        integer     NOT NULL,
+    condition_spec jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    fire_policy    jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    action_spec    jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    cardinality    text        NOT NULL DEFAULT 'per_entity',
+    fan_out_cap    integer     NOT NULL DEFAULT 100,
+    description    text,
+    owner          text,
+    labels         jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (name, version)
+);
+CREATE INDEX IF NOT EXISTS alert_rules_name_created_idx
+    ON rvbbit.alert_rules (name, created_at DESC, version DESC);
+
+-- Mutable runtime control, one row per rule name (survives re-definition).
+CREATE TABLE IF NOT EXISTS rvbbit.alert_control (
+    name         text PRIMARY KEY,
+    enabled      boolean     NOT NULL DEFAULT true,
+    muted_until  timestamptz,
+    cadence_tier text        NOT NULL DEFAULT 'normal',
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- Reconciler memory: last observed status per (rule, entity). Keyed by NAME so
+-- it survives re-definition; '' entity_key for a scalar rule.
+CREATE TABLE IF NOT EXISTS rvbbit.alert_state (
+    rule_name       text        NOT NULL,
+    entity_key      text        NOT NULL DEFAULT '',
+    last_status     text,
+    score           numeric,
+    consecutive     integer     NOT NULL DEFAULT 0,
+    last_changed_at timestamptz,
+    last_fired_at   timestamptz,
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (rule_name, entity_key)
+);
+
+-- Pending actions: the sweep enqueues transitions; the worker (P2) drains.
+CREATE TABLE IF NOT EXISTS rvbbit.alert_queue (
+    queue_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    rule_name     text        NOT NULL,
+    entity_key    text        NOT NULL DEFAULT '',
+    transition    text        NOT NULL DEFAULT 'enter_fail',
+    rendered_args jsonb,
+    status        text        NOT NULL DEFAULT 'pending',
+    attempts      integer     NOT NULL DEFAULT 0,
+    enqueued_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS alert_queue_drain_idx
+    ON rvbbit.alert_queue (status, enqueued_at);
+
+-- Firing log: one row per action attempt (audit + external-artifact correlation).
+CREATE TABLE IF NOT EXISTS rvbbit.alert_events (
+    event_id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    rule_name         text        NOT NULL,
+    entity_key        text        NOT NULL DEFAULT '',
+    transition        text        NOT NULL DEFAULT 'enter_fail',
+    action_receipt_id text,
+    action_output     jsonb,
+    external_artifact text,
+    status            text        NOT NULL DEFAULT 'fired',
+    error             text,
+    ts                timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS alert_events_rule_ts_idx
+    ON rvbbit.alert_events (rule_name, ts DESC);
+
+-- Sweep heartbeat: makes the reconciler itself observable.
+CREATE TABLE IF NOT EXISTS rvbbit.alert_sweep_runs (
+    sweep_id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tier            text        NOT NULL,
+    started_at      timestamptz NOT NULL DEFAULT now(),
+    finished_at     timestamptz,
+    rules_evaluated integer     NOT NULL DEFAULT 0,
+    transitions     integer     NOT NULL DEFAULT 0,
+    enqueued        integer     NOT NULL DEFAULT 0,
+    errors          integer     NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS alert_sweep_runs_tier_started_idx
+    ON rvbbit.alert_sweep_runs (tier, started_at DESC);
+
+-- Global kill-switch (the sweep + worker check this).
+INSERT INTO rvbbit.settings (key, value)
+VALUES ('alerts_enabled', to_jsonb(true))
+ON CONFLICT (key) DO NOTHING;
+
+-- ---- DDL functions (mirror define_metric / resolve_metric) ----------------
+CREATE OR REPLACE FUNCTION rvbbit.define_alert(
+    p_name        text,
+    p_condition   jsonb,
+    p_action      jsonb,
+    p_fire_policy jsonb    DEFAULT '{}'::jsonb,
+    p_cardinality text     DEFAULT 'per_entity',
+    p_fan_out_cap integer  DEFAULT 100,
+    p_cadence     text     DEFAULT 'normal',
+    p_description text     DEFAULT NULL,
+    p_owner       text     DEFAULT NULL,
+    p_labels      jsonb    DEFAULT '{}'::jsonb
+) RETURNS integer
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_version integer;
+BEGIN
+    IF p_name IS NULL OR btrim(p_name) = '' THEN
+        RAISE EXCEPTION 'rvbbit.define_alert: name is required';
+    END IF;
+    IF p_condition IS NULL OR p_condition = '{}'::jsonb THEN
+        RAISE EXCEPTION 'rvbbit.define_alert: condition is required';
+    END IF;
+    IF p_action IS NULL OR p_action = '{}'::jsonb THEN
+        RAISE EXCEPTION 'rvbbit.define_alert: action is required';
+    END IF;
+    IF p_cardinality NOT IN ('per_entity', 'aggregate') THEN
+        RAISE EXCEPTION 'rvbbit.define_alert: cardinality must be per_entity or aggregate (got %)', p_cardinality;
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended('rvbbit.alert:' || p_name, 0));
+    SELECT coalesce(max(version), 0) + 1 INTO v_version
+    FROM rvbbit.alert_rules WHERE name = p_name;
+    INSERT INTO rvbbit.alert_rules
+        (name, version, condition_spec, fire_policy, action_spec,
+         cardinality, fan_out_cap, description, owner, labels)
+    VALUES
+        (p_name, v_version, p_condition, coalesce(p_fire_policy, '{}'::jsonb), p_action,
+         p_cardinality, greatest(coalesce(p_fan_out_cap, 100), 1), p_description, p_owner,
+         coalesce(p_labels, '{}'::jsonb));
+    -- Runtime control row: created on first define, preserved on re-definition.
+    INSERT INTO rvbbit.alert_control (name, cadence_tier)
+    VALUES (p_name, coalesce(nullif(btrim(p_cadence), ''), 'normal'))
+    ON CONFLICT (name) DO NOTHING;
+    RETURN v_version;
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION rvbbit.resolve_alert(
+    p_name        text,
+    p_def_as_of   timestamptz DEFAULT now(),
+    OUT r_version     integer,
+    OUT r_condition   jsonb,
+    OUT r_fire_policy jsonb,
+    OUT r_action      jsonb,
+    OUT r_cardinality text,
+    OUT r_fan_out_cap integer
+) LANGUAGE plpgsql AS $fn$
+BEGIN
+    SELECT version, condition_spec, fire_policy, action_spec, cardinality, fan_out_cap
+      INTO r_version, r_condition, r_fire_policy, r_action, r_cardinality, r_fan_out_cap
+    FROM rvbbit.alert_rules
+    WHERE name = p_name
+      AND created_at <= p_def_as_of
+    ORDER BY created_at DESC, version DESC
+    LIMIT 1;
+    IF r_version IS NULL THEN
+        RAISE EXCEPTION 'rvbbit.resolve_alert: no alert named % as of %', p_name, p_def_as_of;
+    END IF;
+END;
+$fn$;
+
+-- Latest definition per name, joined with the runtime control flags.
+CREATE OR REPLACE VIEW rvbbit.alert_catalog AS
+SELECT DISTINCT ON (r.name)
+    r.name, r.version, r.condition_spec, r.fire_policy, r.action_spec,
+    r.cardinality, r.fan_out_cap, r.description, r.owner, r.labels, r.created_at,
+    coalesce(c.enabled, true)                             AS enabled,
+    c.muted_until,
+    (c.muted_until IS NOT NULL AND c.muted_until > now()) AS muted,
+    coalesce(c.cadence_tier, 'normal')                    AS cadence_tier
+FROM rvbbit.alert_rules r
+LEFT JOIN rvbbit.alert_control c ON c.name = r.name
+ORDER BY r.name, r.created_at DESC, r.version DESC;
+
+-- ---- Control toggles (mutate alert_control) -------------------------------
+CREATE OR REPLACE FUNCTION rvbbit.enable_alert(p_name text) RETURNS void
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    INSERT INTO rvbbit.alert_control (name, enabled, updated_at)
+    VALUES (p_name, true, now())
+    ON CONFLICT (name) DO UPDATE SET enabled = true, updated_at = now();
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION rvbbit.disable_alert(p_name text) RETURNS void
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    INSERT INTO rvbbit.alert_control (name, enabled, updated_at)
+    VALUES (p_name, false, now())
+    ON CONFLICT (name) DO UPDATE SET enabled = false, updated_at = now();
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION rvbbit.mute_alert(p_name text, p_duration interval DEFAULT NULL)
+RETURNS timestamptz
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_until timestamptz := CASE WHEN p_duration IS NULL THEN 'infinity'::timestamptz ELSE now() + p_duration END;
+BEGIN
+    INSERT INTO rvbbit.alert_control (name, muted_until, updated_at)
+    VALUES (p_name, v_until, now())
+    ON CONFLICT (name) DO UPDATE SET muted_until = v_until, updated_at = now();
+    RETURN v_until;
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION rvbbit.unmute_alert(p_name text) RETURNS void
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    INSERT INTO rvbbit.alert_control (name, muted_until, updated_at)
+    VALUES (p_name, NULL, now())
+    ON CONFLICT (name) DO UPDATE SET muted_until = NULL, updated_at = now();
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION rvbbit.set_alert_cadence(p_name text, p_tier text) RETURNS void
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF p_tier NOT IN ('fast', 'normal', 'slow') THEN
+        RAISE EXCEPTION 'rvbbit.set_alert_cadence: tier must be fast, normal, or slow (got %)', p_tier;
+    END IF;
+    INSERT INTO rvbbit.alert_control (name, cadence_tier, updated_at)
+    VALUES (p_name, p_tier, now())
+    ON CONFLICT (name) DO UPDATE SET cadence_tier = p_tier, updated_at = now();
+END;
+$fn$;
+
+-- ---- Global kill-switch ----------------------------------------------------
+CREATE OR REPLACE FUNCTION rvbbit.alerts_enabled() RETURNS boolean
+LANGUAGE sql STABLE AS $fn$
+    SELECT coalesce(
+        (SELECT value #>> '{}' FROM rvbbit.settings WHERE key = 'alerts_enabled'),
+        'true'
+    )::boolean
+$fn$;
+
+CREATE OR REPLACE FUNCTION rvbbit.set_alerts_enabled(p_on boolean) RETURNS boolean
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    INSERT INTO rvbbit.settings (key, value, updated_at)
+    VALUES ('alerts_enabled', to_jsonb(p_on), clock_timestamp())
+    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = clock_timestamp();
+    RETURN p_on;
+END;
+$fn$;
+
+-- ---- P1: the reconciler ----------------------------------------------------
+-- One sweep over the rules in a cadence tier: evaluate each rule's condition
+-- query -> (entity_key, status), diff against alert_state, and ENQUEUE
+-- transitions (it never calls the action — the P2 worker drains alert_queue).
+-- Edge-triggered: fires once per fail-episode (status='fail'), after
+-- consecutive_n hysteresis, re-arming on recovery; cooldown_secs throttles;
+-- fan_out_cap bounds enqueues per rule per sweep (excess stays eligible and
+-- drains over later sweeps — nothing is silently dropped). Each rule runs in
+-- its own subtransaction so a bad condition query can't abort the whole sweep.
+-- Uses clock_timestamp() (not now()) so episode timing advances within a txn.
+CREATE OR REPLACE FUNCTION rvbbit.alert_sweep(p_tier text DEFAULT 'normal')
+RETURNS jsonb
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_now         timestamptz := clock_timestamp();
+    v_sweep_id    bigint;
+    v_rule        record;
+    v_cond        record;
+    v_query       text;
+    v_n           integer;
+    v_cooldown    integer;
+    v_cap         integer;
+    v_rules       integer := 0;
+    v_transitions integer := 0;
+    v_enqueued    integer := 0;
+    v_errors      integer := 0;
+    v_rule_fires  integer;
+    v_ek          text;
+    v_status      text;
+    v_ps          text;
+    v_pc          integer;
+    v_pchg        timestamptz;
+    v_pfire       timestamptz;
+    v_consec      integer;
+    v_changed     timestamptz;
+    v_eligible    boolean;
+    v_did_enqueue boolean;
+BEGIN
+    INSERT INTO rvbbit.alert_sweep_runs (tier, started_at)
+    VALUES (p_tier, v_now) RETURNING sweep_id INTO v_sweep_id;
+
+    IF NOT rvbbit.alerts_enabled() THEN
+        UPDATE rvbbit.alert_sweep_runs SET finished_at = clock_timestamp() WHERE sweep_id = v_sweep_id;
+        RETURN jsonb_build_object('sweep_id', v_sweep_id, 'skipped', true, 'reason', 'alerts_disabled');
+    END IF;
+
+    FOR v_rule IN
+        SELECT name, condition_spec, fire_policy, fan_out_cap
+        FROM rvbbit.alert_catalog
+        WHERE enabled AND NOT muted AND cadence_tier = p_tier
+    LOOP
+        v_rules := v_rules + 1;
+        v_rule_fires := 0;
+        v_n        := greatest(coalesce((v_rule.fire_policy->>'consecutive_n')::int, 1), 1);
+        v_cooldown := greatest(coalesce((v_rule.fire_policy->>'cooldown_secs')::int, 0), 0);
+        v_cap      := greatest(coalesce(v_rule.fan_out_cap, 100), 1);
+
+        BEGIN  -- per-rule subtransaction: an error here won't abort the sweep
+            IF coalesce(v_rule.condition_spec->>'kind', 'sql') <> 'sql' THEN
+                CONTINUE;  -- operator/flow condition kinds arrive in P5
+            END IF;
+            v_query := v_rule.condition_spec->>'query';
+            IF v_query IS NULL OR btrim(v_query) = '' THEN
+                RAISE EXCEPTION 'alert %: condition_spec.query is empty', v_rule.name;
+            END IF;
+
+            -- The condition query must return columns entity_key (text) and
+            -- status (text); '' entity_key + status='fail' for a scalar breach.
+            FOR v_cond IN EXECUTE v_query LOOP
+                v_ek     := coalesce(v_cond.entity_key, '');
+                v_status := v_cond.status;
+
+                SELECT last_status, consecutive, last_changed_at, last_fired_at
+                  INTO v_ps, v_pc, v_pchg, v_pfire
+                  FROM rvbbit.alert_state
+                 WHERE rule_name = v_rule.name AND entity_key = v_ek;
+
+                IF v_status = 'fail' THEN
+                    IF v_ps = 'fail' THEN
+                        v_consec  := coalesce(v_pc, 0) + 1;
+                        v_changed := coalesce(v_pchg, v_now);
+                    ELSE
+                        v_consec  := 1;
+                        v_changed := v_now;          -- new fail-episode starts here
+                    END IF;
+                ELSE
+                    v_consec  := 0;
+                    v_changed := CASE WHEN v_ps IS DISTINCT FROM v_status
+                                      THEN v_now ELSE coalesce(v_pchg, v_now) END;
+                END IF;
+
+                -- Fire once per episode (last_fired_at < the episode's start),
+                -- after hysteresis, under cooldown.
+                v_eligible := v_status = 'fail'
+                          AND v_consec >= v_n
+                          AND (v_pfire IS NULL OR v_pfire < v_changed)
+                          AND (v_pfire IS NULL OR extract(epoch FROM (v_now - v_pfire)) >= v_cooldown);
+
+                v_did_enqueue := false;
+                IF v_eligible THEN
+                    v_transitions := v_transitions + 1;
+                    IF v_rule_fires < v_cap THEN
+                        INSERT INTO rvbbit.alert_queue (rule_name, entity_key, transition, enqueued_at)
+                        VALUES (v_rule.name, v_ek, 'enter_fail', v_now);
+                        v_rule_fires  := v_rule_fires + 1;
+                        v_enqueued    := v_enqueued + 1;
+                        v_did_enqueue := true;
+                    END IF;  -- over cap: leave eligible (drains next sweep)
+                END IF;
+
+                INSERT INTO rvbbit.alert_state
+                    (rule_name, entity_key, last_status, consecutive, last_changed_at, last_fired_at, updated_at)
+                VALUES
+                    (v_rule.name, v_ek, v_status, v_consec, v_changed,
+                     CASE WHEN v_did_enqueue THEN v_now ELSE v_pfire END, v_now)
+                ON CONFLICT (rule_name, entity_key) DO UPDATE
+                   SET last_status     = EXCLUDED.last_status,
+                       consecutive     = EXCLUDED.consecutive,
+                       last_changed_at = EXCLUDED.last_changed_at,
+                       last_fired_at   = EXCLUDED.last_fired_at,
+                       updated_at      = EXCLUDED.updated_at;
+            END LOOP;
+        EXCEPTION WHEN OTHERS THEN
+            v_errors := v_errors + 1;
+        END;
+    END LOOP;
+
+    UPDATE rvbbit.alert_sweep_runs
+       SET finished_at = clock_timestamp(), rules_evaluated = v_rules,
+           transitions = v_transitions, enqueued = v_enqueued, errors = v_errors
+     WHERE sweep_id = v_sweep_id;
+
+    RETURN jsonb_build_object('sweep_id', v_sweep_id, 'rules_evaluated', v_rules,
+                              'transitions', v_transitions, 'enqueued', v_enqueued, 'errors', v_errors);
+END;
+$fn$;
+
+-- ---- P3: action arg-binding (templated body <- alert context) -------------
+-- Replace {key} tokens in a string with context values.
+CREATE OR REPLACE FUNCTION rvbbit._alert_interpolate(p_str text, p_ctx jsonb)
+RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE
+    v_out text := p_str;
+    v_key text;
+BEGIN
+    FOR v_key IN SELECT DISTINCT (regexp_matches(p_str, '\{(\w+)\}', 'g'))[1] LOOP
+        v_out := replace(v_out, '{' || v_key || '}', coalesce(p_ctx ->> v_key, ''));
+    END LOOP;
+    RETURN v_out;
+END;
+$fn$;
+
+-- Recursively render an args template against the context. A whole-string
+-- placeholder ("{count}") keeps the context value's JSON TYPE (number stays a
+-- number); an embedded one ("hi {entity}") interpolates as text.
+CREATE OR REPLACE FUNCTION rvbbit._alert_render_args(p_template jsonb, p_ctx jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE
+    v_type  text := jsonb_typeof(p_template);
+    v_out   jsonb;
+    v_key   text;
+    v_val   jsonb;
+    v_str   text;
+    v_whole text;
+BEGIN
+    IF v_type = 'object' THEN
+        v_out := '{}'::jsonb;
+        FOR v_key, v_val IN SELECT * FROM jsonb_each(p_template) LOOP
+            v_out := v_out || jsonb_build_object(v_key, rvbbit._alert_render_args(v_val, p_ctx));
+        END LOOP;
+        RETURN v_out;
+    ELSIF v_type = 'array' THEN
+        SELECT coalesce(jsonb_agg(rvbbit._alert_render_args(elem, p_ctx)), '[]'::jsonb)
+          INTO v_out FROM jsonb_array_elements(p_template) elem;
+        RETURN v_out;
+    ELSIF v_type = 'string' THEN
+        v_str   := p_template #>> '{}';
+        v_whole := substring(v_str from '^\{(\w+)\}$');
+        IF v_whole IS NOT NULL AND p_ctx ? v_whole THEN
+            RETURN p_ctx -> v_whole;
+        END IF;
+        RETURN to_jsonb(rvbbit._alert_interpolate(v_str, p_ctx));
+    ELSE
+        RETURN p_template;  -- number / boolean / null pass through
+    END IF;
+END;
+$fn$;
+
+-- Resolve + run an alert's action. Every action is one operator-call shape:
+--   noop     -> {ok}                       (test)
+--   sql      -> EXECUTE action.sql USING $1=context jsonb  (test; safe, parameterized)
+--   mcp_call -> rvbbit.mcp_call(server, tool, render(args, ctx))  (live)
+--   flow     -> rvbbit.flow(interpolate(spec, ctx))              (live)
+-- Validation is LIGHT here (server/tool present, rendered args is an object);
+-- deep manifest-schema validation lives in the Alerts UI authoring form.
+CREATE OR REPLACE FUNCTION rvbbit._alert_dispatch(
+    p_rule text, p_entity text, p_transition text, p_action jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_op   text  := coalesce(p_action->>'operator', '');
+    v_ctx  jsonb := jsonb_build_object('rule', p_rule, 'entity', p_entity, 'transition', p_transition);
+    v_args jsonb;
+    v_sql  text;
+    v_spec text;
+BEGIN
+    IF v_op = 'noop' THEN
+        RETURN jsonb_build_object('ok', true, 'operator', 'noop') || v_ctx;
+    ELSIF v_op = 'sql' THEN
+        v_sql := p_action->>'sql';
+        IF v_sql IS NULL OR btrim(v_sql) = '' THEN
+            RAISE EXCEPTION 'sql action: action_spec.sql is empty';
+        END IF;
+        EXECUTE v_sql USING v_ctx;   -- the action SQL references the context as $1 (jsonb)
+        RETURN jsonb_build_object('ok', true, 'operator', 'sql');
+    ELSIF v_op = 'mcp_call' THEN
+        IF coalesce(p_action->>'server', '') = '' OR coalesce(p_action->>'tool', '') = '' THEN
+            RAISE EXCEPTION 'mcp_call action: server and tool are required';
+        END IF;
+        v_args := rvbbit._alert_render_args(coalesce(p_action->'args', '{}'::jsonb), v_ctx);
+        IF jsonb_typeof(v_args) <> 'object' THEN
+            RAISE EXCEPTION 'mcp_call action: rendered args must be a JSON object';
+        END IF;
+        RETURN jsonb_build_object('ok', true, 'operator', 'mcp_call',
+            'result', rvbbit.mcp_call(p_action->>'server', p_action->>'tool', v_args));
+    ELSIF v_op = 'flow' THEN
+        v_spec := rvbbit._alert_interpolate(coalesce(p_action->>'spec', ''), v_ctx);
+        IF btrim(v_spec) = '' THEN
+            RAISE EXCEPTION 'flow action: action_spec.spec is empty';
+        END IF;
+        PERFORM rvbbit.flow(v_spec);
+        RETURN jsonb_build_object('ok', true, 'operator', 'flow');
+    ELSE
+        RAISE EXCEPTION 'rvbbit._alert_dispatch: unknown operator %', v_op;
+    END IF;
+END;
+$fn$;
+
+-- Drain up to p_max pending queue items: dispatch each action, log to
+-- alert_events, mark the item done/failed. FOR UPDATE SKIP LOCKED so multiple
+-- workers don't collide. Fire-and-forget (no retry) for v1; the kill-switch
+-- (alerts_enabled) is the "stop acting" stage. Each item runs in its own
+-- subtransaction so one failing action can't abort the whole drain.
+CREATE OR REPLACE FUNCTION rvbbit.alert_worker_tick(p_max integer DEFAULT 50)
+RETURNS jsonb
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_item   record;
+    v_action jsonb;
+    v_out    jsonb;
+    v_done   integer := 0;
+    v_failed integer := 0;
+BEGIN
+    IF NOT rvbbit.alerts_enabled() THEN
+        RETURN jsonb_build_object('skipped', true, 'reason', 'alerts_disabled');
+    END IF;
+
+    FOR v_item IN
+        SELECT queue_id, rule_name, entity_key, transition
+        FROM rvbbit.alert_queue
+        WHERE status = 'pending'
+        ORDER BY enqueued_at
+        LIMIT greatest(p_max, 1)
+        FOR UPDATE SKIP LOCKED
+    LOOP
+        BEGIN
+            SELECT action_spec INTO v_action FROM rvbbit.alert_catalog WHERE name = v_item.rule_name;
+            IF v_action IS NULL THEN
+                RAISE EXCEPTION 'alert %: no current rule definition', v_item.rule_name;
+            END IF;
+            v_out := rvbbit._alert_dispatch(v_item.rule_name, v_item.entity_key, v_item.transition, v_action);
+            UPDATE rvbbit.alert_queue SET status = 'done', attempts = attempts + 1 WHERE queue_id = v_item.queue_id;
+            INSERT INTO rvbbit.alert_events (rule_name, entity_key, transition, action_output, status)
+            VALUES (v_item.rule_name, v_item.entity_key, v_item.transition, v_out, 'fired');
+            v_done := v_done + 1;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE rvbbit.alert_queue SET status = 'failed', attempts = attempts + 1 WHERE queue_id = v_item.queue_id;
+            INSERT INTO rvbbit.alert_events (rule_name, entity_key, transition, status, error)
+            VALUES (v_item.rule_name, v_item.entity_key, v_item.transition, 'failed', SQLERRM);
+            v_failed := v_failed + 1;
+        END;
+    END LOOP;
+
+    RETURN jsonb_build_object('done', v_done, 'failed', v_failed);
+END;
+$fn$;
+"#,
+    name = "rvbbit_alerts",
+    requires = ["rvbbit_bootstrap", "rvbbit_metrics"],
+);
+
 const CAPABILITY_CATALOG_SEED: &str = include_str!("capability_catalog_seed.json");
 
 fn seed_sql_lit(value: &str) -> String {
@@ -7062,3 +7615,318 @@ SELECT rvbbit.seed_capability_catalog();
     name = "seed_capability_catalog_on_install",
     requires = ["rvbbit_bootstrap", seed_capability_catalog],
 );
+
+// ===========================================================================
+// Alerts P0 — define_alert round-trip + versioning + control + kill-switch.
+// ===========================================================================
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use pgrx::prelude::*;
+
+    #[pg_test]
+    fn define_alert_roundtrip_versioning_and_control() {
+        // First definition returns version 1.
+        let v1: i32 = Spi::get_one(
+            "SELECT rvbbit.define_alert('rev_drop', \
+             '{\"kind\":\"sql\",\"metric_name\":\"daily_revenue\"}'::jsonb, \
+             '{\"operator\":\"mcp_call\",\"server\":\"linear\"}'::jsonb)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(v1, 1, "first define_alert returns version 1");
+
+        // Re-defining the same name bumps the version.
+        let v2: i32 = Spi::get_one(
+            "SELECT rvbbit.define_alert('rev_drop', '{\"kind\":\"sql\"}'::jsonb, '{\"operator\":\"x\"}'::jsonb)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(v2, 2, "re-define bumps version");
+
+        // alert_catalog exposes the LATEST version + default runtime flags.
+        let cat_version: i32 =
+            Spi::get_one("SELECT version FROM rvbbit.alert_catalog WHERE name = 'rev_drop'")
+                .unwrap()
+                .unwrap();
+        assert_eq!(cat_version, 2, "catalog shows the latest version");
+        let enabled: bool =
+            Spi::get_one("SELECT enabled FROM rvbbit.alert_catalog WHERE name = 'rev_drop'")
+                .unwrap()
+                .unwrap();
+        assert!(enabled, "a new alert is enabled by default");
+        let tier: String =
+            Spi::get_one("SELECT cadence_tier FROM rvbbit.alert_catalog WHERE name = 'rev_drop'")
+                .unwrap()
+                .unwrap();
+        assert_eq!(tier, "normal", "default cadence is normal");
+
+        // disable -> reflected in the catalog.
+        Spi::run("SELECT rvbbit.disable_alert('rev_drop')").unwrap();
+        let enabled: bool =
+            Spi::get_one("SELECT enabled FROM rvbbit.alert_catalog WHERE name = 'rev_drop'")
+                .unwrap()
+                .unwrap();
+        assert!(!enabled, "disable_alert clears enabled");
+
+        // Re-defining must PRESERVE the disabled control state (separate table).
+        Spi::run(
+            "SELECT rvbbit.define_alert('rev_drop', '{\"kind\":\"sql\"}'::jsonb, '{\"operator\":\"x\"}'::jsonb)",
+        )
+        .unwrap();
+        let enabled: bool =
+            Spi::get_one("SELECT enabled FROM rvbbit.alert_catalog WHERE name = 'rev_drop'")
+                .unwrap()
+                .unwrap();
+        assert!(!enabled, "re-define preserves the disabled runtime state");
+
+        // cadence + mute/unmute.
+        Spi::run("SELECT rvbbit.set_alert_cadence('rev_drop', 'fast')").unwrap();
+        let tier: String =
+            Spi::get_one("SELECT cadence_tier FROM rvbbit.alert_catalog WHERE name = 'rev_drop'")
+                .unwrap()
+                .unwrap();
+        assert_eq!(tier, "fast", "set_alert_cadence updates the tier");
+
+        Spi::run("SELECT rvbbit.mute_alert('rev_drop', interval '1 hour')").unwrap();
+        let muted: bool =
+            Spi::get_one("SELECT muted FROM rvbbit.alert_catalog WHERE name = 'rev_drop'")
+                .unwrap()
+                .unwrap();
+        assert!(muted, "mute_alert marks the alert muted");
+        Spi::run("SELECT rvbbit.unmute_alert('rev_drop')").unwrap();
+        let muted: bool =
+            Spi::get_one("SELECT muted FROM rvbbit.alert_catalog WHERE name = 'rev_drop'")
+                .unwrap()
+                .unwrap();
+        assert!(!muted, "unmute_alert clears muted");
+
+        // resolve_alert returns the latest version (3 after the third define).
+        let rv: i32 = Spi::get_one("SELECT r_version FROM rvbbit.resolve_alert('rev_drop')")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rv, 3, "resolve_alert returns the latest version");
+    }
+
+    #[pg_test]
+    fn alerts_enabled_killswitch_toggles() {
+        let on: bool = Spi::get_one("SELECT rvbbit.alerts_enabled()").unwrap().unwrap();
+        assert!(on, "alerts_enabled() defaults to true");
+        Spi::run("SELECT rvbbit.set_alerts_enabled(false)").unwrap();
+        let off: bool = Spi::get_one("SELECT rvbbit.alerts_enabled()").unwrap().unwrap();
+        assert!(!off, "the global kill-switch flips the flag");
+    }
+
+    #[pg_test(error = "rvbbit.define_alert: condition is required")]
+    fn define_alert_rejects_empty_condition() {
+        Spi::run("SELECT rvbbit.define_alert('bad', '{}'::jsonb, '{\"operator\":\"x\"}'::jsonb)")
+            .unwrap();
+    }
+
+    // ---- P1: reconciler (alert_sweep) ----
+    fn qcount(rule: &str) -> i64 {
+        Spi::get_one(&format!(
+            "SELECT count(*)::bigint FROM rvbbit.alert_queue WHERE rule_name = '{rule}'"
+        ))
+        .unwrap()
+        .unwrap()
+    }
+
+    #[pg_test]
+    fn alert_sweep_edge_triggers_and_rearms() {
+        Spi::run("CREATE TABLE _aobs (entity_key text, status text)").unwrap();
+        Spi::run("INSERT INTO _aobs VALUES ('', 'pass')").unwrap();
+        Spi::run(
+            "SELECT rvbbit.define_alert('s1', \
+             '{\"kind\":\"sql\",\"query\":\"SELECT entity_key, status FROM _aobs\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb)",
+        )
+        .unwrap();
+
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("s1"), 0, "pass does not enqueue");
+
+        Spi::run("UPDATE _aobs SET status='fail'").unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("s1"), 1, "enter_fail enqueues once");
+
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("s1"), 1, "sustained fail does not re-fire");
+
+        Spi::run("UPDATE _aobs SET status='pass'").unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        Spi::run("UPDATE _aobs SET status='fail'").unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("s1"), 2, "re-arms after recovery");
+    }
+
+    #[pg_test]
+    fn alert_sweep_consecutive_n_hysteresis() {
+        Spi::run("CREATE TABLE _aobs (entity_key text, status text)").unwrap();
+        Spi::run("INSERT INTO _aobs VALUES ('', 'fail')").unwrap();
+        Spi::run(
+            "SELECT rvbbit.define_alert('s2', \
+             '{\"kind\":\"sql\",\"query\":\"SELECT entity_key, status FROM _aobs\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb, p_fire_policy => '{\"consecutive_n\":3}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("s2"), 0, "no fire before consecutive_n");
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("s2"), 1, "fires on the Nth consecutive fail");
+    }
+
+    #[pg_test]
+    fn alert_sweep_fan_out_cap_drains_over_sweeps() {
+        Spi::run("CREATE TABLE _aobs (entity_key text, status text)").unwrap();
+        Spi::run("INSERT INTO _aobs SELECT 'e'||g, 'fail' FROM generate_series(1,5) g").unwrap();
+        Spi::run(
+            "SELECT rvbbit.define_alert('s3', \
+             '{\"kind\":\"sql\",\"query\":\"SELECT entity_key, status FROM _aobs\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb, p_fan_out_cap => 2)",
+        )
+        .unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("s3"), 2, "cap=2 enqueues 2 on the first sweep");
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("s3"), 4, "remaining drain on the next sweep");
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("s3"), 5, "all 5 enqueued, nothing dropped");
+    }
+
+    // ---- P2: worker (alert_worker_tick) ----
+    #[pg_test]
+    fn alert_worker_drains_queue_logs_events_and_is_idempotent() {
+        Spi::run(
+            "SELECT rvbbit.define_alert('w1', '{\"kind\":\"sql\",\"query\":\"SELECT 1\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO rvbbit.alert_queue (rule_name, entity_key, transition) VALUES ('w1','','enter_fail')")
+            .unwrap();
+
+        Spi::run("SELECT rvbbit.alert_worker_tick(50)").unwrap();
+        let done: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.alert_queue WHERE rule_name='w1' AND status='done'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(done, 1, "worker marks the item done");
+        let pending: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.alert_queue WHERE rule_name='w1' AND status='pending'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(pending, 0, "no pending remains");
+        let fired: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.alert_events WHERE rule_name='w1' AND status='fired'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fired, 1, "a fired event is logged");
+
+        // idempotent: a second tick has nothing to drain
+        Spi::run("SELECT rvbbit.alert_worker_tick(50)").unwrap();
+        let events: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.alert_events WHERE rule_name='w1'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(events, 1, "drained items are not re-processed");
+    }
+
+    #[pg_test]
+    fn alert_worker_killswitch_holds_and_logs_failures() {
+        // kill-switch off → worker no-ops, the item stays pending
+        Spi::run(
+            "SELECT rvbbit.define_alert('k1', '{\"kind\":\"sql\",\"query\":\"SELECT 1\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO rvbbit.alert_queue (rule_name, entity_key, transition) VALUES ('k1','','enter_fail')")
+            .unwrap();
+        Spi::run("SELECT rvbbit.set_alerts_enabled(false)").unwrap();
+        Spi::run("SELECT rvbbit.alert_worker_tick(50)").unwrap();
+        let pending: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.alert_queue WHERE rule_name='k1' AND status='pending'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(pending, 1, "kill-switch off: worker does not drain");
+        Spi::run("SELECT rvbbit.set_alerts_enabled(true)").unwrap();
+
+        // an operator not wired until P3 → failed + logged, no crash
+        Spi::run(
+            "SELECT rvbbit.define_alert('f1', '{\"kind\":\"sql\",\"query\":\"SELECT 1\"}'::jsonb, \
+             '{\"operator\":\"mcp_call\",\"server\":\"linear\"}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO rvbbit.alert_queue (rule_name, entity_key, transition) VALUES ('f1','','enter_fail')")
+            .unwrap();
+        Spi::run("SELECT rvbbit.alert_worker_tick(50)").unwrap();
+        let failed: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.alert_queue WHERE rule_name='f1' AND status='failed'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(failed, 1, "unsupported operator marks the item failed");
+        let logged: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.alert_events \
+             WHERE rule_name='f1' AND status='failed' AND error IS NOT NULL",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(logged, 1, "the failure is logged with an error");
+    }
+
+    // ---- P3: action arg-binding + real dispatch (sql / noop) ----
+    #[pg_test]
+    fn alert_render_args_substitutes_placeholders() {
+        let title: String = Spi::get_one(
+            "SELECT rvbbit._alert_render_args('{\"title\":\"{rule} breached for {entity}\"}'::jsonb, \
+             '{\"rule\":\"rev\",\"entity\":\"US\"}'::jsonb) ->> 'title'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(title, "rev breached for US", "embedded placeholders interpolate");
+
+        let typ: String = Spi::get_one(
+            "SELECT jsonb_typeof(rvbbit._alert_render_args('{\"n\":\"{count}\"}'::jsonb, \
+             '{\"count\":42}'::jsonb) -> 'n')",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(typ, "number", "a whole-string placeholder keeps the typed value");
+    }
+
+    #[pg_test]
+    fn alert_worker_runs_sql_action_with_context() {
+        Spi::run("CREATE TABLE _hits (r text, e text)").unwrap();
+        Spi::run(
+            "SELECT rvbbit.define_alert('sa', '{\"kind\":\"sql\",\"query\":\"SELECT 1\"}'::jsonb, \
+             '{\"operator\":\"sql\",\"sql\":\"INSERT INTO _hits(r,e) VALUES ($1->>''rule'', $1->>''entity'')\"}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO rvbbit.alert_queue (rule_name, entity_key, transition) VALUES ('sa','US','enter_fail')")
+            .unwrap();
+        Spi::run("SELECT rvbbit.alert_worker_tick(50)").unwrap();
+
+        let hits: i64 = Spi::get_one("SELECT count(*)::bigint FROM _hits WHERE r='sa' AND e='US'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits, 1, "sql action runs with the alert context bound to $1");
+        let done: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.alert_queue WHERE rule_name='sa' AND status='done'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(done, 1, "the sql-action item is marked done");
+        let fired: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.alert_events WHERE rule_name='sa' AND status='fired'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fired, 1, "a fired event is logged");
+    }
+}
