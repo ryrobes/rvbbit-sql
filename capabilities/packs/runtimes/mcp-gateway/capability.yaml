@@ -19,6 +19,11 @@ runtime:
   health_path: /health
   env:
     RVBBIT_DSN: postgresql://postgres:rvbbit@postgres:5432/rvbbit
+    # Bearer token guarding the tool-invocation / subprocess-spawn endpoints.
+    # The gateway refuses to start if this is empty unless
+    # RVBBIT_GATEWAY_ALLOW_NO_AUTH=1 is set (explicit opt-in for trusted nets).
+    RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}
+    RVBBIT_GATEWAY_ALLOW_NO_AUTH: ${RVBBIT_GATEWAY_ALLOW_NO_AUTH:-}
     GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     GITHUB_USERNAME: ${GITHUB_USERNAME:-}
     OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}

@@ -446,8 +446,12 @@ END $$;
 -- tombstones for the same (rg_id, ordinal) update their deleted_xid
 -- and bump deleted_generation forward — a re-delete is a no-op
 -- semantically but should observably appear in a later generation.
+-- NB: parameters are prefixed p_ so they don't shadow the delete_log column
+-- names in the ON CONFLICT target (table_oid, rg_id, ordinal) — an unprefixed
+-- `rg_id`/`ordinal` parameter makes that reference ambiguous and the function
+-- raises at runtime ("column reference \"rg_id\" is ambiguous").
 CREATE OR REPLACE FUNCTION rvbbit.tombstone(
-    reloid regclass, rg_id bigint, ordinal int
+    reloid regclass, p_rg_id bigint, p_ordinal int
 ) RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
     gen bigint;
@@ -456,7 +460,7 @@ BEGIN
     INSERT INTO rvbbit.delete_log
         (table_oid, rg_id, ordinal, deleted_xid, deleted_generation)
     VALUES
-        (reloid, rg_id, ordinal, pg_current_xact_id(), gen)
+        (reloid, p_rg_id, p_ordinal, pg_current_xact_id(), gen)
     ON CONFLICT (table_oid, rg_id, ordinal) DO UPDATE SET
         deleted_xid = EXCLUDED.deleted_xid,
         deleted_generation = EXCLUDED.deleted_generation;

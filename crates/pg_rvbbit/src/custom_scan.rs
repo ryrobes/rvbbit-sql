@@ -159,6 +159,13 @@ struct RustScanState {
     /// Current batch we're emitting rows from.
     current_batch: Option<RecordBatch>,
     row_in_batch: usize,
+    /// Absolute ordinal of the current batch's first row within the current
+    /// row group. The parquet reader yields batches of READ_BATCH_SIZE rows
+    /// and `row_in_batch` resets to 0 each batch, but `delete_log` tombstones
+    /// are keyed by the absolute per-row-group ordinal — so the tombstone
+    /// check needs `batch_base + row_in_batch`. Reset to 0 when a new row
+    /// group opens; advanced by each finished batch's row count.
+    batch_base: u32,
     /// The scan slot's value/isnull arrays are reused row-by-row. Initialize
     /// untouched columns to NULL once, then per-row writes only touch projected
     /// columns.
@@ -567,6 +574,7 @@ unsafe extern "C-unwind" fn begin_custom_scan(
         current_cache_accum: Vec::new(),
         current_batch: None,
         row_in_batch: 0,
+        batch_base: 0,
         slot_nulls_initialized: false,
         cached_batches: Vec::new(),
         cache_complete: false,
@@ -2484,6 +2492,15 @@ unsafe fn prepare_indexed_lookup(state: &mut RustScanState) {
     if !state.cache_complete || !state.indexed_lookup_dirty {
         return;
     }
+    // The indexed-lookup path emits rows straight from the flat `cached_batches`
+    // list, which carries no per-row-group ordinal, so it cannot apply delete_log
+    // tombstones. When any are visible, leave it inactive and fall back to the
+    // sequential parquet scan (which applies tombstones via batch_base).
+    if !state.delete_bitmaps.is_empty() {
+        state.indexed_lookup_dirty = false;
+        state.indexed_lookup_active = false;
+        return;
+    }
     state.indexed_lookup_dirty = false;
     state.indexed_lookup_active = false;
     state.indexed_row_refs.clear();
@@ -2853,7 +2870,13 @@ unsafe extern "C-unwind" fn exec_custom_scan(
                 // when there are no tombstones (the get() returns None
                 // immediately for the common case).
                 if let Some(bm) = state.delete_bitmaps.get(&state.current_rg_id) {
-                    if bm.contains(state.row_in_batch as u32) {
+                    // Tombstones are keyed by absolute per-row-group ordinal,
+                    // but row_in_batch resets every READ_BATCH_SIZE-row batch —
+                    // so test against batch_base + row_in_batch, not the raw
+                    // per-batch index (else deletes past the first batch are
+                    // mis-applied: the target row survives and a phantom row
+                    // exactly READ_BATCH_SIZE later is wrongly dropped).
+                    if bm.contains(state.batch_base + state.row_in_batch as u32) {
                         state.row_in_batch += 1;
                         continue;
                     }
@@ -2914,7 +2937,11 @@ unsafe extern "C-unwind" fn exec_custom_scan(
         }
 
         // Current batch exhausted: pull the next one from the current reader.
-        if !state.dynamic_quals.is_empty() && state.cache_complete {
+        // The cached-replay fast path (re-emitting accumulated batches on rescan)
+        // also loses per-row-group ordinals, so skip it when tombstones are
+        // visible and re-read parquet instead (correct via batch_base).
+        if !state.dynamic_quals.is_empty() && state.cache_complete && state.delete_bitmaps.is_empty()
+        {
             if state.cached_batch_idx < state.cached_batches.len() {
                 state.current_batch = Some(state.cached_batches[state.cached_batch_idx].clone());
                 state.cached_batch_idx += 1;
@@ -2951,6 +2978,13 @@ unsafe extern "C-unwind" fn exec_custom_scan(
                 }
                 if !state.dynamic_quals.is_empty() && !state.cache_complete {
                     state.cached_batches.push(batch.clone());
+                }
+                // Advance the absolute-ordinal base by the batch we just
+                // finished (only within the same row group — current_batch is
+                // None right after a row group opens, so the first batch keeps
+                // batch_base == 0).
+                if let Some(prev) = state.current_batch.as_ref() {
+                    state.batch_base = state.batch_base.saturating_add(prev.num_rows() as u32);
                 }
                 state.current_batch = Some(batch);
                 state.row_in_batch = 0;
@@ -2995,6 +3029,8 @@ unsafe extern "C-unwind" fn exec_custom_scan(
                 // a new row group — record its rg_id so the tombstone filter
                 // in the hot loop checks the right bitmap.
                 state.current_rg_id = state.row_groups[state.rg_idx].rg_id;
+                // New row group: absolute ordinals restart at 0 for the tombstone bitmap.
+                state.batch_base = 0;
                 let path_str = state.row_groups[state.rg_idx].path.clone();
                 let path = std::path::Path::new(&path_str);
 
@@ -3843,6 +3879,7 @@ unsafe extern "C-unwind" fn rescan_custom_scan(node: *mut pg_sys::CustomScanStat
     state.current_cache_accum.clear();
     state.current_batch = None;
     state.row_in_batch = 0;
+    state.batch_base = 0;
     state.cached_batch_idx = 0;
     state.indexed_row_refs.clear();
     state.indexed_row_ref_idx = 0;
@@ -3882,4 +3919,31 @@ unsafe extern "C-unwind" fn explain_custom_scan(
         state.pruned_row_groups as i64,
         es,
     );
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use pgrx::prelude::*;
+
+    // mvcc-01 (write-path half): the single-row rvbbit.tombstone() helper must
+    // not raise "column reference \"rg_id\" is ambiguous" — its parameters used
+    // to shadow the delete_log column names in the ON CONFLICT target.
+    //
+    // The read-path half (tombstones keyed by absolute per-row-group ordinal vs
+    // the per-READ_BATCH_SIZE-batch index) needs a real compaction + native
+    // custom scan, which the single-transaction unit harness can't drive
+    // (refresh_acceleration publishes row groups across commit boundaries). It
+    // is covered by docker/sql/mvcc01-tombstone-verify.sql against a live
+    // instance instead.
+    #[pg_test]
+    fn single_tombstone_helper_does_not_raise_ambiguous() {
+        Spi::run("CREATE TABLE mvcc1c (id int) USING rvbbit").unwrap();
+        Spi::run("INSERT INTO mvcc1c SELECT g FROM generate_series(0, 9) g").unwrap();
+        Spi::run("SELECT rvbbit.refresh_acceleration('mvcc1c'::regclass, false)").unwrap();
+        let gen: i64 = Spi::get_one("SELECT rvbbit.tombstone('mvcc1c'::regclass, 0::bigint, 3)")
+            .unwrap()
+            .unwrap();
+        assert!(gen >= 1, "tombstone() should return an allocated generation, got {gen}");
+    }
 }

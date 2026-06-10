@@ -45,6 +45,38 @@ def update_json_version(path: Path, version: str) -> None:
     print(f"updated {rel}")
 
 
+def read_control_version(control_path: Path) -> str:
+    m = re.search(r"^default_version\s*=\s*'([^']+)'", control_path.read_text(), flags=re.MULTILINE)
+    if not m:
+        raise SystemExit(f"{control_path}: could not read default_version")
+    return m.group(1)
+
+
+def ensure_upgrade_stub(sql_dir: Path, old: str, new: str) -> None:
+    """Postgres builds the ALTER EXTENSION UPDATE path from the graph of
+    pg_rvbbit--FROM--TO.sql files; it never invents edges. Every default_version
+    change therefore needs an edge, or in-place upgrades break with
+    'no update path'. Create an empty stub when one doesn't exist so the chain
+    stays contiguous; if this release changed the SQL surface (new/changed
+    tables, functions, views) the stub MUST be filled with the diff DDL — see
+    `make migration-check` / scripts/release/check-migration-chain.py."""
+    if old == new:
+        return
+    path = sql_dir / f"pg_rvbbit--{old}--{new}.sql"
+    if path.exists():
+        print(f"upgrade script already present: {path.name}")
+        return
+    path.write_text(
+        f"-- Upgrade pg_rvbbit {old} -> {new}\n"
+        f"--\n"
+        f"-- AUTO-GENERATED STUB. Postgres needs this edge for ALTER EXTENSION UPDATE.\n"
+        f"-- If this release changed the SQL surface (CREATE/ALTER TABLE/FUNCTION/VIEW,\n"
+        f"-- new catalog columns, etc.), replace this comment with the upgrade DDL.\n"
+        f"-- Verify with: make migration-check\n"
+    )
+    print(f"created upgrade stub {path.name} (fill in DDL if the SQL surface changed)")
+
+
 def refresh_cargo_locks() -> None:
     lockfiles = [
         (ROOT / "Cargo.toml", "Cargo.lock"),
@@ -80,11 +112,15 @@ def main() -> None:
         r'^version\s*=\s*"[^"]+"',
         f'version = "{version}"',
     )
+    control_path = ROOT / "crates" / "pg_rvbbit" / "pg_rvbbit.control"
+    old_version = read_control_version(control_path)
     replace_once(
-        ROOT / "crates" / "pg_rvbbit" / "pg_rvbbit.control",
+        control_path,
         r"^default_version\s*=\s*'[^']+'",
         f"default_version = '{version}'",
     )
+    # Keep the ALTER EXTENSION UPDATE chain contiguous on every bump.
+    ensure_upgrade_stub(ROOT / "crates" / "pg_rvbbit" / "sql", old_version, version)
     refresh_cargo_locks()
 
     lens_dir = Path(args.lens_dir)

@@ -294,6 +294,9 @@ warren-once: ## Claim at most one Warren job, useful for smoke/debug
 release-bump: ## Bump Cargo/control/Lens versions (RELEASE_VERSION=x.y.z)
 	scripts/release/bump-version.py '$(RELEASE_VERSION)'
 
+migration-check: ## Assert every shipped version has an ALTER EXTENSION UPDATE path to default_version
+	python3 scripts/release/check-migration-chain.py
+
 release-build: ## Build release images locally (RELEASE_VERSION=x.y.z)
 	scripts/release/build-and-push.sh \
 	  --version '$(RELEASE_VERSION)' \

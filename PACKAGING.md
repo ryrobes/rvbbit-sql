@@ -96,7 +96,7 @@ sudo ./install.sh
 `install.sh` auto-detects `pg_config` and drops:
 
 - `pg_rvbbit.so` → `$(pg_config --pkglibdir)`
-- `pg_rvbbit*.control` + 56 SQL migration files → `$(pg_config --sharedir)/extension`
+- `pg_rvbbit*.control` + the generated base SQL (`pg_rvbbit--<version>.sql`) and versioned `pg_rvbbit--<from>--<to>.sql` migration scripts → `$(pg_config --sharedir)/extension`
 - `rvbbit-duck` binary → `/usr/local/bin/` (override with `DUCK_BIN_DIR=`)
 
 Then add `pg_rvbbit` to `shared_preload_libraries` in `postgresql.conf`,
@@ -158,17 +158,38 @@ sudo cp crates/rvbbit_duck/target/release/rvbbit-duck /usr/local/bin/
 
 ## Upgrading
 
-Drop in the new artifacts (via tarball, docker pull, or rebuild), then:
+**2.0.14 is the first generally-available release.** In-place
+`ALTER EXTENSION ... UPDATE` is supported only *from 2.0.14 onward* —
+the versioned `pg_rvbbit--<from>--<to>.sql` migration scripts are
+installed alongside the `.control` file and Postgres walks that chain
+from your installed version to the new `default_version`, preserving
+database state (parquet files, judgment cache, embeddings, KG, route
+decisions).
+
+To upgrade a 2.0.14+ install, drop in the new artifacts (tarball,
+docker pull, or rebuild), then:
 
 ```sql
 ALTER EXTENSION pg_rvbbit UPDATE;
 ```
 
-The versioned migration scripts are installed alongside the .control
-file. `ALTER EXTENSION ... UPDATE` walks the upgrade chain from your
-current installed version to the new `default_version`. Database state
-(parquet files, judgment cache, embeddings, KG, route decisions) is
-preserved.
+**Pre-2.0.14 builds were dev/preview and have no in-place upgrade
+path.** To move one to a supported release, recreate the extension:
+
+```sql
+DROP EXTENSION pg_rvbbit CASCADE;   -- drops the rvbbit schema + catalog
+CREATE EXTENSION pg_rvbbit;          -- installs at default_version
+```
+
+(Parquet files under `$PGDATA/rvbbit/` survive `DROP EXTENSION`; remove
+them too for a fully clean slate.)
+
+The release tooling guarantees the chain stays intact going forward:
+`scripts/release/bump-version.py` auto-creates a contiguous upgrade
+stub on every version bump, and `make migration-check`
+(`scripts/release/check-migration-chain.py`, also enforced before
+`--push`) fails the release if any supported version cannot reach
+`default_version`.
 
 ## Uninstalling
 

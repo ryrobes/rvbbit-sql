@@ -166,6 +166,13 @@ if [[ "$BUMP" -eq 1 ]]; then
     run "$ROOT/scripts/release/bump-version.py" "$VERSION" --lens-dir "$LENS_DIR"
 fi
 
+# Gate PUBLISHING on a contiguous ALTER EXTENSION UPDATE chain: an existing
+# install must be able to upgrade in place to the new default_version. Local
+# (--load) builds are not blocked so day-to-day dev keeps working.
+if [[ "$PUSH" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
+    run_always "$ROOT/scripts/release/check-migration-chain.py"
+fi
+
 mkdir -p "$RELEASE_DIR"
 
 # Captured MCP servers live only in the committed extension seed (no on-disk

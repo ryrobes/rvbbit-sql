@@ -445,7 +445,8 @@ def _serialize_content(c: Any) -> dict:
 
 
 @app.post("/call")
-async def call(req: CallRequest):
+async def call(req: CallRequest, authorization: str | None = Header(default=None)):
+    _check_token(authorization)
     proc = await get_server(req.server)
     try:
         result = await proc.call_tool(req.tool, req.arguments)
@@ -499,7 +500,8 @@ class ReadResourceRequest(BaseModel):
 
 
 @app.post("/refresh/{server}")
-async def refresh(server: str):
+async def refresh(server: str, authorization: str | None = Header(default=None)):
+    _check_token(authorization)
     # Drop any cached subprocess + tools cache, then re-list everything.
     await evict_server(server)
     proc = await get_server(server)
@@ -516,13 +518,15 @@ async def refresh(server: str):
 
 
 @app.post("/drop/{server}")
-async def drop(server: str):
+async def drop(server: str, authorization: str | None = Header(default=None)):
+    _check_token(authorization)
     await evict_server(server)
     return {"dropped": server}
 
 
 @app.get("/tools/{server}")
-async def get_tools(server: str):
+async def get_tools(server: str, authorization: str | None = Header(default=None)):
+    _check_token(authorization)
     proc = await get_server(server)
     try:
         tools = await proc.list_tools()
@@ -532,7 +536,8 @@ async def get_tools(server: str):
 
 
 @app.post("/resource")
-async def read_resource(req: ReadResourceRequest):
+async def read_resource(req: ReadResourceRequest, authorization: str | None = Header(default=None)):
+    _check_token(authorization)
     proc = await get_server(req.server)
     try:
         result = await proc.read_resource(req.uri)
@@ -544,10 +549,11 @@ async def read_resource(req: ReadResourceRequest):
 
 
 @app.post("/probe/{server}")
-async def probe(server: str):
+async def probe(server: str, authorization: str | None = Header(default=None)):
     """Active health probe — forces tools/list, returns latency + result.
     A reachable server returns reachable=true even if no tools (degenerate
     but valid)."""
+    _check_token(authorization)
     import time as _time
     try:
         proc = await get_server(server)
@@ -643,6 +649,21 @@ async def _init_codecs(conn):
 @app.on_event("startup")
 async def startup():
     global db_pool
+    # Secure by default: /call, /refresh, /drop, /tools, /resource, /probe can
+    # invoke arbitrary registered tools and spawn stdio subprocesses, so refuse
+    # to run unauthenticated unless an operator explicitly opts in for local dev.
+    if GATEWAY_TOKEN is None and os.environ.get("RVBBIT_GATEWAY_ALLOW_NO_AUTH") != "1":
+        raise RuntimeError(
+            "RVBBIT_GATEWAY_TOKEN is not set. The MCP gateway exposes "
+            "tool-invocation and subprocess-spawn endpoints and must not run "
+            "open. Set RVBBIT_GATEWAY_TOKEN, or set RVBBIT_GATEWAY_ALLOW_NO_AUTH=1 "
+            "to explicitly allow an unauthenticated gateway on a trusted network."
+        )
+    if GATEWAY_TOKEN is None:
+        log.warning(
+            "mcp-gateway running UNAUTHENTICATED (RVBBIT_GATEWAY_ALLOW_NO_AUTH=1); "
+            "do not expose port 9180 beyond a trusted network"
+        )
     # pg-rvbbit may not be ready yet when the gateway starts; retry briefly.
     for attempt in range(60):
         try:
