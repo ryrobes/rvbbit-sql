@@ -1926,7 +1926,7 @@
       "runtime_language": "mcp",
       "runtime_mode": "build",
       "runtime_name": "mcp_default",
-      "runtime_port": 9100,
+      "runtime_port": 9180,
       "runtime_template": "mcp-gateway",
       "source_model": "rvbbit/mcp-gateway",
       "source_provider": "builtin",

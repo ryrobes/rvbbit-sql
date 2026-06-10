@@ -174,7 +174,7 @@ LIMIT 1;
 
 If no row is ready, render the MCP Gateway capability
 (`runtimes/mcp-gateway`) as the install/open-runtime action. The UI should not
-assume `http://mcp-gateway:9100` is alive.
+assume `http://mcp-gateway:9180` is alive.
 
 ### `rvbbit.mcp_tools` — discovered tools per server
 
@@ -405,7 +405,7 @@ read `mcp_gateway_endpoint()` before making HTTP calls.
 SELECT rvbbit.mcp_gateway_endpoint();
 
 -- Manual override for custom deployments.
-SELECT rvbbit.set_mcp_gateway_endpoint('http://my-gateway.internal:9100');
+SELECT rvbbit.set_mcp_gateway_endpoint('http://my-gateway.internal:9180');
 ```
 
 The UI should prefer `rvbbit.mcp_gateways` for readiness and provenance, and

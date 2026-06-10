@@ -24,7 +24,7 @@ runtime:
   template: mcp-gateway
   handler: mcp_gateway
   device: cpu
-  port: 9100
+  port: 9180
   health_path: /health
 exports:
   runtime: mcp_default

@@ -15,7 +15,7 @@ runtime:
   language: mcp
   handler: mcp_gateway
   device: cpu
-  port: 9100
+  port: 9180
   health_path: /health
   env:
     RVBBIT_DSN: postgresql://postgres:rvbbit@postgres:5432/rvbbit

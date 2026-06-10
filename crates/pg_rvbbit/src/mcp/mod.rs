@@ -47,7 +47,7 @@ pub fn gateway_url() -> String {
         set_cached_gateway_url(Some(url.clone()));
         return url;
     }
-    "http://mcp-gateway:9100".into()
+    "http://mcp-gateway:9180".into()
 }
 
 #[pg_extern]

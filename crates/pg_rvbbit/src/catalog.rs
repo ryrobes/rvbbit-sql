@@ -4310,7 +4310,7 @@ $fwj$;
 -- ---------------------------------------------------------------------------
 
 INSERT INTO rvbbit.settings (key, value)
-VALUES ('mcp_gateway_endpoint', to_jsonb('http://mcp-gateway:9100'::text))
+VALUES ('mcp_gateway_endpoint', to_jsonb('http://mcp-gateway:9180'::text))
 ON CONFLICT (key) DO NOTHING;
 
 CREATE OR REPLACE FUNCTION rvbbit.mcp_gateway_endpoint()
@@ -4320,7 +4320,7 @@ STABLE
 AS $$
     SELECT coalesce(
         (SELECT value #>> '{}' FROM rvbbit.settings WHERE key = 'mcp_gateway_endpoint'),
-        'http://mcp-gateway:9100'
+        'http://mcp-gateway:9180'
     )
 $$;
 

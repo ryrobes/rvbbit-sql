@@ -499,7 +499,7 @@ async def startup():
             await asyncio.sleep(1)
     if db_pool is None:
         raise RuntimeError(f"could not connect to {DSN} after 60 attempts")
-    log.info("mcp-gateway ready on :9100")
+    log.info("mcp-gateway ready on :9180")
 
 
 @app.on_event("shutdown")

@@ -22,7 +22,7 @@ COPY main.py /app/
 COPY mcp-test-server /opt/mcp-test-server
 
 # curl is kept for the healthcheck.
-EXPOSE 9100
+EXPOSE 9180
 HEALTHCHECK --interval=10s --timeout=3s --retries=5 \
-    CMD curl -fsS http://localhost:9100/health || exit 1
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9100", "--log-level", "info"]
+    CMD curl -fsS http://localhost:9180/health || exit 1
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9180", "--log-level", "info"]
