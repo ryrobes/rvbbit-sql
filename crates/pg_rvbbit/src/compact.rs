@@ -863,9 +863,13 @@ fn export_to_parquet_xid_range(
     if max_xid.parse::<u128>()? <= min_xid.parse::<u128>()? {
         return Ok(0);
     }
+    // mvcc-08: compare in full-xid8 space (rvbbit.xid_to_fxid reconstructs the
+    // 32-bit heap xmin against the current epoch) so the delta filter stays
+    // monotonic across XID wraparound — a bare 32-bit xmin comparison silently
+    // drops every new row once the watermark passes 2^32.
     let filter = format!(
-        "(xmin::text)::numeric > {min_xid}::numeric \
-         AND (xmin::text)::numeric <= {max_xid}::numeric"
+        "rvbbit.xid_to_fxid(xmin) > {min_xid}::numeric \
+         AND rvbbit.xid_to_fxid(xmin) <= {max_xid}::numeric"
     );
     export_to_parquet_impl(rel, Some(filter), false)
 }

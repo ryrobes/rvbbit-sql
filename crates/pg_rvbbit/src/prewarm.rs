@@ -253,7 +253,9 @@ fn dispatch_per_row(
     receivers
         .into_iter()
         .map(|rx| {
-            let row = rx.recv().unwrap();
+            let row = rx
+                .recv()
+                .unwrap_or_else(|_| pgrx::error!("rvbbit: pool worker panicked during prewarm"));
             // Leader-side live progress: one operator call resolved.
             crate::live_counters::tick(&op.name, 1);
             row
@@ -353,7 +355,9 @@ fn dispatch_batched_specialist(
 
     let mut out: Vec<(Value, WorkResult)> = Vec::new();
     for rx in receivers {
-        let (chunk_inputs, outputs, latency, spec_name) = rx.recv().unwrap();
+        let (chunk_inputs, outputs, latency, spec_name) = rx
+            .recv()
+            .unwrap_or_else(|_| pgrx::error!("rvbbit: pool worker panicked during prewarm"));
         // Leader-side live progress: a batch of `chunk_inputs.len()` calls landed.
         crate::live_counters::tick(&op.name, chunk_inputs.len() as u64);
         match outputs {
@@ -554,7 +558,9 @@ fn dispatch_batched_multistep_specialist(
         .unwrap_or_default();
     let mut out: Vec<(Value, WorkResult)> = Vec::new();
     for rx in receivers {
-        let (chunk_inputs, outputs, latency) = rx.recv().unwrap();
+        let (chunk_inputs, outputs, latency) = rx
+            .recv()
+            .unwrap_or_else(|_| pgrx::error!("rvbbit: pool worker panicked during prewarm"));
         // Leader-side live progress: a batch of `chunk_inputs.len()` calls landed.
         crate::live_counters::tick(&op.name, chunk_inputs.len() as u64);
         match outputs {

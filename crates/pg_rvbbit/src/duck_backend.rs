@@ -749,7 +749,24 @@ fn native_fallback_query_json(query: &str, max_rows: i32) -> Result<JsonB, Strin
         Ok(())
     })
     .map_err(|e| e.to_string())?;
-    Ok(out.unwrap_or_else(|| JsonB(json!([]))))
+    let out = out.unwrap_or_else(|| JsonB(json!([])));
+    // ops-04: the LIMIT above is max_rows+1 purely to detect overflow. If we hit
+    // it, the true result exceeds the engine row cap — fail loudly rather than
+    // silently return a truncated, order-undefined set (this is the fail-open
+    // fallback that is supposed to be heap-equivalent). Running uncapped instead
+    // would risk OOM materializing the whole result as one jsonb, so we error and
+    // let the caller add a LIMIT or raise the cap.
+    if out
+        .0
+        .as_array()
+        .is_some_and(|arr| arr.len() as i64 > max_rows.max(1) as i64)
+    {
+        return Err(format!(
+            "result exceeds rvbbit.duck_backend_max_rows ({max_rows}); add a LIMIT to the query \
+             or raise rvbbit.duck_backend_max_rows to materialize the full result"
+        ));
+    }
+    Ok(out)
 }
 
 fn run_engine_query(

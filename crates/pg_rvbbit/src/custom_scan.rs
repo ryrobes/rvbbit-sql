@@ -3978,4 +3978,55 @@ mod tests {
             .unwrap();
         assert!(gen >= 1, "tombstone() should return an allocated generation, got {gen}");
     }
+
+    // mvcc-08: xid_to_fxid reconstructs the full 64-bit xid; its low 32 bits must
+    // always round-trip back to the bare xmin, in any epoch (the epoch base it
+    // adds/subtracts is a whole multiple of 2^32). This is the epoch-independent
+    // invariant — asserting plain identity is wrong once the cluster's xid8 has
+    // crossed a 2^32 boundary (then the function correctly returns the full xid).
+    #[pg_test]
+    fn xid_to_fxid_low_bits_round_trip() {
+        Spi::run("CREATE TABLE xf (id int)").unwrap();
+        Spi::run("INSERT INTO xf VALUES (1)").unwrap();
+        let ok: bool = Spi::get_one(
+            "SELECT rvbbit.xid_to_fxid(xmin) > 0 \
+                AND rvbbit.xid_to_fxid(xmin) % 4294967296::numeric = (xmin::text)::numeric \
+             FROM xf LIMIT 1",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ok, "xid_to_fxid low 32 bits must equal the bare xmin in any epoch");
+    }
+
+    // resources-02/ops-02: reap_logs deletes rows older than max_age and leaves
+    // recent rows, for tables that exist (to_regclass-guarded).
+    #[pg_test]
+    fn reap_logs_trims_old_rows() {
+        // accel_tick_runs(ran_at) is a plain log table created in the bootstrap.
+        Spi::run(
+            "INSERT INTO rvbbit.accel_tick_runs (table_name, action, ran_at) \
+             VALUES ('t', 'skip', now() - interval '40 days')",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO rvbbit.accel_tick_runs (table_name, action, ran_at) VALUES ('t', 'skip', now())",
+        )
+        .unwrap();
+        let before: i64 =
+            Spi::get_one("SELECT count(*) FROM rvbbit.accel_tick_runs WHERE ran_at < now() - interval '14 days'")
+                .unwrap()
+                .unwrap();
+        assert!(before >= 1, "should have an old row to reap");
+        Spi::run("SELECT rvbbit.reap_logs(interval '14 days')").unwrap();
+        let old_left: i64 =
+            Spi::get_one("SELECT count(*) FROM rvbbit.accel_tick_runs WHERE ran_at < now() - interval '14 days'")
+                .unwrap()
+                .unwrap();
+        assert_eq!(old_left, 0, "reap_logs should delete rows older than max_age");
+        let recent: i64 =
+            Spi::get_one("SELECT count(*) FROM rvbbit.accel_tick_runs WHERE ran_at >= now() - interval '1 day'")
+                .unwrap()
+                .unwrap();
+        assert!(recent >= 1, "reap_logs must keep recent rows");
+    }
 }

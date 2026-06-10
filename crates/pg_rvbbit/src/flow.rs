@@ -107,7 +107,16 @@ impl Pool {
                 IN_POOL_WORKER.with(|c| c.set(true));
                 while let Ok(maybe_job) = rx.recv() {
                     match maybe_job {
-                        Some(job) => job(),
+                        // concurrency-02/resources-03: a panicking job must not
+                        // kill the worker thread (which would permanently shrink
+                        // the pool toward zero). Catch it here; the job's result
+                        // sender drops, so the leader sees a clean RecvError and
+                        // raises a statement error instead of the thread dying.
+                        // These are plain std threads (not the PG backend), so a
+                        // panic here never crosses the C FFI boundary.
+                        Some(job) => {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        }
                         None => break,
                     }
                 }

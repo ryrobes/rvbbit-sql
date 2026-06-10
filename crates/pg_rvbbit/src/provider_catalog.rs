@@ -114,6 +114,7 @@ DECLARE
     compacted jsonb := '[]'::jsonb;
     refreshed jsonb := '[]'::jsonb;
     errors jsonb := '[]'::jsonb;
+    logs_reaped jsonb := '[]'::jsonb;
     cap bigint := greatest(coalesce(max_tables, 0), 0);
 BEGIN
     IF cap = 0 THEN
@@ -181,9 +182,24 @@ BEGIN
         END LOOP;
     END IF;
 
+    -- resources-02/ops-02: trim the append-only telemetry logs on the same
+    -- maintenance heartbeat. Isolated so a reap failure never fails maintenance.
+    BEGIN
+        SELECT coalesce(
+                   jsonb_agg(jsonb_build_object('table', table_name, 'rows', rows_reaped)),
+                   '[]'::jsonb)
+          INTO logs_reaped
+          FROM rvbbit.reap_logs();
+    EXCEPTION WHEN OTHERS THEN
+        errors := errors || jsonb_build_array(
+            jsonb_build_object('phase', 'reap_logs', 'error', SQLERRM)
+        );
+    END;
+
     RETURN jsonb_build_object(
         'compacted', compacted,
         'refreshed_variants', refreshed,
+        'logs_reaped', logs_reaped,
         'errors', errors
     );
 END $$;

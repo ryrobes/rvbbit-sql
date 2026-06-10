@@ -234,7 +234,14 @@ fn run_take_jobs(
             pool.submit(move || run_one_take(&op_c, &inputs_c, &opts_c, fb_c.as_deref(), &job)),
         );
     }
-    receivers.into_iter().map(|rx| rx.recv().unwrap()).collect()
+    receivers
+        .into_iter()
+        .map(|rx| {
+            rx.recv().unwrap_or_else(|_| {
+                pgrx::error!("rvbbit: pool worker panicked while running a semantic take")
+            })
+        })
+        .collect()
 }
 
 fn run_one_take(

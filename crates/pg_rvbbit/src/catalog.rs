@@ -420,6 +420,67 @@ CREATE INDEX delete_log_xid_idx ON rvbbit.delete_log (deleted_xid);
 CREATE INDEX delete_log_table_generation_idx
     ON rvbbit.delete_log (table_oid, deleted_generation);
 
+-- mvcc-08: reconstruct a 32-bit heap xmin into the full 64-bit transaction id
+-- (as numeric) so it can be compared against xid8 watermarks (pg_snapshot_xmin)
+-- across XID wraparound. The bare 32-bit xmin wraps every ~4.29e9 transactions,
+-- so a plain `xmin::numeric > watermark` silently excludes all new rows once the
+-- watermark passes 2^32 — stopping incremental accelerator ingest. Pairing xmin
+-- with the current snapshot's epoch (and stepping back one epoch when the
+-- candidate lands in the future) yields the monotonic full xid.
+CREATE OR REPLACE FUNCTION rvbbit.xid_to_fxid(x xid)
+RETURNS numeric LANGUAGE sql STABLE AS $$
+    -- `cur` must be the HIGH watermark (xmax = the next xid to be assigned), not
+    -- xmin: a row's xmin is normally newer than the oldest active xid, so using
+    -- xmin as the reference would make candidate > cur fire spuriously and
+    -- subtract an epoch. With xmax, every assigned xid <= cur, so the subtract
+    -- only triggers for xids that genuinely wrapped from the previous epoch.
+    SELECT CASE
+        WHEN floor(cur / 4294967296::numeric) * 4294967296::numeric + xv > cur
+        THEN floor(cur / 4294967296::numeric) * 4294967296::numeric + xv - 4294967296::numeric
+        ELSE floor(cur / 4294967296::numeric) * 4294967296::numeric + xv
+    END
+    FROM (
+        SELECT (x::text)::numeric AS xv,
+               (pg_snapshot_xmax(pg_current_snapshot())::text)::numeric AS cur
+    ) v
+$$;
+
+-- resources-02/ops-02: bound the append-only telemetry/heartbeat log tables.
+-- They grow forever otherwise (accel_tick_runs alone is ~1 row/table/minute on
+-- the heartbeat) and several feed per-tick budget subqueries that degrade with
+-- history. The immutable BI log (metric_observations) and drift baselines
+-- (catalog_snapshots) are intentionally NOT reaped here — they have functional
+-- dependents. Call from a maintenance heartbeat (rvbbit.maintain_storage does).
+CREATE OR REPLACE FUNCTION rvbbit.reap_logs(max_age interval DEFAULT interval '14 days')
+RETURNS TABLE (table_name text, rows_reaped bigint)
+LANGUAGE plpgsql AS $$
+DECLARE
+    spec   record;
+    cutoff timestamptz := now() - max_age;
+    n      bigint;
+BEGIN
+    FOR spec IN
+        SELECT * FROM (VALUES
+            ('rvbbit.accel_tick_runs',  'ran_at'),
+            ('rvbbit.route_decisions',  'decided_at'),
+            ('rvbbit.route_executions', 'executed_at'),
+            ('rvbbit.mcp_invocations',  'invocation_at'),
+            ('rvbbit.cost_events',      'created_at'),
+            ('rvbbit.sync_runs',        'started_at'),
+            ('rvbbit.receipts',         'invocation_at')
+        ) AS t(tbl, col)
+    LOOP
+        IF to_regclass(spec.tbl) IS NULL THEN
+            CONTINUE;  -- table from an uninstalled feature; skip
+        END IF;
+        EXECUTE format('DELETE FROM %s WHERE %I < $1', spec.tbl, spec.col) USING cutoff;
+        GET DIAGNOSTICS n = ROW_COUNT;
+        table_name  := spec.tbl;
+        rows_reaped := n;
+        RETURN NEXT;
+    END LOOP;
+END $$;
+
 -- Allocate a new generation for the given table — same per-table
 -- advisory-lock pattern that compact() uses, so any tombstone-writing
 -- code can stamp delete_log entries with a number that doesn't collide
@@ -676,6 +737,7 @@ DECLARE
     safe_upper_xid numeric;
     phase_id bigint;
     phase_bytes_written bigint := 0;
+    orphan_paths text[];
 BEGIN
     IF NOT rvbbit.is_rvbbit_table(reloid) THEN
         RAISE EXCEPTION '% is not an rvbbit table', reloid;
@@ -705,13 +767,16 @@ BEGIN
     )
     RETURNING id INTO op_id;
 
-    SELECT count(*)::int INTO dropped_rgs
+    -- resources-01: capture the on-disk parquet paths so we can unlink them.
+    -- rg_id restarts at 0 on rebuild, so any file above the post-rebuild
+    -- high-water mark would never be overwritten and would leak forever.
+    SELECT count(*)::int, array_agg(path)
+      INTO dropped_rgs, orphan_paths
       FROM rvbbit.row_groups WHERE table_oid = reloid;
 
-    -- Wipe derived state. Old on-disk parquet files are left orphaned;
-    -- the rebuild uses the same path scheme (rg_id starting at 0) so the
-    -- next write overwrites active names. Stale orphans are harmless because
-    -- nothing in the catalog references them.
+    -- Wipe derived state, then unlink the orphaned files. The retained heap is
+    -- authoritative (shadow_heap_retained set below) so the data is recoverable
+    -- even though the unlink runs before this transaction commits.
     DELETE FROM rvbbit.delete_log         WHERE table_oid = reloid;
     DELETE FROM rvbbit.layout_variant_status WHERE table_oid = reloid;
     DELETE FROM rvbbit.row_group_variants WHERE table_oid = reloid;
@@ -723,6 +788,13 @@ BEGIN
            shadow_heap_dirty = false
      WHERE table_oid = reloid;
     DELETE FROM rvbbit.acceleration_state WHERE table_oid = reloid;
+
+    -- resources-01: drop the orphaned parquet files (idempotent; missing files
+    -- are a no-op). Done after the catalog wipe so a failure before here leaves
+    -- the files referenced and intact.
+    IF orphan_paths IS NOT NULL THEN
+        PERFORM rvbbit.reap_unlink_files(orphan_paths);
+    END IF;
 
     INSERT INTO rvbbit.acceleration_operation_phases (
         operation_id, table_oid, table_name, phase, layout, status, details
