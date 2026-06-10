@@ -74,6 +74,10 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       RVBBIT_DUCK_BACKEND: ${RVBBIT_DUCK_BACKEND:-true}
+      # security-01: when set, the backend sends this bearer token on every MCP
+      # gateway request; set the SAME value on the mcp-gateway service to enforce
+      # auth. Empty (dev default) = the gateway runs open on the internal network.
+      RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}
       # Google ADC can be a normal credentials path inside the container or
       # compact service-account JSON for local/dev Compose usage.
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}

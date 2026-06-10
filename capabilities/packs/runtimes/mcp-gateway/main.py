@@ -649,20 +649,18 @@ async def _init_codecs(conn):
 @app.on_event("startup")
 async def startup():
     global db_pool
-    # Secure by default: /call, /refresh, /drop, /tools, /resource, /probe can
-    # invoke arbitrary registered tools and spawn stdio subprocesses, so refuse
-    # to run unauthenticated unless an operator explicitly opts in for local dev.
-    if GATEWAY_TOKEN is None and os.environ.get("RVBBIT_GATEWAY_ALLOW_NO_AUTH") != "1":
-        raise RuntimeError(
-            "RVBBIT_GATEWAY_TOKEN is not set. The MCP gateway exposes "
-            "tool-invocation and subprocess-spawn endpoints and must not run "
-            "open. Set RVBBIT_GATEWAY_TOKEN, or set RVBBIT_GATEWAY_ALLOW_NO_AUTH=1 "
-            "to explicitly allow an unauthenticated gateway on a trusted network."
-        )
+    # security-01: /call,/refresh,/drop,/tools,/resource,/probe can invoke any
+    # registered tool and spawn stdio subprocesses. When RVBBIT_GATEWAY_TOKEN is
+    # set those routes require it (and the rvbbit backend sends it); when it is
+    # unset the gateway runs OPEN — fine on a trusted internal docker network, but
+    # it must not be exposed. We warn loudly rather than fail closed so the
+    # turnkey/local flow keeps working; production sets the token on BOTH the
+    # gateway and the pg-rvbbit backend and binds the port internal-only.
     if GATEWAY_TOKEN is None:
         log.warning(
-            "mcp-gateway running UNAUTHENTICATED (RVBBIT_GATEWAY_ALLOW_NO_AUTH=1); "
-            "do not expose port 9180 beyond a trusted network"
+            "mcp-gateway running UNAUTHENTICATED: set RVBBIT_GATEWAY_TOKEN (on the "
+            "gateway AND the pg-rvbbit backend) and bind port 9180 internal-only "
+            "before exposing it beyond a trusted network."
         )
     # pg-rvbbit may not be ready yet when the gateway starts; retry briefly.
     for attempt in range(60):

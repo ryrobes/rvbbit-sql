@@ -33,6 +33,26 @@ use crate::specialists::http_client;
 /// non-default deployments; defaults to the docker-compose service name.
 static MCP_GATEWAY_URL: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 
+/// security-01: the shared bearer token for the MCP gateway, read from the
+/// pg-rvbbit backend's environment. When set, every gateway request carries it;
+/// the gateway enforces it on the tool-call/subprocess routes. Unset (the
+/// turnkey default) means the gateway runs open on the trusted internal network.
+fn gateway_token() -> Option<String> {
+    std::env::var("RVBBIT_GATEWAY_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// Attach the gateway bearer token to a request when one is configured.
+fn with_gateway_auth(
+    req: reqwest::blocking::RequestBuilder,
+) -> reqwest::blocking::RequestBuilder {
+    match gateway_token() {
+        Some(token) => req.bearer_auth(token),
+        None => req,
+    }
+}
+
 pub fn gateway_url() -> String {
     if let Some(url) = std::env::var("RVBBIT_MCP_GATEWAY_URL")
         .ok()
@@ -173,8 +193,7 @@ pub fn call(server: &str, tool: &str, args: &Value) -> Result<Value, ProviderErr
         arguments: args,
     };
     let url = format!("{}/call", gateway_url());
-    let resp = http_client()
-        .post(&url)
+    let resp = with_gateway_auth(http_client().post(&url))
         .timeout(Duration::from_secs(180))
         .json(&body)
         .send()?;
@@ -196,8 +215,7 @@ pub fn call(server: &str, tool: &str, args: &Value) -> Result<Value, ProviderErr
 /// and re-runs `tools/list`), returns the fresh tool list.
 pub fn refresh(server: &str) -> Result<(Vec<ToolDef>, Vec<ResourceDef>), ProviderError> {
     let url = format!("{}/refresh/{}", gateway_url(), server);
-    let resp = http_client()
-        .post(&url)
+    let resp = with_gateway_auth(http_client().post(&url))
         .timeout(Duration::from_secs(60))
         .send()?;
     let status = resp.status();
@@ -214,8 +232,7 @@ pub fn refresh(server: &str) -> Result<(Vec<ToolDef>, Vec<ResourceDef>), Provide
 pub fn read_resource(server: &str, uri: &str) -> Result<Value, ProviderError> {
     let body = ReadResourceReq { server, uri };
     let url = format!("{}/resource", gateway_url());
-    let resp = http_client()
-        .post(&url)
+    let resp = with_gateway_auth(http_client().post(&url))
         .timeout(Duration::from_secs(60))
         .json(&body)
         .send()?;
@@ -232,8 +249,7 @@ pub fn read_resource(server: &str, uri: &str) -> Result<Value, ProviderError> {
 
 pub fn probe_server(server: &str) -> Result<Value, ProviderError> {
     let url = format!("{}/probe/{}", gateway_url(), server);
-    let resp = http_client()
-        .post(&url)
+    let resp = with_gateway_auth(http_client().post(&url))
         .timeout(Duration::from_secs(30))
         .send()?;
     let status = resp.status();

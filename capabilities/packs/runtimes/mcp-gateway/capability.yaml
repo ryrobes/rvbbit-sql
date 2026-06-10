@@ -20,10 +20,10 @@ runtime:
   env:
     RVBBIT_DSN: postgresql://postgres:rvbbit@postgres:5432/rvbbit
     # Bearer token guarding the tool-invocation / subprocess-spawn endpoints.
-    # The gateway refuses to start if this is empty unless
-    # RVBBIT_GATEWAY_ALLOW_NO_AUTH=1 is set (explicit opt-in for trusted nets).
+    # When set, the gateway enforces it AND the pg-rvbbit backend sends it (set
+    # the SAME value on the pg-rvbbit service). Empty = open on the trusted
+    # internal network (the gateway logs a warning); never expose port 9180 then.
     RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}
-    RVBBIT_GATEWAY_ALLOW_NO_AUTH: ${RVBBIT_GATEWAY_ALLOW_NO_AUTH:-}
     GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     GITHUB_USERNAME: ${GITHUB_USERNAME:-}
     OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
