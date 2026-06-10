@@ -7507,6 +7507,81 @@ BEGIN
     RETURN jsonb_build_object('done', v_done, 'failed', v_failed);
 END;
 $fn$;
+
+-- ---- P4: pg_cron tier wiring + kill-switch ---------------------------------
+-- Register the sweep (one job per cadence tier) + the worker as pg_cron jobs.
+-- p_dry_run returns the plan without scheduling (no pg_cron needed) — that's
+-- the deterministic test path and a safe "what would this do?" preview. Mirrors
+-- rvbbit.schedule_materialize_tick's home-db + pg_cron-exists guards. The kill-
+-- switch (rvbbit.alerts_enabled / set_alerts_enabled) lets the jobs keep firing
+-- cheaply while doing nothing; alerts_uninstall_cron() stops them entirely.
+CREATE OR REPLACE FUNCTION rvbbit.alerts_install_cron(
+    p_fast       text    DEFAULT '* * * * *',
+    p_normal     text    DEFAULT '*/15 * * * *',
+    p_slow       text    DEFAULT '0 * * * *',
+    p_worker     text    DEFAULT '* * * * *',
+    p_worker_max integer DEFAULT 50,
+    p_dry_run    boolean DEFAULT false
+) RETURNS jsonb
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_cron_home text := current_setting('cron.database_name', true);
+    v_this_db   text := current_database();
+    v_jobs      jsonb := '[]'::jsonb;
+    v_spec      record;
+    v_jobid     bigint;
+BEGIN
+    FOR v_spec IN
+        SELECT * FROM (VALUES
+            ('rvbbit_alert_sweep_fast',   p_fast,   format('SELECT rvbbit.alert_sweep(%L)', 'fast')),
+            ('rvbbit_alert_sweep_normal', p_normal, format('SELECT rvbbit.alert_sweep(%L)', 'normal')),
+            ('rvbbit_alert_sweep_slow',   p_slow,   format('SELECT rvbbit.alert_sweep(%L)', 'slow')),
+            ('rvbbit_alert_worker',       p_worker, format('SELECT rvbbit.alert_worker_tick(%s)', p_worker_max))
+        ) AS t(job_name, schedule, command)
+    LOOP
+        IF p_dry_run THEN
+            v_jobs := v_jobs || jsonb_build_object('name', v_spec.job_name,
+                'schedule', v_spec.schedule, 'command', v_spec.command);
+            CONTINUE;
+        END IF;
+        IF v_cron_home IS NOT NULL AND v_cron_home <> '' AND v_cron_home <> v_this_db THEN
+            RAISE EXCEPTION 'pg_cron home database is %, not %; cron.* is not callable here.',
+                v_cron_home, v_this_db
+                USING HINT = format('connect to %L and use cron.schedule_in_database(..., %L)', v_cron_home, v_this_db);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+            RAISE EXCEPTION 'pg_cron is not installed; run rvbbit.alert_sweep()/alert_worker_tick() manually.';
+        END IF;
+        EXECUTE format('SELECT cron.schedule(%L, %L, %L)', v_spec.job_name, v_spec.schedule, v_spec.command)
+            INTO v_jobid;
+        v_jobs := v_jobs || jsonb_build_object('name', v_spec.job_name, 'schedule', v_spec.schedule,
+            'command', v_spec.command, 'jobid', v_jobid);
+    END LOOP;
+    RETURN jsonb_build_object('dry_run', p_dry_run, 'jobs', v_jobs);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION rvbbit.alerts_uninstall_cron() RETURNS jsonb
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_name    text;
+    v_removed text[] := '{}';
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        RETURN jsonb_build_object('removed', '[]'::jsonb, 'note', 'pg_cron not installed');
+    END IF;
+    FOREACH v_name IN ARRAY ARRAY['rvbbit_alert_sweep_fast', 'rvbbit_alert_sweep_normal',
+                                  'rvbbit_alert_sweep_slow', 'rvbbit_alert_worker'] LOOP
+        BEGIN
+            EXECUTE format('SELECT cron.unschedule(%L)', v_name);
+            v_removed := v_removed || v_name;
+        EXCEPTION WHEN OTHERS THEN
+            NULL;  -- wasn't scheduled
+        END;
+    END LOOP;
+    RETURN jsonb_build_object('removed', to_jsonb(v_removed));
+END;
+$fn$;
 "#,
     name = "rvbbit_alerts",
     requires = ["rvbbit_bootstrap", "rvbbit_metrics"],
@@ -7928,5 +8003,40 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(fired, 1, "a fired event is logged");
+    }
+
+    // ---- P4: pg_cron tier wiring ----
+    #[pg_test]
+    fn alerts_install_cron_dry_run_plans_tiers_and_worker() {
+        let n: i64 = Spi::get_one(
+            "SELECT jsonb_array_length(rvbbit.alerts_install_cron(p_dry_run => true) -> 'jobs')::bigint",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 4, "plans 3 sweep tiers + 1 worker");
+
+        let worker_ok: bool = Spi::get_one(
+            "SELECT EXISTS (SELECT 1 FROM jsonb_array_elements(\
+             rvbbit.alerts_install_cron(p_dry_run => true) -> 'jobs') j \
+             WHERE j->>'name' = 'rvbbit_alert_worker' AND j->>'command' LIKE '%alert_worker_tick%')",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(worker_ok, "worker job is planned with the right command");
+
+        let custom_ok: bool = Spi::get_one(
+            "SELECT EXISTS (SELECT 1 FROM jsonb_array_elements(\
+             rvbbit.alerts_install_cron(p_fast => '*/2 * * * *', p_dry_run => true) -> 'jobs') j \
+             WHERE j->>'name' = 'rvbbit_alert_sweep_fast' AND j->>'schedule' = '*/2 * * * *')",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(custom_ok, "a custom schedule flows through to the plan");
+    }
+
+    #[pg_test(error = "pg_cron is not installed")]
+    fn alerts_install_cron_requires_pg_cron_to_schedule() {
+        // the test harness has no pg_cron, so the live (non-dry-run) path errors clearly
+        Spi::run("SELECT rvbbit.alerts_install_cron()").unwrap();
     }
 }
