@@ -1929,13 +1929,17 @@ DECLARE
     raw_query_id   text := NULLIF(current_setting('rvbbit.query_id', true), '');
     next_query_id  uuid;
 BEGIN
-    -- One id per top-level transaction = one per query. We KEY the stored id to
-    -- txid_current() rather than relying on GUC lifetime: a pooled connection
-    -- can carry a stale session-level rvbbit.query_id from an earlier query, so
-    -- we only reuse the stored id when it belongs to *this* transaction.
+    -- Reuse the stored id when it is either:
+    --   (a) explicitly PINNED via rvbbit.reset_query_id() (stored_txid = 'pinned')
+    --       — sticky across statements, even on an autocommit connection, so a
+    --       caller can tag a multi-statement sequence of operations with one id; or
+    --   (b) from THIS transaction (stored_txid = cur_txid) — the implicit per-query
+    --       default, keyed to txid_current() so a pooled connection never carries a
+    --       stale session id into an unrelated later query.
     -- Multiple receipt writes in one query (and a prewarm's SPI, same txn) all
-    -- see the same txid and share the id; the next query is a new txn -> new id.
-    IF stored_txid IS NOT NULL AND stored_txid = cur_txid AND raw_query_id IS NOT NULL THEN
+    -- share the id; without a pin, the next query is a new txn -> new id.
+    IF raw_query_id IS NOT NULL
+       AND (stored_txid = 'pinned' OR stored_txid = cur_txid) THEN
         BEGIN
             RETURN raw_query_id::uuid;
         EXCEPTION WHEN OTHERS THEN
@@ -1957,10 +1961,15 @@ AS $$
 DECLARE
     next_query_id uuid := gen_random_uuid();
 BEGIN
-    -- Force a fresh id for the current transaction, keyed to its txid so
-    -- current_query_id() reuses it for the rest of this query.
+    -- Explicitly PIN a fresh query_id for this session. current_query_id() then
+    -- reuses it across statements (even on an autocommit connection) until the
+    -- next reset_query_id() or a session reset (DISCARD/RESET ALL) — so a caller
+    -- can tag a whole sequence of operations with one id. Pinning is opt-in;
+    -- without it current_query_id() stays per-query (keyed to txid_current()), so
+    -- pooled connections never carry a stale id. The 'pinned' sentinel is what
+    -- current_query_id() recognizes (txid_current() is always numeric, never that).
     PERFORM set_config('rvbbit.query_id', next_query_id::text, false);
-    PERFORM set_config('rvbbit.query_txid', txid_current()::text, false);
+    PERFORM set_config('rvbbit.query_txid', 'pinned', false);
     RETURN next_query_id;
 END $$;
 
