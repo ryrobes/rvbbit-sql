@@ -7089,6 +7089,14 @@ BEGIN
     IF p_action IS NULL OR p_action = '{}'::jsonb THEN
         RAISE EXCEPTION 'rvbbit.define_alert: action is required';
     END IF;
+    IF coalesce(p_condition->>'kind', 'sql') = 'metric'
+       AND coalesce(p_condition->>'metric', '') = '' THEN
+        RAISE EXCEPTION 'rvbbit.define_alert: condition kind=metric requires a metric name';
+    END IF;
+    IF coalesce(p_action->>'operator', '') = 'operator'
+       AND coalesce(p_action->>'operator_name', '') = '' THEN
+        RAISE EXCEPTION 'rvbbit.define_alert: operator action requires operator_name';
+    END IF;
     IF p_cardinality NOT IN ('per_entity', 'aggregate') THEN
         RAISE EXCEPTION 'rvbbit.define_alert: cardinality must be per_entity or aggregate (got %)', p_cardinality;
     END IF;
@@ -7245,6 +7253,20 @@ $fn$;
 -- drains over later sweeps — nothing is silently dropped). Each rule runs in
 -- its own subtransaction so a bad condition query can't abort the whole sweep.
 -- Uses clock_timestamp() (not now()) so episode timing advances within a txn.
+-- A metric-ref condition rides the referenced metric's latest KPI verdict
+-- (pass/fail, already 'pass'/'fail' text) from the pre-materialized observations
+-- log — no re-run, no threshold. entity_key = the metric name (scalar).
+CREATE OR REPLACE FUNCTION rvbbit._alert_metric_condition_sql(p_metric text)
+RETURNS text
+LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT format(
+        'SELECT %L::text AS entity_key, o.status AS status FROM ('
+        || 'SELECT status FROM rvbbit.metric_observations '
+        || 'WHERE metric_name = %L ORDER BY data_as_of DESC NULLS LAST, observed_at DESC LIMIT 1'
+        || ') o WHERE o.status IS NOT NULL',
+        p_metric, p_metric);
+$fn$;
+
 CREATE OR REPLACE FUNCTION rvbbit.alert_sweep(p_tier text DEFAULT 'normal')
 RETURNS jsonb
 LANGUAGE plpgsql AS $fn$
@@ -7276,6 +7298,7 @@ DECLARE
     v_changed     timestamptz;
     v_eligible    boolean;
     v_did_enqueue boolean;
+    v_kind        text;
 BEGIN
     INSERT INTO rvbbit.alert_sweep_runs (tier, started_at)
     VALUES (p_tier, v_now) RETURNING sweep_id INTO v_sweep_id;
@@ -7297,14 +7320,24 @@ BEGIN
         v_cap      := greatest(coalesce(v_rule.fan_out_cap, 100), 1);
         v_thresh   := nullif(v_rule.condition_spec->>'threshold', '')::numeric;
         v_cmp      := coalesce(v_rule.condition_spec->>'compare', 'gte');
+        v_kind     := coalesce(v_rule.condition_spec->>'kind', 'sql');
 
         BEGIN  -- per-rule subtransaction: an error here won't abort the sweep
-            IF coalesce(v_rule.condition_spec->>'kind', 'sql') <> 'sql' THEN
-                CONTINUE;  -- non-SQL kinds: the query can already call any operator
+            -- Resolve the condition into an executable query. 'sql' runs the
+            -- free-form query; 'metric' rides the referenced metric's latest KPI
+            -- verdict from metric_observations; unknown kinds are skipped.
+            IF v_kind = 'metric' THEN
+                IF coalesce(v_rule.condition_spec->>'metric', '') = '' THEN
+                    RAISE EXCEPTION 'alert %: condition kind=metric has no metric name', v_rule.name;
+                END IF;
+                v_query := rvbbit._alert_metric_condition_sql(v_rule.condition_spec->>'metric');
+            ELSIF v_kind = 'sql' THEN
+                v_query := v_rule.condition_spec->>'query';
+            ELSE
+                CONTINUE;
             END IF;
-            v_query := v_rule.condition_spec->>'query';
             IF v_query IS NULL OR btrim(v_query) = '' THEN
-                RAISE EXCEPTION 'alert %: condition_spec.query is empty', v_rule.name;
+                RAISE EXCEPTION 'alert %: condition produced no query (kind=%)', v_rule.name, v_kind;
             END IF;
 
             -- Read each row as jsonb so the query may return a `status` (text
@@ -7480,6 +7513,44 @@ BEGIN
         END IF;
         RETURN jsonb_build_object('ok', true, 'operator', 'mcp_call',
             'result', rvbbit.mcp_call(p_action->>'server', p_action->>'tool', v_args));
+    ELSIF v_op = 'operator' THEN
+        -- Invoke a catalogued operator by name with rendered, typed positional
+        -- args (arg_names order). Calling rvbbit.<op>() runs through the operator
+        -- wrapper, so receipts/observability are captured for free.
+        DECLARE
+            v_opname    text := p_action->>'operator_name';
+            v_arg_names text[];
+            v_arg_types text[];
+            v_parts     text[] := '{}';
+            v_call      text;
+            v_oresult   jsonb;
+            v_type      regtype;
+            i           integer;
+        BEGIN
+            IF coalesce(v_opname, '') = '' THEN
+                RAISE EXCEPTION 'operator action: action_spec.operator_name is required';
+            END IF;
+            SELECT arg_names, arg_types INTO v_arg_names, v_arg_types
+              FROM rvbbit.operators WHERE name = v_opname;
+            IF v_arg_names IS NULL THEN
+                RAISE EXCEPTION 'operator action: unknown operator %', v_opname;
+            END IF;
+            v_args := rvbbit._alert_render_args(coalesce(p_action->'args', '{}'::jsonb), v_ctx);
+            FOR i IN 1 .. coalesce(array_length(v_arg_names, 1), 0) LOOP
+                -- validate the catalog-declared type is a real type (so it can't
+                -- smuggle SQL into the cast) and use its canonical, safe name
+                v_type := to_regtype(coalesce(v_arg_types[i], 'text'));
+                IF v_type IS NULL THEN
+                    RAISE EXCEPTION 'operator action: operator % has an invalid arg type %', v_opname, v_arg_types[i];
+                END IF;
+                v_parts := v_parts || (quote_nullable(v_args ->> v_arg_names[i]) || '::' || v_type::text);
+            END LOOP;
+            v_call := format('SELECT to_jsonb(rvbbit.%I(%s)) AS r',
+                             v_opname, array_to_string(v_parts, ', '));
+            EXECUTE v_call INTO v_oresult;
+            RETURN jsonb_build_object('ok', true, 'operator', 'operator',
+                'name', v_opname, 'result', v_oresult);
+        END;
     ELSIF v_op = 'flow' THEN
         v_spec := rvbbit._alert_interpolate(coalesce(p_action->>'spec', ''), v_ctx);
         IF btrim(v_spec) = '' THEN
@@ -8143,5 +8214,96 @@ mod tests {
         assert_eq!(state, 0, "its per-entity state is gone");
         let again: bool = Spi::get_one("SELECT rvbbit.delete_alert('d1')").unwrap().unwrap();
         assert!(!again, "delete returns false for a missing rule");
+    }
+
+    #[pg_test]
+    fn alert_metric_condition_rides_the_verdict() {
+        // a metric-ref condition reads the referenced metric's latest KPI verdict
+        Spi::run(
+            "INSERT INTO rvbbit.metric_observations (metric_name, data_as_of, status) \
+             VALUES ('mc_fail', now(), 'fail'), ('mc_pass', now(), 'pass')",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT rvbbit.define_alert('mc_a', '{\"kind\":\"metric\",\"metric\":\"mc_fail\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb, '{\"consecutive_n\":1}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT rvbbit.define_alert('mc_b', '{\"kind\":\"metric\",\"metric\":\"mc_pass\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb, '{\"consecutive_n\":1}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        let fail_st: String = Spi::get_one("SELECT last_status FROM rvbbit.alert_state WHERE rule_name='mc_a'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fail_st, "fail", "a metric with a 'fail' verdict drives the alert to fail");
+        let pass_st: String = Spi::get_one("SELECT last_status FROM rvbbit.alert_state WHERE rule_name='mc_b'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pass_st, "pass", "a metric with a 'pass' verdict stays passing");
+    }
+
+    #[pg_test]
+    fn alert_operator_action_invokes_the_operator() {
+        // a stand-in operator (plain SQL fn + a catalog row) exercises the dispatch
+        // plumbing — rendered typed positional args — without a live model call
+        Spi::run("CREATE OR REPLACE FUNCTION rvbbit._t_echo(a text) RETURNS jsonb LANGUAGE sql AS $$ SELECT jsonb_build_object('got', a) $$")
+            .unwrap();
+        Spi::run(
+            "INSERT INTO rvbbit.operators (name, shape, arg_names, arg_types, return_type, model, system_prompt, user_prompt, parser) \
+             VALUES ('_t_echo','scalar','{a}','{text}','jsonb','x','x','x','raw_text')",
+        )
+        .unwrap();
+        let got: String = Spi::get_one(
+            "SELECT rvbbit._alert_dispatch('r','APAC','enter_fail', \
+             '{\"operator\":\"operator\",\"operator_name\":\"_t_echo\",\"args\":{\"a\":\"{entity}\"}}'::jsonb)->'result'->>'got'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(got, "APAC", "the operator ran with the entity-rendered arg");
+    }
+
+    #[pg_test(error = "operator action: unknown operator nope")]
+    fn alert_operator_action_unknown_operator_errors() {
+        Spi::run(
+            "SELECT rvbbit._alert_dispatch('r','e','enter_fail', \
+             '{\"operator\":\"operator\",\"operator_name\":\"nope\"}'::jsonb)",
+        )
+        .unwrap();
+    }
+
+    #[pg_test(error = "operator action: operator _t_badtype has an invalid arg type wat")]
+    fn alert_operator_action_rejects_invalid_arg_type() {
+        // a hostile/garbage arg_type in the catalog must be rejected, not concatenated
+        Spi::run("CREATE OR REPLACE FUNCTION rvbbit._t_badtype(a text) RETURNS jsonb LANGUAGE sql AS $$ SELECT '{}'::jsonb $$")
+            .unwrap();
+        Spi::run(
+            "INSERT INTO rvbbit.operators (name, shape, arg_names, arg_types, return_type, model, system_prompt, user_prompt, parser) \
+             VALUES ('_t_badtype','scalar','{a}','{wat}','jsonb','x','x','x','raw_text')",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT rvbbit._alert_dispatch('r','e','enter_fail', \
+             '{\"operator\":\"operator\",\"operator_name\":\"_t_badtype\",\"args\":{\"a\":\"x\"}}'::jsonb)",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn alert_metric_condition_without_name_is_an_error_not_silent() {
+        // bypass define_alert's guard by inserting a malformed rule directly; the
+        // sweep must surface it as an error (caught per-rule), not a silent no-op
+        Spi::run(
+            "INSERT INTO rvbbit.alert_rules (name, version, condition_spec, fire_policy, action_spec, cardinality, fan_out_cap) \
+             VALUES ('mc_bad', 1, '{\"kind\":\"metric\"}'::jsonb, '{}'::jsonb, '{\"operator\":\"noop\"}'::jsonb, 'per_entity', 100)",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO rvbbit.alert_control (name, cadence_tier) VALUES ('mc_bad','normal')").unwrap();
+        let errors: i32 = Spi::get_one("SELECT (rvbbit.alert_sweep('normal')->>'errors')::int")
+            .unwrap()
+            .unwrap();
+        assert!(errors >= 1, "a metric condition with no metric name surfaces as a sweep error, not a silent stale");
     }
 }
