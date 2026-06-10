@@ -824,7 +824,7 @@ unsafe fn recognize_push_expr(
             }
         }
         pg_sys::NodeTag::T_OpExpr => push_one_qual(
-            try_recognize_clause(node, scan_varno, parent, plan),
+            try_recognize_clause(node, scan_varno, parent, plan, require_complete_or_branch),
             &mut plan.quals,
         ),
         pg_sys::NodeTag::T_ScalarArrayOpExpr => push_one_qual(
@@ -870,6 +870,9 @@ unsafe fn try_recognize_clause(
     scan_varno: pg_sys::Index,
     parent: *mut pg_sys::PlanState,
     plan: &mut PushedQualPlan,
+    // When true the caller needs an EXACT result (it will skip ExecQual). When
+    // false the qual is only a superset pre-filter and ExecQual re-checks.
+    exact: bool,
 ) -> Option<PushedQual> {
     if node.is_null() {
         return None;
@@ -880,6 +883,23 @@ unsafe fn try_recognize_clause(
     let op = node as *mut pg_sys::OpExpr;
     let opno = (*op).opno.to_u32();
     let push_op = recognize_op(opno)?;
+    // mvcc-04/05: keep PostgreSQL as the authority for text predicates the
+    // Arrow-side evaluator can't replicate faithfully.
+    match push_op {
+        // The Rust LIKE matcher treats _/% as wildcards and ignores PG's ESCAPE,
+        // making it strictly MORE permissive than PG — a safe superset pre-filter,
+        // but never the exact (ExecQual-skipping) evaluator.
+        PushOp::Like if exact => return None,
+        // ILIKE case-folding and NOT LIKE/NOT ILIKE negation are not guaranteed
+        // supersets of PG semantics, so they can't even pre-filter safely (a
+        // subset pre-filter drops rows ExecQual can never re-add) → fully residual.
+        PushOp::ILike | PushOp::NotLike | PushOp::NotILike => return None,
+        // Text equality under a non-deterministic collation: Rust byte-equality
+        // is a SUBSET of collation-equality (misses rows the collation treats as
+        // equal), so it is unsafe even as a pre-filter → fully residual.
+        PushOp::Eq if collation_maybe_nondeterministic((*op).inputcollid) => return None,
+        _ => {}
+    }
     let args = (*op).args;
     if args.is_null() || (*args).length != 2 {
         return None;
@@ -1045,6 +1065,18 @@ fn is_supported_push_typoid(typoid: u32) -> bool {
 
 /// PG operator OIDs for the comparison ops we recognize. Source:
 /// src/include/catalog/pg_operator.dat.
+/// Conservatively true when a comparison's collation might be non-deterministic
+/// (so Rust byte-equality is not faithful). The builtin `C` collation and the
+/// database default are always deterministic; `InvalidOid` means the comparison
+/// isn't collation-sensitive (e.g. integers). Any other (explicit / ICU)
+/// collation is treated as potentially non-deterministic — correctness over a
+/// rare lost pushdown. (mvcc-05)
+fn collation_maybe_nondeterministic(collid: pg_sys::Oid) -> bool {
+    collid != pg_sys::InvalidOid
+        && collid != pg_sys::C_COLLATION_OID
+        && collid != pg_sys::DEFAULT_COLLATION_OID
+}
+
 fn recognize_op(opno: u32) -> Option<PushOp> {
     use PushOp::*;
     Some(match opno {

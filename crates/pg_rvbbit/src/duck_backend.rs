@@ -411,11 +411,11 @@ fn engine_query_json(
         match crate::df::query_engine(layout, query, max_rows) {
             Ok(payload) => Some(payload),
             Err(err) => {
-                if matches!(layout, "mem" | "memory") {
+                // ops-03: vortex (like mem) falls back to native/heap, not the
+                // sidecar — re-reading the same .vortex via the sidecar would just
+                // re-fail. Every layout must honor "heap is always the fallback".
+                if matches!(layout, "mem" | "memory" | "vortex" | "vortex_scan") {
                     return fail_open_or_error(engine, query, max_rows, &err);
-                }
-                if matches!(layout, "vortex" | "vortex_scan") {
-                    return engine_error(engine, &err);
                 }
                 pgrx::warning!(
                     "rvbbit.{engine}_query_json: in-process DF failed ({err}); falling back to sidecar"
@@ -448,9 +448,7 @@ fn engine_query_json(
             result_format,
         ) {
             Ok(p) => p,
-            Err(err) if matches!(layout, "vortex" | "vortex_scan") => {
-                return engine_error(engine, &err);
-            }
+            // ops-03: vortex sidecar errors fall open to native/heap like every other layout.
             Err(err) => return fail_open_or_error(engine, query, max_rows, &err),
         }
     };
@@ -489,22 +487,13 @@ fn engine_query_json(
                         .get("error")
                         .and_then(Value::as_str)
                         .unwrap_or("rvbbit-duck returned non-ok status");
-                    if matches!(layout, "vortex" | "vortex_scan") {
-                        return engine_error(engine, fallback_err);
-                    }
                     return fail_open_or_error(engine, query, max_rows, fallback_err);
-                }
-                Err(fallback_err) if matches!(layout, "vortex" | "vortex_scan") => {
-                    return engine_error(engine, &fallback_err);
                 }
                 Err(fallback_err) => {
                     return fail_open_or_error(engine, query, max_rows, &fallback_err);
                 }
             }
         } else {
-            if matches!(layout, "vortex" | "vortex_scan") {
-                return engine_error(engine, err);
-            }
             return fail_open_or_error(engine, query, max_rows, err);
         }
     }
@@ -532,9 +521,7 @@ fn engine_query_json(
                 SidecarResultFormat::Json,
             ) {
                 Ok(p) => p,
-                Err(sidecar_err) if matches!(layout, "vortex" | "vortex_scan") => {
-                    return engine_error(engine, &sidecar_err);
-                }
+                // ops-03: vortex falls open to native/heap like every other layout.
                 Err(sidecar_err) => {
                     return fail_open_or_error(engine, query, max_rows, &sidecar_err)
                 }
@@ -544,18 +531,12 @@ fn engine_query_json(
                     .get("error")
                     .and_then(Value::as_str)
                     .unwrap_or("rvbbit-duck returned non-ok status");
-                if matches!(layout, "vortex" | "vortex_scan") {
-                    return engine_error(engine, err);
-                }
                 return fail_open_or_error(engine, query, max_rows, err);
             }
             match payload_to_json_objects(&fallback_payload, &columns, max_rows) {
                 Ok(out) => out,
                 Err(json_err) => return fail_open_or_error(engine, query, max_rows, &json_err),
             }
-        }
-        Err(err) if matches!(layout, "vortex" | "vortex_scan") => {
-            return engine_error(engine, &err);
         }
         Err(err) => return fail_open_or_error(engine, query, max_rows, &err),
     };
@@ -731,10 +712,6 @@ fn arrow_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<Value, String
         }
     };
     Ok(value)
-}
-
-fn engine_error(engine: &str, err: &str) -> JsonB {
-    pgrx::error!("rvbbit.{engine}_query_json: {err}");
 }
 
 fn fail_open_or_error(engine: &str, query: &str, max_rows: i32, err: &str) -> JsonB {

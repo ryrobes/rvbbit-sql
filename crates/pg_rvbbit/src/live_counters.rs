@@ -102,6 +102,22 @@ pub fn bump_scan_epoch() {
     SCAN_EPOCH.get().fetch_add(1, Ordering::SeqCst);
 }
 
+/// Defer the scan-epoch bump until the CURRENT transaction commits
+/// (concurrency-01). Bumping the shared epoch while a compaction's catalog
+/// writes are still uncommitted lets a concurrent pooled reader advance its
+/// epoch watermark on stale rows and then permanently serve pre-compact data.
+/// A post-commit callback bumps only after the new row groups are visible to
+/// other backends. On abort nothing fires, so the epoch never moves for a
+/// rolled-back compaction. Registering the callback more than once per
+/// transaction is harmless — the epoch is a watermark; extra increments still
+/// invalidate caches correctly.
+pub fn bump_scan_epoch_on_commit() {
+    if !SHMEM_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, bump_scan_epoch);
+}
+
 /// Current cross-backend scan epoch (0 when shmem isn't ready).
 pub fn scan_epoch() -> u64 {
     if !SHMEM_READY.load(Ordering::Relaxed) {

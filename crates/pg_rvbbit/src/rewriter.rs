@@ -675,7 +675,13 @@ unsafe fn try_duck_backend_rewrite(
     if query_source.is_empty() || query_source.to_ascii_lowercase().contains("rvbbit.") {
         return false;
     }
-    if crate::time_travel::has_as_of_timestamp_directive(query_source) {
+    // mvcc-02: bail on AS OF — both the inline comment directive AND the
+    // rvbbit.as_of_generation / rvbbit.as_of_timestamp GUCs (active_as_of_enabled).
+    // The DuckDB backend reads current parquet with no generation predicate, so a
+    // GUC-driven historical query must fall through to the native path.
+    if crate::time_travel::has_as_of_timestamp_directive(query_source)
+        || crate::time_travel::active_as_of_enabled()
+    {
         return false;
     }
 
@@ -719,6 +725,16 @@ unsafe fn try_duck_backend_rewrite(
             | "datafusion_vortex"
             | "datafusion_mem"
     ) {
+        log_route_probe(query_source, route_doc, route_probe.cache_hit, false);
+        return false;
+    }
+
+    // mvcc-07: a collation-sensitive ORDER BY cannot be served by the engines —
+    // DuckDB/DataFusion sort text in binary order and the jsonb_to_recordset
+    // wrapper does not re-impose PG's collation order, so the rows come back in
+    // the wrong order (and under LIMIT, the WRONG rows). Fall through to native,
+    // which lets PostgreSQL do the collation-correct sort.
+    if query_orders_by_collatable_text(query) {
         log_route_probe(query_source, route_doc, route_probe.cache_hit, false);
         return false;
     }
@@ -794,6 +810,42 @@ fn duck_route_doc_for_probe(query_sql: &str) -> DuckRouteProbe {
         doc: out,
         cache_hit: false,
     }
+}
+
+/// True if any ORDER BY sort key is a collatable text type whose collation is
+/// not provably byte-order (anything other than the `C` collation — POSIX and a
+/// real default/ICU/libc collation all sort differently from DuckDB/DataFusion's
+/// binary order). Used to keep such queries on the native path. (mvcc-07)
+unsafe fn query_orders_by_collatable_text(query: *mut pg_sys::Query) -> bool {
+    let sort = (*query).sortClause;
+    let tlist = (*query).targetList;
+    if sort.is_null() || tlist.is_null() {
+        return false;
+    }
+    for s in 0..(*sort).length as usize {
+        let sgc = (*(*sort).elements.add(s)).ptr_value as *mut pg_sys::SortGroupClause;
+        if sgc.is_null() {
+            continue;
+        }
+        let sort_ref = (*sgc).tleSortGroupRef;
+        for t in 0..(*tlist).length as usize {
+            let tle = (*(*tlist).elements.add(t)).ptr_value as *mut pg_sys::TargetEntry;
+            if tle.is_null() || (*tle).ressortgroupref != sort_ref {
+                continue;
+            }
+            let node = (*tle).expr as *mut pg_sys::Node;
+            let typ = pg_sys::exprType(node);
+            let collatable = typ == pg_sys::TEXTOID
+                || typ == pg_sys::VARCHAROID
+                || typ == pg_sys::BPCHAROID
+                || typ == pg_sys::NAMEOID;
+            if collatable && pg_sys::exprCollation(node) != pg_sys::C_COLLATION_OID {
+                return true;
+            }
+            break;
+        }
+    }
+    false
 }
 
 unsafe fn duck_output_columns(query: *mut pg_sys::Query) -> Option<Vec<DuckOutputColumn>> {

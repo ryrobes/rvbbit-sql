@@ -4014,10 +4014,15 @@ fn build_features(
         like_count: count_word(&lowered, "like"),
         not_like_count: count_substr(&lowered, "not like"),
         fixed_contains_like_count: fixed_contains_like_count(sql),
-        regex_count: count_substr(&lowered, "regex_replace(")
-            + count_substr(&lowered, "regexp_replace(")
-            + count_word_fn(&lowered, "regex_replace")
-            + count_word_fn(&lowered, "regexp_replace"),
+        // mvcc-06: PG regex has POSIX semantics (backrefs, [[:class:]], locale
+        // case-folding) that DuckDB/DataFusion (RE2) do not match. Count the
+        // whole regexp_* function family AND the POSIX match operators
+        // (~ ~* !~ !~* all contain '~') so duck_availability's regex veto pins
+        // any regex query to the native, heap-equivalent path. Overcounting only
+        // makes routing more conservative, never wrong.
+        regex_count: count_substr(&lowered, "regexp_")
+            + count_substr(&lowered, "regex_replace")
+            + count_substr(&lowered, "~"),
         limit_bucket: limit_bucket(&lowered),
         offset_present: has_word(&lowered, "offset"),
         group_expr_count_bucket: bucket(group_exprs, &[0, 1, 2, 4, 8, 16]),
@@ -4735,6 +4740,17 @@ fn candidate_availability(
     }
     if let Some(reason) = candidate_denied_by_table_policy(candidate, tables) {
         return (false, reason);
+    }
+    // mvcc-02: AS OF time-travel is only correct on the native parquet path,
+    // which filters row groups by the resolved generation and applies tombstones
+    // generation-aware. The duck/datafusion/hive/mem engines and pg_rowstore
+    // (the shadow heap) all read CURRENT data, so they would silently return
+    // latest rows for a historical query. Force AS OF onto the native path.
+    if crate::time_travel::active_as_of_enabled() && candidate != Candidate::RvbbitNative {
+        return (
+            false,
+            "AS OF time-travel is served only by the native parquet path".to_string(),
+        );
     }
     match candidate {
         Candidate::DuckVector => vector_availability("DuckDB", features, tables),

@@ -206,10 +206,11 @@ fn lookup_text_dictionary_row_groups(
         return Ok(None);
     }
     let col_esc = col.replace('\'', "''");
+    // mvcc-03/10: row_groups_visible applies the snapshot floor.
     let sql = format!(
         "SELECT rg.rg_id, rg.path, rg.n_rows, \
                 td.path, td.n_values, td.n_nulls, td.n_empty, td.n_bytes \
-         FROM rvbbit.row_groups rg \
+         FROM rvbbit.row_groups_visible rg \
          LEFT JOIN rvbbit.text_dictionaries td \
            ON td.table_oid = rg.table_oid \
           AND td.rg_id = rg.rg_id \
@@ -466,16 +467,21 @@ fn lookup_paths_with_stats(
 ) -> Result<Vec<RowGroupPathStats>, String> {
     let mut row_groups = Vec::new();
     Spi::connect(|client| -> Result<(), String> {
+        // mvcc-03/10: read through row_groups_visible so SNAPSHOT tables
+        // (min_visible_generation > 0) never sum/scan across hidden generations.
+        // For APPEND tables (floor 0) this is identical to rvbbit.row_groups.
         let sql = if let Some(layout) = variant_layout {
             let layout = layout.replace('\'', "''");
             format!(
-                "SELECT path, stats::text FROM rvbbit.row_group_variants \
-                 WHERE table_oid = {rel_oid}::oid AND layout = '{layout}' \
-                 ORDER BY rg_id"
+                "SELECT v.path, v.stats::text FROM rvbbit.row_group_variants v \
+                 JOIN rvbbit.row_groups_visible rg \
+                   ON rg.table_oid = v.table_oid AND rg.rg_id = v.rg_id \
+                 WHERE v.table_oid = {rel_oid}::oid AND v.layout = '{layout}' \
+                 ORDER BY v.rg_id"
             )
         } else {
             format!(
-                "SELECT path, stats::text FROM rvbbit.row_groups \
+                "SELECT path, stats::text FROM rvbbit.row_groups_visible \
                  WHERE table_oid = {rel_oid}::oid \
                  ORDER BY rg_id"
             )
@@ -1323,11 +1329,17 @@ fn group_count_map_catalog(
         return Ok(None);
     }
     let col = group_col.replace('\'', "''");
+    // mvcc-03/10: group_stats has no generation column, so join to
+    // row_groups_visible on (table_oid, rg_id) to drop stats rows whose row
+    // group is hidden under the snapshot floor (SNAPSHOT tables). The join is
+    // 1:1 (one visible row group per rg_id), so per-group counts aren't inflated.
     let sql = format!(
-        "SELECT group_value_text, sum(count)::bigint \
-         FROM rvbbit.group_stats \
-         WHERE table_oid = {rel_oid}::oid AND group_col = '{col}' \
-         GROUP BY group_value_text"
+        "SELECT gs.group_value_text, sum(gs.count)::bigint \
+         FROM rvbbit.group_stats gs \
+         JOIN rvbbit.row_groups_visible rgv \
+           ON rgv.table_oid = gs.table_oid AND rgv.rg_id = gs.rg_id \
+         WHERE gs.table_oid = {rel_oid}::oid AND gs.group_col = '{col}' \
+         GROUP BY gs.group_value_text"
     );
     let mut out: HashMap<Option<String>, i64> = HashMap::default();
     Spi::connect(|client| -> Result<(), pgrx::spi::Error> {

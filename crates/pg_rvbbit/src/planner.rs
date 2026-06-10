@@ -126,11 +126,35 @@ unsafe extern "C-unwind" fn rvbbit_planner_hook(
         return call_next_planner(parse, query_string, cursor_options, bound_params);
     }
 
+    // Stash the value to restore in a thread-local so an xact/subxact abort
+    // callback can put it back if standard_planner longjmps past the restore
+    // below (ffi-02 — otherwise nestloop stays globally disabled for the whole
+    // pooled session).
     let saved = pg_sys::enable_nestloop;
+    SAVED_NESTLOOP.with(|s| s.set(Some(saved)));
     pg_sys::enable_nestloop = false;
     let planned = call_next_planner(parse, query_string, cursor_options, bound_params);
     pg_sys::enable_nestloop = saved;
+    SAVED_NESTLOOP.with(|s| s.set(None));
     planned
+}
+
+thread_local! {
+    /// Set while the planner hook has temporarily forced `enable_nestloop=false`
+    /// for a join-heavy rvbbit query. Restored on the normal path; restored by
+    /// `reset_nestloop_guard()` from the abort callback if planning errored.
+    static SAVED_NESTLOOP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restore `enable_nestloop` if the planner hook had overridden it and the
+/// restore was skipped by a longjmp. Called from the xact/subxact abort
+/// callbacks. Must not panic/ereport.
+pub(crate) unsafe fn reset_nestloop_guard() {
+    SAVED_NESTLOOP.with(|s| {
+        if let Some(v) = s.take() {
+            pg_sys::enable_nestloop = v;
+        }
+    });
 }
 
 unsafe fn call_next_planner(
