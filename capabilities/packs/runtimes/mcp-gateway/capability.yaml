@@ -18,7 +18,16 @@ runtime:
   port: 9180
   health_path: /health
   env:
-    RVBBIT_DSN: postgresql://postgres:rvbbit@postgres:5432/rvbbit
+    # In-network DSN the deployed gateway uses to reach Postgres. `docker compose
+    # up` (run by warren at deploy time) resolves it in this order:
+    #   1. RVBBIT_GATEWAY_DSN — explicit override; dev points this at the dev
+    #      service name (see the Makefile), since warren-agent's own control-plane
+    #      DSN there is the host-mapped port, not the in-network one.
+    #   2. RVBBIT_DSN — inherited from warren, already templated from
+    #      POSTGRES_DB/POSTGRES_PASSWORD in the uber/release compose, so a
+    #      customized install flows through to the gateway automatically.
+    #   3. the literal default below (matches the uber/release compose defaults).
+    RVBBIT_DSN: "${RVBBIT_GATEWAY_DSN:-${RVBBIT_DSN:-postgresql://postgres:rvbbit@postgres:5432/rvbbit}}"
     # Bearer token guarding the tool-invocation / subprocess-spawn endpoints.
     # When set, the gateway enforces it AND the pg-rvbbit backend sends it (set
     # the SAME value on the pg-rvbbit service). Empty = open on the trusted

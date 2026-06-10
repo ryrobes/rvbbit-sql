@@ -5555,7 +5555,8 @@
             "GOOGLE_CLOUD_QUOTA_PROJECT": "${GOOGLE_CLOUD_QUOTA_PROJECT:-}",
             "OPENAI_API_KEY": "${OPENAI_API_KEY:-}",
             "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY:-}",
-            "RVBBIT_DSN": "postgresql://postgres:rvbbit@postgres:5432/rvbbit"
+            "RVBBIT_DSN": "${RVBBIT_GATEWAY_DSN:-${RVBBIT_DSN:-postgresql://postgres:rvbbit@postgres:5432/rvbbit}}",
+            "RVBBIT_GATEWAY_TOKEN": "${RVBBIT_GATEWAY_TOKEN:-}"
           },
           "handler": "mcp_gateway",
           "health_path": "/health",

@@ -19,6 +19,15 @@ MCP_GATEWAY_IMAGE ?= rvbbit/mcp-gateway:local
         release-compose-up release-uber-up
 
 RVBBIT_DSN ?= postgresql://postgres:rvbbit@localhost:55433/bench
+# Data-plane DSN handed to capability runtimes (e.g. the MCP gateway) that run
+# *inside* the docker network and reach Postgres by its in-network service name,
+# not the host-mapped port. Kept separate from RVBBIT_DSN above (the host-side
+# control-plane DSN warren-agent itself dials). Exported so the `docker compose
+# up` warren runs for a deployed runtime can expand ${RVBBIT_GATEWAY_DSN} in the
+# rendered env. In uber/release this is unset and the gateway inherits warren's
+# already-templated RVBBIT_DSN instead.
+RVBBIT_GATEWAY_DSN ?= postgresql://postgres:rvbbit@pg-rvbbit:5432/bench
+export RVBBIT_GATEWAY_DSN
 WARREN_NODE ?= local-warren
 WARREN_WORK_DIR ?= .rvbbit/warren
 WARREN_LABELS ?= {"capability":true,"docker":true,"gpu":false}
