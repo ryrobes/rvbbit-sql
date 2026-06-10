@@ -2841,16 +2841,29 @@ unsafe fn emit_indexed_row(
     state: &mut RustScanState,
     scan_slot: *mut pg_sys::TupleTableSlot,
 ) -> *mut pg_sys::TupleTableSlot {
+    // perf-scan-04: rows from the eq-index resolve to (batch_idx, row) and are
+    // contiguous by batch, so build the Arrow column/qual readers ONCE per batch
+    // (each rebuild re-downcasts every column + allocs 3 Vecs) instead of per
+    // emitted row. The readers own Arc clones of the batch arrays, so they stay
+    // valid across rows until the batch_idx changes.
+    let mut memo_batch_idx: Option<usize> = None;
+    let mut qual_readers: Vec<ColumnReader> = Vec::new();
+    let mut qual_rhs_readers: Vec<ColumnReader> = Vec::new();
+    let mut column_readers: Vec<NeededColumn> = Vec::new();
     while state.indexed_row_ref_idx < state.indexed_row_refs.len() {
         let row_ref = state.indexed_row_refs[state.indexed_row_ref_idx];
         state.indexed_row_ref_idx += 1;
-        let Some(batch) = state.cached_batches.get(row_ref.batch_idx).cloned() else {
-            continue;
-        };
-        let qual_readers =
-            build_qual_readers_for_batch(&batch, &state.pg_attrs, &state.pushed_quals);
-        let qual_rhs_readers =
-            build_qual_rhs_readers_for_batch(&batch, &state.pg_attrs, &state.pushed_quals);
+        if memo_batch_idx != Some(row_ref.batch_idx) {
+            let Some(batch) = state.cached_batches.get(row_ref.batch_idx).cloned() else {
+                continue;
+            };
+            qual_readers = build_qual_readers_for_batch(&batch, &state.pg_attrs, &state.pushed_quals);
+            qual_rhs_readers =
+                build_qual_rhs_readers_for_batch(&batch, &state.pg_attrs, &state.pushed_quals);
+            column_readers =
+                build_column_readers_for_batch(&batch, &state.pg_attrs, &state.needed_attnums);
+            memo_batch_idx = Some(row_ref.batch_idx);
+        }
         if let Some(expr) = &state.pushed_expr {
             if !pushed_expr_pass(
                 &qual_readers,
@@ -2863,8 +2876,6 @@ unsafe fn emit_indexed_row(
             }
         }
 
-        let column_readers =
-            build_column_readers_for_batch(&batch, &state.pg_attrs, &state.needed_attnums);
         fill_slot_from_batch(scan_slot, row_ref.row, &column_readers);
         pg_sys::ExecStoreVirtualTuple(scan_slot);
 

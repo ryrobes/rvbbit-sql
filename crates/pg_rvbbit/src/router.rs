@@ -4411,21 +4411,55 @@ fn hive_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> 
     }
 }
 
+thread_local! {
+    // perf-router-08: per-table variant readiness (vortex_scan, hive) cached with
+    // the same TTL + correctness-neutral contract as ROUTE_TABLE_STATE_MEMO. The
+    // availability checks otherwise issue a fresh EXISTS round-trip per table per
+    // vortex/hive candidate on the routing hot path (3x redundant per query). A
+    // <=TTL-stale readiness only affects which engine is CHOSEN — every candidate
+    // returns identical results and falls back — so it never changes correctness,
+    // at worst delaying use of a just-built variant by one TTL.
+    static VARIANT_READY_MEMO: std::cell::RefCell<std::collections::HashMap<u32, (Instant, (bool, bool))>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `(vortex_scan_ready, hive_ready)` for one table — one SPI query for both,
+/// memoized per (oid, TTL). On any error (e.g. variant catalog absent) returns
+/// `(false, false)`, matching the prior per-probe `.unwrap_or(false)`.
+fn variant_readiness(table_oid: u32) -> (bool, bool) {
+    let ttl = route_stamp_ttl();
+    if !ttl.is_zero() {
+        if let Some(v) = VARIANT_READY_MEMO.with(|m| {
+            m.borrow()
+                .get(&table_oid)
+                .filter(|(at, _)| at.elapsed() < ttl)
+                .map(|(_, v)| *v)
+        }) {
+            return v;
+        }
+    }
+    let sql = format!(
+        "SELECT coalesce(bool_or(rg.layout = 'vortex_scan'), false), \
+                coalesce(bool_or(rg.layout LIKE 'hive:%'), false) \
+         FROM rvbbit.row_group_variants rg \
+         JOIN rvbbit.layout_variant_status s \
+           ON s.table_oid = rg.table_oid AND s.layout = rg.layout \
+         WHERE rg.table_oid = {table_oid}::oid AND s.status = 'ready'"
+    );
+    let v = match Spi::get_two::<bool, bool>(&sql) {
+        Ok((vx, hv)) => (vx.unwrap_or(false), hv.unwrap_or(false)),
+        Err(_) => (false, false),
+    };
+    if !ttl.is_zero() {
+        VARIANT_READY_MEMO.with(|m| {
+            m.borrow_mut().insert(table_oid, (Instant::now(), v));
+        });
+    }
+    v
+}
+
 fn table_has_hive_variant(table_oid: u32) -> bool {
-    Spi::get_one::<bool>(&format!(
-        "SELECT EXISTS (\
-             SELECT 1 FROM rvbbit.row_group_variants rg \
-             JOIN rvbbit.layout_variant_status s \
-               ON s.table_oid = rg.table_oid AND s.layout = rg.layout \
-             WHERE rg.table_oid = {table_oid}::oid \
-               AND rg.layout LIKE 'hive:%' \
-               AND s.status = 'ready' \
-             LIMIT 1\
-         )"
-    ))
-    .ok()
-    .flatten()
-    .unwrap_or(false)
+    variant_readiness(table_oid).1
 }
 
 fn duck_vortex_availability(
@@ -4582,20 +4616,7 @@ fn vortex_temporal_allowed() -> bool {
 }
 
 fn table_has_vortex_scan(table_oid: u32) -> bool {
-    Spi::get_one::<bool>(&format!(
-        "SELECT EXISTS (\
-             SELECT 1 FROM rvbbit.row_group_variants rg \
-             JOIN rvbbit.layout_variant_status s \
-               ON s.table_oid = rg.table_oid AND s.layout = rg.layout \
-             WHERE rg.table_oid = {table_oid}::oid \
-               AND rg.layout = 'vortex_scan' \
-               AND s.status = 'ready' \
-             LIMIT 1\
-         )"
-    ))
-    .ok()
-    .flatten()
-    .unwrap_or(false)
+    variant_readiness(table_oid).0
 }
 
 fn candidate_gate_enabled(candidate: Candidate) -> bool {
