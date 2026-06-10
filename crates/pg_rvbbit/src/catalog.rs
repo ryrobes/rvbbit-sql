@@ -7236,11 +7236,15 @@ DECLARE
     v_now         timestamptz := clock_timestamp();
     v_sweep_id    bigint;
     v_rule        record;
-    v_cond        record;
+    v_row         record;
+    v_j           jsonb;
     v_query       text;
     v_n           integer;
     v_cooldown    integer;
     v_cap         integer;
+    v_thresh      numeric;
+    v_cmp         text;
+    v_score       numeric;
     v_rules       integer := 0;
     v_transitions integer := 0;
     v_enqueued    integer := 0;
@@ -7275,21 +7279,34 @@ BEGIN
         v_n        := greatest(coalesce((v_rule.fire_policy->>'consecutive_n')::int, 1), 1);
         v_cooldown := greatest(coalesce((v_rule.fire_policy->>'cooldown_secs')::int, 0), 0);
         v_cap      := greatest(coalesce(v_rule.fan_out_cap, 100), 1);
+        v_thresh   := nullif(v_rule.condition_spec->>'threshold', '')::numeric;
+        v_cmp      := coalesce(v_rule.condition_spec->>'compare', 'gte');
 
         BEGIN  -- per-rule subtransaction: an error here won't abort the sweep
             IF coalesce(v_rule.condition_spec->>'kind', 'sql') <> 'sql' THEN
-                CONTINUE;  -- operator/flow condition kinds arrive in P5
+                CONTINUE;  -- non-SQL kinds: the query can already call any operator
             END IF;
             v_query := v_rule.condition_spec->>'query';
             IF v_query IS NULL OR btrim(v_query) = '' THEN
                 RAISE EXCEPTION 'alert %: condition_spec.query is empty', v_rule.name;
             END IF;
 
-            -- The condition query must return columns entity_key (text) and
-            -- status (text); '' entity_key + status='fail' for a scalar breach.
-            FOR v_cond IN EXECUTE v_query LOOP
-                v_ek     := coalesce(v_cond.entity_key, '');
-                v_status := v_cond.status;
+            -- Read each row as jsonb so the query may return a `status` (text
+            -- 'pass'/'fail') OR a `score` (numeric, thresholded below) — a missing
+            -- key comes back NULL instead of erroring. '' entity_key = scalar.
+            FOR v_row IN EXECUTE 'SELECT to_jsonb(q) AS j FROM (' || v_query || ') q' LOOP
+                v_j      := v_row.j;
+                v_ek     := coalesce(v_j ->> 'entity_key', '');
+                v_status := v_j ->> 'status';
+                v_score  := nullif(v_j ->> 'score', '')::numeric;
+                -- score-not-vibe: derive status from a numeric score + threshold,
+                -- so a semantic/anomaly score rides the same edge-trigger path.
+                IF v_status IS NULL AND v_score IS NOT NULL AND v_thresh IS NOT NULL THEN
+                    v_status := CASE
+                        WHEN v_cmp = 'lte' AND v_score <= v_thresh THEN 'fail'
+                        WHEN v_cmp = 'gte' AND v_score >= v_thresh THEN 'fail'
+                        ELSE 'pass' END;
+                END IF;
 
                 SELECT last_status, consecutive, last_changed_at, last_fired_at
                   INTO v_ps, v_pc, v_pchg, v_pfire
@@ -7330,12 +7347,13 @@ BEGIN
                 END IF;
 
                 INSERT INTO rvbbit.alert_state
-                    (rule_name, entity_key, last_status, consecutive, last_changed_at, last_fired_at, updated_at)
+                    (rule_name, entity_key, last_status, score, consecutive, last_changed_at, last_fired_at, updated_at)
                 VALUES
-                    (v_rule.name, v_ek, v_status, v_consec, v_changed,
+                    (v_rule.name, v_ek, v_status, v_score, v_consec, v_changed,
                      CASE WHEN v_did_enqueue THEN v_now ELSE v_pfire END, v_now)
                 ON CONFLICT (rule_name, entity_key) DO UPDATE
                    SET last_status     = EXCLUDED.last_status,
+                       score           = EXCLUDED.score,
                        consecutive     = EXCLUDED.consecutive,
                        last_changed_at = EXCLUDED.last_changed_at,
                        last_fired_at   = EXCLUDED.last_fired_at,
@@ -8034,9 +8052,57 @@ mod tests {
         assert!(custom_ok, "a custom schedule flows through to the plan");
     }
 
-    #[pg_test(error = "pg_cron is not installed")]
+    #[pg_test(error = "pg_cron is not installed; run rvbbit.alert_sweep()/alert_worker_tick() manually.")]
     fn alerts_install_cron_requires_pg_cron_to_schedule() {
         // the test harness has no pg_cron, so the live (non-dry-run) path errors clearly
         Spi::run("SELECT rvbbit.alerts_install_cron()").unwrap();
+    }
+
+    // ---- P5: scored / semantic conditions (score + threshold -> status) ----
+    #[pg_test]
+    fn alert_sweep_scored_condition_thresholds_to_status() {
+        Spi::run("CREATE TABLE _sc (entity_key text, score numeric)").unwrap();
+        Spi::run("INSERT INTO _sc VALUES ('US', 0.95)").unwrap();
+        Spi::run(
+            "SELECT rvbbit.define_alert('sc_hi', \
+             '{\"kind\":\"sql\",\"query\":\"SELECT entity_key, score FROM _sc\",\"threshold\":0.8,\"compare\":\"gte\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("sc_hi"), 1, "a score above the gte threshold breaches and fires");
+
+        let s: f64 = Spi::get_one(
+            "SELECT score::float8 FROM rvbbit.alert_state WHERE rule_name='sc_hi' AND entity_key='US'",
+        )
+        .unwrap()
+        .unwrap();
+        assert!((s - 0.95).abs() < 1e-9, "the numeric score is recorded in alert_state");
+
+        // below threshold → no fire
+        Spi::run("CREATE TABLE _sc2 (entity_key text, score numeric)").unwrap();
+        Spi::run("INSERT INTO _sc2 VALUES ('EU', 0.5)").unwrap();
+        Spi::run(
+            "SELECT rvbbit.define_alert('sc_lo', \
+             '{\"kind\":\"sql\",\"query\":\"SELECT entity_key, score FROM _sc2\",\"threshold\":0.8,\"compare\":\"gte\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("sc_lo"), 0, "a score below the gte threshold does not fire");
+    }
+
+    #[pg_test]
+    fn alert_sweep_scored_lte_breaches_on_low_score() {
+        Spi::run("CREATE TABLE _sc (entity_key text, score numeric)").unwrap();
+        Spi::run("INSERT INTO _sc VALUES ('svc', 0.2)").unwrap();
+        Spi::run(
+            "SELECT rvbbit.define_alert('sc_lte', \
+             '{\"kind\":\"sql\",\"query\":\"SELECT entity_key, score FROM _sc\",\"threshold\":0.5,\"compare\":\"lte\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        assert_eq!(qcount("sc_lte"), 1, "a low score breaches an lte threshold (e.g. health dropping)");
     }
 }
