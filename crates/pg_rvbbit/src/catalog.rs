@@ -7299,6 +7299,8 @@ DECLARE
     v_eligible    boolean;
     v_did_enqueue boolean;
     v_kind        text;
+    v_expr        text;
+    v_has_expr    boolean;
 BEGIN
     INSERT INTO rvbbit.alert_sweep_runs (tier, started_at)
     VALUES (p_tier, v_now) RETURNING sweep_id INTO v_sweep_id;
@@ -7339,6 +7341,16 @@ BEGIN
             IF v_query IS NULL OR btrim(v_query) = '' THEN
                 RAISE EXCEPTION 'alert %: condition produced no query (kind=%)', v_rule.name, v_kind;
             END IF;
+            -- optional boolean expression over the query's columns: a row fails
+            -- when the expr is true. Postgres rejects a non-boolean expr (the
+            -- CASE/WHEN type check), so a bad expr surfaces as a per-rule error.
+            v_expr := v_rule.condition_spec->>'expr';
+            v_has_expr := (v_kind = 'sql' AND coalesce(btrim(v_expr), '') <> '');
+            IF v_has_expr THEN
+                v_query := format(
+                    'SELECT q2.*, CASE WHEN (%s) THEN ''fail'' ELSE ''pass'' END AS _alert_status FROM (%s) q2',
+                    v_expr, v_query);
+            END IF;
 
             -- Read each row as jsonb so the query may return a `status` (text
             -- 'pass'/'fail') OR a `score` (numeric, thresholded below) — a missing
@@ -7346,7 +7358,7 @@ BEGIN
             FOR v_row IN EXECUTE 'SELECT to_jsonb(q) AS j FROM (' || v_query || ') q' LOOP
                 v_j      := v_row.j;
                 v_ek     := coalesce(v_j ->> 'entity_key', '');
-                v_status := v_j ->> 'status';
+                v_status := CASE WHEN v_has_expr THEN v_j ->> '_alert_status' ELSE v_j ->> 'status' END;
                 v_score  := nullif(v_j ->> 'score', '')::numeric;
                 -- score-not-vibe: derive status from a numeric score + threshold,
                 -- so a semantic/anomaly score rides the same edge-trigger path.
@@ -8305,5 +8317,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(errors >= 1, "a metric condition with no metric name surfaces as a sweep error, not a silent stale");
+    }
+
+    #[pg_test]
+    fn alert_sql_expr_condition_drives_status() {
+        // a boolean expression over the query's columns decides fail/pass per row
+        Spi::run(
+            "SELECT rvbbit.define_alert('ex1', \
+             '{\"kind\":\"sql\",\"query\":\"SELECT region AS entity_key, drop_pct FROM (VALUES (''US'',0.25),(''EU'',0.05)) v(region,drop_pct)\",\"expr\":\"drop_pct > 0.15\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb, '{\"consecutive_n\":1}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
+        let us: String = Spi::get_one("SELECT last_status FROM rvbbit.alert_state WHERE rule_name='ex1' AND entity_key='US'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(us, "fail", "US drop_pct 0.25 > 0.15 → the expr is true → fail");
+        let eu: String = Spi::get_one("SELECT last_status FROM rvbbit.alert_state WHERE rule_name='ex1' AND entity_key='EU'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(eu, "pass", "EU drop_pct 0.05 is not > 0.15 → pass");
+    }
+
+    #[pg_test]
+    fn alert_sql_expr_non_boolean_is_a_sweep_error() {
+        // a non-boolean expr is rejected by the CASE/WHEN type check, surfacing
+        // as a per-rule sweep error rather than silently mis-firing
+        Spi::run(
+            "SELECT rvbbit.define_alert('ex_bad', \
+             '{\"kind\":\"sql\",\"query\":\"SELECT ''x'' AS entity_key, 5 AS n\",\"expr\":\"n + 1\"}'::jsonb, \
+             '{\"operator\":\"noop\"}'::jsonb, '{\"consecutive_n\":1}'::jsonb)",
+        )
+        .unwrap();
+        let errors: i32 = Spi::get_one("SELECT (rvbbit.alert_sweep('normal')->>'errors')::int")
+            .unwrap()
+            .unwrap();
+        assert!(errors >= 1, "a non-boolean expr (n + 1) surfaces as a sweep error");
     }
 }
