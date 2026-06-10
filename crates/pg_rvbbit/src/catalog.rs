@@ -7200,6 +7200,22 @@ BEGIN
 END;
 $fn$;
 
+-- Remove a rule and everything keyed to it. Returns true if it existed.
+CREATE OR REPLACE FUNCTION rvbbit.delete_alert(p_name text) RETURNS boolean
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_existed boolean;
+BEGIN
+    SELECT EXISTS (SELECT 1 FROM rvbbit.alert_rules WHERE name = p_name) INTO v_existed;
+    DELETE FROM rvbbit.alert_events  WHERE rule_name = p_name;
+    DELETE FROM rvbbit.alert_queue   WHERE rule_name = p_name;
+    DELETE FROM rvbbit.alert_state   WHERE rule_name = p_name;
+    DELETE FROM rvbbit.alert_control WHERE name = p_name;
+    DELETE FROM rvbbit.alert_rules   WHERE name = p_name;
+    RETURN v_existed;
+END;
+$fn$;
+
 -- ---- Global kill-switch ----------------------------------------------------
 CREATE OR REPLACE FUNCTION rvbbit.alerts_enabled() RETURNS boolean
 LANGUAGE sql STABLE AS $fn$
@@ -8104,5 +8120,28 @@ mod tests {
         .unwrap();
         Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
         assert_eq!(qcount("sc_lte"), 1, "a low score breaches an lte threshold (e.g. health dropping)");
+    }
+
+    #[pg_test]
+    fn delete_alert_removes_rule_and_all_state() {
+        Spi::run(
+            "SELECT rvbbit.define_alert('d1', '{\"kind\":\"sql\",\"query\":\"SELECT 1\"}'::jsonb, '{\"operator\":\"noop\"}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO rvbbit.alert_state (rule_name, entity_key, last_status) VALUES ('d1','x','fail')").unwrap();
+        Spi::run("INSERT INTO rvbbit.alert_events (rule_name) VALUES ('d1')").unwrap();
+
+        let existed: bool = Spi::get_one("SELECT rvbbit.delete_alert('d1')").unwrap().unwrap();
+        assert!(existed, "delete returns true when the rule existed");
+        let rules: i64 = Spi::get_one("SELECT count(*)::bigint FROM rvbbit.alert_catalog WHERE name='d1'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rules, 0, "the rule is gone from the catalog");
+        let state: i64 = Spi::get_one("SELECT count(*)::bigint FROM rvbbit.alert_state WHERE rule_name='d1'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, 0, "its per-entity state is gone");
+        let again: bool = Spi::get_one("SELECT rvbbit.delete_alert('d1')").unwrap().unwrap();
+        assert!(!again, "delete returns false for a missing rule");
     }
 }
