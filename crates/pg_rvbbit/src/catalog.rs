@@ -675,6 +675,15 @@ BEGIN
     END IF;
     dest_local := substring(prefix_norm FROM 8);   -- strip "file://"
 
+    -- security-04: dest_local is interpolated into COPY ... TO PROGRAM shell
+    -- commands below. SQL-quote-doubling only stops it breaking the SQL literal,
+    -- not the shell, so a path like '/tmp/x; rm -rf /' would inject. Require a
+    -- strict safe-path allowlist (letters, digits, / _ . -) — no spaces or shell
+    -- metacharacters. (table_oid and rg_id are numeric, so they're already safe.)
+    IF dest_local !~ '^/[A-Za-z0-9_./-]+$' THEN
+        RAISE EXCEPTION 'rvbbit.migrate_to_cold: cold_url_prefix path may only contain letters, digits, and / _ . - (got %)', dest_local;
+    END IF;
+
     -- Create destination directory tree using COPY TO PROGRAM, which is the
     -- least-bad way to invoke `mkdir -p` from inside a function. We're
     -- already running as a superuser-only extension, so this stays inside
@@ -2144,6 +2153,9 @@ CREATE OR REPLACE FUNCTION rvbbit.register_backend(
 LANGUAGE plpgsql
 AS $rb$
 BEGIN
+    -- security-03: backends.endpoint_url drives outbound HTTP (an SSRF target);
+    -- gate registration like the other DDL rather than leaving it ungated.
+    PERFORM rvbbit.require_mcp_gateway_admin();
     INSERT INTO rvbbit.backends
         (name, transport, endpoint_url, batch_size, max_concurrent,
          timeout_ms, auth_header_env, transport_opts, description,
@@ -4654,6 +4666,10 @@ CREATE OR REPLACE FUNCTION rvbbit.register_mcp_server(
 LANGUAGE plpgsql
 AS $rm$
 BEGIN
+    -- security-03: writing mcp_servers == arbitrary command execution on the
+    -- gateway host (command/args are spawned). Gate it like the other gateway
+    -- DDL instead of leaving the most dangerous registration ungated.
+    PERFORM rvbbit.require_mcp_gateway_admin();
     INSERT INTO rvbbit.mcp_servers
         (name, transport, command, args, env, url, auth_header_env,
          timeout_ms, description)

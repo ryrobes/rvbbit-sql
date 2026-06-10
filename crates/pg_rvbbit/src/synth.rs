@@ -281,6 +281,21 @@ pub(crate) fn run_synth_sql_op(
                 continue;
             }
         };
+        // security-02: reject model-authored SQL that writes (a ModifyTable node)
+        // BEFORE executing it. validate_sql PREPARE+EXPLAINs with an empty input,
+        // so it never runs the statement (no side effects), and a rejection just
+        // feeds the error back for another attempt — only read-only SELECTs reach
+        // the cache / the sample+full execution below.
+        let validate_target = format!(
+            "WITH _input AS (SELECT * FROM jsonb_to_recordset('[]'::jsonb) AS _t({})) \
+             SELECT to_jsonb(q) FROM ({}) q",
+            coldefs(&schema),
+            gen_sql
+        );
+        if let Err(e) = validate_sql(&validate_target) {
+            last_err = format!("generated SQL is not a read-only SELECT: {e}");
+            continue;
+        }
         // Validate on a sample (cheap); on success, run on the full rowset.
         match execute_over_input(&sample, &schema, &gen_sql) {
             Ok(_) => {
@@ -489,6 +504,14 @@ pub(crate) fn run_synth_sql_scalar(op: &OpDef, inputs: &Value, opts: &Value) -> 
                 continue;
             }
         };
+        // security-02: reject a model expression that writes before apply_scalar
+        // executes it (on the example + the real value). validate_sql PREPAREs the
+        // wrapped expression and rejects any ModifyTable; rejections retry.
+        let validate_target = format!("SELECT ({expr})::text FROM (SELECT ''::text AS x) _v");
+        if let Err(e) = validate_sql(&validate_target) {
+            last_err = format!("generated expression is not a read-only SELECT: {e}");
+            continue;
+        }
         match (apply_scalar(&expr, &example), apply_scalar(&expr, value)) {
             (Ok(_), Ok(out)) => {
                 synth_cache_put(&op.name, &shape, &p_hash, &expr, &json!({ "kind": "scalar", "attempts": attempt + 1 }), false);

@@ -2063,6 +2063,12 @@ thread_local! {
         std::cell::RefCell::new(BloomCache::default());
 }
 
+/// resources-05: per-backend ceiling on the bloom cache. Each entry holds the
+/// decoded Sbbf blocks for one parquet file; without a bound a long-lived pooled
+/// backend that scans many files over many compaction generations accumulates
+/// them forever. Random-evict to this ceiling — blooms reload cheaply on a miss.
+const BLOOM_CACHE_MAX_ENTRIES: usize = 2048;
+
 fn bloom_cache_key(path: &str) -> BloomCacheKey {
     let (file_len, file_mtime_nanos) = std::fs::metadata(path)
         .ok()
@@ -2129,7 +2135,15 @@ fn load_blooms_for_path(path: &str) -> std::sync::Arc<HashMap<String, Sbbf>> {
         }
     }
     let arc = std::sync::Arc::new(blooms);
-    BLOOM_CACHE.with(|c| c.borrow_mut().entries.insert(key, arc.clone()));
+    BLOOM_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.entries.len() >= BLOOM_CACHE_MAX_ENTRIES {
+            if let Some(victim) = c.entries.keys().next().cloned() {
+                c.entries.remove(&victim);
+            }
+        }
+        c.entries.insert(key, arc.clone());
+    });
     arc
 }
 

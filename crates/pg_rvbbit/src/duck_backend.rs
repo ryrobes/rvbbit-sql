@@ -1023,8 +1023,15 @@ fn ensure_shared_daemon(key: &DuckSharedKey, socket_path: &str) -> Result<(), St
         .open(&lock_path)
     {
         Ok(_lock) => {
-            spawn_shared_daemon(key, socket_path)?;
-            let result = wait_for_shared_socket(socket_path, Duration::from_secs(5));
+            // resources-04: always remove the lock file, even when spawn fails.
+            // Previously the `?` early-return on a transient spawn error (EAGAIN,
+            // binary momentarily missing) leaked the lock, permanently blocking
+            // auto-launch of the shared daemon until an operator deleted it.
+            let spawn = spawn_shared_daemon(key, socket_path);
+            let result = match spawn {
+                Ok(()) => wait_for_shared_socket(socket_path, Duration::from_secs(5)),
+                Err(e) => Err(e),
+            };
             let _ = fs::remove_file(&lock_path);
             result
         }

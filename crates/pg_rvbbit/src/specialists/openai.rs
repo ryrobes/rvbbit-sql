@@ -125,6 +125,21 @@ impl Transport for OpenAiEmbeddingsTransport {
                 inputs.len()
             )));
         }
+        // security-10: a matching count is not enough — a non-conforming endpoint
+        // can return duplicate or gappy indices (e.g. [0,0,2] for 3 inputs), which
+        // would silently map the wrong vector to a row and corrupt the embedding
+        // cache / Lance / KNN. After the sort the indices must be exactly 0..n-1.
+        for (expected, item) in parsed.data.iter().enumerate() {
+            if item.index as usize != expected {
+                return Err(ProviderError::BadResponse(format!(
+                    "openai embeddings: non-contiguous response index {} at position {} \
+                     (expected 0..{}); cannot safely map embeddings back to inputs",
+                    item.index,
+                    expected,
+                    inputs.len().saturating_sub(1)
+                )));
+            }
+        }
 
         let outputs: Vec<Value> = parsed
             .data

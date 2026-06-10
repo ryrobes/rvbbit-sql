@@ -898,12 +898,6 @@ fn export_to_parquet_impl(
         None => qualified.clone(),
     };
 
-    let first_rg_id: i64 = Spi::get_one(&format!(
-        "SELECT coalesce(max(rg_id), -1) + 1 \
-         FROM rvbbit.row_groups WHERE table_oid = {rel_oid}::oid"
-    ))?
-    .unwrap_or(0);
-
     // Phase 2 generation allocation. The advisory_xact_lock is per-table:
     // class id 0x52564254 (ASCII "RVBT") + table_oid packed into one bigint,
     // so two concurrent compacts on the SAME table serialize but two on
@@ -925,6 +919,17 @@ fn export_to_parquet_impl(
          SELECT g FROM bumped, locked"
     ))?
     .unwrap_or(1);
+
+    // concurrency-03/mvcc-09: choose first_rg_id only AFTER the per-table advisory
+    // lock above is held. The lock serializes concurrent compacts on the same
+    // table, so a second compaction blocks until the first commits and then reads
+    // its row groups — otherwise both could pick the same rg_id and overwrite each
+    // other's parquet files (committed catalog row pointing at rolled-back bytes).
+    let first_rg_id: i64 = Spi::get_one(&format!(
+        "SELECT coalesce(max(rg_id), -1) + 1 \
+         FROM rvbbit.row_groups WHERE table_oid = {rel_oid}::oid"
+    ))?
+    .unwrap_or(0);
 
     let mut plans = introspect_columns(rel_oid)?;
     extend_plans_with_legacy_shreds(&mut plans);
