@@ -6006,7 +6006,15 @@ BEGIN
                OR v_prev_fp IS DISTINCT FROM v_fp           -- schema drift (or first run)
                OR v_ft_present IS DISTINCT FROM v_remote_n  -- foreign tables missing/extra
             THEN
+                v_t0 := clock_timestamp();
                 PERFORM rvbbit.fdw_import(v_srv->>'name', v_remote, v_fdw_schema, v_spec_tbls);
+                -- Record the IMPORT FOREIGN SCHEMA phase as a first-class row: it was
+                -- previously invisible (no per-table row), so the overview could not
+                -- show import time. action='import', rows_loaded = # foreign tables.
+                -- Its ABSENCE in a sweep = the import was skipped (schema unchanged).
+                INSERT INTO rvbbit.sync_runs(run_id, job_name, action, rows_loaded, elapsed_ms, started_at)
+                VALUES (v_rid, v_jn, 'import', v_remote_n,
+                        (extract(epoch FROM clock_timestamp() - v_t0) * 1000)::int, v_t0);
                 UPDATE rvbbit.sync_jobs
                    SET fdw_fingerprint = v_fp, fdw_imported_at = now()
                  WHERE job_name = v_jn;
