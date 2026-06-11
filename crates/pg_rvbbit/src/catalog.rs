@@ -5676,6 +5676,53 @@ BEGIN
 END;
 $$;
 
+-- Cheap remote-schema fingerprint over postgres_fdw — a single stable foreign
+-- table per server over the remote information_schema.columns (created once,
+-- reused), hashed. Lets run_sync SKIP the expensive DROP + IMPORT FOREIGN SCHEMA
+-- (a catalog-cache-invalidation storm that slows the whole DB) when the source
+-- shape is unchanged. Returns the fingerprint + remote table count (so the caller
+-- can also detect missing local foreign tables). ~20ms vs per-table DDL.
+CREATE OR REPLACE FUNCTION rvbbit.fdw_remote_fingerprint(
+    server_name text, remote_schema text, only_tables text[] DEFAULT NULL
+) RETURNS TABLE(fingerprint text, n_tables int)
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_meta text := format('%I.%I', 'rvbbit_meta', 'cols__' || server_name);
+BEGIN
+    CREATE SCHEMA IF NOT EXISTS rvbbit_meta;
+    EXECUTE format($f$
+        CREATE FOREIGN TABLE IF NOT EXISTS %s (
+            table_schema text, table_name text, column_name text,
+            ordinal_position int, data_type text,
+            character_maximum_length int, numeric_precision int, numeric_scale int, udt_name text
+        ) SERVER %I OPTIONS (schema_name 'information_schema', table_name 'columns')
+    $f$, v_meta, server_name);
+    RETURN QUERY EXECUTE format($q$
+        SELECT md5(coalesce(string_agg(
+                   table_name||'|'||ordinal_position||'|'||column_name||'|'||data_type||'|'||
+                   coalesce(character_maximum_length::text,'')||'|'||
+                   coalesce(numeric_precision::text,'')||'|'||
+                   coalesce(numeric_scale::text,'')||'|'||udt_name,
+                   ',' ORDER BY table_name, ordinal_position), '')),
+               count(DISTINCT table_name)::int
+        FROM %s
+        WHERE table_schema = %L AND (%L::text[] IS NULL OR table_name = ANY(%L::text[]))
+    $q$, v_meta, remote_schema, only_tables, only_tables);
+END $fn$;
+
+-- Escape hatch: clear stored fingerprints so the next run re-imports (NULL job =
+-- all). Use after a manual fdw change, or if you suspect drift slipped past the
+-- fingerprint. Returns the number of jobs reset.
+CREATE OR REPLACE FUNCTION rvbbit.reset_sync_fingerprint(p_job_name text DEFAULT NULL)
+RETURNS integer LANGUAGE sql AS $$
+    WITH upd AS (
+        UPDATE rvbbit.sync_jobs SET fdw_fingerprint = NULL
+        WHERE p_job_name IS NULL OR job_name = p_job_name
+        RETURNING 1
+    )
+    SELECT count(*)::int FROM upd;
+$$;
+
 -- ── Retention reaper ──────────────────────────────────────────────────
 -- Bound disk + AS OF history for SNAPSHOT tables (min_visible_generation > 0).
 -- Reaps generations strictly BELOW the live snapshot (never the current one)
@@ -5758,6 +5805,8 @@ CREATE TABLE IF NOT EXISTS rvbbit.sync_jobs (
     enabled     boolean NOT NULL DEFAULT true,
     spec        jsonb NOT NULL,
     last_run_at timestamptz,
+    fdw_fingerprint text,           -- last-seen remote schema fingerprint (skip re-import when unchanged)
+    fdw_imported_at timestamptz,    -- when the foreign tables were last (re-)imported
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
@@ -5878,6 +5927,12 @@ DECLARE
     v_rows       bigint;
     v_action     text;
     v_job_ok     boolean;
+    -- fingerprint gate (skip DROP+IMPORT FOREIGN SCHEMA when the remote is unchanged)
+    v_fp         text;
+    v_prev_fp    text;
+    v_remote_n   int;
+    v_ft_present int;
+    v_force      boolean;
 BEGIN
     -- Self-healing singleton lock. Steal it when the holder is provably gone —
     -- its backend pid is no longer active, or the lock predates this server's
@@ -5924,7 +5979,38 @@ BEGIN
             PERFORM rvbbit.fdw_setup_server(
                 v_srv->>'name', v_srv->>'host', (v_srv->>'port')::int, v_srv->>'dbname',
                 v_srv->>'user', v_srv->>'password', coalesce((v_srv->>'fetch_size')::int, 10000));
-            PERFORM rvbbit.fdw_import(v_srv->>'name', v_remote, v_fdw_schema, v_spec_tbls);
+
+            -- Skip the expensive DROP + IMPORT FOREIGN SCHEMA (a catalog-invalidation
+            -- storm that slows every query DB-wide) when the remote shape is unchanged
+            -- AND the foreign tables are all present. Re-import only on drift / first
+            -- run / missing FTs / explicit force. ~20ms fingerprint vs per-table DDL.
+            v_fp := NULL; v_remote_n := NULL;
+            BEGIN
+                SELECT fingerprint, n_tables INTO v_fp, v_remote_n
+                FROM rvbbit.fdw_remote_fingerprint(v_srv->>'name', v_remote, v_spec_tbls);
+            EXCEPTION WHEN OTHERS THEN
+                v_fp := NULL; v_remote_n := NULL;  -- can't fingerprint => import (surfaces the real error)
+            END;
+            SELECT fdw_fingerprint INTO v_prev_fp FROM rvbbit.sync_jobs WHERE job_name = v_jn;
+            SELECT count(*) INTO v_ft_present
+            FROM pg_foreign_table ft
+            JOIN pg_class c ON c.oid = ft.ftrelid
+            JOIN pg_namespace ns ON ns.oid = c.relnamespace
+            WHERE ns.nspname = v_fdw_schema
+              AND (v_spec_tbls IS NULL OR c.relname = ANY(v_spec_tbls));
+            v_force := lower(coalesce(current_setting('rvbbit.sync_force_reimport', true), 'off'))
+                       IN ('1','true','on','yes');
+
+            IF v_force
+               OR v_fp IS NULL                              -- couldn't fingerprint => be safe
+               OR v_prev_fp IS DISTINCT FROM v_fp           -- schema drift (or first run)
+               OR v_ft_present IS DISTINCT FROM v_remote_n  -- foreign tables missing/extra
+            THEN
+                PERFORM rvbbit.fdw_import(v_srv->>'name', v_remote, v_fdw_schema, v_spec_tbls);
+                UPDATE rvbbit.sync_jobs
+                   SET fdw_fingerprint = v_fp, fdw_imported_at = now()
+                 WHERE job_name = v_jn;
+            END IF;
         EXCEPTION WHEN OTHERS THEN
             v_job_ok := false;
             INSERT INTO rvbbit.sync_runs(run_id, job_name, action, error, started_at)
