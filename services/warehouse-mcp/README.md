@@ -139,6 +139,16 @@ to `/api/d/<slug>/q`, runs read-only on the mirror (`safe_select`-gated), and lo
 `publish_dashboard` / `update_dashboard` / `list_dashboards` / `get_dashboard`. Tables
 auto-create on startup (no migration). Design: [`docs/DASHBOARDS_PLAN.md`](../../docs/DASHBOARDS_PLAN.md).
 
+**Phase 1 — catalog-linked inspection.** `dashboard_crawl(slug)` extracts each dashboard's
+data dependencies — parses the `rvbbitQuery(...)` calls, reconciles the queries it actually
+ran (from `mcp_activity`), an OpenRouter LLM fallback (`OPENROUTER_API_KEY`) for artifacts
+that dodge the contract — and resolves every query to its tables via `EXPLAIN` (catches
+plain heap tables, not just rvbbit-managed). Stored in `rvbbit.dashboard_deps` (a derived,
+regenerable index; re-run on publish/update). `get_dashboard` returns the `sources` (the
+lens "open base SQL" list); `dashboard_dependents(object)` is impact analysis ("what breaks
+if I change this table"); views `rvbbit.dashboard_sources` / `rvbbit.dashboard_dependents`.
+No `rvbbitQuery`/metric found ⇒ flagged `materialized` (a "dead tree" — nudge against).
+
 ## Config (env)
 `WAREHOUSE_DSN` · `RVBBIT_CATALOG_GRAPH` (default `db_catalog`) ·
 `WAREHOUSE_SCHEMAS` (CSV allowlist; default = all but rvbbit/pg_*) ·
