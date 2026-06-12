@@ -129,6 +129,16 @@ it's hidden from `search_data`. Logging is best-effort; with a read-only data ro
   password → **Allow**. No header.
 - **Claude Code (either mode):** `claude mcp add --transport http rvbbit-warehouse <url>/mcp --header "Authorization: Bearer $WAREHOUSE_MCP_KEY"`
 
+## Dashboards (Phase 0 — artifacts that live + work outside Claude)
+Claude calls `publish_dashboard(name, html, team?, description?)` → stored versioned in
+`rvbbit.dashboards` and served at `<WAREHOUSE_PUBLIC_URL>/d/<slug>` behind the same login
+(a `wh_session` cookie). **Live, not baked:** build the artifact to fetch through the
+injected client — `const {columns, rows} = await rvbbitQuery("SELECT ...")` — which posts
+to `/api/d/<slug>/q`, runs read-only on the mirror (`safe_select`-gated), and logs to
+`mcp_activity` (`tool='dashboard_query'`, tagged with the slug + the viewer's email). Tools:
+`publish_dashboard` / `update_dashboard` / `list_dashboards` / `get_dashboard`. Tables
+auto-create on startup (no migration). Design: [`docs/DASHBOARDS_PLAN.md`](../../docs/DASHBOARDS_PLAN.md).
+
 ## Config (env)
 `WAREHOUSE_DSN` · `RVBBIT_CATALOG_GRAPH` (default `db_catalog`) ·
 `WAREHOUSE_SCHEMAS` (CSV allowlist; default = all but rvbbit/pg_*) ·

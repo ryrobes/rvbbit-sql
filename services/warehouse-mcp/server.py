@@ -31,7 +31,7 @@ from __future__ import annotations
 # (DictRow vs TupleRow covariance); the code is correct at runtime (see --selftest).
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
-import hmac, json, os, sys, time
+import hmac, json, os, re, sys, time
 
 import psycopg
 from psycopg import sql as pgsql
@@ -405,8 +405,10 @@ def _summary(tool, res):
     return None
 
 
-def _record(tool, args, res, err, elapsed_ms):
+def _record(tool, args, res, err, elapsed_ms, caller_override=None):
     caller, client_id = _caller()
+    if caller_override:                  # browser/dashboard sessions aren't OAuth-token calls
+        caller = caller_override
     rows = res.get("row_count") if isinstance(res, dict) else None
     engine = res.get("engine") if isinstance(res, dict) else None
     as_of = args.get("as_of") if isinstance(args, dict) else None
@@ -439,6 +441,197 @@ def _logged(tool, args, thunk):
         _record(tool, args, res, err, int((time.time() - t0) * 1000))
 
 
+# ── dashboards registry (Phase 0: publish → store → serve live, outside Claude) ──
+# Claude publishes an artifact; it's stored versioned in rvbbit.dashboards and served at
+# <public>/d/<slug> behind the same login. The artifact fetches live data via the injected
+# `rvbbitQuery(sql)` client → /api/d/<slug>/q, which runs read-only on the MIRROR
+# (safe_select-gated) and logs to mcp_activity. The dashboard outlives the chat.
+
+_DASHBOARDS_DDL = """
+CREATE TABLE IF NOT EXISTS rvbbit.dashboards (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug        text UNIQUE NOT NULL,
+  name        text NOT NULL,
+  description text,
+  owner_email text,
+  team        text,
+  status      text DEFAULT 'live',            -- 'live' | 'materialized' (dead tree)
+  latest_version int DEFAULT 1,
+  created_at  timestamptz DEFAULT now(),
+  updated_at  timestamptz DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS rvbbit.dashboard_versions (
+  dashboard_id bigint NOT NULL REFERENCES rvbbit.dashboards(id) ON DELETE CASCADE,
+  version      int NOT NULL,
+  html         text NOT NULL,
+  kind         text DEFAULT 'live',
+  created_by   text, created_at timestamptz DEFAULT now(), notes text,
+  PRIMARY KEY (dashboard_id, version)
+);
+CREATE INDEX IF NOT EXISTS dashboards_team_idx ON rvbbit.dashboards (team, updated_at DESC);
+"""
+
+
+def _ensure_dashboard_tables():
+    try:
+        with _conn() as c:
+            c.execute(_DASHBOARDS_DDL)
+    except Exception as e:   # noqa: BLE001
+        print(f"WARNING: dashboards disabled (could not ensure tables): {e}", file=sys.stderr)
+
+
+def _slugify(name):
+    s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    return s[:60] or "dashboard"
+
+
+def _dash_url(slug):
+    public = os.environ.get("WAREHOUSE_PUBLIC_URL", "").rstrip("/")
+    return f"{public}/d/{slug}" if public else None
+
+
+def tool_publish_dashboard(name, html, team=None, description=None, kind="live"):
+    caller, _ = _caller()
+    base = _slugify(name)
+    with _conn() as c:
+        slug, n = base, 1
+        while c.execute("SELECT 1 FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone():
+            n += 1
+            slug = f"{base}-{n}"
+        d = c.execute(
+            "INSERT INTO rvbbit.dashboards (slug,name,description,owner_email,team,status,latest_version) "
+            "VALUES (%s,%s,%s,%s,%s,%s,1) RETURNING id", (slug, name, description, caller, team, kind)).fetchone()
+        c.execute("INSERT INTO rvbbit.dashboard_versions (dashboard_id,version,html,kind,created_by) "
+                  "VALUES (%s,1,%s,%s,%s)", (d["id"], html, kind, caller))
+    return {"slug": slug, "version": 1, "url": _dash_url(slug), "owner": caller, "kind": kind}
+
+
+def tool_update_dashboard(slug, html, notes=None):
+    caller, _ = _caller()
+    with _conn() as c:
+        d = c.execute("SELECT id, latest_version FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
+        if not d:
+            return {"error": {"code": "NOT_FOUND", "message": slug}}
+        nv = d["latest_version"] + 1
+        c.execute("INSERT INTO rvbbit.dashboard_versions (dashboard_id,version,html,created_by,notes) "
+                  "VALUES (%s,%s,%s,%s,%s)", (d["id"], nv, html, caller, notes))
+        c.execute("UPDATE rvbbit.dashboards SET latest_version=%s, updated_at=now() WHERE id=%s", (nv, d["id"]))
+    return {"slug": slug, "version": nv, "url": _dash_url(slug)}
+
+
+def tool_list_dashboards(team=None, search=None):
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT slug, name, description, owner_email, team, status, latest_version, updated_at "
+            "FROM rvbbit.dashboards "
+            "WHERE (%s::text IS NULL OR team=%s::text) "
+            "AND (%s::text IS NULL OR name ILIKE '%%'||%s::text||'%%' OR description ILIKE '%%'||%s::text||'%%') "
+            "ORDER BY updated_at DESC LIMIT 100", (team, team, search, search, search)).fetchall()
+    return {"dashboards": rows}
+
+
+def tool_get_dashboard(slug, version=None):
+    with _conn() as c:
+        d = c.execute("SELECT id, slug, name, description, owner_email, team, status, latest_version, created_at "
+                      "FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
+        if not d:
+            return {"error": {"code": "NOT_FOUND", "message": slug}}
+        v = int(version or d["latest_version"])
+        d["version"] = c.execute(
+            "SELECT version, html, kind, created_by, created_at, notes "
+            "FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s", (d["id"], v)).fetchone()
+    d["url"] = _dash_url(slug)
+    return d
+
+
+# MCP wrappers (named, so their docstring becomes the tool description Claude reads)
+def _mcp_publish_dashboard(name, html, team=None, description=None, kind="live"):
+    """Publish a dashboard so it lives + works OUTSIDE Claude — returns a shareable URL.
+    Build `html` as a self-contained page that fetches LIVE data via the injected client:
+    `const {columns, rows} = await rvbbitQuery("SELECT ...")` (returns {columns:[{name,type}],
+    rows:[[...]]}). Do NOT bake query results into the HTML — that makes a 'dead tree' with no
+    live data or inspectability. Design the queries first with validate_sql / run_sql."""
+    return _logged("publish_dashboard", {"name": name, "team": team, "kind": kind, "html_bytes": len(html or "")},
+                   lambda: tool_publish_dashboard(name, html, team, description, kind))
+
+
+def _mcp_update_dashboard(slug, html, notes=None):
+    """Publish a new version of an existing dashboard (by slug)."""
+    return _logged("update_dashboard", {"slug": slug, "html_bytes": len(html or ""), "notes": notes},
+                   lambda: tool_update_dashboard(slug, html, notes))
+
+
+def _mcp_list_dashboards(team=None, search=None):
+    """List published dashboards (optionally filter by team or a name/description search)."""
+    return _logged("list_dashboards", {"team": team, "search": search},
+                   lambda: tool_list_dashboards(team, search))
+
+
+def _mcp_get_dashboard(slug, version=None):
+    """Fetch a dashboard's metadata + source (to inspect or fork it)."""
+    return _logged("get_dashboard", {"slug": slug, "version": version},
+                   lambda: tool_get_dashboard(slug, version))
+
+
+# the data client injected into every served dashboard (binds rvbbitQuery to this slug)
+_DASH_SHIM = (
+    "<script>\n"
+    "window.RVBBIT_DASHBOARD={slug:__SLUG__};\n"
+    "window.rvbbitQuery=async function(sql,opts){opts=opts||{};"
+    "const r=await fetch('/api/d/'+__SLUG__+'/q',{method:'POST',headers:{'content-type':'application/json'},"
+    "body:JSON.stringify({sql:sql,as_of:opts.as_of||null})});const d=await r.json();"
+    "if(!r.ok||d.error){throw new Error((d.error&&d.error.message)||('query failed '+r.status));}return d;};\n"
+    "</script>\n")
+
+
+def _dash_shim(slug):
+    return _DASH_SHIM.replace("__SLUG__", json.dumps(slug))
+
+
+def register_dashboard_routes(m):
+    import auth
+    from urllib.parse import quote
+    from starlette.responses import HTMLResponse, RedirectResponse, Response
+
+    def _json(obj, status=200):   # default=str handles Decimal / datetime in query rows
+        return Response(json.dumps(obj, default=str), media_type="application/json", status_code=status)
+
+    @m.custom_route("/d/{slug}", methods=["GET"])
+    async def _view(request):
+        if not auth.read_session(request):
+            return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
+        slug = request.path_params["slug"]
+        with _conn() as c:
+            d = c.execute("SELECT id, latest_version FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
+            if not d:
+                return HTMLResponse("<h1>404 — no such dashboard</h1>", status_code=404)
+            v = c.execute("SELECT html FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
+                          (d["id"], d["latest_version"])).fetchone()
+        return HTMLResponse(_dash_shim(slug) + (v["html"] or ""))
+
+    @m.custom_route("/api/d/{slug}/q", methods=["POST"])
+    async def _data(request):
+        email = auth.read_session(request)
+        if not email:
+            return _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        slug = request.path_params["slug"]
+        try:
+            body = await request.json()
+        except Exception:   # noqa: BLE001
+            body = {}
+        sql = (body or {}).get("sql")
+        if not sql:
+            return _json({"error": {"code": "MISSING_SQL"}}, 400)
+        as_of = (body or {}).get("as_of")
+        t0 = time.time()
+        res = tool_run_sql(sql, as_of)
+        _record("dashboard_query", {"dashboard": slug, "sql": sql, "as_of": as_of},
+                res, res.get("error"), int((time.time() - t0) * 1000), caller_override=email)
+        return _json(res, 400 if res.get("error") else 200)
+
+    return _view, _data
+
+
 # ── MCP server ───────────────────────────────────────────────────────────────
 
 def _register(mcp):
@@ -460,6 +653,10 @@ def _register(mcp):
     mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(
         "run_sql", {"sql": sql, "as_of": as_of, "limit": limit},
         lambda: tool_run_sql(sql, as_of, limit)))
+    mcp.tool(name="publish_dashboard")(_mcp_publish_dashboard)
+    mcp.tool(name="update_dashboard")(_mcp_update_dashboard)
+    mcp.tool(name="list_dashboards")(_mcp_list_dashboards)
+    mcp.tool(name="get_dashboard")(_mcp_get_dashboard)
 
 
 def _selftest():
@@ -492,6 +689,7 @@ def _build_mcp():
     m = FastMCP("rvbbit-warehouse")
     _register(m)
     _ensure_activity_table()
+    _ensure_dashboard_tables()
     return m
 
 
@@ -516,7 +714,9 @@ def _build_mcp_oauth(public: str):
                 auth=auth.make_auth_settings(public))
     _register(m)
     _ensure_activity_table()
+    _ensure_dashboard_tables()
     auth.register_login_route(m, provider)
+    register_dashboard_routes(m)
 
     @m.custom_route("/health", methods=["GET"])
     async def _health(_req):

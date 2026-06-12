@@ -71,6 +71,8 @@ STATE_FILE = os.environ.get("WAREHOUSE_STATE_FILE", "")   # empty = in-memory on
 LOGIN_MAX_FAILS = 5       # per-IP failed logins ...
 LOGIN_WINDOW = 300        # ... within this many seconds → lockout
 MIN_PASSWORD_LEN = 12
+SESSION_COOKIE = "wh_session"
+SESSION_TTL = int(os.environ.get("WAREHOUSE_SESSION_TTL", str(12 * 3600)))   # browser view session
 
 
 def validate_config() -> list[str]:
@@ -305,6 +307,40 @@ def _client_ip(request: Request) -> str:
     return (xff.split(",")[0].strip() if xff else "") or (request.client.host if request.client else "?")
 
 
+def _creds_ok(email: str, password: str) -> bool:
+    good_pw = bool(LOGIN_PASSWORD) and hmac.compare_digest(password, LOGIN_PASSWORD)
+    allowed = (not ALLOWED_EMAILS) or (email in ALLOWED_EMAILS)
+    return bool(good_pw and allowed and email and "@" in email)
+
+
+# ── browser view session (cookie, for /d/<slug> dashboards) ──────────────────
+
+def set_session(resp, email: str, secure: bool) -> None:
+    """Sign an email into the wh_session cookie (same JWT secret as the OAuth tokens)."""
+    now = int(time.time())
+    tok = jwt.encode({"sub": email, "typ": "session", "iat": now, "exp": now + SESSION_TTL},
+                     JWT_SECRET, algorithm=JWT_ALG)
+    resp.set_cookie(SESSION_COOKIE, tok, max_age=SESSION_TTL, httponly=True,
+                    secure=secure, samesite="lax", path="/")
+
+
+def read_session(request: Request) -> str | None:
+    """The authenticated viewer email from the wh_session cookie, or None."""
+    tok = request.cookies.get(SESSION_COOKIE)
+    if not tok:
+        return None
+    try:
+        c = jwt.decode(tok, JWT_SECRET, algorithms=[JWT_ALG])
+        return c.get("sub") if c.get("typ") == "session" else None
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def _safe_next(nxt: str) -> str:
+    """Open-redirect guard: only same-site absolute paths."""
+    return nxt if (nxt.startswith("/") and not nxt.startswith("//")) else "/"
+
+
 # ── login page ───────────────────────────────────────────────────────────────
 
 def _page(body: str, status: int = 200) -> HTMLResponse:
@@ -324,16 +360,22 @@ def _page(body: str, status: int = 200) -> HTMLResponse:
 <div class=card>{body}</div>""", status_code=status)
 
 
-def _login_form(txn: str, error: str | None = None) -> HTMLResponse:
+def _login_form(hidden: dict, error: str | None = None,
+                cta: str = "Sign in", sub: str = "Sign in to your warehouse.") -> HTMLResponse:
     err = f'<div class=err>{html.escape(error)}</div>' if error else ""
+    fields = "".join(f'<input type=hidden name="{html.escape(k)}" value="{html.escape(str(v))}">'
+                     for k, v in hidden.items() if v)
     return _page(
-        f"""<h1>Data Warehouse</h1><p class=sub>Sign in to connect Claude to your warehouse.</p>
+        f"""<h1>Data Warehouse</h1><p class=sub>{html.escape(sub)}</p>
 <form method=post action=/login>
- <input type=hidden name=txn value="{html.escape(txn)}">
+ {fields}
  <label>Email</label><input name=email type=email autocomplete=username autofocus required>
  <label>Access password</label><input name=password type=password autocomplete=current-password required>
- <button type=submit>Authorize Claude</button>{err}
+ <button type=submit>{html.escape(cta)}</button>{err}
 </form>""", status=401 if error else 200)
+
+
+_EXPIRED = "<h1>Session expired</h1><p class=sub>Re-launch the connector from Claude to try again.</p>"
 
 
 def register_login_route(mcp, provider: WarehouseAuthProvider):
@@ -341,34 +383,42 @@ def register_login_route(mcp, provider: WarehouseAuthProvider):
     async def login(request: Request):
         if request.method == "GET":
             txn = request.query_params.get("txn", "")
-            if not provider.has_pending(txn):
-                return _page("<h1>Session expired</h1><p class=sub>Re-launch the connector from Claude to try again.</p>", 400)
-            return _login_form(txn)
+            if txn:   # OAuth (Claude) flow
+                return _login_form({"txn": txn}, cta="Authorize Claude",
+                                   sub="Sign in to connect Claude to your warehouse.") \
+                    if provider.has_pending(txn) else _page(_EXPIRED, 400)
+            # browser view session (a dashboard sent us here with ?next=)
+            nxt = _safe_next(request.query_params.get("next", "/"))
+            return _login_form({"next": nxt}, cta="Sign in", sub="Sign in to view your dashboards.")
 
         form = await request.form()
         txn = str(form.get("txn", ""))
+        nxt = _safe_next(str(form.get("next", "/")))
         email = str(form.get("email", "")).strip().lower()
         password = str(form.get("password", ""))
         ip = _client_ip(request)
         if _LIMITER.blocked(ip):
             return _page("<h1>Too many attempts</h1><p class=sub>Wait a few minutes, then try again.</p>", 429)
-        if not provider.has_pending(txn):
-            return _page("<h1>Session expired</h1><p class=sub>Re-launch the connector from Claude to try again.</p>", 400)
+        if txn and not provider.has_pending(txn):
+            return _page(_EXPIRED, 400)
 
         # Serialize credential checks: parallel guesses queue on this lock, so the
         # per-attempt cost (and the per-IP counter) actually rate-limits brute force.
         async with _LIMITER.lock:
-            good_pw = bool(LOGIN_PASSWORD) and hmac.compare_digest(password, LOGIN_PASSWORD)
-            allowed = (not ALLOWED_EMAILS) or (email in ALLOWED_EMAILS)
-            if not (good_pw and allowed and email and "@" in email):
+            if not _creds_ok(email, password):
                 _LIMITER.record_fail(ip)
                 await asyncio.sleep(1.0)
-                return _login_form(txn, error="Invalid email or password.")
+                hidden = {"txn": txn} if txn else {"next": nxt}
+                return _login_form(hidden, error="Invalid email or password.",
+                                   cta="Authorize Claude" if txn else "Sign in")
             _LIMITER.record_success(ip)
 
-        target = provider.complete_login(txn, email)
-        if not target:
-            return _page("<h1>Session expired</h1><p class=sub>Re-launch the connector from Claude to try again.</p>", 400)
-        return RedirectResponse(target, status_code=302)
+        if txn:   # OAuth: mint the code, redirect back to Claude
+            target = provider.complete_login(txn, email)
+            return RedirectResponse(target, status_code=302) if target else _page(_EXPIRED, 400)
+        # browser session: set the cookie, go where they were headed
+        resp = RedirectResponse(nxt, status_code=302)
+        set_session(resp, email, secure=request.url.scheme == "https")
+        return resp
 
     return login
