@@ -1,6 +1,0 @@
--- Upgrade pg_rvbbit 2.0.16 -> 2.0.2
---
--- AUTO-GENERATED STUB. Postgres needs this edge for ALTER EXTENSION UPDATE.
--- If this release changed the SQL surface (CREATE/ALTER TABLE/FUNCTION/VIEW,
--- new catalog columns, etc.), replace this comment with the upgrade DDL.
--- Verify with: make migration-check
