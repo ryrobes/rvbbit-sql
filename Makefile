@@ -134,6 +134,14 @@ reload-extension: ## Non-destructive extension reload/update; preserves KG/cache
 	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 \
 	  -c "CREATE EXTENSION IF NOT EXISTS pg_rvbbit;" \
 	  -c "ALTER EXTENSION pg_rvbbit UPDATE;"
+	# ALTER EXTENSION UPDATE only walks versioned migration edges; it does NOT
+	# re-run the extension's base schema SQL. So pure-SQL surfaces edited in place
+	# (e.g. sql/catalog_kg.sql) never reach an already-installed extension on a
+	# .so rebuild. Re-apply the idempotent ones here so a rebuild+reload always
+	# converges, independent of the migration-version chain. (CREATE OR REPLACE /
+	# IF NOT EXISTS throughout, so this is safe to run repeatedly.)
+	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 \
+	  -f - < crates/pg_rvbbit/sql/catalog_kg.sql
 
 bigfoot-load:    ## Load BFRO sightings CSV into rvbbit
 	$(COMPOSE) exec bench python /bench/bigfoot_bench.py load
