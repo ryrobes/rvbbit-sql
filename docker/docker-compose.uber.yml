@@ -170,6 +170,7 @@ services:
   # server already enforces read-only, but least-privilege is belt-and-suspenders).
   warehouse-mcp:
     profiles: ["warehouse"]
+    image: ${RVBBIT_WAREHOUSE_MCP_IMAGE:-ghcr.io/ryrobes/rvbbit-warehouse-mcp:${RVBBIT_VERSION:-latest}}
     build:
       context: ../services/warehouse-mcp
     container_name: rvbbit-warehouse-mcp

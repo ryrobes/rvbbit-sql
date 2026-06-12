@@ -30,6 +30,7 @@ TAG_LATEST=0
 SKIP_DB=0
 SKIP_LENS=0
 SKIP_WARREN=0
+SKIP_WAREHOUSE_MCP=0
 BUILD_CAPABILITIES=0
 DRY_RUN=0
 CHECK_PUBLIC=0
@@ -58,6 +59,7 @@ Options:
   --skip-db
   --skip-lens
   --skip-warren
+  --skip-warehouse-mcp     Skip the Warehouse MCP server image.
   --with-capabilities      Also build/push all catalog capability images.
   --skip-capabilities      Deprecated no-op; full catalog images are skipped by default.
   --check-public          After push, verify anonymous pull access with a clean Docker config.
@@ -79,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --skip-db) SKIP_DB=1; shift ;;
         --skip-lens) SKIP_LENS=1; shift ;;
         --skip-warren) SKIP_WARREN=1; shift ;;
+        --skip-warehouse-mcp) SKIP_WAREHOUSE_MCP=1; shift ;;
         --with-capabilities) BUILD_CAPABILITIES=1; shift ;;
         --skip-capabilities) BUILD_CAPABILITIES=0; shift ;;
         --check-public) CHECK_PUBLIC=1; shift ;;
@@ -255,6 +258,13 @@ fi
 if [[ "$SKIP_LENS" -eq 0 ]]; then
     build_image rvbbit-lens "$LENS_CONTEXT_DIR/Dockerfile" "$LENS_CONTEXT_DIR" "$PLATFORM" \
         --label "org.opencontainers.image.title=rvbbit-lens"
+fi
+
+# Warehouse MCP — a self-contained sidecar (server.py + requirements), so it builds
+# straight from services/warehouse-mcp; no staged release context needed.
+if [[ "$SKIP_WAREHOUSE_MCP" -eq 0 ]]; then
+    build_image rvbbit-warehouse-mcp "$ROOT/services/warehouse-mcp/Dockerfile" "$ROOT/services/warehouse-mcp" "$PLATFORM" \
+        --label "org.opencontainers.image.title=rvbbit-warehouse-mcp"
 fi
 
 if [[ "$BUILD_CAPABILITIES" -eq 1 ]]; then
