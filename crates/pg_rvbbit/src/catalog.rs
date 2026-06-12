@@ -5933,6 +5933,7 @@ DECLARE
     v_remote_n   int;
     v_ft_present int;
     v_force      boolean;
+    v_skip_variants boolean;
 BEGIN
     -- Self-healing singleton lock. Steal it when the holder is provably gone —
     -- its backend pid is no longer active, or the lock predates this server's
@@ -5953,6 +5954,15 @@ BEGIN
         RETURN;
     END IF;
     COMMIT;
+
+    -- Sync writes the snapshot (the time-travel generation) but skips the heavy
+    -- inline columnar-variant build (vortex) BY DEFAULT — a big sync shouldn't
+    -- monopolize the box building accelerators it can maintain off the critical
+    -- path. We force rvbbit.compact_variants_sync=off per-table (SET LOCAL, reverts
+    -- at each COMMIT, sync-scoped — manual compact()/rebuild_acceleration in other
+    -- sessions are unaffected). An EXPLICIT rvbbit.compact_variants_sync override
+    -- (on or off) still wins, so this only sets the default when it's unset.
+    v_skip_variants := nullif(current_setting('rvbbit.compact_variants_sync', true), '') IS NULL;
 
     SELECT array_agg(job_name ORDER BY job_name) INTO v_jobs
     FROM rvbbit.sync_jobs
@@ -6056,6 +6066,11 @@ BEGIN
                 FOREACH v_tbl IN ARRAY coalesce(v_tbls, ARRAY[]::text[]) LOOP
                     v_fdw_tbl := to_regclass(format('%I.%I', v_fdw_schema, v_tbl));
                     v_t0 := clock_timestamp();
+                    -- snapshot-only: skip the inline vortex build for this table's
+                    -- compact (transaction-local, reverts at the COMMIT below).
+                    IF v_skip_variants THEN
+                        PERFORM set_config('rvbbit.compact_variants_sync', 'off', true);
+                    END IF;
                     BEGIN
                         SELECT generation, rows_loaded, action INTO v_gen, v_rows, v_action
                         FROM rvbbit.sync_table(v_fdw_tbl, v_dest_schema, v_tbl);
