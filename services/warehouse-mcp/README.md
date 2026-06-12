@@ -24,13 +24,35 @@ read-only guard rejects anything that isn't a `safe_select`.
 ```bash
 pip install -r requirements.txt
 export WAREHOUSE_DSN="host=... port=5432 dbname=... user=warehouse_reader password=..."
-python server.py            # stdio MCP server (point a Claude client at it)
-python server.py --selftest # exercise every tool against the warehouse
+
+# remote (Cowork + Code): streamable-HTTP, single shared key
+export WAREHOUSE_MCP_KEY="$(openssl rand -hex 24)"   # share this with users
+python server.py --http        # serves http://0.0.0.0:8765/mcp  (/health is open)
+
+python server.py --selftest    # exercise every tool against the warehouse
+python server.py               # stdio (local Claude Code only)
 ```
+
+### Make it remotely reachable (no open ports, no exposed Postgres)
+Run `--http` **next to the warehouse** (DB over localhost) and expose only the MCP
+endpoint via a tunnel:
+```bash
+cloudflared tunnel --url http://localhost:8765      # → https://<random>.trycloudflare.com
+# (or a named Cloudflare Tunnel / Tailscale for a stable URL)
+```
+
+### Connect Claude
+- **Claude Code:** `claude mcp add --transport http rvbbit-warehouse <url>/mcp --header "Authorization: Bearer $WAREHOUSE_MCP_KEY"`
+- **Claude Cowork / claude.ai:** add a **custom connector** → URL `<url>/mcp`, header `Authorization: Bearer <key>`.
+
+Non-tech users just paste the URL + key once. Revoke = rotate `WAREHOUSE_MCP_KEY`
+(per-user keys via an `mcp_api_keys` table are Phase 1).
 
 ## Config (env)
 `WAREHOUSE_DSN` · `RVBBIT_CATALOG_GRAPH` (default `db_catalog`) ·
-`WAREHOUSE_ROW_CAP` (1000) · `WAREHOUSE_STMT_TIMEOUT_MS` (30000)
+`WAREHOUSE_ROW_CAP` (1000) · `WAREHOUSE_STMT_TIMEOUT_MS` (30000) ·
+`WAREHOUSE_MCP_KEY` (shared bearer key; unset = auth OFF, dev only) ·
+`WAREHOUSE_MCP_HOST` (0.0.0.0) · `WAREHOUSE_MCP_PORT` (8765)
 
 ## Deferred to Phase 1+
 Per-user identity → scoped role (tools run as the *caller's* scope), PII masking in

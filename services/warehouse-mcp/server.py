@@ -21,7 +21,7 @@ from __future__ import annotations
 # (DictRow vs TupleRow covariance); the code is correct at runtime (see --selftest).
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false
-import json, os, sys, time
+import hmac, json, os, sys, time
 
 import psycopg
 from psycopg import sql as pgsql
@@ -228,11 +228,55 @@ def _selftest():
     print("\nselftest done")
 
 
+def _build_mcp():
+    from mcp.server.fastmcp import FastMCP
+    m = FastMCP("rvbbit-warehouse")
+    _register(m)
+    return m
+
+
+def _with_api_key(app, key: str):
+    """ASGI gate: require `Authorization: Bearer <key>` on HTTP requests (single
+    shared key for now; lifespan + a /health probe pass through). Per-user keys
+    are Phase 1 — swap this lookup for the mcp_api_keys table."""
+    async def wrapper(scope, receive, send):
+        if scope["type"] != "http" or not key:
+            return await app(scope, receive, send)
+        if scope.get("path", "").rstrip("/") == "/health":
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": b"ok"})
+            return
+        auth = dict(scope.get("headers") or {}).get(b"authorization", b"").decode()
+        if not (auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], key)):
+            await send({"type": "http.response.start", "status": 401,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"www-authenticate", b"Bearer")]})
+            await send({"type": "http.response.body", "body": b'{"error":"unauthorized"}'})
+            return
+        return await app(scope, receive, send)
+    return wrapper
+
+
+def _serve_http():
+    import uvicorn
+    m = _build_mcp()
+    app = m.streamable_http_app()
+    key = os.environ.get("WAREHOUSE_MCP_KEY", "")
+    host = os.environ.get("WAREHOUSE_MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("WAREHOUSE_MCP_PORT", "8765"))
+    path = getattr(m.settings, "streamable_http_path", "/mcp")
+    if not key:
+        print("WARNING: WAREHOUSE_MCP_KEY unset — auth DISABLED (dev only)", file=sys.stderr)
+    print(f"rvbbit-warehouse MCP → http://{host}:{port}{path}  (auth: {'on' if key else 'OFF'})",
+          file=sys.stderr)
+    uvicorn.run(_with_api_key(app, key), host=host, port=port, log_level="warning")
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         _selftest()
+    elif "--http" in sys.argv:
+        _serve_http()       # remote: streamable-HTTP + shared-key gate
     else:
-        from mcp.server.fastmcp import FastMCP
-        _mcp = FastMCP("rvbbit-warehouse")
-        _register(_mcp)
-        _mcp.run()
+        _build_mcp().run()  # local: stdio (Claude Code)
