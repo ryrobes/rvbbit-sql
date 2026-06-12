@@ -576,13 +576,28 @@ def tool_get_dashboard(slug, version=None):
 # ── dependency extraction (Phase 1: queries → tables/metrics, the derived index) ──
 
 _RVBBIT_QUERY_RE = re.compile(r"rvbbitQuery\(\s*([`'\"])(.*?)\1", re.DOTALL)
+# Any quoted string that looks like SQL — catches SQL assigned to a variable and passed
+# as `client(sql)` (Claude rarely inlines the literal in the rvbbitQuery() call). EXPLAIN
+# is the filter: a candidate that resolves to real tables is a real query; junk is dropped.
+_SQL_LIT_RE = re.compile(r"([`'\"])\s*((?:select|with)\b.*?\bfrom\b.*?)\1", re.IGNORECASE | re.DOTALL)
 _METRIC_RE = re.compile(r"""(?:rvbbitMetric|rvbbit\.metric|\bmetric)\(\s*['"]([a-zA-Z0-9_]+)['"]""")
 EXTRACT_MODEL = os.environ.get("WAREHOUSE_EXTRACT_MODEL", "anthropic/claude-3.5-sonnet")
 
 
 def _extract_queries(html):
-    """SQL the artifact runs via the injected client — the contract makes this a grep."""
+    """SQL passed literally to the injected client (the cleanest case)."""
     return [m.group(2).strip() for m in _RVBBIT_QUERY_RE.finditer(html or "") if m.group(2).strip()]
+
+
+def _extract_sql_literals(html):
+    """Candidate SQL-shaped string literals anywhere in the artifact (validated by EXPLAIN)."""
+    out, seen = [], set()
+    for m in _SQL_LIT_RE.finditer(html or ""):
+        s = m.group(2).strip()
+        if s and len(s) < 8000 and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 def _referenced_tables(sql):
@@ -654,23 +669,32 @@ def dashboard_crawl(slug, use_llm=True):
             "WHERE tool='dashboard_query' AND args->>'dashboard'=%s AND args->>'sql' IS NOT NULL", (slug,)).fetchall()]
         known_metrics = {r["name"] for r in c.execute("SELECT DISTINCT name FROM rvbbit.metric_defs").fetchall()}
 
-    sql_src = {}                                  # sql -> where we found it
+    sql_src = {}                                  # sql -> where we found it (trusted)
     for q in _extract_queries(html):
-        sql_src.setdefault(q, "parse")
+        sql_src.setdefault(q, "rvbbitQuery")
     for q in runtime:
         sql_src.setdefault(q, "runtime")
+    # SQL-shaped literals are candidates — only kept if EXPLAIN resolves real tables
+    candidates = [q for q in _extract_sql_literals(html) if q not in sql_src]
     llm_metrics = []
-    if use_llm and not sql_src:                   # only pay for the LLM when the cheap paths are empty
+    if use_llm and not sql_src and not candidates:   # only pay for the LLM when nothing else found
         lq, llm_metrics = _llm_extract(html)
         for q in lq:
             sql_src.setdefault(q, "llm")
+
+    sql_tables = {sql: _referenced_tables(sql) for sql in sql_src}   # resolve trusted queries
+    for sql in candidates:                        # promote candidates that validate
+        t = _referenced_tables(sql)
+        if t:
+            sql_src.setdefault(sql, "sql-literal")
+            sql_tables[sql] = t
 
     metric_names = ({m for m in _METRIC_RE.findall(html or "")} | set(llm_metrics)) & known_metrics
     tables = {}                                   # table -> source
     rows = []
     for sql, src in sql_src.items():
         rows.append(("query", None, sql, src))
-        for t in _referenced_tables(sql):
+        for t in sql_tables.get(sql, []):
             tables.setdefault(t, src)
     rows += [("table", t, None, src) for t, src in tables.items()]
     rows += [("metric", m, None, "parse") for m in metric_names]

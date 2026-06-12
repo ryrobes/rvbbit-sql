@@ -140,9 +140,11 @@ to `/api/d/<slug>/q`, runs read-only on the mirror (`safe_select`-gated), and lo
 auto-create on startup (no migration). Design: [`docs/DASHBOARDS_PLAN.md`](../../docs/DASHBOARDS_PLAN.md).
 
 **Phase 1 — catalog-linked inspection.** `dashboard_crawl(slug)` extracts each dashboard's
-data dependencies — parses the `rvbbitQuery(...)` calls, reconciles the queries it actually
-ran (from `mcp_activity`), an OpenRouter LLM fallback (`OPENROUTER_API_KEY`) for artifacts
-that dodge the contract — and resolves every query to its tables via `EXPLAIN` (catches
+data dependencies — parses literal `rvbbitQuery(...)` calls, **SQL-shaped string literals
+anywhere in the artifact** (catches SQL Claude assigns to a variable and passes as
+`client(sql)`; `EXPLAIN` validates them so junk like `"select … from the menu"` is dropped),
+reconciles the queries it actually ran (from `mcp_activity`), and an OpenRouter LLM fallback
+(`OPENROUTER_API_KEY`) — then resolves every query to its tables via `EXPLAIN` (catches
 plain heap tables, not just rvbbit-managed). Stored in `rvbbit.dashboard_deps` (a derived,
 regenerable index; re-run on publish/update). `get_dashboard` returns the `sources` (the
 lens "open base SQL" list); `dashboard_dependents(object)` is impact analysis ("what breaks
