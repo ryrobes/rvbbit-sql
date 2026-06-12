@@ -31,7 +31,21 @@ database, mirror it in (Temporal Mirror) — then it's covered, time-travel and 
 The hard backstop is still the DB role: don't grant `warehouse_reader` SELECT on the
 `rvbbit` schema and the internals are unreadable even via `run_sql`.
 
-## Run
+## Run on the uber stack (Docker)
+The image ships in the release set (`ghcr.io/<ns>/rvbbit-warehouse-mcp`) and is wired
+into `docker-compose.uber.yml` behind an **opt-in `warehouse` profile** — so a plain
+`make release-uber-up` / `docker compose up -d` does **not** start it (by design: it's
+an internet-facing endpoint). Bring it up explicitly:
+```bash
+export WAREHOUSE_MCP_KEY="$(openssl rand -hex 24)"   # required — endpoint won't start without it
+make warehouse-up RELEASE_VERSION=<the version you pushed>   # pulls the image, starts MCP + tunnel
+make warehouse-url                                          # the public https://<…>.trycloudflare.com URL
+make warehouse-down                                         # stop just these two
+```
+Equivalently, raw compose: `… --profile warehouse up -d` (the `--profile` flag is the
+thing that's easy to forget — without it the two services are silently skipped).
+
+## Run standalone (no Docker)
 ```bash
 pip install -r requirements.txt
 export WAREHOUSE_DSN="host=... port=5432 dbname=... user=warehouse_reader password=..."
