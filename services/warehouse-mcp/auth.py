@@ -26,8 +26,10 @@ from __future__ import annotations
 import asyncio
 import hmac
 import html
+import json
 import os
 import secrets
+import sys
 import time
 
 import jwt
@@ -63,6 +65,9 @@ CODE_TTL = 300                                                                  
 SCOPE = "warehouse"
 MAX_PENDING = 2000        # caps on the unauthenticated in-memory OAuth state (DoS backstop)
 MAX_CLIENTS = 1000
+# Persist the durable OAuth state (registered clients + refresh tokens) so a restart
+# doesn't strand every connector with "client_id not found". Put it on a volume.
+STATE_FILE = os.environ.get("WAREHOUSE_STATE_FILE", "")   # empty = in-memory only
 LOGIN_MAX_FAILS = 5       # per-IP failed logins ...
 LOGIN_WINDOW = 300        # ... within this many seconds → lockout
 MIN_PASSWORD_LEN = 12
@@ -117,6 +122,35 @@ class WarehouseAuthProvider:
         self._pending: dict[str, tuple[str, AuthorizationParams, float]] = {}  # txn -> (client_id, params, created)
         self._codes: dict[str, _AuthCode] = {}
         self._refresh: dict[str, dict] = {}                            # rt -> {client_id, email, exp}
+        self._load()
+
+    # — persistence (durable: registered clients + refresh tokens) —
+    def _load(self) -> None:
+        if not STATE_FILE or not os.path.exists(STATE_FILE):
+            return
+        try:
+            data = json.loads(open(STATE_FILE).read())
+            self._clients = {k: OAuthClientInformationFull.model_validate(v)
+                             for k, v in data.get("clients", {}).items()}
+            self._refresh = {k: v for k, v in data.get("refresh", {}).items() if v.get("exp", 0) > time.time()}
+            print(f"loaded {len(self._clients)} clients / {len(self._refresh)} refresh tokens from {STATE_FILE}",
+                  file=sys.stderr)
+        except Exception as e:   # noqa: BLE001 — a bad/old state file must not break auth
+            print(f"WARNING: could not load OAuth state from {STATE_FILE}: {e}", file=sys.stderr)
+
+    def _persist(self) -> None:
+        if not STATE_FILE:
+            return
+        try:
+            os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
+            data = {"clients": {k: v.model_dump(mode="json") for k, v in self._clients.items()},
+                    "refresh": self._refresh}
+            tmp = f"{STATE_FILE}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, STATE_FILE)   # atomic
+        except Exception as e:   # noqa: BLE001 — persistence is best-effort
+            print(f"WARNING: could not persist OAuth state: {e}", file=sys.stderr)
 
     def _sweep(self) -> None:
         """Evict expired/abandoned state so the unauthenticated dicts can't grow without
@@ -138,6 +172,7 @@ class WarehouseAuthProvider:
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self._cap(self._clients, MAX_CLIENTS)
         self._clients[client_info.client_id] = client_info
+        self._persist()
 
     # — /authorize: hand the browser to our own login page —
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
@@ -214,6 +249,7 @@ class WarehouseAuthProvider:
     async def revoke_token(self, token) -> None:
         # best-effort: drop refresh tokens (access JWTs are stateless and expire).
         self._refresh.pop(getattr(token, "token", token), None)
+        self._persist()
 
     # — helpers —
     def _issue(self, client_id: str, email: str, scopes: list[str]) -> OAuthToken:
@@ -226,6 +262,7 @@ class WarehouseAuthProvider:
             JWT_SECRET, algorithm=JWT_ALG)
         rt = secrets.token_urlsafe(32)
         self._refresh[rt] = {"client_id": client_id, "email": email, "exp": time.time() + REFRESH_TTL}
+        self._persist()
         return OAuthToken(access_token=access, token_type="Bearer", expires_in=ACCESS_TTL,
                           scope=" ".join(scopes), refresh_token=rt)
 

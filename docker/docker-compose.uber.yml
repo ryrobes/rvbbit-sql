@@ -185,6 +185,8 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:8765:8765"   # localhost-only — your host nginx/proxy reaches it here
+    volumes:
+      - rvbbit_warehouse_mcp:/app/data   # durable OAuth state (clients + refresh tokens)
     environment:
       WAREHOUSE_DSN: ${WAREHOUSE_DSN:-postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}}
       WAREHOUSE_MCP_PORT: "8765"
@@ -193,6 +195,7 @@ services:
       WAREHOUSE_LOGIN_PASSWORD: ${WAREHOUSE_LOGIN_PASSWORD:-}
       WAREHOUSE_ALLOWED_EMAILS: ${WAREHOUSE_ALLOWED_EMAILS:-}
       WAREHOUSE_JWT_SECRET: ${WAREHOUSE_JWT_SECRET:-}
+      WAREHOUSE_STATE_FILE: /app/data/oauth_state.json   # survives restarts (no re-add of connectors)
       # Shared-key fallback (Claude Code / optional):
       WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:-}
     restart: unless-stopped
@@ -225,3 +228,5 @@ volumes:
     name: ${RVBBIT_LENS_VOLUME:-rvbbit_uber_lens}
   rvbbit_warren:
     name: ${RVBBIT_WARREN_VOLUME:-rvbbit_uber_warren}
+  rvbbit_warehouse_mcp:
+    name: ${RVBBIT_WAREHOUSE_MCP_VOLUME:-rvbbit_uber_warehouse_mcp}
