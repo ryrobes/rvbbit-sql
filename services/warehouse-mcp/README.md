@@ -10,8 +10,8 @@ read-only connection** — per-user role scoping is Phase 1.
 ## Tools
 | tool | what | backing |
 |---|---|---|
-| `search_data(query, limit?, schema?)` | semantic search → ranked tables/cols + **live samples** | `data_search` |
-| `describe_table(table)` | columns + samples | information_schema + samples |
+| `search_data(query, limit?, schema?)` | semantic search → ranked tables/cols, each grounded with **live samples + per-column stats + freshness/drift** | `data_search` + `pg_stats` + `accel_freshness` |
+| `describe_table(table)` | columns + samples + per-column stats + freshness | information_schema + `pg_stats` + `accel_freshness` |
 | `list_metrics(category?, search?)` / `get_metric(name)` | the blessed metric catalog | `metric_defs` |
 | `metric(name, params?, as_of?, def_as_of?)` | a governed number (bitemporal) | `rvbbit.metric()` |
 | `validate_sql(sql, as_of?)` | plan, **don't execute** (self-correct loop) | `route_explain` |
@@ -19,6 +19,17 @@ read-only connection** — per-user role scoping is Phase 1.
 
 `as_of` (data-time) flows in as the engine's `-- rvbbit: as_of <ts>` directive; the
 read-only guard rejects anything that isn't a `safe_select`.
+
+## What's exposed — databases & schemas
+The warehouse and rvbbit's own internals live in **one database, different schemas**
+(the Temporal Mirror syncs external sources into dest schemas right next to the
+`rvbbit.*` catalog). So scoping is by **schema**, not database: `search_data` and
+`describe_table` always hide `rvbbit` / `pg_*` / `information_schema`, surfacing only
+the data schemas. Set `WAREHOUSE_SCHEMAS` (CSV) to restrict to an explicit allowlist
+(e.g. `mirror_sales,mirror_ops,analytics`). To expose data that lives in a *separate*
+database, mirror it in (Temporal Mirror) — then it's covered, time-travel and all.
+The hard backstop is still the DB role: don't grant `warehouse_reader` SELECT on the
+`rvbbit` schema and the internals are unreadable even via `run_sql`.
 
 ## Run
 ```bash
@@ -50,6 +61,7 @@ Non-tech users just paste the URL + key once. Revoke = rotate `WAREHOUSE_MCP_KEY
 
 ## Config (env)
 `WAREHOUSE_DSN` · `RVBBIT_CATALOG_GRAPH` (default `db_catalog`) ·
+`WAREHOUSE_SCHEMAS` (CSV allowlist; default = all but rvbbit/pg_*) ·
 `WAREHOUSE_ROW_CAP` (1000) · `WAREHOUSE_STMT_TIMEOUT_MS` (30000) ·
 `WAREHOUSE_MCP_KEY` (shared bearer key; unset = auth OFF, dev only) ·
 `WAREHOUSE_MCP_HOST` (0.0.0.0) · `WAREHOUSE_MCP_PORT` (8765)

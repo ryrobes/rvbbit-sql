@@ -15,6 +15,8 @@ Config (env):
   RVBBIT_CATALOG_GRAPH       catalog KG name (default: db_catalog)
   WAREHOUSE_ROW_CAP          max rows returned by run_sql (default 1000)
   WAREHOUSE_STMT_TIMEOUT_MS  per-query timeout (default 30000)
+  WAREHOUSE_SCHEMAS          CSV allowlist of exposed schemas (default: all but
+                             rvbbit/pg_*/information_schema — i.e. hide internals)
 """
 from __future__ import annotations
 # psycopg's dict_row factory + sql.SQL composition trip Pyright's strict overloads
@@ -34,6 +36,12 @@ GRAPH = os.environ.get("RVBBIT_CATALOG_GRAPH", "db_catalog")
 ROW_CAP = int(os.environ.get("WAREHOUSE_ROW_CAP", "1000"))
 STMT_TIMEOUT_MS = int(os.environ.get("WAREHOUSE_STMT_TIMEOUT_MS", "30000"))
 
+# Schema scoping — the warehouse and rvbbit's own internals share one database, so we
+# expose the data schemas and hide the engine's catalog. _DENY is always hidden;
+# WAREHOUSE_SCHEMAS (optional CSV allowlist) further restricts to just those.
+_DENY_SCHEMAS = {"rvbbit", "pg_catalog", "information_schema", "pg_toast", "pg_temp"}
+_ALLOW_SCHEMAS = {s.strip() for s in os.environ.get("WAREHOUSE_SCHEMAS", "").split(",") if s.strip()}
+
 # common PG type OIDs -> friendly names (best-effort, Phase-0)
 _TYPE = {16: "bool", 20: "int8", 21: "int2", 23: "int4", 25: "text", 700: "float4",
          701: "float8", 1043: "varchar", 1082: "date", 1114: "timestamp",
@@ -50,19 +58,18 @@ def _conn(read_only: bool = False):
     return c
 
 
+def _ro():
+    """An autocommit, read-only connection for grounding lookups (samples/stats/
+    freshness) — autocommit so one failed probe can't poison the rest of the loop."""
+    c = psycopg.connect(DSN, row_factory=dict_row, autocommit=True)
+    c.execute("SET default_transaction_read_only = on")
+    c.execute(f"SET statement_timeout = {STMT_TIMEOUT_MS}")
+    return c
+
+
 def _with_as_of(sql: str, as_of):
     """Time-travel: the engine reads a leading `-- rvbbit: as_of <ts>` directive."""
     return f"-- rvbbit: as_of {as_of}\n{sql}" if as_of else sql
-
-
-def _samples(schema: str, rel: str, n: int = 5):
-    try:
-        with _conn(read_only=True) as c, c.cursor() as cur:
-            cur.execute(pgsql.SQL("SELECT * FROM {}.{} LIMIT %s").format(
-                pgsql.Identifier(schema), pgsql.Identifier(rel)), (n,))
-            return cur.fetchall()
-    except Exception as e:  # noqa: BLE001
-        return {"error": str(e)}
 
 
 def _split(table: str):
@@ -70,47 +77,150 @@ def _split(table: str):
     return ("public", parts[0]) if len(parts) == 1 else (parts[0], parts[1])
 
 
+def _schema_allowed(schema: str) -> bool:
+    """Hide rvbbit internals (and any pg_* schema); honor the optional allowlist."""
+    if schema in _DENY_SCHEMAS or schema.startswith("pg_"):
+        return False
+    return (not _ALLOW_SCHEMAS) or (schema in _ALLOW_SCHEMAS)
+
+
+def _samples(cur, schema: str, rel: str, n: int = 5):
+    try:
+        cur.execute(pgsql.SQL("SELECT * FROM {}.{} LIMIT %s").format(
+            pgsql.Identifier(schema), pgsql.Identifier(rel)), (n,))
+        return cur.fetchall()
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+
+
+def _fmt_ndv(nd):
+    """pg_stats n_distinct → friendly: positive=absolute count, negative=distinct/row ratio."""
+    if nd is None or nd == 0:
+        return None
+    if nd > 0:
+        return int(nd)
+    if nd == -1:
+        return "unique"
+    return f"~{round(-nd * 100)}% distinct"
+
+
+def _col_stats(cur, schema: str, rel: str, max_cols: int = 16):
+    """Cheap per-column profile from the planner's ANALYZE stats (pg_stats): distinct
+    count, null %, most-common values — what keeps Claude from inventing columns."""
+    try:
+        rows = cur.execute(
+            "SELECT attname, n_distinct, round((null_frac*100)::numeric, 1) AS null_pct, "
+            "(most_common_vals::text::text[])[1:6] AS top_vals "
+            "FROM pg_stats WHERE schemaname=%s AND tablename=%s ORDER BY attname LIMIT %s",
+            (schema, rel, max_cols),
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return None
+    out = {}
+    for r in rows:
+        col = {}
+        ndv = _fmt_ndv(r["n_distinct"])
+        if ndv is not None:
+            col["ndv"] = ndv
+        if r["null_pct"] is not None and float(r["null_pct"]) > 0:
+            col["null_pct"] = float(r["null_pct"])
+        if r["top_vals"]:
+            col["top"] = r["top_vals"]
+        if col:
+            out[r["attname"]] = col
+    return out or None
+
+
+def _freshness(cur, schema: str, rel: str):
+    """rvbbit's superpower, surfaced in the grounding: rows, last sync, staleness/drift."""
+    try:
+        r = cur.execute(
+            "SELECT parquet_rows, row_groups, parquet_bytes, last_refresh_at, "
+            "round(seconds_since_refresh) AS secs, drift_rows, shadow_heap_dirty "
+            "FROM rvbbit.accel_freshness WHERE table_oid = to_regclass(%s)::oid LIMIT 1",
+            (f"{schema}.{rel}",),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    if not r:
+        return None
+    drift = int(r["drift_rows"] or 0)
+    return {
+        "rows": r["parquet_rows"],
+        "row_groups": r["row_groups"],
+        "bytes": r["parquet_bytes"],
+        "last_synced": r["last_refresh_at"],
+        "seconds_since_refresh": float(r["secs"]) if r["secs"] is not None else None,
+        "drift_rows": drift,
+        "stale": bool(r["shadow_heap_dirty"]) or drift > 0,
+    }
+
+
 # ── tools ───────────────────────────────────────────────────────────────────
 
 def tool_search_data(query: str, limit: int = 8, schema=None) -> dict:
-    """Semantic search over the catalog KG + data-KG; grounded with live samples."""
+    """Semantic search over the catalog KG + data-KG, each table hit grounded with live
+    samples, cheap per-column stats, and freshness/drift. Internal (rvbbit/pg_*)
+    schemas are hidden, so users only ever see the data they're meant to."""
     limit = max(1, min(int(limit), 25))
     with _conn() as c:
         hits = c.execute(
             "SELECT node_id, kind, schema_name, rel_name, col_name, score, doc "
             "FROM rvbbit.data_search(%s, %s, %s, %s)",
-            (query, limit, None, GRAPH),
+            (query, min(limit * 4, 100), None, GRAPH),   # over-fetch; internals get filtered out
         ).fetchall()
     matches = []
-    for h in hits:
-        if schema and h["schema_name"] != schema:
-            continue
-        m = {
-            "object": f'{h["schema_name"]}.{h["rel_name"]}'
-            + (f'.{h["col_name"]}' if h["col_name"] else ""),
-            "kind": h["kind"],
-            "score": round(float(h["score"]), 3),
-            "doc": h["doc"],
-        }
-        if not h["col_name"]:  # a table hit -> ground it with samples
-            m["samples"] = _samples(h["schema_name"], h["rel_name"], 5)
-        matches.append(m)
+    with _ro() as rc, rc.cursor() as cur:
+        for h in hits:
+            if len(matches) >= limit:
+                break
+            if not _schema_allowed(h["schema_name"]):
+                continue
+            if schema and h["schema_name"] != schema:
+                continue
+            m = {
+                "object": f'{h["schema_name"]}.{h["rel_name"]}'
+                + (f'.{h["col_name"]}' if h["col_name"] else ""),
+                "kind": h["kind"],
+                "score": round(float(h["score"]), 3),
+                "doc": h["doc"],
+            }
+            if not h["col_name"]:  # a table hit -> ground it (samples + stats + freshness)
+                m["samples"] = _samples(cur, h["schema_name"], h["rel_name"], 5)
+                st = _col_stats(cur, h["schema_name"], h["rel_name"])
+                if st:
+                    m["column_stats"] = st
+                fr = _freshness(cur, h["schema_name"], h["rel_name"])
+                if fr:
+                    m["freshness"] = fr
+            matches.append(m)
     return {"matches": matches,
             "note": None if matches else "no strong matches; try broader terms"}
 
 
 def tool_describe_table(table: str) -> dict:
-    """Full profile of one table: columns + live samples (+ stats in Phase 1)."""
+    """Full profile of one table: columns, live samples, per-column stats, freshness."""
     schema, rel = _split(table)
-    with _conn() as c:
-        cols = c.execute(
+    if not _schema_allowed(schema):
+        return {"error": {"code": "NOT_AUTHORIZED",
+                          "message": f"schema '{schema}' is not exposed"}}
+    with _ro() as rc, rc.cursor() as cur:
+        cols = cur.execute(
             "SELECT column_name AS name, data_type AS type FROM information_schema.columns "
             "WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position",
             (schema, rel),
         ).fetchall()
-    if not cols:
-        return {"error": {"code": "TABLE_NOT_FOUND", "message": table}}
-    return {"table": f"{schema}.{rel}", "columns": cols, "samples": _samples(schema, rel, 5)}
+        if not cols:
+            return {"error": {"code": "TABLE_NOT_FOUND", "message": table}}
+        out = {"table": f"{schema}.{rel}", "columns": cols,
+               "samples": _samples(cur, schema, rel, 5)}
+        st = _col_stats(cur, schema, rel, max_cols=128)
+        if st:
+            out["column_stats"] = st
+        fr = _freshness(cur, schema, rel)
+        if fr:
+            out["freshness"] = fr
+    return out
 
 
 def tool_list_metrics(category=None, search=None) -> dict:
@@ -219,6 +329,9 @@ def _selftest():
         s = json.dumps(out, default=str)
         print(f"\n## {name}\n{s[:600]}{'…' if len(s) > 600 else ''}")
     show("search_data('orders and revenue')", tool_search_data("orders and revenue", 3))
+    show("describe_table('public._demo_revenue')", tool_describe_table("public._demo_revenue"))
+    show("describe_table('rvbbit.row_groups') — internal, must be hidden",
+         tool_describe_table("rvbbit.row_groups"))
     show("list_metrics(search='error')", tool_list_metrics(search="error"))
     show("metric('demo_error_rate')", tool_metric("demo_error_rate", {}))
     show("validate_sql(good SELECT)", tool_validate_sql("SELECT region, drop_pct FROM public._demo_revenue"))
