@@ -774,6 +774,42 @@ impl Candidate {
     }
 }
 
+/// The physical storage actually read for this decision — a logging/observability
+/// label only, NOT a routing input (the chosen `candidate` is unchanged).
+///
+/// `engine()`/`route()` collapse the whole native family to "native", which hides
+/// three very different reads: a heap-only table (no row groups) plans a plain
+/// PostgreSQL heap SeqScan (the custom scan bails at `n_rgs == 0`, planner.rs),
+/// a compacted table uses the native vector scan over parquet, and the vortex
+/// route reads `.vortex`. This splits them so the route log/UI shows
+/// `native · heap` vs `native · parquet` vs `native · vortex`. Columnar engines
+/// are gated on `row_groups > 0`, so they never see the heap case.
+fn physical_path(candidate: Candidate, tables: &[RvbbitTableMetric]) -> &'static str {
+    match candidate {
+        Candidate::RvbbitNativeVortex
+        | Candidate::DuckVortex
+        | Candidate::DataFusionVortex => "vortex",
+        Candidate::DuckHive | Candidate::DataFusionHive => "hive",
+        Candidate::DataFusionMem => "mem",
+        Candidate::DuckVector | Candidate::DataFusionVector => "parquet",
+        // pg_rowstore reads the retained shadow heap; native with no row groups
+        // falls through to a plain PG heap SeqScan.
+        Candidate::PgRowstore => "heap",
+        Candidate::RvbbitNative => {
+            let with_rg = tables.iter().filter(|t| t.row_groups > 0).count();
+            if with_rg == 0 {
+                "heap"
+            } else if with_rg == tables.len() {
+                "parquet"
+            } else {
+                // some referenced tables are compacted, some are heap-only —
+                // each plans independently, so the query mixes both reads.
+                "mixed"
+            }
+        }
+    }
+}
+
 thread_local! {
     static PG_ROWSTORE_ROUTE_SELECTED: Cell<bool> = const { Cell::new(false) };
 }
@@ -1736,6 +1772,10 @@ fn route_explain_value_inner(
         "chosen_candidate".into(),
         candidate.map_or(Value::Null, |c| json!(c.as_str())),
     );
+    out.insert(
+        "physical_path".into(),
+        candidate.map_or(Value::Null, |c| json!(physical_path(c, &tables))),
+    );
     out.insert("route_source".into(), json!(decision.source));
     out.insert("reason".into(), json!(decision.reason));
     out.insert(
@@ -1794,6 +1834,10 @@ fn route_doc_from_decision(
     out.insert(
         "chosen_candidate".into(),
         candidate.map_or(Value::Null, |c| json!(c.as_str())),
+    );
+    out.insert(
+        "physical_path".into(),
+        candidate.map_or(Value::Null, |c| json!(physical_path(c, tables))),
     );
     out.insert("route_source".into(), json!(decision.source));
     out.insert("reason".into(), json!(decision.reason));
