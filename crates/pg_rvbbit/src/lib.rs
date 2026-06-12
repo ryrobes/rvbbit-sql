@@ -38,6 +38,7 @@ mod generic_search;
 mod kg;
 mod lance;
 mod live_counters;
+mod migrations;
 mod model_orchestration;
 mod model_studio;
 mod pgvector_tier;

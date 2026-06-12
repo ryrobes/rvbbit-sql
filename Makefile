@@ -132,16 +132,19 @@ e2e-realworld-warren: ## Run real Warren deploy/probe/operator acceptance smoke
 
 reload-extension: ## Non-destructive extension reload/update; preserves KG/cache/router data
 	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 \
-	  -c "CREATE EXTENSION IF NOT EXISTS pg_rvbbit;" \
-	  -c "ALTER EXTENSION pg_rvbbit UPDATE;"
-	# ALTER EXTENSION UPDATE only walks versioned migration edges; it does NOT
-	# re-run the extension's base schema SQL. So pure-SQL surfaces edited in place
-	# (e.g. sql/catalog_kg.sql) never reach an already-installed extension on a
-	# .so rebuild. Re-apply the idempotent ones here so a rebuild+reload always
-	# converges, independent of the migration-version chain. (CREATE OR REPLACE /
-	# IF NOT EXISTS throughout, so this is safe to run repeatedly.)
+	  -c "CREATE EXTENSION IF NOT EXISTS pg_rvbbit;"
+	# Schema evolution is decoupled from the extension version: instead of
+	# ALTER EXTENSION UPDATE (which only walks versioned migration edges and never
+	# re-runs base schema SQL), run the stacked idempotent migrations. migrate()
+	# applies every sql/migrations/NNNN_*.sql not yet recorded in
+	# rvbbit.schema_migrations. migrate.sql also (re)creates migrate()'s binding so
+	# this bootstraps onto installs that predate it. See src/migrations.rs.
 	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 \
-	  -f - < crates/pg_rvbbit/sql/catalog_kg.sql
+	  -f - < crates/pg_rvbbit/sql/migrate.sql
+
+migrate: ## Run pending stacked SQL migrations (rvbbit.migrate); DB=bench to override
+	$(COMPOSE) exec -T pg-rvbbit psql -U postgres -d $(or $(DB),bench) -v ON_ERROR_STOP=1 \
+	  -f - < crates/pg_rvbbit/sql/migrate.sql
 
 bigfoot-load:    ## Load BFRO sightings CSV into rvbbit
 	$(COMPOSE) exec bench python /bench/bigfoot_bench.py load

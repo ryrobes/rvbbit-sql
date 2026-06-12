@@ -1,6 +1,14 @@
 -- Auto-run on first boot of the rvbbit container.
 CREATE EXTENSION IF NOT EXISTS pg_rvbbit;
 
+-- Apply the stacked SQL migrations (sql/migrations/NNNN_*.sql), tracked in
+-- rvbbit.schema_migrations and decoupled from the extension version. The binding
+-- exists from CREATE EXTENSION on a fresh install; this is a no-op once applied.
+DO $$
+BEGIN
+    RAISE NOTICE '%', rvbbit.migrate();
+END $$;
+
 -- Sanity check: print version into the postgres log so `docker compose logs`
 -- confirms the extension actually loaded.
 DO $$
