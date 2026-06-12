@@ -166,8 +166,14 @@ services:
   # Inbound (Claude -> rvbbit), the OPPOSITE of the capability mcp-gateway. Its own
   # tiny image; connects straight to postgres (never via the gateway). Opt-in:
   #   docker compose -f docker/docker-compose.uber.yml --profile warehouse up -d
-  # Prod hardening: point WAREHOUSE_DSN at a read-only `warehouse_reader` role (the
-  # server already enforces read-only, but least-privilege is belt-and-suspenders).
+  # AUTH — two modes (the server picks based on WAREHOUSE_PUBLIC_URL):
+  #   * OAuth (recommended, for Claude Desktop/Cowork's native connector): set
+  #     WAREHOUSE_PUBLIC_URL + WAREHOUSE_LOGIN_PASSWORD + WAREHOUSE_JWT_SECRET
+  #     (JWT secret MUST differ from WAREHOUSE_MCP_KEY). Terminate TLS at your proxy
+  #     and forward it to the published 127.0.0.1:8765 below.
+  #   * Shared key (Claude Code): set only WAREHOUSE_MCP_KEY (a bearer header).
+  # The server fail-fasts on a bad OAuth config, so a misconfig won't serve unauthed.
+  # Prod hardening: point WAREHOUSE_DSN at a read-only `warehouse_reader` role.
   warehouse-mcp:
     profiles: ["warehouse"]
     image: ${RVBBIT_WAREHOUSE_MCP_IMAGE:-ghcr.io/ryrobes/rvbbit-warehouse-mcp:${RVBBIT_VERSION:-latest}}
@@ -177,23 +183,30 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    ports:
+      - "127.0.0.1:8765:8765"   # localhost-only — your host nginx/proxy reaches it here
     environment:
       WAREHOUSE_DSN: ${WAREHOUSE_DSN:-postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}}
-      WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:?set WAREHOUSE_MCP_KEY to a strong shared secret before exposing}
       WAREHOUSE_MCP_PORT: "8765"
+      # OAuth mode (set these for the native connector):
+      WAREHOUSE_PUBLIC_URL: ${WAREHOUSE_PUBLIC_URL:-}
+      WAREHOUSE_LOGIN_PASSWORD: ${WAREHOUSE_LOGIN_PASSWORD:-}
+      WAREHOUSE_ALLOWED_EMAILS: ${WAREHOUSE_ALLOWED_EMAILS:-}
+      WAREHOUSE_JWT_SECRET: ${WAREHOUSE_JWT_SECRET:-}
+      # Shared-key fallback (Claude Code / optional):
+      WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:-}
     restart: unless-stopped
 
-  # Cloudflare QUICK tunnel — instant public HTTPS, no account/cert/open port. The
-  # https://<random>.trycloudflare.com URL prints to this service's logs:
-  #   docker compose -f docker/docker-compose.uber.yml logs warehouse-tunnel | grep trycloudflare
-  # Ephemeral (changes on restart) — fine for testing; use a named tunnel +
-  # TUNNEL_TOKEN (cloudflared ... run) for a stable production URL.
+  # OPTIONAL Cloudflare QUICK tunnel — only if you have NO proxy of your own. Separate
+  # profile so the `warehouse` profile (above) does NOT start it. Instant public HTTPS,
+  # ephemeral URL in its logs (`logs warehouse-tunnel | grep trycloudflare`). NOTE:
+  # OAuth mode needs a STABLE url, so pair the tunnel with shared-key mode, or use a
+  # named tunnel (TUNNEL_TOKEN) / your own proxy for OAuth.
+  #   docker compose -f docker/docker-compose.uber.yml --profile warehouse-tunnel up -d
   warehouse-tunnel:
-    profiles: ["warehouse"]
+    profiles: ["warehouse-tunnel"]
     image: cloudflare/cloudflared:latest
     container_name: rvbbit-warehouse-tunnel
-    depends_on:
-      - warehouse-mcp
     command: tunnel --no-autoupdate --url http://warehouse-mcp:8765
     restart: unless-stopped
 

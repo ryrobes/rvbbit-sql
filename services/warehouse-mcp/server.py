@@ -17,12 +17,20 @@ Config (env):
   WAREHOUSE_STMT_TIMEOUT_MS  per-query timeout (default 30000)
   WAREHOUSE_SCHEMAS          CSV allowlist of exposed schemas (default: all but
                              rvbbit/pg_*/information_schema — i.e. hide internals)
+
+OAuth mode (for Claude Desktop/Cowork's native connector) — set a public URL:
+  WAREHOUSE_PUBLIC_URL       e.g. https://dwmcp.example.com (enables the OAuth AS;
+                             unset = legacy shared-key gate via WAREHOUSE_MCP_KEY)
+  WAREHOUSE_LOGIN_PASSWORD   REQUIRED in OAuth mode; shared login password
+  WAREHOUSE_ALLOWED_EMAILS   optional CSV email allowlist (else any email + the pw)
+  WAREHOUSE_JWT_SECRET       REQUIRED in OAuth mode; token-signing secret — MUST be
+                             independent of WAREHOUSE_MCP_KEY (users hold that one)
 """
 from __future__ import annotations
 # psycopg's dict_row factory + sql.SQL composition trip Pyright's strict overloads
 # (DictRow vs TupleRow covariance); the code is correct at runtime (see --selftest).
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
-# pyright: reportReturnType=false, reportOptionalSubscript=false
+# pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
 import hmac, json, os, sys, time
 
 import psycopg
@@ -348,6 +356,35 @@ def _build_mcp():
     return m
 
 
+def _build_mcp_oauth(public: str):
+    """FastMCP with our self-contained OAuth AS (auth.py). The SDK mounts /authorize,
+    /token, /register + the .well-known metadata and verifies PKCE; auth.py supplies
+    the storage, the /login page, and signed tokens. The static WAREHOUSE_MCP_KEY is
+    still accepted as a bearer (Claude Code), so both auth paths coexist."""
+    from mcp.server.fastmcp import FastMCP
+    from starlette.responses import PlainTextResponse
+    import auth
+    fatal = auth.validate_config()
+    if fatal:
+        for e in fatal:
+            print(f"FATAL (OAuth mode): {e}", file=sys.stderr)
+        raise SystemExit(2)
+    for w in auth.config_warnings():
+        print(f"WARNING: {w}", file=sys.stderr)
+    provider = auth.WarehouseAuthProvider(public)
+    m = FastMCP("rvbbit-warehouse",
+                auth_server_provider=provider,
+                auth=auth.make_auth_settings(public))
+    _register(m)
+    auth.register_login_route(m, provider)
+
+    @m.custom_route("/health", methods=["GET"])
+    async def _health(_req):
+        return PlainTextResponse("ok")
+
+    return m
+
+
 def _with_api_key(app, key: str):
     """ASGI gate: require `Authorization: Bearer <key>` on HTTP requests (single
     shared key for now; lifespan + a /health probe pass through). Per-user keys
@@ -373,11 +410,22 @@ def _with_api_key(app, key: str):
 
 def _serve_http():
     import uvicorn
+    host = os.environ.get("WAREHOUSE_MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("WAREHOUSE_MCP_PORT", "8765"))
+    public = os.environ.get("WAREHOUSE_PUBLIC_URL", "").rstrip("/")
+    if public:
+        # OAuth mode: Claude Desktop/Cowork's native connector flow works (login at
+        # <public>/login). Terminate TLS at your proxy and forward all paths to this port.
+        m = _build_mcp_oauth(public)
+        print(f"rvbbit-warehouse MCP (OAuth AS) → {public}/mcp  (issuer {public}, login {public}/login)",
+              file=sys.stderr)
+        uvicorn.run(m.streamable_http_app(), host=host, port=port, log_level="warning",
+                    forwarded_allow_ips="*")   # trust X-Forwarded-* from the fronting proxy
+        return
+    # shared-key mode (local dev / Claude Code only — no public URL configured)
     m = _build_mcp()
     app = m.streamable_http_app()
     key = os.environ.get("WAREHOUSE_MCP_KEY", "")
-    host = os.environ.get("WAREHOUSE_MCP_HOST", "0.0.0.0")
-    port = int(os.environ.get("WAREHOUSE_MCP_PORT", "8765"))
     path = getattr(m.settings, "streamable_http_path", "/mcp")
     if not key:
         print("WARNING: WAREHOUSE_MCP_KEY unset — auth DISABLED (dev only)", file=sys.stderr)

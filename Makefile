@@ -329,17 +329,21 @@ release-compose-up: ## Start the published-image clean-slate stack
 release-uber-up: ## Start the turnkey stack and bootstrap baseline Warren capabilities
 	RVBBIT_VERSION='$(RELEASE_VERSION)' docker compose -f docker/docker-compose.uber.yml up -d
 
-warehouse-up: ## Start Warehouse MCP + Cloudflare tunnel on uber (needs WAREHOUSE_MCP_KEY; RELEASE_VERSION pins the image, else :latest). Opt-in 'warehouse' profile, so release-uber-up does NOT start these.
-	@test -n "$${WAREHOUSE_MCP_KEY:-}" || { echo "set WAREHOUSE_MCP_KEY=... (a strong shared secret) — the public endpoint won't start without it" >&2; exit 2; }
+warehouse-up: ## Start the Warehouse MCP on uber ('warehouse' profile; opt-in, so release-uber-up does NOT). OAuth mode: set WAREHOUSE_PUBLIC_URL + WAREHOUSE_LOGIN_PASSWORD + WAREHOUSE_JWT_SECRET. Or shared-key: WAREHOUSE_MCP_KEY. RELEASE_VERSION pins the image (else :latest).
+	@test -n "$${WAREHOUSE_PUBLIC_URL:-}" -o -n "$${WAREHOUSE_MCP_KEY:-}" || { echo "configure auth first — OAuth: WAREHOUSE_PUBLIC_URL + WAREHOUSE_LOGIN_PASSWORD + WAREHOUSE_JWT_SECRET (JWT secret must differ from any WAREHOUSE_MCP_KEY); or shared-key: WAREHOUSE_MCP_KEY" >&2; exit 2; }
 	RVBBIT_VERSION='$(RELEASE_VERSION)' docker compose -f docker/docker-compose.uber.yml --profile warehouse up -d
+	@sleep 2; docker logs rvbbit-warehouse-mcp 2>&1 | tail -2
+
+warehouse-tunnel-up: ## (Optional) add a Cloudflare quick-tunnel in front of warehouse-mcp — only if you have no proxy of your own
+	RVBBIT_VERSION='$(RELEASE_VERSION)' docker compose -f docker/docker-compose.uber.yml --profile warehouse --profile warehouse-tunnel up -d
 	@sleep 3; $(MAKE) --no-print-directory warehouse-url
 
 warehouse-url: ## Print the current Cloudflare quick-tunnel URL (it changes on each tunnel restart)
 	@url=$$(docker logs rvbbit-warehouse-tunnel 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1); \
 	  if [ -n "$$url" ]; then echo "$$url"; \
-	  else echo "(no URL yet — give warehouse-tunnel a few seconds, then: make warehouse-url)"; fi
+	  else echo "(no tunnel URL — running behind your own proxy? use that hostname instead)"; fi
 
-warehouse-down: ## Stop + remove the Warehouse MCP + tunnel (leaves the rest of the uber stack up)
+warehouse-down: ## Stop + remove the Warehouse MCP (+ tunnel if running); leaves the rest of the uber stack up
 	docker rm -f rvbbit-warehouse-mcp rvbbit-warehouse-tunnel 2>/dev/null || true
 
 clean:           ## Remove built artifacts

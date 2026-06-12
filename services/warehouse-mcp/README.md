@@ -66,19 +66,63 @@ cloudflared tunnel --url http://localhost:8765      # → https://<random>.trycl
 # (or a named Cloudflare Tunnel / Tailscale for a stable URL)
 ```
 
-### Connect Claude
-- **Claude Code:** `claude mcp add --transport http rvbbit-warehouse <url>/mcp --header "Authorization: Bearer $WAREHOUSE_MCP_KEY"`
-- **Claude Cowork / claude.ai:** add a **custom connector** → URL `<url>/mcp`, header `Authorization: Bearer <key>`.
+## Two auth modes
+The server picks the mode from `WAREHOUSE_PUBLIC_URL`:
 
-Non-tech users just paste the URL + key once. Revoke = rotate `WAREHOUSE_MCP_KEY`
-(per-user keys via an `mcp_api_keys` table are Phase 1).
+**OAuth (recommended — Claude Desktop/Cowork's native connector).** A self-contained
+OAuth 2.1 AS (`auth.py`): the SDK mounts `/authorize`/`/token`/`/register` + the
+`.well-known` metadata and verifies PKCE; we supply the `/login` page (a shared
+`WAREHOUSE_LOGIN_PASSWORD` + optional `WAREHOUSE_ALLOWED_EMAILS`) and HS256 JWTs. Users
+just **paste the URL → log in → Allow** — no header to configure. Needs a **stable
+HTTPS URL** (OAuth redirects), so terminate TLS at a proxy.
+```bash
+export WAREHOUSE_PUBLIC_URL="https://dwmcp.example.com"   # your stable domain
+export WAREHOUSE_LOGIN_PASSWORD="$(openssl rand -hex 16)" # the shared login password
+export WAREHOUSE_JWT_SECRET="$(openssl rand -hex 32)"     # MUST differ from WAREHOUSE_MCP_KEY
+export WAREHOUSE_ALLOWED_EMAILS="a@co.com,b@co.com"       # optional allowlist
+python server.py --http     # serves :8765; behind your proxy at WAREHOUSE_PUBLIC_URL
+```
+> **Security:** `WAREHOUSE_JWT_SECRET` must be independent of `WAREHOUSE_MCP_KEY` — that
+> key is handed to users, and reusing it to sign would let any holder forge a token for
+> any email. The server **refuses to start** if they match or if either secret/password
+> is missing. Login is rate-limited (per-IP lockout + serialized checks).
+
+**Shared key (Claude Code / scripts).** No `WAREHOUSE_PUBLIC_URL`; gate on a static
+bearer. Still accepted in OAuth mode too, so Code keeps working alongside the UI flow.
+
+### nginx (terminate TLS, forward all paths to `127.0.0.1:8765`)
+```nginx
+server {
+  listen 443 ssl;
+  server_name dwmcp.example.com;
+  # ssl_certificate ... (e.g. certbot)
+  location / {                       # /mcp, /authorize, /token, /register, /.well-known/*, /login
+    proxy_pass http://127.0.0.1:8765;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;     # the server rate-limits per this IP
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;             # streamable-HTTP / SSE
+    proxy_read_timeout 3600s;
+  }
+}
+```
+
+### Connect Claude
+- **Claude Desktop / Cowork (OAuth):** Settings → Connectors → **Add custom connector** →
+  URL `https://dwmcp.example.com/mcp` → it opens the login page → enter email + the shared
+  password → **Allow**. No header.
+- **Claude Code (either mode):** `claude mcp add --transport http rvbbit-warehouse <url>/mcp --header "Authorization: Bearer $WAREHOUSE_MCP_KEY"`
 
 ## Config (env)
 `WAREHOUSE_DSN` · `RVBBIT_CATALOG_GRAPH` (default `db_catalog`) ·
 `WAREHOUSE_SCHEMAS` (CSV allowlist; default = all but rvbbit/pg_*) ·
 `WAREHOUSE_ROW_CAP` (1000) · `WAREHOUSE_STMT_TIMEOUT_MS` (30000) ·
-`WAREHOUSE_MCP_KEY` (shared bearer key; unset = auth OFF, dev only) ·
 `WAREHOUSE_MCP_HOST` (0.0.0.0) · `WAREHOUSE_MCP_PORT` (8765)
+**OAuth mode:** `WAREHOUSE_PUBLIC_URL` (enables it) · `WAREHOUSE_LOGIN_PASSWORD` (req) ·
+`WAREHOUSE_JWT_SECRET` (req, ≠ MCP_KEY) · `WAREHOUSE_ALLOWED_EMAILS` (opt) ·
+`WAREHOUSE_ACCESS_TTL` (3600) · `WAREHOUSE_REFRESH_TTL` (30d).
+**Shared-key mode:** `WAREHOUSE_MCP_KEY` (bearer; unset = auth OFF, dev only).
 
 ## Deferred to Phase 1+
 Per-user identity → scoped role (tools run as the *caller's* scope), PII masking in
