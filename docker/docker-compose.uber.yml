@@ -162,6 +162,40 @@ services:
       - rvbbit_lens:/var/lib/rvbbit/lens
     restart: "no"
 
+  # ── Warehouse MCP — serve the warehouse to Claude (Cowork & Code) ──────────
+  # Inbound (Claude -> rvbbit), the OPPOSITE of the capability mcp-gateway. Its own
+  # tiny image; connects straight to postgres (never via the gateway). Opt-in:
+  #   docker compose -f docker/docker-compose.uber.yml --profile warehouse up -d
+  # Prod hardening: point WAREHOUSE_DSN at a read-only `warehouse_reader` role (the
+  # server already enforces read-only, but least-privilege is belt-and-suspenders).
+  warehouse-mcp:
+    profiles: ["warehouse"]
+    build:
+      context: ../services/warehouse-mcp
+    container_name: rvbbit-warehouse-mcp
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      WAREHOUSE_DSN: ${WAREHOUSE_DSN:-postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}}
+      WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:?set WAREHOUSE_MCP_KEY to a strong shared secret before exposing}
+      WAREHOUSE_MCP_PORT: "8765"
+    restart: unless-stopped
+
+  # Cloudflare QUICK tunnel — instant public HTTPS, no account/cert/open port. The
+  # https://<random>.trycloudflare.com URL prints to this service's logs:
+  #   docker compose -f docker/docker-compose.uber.yml logs warehouse-tunnel | grep trycloudflare
+  # Ephemeral (changes on restart) — fine for testing; use a named tunnel +
+  # TUNNEL_TOKEN (cloudflared ... run) for a stable production URL.
+  warehouse-tunnel:
+    profiles: ["warehouse"]
+    image: cloudflare/cloudflared:latest
+    container_name: rvbbit-warehouse-tunnel
+    depends_on:
+      - warehouse-mcp
+    command: tunnel --no-autoupdate --url http://warehouse-mcp:8765
+    restart: unless-stopped
+
 networks:
   default:
     name: ${RVBBIT_DOCKER_NETWORK:-rvbbit_uber}
