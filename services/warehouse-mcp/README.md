@@ -108,6 +108,21 @@ server {
 }
 ```
 
+> **Connector gotcha:** in the "Add custom connector" dialog, leave **OAuth Client ID**
+> and **OAuth Client Secret** EMPTY — those are for pre-registered clients and bypass
+> auto-registration. If you put your email there you'll get "Client ID not found." Your
+> email + password go on the *login page* that appears after, not in the dialog.
+
+## Activity log (audit + usage-learning)
+Every tool call is recorded to **`rvbbit.mcp_activity`** (auto-created on startup):
+`caller` (the OAuth token's email), `tool`, `args` (incl. the SQL/search query),
+`ok`/`error`, `objects` (schema.tables touched), `rows`, `engine`, `elapsed_ms`, `as_of`,
+`result_summary`. Two rollup views ship with it: `rvbbit.mcp_activity_summary`
+(per tool/caller: calls, errors, avg ms) and `rvbbit.mcp_popular_objects` (most-touched
+tables — the seed for "the catalog learns from usage"). It's in the `rvbbit` schema, so
+it's hidden from `search_data`. Logging is best-effort; with a read-only data role,
+`GRANT INSERT ON rvbbit.mcp_activity` (and the table's privileges) so writes succeed.
+
 ### Connect Claude
 - **Claude Desktop / Cowork (OAuth):** Settings → Connectors → **Add custom connector** →
   URL `https://dwmcp.example.com/mcp` → it opens the login page → enter email + the shared

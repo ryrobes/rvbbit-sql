@@ -317,19 +317,149 @@ def tool_run_sql(sql: str, as_of=None, limit=None) -> dict:
             "as_of_applied": as_of}
 
 
+# ── activity log (audit + a substrate for usage-learning) ────────────────────
+# Every tool call is recorded to a system table: who (the token's email), the tool,
+# the args (incl. the SQL/query), outcome, the objects it touched, rows, engine, ms.
+# It answers "who is doing what" now, and is the raw material for a feedback loop
+# later (popular tables → search-rank boosts, common questions → suggested metrics,
+# repeated errors → catalog gaps). Best-effort: a logging failure never breaks a call.
+
+ACTIVITY_TABLE = os.environ.get("WAREHOUSE_ACTIVITY_TABLE", "rvbbit.mcp_activity")
+_ACTIVITY_DDL = f"""
+CREATE TABLE IF NOT EXISTS {ACTIVITY_TABLE} (
+  id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  ts             timestamptz NOT NULL DEFAULT now(),
+  caller         text,                 -- email from the OAuth token (or null for the static key)
+  client_id      text,
+  tool           text NOT NULL,
+  args           jsonb,                -- the tool input, including the SQL / search query
+  ok             boolean,
+  error          jsonb,
+  objects        text[],               -- schema.table objects searched / described / queried
+  rows           integer,
+  engine         text,
+  elapsed_ms     integer,
+  as_of          text,
+  result_summary jsonb                 -- compact: match scores, columns+row_count, metric value
+);
+CREATE INDEX IF NOT EXISTS mcp_activity_ts_idx      ON {ACTIVITY_TABLE} (ts DESC);
+CREATE INDEX IF NOT EXISTS mcp_activity_caller_idx  ON {ACTIVITY_TABLE} (caller, ts DESC);
+CREATE INDEX IF NOT EXISTS mcp_activity_tool_idx    ON {ACTIVITY_TABLE} (tool, ts DESC);
+CREATE INDEX IF NOT EXISTS mcp_activity_objects_idx ON {ACTIVITY_TABLE} USING gin (objects);
+CREATE OR REPLACE VIEW rvbbit.mcp_activity_summary AS
+  SELECT tool, caller, count(*) AS calls, count(*) FILTER (WHERE NOT ok) AS errors,
+         round(avg(elapsed_ms)) AS avg_ms, max(ts) AS last_seen
+  FROM {ACTIVITY_TABLE} GROUP BY tool, caller;
+CREATE OR REPLACE VIEW rvbbit.mcp_popular_objects AS
+  SELECT obj AS object, count(*) AS touches, count(DISTINCT caller) AS users, max(ts) AS last_touch
+  FROM {ACTIVITY_TABLE}, unnest(objects) AS obj GROUP BY obj ORDER BY touches DESC;
+"""
+
+
+def _ensure_activity_table():
+    try:
+        with _conn() as c:
+            c.execute(_ACTIVITY_DDL)
+    except Exception as e:  # noqa: BLE001 — logging is best-effort (e.g. a read-only role)
+        print(f"WARNING: activity logging disabled (could not ensure {ACTIVITY_TABLE}): {e}", file=sys.stderr)
+
+
+def _caller():
+    """The authenticated caller (email, client_id) from the OAuth token, if any."""
+    try:
+        from mcp.server.auth.middleware.auth_context import get_access_token
+        t = get_access_token()
+        if t is not None:
+            return getattr(t, "email", None) or getattr(t, "client_id", None), getattr(t, "client_id", None)
+    except Exception:  # noqa: BLE001 — no auth context (stdio / shared-key) → anonymous
+        pass
+    return None, None
+
+
+def _objects(tool, args, res):
+    if not isinstance(res, dict):
+        return None
+    if tool == "search_data":
+        return [m.get("object") for m in res.get("matches", []) if m.get("object")] or None
+    if tool == "describe_table":
+        return [res.get("table") or args.get("table")]
+    if tool == "metric" and args.get("name"):
+        return [args["name"]]
+    if tool in ("validate_sql", "run_sql"):
+        return res.get("rvbbit_tables") or None
+    return None
+
+
+def _summary(tool, res):
+    if not isinstance(res, dict):
+        return None
+    if tool == "search_data":
+        return {"matches": [{"object": m.get("object"), "score": m.get("score")} for m in res.get("matches", [])]}
+    if tool == "run_sql":
+        return {"columns": [c.get("name") for c in res.get("columns", [])],
+                "row_count": res.get("row_count"), "truncated": res.get("truncated")}
+    if tool == "metric":
+        return {"result": res.get("result")}
+    if tool == "validate_sql":
+        return {"safe_select": res.get("safe_select"), "engine": res.get("engine")}
+    return None
+
+
+def _record(tool, args, res, err, elapsed_ms):
+    caller, client_id = _caller()
+    rows = res.get("row_count") if isinstance(res, dict) else None
+    engine = res.get("engine") if isinstance(res, dict) else None
+    as_of = args.get("as_of") if isinstance(args, dict) else None
+    try:
+        with _conn() as c:
+            c.execute(
+                f"INSERT INTO {ACTIVITY_TABLE} "
+                "(caller, client_id, tool, args, ok, error, objects, rows, engine, elapsed_ms, as_of, result_summary) "
+                "VALUES (%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb)",
+                (caller, client_id, tool, json.dumps(args, default=str), err is None,
+                 json.dumps(err, default=str) if err is not None else None,
+                 _objects(tool, args, res), rows, engine, elapsed_ms, as_of,
+                 json.dumps(_summary(tool, res), default=str)))
+    except Exception:  # noqa: BLE001 — never let logging break a tool call
+        pass
+
+
+def _logged(tool, args, thunk):
+    t0 = time.time()
+    res = err = None
+    try:
+        res = thunk()
+        if isinstance(res, dict) and res.get("error"):
+            err = res["error"]
+        return res
+    except Exception as e:  # noqa: BLE001
+        err = {"code": "EXCEPTION", "message": str(e)}
+        raise
+    finally:
+        _record(tool, args, res, err, int((time.time() - t0) * 1000))
+
+
 # ── MCP server ───────────────────────────────────────────────────────────────
 
 def _register(mcp):
-    mcp.tool(name="search_data")(
-        lambda query, limit=8, schema=None: tool_search_data(query, limit, schema))
-    mcp.tool(name="describe_table")(lambda table: tool_describe_table(table))
-    mcp.tool(name="list_metrics")(
-        lambda category=None, search=None: tool_list_metrics(category, search))
-    mcp.tool(name="get_metric")(lambda name: tool_get_metric(name))
-    mcp.tool(name="metric")(
-        lambda name, params=None, as_of=None, def_as_of=None: tool_metric(name, params, as_of, def_as_of))
-    mcp.tool(name="validate_sql")(lambda sql, as_of=None: tool_validate_sql(sql, as_of))
-    mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: tool_run_sql(sql, as_of, limit))
+    mcp.tool(name="search_data")(lambda query, limit=8, schema=None: _logged(
+        "search_data", {"query": query, "limit": limit, "schema": schema},
+        lambda: tool_search_data(query, limit, schema)))
+    mcp.tool(name="describe_table")(lambda table: _logged(
+        "describe_table", {"table": table}, lambda: tool_describe_table(table)))
+    mcp.tool(name="list_metrics")(lambda category=None, search=None: _logged(
+        "list_metrics", {"category": category, "search": search},
+        lambda: tool_list_metrics(category, search)))
+    mcp.tool(name="get_metric")(lambda name: _logged(
+        "get_metric", {"name": name}, lambda: tool_get_metric(name)))
+    mcp.tool(name="metric")(lambda name, params=None, as_of=None, def_as_of=None: _logged(
+        "metric", {"name": name, "params": params, "as_of": as_of, "def_as_of": def_as_of},
+        lambda: tool_metric(name, params, as_of, def_as_of)))
+    mcp.tool(name="validate_sql")(lambda sql, as_of=None: _logged(
+        "validate_sql", {"sql": sql, "as_of": as_of}, lambda: tool_validate_sql(sql, as_of)))
+    mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(
+        "run_sql", {"sql": sql, "as_of": as_of, "limit": limit},
+        lambda: tool_run_sql(sql, as_of, limit)))
 
 
 def _selftest():
@@ -346,6 +476,14 @@ def _selftest():
     show("validate_sql(a write — must be unsafe)", tool_validate_sql("DELETE FROM public._demo_revenue"))
     show("run_sql(good SELECT)", tool_run_sql("SELECT region, drop_pct FROM public._demo_revenue", limit=3))
     show("run_sql(a write — must be blocked)", tool_run_sql("DELETE FROM public._demo_revenue"))
+    # activity log: ensure the table, log one call through the wrapper, read it back
+    _ensure_activity_table()
+    _logged("search_data", {"query": "orders"}, lambda: tool_search_data("orders", 2))
+    with _conn() as c:
+        row = c.execute(f"SELECT count(*) AS n FROM {ACTIVITY_TABLE}").fetchone()
+        recent = c.execute(
+            f"SELECT tool, objects, rows, elapsed_ms FROM {ACTIVITY_TABLE} ORDER BY ts DESC LIMIT 1").fetchone()
+    show(f"activity log ({ACTIVITY_TABLE})", {"total_rows": row["n"], "most_recent": recent})
     print("\nselftest done")
 
 
@@ -353,6 +491,7 @@ def _build_mcp():
     from mcp.server.fastmcp import FastMCP
     m = FastMCP("rvbbit-warehouse")
     _register(m)
+    _ensure_activity_table()
     return m
 
 
@@ -376,6 +515,7 @@ def _build_mcp_oauth(public: str):
                 auth_server_provider=provider,
                 auth=auth.make_auth_settings(public))
     _register(m)
+    _ensure_activity_table()
     auth.register_login_route(m, provider)
 
     @m.custom_route("/health", methods=["GET"])
