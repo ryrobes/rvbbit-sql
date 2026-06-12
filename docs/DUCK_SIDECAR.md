@@ -213,6 +213,18 @@ The broker needs:
 - enough PG `max_connections` headroom for broker workers;
 - a restart policy and health check.
 
+The packaged uber compose file follows this model by default: it starts a
+`duck` service from the same Postgres image, enables
+`RVBBIT_DUCK_BACKEND_SHARED=true` in Postgres, shares `/run/rvbbit/duck` for the
+Unix socket, and shares `/tmp/rvbbit-arrow-ipc` for fast Arrow IPC result files.
+The broker uses `--serve-derived-socket`, which computes the same engine/layout
+socket path that the extension derives. That avoids a global socket override:
+the default uber broker serves `duck` + `vortex`, while any other Duck layout can
+fall back to the normal local persistent sidecar path if no matching broker is
+running. `RVBBIT_DUCK_BACKEND_SHARED_TARGETS=duck:vortex` is set in the
+Postgres service so non-vortex Duck routes skip the shared-broker attempt
+instead of logging a missing-socket fallback first.
+
 ### Broker Command
 
 Example command inside the same container namespace as Postgres:
@@ -227,6 +239,21 @@ rvbbit-duck \
   --threads 4 \
   --pgdata-prefix /var/lib/postgresql/18/docker \
   --visible-pgdata-prefix /var/lib/postgresql/18/docker
+```
+
+When the broker runs beside the extension and should use the extension's
+derived socket path instead of an explicit global socket override, use:
+
+```bash
+rvbbit-duck \
+  --serve-derived-socket \
+  --workers 4 \
+  --engine duck \
+  --layout vortex \
+  --dsn "postgresql://postgres:rvbbit@postgres:5432/rvbbit" \
+  --threads 4 \
+  --pgdata-prefix /var/lib/postgresql \
+  --visible-pgdata-prefix /var/lib/postgresql
 ```
 
 `--pgdata-prefix` is the path root stored in Rvbbit metadata. `--visible-pgdata-prefix`
@@ -325,6 +352,7 @@ Unix socket. A TCP broker would need authentication and transport hardening.
 | `rvbbit.duck_backend` / `RVBBIT_DUCK_BACKEND` | `on` | Enables Duck sidecar routes. |
 | `rvbbit.duck_backend_persistent` / `RVBBIT_DUCK_BACKEND_PERSISTENT` | `on` | Reuse one local sidecar per PG backend. |
 | `rvbbit.duck_backend_shared` / `RVBBIT_DUCK_BACKEND_SHARED` | `off` | Use a shared broker socket first. |
+| `rvbbit.duck_backend_shared_targets` / `RVBBIT_DUCK_BACKEND_SHARED_TARGETS` | all | Comma-separated shared broker targets such as `duck:vortex`; entries may also be just an engine or layout. Non-matching routes use the local sidecar path directly. |
 | `rvbbit.duck_backend_shared_socket` / `RVBBIT_DUCK_BACKEND_SHARED_SOCKET` | derived path | Explicit broker socket path. |
 | `rvbbit.duck_backend_shared_dir` / `RVBBIT_DUCK_BACKEND_SHARED_DIR` | `/tmp/rvbbit-duck` | Directory for derived socket paths. |
 | `rvbbit.duck_backend_shared_workers` / `RVBBIT_DUCK_BACKEND_SHARED_WORKERS` | `4` | Expected broker worker count; part of derived socket identity. |

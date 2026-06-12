@@ -18,16 +18,72 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rvbbit}
       POSTGRES_DB: ${POSTGRES_DB:-rvbbit}
       RVBBIT_DUCK_BACKEND: ${RVBBIT_DUCK_BACKEND:-true}
+      RVBBIT_DUCK_BIN: ${RVBBIT_DUCK_BIN:-/usr/local/bin/rvbbit-duck}
+      RVBBIT_DUCK_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}
+      RVBBIT_DUCK_BACKEND_SHARED: ${RVBBIT_DUCK_BACKEND_SHARED:-true}
+      RVBBIT_DUCK_BACKEND_SHARED_TARGETS: ${RVBBIT_DUCK_BACKEND_SHARED_TARGETS:-duck:vortex}
+      RVBBIT_DUCK_BACKEND_SHARED_DIR: ${RVBBIT_DUCK_BACKEND_SHARED_DIR:-/run/rvbbit/duck}
+      RVBBIT_DUCK_BACKEND_SHARED_WORKERS: ${RVBBIT_DUCK_BACKEND_SHARED_WORKERS:-4}
+      RVBBIT_DUCK_THREADS: ${RVBBIT_DUCK_THREADS:-4}
+      RVBBIT_PGDATA_PREFIX: ${RVBBIT_PGDATA_PREFIX:-/var/lib/postgresql}
+      RVBBIT_VISIBLE_PGDATA_PREFIX: ${RVBBIT_VISIBLE_PGDATA_PREFIX:-/var/lib/postgresql}
+      RVBBIT_ARROW_IPC_DIR: ${RVBBIT_ARROW_IPC_DIR:-/tmp/rvbbit-arrow-ipc}
     ports:
       - "${RVBBIT_POSTGRES_PORT:-55433}:5432"
     volumes:
       - rvbbit_pgdata:/var/lib/postgresql
+      - rvbbit_duck_run:/run/rvbbit
+      - rvbbit_duck_arrow_ipc:/tmp/rvbbit-arrow-ipc
     command:
       - postgres
       - -c
       - config_file=/etc/rvbbit/tuning.conf
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-rvbbit}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  duck:
+    image: ${RVBBIT_POSTGRES_IMAGE:-ghcr.io/ryrobes/rvbbit-postgres:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-duck
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RVBBIT_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}
+      RVBBIT_DUCK_BIN: ${RVBBIT_DUCK_BIN:-/usr/local/bin/rvbbit-duck}
+      RVBBIT_DUCK_BACKEND_SHARED_DIR: ${RVBBIT_DUCK_BACKEND_SHARED_DIR:-/run/rvbbit/duck}
+      RVBBIT_DUCK_WORKERS: ${RVBBIT_DUCK_BACKEND_SHARED_WORKERS:-4}
+      RVBBIT_DUCK_THREADS: ${RVBBIT_DUCK_THREADS:-4}
+      RVBBIT_PGDATA_PREFIX: ${RVBBIT_PGDATA_PREFIX:-/var/lib/postgresql}
+      RVBBIT_VISIBLE_PGDATA_PREFIX: ${RVBBIT_VISIBLE_PGDATA_PREFIX:-/var/lib/postgresql}
+      RVBBIT_ARROW_IPC_DIR: ${RVBBIT_ARROW_IPC_DIR:-/tmp/rvbbit-arrow-ipc}
+      RVBBIT_DUCK_NODE_ID: ${RVBBIT_DUCK_NODE_ID:-compose-duck}
+    command:
+      - rvbbit-duck
+      - --serve-derived-socket
+      - --workers
+      - ${RVBBIT_DUCK_BACKEND_SHARED_WORKERS:-4}
+      - --engine
+      - ${RVBBIT_DUCK_ENGINE:-duck}
+      - --layout
+      - ${RVBBIT_DUCK_LAYOUT:-vortex}
+      - --dsn
+      - postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}
+      - --threads
+      - ${RVBBIT_DUCK_THREADS:-4}
+      - --pgdata-prefix
+      - ${RVBBIT_PGDATA_PREFIX:-/var/lib/postgresql}
+      - --visible-pgdata-prefix
+      - ${RVBBIT_VISIBLE_PGDATA_PREFIX:-/var/lib/postgresql}
+    volumes:
+      - rvbbit_duck_run:/run/rvbbit
+      - rvbbit_duck_arrow_ipc:/tmp/rvbbit-arrow-ipc
+      - rvbbit_pgdata:/var/lib/postgresql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "find /run/rvbbit/duck -maxdepth 1 -type s -name 'rvbbit-duck-*.sock' | grep -q ."]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -113,6 +169,10 @@ networks:
 volumes:
   rvbbit_pgdata:
     name: ${RVBBIT_PGDATA_VOLUME:-rvbbit_uber_pgdata}
+  rvbbit_duck_run:
+    name: ${RVBBIT_DUCK_RUN_VOLUME:-rvbbit_uber_duck_run}
+  rvbbit_duck_arrow_ipc:
+    name: ${RVBBIT_DUCK_ARROW_IPC_VOLUME:-rvbbit_uber_duck_arrow_ipc}
   rvbbit_lens:
     name: ${RVBBIT_LENS_VOLUME:-rvbbit_uber_lens}
   rvbbit_warren:

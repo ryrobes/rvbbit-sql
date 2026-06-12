@@ -245,9 +245,18 @@ Docker can use `sudo env RVBBIT_VERSION=... docker compose ...`, and
 rootless/user Docker should set `RVBBIT_DOCKER_SOCKET` to the user Docker
 socket before launching.
 
-This starts the same Postgres, Lens, and Warren services, plus a one-shot
-`bootstrap` service from the Postgres image. The bootstrap waits for Warren to
-register, then deploys and verifies:
+This starts the same Postgres, Lens, and Warren services, a pooled
+`rvbbit-duck` broker service, plus a one-shot `bootstrap` service from the
+Postgres image. The Duck broker is enabled through
+`RVBBIT_DUCK_BACKEND_SHARED=true` on Postgres and listens on a shared Unix
+socket volume under `/run/rvbbit/duck`; Arrow IPC result files are written to a
+shared `/tmp/rvbbit-arrow-ipc` volume so Postgres can read broker results. The
+default broker serves the `duck` / `vortex` layout with
+`RVBBIT_DUCK_BACKEND_SHARED_WORKERS=4` and `RVBBIT_DUCK_THREADS=4`; other Duck
+layouts use local persistent sidecars directly because
+`RVBBIT_DUCK_BACKEND_SHARED_TARGETS=duck:vortex` is set by default.
+
+The bootstrap waits for Warren to register, then deploys and verifies:
 
 - `smoke/warren-echo`
 - `runtimes/python-runtime`

@@ -1,6 +1,8 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -33,6 +35,7 @@ use serde_json::{json, Value};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 const DEFAULT_DSN: &str = "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench";
+const DEFAULT_DUCK_BIN: &str = "/usr/local/bin/rvbbit-duck";
 const DEFAULT_PGDATA_PREFIX: &str = "/var/lib/postgresql";
 const DEFAULT_VISIBLE_PGDATA_PREFIX: &str = "/rvbbit_pgdata";
 const DEFAULT_TELEMETRY_QUEUE_CAPACITY: usize = 8192;
@@ -1078,6 +1081,8 @@ fn write_arrow_ipc_file(schema: SchemaRef, batches: &[RecordBatch]) -> Result<(S
     let dir =
         env::var("RVBBIT_ARROW_IPC_DIR").unwrap_or_else(|_| "/tmp/rvbbit-arrow-ipc".to_string());
     fs::create_dir_all(&dir).with_context(|| format!("creating Arrow IPC dir {dir}"))?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777))
+        .with_context(|| format!("setting Arrow IPC dir permissions on {dir}"))?;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -1093,6 +1098,8 @@ fn write_arrow_ipc_file(schema: SchemaRef, batches: &[RecordBatch]) -> Result<(S
         writer.write(batch)?;
     }
     writer.finish()?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666))
+        .with_context(|| format!("setting Arrow IPC file permissions on {path}"))?;
     let bytes = fs::metadata(&path)?.len();
     Ok((path, bytes))
 }
@@ -1828,6 +1835,7 @@ fn parse_args() -> Result<Args> {
     let mut explain_only = false;
     let mut serve = false;
     let mut serve_socket = None;
+    let mut serve_derived_socket = false;
     let mut workers = env::var("RVBBIT_DUCK_WORKERS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -1855,6 +1863,7 @@ fn parse_args() -> Result<Args> {
             "--explain-only" => explain_only = true,
             "--serve" => serve = true,
             "--serve-socket" => serve_socket = Some(need_value(&mut it, "--serve-socket")?),
+            "--serve-derived-socket" => serve_derived_socket = true,
             "--workers" => workers = need_value(&mut it, "--workers")?.parse()?,
             "-h" | "--help" => {
                 print_help();
@@ -1864,10 +1873,7 @@ fn parse_args() -> Result<Args> {
         }
     }
 
-    if !serve && serve_socket.is_none() && sql.is_none() {
-        bail!("--sql is required unless --serve is set");
-    }
-    Ok(Args {
+    let mut args = Args {
         engine,
         dsn,
         sql,
@@ -1883,7 +1889,52 @@ fn parse_args() -> Result<Args> {
         serve,
         serve_socket,
         workers,
-    })
+    };
+
+    if serve_derived_socket {
+        if args.serve_socket.is_some() {
+            bail!("--serve-derived-socket cannot be combined with --serve-socket");
+        }
+        args.serve_socket = Some(derived_shared_socket_path(&args)?);
+    }
+
+    if !args.serve && args.serve_socket.is_none() && args.sql.is_none() {
+        bail!("--sql is required unless --serve is set");
+    }
+    Ok(args)
+}
+
+fn duck_binary_key() -> String {
+    env::var("RVBBIT_DUCK_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_DUCK_BIN.to_string())
+}
+
+fn derived_shared_socket_path(args: &Args) -> Result<String> {
+    let dir = env::var("RVBBIT_DUCK_BACKEND_SHARED_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/tmp/rvbbit-duck".to_string());
+    fs::create_dir_all(&dir).with_context(|| format!("creating shared socket dir {dir}"))?;
+
+    let mut hasher = DefaultHasher::new();
+    duck_binary_key().hash(&mut hasher);
+    args.dsn.hash(&mut hasher);
+    args.engine.as_str().hash(&mut hasher);
+    args.layout.hash(&mut hasher);
+    args.threads.hash(&mut hasher);
+    args.workers.hash(&mut hasher);
+    args.pgdata_prefix.hash(&mut hasher);
+    args.visible_pgdata_prefix.hash(&mut hasher);
+
+    Ok(format!(
+        "{}/rvbbit-duck-{:016x}.sock",
+        dir.trim_end_matches('/'),
+        hasher.finish()
+    ))
 }
 
 fn parse_engine(raw: &str) -> Result<Engine> {
@@ -1911,6 +1962,7 @@ fn print_help() {
         "rvbbit-duck --sql SQL [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--repeat N] [--timeout-s N] [--threads N] [--max-rows N] [--result-format json|arrow_ipc_file]\n\
          rvbbit-duck --serve [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
          rvbbit-duck --serve-socket PATH [--workers N] [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
+         rvbbit-duck --serve-derived-socket [--workers N] [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
          Server JSONL requests: {{\"sql\":\"SELECT ...\",\"result_format\":\"json|arrow_ipc_file\"}} or {{\"command\":\"prewarm\"}}"
     );
 }

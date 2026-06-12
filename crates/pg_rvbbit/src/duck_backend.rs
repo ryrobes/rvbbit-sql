@@ -189,6 +189,27 @@ fn shared_enabled() -> bool {
         .unwrap_or_else(|| env_enabled("RVBBIT_DUCK_BACKEND_SHARED", false))
 }
 
+fn shared_target_enabled(engine: &str, layout: &str) -> bool {
+    let raw = guc_setting("rvbbit.duck_backend_shared_targets")
+        .or_else(|| std::env::var("RVBBIT_DUCK_BACKEND_SHARED_TARGETS").ok())
+        .unwrap_or_default();
+    shared_target_list_matches(&raw, engine, layout)
+}
+
+fn shared_target_list_matches(raw: &str, engine: &str, layout: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") || trimmed == "*" {
+        return true;
+    }
+    let wanted = format!("{}:{}", engine.trim(), layout.trim()).to_ascii_lowercase();
+    let engine = engine.trim().to_ascii_lowercase();
+    let layout = layout.trim().to_ascii_lowercase();
+    trimmed.split(',').any(|entry| {
+        let entry = entry.trim().to_ascii_lowercase();
+        entry == "*" || entry == "all" || entry == wanted || entry == engine || entry == layout
+    })
+}
+
 fn shared_workers() -> usize {
     guc_setting("rvbbit.duck_backend_shared_workers")
         .or_else(|| std::env::var("RVBBIT_DUCK_BACKEND_SHARED_WORKERS").ok())
@@ -780,7 +801,7 @@ fn run_engine_query(
     threads: usize,
     result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
-    if shared_enabled() {
+    if shared_enabled() && shared_target_enabled(engine, layout) {
         execute_shared(
             engine,
             layout,
@@ -1264,6 +1285,20 @@ mod tests {
             vec!["a".to_string(), "b".to_string()]
         );
         assert!(parse_column_names(&json!({"a": 1})).is_empty());
+    }
+
+    #[test]
+    fn shared_target_list_filters_engine_layout_pairs() {
+        assert!(shared_target_list_matches("", "duck", "scan"));
+        assert!(shared_target_list_matches("all", "duck", "scan"));
+        assert!(shared_target_list_matches("duck:vortex", "duck", "vortex"));
+        assert!(!shared_target_list_matches("duck:vortex", "duck", "scan"));
+        assert!(shared_target_list_matches(
+            "datafusion, duck:hive",
+            "datafusion",
+            "scan"
+        ));
+        assert!(shared_target_list_matches("vortex", "duck", "vortex"));
     }
 
     #[test]
