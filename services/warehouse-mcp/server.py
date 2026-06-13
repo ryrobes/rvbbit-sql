@@ -803,7 +803,10 @@ def _mcp_dashboard_template():
     return _logged("dashboard_template", {}, tool_dashboard_template)
 
 
-# the data client injected into every served dashboard (binds rvbbitQuery to this slug)
+# Data clients injected into every served dashboard. We provide BOTH the hosted
+# rvbbitQuery AND a cowork.callMcpTool shim (routing to the same read-only endpoint), so a
+# Cowork-built artifact (callMcpTool) and a hosted-built one (rvbbitQuery) both run here
+# unchanged — no codemod of the artifact needed.
 _DASH_SHIM = (
     "<script>\n"
     "window.RVBBIT_DASHBOARD={slug:__SLUG__};\n"
@@ -811,6 +814,9 @@ _DASH_SHIM = (
     "const r=await fetch('/api/d/'+__SLUG__+'/q',{method:'POST',headers:{'content-type':'application/json'},"
     "body:JSON.stringify({sql:sql,as_of:opts.as_of||null})});const d=await r.json();"
     "if(!r.ok||d.error){throw new Error((d.error&&d.error.message)||('query failed '+r.status));}return d;};\n"
+    "window.cowork=window.cowork||{};"
+    "if(!window.cowork.callMcpTool){window.cowork.callMcpTool=async function(tool,args){"
+    "const d=await window.rvbbitQuery((args&&args.sql)||'');return{structuredContent:{rows:(d&&d.rows)||[]}};};}\n"
     "</script>\n")
 
 

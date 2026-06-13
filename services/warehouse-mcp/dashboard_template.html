@@ -118,12 +118,21 @@ function waitForBridge(ms=6000){
     if(Date.now()-t0>ms) return rej(new Error('NO_BRIDGE: no data bridge — open this inside a Cowork artifact, or on your rvbbit dashboard host'));
     setTimeout(p,150);})(); });
 }
+/* Normalize a client result to an array of column-keyed objects (handles rvbbitQuery's
+   positional {columns,rows:[[...]]} as well as already-keyed rows). */
+function rowsToObjects(res){
+  if(Array.isArray(res)) return res;
+  if(!res) return [];
+  const cols = (res.columns||res.fields||[]).map(c=> typeof c==='string'?c:(c.name||c.column));
+  const rows = res.rows||res.data||[];
+  if(rows.length && Array.isArray(rows[0]) && cols.length) return rows.map(r=>{const o={};cols.forEach((c,i)=>o[c]=r[i]);return o;});
+  return rows;
+}
 function makeRunSql(serverId){
   const TOOL = 'mcp__'+serverId+'__run_sql';
   return async function runSql(sql){
     if(typeof window.rvbbitQuery==='function' && !(window.cowork && window.cowork.callMcpTool)){
-      const d = await window.rvbbitQuery(sql);   // hosted path: host already authed the viewer
-      return (d && d.rows) || [];
+      return rowsToObjects(await window.rvbbitQuery(sql));   // hosted path; host authed the viewer
     }
     const r = await window.cowork.callMcpTool(TOOL, { sql });
     if(r && r.isError) throw new Error('TOOL_ERROR: '+JSON.stringify(r.content||r).slice(0,240));
