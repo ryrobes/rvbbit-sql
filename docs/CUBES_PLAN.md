@@ -236,8 +236,21 @@ question. None of which dbt/Cube.dev/LookML do natively.
   `list_cubes`/`describe_cube` + `search_data` tier-boost (metrics→cubes→raw, verified). Manual
   docs; metrics can target `cubes.<name>`. (pg_cron auto-refresh wiring + numeric-column cubes
   — the latter needs the text-surrogate build, commit 202f985 — are the small follow-ons.)
-- **V2 — the semantic layer.** `enrich_cube` (LLM column docs + grain) + cube embeddings +
-  metric→cube→raw ranking + `describe_cube` returns docs/lineage/freshness/drift/samples.
+- **V2 — the semantic layer. ✅ LANDED** (`sql/migrations/0005_cubes_enrich.sql`).
+  `rvbbit.cube_columns` (per-column doc/semantics/source_ref/confidence/edited_by, human-
+  editable) + `enrich_cube(name, sample_rows, overwrite_edited)` — ONE LLM call (the new
+  `cube_enrich` jsonb operator, same `create_operator`/`_exec_op_jsonb` path + retry-validator
+  as `triples`) drafts a description, grain, and per-column docs from the cube SQL + a clamped
+  row sample + the **source tables' catalog docs**. Lineage via `_cube_source_tables` (walks
+  `EXPLAIN (FORMAT JSON, VERBOSE)` for every base relation — raw + rvbbit; **VOLATILE** since
+  EXPLAIN is barred in non-volatile fns). The enriched docs fold back into a far richer catalog
+  embedding (`register_cube_node` now embeds the curated column docs, ~1.5KB vs V1's terse
+  types → sharper KNN). `describe_cube` now returns columns-with-docs + lineage + auto/human
+  description + freshness + a 5-row sample (so the MCP `describe_cube` tool carries the
+  semantics automatically — no server change). `set_cube_column_doc` for human corrections;
+  `drop_cube` cleans `cube_columns`. Verified live: a 7-column `sales_orders` cube enriched with
+  lineage-traced `source_ref`s (incl. `derived:` exprs), cube ranks **1.000** (top) on semantic
+  `data_search`. Enrich stays SQL/Studio-side (a write + LLM cost); MCP enrich is a V3 item.
 - **V3 — curation + studio + learning.** The lens **Cube Studio** (Catalog/Creator/Inspector
   w/ metadata editing), `propose_cube` (agent-drafted → human-blessed), cube→metric promotion,
   usage-learning, drift→cube-health, incremental refresh.
