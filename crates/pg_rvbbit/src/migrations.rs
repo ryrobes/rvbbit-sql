@@ -20,10 +20,20 @@
 use pgrx::prelude::*;
 
 /// Ordered, compile-time-embedded migration list. APPEND ONLY.
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_durable_catalog_crawl",
-    include_str!("../sql/migrations/0001_durable_catalog_crawl.sql"),
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_durable_catalog_crawl",
+        include_str!("../sql/migrations/0001_durable_catalog_crawl.sql"),
+    ),
+    (
+        "0002_default_embedder",
+        include_str!("../sql/migrations/0002_default_embedder.sql"),
+    ),
+    (
+        "0003_parallel_catalog_crawl",
+        include_str!("../sql/migrations/0003_parallel_catalog_crawl.sql"),
+    ),
+];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS rvbbit.schema_migrations (
@@ -64,9 +74,7 @@ fn migrate() -> String {
             "INSERT INTO rvbbit.schema_migrations (name) VALUES ('{}')",
             sql_quote(name)
         ))
-        .unwrap_or_else(|e| {
-            pgrx::error!("rvbbit.migrate: recording '{}' failed: {:?}", name, e)
-        });
+        .unwrap_or_else(|e| pgrx::error!("rvbbit.migrate: recording '{}' failed: {:?}", name, e));
         applied.push(name);
     }
 
