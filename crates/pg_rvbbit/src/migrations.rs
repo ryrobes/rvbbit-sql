@@ -69,6 +69,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0012_semantic_model",
         include_str!("../sql/migrations/0012_semantic_model.sql"),
     ),
+    (
+        "0013_proposal_lifecycle",
+        include_str!("../sql/migrations/0013_proposal_lifecycle.sql"),
+    ),
+    (
+        "0014_materialize_all_metrics",
+        include_str!("../sql/migrations/0014_materialize_all_metrics.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
