@@ -285,17 +285,31 @@ def tool_describe_cube(name: str) -> dict:
 def tool_propose_cube(subject: str, seed_tables=None, schema=None) -> dict:
     """Draft a candidate cube for a subject — a documented join over your tables. Returns a DRAFT
     only (name, sql, grain, description, source_tables, join_rationale, confidence + the FK edges
-    it reasoned from); NOTHING is created. A human blesses the draft with define_cube on the
-    primary. Use this to scaffold the curated layer instead of reasoning over raw tables every
-    time. Pass seed_tables (schema.table list) to pin the join, or a schema to scope discovery."""
+    it reasoned from); NOTHING is created. The draft is LOGGED to a review queue (returns its
+    proposal_id) so a human can bless it in the lens Cube Proposals inbox (or define_cube on the
+    primary). Propose freely — good ideas are captured for review, not lost. Pass seed_tables
+    (schema.table list) to pin the join, or a schema to scope discovery."""
     with _conn() as c:
         try:
-            d = c.execute(
+            row = c.execute(
                 "SELECT rvbbit.propose_cube(%s, %s::text[], %s) AS d",
                 (subject, seed_tables, schema)).fetchone()
         except Exception as e:  # noqa: BLE001
             return {"error": {"code": "PROPOSE_FAILED", "message": str(e)}}
-    return d["d"] if (d and d["d"] is not None) else {"error": {"code": "PROPOSE_FAILED", "message": "no draft"}}
+        draft = row["d"] if row else None
+        if not draft:
+            return {"error": {"code": "PROPOSE_FAILED", "message": "no draft"}}
+        # Log the draft to the review queue (best-effort: a read-only mirror just skips it).
+        try:
+            draft = {**draft, "subject": subject}
+            pid = c.execute(
+                "SELECT rvbbit.record_proposal('cube', %s::jsonb, 'mcp', 'mcp') AS id",
+                (json.dumps(draft),)).fetchone()
+            if pid and pid["id"] is not None:
+                draft = {**draft, "proposal_id": pid["id"]}
+        except Exception:  # noqa: BLE001
+            pass
+    return draft
 
 
 def tool_metric(name: str, params=None, as_of=None, def_as_of=None) -> dict:
