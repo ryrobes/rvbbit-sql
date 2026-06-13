@@ -33,6 +33,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_parallel_catalog_crawl",
         include_str!("../sql/migrations/0003_parallel_catalog_crawl.sql"),
     ),
+    (
+        "0004_cubes",
+        include_str!("../sql/migrations/0004_cubes.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -227,10 +227,15 @@ question. None of which dbt/Cube.dev/LookML do natively.
 ---
 
 ## 14. Phased plan
-- **V1 — the primitive.** `define_cube` / `refresh_cube` / `drop_cube` → materialized
-  `cubes.<name>` (`USING rvbbit`) + `cube_defs` + a `kind='cube'` catalog node + pg_cron refresh.
-  `list_cubes` / `describe_cube`. `search_data` tier-boosts cubes. Manual docs. Metrics can be
-  defined over a cube.
+- **V1 — the primitive. ✅ LANDED** (`sql/migrations/0004_cubes.sql`). `define_cube` /
+  `refresh_cube` / `drop_cube` → materialized `cubes.<name>` (`USING rvbbit`, shape inferred
+  via CTAS `WITH NO DATA`) + `cube_defs`/`cube_control` + a `kind='cube'` catalog node
+  (`register_cube_node`, embed best-effort). `refresh_cube` **reuses `rvbbit.snapshot_load`**
+  (TRUNCATE+load+compact+`set_visible_floor`) so each refresh REPLACES the current view *and*
+  retains an AS-OF generation. `rvbbit.cubes()` / `rvbbit.describe_cube()`; warehouse-MCP
+  `list_cubes`/`describe_cube` + `search_data` tier-boost (metrics→cubes→raw, verified). Manual
+  docs; metrics can target `cubes.<name>`. (pg_cron auto-refresh wiring + numeric-column cubes
+  — the latter needs the text-surrogate build, commit 202f985 — are the small follow-ons.)
 - **V2 — the semantic layer.** `enrich_cube` (LLM column docs + grain) + cube embeddings +
   metric→cube→raw ranking + `describe_cube` returns docs/lineage/freshness/drift/samples.
 - **V3 — curation + studio + learning.** The lens **Cube Studio** (Catalog/Creator/Inspector
