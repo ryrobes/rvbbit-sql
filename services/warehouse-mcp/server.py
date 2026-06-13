@@ -340,6 +340,63 @@ def tool_propose_metric(subject: str, seed_sources=None, schema=None) -> dict:
     return draft
 
 
+# ── proposal queue: see your drafts' fate + iterate on pending ones ──────────
+
+def tool_list_proposals(status=None, kind=None, proposed_by=None, limit=20) -> dict:
+    """See the proposal queue — drafts (yours or others') and their fate. Filter by status
+    (pending/accepted/rejected/withdrawn), kind (cube/metric), or proposed_by. ACCEPTED proposals
+    carry result_name (the object created); REJECTED/WITHDRAWN carry notes (the reason). Use this to
+    LEARN from feedback before proposing again — don't re-propose something already rejected, and
+    refine_proposal a pending draft instead of submitting a duplicate."""
+    lim = max(1, min(int(limit or 20), 100))
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT proposal_id, kind, name, subject, status, confidence, "
+            "       created_at::text AS created_at, reviewed_at::text AS reviewed_at, result_name, notes "
+            "FROM rvbbit.proposals(%s, %s) "
+            "WHERE (%s IS NULL OR proposed_by = %s) LIMIT %s",
+            (status, kind, proposed_by, proposed_by, lim)).fetchall()
+    return {"proposals": rows}
+
+
+def tool_get_proposal(proposal_id) -> dict:
+    """Full detail of one proposal — sql, grain, source_tables, params, check_sql, join_rationale,
+    confidence, status, result_name. Use after list_proposals to inspect a specific draft."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT proposal_id, kind, status, name, subject, sql, grain, description, source_tables, "
+            "       fk_edges, join_rationale, confidence, params, check_sql, proposed_by, proposed_via, "
+            "       result_name, notes, created_at::text AS created_at, reviewed_at::text AS reviewed_at "
+            "FROM rvbbit.proposals WHERE proposal_id = %s", (proposal_id,)).fetchone()
+    return row or {"error": {"code": "PROPOSAL_NOT_FOUND", "message": str(proposal_id)}}
+
+
+def tool_refine_proposal(proposal_id, name=None, sql=None, grain=None, description=None,
+                         params=None, check_sql=None, join_rationale=None, confidence=None) -> dict:
+    """Edit a PENDING proposal in place after seeing feedback — instead of submitting a duplicate.
+    Only the fields you pass change. (Cube SQL is plain; metric SQL may use {param} tokens.)"""
+    with _conn() as c:
+        try:
+            row = c.execute(
+                "SELECT rvbbit.refine_proposal(%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s) AS r",
+                (proposal_id, name, sql, grain, description,
+                 json.dumps(params) if params is not None else None,
+                 check_sql, join_rationale, confidence)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "REFINE_FAILED", "message": str(e)}}
+    return row["r"] if (row and row["r"] is not None) else {"error": {"code": "REFINE_FAILED", "message": "no result"}}
+
+
+def tool_withdraw_proposal(proposal_id, reason=None) -> dict:
+    """Retract a PENDING proposal you no longer want reviewed (status -> withdrawn)."""
+    with _conn() as c:
+        try:
+            c.execute("SELECT rvbbit.withdraw_proposal(%s, %s)", (proposal_id, reason))
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "WITHDRAW_FAILED", "message": str(e)}}
+    return {"status": "withdrawn", "proposal_id": proposal_id}
+
+
 def tool_metric(name: str, params=None, as_of=None, def_as_of=None) -> dict:
     """A blessed, governed number — bitemporal (as_of = data-time, def_as_of = def-time)."""
     params = params or {}
@@ -969,6 +1026,17 @@ def _register(mcp):
     mcp.tool(name="propose_metric")(lambda subject, seed_sources=None, schema=None: _logged(
         "propose_metric", {"subject": subject, "seed_sources": seed_sources, "schema": schema},
         lambda: tool_propose_metric(subject, seed_sources, schema)))
+    mcp.tool(name="list_proposals")(lambda status=None, kind=None, proposed_by=None, limit=20: _logged(
+        "list_proposals", {"status": status, "kind": kind, "proposed_by": proposed_by, "limit": limit},
+        lambda: tool_list_proposals(status, kind, proposed_by, limit)))
+    mcp.tool(name="get_proposal")(lambda proposal_id: _logged(
+        "get_proposal", {"proposal_id": proposal_id}, lambda: tool_get_proposal(proposal_id)))
+    mcp.tool(name="refine_proposal")(lambda proposal_id, name=None, sql=None, grain=None, description=None, params=None, check_sql=None, join_rationale=None, confidence=None: _logged(
+        "refine_proposal", {"proposal_id": proposal_id},
+        lambda: tool_refine_proposal(proposal_id, name, sql, grain, description, params, check_sql, join_rationale, confidence)))
+    mcp.tool(name="withdraw_proposal")(lambda proposal_id, reason=None: _logged(
+        "withdraw_proposal", {"proposal_id": proposal_id, "reason": reason},
+        lambda: tool_withdraw_proposal(proposal_id, reason)))
     mcp.tool(name="metric")(lambda name, params=None, as_of=None, def_as_of=None: _logged(
         "metric", {"name": name, "params": params, "as_of": as_of, "def_as_of": def_as_of},
         lambda: tool_metric(name, params, as_of, def_as_of)))
