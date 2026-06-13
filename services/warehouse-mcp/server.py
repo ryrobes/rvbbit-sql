@@ -312,6 +312,34 @@ def tool_propose_cube(subject: str, seed_tables=None, schema=None) -> dict:
     return draft
 
 
+def tool_propose_metric(subject: str, seed_sources=None, schema=None) -> dict:
+    """Draft a candidate metric for a subject — a small, governed aggregation, PREFERRING a cube as
+    its source. Returns a DRAFT only (name, sql, grain, description, params, optional KPI check_sql,
+    source, confidence); NOTHING is created. The draft is LOGGED to the review queue (returns its
+    proposal_id) so a human can bless it in the lens Proposals inbox (→ define_metric). Propose
+    freely. Pass seed_sources (cubes.x / schema.table list) to pin the source, or a schema to scope."""
+    with _conn() as c:
+        try:
+            row = c.execute(
+                "SELECT rvbbit.propose_metric(%s, %s::text[], %s) AS d",
+                (subject, seed_sources, schema)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "PROPOSE_FAILED", "message": str(e)}}
+        draft = row["d"] if row else None
+        if not draft:
+            return {"error": {"code": "PROPOSE_FAILED", "message": "no draft"}}
+        try:
+            draft = {**draft, "subject": subject}
+            pid = c.execute(
+                "SELECT rvbbit.record_proposal('metric', %s::jsonb, 'mcp', 'mcp') AS id",
+                (json.dumps(draft),)).fetchone()
+            if pid and pid["id"] is not None:
+                draft = {**draft, "proposal_id": pid["id"]}
+        except Exception:  # noqa: BLE001
+            pass
+    return draft
+
+
 def tool_metric(name: str, params=None, as_of=None, def_as_of=None) -> dict:
     """A blessed, governed number — bitemporal (as_of = data-time, def_as_of = def-time)."""
     params = params or {}
@@ -938,6 +966,9 @@ def _register(mcp):
     mcp.tool(name="propose_cube")(lambda subject, seed_tables=None, schema=None: _logged(
         "propose_cube", {"subject": subject, "seed_tables": seed_tables, "schema": schema},
         lambda: tool_propose_cube(subject, seed_tables, schema)))
+    mcp.tool(name="propose_metric")(lambda subject, seed_sources=None, schema=None: _logged(
+        "propose_metric", {"subject": subject, "seed_sources": seed_sources, "schema": schema},
+        lambda: tool_propose_metric(subject, seed_sources, schema)))
     mcp.tool(name="metric")(lambda name, params=None, as_of=None, def_as_of=None: _logged(
         "metric", {"name": name, "params": params, "as_of": as_of, "def_as_of": def_as_of},
         lambda: tool_metric(name, params, as_of, def_as_of)))
