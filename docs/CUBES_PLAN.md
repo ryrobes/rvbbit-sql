@@ -251,9 +251,29 @@ question. None of which dbt/Cube.dev/LookML do natively.
   `drop_cube` cleans `cube_columns`. Verified live: a 7-column `sales_orders` cube enriched with
   lineage-traced `source_ref`s (incl. `derived:` exprs), cube ranks **1.000** (top) on semantic
   `data_search`. Enrich stays SQL/Studio-side (a write + LLM cost); MCP enrich is a V3 item.
-- **V3 — curation + studio + learning.** The lens **Cube Studio** (Catalog/Creator/Inspector
-  w/ metadata editing), `propose_cube` (agent-drafted → human-blessed), cube→metric promotion,
-  usage-learning, drift→cube-health, incremental refresh.
+- **V3 — curation + authoring + health. BACKEND ✅ LANDED** (`sql/migrations/0006_cubes_v3.sql`);
+  lens Cube Studio in progress.
+  - **`propose_cube(subject, seed_tables?, schema?, max_tables?)`** — an LLM (new `propose_cube_draft`
+    jsonb operator, same path as `cube_enrich`) drafts a wide join SQL + grain + description + name
+    from FK edges (`pg_constraint`, oid-matched), `data_search` candidates (→ `information_schema`
+    fallback when uncrawled), per-table columns + catalog docs. Returns a DRAFT only (never persists;
+    a human blesses via `define_cube`). Verified: drafts a correct FK-joined cube, confidence 0.97,
+    draft SQL EXPLAINs, bless-loop produces a live cube.
+  - **Cube packs** — `rvbbit.cube_packs`/`cube_packs_latest`/`pack_bindings` + a seeded
+    `salesforce.opportunities` pack (canonical join template + per-column docs + binding field specs).
+    `fuzzy_suggest_bindings(pack, schema?)` (lexical + type-family match, no crawl needed),
+    `apply_cube_pack(pack, bindings)` (substitute + EXPLAIN-validate, dry-run), `define_cube_from_pack`
+    (materialize + pre-seed curated docs at `edited_by='pack'` so `enrich_cube` preserves them).
+    Verified: synthetic renamed CRM schema → fuzzy-bound → live 200-row documented `sf_opportunities`.
+  - **`promote_cube_to_metric(cube, metric, …)`** — zero-copy metric over `cubes.<name>` (`SELECT *`,
+    `labels.cube_source` for reverse lookup); derived/aggregated metrics are still hand-written.
+  - **`cube_health(name)`** (folded into `describe_cube` as `health`) — freshness (keyed off
+    `cube_control.refreshed_at`, not the parquet clock) / staleness / drift (`accel_freshness`,
+    null-guarded) / usage + a skip/delta/full-rebuild recommendation.
+  - **MCP**: `propose_cube` added (read-only-safe draft, audited); all persisting/DDL cube ops stay
+    primary-only (the mirror proposes, the human blesses). Pending: lens **Cube Studio**
+    (Catalog/Creator with Manual|Propose|From-Pack modes/Inspector w/ column-doc editing + Health),
+    plus deferrals — incremental/delta refresh, the Inspector AS-OF scrubber, MCP enrich-preview.
 
 ---
 

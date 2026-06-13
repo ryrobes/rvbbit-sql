@@ -282,6 +282,22 @@ def tool_describe_cube(name: str) -> dict:
     return d["d"] if (d and d["d"] is not None) else {"error": {"code": "CUBE_NOT_FOUND", "message": name}}
 
 
+def tool_propose_cube(subject: str, seed_tables=None, schema=None) -> dict:
+    """Draft a candidate cube for a subject — a documented join over your tables. Returns a DRAFT
+    only (name, sql, grain, description, source_tables, join_rationale, confidence + the FK edges
+    it reasoned from); NOTHING is created. A human blesses the draft with define_cube on the
+    primary. Use this to scaffold the curated layer instead of reasoning over raw tables every
+    time. Pass seed_tables (schema.table list) to pin the join, or a schema to scope discovery."""
+    with _conn() as c:
+        try:
+            d = c.execute(
+                "SELECT rvbbit.propose_cube(%s, %s::text[], %s) AS d",
+                (subject, seed_tables, schema)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "PROPOSE_FAILED", "message": str(e)}}
+    return d["d"] if (d and d["d"] is not None) else {"error": {"code": "PROPOSE_FAILED", "message": "no draft"}}
+
+
 def tool_metric(name: str, params=None, as_of=None, def_as_of=None) -> dict:
     """A blessed, governed number — bitemporal (as_of = data-time, def_as_of = def-time)."""
     params = params or {}
@@ -905,6 +921,9 @@ def _register(mcp):
     mcp.tool(name="list_cubes")(lambda: _logged("list_cubes", {}, tool_list_cubes))
     mcp.tool(name="describe_cube")(lambda name: _logged(
         "describe_cube", {"name": name}, lambda: tool_describe_cube(name)))
+    mcp.tool(name="propose_cube")(lambda subject, seed_tables=None, schema=None: _logged(
+        "propose_cube", {"subject": subject, "seed_tables": seed_tables, "schema": schema},
+        lambda: tool_propose_cube(subject, seed_tables, schema)))
     mcp.tool(name="metric")(lambda name, params=None, as_of=None, def_as_of=None: _logged(
         "metric", {"name": name, "params": params, "as_of": as_of, "def_as_of": def_as_of},
         lambda: tool_metric(name, params, as_of, def_as_of)))
