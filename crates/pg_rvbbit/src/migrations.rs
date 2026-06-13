@@ -85,6 +85,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0016_activity_discovery",
         include_str!("../sql/migrations/0016_activity_discovery.sql"),
     ),
+    (
+        "0017_usage_weighted_search",
+        include_str!("../sql/migrations/0017_usage_weighted_search.sql"),
+    ),
+    (
+        "0018_proposal_quality",
+        include_str!("../sql/migrations/0018_proposal_quality.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

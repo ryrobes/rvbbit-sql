@@ -172,14 +172,16 @@ def tool_search_data(query: str, limit: int = 8, schema=None) -> dict:
     schemas are hidden, so users only ever see the data they're meant to."""
     limit = max(1, min(int(limit), 25))
     with _conn() as c:
+        # usage-weighted: objects employees actually query climb (boosted_score folds in
+        # mcp_popular_objects). Falls back to pure relevance when nothing is logged yet.
         hits = c.execute(
-            "SELECT node_id, kind, schema_name, rel_name, col_name, score, doc "
-            "FROM rvbbit.data_search(%s, %s, %s, %s)",
+            "SELECT node_id, kind, schema_name, rel_name, col_name, score, boosted_score, doc, usage_touches "
+            "FROM rvbbit.search_data_weighted(%s, %s, %s, %s, 0.5)",
             (query, min(limit * 4, 100), None, GRAPH),   # over-fetch; internals get filtered out
         ).fetchall()
-    # discovery gradient: curated metrics/cubes outrank raw tables (search them first)
+    # discovery gradient: curated metrics/cubes outrank raw tables, then by usage-weighted score
     _tier = {"metric": 0, "cube": 1, "db_table": 2, "db_column": 2}
-    hits.sort(key=lambda h: (_tier.get(h["kind"], 3), -float(h["score"] or 0)))
+    hits.sort(key=lambda h: (_tier.get(h["kind"], 3), -float(h["boosted_score"] or h["score"] or 0)))
     matches = []
     with _ro() as rc, rc.cursor() as cur:
         for h in hits:
@@ -197,6 +199,8 @@ def tool_search_data(query: str, limit: int = 8, schema=None) -> dict:
                 "score": round(float(h["score"]), 3),
                 "doc": h["doc"],
             }
+            if h["usage_touches"]:
+                m["usage_touches"] = int(h["usage_touches"])   # how often employees query it
             if not h["col_name"]:  # a table hit -> ground it (samples + stats + freshness)
                 m["samples"] = _samples(cur, h["schema_name"], h["rel_name"], 5)
                 st = _col_stats(cur, h["schema_name"], h["rel_name"])
