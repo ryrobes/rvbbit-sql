@@ -65,6 +65,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0011_near_frontier_proposals",
         include_str!("../sql/migrations/0011_near_frontier_proposals.sql"),
     ),
+    (
+        "0012_semantic_model",
+        include_str!("../sql/migrations/0012_semantic_model.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
