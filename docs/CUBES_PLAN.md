@@ -88,9 +88,15 @@ cubes.<name>                              -- CREATE TABLE cubes.<name> USING rvb
 3. register a `kind='cube'` catalog node + lineage edges (the source tables from `route_explain`);
 4. schedule `refresh_cube(name)` on `refresh_cron` via pg_cron.
 
-`refresh_cube(name)` → re-run the SQL (full rebuild v1; swap-in), `compact()`, re-fingerprint,
-re-embed. `enrich_cube(name)` → LLM-draft `cube_columns` + grain from the SQL + samples +
-source docs, then embed. `drop_cube(name)` → drop the table + def + catalog node.
+`refresh_cube(name)` → **in-place snapshot reload, not a rename-swap.** Reload the SQL result
+into the *same* `cubes.<name>` (truncate-and-load, table identity preserved) + `compact()` =
+**a new generation/snapshot**. Crucially this **reuses the Temporal Mirror's snapshot-load
+machinery** (`snapshot_load` + `compact(keep_heap)`): each refresh is a snapshot, old
+generations retained (with a reaper/retention policy), so **the refresh history *is* the
+cube's AS-OF timeline** — *"the sales cube as of last Tuesday's refresh."* A rebuild-then-
+rename would orphan the generation chain and kill time-travel; that's why we don't swap.
+Then re-fingerprint + re-embed. `enrich_cube(name)` → LLM-draft `cube_columns` + grain from
+the SQL + samples + source docs, then embed. `drop_cube(name)` → drop the table + def + node.
 
 ---
 
@@ -123,6 +129,15 @@ All three land in `cube_defs` + the materialized table. The human-vs-agent quest
 start **human-authored** (V1), add **propose_cube** (agent-drafted → human-blessed) and
 direct MCP creation as the loop matures. Enrichment (`enrich_cube`) is the same regardless of
 who authored the SQL.
+
+**Cube packs (known schemas ship as templates).** Grounding a `propose_cube` in a 2,000-table
+custom schema is hard — but *known* SaaS schemas aren't custom. Salesforce, HubSpot, Stripe,
+etc. have a fixed object model (Account ← Opportunity ← OpportunityLineItem, AccountId/
+OpportunityId FKs, standard fields). So ship **packs**: parameterized cube templates (the
+opportunities cube, the accounts cube…) that bind to the user's actual table/column names
+(Salesforce exports prefix/rename) + come with the docs pre-written. For known sources this is
+a near-one-click curated layer; for custom schemas, fall back to FK-graph + KG + sampling
+reasoning. **Salesforce is the obvious first pack** — highest pain, fully known patterns.
 
 ---
 
@@ -224,18 +239,29 @@ question. None of which dbt/Cube.dev/LookML do natively.
 
 ---
 
-## 15. Open questions
-1. **Schema home** — a dedicated `cubes` schema (clean, easy to scope/expose) vs. `rvbbit`? Lean
-   `cubes`.
-2. **Refresh granularity** — full rebuild vs. incremental, and the swap mechanism (rebuild-then-
-   rename vs. truncate+insert) to avoid serving a half-built cube.
-3. **Versioning a materialized thing** — `cube_defs` is versioned like metrics, but the table is
-   singular; do we keep old versions queryable (AS OF already gives data-time; def-time history
-   is the def)?
-4. **Embedding model/space** — confirm cubes share the catalog's embedding model so KNN is
+## 15. Decisions & open questions
+- **DECIDED — Schema home:** `cubes.<name>`. Clean, easy for the warehouse-mcp schema-scoping
+  to expose, keeps the curated layer out of `rvbbit` internals.
+- **DECIDED — Refresh:** **in-place truncate-and-load (a snapshot generation), not a rename-
+  swap** — rename orphans the time-travel chain; in-place reload preserves table identity so
+  each refresh is an AS-OF snapshot. Reuse the Temporal Mirror's `snapshot_load` + `compact`
+  machinery + a retention/reaper for old generations. Full rebuild in V1; incremental
+  (compaction-is-the-diff-engine) is the follow-on.
+- **DECIDED — Propose-cube grounding:** **all three** (FK graph + catalog KG + sampling) for
+  custom schemas, **plus cube packs** (parameterized templates) for known SaaS schemas.
+  **Salesforce ships first** — known patterns mean templates beat from-scratch reasoning.
+
+Still open:
+1. **Versioning a materialized thing** — `cube_defs` is versioned like metrics, but the table is
+   singular; AS OF already gives data-time, def-time history is the def — confirm we don't need
+   per-version tables.
+2. **Embedding model/space** — confirm cubes share the catalog's embedding model so KNN is
    comparable (the "works with the existing vector system" requirement).
-5. **Propose-cube grounding** — how Claude finds the right tables to join in a 2,000-table
-   schema (FK graph + catalog KG + sampling); how much human review the draft needs.
+3. **Refresh atomicity** — truncate+load briefly locks (ACCESS EXCLUSIVE on TRUNCATE) or leaves
+   dead tuples (DELETE); pick the load path that never serves a half-built cube (the Temporal
+   Mirror already solved this with per-table COMMIT + keep_heap — inherit it).
+4. **Pack binding** — how a Salesforce pack maps its canonical objects to the user's
+   actual (prefixed/renamed) table+column names — fuzzy match + confirm, or a small mapping file.
 
 ---
 
