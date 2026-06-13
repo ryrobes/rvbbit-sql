@@ -129,15 +129,19 @@ it's hidden from `search_data`. Logging is best-effort; with a read-only data ro
   password → **Allow**. No header.
 - **Claude Code (either mode):** `claude mcp add --transport http rvbbit-warehouse <url>/mcp --header "Authorization: Bearer $WAREHOUSE_MCP_KEY"`
 
-## Dashboards (Phase 0 — artifacts that live + work outside Claude)
-Claude calls `publish_dashboard(name, html, team?, description?)` → stored versioned in
-`rvbbit.dashboards` and served at `<WAREHOUSE_PUBLIC_URL>/d/<slug>` behind the same login
-(a `wh_session` cookie). **Live, not baked:** build the artifact to fetch through the
-injected client — `const {columns, rows} = await rvbbitQuery("SELECT ...")` — which posts
-to `/api/d/<slug>/q`, runs read-only on the mirror (`safe_select`-gated), and logs to
-`mcp_activity` (`tool='dashboard_query'`, tagged with the slug + the viewer's email). Tools:
-`publish_dashboard` / `update_dashboard` / `list_dashboards` / `get_dashboard`. Tables
-auto-create on startup (no migration). Design: [`docs/DASHBOARDS_PLAN.md`](../../docs/DASHBOARDS_PLAN.md).
+## Dashboards (artifacts that live + work outside Claude)
+**Start from `dashboard_template`** — the proven boilerplate (see [`DASHBOARD_TEMPLATE.md`](DASHBOARD_TEMPLATE.md)).
+Its dual-mode data bridge means the *same* artifact runs live in **two places, no login**:
+- **In a Cowork artifact** — `window.cowork.callMcpTool('mcp__<id>__run_sql', {sql})`, authed by
+  the connector OAuth the user already granted (the sandbox blocks `fetch`, so this is the path).
+- **Hosted** — `publish_dashboard(name, html, …)` stores it versioned in `rvbbit.dashboards`,
+  serves it at `<WAREHOUSE_PUBLIC_URL>/d/<slug>` behind the login cookie, and injects
+  `rvbbitQuery()` (→ `/api/d/<slug>/q`, read-only on the mirror, logged to `mcp_activity`).
+
+Key rule: compose each view into **one** `run_sql` via `composePayload` (each bridge call has
+~1.5s overhead; the DB aggregates in ~100ms). Never bake data in — that's a 'dead tree'.
+Tools: `dashboard_template` / `publish_dashboard` / `update_dashboard` / `list_dashboards` /
+`get_dashboard`. Tables auto-create on startup (no migration). Design: [`docs/DASHBOARDS_PLAN.md`](../../docs/DASHBOARDS_PLAN.md).
 
 **Phase 1 — catalog-linked inspection.** `dashboard_crawl(slug)` extracts each dashboard's
 data dependencies — parses literal `rvbbitQuery(...)` calls, **SQL-shaped string literals

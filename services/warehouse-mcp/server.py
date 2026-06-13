@@ -728,11 +728,12 @@ def tool_dashboard_dependents(object_ref):
 
 # MCP wrappers (named, so their docstring becomes the tool description Claude reads)
 def _mcp_publish_dashboard(name, html, team=None, description=None, kind="live"):
-    """Publish a dashboard so it lives + works OUTSIDE Claude — returns a shareable URL.
-    Build `html` as a self-contained page that fetches LIVE data via the injected client:
-    `const {columns, rows} = await rvbbitQuery("SELECT ...")` (returns {columns:[{name,type}],
-    rows:[[...]]}). Do NOT bake query results into the HTML — that makes a 'dead tree' with no
-    live data or inspectability. Design the queries first with validate_sql / run_sql."""
+    """Persist a dashboard so it lives + works OUTSIDE Cowork (a shareable URL + the lens app).
+    Build `html` from the `dashboard_template` boilerplate (call that tool FIRST): it gets LIVE
+    data through Cowork's callMcpTool→run_sql bridge in-app, and the host's injected rvbbitQuery
+    when served — the SAME artifact works both places, no login. Compose each view into ONE
+    run_sql (composePayload). NEVER bake query results into the HTML — that's a 'dead tree' with
+    no live data or inspectability."""
     return _logged("publish_dashboard", {"name": name, "team": team, "kind": kind, "html_bytes": len(html or "")},
                    lambda: tool_publish_dashboard(name, html, team, description, kind))
 
@@ -765,6 +766,41 @@ def _mcp_dashboard_dependents(object):
     """Impact analysis: which dashboards depend on a given table or metric."""
     return _logged("dashboard_dependents", {"object": object},
                    lambda: tool_dashboard_dependents(object))
+
+
+_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_template.html")
+
+
+def tool_dashboard_template():
+    try:
+        with open(_TEMPLATE_PATH) as f:
+            html = f.read()
+    except Exception as e:   # noqa: BLE001
+        return {"error": str(e)}
+    return {
+        "template_html": html,
+        "how_to_use": [
+            "Set SERVER_ID to the <id> in your `mcp__<id>__run_sql` tool name.",
+            "Compose ALL of a view's data into ONE run_sql via composePayload() — each callMcpTool "
+            "adds ~1.5s host overhead; the DB aggregates the whole payload in ~100ms.",
+            "Edit only the two `>>> EDIT` blocks (CONFIG: title + composePayload map; RENDER: KPIs / "
+            "chart() / table()). Leave everything between the FRAMEWORK markers as-is.",
+            "Live data is the Cowork callMcpTool→run_sql bridge (authed by the connector you already "
+            "granted — no fetch, no login); it falls back to the host's rvbbitQuery when published.",
+            "SQL gotchas (rvbbit read-only guard): no `::type` casts (use `cast(x as t)` or bare "
+            "json_agg/row_to_json); no reserved-word bare aliases (use `ym`, not `month`).",
+            "Sandbox CDN allowlist only: Chart.js 4.5.0, Grid.js 5.0.2 (+ theme css), Mermaid 11.10.0. "
+            "Anything else is silently blocked.",
+        ],
+    }
+
+
+def _mcp_dashboard_template():
+    """Return the proven drop-in boilerplate for a LIVE dashboard (Cowork artifact + hosted).
+    ALWAYS start a dashboard from this — it has the data bridge, single-round-trip query
+    pattern (composePayload), formatters, and chart/table wrappers already solved. Adapt only
+    its two `>>> EDIT` blocks. Then optionally publish_dashboard to persist/share it."""
+    return _logged("dashboard_template", {}, tool_dashboard_template)
 
 
 # the data client injected into every served dashboard (binds rvbbitQuery to this slug)
@@ -853,6 +889,7 @@ def _register(mcp):
     mcp.tool(name="get_dashboard")(_mcp_get_dashboard)
     mcp.tool(name="dashboard_crawl")(_mcp_dashboard_crawl)
     mcp.tool(name="dashboard_dependents")(_mcp_dashboard_dependents)
+    mcp.tool(name="dashboard_template")(_mcp_dashboard_template)
 
 
 def _selftest():
@@ -880,9 +917,21 @@ def _selftest():
     print("\nselftest done")
 
 
+_INSTRUCTIONS = (
+    "rvbbit warehouse — a governed, semantic, time-travel data warehouse. Discover tables/columns "
+    "by what their data is about with search_data; get official numbers with metric(); explore SQL "
+    "with validate_sql then run_sql (read-only). "
+    "TO BUILD A DASHBOARD: call `dashboard_template` FIRST for the proven boilerplate, set its "
+    "SERVER_ID to the <id> in your `mcp__<id>__run_sql` tool, and edit only its CONFIG + RENDER "
+    "blocks. Live data flows through Cowork's callMcpTool→run_sql bridge (authed by the connector "
+    "you already granted — no fetch, no login); compose each view into ONE run_sql. To persist or "
+    "share a dashboard outside Cowork, also call publish_dashboard."
+)
+
+
 def _build_mcp():
     from mcp.server.fastmcp import FastMCP
-    m = FastMCP("rvbbit-warehouse")
+    m = FastMCP("rvbbit-warehouse", instructions=_INSTRUCTIONS)
     _register(m)
     _ensure_activity_table()
     _ensure_dashboard_tables()
@@ -906,6 +955,7 @@ def _build_mcp_oauth(public: str):
         print(f"WARNING: {w}", file=sys.stderr)
     provider = auth.WarehouseAuthProvider(public)
     m = FastMCP("rvbbit-warehouse",
+                instructions=_INSTRUCTIONS,
                 auth_server_provider=provider,
                 auth=auth.make_auth_settings(public))
     _register(m)

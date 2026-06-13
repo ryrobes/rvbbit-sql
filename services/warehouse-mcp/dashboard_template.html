@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rvbbit live dashboard — boilerplate</title>
+
+<!--
+  ============================================================================
+  rvbbit live-dashboard boilerplate  (Cowork artifact edition)
+  ============================================================================
+  Live data path:  artifact -> window.cowork.callMcpTool('mcp__<id>__run_sql')
+                   -> Cowork host -> your MCP server -> warehouse.
+  No fetch(), no login in the artifact. Auth is the connector OAuth the user
+  granted once. The browser never sees DB credentials.
+
+  THREE RULES (each one cost us a debugging round; don't skip):
+   1) WAIT FOR THE BRIDGE. window.cowork.callMcpTool is injected a beat after
+      the inline script runs. Calling it immediately hangs. waitForBridge() polls.
+   2) MINIMIZE ROUND TRIPS, NOT ROWS. Each callMcpTool adds ~1.5s host overhead;
+      several in parallel can trip a concurrency/timeout cap. Compose ALL of a
+      view's data into ONE run_sql via json_build_object and make a single call.
+      The DB does the work in ~100ms regardless.
+   3) DECLARE THE TOOL. The fully-qualified 'mcp__<server-id>__run_sql' must be
+      listed in the artifact's mcp_tools, and the id must match your server.
+
+  SQL gotchas on this engine (rvbbit_native):
+   - The read-only guard rejects '::type' casts. Use json_agg/row_to_json bare,
+     or cast(x as t) only if unavoidable.
+   - Reserved words can't be bare aliases (e.g. 'month' -> use 'ym').
+   - Via the bridge, numbers arrive as real JSON numbers (4649793.4), not the
+     stringified "4649793.4000" you get from raw run_sql rows. No parseFloat needed.
+
+  ADAPTING: edit only the two CONFIG blocks marked  >>> EDIT  below.
+  Everything between  --- FRAMEWORK ---  markers can stay as-is.
+  ============================================================================
+-->
+
+<!-- Allowlisted libs only. Use these exact tags (integrity-pinned) or the sandbox blocks them. -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.js" integrity="sha384-iU8HYtnGQ8Cy4zl7gbNMOhsDTTKX02BTXptVP/vqAWIaTfM7isw76iyZCsjL2eVi" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/gridjs@5.0.2/dist/gridjs.umd.js" integrity="sha384-/XXDzxe4FsGiAe50i/u9pY/Vy/uX654MHB1xoc1BJNnH1WXHhqHga9g3q5tF4gj7" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridjs@5.0.2/dist/theme/mermaid.min.css" integrity="sha384-jZvDSsmGB9oGGT/4l9bHXGoAv1OxvG/cFmSo0dZaSqmBgvQTKDBFAMftlXTmMbNW" crossorigin="anonymous">
+<!-- Optional diagrams:
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.10.0/dist/mermaid.min.js" integrity="sha384-PY+AFiXLIHkR5jE4nk0JwPQQmmQlT4mJXFlgeT4jJeuARaBQBK+nSwwxzrPRAtUM" crossorigin="anonymous"></script> -->
+
+<style>
+  /* ---- design tokens (shadcn-inspired, light). Restyle here, everything inherits. ---- */
+  :root{
+    color-scheme: light;
+    --background:#ffffff; --card:#ffffff; --muted:#f6f7f9;
+    --foreground:#1a1a1a; --muted-foreground:#6a6a6a; --border:#e6e6e6;
+    --primary:#2f6fd1; --success:#1a9e54; --warning:#c9820a; --danger:#cc3333;
+    --radius:12px;
+    --font: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono: ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--background);color:var(--foreground);font-family:var(--font);line-height:1.5;padding:22px}
+  .wrap{max-width:1100px;margin:0 auto}
+  h1{font-size:21px;margin:0 0 4px;letter-spacing:-.3px}
+  h2{font-size:14px;font-weight:500;margin:0 0 2px}
+  .subtitle{color:var(--muted-foreground);font-size:13px;margin:0 0 14px}
+  code{background:var(--muted);padding:1px 5px;border-radius:5px;font-family:var(--mono);font-size:12px}
+
+  .status{display:flex;align-items:center;gap:8px;font-size:12.5px;margin-bottom:16px;color:var(--muted-foreground)}
+  .status .dotp{width:9px;height:9px;border-radius:50%;background:#bbb;display:inline-block;flex:none}
+  .status.ok{color:#137a40}.status.ok .dotp{background:var(--success)}
+  .status.err{color:#a32020}.status.err .dotp{background:var(--danger)}
+  .btn{cursor:pointer;font-size:12px;font-weight:500;padding:6px 12px;border:1px solid #cfcfcf;border-radius:8px;background:#fff;color:var(--foreground)}
+  .btn:hover{background:#f2f2f2}.btn:active{transform:scale(.98)}
+  .status .btn{margin-left:auto}
+
+  .grid{display:grid;gap:14px}
+  .cols-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:15px 17px}
+  .card .cap{color:var(--muted-foreground);font-size:12px;margin:2px 0 12px}
+  .kpi .lab{color:var(--muted-foreground);font-size:11.5px;text-transform:uppercase;letter-spacing:.4px}
+  .kpi .val{font-size:24px;font-weight:500;margin-top:5px;letter-spacing:-.4px}
+  .kpi .note{color:var(--muted-foreground);font-size:11.5px;margin-top:3px}
+  .badge{display:inline-block;font-size:11px;font-weight:500;padding:2px 9px;border-radius:999px;background:var(--muted);color:var(--muted-foreground)}
+  .badge.good{background:#eaf7ef;color:#137a40}.badge.warn{background:#fcf3e3;color:#8a5a06}.badge.bad{background:#fcebeb;color:#a32020}
+  .chartbox{position:relative;height:280px}.chartbox.tall{height:320px}
+  .mt{margin-top:14px}
+  .gridjs-wrapper{box-shadow:none!important;border:1px solid var(--border)!important}
+  .gridjs-table{font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 id="title">Dashboard</h1>
+  <p class="subtitle" id="subtitle">Live via <code>callMcpTool → run_sql</code></p>
+  <div class="status" id="status"><span class="dotp"></span><span id="statustext">connecting…</span><button class="btn" id="reload">Reload</button></div>
+  <div id="root"></div>
+</div>
+
+<script>
+/* ===================== FRAMEWORK (rarely edited) ===================== */
+
+/* --- formatters --- */
+const fmt = {
+  usd:  n => '$' + Math.round(+n).toLocaleString(),
+  usdK: n => +n>=1e6 ? '$'+(+n/1e6).toFixed(2)+'M' : '$'+Math.round(+n/1e3)+'K',
+  num:  n => Math.round(+n).toLocaleString(),
+  pct:  (n,d=1) => (+n).toFixed(d)+'%',
+};
+const $ = (id)=>document.getElementById(id);
+function setStatus(html, kind){ $('status').className='status'+(kind?(' '+kind):''); $('statustext').innerHTML=html; }
+
+/* --- the bridge: wait for it, then a single-call query wrapper ---
+   Dual-mode: prefers Cowork's callMcpTool (the in-app path); falls back to the
+   host-injected window.rvbbitQuery when served at your /d/<slug> host — so the SAME
+   artifact runs live in Cowork AND when published. */
+function waitForBridge(ms=6000){
+  return new Promise((res,rej)=>{ const t0=Date.now();(function p(){
+    if(window.cowork && typeof window.cowork.callMcpTool==='function') return res();
+    if(typeof window.rvbbitQuery==='function') return res();   // hosted /d/<slug> path
+    if(Date.now()-t0>ms) return rej(new Error('NO_BRIDGE: no data bridge — open this inside a Cowork artifact, or on your rvbbit dashboard host'));
+    setTimeout(p,150);})(); });
+}
+function makeRunSql(serverId){
+  const TOOL = 'mcp__'+serverId+'__run_sql';
+  return async function runSql(sql){
+    if(typeof window.rvbbitQuery==='function' && !(window.cowork && window.cowork.callMcpTool)){
+      const d = await window.rvbbitQuery(sql);   // hosted path: host already authed the viewer
+      return (d && d.rows) || [];
+    }
+    const r = await window.cowork.callMcpTool(TOOL, { sql });
+    if(r && r.isError) throw new Error('TOOL_ERROR: '+JSON.stringify(r.content||r).slice(0,240));
+    let data = r && r.structuredContent;
+    if(!data && r && r.content && r.content[0] && r.content[0].text) data = JSON.parse(r.content[0].text);
+    if(!data) data = r;
+    return data.rows || [];
+  };
+}
+/* Compose many sub-SELECTs into ONE round trip.
+   parts = { name: {sql:'select ...', shape:'row'|'list'} }
+   shape 'row'  -> single object   (row_to_json)
+   shape 'list' -> array of objects (json_agg, preserves the sub-SELECT's ORDER BY)
+   returns: { name: object|array, ... } */
+function composePayload(parts){
+  const entries = Object.entries(parts).map(([k,v])=>{
+    const wrap = v.shape==='row' ? 'row_to_json(t)' : 'json_agg(t)';
+    return `'${k}', (select ${wrap} from (${v.sql}) t)`;
+  });
+  return `select json_build_object(${entries.join(',\n')}) as payload`;
+}
+
+/* --- chart + table helpers (thin wrappers over Chart.js / Grid.js) --- */
+const PALETTE = ['#2f6fd1','#c9820a','#1a9e54','#cc3333','#7a5cd0','#0e9aa7'];
+let _charts = [];
+function destroyCharts(){ _charts.forEach(c=>{try{c.destroy()}catch(e){}}); _charts=[]; }
+function chart(canvasId, cfg){ if(!window.Chart) return; try{ _charts.push(new Chart($(canvasId), cfg)); }catch(e){ console.error(canvasId,e);} }
+const baseOpts = (extra={}) => Object.assign({responsive:true,maintainAspectRatio:false,
+  plugins:{legend:{labels:{boxWidth:12,padding:12,font:{size:11}}}},
+  scales:{y:{beginAtZero:true,grid:{color:'#e6e6e6'}},x:{grid:{display:false}}}}, extra);
+function table(mountId, columns, rows){
+  if(!window.gridjs) return;
+  $(mountId).innerHTML='';
+  new gridjs.Grid({ columns, data:rows, sort:true, search:rows.length>12,
+    pagination: rows.length>15 ? {limit:15} : false,
+    style:{ table:{fontSize:'13px'} } }).render($(mountId));
+}
+/* ===================== /FRAMEWORK ===================== */
+
+
+/* ===================== >>> EDIT 1: CONFIG ===================== */
+const SERVER_ID = 'REPLACE_WITH_YOUR_SERVER_ID';   // <-- the <id> from your `mcp__<id>__run_sql` tool name
+const runSql = makeRunSql(SERVER_ID);
+
+$('title').textContent = 'Marketing Attribution — live demo';
+$('subtitle').innerHTML = 'One <code>callMcpTool → run_sql</code> round trip · <code>marts.mart_blended_cac_by_channel</code> + <code>marts.mart_unified_leads_rebuilt</code>';
+
+/* All of this view's data, composed into ONE query. Add/remove parts freely. */
+const PAYLOAD_SQL = composePayload({
+  kpi: { shape:'row', sql:`
+    select sum(revenue_booked) revenue, sum(spend) spend, sum(students_enrolled) students,
+           sum(leads_submitted) leads,
+           sum(revenue_booked) filter (where channel in ('Unknown','Direct')) gap_rev
+    from marts.mart_blended_cac_by_channel` },
+  channel: { shape:'list', sql:`
+    select channel, sum(spend) spend, sum(revenue_booked) revenue, sum(students_enrolled) students,
+           round(sum(revenue_booked)/nullif(sum(spend),0),2) roas
+    from marts.mart_blended_cac_by_channel group by channel order by revenue desc` },
+  trend: { shape:'list', sql:`
+    select to_char(date_trunc('month',date_day),'YYYY-MM') ym,
+           sum(revenue_booked) revenue, sum(spend) spend
+    from marts.mart_blended_cac_by_channel group by 1 order by 1` },
+  tier: { shape:'list', sql:`
+    select first_touch_method method, count(*) leads,
+           round(100.0*count(*)/sum(count(*)) over(),1) pct
+    from marts.mart_unified_leads_rebuilt group by 1 order by leads desc` },
+});
+/* ===================== <<< EDIT 1 ===================== */
+
+
+/* ===================== >>> EDIT 2: RENDER ===================== */
+function render(p){
+  // p.kpi is an object; p.channel / p.trend / p.tier are arrays.
+  const root = $('root');
+  root.innerHTML = `
+    <div class="grid cols-4">
+      <div class="card kpi"><div class="lab">Revenue</div><div class="val">${fmt.usdK(p.kpi.revenue)}</div><div class="note">all channels</div></div>
+      <div class="card kpi"><div class="lab">Ad spend</div><div class="val">${fmt.usdK(p.kpi.spend)}</div><div class="note">paid media</div></div>
+      <div class="card kpi"><div class="lab">Students</div><div class="val">${fmt.num(p.kpi.students)}</div><div class="note">${fmt.num(p.kpi.leads)} leads</div></div>
+      <div class="card kpi"><div class="lab">Misattributed</div><div class="val" style="color:var(--danger)">${fmt.usdK(p.kpi.gap_rev)}</div><div class="note">${Math.round(100*p.kpi.gap_rev/p.kpi.revenue)}% → Unknown/Direct</div></div>
+    </div>
+
+    <div class="grid cols-2 mt">
+      <div class="card"><h2>Attribution method</h2><p class="cap">Where the model files each lead.</p><div class="chartbox"><canvas id="c_tier"></canvas></div></div>
+      <div class="card"><h2>Revenue vs spend</h2><p class="cap">Monthly. Latest month partial.</p><div class="chartbox"><canvas id="c_trend"></canvas></div></div>
+    </div>
+
+    <div class="card mt"><h2>Channel performance</h2><p class="cap">Sortable. ROAS distorted by the Direct leakage.</p><div id="t_channel"></div></div>
+  `;
+
+  chart('c_tier', { type:'doughnut',
+    data:{ labels:p.tier.map(r=>`${r.method} (${fmt.pct(r.pct)})`),
+      datasets:[{ data:p.tier.map(r=>r.leads),
+        backgroundColor:p.tier.map(r=>r.method==='direct_fallback'?'#cc3333':r.method==='utm_override'?'#1a9e54':'#c9820a'),
+        borderColor:'#fff', borderWidth:2 }] },
+    options: baseOpts({ cutout:'58%', scales:{}, plugins:{legend:{position:'bottom',labels:{boxWidth:12,padding:10,font:{size:11}}},
+      tooltip:{callbacks:{label:c=>' '+fmt.num(c.raw)+' leads'}}} }) });
+
+  chart('c_trend', {
+    data:{ labels:p.trend.map(r=>r.ym), datasets:[
+      { type:'bar', label:'Revenue', data:p.trend.map(r=>r.revenue), backgroundColor:'#2f6fd1', borderRadius:4 },
+      { type:'line', label:'Spend', data:p.trend.map(r=>r.spend), borderColor:'#c9820a', backgroundColor:'transparent', tension:.3, pointRadius:3 } ] },
+    options: baseOpts({ scales:{ y:{beginAtZero:true,grid:{color:'#e6e6e6'},ticks:{callback:v=>'$'+(v/1e6).toFixed(1)+'M'}}, x:{grid:{display:false}} },
+      plugins:{legend:{labels:{boxWidth:12,padding:12,font:{size:11}}}, tooltip:{callbacks:{label:c=>' '+c.dataset.label+': '+fmt.usd(c.raw)}}} }) });
+
+  table('t_channel',
+    [ {name:'Channel'},
+      {name:'Spend', formatter:c=> c>0?fmt.usd(c):'—'},
+      {name:'Revenue', formatter:c=>fmt.usd(c)},
+      {name:'Students', formatter:c=>fmt.num(c)},
+      {name:'ROAS', formatter:c=> c==null?'—':(+c).toFixed(2)+'×'} ],
+    p.channel.map(r=>[r.channel, r.spend, r.revenue, r.students, r.roas]) );
+}
+/* ===================== <<< EDIT 2 ===================== */
+
+
+/* --- boot (framework) --- */
+async function load(){
+  destroyCharts();
+  setStatus('connecting to data bridge…');
+  try{
+    await waitForBridge();
+    setStatus('running live query…');
+    const t0 = performance.now();
+    const rows = await runSql(PAYLOAD_SQL);
+    const ms = Math.round(performance.now()-t0);
+    render(rows[0].payload);
+    setStatus(`live · 1 round trip in ${ms} ms · ${new Date().toLocaleTimeString()}`, 'ok');
+  }catch(e){
+    const msg = e && e.message ? e.message : String(e);
+    setStatus('failed: '+msg, 'err');
+    $('root').innerHTML = `<div class="card"><b style="color:var(--danger)">Live data did not load.</b><br><span style="color:var(--muted-foreground);font-size:13px">${msg}</span></div>`;
+    console.error(e);
+  }
+}
+$('reload').addEventListener('click', load);
+load();
+</script>
+</body>
+</html>
