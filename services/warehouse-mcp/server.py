@@ -177,12 +177,16 @@ def tool_search_data(query: str, limit: int = 8, schema=None) -> dict:
             "FROM rvbbit.data_search(%s, %s, %s, %s)",
             (query, min(limit * 4, 100), None, GRAPH),   # over-fetch; internals get filtered out
         ).fetchall()
+    # discovery gradient: curated metrics/cubes outrank raw tables (search them first)
+    _tier = {"metric": 0, "cube": 1, "db_table": 2, "db_column": 2}
+    hits.sort(key=lambda h: (_tier.get(h["kind"], 3), -float(h["score"] or 0)))
     matches = []
     with _ro() as rc, rc.cursor() as cur:
         for h in hits:
             if len(matches) >= limit:
                 break
-            if not _schema_allowed(h["schema_name"]):
+            curated = h["kind"] in ("metric", "cube")   # always allowed (not raw schema)
+            if not curated and not _schema_allowed(h["schema_name"]):
                 continue
             if schema and h["schema_name"] != schema:
                 continue
@@ -259,6 +263,23 @@ def tool_get_metric(name: str) -> dict:
             "SELECT version, created_at FROM rvbbit.metric_defs WHERE name=%s ORDER BY version DESC",
             (name,)).fetchall()
     return d
+
+
+def tool_list_cubes() -> dict:
+    """Curated subject-area tables (cubes) — wide, documented, accelerated. The agent's
+    entry point: look here (and at metrics) before raw tables."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT name, grain, description, category, version, refreshed_at::text AS refreshed_at, rows "
+            "FROM rvbbit.cubes()").fetchall()
+    return {"cubes": rows}
+
+
+def tool_describe_cube(name: str) -> dict:
+    """A cube's grain, columns, freshness + definition SQL (the agent's grounding to query it)."""
+    with _conn() as c:
+        d = c.execute("SELECT rvbbit.describe_cube(%s) AS d", (name,)).fetchone()
+    return d["d"] if (d and d["d"] is not None) else {"error": {"code": "CUBE_NOT_FOUND", "message": name}}
 
 
 def tool_metric(name: str, params=None, as_of=None, def_as_of=None) -> dict:
@@ -881,6 +902,9 @@ def _register(mcp):
         lambda: tool_list_metrics(category, search)))
     mcp.tool(name="get_metric")(lambda name: _logged(
         "get_metric", {"name": name}, lambda: tool_get_metric(name)))
+    mcp.tool(name="list_cubes")(lambda: _logged("list_cubes", {}, tool_list_cubes))
+    mcp.tool(name="describe_cube")(lambda name: _logged(
+        "describe_cube", {"name": name}, lambda: tool_describe_cube(name)))
     mcp.tool(name="metric")(lambda name, params=None, as_of=None, def_as_of=None: _logged(
         "metric", {"name": name, "params": params, "as_of": as_of, "def_as_of": def_as_of},
         lambda: tool_metric(name, params, as_of, def_as_of)))
