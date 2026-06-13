@@ -1,0 +1,40 @@
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: openrouter_embeddings
+title: OpenRouter Embeddings
+description: Remote OpenAI-compatible embeddings through OpenRouter for faster hosted semantic search.
+license: provider
+tags: [embedding, retrieval, remote, openrouter]
+source:
+  provider: openrouter
+  model: openai/text-embedding-3-small
+  url: https://openrouter.ai/docs/api-reference/embeddings
+runtime:
+  mode: external
+  handler: embedding
+  device: api
+backend:
+  name: embed_openrouter
+  endpoint: https://openrouter.ai/api/v1/embeddings
+  transport: openai
+  batch_size: 64
+  max_concurrent: 8
+  timeout_ms: 120000
+  auth_env: OPENROUTER_API_KEY
+  opts:
+    model: openai/text-embedding-3-small
+  description: OpenRouter OpenAI-compatible hosted embeddings.
+operators:
+  - name: embed_openrouter
+    description: Return an OpenRouter-hosted embedding as JSON for exploratory use.
+    arg_names: [text]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    inputs:
+      text: "{{ inputs.text }}"
+smoke:
+  inputs:
+    - text: refund request from angry customer
+  sql:
+    - "SELECT jsonb_array_length(rvbbit.embed_openrouter('hello world'));"

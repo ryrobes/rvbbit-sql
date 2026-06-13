@@ -377,3 +377,178 @@ def test_default_embed_backend_is_local_but_replaceable(rvbbit):
                 (*original[:6], json.dumps(original[6]), original[7]),
             )
         rvbbit.execute("SELECT rvbbit.reload_backends()")
+
+
+def test_set_default_embedder_promotes_named_backend_and_purges_cache(rvbbit):
+    original = rvbbit.execute(
+        "SELECT transport, endpoint_url, batch_size, max_concurrent, "
+        "timeout_ms, auth_header_env, transport_opts, description, "
+        "source_provider, source_model, source_revision, install_manifest "
+        "FROM rvbbit.backends WHERE name = 'embed'"
+    ).fetchone()
+    promoted = f"stub_default_{uuid.uuid4().hex[:8]}"
+    text = f"default switch {uuid.uuid4().hex}"
+    try:
+        rvbbit.execute(
+            "SELECT rvbbit.register_backend("
+            "  backend_name => 'embed', "
+            "  backend_endpoint => 'stub://384', "
+            "  backend_transport => 'stub')"
+        )
+        rvbbit.execute(
+            "SELECT rvbbit.register_backend("
+            "  backend_name => %s, "
+            "  backend_endpoint => 'stub://128', "
+            "  backend_transport => 'stub', "
+            "  backend_source_provider => 'test', "
+            "  backend_source_model => 'stub-128', "
+            "  backend_install_manifest => %s::jsonb)",
+            (
+                promoted,
+                json.dumps(
+                    {
+                        "kind": "hf_backend",
+                        "tags": ["embedding"],
+                        "runtime": {"handler": "embedding"},
+                    }
+                ),
+            ),
+        )
+        rvbbit.execute("SELECT rvbbit.reload_backends()")
+
+        old_vec = rvbbit.execute("SELECT rvbbit.embed(%s)", (text,)).fetchone()[0]
+        assert len(old_vec) == 384
+
+        result = rvbbit.execute(
+            "SELECT rvbbit.set_default_embedder(%s, true)", (promoted,)
+        ).fetchone()[0]
+        assert result["default_embedder"] == "embed"
+        assert result["source_backend"] == promoted
+        assert result["source_model"] == "stub-128"
+        assert result["purged_entries"] >= 1
+
+        row = rvbbit.execute(
+            "SELECT endpoint_url, source_model, "
+            "install_manifest #>> '{rvbbit_default_embedder,source_backend}' "
+            "FROM rvbbit.backends WHERE name = 'embed'"
+        ).fetchone()
+        assert row == ("stub://128", "stub-128", promoted)
+
+        new_vec = rvbbit.execute("SELECT rvbbit.embed(%s)", (text,)).fetchone()[0]
+        assert len(new_vec) == 128
+    finally:
+        rvbbit.execute("SELECT rvbbit.embedding_purge('embed')")
+        rvbbit.execute("SELECT rvbbit.embedding_purge(%s)", (promoted,))
+        rvbbit.execute("DELETE FROM rvbbit.backends WHERE name IN ('embed', %s)", (promoted,))
+        if original:
+            rvbbit.execute(
+                "INSERT INTO rvbbit.backends "
+                "(name, transport, endpoint_url, batch_size, max_concurrent, "
+                " timeout_ms, auth_header_env, transport_opts, description, "
+                " source_provider, source_model, source_revision, install_manifest) "
+                "VALUES ('embed', %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    *original[:6],
+                    json.dumps(original[6]),
+                    original[7],
+                    original[8],
+                    original[9],
+                    original[10],
+                    json.dumps(original[11]) if original[11] is not None else None,
+                ),
+            )
+        rvbbit.execute("SELECT rvbbit.reload_backends()")
+
+
+def test_catalog_crawl_run_uses_promoted_default_embedder(rvbbit):
+    original = rvbbit.execute(
+        "SELECT transport, endpoint_url, batch_size, max_concurrent, "
+        "timeout_ms, auth_header_env, transport_opts, description, "
+        "source_provider, source_model, source_revision, install_manifest "
+        "FROM rvbbit.backends WHERE name = 'embed'"
+    ).fetchone()
+    promoted = f"stub_crawl_default_{uuid.uuid4().hex[:8]}"
+    schema = f"crawl_embed_{uuid.uuid4().hex[:8]}"
+    graph = f"crawl_embed_{uuid.uuid4().hex[:8]}"
+    try:
+        rvbbit.execute(f"CREATE SCHEMA {schema}")
+        rvbbit.execute(
+            f"CREATE TABLE {schema}.docs (id int PRIMARY KEY, body text NOT NULL)"
+        )
+        rvbbit.execute(
+            f"INSERT INTO {schema}.docs VALUES "
+            "(1, 'refund request from angry customer'), "
+            "(2, 'late shipment with missing tracking')"
+        )
+        rvbbit.execute(
+            "SELECT rvbbit.register_backend("
+            "  backend_name => %s, "
+            "  backend_endpoint => 'stub://128', "
+            "  backend_transport => 'stub', "
+            "  backend_source_provider => 'test', "
+            "  backend_source_model => 'stub-128', "
+            "  backend_install_manifest => %s::jsonb)",
+            (
+                promoted,
+                json.dumps(
+                    {
+                        "kind": "hf_backend",
+                        "tags": ["embedding"],
+                        "runtime": {"handler": "embedding"},
+                    }
+                ),
+            ),
+        )
+        rvbbit.execute("SELECT rvbbit.set_default_embedder(%s, true)", (promoted,))
+
+        rvbbit.execute(
+            "CALL rvbbit.catalog_crawl_run(ARRAY[%s]::text[], %s, 100, 2, true)",
+            (schema, graph),
+        )
+
+        dims = [
+            row[0]
+            for row in rvbbit.execute(
+                "SELECT DISTINCT array_length(embedding, 1) "
+                "FROM rvbbit.catalog_docs "
+                "WHERE graph_id = %s AND embedding IS NOT NULL "
+                "ORDER BY 1",
+                (graph,),
+            ).fetchall()
+        ]
+        assert dims == [128]
+    finally:
+        rvbbit.execute("DELETE FROM rvbbit.catalog_docs WHERE graph_id = %s", (graph,))
+        rvbbit.execute("DELETE FROM rvbbit.catalog_snapshots WHERE graph_id = %s", (graph,))
+        rvbbit.execute(
+            "DELETE FROM rvbbit.catalog_crawl_progress "
+            "WHERE run_id IN (SELECT run_id FROM rvbbit.catalog_runs WHERE graph_id = %s)",
+            (graph,),
+        )
+        rvbbit.execute("DELETE FROM rvbbit.catalog_runs WHERE graph_id = %s", (graph,))
+        rvbbit.execute("DELETE FROM rvbbit.kg_evidence WHERE graph_id = %s", (graph,))
+        rvbbit.execute("DELETE FROM rvbbit.kg_edges WHERE graph_id = %s", (graph,))
+        rvbbit.execute("DELETE FROM rvbbit.kg_aliases WHERE graph_id = %s", (graph,))
+        rvbbit.execute("DELETE FROM rvbbit.kg_nodes WHERE graph_id = %s", (graph,))
+        rvbbit.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        rvbbit.execute("SELECT rvbbit.embedding_purge('embed')")
+        rvbbit.execute("SELECT rvbbit.embedding_purge(%s)", (promoted,))
+        rvbbit.execute("DELETE FROM rvbbit.backends WHERE name IN ('embed', %s)", (promoted,))
+        if original:
+            rvbbit.execute(
+                "INSERT INTO rvbbit.backends "
+                "(name, transport, endpoint_url, batch_size, max_concurrent, "
+                " timeout_ms, auth_header_env, transport_opts, description, "
+                " source_provider, source_model, source_revision, install_manifest) "
+                "VALUES ('embed', %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    *original[:6],
+                    json.dumps(original[6]),
+                    original[7],
+                    original[8],
+                    original[9],
+                    original[10],
+                    json.dumps(original[11]) if original[11] is not None else None,
+                ),
+            )
+        rvbbit.execute("SELECT rvbbit.reload_backends()")

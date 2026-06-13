@@ -1,0 +1,59 @@
+api_version: rvbbit.pack/v1
+id: embeddings/openrouter
+name: openrouter_embeddings
+title: OpenRouter Embeddings
+description: Remote OpenAI-compatible embeddings through OpenRouter for faster hosted semantic search.
+license: provider
+tags:
+- embedding
+- retrieval
+- remote
+- openrouter
+capability: capability.yaml
+source:
+  provider: openrouter
+  model: openai/text-embedding-3-small
+  url: https://openrouter.ai/docs/api-reference/embeddings
+runtime:
+  mode: external
+  handler: embedding
+  device: api
+exports:
+  backend: embed_openrouter
+  operators:
+  - embed_openrouter
+install:
+  mode: external
+  warren: false
+  docker: false
+acceptance:
+  target_selector:
+    capability: true
+    external: true
+  tests:
+  - name: openrouter_embedding_vector_shape
+    description: Verify OpenRouter auth is configured and the embedding endpoint returns a vector.
+    sql: |
+      DO $$
+      DECLARE
+          result jsonb;
+          started timestamptz := clock_timestamp();
+      BEGIN
+          IF NOT rvbbit.env_present('OPENROUTER_API_KEY') THEN
+              RAISE EXCEPTION 'OPENROUTER_API_KEY is not visible to the Postgres extension process';
+          END IF;
+
+          LOOP
+              SELECT rvbbit.embed_openrouter('query: refund request from angry customer') INTO result;
+              EXIT WHEN result IS NOT NULL;
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'embed_openrouter returned NULL after readiness window';
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
+
+          IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN
+              RAISE EXCEPTION 'unexpected OpenRouter embedding shape: %', left(result::text, 200);
+          END IF;
+      END
+      $$;

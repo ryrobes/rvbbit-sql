@@ -203,6 +203,24 @@ def runtime_endpoint_path(manifest: dict[str, Any]) -> str:
     return path if str(path).startswith("/") else f"/{path}"
 
 
+def is_external_backend(manifest: dict[str, Any]) -> bool:
+    runtime = manifest.get("runtime") or {}
+    backend = manifest.get("backend") or {}
+    mode = str(runtime.get("mode") or "").lower()
+    endpoint = str(backend.get("endpoint") or "").strip()
+    return bool(
+        backend
+        and (
+            mode in {"external", "remote"}
+            or (
+                endpoint.startswith(("http://", "https://"))
+                and not runtime.get("template")
+                and not runtime.get("image")
+            )
+        )
+    )
+
+
 def install_manifest(
     manifest: dict[str, Any],
     resources: dict[str, Any] | None = None,
@@ -449,6 +467,11 @@ def render_smoke_sql(manifest: dict[str, Any]) -> str:
 
 
 def render_compose(manifest: dict[str, Any]) -> str:
+    if is_external_backend(manifest):
+        return (
+            f"# {manifest['name']} is an external/API-backed capability.\n"
+            "# No Docker sidecar is generated; register.sql installs the backend endpoint directly.\n"
+        )
     service = manifest["name"].replace("_", "-")
     source = manifest.get("source") or {}
     runtime = manifest.get("runtime") or {}
@@ -502,6 +525,8 @@ volumes:
 
 
 def render_host_ports_compose(manifest: dict[str, Any]) -> str:
+    if is_external_backend(manifest):
+        return f"# {manifest['name']} is external/API-backed; no host port overlay applies.\n"
     service = manifest["name"].replace("_", "-")
     container_port = runtime_container_port(manifest)
     return f"""services:
@@ -561,6 +586,8 @@ def render_runtime_ipc(runtime: dict[str, Any]) -> str:
 
 
 def render_gpu_compose(manifest: dict[str, Any]) -> str:
+    if is_external_backend(manifest):
+        return f"# {manifest['name']} is external/API-backed; no GPU overlay applies.\n"
     service = manifest["name"].replace("_", "-")
     return f"""services:
   {service}:
@@ -637,7 +664,7 @@ def scaffold(manifest: dict[str, Any], out_dir: Path, force: bool = False) -> No
 
     runtime = manifest.get("runtime") or {}
     source = manifest.get("source") or {}
-    if not runtime_image(runtime):
+    if not runtime_image(runtime) and not is_external_backend(manifest):
         template = runtime.get("template", "hf-rvbbit-fastapi")
         template_dir = TEMPLATES / template
         if not template_dir.exists():
@@ -698,6 +725,22 @@ def scaffold(manifest: dict[str, Any], out_dir: Path, force: bool = False) -> No
 def scaffold_readme(manifest: dict[str, Any]) -> str:
     service = manifest["name"].replace("_", "-")
     runtime = manifest.get("runtime") or {}
+    if is_external_backend(manifest):
+        return f"""# {manifest.get('title') or manifest['name']}
+
+{manifest.get('description') or 'Generated Rvbbit external capability.'}
+
+## Register In Rvbbit
+
+```bash
+psql "$RVBBIT_DSN" -f register.sql
+psql "$RVBBIT_DSN" -f operator.sql
+psql "$RVBBIT_DSN" -f smoke.sql
+```
+
+This capability registers the remote endpoint from `backend.endpoint`; no local
+Docker sidecar is generated.
+"""
     compose_up = "docker compose up -d" if runtime_image(runtime) else "docker compose up -d --build"
     gpu_compose_up = (
         "docker compose -f compose.yaml -f compose.gpu.yaml up -d"
@@ -859,7 +902,7 @@ def image_release_entry_manifest(
     pull_policy: str,
     default_install_mode: str = "build",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if runtime_image(manifest.get("runtime") or {}):
+    if runtime_image(manifest.get("runtime") or {}) or is_external_backend(manifest):
         return entry, manifest
     image = capability_image_ref(entry, image_prefix, image_tag)
     if not image:

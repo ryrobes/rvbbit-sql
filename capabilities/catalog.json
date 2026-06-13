@@ -852,6 +852,78 @@
         "setup_sql": [],
         "target_selector": {
           "capability": true,
+          "external": true
+        },
+        "teardown_sql": [],
+        "tests": [
+          {
+            "description": "Verify OpenRouter auth is configured and the embedding endpoint returns a vector.",
+            "name": "openrouter_embedding_vector_shape",
+            "sql": "DO $$\nDECLARE\n    result jsonb;\n    started timestamptz := clock_timestamp();\nBEGIN\n    IF NOT rvbbit.env_present('OPENROUTER_API_KEY') THEN\n        RAISE EXCEPTION 'OPENROUTER_API_KEY is not visible to the Postgres extension process';\n    END IF;\n\n    LOOP\n        SELECT rvbbit.embed_openrouter('query: refund request from angry customer') INTO result;\n        EXIT WHEN result IS NOT NULL;\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'embed_openrouter returned NULL after readiness window';\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\n\n    IF jsonb_typeof(result) <> 'array' OR jsonb_array_length(result) < 16 THEN\n        RAISE EXCEPTION 'unexpected OpenRouter embedding shape: %', left(result::text, 200);\n    END IF;\nEND\n$$;\n"
+          }
+        ]
+      },
+      "acceptance_tests": [
+        "openrouter_embedding_vector_shape"
+      ],
+      "backend_name": "embed_openrouter",
+      "backend_transport": "openai",
+      "capability_role": null,
+      "catalog_visibility": "public",
+      "description": "Remote OpenAI-compatible embeddings through OpenRouter for faster hosted semantic search.",
+      "device": "api",
+      "endpoint_path": null,
+      "gpu_placement": null,
+      "gpu_required": false,
+      "health_path": null,
+      "id": "embeddings/openrouter",
+      "install_docker": false,
+      "install_mode": "external",
+      "install_warren": false,
+      "kind": "hf_backend",
+      "license": "provider",
+      "manifest_path": "capabilities/packs/embeddings/openrouter/capability.yaml",
+      "model_size_bytes": null,
+      "name": "openrouter_embeddings",
+      "operators": [
+        "embed_openrouter"
+      ],
+      "pack_api_version": "rvbbit.pack/v1",
+      "pack_id": "embeddings/openrouter",
+      "pack_manifest_path": "capabilities/packs/embeddings/openrouter/rvbbit-pack.yaml",
+      "pack_path": "capabilities/packs/embeddings/openrouter",
+      "provider_model": null,
+      "provider_name": null,
+      "provider_set_default": false,
+      "repo_url": null,
+      "resources": {},
+      "runtime_handler": "embedding",
+      "runtime_image": null,
+      "runtime_language": null,
+      "runtime_mode": "external",
+      "runtime_name": null,
+      "runtime_port": null,
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": "openai/text-embedding-3-small",
+      "source_provider": "openrouter",
+      "source_revision": null,
+      "source_url": "https://openrouter.ai/docs/api-reference/embeddings",
+      "system_runtime": false,
+      "tags": [
+        "embedding",
+        "retrieval",
+        "remote",
+        "openrouter"
+      ],
+      "title": "OpenRouter Embeddings",
+      "vram_headroom_pct": null,
+      "vram_required_bytes": null
+    },
+    {
+      "acceptance": {
+        "setup_sql": [],
+        "target_selector": {
+          "capability": true,
           "docker": true
         },
         "teardown_sql": [],

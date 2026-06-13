@@ -358,7 +358,7 @@ Each `capabilities[]` entry has these fields:
 | `title` | string | Human-readable title. |
 | `description` | string/null | Short description. |
 | `tags` | string[] | UI filters such as `embedding`, `extract`, `gpu`. |
-| `kind` | string | `hf_backend`, `runtime_sidecar`, or `llm_provider`. |
+| `kind` | string | `hf_backend`, `runtime_sidecar`, or `llm_provider`; API-backed remote model packs still use `hf_backend` with `runtime.mode = 'external'`. |
 | `system_runtime` | boolean | True for operator-runtime capabilities that unlock broader workflow primitives instead of a single model specialist. |
 | `capability_role` | string/null | Role hint such as `operator_runtime`. |
 | `license` | string/null | Model or pack license hint. |
@@ -374,7 +374,7 @@ Each `capabilities[]` entry has these fields:
 | `runtime_language` | string/null | Runtime language, currently `python` or `mcp` for runtime sidecars. |
 | `runtime_image` | string/null | OCI image for image-native packs or optional prebuilt release artifact for build-mode packs. |
 | `prebuilt_runtime_image` | string/null | Optional release image that may be used when a caller explicitly requests image mode. |
-| `runtime_mode` | string | `image` for pull/run packs, `build` for local build/template packs. |
+| `runtime_mode` | string | `image` for pull/run packs, `build` for local build/template packs, `external` for API-backed packs with no sidecar. |
 | `install_mode` | string | Pack install mode, currently usually the same as `runtime_mode`. |
 | `install_warren` | boolean/null | Whether the pack metadata declares Warren install support. |
 | `install_docker` | boolean/null | Whether the pack expects Docker as the sidecar runtime. |
@@ -515,6 +515,32 @@ An `llm_provider` pack does not need to export operators. It installs a normal
 chat backend/provider target, so `kind: llm` operator steps can reference
 `"provider": "gemma_4_12b_it"` directly; users may still opt in to
 `rvbbit.set_default_provider(...)` later.
+
+External embedding example:
+
+```yaml
+api_version: rvbbit.capability/v1
+kind: hf_backend
+name: openrouter_embeddings
+source:
+  provider: openrouter
+  model: openai/text-embedding-3-small
+runtime:
+  mode: external
+  handler: embedding
+  device: api
+backend:
+  name: embed_openrouter
+  endpoint: https://openrouter.ai/api/v1/embeddings
+  transport: openai
+  auth_env: OPENROUTER_API_KEY
+  opts:
+    model: openai/text-embedding-3-small
+```
+
+External packs register SQL state only. Lens skips scaffold/build for them, and
+embedding packs can optionally run `rvbbit.set_default_embedder(...)` after
+smoke to make the installed backend the canonical `embed` backend.
 
 Runtime sidecar example:
 

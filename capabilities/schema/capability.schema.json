@@ -44,7 +44,7 @@
       "required": ["provider", "model"],
       "additionalProperties": false,
       "properties": {
-        "provider": { "type": "string", "enum": ["huggingface", "builtin"] },
+        "provider": { "type": "string", "enum": ["huggingface", "builtin", "openrouter"] },
         "model": { "type": "string" },
         "revision": { "type": "string" },
         "url": { "type": "string" }
@@ -86,7 +86,7 @@
             "custom"
           ]
         },
-        "device": { "type": "string", "enum": ["auto", "cpu", "cuda"] },
+        "device": { "type": "string", "enum": ["auto", "cpu", "cuda", "api"] },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "health_path": { "type": "string" },
         "language": { "type": "string" },

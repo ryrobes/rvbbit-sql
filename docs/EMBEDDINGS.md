@@ -67,6 +67,7 @@ All of the above use backend `embed` implicitly.
 | `rvbbit.knn_text(rel, col, query, k [, specialist])` | Top-k semantic retrieval over distinct text values. |
 | `rvbbit.embedding_cache_stats()` | Cache observability. |
 | `rvbbit.embedding_purge(specialist)` | Remove cached embeddings for one backend. |
+| `rvbbit.set_default_embedder(backend_name [, purge_cache])` | Copy a registered embedding backend into canonical `embed`. |
 
 ## Recommended Pattern
 
@@ -142,6 +143,62 @@ SELECT rvbbit.register_backend(
 SELECT rvbbit.reload_backends();
 ```
 
+OpenRouter uses the same OpenAI-compatible embeddings transport:
+
+```sql
+SELECT rvbbit.register_backend(
+  backend_name      => 'embed_openrouter',
+  backend_endpoint  => 'https://openrouter.ai/api/v1/embeddings',
+  backend_transport => 'openai',
+  backend_auth_env  => 'OPENROUTER_API_KEY',
+  backend_opts      => '{"model":"openai/text-embedding-3-small"}'::jsonb,
+  backend_batch_size => 64,
+  backend_max_concur => 8
+);
+
+SELECT rvbbit.set_default_embedder('embed_openrouter', true);
+```
+
+The curated capability catalog also includes `embeddings/openrouter`; install it
+from Lens Capabilities, edit the model knob if needed, and enable "use as
+system embedder" to run the same promotion step after smoke.
+
+On an existing database, make sure the run-once SQL migrations have been
+applied after upgrading the extension:
+
+```sql
+SELECT rvbbit.migrate();
+```
+
+Confirm the canonical backend after promotion:
+
+```sql
+SELECT
+  name,
+  transport,
+  endpoint_url,
+  auth_header_env,
+  transport_opts->>'model' AS model,
+  install_manifest #>> '{rvbbit_default_embedder,source_backend}' AS source_backend
+FROM rvbbit.backends
+WHERE name IN ('embed', 'embed_openrouter')
+ORDER BY name;
+
+SELECT array_length(rvbbit.embed('default embedder probe', '', 'query'), 1) AS dim;
+```
+
+If `catalog_crawl_run()` still appears to use the old vector space, check the
+latest crawl dimensions:
+
+```sql
+SELECT array_length(embedding, 1) AS dim, count(*)
+FROM rvbbit.catalog_docs
+WHERE graph_id = 'db_catalog'
+  AND embedding IS NOT NULL
+GROUP BY 1
+ORDER BY 1;
+```
+
 Use a named alternate backend without replacing the default:
 
 ```sql
@@ -200,6 +257,8 @@ That means:
 - Same text through the same backend hits cache.
 - Same text through two backend names stores two independent embeddings.
 - If you change the model behind an existing backend name, purge its cache.
+- `rvbbit.set_default_embedder(..., true)` purges `embed` automatically because
+  changing the canonical backend changes the vector space behind cached entries.
 
 Inspect cache:
 
