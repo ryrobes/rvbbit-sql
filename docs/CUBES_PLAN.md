@@ -251,8 +251,8 @@ question. None of which dbt/Cube.dev/LookML do natively.
   `drop_cube` cleans `cube_columns`. Verified live: a 7-column `sales_orders` cube enriched with
   lineage-traced `source_ref`s (incl. `derived:` exprs), cube ranks **1.000** (top) on semantic
   `data_search`. Enrich stays SQL/Studio-side (a write + LLM cost); MCP enrich is a V3 item.
-- **V3 — curation + authoring + health. BACKEND ✅ LANDED** (`sql/migrations/0006_cubes_v3.sql`);
-  lens Cube Studio in progress.
+- **V3 — curation + authoring + health. ✅ LANDED** (backend `sql/migrations/0006_cubes_v3.sql`
+  + the lens **Cube Studio**).
   - **`propose_cube(subject, seed_tables?, schema?, max_tables?)`** — an LLM (new `propose_cube_draft`
     jsonb operator, same path as `cube_enrich`) drafts a wide join SQL + grain + description + name
     from FK edges (`pg_constraint`, oid-matched), `data_search` candidates (→ `information_schema`
@@ -271,9 +271,18 @@ question. None of which dbt/Cube.dev/LookML do natively.
     `cube_control.refreshed_at`, not the parquet clock) / staleness / drift (`accel_freshness`,
     null-guarded) / usage + a skip/delta/full-rebuild recommendation.
   - **MCP**: `propose_cube` added (read-only-safe draft, audited); all persisting/DDL cube ops stay
-    primary-only (the mirror proposes, the human blesses). Pending: lens **Cube Studio**
-    (Catalog/Creator with Manual|Propose|From-Pack modes/Inspector w/ column-doc editing + Health),
-    plus deferrals — incremental/delta refresh, the Inspector AS-OF scrubber, MCP enrich-preview.
+    primary-only (the mirror proposes, the human blesses).
+  - **Lens Cube Studio** (rvbbit-lens) — three desktop apps mirroring the Metrics studio:
+    **Cube Catalog** (browse/search/sort), **Cube Creator** with three modes —
+    **Manual** (SQL + live LIMIT-5 preview), **Propose** (subject + optional seed-tables/schema →
+    `propose_cube` → pre-fills the Manual form to review & Save) and **From Pack** (pick a SaaS pack
+    → auto-suggest bindings → preview resolved SQL → `define_cube_from_pack`) — and **Cube Inspector**
+    (Overview/Columns/Health/Lineage; inline column-doc editing via `set_cube_column_doc`,
+    Refresh/Enrich/Promote-to-Metric actions). New `lib/rvbbit/cubes.ts` + `cube-shared.tsx`;
+    registered in `desktop-shell.tsx`/`types.ts` under a new **Cubes** launcher folder. tsc + eslint
+    clean.
+  - Deferred to v3.1: incremental/delta refresh (the executor; `cube_health` already emits the
+    skip/delta/full signal), the Inspector AS-OF time-travel scrubber, an MCP enrich-preview tool.
 
 ---
 
