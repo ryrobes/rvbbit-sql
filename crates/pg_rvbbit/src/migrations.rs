@@ -53,6 +53,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0008_proposals",
         include_str!("../sql/migrations/0008_proposals.sql"),
     ),
+    (
+        "0009_cube_model",
+        include_str!("../sql/migrations/0009_cube_model.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
