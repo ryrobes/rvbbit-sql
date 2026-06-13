@@ -235,6 +235,51 @@ struct NeededColumn {
     has_nulls: bool,
 }
 
+/// How to turn a Utf8 parquet value back into a PG datum. text-family columns
+/// store the value verbatim; the text-surrogate types (uuid/numeric/inet/enum/…,
+/// see compact::is_text_surrogate_type) store canonical text and are rebuilt
+/// into the real type via its input function, so the column stays its declared
+/// type to SQL (comparisons/joins/order behave exactly as on the heap).
+#[derive(Clone, Copy)]
+enum Utf8Recon {
+    /// text / varchar / bpchar / name — the stored string IS the value.
+    Text,
+    /// jsonb — fast path via jsonb_in (used only by legacy Utf8-encoded jsonb;
+    /// current exports write jsonb as Binary).
+    Jsonb,
+    /// Reconstruct via the column type's input function on the canonical text.
+    TypeInput {
+        typinput: pg_sys::Oid,
+        typioparam: pg_sys::Oid,
+        typmod: i32,
+    },
+}
+
+/// Pick the reconstruction strategy for a Utf8 parquet column from the column's
+/// real PG type. Anything that isn't text-family or jsonb but landed in a Utf8
+/// column was exported as a text surrogate (uuid/numeric/inet/enum/…) and is
+/// rebuilt via its input function.
+unsafe fn utf8_recon_for(typoid: pg_sys::Oid, typmod: i32) -> Utf8Recon {
+    if typoid == pg_sys::TEXTOID
+        || typoid == pg_sys::VARCHAROID
+        || typoid == pg_sys::BPCHAROID
+        || typoid == pg_sys::NAMEOID
+    {
+        return Utf8Recon::Text;
+    }
+    if typoid == pg_sys::JSONBOID {
+        return Utf8Recon::Jsonb;
+    }
+    let mut typinput = pg_sys::InvalidOid;
+    let mut typioparam = pg_sys::InvalidOid;
+    pg_sys::getTypeInputInfo(typoid, &mut typinput, &mut typioparam);
+    Utf8Recon::TypeInput {
+        typinput,
+        typioparam,
+        typmod,
+    }
+}
+
 /// Typed read into the currently-active Arrow batch.
 /// Pointers are valid only as long as `current_batch` lives — rebuilt
 /// every time a new batch is pulled. The owning `current_batch` field on
@@ -251,7 +296,7 @@ enum ColumnReader {
     Bool(*const BooleanArray),
     Utf8 {
         arr: *const StringArray,
-        is_jsonb: bool,
+        recon: Utf8Recon,
     },
     Binary(*const BinaryArray),
     TimestampMicros(*const TimestampMicrosecondArray),
@@ -2509,7 +2554,7 @@ unsafe fn make_reader_for(array: &Arc<dyn Array>, attr: &PgAttr) -> ColumnReader
         }
         DataType::Utf8 => ColumnReader::Utf8 {
             arr: array.as_any().downcast_ref::<StringArray>().unwrap() as *const _,
-            is_jsonb: attr.typoid == pg_sys::JSONBOID,
+            recon: utf8_recon_for(attr.typoid, attr.typmod),
         },
         DataType::Binary => {
             ColumnReader::Binary(array.as_any().downcast_ref::<BinaryArray>().unwrap() as *const _)
@@ -3686,30 +3731,53 @@ unsafe fn read_via(reader: &ColumnReader, row: usize, has_nulls: bool) -> (pg_sy
                 (pg_sys::Datum::from(a.value(row) as usize), false)
             }
         }
-        ColumnReader::Utf8 { arr, is_jsonb } => {
+        ColumnReader::Utf8 { arr, recon } => {
             let a = &**arr;
             if has_nulls && a.is_null(row) {
                 return (pg_sys::Datum::from(0usize), true);
             }
             let s = a.value(row);
-            if *is_jsonb {
-                let mut buf = Vec::with_capacity(s.len() + 1);
-                buf.extend_from_slice(s.as_bytes());
-                buf.push(0);
-                type CUnwindPGFn =
-                    unsafe extern "C-unwind" fn(pg_sys::FunctionCallInfo) -> pg_sys::Datum;
-                let jsonb_in: CUnwindPGFn = std::mem::transmute(pg_sys::jsonb_in as *const ());
-                let datum = pg_sys::DirectFunctionCall1Coll(
-                    Some(jsonb_in),
-                    pg_sys::InvalidOid,
-                    pg_sys::Datum::from(buf.as_ptr() as usize),
-                );
-                drop(buf);
-                (datum, false)
-            } else {
-                let text_ptr =
-                    pg_sys::cstring_to_text_with_len(s.as_ptr() as *const i8, s.len() as i32);
-                (pg_sys::Datum::from(text_ptr as usize), false)
+            match recon {
+                Utf8Recon::Text => {
+                    let text_ptr =
+                        pg_sys::cstring_to_text_with_len(s.as_ptr() as *const i8, s.len() as i32);
+                    (pg_sys::Datum::from(text_ptr as usize), false)
+                }
+                Utf8Recon::Jsonb => {
+                    let mut buf = Vec::with_capacity(s.len() + 1);
+                    buf.extend_from_slice(s.as_bytes());
+                    buf.push(0);
+                    type CUnwindPGFn =
+                        unsafe extern "C-unwind" fn(pg_sys::FunctionCallInfo) -> pg_sys::Datum;
+                    let jsonb_in: CUnwindPGFn = std::mem::transmute(pg_sys::jsonb_in as *const ());
+                    let datum = pg_sys::DirectFunctionCall1Coll(
+                        Some(jsonb_in),
+                        pg_sys::InvalidOid,
+                        pg_sys::Datum::from(buf.as_ptr() as usize),
+                    );
+                    drop(buf);
+                    (datum, false)
+                }
+                // Reconstruct the real type (uuid/numeric/inet/enum/…) from its
+                // canonical text via the type's input function. OidInputFunctionCall
+                // palloc's the result in the current context, like any input fn.
+                Utf8Recon::TypeInput {
+                    typinput,
+                    typioparam,
+                    typmod,
+                } => {
+                    let mut buf = Vec::with_capacity(s.len() + 1);
+                    buf.extend_from_slice(s.as_bytes());
+                    buf.push(0);
+                    let datum = pg_sys::OidInputFunctionCall(
+                        *typinput,
+                        buf.as_mut_ptr() as *mut std::os::raw::c_char,
+                        *typioparam,
+                        *typmod,
+                    );
+                    drop(buf);
+                    (datum, false)
+                }
             }
         }
         ColumnReader::Binary(p) => {
@@ -4053,5 +4121,30 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert!(recent >= 1, "reap_logs must keep recent rows");
+    }
+
+    // Text-surrogate export (the Salesforce-keys case): a table with uuid +
+    // numeric + enum columns must compact to parquet instead of raising
+    // "unsupported PG type oid 2950". Covers the EXPORT half end-to-end (writing
+    // a parquet file in-transaction); the READ-half reconstruction round-trip
+    // needs committed row groups + a native scan, so it lives in
+    // docker/sql/uuid-surrogate-verify.sql against a live instance.
+    #[pg_test]
+    fn export_to_parquet_supports_uuid_numeric_enum() {
+        Spi::run("CREATE TYPE sf_status AS ENUM ('open', 'closed')").unwrap();
+        Spi::run(
+            "CREATE TABLE sf_keys (id uuid, amount numeric, status sf_status, note text) USING rvbbit",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO sf_keys VALUES \
+                (gen_random_uuid(), 12.34, 'open', 'a'), \
+                (gen_random_uuid(), 99.95, 'closed', 'b')",
+        )
+        .unwrap();
+        let n: i64 = Spi::get_one("SELECT rvbbit.export_to_parquet('sf_keys'::regclass)")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 2, "export_to_parquet should write both rows of the uuid/numeric/enum table");
     }
 }

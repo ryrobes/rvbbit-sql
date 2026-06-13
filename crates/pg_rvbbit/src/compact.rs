@@ -171,11 +171,37 @@ impl ColumnBuilder {
     }
 }
 
+/// PG types we store in parquet as their canonical TEXT (Arrow Utf8) and
+/// reconstruct to the real type on read via the type's input function (see
+/// custom_scan's ColumnReader::Utf8 reconstruction). Lossless and semantics-
+/// preserving: the column stays its declared type to SQL, so uuid/numeric/inet/…
+/// comparisons, joins, and ORDER BY behave exactly as on the heap.
+///
+/// An explicit allowlist (plus user enums, whose oids are dynamic) rather than a
+/// blind catch-all, so genuinely lossy/unhandled types (ranges, composites,
+/// geometry, arrays-of-composite) still fail loudly instead of degrading.
+fn is_text_surrogate_type(pg_type: u32, typtype: &str) -> bool {
+    typtype == "e" // user-defined enum (dynamic oid)
+        || matches!(
+            pg_type,
+            2950   // uuid
+            | 1700 // numeric
+            | 869  // inet
+            | 650  // cidr
+            | 829  // macaddr
+            | 774  // macaddr8
+            | 1083 // time
+            | 1266 // timetz
+            | 1186 // interval
+        )
+}
+
 /// Returns (arrow_type, select_expression). The select_expression is what
 /// gets emitted in the SELECT list — for most types it's just the column
-/// name; for timestamps we project to epoch microseconds, for jsonb we
-/// project to ::text (then convert back to body bytes when ingesting).
-fn plan_for_pg_type(pg_type: u32, col_name: &str) -> Result<(DataType, String), String> {
+/// name; for timestamps we project to epoch microseconds, for jsonb and the
+/// text-surrogate types (uuid/numeric/inet/enum/…) we project to ::text and
+/// reconstruct on read.
+fn plan_for_pg_type(pg_type: u32, typtype: &str, col_name: &str) -> Result<(DataType, String), String> {
     let quoted = format!("\"{}\"", col_name.replace('"', "\"\""));
     Ok(match pg_type {
         16 => (DataType::Boolean, quoted),  // BOOLOID
@@ -201,12 +227,17 @@ fn plan_for_pg_type(pg_type: u32, col_name: &str) -> Result<(DataType, String), 
             DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
             quoted,
         ),
+        // Text-surrogate types (uuid/numeric/inet/…/enum): store canonical text,
+        // reconstruct the real type on read via its input function.
+        n if is_text_surrogate_type(n, typtype) => (DataType::Utf8, format!("{quoted}::text")),
         other => {
             return Err(format!(
                 "rvbbit.export_to_parquet: unsupported PG type oid {other} \
-                 for column '{col_name}' (supported: bool, int2, int4, int8, \
-                 float4, float8, text, varchar, char, name, timestamp, \
-                 timestamptz, date, jsonb, bytea)"
+                 for column '{col_name}' (natively supported: bool, int2, int4, \
+                 int8, float4, float8, text, varchar, char, name, timestamp, \
+                 timestamptz, date, jsonb, bytea, real[]; round-tripped as text: \
+                 uuid, numeric, inet, cidr, macaddr, macaddr8, time, timetz, \
+                 interval, enums)"
             ));
         }
     })
@@ -216,10 +247,10 @@ fn introspect_columns(rel_oid: u32) -> Result<Vec<ColumnPlan>, String> {
     // attname is the PG `name` type, not text — explicit ::text cast so
     // SPI's row.get::<String>() doesn't choke on the oid mismatch.
     let sql = format!(
-        "SELECT attname::text, atttypid::oid::int, attnotnull \
-         FROM pg_attribute \
-         WHERE attrelid = {rel_oid}::oid AND attnum > 0 AND NOT attisdropped \
-         ORDER BY attnum"
+        "SELECT a.attname::text, a.atttypid::oid::int, a.attnotnull, t.typtype::text \
+         FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+         WHERE a.attrelid = {rel_oid}::oid AND a.attnum > 0 AND NOT a.attisdropped \
+         ORDER BY a.attnum"
     );
     let mut plans: Vec<ColumnPlan> = Vec::new();
     Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
@@ -228,8 +259,9 @@ fn introspect_columns(rel_oid: u32) -> Result<Vec<ColumnPlan>, String> {
             let name: String = row.get::<String>(1)?.unwrap_or_default();
             let pg_type: i32 = row.get::<i32>(2)?.unwrap_or(0);
             let not_null: bool = row.get::<bool>(3)?.unwrap_or(false);
+            let typtype: String = row.get::<String>(4)?.unwrap_or_default();
             let pg_type_u32 = pg_type as u32;
-            let (arrow_type, select_expr) = plan_for_pg_type(pg_type_u32, &name)
+            let (arrow_type, select_expr) = plan_for_pg_type(pg_type_u32, &typtype, &name)
                 .map_err(|e| pgrx::spi::Error::CursorNotFound(e))?;
             plans.push(ColumnPlan {
                 name,
@@ -3035,5 +3067,30 @@ mod tests {
             hive_partition_to_flush_on_transition(None, "A", 1),
             Err("hive writer has buffered rows without a current partition")
         );
+    }
+
+    // The text-surrogate allowlist: uuid/numeric/inet/…/enum plan as Utf8 via
+    // ::text (reconstructed on read), native types are untouched, and genuinely
+    // unsupported types still error loudly instead of silently degrading.
+    #[test]
+    fn text_surrogate_allowlist_maps_to_cast_text() {
+        use super::{is_text_surrogate_type, plan_for_pg_type};
+        // built-in surrogate oids — uuid(2950), numeric(1700), inet(869),
+        // cidr(650), macaddr(829), macaddr8(774), time(1083), timetz(1266),
+        // interval(1186)
+        for &oid in &[2950u32, 1700, 869, 650, 829, 774, 1083, 1266, 1186] {
+            assert!(is_text_surrogate_type(oid, "b"), "oid {oid} should be a text surrogate");
+            let (_, expr) = plan_for_pg_type(oid, "b", "c").expect("surrogate must plan ok");
+            assert!(expr.contains("::text"), "surrogate oid {oid} must project ::text: {expr}");
+        }
+        // user enums are caught by typtype 'e' regardless of (dynamic) oid
+        assert!(is_text_surrogate_type(999_999, "e"));
+        assert!(plan_for_pg_type(999_999, "e", "status").unwrap().1.contains("::text"));
+        // native types are not surrogates and keep planning natively (int4=23)
+        assert!(!is_text_surrogate_type(23, "b"));
+        assert!(plan_for_pg_type(23, "b", "i").is_ok());
+        // genuinely unsupported types still error (point = 600, not allowlisted)
+        assert!(!is_text_surrogate_type(600, "b"));
+        assert!(plan_for_pg_type(600, "b", "p").is_err());
     }
 }
