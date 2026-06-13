@@ -45,6 +45,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0006_cubes_v3",
         include_str!("../sql/migrations/0006_cubes_v3.sql"),
     ),
+    (
+        "0007_cubes_sql_trim",
+        include_str!("../sql/migrations/0007_cubes_sql_trim.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
