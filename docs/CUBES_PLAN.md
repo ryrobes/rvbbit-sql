@@ -281,8 +281,16 @@ question. None of which dbt/Cube.dev/LookML do natively.
     Refresh/Enrich/Promote-to-Metric actions). New `lib/rvbbit/cubes.ts` + `cube-shared.tsx`;
     registered in `desktop-shell.tsx`/`types.ts` under a new **Cubes** launcher folder. tsc + eslint
     clean.
+  - **Proposal queue** (migration 0008) — `propose_cube` drafts were ephemeral; now the MCP
+    `propose_cube` *tool* logs every draft to `rvbbit.proposals` (generic over kind — cubes now,
+    metrics later). `record_proposal` (dedup-supersedes a prior pending same-name), `accept_proposal`
+    (→ `define_cube` + optional enrich, links `result_name`), `reject_proposal`, `proposals()` list.
+    A lens **Cube Proposals** inbox triages them (review subject/lineage/confidence/rationale +
+    editable name/SQL → Accept / Accept & Enrich / Reject). The accept/reject signal is the
+    substrate for the future learning loop.
   - Deferred to v3.1: incremental/delta refresh (the executor; `cube_health` already emits the
-    skip/delta/full signal), the Inspector AS-OF time-travel scrubber, an MCP enrich-preview tool.
+    skip/delta/full signal), the Inspector AS-OF time-travel scrubber, an MCP enrich-preview tool,
+    and `propose_metric` (the proposals table is already kind-generic for it).
 
 ---
 
