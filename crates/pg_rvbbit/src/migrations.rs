@@ -93,6 +93,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0018_proposal_quality",
         include_str!("../sql/migrations/0018_proposal_quality.sql"),
     ),
+    (
+        "0019_metric_check_resilience",
+        include_str!("../sql/migrations/0019_metric_check_resilience.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
