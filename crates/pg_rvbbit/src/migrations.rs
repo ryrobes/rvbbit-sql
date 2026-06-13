@@ -101,6 +101,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0020_proposal_categories",
         include_str!("../sql/migrations/0020_proposal_categories.sql"),
     ),
+    (
+        "0021_edit_primitives",
+        include_str!("../sql/migrations/0021_edit_primitives.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

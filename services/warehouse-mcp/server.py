@@ -401,6 +401,41 @@ def tool_withdraw_proposal(proposal_id, reason=None) -> dict:
     return {"status": "withdrawn", "proposal_id": proposal_id}
 
 
+# ── direct edits (versioned, so reversible) ──────────────────────────────────
+
+def tool_edit_metric(name, sql=None, grain=None, description=None, params=None,
+                     check_sql=None, category=None, subcategory=None) -> dict:
+    """Edit an existing metric IN PLACE — appends a new version (old versions are kept, so it's
+    reversible) that goes LIVE immediately. Only the fields you pass change. check_sql: omit to keep
+    the current check, pass "" to remove it. Use this to fix/improve a metric you (or someone) defined."""
+    with _conn() as c:
+        try:
+            row = c.execute(
+                "SELECT rvbbit.revise_metric(%s, p_sql=>%s, p_grain=>%s, p_description=>%s, "
+                "p_params=>%s::jsonb, p_check_sql=>%s, p_category=>%s, p_subcategory=>%s) AS v",
+                (name, sql, grain, description,
+                 json.dumps(params) if params is not None else None,
+                 check_sql, category, subcategory)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "EDIT_FAILED", "message": str(e)}}
+    return {"metric": name, "version": row["v"] if row else None}
+
+
+def tool_edit_cube(name, sql, grain=None, description=None, category=None, subcategory=None) -> dict:
+    """Edit an existing cube's DEFINITION in place — appends a new version (revert via the prior
+    version) that goes LIVE immediately. Shape-aware: a column change rebuilds the cube table, a
+    filter-only change preserves its AS-OF history. sql is required (the full new SELECT)."""
+    with _conn() as c:
+        try:
+            row = c.execute(
+                "SELECT rvbbit.redefine_cube(%s, %s, p_grain=>%s, p_description=>%s, "
+                "p_category=>%s, p_subcategory=>%s) AS v",
+                (name, sql, grain, description, category, subcategory)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "EDIT_FAILED", "message": str(e)}}
+    return {"cube": name, "version": row["v"] if row else None}
+
+
 def tool_metric(name: str, params=None, as_of=None, def_as_of=None) -> dict:
     """A blessed, governed number — bitemporal (as_of = data-time, def_as_of = def-time)."""
     params = params or {}
@@ -1041,6 +1076,12 @@ def _register(mcp):
     mcp.tool(name="withdraw_proposal")(lambda proposal_id, reason=None: _logged(
         "withdraw_proposal", {"proposal_id": proposal_id, "reason": reason},
         lambda: tool_withdraw_proposal(proposal_id, reason)))
+    mcp.tool(name="edit_metric")(lambda name, sql=None, grain=None, description=None, params=None, check_sql=None, category=None, subcategory=None: _logged(
+        "edit_metric", {"name": name},
+        lambda: tool_edit_metric(name, sql, grain, description, params, check_sql, category, subcategory)))
+    mcp.tool(name="edit_cube")(lambda name, sql, grain=None, description=None, category=None, subcategory=None: _logged(
+        "edit_cube", {"name": name},
+        lambda: tool_edit_cube(name, sql, grain, description, category, subcategory)))
     mcp.tool(name="metric")(lambda name, params=None, as_of=None, def_as_of=None: _logged(
         "metric", {"name": name, "params": params, "as_of": as_of, "def_as_of": def_as_of},
         lambda: tool_metric(name, params, as_of, def_as_of)))
