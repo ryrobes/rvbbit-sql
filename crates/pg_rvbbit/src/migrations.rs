@@ -97,6 +97,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0019_metric_check_resilience",
         include_str!("../sql/migrations/0019_metric_check_resilience.sql"),
     ),
+    (
+        "0020_proposal_categories",
+        include_str!("../sql/migrations/0020_proposal_categories.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
