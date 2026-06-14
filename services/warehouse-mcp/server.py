@@ -509,20 +509,44 @@ def tool_edit_cube(name, sql, grain=None, description=None, category=None, subca
     return {"cube": name, "version": row["v"] if row else None}
 
 
-def tool_metric(name: str, params=None, as_of=None, def_as_of=None) -> dict:
-    """A blessed, governed number — bitemporal (as_of = data-time, def_as_of = def-time)."""
+def tool_metric(name: str, params=None, as_of=None, def_as_of=None, group_by=None) -> dict:
+    """A blessed, governed number — bitemporal (as_of = data-time, def_as_of = def-time). Pass
+    group_by (a list of cube dimension columns) to slice a DIMENSIONAL metric — one defined over a
+    cube (labels.cube_source) — into a breakdown row per group (e.g. group_by=['stage_name']). The
+    metric's measures are reused verbatim; dimensions are validated against the cube's real columns.
+    Call metric_dimensions(name) to discover which columns are sliceable."""
     params = params or {}
+    dims = [d for d in (group_by or []) if d]
     with _conn() as c:
         if as_of:
             c.execute("SET rvbbit.as_of_timestamp = %s", (str(as_of),))
         try:
-            rows = c.execute("SELECT rvbbit.metric(%s, %s::jsonb) AS m",
-                             (name, json.dumps(params))).fetchall()
+            if dims:
+                rows = c.execute("SELECT rvbbit.metric_by(%s, %s::text[], %s::jsonb) AS m",
+                                 (name, dims, json.dumps(params))).fetchall()
+            else:
+                rows = c.execute("SELECT rvbbit.metric(%s, %s::jsonb) AS m",
+                                 (name, json.dumps(params))).fetchall()
         except Exception as e:  # noqa: BLE001
             return {"error": {"code": "METRIC_FAILED", "message": str(e)}}
     vals = [r["m"] for r in rows]
-    return {"name": name, "result": vals[0] if len(vals) == 1 else vals,
-            "params": params, "data_as_of": as_of, "def_as_of": def_as_of}
+    out = {"name": name, "result": vals[0] if (len(vals) == 1 and not dims) else vals,
+           "params": params, "data_as_of": as_of, "def_as_of": def_as_of}
+    if dims:
+        out["group_by"] = dims
+    return out
+
+
+def tool_metric_dimensions(name: str) -> dict:
+    """The cube columns a DIMENSIONAL metric can be sliced by (empty unless it declares labels.cube_source).
+    Each entry: column, type, kind (dimension/time/key/measure), groupable. Feed groupable columns to
+    metric(name, group_by=[...]) for a breakdown."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT column_name, data_type, kind, groupable, distinct_est, semantics "
+            "FROM rvbbit.metric_dimensions(%s)", (name,)).fetchall()
+    return {"metric": name, "dimensions": rows,
+            "groupable": [r["column_name"] for r in rows if r["groupable"]]}
 
 
 # ── monitoring surface: snapshot, history, breaches, lineage ─────────────────
@@ -1206,9 +1230,11 @@ def _register(mcp):
     mcp.tool(name="edit_cube")(lambda name, sql, grain=None, description=None, category=None, subcategory=None: _logged(
         "edit_cube", {"name": name},
         lambda: tool_edit_cube(name, sql, grain, description, category, subcategory)))
-    mcp.tool(name="metric")(lambda name, params=None, as_of=None, def_as_of=None: _logged(
-        "metric", {"name": name, "params": params, "as_of": as_of, "def_as_of": def_as_of},
-        lambda: tool_metric(name, params, as_of, def_as_of)))
+    mcp.tool(name="metric")(lambda name, params=None, as_of=None, def_as_of=None, group_by=None: _logged(
+        "metric", {"name": name, "params": params, "as_of": as_of, "def_as_of": def_as_of, "group_by": group_by},
+        lambda: tool_metric(name, params, as_of, def_as_of, group_by)))
+    mcp.tool(name="metric_dimensions")(lambda name: _logged(
+        "metric_dimensions", {"name": name}, lambda: tool_metric_dimensions(name)))
     mcp.tool(name="materialize_metric")(lambda name, params=None, as_of=None, def_as_of=None: _logged(
         "materialize_metric", {"name": name},
         lambda: tool_materialize_metric(name, params, as_of, def_as_of)))
