@@ -137,6 +137,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0029_cube_refresh_pacing_and_accel_exclude",
         include_str!("../sql/migrations/0029_cube_refresh_pacing_and_accel_exclude.sql"),
     ),
+    (
+        "0030_fix_refresh_all_cubes_overload",
+        include_str!("../sql/migrations/0030_fix_refresh_all_cubes_overload.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
