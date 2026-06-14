@@ -121,6 +121,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0025_fk_inference",
         include_str!("../sql/migrations/0025_fk_inference.sql"),
     ),
+    (
+        "0026_refresh_all_cubes",
+        include_str!("../sql/migrations/0026_refresh_all_cubes.sql"),
+    ),
+    (
+        "0027_dimensional_metrics",
+        include_str!("../sql/migrations/0027_dimensional_metrics.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
