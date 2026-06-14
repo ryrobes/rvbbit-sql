@@ -32,6 +32,7 @@ from __future__ import annotations
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
 import hmac, json, os, re, sys, time
+from decimal import Decimal
 
 import psycopg
 from psycopg import sql as pgsql
@@ -845,6 +846,259 @@ def tool_preview_metric_observation(metric) -> dict:
     return {"metric": metric, "observation": row}
 
 
+# ── consumer verbs: opinionated, pre-shaped business views ────────────────────
+# The MCP can't render UI, so these return data ALREADY shaped (rows/cols/totals) plus an explicit
+# `render` instruction the agent follows — a "pre-baked opinion" on how to look at the numbers, not a
+# raw crosstab. All thin compositions over the blessed metric / metric_by / observation log.
+
+_GRAINS = {"day", "week", "month", "quarter", "year"}
+
+
+def _isnum(v):
+    """A real number (int/float/Decimal) — NOT a bool (which is an int subclass in Python)."""
+    return isinstance(v, (int, float, Decimal)) and not isinstance(v, bool)
+
+
+def _metric_scalar(v, prefer=None):
+    """Pull a representative number out of a metric row (dict), a stored value ([{...}] list), or a
+    bare number. Prefers `prefer`, then a 'value' key, then the first numeric field."""
+    if v is None or isinstance(v, bool):
+        return None
+    if _isnum(v):
+        return float(v)
+    if isinstance(v, list):
+        v = v[0] if v else None
+    if isinstance(v, dict):
+        for k in ([prefer] if prefer else []) + ["value"]:
+            if k and _isnum(v.get(k)):
+                return float(v[k])
+        for val in v.values():
+            if _isnum(val):
+                return float(val)
+    return None
+
+
+def _measure_order(c, metric):
+    """The metric's measure aliases in DEFINITION order (its select-list) — the first is the headline
+    measure. jsonb reorders keys by (length, alpha), so without this the 'first numeric' would be
+    arbitrary; this restores the author's intended order."""
+    row = c.execute(
+        "SELECT sql FROM rvbbit.metric_defs WHERE name=%s ORDER BY created_at DESC, version DESC LIMIT 1",
+        (metric,)).fetchone()
+    if not row or not row.get("sql"):
+        return []
+    mobj = re.match(r"(?is)^\s*select\s+(.*?)\s+from\s", row["sql"])
+    if not mobj:
+        return []
+    parts, depth, cur = [], 0, ""
+    for ch in mobj.group(1):
+        if ch == "(":
+            depth += 1; cur += ch
+        elif ch == ")":
+            depth -= 1; cur += ch
+        elif ch == "," and depth == 0:
+            parts.append(cur); cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur)
+    out = []
+    for p in parts:
+        p = p.strip()
+        am = re.search(r'(?is)\bas\s+"?([a-z_][a-z0-9_]*)"?\s*$', p) or re.search(r"([a-z_][a-z0-9_]*)\s*$", p, re.I)
+        if am:
+            out.append(am.group(1).lower())
+    return out
+
+
+def _pick_measures(c, metric, sample, exclude):
+    """Numeric measure columns of a metric row, ranked by the metric's definition order (headline first)."""
+    numeric = [k for k, v in sample.items() if k not in exclude and _isnum(v)]
+    order = _measure_order(c, metric)
+    return sorted(numeric, key=lambda k: (order.index(k) if k in order else 999, k))
+
+
+def tool_scoreboard(category=None, grain="month", periods=6, as_of=None) -> dict:
+    """The executive KPI matrix: every blessed metric laid out as category › subcategory (left axis) ×
+    time periods (top axis), each cell = the metric's value that period, with its latest target verdict
+    and a trend. Reads the materialized observation log (the governed history — no recompute). Filter by
+    category; grain = day|week|month|quarter|year; periods = how many columns back. The 'how are we
+    doing?' view — render it as one opinionated matrix, not a flat list."""
+    if grain not in _GRAINS:
+        return {"error": {"code": "BAD_GRAIN", "message": f"grain must be one of {sorted(_GRAINS)}"}}
+    n = max(1, min(int(periods or 6), 36))
+    step = f"1 {grain}"
+    with _ro() as c:
+        axis = [r["period"] for r in c.execute(
+            "SELECT to_char(b,'YYYY-MM-DD') AS period FROM generate_series("
+            "date_trunc(%s, coalesce(%s::timestamptz, now())) - ((%s - 1) * (%s)::interval), "
+            "date_trunc(%s, coalesce(%s::timestamptz, now())), (%s)::interval) b ORDER BY b",
+            (grain, as_of, n, step, grain, as_of, step)).fetchall()]
+        long = c.execute(
+            "WITH obs AS (SELECT o.metric_name, "
+            "  to_char(date_trunc(%s, coalesce(o.data_as_of,o.observed_at)),'YYYY-MM-DD') AS bucket, "
+            "  o.value, o.status, row_number() OVER (PARTITION BY o.metric_name, "
+            "    date_trunc(%s, coalesce(o.data_as_of,o.observed_at)) ORDER BY o.observed_at DESC) AS rn "
+            "  FROM rvbbit.metric_observations o) "
+            "SELECT m.name, m.category, m.subcategory, m.description, m.grain AS metric_grain, "
+            "       obs.bucket, obs.value, obs.status "
+            "FROM rvbbit.metric_catalog m LEFT JOIN obs ON obs.metric_name=m.name AND obs.rn=1 "
+            "WHERE (%s::text IS NULL OR m.category=%s::text) "
+            "ORDER BY m.category NULLS LAST, m.subcategory NULLS LAST, m.name",
+            (grain, grain, category, category)).fetchall()
+    axis_set = set(axis)
+    metrics, order = {}, []
+    for r in long:
+        nm = r["name"]
+        if nm not in metrics:
+            metrics[nm] = {"category": r["category"], "subcategory": r["subcategory"],
+                           "description": r["description"], "metric_grain": r["metric_grain"], "cells": {}}
+            order.append(nm)
+        b = r["bucket"]
+        if b and b in axis_set:
+            metrics[nm]["cells"][b] = {"value": _metric_scalar(r["value"]), "status": r["status"]}
+    groups = {}
+    for nm in order:
+        md = metrics[nm]
+        series = [(md["cells"].get(p) or {}).get("value") for p in axis]
+        present = [md["cells"][p] for p in axis if p in md["cells"]]
+        latest = present[-1] if present else {}
+        nn = [v for v in series if v is not None]
+        trend = None
+        if len(nn) >= 2:
+            trend = "up" if nn[-1] > nn[0] else ("down" if nn[-1] < nn[0] else "flat")
+        key = (md["category"] or "Uncategorized", md["subcategory"] or "")
+        groups.setdefault(key, []).append({
+            "name": nm, "description": md["description"], "metric_grain": md["metric_grain"],
+            "cells": series, "latest": latest.get("value"), "status": latest.get("status"), "trend": trend})
+    out_groups = [{"category": k[0], "subcategory": k[1], "metrics": v}
+                  for k, v in sorted(groups.items())]
+    return {"grain": grain, "periods": axis, "groups": out_groups,
+            "render": {"as": "kpi_matrix",
+                       "note": "Render as ONE matrix: left axis = category › subcategory › metric (grouped with "
+                               "subcategory subheaders, indented), top axis = the periods (oldest left → newest "
+                               "right), each cell = the value. On the latest cell append a ▲/▼/– from trend and a "
+                               "✓/✗ from status. Right-align numbers. This is an executive scoreboard, not a list."}}
+
+
+def tool_pivot(metric, rows, cols, measure=None, params=None, as_of=None) -> dict:
+    """A governed crosstab of a DIMENSIONAL metric: rows (a cube dimension) × cols (a cube dimension) ×
+    one measure, with row/column/grand totals. Reshapes metric_by into a matrix — values are the blessed
+    metric's, dimensions are validated against the cube — so it's a repeatable pivot table, not hand-rolled
+    SQL. measure defaults to the metric's first numeric measure. Call metric_dimensions(metric) to see
+    the sliceable columns. Render as a matrix."""
+    if not rows or not cols:
+        return {"error": {"code": "BAD_AXES", "message": "rows and cols are required cube dimensions"}}
+    available = []
+    with _conn() as c:
+        try:
+            recs = c.execute(
+                "SELECT rvbbit.metric_by(%s, %s::text[], %s::jsonb, now(), %s::timestamptz) AS m",
+                (metric, [rows, cols], json.dumps(params or {}), as_of)).fetchall()
+            longrows = [r["m"] for r in recs if r["m"] is not None]
+            if longrows:
+                available = _pick_measures(c, metric, longrows[0], {rows, cols})
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "PIVOT_FAILED", "message": str(e)}}
+    if not longrows:
+        return {"metric": metric, "rows_dim": rows, "cols_dim": cols, "matrix": [], "note": "no rows"}
+    if measure is None:
+        measure = available[0] if available else None        # headline measure (definition order)
+    elif measure not in available:
+        return {"error": {"code": "BAD_MEASURE",
+                          "message": f"'{measure}' is not a numeric measure; available: {available}"}}
+    if measure is None:
+        return {"error": {"code": "NO_MEASURE",
+                          "message": f"no numeric measure found in {sorted(longrows[0].keys())}; pass measure="}}
+    cells, row_vals, col_vals = {}, [], []
+    for rec in longrows:
+        rv = "" if rec.get(rows) is None else str(rec.get(rows))
+        cv = "" if rec.get(cols) is None else str(rec.get(cols))
+        if rv not in cells:
+            cells[rv] = {}
+            row_vals.append(rv)
+        if cv not in col_vals:
+            col_vals.append(cv)
+        cells[rv][cv] = rec.get(measure)
+    row_vals.sort()
+    col_vals.sort()
+    col_tot = {cv: 0.0 for cv in col_vals}
+    grand = 0.0
+    matrix = []
+    for rv in row_vals:
+        rc = {cv: cells[rv].get(cv) for cv in col_vals}
+        rtot = 0.0
+        for cv in col_vals:
+            x = rc[cv]
+            if _isnum(x):
+                rtot += x
+                col_tot[cv] += x
+        grand += rtot
+        matrix.append({"row": rv, "cells": rc, "total": rtot})
+    return {"metric": metric, "rows_dim": rows, "cols_dim": cols, "measure": measure,
+            "available_measures": available, "columns": col_vals, "matrix": matrix,
+            "col_totals": col_tot, "grand_total": grand,
+            "render": {"as": "pivot",
+                       "note": f"Render as a matrix: '{rows}' down the left, '{cols}' across the top, cell = "
+                               f"{measure}. Right-align numbers; add the per-row 'total' column and the col_totals "
+                               f"row (with grand_total in the corner); bold totals. Other measures available: "
+                               f"{[a for a in available if a != measure]} (re-call pivot with measure= to switch)."}}
+
+
+def tool_compare(metric, period_a, period_b, by=None, params=None) -> dict:
+    """Period-over-period / variance for a metric: its value at period_a vs period_b with Δ and %Δ. Pass
+    `by` (a cube dimension) to break it down per segment (a variance table). Periods are data-time
+    instants (e.g. '2026-03-31' vs '2026-06-30') — each side is the metric AS OF that instant via the
+    bitemporal engine. Render the breakdown as a table sorted by |Δ|."""
+    pj = json.dumps(params or {})
+
+    def delta(a, b):
+        if a is None or b is None:
+            return {"a": a, "b": b, "delta": None, "pct": None}
+        d = b - a
+        return {"a": a, "b": b, "delta": d, "pct": (d / a * 100.0) if a else None}
+
+    measure = None
+    with _conn() as c:
+        try:
+            if by:
+                ra = [r["m"] for r in c.execute(
+                    "SELECT rvbbit.metric_by(%s,%s::text[],%s::jsonb,now(),%s::timestamptz) AS m",
+                    (metric, [by], pj, period_a)).fetchall() if r["m"] is not None]
+                rb = [r["m"] for r in c.execute(
+                    "SELECT rvbbit.metric_by(%s,%s::text[],%s::jsonb,now(),%s::timestamptz) AS m",
+                    (metric, [by], pj, period_b)).fetchall() if r["m"] is not None]
+                sample = (ra or rb or [{}])[0]
+                picks = _pick_measures(c, metric, sample, {by})
+                measure = picks[0] if picks else None
+            else:
+                ra = [r["m"] for r in c.execute(
+                    "SELECT rvbbit.metric(%s,%s::jsonb,now(),%s::timestamptz) AS m",
+                    (metric, pj, period_a)).fetchall() if r["m"] is not None]
+                rb = [r["m"] for r in c.execute(
+                    "SELECT rvbbit.metric(%s,%s::jsonb,now(),%s::timestamptz) AS m",
+                    (metric, pj, period_b)).fetchall() if r["m"] is not None]
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "COMPARE_FAILED", "message": str(e)}}
+    if by:
+        amap = {str(r.get(by)): _metric_scalar(r, measure) for r in ra}
+        bmap = {str(r.get(by)): _metric_scalar(r, measure) for r in rb}
+        rows = [{"segment": s, **delta(amap.get(s), bmap.get(s))} for s in sorted(set(amap) | set(bmap))]
+        rows.sort(key=lambda x: abs(x["delta"]) if x["delta"] is not None else -1, reverse=True)
+        ta = sum(v for v in amap.values() if v is not None)
+        tb = sum(v for v in bmap.values() if v is not None)
+        return {"metric": metric, "by": by, "measure": measure, "period_a": period_a, "period_b": period_b,
+                "total": delta(ta, tb), "rows": rows,
+                "render": {"as": "variance",
+                           "note": f"Variance table: one row per '{by}', columns value@{period_a}, value@{period_b}, "
+                                   "Δ, %Δ; sorted by |Δ| (biggest movers first); show the total row; "
+                                   "color Δ red(neg)/green(pos)."}}
+    a = _metric_scalar(ra[0]) if ra else None
+    b = _metric_scalar(rb[0]) if rb else None
+    return {"metric": metric, "period_a": period_a, "period_b": period_b, **delta(a, b),
+            "render": {"as": "delta", "note": "Show value@A, value@B, Δ and %Δ as a compact stat line."}}
+
+
 def tool_validate_sql(sql: str, as_of=None) -> dict:
     """Plan, don't execute — route_explain dry-run so Claude can self-correct cheaply."""
     try:
@@ -1523,6 +1777,16 @@ def _register(mcp):
         "preview_alert_condition", {"query": query, "expr": expr}, lambda: tool_preview_alert_condition(query, expr)))
     mcp.tool(name="preview_metric_observation")(lambda metric: _logged(
         "preview_metric_observation", {"metric": metric}, lambda: tool_preview_metric_observation(metric)))
+    # consumer verbs — opinionated, pre-shaped business views
+    mcp.tool(name="scoreboard")(lambda category=None, grain="month", periods=6, as_of=None: _logged(
+        "scoreboard", {"category": category, "grain": grain, "periods": periods, "as_of": as_of},
+        lambda: tool_scoreboard(category, grain, periods, as_of)))
+    mcp.tool(name="pivot")(lambda metric, rows, cols, measure=None, params=None, as_of=None: _logged(
+        "pivot", {"metric": metric, "rows": rows, "cols": cols, "measure": measure, "as_of": as_of},
+        lambda: tool_pivot(metric, rows, cols, measure, params, as_of)))
+    mcp.tool(name="compare")(lambda metric, period_a, period_b, by=None, params=None: _logged(
+        "compare", {"metric": metric, "period_a": period_a, "period_b": period_b, "by": by},
+        lambda: tool_compare(metric, period_a, period_b, by, params)))
     mcp.tool(name="validate_sql")(lambda sql, as_of=None: _logged(
         "validate_sql", {"sql": sql, "as_of": as_of}, lambda: tool_validate_sql(sql, as_of)))
     mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(
