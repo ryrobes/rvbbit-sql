@@ -601,6 +601,250 @@ def tool_metric_lineage(name: str) -> dict:
     return {"metric": name, "source_tables": (row["t"] if row else None) or []}
 
 
+# ── alerts: observe + operate + author-conditions (T0+T1) ────────────────────
+# Read + control over the durable alert engine (edge-triggered condition->action rules, pg_cron
+# sweep+worker). v1 lets an agent see what's firing, operate the controls (enable/mute/cadence/
+# kill-switch, manual sweep+worker), and DRY-RUN conditions. Authoring whole rules (define_alert) is
+# deferred: open-ended actions (mcp_call/flow) go through the human bless path in the lens, where the
+# action form + manifest validation lives.
+
+def tool_list_alerts(category=None, enabled=None, muted=None, tier=None, search=None, limit=50) -> dict:
+    """Alert rules with live vitals: each rule's condition/action shape, on/off + mute + cadence tier,
+    and current breach/entity/pending counts + last-fired. The agent's entry point for "what's firing
+    and why". Filters: category, enabled (bool), muted (bool), tier (fast|normal|slow), search
+    (name/description). Also returns the global alerts_enabled kill-switch state."""
+    lim = max(1, min(int(limit or 50), 500))
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT c.name, c.condition_spec, c.fire_policy, c.action_spec, c.cardinality, c.fan_out_cap, "
+            "c.description, c.enabled, c.muted, c.cadence_tier, c.category, c.subcategory, "
+            "c.created_at::text AS created_at, "
+            "(SELECT count(*) FROM rvbbit.alert_state s WHERE s.rule_name=c.name AND s.last_status='fail') AS breaching, "
+            "(SELECT count(*) FROM rvbbit.alert_state s WHERE s.rule_name=c.name) AS entities, "
+            "(SELECT count(*) FROM rvbbit.alert_queue q WHERE q.rule_name=c.name AND q.status='pending') AS pending, "
+            "(SELECT max(s.last_fired_at)::text FROM rvbbit.alert_state s WHERE s.rule_name=c.name) AS last_fired "
+            "FROM rvbbit.alert_catalog c "
+            "WHERE (%s::text IS NULL OR c.category=%s::text) "
+            "  AND (%s::bool IS NULL OR c.enabled=%s::bool) "
+            "  AND (%s::bool IS NULL OR c.muted=%s::bool) "
+            "  AND (%s::text IS NULL OR c.cadence_tier=%s::text) "
+            "  AND (%s::text IS NULL OR c.name ILIKE '%%'||%s::text||'%%' OR c.description ILIKE '%%'||%s::text||'%%') "
+            "ORDER BY c.name LIMIT %s",
+            (category, category, enabled, enabled, muted, muted, tier, tier, search, search, search, lim)).fetchall()
+        on = c.execute("SELECT rvbbit.alerts_enabled() AS on").fetchone()["on"]
+    return {"alerts": rows, "alerts_enabled": on, "count": len(rows)}
+
+
+def tool_get_alert(name) -> dict:
+    """One alert rule in full: latest-version condition_spec/action_spec/fire_policy, cardinality,
+    fan-out cap, control state (enabled/muted/cadence), category, version history, a live state
+    summary (breaching/entities/pending, last fired), and its most recent firing events."""
+    with _conn() as c:
+        d = c.execute(
+            "SELECT name, version, condition_spec, fire_policy, action_spec, cardinality, fan_out_cap, "
+            "description, owner, labels, enabled, muted, muted_until::text AS muted_until, cadence_tier, "
+            "category, subcategory, created_at::text AS created_at FROM rvbbit.alert_catalog WHERE name=%s",
+            (name,)).fetchone()
+        if not d:
+            return {"error": {"code": "ALERT_NOT_FOUND", "message": name}}
+        d["state"] = c.execute(
+            "SELECT count(*) FILTER (WHERE last_status='fail') AS breaching, count(*) AS entities, "
+            "max(last_fired_at)::text AS last_fired FROM rvbbit.alert_state WHERE rule_name=%s",
+            (name,)).fetchone()
+        d["pending"] = c.execute(
+            "SELECT count(*) AS n FROM rvbbit.alert_queue WHERE rule_name=%s AND status='pending'",
+            (name,)).fetchone()["n"]
+        d["recent_events"] = c.execute(
+            "SELECT entity_key, transition, status, error, ts::text AS ts FROM rvbbit.alert_events "
+            "WHERE rule_name=%s ORDER BY ts DESC LIMIT 5", (name,)).fetchall()
+        d["versions"] = c.execute(
+            "SELECT version, created_at::text AS created_at FROM rvbbit.alert_rules WHERE name=%s "
+            "ORDER BY version DESC", (name,)).fetchall()
+    return d
+
+
+def tool_alert_state(name, limit=200) -> dict:
+    """Per-entity reconciler state for a rule: entity_key, last_status (pass|fail), score, consecutive
+    fail count, and when it last changed/fired — the breakdown behind a rule's breach count."""
+    lim = max(1, min(int(limit or 200), 1000))
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT entity_key, last_status, score, consecutive, last_changed_at::text AS last_changed_at, "
+            "last_fired_at::text AS last_fired_at FROM rvbbit.alert_state WHERE rule_name=%s "
+            "ORDER BY (score IS NULL), score DESC NULLS LAST, entity_key LIMIT %s", (name, lim)).fetchall()
+    return {"alert": name, "entities": rows, "count": len(rows)}
+
+
+def tool_alert_events(name=None, limit=50) -> dict:
+    """The firing audit log (newest first): which rule+entity fired, the transition, fired/failed
+    status, the action output or error, and when. Pass name to scope to one rule."""
+    lim = max(1, min(int(limit or 50), 500))
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT rule_name, entity_key, transition, status, action_output, error, ts::text AS ts "
+            "FROM rvbbit.alert_events WHERE (%s::text IS NULL OR rule_name=%s::text) "
+            "ORDER BY ts DESC LIMIT %s", (name, name, lim)).fetchall()
+    return {"events": rows, "count": len(rows)}
+
+
+def tool_alert_sweep_runs(limit=40) -> dict:
+    """The sweep heartbeat (newest first): per tick — tier, start/finish, rules evaluated,
+    transitions, enqueued, errors. Use it to confirm the reconciler is alive and see its rate."""
+    lim = max(1, min(int(limit or 40), 500))
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT sweep_id, tier, started_at::text AS started_at, finished_at::text AS finished_at, "
+            "rules_evaluated, transitions, enqueued, errors FROM rvbbit.alert_sweep_runs "
+            "ORDER BY started_at DESC LIMIT %s", (lim,)).fetchall()
+    return {"sweeps": rows, "count": len(rows)}
+
+
+def tool_breaching_alerts() -> dict:
+    """Which alerts are FAILING right now — the scalar analog of breaching_kpis. Per rule currently in
+    fail state: how many entities are breaching, the worst (max) score, when it last fired, plus its
+    enabled/muted/tier so you can tell real fires from silenced ones."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT c.name, c.cadence_tier, c.enabled, c.muted, c.category, "
+            "count(*) AS breaching_entities, max(s.score) AS worst_score, "
+            "max(s.last_fired_at)::text AS last_fired "
+            "FROM rvbbit.alert_state s JOIN rvbbit.alert_catalog c ON c.name=s.rule_name "
+            "WHERE s.last_status='fail' "
+            "GROUP BY c.name, c.cadence_tier, c.enabled, c.muted, c.category "
+            "ORDER BY breaching_entities DESC, c.name").fetchall()
+    return {"breaching": rows, "count": len(rows)}
+
+
+def tool_set_alert_enabled(name, enabled) -> dict:
+    """Enable or disable a rule (control flag; survives re-definition). Disabled rules are skipped by
+    the sweep. The non-destructive on/off — use this (or mute) to silence a noisy alert, not delete."""
+    fn = "enable_alert" if enabled else "disable_alert"   # fixed literals, not user input
+    with _conn() as c:
+        try:
+            c.execute(f"SELECT rvbbit.{fn}(%s)", (name,))
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "ALERT_CONTROL_FAILED", "message": str(e)}}
+    return {"alert": name, "enabled": bool(enabled)}
+
+
+def tool_mute_alert(name, minutes=None) -> dict:
+    """Temporarily silence a rule's ACTIONS without stopping evaluation. minutes=None mutes
+    indefinitely (until unmuted); otherwise for that many minutes. Returns the muted_until."""
+    with _conn() as c:
+        try:
+            if minutes is None:
+                row = c.execute("SELECT rvbbit.mute_alert(%s)::text AS until", (name,)).fetchone()
+            else:
+                row = c.execute("SELECT rvbbit.mute_alert(%s, make_interval(mins => %s))::text AS until",
+                                (name, int(minutes))).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "MUTE_FAILED", "message": str(e)}}
+    return {"alert": name, "muted_until": row["until"] if row else None}
+
+
+def tool_unmute_alert(name) -> dict:
+    """Clear a rule's mute (resume its actions)."""
+    with _conn() as c:
+        try:
+            c.execute("SELECT rvbbit.unmute_alert(%s)", (name,))
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "UNMUTE_FAILED", "message": str(e)}}
+    return {"alert": name, "muted": False}
+
+
+def tool_set_alert_cadence(name, tier) -> dict:
+    """Move a rule to a sweep tier: 'fast' (~1m), 'normal' (~15m), or 'slow' (~hourly)."""
+    if tier not in ("fast", "normal", "slow"):
+        return {"error": {"code": "BAD_TIER", "message": "tier must be fast|normal|slow"}}
+    with _conn() as c:
+        try:
+            c.execute("SELECT rvbbit.set_alert_cadence(%s, %s)", (name, tier))
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "CADENCE_FAILED", "message": str(e)}}
+    return {"alert": name, "cadence_tier": tier}
+
+
+def tool_set_alerts_enabled(on) -> dict:
+    """The GLOBAL alerts kill-switch. on=false pauses ALL sweeps + actions at once (the circuit
+    breaker); on=true resumes. Returns the new state. Pairs with the alerts_enabled flag in list_alerts."""
+    with _conn() as c:
+        try:
+            row = c.execute("SELECT rvbbit.set_alerts_enabled(%s) AS on", (bool(on),)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "KILLSWITCH_FAILED", "message": str(e)}}
+    return {"alerts_enabled": row["on"] if row else None}
+
+
+def tool_run_alert_sweep(tier="normal") -> dict:
+    """Run one reconciler sweep NOW for a tier (fast|normal|slow) instead of waiting for cron —
+    evaluates conditions, diffs state, enqueues transitions. Returns the sweep summary. Pair with
+    run_alert_worker to actually dispatch what it enqueues."""
+    if tier not in ("fast", "normal", "slow"):
+        return {"error": {"code": "BAD_TIER", "message": "tier must be fast|normal|slow"}}
+    with _conn() as c:
+        try:
+            row = c.execute("SELECT rvbbit.alert_sweep(%s) AS j", (tier,)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "SWEEP_FAILED", "message": str(e)}}
+    return {"tier": tier, "summary": row["j"] if row else None}
+
+
+def tool_run_alert_worker(max_items=50) -> dict:
+    """Drain up to max_items from the action queue NOW (dispatch pending alert actions) instead of
+    waiting for cron. Fire-and-forget; results land in alert_events. Returns the drain summary."""
+    n = max(1, min(int(max_items or 50), 500))
+    with _conn() as c:
+        try:
+            row = c.execute("SELECT rvbbit.alert_worker_tick(%s) AS j", (n,)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "WORKER_FAILED", "message": str(e)}}
+    return {"max": n, "summary": row["j"] if row else None}
+
+
+def tool_preview_alert_condition(query, expr=None) -> dict:
+    """Dry-run an alert CONDITION read-only — the observable feedback for authoring a rule before any
+    rule exists. Runs the query (LIMIT 500) and returns its (entity_key, score, status) rows + counts.
+    If expr is given, wraps the query in the same CASE the sweep uses (status='fail' when expr true)
+    so a bad boolean expr surfaces as an error here. A condition query should return an entity_key
+    column plus EITHER a status ('pass'/'fail') OR a numeric score. Read-only: writes are blocked."""
+    trimmed = (query or "").strip().rstrip(";").strip()
+    if not trimmed:
+        return {"error": {"code": "EMPTY_QUERY", "message": "query is required"}}
+    e = (expr or "").strip()
+    inner = (f"SELECT q2.*, CASE WHEN ({e}) THEN 'fail' ELSE 'pass' END AS _alert_status FROM ({trimmed}) q2"
+             if e else trimmed)
+    try:
+        with _ro() as c:   # read-only txn + statement timeout: agent-supplied SQL cannot write
+            rows = c.execute(f"SELECT to_jsonb(q) AS j FROM ({inner}) q LIMIT 500").fetchall()
+    except Exception as ex:  # noqa: BLE001
+        return {"valid": False, "error": str(ex)}
+    out = []
+    for r in rows:
+        j = r["j"] or {}
+        out.append({
+            "entity_key": j["entity_key"] if j.get("entity_key") is not None else "",
+            "score": j.get("score"),
+            "status": (j.get("_alert_status") if e else j.get("status")),
+        })
+    breaching = sum(1 for x in out if str(x["status"]).lower() == "fail")
+    return {"valid": True, "rows": out, "count": len(out), "breaching": breaching,
+            "columns": list((rows[0]["j"] or {}).keys()) if rows else []}
+
+
+def tool_preview_metric_observation(metric) -> dict:
+    """The latest materialized observation for a metric — exactly what a metric-kind condition reads
+    (status pass/fail, value, verdict, data-time). Check this before wiring an alert onto a metric."""
+    with _ro() as c:
+        row = c.execute(
+            "SELECT status, data_as_of::text AS data_as_of, value, verdict FROM rvbbit.metric_observations "
+            "WHERE metric_name=%s ORDER BY data_as_of DESC NULLS LAST, observed_at DESC LIMIT 1",
+            (metric,)).fetchone()
+    if not row:
+        return {"metric": metric, "observation": None,
+                "note": "no materialized observation yet — run materialize_metric first"}
+    return {"metric": metric, "observation": row}
+
+
 def tool_validate_sql(sql: str, as_of=None) -> dict:
     """Plan, don't execute — route_explain dry-run so Claude can self-correct cheaply."""
     try:
@@ -1250,6 +1494,35 @@ def _register(mcp):
     mcp.tool(name="breaching_kpis")(lambda: _logged("breaching_kpis", {}, tool_breaching_kpis))
     mcp.tool(name="metric_lineage")(lambda name: _logged(
         "metric_lineage", {"name": name}, lambda: tool_metric_lineage(name)))
+    # alerts — observe + operate + author-conditions (T0+T1)
+    mcp.tool(name="list_alerts")(lambda category=None, enabled=None, muted=None, tier=None, search=None, limit=50: _logged(
+        "list_alerts", {"category": category, "enabled": enabled, "muted": muted, "tier": tier, "search": search, "limit": limit},
+        lambda: tool_list_alerts(category, enabled, muted, tier, search, limit)))
+    mcp.tool(name="get_alert")(lambda name: _logged("get_alert", {"name": name}, lambda: tool_get_alert(name)))
+    mcp.tool(name="alert_state")(lambda name, limit=200: _logged(
+        "alert_state", {"name": name, "limit": limit}, lambda: tool_alert_state(name, limit)))
+    mcp.tool(name="alert_events")(lambda name=None, limit=50: _logged(
+        "alert_events", {"name": name, "limit": limit}, lambda: tool_alert_events(name, limit)))
+    mcp.tool(name="alert_sweep_runs")(lambda limit=40: _logged(
+        "alert_sweep_runs", {"limit": limit}, lambda: tool_alert_sweep_runs(limit)))
+    mcp.tool(name="breaching_alerts")(lambda: _logged("breaching_alerts", {}, tool_breaching_alerts))
+    mcp.tool(name="set_alert_enabled")(lambda name, enabled: _logged(
+        "set_alert_enabled", {"name": name, "enabled": enabled}, lambda: tool_set_alert_enabled(name, enabled)))
+    mcp.tool(name="mute_alert")(lambda name, minutes=None: _logged(
+        "mute_alert", {"name": name, "minutes": minutes}, lambda: tool_mute_alert(name, minutes)))
+    mcp.tool(name="unmute_alert")(lambda name: _logged("unmute_alert", {"name": name}, lambda: tool_unmute_alert(name)))
+    mcp.tool(name="set_alert_cadence")(lambda name, tier: _logged(
+        "set_alert_cadence", {"name": name, "tier": tier}, lambda: tool_set_alert_cadence(name, tier)))
+    mcp.tool(name="set_alerts_enabled")(lambda on: _logged(
+        "set_alerts_enabled", {"on": on}, lambda: tool_set_alerts_enabled(on)))
+    mcp.tool(name="run_alert_sweep")(lambda tier="normal": _logged(
+        "run_alert_sweep", {"tier": tier}, lambda: tool_run_alert_sweep(tier)))
+    mcp.tool(name="run_alert_worker")(lambda max_items=50: _logged(
+        "run_alert_worker", {"max_items": max_items}, lambda: tool_run_alert_worker(max_items)))
+    mcp.tool(name="preview_alert_condition")(lambda query, expr=None: _logged(
+        "preview_alert_condition", {"query": query, "expr": expr}, lambda: tool_preview_alert_condition(query, expr)))
+    mcp.tool(name="preview_metric_observation")(lambda metric: _logged(
+        "preview_metric_observation", {"metric": metric}, lambda: tool_preview_metric_observation(metric)))
     mcp.tool(name="validate_sql")(lambda sql, as_of=None: _logged(
         "validate_sql", {"sql": sql, "as_of": as_of}, lambda: tool_validate_sql(sql, as_of)))
     mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(
