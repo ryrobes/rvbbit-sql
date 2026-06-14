@@ -1191,6 +1191,63 @@ def tool_brain_exclude(doc_id, principal, reason=None) -> dict:
     return {"doc_id": doc_id, "principal": principal, "excluded": True}
 
 
+_BRAIN_TEXT_EXT = {".md", ".markdown", ".mdx", ".txt", ".text", ".rst", ".org", ".log"}
+
+
+def tool_brain_crawl_folder(path, source=None, roles=None, base_folder=None,
+                            recursive=True, max_files=500, max_bytes=1_000_000) -> dict:
+    """Crawl a SERVER-LOCAL folder and ingest its text documents into the brain — the on-disk folder
+    structure becomes the brain's folder tree (e.g. <root>/HR/policy.md → folder /<source>/HR). `path`
+    must be readable by the MCP process (mount it into the container). roles = access roles applied to
+    EVERY ingested doc (omit → the source's defaults → DEFAULT-DENY: nobody sees them). Handles
+    .md/.markdown/.mdx/.txt/.text/.rst/.org/.log; skips binaries + files over max_bytes. Re-crawl is
+    idempotent (keyed on each file's path), so it doubles as a sync."""
+    root = os.path.abspath(os.path.expanduser(path or ""))
+    if not os.path.isdir(root):
+        return {"error": {"code": "BAD_PATH", "message": f"not a readable directory: {root}"}}
+    src = source or (os.path.basename(root.rstrip("/")) or "crawl")
+    base = (base_folder or ("/" + src)).rstrip("/") or "/"
+    cap = max(1, min(int(max_files or 500), 5000))
+    ingested, skipped, errors = [], 0, []
+    n = 0
+    with _conn() as c:
+        for dirpath, dirnames, filenames in os.walk(root):
+            if not recursive:
+                dirnames[:] = []
+            for fn in sorted(filenames):
+                if n >= cap:
+                    break
+                fp = os.path.join(dirpath, fn)
+                if os.path.splitext(fn)[1].lower() not in _BRAIN_TEXT_EXT:
+                    skipped += 1
+                    continue
+                try:
+                    if os.path.getsize(fp) > max_bytes:
+                        skipped += 1
+                        continue
+                    with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                        body = fh.read()
+                except Exception as e:  # noqa: BLE001
+                    errors.append({"file": fp, "error": str(e)})
+                    continue
+                subdir = os.path.dirname(os.path.relpath(fp, root)).replace(os.sep, "/")
+                folder = base + ("/" + subdir if subdir else "")
+                title = os.path.splitext(os.path.basename(fp))[0]
+                try:
+                    row = c.execute(
+                        "SELECT rvbbit.brain_ingest(%s, %s, %s, %s::text[], %s, %s) AS id",
+                        (src, title, body, roles, folder, fp)).fetchone()
+                    ingested.append({"doc_id": row["id"] if row else None, "title": title, "folder": folder})
+                    n += 1
+                except Exception as e:  # noqa: BLE001
+                    errors.append({"file": fp, "error": str(e)})
+            if n >= cap:
+                break
+    return {"source": src, "root": root, "ingested": len(ingested), "skipped": skipped,
+            "errors": errors[:10], "docs": ingested[:50],
+            "note": (None if roles else "no roles given → docs are DEFAULT-DENY (visible to no one) until a role is granted")}
+
+
 def tool_validate_sql(sql: str, as_of=None) -> dict:
     """Plan, don't execute — route_explain dry-run so Claude can self-correct cheaply."""
     try:
@@ -1895,6 +1952,9 @@ def _register(mcp):
     mcp.tool(name="brain_exclude")(lambda doc_id, principal, reason=None: _logged(
         "brain_exclude", {"doc_id": doc_id, "principal": principal},
         lambda: tool_brain_exclude(doc_id, principal, reason)))
+    mcp.tool(name="brain_crawl_folder")(lambda path, source=None, roles=None, base_folder=None, recursive=True, max_files=500: _logged(
+        "brain_crawl_folder", {"path": path, "source": source, "roles": roles, "recursive": recursive},
+        lambda: tool_brain_crawl_folder(path, source, roles, base_folder, recursive, max_files)))
     mcp.tool(name="validate_sql")(lambda sql, as_of=None: _logged(
         "validate_sql", {"sql": sql, "as_of": as_of}, lambda: tool_validate_sql(sql, as_of)))
     mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(
