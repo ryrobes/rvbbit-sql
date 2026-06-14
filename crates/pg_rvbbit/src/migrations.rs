@@ -129,6 +129,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0027_dimensional_metrics",
         include_str!("../sql/migrations/0027_dimensional_metrics.sql"),
     ),
+    (
+        "0028_drop_stale_overloads",
+        include_str!("../sql/migrations/0028_drop_stale_overloads.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

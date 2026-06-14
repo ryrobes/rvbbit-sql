@@ -449,16 +449,23 @@ def tool_get_proposal(proposal_id) -> dict:
 
 
 def tool_refine_proposal(proposal_id, name=None, sql=None, grain=None, description=None,
-                         params=None, check_sql=None, join_rationale=None, confidence=None) -> dict:
+                         params=None, check_sql=None, join_rationale=None, confidence=None,
+                         category=None, subcategory=None) -> dict:
     """Edit a PENDING proposal in place after seeing feedback — instead of submitting a duplicate.
-    Only the fields you pass change. (Cube SQL is plain; metric SQL may use {param} tokens.)"""
+    Only the fields you pass change. (Cube SQL is plain; metric SQL may use {param} tokens.) Pass
+    category/subcategory to (re)file it under a folder before review."""
+    # EVERY arg is cast explicitly: psycopg sends a Python int as the narrowest int type (smallint)
+    # and a Python float as double precision — neither implicitly casts to the declared bigint/real,
+    # which otherwise yields AmbiguousFunction / UndefinedFunction at resolution time.
     with _conn() as c:
         try:
             row = c.execute(
-                "SELECT rvbbit.refine_proposal(%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s) AS r",
+                "SELECT rvbbit.refine_proposal("
+                "%s::bigint, %s::text, %s::text, %s::text, %s::text, %s::jsonb, "
+                "%s::text, %s::text, %s::real, %s::text, %s::text) AS r",
                 (proposal_id, name, sql, grain, description,
                  json.dumps(params) if params is not None else None,
-                 check_sql, join_rationale, confidence)).fetchone()
+                 check_sql, join_rationale, confidence, category, subcategory)).fetchone()
         except Exception as e:  # noqa: BLE001
             return {"error": {"code": "REFINE_FAILED", "message": str(e)}}
     return row["r"] if (row and row["r"] is not None) else {"error": {"code": "REFINE_FAILED", "message": "no result"}}
@@ -1218,9 +1225,9 @@ def _register(mcp):
         lambda: tool_list_proposals(status, kind, proposed_by, limit)))
     mcp.tool(name="get_proposal")(lambda proposal_id: _logged(
         "get_proposal", {"proposal_id": proposal_id}, lambda: tool_get_proposal(proposal_id)))
-    mcp.tool(name="refine_proposal")(lambda proposal_id, name=None, sql=None, grain=None, description=None, params=None, check_sql=None, join_rationale=None, confidence=None: _logged(
+    mcp.tool(name="refine_proposal")(lambda proposal_id, name=None, sql=None, grain=None, description=None, params=None, check_sql=None, join_rationale=None, confidence=None, category=None, subcategory=None: _logged(
         "refine_proposal", {"proposal_id": proposal_id},
-        lambda: tool_refine_proposal(proposal_id, name, sql, grain, description, params, check_sql, join_rationale, confidence)))
+        lambda: tool_refine_proposal(proposal_id, name, sql, grain, description, params, check_sql, join_rationale, confidence, category, subcategory)))
     mcp.tool(name="withdraw_proposal")(lambda proposal_id, reason=None: _logged(
         "withdraw_proposal", {"proposal_id": proposal_id, "reason": reason},
         lambda: tool_withdraw_proposal(proposal_id, reason)))
