@@ -133,6 +133,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0028_drop_stale_overloads",
         include_str!("../sql/migrations/0028_drop_stale_overloads.sql"),
     ),
+    (
+        "0029_cube_refresh_pacing_and_accel_exclude",
+        include_str!("../sql/migrations/0029_cube_refresh_pacing_and_accel_exclude.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
