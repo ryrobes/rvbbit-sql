@@ -349,9 +349,15 @@ def tool_propose_cube(subject: str, seed_tables=None, schema=None) -> dict:
         draft = row["d"] if row else None
         if not draft:
             return {"error": {"code": "PROPOSE_FAILED", "message": "no draft"}}
+        # self-validate (dry-run) so a hallucinated column never reaches the user
+        ok_v, samp, verr = _validate_draft(c, draft["sql"])
+        draft = {**draft, "subject": subject, "validated": ok_v}
+        if ok_v:
+            draft["sample"] = samp
+        else:
+            draft["validation_error"] = verr
         # Log the draft to the review queue (best-effort: a read-only mirror just skips it).
         try:
-            draft = {**draft, "subject": subject}
             pid = c.execute(
                 "SELECT rvbbit.record_proposal('cube', %s::jsonb, 'mcp', 'mcp') AS id",
                 (json.dumps(draft),)).fetchone()
@@ -362,12 +368,22 @@ def tool_propose_cube(subject: str, seed_tables=None, schema=None) -> dict:
     return draft
 
 
+def _validate_draft(c, sql) -> tuple:
+    """Dry-run a draft SELECT (LIMIT 3): proves it executes against the real schema (catching
+    hallucinated columns) and returns a small sample. Autocommit conn → a failure doesn't poison it."""
+    try:
+        rows = c.execute(f"SELECT to_jsonb(_v) AS r FROM ({sql}) _v LIMIT 3").fetchall()
+        return True, [r["r"] for r in rows], None
+    except Exception as e:  # noqa: BLE001
+        return False, None, str(e)
+
+
 def tool_propose_metric(subject: str, seed_sources=None, schema=None) -> dict:
     """Draft a candidate metric for a subject — a small, governed aggregation, PREFERRING a cube as
     its source. Returns a DRAFT only (name, sql, grain, description, params, optional KPI check_sql,
-    source, confidence); NOTHING is created. The draft is LOGGED to the review queue (returns its
-    proposal_id) so a human can bless it in the lens Proposals inbox (→ define_metric). Propose
-    freely. Pass seed_sources (cubes.x / schema.table list) to pin the source, or a schema to scope."""
+    source, confidence) plus validated/sample from a dry-run; NOTHING is created. The draft is LOGGED
+    to the review queue (returns its proposal_id) so a human can bless it in the lens Proposals inbox
+    (→ define_metric). Propose freely. Pass seed_sources (cubes.x / schema.table list) or a schema."""
     with _conn() as c:
         try:
             row = c.execute(
@@ -378,8 +394,19 @@ def tool_propose_metric(subject: str, seed_sources=None, schema=None) -> dict:
         draft = row["d"] if row else None
         if not draft:
             return {"error": {"code": "PROPOSE_FAILED", "message": "no draft"}}
+        # self-validate: resolve {param} then dry-run, so a hallucinated column is caught here
         try:
-            draft = {**draft, "subject": subject}
+            resolved = c.execute("SELECT rvbbit.preview_metric_sql(%s, %s::jsonb) AS s",
+                                 (draft["sql"], json.dumps(draft.get("params") or {}))).fetchone()["s"]
+        except Exception:  # noqa: BLE001
+            resolved = draft["sql"]
+        ok_v, samp, verr = _validate_draft(c, resolved or draft["sql"])
+        draft = {**draft, "subject": subject, "validated": ok_v}
+        if ok_v:
+            draft["sample"] = samp
+        else:
+            draft["validation_error"] = verr
+        try:
             pid = c.execute(
                 "SELECT rvbbit.record_proposal('metric', %s::jsonb, 'mcp', 'mcp') AS id",
                 (json.dumps(draft),)).fetchone()

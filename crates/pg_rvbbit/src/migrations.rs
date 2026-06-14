@@ -117,6 +117,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0024_metric_lineage_breaching",
         include_str!("../sql/migrations/0024_metric_lineage_breaching.sql"),
     ),
+    (
+        "0025_fk_inference",
+        include_str!("../sql/migrations/0025_fk_inference.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
