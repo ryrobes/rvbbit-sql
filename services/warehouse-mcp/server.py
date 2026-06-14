@@ -240,26 +240,29 @@ def tool_describe_table(table: str) -> dict:
 
 
 def tool_list_metrics(category=None, search=None) -> dict:
-    """The blessed, governed metric catalog (latest version per metric)."""
-    _ = category  # reserved: Phase-1 filters via rvbbit.entity_categories
+    """The blessed, governed metric catalog (latest version per metric), with its category. Read
+    from metric_catalog (not metric_defs) so the shared category/subcategory taxonomy is included —
+    use the optional `category` filter to scope to one subject area."""
     with _conn() as c:
         rows = c.execute(
-            "SELECT DISTINCT ON (name) name, description, params, grain, "
-            "check_sql IS NOT NULL AS has_check, version "
-            "FROM rvbbit.metric_defs "
+            "SELECT name, description, params, grain, check_sql IS NOT NULL AS has_check, version, "
+            "category, subcategory "
+            "FROM rvbbit.metric_catalog "
             "WHERE (%s::text IS NULL OR description ILIKE '%%'||%s::text||'%%' OR name ILIKE '%%'||%s::text||'%%') "
-            "ORDER BY name, version DESC",
-            (search, search, search),
+            "  AND (%s::text IS NULL OR category = %s::text) "
+            "ORDER BY name",
+            (search, search, search, category, category),
         ).fetchall()
     return {"metrics": rows}
 
 
 def tool_get_metric(name: str) -> dict:
-    """One metric's definition + version history."""
+    """One metric's definition (with category/subcategory) + version history."""
     with _conn() as c:
         d = c.execute(
-            "SELECT name, description, params, grain, sql AS definition_sql, check_sql "
-            "FROM rvbbit.metric_defs WHERE name=%s ORDER BY version DESC LIMIT 1", (name,)
+            "SELECT name, description, params, grain, sql AS definition_sql, check_sql, "
+            "category, subcategory "
+            "FROM rvbbit.metric_catalog WHERE name=%s", (name,)
         ).fetchone()
         if not d:
             return {"error": {"code": "METRIC_NOT_FOUND", "message": name}}
