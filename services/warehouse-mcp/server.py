@@ -214,8 +214,11 @@ def tool_search_data(query: str, limit: int = 8, schema=None) -> dict:
             "note": None if matches else "no strong matches; try broader terms"}
 
 
-def tool_describe_table(table: str) -> dict:
-    """Full profile of one table: columns, live samples, per-column stats, freshness."""
+def tool_describe_table(table: str, lean: bool = False) -> dict:
+    """Full profile of one table: columns, live samples, AND per-column stats — null %, distinct
+    count, and the actual most-common values (the enum/value dictionary, so you never guess a
+    status/type literal) — plus freshness. Pass lean=true for a compact view (columns + null%/distinct
+    + freshness, no samples or top-values) on wide tables to stay under the token budget."""
     schema, rel = _split(table)
     if not _schema_allowed(schema):
         return {"error": {"code": "NOT_AUTHORIZED",
@@ -228,15 +231,42 @@ def tool_describe_table(table: str) -> dict:
         ).fetchall()
         if not cols:
             return {"error": {"code": "TABLE_NOT_FOUND", "message": table}}
-        out = {"table": f"{schema}.{rel}", "columns": cols,
-               "samples": _samples(cur, schema, rel, 5)}
+        out = {"table": f"{schema}.{rel}", "columns": cols}
+        if not lean:
+            out["samples"] = _samples(cur, schema, rel, 5)
         st = _col_stats(cur, schema, rel, max_cols=128)
         if st:
-            out["column_stats"] = st
+            # lean: drop the (potentially long) top-values, keep null%/distinct
+            out["column_stats"] = (
+                [{"attname": s["attname"], "n_distinct": s["n_distinct"], "null_pct": s["null_pct"]} for s in st]
+                if lean else st
+            )
         fr = _freshness(cur, schema, rel)
         if fr:
             out["freshness"] = fr
     return out
+
+
+def tool_profile_schema(schema=None) -> dict:
+    """A fast overview of every (allowed) table: estimated row count + column count — to see which
+    tables are populated WITHOUT running count(*) probes. Optionally scope to one schema. Row counts
+    are planner estimates (pg_class.reltuples, ~0 if never analyzed); use describe_table for a full
+    per-column profile of one table."""
+    with _ro() as rc, rc.cursor() as cur:
+        rows = cur.execute(
+            "SELECT n.nspname AS schema, c.relname AS \"table\", "
+            "       greatest(c.reltuples, 0)::bigint AS est_rows, "
+            "       (SELECT count(*) FROM information_schema.columns ic "
+            "          WHERE ic.table_schema = n.nspname AND ic.table_name = c.relname) AS columns "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relkind IN ('r','p','f') "
+            "  AND n.nspname NOT LIKE 'pg_%%' AND n.nspname <> 'information_schema' "
+            "  AND (%s::text IS NULL OR n.nspname = %s::text) "
+            "ORDER BY n.nspname, c.relname",
+            (schema, schema),
+        ).fetchall()
+    rows = [r for r in rows if _schema_allowed(r["schema"])]
+    return {"tables": rows, "note": "est_rows are planner estimates; 0 may mean empty OR never-analyzed"}
 
 
 def tool_list_metrics(category=None, search=None) -> dict:
@@ -1065,8 +1095,10 @@ def _register(mcp):
     mcp.tool(name="search_data")(lambda query, limit=8, schema=None: _logged(
         "search_data", {"query": query, "limit": limit, "schema": schema},
         lambda: tool_search_data(query, limit, schema)))
-    mcp.tool(name="describe_table")(lambda table: _logged(
-        "describe_table", {"table": table}, lambda: tool_describe_table(table)))
+    mcp.tool(name="describe_table")(lambda table, lean=False: _logged(
+        "describe_table", {"table": table, "lean": lean}, lambda: tool_describe_table(table, lean)))
+    mcp.tool(name="profile_schema")(lambda schema=None: _logged(
+        "profile_schema", {"schema": schema}, lambda: tool_profile_schema(schema)))
     mcp.tool(name="list_metrics")(lambda category=None, search=None: _logged(
         "list_metrics", {"category": category, "search": search},
         lambda: tool_list_metrics(category, search)))

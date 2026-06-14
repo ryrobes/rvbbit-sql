@@ -109,6 +109,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0022_cube_categories",
         include_str!("../sql/migrations/0022_cube_categories.sql"),
     ),
+    (
+        "0023_propose_column_profile",
+        include_str!("../sql/migrations/0023_propose_column_profile.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
