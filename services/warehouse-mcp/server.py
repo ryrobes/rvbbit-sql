@@ -1099,6 +1099,98 @@ def tool_compare(metric, period_a, period_b, by=None, params=None) -> dict:
             "render": {"as": "delta", "note": "Show value@A, value@B, Δ and %Δ as a compact stat line."}}
 
 
+# ── document brain — role-gated, semantically-searchable docs ─────────────────
+# Access is enforced server-side from the AUTHENTICATED caller email (never a tool argument): the
+# retrieval filters to the caller's permitted docs BEFORE the vector search, so a restricted doc never
+# enters the result set and can't be paraphrased into an answer. caller_email is injected by the
+# registration lambda from _caller(); read tools require it (default-deny on no identity).
+
+def tool_ask_brain(query, k=8, caller_email=None) -> dict:
+    """Ask the document brain — semantic search over the docs YOU are permitted to see, returned as
+    grounded, citeable context (NOT a synthesized answer — compose the answer from these chunks and
+    cite title/folder). Access is enforced from your authenticated identity: docs you lack a role for,
+    or that exclude you, never appear. The ABSENCE of a doc means you're not cleared for it — never
+    speculate about what you can't see. Returns ranked {doc_id,title,folder,source,chunk,score}."""
+    if not caller_email:
+        return {"error": {"code": "NO_IDENTITY", "message": "brain access requires an authenticated caller (OAuth email)"}}
+    k = max(1, min(int(k or 8), 50))
+    with _conn() as c:   # _conn (writable): rvbbit.embed may populate its embedding cache
+        try:
+            rows = c.execute(
+                "SELECT doc_id, title, folder_path, source, occurred_at::text AS occurred_at, chunk, "
+                "round(score::numeric, 4) AS score FROM rvbbit.ask_brain(%s, %s, %s)",
+                (caller_email, query, k)).fetchall()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "ASK_BRAIN_FAILED", "message": str(e)}}
+    return {"query": query, "as": caller_email, "hits": rows, "count": len(rows),
+            "note": "Answer ONLY from these chunks; cite title/folder. Absence = not cleared, not 'nothing exists'."}
+
+
+def tool_brain_browse(caller_email=None) -> dict:
+    """The document brain as a file tree — every folder + doc YOU may see (ACL-enforced). Powers a
+    file-explorer view and lets you navigate before asking. Returns folders + docs with folder_path,
+    title, source, mime, occurred_at, chunk count."""
+    if not caller_email:
+        return {"error": {"code": "NO_IDENTITY", "message": "brain access requires an authenticated caller"}}
+    with _ro() as c:
+        rows = c.execute(
+            "SELECT folder_path, doc_id, title, source, mime, author, occurred_at::text AS occurred_at, "
+            "ingested_at::text AS ingested_at, chunks FROM rvbbit.brain_tree(%s)", (caller_email,)).fetchall()
+    return {"as": caller_email, "folders": sorted({r["folder_path"] for r in rows}),
+            "documents": rows, "count": len(rows)}
+
+
+def tool_brain_get_doc(doc_id, caller_email=None) -> dict:
+    """Open one document's full body + metadata — only if you're cleared for it (else NOT_VISIBLE)."""
+    if not caller_email:
+        return {"error": {"code": "NO_IDENTITY", "message": "brain access requires an authenticated caller"}}
+    with _ro() as c:
+        row = c.execute("SELECT rvbbit.brain_get_doc(%s, %s::bigint) AS d", (caller_email, doc_id)).fetchone()
+    d = row["d"] if row else None
+    if not d:
+        return {"error": {"code": "NOT_VISIBLE", "message": f"doc {doc_id} not found or not permitted"}}
+    return d
+
+
+def tool_brain_ingest(source, title, body, roles=None, folder=None, uri=None,
+                      author=None, occurred_at=None) -> dict:
+    """Ingest a document into the brain (operator action): chunks + embeds it and assigns access role(s).
+    roles = the roles allowed to see it (omit → the source's default roles → if none, DEFAULT-DENY:
+    nobody can see it until granted a role). folder = its file-explorer path. Returns the doc_id."""
+    with _conn() as c:
+        try:
+            row = c.execute(
+                "SELECT rvbbit.brain_ingest(%s, %s, %s, %s::text[], %s, %s, %s, %s::timestamptz) AS id",
+                (source, title, body, roles, folder, uri, author, occurred_at)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "INGEST_FAILED", "message": str(e)}}
+    return {"doc_id": row["id"] if row else None, "source": source, "title": title, "roles": roles}
+
+
+def tool_brain_grant(role, principal, on=True) -> dict:
+    """Grant (on=true) or revoke (on=false) a brain ROLE to a principal (email). Roles→emails are just
+    rows — this IS the access model; who holds what determines what each person's brain can see.
+    Revocation takes effect on the next query (no re-index)."""
+    fn = "brain_grant" if on else "brain_revoke"   # fixed literals
+    with _conn() as c:
+        try:
+            c.execute(f"SELECT rvbbit.{fn}(%s, %s)", (role, principal))
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "GRANT_FAILED", "message": str(e)}}
+    return {"role": role, "principal": principal, "granted": bool(on)}
+
+
+def tool_brain_exclude(doc_id, principal, reason=None) -> dict:
+    """The subject-exclusion belt: hide a specific doc from a specific person even if their role would
+    allow it (the meeting that's ABOUT them). Returns the exclusion."""
+    with _conn() as c:
+        try:
+            c.execute("SELECT rvbbit.brain_exclude(%s::bigint, %s, %s)", (doc_id, principal, reason))
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "EXCLUDE_FAILED", "message": str(e)}}
+    return {"doc_id": doc_id, "principal": principal, "excluded": True}
+
+
 def tool_validate_sql(sql: str, as_of=None) -> dict:
     """Plan, don't execute — route_explain dry-run so Claude can self-correct cheaply."""
     try:
@@ -1787,6 +1879,22 @@ def _register(mcp):
     mcp.tool(name="compare")(lambda metric, period_a, period_b, by=None, params=None: _logged(
         "compare", {"metric": metric, "period_a": period_a, "period_b": period_b, "by": by},
         lambda: tool_compare(metric, period_a, period_b, by, params)))
+    # document brain — caller identity comes from the OAuth token (_caller), never a tool argument
+    mcp.tool(name="ask_brain")(lambda query, k=8: _logged(
+        "ask_brain", {"query": query, "k": k}, lambda: tool_ask_brain(query, k, _caller()[0])))
+    mcp.tool(name="brain_browse")(lambda: _logged(
+        "brain_browse", {}, lambda: tool_brain_browse(_caller()[0])))
+    mcp.tool(name="brain_get_doc")(lambda doc_id: _logged(
+        "brain_get_doc", {"doc_id": doc_id}, lambda: tool_brain_get_doc(doc_id, _caller()[0])))
+    mcp.tool(name="brain_ingest")(lambda source, title, body, roles=None, folder=None, uri=None, author=None, occurred_at=None: _logged(
+        "brain_ingest", {"source": source, "title": title, "roles": roles},
+        lambda: tool_brain_ingest(source, title, body, roles, folder, uri, author, occurred_at)))
+    mcp.tool(name="brain_grant")(lambda role, principal, on=True: _logged(
+        "brain_grant", {"role": role, "principal": principal, "on": on},
+        lambda: tool_brain_grant(role, principal, on)))
+    mcp.tool(name="brain_exclude")(lambda doc_id, principal, reason=None: _logged(
+        "brain_exclude", {"doc_id": doc_id, "principal": principal},
+        lambda: tool_brain_exclude(doc_id, principal, reason)))
     mcp.tool(name="validate_sql")(lambda sql, as_of=None: _logged(
         "validate_sql", {"sql": sql, "as_of": as_of}, lambda: tool_validate_sql(sql, as_of)))
     mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(

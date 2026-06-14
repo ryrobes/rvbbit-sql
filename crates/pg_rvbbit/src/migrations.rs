@@ -141,6 +141,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0030_fix_refresh_all_cubes_overload",
         include_str!("../sql/migrations/0030_fix_refresh_all_cubes_overload.sql"),
     ),
+    (
+        "0031_brain_phase0",
+        include_str!("../sql/migrations/0031_brain_phase0.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
