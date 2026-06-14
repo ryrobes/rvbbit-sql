@@ -113,6 +113,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0023_propose_column_profile",
         include_str!("../sql/migrations/0023_propose_column_profile.sql"),
     ),
+    (
+        "0024_metric_lineage_breaching",
+        include_str!("../sql/migrations/0024_metric_lineage_breaching.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

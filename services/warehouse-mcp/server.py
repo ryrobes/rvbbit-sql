@@ -498,6 +498,51 @@ def tool_metric(name: str, params=None, as_of=None, def_as_of=None) -> dict:
             "params": params, "data_as_of": as_of, "def_as_of": def_as_of}
 
 
+# ── monitoring surface: snapshot, history, breaches, lineage ─────────────────
+
+def tool_materialize_metric(name: str, params=None, as_of=None, def_as_of=None) -> dict:
+    """Snapshot a metric NOW into the durable observation log (value + KPI verdict at this instant) —
+    the basis for trend history and breach monitoring. Returns the observation id."""
+    with _conn() as c:
+        try:
+            row = c.execute(
+                "SELECT rvbbit.materialize_metric(%s, %s::jsonb, coalesce(%s::timestamptz, now()), "
+                "%s::timestamptz, NULL, 'mcp') AS id",
+                (name, json.dumps(params or {}), def_as_of, as_of)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "MATERIALIZE_FAILED", "message": str(e)}}
+    return {"metric": name, "observation_id": row["id"] if row else None}
+
+
+def tool_metric_history(name: str, limit: int = 50) -> dict:
+    """The durable observation series for a metric (newest first): value, KPI verdict/status, the
+    data-time it was taken at, and how it was triggered. Turns a definition into a trend."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT observation_id, metric_version, value, verdict, status, trigger, "
+            "       data_as_of::text AS data_as_of, observed_at::text AS observed_at "
+            "FROM rvbbit.metric_history(%s, %s)", (name, max(1, min(int(limit or 50), 500)))).fetchall()
+    return {"metric": name, "observations": rows}
+
+
+def tool_breaching_kpis() -> dict:
+    """Which KPIs are FAILING their target right now — the latest observation per metric where the
+    check verdict is false. A monitoring dashboard in one call (materialize metrics first to populate)."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT metric_name, status, value, verdict, observed_at::text AS observed_at "
+            "FROM rvbbit.breaching_kpis()").fetchall()
+    return {"breaching": rows, "count": len(rows)}
+
+
+def tool_metric_lineage(name: str) -> dict:
+    """The base tables a metric reads (for impact analysis) — resolved from its SQL via the planner.
+    The metric-side mirror of dashboard_dependents."""
+    with _conn() as c:
+        row = c.execute("SELECT rvbbit.metric_lineage(%s) AS t", (name,)).fetchone()
+    return {"metric": name, "source_tables": (row["t"] if row else None) or []}
+
+
 def tool_validate_sql(sql: str, as_of=None) -> dict:
     """Plan, don't execute — route_explain dry-run so Claude can self-correct cheaply."""
     try:
@@ -1137,6 +1182,14 @@ def _register(mcp):
     mcp.tool(name="metric")(lambda name, params=None, as_of=None, def_as_of=None: _logged(
         "metric", {"name": name, "params": params, "as_of": as_of, "def_as_of": def_as_of},
         lambda: tool_metric(name, params, as_of, def_as_of)))
+    mcp.tool(name="materialize_metric")(lambda name, params=None, as_of=None, def_as_of=None: _logged(
+        "materialize_metric", {"name": name},
+        lambda: tool_materialize_metric(name, params, as_of, def_as_of)))
+    mcp.tool(name="metric_history")(lambda name, limit=50: _logged(
+        "metric_history", {"name": name, "limit": limit}, lambda: tool_metric_history(name, limit)))
+    mcp.tool(name="breaching_kpis")(lambda: _logged("breaching_kpis", {}, tool_breaching_kpis))
+    mcp.tool(name="metric_lineage")(lambda name: _logged(
+        "metric_lineage", {"name": name}, lambda: tool_metric_lineage(name)))
     mcp.tool(name="validate_sql")(lambda sql, as_of=None: _logged(
         "validate_sql", {"sql": sql, "as_of": as_of}, lambda: tool_validate_sql(sql, as_of)))
     mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(
