@@ -272,14 +272,27 @@ def tool_get_metric(name: str) -> dict:
     return d
 
 
-def tool_list_cubes() -> dict:
-    """Curated subject-area tables (cubes) — wide, documented, accelerated. The agent's
-    entry point: look here (and at metrics) before raw tables."""
+def tool_list_cubes(category=None) -> dict:
+    """Curated subject-area tables (cubes) — wide, documented, accelerated, with their category. The
+    agent's entry point: look here (and at metrics) before raw tables. Optional `category` filter."""
     with _conn() as c:
         rows = c.execute(
             "SELECT name, grain, description, category, version, refreshed_at::text AS refreshed_at, rows "
-            "FROM rvbbit.cubes()").fetchall()
+            "FROM rvbbit.cubes() WHERE (%s::text IS NULL OR category = %s::text)",
+            (category, category)).fetchall()
     return {"cubes": rows}
+
+
+def tool_set_category(kind, name, category=None, subcategory=None) -> dict:
+    """Categorize a cube or metric (kind = 'cube' | 'metric') in the shared taxonomy — lightweight
+    and mutable (no new version). Pass category=null to clear it. Use this to organize the catalog;
+    read it back via list_cubes / list_metrics."""
+    with _conn() as c:
+        try:
+            c.execute("SELECT rvbbit.set_category(%s, %s, %s, %s)", (kind, name, category, subcategory))
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "SET_CATEGORY_FAILED", "message": str(e)}}
+    return {"kind": kind, "name": name, "category": category, "subcategory": subcategory}
 
 
 def tool_describe_cube(name: str) -> dict:
@@ -1059,7 +1072,11 @@ def _register(mcp):
         lambda: tool_list_metrics(category, search)))
     mcp.tool(name="get_metric")(lambda name: _logged(
         "get_metric", {"name": name}, lambda: tool_get_metric(name)))
-    mcp.tool(name="list_cubes")(lambda: _logged("list_cubes", {}, tool_list_cubes))
+    mcp.tool(name="list_cubes")(lambda category=None: _logged(
+        "list_cubes", {"category": category}, lambda: tool_list_cubes(category)))
+    mcp.tool(name="set_category")(lambda kind, name, category=None, subcategory=None: _logged(
+        "set_category", {"kind": kind, "name": name, "category": category, "subcategory": subcategory},
+        lambda: tool_set_category(kind, name, category, subcategory)))
     mcp.tool(name="describe_cube")(lambda name: _logged(
         "describe_cube", {"name": name}, lambda: tool_describe_cube(name)))
     mcp.tool(name="propose_cube")(lambda subject, seed_tables=None, schema=None: _logged(
