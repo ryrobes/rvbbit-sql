@@ -64,6 +64,24 @@ BEGIN
     v_comment := fp->>'comment';
     v_tlabel  := v_schema || '.' || v_table;
 
+    -- Batch-warm the embedding cache for this table's docs (the table doc + every
+    -- column doc) in ONE embedder call, so the per-doc rvbbit.embed() calls below
+    -- resolve from cache. Decisive for a REMOTE embedder (OpenAI/OpenRouter,
+    -- ~200ms/call): collapses N+1 sequential round-trips into one batched request.
+    -- Best-effort — on any failure (e.g. older build without embed_batch) the
+    -- per-doc embed path below still runs unchanged.
+    IF v_embed_ok THEN
+        BEGIN
+            PERFORM rvbbit.embed_batch(
+                ARRAY[rvbbit.catalog_table_doc(fp)]
+                || COALESCE((SELECT array_agg(
+                       rvbbit.catalog_column_doc(v_schema, v_table, v_comment, e))
+                     FROM jsonb_array_elements(fp->'columns') AS e), ARRAY[]::text[]),
+                p_embed_specialist, 'document');
+        EXCEPTION WHEN others THEN NULL;  -- fall back to per-doc embed
+        END;
+    END IF;
+
     -- schema node + has_table edge are SHARED across shards (every table touches
     -- the one schema node) → deferred to the parent's serial pass when requested.
     IF NOT p_defer_shared THEN
@@ -342,6 +360,10 @@ BEGIN
            AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'rvbbit')
            AND n.nspname NOT LIKE 'pg_toast%'
            AND n.nspname NOT LIKE 'pg_temp_%'
+           -- Skip configured operational schemas (e.g. dagster_operational): they
+           -- are high-churn and the live app's locks on them convoy the crawl
+           -- shards, and their transient run/event tables have little search value.
+           AND n.nspname <> ALL (rvbbit._catalog_excluded_schemas())
            AND (schemas IS NULL OR n.nspname = ANY (schemas))
     )
     INSERT INTO rvbbit.catalog_crawl_progress

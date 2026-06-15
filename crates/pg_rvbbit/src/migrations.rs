@@ -145,6 +145,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0031_brain_phase0",
         include_str!("../sql/migrations/0031_brain_phase0.sql"),
     ),
+    (
+        "0032_batch_embed_crawl_prewarm",
+        include_str!("../sql/migrations/0032_batch_embed_crawl_prewarm.sql"),
+    ),
+    (
+        "0033_crawl_exclude_operational_schemas",
+        include_str!("../sql/migrations/0033_crawl_exclude_operational_schemas.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

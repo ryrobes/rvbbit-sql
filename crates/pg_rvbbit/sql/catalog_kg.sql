@@ -299,6 +299,28 @@ BEGIN
 END $fn$;
 
 -- ---------------------------------------------------------------------
+-- Schemas the crawler skips. Configurable via rvbbit.settings key
+-- 'catalog_crawl_exclude_schemas' (a jsonb array of schema names). When the
+-- key is unset, defaults to ['dagster_operational'] — a high-churn operational
+-- schema whose live locks convoy the parallel crawl. Never returns NULL (a NULL
+-- would make `nspname <> ALL(...)` filter out every table).
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION rvbbit._catalog_excluded_schemas()
+RETURNS text[] LANGUAGE sql STABLE AS $$
+    SELECT CASE
+        WHEN to_regclass('rvbbit.settings') IS NULL THEN ARRAY['dagster_operational']::text[]
+        WHEN EXISTS (SELECT 1 FROM rvbbit.settings WHERE key = 'catalog_crawl_exclude_schemas')
+            THEN COALESCE(
+                (SELECT array_agg(x.v)
+                   FROM rvbbit.settings s,
+                        LATERAL jsonb_array_elements_text(s.value) AS x(v)
+                  WHERE s.key = 'catalog_crawl_exclude_schemas'),
+                ARRAY[]::text[])
+        ELSE ARRAY['dagster_operational']::text[]
+    END;
+$$;
+
+-- ---------------------------------------------------------------------
 -- The crawler: enumerate user tables -> fingerprint -> KG + docs
 -- ---------------------------------------------------------------------
 
@@ -344,6 +366,9 @@ BEGIN
            AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'rvbbit')
            AND n.nspname NOT LIKE 'pg_toast%'
            AND n.nspname NOT LIKE 'pg_temp_%'
+           -- Skip configured operational schemas (rvbbit._catalog_excluded_schemas);
+           -- high-churn app tables (e.g. dagster_operational) convoy the crawl on locks.
+           AND n.nspname <> ALL (rvbbit._catalog_excluded_schemas())
            AND (schemas IS NULL OR n.nspname = ANY (schemas))
          ORDER BY n.nspname, c.relname
     LOOP
@@ -357,6 +382,22 @@ BEGIN
         v_table   := fp->>'table';
         v_comment := fp->>'comment';
         v_tlabel  := v_schema || '.' || v_table;
+
+        -- Batch-warm the embedding cache for this table's docs (table + every
+        -- column) in ONE embedder call so the per-doc rvbbit.embed() below are
+        -- cache hits — decisive for a remote embedder (OpenAI/OpenRouter). One
+        -- batched request instead of N+1 round-trips. Best-effort.
+        IF v_embed_ok THEN
+            BEGIN
+                PERFORM rvbbit.embed_batch(
+                    ARRAY[rvbbit.catalog_table_doc(fp)]
+                    || COALESCE((SELECT array_agg(
+                           rvbbit.catalog_column_doc(v_schema, v_table, v_comment, e))
+                         FROM jsonb_array_elements(fp->'columns') AS e), ARRAY[]::text[]),
+                    embed_specialist, 'document');
+            EXCEPTION WHEN others THEN NULL;  -- fall back to per-doc embed
+            END;
+        END IF;
 
         -- schema node
         PERFORM rvbbit.kg_assert_node('db_schema', v_schema,

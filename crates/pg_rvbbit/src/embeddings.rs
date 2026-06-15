@@ -161,6 +161,45 @@ pub(crate) fn bulk_cache_lookup(specialist: &str) -> std::collections::HashMap<[
     out
 }
 
+/// Which of `hashes` are already cached for `specialist` — a single
+/// index-backed lookup over just this batch's keys (O(batch), unlike
+/// bulk_cache_lookup which loads the whole specialist's cache). Used by
+/// embed_batch so a per-table prewarm over a huge cache stays cheap.
+fn cached_hashes(specialist: &str, hashes: &[[u8; 32]]) -> std::collections::HashSet<[u8; 32]> {
+    let mut out = std::collections::HashSet::new();
+    if hashes.is_empty() {
+        return out;
+    }
+    let esc = specialist.replace('\'', "''");
+    let list = hashes
+        .iter()
+        .map(|h| format!("'\\x{}'::bytea", hex_encode(h)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(
+            &format!(
+                "SELECT text_hash FROM rvbbit.embedding_cache \
+                 WHERE specialist = '{esc}' AND text_hash IN ({list})"
+            ),
+            None,
+            &[],
+        )?;
+        for row in table {
+            let h: Option<Vec<u8>> = row.get(1)?;
+            if let Some(h) = h {
+                if h.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&h);
+                    out.insert(arr);
+                }
+            }
+        }
+        Ok(())
+    });
+    out
+}
+
 pub(crate) fn cache_store(
     text_hash: &[u8; 32],
     specialist: &str,
@@ -253,6 +292,88 @@ fn embed(text: &str, specialist: default!(&str, "''"), mode: default!(&str, "''"
         Ok(v) => v,
         Err(e) => pgrx::error!("{e}"),
     }
+}
+
+/// Batch-warm the embedding cache for many texts in one shot. Sends the
+/// embedder up to `spec.batch_size` inputs per request via `predict_batch`
+/// — for a remote embedder (OpenAI/OpenRouter, ~200ms/call) this collapses N
+/// HTTP round-trips into ceil(N/batch_size). Already-cached texts are skipped;
+/// NULLs and intra-batch duplicates are ignored. The mode prefix + hashing
+/// match `embed_one` exactly, so a subsequent `rvbbit.embed(text, spec, mode)`
+/// for any warmed text is a local cache hit. Returns the count newly embedded.
+///
+/// Used by the catalog crawl to pre-warm a table's docs (table + every column)
+/// in one call, instead of one remote embed per doc.
+#[pg_extern(volatile)]
+fn embed_batch(
+    texts: Vec<Option<String>>,
+    specialist: default!(&str, "''"),
+    mode: default!(&str, "''"),
+) -> i64 {
+    let spec = match resolve_specialist(specialist) {
+        Ok(s) => s,
+        Err(e) => pgrx::error!("{e}"),
+    };
+    let model = spec_model(&spec);
+
+    // Prefix BEFORE hashing (matches embed_one) + dedup within the batch.
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut candidates: Vec<(String, [u8; 32])> = Vec::new(); // (prefixed, hash)
+    for t in texts.into_iter().flatten() {
+        let prefixed = apply_mode_prefix(&t, mode, &model);
+        let h = text_hash(&spec.name, &prefixed);
+        if seen.insert(h) {
+            candidates.push((prefixed, h));
+        }
+    }
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    // One index-backed lookup over just this batch's keys, then drop the hits —
+    // we only send genuine misses to the embedder. (O(batch), not O(cache).)
+    let hashes: Vec<[u8; 32]> = candidates.iter().map(|(_, h)| *h).collect();
+    let cached = cached_hashes(&spec.name, &hashes);
+    let to_embed: Vec<String> = candidates
+        .into_iter()
+        .filter(|(_, h)| !cached.contains(h))
+        .map(|(prefixed, _)| prefixed)
+        .collect();
+    if to_embed.is_empty() {
+        return 0;
+    }
+
+    let batch_size = spec.batch_size.max(1);
+    let mut produced: i64 = 0;
+    for chunk in to_embed.chunks(batch_size) {
+        let inputs: Vec<JsonValue> = chunk
+            .iter()
+            .map(|t| serde_json::json!({ "text": t }))
+            .collect();
+        let result = match crate::specialists::predict_batch(&spec, &inputs) {
+            Ok(r) => r,
+            Err(e) => pgrx::error!("rvbbit.embed_batch: predict_batch: {e}"),
+        };
+        if result.outputs.len() != chunk.len() {
+            pgrx::error!(
+                "rvbbit.embed_batch: got {} outputs for {} inputs",
+                result.outputs.len(),
+                chunk.len()
+            );
+        }
+        for (prefixed, output) in chunk.iter().zip(result.outputs.iter()) {
+            let vec = match parse_embedding_value(output) {
+                Ok(v) => v,
+                Err(e) => pgrx::error!("rvbbit.embed_batch: {e}"),
+            };
+            let h = text_hash(&spec.name, prefixed);
+            if let Err(e) = cache_store(&h, &spec.name, &model, &vec) {
+                pgrx::error!("{e}");
+            }
+            produced += 1;
+        }
+    }
+    produced
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
