@@ -1191,6 +1191,18 @@ def tool_brain_exclude(doc_id, principal, reason=None) -> dict:
     return {"doc_id": doc_id, "principal": principal, "excluded": True}
 
 
+def tool_brain_set_doc_roles(doc_id, roles=None) -> dict:
+    """Set the access role(s) on a document — the docs a role grants are visible to anyone holding it.
+    Pass [] to make it private again (default-deny). A freshly-ingested doc with no roles is invisible
+    to everyone (incl. the explorer's own listing); this is how you make it visible."""
+    with _conn() as c:
+        try:
+            c.execute("SELECT rvbbit.brain_set_doc_roles(%s::bigint, %s::text[])", (doc_id, roles))
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "SET_DOC_ROLES_FAILED", "message": str(e)}}
+    return {"doc_id": doc_id, "roles": roles or []}
+
+
 _BRAIN_TEXT_EXT = {".md", ".markdown", ".mdx", ".txt", ".text", ".rst", ".org", ".log"}
 
 
@@ -1955,6 +1967,9 @@ def _register(mcp):
     mcp.tool(name="brain_crawl_folder")(lambda path, source=None, roles=None, base_folder=None, recursive=True, max_files=500: _logged(
         "brain_crawl_folder", {"path": path, "source": source, "roles": roles, "recursive": recursive},
         lambda: tool_brain_crawl_folder(path, source, roles, base_folder, recursive, max_files)))
+    mcp.tool(name="brain_set_doc_roles")(lambda doc_id, roles=None: _logged(
+        "brain_set_doc_roles", {"doc_id": doc_id, "roles": roles},
+        lambda: tool_brain_set_doc_roles(doc_id, roles)))
     mcp.tool(name="validate_sql")(lambda sql, as_of=None: _logged(
         "validate_sql", {"sql": sql, "as_of": as_of}, lambda: tool_validate_sql(sql, as_of)))
     mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(

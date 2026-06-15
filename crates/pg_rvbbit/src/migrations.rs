@@ -153,6 +153,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0033_crawl_exclude_operational_schemas",
         include_str!("../sql/migrations/0033_crawl_exclude_operational_schemas.sql"),
     ),
+    (
+        "0034_brain_acl_management",
+        include_str!("../sql/migrations/0034_brain_acl_management.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
