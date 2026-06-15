@@ -157,6 +157,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0034_brain_acl_management",
         include_str!("../sql/migrations/0034_brain_acl_management.sql"),
     ),
+    (
+        "0035_fast_fingerprint_materialize_sample",
+        include_str!("../sql/migrations/0035_fast_fingerprint_materialize_sample.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

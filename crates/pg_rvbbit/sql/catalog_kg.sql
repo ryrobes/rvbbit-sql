@@ -169,14 +169,26 @@ BEGIN
 
     EXECUTE format('SELECT count(*) FROM %s', rel) INTO v_nrows;
 
+    -- Materialize the working set ONCE into a temp table, then run every
+    -- per-column stat below against it. Previously v_src was a (TABLESAMPLE…)
+    -- or (… LIMIT) SUBQUERY, so each of the ~5 stats per column re-ran it —
+    -- re-scanning a multi-GB table (or re-executing a view) N_columns×5 times.
+    -- One materialization makes the per-column passes hit a tiny local table;
+    -- small tables read directly (already cheap).
+    EXECUTE 'DROP TABLE IF EXISTS _fp_sample';
     IF v_nrows > sample_rows THEN
         v_sampled := true;
         IF v_relkind IN ('r', 'm') THEN
             v_pct := greatest(0.000001, least(100.0, 100.0 * sample_rows / NULLIF(v_nrows, 0)));
-            v_src := format('(SELECT * FROM %s TABLESAMPLE SYSTEM (%s)) _s', rel, v_pct);
+            EXECUTE format(
+                'CREATE TEMP TABLE _fp_sample AS SELECT * FROM %s TABLESAMPLE SYSTEM (%s)',
+                rel, v_pct);
         ELSE
-            v_src := format('(SELECT * FROM %s LIMIT %s) _s', rel, sample_rows);
+            EXECUTE format(
+                'CREATE TEMP TABLE _fp_sample AS SELECT * FROM %s LIMIT %s',
+                rel, sample_rows);
         END IF;
+        v_src := '_fp_sample';
     ELSE
         v_src := rel::text;
     END IF;
@@ -281,6 +293,8 @@ BEGIN
             'value_dist_complete', (v_ndv IS NOT NULL AND v_ndv <= distinct_cap),
             'quantiles',      v_quantiles);
     END LOOP;
+
+    EXECUTE 'DROP TABLE IF EXISTS _fp_sample';
 
     RETURN jsonb_build_object(
         'rel',         rel::text,

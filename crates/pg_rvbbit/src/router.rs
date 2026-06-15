@@ -3797,7 +3797,9 @@ pub(crate) fn route_runtime_stamp() -> String {
 }
 
 /// The expensive full-catalog table-state aggregation, memoized per-backend with a TTL.
-/// Identical output to the inline form it replaced (`string_agg(...)` or `none`).
+/// Same shape as the inline form it replaced (`string_agg(...)` or `none`), but using
+/// `relpages` instead of `pg_relation_size` for the heap-fork size — see the note in the
+/// body for why (the fs-stat version was the catalog-crawl slowness).
 fn route_table_state_stamp() -> String {
     let ttl = route_stamp_ttl();
     if !ttl.is_zero() {
@@ -3810,9 +3812,18 @@ fn route_table_state_stamp() -> String {
             return cached;
         }
     }
+    // `c.relpages * block_size` (catalog estimate, refreshed by (auto)vacuum/analyze)
+    // replaces `pg_relation_size(c.oid)` here. pg_relation_size stat()s every fork of
+    // every rvbbit-AM relation on EACH call; on a real warehouse (2800+ such relations,
+    // incl. toast) that is ~8s of syscalls, and with this stamp memoized at only a 1s TTL
+    // it recomputed ~10x across a single multi-query statement — turning every routed
+    // catalog-crawl sub-query into an 8s tax (90s to fingerprint a 71-row table). relpages
+    // is free (already in the catalog) and good enough: this string is ONLY a route-cache
+    // key, the precise rvbbit data size is still captured by rg.bytes, and routing is
+    // correctness-neutral so a slightly-stale heap-fork estimate at worst delays a re-route.
     let table_state = Spi::get_one::<String>(
         "SELECT coalesce(string_agg( \
-                    c.oid::text || ':' || pg_relation_size(c.oid)::text || ':' || \
+                    c.oid::text || ':' || (c.relpages::bigint * current_setting('block_size')::bigint)::text || ':' || \
                     coalesce(rg.rows, 0)::text || ':' || coalesce(rg.bytes, 0)::text || ':' || \
                     coalesce(dl.deletes, 0)::text || ':' || \
                     coalesce(t.shadow_heap_retained, false)::text || ':' || \
@@ -3851,12 +3862,16 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
     let stringless = sql_stringless(sql).to_lowercase();
     let plan_lower = plan_text.map(str::to_lowercase);
     let mut out = Vec::new();
+    // NOTE: heap_bytes below uses relpages*block_size, not pg_relation_size(c.oid). This
+    // runs per routed query UNMEMOIZED over every rvbbit-AM relation; the fs-stat form cost
+    // ~10s/query on a large catalog and was the dominant half of the catalog-crawl slowness.
+    // heap_bytes is a routing heuristic, so the catalog estimate is more than precise enough.
     let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let table = client.select(
             "SELECT lower(n.nspname), lower(c.relname), c.oid::bigint, \
                     count(rg.*)::bigint, coalesce(sum(rg.n_rows), 0)::bigint, \
                     coalesce(sum(rg.n_bytes), 0)::bigint, \
-                    pg_relation_size(c.oid)::bigint, \
+                    (c.relpages::bigint * current_setting('block_size')::bigint)::bigint, \
                     coalesce(t.shadow_heap_retained, false), \
                     coalesce(t.shadow_heap_dirty, false), \
                     (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid), \
