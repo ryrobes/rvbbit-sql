@@ -1957,6 +1957,79 @@ fn insert_profile_selection_json(out: &mut Map<String, Value>, profile: &RoutePr
     }
 }
 
+thread_local! {
+    // routing-overlay: shape_key -> tested engine pin (enabled rows only), memoized per-backend
+    // under the same TTL contract as the other route memos (RVBBIT_ROUTE_STAMP_TTL_MS). The
+    // overlay changes only on an explicit train, so this is a hashmap hit per query. A
+    // <=TTL-stale map only affects which engine is CHOSEN — the pin still passes
+    // candidate_availability in overlay_decision, so it never changes correctness.
+    static OVERLAY_MEMO: std::cell::RefCell<Option<(Instant, std::collections::HashMap<String, Candidate>)>> =
+        const { std::cell::RefCell::new(None) };
+
+    // Set by the trainer while it computes the TRUE base decision (what base rules would pick
+    // with no pin present). Never set on the normal query path.
+    static OVERLAY_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// All enabled overlay pins as shape_key -> engine, refreshed at most once per TTL. Empty (no
+/// behavior change) until the route_overlay table exists and has rows.
+fn overlay_map() -> std::collections::HashMap<String, Candidate> {
+    let ttl = route_stamp_ttl();
+    let stale = ttl.is_zero()
+        || OVERLAY_MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .map(|(at, _)| at.elapsed() >= ttl)
+                .unwrap_or(true)
+        });
+    if stale {
+        let mut map: std::collections::HashMap<String, Candidate> = std::collections::HashMap::new();
+        if relations_present(&["rvbbit.route_overlay"]) {
+            let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+                let rows = client.select(
+                    "SELECT shape_key, engine FROM rvbbit.route_overlay WHERE enabled",
+                    None,
+                    &[],
+                )?;
+                for row in rows {
+                    let key: String = row.get(1)?.unwrap_or_default();
+                    let eng: String = row.get(2)?.unwrap_or_default();
+                    if !key.is_empty() {
+                        if let Some(c) = Candidate::from_str(&eng) {
+                            map.insert(key, c);
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+        OVERLAY_MEMO.with(|m| *m.borrow_mut() = Some((Instant::now(), map.clone())));
+        return map;
+    }
+    OVERLAY_MEMO.with(|m| m.borrow().as_ref().map(|(_, x)| x.clone()).unwrap_or_default())
+}
+
+/// The tested-pin layer: a decision iff this shape is pinned AND the pinned engine is
+/// available for this query. Otherwise None -> fall through to base rules. A pin can never
+/// force an unavailable/unsafe engine, so it never affects correctness — only engine choice.
+fn overlay_decision(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> Option<RouteDecision> {
+    if OVERLAY_BYPASS.with(|b| b.get()) {
+        return None;
+    }
+    let cand = *overlay_map().get(&features.shape_key)?;
+    let (available, reason) = candidate_availability(cand, features, tables);
+    if !available {
+        return None;
+    }
+    Some(decision(
+        cand,
+        "overlay",
+        &format!("tested overlay pin; {reason}"),
+        Some(1.0),
+        None,
+    ))
+}
+
 fn choose_route_fast(
     features: &RouteFeatures,
     tables: &[RvbbitTableMetric],
@@ -1973,6 +2046,9 @@ fn choose_route_fast(
     }
     if let Some(decision) = forced_route_decision(features, tables) {
         return Some(decision);
+    }
+    if let Some(d) = overlay_decision(features, tables) {
+        return Some(d);
     }
     let (_vector_available, vector_reason) = duck_availability(features, tables);
     let (pg_available, pg_reason) = pg_rowstore_availability(tables);
@@ -2066,6 +2142,9 @@ fn choose_route(
     }
     if let Some(decision) = forced_route_decision(features, tables) {
         return decision;
+    }
+    if let Some(d) = overlay_decision(features, tables) {
+        return d;
     }
     let (_vector_available, vector_reason) = duck_availability(features, tables);
     let (pg_available, pg_reason) = pg_rowstore_availability(tables);

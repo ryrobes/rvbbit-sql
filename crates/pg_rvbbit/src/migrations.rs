@@ -173,6 +173,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0038_fingerprint_force_heap_scan",
         include_str!("../sql/migrations/0038_fingerprint_force_heap_scan.sql"),
     ),
+    (
+        "0039_route_overlay",
+        include_str!("../sql/migrations/0039_route_overlay.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
