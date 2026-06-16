@@ -30,6 +30,7 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
+use datafusion::catalog::{CatalogProvider, MemorySchemaProvider};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -744,11 +745,30 @@ fn table_signature(t: &RvbbitTable, asof: Option<&AsOf>) -> u64 {
     h.finish()
 }
 
+/// DataFusion's default `SessionContext` ships only catalog `datafusion` / schema `public`, so
+/// registering a table under a qualified name like `cubes.foo` fails with "failed to resolve
+/// schema: cubes" until that schema exists in the catalog. Register an empty in-memory schema
+/// provider on demand so any Postgres schema can host accelerated tables. (Surfaced by the
+/// `cubes.*` tables — the only schema with materialized row groups — but it applies to every
+/// non-`public` schema.) No-op once the schema is present.
+fn ensure_df_schema(ctx: &SessionContext, schema: &str) {
+    if schema.is_empty() || schema == "public" {
+        return;
+    }
+    // "datafusion" is the default catalog name (SessionConfig::new()).
+    if let Some(catalog) = ctx.catalog("datafusion") {
+        if catalog.schema(schema).is_none() {
+            let _ = catalog.register_schema(schema, Arc::new(MemorySchemaProvider::new()));
+        }
+    }
+}
+
 async fn register_listing_table(
     ctx: &SessionContext,
     qualified: &str,
     t: &RvbbitTable,
 ) -> Result<(), String> {
+    ensure_df_schema(ctx, &t.schema);
     let _ = ctx.deregister_table(qualified);
     let raw_name = raw_table_name(t);
     let date_projection = t.columns.iter().any(|c| c.typname == "date");
@@ -1379,6 +1399,7 @@ async fn register_hot_tables(ctx: &SessionContext) -> Result<Vec<HotCatalogObjec
             continue;
         };
         let qualified = format!("{}.{}", object.schema, object.relname);
+        ensure_df_schema(ctx, &object.schema);
         REG_CACHE.with(|cache| {
             cache.borrow_mut().remove(&qualified);
         });
