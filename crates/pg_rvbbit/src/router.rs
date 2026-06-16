@@ -3861,13 +3861,152 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
     }
     let stringless = sql_stringless(sql).to_lowercase();
     let plan_lower = plan_text.map(str::to_lowercase);
+    // Resolve which rvbbit-AM relations this query references (Step 1, memoized candidate
+    // list) and gather full metrics only for those (Step 2, per-oid memo). Both are O(refs),
+    // not O(catalog): see referenced_am_oids / table_metrics_for.
+    let ref_oids = referenced_am_oids(&stringless, plan_lower.as_deref());
+    if ref_oids.is_empty() {
+        return Vec::new();
+    }
+    table_metrics_for(&ref_oids)
+}
+
+/// `(oid, lower(schema), lower(relname))` for one rvbbit-AM relation — the memoized
+/// candidate row that the per-query name match filters against.
+type AmRelation = (i64, String, String);
+
+thread_local! {
+    // perf-router-09: the rvbbit-AM relation list (oid/schema/relname) memoized per-backend
+    // under the same TTL + correctness-neutral contract as ROUTE_TABLE_STATE_MEMO /
+    // VARIANT_READY_MEMO. This is the O(catalog) candidate scan that ran on every routed
+    // query; a <=TTL-stale list only delays seeing a just-created/dropped rvbbit-AM table by
+    // one TTL, and an unseen new table simply routes to the postgres heap fallback (correct,
+    // just not yet accelerated) — never wrong results.
+    static RVBBIT_AM_RELATIONS_MEMO: std::cell::RefCell<Option<(Instant, Vec<AmRelation>)>> =
+        const { std::cell::RefCell::new(None) };
+
+    // perf-router-09: per-table routing metrics memoized by oid, same contract. A
+    // <=TTL-stale metric only changes which engine is CHOSEN (every candidate returns
+    // identical results + falls back); the correctness-sensitive metadata fast-path keeps its
+    // own fresh tombstone check (metadata_rewrites_unsafe_for_correctness), so this never
+    // affects results. Bounded to one small entry per rvbbit-AM table per backend.
+    static TABLE_METRIC_MEMO: std::cell::RefCell<std::collections::HashMap<u32, (Instant, RvbbitTableMetric)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// OIDs of the rvbbit-AM relations this query references — name-matched against the memoized
+/// relation list (refreshed at most once per TTL). The match is plain string work; memoizing
+/// the list is what removes the per-query O(catalog) scan that previously cost ~4.5s at ~2900
+/// tables (and which a bare `SELECT 1` paid too).
+fn referenced_am_oids(stringless: &str, plan_lower: Option<&str>) -> Vec<i64> {
+    let ttl = route_stamp_ttl();
+    let stale = ttl.is_zero()
+        || RVBBIT_AM_RELATIONS_MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .map(|(at, _)| at.elapsed() >= ttl)
+                .unwrap_or(true)
+        });
+    if stale {
+        let list = fetch_rvbbit_am_relations();
+        RVBBIT_AM_RELATIONS_MEMO.with(|m| *m.borrow_mut() = Some((Instant::now(), list)));
+    }
+    RVBBIT_AM_RELATIONS_MEMO.with(|m| {
+        m.borrow()
+            .as_ref()
+            .map(|(_, list)| {
+                list.iter()
+                    .filter(|(oid, schema, relname)| {
+                        *oid > 0
+                            && (sql_mentions_relation(stringless, schema, relname)
+                                || plan_lower
+                                    .map(|plan| plan_mentions_relation(plan, schema, relname))
+                                    .unwrap_or(false))
+                    })
+                    .map(|(oid, _, _)| *oid)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// One cheap catalog scan: (oid, schema, relname) of every rvbbit-AM relation. No metrics,
+/// no per-relation subqueries or fs stat()s — those are gathered per referenced oid below.
+fn fetch_rvbbit_am_relations() -> Vec<AmRelation> {
+    let mut list: Vec<AmRelation> = Vec::new();
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let rows = client.select(
+            "SELECT c.oid::bigint, lower(n.nspname), lower(c.relname) \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_am am ON am.oid = c.relam \
+             WHERE am.amname = 'rvbbit'",
+            None,
+            &[],
+        )?;
+        for row in rows {
+            let oid: i64 = row.get(1)?.unwrap_or_default();
+            let schema: String = row.get(2)?.unwrap_or_default();
+            let relname: String = row.get(3)?.unwrap_or_default();
+            list.push((oid, schema, relname));
+        }
+        Ok(())
+    });
+    list
+}
+
+/// Metrics for the referenced oids, served from the per-oid memo where fresh; the misses are
+/// fetched in one batched query and cached. Same result as an uncached gather, minus the SPI
+/// round-trips for tables already seen this TTL window.
+fn table_metrics_for(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
+    let ttl = route_stamp_ttl();
+    let mut out: Vec<RvbbitTableMetric> = Vec::with_capacity(ref_oids.len());
+    let mut misses: Vec<i64> = Vec::new();
+    for &oid in ref_oids {
+        let cached = if ttl.is_zero() {
+            None
+        } else {
+            TABLE_METRIC_MEMO.with(|m| {
+                m.borrow()
+                    .get(&(oid.max(0) as u32))
+                    .filter(|(at, _)| at.elapsed() < ttl)
+                    .map(|(_, v)| v.clone())
+            })
+        };
+        match cached {
+            Some(v) => out.push(v),
+            None => misses.push(oid),
+        }
+    }
+    if !misses.is_empty() {
+        for m in fetch_table_metrics(&misses) {
+            if !ttl.is_zero() {
+                let key = m.oid;
+                let entry = m.clone();
+                TABLE_METRIC_MEMO.with(|c| {
+                    c.borrow_mut().insert(key, (Instant::now(), entry));
+                });
+            }
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// The expensive per-relation metric gather, scoped to the given oids (trusted catalog
+/// integers, so the inlined IN-list is injection-safe). heap_bytes uses relpages*block_size,
+/// not pg_relation_size(c.oid): a routing heuristic, so the catalog estimate is precise
+/// enough and avoids a per-relation fs stat().
+fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
+    let oid_list = ref_oids
+        .iter()
+        .map(|o| o.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut out = Vec::new();
-    // NOTE: heap_bytes below uses relpages*block_size, not pg_relation_size(c.oid). This
-    // runs per routed query UNMEMOIZED over every rvbbit-AM relation; the fs-stat form cost
-    // ~10s/query on a large catalog and was the dominant half of the catalog-crawl slowness.
-    // heap_bytes is a routing heuristic, so the catalog estimate is more than precise enough.
     let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let table = client.select(
+            &format!(
             "SELECT lower(n.nspname), lower(c.relname), c.oid::bigint, \
                     count(rg.*)::bigint, coalesce(sum(rg.n_rows), 0)::bigint, \
                     coalesce(sum(rg.n_bytes), 0)::bigint, \
@@ -3897,32 +4036,24 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
                               'time with time zone'::regtype \
                           ) \
                     ), ''), \
-                    array_to_string(coalesce(p.denied_engines, '{}'), ','), \
-                    array_to_string(coalesce(p.denied_layouts, '{}'), ',') \
+                    array_to_string(coalesce(p.denied_engines, '{{}}'), ','), \
+                    array_to_string(coalesce(p.denied_layouts, '{{}}'), ',') \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_am am ON am.oid = c.relam \
              LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid \
              LEFT JOIN rvbbit.accel_policy p ON p.table_oid = c.oid \
              LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = c.oid \
-             WHERE am.amname = 'rvbbit' \
+             WHERE am.amname = 'rvbbit' AND c.oid IN ({oid_list}) \
              GROUP BY n.nspname, c.relname, c.oid, t.shadow_heap_retained, t.shadow_heap_dirty, \
-                      p.denied_engines, p.denied_layouts",
+                      p.denied_engines, p.denied_layouts"
+            ),
             None,
             &[],
         )?;
         for row in table {
             let schema: String = row.get(1)?.unwrap_or_default();
             let relname: String = row.get(2)?.unwrap_or_default();
-            let sql_referenced = sql_mentions_relation(&stringless, &schema, &relname);
-            let plan_referenced = plan_lower
-                .as_deref()
-                .map(|plan| plan_mentions_relation(plan, &schema, &relname))
-                .unwrap_or(false);
-            let referenced = sql_referenced || plan_referenced;
-            if !referenced {
-                continue;
-            }
             let oid_i64: i64 = row.get(3)?.unwrap_or_default();
             out.push(RvbbitTableMetric {
                 schema,
