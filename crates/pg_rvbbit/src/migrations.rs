@@ -177,6 +177,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0039_route_overlay",
         include_str!("../sql/migrations/0039_route_overlay.sql"),
     ),
+    (
+        "0040_route_optimization_candidates",
+        include_str!("../sql/migrations/0040_route_optimization_candidates.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

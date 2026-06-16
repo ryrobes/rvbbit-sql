@@ -2030,6 +2030,171 @@ fn overlay_decision(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> O
     ))
 }
 
+/// Drop the per-backend overlay memo so the next lookup re-reads the table — called by the
+/// trainer right after it writes/deletes a pin so the change takes effect immediately.
+fn overlay_invalidate() {
+    OVERLAY_MEMO.with(|m| *m.borrow_mut() = None);
+}
+
+/// Server-side execution time (ms) of one `EXPLAIN (ANALYZE, TIMING OFF) <sql>` run, isolated
+/// in a subtransaction so a slow/erroring engine (statement_timeout, an un-pushable function,
+/// …) yields None instead of poisoning the trainer's transaction. EXPLAIN ANALYZE executes the
+/// plan, so it routes per the currently-forced candidate; it's a utility statement, hence the
+/// mutable SPI path (mirrors explain_sql).
+fn explain_exec_ms(sql: &str) -> Option<f64> {
+    let probe = format!("EXPLAIN (ANALYZE, TIMING OFF) {sql}");
+    pgrx::PgTryBuilder::new(std::panic::AssertUnwindSafe(|| {
+        let mut out: Option<f64> = None;
+        let _ = Spi::connect_mut(|client| -> Result<(), pgrx::spi::Error> {
+            let table = client.update(&probe, None, &[])?;
+            for row in table {
+                let line: String = row.get(1)?.unwrap_or_default();
+                if let Some(rest) = line.trim().strip_prefix("Execution Time:") {
+                    out = rest.trim().trim_end_matches("ms").trim().parse::<f64>().ok();
+                }
+            }
+            Ok(())
+        });
+        out
+    }))
+    .catch_others(|_| None)
+    .catch_rust_panic(|_| None)
+    .execute()
+}
+
+/// Force `cand`, then benchmark `sql`: one warmup + `samples` measured runs, median ms. Returns
+/// None if the engine couldn't be exercised (unavailable / timed out / errored every run).
+/// Always restores the prior `route_force_candidate`.
+fn bench_candidate(sql: &str, cand: Candidate, samples: i32) -> Option<f64> {
+    let prev = guc_setting("rvbbit.route_force_candidate").unwrap_or_default();
+    if set_route_force_candidate(cand.as_str()).is_err() {
+        return None;
+    }
+    let _ = explain_exec_ms(sql); // warmup
+    let mut times: Vec<f64> = Vec::new();
+    for _ in 0..samples.max(1) {
+        if let Some(ms) = explain_exec_ms(sql) {
+            times.push(ms);
+        }
+    }
+    let _ = set_route_force_candidate(&prev);
+    if times.is_empty() {
+        return None;
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(times[times.len() / 2])
+}
+
+/// Benchmark one read-only query on every available engine and, if a non-base engine wins by
+/// >= `min_margin_pct`, pin that shape -> engine in rvbbit.route_overlay. If the base engine is
+/// already best (or the win is sub-threshold), any existing pin for the shape is removed
+/// (self-pruning). Read-only and side-effect-free apart from the overlay row; each bench run is
+/// subtransaction-isolated and bounded by a local statement_timeout.
+#[pg_extern]
+fn route_optimize_query(
+    sql: &str,
+    samples: default!(i32, "3"),
+    min_margin_pct: default!(f64, "15.0"),
+) -> JsonB {
+    if safe_select(sql).is_err() {
+        return JsonB(json!({"ok": false, "reason": "not a read-only SELECT"}));
+    }
+    // Backstop so a pathological query can't pin the box during benchmarking.
+    let _ = Spi::run("SET LOCAL statement_timeout = '30s'");
+
+    let plan = explain_sql(sql).ok();
+    let tables = referenced_rvbbit_tables(sql, plan.as_deref());
+    if tables.is_empty() {
+        return JsonB(json!({"ok": true, "pinned": false,
+            "skipped": "query does not reference rvbbit tables"}));
+    }
+    let features = build_features(sql, plan.as_deref(), &tables);
+    let profile = route_profile_selection();
+
+    // True base decision: what base rules pick with NO pin present.
+    OVERLAY_BYPASS.with(|b| b.set(true));
+    let base = choose_route(&features, &tables, &profile);
+    OVERLAY_BYPASS.with(|b| b.set(false));
+    let base_cand = base.candidate.unwrap_or(Candidate::RvbbitNative);
+
+    // Bench every AVAILABLE candidate (forcing an unavailable one would silently fall back).
+    let mut results: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for cand in Candidate::all() {
+        if candidate_availability(cand, &features, &tables).0 {
+            if let Some(ms) = bench_candidate(sql, cand, samples) {
+                results.insert(cand.as_str().to_string(), ms);
+            }
+        }
+    }
+
+    let winner = results
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(k, _)| k.clone());
+    let base_ms = results.get(base_cand.as_str()).copied();
+
+    let (pinned, margin) = match (&winner, base_ms) {
+        (Some(w), Some(bms)) if bms > 0.0 => {
+            let margin = (bms - results[w]) / bms * 100.0;
+            if w != base_cand.as_str() && margin >= min_margin_pct {
+                let _ = Spi::run(&format!(
+                    "INSERT INTO rvbbit.route_overlay \
+                       (shape_key, shape_family, engine, base_engine, margin_pct, sample_ms, n_samples, source) \
+                     VALUES ({sk}, {sf}, {eng}, {base}, {margin}, {sms}::jsonb, {n}, 'tested') \
+                     ON CONFLICT (shape_key) DO UPDATE SET \
+                       shape_family = EXCLUDED.shape_family, engine = EXCLUDED.engine, \
+                       base_engine = EXCLUDED.base_engine, margin_pct = EXCLUDED.margin_pct, \
+                       sample_ms = EXCLUDED.sample_ms, n_samples = EXCLUDED.n_samples, \
+                       source = 'tested', tested_at = now()",
+                    sk = sql_lit(&features.shape_key),
+                    sf = sql_lit(&features.shape_family),
+                    eng = sql_lit(w),
+                    base = sql_lit(base_cand.as_str()),
+                    margin = margin,
+                    sms = sql_lit(&json!(results).to_string()),
+                    n = samples.max(1),
+                ));
+                (true, margin)
+            } else {
+                // base wins or sub-threshold → ensure no stale pin lingers
+                let _ = Spi::run(&format!(
+                    "DELETE FROM rvbbit.route_overlay WHERE shape_key = {}",
+                    sql_lit(&features.shape_key)
+                ));
+                (false, margin)
+            }
+        }
+        _ => (false, 0.0),
+    };
+    overlay_invalidate();
+
+    JsonB(json!({
+        "ok": true,
+        "shape_key": features.shape_key,
+        "shape_family": features.shape_family,
+        "base_engine": base_cand.as_str(),
+        "winner": winner,
+        "margin_pct": margin,
+        "pinned": pinned,
+        "samples_ms": results,
+    }))
+}
+
+/// Batch form: optimize many queries (intended use: one representative SQL per hot shape).
+#[pg_extern]
+fn route_optimize_queries(sqls: Vec<String>, samples: default!(i32, "3")) -> JsonB {
+    let mut pinned = 0i64;
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(sqls.len());
+    for s in &sqls {
+        let r = route_optimize_query(s, samples, 15.0).0;
+        if r.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false) {
+            pinned += 1;
+        }
+        out.push(r);
+    }
+    JsonB(json!({"queries": sqls.len(), "pinned": pinned, "results": out}))
+}
+
 fn choose_route_fast(
     features: &RouteFeatures,
     tables: &[RvbbitTableMetric],
