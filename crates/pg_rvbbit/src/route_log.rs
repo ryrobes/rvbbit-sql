@@ -93,6 +93,7 @@ struct RouteDecisionEvent {
 #[derive(Clone, Debug)]
 struct RouteExecutionTemplate {
     dsn: String,
+    query_text: String, // representative SQL captured per shape for the auto-optimizer
     backend_pid: i32,
     database_name: String,
     role_name: String,
@@ -240,7 +241,7 @@ fn build_event(
 }
 
 fn build_execution_template(
-    _query_sql: &str,
+    query_sql: &str,
     route_doc: &Value,
     cache_hit: bool,
     rewritten: bool,
@@ -264,6 +265,13 @@ fn build_execution_template(
 
     Some(RouteExecutionTemplate {
         dsn: log_dsn(),
+        // One representative SQL per shape for the auto-optimizer (route_shape_samples).
+        // Skip pathologically long queries — we need the full runnable text to benchmark.
+        query_text: if query_sql.len() <= 65_536 {
+            query_sql.to_string()
+        } else {
+            String::new()
+        },
         backend_pid: unsafe { pg_sys::MyProcPid },
         database_name: current_database_name().unwrap_or_else(|| "unknown".to_string()),
         role_name: current_user_name().unwrap_or_else(|| "unknown".to_string()),
@@ -554,6 +562,10 @@ fn write_batch(
     )?;
     let mut decisions = 0;
     let mut executions = 0;
+    // One representative SQL per (new) shape, deduped within the batch; upserted AFTER commit
+    // (best-effort, autocommit) so a missing route_shape_samples table can't poison the logs.
+    let mut shape_samples: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
     for event in batch {
         match event {
             RouteLogEvent::Decision(event) => {
@@ -609,10 +621,25 @@ fn write_batch(
                     ],
                 )?;
                 executions += 1;
+                if !template.query_text.is_empty() && !template.shape_key.is_empty() {
+                    shape_samples.entry(template.shape_key.clone()).or_insert_with(|| {
+                        (template.shape_family.clone(), template.query_text.clone())
+                    });
+                }
             }
         }
     }
     tx.commit()?;
+
+    // Best-effort, isolated from the committed logs: capture a representative SQL per shape.
+    // Each upsert is its own autocommit statement; a missing table just errors harmlessly.
+    for (shape_key, (shape_family, sql)) in shape_samples {
+        let _ = client.execute(
+            "INSERT INTO rvbbit.route_shape_samples (shape_key, shape_family, sql) \
+             VALUES ($1, $2, $3) ON CONFLICT (shape_key) DO NOTHING",
+            &[&shape_key, &shape_family, &sql],
+        );
+    }
     Ok((decisions, executions))
 }
 

@@ -181,6 +181,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0040_route_optimization_candidates",
         include_str!("../sql/migrations/0040_route_optimization_candidates.sql"),
     ),
+    (
+        "0041_route_shape_samples",
+        include_str!("../sql/migrations/0041_route_shape_samples.sql"),
+    ),
+    (
+        "0042_route_optimize_runs",
+        include_str!("../sql/migrations/0042_route_optimize_runs.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

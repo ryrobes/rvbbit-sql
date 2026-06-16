@@ -2195,6 +2195,112 @@ fn route_optimize_queries(sqls: Vec<String>, samples: default!(i32, "3")) -> Jso
     JsonB(json!({"queries": sqls.len(), "pinned": pinned, "results": out}))
 }
 
+/// Auto-optimizer pass: benchmark the hottest shapes still on base rules
+/// (route_optimization_candidates) that have a captured representative SQL (route_shape_samples),
+/// writing divergent pins. Bounded by `top_k` shapes and a `max_seconds` wall-clock budget; logs
+/// the pass to route_optimize_runs. Built for a nightly pg_cron job, safe to run manually.
+#[pg_extern]
+fn route_optimize_auto(
+    top_k: default!(i32, "20"),
+    max_seconds: default!(i32, "600"),
+    samples: default!(i32, "3"),
+) -> JsonB {
+    if !relations_present(&[
+        "rvbbit.route_shape_samples",
+        "rvbbit.route_optimize_runs",
+        "rvbbit.route_optimization_candidates",
+    ]) {
+        return JsonB(json!({"ok": false, "reason": "auto-optimizer tables not present (run migrate)"}));
+    }
+    let started = Instant::now();
+
+    // open a run row (write path + RETURNING)
+    let mut run_id: i64 = 0;
+    let _ = Spi::connect_mut(|client| -> Result<(), pgrx::spi::Error> {
+        let rows = client.update(
+            "INSERT INTO rvbbit.route_optimize_runs (trigger) VALUES ('auto') RETURNING run_id",
+            None,
+            &[],
+        )?;
+        for row in rows {
+            run_id = row.get::<i64>(1)?.unwrap_or(0);
+        }
+        Ok(())
+    });
+
+    // hot, base-routed shapes that have a captured sample SQL, ranked by potential (freq × latency)
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let rows = client.select(
+            &format!(
+                "SELECT c.shape_key, s.sql \
+                 FROM rvbbit.route_optimization_candidates c \
+                 JOIN rvbbit.route_shape_samples s ON s.shape_key = c.shape_key \
+                 ORDER BY c.potential_ms DESC NULLS LAST \
+                 LIMIT {}",
+                top_k.max(1)
+            ),
+            None,
+            &[],
+        )?;
+        for row in rows {
+            let sk: String = row.get(1)?.unwrap_or_default();
+            let sql: String = row.get(2)?.unwrap_or_default();
+            if !sk.is_empty() && !sql.is_empty() {
+                candidates.push((sk, sql));
+            }
+        }
+        Ok(())
+    });
+
+    let mut tested = 0i32;
+    let mut pinned = 0i32;
+    let mut errors = 0i32;
+    let mut detail: Vec<Value> = Vec::new();
+    for (sk, sql) in candidates {
+        if started.elapsed().as_secs() as i32 >= max_seconds {
+            break;
+        }
+        let r = route_optimize_query(&sql, samples, 15.0).0;
+        tested += 1;
+        let was_pinned = r.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+        if was_pinned {
+            pinned += 1;
+        }
+        if r.get("ok").and_then(Value::as_bool) != Some(true) {
+            errors += 1;
+        }
+        detail.push(json!({
+            "shape_key": sk,
+            "pinned": was_pinned,
+            "winner": r.get("winner").cloned().unwrap_or(Value::Null),
+            "margin_pct": r.get("margin_pct").cloned().unwrap_or(Value::Null),
+        }));
+    }
+
+    let _ = Spi::run(&format!(
+        "UPDATE rvbbit.route_optimize_runs \
+         SET finished_at = now(), shapes_tested = {}, pinned = {}, errors = {}, elapsed_sec = {}, \
+             detail = {}::jsonb \
+         WHERE run_id = {}",
+        tested,
+        pinned,
+        errors,
+        started.elapsed().as_secs(),
+        sql_lit(&json!(detail).to_string()),
+        run_id,
+    ));
+
+    JsonB(json!({
+        "ok": true,
+        "run_id": run_id,
+        "shapes_tested": tested,
+        "pinned": pinned,
+        "errors": errors,
+        "elapsed_sec": started.elapsed().as_secs(),
+    }))
+}
+
 fn choose_route_fast(
     features: &RouteFeatures,
     tables: &[RvbbitTableMetric],
