@@ -142,6 +142,8 @@ DECLARE
     v_comment  text;
     v_size     bigint;
     v_nrows    bigint;
+    -- NB: body sets rvbbit.force_heap_scan locally to skip the router's per-shape
+    -- route computation (~4.5s/novel shape) — see migration 0038.
     v_nsampled bigint;
     v_sampled  boolean := false;
     v_src      text;
@@ -160,6 +162,11 @@ DECLARE
     v_quantiles jsonb;
     distinct_cap int := 256;
 BEGIN
+    -- Skip the router's per-shape route computation (~4.5s/novel shape) for every
+    -- internal aggregate below — they are structural and always heap-scannable.
+    -- Transaction-local: auto-reverts on commit, never affects user queries.
+    PERFORM set_config('rvbbit.force_heap_scan', 'on', true);
+
     SELECT n.nspname, c.relname, c.relkind,
            obj_description(c.oid, 'pg_class'),
            pg_total_relation_size(c.oid)
@@ -167,14 +174,26 @@ BEGIN
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.oid = rel;
 
-    EXECUTE format('SELECT count(*) FROM %s', rel) INTO v_nrows;
+    -- Row count via the planner's estimate, NOT a full count(*) scan: on large
+    -- rvbbit-AM / heap-alias tables count(*) is a multi-second full scan, and ×N
+    -- parallel crawl shards it dominated the crawl. reltuples is free + accurate for
+    -- analyzed tables; exact count only when the estimate is missing/zero (see
+    -- migration 0036_fingerprint_reltuples_rowcount).
+    SELECT c.reltuples::bigint INTO v_nrows FROM pg_class c WHERE c.oid = rel;
+    IF v_nrows IS NULL OR v_nrows < 0 THEN
+        v_nrows := 0;
+    END IF;
+    IF v_nrows = 0 THEN
+        EXECUTE format('SELECT count(*) FROM %s', rel) INTO v_nrows;
+    END IF;
 
-    -- Materialize the working set ONCE into a temp table, then run every
-    -- per-column stat below against it. Previously v_src was a (TABLESAMPLE…)
-    -- or (… LIMIT) SUBQUERY, so each of the ~5 stats per column re-ran it —
-    -- re-scanning a multi-GB table (or re-executing a view) N_columns×5 times.
-    -- One materialization makes the per-column passes hit a tiny local table;
-    -- small tables read directly (already cheap).
+    -- ALWAYS materialize the working set into a plain row-store TEMP table, then
+    -- run every per-column stat against THAT (never the base relation). Beyond
+    -- avoiding N_columns×5 re-scans, this is critical for rvbbit-AM (columnar)
+    -- tables: a direct aggregate carries seconds of engine overhead + serializes on
+    -- a shared resource, so 150+ per-column aggregates on even a ~300-row
+    -- accelerated table took minutes (see migration 0037_fingerprint_always_materialize).
+    -- Large tables are sampled (TABLESAMPLE/LIMIT); small tables copied in full.
     EXECUTE 'DROP TABLE IF EXISTS _fp_sample';
     IF v_nrows > sample_rows THEN
         v_sampled := true;
@@ -188,10 +207,12 @@ BEGIN
                 'CREATE TEMP TABLE _fp_sample AS SELECT * FROM %s LIMIT %s',
                 rel, sample_rows);
         END IF;
-        v_src := '_fp_sample';
     ELSE
-        v_src := rel::text;
+        -- Small enough to profile exactly: copy the FULL relation into a heap temp
+        -- table (still keeps per-column aggregates off the columnar store).
+        EXECUTE format('CREATE TEMP TABLE _fp_sample AS SELECT * FROM %s', rel);
     END IF;
+    v_src := '_fp_sample';
 
     EXECUTE format('SELECT count(*) FROM %s', v_src) INTO v_nsampled;
 

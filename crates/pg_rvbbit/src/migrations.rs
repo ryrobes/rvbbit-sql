@@ -161,6 +161,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0035_fast_fingerprint_materialize_sample",
         include_str!("../sql/migrations/0035_fast_fingerprint_materialize_sample.sql"),
     ),
+    (
+        "0036_fingerprint_reltuples_rowcount",
+        include_str!("../sql/migrations/0036_fingerprint_reltuples_rowcount.sql"),
+    ),
+    (
+        "0037_fingerprint_always_materialize",
+        include_str!("../sql/migrations/0037_fingerprint_always_materialize.sql"),
+    ),
+    (
+        "0038_fingerprint_force_heap_scan",
+        include_str!("../sql/migrations/0038_fingerprint_force_heap_scan.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
