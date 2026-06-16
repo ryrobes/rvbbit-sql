@@ -2198,7 +2198,7 @@ fn route_optimize_queries(sqls: Vec<String>, samples: default!(i32, "3")) -> Jso
 fn choose_route_fast(
     features: &RouteFeatures,
     tables: &[RvbbitTableMetric],
-    profile: &RouteProfileSelection,
+    _profile: &RouteProfileSelection, // profile layer retired; param kept for signature parity
 ) -> Option<RouteDecision> {
     if features.regex_count > 0 {
         return Some(decision(
@@ -2288,7 +2288,9 @@ fn choose_route_fast(
             None,
         ));
     }
-    choose_from_fast_profile_entry(features, tables, profile)
+    // Profile/observation layer retired — the routing overlay (tested pins) supersedes it.
+    // The fast path defers any non-hard-rule shape to choose_route (base rules + overlay).
+    None
 }
 
 fn choose_route(
@@ -2422,10 +2424,8 @@ fn choose_route(
         );
     }
 
-    if let Some(decision) = choose_from_active_profile(features, tables, profile) {
-        return decision;
-    }
-
+    // Profile/observation layer retired — the routing overlay supersedes it (it ran above,
+    // right after force_candidate). With no active profile this always takes the base route.
     if profile.effective.is_none() {
         return choose_no_profile_route(features, tables, profile);
     }
@@ -2494,281 +2494,6 @@ fn decision(
         confidence,
         profile_entry,
     }
-}
-
-fn choose_from_active_profile(
-    features: &RouteFeatures,
-    tables: &[RvbbitTableMetric],
-    profile: &RouteProfileSelection,
-) -> Option<RouteDecision> {
-    if !relations_present(&["rvbbit.route_profiles"]) {
-        return None;
-    }
-    profile.effective.as_ref()?;
-    if let Some(decision) = choose_from_active_profile_entry(features, tables, profile) {
-        return Some(decision);
-    }
-    if let Some(curve) = choose_from_profile_points(features, tables, profile) {
-        return Some(curve);
-    }
-    if let Some(profile_json) = selected_profile(profile) {
-        if let Some(curve) = choose_from_profile_curve(&profile_json, features, tables) {
-            return Some(curve);
-        }
-        if let Some(decision) = choose_from_profile_json_entry(&profile_json, features, tables) {
-            return Some(decision);
-        }
-    }
-    if profile.requested.is_some() {
-        return None;
-    }
-    choose_from_observation_curve(features, tables)
-}
-
-fn choose_from_profile_json_entry(
-    profile: &Value,
-    features: &RouteFeatures,
-    tables: &[RvbbitTableMetric],
-) -> Option<RouteDecision> {
-    let entry = profile
-        .get("entries")
-        .and_then(Value::as_object)
-        .and_then(|entries| {
-            entries
-                .get(&features.shape_key)
-                .or_else(|| entries.get(&features.legacy_shape_key))
-        })?;
-    let choice = entry.get("choice").and_then(Value::as_str)?;
-    let candidate = Candidate::from_str(choice)?;
-    let confidence = entry.get("confidence").and_then(Value::as_f64);
-    if !candidate_can_route(candidate, features, tables, confidence.unwrap_or(0.0)) {
-        return None;
-    }
-    Some(decision(
-        candidate,
-        "profile",
-        entry
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("profile match"),
-        confidence,
-        Some(entry.clone()),
-    ))
-}
-
-fn choose_from_active_profile_entry(
-    features: &RouteFeatures,
-    tables: &[RvbbitTableMetric],
-    profile: &RouteProfileSelection,
-) -> Option<RouteDecision> {
-    if !relations_present(&["rvbbit.route_profile_entries"]) {
-        return None;
-    }
-    let profile_name = profile.effective.as_deref()?;
-    let profile_lit = sql_lit(profile_name);
-    let shape_lit = sql_lit(&features.shape_key);
-    let legacy_shape_lit = sql_lit(&features.legacy_shape_key);
-    let mut out = None;
-    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
-        let table = client.select(
-            &format!(
-                "SELECT pe.choice, pe.confidence, pe.reason, pe.entry \
-                 FROM rvbbit.route_profiles rp \
-                 JOIN rvbbit.route_profile_entries pe ON pe.profile_name = rp.name \
-                 WHERE rp.name = {profile_lit} \
-                   AND pe.shape_key IN ({shape_lit}, {legacy_shape_lit}) \
-                 ORDER BY (pe.shape_key = {shape_lit}) DESC, rp.updated_at DESC \
-                 LIMIT 1"
-            ),
-            None,
-            &[],
-        )?;
-        for row in table {
-            let choice: String = row.get(1)?.unwrap_or_default();
-            let Some(candidate) = Candidate::from_str(&choice) else {
-                continue;
-            };
-            let confidence: f64 = row.get(2)?.unwrap_or_default();
-            if !candidate_can_route(candidate, features, tables, confidence) {
-                continue;
-            }
-            let reason: String = row
-                .get(3)?
-                .unwrap_or_else(|| "profile entry match".to_string());
-            let entry: JsonB = row.get(4)?.unwrap_or_else(|| JsonB(json!({})));
-            out = Some(decision(
-                candidate,
-                "profile-entry",
-                &reason,
-                Some(confidence),
-                Some(entry.0),
-            ));
-        }
-        Ok(())
-    });
-    out
-}
-
-fn choose_from_fast_profile_entry(
-    features: &RouteFeatures,
-    tables: &[RvbbitTableMetric],
-    profile: &RouteProfileSelection,
-) -> Option<RouteDecision> {
-    if !relations_present(&["rvbbit.route_profile_entries"]) {
-        return None;
-    }
-    let profile_name = profile.effective.as_deref()?;
-    let profile_lit = sql_lit(profile_name);
-    let shape_lit = sql_lit(&planless_shape_key(&features.shape_key));
-    let legacy_shape_lit = sql_lit(&planless_shape_key(&features.legacy_shape_key));
-    let mut best: Option<(Candidate, f64, String, i64, Value)> = None;
-    let mut ambiguous = false;
-    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
-        let table = client.select(
-            &format!(
-                "SELECT pe.choice, pe.confidence, pe.reason, pe.entry, pe.observations \
-                 FROM rvbbit.route_profiles rp \
-                 JOIN rvbbit.route_profile_entries pe ON pe.profile_name = rp.name \
-                 WHERE rp.name = {profile_lit} \
-                   AND regexp_replace(pe.shape_key, '(\\|width=[^|]*|\\|plan_join=[^|]*|\\|subplan=[^|]*)', '', 'g') \
-                       IN ({shape_lit}, {legacy_shape_lit}) \
-                 ORDER BY \
-                   (regexp_replace(pe.shape_key, '(\\|width=[^|]*|\\|plan_join=[^|]*|\\|subplan=[^|]*)', '', 'g') = {shape_lit}) DESC, \
-                   pe.confidence DESC, pe.observations DESC, rp.updated_at DESC \
-                 LIMIT 32"
-            ),
-            None,
-            &[],
-        )?;
-        for row in table {
-            let choice: String = row.get(1)?.unwrap_or_default();
-            let Some(candidate) = Candidate::from_str(&choice) else {
-                continue;
-            };
-            let confidence: f64 = row.get(2)?.unwrap_or_default();
-            if !candidate_can_route(candidate, features, tables, confidence) {
-                continue;
-            }
-            if best
-                .as_ref()
-                .is_some_and(|(best_candidate, _, _, _, _)| *best_candidate != candidate)
-            {
-                ambiguous = true;
-                break;
-            }
-            let base_reason: String = row
-                .get(3)?
-                .unwrap_or_else(|| "planless profile entry match".to_string());
-            let observations: i64 = row.get(5)?.unwrap_or_default();
-            let mut entry: Value = row.get::<JsonB>(4)?.unwrap_or_else(|| JsonB(json!({}))).0;
-            if let Value::Object(map) = &mut entry {
-                map.insert("fast_planless_match".into(), json!(true));
-                map.insert("matched_observations".into(), json!(observations));
-            }
-            best = Some((candidate, confidence, base_reason, observations, entry));
-        }
-        Ok(())
-    });
-    if ambiguous {
-        return None;
-    }
-    let (candidate, confidence, base_reason, _, entry) = best?;
-    Some(decision(
-        candidate,
-        "profile-entry-fast",
-        &format!("fast profile match: {base_reason}"),
-        Some(confidence),
-        Some(entry),
-    ))
-}
-
-fn choose_from_profile_curve(
-    profile: &Value,
-    features: &RouteFeatures,
-    tables: &[RvbbitTableMetric],
-) -> Option<RouteDecision> {
-    let observations = profile.get("observations").and_then(Value::as_array)?;
-    let mut anchors: BTreeMap<i64, Vec<RouteCurveSample>> = BTreeMap::new();
-    for obs in observations {
-        let obs_features = obs.get("features")?;
-        let obs_shape = obs_features.get("shape_key").and_then(Value::as_str)?;
-        let obs_family = shape_family_key(obs_shape);
-        if obs_family != features.shape_family && obs_family != features.legacy_shape_family {
-            continue;
-        }
-        let rows = obs_features.get("table_rows").and_then(Value::as_i64)?;
-        let sample = RouteCurveSample {
-            native_ms: positive_f64(obs.get("native_ms")),
-            native_vortex_ms: positive_f64(obs.get("native_vortex_ms")),
-            duck_ms: positive_f64(obs.get("duck_ms")),
-            duck_hive_ms: positive_f64(obs.get("duck_hive_ms")),
-            duck_vortex_ms: positive_f64(obs.get("duck_vortex_ms")),
-            datafusion_ms: positive_f64(obs.get("datafusion_ms")),
-            datafusion_hive_ms: positive_f64(obs.get("datafusion_hive_ms")),
-            pg_ms: positive_f64(obs.get("pg_ms")),
-        };
-        if rows > 0 && sample.has_at_least_two() {
-            anchors.entry(rows).or_default().push(sample);
-        }
-    }
-    route_curve_from_anchors(anchors, features, tables, "profile-curve")
-}
-
-fn choose_from_profile_points(
-    features: &RouteFeatures,
-    tables: &[RvbbitTableMetric],
-    profile: &RouteProfileSelection,
-) -> Option<RouteDecision> {
-    if !relations_present(&["rvbbit.route_profile_points"]) {
-        return None;
-    }
-    let profile_name = profile.effective.as_deref()?;
-    let profile_lit = sql_lit(profile_name);
-    let family_lit = sql_lit(&features.shape_family);
-    let legacy_family_lit = sql_lit(&features.legacy_shape_family);
-    let mut anchors: BTreeMap<i64, Vec<RouteCurveSample>> = BTreeMap::new();
-    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
-        let table = client.select(
-            &format!(
-                "SELECT p.table_rows, p.native_ms, p.native_vortex_ms, p.duck_ms, p.duck_hive_ms, \
-                        p.duck_vortex_ms, p.datafusion_ms, p.datafusion_hive_ms, p.pg_ms \
-                 FROM rvbbit.route_profiles rp \
-                 JOIN rvbbit.route_profile_points p ON p.profile_name = rp.name \
-                 WHERE rp.name = {profile_lit} \
-                   AND p.shape_family IN ({family_lit}, {legacy_family_lit}) \
-                 ORDER BY p.table_rows \
-                 LIMIT 2000"
-            ),
-            None,
-            &[],
-        )?;
-        for row in table {
-            let rows: i64 = row.get(1)?.unwrap_or_default();
-            let native: f64 = row.get(2)?.unwrap_or_default();
-            let native_vortex: f64 = row.get(3)?.unwrap_or_default();
-            let duck: f64 = row.get(4)?.unwrap_or_default();
-            let duck_hive: f64 = row.get(5)?.unwrap_or_default();
-            let duck_vortex: f64 = row.get(6)?.unwrap_or_default();
-            let datafusion: f64 = row.get(7)?.unwrap_or_default();
-            let datafusion_hive: f64 = row.get(8)?.unwrap_or_default();
-            let pg: f64 = row.get(9)?.unwrap_or_default();
-            let sample = RouteCurveSample {
-                native_ms: (native > 0.0).then_some(native),
-                native_vortex_ms: (native_vortex > 0.0).then_some(native_vortex),
-                duck_ms: (duck > 0.0).then_some(duck),
-                duck_hive_ms: (duck_hive > 0.0).then_some(duck_hive),
-                duck_vortex_ms: (duck_vortex > 0.0).then_some(duck_vortex),
-                datafusion_ms: (datafusion > 0.0).then_some(datafusion),
-                datafusion_hive_ms: (datafusion_hive > 0.0).then_some(datafusion_hive),
-                pg_ms: (pg > 0.0).then_some(pg),
-            };
-            if rows > 0 && sample.has_at_least_two() {
-                anchors.entry(rows).or_default().push(sample);
-            }
-        }
-        Ok(())
-    });
-    route_curve_from_anchors(anchors, features, tables, "profile-point-curve")
 }
 
 fn choose_shadow_learned_route(
@@ -3977,19 +3702,6 @@ fn route_profile_selection_by_name(name: String, source: &'static str) -> RouteP
     selection
 }
 
-fn selected_profile(profile: &RouteProfileSelection) -> Option<Value> {
-    let name = profile.effective.as_deref()?;
-    if !relations_present(&["rvbbit.route_profiles"]) {
-        return None;
-    }
-    Spi::get_one::<JsonB>(&format!(
-        "SELECT profile FROM rvbbit.route_profiles WHERE name = {} LIMIT 1",
-        sql_lit(name)
-    ))
-    .ok()
-    .flatten()
-    .map(|j| j.0)
-}
 
 thread_local! {
     /// Per-backend memo of the EXPENSIVE half of the route runtime stamp — the
@@ -5361,17 +5073,6 @@ fn first_available_candidate(
         .find(|candidate| candidate_availability(*candidate, features, tables).0)
 }
 
-fn candidate_can_route(
-    candidate: Candidate,
-    features: &RouteFeatures,
-    tables: &[RvbbitTableMetric],
-    confidence: f64,
-) -> bool {
-    if confidence < min_confidence_for_candidate(candidate) {
-        return false;
-    }
-    candidate_availability(candidate, features, tables).0
-}
 
 fn forced_candidate_setting() -> Option<Candidate> {
     guc_setting("rvbbit.route_force_candidate")
@@ -7082,16 +6783,6 @@ fn shape_family_key(key: &str) -> String {
         .join("|")
 }
 
-fn planless_shape_key(key: &str) -> String {
-    key.split('|')
-        .filter(|part| {
-            !part.starts_with("width=")
-                && !part.starts_with("plan_join=")
-                && !part.starts_with("subplan=")
-        })
-        .collect::<Vec<_>>()
-        .join("|")
-}
 
 fn canonical_shape_key(key: &str, features: Option<&Value>) -> String {
     if key.starts_with("native_cap=") {
@@ -7126,9 +6817,6 @@ fn median_option(values: Vec<f64>) -> Option<f64> {
     (!values.is_empty()).then(|| median_f64(values))
 }
 
-fn positive_f64(value: Option<&Value>) -> Option<f64> {
-    value.and_then(Value::as_f64).filter(|v| *v > 0.0)
-}
 
 fn interpolate_predictions(
     lower: RouteCurveSample,
