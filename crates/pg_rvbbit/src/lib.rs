@@ -52,6 +52,7 @@ mod provider_catalog;
 mod providers;
 mod python_runtime;
 mod rewriter;
+mod storage;
 #[cfg(not(test))]
 mod route_log;
 #[cfg(test)]

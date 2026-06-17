@@ -1056,6 +1056,10 @@ fn export_to_parquet_impl(
     // caches are stale so they don't keep serving the pre-compact row groups.
     crate::live_counters::bump_scan_epoch_on_commit();
 
+    // Keep-cold: if this table is pinned to a cold tier, re-upload the freshly
+    // written local row groups so it stays on object storage automatically.
+    crate::storage::maybe_reoffload_cold(rel_oid);
+
     Ok(total_rows)
 }
 

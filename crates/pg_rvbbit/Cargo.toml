@@ -33,6 +33,12 @@ tiktoken-rs = { workspace = true }
 roaring = { workspace = true }
 fastembed = { workspace = true }
 datafusion = { workspace = true }
+# Object-store backing for cold-tier accel files. Pinned to 0.13 to match the
+# version DataFusion 53 resolves to (unified with vortex), so stores we build
+# register cleanly with its runtime_env. aws/gcp enable the S3 + GCS backends
+# (credentials from env / instance metadata).
+object_store = { version = "0.13", features = ["aws", "gcp"] }
+url = "2"
 tokio = { workspace = true }
 vortex = { workspace = true }
 vortex-datafusion = { workspace = true }

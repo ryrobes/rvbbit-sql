@@ -782,6 +782,10 @@ async fn register_listing_table(
     // authoritative file set.
     // Paths in t.paths are full URLs (file:// for local rows; s3://,
     // gs://, etc. for cold-tier rows when migrated).
+    // Cold-tier reads: register the S3/GCS object store for any remote cold_url
+    // before DataFusion tries to resolve it (creds from env/instance metadata).
+    // file:// / bare paths use the default LocalFileSystem store.
+    crate::storage::register_for_datafusion(&ctx.runtime_env(), &t.paths)?;
     let urls: Vec<ListingTableUrl> = t
         .paths
         .iter()

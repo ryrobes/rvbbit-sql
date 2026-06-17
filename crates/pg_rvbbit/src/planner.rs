@@ -228,6 +228,13 @@ unsafe extern "C-unwind" fn rvbbit_get_relation_info_hook(
     if !is_rvbbit_table(oid_u32) {
         return;
     }
+    // Standby (hot standby in recovery): acceleration files aren't WAL-shipped and
+    // can't be maintained on a read-only node, but the heap rows ARE replicated
+    // (rvbbit = heap). Skip acceleration so PostgreSQL plans a plain heap scan —
+    // correct, just unaccelerated — instead of erroring on a missing row-group file.
+    if pg_sys::RecoveryInProgress() {
+        return;
+    }
     if force_heap_scan_enabled() || router::pg_rowstore_route_selected() {
         return;
     }
@@ -277,6 +284,13 @@ unsafe extern "C-unwind" fn rvbbit_set_rel_pathlist_hook(
         return;
     }
     if !is_rvbbit_table(oid_u32) {
+        return;
+    }
+    // Standby (hot standby in recovery): acceleration files aren't WAL-shipped and
+    // can't be maintained on a read-only node, but the heap rows ARE replicated
+    // (rvbbit = heap). Skip acceleration so PostgreSQL plans a plain heap scan —
+    // correct, just unaccelerated — instead of erroring on a missing row-group file.
+    if pg_sys::RecoveryInProgress() {
         return;
     }
     if force_heap_scan_enabled() || router::pg_rowstore_route_selected() {

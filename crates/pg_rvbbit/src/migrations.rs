@@ -189,6 +189,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0042_route_optimize_runs",
         include_str!("../sql/migrations/0042_route_optimize_runs.sql"),
     ),
+    (
+        "0043_cube_refresh_resource_cap",
+        include_str!("../sql/migrations/0043_cube_refresh_resource_cap.sql"),
+    ),
+    (
+        "0044_cold_tier_object_store",
+        include_str!("../sql/migrations/0044_cold_tier_object_store.sql"),
+    ),
+    (
+        "0045_cold_tier_keep_policy",
+        include_str!("../sql/migrations/0045_cold_tier_keep_policy.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

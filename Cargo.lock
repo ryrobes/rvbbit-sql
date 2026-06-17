@@ -5230,16 +5230,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "622acbc9100d3c10e2ee15804b0caa40e55c933d5aa53814cd520805b7958a49"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "chrono",
+ "form_urlencoded",
  "futures-channel",
  "futures-core",
  "futures-util",
  "http 1.4.1",
+ "http-body-util",
  "humantime",
+ "hyper",
  "itertools 0.14.0",
+ "md-5 0.10.6",
  "parking_lot",
  "percent-encoding",
+ "quick-xml 0.39.4",
+ "rand 0.10.1",
+ "reqwest",
+ "ring",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5571,7 +5584,7 @@ dependencies = [
 
 [[package]]
 name = "pg_rvbbit"
-version = "2.2.4"
+version = "2.2.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -5584,6 +5597,7 @@ dependencies = [
  "lance-index",
  "lance-linalg",
  "lru",
+ "object_store 0.13.2",
  "parking_lot",
  "parquet",
  "pgrx",
@@ -5598,6 +5612,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tiktoken-rs",
  "tokio",
+ "url",
  "vortex",
  "vortex-datafusion",
 ]
@@ -6047,6 +6062,16 @@ name = "quick-xml"
 version = "0.38.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.39.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
 dependencies = [
  "memchr",
  "serde",
@@ -6641,7 +6666,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rvbbit_storage"
-version = "2.2.4"
+version = "2.2.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -8610,7 +8635,7 @@ dependencies = [
 
 [[package]]
 name = "warren-agent"
-version = "2.2.4"
+version = "2.2.6"
 dependencies = [
  "anyhow",
  "postgres",
