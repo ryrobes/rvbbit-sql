@@ -201,6 +201,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0045_cold_tier_keep_policy",
         include_str!("../sql/migrations/0045_cold_tier_keep_policy.sql"),
     ),
+    (
+        "0046_brain_remote_sources",
+        include_str!("../sql/migrations/0046_brain_remote_sources.sql"),
+    ),
+    (
+        "0047_brain_sync_orchestration",
+        include_str!("../sql/migrations/0047_brain_sync_orchestration.sql"),
+    ),
+    (
+        "0048_brain_kg_enrichment",
+        include_str!("../sql/migrations/0048_brain_kg_enrichment.sql"),
+    ),
+    (
+        "0049_brain_source_delete_and_relations",
+        include_str!("../sql/migrations/0049_brain_source_delete_and_relations.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

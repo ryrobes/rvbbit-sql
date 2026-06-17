@@ -12,6 +12,7 @@ use std::time::Instant;
 ::pgrx::pg_module_magic!();
 
 mod bitmap;
+mod brain;
 mod cache;
 mod catalog;
 mod catalog_kg;
