@@ -217,6 +217,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0049_brain_source_delete_and_relations",
         include_str!("../sql/migrations/0049_brain_source_delete_and_relations.sql"),
     ),
+    (
+        "0050_brain_agent_retrieval",
+        include_str!("../sql/migrations/0050_brain_agent_retrieval.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

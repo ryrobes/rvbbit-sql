@@ -1110,20 +1110,43 @@ def tool_ask_brain(query, k=8, caller_email=None) -> dict:
     grounded, citeable context (NOT a synthesized answer — compose the answer from these chunks and
     cite title/folder). Access is enforced from your authenticated identity: docs you lack a role for,
     or that exclude you, never appear. The ABSENCE of a doc means you're not cleared for it — never
-    speculate about what you can't see. Returns ranked {doc_id,title,folder,source,chunk,score}."""
+    speculate about what you can't see.
+
+    This is the ENTRY POINT, not the whole story. Each hit carries breadcrumbs — its doc's key
+    `entities` (knowledge-graph handles) — and a doc-level `documents` rollup lists, per doc, its
+    entities + `related` docs (other docs you can see that share its concepts). Pull threads on demand
+    rather than over-fetching: brain_context(doc_id, chunk_idx) for the chunks around a hit,
+    brain_get_doc(doc_id) for the full document, brain_related(doc_id) to walk the graph from a doc,
+    brain_entity(name) to ask 'what do we know about X?'."""
     if not caller_email:
         return {"error": {"code": "NO_IDENTITY", "message": "brain access requires an authenticated caller (OAuth email)"}}
     k = max(1, min(int(k or 8), 50))
     with _conn() as c:   # _conn (writable): rvbbit.embed may populate its embedding cache
         try:
-            rows = c.execute(
-                "SELECT doc_id, title, folder_path, source, occurred_at::text AS occurred_at, chunk, "
-                "round(score::numeric, 4) AS score FROM rvbbit.ask_brain(%s, %s, %s)",
-                (caller_email, query, k)).fetchall()
+            hits = c.execute(
+                "SELECT doc_id, chunk_idx, title, folder_path AS folder, source, "
+                "occurred_at::text AS occurred_at, chunk, round(score::numeric, 4) AS score, entities "
+                "FROM rvbbit.brain_search(%s, %s, %s)", (caller_email, query, k)).fetchall()
+            # Doc-level rollup: dedupe the hit docs, union their entities, attach related-doc threads.
+            docs: dict = {}
+            for h in hits:
+                d = docs.setdefault(h["doc_id"], {"doc_id": h["doc_id"], "title": h["title"],
+                                                  "source": h["source"], "n_hits": 0, "_ents": set()})
+                d["n_hits"] += 1
+                for e in (h["entities"] or []):
+                    d["_ents"].add(e)
+            for did, d in docs.items():
+                rel = c.execute("SELECT rvbbit.brain_related(%s, %s::bigint, 6) AS r", (caller_email, did)).fetchone()
+                rr = (rel["r"] if rel else {}) or {}
+                d["related"] = rr.get("related", [])
+                d["entities"] = sorted(d.pop("_ents"))[:10]
         except Exception as e:  # noqa: BLE001
             return {"error": {"code": "ASK_BRAIN_FAILED", "message": str(e)}}
-    return {"query": query, "as": caller_email, "hits": rows, "count": len(rows),
-            "note": "Answer ONLY from these chunks; cite title/folder. Absence = not cleared, not 'nothing exists'."}
+    return {"query": query, "as": caller_email, "hits": hits, "documents": list(docs.values()),
+            "count": len(hits),
+            "note": "Grounded context, not an answer — cite title/folder. Go deeper with "
+                    "brain_context / brain_get_doc / brain_related / brain_entity. "
+                    "Absence = not cleared, not 'nothing exists'."}
 
 
 def tool_brain_browse(caller_email=None) -> dict:
@@ -1150,6 +1173,41 @@ def tool_brain_get_doc(doc_id, caller_email=None) -> dict:
     if not d:
         return {"error": {"code": "NOT_VISIBLE", "message": f"doc {doc_id} not found or not permitted"}}
     return d
+
+
+def tool_brain_context(doc_id, chunk_idx, window=2, caller_email=None) -> dict:
+    """VERTICAL expand: the chunks immediately AROUND a search hit (window on each side) — cheaper than
+    pulling a whole long document when you just need a hit's local context. Pass the doc_id + chunk_idx
+    from an ask_brain hit. ACL-gated (empty if you're not cleared for the doc)."""
+    if not caller_email:
+        return {"error": {"code": "NO_IDENTITY", "message": "brain access requires an authenticated caller"}}
+    with _ro() as c:
+        rows = c.execute(
+            "SELECT idx, chunk FROM rvbbit.brain_context(%s, %s::bigint, %s::int, %s::int)",
+            (caller_email, doc_id, chunk_idx, window)).fetchall()
+    return {"doc_id": doc_id, "chunk_idx": chunk_idx, "window": window, "chunks": rows, "count": len(rows)}
+
+
+def tool_brain_related(doc_id, caller_email=None) -> dict:
+    """LATERAL expand: a document's knowledge-graph neighborhood — the entities it names, the typed
+    relations among them (e.g. X -acquired-> Y), and OTHER docs you can see that share its entities.
+    Follow a thread from a doc instead of re-searching. ACL-gated."""
+    if not caller_email:
+        return {"error": {"code": "NO_IDENTITY", "message": "brain access requires an authenticated caller"}}
+    with _ro() as c:
+        row = c.execute("SELECT rvbbit.brain_related(%s, %s::bigint) AS r", (caller_email, doc_id)).fetchone()
+    return (row["r"] if row else {}) or {}
+
+
+def tool_brain_entity(name, caller_email=None) -> dict:
+    """LATERAL expand, entity-centric: given a concept/person/org/metric (e.g. 'NPS', 'refund policy'),
+    return its typed relations and the visible documents that mention it — 'what do we know about X?'.
+    Resolves by exact then fuzzy name match. ACL-gated (docs list is filtered to what you can see)."""
+    if not caller_email:
+        return {"error": {"code": "NO_IDENTITY", "message": "brain access requires an authenticated caller"}}
+    with _ro() as c:
+        row = c.execute("SELECT rvbbit.brain_entity(%s, %s) AS r", (caller_email, name)).fetchone()
+    return (row["r"] if row else {}) or {}
 
 
 def tool_brain_ingest(source, title, body, roles=None, folder=None, uri=None,
@@ -1955,6 +2013,13 @@ def _register(mcp):
         "brain_browse", {}, lambda: tool_brain_browse(_caller()[0])))
     mcp.tool(name="brain_get_doc")(lambda doc_id: _logged(
         "brain_get_doc", {"doc_id": doc_id}, lambda: tool_brain_get_doc(doc_id, _caller()[0])))
+    mcp.tool(name="brain_context")(lambda doc_id, chunk_idx, window=2: _logged(
+        "brain_context", {"doc_id": doc_id, "chunk_idx": chunk_idx, "window": window},
+        lambda: tool_brain_context(doc_id, chunk_idx, window, _caller()[0])))
+    mcp.tool(name="brain_related")(lambda doc_id: _logged(
+        "brain_related", {"doc_id": doc_id}, lambda: tool_brain_related(doc_id, _caller()[0])))
+    mcp.tool(name="brain_entity")(lambda name: _logged(
+        "brain_entity", {"name": name}, lambda: tool_brain_entity(name, _caller()[0])))
     mcp.tool(name="brain_ingest")(lambda source, title, body, roles=None, folder=None, uri=None, author=None, occurred_at=None: _logged(
         "brain_ingest", {"source": source, "title": title, "roles": roles},
         lambda: tool_brain_ingest(source, title, body, roles, folder, uri, author, occurred_at)))
