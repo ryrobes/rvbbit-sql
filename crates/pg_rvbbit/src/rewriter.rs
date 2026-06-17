@@ -9254,15 +9254,33 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
     if effective_rows == 0 {
         return;
     }
-    if effective_rows > cap {
+    // The prewarm query dedups (SELECT DISTINCT below), so the real warm cost is
+    // the number of DISTINCT operator-input tuples, not the raw row count. A huge
+    // table with few distinct argument values — e.g. 321k rows but 25 distinct
+    // categories — should still warm rather than degrade to per-row. Estimate the
+    // distinct count from column stats; fall back to the raw row estimate when the
+    // args aren't plain columns or the table hasn't been analyzed (no regression).
+    let mut warm_cols: Vec<String> = Vec::new();
+    for (_op, frags) in calls.iter().chain(where_calls.iter()) {
+        for f in frags {
+            if let Some(c) = column_ident_from_frag(f) {
+                if !warm_cols.contains(&c) {
+                    warm_cols.push(c);
+                }
+            }
+        }
+    }
+    let warm_estimate =
+        estimate_distinct_warm_rows(table_oid, &warm_cols, effective_rows).unwrap_or(effective_rows);
+    if warm_estimate > cap {
         // Visible (not debug1) so a slow large query explains itself: this is the
         // common "why is this timing out" case — prewarm is skipped and the
-        // operator runs per-row. Raise the cap or pre-filter to a smaller set.
+        // operator runs per-row. Raise the cap, pre-filter, or ANALYZE the table.
         pgrx::notice!(
-            "rvbbit: semantic prewarm skipped — estimated {effective_rows} rows exceeds cap {cap}; \
-             running per-row (slow). Raise rvbbit.implicit_prewarm cap via \
-             RVBBIT_IMPLICIT_PREWARM_MAX_ROWS, pre-filter to fewer rows, or call \
-             rvbbit.prewarm_operator(...) explicitly."
+            "rvbbit: semantic prewarm skipped — estimated {warm_estimate} distinct input(s) over \
+             {effective_rows} rows exceeds cap {cap}; running per-row (slow). Raise the cap via \
+             RVBBIT_IMPLICIT_PREWARM_MAX_ROWS, pre-filter to fewer rows, ANALYZE the table for a \
+             sharper distinct estimate, or call rvbbit.prewarm_operator(...) explicitly."
         );
         return;
     }
@@ -9295,10 +9313,13 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
         let op_literal = sql_literal(&op_name);
         // Use a uniquely-tagged dollar-quote so we don't collide with
         // any literal $$ in operator names.
+        // DISTINCT pushes the dedup into Postgres so prewarm materializes and warms
+        // only the unique argument tuples — bounding both memory and backend calls by
+        // cardinality, not row count (so 321k rows / 25 distinct = 25 warm calls).
         let prewarm_sql = format!(
             "SELECT * FROM rvbbit.prewarm_operator(\
                  {op_literal}, \
-                 $rvbbitprewarm$SELECT {select_cols} {from_tail}$rvbbitprewarm$, \
+                 $rvbbitprewarm$SELECT DISTINCT {select_cols} {from_tail}$rvbbitprewarm$, \
                  {max_conc})"
         );
         if let Err(err) = pgrx::Spi::run(&prewarm_sql) {
@@ -9776,6 +9797,62 @@ fn estimate_relation_rows(table_oid: u32) -> i64 {
     let sql =
         format!("SELECT coalesce(reltuples, 0)::bigint FROM pg_class WHERE oid = {table_oid}::oid");
     pgrx::Spi::get_one::<i64>(&sql).ok().flatten().unwrap_or(0)
+}
+
+/// If `frag` is a bare column reference (a Var arg the rewriter emitted as a
+/// quoted-or-plain ident), return the unquoted column name. Returns None for
+/// literals and expressions, which carry quotes, casts, parens, dots, or spaces.
+fn column_ident_from_frag(frag: &str) -> Option<String> {
+    let f = frag.trim();
+    if f.is_empty()
+        || f.contains('\'')
+        || f.contains("::")
+        || f.contains('(')
+        || f.contains(' ')
+        || f.contains('.')
+    {
+        return None;
+    }
+    let name = f.trim_matches('"');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Estimate how many DISTINCT operator-input tuples a prewarm would warm, from
+/// `pg_stats.n_distinct` for the referenced plain columns (product of per-column
+/// distincts, capped at the relation estimate). Returns None when no plain columns
+/// were identified or any referenced column lacks stats, so the caller falls back
+/// to the raw-row cap (preserving prior behavior — no regression).
+fn estimate_distinct_warm_rows(table_oid: u32, cols: &[String], est_rows: i64) -> Option<i64> {
+    if cols.is_empty() || est_rows <= 0 {
+        return None;
+    }
+    let mut product: i128 = 1;
+    for col in cols {
+        let esc = col.replace('\'', "''");
+        let sql = format!(
+            "SELECT s.n_distinct::float8 \
+             FROM pg_stats s, pg_class c, pg_namespace nsp \
+             WHERE c.oid = {table_oid}::oid AND c.relnamespace = nsp.oid \
+               AND s.schemaname = nsp.nspname AND s.tablename = c.relname \
+               AND s.attname = '{esc}'"
+        );
+        let n_distinct = pgrx::Spi::get_one::<f64>(&sql).ok().flatten()?;
+        let col_distinct: i64 = if n_distinct > 0.0 {
+            // positive = absolute distinct estimate
+            n_distinct.ceil() as i64
+        } else if n_distinct < 0.0 {
+            // negative encodes -(fraction of total rows)
+            ((-n_distinct) * est_rows as f64).ceil() as i64
+        } else {
+            // 0 = unknown / never analyzed → don't guess, let caller fall back
+            return None;
+        };
+        product = product.saturating_mul(col_distinct.max(1) as i128);
+        if product >= est_rows as i128 {
+            return Some(est_rows);
+        }
+    }
+    Some((product.min(est_rows as i128)).max(1) as i64)
 }
 
 /// Exact count for the trivial `SELECT count(*) FROM rel` rewrite.

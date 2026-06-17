@@ -11,8 +11,11 @@
 //! All prompt / step / model logic lives in catalog + unit_of_work — these
 //! functions are pure plumbing.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use pgrx::prelude::*;
 use pgrx::JsonB;
@@ -25,6 +28,7 @@ use crate::unit_of_work::{self, OpDef, SubCall, WorkResult};
 fn flush_cache() {
     crate::cache::flush();
     crate::synth::clear_scalar_cache();
+    flush_op_memo();
 }
 
 #[pg_extern(stable, parallel_safe)]
@@ -136,8 +140,8 @@ fn judgment_purge(op_name: &str) -> i64 {
 
 #[pg_extern(parallel_safe, strict)]
 fn _exec_op_bool(op_name: &str, inputs: JsonB, opts: JsonB) -> bool {
-    let op = match load_op(op_name) {
-        Some(o) => o,
+    let (op, prompt_seed) = match load_op_memo(op_name) {
+        Some(t) => t,
         None => {
             pgrx::warning!("rvbbit: unknown operator '{}'", op_name);
             return false;
@@ -151,7 +155,7 @@ fn _exec_op_bool(op_name: &str, inputs: JsonB, opts: JsonB) -> bool {
         );
         return false;
     }
-    match invoke_with_cache(&op, &inputs.0, &opts.0) {
+    match invoke_with_cache_seeded(&op, &prompt_seed, &inputs.0, &opts.0) {
         Ok(s) => parse_bool(&s, &op.parser),
         Err(_) => false,
     }
@@ -159,8 +163,8 @@ fn _exec_op_bool(op_name: &str, inputs: JsonB, opts: JsonB) -> bool {
 
 #[pg_extern(parallel_safe, strict)]
 fn _exec_op_text(op_name: &str, inputs: JsonB, opts: JsonB) -> String {
-    let op = match load_op(op_name) {
-        Some(o) => o,
+    let (op, prompt_seed) = match load_op_memo(op_name) {
+        Some(t) => t,
         None => {
             pgrx::warning!("rvbbit: unknown operator '{}'", op_name);
             return String::new();
@@ -179,7 +183,7 @@ fn _exec_op_text(op_name: &str, inputs: JsonB, opts: JsonB) -> String {
     if op.parser == "sql" {
         return crate::synth::run_synth_sql_scalar(&op, &inputs.0, &opts.0);
     }
-    match invoke_with_cache(&op, &inputs.0, &opts.0) {
+    match invoke_with_cache_seeded(&op, &prompt_seed, &inputs.0, &opts.0) {
         Ok(s) => parse_text(&s, &op.parser),
         Err(_) => String::new(),
     }
@@ -187,8 +191,8 @@ fn _exec_op_text(op_name: &str, inputs: JsonB, opts: JsonB) -> String {
 
 #[pg_extern(parallel_safe, strict)]
 fn _exec_op_jsonb(op_name: &str, inputs: JsonB, opts: JsonB) -> Option<JsonB> {
-    let op = match load_op(op_name) {
-        Some(o) => o,
+    let (op, prompt_seed) = match load_op_memo(op_name) {
+        Some(t) => t,
         None => {
             pgrx::warning!("rvbbit: unknown operator '{}'", op_name);
             return None;
@@ -202,7 +206,7 @@ fn _exec_op_jsonb(op_name: &str, inputs: JsonB, opts: JsonB) -> Option<JsonB> {
         );
         return None;
     }
-    let s = match invoke_with_cache(&op, &inputs.0, &opts.0) {
+    let s = match invoke_with_cache_seeded(&op, &prompt_seed, &inputs.0, &opts.0) {
         Ok(s) => s,
         Err(_) => return None,
     };
@@ -225,8 +229,8 @@ fn _exec_op_jsonb(op_name: &str, inputs: JsonB, opts: JsonB) -> Option<JsonB> {
 
 #[pg_extern(parallel_safe, strict)]
 fn _exec_op_float8(op_name: &str, inputs: JsonB, opts: JsonB) -> f64 {
-    let op = match load_op(op_name) {
-        Some(o) => o,
+    let (op, prompt_seed) = match load_op_memo(op_name) {
+        Some(t) => t,
         None => {
             pgrx::warning!("rvbbit: unknown operator '{}'", op_name);
             return 0.0;
@@ -240,7 +244,7 @@ fn _exec_op_float8(op_name: &str, inputs: JsonB, opts: JsonB) -> f64 {
         );
         return 0.0;
     }
-    match invoke_with_cache(&op, &inputs.0, &opts.0) {
+    match invoke_with_cache_seeded(&op, &prompt_seed, &inputs.0, &opts.0) {
         Ok(s) => parse_float8(&s, &op.parser),
         Err(_) => 0.0,
     }
@@ -618,6 +622,74 @@ pub(crate) fn load_op(name: &str) -> Option<OpDef> {
     result
 }
 
+// ---- Operator memo (per-backend) -----------------------------------------
+//
+// `load_op` runs a full SPI `SELECT ... FROM rvbbit.operators` every call, and
+// the cached-invoke path rebuilds the prompt seed (serializing `steps`, resolving
+// the runtime dependency seed) every call. On a large scan that's evaluated per
+// row — e.g. `SELECT rvbbit.classify(col, '...') FROM big_table` — those two costs
+// dominate the wall-clock even when every row is a cache hit (no model call at all).
+//
+// Both the OpDef and the prompt seed are invariant for a given operator, so we
+// memoize them per backend behind a short TTL: stable within a query (where it
+// matters), refreshed across queries so a `register_operator` edit is picked up
+// within a few seconds, and cleared eagerly by `flush_cache()`.
+
+struct OpMemoEntry {
+    at: Instant,
+    op: Arc<OpDef>,
+    prompt_seed: Arc<str>,
+}
+
+thread_local! {
+    static OP_MEMO: RefCell<HashMap<String, OpMemoEntry>> = RefCell::new(HashMap::new());
+}
+
+fn op_memo_ttl() -> Duration {
+    Duration::from_millis(
+        std::env::var("RVBBIT_OP_MEMO_TTL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(3000),
+    )
+}
+
+/// Memoized operator load: returns the `OpDef` plus its precomputed `prompt_seed`,
+/// avoiding a per-row catalog SPI and prompt-seed rebuild. The seed is exactly what
+/// `compute_prompt_seed` returns, so the cache key (and every existing receipt) is
+/// byte-identical.
+pub(crate) fn load_op_memo(name: &str) -> Option<(Arc<OpDef>, Arc<str>)> {
+    let ttl = op_memo_ttl();
+    let hit = OP_MEMO.with(|m| {
+        m.borrow()
+            .get(name)
+            .filter(|e| e.at.elapsed() < ttl)
+            .map(|e| (e.op.clone(), e.prompt_seed.clone()))
+    });
+    if let Some(found) = hit {
+        return Some(found);
+    }
+    let op = Arc::new(load_op(name)?);
+    let prompt_seed: Arc<str> = Arc::from(compute_prompt_seed(&op));
+    OP_MEMO.with(|m| {
+        m.borrow_mut().insert(
+            name.to_string(),
+            OpMemoEntry {
+                at: Instant::now(),
+                op: op.clone(),
+                prompt_seed: prompt_seed.clone(),
+            },
+        );
+    });
+    Some((op, prompt_seed))
+}
+
+/// Drop the per-backend operator memo. Called by `flush_cache()` so an explicit
+/// flush picks up catalog edits immediately rather than waiting out the TTL.
+pub(crate) fn flush_op_memo() {
+    OP_MEMO.with(|m| m.borrow_mut().clear());
+}
+
 // ---- The cached invoke ---------------------------------------------------
 
 pub(crate) fn invoke_with_cache(
@@ -625,21 +697,44 @@ pub(crate) fn invoke_with_cache(
     inputs: &serde_json::Value,
     opts: &serde_json::Value,
 ) -> Result<String, ()> {
-    // For now we hash on a canonical (operator name + inputs + opts.model)
-    // because the rendered prompt is internal and the operator name +
-    // inputs are the contract surface. If the prompt changes via UPDATE
-    // on rvbbit.operators, you'd want the cache to invalidate; we add a
-    // prompt-hash component below to do that cheaply.
-    let model_override = opts.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    // Cold-path entry: compute the prompt seed inline. The hot scalar externs
+    // skip straight to invoke_with_cache_seeded with a memoized seed.
+    let prompt_seed = compute_prompt_seed(op);
+    invoke_with_cache_seeded(op, &prompt_seed, inputs, opts)
+}
+
+/// The prompt-seed component of the cache key — invariant for a given operator
+/// (independent of the per-row inputs and of opts.model). Folded into the hash
+/// so editing the operator's prompt/steps via `rvbbit.operators` auto-invalidates
+/// its cache entries. Recomputing this per row (serializing `steps`, resolving
+/// the runtime dependency seed) is pure overhead on the hot path — memoized by
+/// `load_op_memo`.
+pub(crate) fn compute_prompt_seed(op: &OpDef) -> String {
     let runtime_seed = crate::python_runtime::dependency_seed(op.steps.as_ref(), op.takes.as_ref());
-    let prompt_seed = format!(
+    format!(
         "{}\0{}\0{}\0{}",
         op.system_prompt,
         op.user_prompt,
         serde_json::to_string(&op.steps).unwrap_or_default(),
         runtime_seed
-    );
-    let hash = input_hash(&op.name, &op.model, model_override, inputs, &prompt_seed);
+    )
+}
+
+/// Cached invoke with a precomputed `prompt_seed`. Hash bytes are identical to
+/// the inline path — same `input_hash` arguments, same seed content — so existing
+/// receipts stay valid.
+pub(crate) fn invoke_with_cache_seeded(
+    op: &OpDef,
+    prompt_seed: &str,
+    inputs: &serde_json::Value,
+    opts: &serde_json::Value,
+) -> Result<String, ()> {
+    // For now we hash on a canonical (operator name + inputs + opts.model)
+    // because the rendered prompt is internal and the operator name +
+    // inputs are the contract surface. The prompt_seed component invalidates
+    // the cache cheaply when the operator definition changes.
+    let model_override = opts.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let hash = input_hash(&op.name, &op.model, model_override, inputs, prompt_seed);
 
     // L1: in-memory LRU cache. ~5μs lookup. Skips SPI entirely.
     if let Some(cached) = crate::cache::get(&hash) {
