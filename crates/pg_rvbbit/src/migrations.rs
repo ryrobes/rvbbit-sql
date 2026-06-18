@@ -265,6 +265,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0061_brain_norm_preserve",
         include_str!("../sql/migrations/0061_brain_norm_preserve.sql"),
     ),
+    (
+        "0062_brain_query_sources",
+        include_str!("../sql/migrations/0062_brain_query_sources.sql"),
+    ),
+    (
+        "0063_brain_structured_edges",
+        include_str!("../sql/migrations/0063_brain_structured_edges.sql"),
+    ),
+    (
+        "0064_brain_enrich_source",
+        include_str!("../sql/migrations/0064_brain_enrich_source.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

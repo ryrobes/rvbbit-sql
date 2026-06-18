@@ -47,6 +47,15 @@ def search(q: str) -> dict:
     return {"query": q, "total": len(items), "items": items}
 
 
+@mcp.tool()
+def getenv(name: str) -> str:
+    """Return the value of an environment variable inside the subprocess.
+    Used to prove the gateway resolves ${VAR} env refs (incl. UI-entered
+    secrets from the gateway secret store) into the spawned server's env."""
+    import os
+    return os.environ.get(name, "")
+
+
 # ---- Resources ------------------------------------------------------------
 # Two static MCP resources for the Phase 4 read-by-URI surface tests.
 

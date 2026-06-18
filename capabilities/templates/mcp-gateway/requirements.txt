@@ -3,3 +3,4 @@ uvicorn[standard]==0.32.*
 asyncpg==0.30.*
 mcp>=1.0,<2.0
 pydantic==2.*
+cryptography>=42,<46

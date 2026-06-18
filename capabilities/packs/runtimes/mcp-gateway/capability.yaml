@@ -45,6 +45,12 @@ runtime:
   volumes:
     - name: mcp_npm_cache
       mount: /root/.npm
+    # MCP install-time secrets (encrypted) live at /app/data/mcp-secrets.bin (+ .key).
+    # Without a volume they're wiped on every gateway rebuild/recreate — which silently
+    # breaks every MCP server that needs a key (e.g. linear's LINEAR_API_TOKEN) until the
+    # secret is re-pushed. Persist them so secrets survive redeploys.
+    - name: mcp_secrets
+      mount: /app/data
 runtime_registration:
   name: mcp_default
   language: mcp
