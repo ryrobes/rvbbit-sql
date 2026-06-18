@@ -1127,19 +1127,20 @@ def tool_ask_brain(query, k=8, caller_email=None) -> dict:
                 "SELECT doc_id, chunk_idx, title, folder_path AS folder, source, "
                 "occurred_at::text AS occurred_at, chunk, round(score::numeric, 4) AS score, entities "
                 "FROM rvbbit.brain_search(%s, %s, %s)", (caller_email, query, k)).fetchall()
-            # Doc-level rollup: dedupe the hit docs, union their entities, attach related-doc threads.
+            # Doc-level rollup: dedupe the hit docs; attach DOC-LEVEL entities + related threads from
+            # brain_related (same store as the relatedness `shared` counts, so they reconcile). Each
+            # related doc carries `shared_entities` — the exact overlap that explains its `shared`.
+            # (Per-hit `entities` stay CHUNK-scoped for local signal; the rollup is the doc-level view.)
             docs: dict = {}
             for h in hits:
                 d = docs.setdefault(h["doc_id"], {"doc_id": h["doc_id"], "title": h["title"],
-                                                  "source": h["source"], "n_hits": 0, "_ents": set()})
+                                                  "source": h["source"], "n_hits": 0})
                 d["n_hits"] += 1
-                for e in (h["entities"] or []):
-                    d["_ents"].add(e)
             for did, d in docs.items():
-                rel = c.execute("SELECT rvbbit.brain_related(%s, %s::bigint, 6) AS r", (caller_email, did)).fetchone()
+                rel = c.execute("SELECT rvbbit.brain_related(%s, %s::bigint, 15) AS r", (caller_email, did)).fetchone()
                 rr = (rel["r"] if rel else {}) or {}
+                d["entities"] = [e.get("label") for e in rr.get("entities", []) if e.get("label")]
                 d["related"] = rr.get("related", [])
-                d["entities"] = sorted(d.pop("_ents"))[:10]
         except Exception as e:  # noqa: BLE001
             return {"error": {"code": "ASK_BRAIN_FAILED", "message": str(e)}}
     return {"query": query, "as": caller_email, "hits": hits, "documents": list(docs.values()),

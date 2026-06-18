@@ -221,6 +221,50 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0050_brain_agent_retrieval",
         include_str!("../sql/migrations/0050_brain_agent_retrieval.sql"),
     ),
+    (
+        "0051_brain_chunk_entities",
+        include_str!("../sql/migrations/0051_brain_chunk_entities.sql"),
+    ),
+    (
+        "0052_brain_ner_pass",
+        include_str!("../sql/migrations/0052_brain_ner_pass.sql"),
+    ),
+    (
+        "0053_brain_enrich_clean_and_filter",
+        include_str!("../sql/migrations/0053_brain_enrich_clean_and_filter.sql"),
+    ),
+    (
+        "0054_brain_related_shared_entities",
+        include_str!("../sql/migrations/0054_brain_related_shared_entities.sql"),
+    ),
+    (
+        "0055_brain_ner_full_coverage",
+        include_str!("../sql/migrations/0055_brain_ner_full_coverage.sql"),
+    ),
+    (
+        "0056_brain_entity_denoise",
+        include_str!("../sql/migrations/0056_brain_entity_denoise.sql"),
+    ),
+    (
+        "0057_brain_related_tfidf",
+        include_str!("../sql/migrations/0057_brain_related_tfidf.sql"),
+    ),
+    (
+        "0058_brain_entity_normalization",
+        include_str!("../sql/migrations/0058_brain_entity_normalization.sql"),
+    ),
+    (
+        "0059_brain_norm_cache",
+        include_str!("../sql/migrations/0059_brain_norm_cache.sql"),
+    ),
+    (
+        "0060_brain_shared_idf_floor",
+        include_str!("../sql/migrations/0060_brain_shared_idf_floor.sql"),
+    ),
+    (
+        "0061_brain_norm_preserve",
+        include_str!("../sql/migrations/0061_brain_norm_preserve.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
