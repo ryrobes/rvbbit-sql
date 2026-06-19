@@ -113,6 +113,22 @@ pub trait Transport: Send + Sync {
     /// prewarm uses this to decide whether to chunk by batch_size or
     /// dispatch one pool task per input.
     fn client_batches(&self) -> bool;
+
+    /// Tool-calling chat for the `agent` step kind: a multi-message transcript
+    /// plus tool specs, returning the model's `tool_calls` (or a final answer).
+    /// Default-unsupported — only OpenAI-compatible transports override it.
+    fn chat_with_tools(
+        &self,
+        _spec: &SpecialistSpec,
+        _model: &str,
+        _messages: &[crate::providers::ChatMessage],
+        _tools: &[crate::providers::ToolSpec],
+    ) -> Result<crate::providers::ChatToolsResponse, ProviderError> {
+        Err(ProviderError::NotImplemented(format!(
+            "transport '{}' does not support tool-calling chat",
+            self.name()
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------

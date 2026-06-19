@@ -3527,7 +3527,7 @@ unsafe fn datum_output_text(datum: pg_sys::Datum, typoid: pg_sys::Oid) -> String
     out
 }
 
-fn caught_error_message(cause: pg_sys::panic::CaughtError) -> String {
+pub(crate) fn caught_error_message(cause: pg_sys::panic::CaughtError) -> String {
     match cause {
         pg_sys::panic::CaughtError::PostgresError(report)
         | pg_sys::panic::CaughtError::ErrorReport(report) => {

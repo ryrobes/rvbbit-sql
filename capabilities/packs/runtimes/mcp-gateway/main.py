@@ -168,25 +168,32 @@ class SecretStore:
 secrets = SecretStore()
 
 
-def resolve_env(env_template: dict[str, Any] | None, server_name: str | None = None) -> dict[str, str]:
-    """Expand ${VAR} refs in env values. Resolution order, highest first:
-    the per-server secret store (UI-entered keys), then the gateway's own
-    process env. Keys never round-trip through Postgres.
-    """
-    if not env_template:
-        return {}
+def _expand_refs(value: str, server_name: str | None) -> str:
+    """Expand ${VAR} refs in a string. Resolution order, highest first: the per-server secret store
+    (UI-entered keys), then the gateway's own process env. Keys never round-trip through Postgres."""
     store = secrets.for_server(server_name) if server_name else {}
 
     def _sub(m):
         var = m.group(1)
         return store[var] if var in store else os.environ.get(var, "")
 
+    return _ENV_REF.sub(_sub, value)
+
+
+def resolve_env(env_template: dict[str, Any] | None, server_name: str | None = None) -> dict[str, str]:
+    """Expand ${VAR} refs in env VALUES (see _expand_refs)."""
+    if not env_template:
+        return {}
     out: dict[str, str] = {}
     for k, v in env_template.items():
-        if isinstance(v, str):
-            v = _ENV_REF.sub(_sub, v)
-        out[k] = str(v)
+        out[k] = _expand_refs(v, server_name) if isinstance(v, str) else str(v)
     return out
+
+
+def resolve_args(args: list | None, server_name: str | None = None) -> list:
+    """Expand ${VAR} refs in command ARGS too — so remote servers bridged via `npx mcp-remote … --header
+    'Authorization: Bearer ${API_KEY}'` get their secret injected, exactly like env-based servers."""
+    return [_expand_refs(a, server_name) if isinstance(a, str) else a for a in (args or [])]
 
 
 # ---- DB config fetch ------------------------------------------------------
@@ -269,7 +276,7 @@ class MCPServerProcess:
             if self.config.transport == "stdio":
                 params = StdioServerParameters(
                     command=self.config.command,
-                    args=self.config.args,
+                    args=resolve_args(self.config.args, self.config.name),
                     env={**os.environ, **resolve_env(self.config.env, self.config.name)},
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))

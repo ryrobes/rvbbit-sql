@@ -182,3 +182,92 @@ pub fn chat(req: ChatRequest) -> Result<ChatResponse, ProviderError> {
         raw_usage: usage.raw,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Tool-calling chat (the agent step kind). `chat` above is single-turn; an agent
+// loop needs a multi-message transcript + tool specs + the model's `tool_calls`
+// back. Only OpenAI-compatible transports implement it (others return an error).
+// ---------------------------------------------------------------------------
+
+/// One message in an agent transcript. `tool_calls` echoes an assistant turn's
+/// chosen calls back to the model verbatim; `tool_call_id` ties a tool-result
+/// turn to the call it answers.
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: String, // "system" | "user" | "assistant" | "tool"
+    pub content: Option<String>,
+    pub tool_calls: Option<Value>,
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn system(s: impl Into<String>) -> Self {
+        Self { role: "system".into(), content: Some(s.into()), tool_calls: None, tool_call_id: None }
+    }
+    pub fn user(s: impl Into<String>) -> Self {
+        Self { role: "user".into(), content: Some(s.into()), tool_calls: None, tool_call_id: None }
+    }
+}
+
+/// A tool advertised to the model (name + JSON-schema parameters).
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+/// A tool call the model chose to make.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value, // parsed object ({} if the model emitted invalid JSON)
+}
+
+/// Response from one tool-calling chat turn.
+#[derive(Debug)]
+pub struct ChatToolsResponse {
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub raw_tool_calls: Option<Value>, // echoed verbatim into the next assistant message
+    pub finish_reason: Option<String>,
+    pub model: String,
+    pub provider: String,
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+    pub cost_usd: Option<f64>,
+    /// Filled by the transport; consumed by the v0.1 per-turn cost reconciler
+    /// (the v0 aggregate sums inline cost and labels itself "agent").
+    #[allow(dead_code)]
+    pub cost_source: Option<String>,
+    pub provider_generation_id: Option<String>,
+    /// As above — the provider's exact token/cost breakdown, kept for reconciliation.
+    #[allow(dead_code)]
+    pub raw_usage: Option<Value>,
+    pub latency_ms: i32,
+}
+
+/// Tool-calling chat against the request's provider. Mirrors `chat`'s spec
+/// resolution, then dispatches to the transport's `chat_with_tools`.
+pub fn chat_with_tools(
+    model: &str,
+    provider: Option<&str>,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+) -> Result<ChatToolsResponse, ProviderError> {
+    let provider = provider.map(|s| s.to_string()).unwrap_or_else(default_provider_name);
+    let spec = match crate::specialists::get_cached_spec(&provider) {
+        Some(s) => s,
+        None => crate::specialists::load_spec(&provider)?,
+    };
+    let mut resp = crate::specialists::transport_for(&spec.transport)?
+        .chat_with_tools(&spec, model, messages, tools)?;
+    if resp.model.is_empty() {
+        resp.model = model.to_string();
+    }
+    if resp.provider.is_empty() {
+        resp.provider = provider;
+    }
+    Ok(resp)
+}

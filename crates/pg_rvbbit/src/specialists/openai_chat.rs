@@ -168,6 +168,171 @@ impl Transport for OpenAiChatTransport {
             latency_ms: t0.elapsed().as_millis().min(i32::MAX as u128) as i32,
         })
     }
+
+    fn chat_with_tools(
+        &self,
+        spec: &SpecialistSpec,
+        model: &str,
+        messages: &[crate::providers::ChatMessage],
+        tools: &[crate::providers::ToolSpec],
+    ) -> Result<crate::providers::ChatToolsResponse, ProviderError> {
+        use crate::providers::{ChatToolsResponse, ToolCall};
+        let t0 = std::time::Instant::now();
+
+        // Wire messages: a Value array so we can echo `tool_calls` verbatim and
+        // attach `tool_call_id` on tool-result turns without a struct per shape.
+        let wire_msgs: Vec<Value> = messages
+            .iter()
+            .map(|m| {
+                let mut o = serde_json::Map::new();
+                o.insert("role".into(), Value::String(m.role.clone()));
+                // role=assistant with tool_calls may carry null content; keep the key.
+                o.insert(
+                    "content".into(),
+                    m.content.clone().map(Value::String).unwrap_or(Value::Null),
+                );
+                if let Some(tc) = &m.tool_calls {
+                    o.insert("tool_calls".into(), tc.clone());
+                }
+                if let Some(id) = &m.tool_call_id {
+                    o.insert("tool_call_id".into(), Value::String(id.clone()));
+                }
+                Value::Object(o)
+            })
+            .collect();
+
+        let mut body = serde_json::json!({ "model": model, "messages": wire_msgs });
+        if !tools.is_empty() {
+            let wire_tools: Vec<Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = Value::Array(wire_tools);
+        }
+        // Generous completion headroom — agents write reports; cap field varies.
+        let use_mct = spec
+            .transport_opts
+            .get("max_tokens_field")
+            .and_then(|v| v.as_str())
+            .map(|field| field == "max_completion_tokens")
+            .unwrap_or_else(|| spec.endpoint_url.contains("api.openai.com"));
+        body[if use_mct { "max_completion_tokens" } else { "max_tokens" }] =
+            serde_json::json!(4096);
+
+        let mut req = http_client()
+            .post(&spec.endpoint_url)
+            .timeout(Duration::from_millis(spec.timeout_ms))
+            .header("HTTP-Referer", "https://github.com/rvbbit-postgres/rvbbit")
+            .header("X-Title", "rvbbit")
+            .json(&body);
+        if let Some(token) = spec.auth_token() {
+            req = req.bearer_auth(token);
+        }
+
+        let _backend_permit = super::acquire_backend_permit(spec);
+        let _permit = self.semaphore.acquire();
+        let resp = req.send()?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ProviderError::ApiStatus {
+                status: status.as_u16(),
+                body: resp.text().unwrap_or_default(),
+            });
+        }
+        let parsed: Value = resp.json()?;
+
+        let gen_id = parsed
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let usage = parsed.get("usage").cloned();
+        let prompt_tokens = usage
+            .as_ref()
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let completion_tokens = usage
+            .as_ref()
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let cost_usd = usage
+            .as_ref()
+            .and_then(|u| u.get("cost"))
+            .and_then(|v| v.as_f64());
+
+        let choice = parsed
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let msg = choice.get("message").cloned().unwrap_or(Value::Null);
+        let content = msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let raw_tool_calls = msg
+            .get("tool_calls")
+            .filter(|v| !v.is_null())
+            .cloned();
+        let tool_calls: Vec<ToolCall> = raw_tool_calls
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|tc| {
+                        let id = tc.get("id").and_then(|v| v.as_str())?.to_string();
+                        let func = tc.get("function")?;
+                        let name = func.get("name").and_then(|v| v.as_str())?.to_string();
+                        let args_str =
+                            func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                        let arguments =
+                            serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({}));
+                        Some(ToolCall { id, name, arguments })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let cost_source = cost_usd.map(|_| "inline".to_string()).or_else(|| {
+            gen_id
+                .as_ref()
+                .filter(|_| {
+                    spec.name == "openrouter" || spec.endpoint_url.contains("openrouter.ai")
+                })
+                .map(|_| "openrouter_generation".to_string())
+        });
+
+        Ok(ChatToolsResponse {
+            content,
+            tool_calls,
+            raw_tool_calls,
+            finish_reason,
+            model: model.to_string(),
+            provider: spec.name.clone(),
+            prompt_tokens,
+            completion_tokens,
+            cost_usd,
+            cost_source,
+            provider_generation_id: gen_id,
+            raw_usage: usage,
+            latency_ms: t0.elapsed().as_millis().min(i32::MAX as u128) as i32,
+        })
+    }
 }
 
 #[derive(Serialize)]

@@ -22,7 +22,8 @@ OAuth mode (for Claude Desktop/Cowork's native connector) — set a public URL:
   WAREHOUSE_PUBLIC_URL       e.g. https://dwmcp.example.com (enables the OAuth AS;
                              unset = legacy shared-key gate via WAREHOUSE_MCP_KEY)
   WAREHOUSE_LOGIN_PASSWORD   REQUIRED in OAuth mode; shared login password
-  WAREHOUSE_ALLOWED_EMAILS   optional CSV email allowlist (else any email + the pw)
+  WAREHOUSE_ALLOWED_EMAILS   optional CSV allowlist; entries match exactly OR as a domain when prefixed
+                             with '@' (e.g. "@acme.com" allows anyone @acme.com). Empty = any email + pw.
   WAREHOUSE_JWT_SECRET       REQUIRED in OAuth mode; token-signing secret — MUST be
                              independent of WAREHOUSE_MCP_KEY (users hold that one)
 """
@@ -1105,12 +1106,18 @@ def tool_compare(metric, period_a, period_b, by=None, params=None) -> dict:
 # enters the result set and can't be paraphrased into an answer. caller_email is injected by the
 # registration lambda from _caller(); read tools require it (default-deny on no identity).
 
-def tool_ask_brain(query, k=8, caller_email=None) -> dict:
+def tool_ask_brain(query, k=8, filters=None, caller_email=None) -> dict:
     """Ask the document brain — semantic search over the docs YOU are permitted to see, returned as
     grounded, citeable context (NOT a synthesized answer — compose the answer from these chunks and
     cite title/folder). Access is enforced from your authenticated identity: docs you lack a role for,
     or that exclude you, never appear. The ABSENCE of a doc means you're not cleared for it — never
     speculate about what you can't see.
+
+    PRE-FILTER to avoid mixing object classes: pass `filters` to narrow BEFORE the search —
+      {"type": "ticket"}  ·  {"type": ["document","meeting"]}  ·  {"source": "Linear · all"}  ·
+      {"folder": "/sops", "since": "2026-01-01"}.
+    Every hit is tagged with `doc_type` (e.g. document, ticket, meeting) and `source`, and `types` /
+    `sources` summarize what came back. Don't know what's filterable? Call brain_facets first.
 
     This is the ENTRY POINT, not the whole story. Each hit carries breadcrumbs — its doc's key
     `entities` (knowledge-graph handles) — and a doc-level `documents` rollup lists, per doc, its
@@ -1121,21 +1128,24 @@ def tool_ask_brain(query, k=8, caller_email=None) -> dict:
     if not caller_email:
         return {"error": {"code": "NO_IDENTITY", "message": "brain access requires an authenticated caller (OAuth email)"}}
     k = max(1, min(int(k or 8), 50))
+    flt = json.dumps(filters if isinstance(filters, dict) else {})
     with _conn() as c:   # _conn (writable): rvbbit.embed may populate its embedding cache
         try:
             hits = c.execute(
-                "SELECT doc_id, chunk_idx, title, folder_path AS folder, source, "
+                "SELECT doc_id, chunk_idx, title, folder_path AS folder, source, doc_type, "
                 "occurred_at::text AS occurred_at, chunk, round(score::numeric, 4) AS score, entities "
-                "FROM rvbbit.brain_search(%s, %s, %s)", (caller_email, query, k)).fetchall()
+                "FROM rvbbit.brain_search(%s, %s, %s, %s::jsonb)", (caller_email, query, k, flt)).fetchall()
             # Doc-level rollup: dedupe the hit docs; attach DOC-LEVEL entities + related threads from
             # brain_related (same store as the relatedness `shared` counts, so they reconcile). Each
             # related doc carries `shared_entities` — the exact overlap that explains its `shared`.
             # (Per-hit `entities` stay CHUNK-scoped for local signal; the rollup is the doc-level view.)
             docs: dict = {}
+            types: dict = {}
             for h in hits:
                 d = docs.setdefault(h["doc_id"], {"doc_id": h["doc_id"], "title": h["title"],
-                                                  "source": h["source"], "n_hits": 0})
+                                                  "source": h["source"], "doc_type": h["doc_type"], "n_hits": 0})
                 d["n_hits"] += 1
+                types[h["doc_type"]] = types.get(h["doc_type"], 0) + 1
             for did, d in docs.items():
                 rel = c.execute("SELECT rvbbit.brain_related(%s, %s::bigint, 15) AS r", (caller_email, did)).fetchone()
                 rr = (rel["r"] if rel else {}) or {}
@@ -1143,11 +1153,27 @@ def tool_ask_brain(query, k=8, caller_email=None) -> dict:
                 d["related"] = rr.get("related", [])
         except Exception as e:  # noqa: BLE001
             return {"error": {"code": "ASK_BRAIN_FAILED", "message": str(e)}}
-    return {"query": query, "as": caller_email, "hits": hits, "documents": list(docs.values()),
-            "count": len(hits),
-            "note": "Grounded context, not an answer — cite title/folder. Go deeper with "
-                    "brain_context / brain_get_doc / brain_related / brain_entity. "
-                    "Absence = not cleared, not 'nothing exists'."}
+    return {"query": query, "as": caller_email, "filters": filters or {}, "hits": hits,
+            "documents": list(docs.values()), "count": len(hits), "types": types,
+            "note": "Grounded context, not an answer — cite title/folder. Each hit is tagged `doc_type` — "
+                    "don't conflate classes (a ticket ≠ an SOP). Pre-filter with `filters` (see brain_facets) "
+                    "to narrow by type/source. Go deeper with brain_context / brain_get_doc / brain_related / "
+                    "brain_entity. Absence = not cleared, not 'nothing exists'."}
+
+
+def tool_brain_facets(caller_email=None) -> dict:
+    """Discover what you can FILTER by: the document TYPES (document, ticket, meeting, …) and SOURCES you
+    are cleared to see, each with a doc count. Call this before ask_brain when you want to narrow — then
+    pass filters={"type": "ticket"} or {"source": "..."} to ask_brain. ACL-enforced: only your visible
+    corpus is counted."""
+    if not caller_email:
+        return {"error": {"code": "NO_IDENTITY", "message": "brain access requires an authenticated caller"}}
+    with _ro() as c:
+        rows = c.execute("SELECT facet, value, docs FROM rvbbit.brain_facets(%s)", (caller_email,)).fetchall()
+    return {"as": caller_email,
+            "types":   {r["value"]: r["docs"] for r in rows if r["facet"] == "type"},
+            "sources": {r["value"]: r["docs"] for r in rows if r["facet"] == "source"},
+            "note": "Pass to ask_brain as filters={\"type\": …, \"source\": …} to pre-narrow the search."}
 
 
 def tool_brain_browse(caller_email=None) -> dict:
@@ -2008,8 +2034,11 @@ def _register(mcp):
         "compare", {"metric": metric, "period_a": period_a, "period_b": period_b, "by": by},
         lambda: tool_compare(metric, period_a, period_b, by, params)))
     # document brain — caller identity comes from the OAuth token (_caller), never a tool argument
-    mcp.tool(name="ask_brain")(lambda query, k=8: _logged(
-        "ask_brain", {"query": query, "k": k}, lambda: tool_ask_brain(query, k, _caller()[0])))
+    mcp.tool(name="ask_brain")(lambda query, k=8, filters=None: _logged(
+        "ask_brain", {"query": query, "k": k, "filters": filters},
+        lambda: tool_ask_brain(query, k, filters, _caller()[0])))
+    mcp.tool(name="brain_facets")(lambda: _logged(
+        "brain_facets", {}, lambda: tool_brain_facets(_caller()[0])))
     mcp.tool(name="brain_browse")(lambda: _logged(
         "brain_browse", {}, lambda: tool_brain_browse(_caller()[0])))
     mcp.tool(name="brain_get_doc")(lambda doc_id: _logged(

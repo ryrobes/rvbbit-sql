@@ -277,6 +277,30 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0064_brain_enrich_source",
         include_str!("../sql/migrations/0064_brain_enrich_source.sql"),
     ),
+    (
+        "0065_brain_enrich_pending_fair",
+        include_str!("../sql/migrations/0065_brain_enrich_pending_fair.sql"),
+    ),
+    (
+        "0066_vector_sources_tier",
+        include_str!("../sql/migrations/0066_vector_sources_tier.sql"),
+    ),
+    (
+        "0067_brain_search_filtered",
+        include_str!("../sql/migrations/0067_brain_search_filtered.sql"),
+    ),
+    (
+        "0068_brain_doc_type_facets",
+        include_str!("../sql/migrations/0068_brain_doc_type_facets.sql"),
+    ),
+    (
+        "0069_fireflies_mcp_capability",
+        include_str!("../sql/migrations/0069_fireflies_mcp_capability.sql"),
+    ),
+    (
+        "0070_agent_loop",
+        include_str!("../sql/migrations/0070_agent_loop.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

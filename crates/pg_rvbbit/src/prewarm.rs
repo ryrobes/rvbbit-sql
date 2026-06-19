@@ -787,7 +787,7 @@ fn load_op(name: &str) -> Option<OpDef> {
     let escaped = name.replace('\'', "''");
     let sql = format!(
         "SELECT shape, return_type, model, system_prompt, user_prompt, parser, \
-                max_tokens, temperature, steps, retry, wards, takes \
+                max_tokens, temperature, steps, retry, wards, takes, cache_policy \
          FROM rvbbit.operators WHERE name = '{escaped}'"
     );
     let mut result: Option<OpDef> = None;
@@ -806,6 +806,7 @@ fn load_op(name: &str) -> Option<OpDef> {
             let retry: Option<JsonB> = row.get(10)?;
             let wards: Option<JsonB> = row.get(11)?;
             let takes: Option<JsonB> = row.get(12)?;
+            let cache_policy: Option<String> = row.get(13)?;
             if let (Some(sh), Some(rt), Some(m), Some(sp), Some(up), Some(p), Some(mt)) = (
                 shape,
                 return_type,
@@ -829,6 +830,7 @@ fn load_op(name: &str) -> Option<OpDef> {
                     retry: retry.map(|j| j.0),
                     wards: wards.map(|j| j.0),
                     takes: takes.map(|j| j.0),
+                    cache_policy: cache_policy.unwrap_or_else(|| "memoize".to_string()),
                 });
             }
         }

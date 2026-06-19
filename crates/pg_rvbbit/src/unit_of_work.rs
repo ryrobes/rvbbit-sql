@@ -40,6 +40,11 @@ pub struct OpDef {
     /// Multi-take plan (jsonb): {factor, models, reduce, filter, evaluator}.
     /// None = run once. Applied by crate::takes.
     pub takes: Option<Value>,
+    /// Result-cache policy ('memoize' default | 'always' | 'never'). 'never' bypasses the
+    /// L1/L2 result cache entirely — the operator always runs fresh (receipts are still logged
+    /// for audit/cost). Required for stateful operators (e.g. agent loops, anything that reads
+    /// mutable tables): without it, identical inputs return a frozen prior output.
+    pub cache_policy: String,
 }
 
 /// What the executor returns to the calling UDF.
@@ -143,7 +148,7 @@ pub fn contains_sql_node(steps: Option<&Value>) -> bool {
 /// worker. SQL nodes use SPI directly. MCP nodes may resolve the active
 /// gateway URL from SQL and log per-call audit rows.
 pub fn contains_leader_node(steps: Option<&Value>) -> bool {
-    contains_sql_node(steps) || contains_step_kind(steps, &["mcp"])
+    contains_sql_node(steps) || contains_step_kind(steps, &["mcp", "agent"])
 }
 
 fn contains_step_kind(steps: Option<&Value>, kinds: &[&str]) -> bool {
@@ -320,6 +325,7 @@ fn run_multi_step_inner(
             "specialist" => run_step_specialist(step, &step_name, scope),
             "sql" => run_step_sql(step, &step_name, scope),
             "mcp" => run_step_mcp(step, &step_name, scope),
+            "agent" => run_step_agent(op, step, &step_name, scope),
             other => (
                 SubCall {
                     step: step_name.clone(),
@@ -456,6 +462,453 @@ fn run_step_llm(
             String::new(),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Agent step (v0): a bounded tool-calling loop.
+//
+// Step config:
+//   {"name":"report","kind":"agent","model":"...","system":"...","task":"...",
+//    "tools":[{"builtin":"query"},{"server":"linear","tool":"list_issues"}],
+//    "max_iters":8,"budget":{"tokens":N,"cost_usd":F,"wall_ms":N},
+//    "tool_result_max_chars":8000}
+//
+// The model gets the system prompt + task + the tool specs, then drives itself:
+// it calls tools (the built-in read-only `query`, or any allow-listed MCP tool),
+// each result is fed back, and the loop ends when the model answers with no tool
+// call — or a cap trips (max_iters / token / cost / wall budget). The final
+// answer is the step output. Every turn is appended to rvbbit.agent_messages,
+// keyed by a generated run_id that is also returned in the step output, for
+// token/cost debugging.
+//
+// v0 scope: one agent, no sub-agents, no validators-back-into-loop. Two seams are
+// left open for v1 without a rewrite: (A) operator-as-tool — a {server:"rvbbit-op"}
+// entry would add an `AgentTool::Operator` arm here; (B) structured output — a
+// "schema" on the step would force a final tool call feeding a reduce step. Audit
+// rows are written in-transaction (visible on commit); out-of-band durability on
+// abort is a v0.1 refinement. Agent operators MUST set cache_policy='never'
+// (a memoized agent would replay a frozen transcript).
+enum AgentTool {
+    Query,
+    Mcp { server: String, tool: String },
+}
+
+const AGENT_QUERY_DESC: &str = "Run a single read-only SQL query against this Postgres database and get the rows back as JSON (capped at 200 rows). Use it to inspect tables, pg_stat_* views, and rvbbit telemetry. SELECT/WITH only — writes and DDL are rejected by the engine.";
+
+fn run_step_agent(
+    op: &OpDef,
+    step: &Value,
+    step_name: &str,
+    scope: &Scope,
+) -> (SubCall, Value, String) {
+    let model = step
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&op.model)
+        .to_string();
+    let provider = step
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let system = scope.render(step.get("system").and_then(|v| v.as_str()).unwrap_or(""));
+    let task = scope.render(step.get("task").and_then(|v| v.as_str()).unwrap_or(""));
+    let max_iters = step
+        .get("max_iters")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8)
+        .clamp(1, 50) as usize;
+    let budget = step.get("budget");
+    let budget_tokens = budget.and_then(|b| b.get("tokens")).and_then(|v| v.as_i64());
+    let budget_cost = budget.and_then(|b| b.get("cost_usd")).and_then(|v| v.as_f64());
+    let budget_wall = budget.and_then(|b| b.get("wall_ms")).and_then(|v| v.as_u64());
+    let tool_result_max = step
+        .get("tool_result_max_chars")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8000)
+        .max(256) as usize;
+
+    // Build the tool specs advertised to the model + the name->handler allowlist.
+    let mut tool_specs: Vec<providers::ToolSpec> = Vec::new();
+    let mut handlers: HashMap<String, AgentTool> = HashMap::new();
+    if let Some(arr) = step.get("tools").and_then(|v| v.as_array()) {
+        for t in arr {
+            if let Some(b) = t.get("builtin").and_then(|v| v.as_str()) {
+                if b == "query" && !handlers.contains_key("query") {
+                    tool_specs.push(providers::ToolSpec {
+                        name: "query".into(),
+                        description: AGENT_QUERY_DESC.into(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "sql": {
+                                    "type": "string",
+                                    "description": "A single read-only SQL SELECT/WITH statement. Capped at 200 rows."
+                                }
+                            },
+                            "required": ["sql"]
+                        }),
+                    });
+                    handlers.insert("query".into(), AgentTool::Query);
+                }
+            } else if let (Some(srv), Some(tool)) = (
+                t.get("server").and_then(|v| v.as_str()),
+                t.get("tool").and_then(|v| v.as_str()),
+            ) {
+                if handlers.contains_key(tool) {
+                    continue;
+                }
+                if let Some((desc, schema)) = load_mcp_tool_spec(srv, tool) {
+                    tool_specs.push(providers::ToolSpec {
+                        name: tool.into(),
+                        description: desc,
+                        parameters: schema,
+                    });
+                    handlers.insert(
+                        tool.into(),
+                        AgentTool::Mcp { server: srv.into(), tool: tool.into() },
+                    );
+                }
+            }
+        }
+    }
+
+    let run_id = new_agent_run_id();
+    let mut turn_idx: i32 = 0;
+
+    let mut messages: Vec<providers::ChatMessage> = Vec::new();
+    if !system.is_empty() {
+        messages.push(providers::ChatMessage::system(system.clone()));
+        audit_agent_turn(&run_id, &op.name, &model, &mut turn_idx, "system", Some(&system), None, None, None, 0, 0, None, 0, None);
+    }
+    messages.push(providers::ChatMessage::user(task.clone()));
+    audit_agent_turn(&run_id, &op.name, &model, &mut turn_idx, "user", Some(&task), None, None, None, 0, 0, None, 0, None);
+
+    let total_t0 = Instant::now();
+    let mut agg_in = 0i32;
+    let mut agg_out = 0i32;
+    let mut agg_cost = 0f64;
+    let mut gen_id: Option<String> = None;
+    let mut last_content = String::new();
+    let mut status = "max_iters";
+
+    for _iter in 0..max_iters {
+        if let Some(bt) = budget_tokens {
+            if (agg_in + agg_out) as i64 >= bt {
+                status = "budget_tokens";
+                break;
+            }
+        }
+        if let Some(bc) = budget_cost {
+            if agg_cost >= bc {
+                status = "budget_cost";
+                break;
+            }
+        }
+        if let Some(bw) = budget_wall {
+            if total_t0.elapsed().as_millis() as u64 >= bw {
+                status = "budget_wall";
+                break;
+            }
+        }
+
+        let resp =
+            match providers::chat_with_tools(&model, provider.as_deref(), &messages, &tool_specs) {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = e.to_string();
+                    audit_agent_turn(&run_id, &op.name, &model, &mut turn_idx, "error", Some(&err), None, None, None, 0, 0, None, 0, Some(&err));
+                    return (
+                        agent_subcall(step_name, &model, gen_id, agg_in, agg_out, agg_cost, &total_t0, Some(err)),
+                        Value::Null,
+                        String::new(),
+                    );
+                }
+            };
+
+        agg_in += resp.prompt_tokens;
+        agg_out += resp.completion_tokens;
+        if let Some(c) = resp.cost_usd {
+            agg_cost += c;
+        }
+        if resp.provider_generation_id.is_some() {
+            gen_id = resp.provider_generation_id.clone();
+        }
+
+        audit_agent_turn(
+            &run_id,
+            &op.name,
+            &model,
+            &mut turn_idx,
+            "assistant",
+            resp.content.as_deref(),
+            None,
+            resp.raw_tool_calls.clone(),
+            resp.finish_reason.as_deref(),
+            resp.prompt_tokens,
+            resp.completion_tokens,
+            resp.cost_usd,
+            resp.latency_ms,
+            None,
+        );
+
+        if !resp.tool_calls.is_empty() {
+            // Echo the assistant turn (content + tool_calls) so the tool-result
+            // turns that follow have the calls they answer.
+            messages.push(providers::ChatMessage {
+                role: "assistant".into(),
+                content: resp.content.clone(),
+                tool_calls: resp.raw_tool_calls.clone(),
+                tool_call_id: None,
+            });
+            for tc in &resp.tool_calls {
+                let (result_text, err) = match handlers.get(&tc.name) {
+                    Some(AgentTool::Query) => agent_run_readonly_query(&tc.arguments, tool_result_max),
+                    Some(AgentTool::Mcp { server, tool }) => {
+                        agent_run_mcp_tool(server, tool, &tc.arguments, tool_result_max)
+                    }
+                    None => (
+                        format!("ERROR: tool '{}' is not permitted for this agent", tc.name),
+                        Some("tool not permitted".to_string()),
+                    ),
+                };
+                audit_agent_turn(
+                    &run_id,
+                    &op.name,
+                    &model,
+                    &mut turn_idx,
+                    "tool",
+                    Some(&result_text),
+                    Some(&tc.name),
+                    Some(tc.arguments.clone()),
+                    None,
+                    0,
+                    0,
+                    None,
+                    0,
+                    err.as_deref(),
+                );
+                messages.push(providers::ChatMessage {
+                    role: "tool".into(),
+                    content: Some(result_text),
+                    tool_calls: None,
+                    tool_call_id: Some(tc.id.clone()),
+                });
+            }
+            continue;
+        }
+
+        // No tool call -> the model is done.
+        last_content = resp.content.unwrap_or_default();
+        status = "done";
+        break;
+    }
+
+    let out = serde_json::json!({
+        "output": last_content,
+        "agent_run_id": run_id,
+        "status": status,
+        "turns": turn_idx,
+        "tokens_in": agg_in,
+        "tokens_out": agg_out,
+    });
+    (
+        agent_subcall(step_name, &model, gen_id, agg_in, agg_out, agg_cost, &total_t0, None),
+        out,
+        last_content,
+    )
+}
+
+/// The aggregate sub-call for an agent step: kind "llm" (so its summed tokens/cost
+/// land in cost_events like any model call), with per-turn detail in agent_messages.
+#[allow(clippy::too_many_arguments)]
+fn agent_subcall(
+    step_name: &str,
+    model: &str,
+    gen_id: Option<String>,
+    tokens_in: i32,
+    tokens_out: i32,
+    cost: f64,
+    t0: &Instant,
+    error: Option<String>,
+) -> SubCall {
+    SubCall {
+        step: step_name.into(),
+        kind: "llm".into(),
+        model: Some(model.to_string()),
+        provider_generation_id: gen_id,
+        tokens_in,
+        tokens_out,
+        // Pre-summed across turns; tell the reconciler not to overwrite from a
+        // single generation id (per-turn ids live in agent_messages).
+        cost_usd: if cost > 0.0 { Some(cost) } else { None },
+        cost_source: Some("agent".into()),
+        latency_ms: t0.elapsed().as_millis().min(i32::MAX as u128) as i32,
+        error,
+        ..Default::default()
+    }
+}
+
+/// Fresh transcript id. The agent step always runs on the leader
+/// (contains_leader_node), so SPI is available.
+fn new_agent_run_id() -> String {
+    pgrx::Spi::get_one::<String>("SELECT gen_random_uuid()::text")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "agent-run".to_string())
+}
+
+/// Load an MCP tool's description + input schema so the model can be told how to
+/// call it. Returns None (tool silently skipped) if the server/tool is unknown.
+fn load_mcp_tool_spec(server: &str, tool: &str) -> Option<(String, Value)> {
+    let wrapped = format!(
+        "SELECT to_jsonb(t) FROM (SELECT coalesce(description,'') AS d, \
+         coalesce(input_schema, '{{\"type\":\"object\"}}'::jsonb) AS s \
+         FROM rvbbit.mcp_tools WHERE server = '{}' AND name = '{}' LIMIT 1) t",
+        server.replace('\'', "''"),
+        tool.replace('\'', "''"),
+    );
+    let row = pgrx::Spi::get_one::<pgrx::JsonB>(&wrapped).ok().flatten()?.0;
+    let desc = row.get("d").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let schema = row
+        .get("s")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+    Some((desc, schema))
+}
+
+/// Built-in read-only `query` tool. The model's SQL runs read-only at the SPI
+/// level (writes/DML-in-CTE are rejected by the engine — not by a keyword
+/// blacklist, so time functions like now()/generate_series stay available),
+/// inside a subtransaction (a bad query can't abort the agent's operator txn),
+/// capped at 200 rows + a wall timeout, result truncated to `max_chars`.
+fn agent_run_readonly_query(args: &Value, max_chars: usize) -> (String, Option<String>) {
+    let raw = args.get("sql").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let sql = raw.trim_end_matches(';').trim();
+    if sql.is_empty() {
+        return (
+            "ERROR: the `query` tool requires a non-empty 'sql' string".into(),
+            Some("no sql".into()),
+        );
+    }
+    let head = sql.to_lowercase();
+    if !(head.starts_with("select") || head.starts_with("with")) {
+        return (
+            "ERROR: the `query` tool only runs read-only SELECT/WITH statements (no writes or DDL)."
+                .into(),
+            Some("not a select".into()),
+        );
+    }
+    // jsonb_agg wrapper -> one text payload; LIMIT caps rows. SELECT shape forces
+    // a read; SPI read-only is the real write guard.
+    let wrapped = format!(
+        "SELECT coalesce(jsonb_agg(t), '[]'::jsonb)::text \
+         FROM (SELECT * FROM ({}) _agent_q LIMIT 200) t",
+        sql
+    );
+    let result: Result<Option<String>, String> = pgrx::PgTryBuilder::new(move || {
+        let _ = pgrx::Spi::run("SET LOCAL statement_timeout = '15s'");
+        pgrx::Spi::get_one::<String>(&wrapped).map_err(|e| e.to_string())
+    })
+    // Clean PG message (`column "x" does not exist`) instead of the raw struct
+    // debug — the model recovers faster and the transcript log reads cleanly.
+    .catch_others(|caught| Err(crate::router::caught_error_message(caught)))
+    .execute();
+    match result {
+        Ok(Some(json)) => (truncate_tool_result(&json, max_chars), None),
+        Ok(None) => ("[]".into(), None),
+        Err(e) => {
+            let msg = format!("ERROR: {}", e);
+            (truncate_tool_result(&msg, max_chars), Some(e))
+        }
+    }
+}
+
+/// Allow-listed MCP tool — calls the gateway, returns the tool's text body.
+fn agent_run_mcp_tool(
+    server: &str,
+    tool: &str,
+    args: &Value,
+    max_chars: usize,
+) -> (String, Option<String>) {
+    match crate::mcp::call(server, tool, args) {
+        Ok(envelope) => {
+            let text = crate::mcp::first_text(&envelope).unwrap_or_else(|| envelope.to_string());
+            (truncate_tool_result(&text, max_chars), None)
+        }
+        Err(e) => {
+            let msg = format!("ERROR calling {server}/{tool}: {e}");
+            (truncate_tool_result(&msg, max_chars), Some(e.to_string()))
+        }
+    }
+}
+
+/// Clamp a tool result so one big payload can't blow the context window.
+fn truncate_tool_result(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max_chars).collect();
+    format!(
+        "{kept}\n…[truncated {} of {total} chars — narrow the query/filter to see more]",
+        total - max_chars
+    )
+}
+
+/// Append one transcript turn to rvbbit.agent_messages. Best-effort + in-txn for
+/// v0 (visible on commit); an insert failure (e.g. table absent) is swallowed so
+/// it can never abort the operator. Out-of-band durability on abort is a v0.1 step.
+#[allow(clippy::too_many_arguments)]
+fn audit_agent_turn(
+    run_id: &str,
+    operator: &str,
+    model: &str,
+    idx: &mut i32,
+    role: &str,
+    content: Option<&str>,
+    tool_name: Option<&str>,
+    tool_calls: Option<Value>,
+    finish: Option<&str>,
+    tokens_in: i32,
+    tokens_out: i32,
+    cost: Option<f64>,
+    latency_ms: i32,
+    error: Option<&str>,
+) {
+    let esc = |s: &str| s.replace('\'', "''");
+    let txt = |o: Option<&str>| o.map(|s| format!("'{}'", esc(s))).unwrap_or_else(|| "NULL".into());
+    let jsn = |o: Option<Value>| {
+        o.map(|v| format!("'{}'::jsonb", esc(&v.to_string())))
+            .unwrap_or_else(|| "NULL".into())
+    };
+    let num = |o: Option<f64>| o.map(|c| c.to_string()).unwrap_or_else(|| "NULL".into());
+    let sql = format!(
+        "INSERT INTO rvbbit.agent_messages \
+         (run_id, operator, model, turn_idx, role, content, tool_name, tool_calls, finish_reason, \
+          tokens_in, tokens_out, cost_usd, latency_ms, error) \
+         VALUES ('{}', '{}', '{}', {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        esc(run_id),
+        esc(operator),
+        esc(model),
+        idx,
+        esc(role),
+        txt(content),
+        txt(tool_name),
+        jsn(tool_calls),
+        txt(finish),
+        tokens_in,
+        tokens_out,
+        num(cost),
+        latency_ms,
+        txt(error),
+    );
+    let _ = pgrx::PgTryBuilder::new(move || {
+        let _ = pgrx::Spi::run(&sql);
+    })
+    .catch_others(|_| ())
+    .execute();
+    *idx += 1;
 }
 
 /// Run a code step. The step config looks like:

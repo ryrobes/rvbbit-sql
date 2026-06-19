@@ -572,7 +572,7 @@ pub(crate) fn load_op(name: &str) -> Option<OpDef> {
     let escaped = name.replace('\'', "''");
     let sql = format!(
         "SELECT shape, return_type, model, system_prompt, user_prompt, parser, \
-                max_tokens, temperature, steps, retry, wards, takes \
+                max_tokens, temperature, steps, retry, wards, takes, cache_policy \
          FROM rvbbit.operators WHERE name = '{escaped}'"
     );
     let mut result: Option<OpDef> = None;
@@ -591,6 +591,7 @@ pub(crate) fn load_op(name: &str) -> Option<OpDef> {
             let retry_jsonb: Option<pgrx::JsonB> = row.get(10)?;
             let wards_jsonb: Option<pgrx::JsonB> = row.get(11)?;
             let takes_jsonb: Option<pgrx::JsonB> = row.get(12)?;
+            let cache_policy: Option<String> = row.get(13)?;
             if let (Some(sh), Some(rt), Some(m), Some(sp), Some(up), Some(p), Some(mt)) = (
                 shape,
                 return_type,
@@ -614,6 +615,7 @@ pub(crate) fn load_op(name: &str) -> Option<OpDef> {
                     retry: retry_jsonb.map(|j| j.0),
                     wards: wards_jsonb.map(|j| j.0),
                     takes: takes_jsonb.map(|j| j.0),
+                    cache_policy: cache_policy.unwrap_or_else(|| "memoize".to_string()),
                 });
             }
         }
@@ -736,18 +738,27 @@ pub(crate) fn invoke_with_cache_seeded(
     let model_override = opts.get("model").and_then(|v| v.as_str()).unwrap_or("");
     let hash = input_hash(&op.name, &op.model, model_override, inputs, prompt_seed);
 
-    // L1: in-memory LRU cache. ~5μs lookup. Skips SPI entirely.
-    if let Some(cached) = crate::cache::get(&hash) {
-        crate::probe::record_l1_hit(&op.name, inputs);
-        return Ok(cached);
-    }
+    // Honor cache_policy. 'never' bypasses the result cache (READ + WRITE) so a stateful
+    // operator — one that reads mutable tables or runs an agent loop — always runs fresh
+    // instead of returning a frozen prior output for identical inputs. Receipts are still
+    // logged below for audit/cost. (Gating only the read is insufficient: the receipt we'd
+    // write becomes the L2 entry; gating the read means a 'never' op never consults it.)
+    let cacheable = op.cache_policy != "never";
 
-    // L2: cross-backend persistent cache (rvbbit.receipts). ~1-3ms SPI.
-    if let Some(cached) = lookup_cached(&hash) {
-        crate::probe::record_l2_hit(&op.name, inputs);
-        // Backfill L1 so future calls in this backend skip the SPI cost.
-        crate::cache::put(&hash, cached.clone());
-        return Ok(cached);
+    if cacheable {
+        // L1: in-memory LRU cache. ~5μs lookup. Skips SPI entirely.
+        if let Some(cached) = crate::cache::get(&hash) {
+            crate::probe::record_l1_hit(&op.name, inputs);
+            return Ok(cached);
+        }
+
+        // L2: cross-backend persistent cache (rvbbit.receipts). ~1-3ms SPI.
+        if let Some(cached) = lookup_cached(&hash) {
+            crate::probe::record_l2_hit(&op.name, inputs);
+            // Backfill L1 so future calls in this backend skip the SPI cost.
+            crate::cache::put(&hash, cached.clone());
+            return Ok(cached);
+        }
     }
 
     // Pre-wards gate the inputs before the operator runs at all.
@@ -789,8 +800,10 @@ pub(crate) fn invoke_with_cache_seeded(
         pgrx::warning!("rvbbit: operator '{}' failed: {}", op.name, err);
         return Err(());
     }
-    // Populate L1 so subsequent calls in this backend are sub-millisecond.
-    crate::cache::put(&hash, result.output.clone());
+    // Populate L1 so subsequent calls in this backend are sub-millisecond (skip for 'never').
+    if cacheable {
+        crate::cache::put(&hash, result.output.clone());
+    }
     Ok(result.output)
 }
 

@@ -307,10 +307,19 @@ def _client_ip(request: Request) -> str:
     return (xff.split(",")[0].strip() if xff else "") or (request.client.host if request.client else "?")
 
 
+def _email_allowed(email: str) -> bool:
+    """WAREHOUSE_ALLOWED_EMAILS entries match exactly, OR — if an entry begins with '@' — any address in
+    that domain (e.g. '@acceleratedacademy.us' allows everyone @acceleratedacademy.us with the shared
+    password). Empty allowlist = any email. (Interim domain gate; per-user identity comes later.)"""
+    e = (email or "").strip().lower()
+    if not ALLOWED_EMAILS:
+        return True
+    return any(e == a or (a.startswith("@") and e.endswith(a)) for a in ALLOWED_EMAILS)
+
+
 def _creds_ok(email: str, password: str) -> bool:
     good_pw = bool(LOGIN_PASSWORD) and hmac.compare_digest(password, LOGIN_PASSWORD)
-    allowed = (not ALLOWED_EMAILS) or (email in ALLOWED_EMAILS)
-    return bool(good_pw and allowed and email and "@" in email)
+    return bool(good_pw and _email_allowed(email) and email and "@" in email)
 
 
 # ── browser view session (cookie, for /d/<slug> dashboards) ──────────────────
