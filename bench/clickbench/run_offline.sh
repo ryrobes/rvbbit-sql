@@ -23,6 +23,22 @@
 #   BENCH_SYSTEMS=rvbbit,rvbbit_native_forced,rvbbit_datafusion_mem_forced ./bench/clickbench/run_offline.sh
 #   RVBBIT_DUCK_HOT_VALIDATE=1 BENCH_SYSTEMS=rvbbit,rvbbit_native_forced ./bench/clickbench/run_offline.sh
 #   RVBBIT_DF_INPROCESS=off ./bench/clickbench/run_offline.sh # force legacy sidecar route (A/B vs new)
+#   RVBBIT_ACCEL_IDENTITY_MAP=on ./bench/clickbench/run_offline.sh
+#                                                            # opt into CTID overlay maps for no-PK mutable tables
+#   RVBBIT_COMPACT_SCAN_CHUNK_ROWS=250000 RVBBIT_COMPACT_WRITER_THREADS=8 ./bench/clickbench/run_offline.sh
+#                                                            # bulk-load profile: overlap canonical parquet chunk writes
+#   RVBBIT_DIRECT_ACCEL_LOAD=1 RVBBIT_DIRECT_ACCEL_CHUNK_ROWS=250000 ./bench/clickbench/run_offline.sh
+#                                                            # build canonical files from source chunks instead of heap rescan
+#   RVBBIT_DIRECT_ACCEL_LOAD=1 RVBBIT_DIRECT_ACCEL_METADATA_PROFILE=minimal ./bench/clickbench/run_offline.sh
+#                                                            # faster direct-load canonical files with thin metadata
+#   RVBBIT_DIRECT_ACCEL_LOAD=1 RVBBIT_DIRECT_ACCEL_METADATA_PROFILE=minimal RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async ./bench/clickbench/run_offline.sh
+#                                                            # canonical accelerator ready first; Hive/Vortex variants build in background
+#   RVBBIT_DIRECT_ACCEL_LOAD=1 RVBBIT_DIRECT_ACCEL_STAGING_MODE=offset_chunks ./bench/clickbench/run_offline.sh
+#                                                            # A/B older LIMIT/OFFSET source chunk staging
+#   RVBBIT_DIRECT_ACCEL_LOAD=1 RVBBIT_DIRECT_ACCEL_STAGING_MODE=source ./bench/clickbench/run_offline.sh
+#                                                            # import original /data/hits.parquet directly; no source staging file
+#   RVBBIT_DIRECT_ACCEL_LOAD=1 RVBBIT_DIRECT_ACCEL_STAGING_MODE=source RVBBIT_DIRECT_ACCEL_METADATA_PROFILE=minimal RVBBIT_COMPACT_WRITER_THREADS=8 RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async ./bench/clickbench/run_offline.sh
+#                                                            # current fast RVBBIT bulk-load profile
 #   ./bench/clickbench/run_offline.sh --rebuild --reset-rvbbit-extension
 #                                                            # full bench against current source
 #   ./bench/clickbench/run_offline.sh --test-name nightly-main
@@ -123,6 +139,22 @@ LOAD_ENV=()
 [ -n "${RVBBIT_HOT_LOAD_AFTER_LOAD:-}" ] && LOAD_ENV+=(-e "RVBBIT_HOT_LOAD_AFTER_LOAD=${RVBBIT_HOT_LOAD_AFTER_LOAD}")
 [ -n "${RVBBIT_HOT_STORE_BUDGET_MB:-}" ] && LOAD_ENV+=(-e "RVBBIT_HOT_STORE_BUDGET_MB=${RVBBIT_HOT_STORE_BUDGET_MB}")
 [ -n "${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS:-}" ] && LOAD_ENV+=(-e "RVBBIT_HOT_STORE_ROUTE_MAX_ROWS=${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS}")
+[ -n "${RVBBIT_ACCEL_IDENTITY_MAP:-}" ] && LOAD_ENV+=(-e "RVBBIT_ACCEL_IDENTITY_MAP=${RVBBIT_ACCEL_IDENTITY_MAP}")
+[ -n "${RVBBIT_ACCEL_IDENTITY_BATCH_ROWS:-}" ] && LOAD_ENV+=(-e "RVBBIT_ACCEL_IDENTITY_BATCH_ROWS=${RVBBIT_ACCEL_IDENTITY_BATCH_ROWS}")
+[ -n "${RVBBIT_COMPACT_SCAN_CHUNK_ROWS:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_SCAN_CHUNK_ROWS=${RVBBIT_COMPACT_SCAN_CHUNK_ROWS}")
+[ -n "${RVBBIT_COMPACT_WRITER_THREADS:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_WRITER_THREADS=${RVBBIT_COMPACT_WRITER_THREADS}")
+[ -n "${RVBBIT_DIRECT_ACCEL_LOAD:-}" ] && LOAD_ENV+=(-e "RVBBIT_DIRECT_ACCEL_LOAD=${RVBBIT_DIRECT_ACCEL_LOAD}")
+[ -n "${RVBBIT_DIRECT_ACCEL_CHUNK_ROWS:-}" ] && LOAD_ENV+=(-e "RVBBIT_DIRECT_ACCEL_CHUNK_ROWS=${RVBBIT_DIRECT_ACCEL_CHUNK_ROWS}")
+[ -n "${RVBBIT_DIRECT_ACCEL_STAGING_MODE:-}" ] && LOAD_ENV+=(-e "RVBBIT_DIRECT_ACCEL_STAGING_MODE=${RVBBIT_DIRECT_ACCEL_STAGING_MODE}")
+[ -n "${RVBBIT_IMPORT_EPOCH_SECONDS_COLUMNS:-}" ] && LOAD_ENV+=(-e "RVBBIT_IMPORT_EPOCH_SECONDS_COLUMNS=${RVBBIT_IMPORT_EPOCH_SECONDS_COLUMNS}")
+[ -n "${RVBBIT_DIRECT_ACCEL_KEEP_CHUNKS:-}" ] && LOAD_ENV+=(-e "RVBBIT_DIRECT_ACCEL_KEEP_CHUNKS=${RVBBIT_DIRECT_ACCEL_KEEP_CHUNKS}")
+[ -n "${RVBBIT_DIRECT_ACCEL_METADATA_PROFILE:-}" ] && LOAD_ENV+=(-e "RVBBIT_DIRECT_ACCEL_METADATA_PROFILE=${RVBBIT_DIRECT_ACCEL_METADATA_PROFILE}")
+[ -n "${RVBBIT_COMPACT_METADATA_PROFILE:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_METADATA_PROFILE=${RVBBIT_COMPACT_METADATA_PROFILE}")
+[ -n "${RVBBIT_COMPACT_TEXT_STATS:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_TEXT_STATS=${RVBBIT_COMPACT_TEXT_STATS}")
+[ -n "${RVBBIT_COMPACT_PER_GROUP_STATS:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_PER_GROUP_STATS=${RVBBIT_COMPACT_PER_GROUP_STATS}")
+[ -n "${RVBBIT_COMPACT_VALUE_BITMAPS:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_VALUE_BITMAPS=${RVBBIT_COMPACT_VALUE_BITMAPS}")
+[ -n "${RVBBIT_COMPACT_TEXT_DICTIONARIES:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_TEXT_DICTIONARIES=${RVBBIT_COMPACT_TEXT_DICTIONARIES}")
+[ -n "${RVBBIT_PARQUET_BLOOM:-}" ] && LOAD_ENV+=(-e "RVBBIT_PARQUET_BLOOM=${RVBBIT_PARQUET_BLOOM}")
 [ -n "${RVBBIT_COMPACT_VARIANTS_SYNC:-}" ] && LOAD_ENV+=(-e "RVBBIT_COMPACT_VARIANTS_SYNC=${RVBBIT_COMPACT_VARIANTS_SYNC}")
 if [ "${HIVE_FORCED_SELECTED}" = "1" ]; then
     LOAD_ENV+=(-e "RVBBIT_COMPACT_HIVE_LAYOUT=${RVBBIT_COMPACT_HIVE_LAYOUT:-on}")

@@ -46,7 +46,9 @@ SELECT
     coalesce(p.denied_layouts, '{}')               AS denied_layouts,
     (p.table_oid IS NOT NULL)                      AS explicit,
     p.note,
-    p.updated_at
+    p.updated_at,
+    NULL::integer                                  AS max_row_groups_before_rebuild,
+    NULL::bigint                                   AS max_tombstones_before_rebuild
 FROM rvbbit.tables t
 JOIN pg_class c     ON c.oid = t.table_oid
 JOIN pg_namespace n ON n.oid = c.relnamespace

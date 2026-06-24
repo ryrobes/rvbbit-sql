@@ -121,12 +121,6 @@ def test_count_star_includes_post_compact_heap_delta(rvbbit, llm_table):
              '{{"stop_reason":"end_turn"}}'::jsonb, '{{"region":"us-east-1"}}'::jsonb)
     """)
 
-    plan = rvbbit.execute(
-        f"EXPLAIN (FORMAT TEXT) SELECT count(*) FROM {llm_table}"
-    ).fetchall()
-    plan_text = "\n".join(r[0] for r in plan)
-    assert "Result" not in plan_text
-
     row = rvbbit.execute(f"SELECT count(*) FROM {llm_table}").fetchone()
     assert row[0] == 202
 

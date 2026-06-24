@@ -16,6 +16,12 @@ services:
     volumes:
       - ../bench/columnar_comparison/data:/data
 
+  # Benchmark-only: allow pg_rvbbit direct accelerator import to read the
+  # original ClickBench parquet without first staging a normalized copy.
+  pg-rvbbit:
+    volumes:
+      - ../bench/columnar_comparison/data:/data:ro
+
   pg-baseline:
     image: postgres:18
     container_name: bench-pg-baseline

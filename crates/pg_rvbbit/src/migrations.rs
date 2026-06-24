@@ -301,6 +301,62 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0070_agent_loop",
         include_str!("../sql/migrations/0070_agent_loop.sql"),
     ),
+    (
+        "0071_accel_dirty_ops_guard",
+        include_str!("../sql/migrations/0071_accel_dirty_ops_guard.sql"),
+    ),
+    (
+        "0072_accel_pk_tombstone_overlay",
+        include_str!("../sql/migrations/0072_accel_pk_tombstone_overlay.sql"),
+    ),
+    (
+        "0073_accel_ctid_identity_overlay",
+        include_str!("../sql/migrations/0073_accel_ctid_identity_overlay.sql"),
+    ),
+    (
+        "0074_accel_ctid_relfilenode_guard",
+        include_str!("../sql/migrations/0074_accel_ctid_relfilenode_guard.sql"),
+    ),
+    (
+        "0075_accel_auto_consolidation",
+        include_str!("../sql/migrations/0075_accel_auto_consolidation.sql"),
+    ),
+    (
+        "0076_accel_staged_fold_swap",
+        include_str!("../sql/migrations/0076_accel_staged_fold_swap.sql"),
+    ),
+    (
+        "0077_accel_orphan_reap_maintenance",
+        include_str!("../sql/migrations/0077_accel_orphan_reap_maintenance.sql"),
+    ),
+    (
+        "0078_accel_lagged_fold_catchup",
+        include_str!("../sql/migrations/0078_accel_lagged_fold_catchup.sql"),
+    ),
+    (
+        "0079_accel_sharded_dirty_markers",
+        include_str!("../sql/migrations/0079_accel_sharded_dirty_markers.sql"),
+    ),
+    (
+        "0080_accel_partition_dirty_triggers",
+        include_str!("../sql/migrations/0080_accel_partition_dirty_triggers.sql"),
+    ),
+    (
+        "0081_accel_partition_attach_reinstall",
+        include_str!("../sql/migrations/0081_accel_partition_attach_reinstall.sql"),
+    ),
+    (
+        "0082_accel_identity_remap_index",
+        include_str!("../sql/migrations/0082_accel_identity_remap_index.sql"),
+    ),
+    (
+        "0083_cube_refresh_autopilot",
+        include_str!("../sql/migrations/0083_cube_refresh_autopilot.sql"),
+    ),
+    (
+        "0084_cube_refresh_selective_sweeps",
+        include_str!("../sql/migrations/0084_cube_refresh_selective_sweeps.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -591,7 +591,7 @@ fn native_rewrite_table_signature(table_oid: u32) -> Option<NativeRewriteTableSi
                 rg.total_rows, rg.total_bytes, \
                 pg_relation_size(t.table_oid)::bigint, \
                 coalesce(t.shadow_heap_retained, false), \
-                coalesce(t.shadow_heap_dirty, false), \
+                rvbbit.shadow_heap_dirty_effective(t.table_oid), \
                 EXISTS(SELECT 1 FROM rvbbit.delete_log), \
                 EXISTS(SELECT 1 FROM rvbbit.row_groups WHERE cold_url IS NOT NULL) \
          FROM rvbbit.tables t \
@@ -9902,8 +9902,7 @@ fn fetch_total_row_count(table_oid: u32) -> Option<i64> {
 
 fn clean_shadow_heap_retained(table_oid: u32) -> bool {
     let sql = format!(
-        "SELECT coalesce(shadow_heap_retained AND NOT shadow_heap_dirty, false) \
-         FROM rvbbit.tables WHERE table_oid = {table_oid}::oid"
+        "SELECT rvbbit.shadow_heap_clean_retained({table_oid}::oid)"
     );
     pgrx::Spi::get_one::<bool>(&sql)
         .ok()

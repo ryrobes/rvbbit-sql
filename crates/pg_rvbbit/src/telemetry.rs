@@ -341,7 +341,7 @@ BEGIN
 
     SELECT count(*), count(*) FILTER (WHERE shadow_heap_dirty)
     INTO v_rvbbit_tables, v_dirty
-    FROM rvbbit.tables;
+    FROM rvbbit.table_dirty_state;
 
     SELECT count(*) INTO v_row_groups FROM rvbbit.row_groups;
     SELECT count(*) INTO v_variants FROM rvbbit.row_group_variants;

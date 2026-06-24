@@ -33,20 +33,20 @@ SELECT
     t.table_oid,
     c.oid::regclass::text                   AS table_name,
     coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-    coalesce(t.shadow_heap_dirty, false)    AS shadow_heap_dirty,
+    coalesce(ds.shadow_heap_dirty, false)   AS shadow_heap_dirty,
     (
         pg_relation_size(t.table_oid) = 0
-        OR coalesce(t.shadow_heap_retained AND NOT t.shadow_heap_dirty, false)
+        OR coalesce(ds.shadow_heap_retained AND NOT ds.shadow_heap_dirty, false)
     )                                       AS parquet_authoritative,
 
     -- staleness aging. dirty_since is NULLed when the table is clean, so the
     -- refresh/rebuild clear-sites don't need to reset the column themselves.
-    CASE WHEN coalesce(t.shadow_heap_dirty, false) THEN t.dirty_since END
+    CASE WHEN coalesce(ds.shadow_heap_dirty, false) THEN ds.dirty_since END
                                             AS dirty_since,
-    CASE WHEN coalesce(t.shadow_heap_dirty, false) AND t.dirty_since IS NOT NULL
-         THEN greatest(0, extract(epoch FROM now() - t.dirty_since))
+    CASE WHEN coalesce(ds.shadow_heap_dirty, false) AND ds.dirty_since IS NOT NULL
+         THEN greatest(0, extract(epoch FROM now() - ds.dirty_since))
     END                                     AS seconds_dirty,
-    t.last_write_at,
+    ds.last_write_at,
 
     s.last_refresh_at,
     CASE WHEN s.last_refresh_at IS NOT NULL
@@ -89,6 +89,7 @@ SELECT
     (t.lance_url IS NOT NULL)               AS lance_accelerated
 FROM rvbbit.tables t
 JOIN pg_class c ON c.oid = t.table_oid
+JOIN rvbbit.table_dirty_state ds ON ds.table_oid = t.table_oid
 LEFT JOIN rvbbit.acceleration_state s ON s.table_oid = t.table_oid
 LEFT JOIN LATERAL (
     SELECT sum(r.n_rows)::bigint  AS parquet_rows,
@@ -142,6 +143,11 @@ CREATE TABLE rvbbit.accel_policy (
     -- Below this drift ratio the executor does a cheap delta refresh; at/above it
     -- escalates to a full rebuild (the LSM major-compaction trigger).
     full_rebuild_drift_ratio double precision NOT NULL DEFAULT 0.5,
+    -- Optional major-compaction pressure limits. These let the heartbeat fold
+    -- accumulated small row groups or tombstones back into a clean current
+    -- accelerator even when freshness is otherwise up to date.
+    max_row_groups_before_rebuild integer,
+    max_tombstones_before_rebuild bigint,
     -- Lance datasets are always full-overwrite (expensive). When true, the
     -- executor refreshes them under a stricter, separate sub-budget.
     lance_separate           boolean NOT NULL DEFAULT true,
@@ -161,7 +167,9 @@ CREATE TABLE rvbbit.accel_policy (
     CHECK (freshness_target_secs IS NULL OR freshness_target_secs > 0),
     CHECK (min_interval_secs >= 0),
     CHECK (daily_refresh_budget IS NULL OR daily_refresh_budget >= 0),
-    CHECK (full_rebuild_drift_ratio >= 0)
+    CHECK (full_rebuild_drift_ratio >= 0),
+    CHECK (max_row_groups_before_rebuild IS NULL OR max_row_groups_before_rebuild > 0),
+    CHECK (max_tombstones_before_rebuild IS NULL OR max_tombstones_before_rebuild > 0)
 );
 
 COMMENT ON TABLE rvbbit.accel_policy IS
@@ -177,6 +185,10 @@ ALTER TABLE IF EXISTS rvbbit.accel_policy
     ADD COLUMN IF NOT EXISTS denied_engines text[] NOT NULL DEFAULT '{}';
 ALTER TABLE IF EXISTS rvbbit.accel_policy
     ADD COLUMN IF NOT EXISTS denied_layouts text[] NOT NULL DEFAULT '{}';
+ALTER TABLE IF EXISTS rvbbit.accel_policy
+    ADD COLUMN IF NOT EXISTS max_row_groups_before_rebuild integer;
+ALTER TABLE IF EXISTS rvbbit.accel_policy
+    ADD COLUMN IF NOT EXISTS max_tombstones_before_rebuild bigint;
 
 -- Effective policy: every registered table, with the manual fallback applied for
 -- tables that have no explicit row. `explicit` distinguishes a real policy from
@@ -196,7 +208,9 @@ SELECT
     coalesce(p.denied_layouts, '{}')               AS denied_layouts,
     (p.table_oid IS NOT NULL)                      AS explicit,
     p.note,
-    p.updated_at
+    p.updated_at,
+    p.max_row_groups_before_rebuild,
+    p.max_tombstones_before_rebuild
 FROM rvbbit.tables t
 JOIN pg_class c ON c.oid = t.table_oid
 LEFT JOIN rvbbit.accel_policy p ON p.table_oid = t.table_oid;
@@ -212,7 +226,9 @@ CREATE OR REPLACE FUNCTION rvbbit.set_accel_policy(
     full_rebuild_drift_ratio double precision DEFAULT 0.5,
     lance_separate           boolean DEFAULT true,
     active                   boolean DEFAULT true,
-    note                     text DEFAULT NULL
+    note                     text DEFAULT NULL,
+    max_row_groups_before_rebuild integer DEFAULT NULL,
+    max_tombstones_before_rebuild bigint DEFAULT NULL
 ) RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
     result jsonb;
@@ -223,10 +239,14 @@ BEGIN
 
     INSERT INTO rvbbit.accel_policy AS ap (
         table_oid, strategy, freshness_target_secs, min_interval_secs,
-        daily_refresh_budget, full_rebuild_drift_ratio, lance_separate, active, note, updated_at
+        daily_refresh_budget, full_rebuild_drift_ratio,
+        max_row_groups_before_rebuild, max_tombstones_before_rebuild,
+        lance_separate, active, note, updated_at
     ) VALUES (
         rel, strategy, freshness_target_secs, min_interval_secs,
-        daily_refresh_budget, full_rebuild_drift_ratio, lance_separate, active, note, now()
+        daily_refresh_budget, full_rebuild_drift_ratio,
+        max_row_groups_before_rebuild, max_tombstones_before_rebuild,
+        lance_separate, active, note, now()
     )
     ON CONFLICT (table_oid) DO UPDATE SET
         strategy                 = EXCLUDED.strategy,
@@ -234,6 +254,8 @@ BEGIN
         min_interval_secs        = EXCLUDED.min_interval_secs,
         daily_refresh_budget     = EXCLUDED.daily_refresh_budget,
         full_rebuild_drift_ratio = EXCLUDED.full_rebuild_drift_ratio,
+        max_row_groups_before_rebuild = EXCLUDED.max_row_groups_before_rebuild,
+        max_tombstones_before_rebuild = EXCLUDED.max_tombstones_before_rebuild,
         lance_separate           = EXCLUDED.lance_separate,
         active                   = EXCLUDED.active,
         note                     = EXCLUDED.note,
@@ -377,7 +399,9 @@ DECLARE
     do_execute  boolean;
     should_act  boolean;
     prop_action text;
+    prop_reason text;
     act_reason  text;
+    maintenance_pressure boolean;
     res         jsonb;
     last_scans  bigint;
     used_today  integer;
@@ -397,6 +421,8 @@ BEGIN
                f.shadow_heap_dirty,
                f.seconds_dirty,
                f.seconds_since_refresh,
+               f.row_groups,
+               f.tombstones,
                f.drift_rows,
                f.drift_ratio,
                f.heap_seq_scans,
@@ -406,6 +432,8 @@ BEGIN
                e.min_interval_secs,
                e.daily_refresh_budget,
                e.full_rebuild_drift_ratio,
+               e.max_row_groups_before_rebuild,
+               e.max_tombstones_before_rebuild,
                e.lance_separate
           FROM rvbbit.accel_freshness f
           JOIN rvbbit.accel_policy_effective e ON e.table_oid = f.table_oid
@@ -414,30 +442,69 @@ BEGIN
          ORDER BY (f.drift_rows * (1 + f.heap_seq_scans)) DESC,
                   f.seconds_dirty DESC NULLS LAST
     LOOP
-        -- Proposed kind: full when there's no baseline or drift crossed the
-        -- threshold (LSM major compaction); otherwise a cheap delta.
-        prop_action := CASE
-            WHEN cand.drift_ratio IS NULL OR cand.drift_ratio >= cand.full_rebuild_drift_ratio
-                THEN 'full' ELSE 'delta' END;
+        -- Proposed kind: row-group/tombstone pressure asks for a major
+        -- compaction even when the accelerator is otherwise fresh. Otherwise,
+        -- dirty tables choose full vs delta by drift, as before.
+        IF cand.max_row_groups_before_rebuild IS NOT NULL
+           AND cand.row_groups >= cand.max_row_groups_before_rebuild THEN
+            prop_action := 'full';
+            prop_reason := format(
+                'row_group_fanout %s >= %s',
+                cand.row_groups,
+                cand.max_row_groups_before_rebuild
+            );
+        ELSIF cand.max_tombstones_before_rebuild IS NOT NULL
+              AND cand.tombstones >= cand.max_tombstones_before_rebuild THEN
+            prop_action := 'full';
+            prop_reason := format(
+                'tombstone_count %s >= %s',
+                cand.tombstones,
+                cand.max_tombstones_before_rebuild
+            );
+        ELSIF cand.shadow_heap_dirty THEN
+            IF cand.drift_ratio IS NULL THEN
+                prop_action := 'full';
+                prop_reason := 'no accelerator baseline';
+            ELSIF cand.drift_ratio >= cand.full_rebuild_drift_ratio THEN
+                prop_action := 'full';
+                prop_reason := format(
+                    'drift_ratio %s >= %s',
+                    round(cand.drift_ratio::numeric, 6),
+                    round(cand.full_rebuild_drift_ratio::numeric, 6)
+                );
+            ELSE
+                prop_action := 'delta';
+                prop_reason := 'dirty';
+            END IF;
+        ELSE
+            prop_action := 'skip';
+            prop_reason := 'clean';
+        END IF;
         is_lance   := coalesce(cand.lance_accelerated, false) AND coalesce(cand.lance_separate, true);
         should_act := false;
-        act_reason := '';
+        act_reason := prop_reason;
+        maintenance_pressure := prop_action = 'full'
+            AND (prop_reason LIKE 'row_group_fanout %' OR prop_reason LIKE 'tombstone_count %');
 
-        IF NOT cand.shadow_heap_dirty THEN
-            act_reason := 'clean';
+        IF prop_action = 'skip' THEN
+            act_reason := prop_reason;
         ELSIF cand.seconds_since_refresh IS NOT NULL
               AND cand.seconds_since_refresh < cand.min_interval_secs THEN
             act_reason := format('min_interval %ss not elapsed', cand.min_interval_secs);
+        ELSIF maintenance_pressure THEN
+            should_act := true;
+            act_reason := prop_reason;
         ELSE
             -- Strategy gate.
             IF cand.strategy IN ('scheduled', 'continuous') THEN
                 should_act := true;
-                act_reason := 'dirty';
+                act_reason := prop_reason;
             ELSIF cand.strategy = 'target' THEN
                 IF cand.freshness_target_secs IS NULL
                    OR coalesce(cand.seconds_dirty, 0) >= cand.freshness_target_secs THEN
                     should_act := true;
-                    act_reason := format('stale %ss >= target %ss',
+                    act_reason := format('%s; stale %ss >= target %ss',
+                        prop_reason,
                         round(coalesce(cand.seconds_dirty, 0))::int,
                         coalesce(cand.freshness_target_secs, 0));
                 ELSE
@@ -451,7 +518,7 @@ BEGIN
                  ORDER BY r.ran_at DESC LIMIT 1;
                 IF last_scans IS NOT NULL AND cand.heap_seq_scans > last_scans THEN
                     should_act := true;
-                    act_reason := 'demand grew on slow path';
+                    act_reason := prop_reason || '; demand grew on slow path';
                 ELSE
                     act_reason := CASE WHEN last_scans IS NULL
                                        THEN 'demand baseline' ELSE 'no new slow-path demand' END;

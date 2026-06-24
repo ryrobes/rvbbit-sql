@@ -123,6 +123,7 @@ services:
       - "55433:5432"
     volumes:
       - rvbbit_data:/var/lib/postgresql
+      - ../bench/clickbench/direct_accel:/rvbbit_import:ro
     # All knobs come from /etc/rvbbit/tuning.conf (see
     # docker/config/rvbbit-tuning.conf). Override individual settings by
     # adding `-c key=value` after the config_file line — last value wins.
@@ -197,6 +198,7 @@ services:
       GOOGLE_CLOUD_QUOTA_PROJECT: ${GOOGLE_CLOUD_QUOTA_PROJECT:-}
     volumes:
       - ../bench:/bench
+      - ../bench/clickbench/direct_accel:/rvbbit_import
       - ../tests:/tests
       - ../sidecars:/sidecars:ro
       - ../results:/results

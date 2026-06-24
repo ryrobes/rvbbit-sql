@@ -1,3 +1,16 @@
+import datetime as dt
+import os
+from pathlib import Path
+
+
+def _heap_scalar(conn, sql):
+    conn.execute("SET rvbbit.force_heap_scan = on")
+    try:
+        return conn.execute(sql).fetchone()
+    finally:
+        conn.execute("RESET rvbbit.force_heap_scan")
+
+
 def test_refresh_phase_log_and_hive_delta_append(rvbbit, temp_table):
     rvbbit.execute(f"""
         CREATE TABLE {temp_table} (
@@ -134,6 +147,115 @@ def test_vortex_format_variant_and_forced_datafusion_route(rvbbit, temp_table):
     finally:
         rvbbit.execute("SET rvbbit.route_force_candidate = ''")
         rvbbit.execute("SET rvbbit.compact_vortex_layout = 'off'")
+
+
+def test_direct_canonical_parquet_import_uses_threaded_writer_and_logs_timing(
+    rvbbit, temp_table
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source_dir = Path(os.environ.get("RVBBIT_DIRECT_ACCEL_DIR", "/rvbbit_import"))
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_path = source_dir / f"{temp_table}.parquet"
+    n_rows = 2000
+    epoch_start = int(dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc).timestamp())
+    source = pa.table(
+        {
+            "id": pa.array(range(n_rows), type=pa.int32()),
+            "label": pa.array([f"label-{i % 17}" for i in range(n_rows)]),
+            "day": pa.array(
+                [dt.date(2024, 1, 1) + dt.timedelta(days=i % 31) for i in range(n_rows)],
+                type=pa.date32(),
+            ),
+            "ts": pa.array([epoch_start + i for i in range(n_rows)], type=pa.int64()),
+        }
+    )
+    pq.write_table(source, source_path, compression="zstd", row_group_size=500)
+
+    try:
+        rvbbit.execute(
+            f"""
+            CREATE TABLE {temp_table} (
+                id int,
+                label text,
+                day date,
+                ts timestamp
+            ) USING rvbbit
+            """
+        )
+        rvbbit.execute(
+            f"""
+            INSERT INTO {temp_table}
+            SELECT g,
+                   'label-' || (g % 17)::text,
+                   DATE '2024-01-01' + ((g % 31)::int),
+                   TIMESTAMP '2024-01-01 00:00:00'
+                     + (g::bigint * INTERVAL '1 second')
+            FROM generate_series(0, {n_rows - 1}) AS g
+            """
+        )
+
+        rvbbit.execute("SET rvbbit.accel_identity_map = 'off'")
+        rvbbit.execute("SET rvbbit.compact_scan_chunk_rows = '500'")
+        rvbbit.execute("SET rvbbit.compact_writer_threads = '4'")
+        rvbbit.execute("SET rvbbit.direct_accel_metadata_profile = 'minimal'")
+        rvbbit.execute("SET rvbbit.import_epoch_seconds_columns = 'ts'")
+        doc = rvbbit.execute(
+            f"""
+            SELECT rvbbit.import_canonical_parquet_chunks(
+                '{temp_table}'::regclass,
+                ARRAY[%s],
+                false
+            )
+            """,
+            (str(source_path),),
+        ).fetchone()[0]
+
+        assert doc["status"] == "ok"
+        assert doc["rows_written"] == n_rows
+        assert doc["row_groups_written"] == 4
+        assert doc["metadata_profile"] == "minimal"
+        assert doc["timing"]["writer_seconds_sum"] > 0
+        assert "source_canonicalize_seconds" in doc["timing"]
+
+        row_groups = rvbbit.execute(
+            f"""
+            SELECT count(*)::int, sum(n_rows)::int
+            FROM rvbbit.row_groups
+            WHERE table_oid = '{temp_table}'::regclass
+            """
+        ).fetchone()
+        assert row_groups == (4, n_rows)
+
+        sql = (
+            f"SELECT count(*)::int, sum(id)::bigint, min(day), max(ts) "
+            f"FROM {temp_table}"
+        )
+        assert rvbbit.execute(sql).fetchone() == _heap_scalar(rvbbit, sql)
+
+        phase = rvbbit.execute(
+            f"""
+            SELECT details->>'writer_threads',
+                   details->>'chunk_rows',
+                   details->>'metadata_profile',
+                   details->'import_timing'
+            FROM rvbbit.acceleration_operation_phases
+            WHERE table_oid = '{temp_table}'::regclass
+              AND phase = 'canonical_delta_import'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        assert phase[0] == "4"
+        assert phase[1] == "500"
+        assert phase[2] == "minimal"
+        assert phase[3]["writer_seconds_sum"] > 0
+    finally:
+        try:
+            source_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def test_vortex_route_skips_temporal_tables(rvbbit, temp_table):

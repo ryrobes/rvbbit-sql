@@ -16,7 +16,20 @@ CREATE OR REPLACE FUNCTION rvbbit.search_data_weighted(
 ) RETURNS TABLE (
     node_id bigint, kind text, schema_name text, rel_name text, col_name text,
     score double precision, doc text, usage_touches bigint, boosted_score double precision
-) LANGUAGE sql STABLE AS $$
+) LANGUAGE plpgsql STABLE AS $$
+BEGIN
+    IF to_regclass('rvbbit.mcp_popular_objects') IS NULL THEN
+        RETURN QUERY
+        SELECT h.node_id, h.kind, h.schema_name, h.rel_name, h.col_name, h.score, h.doc,
+               0::bigint AS usage_touches,
+               h.score AS boosted_score
+        FROM rvbbit.data_search(p_query, greatest(p_k, 1), p_kinds, p_graph) h
+        ORDER BY h.score DESC
+        LIMIT greatest(p_k, 1);
+        RETURN;
+    END IF;
+
+    RETURN QUERY
     WITH hits AS (
         -- over-fetch, then re-rank + trim, so a popular item can climb into the top-k
         SELECT * FROM rvbbit.data_search(p_query, greatest(p_k, 1) * 2, p_kinds, p_graph)
@@ -40,4 +53,5 @@ CREATE OR REPLACE FUNCTION rvbbit.search_data_weighted(
     ) u ON true
     ORDER BY boosted_score DESC
     LIMIT greatest(p_k, 1);
+END;
 $$;

@@ -26,7 +26,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 
 use pgrx::pg_guard;
 use pgrx::pg_sys;
@@ -177,6 +177,19 @@ unsafe fn query_has_join_heavy_rvbbit(query: *mut pg_sys::Query) -> bool {
     count_rvbbit_rtes((*query).rtable) >= 3
 }
 
+unsafe fn query_allows_rvbbit_file_scan(root: *mut pg_sys::PlannerInfo) -> bool {
+    if root.is_null() || (*root).parse.is_null() {
+        return false;
+    }
+    let query = (*root).parse;
+    if (*query).commandType != pg_sys::CmdType::CMD_SELECT {
+        return false;
+    }
+    // Row-locking queries need real heap TIDs. A CustomScan over accelerator
+    // files cannot satisfy UPDATE/DELETE/FOR UPDATE tuple identity.
+    (*query).rowMarks.is_null()
+}
+
 unsafe fn count_rvbbit_rtes(rtable: *mut pg_sys::List) -> usize {
     if rtable.is_null() {
         return 0;
@@ -223,6 +236,9 @@ unsafe extern "C-unwind" fn rvbbit_get_relation_info_hook(
         return;
     }
     if IN_HOOK.with(|f| f.get()) {
+        return;
+    }
+    if !query_allows_rvbbit_file_scan(root) {
         return;
     }
     if !is_rvbbit_table(oid_u32) {
@@ -281,6 +297,9 @@ unsafe extern "C-unwind" fn rvbbit_set_rel_pathlist_hook(
         return;
     }
     if IN_HOOK.with(|f| f.get()) {
+        return;
+    }
+    if !query_allows_rvbbit_file_scan(root) {
         return;
     }
     if !is_rvbbit_table(oid_u32) {
@@ -451,7 +470,7 @@ fn parquet_authoritative_for_oid(oid: u32) -> bool {
     IN_HOOK.with(|f| f.set(true));
     let result: Result<Option<bool>, _> = pgrx::Spi::get_one(&format!(
         "SELECT pg_relation_size(t.table_oid) = 0 \
-                OR coalesce(t.shadow_heap_retained AND NOT t.shadow_heap_dirty, false) \
+                OR rvbbit.shadow_heap_clean_retained(t.table_oid) \
          FROM rvbbit.tables t \
          WHERE t.table_oid = {oid}::oid"
     ));

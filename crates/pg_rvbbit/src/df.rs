@@ -484,7 +484,7 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
                ), ARRAY[]::text[])                                         AS columns,
                pg_relation_size(c.oid)::bigint                            AS heap_bytes,
                coalesce(t.shadow_heap_retained, false)                    AS shadow_heap_retained,
-               coalesce(t.shadow_heap_dirty, false)                       AS shadow_heap_dirty,
+               rvbbit.shadow_heap_dirty_effective(c.oid)                  AS shadow_heap_dirty,
                (SELECT count(*)
                   FROM rvbbit.delete_log dl
                  WHERE dl.table_oid = c.oid
@@ -496,7 +496,7 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
         LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
         WHERE am.amname = 'rvbbit'
           {asof_predicate}
-        GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
+        GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained
         "
     );
     Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
@@ -618,7 +618,7 @@ fn discover_catalog_vortex() -> Result<BTreeMap<String, RvbbitTable>, String> {
                ), ARRAY[]::text[])                                  AS columns,
                pg_relation_size(c.oid)::bigint                      AS heap_bytes,
                coalesce(t.shadow_heap_retained, false)              AS shadow_heap_retained,
-               coalesce(t.shadow_heap_dirty, false)                 AS shadow_heap_dirty,
+               rvbbit.shadow_heap_dirty_effective(c.oid)            AS shadow_heap_dirty,
                (SELECT count(*)
                   FROM rvbbit.delete_log dl
                  WHERE dl.table_oid = c.oid)::bigint                AS deletes
@@ -633,7 +633,7 @@ fn discover_catalog_vortex() -> Result<BTreeMap<String, RvbbitTable>, String> {
         LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
         WHERE am.amname = 'rvbbit'
           AND v.layout = 'vortex_scan'
-        GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
+        GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained
     ";
     Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let table = client.select(sql, None, &[])?;
@@ -996,7 +996,7 @@ fn hot_current_table_state(table_oid: u32) -> Result<HotTableState, String> {
                coalesce(sum(rg.n_bytes), 0)::bigint,
                pg_relation_size(c.oid)::bigint,
                coalesce(t.shadow_heap_retained, false),
-               coalesce(t.shadow_heap_dirty, false),
+               rvbbit.shadow_heap_dirty_effective(c.oid),
                (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint,
                coalesce(string_agg(
                    rg.rg_id::text || ':' ||
@@ -1013,7 +1013,7 @@ fn hot_current_table_state(table_oid: u32) -> Result<HotTableState, String> {
         LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = c.oid
         WHERE c.oid = {table_oid}::oid
           AND am.amname = 'rvbbit'
-        GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
+        GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained
         "#
     );
     Spi::connect(|client| -> Result<(), pgrx::spi::Error> {

@@ -3889,7 +3889,7 @@ fn route_table_state_stamp() -> String {
                     coalesce(rg.rows, 0)::text || ':' || coalesce(rg.bytes, 0)::text || ':' || \
                     coalesce(dl.deletes, 0)::text || ':' || \
                     coalesce(t.shadow_heap_retained, false)::text || ':' || \
-                    coalesce(t.shadow_heap_dirty, false)::text, \
+                    rvbbit.shadow_heap_dirty_effective(c.oid)::text, \
                     ',' ORDER BY c.oid \
                 ), 'none') \
          FROM pg_class c \
@@ -4074,7 +4074,7 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
                     coalesce(sum(rg.n_bytes), 0)::bigint, \
                     (c.relpages::bigint * current_setting('block_size')::bigint)::bigint, \
                     coalesce(t.shadow_heap_retained, false), \
-                    coalesce(t.shadow_heap_dirty, false), \
+                    rvbbit.shadow_heap_dirty_effective(c.oid), \
                     (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid), \
                     coalesce(( \
                         SELECT string_agg(lower(a.attname::text), ',' ORDER BY a.attnum) \
@@ -4107,7 +4107,7 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
              LEFT JOIN rvbbit.accel_policy p ON p.table_oid = c.oid \
              LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = c.oid \
              WHERE am.amname = 'rvbbit' AND c.oid IN ({oid_list}) \
-             GROUP BY n.nspname, c.relname, c.oid, t.shadow_heap_retained, t.shadow_heap_dirty, \
+             GROUP BY n.nspname, c.relname, c.oid, t.shadow_heap_retained, \
                       p.denied_engines, p.denied_layouts"
             ),
             None,

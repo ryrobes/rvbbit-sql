@@ -22,9 +22,19 @@ CREATE TABLE rvbbit.tables (
     data_dir        text,                 -- NULL until Phase 2
     shadow_heap_retained boolean NOT NULL DEFAULT false,
     shadow_heap_dirty boolean NOT NULL DEFAULT false,
-    -- Phase 2: monotonic per-table compaction generation. Each compact()
-    -- call atomically increments this and stamps every row group it writes
-    -- with the OLD value. Reads see the latest generation by default;
+    dirty_has_insert boolean NOT NULL DEFAULT false,
+    dirty_has_update boolean NOT NULL DEFAULT false,
+    dirty_has_delete boolean NOT NULL DEFAULT false,
+    dirty_has_truncate boolean NOT NULL DEFAULT false,
+    -- No-PK tables use heap CTID as a hidden accelerator identity. CTIDs are
+    -- stable across ordinary UPDATE/DELETE triggers but not across heap rewrite
+    -- operations such as VACUUM FULL or CLUSTER, so record the relfilenode that
+    -- produced the current side map and invalidate the overlay if it changes.
+    ctid_identity_relfilenode oid,
+    -- Phase 2: legacy per-table generation floor. New generation allocation
+    -- uses rvbbit.generation_seq to keep OLTP triggers off this catalog row,
+    -- while maintenance still advances this value past the visible file set.
+    -- Reads see the latest generation by default;
     -- AS OF queries (future) can narrow to `generation <= asof`.
     next_generation bigint NOT NULL DEFAULT 1,
     -- Snapshot visibility floor. When > 0, the "latest" (non-AS-OF) scan
@@ -55,6 +65,115 @@ CREATE TABLE rvbbit.tables (
     last_write_at        timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE SEQUENCE rvbbit.generation_seq AS bigint;
+
+-- Write-pressure relief for retained shadow heaps. The DML trigger records the
+-- dirty episode in one of many small marker slots instead of blocking every
+-- writer on the single rvbbit.tables row. Maintenance folds/refreshes clear
+-- these slots while holding the same table lock that defines their watermark.
+CREATE TABLE rvbbit.table_dirty_markers (
+    table_oid       oid NOT NULL,
+    shard           smallint NOT NULL,
+    dirty_op        char(1) NOT NULL,
+    marked_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (table_oid, shard, dirty_op),
+    CHECK (shard >= 0),
+    CHECK (dirty_op IN ('I', 'U', 'D', 'T'))
+);
+
+CREATE INDEX table_dirty_markers_table_time_idx
+    ON rvbbit.table_dirty_markers (table_oid, marked_at DESC);
+
+CREATE OR REPLACE FUNCTION rvbbit.clear_shadow_heap_dirty_flags()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.shadow_heap_dirty IS FALSE THEN
+        NEW.dirty_has_insert := false;
+        NEW.dirty_has_update := false;
+        NEW.dirty_has_delete := false;
+        NEW.dirty_has_truncate := false;
+        DELETE FROM rvbbit.table_dirty_markers WHERE table_oid = NEW.table_oid;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER rvbbit_clear_shadow_heap_dirty_flags
+    BEFORE INSERT OR UPDATE OF shadow_heap_dirty ON rvbbit.tables
+    FOR EACH ROW EXECUTE FUNCTION rvbbit.clear_shadow_heap_dirty_flags();
+
+CREATE OR REPLACE VIEW rvbbit.table_dirty_state AS
+SELECT
+    t.table_oid,
+    coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
+    (coalesce(t.shadow_heap_dirty, false) OR coalesce(dm.has_marker, false))
+        AS shadow_heap_dirty,
+    (coalesce(t.dirty_has_insert, false) OR coalesce(dm.has_insert, false))
+        AS dirty_has_insert,
+    (coalesce(t.dirty_has_update, false) OR coalesce(dm.has_update, false))
+        AS dirty_has_update,
+    (coalesce(t.dirty_has_delete, false) OR coalesce(dm.has_delete, false))
+        AS dirty_has_delete,
+    (coalesce(t.dirty_has_truncate, false) OR coalesce(dm.has_truncate, false))
+        AS dirty_has_truncate,
+    CASE
+        WHEN NOT (coalesce(t.shadow_heap_dirty, false) OR coalesce(dm.has_marker, false))
+            THEN NULL
+        WHEN t.dirty_since IS NULL THEN dm.dirty_since
+        WHEN dm.dirty_since IS NULL THEN t.dirty_since
+        ELSE least(t.dirty_since, dm.dirty_since)
+    END AS dirty_since,
+    CASE
+        WHEN t.last_write_at IS NULL THEN dm.last_write_at
+        WHEN dm.last_write_at IS NULL THEN t.last_write_at
+        ELSE greatest(t.last_write_at, dm.last_write_at)
+    END AS last_write_at
+FROM rvbbit.tables t
+LEFT JOIN LATERAL (
+    SELECT count(*) > 0 AS has_marker,
+           bool_or(m.dirty_op = 'I') AS has_insert,
+           bool_or(m.dirty_op = 'U') AS has_update,
+           bool_or(m.dirty_op = 'D') AS has_delete,
+           bool_or(m.dirty_op = 'T') AS has_truncate,
+           min(m.marked_at) AS dirty_since,
+           max(m.marked_at) AS last_write_at
+      FROM rvbbit.table_dirty_markers m
+     WHERE m.table_oid = t.table_oid
+) dm ON true;
+
+CREATE OR REPLACE FUNCTION rvbbit.shadow_heap_dirty_effective(rel oid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT coalesce((
+        SELECT s.shadow_heap_dirty
+        FROM rvbbit.table_dirty_state s
+        WHERE s.table_oid = rel
+    ), false)
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.shadow_heap_clean_retained(rel oid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT coalesce((
+        SELECT s.shadow_heap_retained AND NOT s.shadow_heap_dirty
+        FROM rvbbit.table_dirty_state s
+        WHERE s.table_oid = rel
+    ), false)
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.clear_table_dirty_markers(rel oid)
+RETURNS void
+LANGUAGE sql
+AS $$
+    DELETE FROM rvbbit.table_dirty_markers WHERE table_oid = rel
+$$;
 
 CREATE TABLE rvbbit.lance_text_indexes (
     table_oid      oid NOT NULL REFERENCES rvbbit.tables(table_oid) ON DELETE CASCADE,
@@ -369,6 +488,21 @@ CREATE INDEX acceleration_operations_table_started_idx
 CREATE INDEX acceleration_operations_status_idx
     ON rvbbit.acceleration_operations (status, started_at DESC);
 
+CREATE TABLE rvbbit.orphaned_files (
+    path            text PRIMARY KEY,
+    table_oid       oid REFERENCES rvbbit.tables(table_oid) ON DELETE SET NULL,
+    reason          text NOT NULL,
+    operation_id    bigint REFERENCES rvbbit.acceleration_operations(id) ON DELETE SET NULL,
+    queued_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
+    attempts        integer NOT NULL DEFAULT 0,
+    last_attempt_at timestamptz,
+    last_error      text,
+    CHECK (attempts >= 0)
+);
+
+CREATE INDEX orphaned_files_queued_idx
+    ON rvbbit.orphaned_files (queued_at);
+
 CREATE TABLE rvbbit.acceleration_operation_phases (
     id                  bigserial PRIMARY KEY,
     operation_id        bigint REFERENCES rvbbit.acceleration_operations(id) ON DELETE CASCADE,
@@ -419,6 +553,26 @@ CREATE TABLE rvbbit.delete_log (
 CREATE INDEX delete_log_xid_idx ON rvbbit.delete_log (deleted_xid);
 CREATE INDEX delete_log_table_generation_idx
     ON rvbbit.delete_log (table_oid, deleted_generation);
+
+CREATE TABLE rvbbit.row_identity_map (
+    table_oid       oid NOT NULL,
+    key_json        text NOT NULL,
+    rg_id           bigint NOT NULL,
+    ordinal         int NOT NULL,
+    generation      bigint NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (table_oid, key_json, rg_id, ordinal),
+    FOREIGN KEY (table_oid, rg_id)
+        REFERENCES rvbbit.row_groups(table_oid, rg_id)
+        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE INDEX row_identity_map_lookup_idx
+    ON rvbbit.row_identity_map (table_oid, key_json);
+
+CREATE INDEX row_identity_map_row_lookup_idx
+    ON rvbbit.row_identity_map (table_oid, rg_id, ordinal)
+    INCLUDE (key_json, generation);
 
 -- mvcc-08: reconstruct a 32-bit heap xmin into the full 64-bit transaction id
 -- (as numeric) so it can be compared against xid8 watermarks (pg_snapshot_xmin)
@@ -481,24 +635,54 @@ BEGIN
     END LOOP;
 END $$;
 
--- Allocate a new generation for the given table — same per-table
--- advisory-lock pattern that compact() uses, so any tombstone-writing
--- code can stamp delete_log entries with a number that doesn't collide
--- with a concurrent compact. Returns the allocated value.
+-- Reap physical files that were made unreachable by a previous committed
+-- metadata swap. Rebuild/fold operations must not unlink files inline: other
+-- transactions can still see the old catalog rows by MVCC until the swap
+-- commits, and already-planned scans may still hold old paths for a short time.
+CREATE OR REPLACE FUNCTION rvbbit.reap_orphaned_files(
+    max_age interval DEFAULT interval '30 minutes',
+    max_files integer DEFAULT 1000
+) RETURNS TABLE (files_dequeued integer, files_unlinked integer)
+LANGUAGE plpgsql AS $$
+DECLARE
+    paths text[];
+BEGIN
+    WITH candidates AS (
+        SELECT o.path
+        FROM rvbbit.orphaned_files o
+        WHERE o.queued_at <= clock_timestamp() - coalesce(max_age, interval '30 minutes')
+          AND NOT EXISTS (SELECT 1 FROM rvbbit.row_groups rg WHERE rg.path = o.path)
+          AND NOT EXISTS (SELECT 1 FROM rvbbit.row_group_variants v WHERE v.path = o.path)
+          AND NOT EXISTS (SELECT 1 FROM rvbbit.text_dictionaries d WHERE d.path = o.path)
+        ORDER BY o.queued_at
+        LIMIT greatest(coalesce(max_files, 1000), 0)
+    ),
+    removed AS (
+        DELETE FROM rvbbit.orphaned_files o
+        USING candidates c
+        WHERE o.path = c.path
+        RETURNING o.path
+    )
+    SELECT coalesce(count(*), 0)::integer, array_agg(path)
+      INTO files_dequeued, paths
+      FROM removed;
+
+    files_unlinked := coalesce(rvbbit.reap_unlink_files(paths), 0);
+    RETURN NEXT;
+END $$;
+
+-- Allocate a new generation without touching the per-table metadata row. A
+-- global sequence gives every table a monotonically increasing subsequence and
+-- keeps high-frequency tombstone triggers away from rvbbit.tables.
 CREATE OR REPLACE FUNCTION rvbbit.allocate_generation(reloid regclass)
 RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
     gen bigint;
 BEGIN
-    PERFORM pg_advisory_xact_lock(
-        ((1380336724::bigint) << 32) | reloid::oid::bigint);
-    UPDATE rvbbit.tables
-       SET next_generation = next_generation + 1
-     WHERE table_oid = reloid
-    RETURNING next_generation - 1 INTO gen;
-    IF gen IS NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM rvbbit.tables WHERE table_oid = reloid) THEN
         RAISE EXCEPTION 'rvbbit.allocate_generation: table % is not registered with the rvbbit access method', reloid;
     END IF;
+    SELECT nextval('rvbbit.generation_seq') INTO gen;
     RETURN gen;
 END $$;
 
@@ -571,6 +755,205 @@ CREATE OR REPLACE FUNCTION rvbbit.tombstone_count(
     WHERE table_oid = reloid
       AND (asof IS NULL OR deleted_generation <= asof)
 $$;
+
+CREATE OR REPLACE FUNCTION rvbbit.accel_identity_columns(reloid regclass)
+RETURNS text[]
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT coalesce(array_agg(a.attname::text ORDER BY k.ord), ARRAY[]::text[])
+    FROM pg_index i
+    JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+    JOIN pg_attribute a
+      ON a.attrelid = i.indrelid
+     AND a.attnum = k.attnum
+    WHERE i.indrelid = reloid
+      AND i.indisprimary
+      AND i.indisvalid
+      AND i.indpred IS NULL
+      AND i.indexprs IS NULL
+      AND NOT a.attisdropped
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.accel_identity_mode(reloid regclass)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT CASE
+        WHEN cardinality(rvbbit.accel_identity_columns(reloid)) > 0 THEN 'primary_key'
+        WHEN rvbbit.is_rvbbit_table(reloid) THEN 'ctid'
+        ELSE NULL
+    END
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.accel_identity_map_complete(reloid regclass)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT coalesce((
+               SELECT count(*)::bigint
+               FROM rvbbit.row_identity_map m
+               WHERE m.table_oid = reloid
+           ), 0) >= coalesce((
+               SELECT sum(rg.n_rows)::bigint
+               FROM rvbbit.row_groups rg
+               WHERE rg.table_oid = reloid
+           ), 0)
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.accel_all_rows_tombstoned(reloid regclass)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT coalesce((
+               SELECT count(*)::bigint
+               FROM rvbbit.delete_log dl
+               WHERE dl.table_oid = reloid
+           ), 0) >= coalesce((
+               SELECT sum(rg.n_rows)::bigint
+               FROM rvbbit.row_groups rg
+               WHERE rg.table_oid = reloid
+           ), 0)
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.accel_ctid_identity_valid(reloid regclass)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT CASE
+        WHEN rvbbit.accel_identity_mode(reloid) <> 'ctid' THEN true
+        ELSE EXISTS (
+            SELECT 1
+            FROM rvbbit.tables t
+            WHERE t.table_oid = reloid
+              AND t.ctid_identity_relfilenode IS NOT NULL
+              AND t.ctid_identity_relfilenode = pg_relation_filenode(reloid)
+        ) OR rvbbit.accel_all_rows_tombstoned(reloid)
+    END
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.accel_identity_expr(
+    reloid regclass,
+    rel_alias text DEFAULT NULL
+) RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    cols text[];
+    expr text;
+BEGIN
+    cols := rvbbit.accel_identity_columns(reloid);
+    IF cols IS NULL OR cardinality(cols) = 0 THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT string_agg(
+               CASE
+                   WHEN rel_alias IS NULL OR btrim(rel_alias) = ''
+                   THEN format('%I', col)
+                   ELSE format('%I.%I', rel_alias, col)
+               END,
+               ', ' ORDER BY ord
+           )
+      INTO expr
+      FROM unnest(cols) WITH ORDINALITY AS c(col, ord);
+
+    RETURN format('jsonb_build_array(%s)::text', expr);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.accel_identity_json_from_row(
+    reloid regclass,
+    row_data jsonb
+) RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    cols text[];
+    key_json jsonb;
+BEGIN
+    cols := rvbbit.accel_identity_columns(reloid);
+    IF cols IS NULL OR cardinality(cols) = 0 THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT jsonb_agg(row_data -> col ORDER BY ord)
+      INTO key_json
+      FROM unnest(cols) WITH ORDINALITY AS c(col, ord);
+
+    RETURN key_json::text;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.accel_overlay_ready(reloid regclass)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT CASE rvbbit.accel_identity_mode(reloid)
+        WHEN 'primary_key' THEN rvbbit.accel_identity_map_complete(reloid)
+        WHEN 'ctid' THEN rvbbit.accel_identity_map_complete(reloid)
+                         AND rvbbit.accel_ctid_identity_valid(reloid)
+        ELSE false
+    END
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.record_ctid_identity_relfilenode()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    rec record;
+    current_node oid;
+    recorded_node oid;
+    has_existing_row_groups boolean;
+BEGIN
+    FOR rec IN
+        SELECT DISTINCT table_oid
+        FROM rvbbit_inserted_identity_rows
+    LOOP
+        current_node := pg_relation_filenode(rec.table_oid::regclass);
+        IF rvbbit.accel_identity_mode(rec.table_oid::regclass) <> 'ctid'
+           OR current_node IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        SELECT t.ctid_identity_relfilenode
+          INTO recorded_node
+          FROM rvbbit.tables t
+         WHERE t.table_oid = rec.table_oid;
+
+        SELECT EXISTS (
+            SELECT 1
+            FROM rvbbit.row_groups rg
+            WHERE rg.table_oid = rec.table_oid
+        ) INTO has_existing_row_groups;
+
+        IF recorded_node IS NULL
+           OR recorded_node = current_node
+           OR NOT has_existing_row_groups
+           OR rvbbit.accel_all_rows_tombstoned(rec.table_oid::regclass) THEN
+            UPDATE rvbbit.tables
+               SET ctid_identity_relfilenode = current_node
+             WHERE table_oid = rec.table_oid;
+        END IF;
+    END LOOP;
+
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS rvbbit_record_ctid_identity_relfilenode ON rvbbit.row_identity_map;
+CREATE TRIGGER rvbbit_record_ctid_identity_relfilenode
+    AFTER INSERT ON rvbbit.row_identity_map
+    REFERENCING NEW TABLE AS rvbbit_inserted_identity_rows
+    FOR EACH STATEMENT EXECUTE FUNCTION rvbbit.record_ctid_identity_relfilenode();
 
 -- ---------------------------------------------------------------------------
 -- Phase 2 slice 5: UPDATE-by-composition.
@@ -743,24 +1126,46 @@ DECLARE
     row_groups_written bigint := 0;
     variants_rows bigint;
     generation_after bigint := 0;
+    pre_max_rg_id bigint := -1;
+    baseline_max_rg_id bigint := -1;
+    staging_rg_base bigint := 0;
+    baseline_generation bigint := 0;
+    catchup_generation bigint := 0;
     safe_upper_xid numeric;
+    scan_snapshot text;
+    scan_upper_xid numeric;
+    final_upper_xid numeric;
     phase_id bigint;
+    catchup_phase_id bigint;
     phase_bytes_written bigint := 0;
+    catchup_rows bigint := 0;
+    catchup_row_groups bigint := 0;
+    remapped_tombstones int := 0;
+    queued_orphan_files int := 0;
     orphan_paths text[];
+    staged_orphan_paths text[];
+    final_lock_attempts int := 0;
+    final_lock_attempt_timeout_ms int := 100;
+    final_lock_retry_sleep_ms int := 50;
+    final_lock_max_wait_ms int := 5000;
+    final_lock_deadline timestamptz;
+    final_lock_acquired boolean := false;
+    previous_lock_timeout text;
 BEGIN
     IF NOT rvbbit.is_rvbbit_table(reloid) THEN
         RAISE EXCEPTION '% is not an rvbbit table', reloid;
     END IF;
 
-    -- Rebuild is an accelerator maintenance operation. Block writers while
-    -- we take the heap snapshot so the retained heap can be marked clean
-    -- without racing a concurrent INSERT/UPDATE/DELETE.
-    EXECUTE format('LOCK TABLE %s IN SHARE MODE', reloid);
-
-    safe_upper_xid := greatest(
+    -- Define the logical fold snapshot without taking a table lock. The long
+    -- baseline scan exports only rows visible to this snapshot; after it
+    -- finishes, a short final lock appends rows not visible to this snapshot
+    -- and remaps concurrent tombstones onto the staged baseline.
+    scan_snapshot := pg_current_snapshot()::text;
+    scan_upper_xid := greatest(
         0::numeric,
-        (pg_snapshot_xmin(pg_current_snapshot())::text)::numeric - 1
+        (pg_snapshot_xmax(scan_snapshot::pg_snapshot)::text)::numeric - 1
     );
+    safe_upper_xid := scan_upper_xid;
 
     INSERT INTO rvbbit.acceleration_operations (
         table_oid, table_name, operation, status,
@@ -770,40 +1175,47 @@ BEGIN
         NULL, safe_upper_xid,
         jsonb_build_object(
             'refresh_variants', refresh_variants,
-            'mode', 'full_heap_rebuild',
-            'heap_guard', 'LOCK TABLE IN SHARE MODE'
+            'mode', 'lagged_staged_full_heap_fold',
+            'heap_guard', 'none_during_baseline_scan',
+            'final_guard', 'polite LOCK TABLE IN SHARE MODE polling',
+            'final_lock_attempt_timeout_ms', final_lock_attempt_timeout_ms,
+            'final_lock_retry_sleep_ms', final_lock_retry_sleep_ms,
+            'final_lock_max_wait_ms', final_lock_max_wait_ms,
+            'scan_snapshot', scan_snapshot,
+            'scan_upper_xid', scan_upper_xid,
+            'metadata_swap', 'post_catchup_export',
+            'file_reap', 'queued_after_swap',
+            'variant_refresh', CASE WHEN refresh_variants THEN 'deferred_to_maintain_storage' ELSE 'skipped' END
         )
     )
     RETURNING id INTO op_id;
 
-    -- resources-01: capture the on-disk parquet paths so we can unlink them.
-    -- rg_id restarts at 0 on rebuild, so any file above the post-rebuild
-    -- high-water mark would never be overwritten and would leak forever.
-    SELECT count(*)::int, array_agg(path)
-      INTO dropped_rgs, orphan_paths
-      FROM rvbbit.row_groups WHERE table_oid = reloid;
-
-    -- Wipe derived state, then unlink the orphaned files. The retained heap is
-    -- authoritative (shadow_heap_retained set below) so the data is recoverable
-    -- even though the unlink runs before this transaction commits.
-    DELETE FROM rvbbit.delete_log         WHERE table_oid = reloid;
-    DELETE FROM rvbbit.layout_variant_status WHERE table_oid = reloid;
-    DELETE FROM rvbbit.row_group_variants WHERE table_oid = reloid;
-    DELETE FROM rvbbit.row_groups         WHERE table_oid = reloid;
-    DELETE FROM rvbbit.generations        WHERE table_oid = reloid;
-    UPDATE rvbbit.tables
-       SET next_generation = 1,
-           shadow_heap_retained = true,
-           shadow_heap_dirty = false
+    -- Capture the old file set, but keep it live while the expensive full
+    -- export runs. Other transactions keep reading the old accelerator until
+    -- this transaction commits the metadata swap; physical files are queued for
+    -- a later reap instead of being unlinked while old catalog rows are still
+    -- MVCC-visible.
+    SELECT count(*)::int, coalesce(max(rg_id), -1)::bigint
+      INTO dropped_rgs, pre_max_rg_id
+      FROM rvbbit.row_groups
      WHERE table_oid = reloid;
-    DELETE FROM rvbbit.acceleration_state WHERE table_oid = reloid;
 
-    -- resources-01: drop the orphaned parquet files (idempotent; missing files
-    -- are a no-op). Done after the catalog wipe so a failure before here leaves
-    -- the files referenced and intact.
-    IF orphan_paths IS NOT NULL THEN
-        PERFORM rvbbit.reap_unlink_files(orphan_paths);
-    END IF;
+    SELECT greatest(coalesce(max(generation), 0) + 1, (op_id * 2) + 1)
+      INTO baseline_generation
+      FROM rvbbit.row_groups
+     WHERE table_oid = reloid;
+    catchup_generation := baseline_generation + 1;
+    staging_rg_base := greatest(pre_max_rg_id + 1, op_id * 1000000000);
+
+    SELECT array_agg(path ORDER BY path)
+      INTO orphan_paths
+      FROM (
+          SELECT path FROM rvbbit.row_groups WHERE table_oid = reloid
+          UNION ALL
+          SELECT path FROM rvbbit.row_group_variants WHERE table_oid = reloid
+          UNION ALL
+          SELECT path FROM rvbbit.text_dictionaries WHERE table_oid = reloid
+      ) old_files;
 
     INSERT INTO rvbbit.acceleration_operation_phases (
         operation_id, table_oid, table_name, phase, layout, status, details
@@ -811,23 +1223,40 @@ BEGIN
         op_id, reloid, table_name_text, 'canonical_full_export', 'scan', 'running',
         jsonb_build_object(
             'source', 'heap',
-            'mode', 'full_heap_rebuild',
-            'dropped_row_groups', dropped_rgs
+            'mode', 'lagged_staged_full_heap_fold',
+            'dropped_row_groups', dropped_rgs,
+            'old_max_rg_id', pre_max_rg_id,
+            'staging_rg_base', staging_rg_base,
+            'baseline_generation', baseline_generation,
+            'scan_snapshot', scan_snapshot
         )
     )
     RETURNING id INTO phase_id;
 
-    SELECT rvbbit.export_to_parquet_full_scan(reloid::oid) INTO rebuilt_rows;
+    SELECT rvbbit.export_to_parquet_snapshot_visible_at(
+        reloid::oid,
+        scan_snapshot,
+        staging_rg_base,
+        baseline_generation
+    )
+      INTO rebuilt_rows;
 
     SELECT count(*)::bigint, coalesce(max(generation), 0)::bigint
       INTO row_groups_written, generation_after
       FROM rvbbit.row_groups
-     WHERE table_oid = reloid;
+     WHERE table_oid = reloid
+       AND rg_id >= staging_rg_base;
+    SELECT coalesce(max(rg_id), pre_max_rg_id)::bigint
+      INTO baseline_max_rg_id
+      FROM rvbbit.row_groups
+     WHERE table_oid = reloid
+       AND rg_id >= staging_rg_base;
 
     SELECT coalesce(sum(n_bytes), 0)::bigint
       INTO phase_bytes_written
       FROM rvbbit.row_groups
-     WHERE table_oid = reloid;
+     WHERE table_oid = reloid
+       AND rg_id >= staging_rg_base;
 
     UPDATE rvbbit.acceleration_operation_phases
        SET status = 'ok',
@@ -840,11 +1269,249 @@ BEGIN
            actual_rows = rebuilt_rows
      WHERE id = phase_id;
 
-    IF refresh_variants AND rebuilt_rows > 0 THEN
-        PERFORM set_config('rvbbit.acceleration_operation_id', op_id::text, true);
-        SELECT rvbbit.refresh_layout_variants(reloid) INTO variants_rows;
-        PERFORM set_config('rvbbit.acceleration_operation_id', '', true);
+    -- Take the short write-blocking handoff lock only after the expensive
+    -- baseline scan. Poll with a short lock timeout so a busy table does not
+    -- leave a SHARE lock request queued in front of later OLTP writers.
+    previous_lock_timeout := current_setting('lock_timeout');
+    PERFORM set_config('lock_timeout', final_lock_attempt_timeout_ms::text || 'ms', true);
+    final_lock_deadline := clock_timestamp()
+        + ((final_lock_max_wait_ms::text || ' milliseconds')::interval);
+    WHILE clock_timestamp() < final_lock_deadline LOOP
+        final_lock_attempts := final_lock_attempts + 1;
+        BEGIN
+            EXECUTE format('LOCK TABLE %s IN SHARE MODE', reloid);
+            final_lock_acquired := true;
+            EXIT;
+        EXCEPTION WHEN lock_not_available THEN
+            PERFORM pg_sleep(final_lock_retry_sleep_ms::double precision / 1000.0);
+        END;
+    END LOOP;
+    PERFORM set_config('lock_timeout', previous_lock_timeout, true);
+
+    IF NOT final_lock_acquired THEN
+        SELECT array_agg(path ORDER BY path)
+          INTO staged_orphan_paths
+          FROM (
+              SELECT path FROM rvbbit.row_groups
+               WHERE table_oid = reloid AND rg_id >= staging_rg_base
+              UNION ALL
+              SELECT path FROM rvbbit.row_group_variants
+               WHERE table_oid = reloid AND rg_id >= staging_rg_base
+              UNION ALL
+              SELECT path FROM rvbbit.text_dictionaries
+               WHERE table_oid = reloid AND rg_id >= staging_rg_base
+          ) staged_files;
+
+        DELETE FROM rvbbit.layout_variant_status WHERE table_oid = reloid;
+        DELETE FROM rvbbit.row_group_variants
+         WHERE table_oid = reloid
+           AND rg_id >= staging_rg_base;
+        DELETE FROM rvbbit.row_groups
+         WHERE table_oid = reloid
+           AND rg_id >= staging_rg_base;
+        DELETE FROM rvbbit.generations
+         WHERE table_oid = reloid
+           AND NOT EXISTS (
+               SELECT 1
+               FROM rvbbit.row_groups rg
+               WHERE rg.table_oid = rvbbit.generations.table_oid
+                 AND rg.generation = rvbbit.generations.generation
+           );
+
+        IF staged_orphan_paths IS NOT NULL THEN
+            INSERT INTO rvbbit.orphaned_files (path, table_oid, reason, operation_id)
+            SELECT DISTINCT p, reloid, 'rebuild_acceleration_final_lock_busy', op_id
+            FROM unnest(staged_orphan_paths) AS p
+            WHERE p IS NOT NULL AND btrim(p) <> ''
+            ON CONFLICT (path) DO UPDATE
+               SET table_oid = EXCLUDED.table_oid,
+                   reason = EXCLUDED.reason,
+                   operation_id = EXCLUDED.operation_id,
+                   queued_at = clock_timestamp(),
+                   last_error = NULL;
+            GET DIAGNOSTICS queued_orphan_files = ROW_COUNT;
+        END IF;
+
+        UPDATE rvbbit.acceleration_operation_phases
+           SET details = details || jsonb_build_object(
+                   'cleaned_up_after_final_lock_busy', true,
+                   'final_lock_attempts', final_lock_attempts
+               )
+         WHERE id = phase_id;
+
+        UPDATE rvbbit.acceleration_operations
+           SET status = 'noop',
+               finished_at = clock_timestamp(),
+               rows_written = 0,
+               row_groups_written = 0,
+               variants_rows = NULL,
+               generation_after = NULL,
+               error = 'final lock busy',
+               settings = settings || jsonb_build_object(
+                   'final_lock_attempts', final_lock_attempts,
+                   'final_lock_acquired', false,
+                   'queued_orphan_files', queued_orphan_files,
+                   'metadata_swap', 'skipped_final_lock_busy'
+               )
+         WHERE id = op_id;
+
+        RETURN jsonb_build_object(
+            'status', 'noop',
+            'operation_id', op_id,
+            'table', table_name_text,
+            'operation', 'rebuild_acceleration',
+            'reason', 'final_lock_busy',
+            'final_lock_attempts', final_lock_attempts,
+            'queued_orphan_files', queued_orphan_files,
+            'baseline_rows', rebuilt_rows,
+            'catchup_rows', 0,
+            'remapped_tombstones', 0,
+            'rows_written', 0,
+            'row_groups_written', 0,
+            'variants_rows', NULL,
+            'generation_after', NULL,
+            'watermark_after', scan_upper_xid
+        );
     END IF;
+
+    final_upper_xid := greatest(
+        0::numeric,
+        (pg_snapshot_xmax(pg_current_snapshot())::text)::numeric - 1
+    );
+    safe_upper_xid := final_upper_xid;
+
+    INSERT INTO rvbbit.acceleration_operation_phases (
+        operation_id, table_oid, table_name, phase, layout, status, details
+    ) VALUES (
+        op_id, reloid, table_name_text, 'canonical_gap_export', 'scan', 'running',
+        jsonb_build_object(
+            'source', 'heap',
+            'mode', 'snapshot_gap',
+            'scan_snapshot', scan_snapshot,
+            'baseline_max_rg_id', baseline_max_rg_id,
+            'catchup_generation', catchup_generation
+        )
+    )
+    RETURNING id INTO catchup_phase_id;
+
+    SELECT rvbbit.export_to_parquet_snapshot_gap_at(
+        reloid::oid,
+        scan_snapshot,
+        greatest(baseline_max_rg_id + 1, staging_rg_base),
+        catchup_generation
+    )
+      INTO catchup_rows;
+
+    SELECT count(*)::bigint
+      INTO catchup_row_groups
+      FROM rvbbit.row_groups
+     WHERE table_oid = reloid
+       AND rg_id >= staging_rg_base
+       AND rg_id > baseline_max_rg_id;
+
+    UPDATE rvbbit.acceleration_operation_phases
+       SET status = 'ok',
+           finished_at = clock_timestamp(),
+           rows_written = catchup_rows,
+           row_groups_written = catchup_row_groups,
+           files_written = catchup_row_groups::integer,
+           expected_rows = catchup_rows,
+           actual_rows = catchup_rows
+     WHERE id = catchup_phase_id;
+
+    WITH remapped AS (
+        INSERT INTO rvbbit.delete_log
+            (table_oid, rg_id, ordinal, deleted_xid, deleted_generation)
+        SELECT reloid,
+               staged_m.rg_id,
+               staged_m.ordinal,
+               dl.deleted_xid,
+               dl.deleted_generation
+        FROM rvbbit.delete_log dl
+        JOIN rvbbit.row_identity_map old_m
+          ON old_m.table_oid = dl.table_oid
+         AND old_m.rg_id = dl.rg_id
+         AND old_m.ordinal = dl.ordinal
+        JOIN rvbbit.row_identity_map staged_m
+         ON staged_m.table_oid = old_m.table_oid
+         AND staged_m.key_json = old_m.key_json
+         AND staged_m.rg_id >= staging_rg_base
+         AND staged_m.rg_id <= baseline_max_rg_id
+        WHERE dl.table_oid = reloid
+          AND dl.rg_id <= pre_max_rg_id
+          AND NOT pg_visible_in_snapshot(dl.deleted_xid, scan_snapshot::pg_snapshot)
+        ON CONFLICT (table_oid, rg_id, ordinal) DO UPDATE SET
+            deleted_xid = EXCLUDED.deleted_xid,
+            deleted_generation = EXCLUDED.deleted_generation
+        RETURNING 1
+    )
+    SELECT count(*)::int INTO remapped_tombstones FROM remapped;
+
+    SELECT count(*)::bigint, coalesce(max(generation), 0)::bigint
+      INTO row_groups_written, generation_after
+      FROM rvbbit.row_groups
+     WHERE table_oid = reloid
+       AND rg_id >= staging_rg_base;
+
+    -- Atomic metadata swap inside this transaction: remove old row groups and
+    -- their dependent stats/identity rows. Old tombstones are discarded after
+    -- any concurrent, post-snapshot tombstones have been remapped onto the
+    -- staged baseline row-group ordinals above.
+    DELETE FROM rvbbit.delete_log
+     WHERE table_oid = reloid
+       AND rg_id <= pre_max_rg_id;
+    DELETE FROM rvbbit.layout_variant_status WHERE table_oid = reloid;
+    DELETE FROM rvbbit.row_group_variants WHERE table_oid = reloid;
+    DELETE FROM rvbbit.row_groups
+     WHERE table_oid = reloid
+       AND rg_id <= pre_max_rg_id;
+    IF row_groups_written > 0 THEN
+        DELETE FROM rvbbit.generations
+         WHERE table_oid = reloid
+           AND NOT EXISTS (
+               SELECT 1
+               FROM rvbbit.row_groups rg
+               WHERE rg.table_oid = rvbbit.generations.table_oid
+                 AND rg.generation = rvbbit.generations.generation
+           );
+    ELSE
+        DELETE FROM rvbbit.generations WHERE table_oid = reloid;
+        generation_after := 0;
+    END IF;
+
+    UPDATE rvbbit.tables
+       SET shadow_heap_retained = true,
+           shadow_heap_dirty = false,
+           dirty_has_insert = false,
+           dirty_has_update = false,
+           dirty_has_delete = false,
+           dirty_has_truncate = false,
+           next_generation = greatest(next_generation, generation_after + 1),
+           ctid_identity_relfilenode = CASE
+               WHEN rvbbit.accel_identity_mode(reloid) = 'ctid'
+               THEN pg_relation_filenode(reloid)
+               ELSE ctid_identity_relfilenode
+           END
+     WHERE table_oid = reloid;
+    PERFORM rvbbit.clear_table_dirty_markers(reloid::oid);
+
+    DELETE FROM rvbbit.acceleration_state WHERE table_oid = reloid;
+
+    IF orphan_paths IS NOT NULL THEN
+        INSERT INTO rvbbit.orphaned_files (path, table_oid, reason, operation_id)
+        SELECT DISTINCT p, reloid, 'rebuild_acceleration_staged_swap', op_id
+        FROM unnest(orphan_paths) AS p
+        WHERE p IS NOT NULL AND btrim(p) <> ''
+        ON CONFLICT (path) DO UPDATE
+           SET table_oid = EXCLUDED.table_oid,
+               reason = EXCLUDED.reason,
+               operation_id = EXCLUDED.operation_id,
+               queued_at = clock_timestamp(),
+               last_error = NULL;
+        GET DIAGNOSTICS queued_orphan_files = ROW_COUNT;
+    END IF;
+
+    variants_rows := NULL;
 
     INSERT INTO rvbbit.acceleration_state (
         table_oid,
@@ -858,7 +1525,7 @@ BEGIN
         reloid,
         safe_upper_xid,
         generation_after,
-        coalesce(rebuilt_rows, 0),
+        coalesce(rebuilt_rows, 0) + coalesce(catchup_rows, 0),
         coalesce(row_groups_written, 0),
         clock_timestamp(),
         clock_timestamp()
@@ -871,20 +1538,33 @@ BEGIN
            last_refresh_at = EXCLUDED.last_refresh_at,
            updated_at = EXCLUDED.updated_at;
 
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty ON %s', reloid);
-    EXECUTE format(
-        'CREATE TRIGGER rvbbit_shadow_heap_dirty AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
-        reloid
-    );
+    PERFORM rvbbit.install_shadow_heap_dirty_triggers(reloid);
 
     UPDATE rvbbit.acceleration_operations
        SET status = 'ok',
            finished_at = clock_timestamp(),
-           rows_written = rebuilt_rows,
+           rows_written = rebuilt_rows + coalesce(catchup_rows, 0),
            row_groups_written = accel_rebuild.row_groups_written,
            variants_rows = accel_rebuild.variants_rows,
            generation_after = accel_rebuild.generation_after,
-           settings = settings || jsonb_build_object('dropped_row_groups', dropped_rgs)
+           watermark_after = safe_upper_xid,
+           settings = settings || jsonb_build_object(
+               'dropped_row_groups', dropped_rgs,
+               'old_max_rg_id', pre_max_rg_id,
+               'baseline_max_rg_id', baseline_max_rg_id,
+               'staging_rg_base', staging_rg_base,
+               'baseline_generation', baseline_generation,
+               'catchup_generation', catchup_generation,
+               'baseline_rows', rebuilt_rows,
+               'catchup_rows', catchup_rows,
+               'catchup_row_groups', catchup_row_groups,
+               'remapped_tombstones', remapped_tombstones,
+               'final_lock_attempts', final_lock_attempts,
+               'final_lock_acquired', true,
+               'queued_orphan_files', queued_orphan_files,
+               'metadata_swap', 'lagged_staged',
+               'watermark_after', safe_upper_xid
+           )
      WHERE id = op_id;
 
     RETURN jsonb_build_object(
@@ -893,7 +1573,11 @@ BEGIN
         'table', table_name_text,
         'operation', 'rebuild_acceleration',
         'dropped_row_groups', dropped_rgs,
-        'rows_written', rebuilt_rows,
+        'queued_orphan_files', queued_orphan_files,
+        'baseline_rows', rebuilt_rows,
+        'catchup_rows', catchup_rows,
+        'remapped_tombstones', remapped_tombstones,
+        'rows_written', rebuilt_rows + coalesce(catchup_rows, 0),
         'row_groups_written', row_groups_written,
         'variants_rows', variants_rows,
         'generation_after', generation_after,
@@ -5196,6 +5880,7 @@ BEGIN
         -- ON DELETE CASCADE on row_groups handles those; delete_log is keyed
         -- by table_oid so wipe it explicitly.
         DELETE FROM rvbbit.delete_log WHERE table_oid = obj.objid;
+        DELETE FROM rvbbit.table_dirty_markers WHERE table_oid = obj.objid;
     END LOOP;
 END;
 $$;
@@ -5208,22 +5893,389 @@ CREATE OR REPLACE FUNCTION rvbbit.mark_shadow_heap_dirty()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    key_expr text;
+    tombstone_gen bigint := 0;
+    overlay_ready boolean := false;
+    identity_mode text;
+    marker_op char(1);
+    marker_shard smallint;
 BEGIN
-    UPDATE rvbbit.tables
-    SET shadow_heap_dirty = true,
-        -- clock_timestamp() (real wall-clock per statement), not now()
-        -- (transaction start), so last_write_at reflects the actual write
-        -- time and a long writer txn doesn't backdate it.
-        last_write_at = clock_timestamp(),
-        -- Stamp the onset only on the clean->dirty edge; keep it stable
-        -- across subsequent writes so seconds_dirty measures the whole
-        -- stale window, not just the last statement.
-        dirty_since = CASE WHEN shadow_heap_dirty THEN dirty_since ELSE clock_timestamp() END
-    WHERE table_oid = TG_RELID
-      AND shadow_heap_retained;
+    marker_op := CASE TG_OP
+        WHEN 'INSERT' THEN 'I'
+        WHEN 'UPDATE' THEN 'U'
+        WHEN 'DELETE' THEN 'D'
+        WHEN 'TRUNCATE' THEN 'T'
+    END;
+    marker_shard := mod(pg_backend_pid(), 1024)::smallint;
+
+    INSERT INTO rvbbit.table_dirty_markers (table_oid, shard, dirty_op, marked_at)
+    SELECT TG_RELID, marker_shard, marker_op, clock_timestamp()
+    WHERE marker_op IS NOT NULL
+      AND EXISTS (
+          SELECT 1
+          FROM rvbbit.tables
+          WHERE table_oid = TG_RELID
+            AND shadow_heap_retained
+      )
+    ON CONFLICT (table_oid, shard, dirty_op) DO NOTHING;
+
+    -- Best-effort compatibility coalesce for code/operators that still inspect
+    -- rvbbit.tables directly. NOWAIT keeps this trigger off the writer hot path;
+    -- the marker table above is the authoritative dirty signal.
+    BEGIN
+        PERFORM 1
+        FROM rvbbit.tables
+        WHERE table_oid = TG_RELID
+          AND shadow_heap_retained
+        FOR NO KEY UPDATE NOWAIT;
+
+        IF FOUND THEN
+            UPDATE rvbbit.tables
+            SET shadow_heap_dirty = true,
+                dirty_has_insert = dirty_has_insert OR TG_OP = 'INSERT',
+                dirty_has_update = dirty_has_update OR TG_OP = 'UPDATE',
+                dirty_has_delete = dirty_has_delete OR TG_OP = 'DELETE',
+                dirty_has_truncate = dirty_has_truncate OR TG_OP = 'TRUNCATE',
+                -- clock_timestamp() (real wall-clock per statement), not now()
+                -- (transaction start), so last_write_at reflects the actual write
+                -- time and a long writer txn doesn't backdate it.
+                last_write_at = clock_timestamp(),
+                -- Stamp the onset only on the clean->dirty edge; keep it stable
+                -- across subsequent writes so seconds_dirty measures the whole
+                -- stale window, not just the last statement.
+                dirty_since = CASE WHEN shadow_heap_dirty THEN dirty_since ELSE clock_timestamp() END
+            WHERE table_oid = TG_RELID;
+        END IF;
+    EXCEPTION WHEN lock_not_available THEN
+        NULL;
+    END;
+
+    identity_mode := rvbbit.accel_identity_mode(TG_RELID);
+    overlay_ready := rvbbit.accel_overlay_ready(TG_RELID);
+    IF TG_OP IN ('UPDATE', 'DELETE') AND overlay_ready AND identity_mode = 'primary_key' THEN
+        key_expr := rvbbit.accel_identity_expr(TG_RELID, 'rvbbit_old_rows');
+        IF key_expr IS NOT NULL THEN
+            tombstone_gen := rvbbit.allocate_generation(TG_RELID);
+            EXECUTE format(
+                'WITH old_keys AS (
+                     SELECT DISTINCT %1$s AS key_json
+                     FROM rvbbit_old_rows
+                 )
+                 INSERT INTO rvbbit.delete_log
+                     (table_oid, rg_id, ordinal, deleted_xid, deleted_generation)
+                 SELECT $1::oid, m.rg_id, m.ordinal, pg_current_xact_id(), $2
+                 FROM old_keys k
+                 JOIN rvbbit.row_identity_map m
+                   ON m.table_oid = $1::oid
+                  AND m.key_json = k.key_json
+                 ON CONFLICT (table_oid, rg_id, ordinal) DO NOTHING',
+                key_expr
+            ) USING TG_RELID, tombstone_gen;
+        END IF;
+    ELSIF TG_OP = 'TRUNCATE' THEN
+        tombstone_gen := rvbbit.allocate_generation(TG_RELID);
+        INSERT INTO rvbbit.delete_log
+            (table_oid, rg_id, ordinal, deleted_xid, deleted_generation)
+        SELECT TG_RELID, rg.rg_id, ord::int, pg_current_xact_id(), tombstone_gen
+        FROM rvbbit.row_groups rg
+        CROSS JOIN LATERAL generate_series(0, rg.n_rows - 1) AS ord
+        WHERE rg.table_oid = TG_RELID
+        ON CONFLICT (table_oid, rg_id, ordinal) DO NOTHING;
+    END IF;
+
     RETURN NULL;
 END;
 $$;
+
+CREATE OR REPLACE FUNCTION rvbbit.mark_shadow_heap_ctid_tombstone()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    old_key_json text;
+    gen_setting text;
+    tombstone_gen bigint;
+BEGIN
+    IF TG_OP NOT IN ('UPDATE', 'DELETE')
+       OR rvbbit.accel_identity_mode(TG_RELID) <> 'ctid'
+       OR NOT rvbbit.accel_overlay_ready(TG_RELID) THEN
+        RETURN NULL;
+    END IF;
+
+    gen_setting := nullif(current_setting('rvbbit.row_tombstone_generation', true), '');
+    IF split_part(coalesce(gen_setting, ''), ':', 1) = TG_RELID::oid::text THEN
+        tombstone_gen := split_part(gen_setting, ':', 2)::bigint;
+    ELSE
+        tombstone_gen := rvbbit.allocate_generation(TG_RELID);
+        PERFORM set_config(
+            'rvbbit.row_tombstone_generation',
+            TG_RELID::oid::text || ':' || tombstone_gen::text,
+            true
+        );
+    END IF;
+
+    old_key_json := jsonb_build_array(OLD.ctid::text)::text;
+    INSERT INTO rvbbit.delete_log
+        (table_oid, rg_id, ordinal, deleted_xid, deleted_generation)
+    SELECT TG_RELID, m.rg_id, m.ordinal, pg_current_xact_id(), tombstone_gen
+    FROM rvbbit.row_identity_map m
+    WHERE m.table_oid = TG_RELID
+      AND m.key_json = old_key_json
+    ON CONFLICT (table_oid, rg_id, ordinal) DO NOTHING;
+
+    RETURN NULL;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.mark_shadow_heap_dirty_row()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    marker_op char(1);
+    marker_shard smallint;
+    identity_mode text;
+    overlay_ready boolean := false;
+    old_key_json text;
+    gen_setting text;
+    tombstone_gen bigint;
+BEGIN
+    marker_op := CASE TG_OP
+        WHEN 'INSERT' THEN 'I'
+        WHEN 'UPDATE' THEN 'U'
+        WHEN 'DELETE' THEN 'D'
+    END;
+    marker_shard := mod(pg_backend_pid(), 1024)::smallint;
+
+    INSERT INTO rvbbit.table_dirty_markers (table_oid, shard, dirty_op, marked_at)
+    SELECT TG_RELID, marker_shard, marker_op, clock_timestamp()
+    WHERE marker_op IS NOT NULL
+      AND EXISTS (
+          SELECT 1
+          FROM rvbbit.tables
+          WHERE table_oid = TG_RELID
+            AND shadow_heap_retained
+      )
+    ON CONFLICT (table_oid, shard, dirty_op) DO NOTHING;
+
+    BEGIN
+        PERFORM 1
+        FROM rvbbit.tables
+        WHERE table_oid = TG_RELID
+          AND shadow_heap_retained
+        FOR NO KEY UPDATE NOWAIT;
+
+        IF FOUND THEN
+            UPDATE rvbbit.tables
+            SET shadow_heap_dirty = true,
+                dirty_has_insert = dirty_has_insert OR TG_OP = 'INSERT',
+                dirty_has_update = dirty_has_update OR TG_OP = 'UPDATE',
+                dirty_has_delete = dirty_has_delete OR TG_OP = 'DELETE',
+                last_write_at = clock_timestamp(),
+                dirty_since = CASE WHEN shadow_heap_dirty THEN dirty_since ELSE clock_timestamp() END
+            WHERE table_oid = TG_RELID;
+        END IF;
+    EXCEPTION WHEN lock_not_available THEN
+        NULL;
+    END;
+
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        identity_mode := rvbbit.accel_identity_mode(TG_RELID);
+        overlay_ready := rvbbit.accel_overlay_ready(TG_RELID);
+
+        IF overlay_ready AND identity_mode = 'primary_key' THEN
+            old_key_json := rvbbit.accel_identity_json_from_row(TG_RELID, to_jsonb(OLD));
+        ELSIF overlay_ready AND identity_mode = 'ctid' THEN
+            old_key_json := jsonb_build_array(OLD.ctid::text)::text;
+        END IF;
+
+        IF old_key_json IS NOT NULL THEN
+            gen_setting := nullif(current_setting('rvbbit.row_tombstone_generation', true), '');
+            IF split_part(coalesce(gen_setting, ''), ':', 1) = TG_RELID::oid::text THEN
+                tombstone_gen := split_part(gen_setting, ':', 2)::bigint;
+            ELSE
+                tombstone_gen := rvbbit.allocate_generation(TG_RELID);
+                PERFORM set_config(
+                    'rvbbit.row_tombstone_generation',
+                    TG_RELID::oid::text || ':' || tombstone_gen::text,
+                    true
+                );
+            END IF;
+
+            INSERT INTO rvbbit.delete_log
+                (table_oid, rg_id, ordinal, deleted_xid, deleted_generation)
+            SELECT TG_RELID, m.rg_id, m.ordinal, pg_current_xact_id(), tombstone_gen
+            FROM rvbbit.row_identity_map m
+            WHERE m.table_oid = TG_RELID
+              AND m.key_json = old_key_json
+            ON CONFLICT (table_oid, rg_id, ordinal) DO NOTHING;
+        END IF;
+    END IF;
+
+    RETURN NULL;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.install_shadow_heap_dirty_triggers(reloid regclass)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    identity_mode text := rvbbit.accel_identity_mode(reloid);
+    is_partition boolean := false;
+BEGIN
+    SELECT coalesce(c.relispartition, false)
+      INTO is_partition
+      FROM pg_class c
+     WHERE c.oid = reloid;
+
+    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty ON %s', reloid);
+    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_insert ON %s', reloid);
+    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_update ON %s', reloid);
+    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_delete ON %s', reloid);
+    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_truncate ON %s', reloid);
+    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_ctid_update ON %s', reloid);
+    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_ctid_delete ON %s', reloid);
+    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_row_insert ON %s', reloid);
+    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_row_update ON %s', reloid);
+    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_row_delete ON %s', reloid);
+
+    IF is_partition THEN
+        EXECUTE format(
+            'CREATE TRIGGER rvbbit_shadow_heap_dirty_row_insert
+                 AFTER INSERT ON %s
+                 FOR EACH ROW
+                 EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty_row()',
+            reloid
+        );
+        EXECUTE format(
+            'CREATE TRIGGER rvbbit_shadow_heap_dirty_row_update
+                 AFTER UPDATE ON %s
+                 FOR EACH ROW
+                 EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty_row()',
+            reloid
+        );
+        EXECUTE format(
+            'CREATE TRIGGER rvbbit_shadow_heap_dirty_row_delete
+                 AFTER DELETE ON %s
+                 FOR EACH ROW
+                 EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty_row()',
+            reloid
+        );
+        EXECUTE format(
+            'CREATE TRIGGER rvbbit_shadow_heap_dirty_truncate
+                 AFTER TRUNCATE ON %s
+                 FOR EACH STATEMENT
+                 EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
+            reloid
+        );
+        RETURN;
+    END IF;
+
+    EXECUTE format(
+        'CREATE TRIGGER rvbbit_shadow_heap_dirty_insert
+             AFTER INSERT ON %s
+             FOR EACH STATEMENT
+             EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
+        reloid
+    );
+    IF identity_mode = 'primary_key' THEN
+        EXECUTE format(
+            'CREATE TRIGGER rvbbit_shadow_heap_dirty_update
+                 AFTER UPDATE ON %s
+                 REFERENCING OLD TABLE AS rvbbit_old_rows
+                 FOR EACH STATEMENT
+                 EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
+            reloid
+        );
+        EXECUTE format(
+            'CREATE TRIGGER rvbbit_shadow_heap_dirty_delete
+                 AFTER DELETE ON %s
+                 REFERENCING OLD TABLE AS rvbbit_old_rows
+                 FOR EACH STATEMENT
+                 EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
+            reloid
+        );
+    ELSE
+        EXECUTE format(
+            'CREATE TRIGGER rvbbit_shadow_heap_dirty_update
+                 AFTER UPDATE ON %s
+                 FOR EACH STATEMENT
+                 EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
+            reloid
+        );
+        EXECUTE format(
+            'CREATE TRIGGER rvbbit_shadow_heap_dirty_delete
+                 AFTER DELETE ON %s
+                 FOR EACH STATEMENT
+                 EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
+            reloid
+        );
+        EXECUTE format(
+            'CREATE TRIGGER rvbbit_shadow_heap_ctid_update
+                 AFTER UPDATE ON %s
+                 FOR EACH ROW
+                 EXECUTE FUNCTION rvbbit.mark_shadow_heap_ctid_tombstone()',
+            reloid
+        );
+        EXECUTE format(
+            'CREATE TRIGGER rvbbit_shadow_heap_ctid_delete
+                 AFTER DELETE ON %s
+                 FOR EACH ROW
+                 EXECUTE FUNCTION rvbbit.mark_shadow_heap_ctid_tombstone()',
+            reloid
+        );
+    END IF;
+    EXECUTE format(
+        'CREATE TRIGGER rvbbit_shadow_heap_dirty_truncate
+             AFTER TRUNCATE ON %s
+             FOR EACH STATEMENT
+             EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
+        reloid
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.reinstall_partition_dirty_triggers_on_alter()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    cmd record;
+    rec record;
+BEGIN
+    FOR cmd IN
+        SELECT *
+        FROM pg_event_trigger_ddl_commands()
+        WHERE command_tag = 'ALTER TABLE'
+          AND classid = 'pg_class'::regclass
+    LOOP
+        IF EXISTS (
+            SELECT 1
+            FROM pg_class c
+            WHERE c.oid = cmd.objid
+              AND c.relkind = 'p'
+        ) THEN
+            FOR rec IN
+                SELECT t.table_oid::regclass AS reloid
+                FROM pg_partition_tree(cmd.objid) p
+                JOIN rvbbit.tables t ON t.table_oid = p.relid
+                WHERE p.relid <> cmd.objid
+                  AND t.shadow_heap_retained
+            LOOP
+                PERFORM rvbbit.install_shadow_heap_dirty_triggers(rec.reloid);
+            END LOOP;
+        END IF;
+    END LOOP;
+END;
+$$;
+
+DROP EVENT TRIGGER IF EXISTS rvbbit_partition_dirty_triggers_on_alter;
+CREATE EVENT TRIGGER rvbbit_partition_dirty_triggers_on_alter
+    ON ddl_command_end
+    WHEN TAG IN ('ALTER TABLE')
+    EXECUTE FUNCTION rvbbit.reinstall_partition_dirty_triggers_on_alter();
 
 -- User-facing helpers ---------------------------------------------------------
 
@@ -5270,6 +6322,10 @@ DECLARE
     generation_after bigint := 0;
     shadow_retained boolean := false;
     shadow_dirty boolean := false;
+    dirty_update boolean := false;
+    dirty_delete boolean := false;
+    dirty_truncate boolean := false;
+    overlay_ready boolean := false;
     heap_bytes bigint := 0;
     phase_id bigint;
     phase_bytes_before bigint := 0;
@@ -5308,13 +6364,17 @@ BEGIN
       FROM rvbbit.row_groups
      WHERE table_oid = reloid;
 
-    SELECT coalesce(t.shadow_heap_retained, false),
-           coalesce(t.shadow_heap_dirty, false)
-      INTO shadow_retained, shadow_dirty
-      FROM rvbbit.tables t
-     WHERE t.table_oid = reloid;
+    SELECT coalesce(ds.shadow_heap_retained, false),
+           coalesce(ds.shadow_heap_dirty, false),
+           coalesce(ds.dirty_has_update, false),
+           coalesce(ds.dirty_has_delete, false),
+           coalesce(ds.dirty_has_truncate, false)
+      INTO shadow_retained, shadow_dirty, dirty_update, dirty_delete, dirty_truncate
+      FROM rvbbit.table_dirty_state ds
+     WHERE ds.table_oid = reloid;
 
     heap_bytes := pg_relation_size(reloid);
+    overlay_ready := rvbbit.accel_overlay_ready(reloid);
 
     INSERT INTO rvbbit.acceleration_operations (
         table_oid, table_name, operation, status,
@@ -5330,17 +6390,39 @@ BEGIN
     )
     RETURNING id INTO op_id;
 
+    IF existing_rgs > 0
+       AND shadow_dirty
+       AND (dirty_update OR dirty_delete OR dirty_truncate)
+       AND NOT overlay_ready THEN
+        UPDATE rvbbit.acceleration_operations
+           SET status = 'failed',
+               finished_at = clock_timestamp(),
+               error = 'non-append dirty episode requires rebuild or complete row identity overlay',
+               settings = settings || jsonb_build_object(
+                   'dirty_has_update', dirty_update,
+                   'dirty_has_delete', dirty_delete,
+                   'dirty_has_truncate', dirty_truncate,
+                   'overlay_ready', overlay_ready,
+                   'recommended_action', 'rebuild_acceleration'
+               )
+         WHERE id = op_id;
+        RAISE EXCEPTION
+            'rvbbit.refresh_acceleration: % has UPDATE/DELETE/TRUNCATE changes since the last refresh; run rvbbit.rebuild_acceleration(%) or use an overlay-capable path',
+            reloid, quote_literal(reloid::text);
+    END IF;
+
     IF last_xid = 0 AND existing_rgs > 0 AND heap_bytes > 0 THEN
         IF shadow_retained AND NOT shadow_dirty THEN
             UPDATE rvbbit.tables
                SET shadow_heap_retained = true,
-                   shadow_heap_dirty = false
+                   shadow_heap_dirty = false,
+                   dirty_has_insert = false,
+                   dirty_has_update = false,
+                   dirty_has_delete = false,
+                   dirty_has_truncate = false
              WHERE table_oid = reloid;
-            EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty ON %s', reloid);
-            EXECUTE format(
-                'CREATE TRIGGER rvbbit_shadow_heap_dirty AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
-                reloid
-            );
+            PERFORM rvbbit.clear_table_dirty_markers(reloid::oid);
+            PERFORM rvbbit.install_shadow_heap_dirty_triggers(reloid);
             UPDATE rvbbit.acceleration_state
                SET last_refresh_xid = safe_upper_xid,
                    last_refresh_generation = generation_after,
@@ -5376,13 +6458,14 @@ BEGIN
         IF existing_rgs > 0 AND NOT shadow_dirty THEN
             UPDATE rvbbit.tables
                SET shadow_heap_retained = true,
-                   shadow_heap_dirty = false
+                   shadow_heap_dirty = false,
+                   dirty_has_insert = false,
+                   dirty_has_update = false,
+                   dirty_has_delete = false,
+                   dirty_has_truncate = false
              WHERE table_oid = reloid;
-            EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty ON %s', reloid);
-            EXECUTE format(
-                'CREATE TRIGGER rvbbit_shadow_heap_dirty AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
-                reloid
-            );
+            PERFORM rvbbit.clear_table_dirty_markers(reloid::oid);
+            PERFORM rvbbit.install_shadow_heap_dirty_triggers(reloid);
         END IF;
         UPDATE rvbbit.acceleration_operations
            SET status = 'noop',
@@ -5420,11 +6503,13 @@ BEGIN
     )
     RETURNING id INTO phase_id;
 
+    PERFORM set_config('rvbbit.acceleration_phase_id', phase_id::text, true);
     SELECT rvbbit.export_to_parquet_xid_range(
         reloid::oid,
         last_xid::text,
         safe_upper_xid::text
     ) INTO rows_written;
+    PERFORM set_config('rvbbit.acceleration_phase_id', '', true);
 
     SELECT count(*)::bigint, coalesce(max(generation), generation_after)::bigint
       INTO row_groups_written, generation_after
@@ -5461,13 +6546,14 @@ BEGIN
     IF existing_rgs > 0 OR row_groups_written > 0 THEN
         UPDATE rvbbit.tables
            SET shadow_heap_retained = true,
-               shadow_heap_dirty = false
+               shadow_heap_dirty = false,
+               dirty_has_insert = false,
+               dirty_has_update = false,
+               dirty_has_delete = false,
+               dirty_has_truncate = false
          WHERE table_oid = reloid;
-        EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty ON %s', reloid);
-        EXECUTE format(
-            'CREATE TRIGGER rvbbit_shadow_heap_dirty AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
-            reloid
-        );
+        PERFORM rvbbit.clear_table_dirty_markers(reloid::oid);
+        PERFORM rvbbit.install_shadow_heap_dirty_triggers(reloid);
     END IF;
 
     UPDATE rvbbit.acceleration_state
@@ -5530,14 +6616,15 @@ SELECT
     coalesce((SELECT count(*)::bigint FROM rvbbit.row_groups rg WHERE rg.table_oid = t.table_oid), 0) AS row_groups,
     pg_relation_size(t.table_oid)::bigint AS heap_bytes,
     coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-    coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+    coalesce(ds.shadow_heap_dirty, false) AS shadow_heap_dirty,
     (
         pg_relation_size(t.table_oid) = 0
-        OR coalesce(t.shadow_heap_retained AND NOT t.shadow_heap_dirty, false)
+        OR coalesce(ds.shadow_heap_retained AND NOT ds.shadow_heap_dirty, false)
     ) AS parquet_authoritative,
     (SELECT max(o.started_at) FROM rvbbit.acceleration_operations o WHERE o.table_oid = t.table_oid) AS last_operation_at
 FROM rvbbit.tables t
 JOIN pg_class c ON c.oid = t.table_oid
+JOIN rvbbit.table_dirty_state ds ON ds.table_oid = t.table_oid
 LEFT JOIN rvbbit.acceleration_state s ON s.table_oid = t.table_oid;
 
 -- rvbbit.compact(rel, keep_heap) is the legacy physical rebuild primitive:
@@ -5582,20 +6669,32 @@ BEGIN
     IF keep_heap THEN
         UPDATE rvbbit.tables
         SET shadow_heap_retained = true,
-            shadow_heap_dirty = false
+            shadow_heap_dirty = false,
+            dirty_has_insert = false,
+            dirty_has_update = false,
+            dirty_has_delete = false,
+            dirty_has_truncate = false
         WHERE table_oid = rel;
-        EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty ON %s', rel);
-        EXECUTE format(
-            'CREATE TRIGGER rvbbit_shadow_heap_dirty AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
-            rel
-        );
+        PERFORM rvbbit.clear_table_dirty_markers(rel::oid);
+        PERFORM rvbbit.install_shadow_heap_dirty_triggers(rel);
         RAISE NOTICE 'rvbbit.compact: preserving clean shadow heap for %; parquet remains authoritative until the heap is mutated', rel;
     ELSE
         UPDATE rvbbit.tables
         SET shadow_heap_retained = false,
-            shadow_heap_dirty = false
+            shadow_heap_dirty = false,
+            dirty_has_insert = false,
+            dirty_has_update = false,
+            dirty_has_delete = false,
+            dirty_has_truncate = false
         WHERE table_oid = rel;
+        PERFORM rvbbit.clear_table_dirty_markers(rel::oid);
         EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty ON %s', rel);
+        EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_insert ON %s', rel);
+        EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_update ON %s', rel);
+        EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_delete ON %s', rel);
+        EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_truncate ON %s', rel);
+        EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_ctid_update ON %s', rel);
+        EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_ctid_delete ON %s', rel);
         -- Drop the heap data. Source is now empty; parquet is authoritative.
         EXECUTE format('TRUNCATE TABLE %s', rel);
     END IF;
@@ -6292,12 +7391,12 @@ AS $$
         coalesce((SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = rel), 0) = 0
             AND (
                 pg_relation_size(rel) = 0
-                OR coalesce((SELECT t.shadow_heap_retained AND NOT t.shadow_heap_dirty FROM rvbbit.tables t WHERE t.table_oid = rel), false)
+                OR rvbbit.shadow_heap_clean_retained(rel::oid)
             ),
         pg_relation_size(rel) > 0
             AND coalesce((SELECT t.shadow_heap_retained FROM rvbbit.tables t WHERE t.table_oid = rel), false),
         coalesce((SELECT t.shadow_heap_retained FROM rvbbit.tables t WHERE t.table_oid = rel), false),
-        coalesce((SELECT t.shadow_heap_dirty FROM rvbbit.tables t WHERE t.table_oid = rel), false);
+        rvbbit.shadow_heap_dirty_effective(rel::oid);
 $$;
 
 -- List all compacted row groups for a table, including sizes and stats.

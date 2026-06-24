@@ -115,6 +115,7 @@ DECLARE
     refreshed jsonb := '[]'::jsonb;
     errors jsonb := '[]'::jsonb;
     logs_reaped jsonb := '[]'::jsonb;
+    orphaned_files_reaped jsonb := '{}'::jsonb;
     cap bigint := greatest(coalesce(max_tables, 0), 0);
 BEGIN
     IF cap = 0 THEN
@@ -129,8 +130,9 @@ BEGIN
     FOR rec IN
         SELECT t.table_oid::regclass AS rel
         FROM rvbbit.tables t
+        JOIN rvbbit.table_dirty_state ds ON ds.table_oid = t.table_oid
         JOIN pg_class c ON c.oid = t.table_oid
-        WHERE t.shadow_heap_dirty
+        WHERE ds.shadow_heap_dirty
         ORDER BY t.created_at
         LIMIT cap
     LOOP
@@ -196,10 +198,24 @@ BEGIN
         );
     END;
 
+    -- Reap old accelerator files only after their metadata swap has committed
+    -- and aged past the grace period. This protects readers that planned
+    -- against the previous row-group set while a fold was committing.
+    BEGIN
+        SELECT to_jsonb(r)
+          INTO orphaned_files_reaped
+          FROM rvbbit.reap_orphaned_files() AS r;
+    EXCEPTION WHEN OTHERS THEN
+        errors := errors || jsonb_build_array(
+            jsonb_build_object('phase', 'reap_orphaned_files', 'error', SQLERRM)
+        );
+    END;
+
     RETURN jsonb_build_object(
         'compacted', compacted,
         'refreshed_variants', refreshed,
         'logs_reaped', logs_reaped,
+        'orphaned_files_reaped', coalesce(orphaned_files_reaped, '{}'::jsonb),
         'errors', errors
     );
 END $$;
