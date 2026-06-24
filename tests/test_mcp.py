@@ -465,10 +465,14 @@ def test_github_mcp_then_llm_chained(rvbbit):
 def test_generate_wrappers(rvbbit, test_server):
     """generate_mcp_wrappers creates a per-tool SETOF jsonb function in a
     per-server schema. Idempotent."""
+    tool_count = rvbbit.execute(
+        "SELECT count(*) FROM rvbbit.mcp_tools WHERE server = %s",
+        (test_server,),
+    ).fetchone()[0]
     n = rvbbit.execute(
         "SELECT rvbbit.generate_mcp_wrappers(%s)", (test_server,)
     ).fetchone()[0]
-    assert n == 5  # echo, add, failing, list_items, search
+    assert n == tool_count
 
     fns = {
         r[0]
@@ -478,14 +482,14 @@ def test_generate_wrappers(rvbbit, test_server):
             (test_server,),
         ).fetchall()
     }
-    assert {"echo", "add", "failing", "list_items", "search"}.issubset(fns), fns
+    assert {"echo", "add", "failing", "getenv", "list_items", "search"}.issubset(fns), fns
 
     # Re-run → same count, no duplicate-object errors (idempotent).
     assert (
         rvbbit.execute(
             "SELECT rvbbit.generate_mcp_wrappers(%s)", (test_server,)
         ).fetchone()[0]
-        == 5
+        == tool_count
     )
 
 
@@ -576,7 +580,11 @@ def test_mcp_health_view(rvbbit, test_server):
         "FROM rvbbit.mcp_health WHERE name = %s",
         (test_server,),
     ).fetchone()
-    assert row == ("stdio", 5, True, True)
+    tool_count = rvbbit.execute(
+        "SELECT count(*) FROM rvbbit.mcp_tools WHERE server = %s",
+        (test_server,),
+    ).fetchone()[0]
+    assert row == ("stdio", tool_count, True, True)
 
 
 # ---- Phase 4: resources, selective caching, active probe ----------------
@@ -782,4 +790,10 @@ def test_mcp_health_includes_resources(rvbbit, test_server):
         "SELECT n_tools, n_resources FROM rvbbit.mcp_health WHERE name = %s",
         (test_server,),
     ).fetchone()
-    assert row == (5, 2)
+    counts = rvbbit.execute(
+        "SELECT "
+        "  (SELECT count(*) FROM rvbbit.mcp_tools WHERE server = %s), "
+        "  (SELECT count(*) FROM rvbbit.mcp_resources WHERE server = %s)",
+        (test_server, test_server),
+    ).fetchone()
+    assert row == counts

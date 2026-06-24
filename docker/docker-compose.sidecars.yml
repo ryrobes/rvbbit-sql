@@ -218,6 +218,7 @@ services:
     build:
       context: ../sidecars/python-runtime
     container_name: rvbbit-python-runtime
+    profiles: ["runtimes"]
     ports:
       - "8096:8080"
     environment:

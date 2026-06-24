@@ -1692,10 +1692,20 @@ CREATE TABLE rvbbit.operators (
 );
 
 -- Bump updated_at on every UPDATE so users can see when prompts changed.
+-- Also clear this backend's result cache/operator memo so an edit followed
+-- by an immediate call in the same session does not reuse the old definition.
 CREATE OR REPLACE FUNCTION rvbbit.touch_operators_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     NEW.updated_at := now();
+    BEGIN
+        PERFORM rvbbit.flush_cache();
+    EXCEPTION WHEN undefined_function THEN
+        -- Fresh CREATE EXTENSION can seed/update operators before pgrx-defined
+        -- functions are registered in the generated SQL. Normal installations
+        -- and upgrades still flush immediately once flush_cache exists.
+        NULL;
+    END;
     RETURN NEW;
 END $$;
 

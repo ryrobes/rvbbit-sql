@@ -36,12 +36,54 @@ run_sql() {
     -f "${ROOT}/examples/bigfoot/${file}"
 }
 
+require_capability_operators() {
+  local missing
+  missing="$(
+    psql "${DSN}" -X -A -t -v ON_ERROR_STOP=1 <<'SQL'
+WITH required(name) AS (
+  VALUES
+    ('extract_entities'),
+    ('contains_entity'),
+    ('has_pii'),
+    ('semantic_score'),
+    ('emotion')
+)
+SELECT COALESCE(string_agg(r.name, ', ' ORDER BY r.name), '')
+FROM required r
+LEFT JOIN rvbbit.operators o ON o.name = r.name
+WHERE o.name IS NULL;
+SQL
+  )"
+  if [[ -n "${missing}" ]]; then
+    cat >&2 <<'EOF'
+
+Missing capability operators for 06_capability_operators.sql.
+Install the required Warren packs first:
+
+  make capability-test MANIFEST=capabilities/packs/extract/gliner-medium-v2.1 TARGET='{"capability":true,"docker":true}'
+  make capability-test MANIFEST=capabilities/packs/rerank/bge-reranker-v2-m3 TARGET='{"capability":true,"docker":true}'
+  make capability-test MANIFEST=capabilities/packs/classify/emotion-distilroberta TARGET='{"capability":true,"docker":true}'
+
+To run only the non-capability notebook sections, set BIGFOOT_SKIP_CAPABILITIES=1.
+EOF
+    echo "Missing operators: ${missing}" >&2
+    exit 1
+  fi
+}
+
 run_sql 00_load.sql
 run_sql 01_profile.sql
 run_sql 02_retrieval.sql
 run_sql 03_semantic_map.sql
 run_sql 04_knowledge_graph.sql
-run_sql 06_capability_operators.sql
+
+if [[ "${BIGFOOT_SKIP_CAPABILITIES:-0}" == "1" ]]; then
+  echo
+  echo "== skipping 06_capability_operators.sql (BIGFOOT_SKIP_CAPABILITIES=1)"
+else
+  require_capability_operators
+  run_sql 06_capability_operators.sql
+fi
 
 if [[ "${BIGFOOT_LIVE:-0}" == "1" ]]; then
   run_sql 07_live_triples_receipts.sql

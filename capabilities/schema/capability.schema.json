@@ -80,6 +80,7 @@
             "data_contract_miner",
             "semantic_column_type",
             "join_detective",
+            "echo",
             "vllm_openai",
             "python_runtime",
             "mcp_gateway",

@@ -71,6 +71,70 @@ def test_cache_populated_via_code_only_operator(rvbbit):
         rvbbit.execute(f"DROP FUNCTION IF EXISTS rvbbit.{name}(text, jsonb)")
 
 
+def test_operator_update_flushes_cache_and_operator_memo(rvbbit):
+    """Changing steps should affect the next same-session call immediately.
+
+    The operator loader memoizes definitions briefly for scan performance; the
+    operators UPDATE trigger must flush that memo and L1 result cache, otherwise
+    an edit followed by an immediate call can reuse the old step definition.
+    """
+    name = f"edit_cache_probe_{uuid.uuid4().hex[:8]}"
+    upper_steps = """[
+        {"name": "x", "kind": "code", "fn": "uppercase",
+         "inputs": {"text": "{{ inputs.text }}"}}
+    ]"""
+    lower_steps = """[
+        {"name": "x", "kind": "code", "fn": "lowercase",
+         "inputs": {"text": "{{ inputs.text }}"}}
+    ]"""
+    try:
+        rvbbit.execute(
+            "SELECT rvbbit.create_operator("
+            "  op_name => %s, op_shape => 'scalar', "
+            "  op_arg_names => ARRAY['text'], op_return_type => 'text', "
+            "  op_system => 'unused', op_user => 'unused', "
+            "  op_steps => %s::jsonb)",
+            (name, upper_steps),
+        )
+        rvbbit.execute("SELECT rvbbit.flush_cache()")
+        marker = f"MiXeD-{uuid.uuid4().hex[:8]}"
+
+        assert (
+            rvbbit.execute(f"SELECT rvbbit.{name}(%s)", (marker,)).fetchone()[0]
+            == marker.upper()
+        )
+        assert (
+            rvbbit.execute(f"SELECT rvbbit.{name}(%s)", (marker,)).fetchone()[0]
+            == marker.upper()
+        )
+        before = rvbbit.execute(
+            "SELECT count(*), count(DISTINCT inputs_hash) "
+            "FROM rvbbit.receipts WHERE operator = %s",
+            (name,),
+        ).fetchone()
+        assert before == (1, 1)
+
+        rvbbit.execute(
+            "UPDATE rvbbit.operators SET steps = %s::jsonb WHERE name = %s",
+            (lower_steps, name),
+        )
+        assert (
+            rvbbit.execute(f"SELECT rvbbit.{name}(%s)", (marker,)).fetchone()[0]
+            == marker.lower()
+        )
+        after = rvbbit.execute(
+            "SELECT count(*), count(DISTINCT inputs_hash) "
+            "FROM rvbbit.receipts WHERE operator = %s",
+            (name,),
+        ).fetchone()
+        assert after == (2, 2)
+    finally:
+        rvbbit.execute(f"DELETE FROM rvbbit.receipts WHERE operator = '{name}'")
+        rvbbit.execute(f"DELETE FROM rvbbit.operators WHERE name = '{name}'")
+        rvbbit.execute(f"DROP FUNCTION IF EXISTS rvbbit.{name}(text, jsonb)")
+        rvbbit.execute("SELECT rvbbit.flush_cache()")
+
+
 def test_flush_cache_drops_in_memory(rvbbit):
     name = f"flush_probe_{uuid.uuid4().hex[:8]}"
     try:

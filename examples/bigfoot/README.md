@@ -14,6 +14,17 @@ be read from the client machine.
 examples/bigfoot/run_all.sh
 ```
 
+The capability-operator section (`06_capability_operators.sql`) expects these
+Warren packs to be installed:
+
+```bash
+make capability-test MANIFEST=capabilities/packs/extract/gliner-medium-v2.1 TARGET='{"capability":true,"docker":true}'
+make capability-test MANIFEST=capabilities/packs/rerank/bge-reranker-v2-m3 TARGET='{"capability":true,"docker":true}'
+make capability-test MANIFEST=capabilities/packs/classify/emotion-distilroberta TARGET='{"capability":true,"docker":true}'
+```
+
+Set `BIGFOOT_SKIP_CAPABILITIES=1` to run only the non-capability sections.
+
 Defaults:
 
 - `RVBBIT_DSN=postgresql://postgres:rvbbit@localhost:55433/bench`

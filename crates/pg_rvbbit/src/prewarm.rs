@@ -467,14 +467,17 @@ fn batchable_specialist_step(op: &OpDef) -> Option<(String, String)> {
                     .map(String::from)
                     .unwrap_or_else(|| format!("step_{i}"));
                 let spec = step.get("specialist")?.as_str()?.to_string();
-                let tmpl = step.get("inputs").map(|v| v.to_string()).unwrap_or_default();
+                let tmpl = step
+                    .get("inputs")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
                 if tmpl.contains("steps.") {
                     return None; // depends on a prior step — can't pre-batch
                 }
                 found = Some((name, spec));
             }
-            "code" => {}            // local, runs per-row after the batch
-            _ => return None,        // llm / python / sql / mcp — leave to per-row
+            "code" => {}      // local, runs per-row after the batch
+            _ => return None, // llm / python / sql / mcp — leave to per-row
         }
     }
     found
@@ -579,7 +582,13 @@ fn dispatch_batched_multistep_specialist(
                         ..Default::default()
                     };
                     let result = unit_of_work::run_multistep_seeded(
-                        op, &steps, &inputs, opts, step_name, seed_output, seed_sub,
+                        op,
+                        &steps,
+                        &inputs,
+                        opts,
+                        step_name,
+                        seed_output,
+                        seed_sub,
                     );
                     out.push((inputs, result));
                 }
@@ -917,6 +926,7 @@ mod phase4_tests {
             retry: None,
             wards: None,
             takes: None,
+            cache_policy: "memoize".into(),
         }
     }
 
@@ -940,22 +950,26 @@ mod phase4_tests {
         // single-step specialist -> handled elsewhere, not here.
         assert!(batchable_specialist_step(&op_with_steps(json!([
             {"kind":"specialist","name":"r","specialist":"x","inputs":{}}
-        ]))).is_none());
+        ])))
+        .is_none());
         // specialist whose inputs depend on a prior step -> can't pre-batch.
         assert!(batchable_specialist_step(&op_with_steps(json!([
             {"kind":"code","name":"pre","fn":"trim","inputs":{"text":"{{ inputs.text }}"}},
             {"kind":"specialist","name":"r","specialist":"x",
              "inputs":{"text":"{{ steps.pre.output }}"}}
-        ]))).is_none());
+        ])))
+        .is_none());
         // two specialists -> not the simple shape.
         assert!(batchable_specialist_step(&op_with_steps(json!([
             {"kind":"specialist","name":"a","specialist":"x","inputs":{}},
             {"kind":"specialist","name":"b","specialist":"y","inputs":{}}
-        ]))).is_none());
+        ])))
+        .is_none());
         // an llm step present -> leave to per-row.
         assert!(batchable_specialist_step(&op_with_steps(json!([
             {"kind":"specialist","name":"a","specialist":"x","inputs":{}},
             {"kind":"llm","name":"b","user":"{{ steps.a.output }}"}
-        ]))).is_none());
+        ])))
+        .is_none());
     }
 }

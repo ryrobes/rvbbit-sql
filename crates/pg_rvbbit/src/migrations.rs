@@ -357,6 +357,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0084_cube_refresh_selective_sweeps",
         include_str!("../sql/migrations/0084_cube_refresh_selective_sweeps.sql"),
     ),
+    (
+        "0085_operator_update_flush_cache",
+        include_str!("../sql/migrations/0085_operator_update_flush_cache.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

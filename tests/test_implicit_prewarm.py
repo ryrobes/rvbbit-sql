@@ -149,6 +149,34 @@ def test_qual_is_preserved_by_prewarm(rvbbit):
         _cleanup(rvbbit, spec, op, tbl)
 
 
+def test_filtered_order_limit_can_sort_by_non_input_column(rvbbit):
+    """Implicit prewarm should preserve an ORDER BY/LIMIT row set even when the
+    sort key is not one of the semantic operator arguments."""
+    spec, op, tbl = _setup(rvbbit)
+    try:
+        _echo_reset()
+        rows = rvbbit.execute(
+            f"""
+            SELECT id, rvbbit.{op}(body) AS out
+            FROM {tbl}
+            WHERE id >= 4
+            ORDER BY id DESC
+            LIMIT 3
+            """
+        ).fetchall()
+        assert rows == [(12, "ITEM12"), (11, "ITEM11"), (10, "ITEM10")]
+
+        n = rvbbit.execute(
+            f"SELECT count(*) FROM rvbbit.receipts WHERE operator = '{op}'"
+        ).fetchone()[0]
+        assert n == 3, f"expected 3 limited prewarm receipts, got {n}"
+
+        stats = _echo_stats()
+        assert stats["total_inputs"] == 3, stats
+    finally:
+        _cleanup(rvbbit, spec, op, tbl)
+
+
 def test_groupby_blocks_prewarm(rvbbit):
     """GROUP BY also disqualifies — rule bails."""
     spec, op, tbl = _setup(rvbbit)

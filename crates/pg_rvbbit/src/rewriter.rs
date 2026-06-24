@@ -9313,13 +9313,23 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
         let op_literal = sql_literal(&op_name);
         // Use a uniquely-tagged dollar-quote so we don't collide with
         // any literal $$ in operator names.
-        // DISTINCT pushes the dedup into Postgres so prewarm materializes and warms
-        // only the unique argument tuples — bounding both memory and backend calls by
-        // cardinality, not row count (so 321k rows / 25 distinct = 25 warm calls).
+        // Preserve the user's row-shaping clause in an inner query, then dedupe
+        // only the operator inputs outside it. A direct `SELECT DISTINCT args
+        // FROM ... ORDER BY id LIMIT n` is invalid when the ORDER BY column is
+        // not also projected, but `SELECT args FROM ... ORDER BY id LIMIT n` is
+        // valid and still gives us the bounded row set to dedupe.
+        let outer_cols = arg_names
+            .iter()
+            .map(|name| quote_ident(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let input_sql = format!(
+            "SELECT DISTINCT {outer_cols} FROM (SELECT {select_cols} {from_tail}) AS rvbbit_prewarm_input"
+        );
         let prewarm_sql = format!(
             "SELECT * FROM rvbbit.prewarm_operator(\
                  {op_literal}, \
-                 $rvbbitprewarm$SELECT DISTINCT {select_cols} {from_tail}$rvbbitprewarm$, \
+                 $rvbbitprewarm${input_sql}$rvbbitprewarm$, \
                  {max_conc})"
         );
         if let Err(err) = pgrx::Spi::run(&prewarm_sql) {
