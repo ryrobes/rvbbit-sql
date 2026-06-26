@@ -18,6 +18,7 @@ extension_sql!(
 
 CREATE TABLE rvbbit.tables (
     table_oid       oid PRIMARY KEY,
+    acceleration_enabled boolean NOT NULL DEFAULT true,
     catcher_oid     oid,                  -- NULL in Phase 1a (no catcher yet)
     data_dir        text,                 -- NULL until Phase 2
     shadow_heap_retained boolean NOT NULL DEFAULT false,
@@ -142,7 +143,8 @@ LEFT JOIN LATERAL (
            max(m.marked_at) AS last_write_at
       FROM rvbbit.table_dirty_markers m
      WHERE m.table_oid = t.table_oid
-) dm ON true;
+) dm ON true
+WHERE coalesce(t.acceleration_enabled, true);
 
 CREATE OR REPLACE FUNCTION rvbbit.shadow_heap_dirty_effective(rel oid)
 RETURNS boolean
@@ -235,7 +237,8 @@ CREATE TABLE rvbbit.row_groups (
 	SELECT rg.*
 	FROM rvbbit.row_groups rg
 	JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
-	WHERE rg.generation >= t.min_visible_generation;
+	WHERE t.min_visible_generation = 0
+	   OR rg.generation = t.min_visible_generation;
 
 	CREATE TABLE rvbbit.group_stats (
 	    table_oid        oid NOT NULL,
@@ -756,6 +759,25 @@ CREATE OR REPLACE FUNCTION rvbbit.tombstone_count(
       AND (asof IS NULL OR deleted_generation <= asof)
 $$;
 
+-- Count tombstones that affect the latest visible view.
+-- Append tables (min_visible_generation = 0) see every row group; snapshot
+-- tables see exactly the current snapshot generation. Hidden snapshot-history
+-- tombstones remain available to AS OF reads, but they must not veto current
+-- acceleration routes or make maintenance look dirty.
+CREATE OR REPLACE FUNCTION rvbbit.visible_tombstone_count(
+    reloid regclass
+) RETURNS bigint LANGUAGE sql STABLE AS $$
+    SELECT count(*)::bigint
+    FROM rvbbit.delete_log dl
+    JOIN rvbbit.row_groups rg
+      ON rg.table_oid = dl.table_oid
+     AND rg.rg_id = dl.rg_id
+    JOIN rvbbit.tables t
+      ON t.table_oid = dl.table_oid
+    WHERE dl.table_oid = reloid
+      AND (t.min_visible_generation = 0 OR rg.generation = t.min_visible_generation)
+$$;
+
 CREATE OR REPLACE FUNCTION rvbbit.accel_identity_columns(reloid regclass)
 RETURNS text[]
 LANGUAGE sql
@@ -808,13 +830,9 @@ RETURNS boolean
 LANGUAGE sql
 STABLE
 AS $$
-    SELECT coalesce((
-               SELECT count(*)::bigint
-               FROM rvbbit.delete_log dl
-               WHERE dl.table_oid = reloid
-           ), 0) >= coalesce((
+    SELECT rvbbit.visible_tombstone_count(reloid) >= coalesce((
                SELECT sum(rg.n_rows)::bigint
-               FROM rvbbit.row_groups rg
+               FROM rvbbit.row_groups_visible rg
                WHERE rg.table_oid = reloid
            ), 0)
 $$;
@@ -1131,6 +1149,7 @@ DECLARE
     staging_rg_base bigint := 0;
     baseline_generation bigint := 0;
     catchup_generation bigint := 0;
+    snapshot_floor_before bigint := 0;
     safe_upper_xid numeric;
     scan_snapshot text;
     scan_upper_xid numeric;
@@ -1198,6 +1217,11 @@ BEGIN
     SELECT count(*)::int, coalesce(max(rg_id), -1)::bigint
       INTO dropped_rgs, pre_max_rg_id
       FROM rvbbit.row_groups
+     WHERE table_oid = reloid;
+
+    SELECT coalesce(min_visible_generation, 0)
+      INTO snapshot_floor_before
+      FROM rvbbit.tables
      WHERE table_oid = reloid;
 
     SELECT greatest(coalesce(max(generation), 0) + 1, (op_id * 2) + 1)
@@ -1486,6 +1510,11 @@ BEGIN
            dirty_has_update = false,
            dirty_has_delete = false,
            dirty_has_truncate = false,
+           min_visible_generation = CASE
+               WHEN snapshot_floor_before > 0 AND generation_after > 0
+               THEN generation_after
+               ELSE min_visible_generation
+           END,
            next_generation = greatest(next_generation, generation_after + 1),
            ctid_identity_relfilenode = CASE
                WHEN rvbbit.accel_identity_mode(reloid) = 'ctid'
@@ -5824,14 +5853,16 @@ CREATE TABLE rvbbit.shreds (
 );
 
 -- Access method registration --------------------------------------------------
--- Phase 1a: alias of heap. Phase 1b will replace this with our own handler.
+-- Compatibility alias only. Newly-created USING rvbbit tables are registered
+-- into rvbbit.tables and then normalized back to heap by the DDL trigger below.
+-- The registry row is the acceleration contract; the table access method is not.
 
 CREATE ACCESS METHOD rvbbit
     TYPE TABLE
     HANDLER pg_catalog.heap_tableam_handler;
 
 COMMENT ON ACCESS METHOD rvbbit IS
-    'Rvbbit columnar (Phase 1a: heap alias; storage layer not yet differentiated)';
+    'Rvbbit compatibility alias; acceleration is registry-based over heap tables';
 
 -- DDL bookkeeping -------------------------------------------------------------
 -- Auto-register newly created rvbbit tables into rvbbit.tables, and tear them
@@ -5845,7 +5876,12 @@ AS $$
 DECLARE
     obj record;
     rvbbit_am_oid oid;
+    rel_kind char;
 BEGIN
+    IF to_regclass('rvbbit.tables') IS NULL THEN
+        RETURN;
+    END IF;
+
     SELECT oid INTO rvbbit_am_oid FROM pg_am WHERE amname = 'rvbbit';
     IF rvbbit_am_oid IS NULL THEN
         RETURN;
@@ -5860,9 +5896,19 @@ BEGIN
             SELECT 1 FROM pg_class
             WHERE oid = obj.objid AND relam = rvbbit_am_oid
         ) THEN
-            INSERT INTO rvbbit.tables (table_oid)
-            VALUES (obj.objid)
-            ON CONFLICT (table_oid) DO NOTHING;
+            INSERT INTO rvbbit.tables (table_oid, acceleration_enabled)
+            VALUES (obj.objid, true)
+            ON CONFLICT (table_oid) DO UPDATE
+                SET acceleration_enabled = true;
+
+            SELECT relkind INTO rel_kind
+            FROM pg_class
+            WHERE oid = obj.objid;
+
+            IF rel_kind IN ('r', 'm') THEN
+                EXECUTE format('ALTER TABLE %s SET ACCESS METHOD heap', obj.objid::regclass);
+            END IF;
+
             RAISE DEBUG 'rvbbit: registered table % (oid=%)',
                 obj.object_identity, obj.objid;
         END IF;
@@ -5882,6 +5928,10 @@ AS $$
 DECLARE
     obj record;
 BEGIN
+    IF to_regclass('rvbbit.tables') IS NULL THEN
+        RETURN;
+    END IF;
+
     FOR obj IN
         SELECT * FROM pg_event_trigger_dropped_objects()
         WHERE object_type = 'table'
@@ -6127,6 +6177,39 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION rvbbit.drop_shadow_heap_dirty_triggers(reloid regclass)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    trigger_name text;
+BEGIN
+    FOREACH trigger_name IN ARRAY ARRAY[
+        'rvbbit_shadow_heap_dirty',
+        'rvbbit_shadow_heap_dirty_insert',
+        'rvbbit_shadow_heap_dirty_update',
+        'rvbbit_shadow_heap_dirty_delete',
+        'rvbbit_shadow_heap_dirty_truncate',
+        'rvbbit_shadow_heap_ctid_update',
+        'rvbbit_shadow_heap_ctid_delete',
+        'rvbbit_shadow_heap_dirty_row_insert',
+        'rvbbit_shadow_heap_dirty_row_update',
+        'rvbbit_shadow_heap_dirty_row_delete'
+    ]
+    LOOP
+        IF EXISTS (
+            SELECT 1
+            FROM pg_trigger
+            WHERE tgrelid = reloid
+              AND tgname = trigger_name
+              AND NOT tgisinternal
+        ) THEN
+            EXECUTE format('DROP TRIGGER %I ON %s', trigger_name, reloid);
+        END IF;
+    END LOOP;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION rvbbit.install_shadow_heap_dirty_triggers(reloid regclass)
 RETURNS void
 LANGUAGE plpgsql
@@ -6140,16 +6223,7 @@ BEGIN
       FROM pg_class c
      WHERE c.oid = reloid;
 
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty ON %s', reloid);
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_insert ON %s', reloid);
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_update ON %s', reloid);
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_delete ON %s', reloid);
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_truncate ON %s', reloid);
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_ctid_update ON %s', reloid);
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_ctid_delete ON %s', reloid);
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_row_insert ON %s', reloid);
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_row_update ON %s', reloid);
-    EXECUTE format('DROP TRIGGER IF EXISTS rvbbit_shadow_heap_dirty_row_delete ON %s', reloid);
+    PERFORM rvbbit.drop_shadow_heap_dirty_triggers(reloid);
 
     IF is_partition THEN
         EXECUTE format(
@@ -6295,9 +6369,177 @@ LANGUAGE sql
 STABLE
 AS $$
     SELECT EXISTS (
-        SELECT 1 FROM pg_class c JOIN pg_am a ON c.relam = a.oid
-        WHERE c.oid = rel AND a.amname = 'rvbbit'
+        SELECT 1
+        FROM rvbbit.tables t
+        JOIN pg_class c ON c.oid = t.table_oid
+        WHERE t.table_oid = rel
+          AND coalesce(t.acceleration_enabled, true)
     );
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.enable_table(
+    reloid regclass,
+    convert_to_heap boolean DEFAULT true
+) RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    rel_kind char;
+    am_name text;
+    was_registered boolean := false;
+    was_enabled boolean := false;
+    had_row_groups boolean := false;
+    converted boolean := false;
+BEGIN
+    SELECT c.relkind, a.amname
+      INTO rel_kind, am_name
+      FROM pg_class c
+      LEFT JOIN pg_am a ON a.oid = c.relam
+     WHERE c.oid = reloid;
+
+    IF rel_kind IS NULL THEN
+        RAISE EXCEPTION 'rvbbit.enable_table: relation % does not exist', reloid;
+    END IF;
+    IF rel_kind NOT IN ('r', 'p', 'm') THEN
+        RAISE EXCEPTION 'rvbbit.enable_table: % has unsupported relkind %', reloid, rel_kind;
+    END IF;
+    IF rel_kind <> 'p' AND coalesce(am_name, '') NOT IN ('heap', 'rvbbit') THEN
+        RAISE EXCEPTION 'rvbbit.enable_table: % uses access method %, expected heap-compatible storage', reloid, am_name;
+    END IF;
+
+    SELECT true, coalesce(t.acceleration_enabled, true)
+      INTO was_registered, was_enabled
+      FROM rvbbit.tables t
+     WHERE t.table_oid = reloid;
+    was_registered := coalesce(was_registered, false);
+    was_enabled := coalesce(was_enabled, false);
+
+    SELECT EXISTS (SELECT 1 FROM rvbbit.row_groups rg WHERE rg.table_oid = reloid)
+      INTO had_row_groups;
+
+    INSERT INTO rvbbit.tables (table_oid, acceleration_enabled)
+    VALUES (reloid, true)
+    ON CONFLICT (table_oid) DO UPDATE
+       SET acceleration_enabled = true,
+           shadow_heap_dirty = CASE
+               WHEN NOT coalesce(rvbbit.tables.acceleration_enabled, true)
+                    AND EXISTS (SELECT 1 FROM rvbbit.row_groups rg WHERE rg.table_oid = reloid)
+               THEN true
+               ELSE rvbbit.tables.shadow_heap_dirty
+           END,
+           dirty_has_insert = CASE
+               WHEN NOT coalesce(rvbbit.tables.acceleration_enabled, true)
+                    AND EXISTS (SELECT 1 FROM rvbbit.row_groups rg WHERE rg.table_oid = reloid)
+               THEN true
+               ELSE rvbbit.tables.dirty_has_insert
+           END,
+           dirty_has_update = CASE
+               WHEN NOT coalesce(rvbbit.tables.acceleration_enabled, true)
+                    AND EXISTS (SELECT 1 FROM rvbbit.row_groups rg WHERE rg.table_oid = reloid)
+               THEN true
+               ELSE rvbbit.tables.dirty_has_update
+           END,
+           dirty_has_delete = CASE
+               WHEN NOT coalesce(rvbbit.tables.acceleration_enabled, true)
+                    AND EXISTS (SELECT 1 FROM rvbbit.row_groups rg WHERE rg.table_oid = reloid)
+               THEN true
+               ELSE rvbbit.tables.dirty_has_delete
+           END,
+           dirty_since = CASE
+               WHEN NOT coalesce(rvbbit.tables.acceleration_enabled, true)
+                    AND EXISTS (SELECT 1 FROM rvbbit.row_groups rg WHERE rg.table_oid = reloid)
+                    AND rvbbit.tables.dirty_since IS NULL
+               THEN clock_timestamp()
+               ELSE rvbbit.tables.dirty_since
+           END,
+           last_write_at = CASE
+               WHEN NOT coalesce(rvbbit.tables.acceleration_enabled, true)
+                    AND EXISTS (SELECT 1 FROM rvbbit.row_groups rg WHERE rg.table_oid = reloid)
+               THEN clock_timestamp()
+               ELSE rvbbit.tables.last_write_at
+           END;
+
+    IF convert_to_heap AND am_name = 'rvbbit' AND rel_kind IN ('r', 'm') THEN
+        EXECUTE format('ALTER TABLE %s SET ACCESS METHOD heap', reloid);
+        converted := true;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'status', 'enabled',
+        'table', reloid::text,
+        'registered_before', was_registered,
+        'enabled_before', was_enabled,
+        'had_row_groups', had_row_groups,
+        'converted_to_heap', converted
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.disable_table(
+    reloid regclass,
+    convert_to_heap boolean DEFAULT true
+) RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    am_name text;
+    rel_kind char;
+    was_registered boolean := false;
+    was_enabled boolean := false;
+    converted boolean := false;
+BEGIN
+    SELECT c.relkind, a.amname
+      INTO rel_kind, am_name
+      FROM pg_class c
+      LEFT JOIN pg_am a ON a.oid = c.relam
+     WHERE c.oid = reloid;
+
+    IF rel_kind IS NULL THEN
+        RAISE EXCEPTION 'rvbbit.disable_table: relation % does not exist', reloid;
+    END IF;
+
+    SELECT true, coalesce(t.acceleration_enabled, true)
+      INTO was_registered, was_enabled
+      FROM rvbbit.tables t
+     WHERE t.table_oid = reloid;
+    was_registered := coalesce(was_registered, false);
+    was_enabled := coalesce(was_enabled, false);
+
+    UPDATE rvbbit.tables
+       SET acceleration_enabled = false,
+           shadow_heap_dirty = false,
+           dirty_has_insert = false,
+           dirty_has_update = false,
+           dirty_has_delete = false,
+           dirty_has_truncate = false
+     WHERE table_oid = reloid;
+
+    PERFORM rvbbit.clear_table_dirty_markers(reloid::oid);
+    PERFORM rvbbit.drop_shadow_heap_dirty_triggers(reloid);
+
+    IF convert_to_heap AND am_name = 'rvbbit' AND rel_kind IN ('r', 'm') THEN
+        EXECUTE format('ALTER TABLE %s SET ACCESS METHOD heap', reloid);
+        converted := true;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'status', 'disabled',
+        'table', reloid::text,
+        'registered_before', was_registered,
+        'enabled_before', was_enabled,
+        'converted_to_heap', converted
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rvbbit.detach_table(
+    reloid regclass,
+    convert_to_heap boolean DEFAULT true
+) RETURNS jsonb
+LANGUAGE sql
+AS $$
+    -- Compatibility alias. `disable_table` is the user-facing off switch.
+    SELECT rvbbit.disable_table(reloid, convert_to_heap)
 $$;
 
 CREATE OR REPLACE FUNCTION rvbbit.list_tables()
@@ -6308,10 +6550,11 @@ AS $$
     SELECT
         t.table_oid,
         c.oid::regclass::text,
-        (SELECT count(*) FROM rvbbit.row_groups rg WHERE rg.table_oid = t.table_oid),
-        (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = t.table_oid)
+        (SELECT count(*) FROM rvbbit.row_groups_visible rg WHERE rg.table_oid = t.table_oid),
+        rvbbit.visible_tombstone_count(t.table_oid::regclass)
     FROM rvbbit.tables t
-    JOIN pg_class c ON c.oid = t.table_oid;
+    JOIN pg_class c ON c.oid = t.table_oid
+    WHERE coalesce(t.acceleration_enabled, true);
 $$;
 
 CREATE OR REPLACE FUNCTION rvbbit.refresh_acceleration(
@@ -6622,8 +6865,8 @@ SELECT
     coalesce(s.last_refresh_generation, 0) AS last_refresh_generation,
     coalesce(s.last_refresh_rows, 0) AS last_refresh_rows,
     coalesce(s.last_refresh_row_groups, 0) AS last_refresh_row_groups,
-    coalesce((SELECT sum(rg.n_rows)::bigint FROM rvbbit.row_groups rg WHERE rg.table_oid = t.table_oid), 0) AS parquet_rows,
-    coalesce((SELECT count(*)::bigint FROM rvbbit.row_groups rg WHERE rg.table_oid = t.table_oid), 0) AS row_groups,
+    coalesce((SELECT sum(rg.n_rows)::bigint FROM rvbbit.row_groups_visible rg WHERE rg.table_oid = t.table_oid), 0) AS parquet_rows,
+    coalesce((SELECT count(*)::bigint FROM rvbbit.row_groups_visible rg WHERE rg.table_oid = t.table_oid), 0) AS row_groups,
     pg_relation_size(t.table_oid)::bigint AS heap_bytes,
     coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
     coalesce(ds.shadow_heap_dirty, false) AS shadow_heap_dirty,
@@ -7394,11 +7637,11 @@ AS $$
         rel::text,
         pg_relation_size(rel)::bigint,
         pg_total_relation_size(rel)::bigint,
-        coalesce((SELECT sum(rg.n_rows)::bigint FROM rvbbit.row_groups rg WHERE rg.table_oid = rel), 0),
-        coalesce((SELECT sum(rg.n_bytes)::bigint FROM rvbbit.row_groups rg WHERE rg.table_oid = rel), 0),
-        coalesce((SELECT count(*)::bigint FROM rvbbit.row_groups rg WHERE rg.table_oid = rel), 0),
-        coalesce((SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = rel), 0),
-        coalesce((SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = rel), 0) = 0
+        coalesce((SELECT sum(rg.n_rows)::bigint FROM rvbbit.row_groups_visible rg WHERE rg.table_oid = rel), 0),
+        coalesce((SELECT sum(rg.n_bytes)::bigint FROM rvbbit.row_groups_visible rg WHERE rg.table_oid = rel), 0),
+        coalesce((SELECT count(*)::bigint FROM rvbbit.row_groups_visible rg WHERE rg.table_oid = rel), 0),
+        rvbbit.visible_tombstone_count(rel),
+        rvbbit.visible_tombstone_count(rel) = 0
             AND (
                 pg_relation_size(rel) = 0
                 OR rvbbit.shadow_heap_clean_retained(rel::oid)
@@ -8093,6 +8336,82 @@ CREATE TABLE IF NOT EXISTS rvbbit.metric_dependencies (
 CREATE INDEX IF NOT EXISTS metric_dependencies_table_idx
     ON rvbbit.metric_dependencies (table_oid);
 
+CREATE OR REPLACE FUNCTION rvbbit.metric_scalar(
+    p_name       text,
+    p_params     jsonb DEFAULT '{}'::jsonb,
+    p_def_as_of  timestamptz DEFAULT now(),
+    p_data_as_of timestamptz DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_labels jsonb := '{}'::jsonb;
+    v_rows   jsonb;
+    v_count  bigint := 0;
+    v_row    jsonb;
+    v_cols   integer := 0;
+    v_col    text;
+    v_value  jsonb;
+BEGIN
+    SELECT coalesce(labels, '{}'::jsonb)
+      INTO v_labels
+    FROM rvbbit.metric_defs
+    WHERE name = p_name
+      AND created_at <= p_def_as_of
+    ORDER BY created_at DESC, version DESC
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'rvbbit.metric_scalar: metric "%" is not defined as of %',
+            p_name, p_def_as_of;
+    END IF;
+
+    SELECT count(*), jsonb_agg(obj)
+      INTO v_count, v_rows
+    FROM rvbbit.metric(p_name, p_params, p_def_as_of, p_data_as_of) AS m(obj);
+
+    IF coalesce(v_count, 0) = 0 THEN
+        RAISE EXCEPTION 'rvbbit.metric_scalar: metric "%" returned no rows', p_name
+            USING HINT = 'A materialized metric must return exactly one row and one headline value.';
+    END IF;
+    IF v_count <> 1 THEN
+        RAISE EXCEPTION 'rvbbit.metric_scalar: metric "%" returned % rows; materialized metrics must be scalar',
+            p_name, v_count
+            USING HINT = 'Aggregate the definition to one row, or keep this query as a cube/dataset instead of a metric.';
+    END IF;
+
+    v_row := v_rows->0;
+    IF jsonb_typeof(v_row) <> 'object' THEN
+        RETURN jsonb_build_object('value', v_row);
+    END IF;
+
+    v_col := nullif(btrim(coalesce(v_labels->>'metric_value_column', v_labels->>'value_column')), '');
+    IF v_col IS NOT NULL THEN
+        IF NOT (v_row ? v_col) THEN
+            RAISE EXCEPTION 'rvbbit.metric_scalar: metric "%" labels.metric_value_column "%" is not present in result row %',
+                p_name, v_col, v_row;
+        END IF;
+    ELSIF v_row ? 'value' THEN
+        v_col := 'value';
+    ELSE
+        SELECT count(*) INTO v_cols FROM jsonb_object_keys(v_row);
+        IF v_cols = 1 THEN
+            SELECT key INTO v_col FROM jsonb_each(v_row) AS e(key, value) LIMIT 1;
+        ELSE
+            RAISE EXCEPTION 'rvbbit.metric_scalar: metric "%" returned one row with % columns and no value column: %',
+                p_name, v_cols, v_row
+                USING HINT = 'Return one column, alias the headline as "value", or set labels.metric_value_column.';
+        END IF;
+    END IF;
+
+    v_value := v_row->v_col;
+    RETURN jsonb_build_object('value', v_value, 'value_column', v_col)
+        || CASE
+             WHEN (v_row - v_col) <> '{}'::jsonb THEN jsonb_build_object('row', v_row)
+             ELSE '{}'::jsonb
+           END;
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION rvbbit.refresh_metric_dependencies(p_name text)
 RETURNS integer LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -8146,9 +8465,7 @@ BEGIN
         RAISE EXCEPTION 'rvbbit.materialize_metric: metric "%" not defined as of %', p_name, p_def_as_of;
     END IF;
 
-    SELECT jsonb_agg(obj) INTO v_value
-    FROM rvbbit.metric(p_name, p_params, p_def_as_of, p_data_as_of) AS m(obj);
-
+    v_value := rvbbit.metric_scalar(p_name, p_params, p_def_as_of, p_data_as_of);
     v_verdict := rvbbit.check_metric(p_name, p_params, p_def_as_of, p_data_as_of);
 
     INSERT INTO rvbbit.metric_observations
@@ -8159,6 +8476,36 @@ BEGIN
          coalesce(p_params, '{}'::jsonb), v_value, v_verdict, v_verdict->>'status', p_trigger)
     RETURNING observation_id INTO v_obs_id;
     RETURN v_obs_id;
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION rvbbit.metric_scalar_audit(
+    p_metrics    text[]      DEFAULT NULL,
+    p_def_as_of  timestamptz DEFAULT now(),
+    p_data_as_of timestamptz DEFAULT NULL
+) RETURNS TABLE(metric_name text, ok boolean, value jsonb, error text)
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    rec record;
+BEGIN
+    FOR rec IN
+        SELECT name
+        FROM rvbbit.metric_catalog
+        WHERE p_metrics IS NULL OR name = ANY(p_metrics)
+        ORDER BY name
+    LOOP
+        metric_name := rec.name;
+        BEGIN
+            value := rvbbit.metric_scalar(rec.name, '{}'::jsonb, p_def_as_of, p_data_as_of);
+            ok := true;
+            error := NULL;
+        EXCEPTION WHEN OTHERS THEN
+            value := NULL;
+            ok := false;
+            error := left(SQLERRM, 500);
+        END;
+        RETURN NEXT;
+    END LOOP;
 END;
 $fn$;
 

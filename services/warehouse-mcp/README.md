@@ -13,7 +13,7 @@ read-only connection** — per-user role scoping is Phase 1.
 | `search_data(query, limit?, schema?)` | semantic search → ranked tables/cols, each grounded with **live samples + per-column stats + freshness/drift** | `data_search` + `pg_stats` + `accel_freshness` |
 | `describe_table(table)` | columns + samples + per-column stats + freshness | information_schema + `pg_stats` + `accel_freshness` |
 | `list_metrics(category?, search?)` / `get_metric(name)` | the blessed metric catalog | `metric_defs` |
-| `metric(name, params?, as_of?, def_as_of?)` | a governed number (bitemporal) | `rvbbit.metric()` |
+| `metric(name, params?, as_of?, def_as_of?)` | a governed scalar number (bitemporal) | `rvbbit.metric_scalar()` |
 | `validate_sql(sql, as_of?)` | plan, **don't execute** (self-correct loop) | `route_explain` |
 | `run_sql(sql, as_of?, limit?)` | **read-only** execute (validate → safe_select gate → run) | engine |
 

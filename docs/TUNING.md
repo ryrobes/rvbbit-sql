@@ -136,16 +136,22 @@ backends, because the limits are per backend.
 
 ## Duck/Vortex sidecar modes
 
-Duck-backed routes use the external `rvbbit-duck` binary. The base extension
-default is still the simple local persistent sidecar path: no broker service is
-required to try or run the extension. The packaged uber compose opts into a
-shared broker by default for bounded process count. Install the binary at
-`/usr/local/bin/rvbbit-duck`, set `RVBBIT_DUCK_BIN`, or ensure `rvbbit-duck` is
-on the postmaster `PATH`.
+Duck-backed routes use the external `rvbbit-duck` binary, but the core extension
+does not require it. If the binary is absent, Duck candidates are skipped while
+in-process DataFusion, native Rvbbit scans, and PostgreSQL rowstore fallback
+remain available. The base Duck extension default is still the simple local
+persistent sidecar path: no broker service is required to try or run Duck-backed
+routes. The packaged uber compose opts into a shared broker by default for
+bounded process count. Install the binary at `/usr/local/bin/rvbbit-duck`, set
+`RVBBIT_DUCK_BIN`, or ensure `rvbbit-duck` is on the postmaster `PATH`.
 `/usr/local/bin/rvbbit-duck` or `RVBBIT_DUCK_BIN` is preferred for production
 because Postgres service `PATH` values vary by supervisor. A shared Unix-socket
 broker is available for high concurrency deployments that need bounded sidecar
 process count and memory.
+
+Use `SELECT rvbbit.accelerator_runtime_status(false);` or the
+`accelerator/runtime` row from `rvbbit.doctor(false)` to see which runtime tier is
+active and what, if anything, is missing.
 
 See [DUCK_SIDECAR.md](DUCK_SIDECAR.md) for the full deployment model, fallback
 semantics, production caveats, and load-test commands.

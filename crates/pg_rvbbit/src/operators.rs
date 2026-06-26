@@ -390,6 +390,16 @@ pub(crate) fn run_rowset_op(
     pos_args: &[serde_json::Value],
     opts: &serde_json::Value,
 ) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
+    run_rowset_op_with_named(op_name, rows, pos_args, &serde_json::Map::new(), opts)
+}
+
+pub(crate) fn run_rowset_op_with_named(
+    op_name: &str,
+    rows: &[serde_json::Value],
+    pos_args: &[serde_json::Value],
+    named_args: &serde_json::Map<String, serde_json::Value>,
+    opts: &serde_json::Value,
+) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
     let op = load_op(op_name).ok_or_else(|| format!("unknown operator '{op_name}'"))?;
     if op.shape != "rowset" {
         return Err(format!(
@@ -400,7 +410,11 @@ pub(crate) fn run_rowset_op(
     // parser='sql' selects the synth-sql strategy: the model authors SQL keyed by
     // the rowset's structural shape, cached and executed natively.
     if op.parser == "sql" {
-        let prompt = pos_args.first().and_then(|v| v.as_str()).unwrap_or("");
+        let prompt = named_args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .or_else(|| pos_args.first().and_then(|v| v.as_str()))
+            .unwrap_or("");
         return crate::synth::run_synth_sql_op(&op, prompt, rows, opts);
     }
     let arg_names = load_arg_names(op_name);
@@ -411,12 +425,21 @@ pub(crate) fn run_rowset_op(
             pos_args.get(i).cloned().unwrap_or(serde_json::Value::Null),
         );
     }
+    for (name, value) in named_args {
+        inputs.insert(name.clone(), value.clone());
+    }
     inputs.insert(
         "_table_columns".to_string(),
         serde_json::json!(infer_columns(rows)),
     );
-    inputs.insert("_table_row_count".to_string(), serde_json::json!(rows.len()));
-    inputs.insert("_table".to_string(), serde_json::Value::Array(rows.to_vec()));
+    inputs.insert(
+        "_table_row_count".to_string(),
+        serde_json::json!(rows.len()),
+    );
+    inputs.insert(
+        "_table".to_string(),
+        serde_json::Value::Array(rows.to_vec()),
+    );
     let inputs_v = serde_json::Value::Object(inputs);
     let raw = invoke_with_cache(&op, &inputs_v, opts)
         .map_err(|_| format!("operator '{op_name}' invocation failed"))?;

@@ -592,8 +592,15 @@ fn native_rewrite_table_signature(table_oid: u32) -> Option<NativeRewriteTableSi
                 pg_relation_size(t.table_oid)::bigint, \
                 coalesce(t.shadow_heap_retained, false), \
                 rvbbit.shadow_heap_dirty_effective(t.table_oid), \
-                EXISTS(SELECT 1 FROM rvbbit.delete_log), \
-                EXISTS(SELECT 1 FROM rvbbit.row_groups WHERE cold_url IS NOT NULL) \
+                EXISTS( \
+                    SELECT 1 \
+                    FROM rvbbit.delete_log dl \
+                    JOIN rvbbit.row_groups_visible rgv \
+                      ON rgv.table_oid = dl.table_oid \
+                     AND rgv.rg_id = dl.rg_id \
+                    WHERE dl.table_oid = t.table_oid \
+                ), \
+                EXISTS(SELECT 1 FROM rvbbit.row_groups_visible WHERE cold_url IS NOT NULL) \
          FROM rvbbit.tables t \
          LEFT JOIN LATERAL ( \
              SELECT count(*)::bigint AS row_group_count, \
@@ -601,7 +608,7 @@ fn native_rewrite_table_signature(table_oid: u32) -> Option<NativeRewriteTableSi
                     coalesce(max(generation), 0)::bigint AS max_generation, \
                     coalesce(sum(n_rows), 0)::bigint AS total_rows, \
                     coalesce(sum(n_bytes), 0)::bigint AS total_bytes \
-             FROM rvbbit.row_groups \
+             FROM rvbbit.row_groups_visible \
              WHERE table_oid = t.table_oid \
          ) rg ON true \
          WHERE t.table_oid = {table_oid}::oid"
@@ -657,7 +664,6 @@ unsafe fn try_duck_backend_rewrite(
     query: *mut pg_sys::Query,
 ) -> bool {
     if DUCK_REWRITE_DISABLED.with(|flag| flag.get())
-        || !duck_backend::backend_enabled()
         || query.is_null()
         || pstate.is_null()
         || (*pstate).p_sourcetext.is_null()
@@ -728,6 +734,16 @@ unsafe fn try_duck_backend_rewrite(
         log_route_probe(query_source, route_doc, route_probe.cache_hit, false);
         return false;
     }
+    let (runtime_available, runtime_reason) = candidate_runtime_available(chosen_candidate);
+    if !runtime_available {
+        pgrx::debug1!(
+            "rvbbit: external route {} unavailable: {}",
+            chosen_candidate,
+            runtime_reason
+        );
+        log_route_probe(query_source, route_doc, route_probe.cache_hit, false);
+        return false;
+    }
 
     // mvcc-07: a collation-sensitive ORDER BY cannot be served by the engines —
     // DuckDB/DataFusion sort text in binary order and the jsonb_to_recordset
@@ -777,6 +793,19 @@ unsafe fn try_duck_backend_rewrite(
 fn log_route_probe(query_sql: &str, route_doc: &Value, cache_hit: bool, rewritten: bool) {
     route_log::enqueue_decision(query_sql, route_doc, cache_hit, rewritten);
     route_log::record_pending_execution(query_sql, route_doc, cache_hit, rewritten);
+}
+
+fn candidate_runtime_available(candidate: &str) -> (bool, String) {
+    match candidate {
+        "duck_vector" | "duck_hive" | "duck_vortex" => duck_backend::duck_routes_available(),
+        "datafusion_mem" | "datafusion_vector" | "datafusion_hive" | "datafusion_vortex" => {
+            duck_backend::datafusion_routes_available()
+        }
+        _ => (
+            true,
+            "candidate does not require an external runtime".to_string(),
+        ),
+    }
 }
 
 struct DuckRouteProbe {
@@ -4559,7 +4588,7 @@ fn has_per_group_stats(table_oid: u32, group_col: &str) -> bool {
     }
     let sql = format!(
         "SELECT EXISTS ( \
-             SELECT 1 FROM rvbbit.row_groups, \
+             SELECT 1 FROM rvbbit.row_groups_visible, \
                           jsonb_array_elements(per_group_stats) AS b \
              WHERE table_oid = {table_oid}::oid \
                AND b->>'group_column' = '{col_esc}' \
@@ -9999,8 +10028,15 @@ fn metadata_rewrites_unsafe_for_correctness() -> bool {
     if !table_exists.unwrap_or(false) {
         return false;
     }
-    let has_tombstones: Option<bool> =
-        pgrx::Spi::get_one("SELECT EXISTS(SELECT 1 FROM rvbbit.delete_log)")
+    let has_tombstones: Option<bool> = pgrx::Spi::get_one(
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM rvbbit.delete_log dl \
+             JOIN rvbbit.row_groups_visible rgv \
+               ON rgv.table_oid = dl.table_oid \
+              AND rgv.rg_id = dl.rg_id \
+         )",
+    )
             .ok()
             .flatten();
     if has_tombstones.unwrap_or(false) {
@@ -10017,7 +10053,7 @@ fn metadata_rewrites_unsafe_for_correctness() -> bool {
     // fast paths. Same one-EXISTS overhead pattern as the tombstone
     // check above.
     let has_cold: Option<bool> = pgrx::Spi::get_one(
-        "SELECT EXISTS(SELECT 1 FROM rvbbit.row_groups WHERE cold_url IS NOT NULL)",
+        "SELECT EXISTS(SELECT 1 FROM rvbbit.row_groups_visible WHERE cold_url IS NOT NULL)",
     )
     .ok()
     .flatten();
@@ -10106,9 +10142,13 @@ fn is_rvbbit_table_cached(oid: u32) -> bool {
         return v;
     }
     let sql = format!(
-        "SELECT (a.amname = 'rvbbit') \
-         FROM pg_class c JOIN pg_am a ON c.relam = a.oid \
-         WHERE c.oid = {oid}::oid"
+        "SELECT EXISTS ( \
+             SELECT 1 \
+             FROM rvbbit.tables t \
+             JOIN pg_class c ON c.oid = t.table_oid \
+             WHERE t.table_oid = {oid}::oid \
+               AND coalesce(t.acceleration_enabled, true) \
+         )"
     );
     let result: Result<Option<bool>, _> = pgrx::Spi::get_one(&sql);
     let v = result.ok().flatten().unwrap_or(false);

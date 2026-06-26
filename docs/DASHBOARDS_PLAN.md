@@ -156,7 +156,7 @@ Claude gets better → dashboards get better → more usage.**
   reproducible forever, shareable publicly (frozen = no auth). Distinct from a dead tree:
   it's a deliberate freeze *with* provenance.
 - **Reproducible + audited by construction** — every view is a receipt.
-- **Metrics-backed = the official number** — panels on `metric()` inherit the check verdict.
+- **Metrics-backed = the official number** — panels on `metric_scalar()` inherit the check verdict.
 - **Impact analysis / blast radius** — "I'm changing `orders.amount` — what breaks?" The
   reverse edges answer instantly. Schema-change safety with zero data engineers.
 - **Self-healing** — Drift detects a source change → flags only the affected dashboards →

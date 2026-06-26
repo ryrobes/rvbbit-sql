@@ -146,11 +146,67 @@ impl Drop for DuckSession {
     }
 }
 
-pub(crate) fn backend_enabled() -> bool {
+pub(crate) fn duck_backend_config_enabled() -> bool {
     let enabled = guc_setting("rvbbit.duck_backend")
         .map(|value| setting_enabled(&value, true))
         .unwrap_or_else(|| env_enabled("RVBBIT_DUCK_BACKEND", true));
-    enabled && duck_binary().is_some()
+    enabled
+}
+
+pub(crate) fn backend_enabled() -> bool {
+    duck_backend_config_enabled() && duck_binary().is_some()
+}
+
+pub(crate) fn duck_routes_available() -> (bool, String) {
+    if !duck_backend_config_enabled() {
+        return (
+            false,
+            "Duck sidecar routes are disabled by rvbbit.duck_backend".to_string(),
+        );
+    }
+    match duck_binary() {
+        Some(path) => (
+            true,
+            format!("rvbbit-duck sidecar binary available at {path}"),
+        ),
+        None => (
+            false,
+            "rvbbit-duck binary not found; Duck sidecar routes are unavailable".to_string(),
+        ),
+    }
+}
+
+pub(crate) fn datafusion_routes_available() -> (bool, String) {
+    if datafusion_inprocess_enabled() {
+        return (
+            true,
+            "in-process DataFusion is enabled; no rvbbit-duck binary is required".to_string(),
+        );
+    }
+    let (duck_available, duck_reason) = duck_routes_available();
+    if duck_available {
+        (
+            true,
+            "in-process DataFusion is disabled, but DataFusion can run through rvbbit-duck"
+                .to_string(),
+        )
+    } else {
+        (
+            false,
+            format!("DataFusion routes unavailable: rvbbit.df_inprocess is off and {duck_reason}"),
+        )
+    }
+}
+
+pub(crate) fn accelerator_route_runtime_stamp() -> String {
+    format!(
+        "duck_cfg:{}|duck_bin:{}|df_inproc:{}|shared:{}|native_vortex:{}",
+        duck_backend_config_enabled(),
+        duck_binary().as_deref().unwrap_or("missing"),
+        datafusion_inprocess_enabled(),
+        shared_enabled(),
+        native_vortex_enabled()
+    )
 }
 
 pub(crate) fn max_rows() -> i32 {
@@ -190,9 +246,7 @@ fn shared_enabled() -> bool {
 }
 
 fn shared_target_enabled(engine: &str, layout: &str) -> bool {
-    let raw = guc_setting("rvbbit.duck_backend_shared_targets")
-        .or_else(|| std::env::var("RVBBIT_DUCK_BACKEND_SHARED_TARGETS").ok())
-        .unwrap_or_default();
+    let raw = raw_shared_targets();
     shared_target_list_matches(&raw, engine, layout)
 }
 
@@ -269,7 +323,7 @@ pub(crate) fn fail_open_enabled() -> bool {
 /// every query at both 100k and (multi-row-group) 1M scale, with safe
 /// transparent fallback to the sidecar on any in-process error.
 /// Disable with `SET rvbbit.df_inprocess = off` for explicit A/B.
-fn df_inprocess_enabled() -> bool {
+pub(crate) fn datafusion_inprocess_enabled() -> bool {
     guc_setting("rvbbit.df_inprocess")
         .map(|value| setting_enabled(&value, true))
         .unwrap_or_else(|| env_enabled("RVBBIT_DF_INPROCESS", true))
@@ -321,6 +375,119 @@ fn duck_binary() -> Option<String> {
         return Some(DEFAULT_DUCK_BIN.to_string());
     }
     find_executable_on_path("rvbbit-duck", std::env::var_os("PATH").as_deref())
+}
+
+fn raw_shared_targets() -> String {
+    guc_setting("rvbbit.duck_backend_shared_targets")
+        .or_else(|| std::env::var("RVBBIT_DUCK_BACKEND_SHARED_TARGETS").ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn accelerator_runtime_status_value(live: bool) -> Value {
+    let duck_config_enabled = duck_backend_config_enabled();
+    let duck_binary = duck_binary();
+    let duck_routes_available = duck_config_enabled && duck_binary.is_some();
+    let df_inprocess = datafusion_inprocess_enabled();
+    let datafusion_routes_available = df_inprocess || duck_routes_available;
+    let shared = shared_enabled();
+    let persistent = persistent_enabled();
+    let mut recommendations = Vec::new();
+
+    if duck_config_enabled && duck_binary.is_none() {
+        recommendations.push(json!({
+            "severity": "info",
+            "action": "install_rvbbit_duck",
+            "detail": "Install rvbbit-duck at /usr/local/bin/rvbbit-duck or set RVBBIT_DUCK_BIN to enable Duck-backed routes."
+        }));
+    }
+    if !df_inprocess && !duck_routes_available {
+        recommendations.push(json!({
+            "severity": "warn",
+            "action": "enable_datafusion_or_install_sidecar",
+            "detail": "Enable rvbbit.df_inprocess or install rvbbit-duck; otherwise DataFusion routes are unavailable and routing falls back to native/PostgreSQL paths."
+        }));
+    }
+
+    let (shared_socket, shared_online) = if let Some(binary) = duck_binary.as_deref() {
+        let socket =
+            shared_socket_hint_no_create(binary, &duck_dsn(), "duck", "vortex", duck_threads())
+                .ok();
+        let online = if live && shared {
+            socket
+                .as_deref()
+                .map(|path| UnixStream::connect(path).is_ok())
+        } else {
+            None
+        };
+        (socket, online)
+    } else {
+        (None, None)
+    };
+
+    if shared && duck_routes_available && live && shared_online == Some(false) {
+        recommendations.push(json!({
+            "severity": "warn",
+            "action": "start_or_check_shared_broker",
+            "detail": "Shared Duck broker is enabled but the derived broker socket was not reachable; queries will fall back to local persistent or one-shot sidecars."
+        }));
+    }
+
+    let status = if (!datafusion_routes_available && !duck_routes_available)
+        || (shared && duck_routes_available && live && shared_online == Some(false))
+    {
+        "warn"
+    } else {
+        "ok"
+    };
+
+    json!({
+        "status": status,
+        "duck_backend_enabled": duck_routes_available,
+        "duck": {
+            "config_enabled": duck_config_enabled,
+            "binary_found": duck_binary.is_some(),
+            "binary_path": duck_binary,
+            "routes_available": duck_routes_available,
+            "impact_if_unavailable": "Duck-backed routes are skipped; DataFusion in-process, native Rvbbit, and PostgreSQL rowstore paths can still run."
+        },
+        "datafusion": {
+            "inprocess_enabled": df_inprocess,
+            "routes_available": datafusion_routes_available,
+            "mode": if df_inprocess {
+                "in_process"
+            } else if duck_routes_available {
+                "rvbbit_duck_sidecar"
+            } else {
+                "unavailable"
+            },
+            "impact_if_unavailable": "DataFusion candidates are skipped; routing falls back to Duck, native Rvbbit, or PostgreSQL rowstore when available."
+        },
+        "native": {
+            "custom_scan_available": true,
+            "native_vortex_enabled": native_vortex_enabled()
+        },
+        "sidecar": {
+            "persistent_enabled": persistent,
+            "shared_enabled": shared,
+            "shared_targets": raw_shared_targets(),
+            "shared_workers": shared_workers(),
+            "shared_socket_duck_vortex": shared_socket,
+            "shared_socket_online": shared_online,
+            "result_format": sidecar_result_format().as_str(),
+            "fail_open": fail_open_enabled()
+        },
+        "limits": {
+            "max_rows": max_rows(),
+            "timeout_s": timeout_s(),
+            "threads": duck_threads()
+        },
+        "recommendations": recommendations
+    })
+}
+
+#[pg_extern]
+fn accelerator_runtime_status(live: default!(bool, "false")) -> JsonB {
+    JsonB(accelerator_runtime_status_value(live))
 }
 
 fn resolve_duck_binary_candidate(candidate: &str) -> Option<String> {
@@ -428,7 +595,7 @@ fn engine_query_json(
     // Phase 1: in-process DataFusion path. Only takes the datafusion engine
     // (DuckDB still goes through the sidecar). If we hit an error, fall
     // through to the sidecar path — safe rollback by design.
-    let inprocess_payload = if engine == "datafusion" && df_inprocess_enabled() {
+    let inprocess_payload = if engine == "datafusion" && datafusion_inprocess_enabled() {
         match crate::df::query_engine(layout, query, max_rows) {
             Ok(payload) => Some(payload),
             Err(err) => {
@@ -451,9 +618,20 @@ fn engine_query_json(
     let mut payload = if let Some(p) = inprocess_payload {
         p
     } else {
-        let binary = duck_binary().unwrap_or_else(|| {
-            pgrx::error!("rvbbit.{engine}_query_json: rvbbit-duck binary not found")
-        });
+        if !duck_backend_config_enabled() {
+            return fail_open_or_error(
+                engine,
+                query,
+                max_rows,
+                "rvbbit-duck sidecar routes are disabled by rvbbit.duck_backend",
+            );
+        }
+        let binary = match duck_binary() {
+            Some(binary) => binary,
+            None => {
+                return fail_open_or_error(engine, query, max_rows, "rvbbit-duck binary not found");
+            }
+        };
         let dsn = duck_dsn();
         let timeout = timeout_s();
         sidecar_context = Some((binary.clone(), dsn.clone(), timeout));
@@ -933,6 +1111,26 @@ fn shared_socket_hint(
     shared_socket_path(&key)
 }
 
+fn shared_socket_hint_no_create(
+    binary: &str,
+    dsn: &str,
+    engine: &str,
+    layout: &str,
+    threads: usize,
+) -> Result<String, String> {
+    let key = DuckSharedKey {
+        binary: binary.to_string(),
+        dsn: dsn.to_string(),
+        engine: engine.to_string(),
+        layout: layout.to_string(),
+        threads,
+        workers: shared_workers(),
+        pgdata_prefix: pgdata_prefix(),
+        visible_pgdata_prefix: visible_pgdata_prefix(),
+    };
+    shared_socket_path_no_create(&key)
+}
+
 fn execute_shared(
     engine: &str,
     layout: &str,
@@ -1000,13 +1198,25 @@ fn shared_socket_path(key: &DuckSharedKey) -> Result<String, String> {
     }
     let dir = shared_socket_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("creating shared rvbbit-duck dir {dir}: {e}"))?;
+    Ok(derived_shared_socket_path(&dir, key))
+}
+
+fn shared_socket_path_no_create(key: &DuckSharedKey) -> Result<String, String> {
+    if let Some(path) = shared_socket_override() {
+        return Ok(path);
+    }
+    let dir = shared_socket_dir();
+    Ok(derived_shared_socket_path(&dir, key))
+}
+
+fn derived_shared_socket_path(dir: &str, key: &DuckSharedKey) -> String {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
-    Ok(format!(
+    format!(
         "{}/rvbbit-duck-{:016x}.sock",
         dir.trim_end_matches('/'),
         hasher.finish()
-    ))
+    )
 }
 
 fn send_shared_request(socket_path: &str, request: &str, timeout: i32) -> Result<Value, String> {

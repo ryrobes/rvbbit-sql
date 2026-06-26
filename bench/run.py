@@ -105,10 +105,11 @@ def smoke() -> None:
             "SELECT a.amname FROM pg_class c JOIN pg_am a ON c.relam = a.oid "
             "WHERE c.oid = 'smoke_rvbbit'::regclass"
         ).fetchone()
-        assert am is not None and am[0] == "rvbbit", f"wrong AM: {am}"
+        assert am is not None and am[0] == "heap", f"wrong AM: {am}"
         registered = c.execute(
             "SELECT count(*) FROM rvbbit.tables "
-            "WHERE table_oid = 'smoke_rvbbit'::regclass"
+            "WHERE table_oid = 'smoke_rvbbit'::regclass "
+            "AND acceleration_enabled"
         ).fetchone()
         assert registered == (1,), f"not in rvbbit.tables: {registered}"
         c.execute("DROP TABLE smoke_rvbbit")

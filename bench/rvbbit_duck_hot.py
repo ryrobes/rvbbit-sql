@@ -457,12 +457,11 @@ def _rvbbit_row_group_catalog(pg_conn: psycopg.Connection) -> dict[str, RvbbitDu
                coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
                coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
                (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) AS deletes
-        FROM rvbbit.row_groups rg
-        JOIN pg_class c ON c.oid = rg.table_oid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_am am ON am.oid = c.relam
-        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-        WHERE am.amname = 'rvbbit'
+	        FROM rvbbit.row_groups rg
+	        JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
+	        JOIN pg_class c ON c.oid = rg.table_oid
+	        JOIN pg_namespace n ON n.oid = c.relnamespace
+	        WHERE coalesce(t.acceleration_enabled, true)
         GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
     """
     catalog: dict[str, RvbbitDuckTable] = {}
@@ -509,12 +508,12 @@ def _rvbbit_row_group_catalog(pg_conn: psycopg.Connection) -> dict[str, RvbbitDu
         cur.execute(
             """
             SELECT n.nspname, c.relname, a.attname, a.atttypid::regtype::text
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
-            JOIN pg_attribute a ON a.attrelid = c.oid
-            WHERE am.amname = 'rvbbit'
-              AND a.attnum > 0
+	            FROM rvbbit.tables t
+	            JOIN pg_class c ON c.oid = t.table_oid
+	            JOIN pg_namespace n ON n.oid = c.relnamespace
+	            JOIN pg_attribute a ON a.attrelid = c.oid
+	            WHERE coalesce(t.acceleration_enabled, true)
+	              AND a.attnum > 0
               AND NOT a.attisdropped
             ORDER BY n.nspname, c.relname, a.attnum
             """
@@ -548,15 +547,14 @@ def _rvbbit_variant_catalog(pg_conn: psycopg.Connection, layout: str) -> dict[st
                coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
                coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
                (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) AS deletes
-        FROM rvbbit.row_group_variants rg
-        JOIN rvbbit.layout_variant_status s
-          ON s.table_oid = rg.table_oid AND s.layout = rg.layout
-        JOIN pg_class c ON c.oid = rg.table_oid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_am am ON am.oid = c.relam
-        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-        WHERE am.amname = 'rvbbit'
-          AND rg.layout = %s
+	        FROM rvbbit.row_group_variants rg
+	        JOIN rvbbit.layout_variant_status s
+	          ON s.table_oid = rg.table_oid AND s.layout = rg.layout
+	        JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
+	        JOIN pg_class c ON c.oid = rg.table_oid
+	        JOIN pg_namespace n ON n.oid = c.relnamespace
+	        WHERE coalesce(t.acceleration_enabled, true)
+	          AND rg.layout = %s
           AND s.status = 'ready'
         GROUP BY n.nspname, c.oid, c.relname, rg.layout, t.shadow_heap_retained, t.shadow_heap_dirty
     """
@@ -603,12 +601,12 @@ def _rvbbit_variant_catalog(pg_conn: psycopg.Connection, layout: str) -> dict[st
         cur.execute(
             """
             SELECT n.nspname, c.relname, a.attname, a.atttypid::regtype::text
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
-            JOIN pg_attribute a ON a.attrelid = c.oid
-            WHERE am.amname = 'rvbbit'
-              AND a.attnum > 0
+	            FROM rvbbit.tables t
+	            JOIN pg_class c ON c.oid = t.table_oid
+	            JOIN pg_namespace n ON n.oid = c.relnamespace
+	            JOIN pg_attribute a ON a.attrelid = c.oid
+	            WHERE coalesce(t.acceleration_enabled, true)
+	              AND a.attnum > 0
               AND NOT a.attisdropped
             ORDER BY n.nspname, c.relname, a.attnum
             """
@@ -640,11 +638,11 @@ def _rvbbit_query_table_metrics(pg_conn: psycopg.Connection, sql: str) -> dict:
                    count(rg.*)::bigint,
                    coalesce(sum(rg.n_rows), 0)::bigint,
                    coalesce(sum(rg.n_bytes), 0)::bigint
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
-            LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = c.oid
-            WHERE am.amname = 'rvbbit'
+	            FROM rvbbit.tables t
+	            JOIN pg_class c ON c.oid = t.table_oid
+	            JOIN pg_namespace n ON n.oid = c.relnamespace
+	            LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = c.oid
+	            WHERE coalesce(t.acceleration_enabled, true)
             GROUP BY n.nspname, c.relname
             """.encode()
         )  # type: ignore[arg-type]

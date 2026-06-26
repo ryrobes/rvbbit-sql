@@ -10,9 +10,15 @@ def _drop_cube(rvbbit, cube: str) -> None:
         rvbbit.execute("SELECT rvbbit.drop_cube(%s)", (cube,))
     except Exception:
         pass
-    rvbbit.execute("DELETE FROM rvbbit.cube_refresh_policy WHERE cube_name = %s", (cube,))
-    rvbbit.execute("DELETE FROM rvbbit.cube_control WHERE cube_name = %s", (cube,))
-    rvbbit.execute("DELETE FROM rvbbit.cube_defs WHERE name = %s", (cube,))
+    for sql in (
+        "DELETE FROM rvbbit.cube_refresh_policy WHERE cube_name = %s",
+        "DELETE FROM rvbbit.cube_control WHERE cube_name = %s",
+        "DELETE FROM rvbbit.cube_defs WHERE name = %s",
+    ):
+        try:
+            rvbbit.execute(sql, (cube,))
+        except Exception:
+            pass
 
 
 def test_refresh_cube_applies_and_reports_autopilot_policy(rvbbit, temp_table):
@@ -192,5 +198,146 @@ def test_refresh_all_cubes_skips_manual_policy_but_direct_refresh_runs(rvbbit, t
             "SELECT last_rows FROM rvbbit.cube_refresh_status WHERE name = %s",
             (cube,),
         ).fetchone()[0] == 3
+    finally:
+        _drop_cube(rvbbit, cube)
+
+
+def test_maintain_builds_cube_layouts_and_refreshes_due_snapshot(rvbbit, temp_table):
+    cube = _cube_name()
+    category = f"test_{cube}"
+    try:
+        rvbbit.execute(f"CREATE TABLE {temp_table} (id int, amount int) USING rvbbit")
+        rvbbit.execute(f"INSERT INTO {temp_table} VALUES (1, 10), (2, 20)")
+        rvbbit.execute(
+            """
+            SELECT rvbbit.set_cube_refresh_policy(
+                %s,
+                p_mode => 'auto',
+                p_refresh_interval_seconds => 999999,
+                p_refresh_variants => 'deferred'
+            )
+            """,
+            (cube,),
+        )
+        rvbbit.execute(
+            "SELECT rvbbit.define_cube(%s, %s, %s, %s, NULL, NULL, %s)",
+            (cube, f"SELECT id, amount FROM {temp_table}", "one row per source row", "maintained cube", category),
+        )
+
+        status = rvbbit.execute(
+            """
+            SELECT lifecycle_state, maintenance_action, needs_maintenance
+            FROM rvbbit.maintenance_status
+            WHERE target_kind = 'cube' AND target_name = %s
+            """,
+            (cube,),
+        ).fetchone()
+        assert status == ("layouts_pending", "build_layouts", True)
+
+        planned = rvbbit.execute(
+            "SELECT maintenance_action, executed, status FROM rvbbit.maintain('cube', %s::text, true)",
+            (cube,),
+        ).fetchone()
+        assert planned == ("build_layouts", False, "planned")
+
+        executed = rvbbit.execute(
+            "SELECT maintenance_action, executed, status, rows_written > 0 FROM rvbbit.maintain('cube', %s::text)",
+            (cube,),
+        ).fetchone()
+        assert executed == ("build_layouts", True, "ok", True)
+        assert rvbbit.execute(
+            """
+            SELECT lifecycle_state, maintenance_action, needs_maintenance
+            FROM rvbbit.maintenance_status
+            WHERE target_kind = 'cube' AND target_name = %s
+            """,
+            (cube,),
+        ).fetchone() == ("current", "none", False)
+
+        rvbbit.execute(f"INSERT INTO {temp_table} VALUES (3, 30)")
+        assert rvbbit.execute(
+            """
+            SELECT lifecycle_state, maintenance_action, needs_maintenance
+            FROM rvbbit.maintenance_status
+            WHERE target_kind = 'cube' AND target_name = %s
+            """,
+            (cube,),
+        ).fetchone() == ("refresh_due", "refresh_snapshot", True)
+
+        executed = rvbbit.execute(
+            "SELECT maintenance_action, executed, status, rows_written FROM rvbbit.maintain('cube', %s::text)",
+            (cube,),
+        ).fetchone()
+        assert executed == ("refresh_snapshot", True, "ok", 3)
+        assert rvbbit.execute(
+            """
+            SELECT current_rows, lifecycle_state, needs_maintenance
+            FROM rvbbit.maintenance_status
+            WHERE target_kind = 'cube' AND target_name = %s
+            """,
+            (cube,),
+        ).fetchone() == (3, "current", False)
+    finally:
+        _drop_cube(rvbbit, cube)
+
+
+def test_cube_refresh_hidden_snapshot_tombstones_do_not_block_current_routes(rvbbit, temp_table):
+    cube = _cube_name()
+    category = f"test_{cube}"
+    cube_rel = f"cubes.{cube}"
+    try:
+        rvbbit.execute(f"CREATE TABLE {temp_table} (id int, amount int) USING rvbbit")
+        rvbbit.execute(f"INSERT INTO {temp_table} VALUES (1, 10), (2, 20), (3, 30)")
+        rvbbit.execute(
+            """
+            SELECT rvbbit.set_cube_refresh_policy(
+                %s,
+                p_mode => 'auto',
+                p_refresh_interval_seconds => 999999,
+                p_refresh_variants => 'deferred'
+            )
+            """,
+            (cube,),
+        )
+        rvbbit.execute(
+            "SELECT rvbbit.define_cube(%s, %s, %s, %s, NULL, NULL, %s)",
+            (cube, f"SELECT id, amount FROM {temp_table}", "one row per source row", "snapshot route cube", category),
+        )
+
+        assert rvbbit.execute("SELECT rvbbit.refresh_cube(%s)", (cube,)).fetchone()[0] == 3
+
+        raw_tombstones, visible_tombstones, all_row_groups, visible_row_groups = rvbbit.execute(
+            f"""
+            SELECT
+                rvbbit.tombstone_count('{cube_rel}'::regclass),
+                rvbbit.visible_tombstone_count('{cube_rel}'::regclass),
+                (SELECT count(*) FROM rvbbit.row_groups WHERE table_oid = '{cube_rel}'::regclass),
+                (SELECT count(*) FROM rvbbit.row_groups_visible WHERE table_oid = '{cube_rel}'::regclass)
+            """
+        ).fetchone()
+        assert raw_tombstones >= 3
+        assert visible_tombstones == 0
+        assert all_row_groups >= 2
+        assert visible_row_groups == 1
+
+        freshness = rvbbit.execute(
+            """
+            SELECT parquet_rows, row_groups, tombstones
+            FROM rvbbit.accel_freshness
+            WHERE table_name = %s
+            """,
+            (cube_rel,),
+        ).fetchone()
+        assert freshness == (3, 1, 0)
+
+        explained = rvbbit.execute(
+            "SELECT rvbbit.route_explain(%s)",
+            (f"SELECT count(*) FROM {cube_rel}",),
+        ).fetchone()[0]
+        assert explained["rvbbit_tables"][0]["delete_count"] == 0
+        assert not any(
+            "delete log" in str(candidate.get("reason", "")).lower()
+            for candidate in explained["candidates"]
+        )
     finally:
         _drop_cube(rvbbit, cube)

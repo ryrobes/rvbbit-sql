@@ -265,8 +265,9 @@ question. None of which dbt/Cube.dev/LookML do natively.
     `apply_cube_pack(pack, bindings)` (substitute + EXPLAIN-validate, dry-run), `define_cube_from_pack`
     (materialize + pre-seed curated docs at `edited_by='pack'` so `enrich_cube` preserves them).
     Verified: synthetic renamed CRM schema → fuzzy-bound → live 200-row documented `sf_opportunities`.
-  - **`promote_cube_to_metric(cube, metric, …)`** — zero-copy metric over `cubes.<name>` (`SELECT *`,
-    `labels.cube_source` for reverse lookup); derived/aggregated metrics are still hand-written.
+  - **`promote_cube_to_metric(cube, metric, …)`** — zero-copy scalar row-count metric over
+    `cubes.<name>` (`labels.cube_source` for reverse lookup); other business scalars are still
+    hand-written over the cube.
   - **`cube_health(name)`** (folded into `describe_cube` as `health`) — freshness (keyed off
     `cube_control.refreshed_at`, not the parquet clock) / staleness / drift (`accel_freshness`,
     null-guarded) / usage + a skip/delta/full-rebuild recommendation.

@@ -445,16 +445,20 @@ fn guc_setting(name: &str) -> Option<String> {
     }
 }
 
-/// Cached lookup: does `pg_class.relam` for this oid resolve to rvbbit?
+/// Cached lookup: is this relation enabled in the rvbbit acceleration registry?
 fn is_rvbbit_table(oid: u32) -> bool {
     if let Some(cached) = IS_RVBBIT_CACHE.with(|c| c.borrow().get(&oid).copied()) {
         return cached;
     }
     IN_HOOK.with(|f| f.set(true));
     let result: Result<Option<bool>, _> = pgrx::Spi::get_one(&format!(
-        "SELECT (a.amname = 'rvbbit') \
-         FROM pg_class c JOIN pg_am a ON c.relam = a.oid \
-         WHERE c.oid = {oid}::oid"
+        "SELECT EXISTS ( \
+             SELECT 1 \
+             FROM rvbbit.tables t \
+             JOIN pg_class c ON c.oid = t.table_oid \
+             WHERE t.table_oid = {oid}::oid \
+               AND coalesce(t.acceleration_enabled, true) \
+         )"
     ));
     IN_HOOK.with(|f| f.set(false));
     let is = result.ok().flatten().unwrap_or(false);
@@ -483,7 +487,7 @@ fn parquet_authoritative_for_oid(oid: u32) -> bool {
 fn count_row_groups(oid: u32) -> i64 {
     IN_HOOK.with(|f| f.set(true));
     let n: Result<Option<i64>, _> = pgrx::Spi::get_one(&format!(
-        "SELECT count(*) FROM rvbbit.row_groups WHERE table_oid = {oid}::oid"
+        "SELECT count(*) FROM rvbbit.row_groups_visible WHERE table_oid = {oid}::oid"
     ));
     IN_HOOK.with(|f| f.set(false));
     n.ok().flatten().unwrap_or(0)
@@ -514,7 +518,7 @@ fn aggregate_for_oid(oid: u32) -> (f64, f64) {
             &format!(
                 "SELECT coalesce(sum(n_rows), 0)::bigint, \
                         coalesce(sum(n_bytes), 0)::bigint \
-                 FROM rvbbit.row_groups WHERE table_oid = {oid}::oid"
+                 FROM rvbbit.row_groups_visible WHERE table_oid = {oid}::oid"
             ),
             None,
             &[],

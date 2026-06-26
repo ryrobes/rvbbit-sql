@@ -150,6 +150,9 @@ if [[ ",${SYSTEMS}," == *",rvbbit,"* ]]; then
         say "resetting pg_rvbbit extension (DESTRUCTIVE: drops rvbbit system/catalog data)"
         ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 <<'SQL'
 DROP EXTENSION IF EXISTS pg_rvbbit CASCADE;
+DROP EVENT TRIGGER IF EXISTS rvbbit_on_create_table;
+DROP EVENT TRIGGER IF EXISTS rvbbit_on_drop_table;
+DROP EVENT TRIGGER IF EXISTS rvbbit_partition_dirty_triggers_on_alter;
 SET rvbbit.duck_backend = off;
 DROP SCHEMA IF EXISTS rvbbit CASCADE;
 CREATE SCHEMA rvbbit;

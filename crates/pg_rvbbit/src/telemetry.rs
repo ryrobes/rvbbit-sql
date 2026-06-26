@@ -318,6 +318,8 @@ DECLARE
     v_row_groups bigint;
     v_variants bigint;
     v_dirty bigint;
+    v_disabled bigint;
+    v_am_bound bigint;
     v_route_status jsonb;
     v_cost_total bigint;
     v_cost_problem bigint;
@@ -327,6 +329,7 @@ DECLARE
     v_warren_nodes bigint;
     v_warren_bad_jobs bigint;
     v_backend_count bigint;
+    v_accel_status jsonb;
 BEGIN
     SELECT e.extversion INTO v_extversion
     FROM pg_extension e
@@ -342,6 +345,13 @@ BEGIN
     SELECT count(*), count(*) FILTER (WHERE shadow_heap_dirty)
     INTO v_rvbbit_tables, v_dirty
     FROM rvbbit.table_dirty_state;
+    SELECT count(*) INTO v_disabled
+    FROM rvbbit.tables
+    WHERE NOT coalesce(acceleration_enabled, true);
+    SELECT count(*) INTO v_am_bound
+    FROM pg_class c
+    JOIN pg_am a ON a.oid = c.relam
+    WHERE a.amname = 'rvbbit';
 
     SELECT count(*) INTO v_row_groups FROM rvbbit.row_groups;
     SELECT count(*) INTO v_variants FROM rvbbit.row_group_variants;
@@ -353,10 +363,43 @@ BEGIN
         CASE WHEN coalesce(v_dirty, 0) > 0 THEN 'warn' ELSE 'ok' END::text,
         jsonb_build_object(
             'tables', coalesce(v_rvbbit_tables, 0),
+            'disabled_tables', coalesce(v_disabled, 0),
             'dirty_shadow_heaps', coalesce(v_dirty, 0),
             'row_groups', coalesce(v_row_groups, 0),
             'layout_variants', coalesce(v_variants, 0)
         );
+
+    RETURN QUERY
+    SELECT
+        'storage'::text,
+        'access_method_aliases'::text,
+        CASE WHEN coalesce(v_am_bound, 0) > 0 THEN 'warn' ELSE 'ok' END::text,
+        jsonb_build_object(
+            'am_bound_tables', coalesce(v_am_bound, 0),
+            'impact', CASE
+                WHEN coalesce(v_am_bound, 0) > 0
+                THEN 'DROP EXTENSION pg_rvbbit will be blocked until these tables are disabled or converted to heap'
+                ELSE 'all registered acceleration tables are heap catalog tables'
+            END,
+            'fix', 'SELECT rvbbit.disable_table(''schema.table''::regclass)'
+        );
+
+    BEGIN
+        SELECT rvbbit.accelerator_runtime_status(live) INTO v_accel_status;
+        RETURN QUERY
+        SELECT
+            'accelerator'::text,
+            'runtime'::text,
+            coalesce(nullif(v_accel_status->>'status', ''), 'warn')::text,
+            v_accel_status;
+    EXCEPTION WHEN undefined_function THEN
+        RETURN QUERY
+        SELECT
+            'accelerator'::text,
+            'runtime'::text,
+            'warn'::text,
+            jsonb_build_object('reason', 'accelerator_runtime_status_unavailable');
+    END;
 
     BEGIN
         SELECT rvbbit.route_status() INTO v_route_status;

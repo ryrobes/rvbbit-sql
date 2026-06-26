@@ -335,7 +335,7 @@ physical AS (
     SELECT
         c.name,
         count(DISTINCT rg.rg_id)::bigint AS row_groups,
-        count(DISTINCT (rgv.layout, rgv.rg_id))::bigint AS variant_files,
+        count(DISTINCT (rgv.layout, rgv.rg_id)) FILTER (WHERE rgv.rg_id IS NOT NULL)::bigint AS variant_files,
         coalesce(max(rg.created_at), '-infinity'::timestamptz) AS newest_row_group_at,
         coalesce(max(rgv.created_at), '-infinity'::timestamptz) AS newest_variant_at
     FROM cubes c

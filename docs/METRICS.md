@@ -5,12 +5,13 @@ SQL metrics, KPI checks, a bitemporal run model, a durable observation history,
 rolling/relative-time baselines, and three desktop apps in the lens.
 
 It is **built in, but opt-in**. There is no separate metrics store, no metric
-DSL, no service to run. A metric is a row in a plain table and a `SELECT`; a KPI
-is that plus one more `SELECT` that returns a boolean. If you never define one,
-nothing changes. If you do, you get systematic, versioned, time-travelable
-reporting over the rvbbit tables you already have — **all your data, no
-lock-in.** Drop the extension and you keep every metric definition and every
-recorded observation as ordinary Postgres rows.
+DSL, no service to run. A metric is a row in a plain table and a `SELECT` that
+reduces to one headline value at a data-time; a KPI is that plus one more
+`SELECT` that returns a boolean. If you never define one, nothing changes. If
+you do, you get systematic, versioned, time-travelable reporting over the
+rvbbit tables you already have — **all your data, no lock-in.** Drop the
+extension and you keep every metric definition and every recorded observation
+as ordinary Postgres rows.
 
 The things this layer can do that a bolt-on BI tool can't:
 
@@ -70,18 +71,20 @@ SELECT * FROM rvbbit.metric('revenue', '{}'::jsonb,
 
 A metric is a name + a SQL template + optional default params, grain,
 description, owner. `define_metric` appends a **new version** every time; the
-definition is never mutated.
+definition is never mutated. For materialization and KPI boards, the definition
+must be scalar: exactly one result row and one headline value. Return one
+column, alias the headline as `value`, or set `labels.metric_value_column` when
+the one-row result carries extra context columns.
 
 ```sql
 SELECT rvbbit.define_metric(
-  'revenue_by_region',
-  $$SELECT region, sum(amount) AS revenue
+  'revenue',
+  $$SELECT sum(amount) AS value
     FROM orders
-    WHERE amount >= {min}
-    GROUP BY region$$,
+    WHERE amount >= {min}$$,
   '{"min": 0}'::jsonb,            -- default params
-  'region',                       -- grain (descriptive)
-  'Revenue per region',           -- description
+  'all',                          -- grain (descriptive)
+  'Revenue',                      -- description
   'analytics');                   -- owner
 -- → 1   (the new version number)
 ```
@@ -101,27 +104,31 @@ defaults, and a referenced metric's defaults flow in underneath.
 ### Composition
 
 ```sql
-SELECT rvbbit.define_metric('top_regions',
-  $$SELECT region, revenue
-    FROM {metric:revenue_by_region} r
-    WHERE revenue > {floor}
-    ORDER BY revenue DESC$$,
+SELECT rvbbit.define_metric('high_value_revenue',
+  $$SELECT sum(amount) AS value
+    FROM orders
+    WHERE amount > {floor}$$,
   '{"floor": 1000000}'::jsonb);
 ```
 
-`{metric:revenue_by_region}` is inlined as a subquery at def-time; cycles are
-detected and rejected.
+`{metric:NAME}` is still inlined as a subquery at def-time, so reusable rowsets
+can exist for SQL composition. They should not be materialized as metrics. If
+the thing you want to preserve is a rowset, make it a cube or table and define
+scalar metrics over it.
 
 ---
 
 ## Running a metric
 
 ```sql
--- run it (SETOF jsonb — one object per result row)
-SELECT * FROM rvbbit.metric('revenue_by_region', '{"min": 50}'::jsonb);
+-- official metric value: one scalar payload
+SELECT rvbbit.metric_scalar('revenue', '{"min": 50}'::jsonb);
+
+-- lower-level rowset runner, useful for preview/composition/debugging
+SELECT * FROM rvbbit.metric('revenue', '{"min": 50}'::jsonb);
 
 -- see the exact composed SQL without running it (the observable surface)
-SELECT rvbbit.metric_sql('revenue_by_region', '{"min": 50}'::jsonb);
+SELECT rvbbit.metric_sql('revenue', '{"min": 50}'::jsonb);
 
 -- preview an UNSAVED draft body (powers the Creator's live preview)
 SELECT rvbbit.preview_metric_sql(
@@ -130,14 +137,15 @@ SELECT rvbbit.preview_metric_sql(
 
 -- the catalog (latest version of each metric) and version history
 SELECT * FROM rvbbit.metric_catalog;
-SELECT * FROM rvbbit.metric_versions('revenue_by_region');
+SELECT * FROM rvbbit.metric_versions('revenue');
 ```
 
-`metric()` is pure SQL underneath — it composes the body, pins the data-time AS
-OF (via the `rvbbit.as_of_timestamp` GUC, which reaches nested execution the
-leading-comment directive can't), and runs it. Everything flows through the same
-router, vortex/duck/native engines, and time-travel machinery as any other
-query.
+`metric_scalar()` is the product contract used by materialization. `metric()` is
+the lower-level rowset runner underneath — it composes the body, pins the
+data-time AS OF (via the `rvbbit.as_of_timestamp` GUC, which reaches nested
+execution the leading-comment directive can't), and runs it. Everything flows
+through the same router, vortex/duck/native engines, and time-travel machinery
+as any other query.
 
 ---
 
@@ -258,8 +266,17 @@ Temporal Mirror, each sync run becomes one observation, automatically.
 
 ```sql
 -- read the durable series
-SELECT data_generation, value->0->>'total' AS total, status, trigger
+SELECT data_generation, value->>'value' AS total, status, trigger
 FROM rvbbit.metric_history('daily_revenue');
+
+-- chart the durable scalar observation series
+SELECT bucket, value, status, metric_version, trigger
+FROM rvbbit.metric_series('daily_revenue',
+    now() - interval '90 days', now(), 'week', '{}'::jsonb)
+ORDER BY bucket;
+
+-- one JSON object with latest definition, latest observation, and source freshness
+SELECT rvbbit.metric_provenance('daily_revenue');
 
 -- snapshot on demand (e.g. backfill an older generation with the current def)
 SELECT rvbbit.materialize_metric('daily_revenue', '{}'::jsonb, now(),
@@ -294,6 +311,10 @@ A **Metrics** folder on the desktop with three apps, none of which you need:
   SQL, a results grid, the pass/fail verdict flipping as you move the axes, and a
   **Trend** tab — the materialized series as a verdict-colored bar strip plus a
   "Materialize now" button.
+- **KPI Board** — a matrix over the durable observation log. Cells drill into
+  the exact value, definition version, trigger, source freshness, and reproducible
+  SQL. Sparklines open a normal SQL block backed by `metric_series(...)` with a
+  line chart already configured.
 
 ---
 
@@ -304,7 +325,8 @@ A **Metrics** folder on the desktop with three apps, none of which you need:
 | Function | Returns | |
 |---|---|---|
 | `define_metric(name, sql, params jsonb, grain, description, owner, labels jsonb, check text)` | `int` | append a version (deps + materialize policy auto-set) |
-| `metric(name, params jsonb, def_as_of timestamptz, data_as_of timestamptz)` | `SETOF jsonb` | run it across the two axes |
+| `metric_scalar(name, params jsonb, def_as_of timestamptz, data_as_of timestamptz)` | `jsonb` | official scalar value across the two axes |
+| `metric(name, params jsonb, def_as_of timestamptz, data_as_of timestamptz)` | `SETOF jsonb` | lower-level rowset runner for preview/composition/debugging |
 | `metric_sql(name, params jsonb, def_as_of timestamptz)` | `text` | the composed SQL (no run) |
 | `preview_metric_sql(draft_sql, params jsonb, def_as_of timestamptz)` | `text` | compose an unsaved draft |
 | `metric_versions(name)` | `TABLE` | version history |
@@ -322,6 +344,14 @@ A **Metrics** folder on the desktop with three apps, none of which you need:
 |---|---|---|
 | `materialize_metric(name, params, def_as_of, data_as_of, data_generation, trigger)` | `bigint` | append one observation |
 | `metric_history(name, limit)` | `TABLE` | the durable series |
+| `metric_series(name, from, to, bucket, params, stale_after)` | `TABLE` | bucketed numeric observation series for SQL blocks/charts |
+| `metric_provenance(name, stale_after)` | `jsonb` | latest definition, latest observation, and dependency freshness |
+| `metric_scalar_audit(metrics, def_as_of, data_as_of)` | `TABLE` | find metric definitions that are still not scalar-safe |
+| `metric_dependency_freshness(metrics, stale_after)` | `TABLE` | check whether metric source tables have stopped receiving fresh source data |
+| `scalarize_latest_metric(name, time_col, value_col)` | `int` | append a scalar version of a period-series metric |
+| `scalarize_metric_observations_latest(name, time_col, value_col)` | `int` | rewrite legacy rowset observations to latest-period scalar payloads |
+| `scalarize_metric_observations_count(name)` | `int` | rewrite legacy rowset observations to row-count scalar payloads |
+| `scalarize_metric_observations_one_row(metrics)` | `int` | rewrite legacy single-row observation arrays to scalar payloads |
 | `set_materialize(name, on_compaction, cron_schedule, enabled)` | `void` | per-metric policy |
 | `materialize_tick(max)` | `int` | drain the compaction queue (pg_cron) |
 | `schedule_materialize_tick(cron, budget)` | `bigint` | register the heartbeat |

@@ -2226,11 +2226,10 @@ fn variant_catalog_fingerprint_sql(layout_predicate: &str) -> String {
                    ), '') AS column_sig
             FROM rvbbit.row_group_variants rg
             JOIN chosen_layout cl ON cl.table_oid = rg.table_oid AND cl.layout = rg.layout
+            JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
             JOIN pg_class c ON c.oid = rg.table_oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
-            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-            WHERE am.amname = 'rvbbit'
+            WHERE coalesce(t.acceleration_enabled, true)
             GROUP BY n.nspname, c.relname, c.oid, cl.layout, t.shadow_heap_retained, t.shadow_heap_dirty
             UNION ALL
             SELECT n.nspname,
@@ -2256,11 +2255,10 @@ fn variant_catalog_fingerprint_sql(layout_predicate: &str) -> String {
                          AND NOT a.attisdropped
                    ), '') AS column_sig
             FROM rvbbit.row_groups rg
+            JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
             JOIN pg_class c ON c.oid = rg.table_oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
-            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-            WHERE am.amname = 'rvbbit'
+            WHERE coalesce(t.acceleration_enabled, true)
               AND NOT EXISTS (
                   SELECT 1
                   FROM chosen_layout cl
@@ -2309,11 +2307,10 @@ fn variant_catalog_fingerprint_sql_exact(layout_predicate: &str) -> String {
             FROM rvbbit.row_group_variants rg
             JOIN rvbbit.layout_variant_status s
               ON s.table_oid = rg.table_oid AND s.layout = rg.layout
+            JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
             JOIN pg_class c ON c.oid = rg.table_oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
-            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-            WHERE am.amname = 'rvbbit'
+            WHERE coalesce(t.acceleration_enabled, true)
               AND {layout_predicate}
               AND s.status = 'ready'
             GROUP BY n.nspname, c.relname, c.oid, rg.layout, t.shadow_heap_retained, t.shadow_heap_dirty
@@ -2363,11 +2360,10 @@ fn catalog_fingerprint_sql(
                    ), '') AS column_sig
             FROM {rg_relation}
             {extra_join}
+            JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
             JOIN pg_class c ON c.oid = rg.table_oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
-            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-            WHERE am.amname = 'rvbbit'
+            WHERE coalesce(t.acceleration_enabled, true)
             GROUP BY n.nspname, c.relname, c.oid, {layout_group_expr}, t.shadow_heap_retained, t.shadow_heap_dirty
         )
         SELECT coalesce(string_agg(
@@ -2439,11 +2435,11 @@ fn rvbbit_row_group_catalog(
     let col_rows = pg.query(
         "
         SELECT n.nspname, c.relname, a.attname, a.atttypid::regtype::text
-        FROM pg_class c
+        FROM rvbbit.tables t
+        JOIN pg_class c ON c.oid = t.table_oid
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_am am ON am.oid = c.relam
         JOIN pg_attribute a ON a.attrelid = c.oid
-        WHERE am.amname = 'rvbbit'
+        WHERE coalesce(t.acceleration_enabled, true)
           AND a.attnum > 0
           AND NOT a.attisdropped
         ORDER BY n.nspname, c.relname, a.attnum
@@ -2494,11 +2490,10 @@ fn catalog_sql_for_layout(layout: &str) -> Result<String> {
                    coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
                    (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
             FROM rvbbit.row_groups rg
+            JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
             JOIN pg_class c ON c.oid = rg.table_oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
-            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-            WHERE am.amname = 'rvbbit'
+            WHERE coalesce(t.acceleration_enabled, true)
             GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
             "
             .to_string(),
@@ -2547,11 +2542,10 @@ fn variant_catalog_sql(layout_predicate: &str) -> String {
                    (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
             FROM rvbbit.row_group_variants rg
             JOIN chosen_layout cl ON cl.table_oid = rg.table_oid AND cl.layout = rg.layout
+            JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
             JOIN pg_class c ON c.oid = rg.table_oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
-            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-            WHERE am.amname = 'rvbbit'
+            WHERE coalesce(t.acceleration_enabled, true)
             GROUP BY n.nspname, c.oid, c.relname, cl.layout, t.shadow_heap_retained, t.shadow_heap_dirty
         ),
         canonical_rows AS (
@@ -2566,11 +2560,10 @@ fn variant_catalog_sql(layout_predicate: &str) -> String {
                    coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
                    (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
             FROM rvbbit.row_groups rg
+            JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
             JOIN pg_class c ON c.oid = rg.table_oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
-            LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-            WHERE am.amname = 'rvbbit'
+            WHERE coalesce(t.acceleration_enabled, true)
               AND NOT EXISTS (
                   SELECT 1
                   FROM chosen_layout cl
@@ -2601,11 +2594,10 @@ fn variant_catalog_sql_exact(layout_predicate: &str) -> String {
         FROM rvbbit.row_group_variants rg
         JOIN rvbbit.layout_variant_status s
           ON s.table_oid = rg.table_oid AND s.layout = rg.layout
+        JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
         JOIN pg_class c ON c.oid = rg.table_oid
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_am am ON am.oid = c.relam
-        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-        WHERE am.amname = 'rvbbit'
+        WHERE coalesce(t.acceleration_enabled, true)
           AND {layout_predicate}
           AND s.status = 'ready'
         GROUP BY n.nspname, c.oid, c.relname, rg.layout, t.shadow_heap_retained, t.shadow_heap_dirty

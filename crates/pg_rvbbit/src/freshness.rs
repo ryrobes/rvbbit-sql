@@ -95,11 +95,18 @@ LEFT JOIN LATERAL (
     SELECT sum(r.n_rows)::bigint  AS parquet_rows,
            count(*)::bigint       AS row_groups,
            sum(r.n_bytes)::bigint AS parquet_bytes
-      FROM rvbbit.row_groups r WHERE r.table_oid = t.table_oid
+      FROM rvbbit.row_groups r
+     WHERE r.table_oid = t.table_oid
+       AND (t.min_visible_generation = 0 OR r.generation = t.min_visible_generation)
 ) rg ON true
 LEFT JOIN LATERAL (
     SELECT count(*)::bigint AS tombstones
-      FROM rvbbit.delete_log d WHERE d.table_oid = t.table_oid
+      FROM rvbbit.delete_log d
+      JOIN rvbbit.row_groups r
+        ON r.table_oid = d.table_oid
+       AND r.rg_id = d.rg_id
+     WHERE d.table_oid = t.table_oid
+       AND (t.min_visible_generation = 0 OR r.generation = t.min_visible_generation)
 ) dl ON true
 LEFT JOIN LATERAL (
     SELECT extract(epoch FROM (o.finished_at - o.started_at)) * 1000.0 AS last_rebuild_ms,

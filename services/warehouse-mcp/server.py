@@ -519,7 +519,7 @@ def tool_edit_cube(name, sql, grain=None, description=None, category=None, subca
 
 
 def tool_metric(name: str, params=None, as_of=None, def_as_of=None, group_by=None) -> dict:
-    """A blessed, governed number — bitemporal (as_of = data-time, def_as_of = def-time). Pass
+    """A blessed, governed scalar number — bitemporal (as_of = data-time, def_as_of = def-time). Pass
     group_by (a list of cube dimension columns) to slice a DIMENSIONAL metric — one defined over a
     cube (labels.cube_source) — into a breakdown row per group (e.g. group_by=['stage_name']). The
     metric's measures are reused verbatim; dimensions are validated against the cube's real columns.
@@ -534,8 +534,9 @@ def tool_metric(name: str, params=None, as_of=None, def_as_of=None, group_by=Non
                 rows = c.execute("SELECT rvbbit.metric_by(%s, %s::text[], %s::jsonb) AS m",
                                  (name, dims, json.dumps(params))).fetchall()
             else:
-                rows = c.execute("SELECT rvbbit.metric(%s, %s::jsonb) AS m",
-                                 (name, json.dumps(params))).fetchall()
+                rows = c.execute(
+                    "SELECT rvbbit.metric_scalar(%s, %s::jsonb, coalesce(%s::timestamptz, now()), %s::timestamptz) AS m",
+                    (name, json.dumps(params), def_as_of, as_of)).fetchall()
         except Exception as e:  # noqa: BLE001
             return {"error": {"code": "METRIC_FAILED", "message": str(e)}}
     vals = [r["m"] for r in rows]

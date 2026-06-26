@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub type CodeFn = fn(inputs: &Value) -> Result<Value, String>;
 
@@ -35,6 +35,11 @@ pub fn registry() -> &'static HashMap<String, CodeFn> {
         m.insert("number_gte".into(), number_gte_fn);
         m.insert("string_eq".into(), string_eq_fn);
         m.insert("cosine_similarity".into(), cosine_similarity_fn);
+        m.insert("ui_metric_card".into(), ui_metric_card_fn);
+        m.insert("ui_bar_chart".into(), ui_bar_chart_fn);
+        m.insert("ui_table_view".into(), ui_table_view_fn);
+        m.insert("ui_vega_lite".into(), ui_vega_lite_fn);
+        m.insert("ui_filter_control".into(), ui_filter_control_fn);
         m
     })
 }
@@ -57,6 +62,139 @@ fn str_input(inputs: &Value, key: &str) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("missing or non-string input '{key}'"))
+}
+
+fn opt_str_input(inputs: &Value, key: &str) -> String {
+    inputs
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn rows_input(inputs: &Value) -> Vec<Value> {
+    inputs
+        .get("rows")
+        .or_else(|| inputs.get("_table"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn first_row_value(rows: &[Value], field: &str) -> Value {
+    rows.first()
+        .and_then(|r| r.as_object())
+        .and_then(|o| o.get(field))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn first_row_string(rows: &[Value], field: &str) -> String {
+    match first_row_value(rows, field) {
+        Value::String(s) => s,
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn field_vega_type(rows: &[Value], field: &str) -> &'static str {
+    for row in rows {
+        let Some(value) = row.as_object().and_then(|o| o.get(field)) else {
+            continue;
+        };
+        match value {
+            Value::Number(_) => return "quantitative",
+            Value::Bool(_) => return "nominal",
+            Value::String(s) => {
+                if s.len() >= 10 {
+                    let dateish =
+                        s.as_bytes().get(4) == Some(&b'-') && s.as_bytes().get(7) == Some(&b'-');
+                    if dateish {
+                        return "temporal";
+                    }
+                }
+                return "nominal";
+            }
+            _ => {}
+        }
+    }
+    "nominal"
+}
+
+fn artifact_id(renderer: &str, title: &str) -> String {
+    let mut slug = title
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("__") {
+        slug = slug.replace("__", "_");
+    }
+    slug = slug.trim_matches('_').to_string();
+    if slug.is_empty() {
+        renderer.to_string()
+    } else {
+        format!("{renderer}_{slug}")
+    }
+}
+
+fn ui_artifact(renderer: &str, title: &str, spec: Value, data: Vec<Value>) -> Value {
+    ui_artifact_kind(
+        renderer,
+        title,
+        "visual",
+        spec,
+        data,
+        Value::Object(Default::default()),
+    )
+}
+
+fn ui_artifact_kind(
+    renderer: &str,
+    title: &str,
+    artifact_kind: &str,
+    spec: Value,
+    data: Vec<Value>,
+    bindings: Value,
+) -> Value {
+    Value::Array(vec![json!({
+        "rvbbit_artifact": "ui",
+        "artifact_id": artifact_id(renderer, title),
+        "artifact_kind": artifact_kind,
+        "renderer": renderer,
+        "title": title,
+        "spec": spec,
+        "data": data,
+        "layout": {},
+        "bindings": bindings,
+        "diagnostics": {}
+    })])
+}
+
+fn normalize_control_kind(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "select" | "single" | "single_select" | "single-select" | "dropdown" => {
+            "dropdown".to_string()
+        }
+        "multi" | "multi_select" | "multi-select" | "multiselect" => "multiselect".to_string(),
+        "date" | "date_picker" | "date-picker" | "datepicker" => "datepicker".to_string(),
+        "number" | "range" | "slider" => "slider".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_control_operator(raw: &str, kind: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "eq" | "in" | "gte" | "lte" => raw.trim().to_ascii_lowercase(),
+        _ if kind == "datepicker" || kind == "slider" => "gte".to_string(),
+        _ => "in".to_string(),
+    }
 }
 
 fn trim_fn(inputs: &Value) -> Result<Value, String> {
@@ -293,4 +431,158 @@ fn cosine_similarity_fn(inputs: &Value) -> Result<Value, String> {
     serde_json::Number::from_f64(score)
         .map(Value::Number)
         .ok_or_else(|| "cosine similarity produced a non-finite score".to_string())
+}
+
+fn ui_metric_card_fn(inputs: &Value) -> Result<Value, String> {
+    let rows = rows_input(inputs);
+    let label_field = opt_str_input(inputs, "label");
+    let value_field = opt_str_input(inputs, "value");
+    if value_field.is_empty() {
+        return Err("ui_metric_card: missing value field".into());
+    }
+    let mut title = opt_str_input(inputs, "title");
+    let label = if label_field.is_empty() {
+        title.clone()
+    } else {
+        first_row_string(&rows, &label_field)
+    };
+    if title.is_empty() {
+        title = if !label.is_empty() {
+            label.clone()
+        } else {
+            value_field.clone()
+        };
+    }
+    let value = first_row_value(&rows, &value_field);
+    let spec = json!({
+        "label_field": label_field,
+        "value_field": value_field,
+        "label": label,
+        "value": value,
+        "row_count": rows.len()
+    });
+    Ok(ui_artifact("metric_card", &title, spec, rows))
+}
+
+fn ui_bar_chart_fn(inputs: &Value) -> Result<Value, String> {
+    let rows = rows_input(inputs);
+    let x = opt_str_input(inputs, "x");
+    let y = opt_str_input(inputs, "y");
+    if x.is_empty() || y.is_empty() {
+        return Err("ui_bar_chart: missing x or y field".into());
+    }
+    let title = {
+        let t = opt_str_input(inputs, "title");
+        if t.is_empty() {
+            format!("{y} by {x}")
+        } else {
+            t
+        }
+    };
+    let spec = json!({
+        "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+        "data": { "values": rows.clone() },
+        "mark": { "type": "bar", "tooltip": true },
+        "encoding": {
+            "x": { "field": x, "type": field_vega_type(&rows, &x), "sort": "-y" },
+            "y": { "field": y, "type": field_vega_type(&rows, &y) },
+            "tooltip": [
+                { "field": x, "type": field_vega_type(&rows, &x) },
+                { "field": y, "type": field_vega_type(&rows, &y) }
+            ]
+        },
+        "width": "container",
+        "height": "container",
+        "autosize": { "type": "fit", "contains": "padding", "resize": true }
+    });
+    Ok(ui_artifact("vega_lite", &title, spec, rows))
+}
+
+fn ui_table_view_fn(inputs: &Value) -> Result<Value, String> {
+    let rows = rows_input(inputs);
+    let title = {
+        let t = opt_str_input(inputs, "title");
+        if t.is_empty() {
+            "Table".to_string()
+        } else {
+            t
+        }
+    };
+    let columns = rows
+        .iter()
+        .find_map(|r| r.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()))
+        .unwrap_or_default();
+    let spec = json!({
+        "columns": columns,
+        "row_count": rows.len()
+    });
+    Ok(ui_artifact("table_view", &title, spec, rows))
+}
+
+fn ui_vega_lite_fn(inputs: &Value) -> Result<Value, String> {
+    let rows = rows_input(inputs);
+    let raw = inputs.get("spec").cloned().unwrap_or(Value::Null);
+    let mut spec = match raw {
+        Value::String(s) => serde_json::from_str::<Value>(&s)
+            .map_err(|e| format!("ui_vega_lite: invalid spec JSON: {e}"))?,
+        Value::Object(_) => raw,
+        Value::Null => return Err("ui_vega_lite: missing spec".into()),
+        other => {
+            return Err(format!(
+                "ui_vega_lite: spec must be object or JSON string, got {other}"
+            ))
+        }
+    };
+    if spec.get("data").is_none() {
+        if let Some(obj) = spec.as_object_mut() {
+            obj.insert("data".into(), json!({ "values": rows.clone() }));
+        }
+    }
+    let title = {
+        let t = opt_str_input(inputs, "title");
+        if t.is_empty() {
+            "Vega-Lite".to_string()
+        } else {
+            t
+        }
+    };
+    Ok(ui_artifact("vega_lite", &title, spec, rows))
+}
+
+fn ui_filter_control_fn(inputs: &Value) -> Result<Value, String> {
+    let rows = rows_input(inputs);
+    let field = opt_str_input(inputs, "field");
+    if field.is_empty() {
+        return Err("ui_filter_control: missing field".into());
+    }
+    let kind = normalize_control_kind(&opt_str_input(inputs, "kind"));
+    let operator = normalize_control_operator(&opt_str_input(inputs, "operator"), &kind);
+    let title = {
+        let t = opt_str_input(inputs, "title");
+        if t.is_empty() {
+            field.clone()
+        } else {
+            t
+        }
+    };
+    let spec = json!({
+        "field": field.clone(),
+        "kind": kind,
+        "operator": operator.clone(),
+        "label": title,
+        "row_count": rows.len()
+    });
+    Ok(ui_artifact_kind(
+        "filter_control",
+        &title,
+        "control",
+        spec,
+        rows,
+        json!({
+            "param": {
+                "field": field,
+                "operator": operator
+            }
+        }),
+    ))
 }

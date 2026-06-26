@@ -80,6 +80,9 @@ This returns only a boolean. It never exposes the secret value.
 Recommended panels:
 
 - Overview: grouped `rvbbit.doctor(false)` rows.
+- Accelerator runtime: render the `accelerator/runtime` row to show whether
+  Duck sidecar routes, in-process DataFusion, native scans, and shared broker
+  mode are available.
 - Provider setup: `rvbbit.provider_doctor(false)` with an optional live-probe
   action that runs `rvbbit.provider_doctor(true)`.
 - Cost audit: link `costs/receipt_cost_audit` warnings to

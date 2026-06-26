@@ -412,6 +412,9 @@ if [ "${RVBBIT_SELECTED}" = "1" ]; then
         say "resetting pg_rvbbit extension (DESTRUCTIVE: drops rvbbit system/catalog data)"
         ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 <<'SQL'
 DROP EXTENSION IF EXISTS pg_rvbbit CASCADE;
+DROP EVENT TRIGGER IF EXISTS rvbbit_on_create_table;
+DROP EVENT TRIGGER IF EXISTS rvbbit_on_drop_table;
+DROP EVENT TRIGGER IF EXISTS rvbbit_partition_dirty_triggers_on_alter;
 -- pg_rvbbit is preloaded, so hooks remain active in this backend after
 -- DROP EXTENSION. Keep routing disabled while replacing the extension schema.
 SET rvbbit.duck_backend = off;

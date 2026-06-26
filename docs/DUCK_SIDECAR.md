@@ -10,8 +10,14 @@ worker mode without making the extension hard to try.
 
 You do not need a broker service to use Rvbbit.
 
-For the default "try the extension" path, install the `rvbbit-duck` binary on
-the PostgreSQL server. The recommended location is:
+You also do not need `rvbbit-duck` for the core extension to load and run. If
+the binary is absent, Duck-backed routes are skipped and Rvbbit falls back to
+in-process DataFusion, native Rvbbit scans, or PostgreSQL rowstore paths when
+those routes are available. Install `rvbbit-duck` when you want DuckDB execution
+or the shared broker mode.
+
+For the default "try Duck-backed acceleration" path, install the `rvbbit-duck`
+binary on the PostgreSQL server. The recommended location is:
 
 ```text
 /usr/local/bin/rvbbit-duck
@@ -26,6 +32,13 @@ The extension resolves the binary in this order:
 Use `/usr/local/bin/rvbbit-duck` or `RVBBIT_DUCK_BIN` for production. `PATH`
 lookup is a convenience fallback, but Postgres service managers often run with
 a minimal or surprising `PATH`.
+
+Check the detected runtime tier with:
+
+```sql
+SELECT rvbbit.accelerator_runtime_status(false);
+SELECT * FROM rvbbit.doctor(false) WHERE area = 'accelerator';
+```
 
 The default path is intentionally simple:
 

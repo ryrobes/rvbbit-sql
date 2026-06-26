@@ -361,6 +361,50 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0085_operator_update_flush_cache",
         include_str!("../sql/migrations/0085_operator_update_flush_cache.sql"),
     ),
+    (
+        "0086_accel_fold_snapshot_floor_guard",
+        include_str!("../sql/migrations/0086_accel_fold_snapshot_floor_guard.sql"),
+    ),
+    (
+        "0087_cube_variant_status_counts",
+        include_str!("../sql/migrations/0087_cube_variant_status_counts.sql"),
+    ),
+    (
+        "0088_unified_maintenance_surface",
+        include_str!("../sql/migrations/0088_unified_maintenance_surface.sql"),
+    ),
+    (
+        "0089_snapshot_visible_tombstones",
+        include_str!("../sql/migrations/0089_snapshot_visible_tombstones.sql"),
+    ),
+    (
+        "0090_scalar_metric_observations",
+        include_str!("../sql/migrations/0090_scalar_metric_observations.sql"),
+    ),
+    (
+        "0091_metric_dependency_freshness",
+        include_str!("../sql/migrations/0091_metric_dependency_freshness.sql"),
+    ),
+    (
+        "0092_metric_series",
+        include_str!("../sql/migrations/0092_metric_series.sql"),
+    ),
+    (
+        "0093_visual_rowset_operators",
+        include_str!("../sql/migrations/0093_visual_rowset_operators.sql"),
+    ),
+    (
+        "0094_accelerator_runtime_status",
+        include_str!("../sql/migrations/0094_accelerator_runtime_status.sql"),
+    ),
+    (
+        "0095_registry_first_acceleration",
+        include_str!("../sql/migrations/0095_registry_first_acceleration.sql"),
+    ),
+    (
+        "0096_filter_control_operator",
+        include_str!("../sql/migrations/0096_filter_control_operator.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

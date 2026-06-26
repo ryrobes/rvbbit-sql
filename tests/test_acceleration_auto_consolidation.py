@@ -246,6 +246,55 @@ def test_rebuild_stages_fold_and_defers_old_file_reap(rvbbit, temp_table):
     )
 
 
+def test_rebuild_preserves_snapshot_visible_generation(rvbbit, temp_table):
+    rvbbit.execute("SET rvbbit.compact_vortex_layout = 'off'")
+    rvbbit.execute("SET rvbbit.compact_hive_layout = 'off'")
+    rvbbit.execute(
+        f"CREATE TABLE {temp_table} (id int PRIMARY KEY, label text) USING rvbbit"
+    )
+    rvbbit.execute(
+        f"""
+        SELECT * FROM rvbbit.snapshot_load(
+            '{temp_table}'::regclass,
+            $$SELECT 1::int AS id, 'one'::text AS label
+              UNION ALL
+              SELECT 2::int AS id, 'two'::text AS label$$
+        )
+        """
+    )
+    assert rvbbit.execute(f"SELECT count(*) FROM {temp_table}").fetchone()[0] == 2
+
+    floor_before, max_generation_before = rvbbit.execute(
+        f"""
+        SELECT t.min_visible_generation, max(rg.generation)::bigint
+        FROM rvbbit.tables t
+        JOIN rvbbit.row_groups rg ON rg.table_oid = t.table_oid
+        WHERE t.table_oid = '{temp_table}'::regclass
+        GROUP BY t.min_visible_generation
+        """
+    ).fetchone()
+    assert floor_before == max_generation_before
+
+    result = rvbbit.execute(
+        f"SELECT rvbbit.rebuild_acceleration('{temp_table}'::regclass, false)"
+    ).fetchone()[0]
+    assert result["status"] == "ok"
+
+    floor_after, max_generation_after, row_groups = rvbbit.execute(
+        f"""
+        SELECT t.min_visible_generation, max(rg.generation)::bigint, count(*)::int
+        FROM rvbbit.tables t
+        JOIN rvbbit.row_groups rg ON rg.table_oid = t.table_oid
+        WHERE t.table_oid = '{temp_table}'::regclass
+        GROUP BY t.min_visible_generation
+        """
+    ).fetchone()
+    assert floor_after == max_generation_after
+    assert floor_after > floor_before
+    assert row_groups == 1
+    assert rvbbit.execute(f"SELECT count(*) FROM {temp_table}").fetchone()[0] == 2
+
+
 def test_rebuild_catches_up_update_committed_during_lagged_fold(rvbbit, temp_table):
     rvbbit.execute("SET rvbbit.compact_vortex_layout = 'off'")
     rvbbit.execute("SET rvbbit.compact_hive_layout = 'off'")

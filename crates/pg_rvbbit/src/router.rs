@@ -1506,6 +1506,7 @@ fn route_status() -> JsonB {
             }))
             .collect::<Vec<_>>(),
         "runtime": {
+            "accelerator": crate::duck_backend::accelerator_runtime_status_value(false),
             "duck_backend_enabled": crate::duck_backend::backend_enabled(),
             "duck_backend_fail_open": crate::duck_backend::fail_open_enabled(),
         },
@@ -3839,6 +3840,7 @@ pub(crate) fn route_runtime_stamp() -> String {
     if !relations_present(&[
         "rvbbit.route_profiles",
         "rvbbit.row_groups",
+        "rvbbit.row_groups_visible",
         "rvbbit.delete_log",
     ]) {
         return "route-runtime-stamp-unavailable".to_string();
@@ -3855,7 +3857,11 @@ pub(crate) fn route_runtime_stamp() -> String {
             .map(|v| v.trim().to_ascii_lowercase())
             .unwrap_or_default()
     );
-    format!("{profile_stamp}|tables={}", route_table_state_stamp())
+    format!(
+        "{profile_stamp}|runtime={}|tables={}",
+        crate::duck_backend::accelerator_route_runtime_stamp(),
+        route_table_state_stamp()
+    )
 }
 
 /// The expensive full-catalog table-state aggregation, memoized per-backend with a TTL.
@@ -3892,20 +3898,22 @@ fn route_table_state_stamp() -> String {
                     rvbbit.shadow_heap_dirty_effective(c.oid)::text, \
                     ',' ORDER BY c.oid \
                 ), 'none') \
-         FROM pg_class c \
-         JOIN pg_am am ON am.oid = c.relam \
-         LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid \
-         LEFT JOIN ( \
-             SELECT table_oid, sum(n_rows)::bigint AS rows, sum(n_bytes)::bigint AS bytes \
-             FROM rvbbit.row_groups \
+	         FROM rvbbit.tables t \
+	         JOIN pg_class c ON c.oid = t.table_oid \
+	         LEFT JOIN ( \
+	             SELECT table_oid, sum(n_rows)::bigint AS rows, sum(n_bytes)::bigint AS bytes \
+             FROM rvbbit.row_groups_visible \
              GROUP BY table_oid \
          ) rg ON rg.table_oid = c.oid \
          LEFT JOIN ( \
-             SELECT table_oid, count(*)::bigint AS deletes \
-             FROM rvbbit.delete_log \
-             GROUP BY table_oid \
+             SELECT dl.table_oid, count(*)::bigint AS deletes \
+             FROM rvbbit.delete_log dl \
+             JOIN rvbbit.row_groups_visible rg \
+               ON rg.table_oid = dl.table_oid \
+              AND rg.rg_id = dl.rg_id \
+             GROUP BY dl.table_oid \
          ) dl ON dl.table_oid = c.oid \
-         WHERE am.amname = 'rvbbit'",
+	         WHERE coalesce(t.acceleration_enabled, true)",
     )
     .ok()
     .flatten()
@@ -3918,12 +3926,12 @@ fn route_table_state_stamp() -> String {
 }
 
 fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTableMetric> {
-    if !relations_present(&["rvbbit.row_groups", "rvbbit.delete_log"]) {
+    if !relations_present(&["rvbbit.row_groups_visible", "rvbbit.delete_log"]) {
         return Vec::new();
     }
     let stringless = sql_stringless(sql).to_lowercase();
     let plan_lower = plan_text.map(str::to_lowercase);
-    // Resolve which rvbbit-AM relations this query references (Step 1, memoized candidate
+    // Resolve which rvbbit-registered relations this query references (Step 1, memoized candidate
     // list) and gather full metrics only for those (Step 2, per-oid memo). Both are O(refs),
     // not O(catalog): see referenced_am_oids / table_metrics_for.
     let ref_oids = referenced_am_oids(&stringless, plan_lower.as_deref());
@@ -3933,12 +3941,12 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
     table_metrics_for(&ref_oids)
 }
 
-/// `(oid, lower(schema), lower(relname))` for one rvbbit-AM relation — the memoized
+/// `(oid, lower(schema), lower(relname))` for one rvbbit-registered relation — the memoized
 /// candidate row that the per-query name match filters against.
 type AmRelation = (i64, String, String);
 
 thread_local! {
-    // perf-router-09: the rvbbit-AM relation list (oid/schema/relname) memoized per-backend
+    // perf-router-09: the rvbbit-registered relation list (oid/schema/relname) memoized per-backend
     // under the same TTL + correctness-neutral contract as ROUTE_TABLE_STATE_MEMO /
     // VARIANT_READY_MEMO. This is the O(catalog) candidate scan that ran on every routed
     // query; a <=TTL-stale list only delays seeing a just-created/dropped rvbbit-AM table by
@@ -3956,7 +3964,7 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// OIDs of the rvbbit-AM relations this query references — name-matched against the memoized
+/// OIDs of the rvbbit-registered relations this query references — name-matched against the memoized
 /// relation list (refreshed at most once per TTL). The match is plain string work; memoizing
 /// the list is what removes the per-query O(catalog) scan that previously cost ~4.5s at ~2900
 /// tables (and which a bare `SELECT 1` paid too).
@@ -3992,17 +4000,17 @@ fn referenced_am_oids(stringless: &str, plan_lower: Option<&str>) -> Vec<i64> {
     })
 }
 
-/// One cheap catalog scan: (oid, schema, relname) of every rvbbit-AM relation. No metrics,
+/// One cheap catalog scan: (oid, schema, relname) of every enabled rvbbit relation. No metrics,
 /// no per-relation subqueries or fs stat()s — those are gathered per referenced oid below.
 fn fetch_rvbbit_am_relations() -> Vec<AmRelation> {
     let mut list: Vec<AmRelation> = Vec::new();
     let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let rows = client.select(
             "SELECT c.oid::bigint, lower(n.nspname), lower(c.relname) \
-             FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             JOIN pg_am am ON am.oid = c.relam \
-             WHERE am.amname = 'rvbbit'",
+	             FROM rvbbit.tables t \
+	             JOIN pg_class c ON c.oid = t.table_oid \
+	             JOIN pg_namespace n ON n.oid = c.relnamespace \
+	             WHERE coalesce(t.acceleration_enabled, true)",
             None,
             &[],
         )?;
@@ -4075,7 +4083,12 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
                     (c.relpages::bigint * current_setting('block_size')::bigint)::bigint, \
                     coalesce(t.shadow_heap_retained, false), \
                     rvbbit.shadow_heap_dirty_effective(c.oid), \
-                    (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid), \
+                    (SELECT count(*)::bigint \
+                       FROM rvbbit.delete_log dl \
+                       JOIN rvbbit.row_groups_visible rgv \
+                         ON rgv.table_oid = dl.table_oid \
+                        AND rgv.rg_id = dl.rg_id \
+                      WHERE dl.table_oid = c.oid), \
                     coalesce(( \
                         SELECT string_agg(lower(a.attname::text), ',' ORDER BY a.attnum) \
                         FROM pg_attribute a \
@@ -4100,13 +4113,12 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
                     ), ''), \
                     array_to_string(coalesce(p.denied_engines, '{{}}'), ','), \
                     array_to_string(coalesce(p.denied_layouts, '{{}}'), ',') \
-             FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             JOIN pg_am am ON am.oid = c.relam \
-             LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid \
-             LEFT JOIN rvbbit.accel_policy p ON p.table_oid = c.oid \
-             LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = c.oid \
-             WHERE am.amname = 'rvbbit' AND c.oid IN ({oid_list}) \
+	             FROM rvbbit.tables t \
+	             JOIN pg_class c ON c.oid = t.table_oid \
+	             JOIN pg_namespace n ON n.oid = c.relnamespace \
+	             LEFT JOIN rvbbit.accel_policy p ON p.table_oid = c.oid \
+	             LEFT JOIN rvbbit.row_groups_visible rg ON rg.table_oid = c.oid \
+	             WHERE coalesce(t.acceleration_enabled, true) AND c.oid IN ({oid_list}) \
              GROUP BY n.nspname, c.relname, c.oid, t.shadow_heap_retained, \
                       p.denied_engines, p.denied_layouts"
             ),
@@ -4694,6 +4706,8 @@ fn variant_readiness(table_oid: u32) -> (bool, bool) {
         "SELECT coalesce(bool_or(rg.layout = 'vortex_scan'), false), \
                 coalesce(bool_or(rg.layout LIKE 'hive:%'), false) \
          FROM rvbbit.row_group_variants rg \
+         JOIN rvbbit.row_groups_visible rgv \
+           ON rgv.table_oid = rg.table_oid AND rgv.rg_id = rg.rg_id \
          JOIN rvbbit.layout_variant_status s \
            ON s.table_oid = rg.table_oid AND s.layout = rg.layout \
          WHERE rg.table_oid = {table_oid}::oid AND s.status = 'ready'"
@@ -5014,6 +5028,11 @@ fn candidate_availability(
     if let Some(reason) = candidate_denied_by_table_policy(candidate, tables) {
         return (false, reason);
     }
+    if let Some((available, reason)) = candidate_runtime_availability(candidate) {
+        if !available {
+            return (false, reason);
+        }
+    }
     // mvcc-02: AS OF time-travel is only correct on the native parquet path,
     // which filters row groups by the resolved generation and applies tombstones
     // generation-aware. The duck/datafusion/hive/mem engines and pg_rowstore
@@ -5035,6 +5054,19 @@ fn candidate_availability(
         Candidate::RvbbitNative => (true, "Rvbbit native PostgreSQL path available".to_string()),
         Candidate::RvbbitNativeVortex => native_vortex_candidate_availability(features, tables),
         Candidate::PgRowstore => pg_rowstore_availability(tables),
+    }
+}
+
+fn candidate_runtime_availability(candidate: Candidate) -> Option<(bool, String)> {
+    match candidate {
+        Candidate::DuckVector | Candidate::DuckHive | Candidate::DuckVortex => {
+            Some(crate::duck_backend::duck_routes_available())
+        }
+        Candidate::DataFusionMem
+        | Candidate::DataFusionVector
+        | Candidate::DataFusionHive
+        | Candidate::DataFusionVortex => Some(crate::duck_backend::datafusion_routes_available()),
+        Candidate::RvbbitNative | Candidate::RvbbitNativeVortex | Candidate::PgRowstore => None,
     }
 }
 

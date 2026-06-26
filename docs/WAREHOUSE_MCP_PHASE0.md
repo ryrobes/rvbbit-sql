@@ -40,7 +40,7 @@ writes). Belt-and-suspenders: the role lacks write grants anyway.
 | `describe_table` | `table` | reader | no | `catalog_docs` + `catalog_fingerprint_table` + `catalog_object_history` |
 | `list_metrics` | — | reader | no | metric catalog / `metric_versions` |
 | `get_metric` | `name` | reader | no | `resolve_metric` + `metric_versions` + `metric_sql` |
-| `metric` | `name` | reader | no | `rvbbit.metric()` + `check_metric` |
+| `metric` | `name` | reader | no | `rvbbit.metric_scalar()` + `check_metric` |
 | `validate_sql` | `sql` | analyst | no | `route_explain` (dry-run) |
 | `run_sql` | `sql` | analyst | no (read-only) | engine + `route_explain` pre-check + receipts |
 
@@ -138,7 +138,7 @@ Make governed metrics the path of least resistance for numbers that matter.
   "sql": "SELECT ...",                                  // for audit; Claude needn't show it
   "provenance": { "receipt_id":"...", "lineage":["analytics.revenue_facts"] } }
 ```
-**Backing:** `rvbbit.metric(name, params_jsonb, as_of)` (SETOF jsonb) + `check_metric`.
+**Backing:** `rvbbit.metric_scalar(name, params_jsonb, as_of)` + `check_metric`.
 **Why it matters:** finance gets the official number — not Claude's guess at which of
 five revenue columns to sum — with the bitemporal twist (`def_as_of` × `as_of`) and a
 pass/fail check baked in.

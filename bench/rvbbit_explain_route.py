@@ -73,11 +73,11 @@ def _referenced_rvbbit_tables(conn: psycopg.Connection, sql: str) -> list[dict[s
                    count(rg.*)::bigint,
                    coalesce(sum(rg.n_rows), 0)::bigint,
                    coalesce(sum(rg.n_bytes), 0)::bigint
-            FROM pg_class c
+            FROM rvbbit.tables t
+            JOIN pg_class c ON c.oid = t.table_oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_am am ON am.oid = c.relam
             LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = c.oid
-            WHERE am.amname = 'rvbbit'
+            WHERE coalesce(t.acceleration_enabled, true)
             GROUP BY n.nspname, c.relname, c.oid
             ORDER BY n.nspname, c.relname
             """.encode()

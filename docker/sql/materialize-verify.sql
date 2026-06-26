@@ -7,10 +7,10 @@
 \set ON_ERROR_STOP on
 \pset pager off
 
-DELETE FROM rvbbit.metric_defs WHERE name='mat_kpi';
-DELETE FROM rvbbit.metric_observations WHERE metric_name='mat_kpi';
-DELETE FROM rvbbit.metric_materialize WHERE metric_name='mat_kpi';
-DELETE FROM rvbbit.metric_dependencies WHERE metric_name='mat_kpi';
+DELETE FROM rvbbit.metric_defs WHERE name IN ('mat_kpi','mat_rowset');
+DELETE FROM rvbbit.metric_observations WHERE metric_name IN ('mat_kpi','mat_rowset');
+DELETE FROM rvbbit.metric_materialize WHERE metric_name IN ('mat_kpi','mat_rowset');
+DELETE FROM rvbbit.metric_dependencies WHERE metric_name IN ('mat_kpi','mat_rowset');
 DROP TABLE IF EXISTS mat_demo;
 
 CREATE TABLE mat_demo (region text, amount int) USING rvbbit;
@@ -43,14 +43,21 @@ SELECT rvbbit.materialize_metric('mat_kpi','{}'::jsonb, now(),
    1, 'backfill') AS backfilled;
 
 -- the durable series: gen1 fail (100<150), gen2 pass (250>=150)
-SELECT 'history' AS check, data_generation AS gen, (value->0->>'total') AS total,
+SELECT 'history' AS check, data_generation AS gen, (value->>'value') AS total,
        status, trigger
 FROM rvbbit.metric_history('mat_kpi') ORDER BY data_generation;
 
+-- A rowset is fine as SQL, but not as a persisted metric observation.
+SELECT rvbbit.define_metric('mat_rowset', 'SELECT region, amount FROM mat_demo') AS rowset_v;
+\set ON_ERROR_STOP off
+SELECT 'rowset materialize should fail scalar contract' AS check;
+SELECT rvbbit.materialize_metric('mat_rowset');
+\set ON_ERROR_STOP on
+
 -- cleanup
-DELETE FROM rvbbit.metric_defs WHERE name='mat_kpi';
-DELETE FROM rvbbit.metric_observations WHERE metric_name='mat_kpi';
-DELETE FROM rvbbit.metric_materialize WHERE metric_name='mat_kpi';
-DELETE FROM rvbbit.metric_dependencies WHERE metric_name='mat_kpi';
+DELETE FROM rvbbit.metric_defs WHERE name IN ('mat_kpi','mat_rowset');
+DELETE FROM rvbbit.metric_observations WHERE metric_name IN ('mat_kpi','mat_rowset');
+DELETE FROM rvbbit.metric_materialize WHERE metric_name IN ('mat_kpi','mat_rowset');
+DELETE FROM rvbbit.metric_dependencies WHERE metric_name IN ('mat_kpi','mat_rowset');
 DROP TABLE mat_demo;
 SELECT 'materialize-verify complete' AS done;

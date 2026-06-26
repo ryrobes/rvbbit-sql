@@ -34,6 +34,7 @@ extension_sql_file!(
 pub(crate) enum StageArg {
     Str(String),
     Num(f64),
+    Named(String, Box<StageArg>),
 }
 
 impl StageArg {
@@ -41,6 +42,7 @@ impl StageArg {
         match self {
             StageArg::Str(s) => Value::String(s.clone()),
             StageArg::Num(n) => json!(n),
+            StageArg::Named(_, v) => v.to_value(),
         }
     }
 }
@@ -208,6 +210,69 @@ fn parse_single_arg(seg: &str) -> Result<StageArg, String> {
     Ok(StageArg::Str(s.to_string()))
 }
 
+fn top_level_arrow(seg: &str) -> Option<usize> {
+    let bytes = seg.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    while i + 1 < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            if depth > 0 {
+                depth -= 1;
+            }
+        } else if c == b'=' && bytes.get(i + 1) == Some(&b'>') && depth == 0 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_arg_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_stage_arg(seg: &str) -> Result<StageArg, String> {
+    let s = seg.trim();
+    if let Some(i) = top_level_arrow(s) {
+        let name = s[..i].trim();
+        let value = s[i + 2..].trim();
+        if !is_arg_name(name) {
+            return Err(format!("invalid named stage argument '{name}'"));
+        }
+        if value.is_empty() {
+            return Err(format!("named stage argument '{name}' has no value"));
+        }
+        return Ok(StageArg::Named(
+            name.to_ascii_lowercase(),
+            Box::new(parse_single_arg(value)?),
+        ));
+    }
+    parse_single_arg(s)
+}
+
 /// Parse the argument list of `(...)`, splitting on top-level commas while
 /// respecting single-quoted strings and nested parens.
 fn parse_paren_args(s: &str) -> Result<Vec<StageArg>, String> {
@@ -260,7 +325,7 @@ fn parse_paren_args(s: &str) -> Result<Vec<StageArg>, String> {
     let mut args = Vec::new();
     for seg in segs {
         if !seg.trim().is_empty() {
-            args.push(parse_single_arg(seg)?);
+            args.push(parse_stage_arg(seg)?);
         }
     }
     Ok(args)
@@ -321,7 +386,10 @@ pub(crate) fn parse_pipeline(spec: &str) -> Result<Pipeline, String> {
 // ---------------------------------------------------------------------------
 
 fn run_query_to_rows(head: &str) -> Result<Vec<Value>, String> {
-    let sql = format!("SELECT to_jsonb(t) FROM ({}) t", head.trim().trim_end_matches(';'));
+    let sql = format!(
+        "SELECT to_jsonb(t) FROM ({}) t",
+        head.trim().trim_end_matches(';')
+    );
     let mut out = Vec::new();
     let r: Result<(), pgrx::spi::Error> = Spi::connect(|client| {
         let table = client.select(&sql, None, &[])?;
@@ -355,7 +423,11 @@ fn unwrap_single_jsonb_column(rows: Vec<Value>) -> Vec<Value> {
         return rows;
     }
     rows.into_iter()
-        .map(|r| r.as_object().and_then(|o| o.values().next().cloned()).unwrap_or(r))
+        .map(|r| {
+            r.as_object()
+                .and_then(|o| o.values().next().cloned())
+                .unwrap_or(r)
+        })
         .collect()
 }
 
@@ -368,6 +440,11 @@ fn stage_n(stage: &Stage, default: usize) -> usize {
     match stage.args.first() {
         Some(StageArg::Num(n)) => *n as usize,
         Some(StageArg::Str(s)) => s.trim().parse::<usize>().unwrap_or(default),
+        Some(StageArg::Named(_, value)) => match value.as_ref() {
+            StageArg::Num(n) => *n as usize,
+            StageArg::Str(s) => s.trim().parse::<usize>().unwrap_or(default),
+            StageArg::Named(_, _) => default,
+        },
         None => default,
     }
 }
@@ -401,8 +478,23 @@ fn run_stage(stage: &Stage, rows: &[Value]) -> Result<(Vec<Value>, Option<String
             Ok((stride_sample(rows, n), None))
         }
         _ => {
-            let pos_args: Vec<Value> = stage.args.iter().map(StageArg::to_value).collect();
-            crate::operators::run_rowset_op(&stage.name, rows, &pos_args, &json!({}))
+            let mut pos_args: Vec<Value> = Vec::new();
+            let mut named_args = serde_json::Map::new();
+            for arg in &stage.args {
+                match arg {
+                    StageArg::Named(name, value) => {
+                        named_args.insert(name.clone(), value.to_value());
+                    }
+                    other => pos_args.push(other.to_value()),
+                }
+            }
+            crate::operators::run_rowset_op_with_named(
+                &stage.name,
+                rows,
+                &pos_args,
+                &named_args,
+                &json!({}),
+            )
         }
     }
 }
@@ -459,15 +551,16 @@ fn stage_spec(stage: &Stage) -> String {
     if stage.args.is_empty() {
         stage.name.clone()
     } else {
-        let args: Vec<String> = stage
-            .args
-            .iter()
-            .map(|a| match a {
-                StageArg::Str(s) => format!("'{}'", s.replace('\'', "''")),
-                StageArg::Num(n) => n.to_string(),
-            })
-            .collect();
+        let args: Vec<String> = stage.args.iter().map(stage_arg_spec).collect();
         format!("{}({})", stage.name, args.join(", "))
+    }
+}
+
+fn stage_arg_spec(arg: &StageArg) -> String {
+    match arg {
+        StageArg::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        StageArg::Num(n) => n.to_string(),
+        StageArg::Named(name, value) => format!("{name} => {}", stage_arg_spec(value)),
     }
 }
 
@@ -548,7 +641,10 @@ mod split_tests {
         let p = parse_pipeline("select * from t then analyze('what stands out?')").unwrap();
         assert_eq!(p.head, "select * from t");
         assert_eq!(names(&p), vec!["analyze"]);
-        assert_eq!(p.stages[0].args, vec![StageArg::Str("what stands out?".into())]);
+        assert_eq!(
+            p.stages[0].args,
+            vec![StageArg::Str("what stands out?".into())]
+        );
     }
 
     #[test]
@@ -568,8 +664,7 @@ mod split_tests {
 
     #[test]
     fn case_then_then_pipeline() {
-        let p =
-            parse_pipeline("select case when a then b end as x from t then count").unwrap();
+        let p = parse_pipeline("select case when a then b end as x from t then count").unwrap();
         assert_eq!(names(&p), vec!["count"]);
         assert!(p.head.contains("case when a then b end"));
     }
@@ -588,10 +683,8 @@ mod split_tests {
 
     #[test]
     fn then_inside_subquery_case_in_parens_ignored() {
-        let p = parse_pipeline(
-            "select (select case when x then 1 end) as y from t then limit(2)",
-        )
-        .unwrap();
+        let p = parse_pipeline("select (select case when x then 1 end) as y from t then limit(2)")
+            .unwrap();
         assert_eq!(names(&p), vec!["limit"]);
         assert_eq!(p.stages[0].args, vec![StageArg::Num(2.0)]);
     }
@@ -606,18 +699,37 @@ mod split_tests {
     fn infix_string_arg() {
         let p = parse_pipeline("select * from t then analyze 'what stands out'").unwrap();
         assert_eq!(names(&p), vec!["analyze"]);
-        assert_eq!(p.stages[0].args, vec![StageArg::Str("what stands out".into())]);
+        assert_eq!(
+            p.stages[0].args,
+            vec![StageArg::Str("what stands out".into())]
+        );
     }
 
     #[test]
     fn multiple_args_and_escaped_quote() {
-        let p =
-            parse_pipeline("select * from t then pivot('by class', 'it''s grouped')").unwrap();
+        let p = parse_pipeline("select * from t then pivot('by class', 'it''s grouped')").unwrap();
         assert_eq!(
             p.stages[0].args,
             vec![
                 StageArg::Str("by class".into()),
                 StageArg::Str("it's grouped".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn named_stage_args() {
+        let p = parse_pipeline(
+            "select * from t then bar_chart(x => 'status', y => 'n', title => 'By status')",
+        )
+        .unwrap();
+        assert_eq!(names(&p), vec!["bar_chart"]);
+        assert_eq!(
+            p.stages[0].args,
+            vec![
+                StageArg::Named("x".into(), Box::new(StageArg::Str("status".into()))),
+                StageArg::Named("y".into(), Box::new(StageArg::Str("n".into()))),
+                StageArg::Named("title".into(), Box::new(StageArg::Str("By status".into()))),
             ]
         );
     }
@@ -714,6 +826,105 @@ mod tests {
     }
 
     #[pg_test]
+    fn visual_rowset_operators_are_seeded() {
+        let value: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.operators \
+             WHERE name IN ('metric_card','bar_chart','table_view','vega_lite','filter_control') \
+               AND shape='rowset' AND parser='json'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(value, 5, "visual/control artifact rowset operators");
+    }
+
+    #[pg_test]
+    fn metric_card_emits_ui_artifact_rows() {
+        let v: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ \
+             select 'Revenue'::text as label, 123::int as value \
+             then metric_card(label => 'label', value => 'value', title => 'Revenue') \
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            v.0.get("rvbbit_artifact").and_then(|x| x.as_str()),
+            Some("ui")
+        );
+        assert_eq!(
+            v.0.get("renderer").and_then(|x| x.as_str()),
+            Some("metric_card")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/value").and_then(|x| x.as_i64()),
+            Some(123)
+        );
+    }
+
+    #[pg_test]
+    fn bar_chart_named_args_emit_vega_lite_artifact() {
+        let v: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ \
+             select * from (values ('Todo', 2), ('Done', 5)) v(status, n) \
+             then bar_chart(x => 'status', y => 'n', title => 'Issues') \
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            v.0.get("rvbbit_artifact").and_then(|x| x.as_str()),
+            Some("ui")
+        );
+        assert_eq!(
+            v.0.get("renderer").and_then(|x| x.as_str()),
+            Some("vega_lite")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/encoding/x/field")
+                .and_then(|x| x.as_str()),
+            Some("status")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/encoding/y/field")
+                .and_then(|x| x.as_str()),
+            Some("n")
+        );
+    }
+
+    #[pg_test]
+    fn filter_control_named_args_emit_control_artifact() {
+        let v: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ \
+             select * from (values ('Todo'), ('Done')) v(status) \
+             then filter_control(field => 'status', kind => 'dropdown', title => 'Status') \
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            v.0.get("rvbbit_artifact").and_then(|x| x.as_str()),
+            Some("ui")
+        );
+        assert_eq!(
+            v.0.get("artifact_kind").and_then(|x| x.as_str()),
+            Some("control")
+        );
+        assert_eq!(
+            v.0.get("renderer").and_then(|x| x.as_str()),
+            Some("filter_control")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/field").and_then(|x| x.as_str()),
+            Some("status")
+        );
+        assert_eq!(
+            v.0.pointer("/bindings/param/operator")
+                .and_then(|x| x.as_str()),
+            Some("in")
+        );
+    }
+
+    #[pg_test]
     fn flow_sample_spreads_rows() {
         // sample(3) of 9 rows -> 3 evenly-spread rows (indices 0,3,6 -> g 1,4,7)
         let n: i64 = Spi::get_one(
@@ -747,10 +958,9 @@ mod tests {
 
     #[pg_test]
     fn shape_fingerprint_differs_by_schema() {
-        let a: String =
-            Spi::get_one("SELECT rvbbit.flow_shape('[{\"class\":\"A\"}]'::jsonb)")
-                .unwrap()
-                .unwrap();
+        let a: String = Spi::get_one("SELECT rvbbit.flow_shape('[{\"class\":\"A\"}]'::jsonb)")
+            .unwrap()
+            .unwrap();
         let b: String = Spi::get_one(
             "SELECT rvbbit.flow_shape('[{\"class\":\"A\",\"season\":\"Spring\"}]'::jsonb)",
         )
@@ -797,7 +1007,10 @@ mod tests {
         )
         .unwrap()
         .unwrap_or_default();
-        assert!(gsql.contains("GROUP BY class"), "generated_sql not recorded: {gsql}");
+        assert!(
+            gsql.contains("GROUP BY class"),
+            "generated_sql not recorded: {gsql}"
+        );
     }
 
     #[pg_test]
@@ -815,16 +1028,25 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(n, 2, "flow should return the base rowset when a stage fails");
+        assert_eq!(
+            n, 2,
+            "flow should return the base rowset when a stage fails"
+        );
     }
 
     #[pg_test]
     fn value_shape_groups_by_format() {
-        let a: String = Spi::get_one("SELECT rvbbit.value_shape('(303) 555-1234')").unwrap().unwrap();
-        let b: String = Spi::get_one("SELECT rvbbit.value_shape('(720) 867-5309')").unwrap().unwrap();
+        let a: String = Spi::get_one("SELECT rvbbit.value_shape('(303) 555-1234')")
+            .unwrap()
+            .unwrap();
+        let b: String = Spi::get_one("SELECT rvbbit.value_shape('(720) 867-5309')")
+            .unwrap()
+            .unwrap();
         assert_eq!(a, b, "same format -> same shape");
         assert_eq!(a, "(ddd) ddd-dddd");
-        let c: String = Spi::get_one("SELECT rvbbit.value_shape('303-555-1234')").unwrap().unwrap();
+        let c: String = Spi::get_one("SELECT rvbbit.value_shape('303-555-1234')")
+            .unwrap()
+            .unwrap();
         assert_ne!(a, c, "different format -> different shape");
     }
 
@@ -949,7 +1171,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(v.0.get("a").and_then(|x| x.as_i64()), Some(1), "rows come back as jsonb");
+        assert_eq!(
+            v.0.get("a").and_then(|x| x.as_i64()),
+            Some(1),
+            "rows come back as jsonb"
+        );
     }
 
     #[pg_test]
@@ -963,7 +1189,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(n, 0, "a write must produce no rows under the read-only guard");
+        assert_eq!(
+            n, 0,
+            "a write must produce no rows under the read-only guard"
+        );
         let left: i64 = Spi::get_one("SELECT count(*)::bigint FROM synth_exec_w")
             .unwrap()
             .unwrap();
@@ -976,7 +1205,10 @@ mod tests {
         let n: i64 = Spi::get_one("SELECT count(*)::bigint FROM rvbbit.synth('anything at all')")
             .unwrap()
             .unwrap();
-        assert_eq!(n, 0, "synth must be a no-op while rvbbit.synth_enabled is off");
+        assert_eq!(
+            n, 0,
+            "synth must be a no-op while rvbbit.synth_enabled is off"
+        );
     }
 
     #[pg_test]
@@ -1001,10 +1233,15 @@ mod tests {
             .and_then(|c| c.get("type"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        assert_eq!(n_type, "bigint", "count(*) result type is authoritative bigint");
+        assert_eq!(
+            n_type, "bigint",
+            "count(*) result type is authoritative bigint"
+        );
         // Bad SQL → empty array, gracefully.
         let bad: pgrx::JsonB =
-            Spi::get_one("SELECT rvbbit._synth_schema('SELECT nope FROM nowhere')").unwrap().unwrap();
+            Spi::get_one("SELECT rvbbit._synth_schema('SELECT nope FROM nowhere')")
+                .unwrap()
+                .unwrap();
         assert_eq!(bad.0.as_array().map(|a| a.len()), Some(0));
     }
 
@@ -1063,7 +1300,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(saw_class, "the single-jsonb head must be unwrapped to its inner fields");
+        assert!(
+            saw_class,
+            "the single-jsonb head must be unwrapped to its inner fields"
+        );
     }
 
     #[pg_test]

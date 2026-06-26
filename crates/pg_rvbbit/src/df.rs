@@ -449,7 +449,7 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
     }
     let mut rows: Vec<Row> = Vec::new();
     // AS OF → generation <= asof; latest (no AS OF) → apply the snapshot
-    // visibility floor (generation >= min_visible_generation) so the
+    // visibility floor (snapshot tables use exactly min_visible_generation) so the
     // in-process DataFusion path agrees with the native custom_scan path and
     // a snapshot-load table shows only its newest snapshot. (`t` is the
     // rvbbit.tables LEFT JOIN already in the query below.)
@@ -458,8 +458,12 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
         None => crate::time_travel::latest_predicate("c.oid", "rg.generation"),
     };
     let tombstone_predicate = match asof.as_ref() {
-        Some(asof) => crate::time_travel::tombstone_predicate(asof, "c.oid", "deleted_generation"),
+        Some(asof) => crate::time_travel::tombstone_predicate(asof, "c.oid", "dl.deleted_generation"),
         None => String::new(),
+    };
+    let tombstone_row_group_predicate = match asof.as_ref() {
+        Some(asof) => crate::time_travel::row_group_predicate(asof, "c.oid", "drg.generation"),
+        None => crate::time_travel::latest_predicate("c.oid", "drg.generation"),
     };
     // Phase 2 ObjectStore tiered storage: prefer the cold_url when it's set
     // (row group has been migrated to an ObjectStore-addressable location).
@@ -487,15 +491,18 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
                rvbbit.shadow_heap_dirty_effective(c.oid)                  AS shadow_heap_dirty,
                (SELECT count(*)
                   FROM rvbbit.delete_log dl
+                  JOIN rvbbit.row_groups drg
+                    ON drg.table_oid = dl.table_oid
+                   AND drg.rg_id = dl.rg_id
                  WHERE dl.table_oid = c.oid
-                   {tombstone_predicate})::bigint                         AS deletes
-        FROM rvbbit.row_groups rg
-        JOIN pg_class c       ON c.oid = rg.table_oid
-        JOIN pg_namespace n   ON n.oid = c.relnamespace
-        JOIN pg_am am         ON am.oid = c.relam
-        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-        WHERE am.amname = 'rvbbit'
-          {asof_predicate}
+                   {tombstone_predicate}
+                   {tombstone_row_group_predicate})::bigint               AS deletes
+	        FROM rvbbit.row_groups rg
+	        JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
+	        JOIN pg_class c       ON c.oid = rg.table_oid
+	        JOIN pg_namespace n   ON n.oid = c.relnamespace
+	        WHERE coalesce(t.acceleration_enabled, true)
+	          {asof_predicate}
         GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained
         "
     );
@@ -621,18 +628,23 @@ fn discover_catalog_vortex() -> Result<BTreeMap<String, RvbbitTable>, String> {
                rvbbit.shadow_heap_dirty_effective(c.oid)            AS shadow_heap_dirty,
                (SELECT count(*)
                   FROM rvbbit.delete_log dl
+                  JOIN rvbbit.row_groups_visible rgv
+                    ON rgv.table_oid = dl.table_oid
+                   AND rgv.rg_id = dl.rg_id
                  WHERE dl.table_oid = c.oid)::bigint                AS deletes
         FROM rvbbit.row_group_variants v
-        JOIN rvbbit.layout_variant_status s
-          ON s.table_oid = v.table_oid
-         AND s.layout = v.layout
-         AND s.status = 'ready'
-        JOIN pg_class c       ON c.oid = v.table_oid
-        JOIN pg_namespace n   ON n.oid = c.relnamespace
-        JOIN pg_am am         ON am.oid = c.relam
-        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-        WHERE am.amname = 'rvbbit'
-          AND v.layout = 'vortex_scan'
+        JOIN rvbbit.row_groups_visible rgv
+          ON rgv.table_oid = v.table_oid
+         AND rgv.rg_id = v.rg_id
+	        JOIN rvbbit.layout_variant_status s
+	          ON s.table_oid = v.table_oid
+	         AND s.layout = v.layout
+	         AND s.status = 'ready'
+	        JOIN rvbbit.tables t ON t.table_oid = v.table_oid
+	        JOIN pg_class c       ON c.oid = v.table_oid
+	        JOIN pg_namespace n   ON n.oid = c.relnamespace
+	        WHERE coalesce(t.acceleration_enabled, true)
+	          AND v.layout = 'vortex_scan'
         GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained
     ";
     Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
@@ -997,7 +1009,12 @@ fn hot_current_table_state(table_oid: u32) -> Result<HotTableState, String> {
                pg_relation_size(c.oid)::bigint,
                coalesce(t.shadow_heap_retained, false),
                rvbbit.shadow_heap_dirty_effective(c.oid),
-               (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint,
+               (SELECT count(*)
+                  FROM rvbbit.delete_log dl
+                  JOIN rvbbit.row_groups_visible rgv
+                    ON rgv.table_oid = dl.table_oid
+                   AND rgv.rg_id = dl.rg_id
+                 WHERE dl.table_oid = c.oid)::bigint,
                coalesce(string_agg(
                    rg.rg_id::text || ':' ||
                    coalesce(rg.generation, 0)::text || ':' ||
@@ -1006,13 +1023,12 @@ fn hot_current_table_state(table_oid: u32) -> Result<HotTableState, String> {
                    coalesce(rg.cold_url, rg.path, ''),
                    ',' ORDER BY rg.rg_id
                ), '')::text
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_am am ON am.oid = c.relam
-        LEFT JOIN rvbbit.tables t ON t.table_oid = c.oid
-        LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = c.oid
-        WHERE c.oid = {table_oid}::oid
-          AND am.amname = 'rvbbit'
+	        FROM pg_class c
+	        JOIN pg_namespace n ON n.oid = c.relnamespace
+	        JOIN rvbbit.tables t ON t.table_oid = c.oid
+	        LEFT JOIN rvbbit.row_groups_visible rg ON rg.table_oid = c.oid
+	        WHERE c.oid = {table_oid}::oid
+	          AND coalesce(t.acceleration_enabled, true)
         GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained
         "#
     );

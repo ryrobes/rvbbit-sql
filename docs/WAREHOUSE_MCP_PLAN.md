@@ -68,7 +68,7 @@ Grouped by depth. "Backs onto" = existing rvbbit function we surface (mostly reu
 - **`metric(name, params, as_of?)`** — a **blessed, governed number** (not Claude's
   guess at which of five revenue columns to sum). Returns value(s) + resolved
   params + def version + data-as-of + check verdict + provenance. Backs onto
-  `rvbbit.metric()` (+ `check_metric`). For finance, this is the whole game.
+  `rvbbit.metric_scalar()` (+ `check_metric`). For finance, this is the whole game.
 - **`ask(question, as_of?)`** — convenience one-shot. Composes `search_data` → LLM
   compose → `validate_sql` → `run_sql`; returns **data + the SQL used (for
   audit/refine) + tables_used + confidence + provenance**. Claude gets the SQL; it
@@ -112,7 +112,7 @@ schema names + `execute`. We can give it:
    cryptically-named table by what its data is *about* — the difference between
    Claude guessing and Claude knowing.
 3. **A governance gradient: free to explore, blessed to report.** Roam with
-   `search_data`/`run_sql` for discovery; `metric()` is the only path to the
+  `search_data`/`run_sql` for discovery; `metric_scalar()` is the only path to the
    *official* sensitive number. Analysts get a sandbox; finance gets the audited
    number.
 4. **Freshness/drift-aware answers.** Every result carries "this table is 3 days
