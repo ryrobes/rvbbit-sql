@@ -233,6 +233,24 @@ SELECT rvbbit.create_operator(
     op_description => 'Pipeline control stage: emit a parameter-publishing filter-control UI artifact from the current resultset.'
 );
 
+SELECT rvbbit.create_operator(
+    op_name        => 'layout_grid',
+    op_arg_names   => ARRAY['layout','title'],
+    op_return_type => 'jsonb',
+    op_shape       => 'rowset',
+    op_parser      => 'json',
+    op_steps       => jsonb_build_array(jsonb_build_object(
+        'name', 'emit',
+        'kind', 'code',
+        'fn', 'ui_layout_grid',
+        'inputs', jsonb_build_object(
+            'layout', '{{ inputs.layout }}',
+            'title', '{{ inputs.title }}'
+        )
+    )),
+    op_description => 'Pipeline meta stage: emit a statement-grid layout artifact for multi-statement UI composition.'
+);
+
 -- RESHAPE: scalar synth-sql operator (Phase 5). The model authors ONE PostgreSQL
 -- expression over a text input `x` per distinct value-shape (digits->d, letters->a),
 -- cached in rvbbit.synth_cache and applied natively. So reshaping 50M values of

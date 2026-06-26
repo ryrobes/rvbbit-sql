@@ -829,12 +829,12 @@ mod tests {
     fn visual_rowset_operators_are_seeded() {
         let value: i64 = Spi::get_one(
             "SELECT count(*)::bigint FROM rvbbit.operators \
-             WHERE name IN ('metric_card','bar_chart','table_view','vega_lite','filter_control') \
+             WHERE name IN ('metric_card','bar_chart','table_view','vega_lite','filter_control','layout_grid') \
                AND shape='rowset' AND parser='json'",
         )
         .unwrap()
         .unwrap();
-        assert_eq!(value, 5, "visual/control artifact rowset operators");
+        assert_eq!(value, 6, "visual/control/meta artifact rowset operators");
     }
 
     #[pg_test]
@@ -921,6 +921,34 @@ mod tests {
             v.0.pointer("/bindings/param/operator")
                 .and_then(|x| x.as_str()),
             Some("in")
+        );
+    }
+
+    #[pg_test]
+    fn layout_grid_named_args_emit_meta_artifact() {
+        let v: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ \
+             select 1 as layout_marker \
+             then layout_grid(layout => '1 / 2', title => 'Dashboard') \
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            v.0.get("rvbbit_artifact").and_then(|x| x.as_str()),
+            Some("ui")
+        );
+        assert_eq!(
+            v.0.get("artifact_kind").and_then(|x| x.as_str()),
+            Some("meta")
+        );
+        assert_eq!(
+            v.0.get("renderer").and_then(|x| x.as_str()),
+            Some("statement_layout")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/layout").and_then(|x| x.as_str()),
+            Some("1 / 2")
         );
     }
 

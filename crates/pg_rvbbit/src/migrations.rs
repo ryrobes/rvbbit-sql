@@ -405,6 +405,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0096_filter_control_operator",
         include_str!("../sql/migrations/0096_filter_control_operator.sql"),
     ),
+    (
+        "0097_layout_grid_operator",
+        include_str!("../sql/migrations/0097_layout_grid_operator.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

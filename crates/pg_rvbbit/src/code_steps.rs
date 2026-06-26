@@ -40,6 +40,7 @@ pub fn registry() -> &'static HashMap<String, CodeFn> {
         m.insert("ui_table_view".into(), ui_table_view_fn);
         m.insert("ui_vega_lite".into(), ui_vega_lite_fn);
         m.insert("ui_filter_control".into(), ui_filter_control_fn);
+        m.insert("ui_layout_grid".into(), ui_layout_grid_fn);
         m
     })
 }
@@ -584,5 +585,29 @@ fn ui_filter_control_fn(inputs: &Value) -> Result<Value, String> {
                 "operator": operator
             }
         }),
+    ))
+}
+
+fn ui_layout_grid_fn(inputs: &Value) -> Result<Value, String> {
+    let layout = opt_str_input(inputs, "layout");
+    let title = {
+        let t = opt_str_input(inputs, "title");
+        if t.is_empty() {
+            "Layout".to_string()
+        } else {
+            t
+        }
+    };
+    let spec = json!({
+        "mode": "arrange",
+        "layout": layout
+    });
+    Ok(ui_artifact_kind(
+        "statement_layout",
+        &title,
+        "meta",
+        spec,
+        Vec::new(),
+        json!({}),
     ))
 }
