@@ -1,0 +1,13 @@
+api_version: rvbbit.capability/v1
+kind: sql_test_pack
+name: core_sql_workflows
+title: Core SQL Workflow Tests
+description: SQL-only catalog tests for rvbbit.flow, seeded operators, and SQL/code workflow nodes.
+license: mit
+tags:
+- sql
+- workflow
+- operators
+- acceptance
+- core
+- test

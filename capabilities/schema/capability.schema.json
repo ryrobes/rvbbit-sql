@@ -12,7 +12,7 @@
     },
     "kind": {
       "type": "string",
-      "enum": ["hf_backend", "runtime_sidecar", "llm_provider"]
+      "enum": ["hf_backend", "runtime_sidecar", "llm_provider", "sql_test_pack"]
     },
     "name": {
       "type": "string",
@@ -153,7 +153,9 @@
       "additionalProperties": false,
       "properties": {
         "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
-        "language": { "type": "string", "enum": ["python", "mcp"] },
+        "language": { "type": "string", "enum": ["python", "mcp", "memory", "hindsight", "http_service"] },
+        "provider": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_\\-]*$" },
+        "auth_env": { "type": "string" },
         "endpoint": { "type": "string" },
         "endpoint_path": { "type": "string" },
         "set_default": { "type": "boolean" },
@@ -236,6 +238,10 @@
             "type": "string",
             "enum": ["scalar", "aggregate", "dimension", "rowset", "query"],
             "default": "scalar"
+          },
+          "cache_policy": {
+            "type": "string",
+            "enum": ["memoize", "always", "never"]
           },
           "inputs": {
             "type": "object",

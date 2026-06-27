@@ -1,0 +1,13 @@
+api_version: rvbbit.capability/v1
+kind: sql_test_pack
+name: workflow_visual_operators
+title: Workflow Visual Operator Tests
+description: SQL-only catalog tests for deterministic rvbbit.flow UI artifact operators.
+license: mit
+tags:
+- sql
+- workflow
+- visual
+- operators
+- acceptance
+- test

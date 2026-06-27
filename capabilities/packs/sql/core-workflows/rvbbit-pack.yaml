@@ -1,0 +1,175 @@
+api_version: rvbbit.pack/v1
+id: sql/core-workflows
+name: core_sql_workflows
+title: Core SQL Workflow Tests
+description: SQL-only acceptance suite for rvbbit.flow, seeded operators, and SQL/code workflow nodes.
+license: mit
+tags:
+- sql
+- workflow
+- operators
+- acceptance
+- core
+- test
+catalog_visibility: public
+capability: capability.yaml
+install:
+  mode: sql
+  warren: false
+  docker: false
+acceptance:
+  target_selector:
+    sql: true
+    capability: false
+  tests:
+  - name: core_catalog_shape
+    description: Assert the SQL workflow substrate and core operators are seeded.
+    sql: |
+      DO $$
+      DECLARE
+          missing text[];
+      BEGIN
+          IF to_regprocedure('rvbbit.flow(text)') IS NULL THEN
+              RAISE EXCEPTION 'rvbbit.flow(text) is not registered';
+          END IF;
+
+          SELECT array_agg(expected.name ORDER BY expected.name)
+          INTO missing
+          FROM (VALUES
+              ('clean_year'),
+              ('redact'),
+              ('headline'),
+              ('analyze'),
+              ('pivot'),
+              ('group'),
+              ('top'),
+              ('filter'),
+              ('normalize'),
+              ('metric_card'),
+              ('line_chart'),
+              ('filter_control'),
+              ('layout_grid')
+          ) AS expected(name)
+          WHERE NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.operators op
+              WHERE op.name = expected.name
+          );
+
+          IF missing IS NOT NULL THEN
+              RAISE EXCEPTION 'missing seeded rvbbit operators: %', missing;
+          END IF;
+      END
+      $$;
+  - name: sql_node_workflow_receipt
+    description: Create a temporary SQL+code operator and verify result plus sub-call provenance.
+    sql: |
+      DO $$
+      DECLARE
+          out_text text;
+          kinds text[];
+      BEGIN
+          CREATE TEMP TABLE catalog_sql_probe (
+              id int PRIMARY KEY,
+              name text NOT NULL,
+              tier text NOT NULL
+          ) ON COMMIT DROP;
+          INSERT INTO catalog_sql_probe VALUES
+              (1, 'Alice', 'gold'),
+              (2, 'Bob', 'silver');
+
+          DELETE FROM rvbbit.receipts WHERE operator = 'catalog_sql_node_probe';
+          DELETE FROM rvbbit.operators WHERE name = 'catalog_sql_node_probe';
+          DROP FUNCTION IF EXISTS rvbbit.catalog_sql_node_probe(text, jsonb);
+
+          PERFORM rvbbit.create_operator(
+              op_name        => 'catalog_sql_node_probe',
+              op_arg_names   => ARRAY['probe_id'],
+              op_arg_types   => ARRAY['text'],
+              op_return_type => 'text',
+              op_shape       => 'scalar',
+              op_description => 'Catalog acceptance probe for SQL and code workflow nodes.',
+              op_steps       => jsonb_build_array(
+                  jsonb_build_object(
+                      'name', 'row',
+                      'kind', 'sql',
+                      'sql', 'SELECT name, tier FROM pg_temp.catalog_sql_probe WHERE id = $1::int',
+                      'params', jsonb_build_array('{{ inputs.probe_id }}')
+                  ),
+                  jsonb_build_object(
+                      'name', 'upper_name',
+                      'kind', 'code',
+                      'fn', 'uppercase',
+                      'inputs', jsonb_build_object('text', '{{ steps.row.output.name }}')
+                  )
+              )
+          );
+
+          SELECT rvbbit.catalog_sql_node_probe('2') INTO out_text;
+          IF out_text IS DISTINCT FROM 'BOB' THEN
+              RAISE EXCEPTION 'catalog_sql_node_probe returned %, expected BOB', out_text;
+          END IF;
+
+          WITH latest AS (
+              SELECT sub_calls
+              FROM rvbbit.receipts
+              WHERE operator = 'catalog_sql_node_probe'
+              ORDER BY invocation_at DESC
+              LIMIT 1
+          )
+          SELECT array_agg(elem->>'kind' ORDER BY ord)
+          INTO kinds
+          FROM latest
+          CROSS JOIN LATERAL jsonb_array_elements(latest.sub_calls) WITH ORDINALITY AS e(elem, ord);
+
+          IF kinds IS DISTINCT FROM ARRAY['sql','code']::text[] THEN
+              RAISE EXCEPTION 'expected sql/code sub-calls, got %', kinds;
+          END IF;
+
+          DELETE FROM rvbbit.receipts WHERE operator = 'catalog_sql_node_probe';
+          DELETE FROM rvbbit.operators WHERE name = 'catalog_sql_node_probe';
+          DROP FUNCTION IF EXISTS rvbbit.catalog_sql_node_probe(text, jsonb);
+      EXCEPTION WHEN OTHERS THEN
+          DELETE FROM rvbbit.receipts WHERE operator = 'catalog_sql_node_probe';
+          DELETE FROM rvbbit.operators WHERE name = 'catalog_sql_node_probe';
+          DROP FUNCTION IF EXISTS rvbbit.catalog_sql_node_probe(text, jsonb);
+          RAISE;
+      END
+      $$;
+  - name: flow_limit_count_steps
+    description: Run a flow cascade and verify output plus persisted step sequence.
+    sql: |
+      DO $$
+      DECLARE
+          v jsonb;
+          latest_run uuid;
+          stages text[];
+      BEGIN
+          SELECT value
+          INTO v
+          FROM rvbbit.flow($q$
+              select g from generate_series(1,10) g
+              then limit(3)
+              then count
+          $q$);
+
+          IF (v->>'n')::int IS DISTINCT FROM 3 THEN
+              RAISE EXCEPTION 'flow limit/count returned %, expected {"n":3}', v;
+          END IF;
+
+          SELECT run_id
+          INTO latest_run
+          FROM rvbbit.flow_steps
+          ORDER BY created_at DESC
+          LIMIT 1;
+
+          SELECT array_agg(stage ORDER BY step_idx)
+          INTO stages
+          FROM rvbbit.flow_steps
+          WHERE run_id = latest_run;
+
+          IF stages IS DISTINCT FROM ARRAY['base','limit','count']::text[] THEN
+              RAISE EXCEPTION 'unexpected flow stages for %: %', latest_run, stages;
+          END IF;
+      END
+      $$;

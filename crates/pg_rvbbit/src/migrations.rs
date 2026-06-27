@@ -433,6 +433,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0103_action_button_operator",
         include_str!("../sql/migrations/0103_action_button_operator.sql"),
     ),
+    (
+        "0104_hindsight_memory_service",
+        include_str!("../sql/migrations/0104_hindsight_memory_service.sql"),
+    ),
+    (
+        "0105_hindsight_catalog_visibility",
+        include_str!("../sql/migrations/0105_hindsight_catalog_visibility.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

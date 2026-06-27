@@ -67,6 +67,40 @@ def test_generated_compose_does_not_publish_default_host_port():
     assert "ports:" not in proc.stdout
 
 
+def test_sql_test_pack_renders_without_backend_or_sidecar():
+    pack = PACKS / "sql" / "core-workflows"
+    register = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "register",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    compose = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "compose",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+
+    assert "register_backend" not in register
+    assert "register_python_runtime" not in register
+    assert "No backend or runtime is registered" in register
+    assert "services:" not in compose
+    assert "No Docker sidecar" in compose
+
+
 def test_generated_operator_sql_replaces_infix_bindings():
     pack = PACKS / "rerank" / "bge-reranker-base"
     proc = subprocess.run(
@@ -208,7 +242,7 @@ def test_acceptance_sql_covers_exported_operators():
     assert not gaps, "acceptance SQL should call every exported operator: " + "; ".join(gaps)
 
 
-def test_acceptance_targets_are_warren_selectors():
+def test_acceptance_targets_are_explicit_selectors():
     bad: list[str] = []
     for path, pack in _pack_docs():
         acceptance = pack.get("acceptance") or {}
@@ -216,10 +250,15 @@ def test_acceptance_targets_are_warren_selectors():
         if not isinstance(target, dict):
             bad.append(str(path.relative_to(PACKS.parent.parent)))
             continue
-        if acceptance.get("tests") and target.get("capability") is not True:
-            bad.append(str(path.relative_to(PACKS.parent.parent)))
+        if not acceptance.get("tests"):
+            continue
+        if target.get("capability") is True:
+            continue
+        if target.get("sql") is True and target.get("capability") is False:
+            continue
+        bad.append(str(path.relative_to(PACKS.parent.parent)))
 
-    assert not bad, "acceptance target_selector should include capability: true: " + ", ".join(bad)
+    assert not bad, "acceptance target_selector should be capability:true or sql:true/capability:false: " + ", ".join(bad)
 
 
 def test_operator_runtime_packs_are_flagged():
@@ -318,6 +357,8 @@ def test_release_catalog_can_emit_image_mode_runtimes():
             "ghcr.io/ryrobes",
             "--image-tag",
             "9.9.9",
+            "--default-install-mode",
+            "image",
         ],
         check=True,
         text=True,
@@ -383,11 +424,7 @@ def test_uber_compose_bootstraps_baseline_capabilities():
     assert services["bootstrap"]["command"] == ["rvbbit-uber-bootstrap"]
 
     warren_volumes = services["warren"]["volumes"]
-    assert "/var/run/docker.sock:/var/run/docker.sock" in warren_volumes
-    assert (
-        "${RVBBIT_DOCKER_CONFIG:-$HOME/.docker}:/root/.docker:ro"
-        in warren_volumes
-    )
+    assert "${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock" in warren_volumes
 
     dockerfile = (ROOT / "docker" / "Dockerfile.rvbbit").read_text(encoding="utf-8")
     assert "docker/uber/bootstrap.sh /usr/local/bin/rvbbit-uber-bootstrap" in dockerfile

@@ -4,6 +4,12 @@ import json
 import uuid
 
 
+def _json_doc(value):
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
 def test_extension_loaded(rvbbit):
     row = rvbbit.execute("SELECT rvbbit.rvbbit_version()").fetchone()
     assert row is not None
@@ -53,7 +59,12 @@ def test_capability_catalog_seeded(rvbbit):
             WHERE active
               AND id = 'rerank/bge-reranker-v2-m3'
               AND operators @> ARRAY['about','means','semantic_score']::text[]
-          ) AS bundled_operator_entries
+          ) AS bundled_operator_entries,
+          count(*) FILTER (
+            WHERE active
+              AND kind = 'sql_test_pack'
+              AND id IN ('sql/core-workflows', 'sql/workflow-visuals')
+          ) AS sql_test_entries
         FROM rvbbit.capability_catalog
         """
     ).fetchone()
@@ -62,6 +73,33 @@ def test_capability_catalog_seeded(rvbbit):
     assert row[2] == 1
     assert row[3] == 1
     assert row[4] == 1
+    assert row[5] == 2
+
+
+def test_sql_test_catalog_acceptance_packs_execute(rvbbit):
+    rows = rvbbit.execute(
+        """
+        SELECT id, catalog_entry->'acceptance' AS acceptance
+        FROM rvbbit.capability_catalog
+        WHERE active
+          AND id IN ('sql/core-workflows', 'sql/workflow-visuals')
+        ORDER BY id
+        """
+    ).fetchall()
+    assert [row[0] for row in rows] == ["sql/core-workflows", "sql/workflow-visuals"]
+
+    for pack_id, raw_acceptance in rows:
+        acceptance = _json_doc(raw_acceptance)
+        assert acceptance and acceptance.get("tests"), f"{pack_id} has no acceptance tests"
+        for sql in acceptance.get("setup_sql") or []:
+            rvbbit.execute(sql)
+        for test in acceptance.get("tests") or []:
+            try:
+                rvbbit.execute(test["sql"])
+            except Exception as exc:  # pragma: no cover - assertion path
+                raise AssertionError(f"{pack_id}:{test.get('name')} failed") from exc
+        for sql in acceptance.get("teardown_sql") or []:
+            rvbbit.execute(sql)
 
 
 def test_access_method_registered(rvbbit):

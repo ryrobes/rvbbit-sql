@@ -64,7 +64,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "mode": { "type": "string", "enum": ["image", "build", "external"] },
+        "mode": { "type": "string", "enum": ["image", "build", "external", "sql"] },
         "image": { "type": "string" },
         "image_digest": { "type": "string" },
         "template": { "type": "string" },

@@ -36,6 +36,10 @@ struct Config {
     /// can differ when the trainer runs in a different network context (e.g. the
     /// agent is on a control host and the trainer execs into a worker container).
     trainer_dsn: Option<String>,
+    /// DSN runtime sidecars use to reach Postgres. Defaults to the agent's DSN,
+    /// but can differ when Warren itself is running on the host and the sidecar
+    /// is running inside the Docker network.
+    runtime_dsn: Option<String>,
     /// Hostname Postgres uses to reach a locally-served sidecar the trainer
     /// stands up (`--serve-host`). Defaults to the node name.
     trainer_serve_host: Option<String>,
@@ -56,6 +60,7 @@ struct WarrenJob {
 
 #[derive(Debug)]
 struct DeploymentResult {
+    manifest: Value,
     endpoint_url: String,
     probe_url: String,
     container_name: String,
@@ -215,6 +220,10 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| vec!["rvbbit-trainer".to_string()]),
             trainer_dsn: env::var("WARREN_TRAINER_DSN").ok(),
+            runtime_dsn: env::var("WARREN_RUNTIME_DSN")
+                .or_else(|_| env::var("RVBBIT_RUNTIME_DSN"))
+                .or_else(|_| env::var("RVBBIT_GATEWAY_DSN"))
+                .ok(),
             trainer_serve_host: env::var("WARREN_TRAINER_SERVE_HOST").ok(),
             trainer_output_root: env::var("WARREN_TRAINER_OUTPUT_ROOT").ok(),
         };
@@ -255,6 +264,7 @@ impl Config {
                         .collect();
                 }
                 "--trainer-dsn" => config.trainer_dsn = Some(take_arg(&mut args, "--trainer-dsn")?),
+                "--runtime-dsn" => config.runtime_dsn = Some(take_arg(&mut args, "--runtime-dsn")?),
                 "--trainer-serve-host" => {
                     config.trainer_serve_host = Some(take_arg(&mut args, "--trainer-serve-host")?)
                 }
@@ -316,6 +326,7 @@ fn print_help() {
            --trainer-cmd <argv>               Command to run the trainer for model_training jobs\n\
                                               (or WARREN_TRAINER_CMD; default 'rvbbit-trainer')\n\
            --trainer-dsn <postgres-url>       DSN the trainer uses (or WARREN_TRAINER_DSN; default --dsn)\n\
+           --runtime-dsn <postgres-url>       DSN runtime sidecars use (or WARREN_RUNTIME_DSN/RVBBIT_RUNTIME_DSN/RVBBIT_GATEWAY_DSN; default --dsn)\n\
            --trainer-serve-host <host>        Host Postgres uses to reach a served sidecar (default --node)\n\
            --trainer-output-root <dir>        Trainer model-bundle output root (default <work-dir>/trained-models)\n\
            --once                             Claim at most one job\n\
@@ -1088,7 +1099,7 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
         other => bail!("Warren job kind {other:?} is not implemented yet"),
     };
 
-    if is_runtime_sidecar(&job.manifest) {
+    if is_runtime_sidecar(&result.manifest) {
         if !config.dry_run {
             try_update_job_progress(
                 db,
@@ -1097,7 +1108,7 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
                 "probing_runtime",
                 json!({"probe_url": result.probe_url}),
             );
-            let probe = probe_runtime(&job.manifest, &result)?;
+            let probe = probe_runtime(&result.manifest, &result)?;
             if !probe.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                 bail!("runtime probe failed after deployment: {probe}");
             }
@@ -1112,7 +1123,26 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
             "registering_runtime",
             json!({"runtime_name": result.runtime_name}),
         );
-        register_runtime(db, &job.manifest, &result)?;
+        register_runtime(db, &result.manifest, &result)?;
+        if result
+            .manifest
+            .get("operators")
+            .and_then(Value::as_array)
+            .is_some_and(|operators| !operators.is_empty())
+        {
+            try_update_job_progress(
+                db,
+                config,
+                job,
+                "registering_runtime_operators",
+                json!({"operator_name": result.operator_name}),
+            );
+            register_manifest_operators(
+                db,
+                &result.manifest,
+                result.runtime_name.as_deref().unwrap_or(""),
+            )?;
+        }
     } else {
         try_update_job_progress(
             db,
@@ -1125,7 +1155,7 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
                 "endpoint_url": result.endpoint_url,
             }),
         );
-        register_backend_and_operators(db, &job.manifest, &result)?;
+        register_backend_and_operators(db, &result.manifest, &result)?;
         if !config.dry_run {
             try_update_job_progress(
                 db,
@@ -1134,7 +1164,7 @@ fn process_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Result<()> 
                 "probing_backend",
                 json!({"backend_name": result.backend_name}),
             );
-            let probe = probe_backend(db, &job.manifest)?;
+            let probe = probe_backend(db, &result.manifest)?;
             if !probe.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                 bail!("backend probe failed after deployment: {probe}");
             }
@@ -1298,6 +1328,7 @@ fn process_training_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Re
         .unwrap_or("")
         .to_string();
     let result = DeploymentResult {
+        manifest: job.manifest.clone(),
         endpoint_url,
         probe_url: String::new(),
         container_name: String::new(),
@@ -1324,6 +1355,7 @@ fn process_training_job(db: &mut Client, config: &Config, job: &WarrenJob) -> Re
 
 fn training_dry_run_result(config: &Config, model_name: &str) -> DeploymentResult {
     DeploymentResult {
+        manifest: json!({}),
         endpoint_url: String::new(),
         probe_url: String::new(),
         container_name: String::new(),
@@ -1335,6 +1367,197 @@ fn training_dry_run_result(config: &Config, model_name: &str) -> DeploymentResul
         work_dir: config.work_dir.clone(),
         health: json!({"trained": false, "dry_run": true}),
     }
+}
+
+fn prepare_runtime_manifest(db: &mut Client, config: &Config, manifest: &Value) -> Result<Value> {
+    if !is_runtime_sidecar(manifest) {
+        return Ok(manifest.clone());
+    }
+    let mut prepared = manifest.clone();
+    let mut env_injections = Map::new();
+    let mut resolved = Map::new();
+
+    if let Some(pg) = manifest
+        .pointer("/warren/postgres_database")
+        .and_then(Value::as_object)
+    {
+        if let Some((env_name, database_url, bootstrap)) =
+            prepare_postgres_database(db, config, pg)?
+        {
+            env_injections.insert(env_name.clone(), json!(database_url));
+            resolved.insert(
+                "postgres_database".into(),
+                json!({
+                    "url_env": env_name,
+                    "database": pg.get("name").and_then(Value::as_str).unwrap_or(""),
+                    "bootstrap": bootstrap,
+                }),
+            );
+        }
+    }
+
+    if let Some(embedder) = manifest.pointer("/warren/embedding_env_from") {
+        let embedding = resolve_embedding_env(db, embedder)?;
+        if let Some(env) = embedding.get("env").and_then(Value::as_object) {
+            for (key, value) in env {
+                env_injections.insert(key.clone(), value.clone());
+            }
+        }
+        resolved.insert("embedding_env".into(), embedding);
+    }
+
+    if !env_injections.is_empty() {
+        merge_runtime_env(&mut prepared, env_injections)?;
+    }
+    if !resolved.is_empty() {
+        merge_warren_resolved(&mut prepared, Value::Object(resolved))?;
+    }
+    Ok(prepared)
+}
+
+fn prepare_postgres_database(
+    db: &mut Client,
+    config: &Config,
+    spec: &Map<String, Value>,
+) -> Result<Option<(String, String, Value)>> {
+    let database = spec
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("hindsight");
+    if !is_identifier_like(database) {
+        bail!("warren.postgres_database.name must be identifier-like");
+    }
+    let url_env = spec
+        .get("url_env")
+        .and_then(Value::as_str)
+        .unwrap_or("HINDSIGHT_API_DATABASE_URL")
+        .to_string();
+    if !is_env_name_like(&url_env) {
+        bail!("warren.postgres_database.url_env must be environment-variable-like");
+    }
+
+    let should_create = spec.get("create").and_then(Value::as_bool).unwrap_or(true);
+    let mut bootstrap = json!({"created": false, "extensions": []});
+    if should_create {
+        let exists: bool = db
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+                &[&database],
+            )
+            .context("checking memory-service database")?
+            .get(0);
+        if !exists {
+            db.execute(&format!("CREATE DATABASE {}", pg_ident(database)), &[])
+                .with_context(|| format!("creating database {database}"))?;
+            if let Some(obj) = bootstrap.as_object_mut() {
+                obj.insert("created".into(), json!(true));
+            }
+        }
+
+        let mut target_cfg: postgres::Config = config
+            .dsn
+            .parse()
+            .context("parsing RVBBIT_DSN for database bootstrap")?;
+        target_cfg.dbname(database);
+        let mut target = target_cfg
+            .connect(NoTls)
+            .with_context(|| format!("connecting to database {database}"))?;
+        let mut extensions = Vec::new();
+        if let Some(arr) = spec.get("extensions").and_then(Value::as_array) {
+            for ext in arr.iter().filter_map(Value::as_str) {
+                if !is_identifier_like(ext) {
+                    bail!("warren.postgres_database.extensions entries must be identifier-like");
+                }
+                target
+                    .execute(
+                        &format!("CREATE EXTENSION IF NOT EXISTS {}", pg_ident(ext)),
+                        &[],
+                    )
+                    .with_context(|| format!("creating extension {ext} in {database}"))?;
+                extensions.push(ext.to_string());
+            }
+        }
+        if let Some(obj) = bootstrap.as_object_mut() {
+            obj.insert("extensions".into(), json!(extensions));
+        }
+    }
+
+    let runtime_base_dsn = config.runtime_dsn.as_deref().unwrap_or(&config.dsn);
+    let database_url = spec
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| dsn_with_database(runtime_base_dsn, database));
+    Ok(Some((url_env, database_url, bootstrap)))
+}
+
+fn resolve_embedding_env(db: &mut Client, spec: &Value) -> Result<Value> {
+    let (backend, required) = match spec {
+        Value::String(s) => (s.as_str(), false),
+        Value::Object(map) => (
+            map.get("backend")
+                .and_then(Value::as_str)
+                .unwrap_or("embed"),
+            map.get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+        _ => ("embed", false),
+    };
+    let row = db
+        .query_one(
+            "SELECT rvbbit.hindsight_embedding_env($1)::text",
+            &[&backend],
+        )
+        .context("resolving RVBBIT embedder for Hindsight")?;
+    let raw: String = row.get(0);
+    let resolved: Value =
+        serde_json::from_str(&raw).context("parsing rvbbit.hindsight_embedding_env output")?;
+    let compatible = resolved
+        .get("compatible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if required && !compatible {
+        let reason = resolved
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("incompatible default embedder");
+        bail!("Hindsight embedding piggyback is required but unavailable: {reason}");
+    }
+    Ok(resolved)
+}
+
+fn merge_runtime_env(manifest: &mut Value, envs: Map<String, Value>) -> Result<()> {
+    let root = manifest
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("manifest must be a JSON object"))?;
+    let runtime = root
+        .entry("runtime")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("manifest.runtime must be a JSON object"))?;
+    let env = runtime
+        .entry("env")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("manifest.runtime.env must be a JSON object"))?;
+    for (key, value) in envs {
+        env.entry(key).or_insert(value);
+    }
+    Ok(())
+}
+
+fn merge_warren_resolved(manifest: &mut Value, resolved: Value) -> Result<()> {
+    let root = manifest
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("manifest must be a JSON object"))?;
+    let warren = root
+        .entry("warren")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("manifest.warren must be a JSON object"))?;
+    warren.insert("resolved".into(), resolved);
+    Ok(())
 }
 
 fn fail_model_training(db: &mut Client, run_id: &str, error: &str) -> Result<()> {
@@ -1496,7 +1719,7 @@ fn deploy_capability(
     config: &Config,
     job: &WarrenJob,
 ) -> Result<DeploymentResult> {
-    let manifest = &job.manifest;
+    let manifest = prepare_runtime_manifest(db, config, &job.manifest)?;
     let pack_name = manifest
         .get("name")
         .and_then(Value::as_str)
@@ -1527,19 +1750,19 @@ fn deploy_capability(
         "scaffolding",
         json!({"work_dir": project_dir.display().to_string()}),
     );
-    scaffold_project(config, manifest, &project_dir, &safe_name)?;
+    scaffold_project(config, &manifest, &project_dir, &safe_name)?;
 
-    let publish_host_port = should_publish_host_port(config, manifest);
+    let publish_host_port = should_publish_host_port(config, &manifest);
     let port = manifest
         .pointer("/warren/port")
         .and_then(Value::as_u64)
         .map(|v| v as u16)
         .unwrap_or_else(|| deterministic_port(&job.job_id, config.port_base));
-    let endpoint_url = endpoint_for(config, manifest, port, &safe_name);
-    let probe_url = if is_runtime_sidecar(manifest) {
-        local_runtime_probe_endpoint_for(manifest, port)
+    let endpoint_url = endpoint_for(config, &manifest, port, &safe_name);
+    let probe_url = if is_runtime_sidecar(&manifest) {
+        local_runtime_probe_endpoint_for(&manifest, port)
     } else {
-        local_probe_endpoint_for(manifest, port)
+        local_probe_endpoint_for(&manifest, port)
     };
 
     if config.dry_run {
@@ -1551,7 +1774,7 @@ fn deploy_capability(
         let should_build = manifest.get("runtime").and_then(runtime_image).is_none();
         // Resolve "auto" device server-side: apply the GPU overlay only when the
         // manifest wants the GPU AND this host actually has one.
-        let use_gpu = resolve_gpu_overlay(manifest, &project_dir);
+        let use_gpu = resolve_gpu_overlay(&manifest, &project_dir);
         try_update_job_progress(
             db,
             config,
@@ -1580,11 +1803,11 @@ fn deploy_capability(
                 config,
                 job,
                 "waiting_health",
-                json!({"health_url": format!("http://127.0.0.1:{port}{}", runtime_health_path(manifest))}),
+                json!({"health_url": format!("http://127.0.0.1:{port}{}", runtime_health_path(&manifest))}),
             );
             wait_for_health(
                 port,
-                runtime_health_path(manifest),
+                runtime_health_path(&manifest),
                 Duration::from_secs(180),
             )?;
         } else {
@@ -1608,6 +1831,7 @@ fn deploy_capability(
         "target_selector": job.target_selector,
     });
     Ok(DeploymentResult {
+        manifest: manifest.clone(),
         endpoint_url,
         probe_url,
         container_name: container_name(&safe_name),
@@ -1623,8 +1847,8 @@ fn deploy_capability(
             .and_then(|op| op.get("name"))
             .and_then(Value::as_str)
             .map(str::to_string),
-        runtime_name: if is_runtime_sidecar(manifest) {
-            runtime_registration_name(manifest).ok()
+        runtime_name: if is_runtime_sidecar(&manifest) {
+            runtime_registration_name(&manifest).ok()
         } else {
             None
         },
@@ -2290,14 +2514,23 @@ fn register_backend_and_operators(
         register_self_hosted_provider(db, manifest, backend_name)?;
     }
 
+    register_manifest_operators(db, manifest, backend_name)?;
+
+    db.execute("SELECT rvbbit.reload_backends()", &[])
+        .context("reloading backend cache")?;
+    Ok(())
+}
+
+fn register_manifest_operators(
+    db: &mut Client,
+    manifest: &Value,
+    backend_name: &str,
+) -> Result<()> {
     if let Some(operators) = manifest.get("operators").and_then(Value::as_array) {
         for op in operators {
             register_operator(db, manifest, backend_name, op)?;
         }
     }
-
-    db.execute("SELECT rvbbit.reload_backends()", &[])
-        .context("reloading backend cache")?;
     Ok(())
 }
 
@@ -2512,6 +2745,40 @@ fn register_runtime(db: &mut Client, manifest: &Value, result: &DeploymentResult
             )
             .context("registering MCP gateway runtime")?;
         }
+        "memory" | "hindsight" | "http_service" => {
+            let provider = runtime_registration
+                .get("provider")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    manifest
+                        .pointer("/warren/service_provider")
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("hindsight");
+            let auth_env: Option<String> = runtime_registration
+                .get("auth_env")
+                .and_then(Value::as_str)
+                .or_else(|| manifest.pointer("/warren/auth_env").and_then(Value::as_str))
+                .map(str::to_string);
+            db.execute(
+                "SELECT rvbbit.register_memory_service(\
+                 service_name => $1, endpoint_url => $2, service_provider => $3, \
+                 service_status => 'ready', auth_header_env => $4, service_labels => $5::text::jsonb, \
+                 service_source => 'warren', warren_deployment_id => NULL, \
+                 install_manifest => $6::text::jsonb, health => $7::text::jsonb, set_default => $8)",
+                &[
+                    &runtime_name,
+                    &result.endpoint_url,
+                    &provider,
+                    &auth_env,
+                    &labels,
+                    &install_manifest,
+                    &health,
+                    &set_default,
+                ],
+            )
+            .context("registering memory service runtime")?;
+        }
         _ => bail!("runtime sidecar language {language:?} is not supported by this agent yet"),
     }
     Ok(())
@@ -2519,10 +2786,13 @@ fn register_runtime(db: &mut Client, manifest: &Value, result: &DeploymentResult
 
 fn probe_runtime(manifest: &Value, result: &DeploymentResult) -> Result<Value> {
     let language = runtime_language(manifest);
-    if matches!(language.as_str(), "mcp" | "mcp_gateway") {
+    if matches!(
+        language.as_str(),
+        "mcp" | "mcp_gateway" | "memory" | "hindsight" | "http_service"
+    ) {
         let parsed = if result.published_host_port {
             http_get_json(&result.probe_url)
-                .with_context(|| format!("probing MCP gateway {}", result.probe_url))?
+                .with_context(|| format!("probing runtime {}", result.probe_url))?
         } else {
             let url = format!(
                 "http://127.0.0.1:{}{}",
@@ -2530,13 +2800,13 @@ fn probe_runtime(manifest: &Value, result: &DeploymentResult) -> Result<Value> {
                 normalized_endpoint_path(runtime_health_path(manifest))
             );
             container_http_get_json(&result.container_name, &url)
-                .with_context(|| format!("probing MCP gateway in {}", result.container_name))?
+                .with_context(|| format!("probing runtime in {}", result.container_name))?
         };
         return Ok(json!({
             "ok": parsed.get("status").and_then(Value::as_str) == Some("ok")
                 || parsed.get("ok").and_then(Value::as_bool).unwrap_or(false)
                 || parsed.get("body").is_some(),
-            "runtime": "mcp",
+            "runtime": language,
             "health": parsed,
         }));
     }
@@ -2776,6 +3046,17 @@ fn register_operator(
         ],
     )
     .with_context(|| format!("registering operator {op_name}"))?;
+    if let Some(cache_policy) = op
+        .get("cache_policy")
+        .and_then(Value::as_str)
+        .filter(|policy| matches!(*policy, "memoize" | "always" | "never"))
+    {
+        db.execute(
+            "UPDATE rvbbit.operators SET cache_policy = $1 WHERE name = $2",
+            &[&cache_policy, &op_name],
+        )
+        .with_context(|| format!("setting cache policy for operator {op_name}"))?;
+    }
     if infix_exists {
         db.execute(
             "UPDATE rvbbit.operators SET infix_symbol = $1, infix_word = $2 WHERE name = $3",
@@ -2987,6 +3268,50 @@ fn deterministic_port(seed: &str, base: u16) -> u16 {
 fn container_name(safe_name: &str) -> String {
     let service = safe_name.replace('_', "-");
     format!("rvbbit-{}", service.trim_matches('-'))
+}
+
+fn is_identifier_like(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_env_name_like(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn pg_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn dsn_with_database(dsn: &str, database: &str) -> String {
+    let (without_query, query) = match dsn.split_once('?') {
+        Some((base, q)) => (base, Some(q)),
+        None => (dsn, None),
+    };
+    let replaced = if let Some(scheme_idx) = without_query.find("://") {
+        let after_scheme = scheme_idx + 3;
+        if let Some(relative_slash) = without_query[after_scheme..].rfind('/') {
+            let slash = after_scheme + relative_slash;
+            format!("{}/{}", &without_query[..slash], database)
+        } else {
+            format!("{without_query}/{database}")
+        }
+    } else {
+        without_query.to_string()
+    };
+    match query {
+        Some(q) => format!("{replaced}?{q}"),
+        None => replaced,
+    }
 }
 
 fn should_publish_host_port(config: &Config, manifest: &Value) -> bool {

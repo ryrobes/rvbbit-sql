@@ -1,0 +1,152 @@
+api_version: rvbbit.capability/v1
+kind: runtime_sidecar
+name: hindsight_slim
+title: Hindsight Memory Service
+description: Hindsight API service for agent long-term memory, backed by a sibling Postgres database and RVBBIT-compatible embedding config where possible.
+license: provider
+system_runtime: false
+capability_role: system_runtime
+tags: [memory, agent-memory, hindsight, hermes, warren, postgres, embeddings, cpu]
+source:
+  provider: builtin
+  model: vectorize-io/hindsight-api-slim
+  url: https://github.com/vectorize-io/hindsight
+runtime:
+  mode: image
+  template: runtime-sidecar
+  image: ghcr.io/vectorize-io/hindsight-api:latest-slim
+  pull_policy: missing
+  language: memory
+  handler: custom
+  device: cpu
+  port: 8888
+  health_path: /health
+  env:
+    HINDSIGHT_API_HOST: 0.0.0.0
+    HINDSIGHT_API_PORT: "8888"
+    HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:-${RVBBIT_HINDSIGHT_LLM_PROVIDER:-none}}
+    HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:-${OPENAI_API_KEY:-}}
+    HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_API_LLM_MODEL:-${RVBBIT_HINDSIGHT_LLM_MODEL:-gpt-5-mini}}
+    HINDSIGHT_API_LLM_BASE_URL: ${HINDSIGHT_API_LLM_BASE_URL:-}
+    HINDSIGHT_API_LLM_TRACE_ENABLED: ${HINDSIGHT_API_LLM_TRACE_ENABLED:-false}
+    HINDSIGHT_API_AUDIT_LOG_ENABLED: ${HINDSIGHT_API_AUDIT_LOG_ENABLED:-true}
+    HINDSIGHT_API_RERANKER_PROVIDER: ${HINDSIGHT_API_RERANKER_PROVIDER:-${RVBBIT_HINDSIGHT_RERANKER_PROVIDER:-rrf}}
+    HINDSIGHT_API_WORKER_ID: ${HINDSIGHT_API_WORKER_ID:-rvbbit-hindsight}
+runtime_registration:
+  name: hindsight_default
+  language: memory
+  provider: hindsight
+  endpoint_path: /
+  set_default: true
+  labels:
+    language: memory
+    provider: hindsight
+    capability_kind: runtime_sidecar
+    runtime_handler: hindsight
+    agent_memory: true
+warren:
+  endpoint_path: /
+  health_path: /health
+  service_provider: hindsight
+  postgres_database:
+    name: hindsight
+    create: true
+    extensions: [vector]
+    url_env: HINDSIGHT_API_DATABASE_URL
+  embedding_env_from:
+    backend: embed
+    required: false
+smoke:
+  sql:
+    - "SELECT name, provider, endpoint_url, status FROM rvbbit.memory_services WHERE name = 'hindsight_default';"
+operators:
+  - name: hindsight_memory_status
+    description: Probe the configured Hindsight memory service and return its health payload.
+    arg_names: [service_name]
+    arg_types: [text]
+    return_type: jsonb
+    parser: json
+    cache_policy: never
+    steps:
+      - name: status
+        kind: sql
+        sql: "SELECT rvbbit.hindsight_status($1) AS result"
+        params:
+          - "{{ inputs.service_name }}"
+      - name: result
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.status.output }}"
+          path: result
+          default: {}
+  - name: hindsight_memory_retain
+    description: Store content in a Hindsight memory bank through the registered memory service.
+    arg_names: [bank_id, content, options, service_name, async_mode]
+    arg_types: [text, text, jsonb, text, bool]
+    return_type: jsonb
+    parser: json
+    cache_policy: never
+    steps:
+      - name: retain
+        kind: sql
+        sql: "SELECT rvbbit.hindsight_retain($1, $2, $3::jsonb, $4, $5::bool) AS result"
+        params:
+          - "{{ inputs.bank_id }}"
+          - "{{ inputs.content }}"
+          - "{{ inputs.options }}"
+          - "{{ inputs.service_name }}"
+          - "{{ inputs.async_mode }}"
+      - name: result
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.retain.output }}"
+          path: result
+          default: {}
+  - name: hindsight_memory_recall
+    description: Search a Hindsight memory bank for memories relevant to a query.
+    arg_names: [bank_id, query, options, service_name]
+    arg_types: [text, text, jsonb, text]
+    return_type: jsonb
+    parser: json
+    cache_policy: never
+    steps:
+      - name: recall
+        kind: sql
+        sql: "SELECT rvbbit.hindsight_recall($1, $2, $3::jsonb, $4) AS result"
+        params:
+          - "{{ inputs.bank_id }}"
+          - "{{ inputs.query }}"
+          - "{{ inputs.options }}"
+          - "{{ inputs.service_name }}"
+      - name: result
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.recall.output }}"
+          path: result
+          default: {}
+  - name: hindsight_memory_reflect
+    description: Ask Hindsight to synthesize context from a memory bank for a query.
+    arg_names: [bank_id, query, options, service_name]
+    arg_types: [text, text, jsonb, text]
+    return_type: jsonb
+    parser: json
+    cache_policy: never
+    steps:
+      - name: reflect
+        kind: sql
+        sql: "SELECT rvbbit.hindsight_reflect($1, $2, $3::jsonb, $4) AS result"
+        params:
+          - "{{ inputs.bank_id }}"
+          - "{{ inputs.query }}"
+          - "{{ inputs.options }}"
+          - "{{ inputs.service_name }}"
+      - name: result
+        kind: code
+        fn: json_get
+        inputs:
+          value: "{{ steps.reflect.output }}"
+          path: result
+          default: {}

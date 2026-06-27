@@ -1,0 +1,131 @@
+api_version: rvbbit.pack/v1
+id: memory/hindsight-slim
+name: hindsight_slim
+title: Hindsight Memory Service
+description: Hindsight API service for agent long-term memory, backed by a sibling Postgres database and RVBBIT-compatible embedding config where possible.
+license: provider
+catalog_visibility: public
+system_runtime: false
+capability_role: system_runtime
+tags:
+- memory
+- agent-memory
+- hindsight
+- hermes
+- warren
+- postgres
+- embeddings
+- cpu
+capability: capability.yaml
+source:
+  provider: builtin
+  model: vectorize-io/hindsight-api-slim
+  url: https://github.com/vectorize-io/hindsight
+runtime:
+  mode: image
+  image: ghcr.io/vectorize-io/hindsight-api:latest-slim
+  handler: custom
+  device: cpu
+  port: 8888
+  health_path: /health
+exports:
+  runtime: hindsight_default
+  operators:
+  - hindsight_memory_status
+  - hindsight_memory_retain
+  - hindsight_memory_recall
+  - hindsight_memory_reflect
+install:
+  mode: image
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  tests:
+  - name: hindsight_registered_ready
+    description: Assert Hindsight is registered as a ready memory service, and Warren inventory is coherent when Warren owns it.
+    sql: |
+      DO $$
+      DECLARE
+          source text;
+      BEGIN
+          SELECT service_source
+          INTO source
+          FROM rvbbit.memory_services
+          WHERE name = 'hindsight_default'
+            AND provider = 'hindsight'
+            AND status = 'ready'
+            AND endpoint_url IS NOT NULL
+            AND endpoint_url <> '';
+
+          IF source IS NULL THEN
+              RAISE EXCEPTION 'hindsight_default memory service is not registered as ready';
+          END IF;
+
+          IF source = 'warren' AND NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.warren_inventory
+              WHERE runtime_name = 'hindsight_default'
+                AND deployment_status = 'running'
+          ) THEN
+              RAISE EXCEPTION 'hindsight_default deployment is not running in Warren inventory';
+          END IF;
+      END
+      $$;
+  - name: hindsight_sql_status
+    description: Assert the SQL wrapper can resolve and probe the registered Hindsight service.
+    sql: |
+      DO $$
+      DECLARE
+          probe jsonb;
+      BEGIN
+          probe := rvbbit.hindsight_status();
+          IF probe IS NULL THEN
+              RAISE EXCEPTION 'rvbbit.hindsight_status returned NULL';
+          END IF;
+      END
+      $$;
+  - name: hindsight_operator_wrappers
+    description: Assert Hindsight SQL operator wrappers are installed and the status wrapper can probe the service.
+    sql: |
+      DO $$
+      DECLARE
+          missing text[];
+          probe jsonb;
+      BEGIN
+          SELECT array_agg(expected.name ORDER BY expected.name)
+          INTO missing
+          FROM (VALUES
+              ('hindsight_memory_status'),
+              ('hindsight_memory_retain'),
+              ('hindsight_memory_recall'),
+              ('hindsight_memory_reflect')
+          ) AS expected(name)
+          WHERE NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.operators op
+              WHERE op.name = expected.name
+                AND op.cache_policy = 'never'
+          );
+
+          IF missing IS NOT NULL THEN
+              RAISE EXCEPTION 'missing Hindsight memory operators: %', missing;
+          END IF;
+
+          SELECT rvbbit.hindsight_memory_status('hindsight_default') INTO probe;
+          IF probe IS NULL THEN
+              RAISE EXCEPTION 'rvbbit.hindsight_memory_status returned NULL';
+          END IF;
+
+          -- Non-idempotent and user-data-bearing wrappers are validated by catalog
+          -- presence here; exercising them would mutate an acceptance-test bank.
+          IF false THEN
+              PERFORM rvbbit.hindsight_memory_retain('__acceptance__', 'noop', '{}'::jsonb, 'hindsight_default', true);
+              PERFORM rvbbit.hindsight_memory_recall('__acceptance__', 'noop', '{}'::jsonb, 'hindsight_default');
+              PERFORM rvbbit.hindsight_memory_reflect('__acceptance__', 'noop', '{}'::jsonb, 'hindsight_default');
+          END IF;
+      END
+      $$;

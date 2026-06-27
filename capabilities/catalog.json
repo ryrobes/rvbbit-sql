@@ -1510,6 +1510,98 @@
         "setup_sql": [],
         "target_selector": {
           "capability": true,
+          "docker": true,
+          "gpu": false
+        },
+        "teardown_sql": [],
+        "tests": [
+          {
+            "description": "Assert Hindsight is registered as a ready memory service, and Warren inventory is coherent when Warren owns it.",
+            "name": "hindsight_registered_ready",
+            "sql": "DO $$\nDECLARE\n    source text;\nBEGIN\n    SELECT service_source\n    INTO source\n    FROM rvbbit.memory_services\n    WHERE name = 'hindsight_default'\n      AND provider = 'hindsight'\n      AND status = 'ready'\n      AND endpoint_url IS NOT NULL\n      AND endpoint_url <> '';\n\n    IF source IS NULL THEN\n        RAISE EXCEPTION 'hindsight_default memory service is not registered as ready';\n    END IF;\n\n    IF source = 'warren' AND NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'hindsight_default'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'hindsight_default deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"
+          },
+          {
+            "description": "Assert the SQL wrapper can resolve and probe the registered Hindsight service.",
+            "name": "hindsight_sql_status",
+            "sql": "DO $$\nDECLARE\n    probe jsonb;\nBEGIN\n    probe := rvbbit.hindsight_status();\n    IF probe IS NULL THEN\n        RAISE EXCEPTION 'rvbbit.hindsight_status returned NULL';\n    END IF;\nEND\n$$;\n"
+          },
+          {
+            "description": "Assert Hindsight SQL operator wrappers are installed and the status wrapper can probe the service.",
+            "name": "hindsight_operator_wrappers",
+            "sql": "DO $$\nDECLARE\n    missing text[];\n    probe jsonb;\nBEGIN\n    SELECT array_agg(expected.name ORDER BY expected.name)\n    INTO missing\n    FROM (VALUES\n        ('hindsight_memory_status'),\n        ('hindsight_memory_retain'),\n        ('hindsight_memory_recall'),\n        ('hindsight_memory_reflect')\n    ) AS expected(name)\n    WHERE NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.operators op\n        WHERE op.name = expected.name\n          AND op.cache_policy = 'never'\n    );\n\n    IF missing IS NOT NULL THEN\n        RAISE EXCEPTION 'missing Hindsight memory operators: %', missing;\n    END IF;\n\n    SELECT rvbbit.hindsight_memory_status('hindsight_default') INTO probe;\n    IF probe IS NULL THEN\n        RAISE EXCEPTION 'rvbbit.hindsight_memory_status returned NULL';\n    END IF;\n\n    -- Non-idempotent and user-data-bearing wrappers are validated by catalog\n    -- presence here; exercising them would mutate an acceptance-test bank.\n    IF false THEN\n        PERFORM rvbbit.hindsight_memory_retain('__acceptance__', 'noop', '{}'::jsonb, 'hindsight_default', true);\n        PERFORM rvbbit.hindsight_memory_recall('__acceptance__', 'noop', '{}'::jsonb, 'hindsight_default');\n        PERFORM rvbbit.hindsight_memory_reflect('__acceptance__', 'noop', '{}'::jsonb, 'hindsight_default');\n    END IF;\nEND\n$$;\n"
+          }
+        ]
+      },
+      "acceptance_tests": [
+        "hindsight_registered_ready",
+        "hindsight_sql_status",
+        "hindsight_operator_wrappers"
+      ],
+      "backend_name": null,
+      "backend_transport": "rvbbit",
+      "capability_role": "system_runtime",
+      "catalog_visibility": "public",
+      "description": "Hindsight API service for agent long-term memory, backed by a sibling Postgres database and RVBBIT-compatible embedding config where possible.",
+      "device": "cpu",
+      "endpoint_path": "/",
+      "gpu_placement": null,
+      "gpu_required": false,
+      "health_path": "/health",
+      "id": "memory/hindsight-slim",
+      "install_docker": true,
+      "install_mode": "image",
+      "install_warren": true,
+      "kind": "runtime_sidecar",
+      "license": "provider",
+      "manifest_path": "capabilities/packs/memory/hindsight-slim/capability.yaml",
+      "model_size_bytes": null,
+      "name": "hindsight_slim",
+      "operators": [
+        "hindsight_memory_status",
+        "hindsight_memory_retain",
+        "hindsight_memory_recall",
+        "hindsight_memory_reflect"
+      ],
+      "pack_api_version": "rvbbit.pack/v1",
+      "pack_id": "memory/hindsight-slim",
+      "pack_manifest_path": "capabilities/packs/memory/hindsight-slim/rvbbit-pack.yaml",
+      "pack_path": "capabilities/packs/memory/hindsight-slim",
+      "provider_model": null,
+      "provider_name": null,
+      "provider_set_default": false,
+      "repo_url": null,
+      "resources": {},
+      "runtime_handler": "custom",
+      "runtime_image": "ghcr.io/vectorize-io/hindsight-api:latest-slim",
+      "runtime_language": "memory",
+      "runtime_mode": "image",
+      "runtime_name": "hindsight_default",
+      "runtime_port": 8888,
+      "runtime_template": "runtime-sidecar",
+      "source_model": "vectorize-io/hindsight-api-slim",
+      "source_provider": "builtin",
+      "source_revision": null,
+      "source_url": "https://github.com/vectorize-io/hindsight",
+      "system_runtime": false,
+      "tags": [
+        "memory",
+        "agent-memory",
+        "hindsight",
+        "hermes",
+        "warren",
+        "postgres",
+        "embeddings",
+        "cpu"
+      ],
+      "title": "Hindsight Memory Service",
+      "vram_headroom_pct": null,
+      "vram_required_bytes": null
+    },
+    {
+      "acceptance": {
+        "setup_sql": [],
+        "target_selector": {
+          "capability": true,
           "docker": true
         },
         "teardown_sql": [],
@@ -2264,6 +2356,180 @@
         "cpu"
       ],
       "title": "Warren Smoke Echo",
+      "vram_headroom_pct": null,
+      "vram_required_bytes": null
+    },
+    {
+      "acceptance": {
+        "setup_sql": [],
+        "target_selector": {
+          "capability": false,
+          "sql": true
+        },
+        "teardown_sql": [],
+        "tests": [
+          {
+            "description": "Assert the SQL workflow substrate and core operators are seeded.",
+            "name": "core_catalog_shape",
+            "sql": "DO $$\nDECLARE\n    missing text[];\nBEGIN\n    IF to_regprocedure('rvbbit.flow(text)') IS NULL THEN\n        RAISE EXCEPTION 'rvbbit.flow(text) is not registered';\n    END IF;\n\n    SELECT array_agg(expected.name ORDER BY expected.name)\n    INTO missing\n    FROM (VALUES\n        ('clean_year'),\n        ('redact'),\n        ('headline'),\n        ('analyze'),\n        ('pivot'),\n        ('group'),\n        ('top'),\n        ('filter'),\n        ('normalize'),\n        ('metric_card'),\n        ('line_chart'),\n        ('filter_control'),\n        ('layout_grid')\n    ) AS expected(name)\n    WHERE NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.operators op\n        WHERE op.name = expected.name\n    );\n\n    IF missing IS NOT NULL THEN\n        RAISE EXCEPTION 'missing seeded rvbbit operators: %', missing;\n    END IF;\nEND\n$$;\n"
+          },
+          {
+            "description": "Create a temporary SQL+code operator and verify result plus sub-call provenance.",
+            "name": "sql_node_workflow_receipt",
+            "sql": "DO $$\nDECLARE\n    out_text text;\n    kinds text[];\nBEGIN\n    CREATE TEMP TABLE catalog_sql_probe (\n        id int PRIMARY KEY,\n        name text NOT NULL,\n        tier text NOT NULL\n    ) ON COMMIT DROP;\n    INSERT INTO catalog_sql_probe VALUES\n        (1, 'Alice', 'gold'),\n        (2, 'Bob', 'silver');\n\n    DELETE FROM rvbbit.receipts WHERE operator = 'catalog_sql_node_probe';\n    DELETE FROM rvbbit.operators WHERE name = 'catalog_sql_node_probe';\n    DROP FUNCTION IF EXISTS rvbbit.catalog_sql_node_probe(text, jsonb);\n\n    PERFORM rvbbit.create_operator(\n        op_name        => 'catalog_sql_node_probe',\n        op_arg_names   => ARRAY['probe_id'],\n        op_arg_types   => ARRAY['text'],\n        op_return_type => 'text',\n        op_shape       => 'scalar',\n        op_description => 'Catalog acceptance probe for SQL and code workflow nodes.',\n        op_steps       => jsonb_build_array(\n            jsonb_build_object(\n                'name', 'row',\n                'kind', 'sql',\n                'sql', 'SELECT name, tier FROM pg_temp.catalog_sql_probe WHERE id = $1::int',\n                'params', jsonb_build_array('{{ inputs.probe_id }}')\n            ),\n            jsonb_build_object(\n                'name', 'upper_name',\n                'kind', 'code',\n                'fn', 'uppercase',\n                'inputs', jsonb_build_object('text', '{{ steps.row.output.name }}')\n            )\n        )\n    );\n\n    SELECT rvbbit.catalog_sql_node_probe('2') INTO out_text;\n    IF out_text IS DISTINCT FROM 'BOB' THEN\n        RAISE EXCEPTION 'catalog_sql_node_probe returned %, expected BOB', out_text;\n    END IF;\n\n    WITH latest AS (\n        SELECT sub_calls\n        FROM rvbbit.receipts\n        WHERE operator = 'catalog_sql_node_probe'\n        ORDER BY invocation_at DESC\n        LIMIT 1\n    )\n    SELECT array_agg(elem->>'kind' ORDER BY ord)\n    INTO kinds\n    FROM latest\n    CROSS JOIN LATERAL jsonb_array_elements(latest.sub_calls) WITH ORDINALITY AS e(elem, ord);\n\n    IF kinds IS DISTINCT FROM ARRAY['sql','code']::text[] THEN\n        RAISE EXCEPTION 'expected sql/code sub-calls, got %', kinds;\n    END IF;\n\n    DELETE FROM rvbbit.receipts WHERE operator = 'catalog_sql_node_probe';\n    DELETE FROM rvbbit.operators WHERE name = 'catalog_sql_node_probe';\n    DROP FUNCTION IF EXISTS rvbbit.catalog_sql_node_probe(text, jsonb);\nEXCEPTION WHEN OTHERS THEN\n    DELETE FROM rvbbit.receipts WHERE operator = 'catalog_sql_node_probe';\n    DELETE FROM rvbbit.operators WHERE name = 'catalog_sql_node_probe';\n    DROP FUNCTION IF EXISTS rvbbit.catalog_sql_node_probe(text, jsonb);\n    RAISE;\nEND\n$$;\n"
+          },
+          {
+            "description": "Run a flow cascade and verify output plus persisted step sequence.",
+            "name": "flow_limit_count_steps",
+            "sql": "DO $$\nDECLARE\n    v jsonb;\n    latest_run uuid;\n    stages text[];\nBEGIN\n    SELECT value\n    INTO v\n    FROM rvbbit.flow($q$\n        select g from generate_series(1,10) g\n        then limit(3)\n        then count\n    $q$);\n\n    IF (v->>'n')::int IS DISTINCT FROM 3 THEN\n        RAISE EXCEPTION 'flow limit/count returned %, expected {\"n\":3}', v;\n    END IF;\n\n    SELECT run_id\n    INTO latest_run\n    FROM rvbbit.flow_steps\n    ORDER BY created_at DESC\n    LIMIT 1;\n\n    SELECT array_agg(stage ORDER BY step_idx)\n    INTO stages\n    FROM rvbbit.flow_steps\n    WHERE run_id = latest_run;\n\n    IF stages IS DISTINCT FROM ARRAY['base','limit','count']::text[] THEN\n        RAISE EXCEPTION 'unexpected flow stages for %: %', latest_run, stages;\n    END IF;\nEND\n$$;\n"
+          }
+        ]
+      },
+      "acceptance_tests": [
+        "core_catalog_shape",
+        "sql_node_workflow_receipt",
+        "flow_limit_count_steps"
+      ],
+      "backend_name": null,
+      "backend_transport": "rvbbit",
+      "capability_role": null,
+      "catalog_visibility": "public",
+      "description": "SQL-only acceptance suite for rvbbit.flow, seeded operators, and SQL/code workflow nodes.",
+      "device": "auto",
+      "endpoint_path": null,
+      "gpu_placement": null,
+      "gpu_required": false,
+      "health_path": null,
+      "id": "sql/core-workflows",
+      "install_docker": false,
+      "install_mode": "sql",
+      "install_warren": false,
+      "kind": "sql_test_pack",
+      "license": "mit",
+      "manifest_path": "capabilities/packs/sql/core-workflows/capability.yaml",
+      "model_size_bytes": null,
+      "name": "core_sql_workflows",
+      "operators": [],
+      "pack_api_version": "rvbbit.pack/v1",
+      "pack_id": "sql/core-workflows",
+      "pack_manifest_path": "capabilities/packs/sql/core-workflows/rvbbit-pack.yaml",
+      "pack_path": "capabilities/packs/sql/core-workflows",
+      "provider_model": null,
+      "provider_name": null,
+      "provider_set_default": false,
+      "repo_url": null,
+      "resources": {},
+      "runtime_handler": "custom",
+      "runtime_image": null,
+      "runtime_language": null,
+      "runtime_mode": "sql",
+      "runtime_name": null,
+      "runtime_port": null,
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": null,
+      "source_provider": null,
+      "source_revision": null,
+      "source_url": null,
+      "system_runtime": false,
+      "tags": [
+        "sql",
+        "workflow",
+        "operators",
+        "acceptance",
+        "core",
+        "test"
+      ],
+      "title": "Core SQL Workflow Tests",
+      "vram_headroom_pct": null,
+      "vram_required_bytes": null
+    },
+    {
+      "acceptance": {
+        "setup_sql": [],
+        "target_selector": {
+          "capability": false,
+          "sql": true
+        },
+        "teardown_sql": [],
+        "tests": [
+          {
+            "description": "Exercise visual/control/action rowset operators and validate artifact shape.",
+            "name": "visual_artifact_operators",
+            "sql": "DO $$\nDECLARE\n    v jsonb;\nBEGIN\n    SELECT value INTO v FROM rvbbit.flow($q$\n        select 'Revenue'::text as label, 123::int as value\n        then metric_card(label => 'label', value => 'value', title => 'Revenue')\n    $q$);\n    IF v->>'renderer' IS DISTINCT FROM 'metric_card' OR v #>> '{spec,value}' IS DISTINCT FROM '123' THEN\n        RAISE EXCEPTION 'metric_card emitted unexpected artifact: %', v;\n    END IF;\n\n    SELECT value INTO v FROM rvbbit.flow($q$\n        select * from (values ('Todo', 2), ('Done', 5)) v(status, n)\n        then bar_chart(x => 'status', y => 'n', title => 'Issues')\n    $q$);\n    IF v->>'renderer' IS DISTINCT FROM 'vega_lite'\n       OR v #>> '{spec,mark,type}' IS DISTINCT FROM 'bar'\n       OR v #>> '{spec,encoding,x,field}' IS DISTINCT FROM 'status' THEN\n        RAISE EXCEPTION 'bar_chart emitted unexpected artifact: %', v;\n    END IF;\n\n    SELECT value INTO v FROM rvbbit.flow($q$\n        select * from (values ('2026-01-01', 'A', 2), ('2026-01-02', 'A', 5)) v(day, series, n)\n        then line_chart(x => 'day', y => 'n', color => 'series', title => 'Trend')\n    $q$);\n    IF v #>> '{spec,mark,type}' IS DISTINCT FROM 'line'\n       OR v #>> '{spec,encoding,color,field}' IS DISTINCT FROM 'series' THEN\n        RAISE EXCEPTION 'line_chart emitted unexpected artifact: %', v;\n    END IF;\n\n    SELECT value INTO v FROM rvbbit.flow($q$\n        select * from (values (1, 2, 'A', 10), (2, 5, 'B', 20)) v(x, y, grp, magnitude)\n        then scatter_plot(x => 'x', y => 'y', color => 'grp', size => 'magnitude', title => 'Scatter')\n    $q$);\n    IF v #>> '{spec,mark,type}' IS DISTINCT FROM 'point'\n       OR v #>> '{spec,encoding,size,field}' IS DISTINCT FROM 'magnitude' THEN\n        RAISE EXCEPTION 'scatter_plot emitted unexpected artifact: %', v;\n    END IF;\n\n    SELECT value INTO v FROM rvbbit.flow($q$\n        select * from (values ('Todo', 2), ('Done', 5)) v(status, n)\n        then table_view(title => 'Issue Table')\n    $q$);\n    IF v->>'renderer' IS DISTINCT FROM 'table_view'\n       OR (v #>> '{spec,row_count}')::int IS DISTINCT FROM 2 THEN\n        RAISE EXCEPTION 'table_view emitted unexpected artifact: %', v;\n    END IF;\n\n    SELECT value INTO v FROM rvbbit.flow($q$\n        select * from (values ('Todo', 2), ('Done', 5)) v(status, n)\n        then vega_lite(spec => '{\"mark\":\"bar\",\"encoding\":{\"x\":{\"field\":\"status\"},\"y\":{\"field\":\"n\"}}}', title => 'Custom')\n    $q$);\n    IF v->>'renderer' IS DISTINCT FROM 'vega_lite'\n       OR v #>> '{spec,mark}' IS DISTINCT FROM 'bar'\n       OR v #>> '{spec,data,values,0,status}' IS DISTINCT FROM 'Todo' THEN\n        RAISE EXCEPTION 'vega_lite emitted unexpected artifact: %', v;\n    END IF;\n\n    SELECT value INTO v FROM rvbbit.flow($q$\n        select * from (values ('Todo'), ('Done')) v(status)\n        then filter_control(field => 'status', kind => 'dropdown', title => 'Status', default => 'Done')\n    $q$);\n    IF v->>'renderer' IS DISTINCT FROM 'filter_control'\n       OR v->>'artifact_kind' IS DISTINCT FROM 'control'\n       OR v #>> '{spec,default_value}' IS DISTINCT FROM 'Done' THEN\n        RAISE EXCEPTION 'filter_control emitted unexpected artifact: %', v;\n    END IF;\n\n    SELECT value INTO v FROM rvbbit.flow($q$\n        select 1 as id\n        then action_button(label => 'Ping', sql => 'select 1', title => 'Ping', confirm => 'Really?', variant => 'danger', refresh => 'false')\n    $q$);\n    IF v->>'renderer' IS DISTINCT FROM 'action_button'\n       OR v->>'artifact_kind' IS DISTINCT FROM 'action'\n       OR v #>> '{bindings,action,type}' IS DISTINCT FROM 'sql' THEN\n        RAISE EXCEPTION 'action_button emitted unexpected artifact: %', v;\n    END IF;\nEND\n$$;\n"
+          },
+          {
+            "description": "Exercise tile naming, filter binding, and dashboard layout metadata operators.",
+            "name": "workflow_layout_bindings",
+            "sql": "DO $$\nDECLARE\n    renderers text[];\n    v jsonb;\nBEGIN\n    SELECT array_agg(value->>'renderer' ORDER BY value->>'renderer')\n    INTO renderers\n    FROM rvbbit.flow($q$\n        select * from (values ('Todo', 2), ('Done', 5)) v(status, n)\n        then bar_chart(x => 'status', y => 'n', title => 'Issues')\n        then tile_name(name => 'issues')\n    $q$);\n    IF renderers IS DISTINCT FROM ARRAY['statement_name','vega_lite']::text[] THEN\n        RAISE EXCEPTION 'tile_name emitted unexpected renderers: %', renderers;\n    END IF;\n\n    SELECT value\n    INTO v\n    FROM rvbbit.flow($q$\n        select * from (values ('Todo'), ('Done')) v(status)\n        then filter_control(field => 'status', kind => 'dropdown', title => 'Status')\n        then tile_name(name => 'filters')\n        then bind_filter(target => 'issues', field => 'status')\n    $q$)\n    WHERE value->>'renderer' = 'filter_binding';\n    IF v #>> '{spec,target}' IS DISTINCT FROM 'issues'\n       OR v #>> '{spec,field}' IS DISTINCT FROM 'status' THEN\n        RAISE EXCEPTION 'bind_filter emitted unexpected binding: %', v;\n    END IF;\n\n    SELECT value\n    INTO v\n    FROM rvbbit.flow($q$\n        select 1 as layout_marker\n        then layout_grid(rows => '[[\"filters\"],[{\"name\":\"issues\",\"w\":2}]]', mode => 'arrange', title => 'Dashboard')\n    $q$);\n    IF v->>'renderer' IS DISTINCT FROM 'statement_layout'\n       OR v #>> '{spec,mode}' IS DISTINCT FROM 'arrange'\n       OR (v #>> '{spec,rows,1,0,w}')::int IS DISTINCT FROM 2 THEN\n        RAISE EXCEPTION 'layout_grid emitted unexpected layout: %', v;\n    END IF;\nEND\n$$;\n"
+          }
+        ]
+      },
+      "acceptance_tests": [
+        "visual_artifact_operators",
+        "workflow_layout_bindings"
+      ],
+      "backend_name": null,
+      "backend_transport": "rvbbit",
+      "capability_role": null,
+      "catalog_visibility": "public",
+      "description": "SQL-only acceptance suite for deterministic rvbbit.flow UI artifact operators.",
+      "device": "auto",
+      "endpoint_path": null,
+      "gpu_placement": null,
+      "gpu_required": false,
+      "health_path": null,
+      "id": "sql/workflow-visuals",
+      "install_docker": false,
+      "install_mode": "sql",
+      "install_warren": false,
+      "kind": "sql_test_pack",
+      "license": "mit",
+      "manifest_path": "capabilities/packs/sql/workflow-visuals/capability.yaml",
+      "model_size_bytes": null,
+      "name": "workflow_visual_operators",
+      "operators": [
+        "metric_card",
+        "bar_chart",
+        "line_chart",
+        "scatter_plot",
+        "table_view",
+        "vega_lite",
+        "filter_control",
+        "action_button",
+        "tile_name",
+        "bind_filter",
+        "layout_grid"
+      ],
+      "pack_api_version": "rvbbit.pack/v1",
+      "pack_id": "sql/workflow-visuals",
+      "pack_manifest_path": "capabilities/packs/sql/workflow-visuals/rvbbit-pack.yaml",
+      "pack_path": "capabilities/packs/sql/workflow-visuals",
+      "provider_model": null,
+      "provider_name": null,
+      "provider_set_default": false,
+      "repo_url": null,
+      "resources": {},
+      "runtime_handler": "custom",
+      "runtime_image": null,
+      "runtime_language": null,
+      "runtime_mode": "sql",
+      "runtime_name": null,
+      "runtime_port": null,
+      "runtime_template": "hf-rvbbit-fastapi",
+      "source_model": null,
+      "source_provider": null,
+      "source_revision": null,
+      "source_url": null,
+      "system_runtime": false,
+      "tags": [
+        "sql",
+        "workflow",
+        "visual",
+        "operators",
+        "acceptance",
+        "test"
+      ],
+      "title": "Workflow Visual Operator Tests",
       "vram_headroom_pct": null,
       "vram_required_bytes": null
     },

@@ -36,6 +36,7 @@ mod fast_hash;
 mod flow;
 mod freshness;
 mod generic_search;
+mod hindsight;
 mod kg;
 mod lance;
 mod live_counters;

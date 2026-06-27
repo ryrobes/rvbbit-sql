@@ -1,0 +1,166 @@
+api_version: rvbbit.pack/v1
+id: sql/workflow-visuals
+name: workflow_visual_operators
+title: Workflow Visual Operator Tests
+description: SQL-only acceptance suite for deterministic rvbbit.flow UI artifact operators.
+license: mit
+tags:
+- sql
+- workflow
+- visual
+- operators
+- acceptance
+- test
+catalog_visibility: public
+capability: capability.yaml
+exports:
+  operators:
+  - metric_card
+  - bar_chart
+  - line_chart
+  - scatter_plot
+  - table_view
+  - vega_lite
+  - filter_control
+  - action_button
+  - tile_name
+  - bind_filter
+  - layout_grid
+install:
+  mode: sql
+  warren: false
+  docker: false
+acceptance:
+  target_selector:
+    sql: true
+    capability: false
+  tests:
+  - name: visual_artifact_operators
+    description: Exercise visual/control/action rowset operators and validate artifact shape.
+    sql: |
+      DO $$
+      DECLARE
+          v jsonb;
+      BEGIN
+          SELECT value INTO v FROM rvbbit.flow($q$
+              select 'Revenue'::text as label, 123::int as value
+              then metric_card(label => 'label', value => 'value', title => 'Revenue')
+          $q$);
+          IF v->>'renderer' IS DISTINCT FROM 'metric_card' OR v #>> '{spec,value}' IS DISTINCT FROM '123' THEN
+              RAISE EXCEPTION 'metric_card emitted unexpected artifact: %', v;
+          END IF;
+
+          SELECT value INTO v FROM rvbbit.flow($q$
+              select * from (values ('Todo', 2), ('Done', 5)) v(status, n)
+              then bar_chart(x => 'status', y => 'n', title => 'Issues')
+          $q$);
+          IF v->>'renderer' IS DISTINCT FROM 'vega_lite'
+             OR v #>> '{spec,mark,type}' IS DISTINCT FROM 'bar'
+             OR v #>> '{spec,encoding,x,field}' IS DISTINCT FROM 'status' THEN
+              RAISE EXCEPTION 'bar_chart emitted unexpected artifact: %', v;
+          END IF;
+
+          SELECT value INTO v FROM rvbbit.flow($q$
+              select * from (values ('2026-01-01', 'A', 2), ('2026-01-02', 'A', 5)) v(day, series, n)
+              then line_chart(x => 'day', y => 'n', color => 'series', title => 'Trend')
+          $q$);
+          IF v #>> '{spec,mark,type}' IS DISTINCT FROM 'line'
+             OR v #>> '{spec,encoding,color,field}' IS DISTINCT FROM 'series' THEN
+              RAISE EXCEPTION 'line_chart emitted unexpected artifact: %', v;
+          END IF;
+
+          SELECT value INTO v FROM rvbbit.flow($q$
+              select * from (values (1, 2, 'A', 10), (2, 5, 'B', 20)) v(x, y, grp, magnitude)
+              then scatter_plot(x => 'x', y => 'y', color => 'grp', size => 'magnitude', title => 'Scatter')
+          $q$);
+          IF v #>> '{spec,mark,type}' IS DISTINCT FROM 'point'
+             OR v #>> '{spec,encoding,size,field}' IS DISTINCT FROM 'magnitude' THEN
+              RAISE EXCEPTION 'scatter_plot emitted unexpected artifact: %', v;
+          END IF;
+
+          SELECT value INTO v FROM rvbbit.flow($q$
+              select * from (values ('Todo', 2), ('Done', 5)) v(status, n)
+              then table_view(title => 'Issue Table')
+          $q$);
+          IF v->>'renderer' IS DISTINCT FROM 'table_view'
+             OR (v #>> '{spec,row_count}')::int IS DISTINCT FROM 2 THEN
+              RAISE EXCEPTION 'table_view emitted unexpected artifact: %', v;
+          END IF;
+
+          SELECT value INTO v FROM rvbbit.flow($q$
+              select * from (values ('Todo', 2), ('Done', 5)) v(status, n)
+              then vega_lite(spec => '{"mark":"bar","encoding":{"x":{"field":"status"},"y":{"field":"n"}}}', title => 'Custom')
+          $q$);
+          IF v->>'renderer' IS DISTINCT FROM 'vega_lite'
+             OR v #>> '{spec,mark}' IS DISTINCT FROM 'bar'
+             OR v #>> '{spec,data,values,0,status}' IS DISTINCT FROM 'Todo' THEN
+              RAISE EXCEPTION 'vega_lite emitted unexpected artifact: %', v;
+          END IF;
+
+          SELECT value INTO v FROM rvbbit.flow($q$
+              select * from (values ('Todo'), ('Done')) v(status)
+              then filter_control(field => 'status', kind => 'dropdown', title => 'Status', default => 'Done')
+          $q$);
+          IF v->>'renderer' IS DISTINCT FROM 'filter_control'
+             OR v->>'artifact_kind' IS DISTINCT FROM 'control'
+             OR v #>> '{spec,default_value}' IS DISTINCT FROM 'Done' THEN
+              RAISE EXCEPTION 'filter_control emitted unexpected artifact: %', v;
+          END IF;
+
+          SELECT value INTO v FROM rvbbit.flow($q$
+              select 1 as id
+              then action_button(label => 'Ping', sql => 'select 1', title => 'Ping', confirm => 'Really?', variant => 'danger', refresh => 'false')
+          $q$);
+          IF v->>'renderer' IS DISTINCT FROM 'action_button'
+             OR v->>'artifact_kind' IS DISTINCT FROM 'action'
+             OR v #>> '{bindings,action,type}' IS DISTINCT FROM 'sql' THEN
+              RAISE EXCEPTION 'action_button emitted unexpected artifact: %', v;
+          END IF;
+      END
+      $$;
+  - name: workflow_layout_bindings
+    description: Exercise tile naming, filter binding, and dashboard layout metadata operators.
+    sql: |
+      DO $$
+      DECLARE
+          renderers text[];
+          v jsonb;
+      BEGIN
+          SELECT array_agg(value->>'renderer' ORDER BY value->>'renderer')
+          INTO renderers
+          FROM rvbbit.flow($q$
+              select * from (values ('Todo', 2), ('Done', 5)) v(status, n)
+              then bar_chart(x => 'status', y => 'n', title => 'Issues')
+              then tile_name(name => 'issues')
+          $q$);
+          IF renderers IS DISTINCT FROM ARRAY['statement_name','vega_lite']::text[] THEN
+              RAISE EXCEPTION 'tile_name emitted unexpected renderers: %', renderers;
+          END IF;
+
+          SELECT value
+          INTO v
+          FROM rvbbit.flow($q$
+              select * from (values ('Todo'), ('Done')) v(status)
+              then filter_control(field => 'status', kind => 'dropdown', title => 'Status')
+              then tile_name(name => 'filters')
+              then bind_filter(target => 'issues', field => 'status')
+          $q$)
+          WHERE value->>'renderer' = 'filter_binding';
+          IF v #>> '{spec,target}' IS DISTINCT FROM 'issues'
+             OR v #>> '{spec,field}' IS DISTINCT FROM 'status' THEN
+              RAISE EXCEPTION 'bind_filter emitted unexpected binding: %', v;
+          END IF;
+
+          SELECT value
+          INTO v
+          FROM rvbbit.flow($q$
+              select 1 as layout_marker
+              then layout_grid(rows => '[["filters"],[{"name":"issues","w":2}]]', mode => 'arrange', title => 'Dashboard')
+          $q$);
+          IF v->>'renderer' IS DISTINCT FROM 'statement_layout'
+             OR v #>> '{spec,mode}' IS DISTINCT FROM 'arrange'
+             OR (v #>> '{spec,rows,1,0,w}')::int IS DISTINCT FROM 2 THEN
+              RAISE EXCEPTION 'layout_grid emitted unexpected layout: %', v;
+          END IF;
+      END
+      $$;
