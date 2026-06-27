@@ -154,6 +154,9 @@ unsafe extern "C-unwind" fn rvbbit_post_parse_analyze_hook(
     if core::ptr::addr_of!(pg_sys::creating_extension).read() {
         return;
     }
+    if crate::pg_context::nonsystem_view_access_restricted() {
+        return;
+    }
     router::set_pg_rowstore_route_selected(false);
     router::set_native_vortex_route_selected(false);
     if (*query).commandType != pg_sys::CmdType::CMD_SELECT {

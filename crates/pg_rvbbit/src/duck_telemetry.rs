@@ -205,7 +205,8 @@ SELECT
 FROM rvbbit.duck_sidecar_query_events
 GROUP BY 1, 2, 3, 4, 5, 6, 7;
 "#,
-    name = "duck_sidecar_telemetry_schema"
+    name = "duck_sidecar_telemetry_schema",
+    requires = ["rvbbit_bootstrap"]
 );
 
 pub(crate) fn record_shared_fallback(

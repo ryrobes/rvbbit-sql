@@ -5869,6 +5869,8 @@ COMMENT ON ACCESS METHOD rvbbit IS
 -- down on drop. We hang off DDL event triggers so the catalog stays in sync
 -- without users having to call helper functions.
 
+DROP EVENT TRIGGER IF EXISTS rvbbit_on_create_table;
+DROP FUNCTION IF EXISTS rvbbit.on_create_table() CASCADE;
 CREATE OR REPLACE FUNCTION rvbbit.on_create_table()
 RETURNS event_trigger
 LANGUAGE plpgsql
@@ -5916,11 +5918,14 @@ BEGIN
 END;
 $$;
 
+DROP EVENT TRIGGER IF EXISTS rvbbit_on_create_table;
 CREATE EVENT TRIGGER rvbbit_on_create_table
     ON ddl_command_end
     WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO')
     EXECUTE FUNCTION rvbbit.on_create_table();
 
+DROP EVENT TRIGGER IF EXISTS rvbbit_on_drop_table;
+DROP FUNCTION IF EXISTS rvbbit.on_drop_table() CASCADE;
 CREATE OR REPLACE FUNCTION rvbbit.on_drop_table()
 RETURNS event_trigger
 LANGUAGE plpgsql
@@ -5945,6 +5950,7 @@ BEGIN
 END;
 $$;
 
+DROP EVENT TRIGGER IF EXISTS rvbbit_on_drop_table;
 CREATE EVENT TRIGGER rvbbit_on_drop_table
     ON sql_drop
     EXECUTE FUNCTION rvbbit.on_drop_table();
@@ -6321,6 +6327,8 @@ BEGIN
 END;
 $$;
 
+DROP EVENT TRIGGER IF EXISTS rvbbit_partition_dirty_triggers_on_alter;
+DROP FUNCTION IF EXISTS rvbbit.reinstall_partition_dirty_triggers_on_alter() CASCADE;
 CREATE OR REPLACE FUNCTION rvbbit.reinstall_partition_dirty_triggers_on_alter()
 RETURNS event_trigger
 LANGUAGE plpgsql

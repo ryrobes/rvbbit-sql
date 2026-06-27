@@ -829,12 +829,15 @@ mod tests {
     fn visual_rowset_operators_are_seeded() {
         let value: i64 = Spi::get_one(
             "SELECT count(*)::bigint FROM rvbbit.operators \
-             WHERE name IN ('metric_card','bar_chart','table_view','vega_lite','filter_control','layout_grid') \
+             WHERE name IN ('metric_card','bar_chart','line_chart','scatter_plot','table_view','vega_lite','filter_control','action_button','tile_name','bind_filter','layout_grid') \
                AND shape='rowset' AND parser='json'",
         )
         .unwrap()
         .unwrap();
-        assert_eq!(value, 6, "visual/control/meta artifact rowset operators");
+        assert_eq!(
+            value, 11,
+            "visual/control/action/meta artifact rowset operators"
+        );
     }
 
     #[pg_test]
@@ -892,11 +895,71 @@ mod tests {
     }
 
     #[pg_test]
+    fn line_chart_named_args_emit_vega_lite_artifact() {
+        let v: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ \
+             select * from (values ('2026-01-01', 'A', 2), ('2026-01-02', 'A', 5)) v(day, series, n) \
+             then line_chart(x => 'day', y => 'n', color => 'series', title => 'Trend') \
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            v.0.get("renderer").and_then(|x| x.as_str()),
+            Some("vega_lite")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/mark/type").and_then(|x| x.as_str()),
+            Some("line")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/encoding/x/type")
+                .and_then(|x| x.as_str()),
+            Some("temporal")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/encoding/color/field")
+                .and_then(|x| x.as_str()),
+            Some("series")
+        );
+    }
+
+    #[pg_test]
+    fn scatter_plot_named_args_emit_vega_lite_artifact() {
+        let v: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ \
+             select * from (values (1, 2, 'A', 10), (2, 5, 'B', 20)) v(x, y, grp, magnitude) \
+             then scatter_plot(x => 'x', y => 'y', color => 'grp', size => 'magnitude', title => 'Scatter') \
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            v.0.get("renderer").and_then(|x| x.as_str()),
+            Some("vega_lite")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/mark/type").and_then(|x| x.as_str()),
+            Some("point")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/encoding/size/field")
+                .and_then(|x| x.as_str()),
+            Some("magnitude")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/encoding/x/type")
+                .and_then(|x| x.as_str()),
+            Some("quantitative")
+        );
+    }
+
+    #[pg_test]
     fn filter_control_named_args_emit_control_artifact() {
         let v: pgrx::JsonB = Spi::get_one(
             "SELECT value FROM rvbbit.flow($q$ \
              select * from (values ('Todo'), ('Done')) v(status) \
-             then filter_control(field => 'status', kind => 'dropdown', title => 'Status') \
+             then filter_control(field => 'status', kind => 'dropdown', title => 'Status', default => 'Done') \
              $q$)",
         )
         .unwrap()
@@ -921,6 +984,39 @@ mod tests {
             v.0.pointer("/bindings/param/operator")
                 .and_then(|x| x.as_str()),
             Some("in")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/default_value").and_then(|x| x.as_str()),
+            Some("Done")
+        );
+    }
+
+    #[pg_test]
+    fn action_button_named_args_emit_action_artifact() {
+        let v: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ \
+             select 1 as id \
+             then action_button(label => 'Ping', sql => 'select 1', title => 'Ping', confirm => 'Really?', variant => 'danger', refresh => 'false') \
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            v.0.get("artifact_kind").and_then(|x| x.as_str()),
+            Some("action")
+        );
+        assert_eq!(
+            v.0.get("renderer").and_then(|x| x.as_str()),
+            Some("action_button")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/sql").and_then(|x| x.as_str()),
+            Some("select 1")
+        );
+        assert_eq!(
+            v.0.pointer("/bindings/action/type")
+                .and_then(|x| x.as_str()),
+            Some("sql")
         );
     }
 
@@ -949,6 +1045,125 @@ mod tests {
         assert_eq!(
             v.0.pointer("/spec/layout").and_then(|x| x.as_str()),
             Some("1 / 2")
+        );
+    }
+
+    #[pg_test]
+    fn layout_grid_rows_json_emit_structured_layout() {
+        let v: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ \
+             select 1 as layout_marker \
+             then layout_grid( \
+               rows => '[[\"filters\"],[{\"name\":\"issues\",\"w\":2}]]', \
+               mode => 'arrange', \
+               title => 'Dashboard' \
+             ) \
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            v.0.get("renderer").and_then(|x| x.as_str()),
+            Some("statement_layout")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/mode").and_then(|x| x.as_str()),
+            Some("arrange")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/rows/0/0").and_then(|x| x.as_str()),
+            Some("filters")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/rows/1/0/name").and_then(|x| x.as_str()),
+            Some("issues")
+        );
+        assert_eq!(
+            v.0.pointer("/spec/rows/1/0/w").and_then(|x| x.as_i64()),
+            Some(2)
+        );
+    }
+
+    #[pg_test]
+    fn tile_name_preserves_artifact_and_appends_alias() {
+        let n: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.flow($q$ \
+             select * from (values ('Todo', 2), ('Done', 5)) v(status, n) \
+             then bar_chart(x => 'status', y => 'n', title => 'Issues') \
+             then tile_name(name => 'issues') \
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 2);
+
+        let renderers: Vec<String> = Spi::connect(|client| {
+            let mut out = Vec::new();
+            let table = client.select(
+                "SELECT value->>'renderer' FROM rvbbit.flow($q$ \
+                 select * from (values ('Todo', 2), ('Done', 5)) v(status, n) \
+                 then bar_chart(x => 'status', y => 'n', title => 'Issues') \
+                 then tile_name(name => 'issues') \
+                 $q$) ORDER BY value->>'renderer'",
+                None,
+                &[],
+            )?;
+            for row in table {
+                if let Some(v) = row.get::<String>(1)? {
+                    out.push(v);
+                }
+            }
+            Ok::<_, pgrx::spi::Error>(out)
+        })
+        .unwrap();
+        assert_eq!(renderers, vec!["statement_name", "vega_lite"]);
+
+        let alias: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ \
+             select * from (values ('Todo', 2), ('Done', 5)) v(status, n) \
+             then bar_chart(x => 'status', y => 'n', title => 'Issues') \
+             then tile_name(name => 'issues') \
+             $q$) WHERE value->>'renderer' = 'statement_name'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            alias.0.pointer("/spec/name").and_then(|x| x.as_str()),
+            Some("issues")
+        );
+    }
+
+    #[pg_test]
+    fn bind_filter_preserves_artifact_and_appends_binding() {
+        let n: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.flow($q$ \
+             select * from (values ('Todo'), ('Done')) v(status) \
+             then filter_control(field => 'status', kind => 'dropdown', title => 'Status') \
+             then tile_name(name => 'filters') \
+             then bind_filter(target => 'issues', field => 'status') \
+             $q$)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 3);
+
+        let binding: pgrx::JsonB = Spi::get_one(
+            "SELECT value FROM rvbbit.flow($q$ \
+             select * from (values ('Todo'), ('Done')) v(status) \
+             then filter_control(field => 'status', kind => 'dropdown', title => 'Status') \
+             then tile_name(name => 'filters') \
+             then bind_filter(target => 'issues', field => 'status') \
+             $q$) WHERE value->>'renderer' = 'filter_binding'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            binding.0.pointer("/spec/target").and_then(|x| x.as_str()),
+            Some("issues")
+        );
+        assert_eq!(
+            binding.0.pointer("/spec/field").and_then(|x| x.as_str()),
+            Some("status")
         );
     }
 

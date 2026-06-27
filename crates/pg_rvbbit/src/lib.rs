@@ -43,6 +43,7 @@ mod migrations;
 mod model_orchestration;
 mod model_studio;
 mod pgvector_tier;
+mod pg_context;
 mod mv;
 mod operators;
 mod pipeline;

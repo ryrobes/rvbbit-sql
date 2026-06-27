@@ -176,6 +176,49 @@ SELECT rvbbit.create_operator(
 );
 
 SELECT rvbbit.create_operator(
+    op_name        => 'line_chart',
+    op_arg_names   => ARRAY['x','y','title','color'],
+    op_return_type => 'jsonb',
+    op_shape       => 'rowset',
+    op_parser      => 'json',
+    op_steps       => jsonb_build_array(jsonb_build_object(
+        'name', 'emit',
+        'kind', 'code',
+        'fn', 'ui_line_chart',
+        'inputs', jsonb_build_object(
+            'rows', '{{ inputs._table }}',
+            'x', '{{ inputs.x }}',
+            'y', '{{ inputs.y }}',
+            'title', '{{ inputs.title }}',
+            'color', '{{ inputs.color }}'
+        )
+    )),
+    op_description => 'Pipeline visual stage: emit a Vega-Lite line-chart UI artifact from the current resultset.'
+);
+
+SELECT rvbbit.create_operator(
+    op_name        => 'scatter_plot',
+    op_arg_names   => ARRAY['x','y','title','color','size'],
+    op_return_type => 'jsonb',
+    op_shape       => 'rowset',
+    op_parser      => 'json',
+    op_steps       => jsonb_build_array(jsonb_build_object(
+        'name', 'emit',
+        'kind', 'code',
+        'fn', 'ui_scatter_plot',
+        'inputs', jsonb_build_object(
+            'rows', '{{ inputs._table }}',
+            'x', '{{ inputs.x }}',
+            'y', '{{ inputs.y }}',
+            'title', '{{ inputs.title }}',
+            'color', '{{ inputs.color }}',
+            'size', '{{ inputs.size }}'
+        )
+    )),
+    op_description => 'Pipeline visual stage: emit a Vega-Lite scatter-plot UI artifact from the current resultset.'
+);
+
+SELECT rvbbit.create_operator(
     op_name        => 'table_view',
     op_arg_names   => ARRAY['title'],
     op_return_type => 'jsonb',
@@ -214,7 +257,7 @@ SELECT rvbbit.create_operator(
 
 SELECT rvbbit.create_operator(
     op_name        => 'filter_control',
-    op_arg_names   => ARRAY['field','kind','title','operator'],
+    op_arg_names   => ARRAY['field','kind','title','operator','default','value','default_value'],
     op_return_type => 'jsonb',
     op_shape       => 'rowset',
     op_parser      => 'json',
@@ -227,15 +270,81 @@ SELECT rvbbit.create_operator(
             'field', '{{ inputs.field }}',
             'kind', '{{ inputs.kind }}',
             'title', '{{ inputs.title }}',
-            'operator', '{{ inputs.operator }}'
+            'operator', '{{ inputs.operator }}',
+            'default', '{{ inputs.default }}',
+            'value', '{{ inputs.value }}',
+            'default_value', '{{ inputs.default_value }}'
         )
     )),
     op_description => 'Pipeline control stage: emit a parameter-publishing filter-control UI artifact from the current resultset.'
 );
 
 SELECT rvbbit.create_operator(
+    op_name        => 'action_button',
+    op_arg_names   => ARRAY['label','sql','title','confirm','variant','refresh'],
+    op_return_type => 'jsonb',
+    op_shape       => 'rowset',
+    op_parser      => 'json',
+    op_steps       => jsonb_build_array(jsonb_build_object(
+        'name', 'emit',
+        'kind', 'code',
+        'fn', 'ui_action_button',
+        'inputs', jsonb_build_object(
+            'rows', '{{ inputs._table }}',
+            'label', '{{ inputs.label }}',
+            'sql', '{{ inputs.sql }}',
+            'title', '{{ inputs.title }}',
+            'confirm', '{{ inputs.confirm }}',
+            'variant', '{{ inputs.variant }}',
+            'refresh', '{{ inputs.refresh }}'
+        )
+    )),
+    op_description => 'Pipeline action stage: emit a SQL action button UI artifact from the current resultset.'
+);
+
+SELECT rvbbit.create_operator(
+    op_name        => 'tile_name',
+    op_arg_names   => ARRAY['name','title'],
+    op_return_type => 'jsonb',
+    op_shape       => 'rowset',
+    op_parser      => 'json',
+    op_steps       => jsonb_build_array(jsonb_build_object(
+        'name', 'emit',
+        'kind', 'code',
+        'fn', 'ui_tile_name',
+        'inputs', jsonb_build_object(
+            'rows', '{{ inputs._table }}',
+            'name', '{{ inputs.name }}',
+            'title', '{{ inputs.title }}'
+        )
+    )),
+    op_description => 'Pipeline meta stage: attach a stable layout alias to the current UI artifact statement.'
+);
+
+SELECT rvbbit.create_operator(
+    op_name        => 'bind_filter',
+    op_arg_names   => ARRAY['target','field','operator','title'],
+    op_return_type => 'jsonb',
+    op_shape       => 'rowset',
+    op_parser      => 'json',
+    op_steps       => jsonb_build_array(jsonb_build_object(
+        'name', 'emit',
+        'kind', 'code',
+        'fn', 'ui_bind_filter',
+        'inputs', jsonb_build_object(
+            'rows', '{{ inputs._table }}',
+            'target', '{{ inputs.target }}',
+            'field', '{{ inputs.field }}',
+            'operator', '{{ inputs.operator }}',
+            'title', '{{ inputs.title }}'
+        )
+    )),
+    op_description => 'Pipeline meta stage: bind a control artifact to a named target tile for cross-filtering.'
+);
+
+SELECT rvbbit.create_operator(
     op_name        => 'layout_grid',
-    op_arg_names   => ARRAY['layout','title'],
+    op_arg_names   => ARRAY['layout','title','rows','mode'],
     op_return_type => 'jsonb',
     op_shape       => 'rowset',
     op_parser      => 'json',
@@ -245,7 +354,9 @@ SELECT rvbbit.create_operator(
         'fn', 'ui_layout_grid',
         'inputs', jsonb_build_object(
             'layout', '{{ inputs.layout }}',
-            'title', '{{ inputs.title }}'
+            'title', '{{ inputs.title }}',
+            'layout_rows', '{{ inputs.rows }}',
+            'mode', '{{ inputs.mode }}'
         )
     )),
     op_description => 'Pipeline meta stage: emit a statement-grid layout artifact for multi-statement UI composition.'

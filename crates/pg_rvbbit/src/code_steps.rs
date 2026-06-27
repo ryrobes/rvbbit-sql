@@ -37,9 +37,14 @@ pub fn registry() -> &'static HashMap<String, CodeFn> {
         m.insert("cosine_similarity".into(), cosine_similarity_fn);
         m.insert("ui_metric_card".into(), ui_metric_card_fn);
         m.insert("ui_bar_chart".into(), ui_bar_chart_fn);
+        m.insert("ui_line_chart".into(), ui_line_chart_fn);
+        m.insert("ui_scatter_plot".into(), ui_scatter_plot_fn);
         m.insert("ui_table_view".into(), ui_table_view_fn);
         m.insert("ui_vega_lite".into(), ui_vega_lite_fn);
         m.insert("ui_filter_control".into(), ui_filter_control_fn);
+        m.insert("ui_action_button".into(), ui_action_button_fn);
+        m.insert("ui_tile_name".into(), ui_tile_name_fn);
+        m.insert("ui_bind_filter".into(), ui_bind_filter_fn);
         m.insert("ui_layout_grid".into(), ui_layout_grid_fn);
         m
     })
@@ -72,6 +77,14 @@ fn opt_str_input(inputs: &Value, key: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+fn opt_value_input(inputs: &Value, key: &str) -> Option<Value> {
+    match inputs.get(key) {
+        Some(Value::String(s)) if s.trim().is_empty() => None,
+        Some(Value::Null) | None => None,
+        Some(v) => Some(v.clone()),
+    }
 }
 
 fn rows_input(inputs: &Value) -> Vec<Value> {
@@ -164,7 +177,25 @@ fn ui_artifact_kind(
     data: Vec<Value>,
     bindings: Value,
 ) -> Value {
-    Value::Array(vec![json!({
+    Value::Array(vec![ui_artifact_row(
+        renderer,
+        title,
+        artifact_kind,
+        spec,
+        data,
+        bindings,
+    )])
+}
+
+fn ui_artifact_row(
+    renderer: &str,
+    title: &str,
+    artifact_kind: &str,
+    spec: Value,
+    data: Vec<Value>,
+    bindings: Value,
+) -> Value {
+    json!({
         "rvbbit_artifact": "ui",
         "artifact_id": artifact_id(renderer, title),
         "artifact_kind": artifact_kind,
@@ -175,7 +206,7 @@ fn ui_artifact_kind(
         "layout": {},
         "bindings": bindings,
         "diagnostics": {}
-    })])
+    })
 }
 
 fn normalize_control_kind(raw: &str) -> String {
@@ -499,6 +530,90 @@ fn ui_bar_chart_fn(inputs: &Value) -> Result<Value, String> {
     Ok(ui_artifact("vega_lite", &title, spec, rows))
 }
 
+fn field_encoding(rows: &[Value], field: &str) -> Value {
+    json!({ "field": field, "type": field_vega_type(rows, field) })
+}
+
+fn xy_chart_title(inputs: &Value, x: &str, y: &str, default_kind: &str) -> String {
+    let title = opt_str_input(inputs, "title");
+    if title.is_empty() {
+        format!("{default_kind}: {y} by {x}")
+    } else {
+        title
+    }
+}
+
+fn xy_chart_spec(rows: &[Value], x: &str, y: &str, mark: Value, color: &str, size: &str) -> Value {
+    let mut encoding = serde_json::Map::new();
+    encoding.insert("x".into(), field_encoding(rows, x));
+    encoding.insert("y".into(), field_encoding(rows, y));
+    if !color.is_empty() {
+        encoding.insert("color".into(), field_encoding(rows, color));
+    }
+    if !size.is_empty() {
+        encoding.insert("size".into(), field_encoding(rows, size));
+    }
+    let mut tooltip = vec![field_encoding(rows, x), field_encoding(rows, y)];
+    if !color.is_empty() {
+        tooltip.push(field_encoding(rows, color));
+    }
+    if !size.is_empty() {
+        tooltip.push(field_encoding(rows, size));
+    }
+    encoding.insert("tooltip".into(), Value::Array(tooltip));
+
+    json!({
+        "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+        "data": { "values": rows.to_vec() },
+        "mark": mark,
+        "encoding": Value::Object(encoding),
+        "width": "container",
+        "height": "container",
+        "autosize": { "type": "fit", "contains": "padding", "resize": true }
+    })
+}
+
+fn ui_line_chart_fn(inputs: &Value) -> Result<Value, String> {
+    let rows = rows_input(inputs);
+    let x = opt_str_input(inputs, "x");
+    let y = opt_str_input(inputs, "y");
+    if x.is_empty() || y.is_empty() {
+        return Err("ui_line_chart: missing x or y field".into());
+    }
+    let color = opt_str_input(inputs, "color");
+    let title = xy_chart_title(inputs, &x, &y, "Line");
+    let spec = xy_chart_spec(
+        &rows,
+        &x,
+        &y,
+        json!({ "type": "line", "point": true, "tooltip": true }),
+        &color,
+        "",
+    );
+    Ok(ui_artifact("vega_lite", &title, spec, rows))
+}
+
+fn ui_scatter_plot_fn(inputs: &Value) -> Result<Value, String> {
+    let rows = rows_input(inputs);
+    let x = opt_str_input(inputs, "x");
+    let y = opt_str_input(inputs, "y");
+    if x.is_empty() || y.is_empty() {
+        return Err("ui_scatter_plot: missing x or y field".into());
+    }
+    let color = opt_str_input(inputs, "color");
+    let size = opt_str_input(inputs, "size");
+    let title = xy_chart_title(inputs, &x, &y, "Scatter");
+    let spec = xy_chart_spec(
+        &rows,
+        &x,
+        &y,
+        json!({ "type": "point", "filled": true, "tooltip": true }),
+        &color,
+        &size,
+    );
+    Ok(ui_artifact("vega_lite", &title, spec, rows))
+}
+
 fn ui_table_view_fn(inputs: &Value) -> Result<Value, String> {
     let rows = rows_input(inputs);
     let title = {
@@ -566,13 +681,21 @@ fn ui_filter_control_fn(inputs: &Value) -> Result<Value, String> {
             t
         }
     };
-    let spec = json!({
+    let mut spec = json!({
         "field": field.clone(),
         "kind": kind,
         "operator": operator.clone(),
         "label": title,
         "row_count": rows.len()
     });
+    if let Some(default_value) = ["default_value", "default", "value"]
+        .iter()
+        .find_map(|key| opt_value_input(inputs, key))
+    {
+        if let Some(obj) = spec.as_object_mut() {
+            obj.insert("default_value".into(), default_value);
+        }
+    }
     Ok(ui_artifact_kind(
         "filter_control",
         &title,
@@ -588,8 +711,193 @@ fn ui_filter_control_fn(inputs: &Value) -> Result<Value, String> {
     ))
 }
 
+fn ui_action_button_fn(inputs: &Value) -> Result<Value, String> {
+    let rows = rows_input(inputs);
+    let sql = opt_str_input(inputs, "sql");
+    if sql.is_empty() {
+        return Err("ui_action_button: missing sql".into());
+    }
+    let label = {
+        let value = opt_str_input(inputs, "label");
+        if value.is_empty() {
+            "Run".to_string()
+        } else {
+            value
+        }
+    };
+    let title = {
+        let value = opt_str_input(inputs, "title");
+        if value.is_empty() {
+            label.clone()
+        } else {
+            value
+        }
+    };
+    let mut spec = json!({
+        "label": label,
+        "sql": sql.clone(),
+        "row_count": rows.len()
+    });
+    if let Some(confirm) = opt_value_input(inputs, "confirm") {
+        if let Some(obj) = spec.as_object_mut() {
+            obj.insert("confirm".into(), confirm);
+        }
+    }
+    if let Some(variant) = opt_value_input(inputs, "variant") {
+        if let Some(obj) = spec.as_object_mut() {
+            obj.insert("variant".into(), variant);
+        }
+    }
+    if let Some(refresh) = opt_value_input(inputs, "refresh") {
+        if let Some(obj) = spec.as_object_mut() {
+            obj.insert("refresh".into(), refresh);
+        }
+    }
+    Ok(ui_artifact_kind(
+        "action_button",
+        &title,
+        "action",
+        spec,
+        rows,
+        json!({
+            "action": {
+                "type": "sql",
+                "sql": sql
+            }
+        }),
+    ))
+}
+
+fn ui_tile_name_fn(inputs: &Value) -> Result<Value, String> {
+    let mut rows = rows_input(inputs);
+    let name = opt_str_input(inputs, "name");
+    if name.is_empty() {
+        return Err("ui_tile_name: missing name".into());
+    }
+    if !rows
+        .iter()
+        .all(|row| row.get("rvbbit_artifact").and_then(|v| v.as_str()) == Some("ui"))
+    {
+        return Err("ui_tile_name: place tile_name after a visual/control UI operator".into());
+    }
+    let title = {
+        let t = opt_str_input(inputs, "title");
+        if t.is_empty() {
+            name.clone()
+        } else {
+            t
+        }
+    };
+    rows.push(ui_artifact_row(
+        "statement_name",
+        &title,
+        "meta",
+        json!({
+            "name": name,
+            "label": title
+        }),
+        Vec::new(),
+        json!({}),
+    ));
+    Ok(Value::Array(rows))
+}
+
+fn ui_bind_filter_fn(inputs: &Value) -> Result<Value, String> {
+    let mut rows = rows_input(inputs);
+    let target = opt_str_input(inputs, "target");
+    if target.is_empty() {
+        return Err("ui_bind_filter: missing target".into());
+    }
+    if !rows
+        .iter()
+        .all(|row| row.get("rvbbit_artifact").and_then(|v| v.as_str()) == Some("ui"))
+    {
+        return Err("ui_bind_filter: place bind_filter after a visual/control UI operator".into());
+    }
+    let field = opt_str_input(inputs, "field");
+    let operator = opt_str_input(inputs, "operator");
+    let title = {
+        let t = opt_str_input(inputs, "title");
+        if t.is_empty() {
+            format!("Filter {target}")
+        } else {
+            t
+        }
+    };
+    rows.push(ui_artifact_row(
+        "filter_binding",
+        &title,
+        "meta",
+        json!({
+            "target": target,
+            "field": field,
+            "operator": operator
+        }),
+        Vec::new(),
+        json!({}),
+    ));
+    Ok(Value::Array(rows))
+}
+
+fn normalize_layout_mode(raw: &str) -> &'static str {
+    if raw.eq_ignore_ascii_case("transcript") {
+        "transcript"
+    } else {
+        "arrange"
+    }
+}
+
+fn parse_layout_value(value: Value) -> Result<Value, String> {
+    match value {
+        Value::String(s) => {
+            let text = s.trim();
+            if text.is_empty() {
+                Ok(Value::Null)
+            } else if text.starts_with('[') || text.starts_with('{') {
+                serde_json::from_str(text)
+                    .map_err(|e| format!("ui_layout_grid: invalid JSON layout: {e}"))
+            } else {
+                Ok(Value::String(text.to_string()))
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+fn apply_layout_value(
+    spec: &mut serde_json::Map<String, Value>,
+    value: Value,
+) -> Result<(), String> {
+    match parse_layout_value(value)? {
+        Value::Null => {}
+        Value::String(s) => {
+            spec.insert("layout".to_string(), Value::String(s));
+        }
+        Value::Array(rows) => {
+            spec.insert("rows".to_string(), Value::Array(rows));
+        }
+        Value::Object(mut obj) => {
+            if let Some(Value::String(mode)) = obj.get("mode") {
+                spec.insert("mode".to_string(), json!(normalize_layout_mode(mode)));
+            }
+            if let Some(rows) = obj.remove("rows") {
+                spec.insert("rows".to_string(), rows);
+            } else if let Some(layout) = obj.remove("layout") {
+                spec.insert("layout".to_string(), layout);
+            } else {
+                spec.insert("rows".to_string(), Value::Object(obj));
+            }
+        }
+        other => {
+            spec.insert("layout".to_string(), Value::String(other.to_string()));
+        }
+    }
+    Ok(())
+}
+
 fn ui_layout_grid_fn(inputs: &Value) -> Result<Value, String> {
     let layout = opt_str_input(inputs, "layout");
+    let mode = normalize_layout_mode(&opt_str_input(inputs, "mode"));
     let title = {
         let t = opt_str_input(inputs, "title");
         if t.is_empty() {
@@ -598,15 +906,19 @@ fn ui_layout_grid_fn(inputs: &Value) -> Result<Value, String> {
             t
         }
     };
-    let spec = json!({
-        "mode": "arrange",
-        "layout": layout
-    });
+    let mut spec = serde_json::Map::new();
+    spec.insert("mode".to_string(), json!(mode));
+    if !layout.is_empty() {
+        apply_layout_value(&mut spec, Value::String(layout))?;
+    }
+    if let Some(rows) = opt_value_input(inputs, "layout_rows") {
+        apply_layout_value(&mut spec, rows)?;
+    }
     Ok(ui_artifact_kind(
         "statement_layout",
         &title,
         "meta",
-        spec,
+        Value::Object(spec),
         Vec::new(),
         json!({}),
     ))

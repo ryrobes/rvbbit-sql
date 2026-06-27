@@ -108,6 +108,9 @@ unsafe extern "C-unwind" fn rvbbit_planner_hook(
     bound_params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
     let _asof_scope = crate::time_travel::planner_scope(query_string);
+    if crate::pg_context::nonsystem_view_access_restricted() {
+        return call_next_planner(parse, query_string, cursor_options, bound_params);
+    }
     // Snapshot the native+vortex route selection at planner entry, before
     // standard_planner's internal route re-computation can clobber the global flag.
     // add_rvbbit_path reads this captured value to stash into the scan node.
@@ -231,6 +234,9 @@ unsafe extern "C-unwind" fn rvbbit_get_relation_info_hook(
     if rel.is_null() {
         return;
     }
+    if crate::pg_context::nonsystem_view_access_restricted() {
+        return;
+    }
     let oid_u32 = relation_oid.to_u32();
     if oid_u32 < FIRST_NORMAL_OBJECT_ID {
         return;
@@ -286,6 +292,9 @@ unsafe extern "C-unwind" fn rvbbit_set_rel_pathlist_hook(
     }
 
     if rte.is_null() || rel.is_null() {
+        return;
+    }
+    if crate::pg_context::nonsystem_view_access_restricted() {
         return;
     }
     if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {

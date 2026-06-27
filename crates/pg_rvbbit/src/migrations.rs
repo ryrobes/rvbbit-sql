@@ -409,6 +409,30 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0097_layout_grid_operator",
         include_str!("../sql/migrations/0097_layout_grid_operator.sql"),
     ),
+    (
+        "0098_tile_name_operator",
+        include_str!("../sql/migrations/0098_tile_name_operator.sql"),
+    ),
+    (
+        "0099_bind_filter_operator",
+        include_str!("../sql/migrations/0099_bind_filter_operator.sql"),
+    ),
+    (
+        "0100_layout_grid_json_args",
+        include_str!("../sql/migrations/0100_layout_grid_json_args.sql"),
+    ),
+    (
+        "0101_line_scatter_visual_operators",
+        include_str!("../sql/migrations/0101_line_scatter_visual_operators.sql"),
+    ),
+    (
+        "0102_filter_control_defaults",
+        include_str!("../sql/migrations/0102_filter_control_defaults.sql"),
+    ),
+    (
+        "0103_action_button_operator",
+        include_str!("../sql/migrations/0103_action_button_operator.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
