@@ -5465,12 +5465,16 @@ CREATE TABLE rvbbit.mcp_servers (
     timeout_ms       int  NOT NULL DEFAULT 30000,
     description      text,
     created_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT mcp_servers_name_check
+        CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_]*$'),
     CONSTRAINT mcp_servers_transport_check
         CHECK (transport IN ('stdio', 'http')),
     CONSTRAINT mcp_servers_stdio_needs_command
         CHECK (transport <> 'stdio' OR command IS NOT NULL),
     CONSTRAINT mcp_servers_http_needs_url
-        CHECK (transport <> 'http'  OR url IS NOT NULL)
+        CHECK (transport <> 'http'  OR url IS NOT NULL),
+    CONSTRAINT mcp_servers_timeout_check
+        CHECK (timeout_ms BETWEEN 1 AND 600000)
 );
 
 -- One row per (server, tool) discovered at registration / refresh time.
@@ -5554,17 +5558,26 @@ CREATE OR REPLACE FUNCTION rvbbit.register_mcp_server(
 ) RETURNS void
 LANGUAGE plpgsql
 AS $rm$
+DECLARE
+    normalized_name text := nullif(btrim(server_name), '');
+    normalized_timeout int := least(greatest(coalesce(server_timeout_ms, 30000), 1), 600000);
 BEGIN
     -- security-03: writing mcp_servers == arbitrary command execution on the
     -- gateway host (command/args are spawned). Gate it like the other gateway
     -- DDL instead of leaving the most dangerous registration ungated.
     PERFORM rvbbit.require_mcp_gateway_admin();
+    IF normalized_name IS NULL THEN
+        RAISE EXCEPTION 'rvbbit.register_mcp_server: server_name cannot be empty';
+    END IF;
+    IF normalized_name !~ '^[A-Za-z_][A-Za-z0-9_]*$' THEN
+        RAISE EXCEPTION 'rvbbit.register_mcp_server: server_name must be an identifier-like name';
+    END IF;
     INSERT INTO rvbbit.mcp_servers
         (name, transport, command, args, env, url, auth_header_env,
          timeout_ms, description)
     VALUES
-        (server_name, server_transport, server_command, server_args,
-         server_env, server_url, server_auth_env, server_timeout_ms,
+        (normalized_name, server_transport, server_command, server_args,
+         server_env, server_url, server_auth_env, normalized_timeout,
          server_description)
     ON CONFLICT (name) DO UPDATE SET
         transport       = EXCLUDED.transport,

@@ -16,6 +16,12 @@ def _labels(rvbbit, table):
     ).fetchone()
 
 
+def _plan_text(rvbbit, sql, analyze=False):
+    opts = "ANALYZE, COSTS OFF, TIMING OFF" if analyze else "FORMAT TEXT"
+    rows = rvbbit.execute(f"EXPLAIN ({opts}) {sql}").fetchall()
+    return "\n".join(row[0] for row in rows)
+
+
 def _dirty_flags(rvbbit, table):
     return rvbbit.execute(
         f"""
@@ -203,6 +209,8 @@ def test_update_dirty_episode_requires_rebuild_when_overlay_incomplete(rvbbit, t
     rvbbit.execute(f"UPDATE {temp_table} SET label = 'new' WHERE id = 1")
     assert _labels(rvbbit, temp_table) == (1, "new")
     assert _dirty_flags(rvbbit, temp_table) == (True, False, True, False, False)
+    plan = _plan_text(rvbbit, f"SELECT label FROM {temp_table} WHERE id >= 1")
+    assert "Custom Scan" not in plan
 
     with pytest.raises(Exception) as exc:
         rvbbit.execute(
@@ -248,6 +256,14 @@ def test_insert_only_dirty_episode_still_delta_refreshes(rvbbit, temp_table):
     rvbbit.execute(f"INSERT INTO {temp_table} VALUES (2, 'two')")
     assert _labels(rvbbit, temp_table) == (2, "one,two")
     assert _dirty_flags(rvbbit, temp_table) == (True, True, False, False, False)
+    plan = _plan_text(
+        rvbbit,
+        f"SELECT label FROM {temp_table} WHERE id >= 1 ORDER BY label",
+        analyze=True,
+    )
+    assert "Custom Scan (RvbbitParquetScan)" in plan
+    assert "Heap Tail: true" in plan
+    assert "Heap Tail Rows: 1" in plan
 
     result = rvbbit.execute(
         f"SELECT rvbbit.refresh_acceleration('{temp_table}'::regclass, false)"

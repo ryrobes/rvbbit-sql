@@ -57,6 +57,13 @@ thread_local! {
     static AGG_CACHE: RefCell<HashMap<u32, (f64, f64)>> = RefCell::new(HashMap::new());
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LatestAccelReadMode {
+    None,
+    ParquetOnly,
+    ParquetWithReadOverlay,
+}
+
 /// Drop the per-table planner aggregate cache. Called from compact() so
 /// the same backend immediately sees its own writes reflected in plan
 /// row estimates.
@@ -263,7 +270,12 @@ unsafe extern "C-unwind" fn rvbbit_get_relation_info_hook(
     if force_heap_scan_enabled() || router::pg_rowstore_route_selected() {
         return;
     }
-    if !as_of_generation_enabled() && !parquet_authoritative_for_oid(oid_u32) {
+    let read_mode = if as_of_generation_enabled() {
+        LatestAccelReadMode::ParquetOnly
+    } else {
+        latest_accel_read_mode_for_oid(oid_u32)
+    };
+    if read_mode == LatestAccelReadMode::None {
         return;
     }
     // Our replacement scan is not parallel-aware yet. If PG keeps heap
@@ -272,8 +284,9 @@ unsafe extern "C-unwind" fn rvbbit_get_relation_info_hook(
     (*rel).consider_parallel = false;
     let total_rows = sum_row_group_rows(oid_u32);
     if total_rows > 0.0 {
-        (*rel).rows = total_rows;
-        (*rel).tuples = total_rows;
+        let est_rows = total_rows + estimated_heap_tail_rows(oid_u32, total_rows);
+        (*rel).rows = est_rows;
+        (*rel).tuples = est_rows;
         // Estimate pages from total parquet bytes / BLCKSZ. Doesn't matter
         // a lot for cost — what matters is that the seqscan path computed
         // later doesn't think the relation is empty.
@@ -327,7 +340,12 @@ unsafe extern "C-unwind" fn rvbbit_set_rel_pathlist_hook(
     if force_heap_scan_enabled() || router::pg_rowstore_route_selected() {
         return;
     }
-    if !as_of_generation_enabled() && !parquet_authoritative_for_oid(oid_u32) {
+    let read_mode = if as_of_generation_enabled() {
+        LatestAccelReadMode::ParquetOnly
+    } else {
+        latest_accel_read_mode_for_oid(oid_u32)
+    };
+    if read_mode == LatestAccelReadMode::None {
         return;
     }
 
@@ -337,14 +355,16 @@ unsafe extern "C-unwind" fn rvbbit_set_rel_pathlist_hook(
     }
 
     let total_rows = sum_row_group_rows(oid_u32);
-    let est_rows = clamp_custom_scan_rows((*rel).rows, total_rows);
-    (*rel).tuples = total_rows;
+    let est_total_rows = total_rows + estimated_heap_tail_rows(oid_u32, total_rows);
+    let est_rows = clamp_custom_scan_rows((*rel).rows, est_total_rows);
+    (*rel).tuples = est_total_rows;
     (*rel).consider_parallel = false;
 
-    // Only wipe heap paths when parquet is authoritative: either the legacy
-    // heap was truncated, or the retained heap is marked clean by the
-    // acceleration refresh machinery. A dirty retained heap remains the SQL
-    // source of truth and must be planned by PostgreSQL normally.
+    // Only wipe heap paths when the CustomScan owns the complete read: either
+    // parquet is authoritative, or the retained heap has a read-time overlay
+    // that merges parquet tombstones with the visible heap tail. Dirty
+    // UPDATE/DELETE/TRUNCATE episodes without a complete overlay remain
+    // heap-only for correctness.
     (*rel).pathlist = std::ptr::null_mut();
     (*rel).partial_pathlist = std::ptr::null_mut();
     (*rel).cheapest_total_path = std::ptr::null_mut();
@@ -353,7 +373,7 @@ unsafe extern "C-unwind" fn rvbbit_set_rel_pathlist_hook(
     (*rel).cheapest_parameterized_paths = std::ptr::null_mut();
 
     let total_bytes = sum_row_group_bytes(oid_u32);
-    add_rvbbit_path(rel, oid_u32, est_rows, total_rows, total_bytes);
+    add_rvbbit_path(rel, oid_u32, est_rows, est_total_rows, total_bytes);
 }
 
 /// Allocate a CustomPath in PG memory and register it with the planner.
@@ -501,20 +521,70 @@ fn is_rvbbit_table(oid: u32) -> bool {
     is
 }
 
-/// Latest-view parquet scans are correct only when the heap is empty
-/// (legacy compact) or the retained heap has not been mutated since the
-/// last acceleration refresh. Historical AS OF reads are handled by the
-/// caller and intentionally bypass this latest-view check.
-fn parquet_authoritative_for_oid(oid: u32) -> bool {
+/// Latest-view accelerated scans are correct when parquet is authoritative
+/// (legacy empty heap or clean retained heap). They are also correct for the
+/// read-time overlay case: a retained heap with a dirty episode that can be
+/// represented as parquet row groups minus tombstones plus visible heap tuples
+/// whose xmin is newer than the last refresh watermark. Insert-only dirtiness
+/// is always overlay-readable. UPDATE/DELETE/TRUNCATE dirtiness also needs a
+/// complete row-identity overlay, because old accelerated rows must be
+/// tombstoned before the heap tail can replace them.
+///
+/// Historical AS OF reads are handled by the caller and intentionally bypass
+/// this latest-view check.
+fn latest_accel_read_mode_for_oid(oid: u32) -> LatestAccelReadMode {
     IN_HOOK.with(|f| f.set(true));
-    let result: Result<Option<bool>, _> = pgrx::Spi::get_one(&format!(
-        "SELECT pg_relation_size(t.table_oid) = 0 \
-                OR rvbbit.shadow_heap_clean_retained(t.table_oid) \
+    let result: Result<Option<String>, _> = pgrx::Spi::get_one(&format!(
+        "SELECT CASE \
+                WHEN pg_relation_size(t.table_oid) = 0 \
+                  OR (coalesce(ds.shadow_heap_retained, false) \
+                      AND NOT coalesce(ds.shadow_heap_dirty, false)) \
+                    THEN 'parquet' \
+                WHEN coalesce(ds.shadow_heap_retained, false) \
+                 AND coalesce(ds.shadow_heap_dirty, false) \
+                 AND coalesce(a.last_refresh_xid, 0) > 0 \
+                 AND ( \
+                      (NOT coalesce(ds.dirty_has_update, false) \
+                       AND NOT coalesce(ds.dirty_has_delete, false) \
+                       AND NOT coalesce(ds.dirty_has_truncate, false)) \
+                      OR rvbbit.accel_overlay_ready(t.table_oid) \
+                 ) \
+                    THEN 'overlay' \
+                ELSE 'none' \
+                END \
          FROM rvbbit.tables t \
+         JOIN rvbbit.table_dirty_state ds ON ds.table_oid = t.table_oid \
+         LEFT JOIN rvbbit.acceleration_state a ON a.table_oid = t.table_oid \
          WHERE t.table_oid = {oid}::oid"
     ));
     IN_HOOK.with(|f| f.set(false));
-    result.ok().flatten().unwrap_or(false)
+    match result.ok().flatten().as_deref() {
+        Some("parquet") => LatestAccelReadMode::ParquetOnly,
+        Some("overlay") => LatestAccelReadMode::ParquetWithReadOverlay,
+        _ => LatestAccelReadMode::None,
+    }
+}
+
+fn estimated_heap_tail_rows(oid: u32, parquet_rows: f64) -> f64 {
+    IN_HOOK.with(|f| f.set(true));
+    let result: Result<Option<i64>, _> = pgrx::Spi::get_one(&format!(
+        "SELECT greatest(0, \
+                    coalesce(pg_stat_get_live_tuples(t.table_oid), 0)::bigint \
+                    - {parquet_rows}::bigint) \
+         FROM rvbbit.tables t \
+         JOIN rvbbit.table_dirty_state ds ON ds.table_oid = t.table_oid \
+         WHERE t.table_oid = {oid}::oid \
+           AND coalesce(ds.shadow_heap_retained, false) \
+           AND coalesce(ds.shadow_heap_dirty, false) \
+           AND ( \
+                (NOT coalesce(ds.dirty_has_update, false) \
+                 AND NOT coalesce(ds.dirty_has_delete, false) \
+                 AND NOT coalesce(ds.dirty_has_truncate, false)) \
+                OR rvbbit.accel_overlay_ready(t.table_oid) \
+           )"
+    ));
+    IN_HOOK.with(|f| f.set(false));
+    result.ok().flatten().unwrap_or(0).max(0) as f64
 }
 
 /// How many row groups does this table have? Not cached because compact()

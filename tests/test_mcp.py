@@ -65,6 +65,31 @@ def test_server_registered(rvbbit, test_server):
     assert row == ("stdio", "python")
 
 
+def test_register_mcp_server_validates_name_and_clamps_timeout(rvbbit):
+    with pytest.raises(Exception):
+        rvbbit.execute(
+            "SELECT rvbbit.register_mcp_server("
+            "  server_name => 'bad/name', server_transport => 'stdio', "
+            "  server_command => 'python')"
+        )
+
+    name = f"cfg_{uuid.uuid4().hex[:6]}"
+    try:
+        rvbbit.execute(
+            "SELECT rvbbit.register_mcp_server("
+            "  server_name => %s, server_transport => 'stdio', "
+            "  server_command => 'python', server_timeout_ms => -5)",
+            (name,),
+        )
+        row = rvbbit.execute(
+            "SELECT timeout_ms FROM rvbbit.mcp_servers WHERE name = %s",
+            (name,),
+        ).fetchone()
+        assert row[0] == 1
+    finally:
+        rvbbit.execute("SELECT rvbbit.drop_mcp_server(%s)", (name,))
+
+
 def test_tools_discovered(rvbbit, test_server):
     names = {
         r[0]

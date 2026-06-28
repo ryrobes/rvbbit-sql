@@ -28,6 +28,7 @@ HANDLERS_DIR = Path(
     os.environ.get("RVBBIT_PYTHON_HANDLERS_DIR", "/tmp/rvbbit-python-handlers")
 )
 RUNNER = Path(__file__).with_name("runner.py")
+SUPPORTED_HASH_LENGTHS = {32, 64}
 
 _lock = threading.Lock()
 _stats = {
@@ -98,6 +99,7 @@ def run(req: RunRequest) -> RunResponse:
     try:
         _validate_hash("env_hash", req.env.env_hash)
         _validate_hash("code_hash", req.handler.code_hash)
+        _validate_content_hash("code_hash", req.handler.code_hash, req.handler.code)
         if not _version_matches(req.env.python_version):
             raise RuntimeError(
                 f"runtime Python {sys.version.split()[0]} does not satisfy "
@@ -164,69 +166,76 @@ def _ensure_env(env: EnvSpec) -> Path:
     env_dir = ENVS_DIR / env.env_hash
     marker = env_dir / ".rvbbit-ready"
     python_bin = env_dir / "bin" / "python"
-    if marker.exists() and python_bin.exists():
+    requirements = _normalize_requirements(env.requirements)
+    if (
+        marker.exists()
+        and python_bin.exists()
+        and _env_marker_matches(marker, env, requirements)
+    ):
         return python_bin
 
-    tmp_dir = env_dir.with_name(f"{env_dir.name}.tmp")
+    tmp_dir = _unique_tmp_path(env_dir)
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
     tmp_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    venv.EnvBuilder(with_pip=True, clear=True).create(tmp_dir)
-    tmp_python = tmp_dir / "bin" / "python"
-    requirements = [req.strip() for req in env.requirements if req.strip()]
-    if requirements:
-        req_file = tmp_dir / "requirements.txt"
-        req_file.write_text("\n".join(requirements) + "\n", encoding="utf-8")
-        proc = subprocess.run(
-            [
-                str(tmp_python),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "-r",
-                str(req_file),
-            ],
-            text=True,
-            capture_output=True,
-            timeout=600,
-            check=False,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                "pip install failed:\n"
-                + (proc.stdout or "")
-                + ("\n" + proc.stderr if proc.stderr else "")
+    try:
+        venv.EnvBuilder(with_pip=True, clear=True).create(tmp_dir)
+        tmp_python = tmp_dir / "bin" / "python"
+        if requirements:
+            req_file = tmp_dir / "requirements.txt"
+            _atomic_write_text(req_file, "\n".join(requirements) + "\n")
+            proc = subprocess.run(
+                [
+                    str(tmp_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "-r",
+                    str(req_file),
+                ],
+                text=True,
+                capture_output=True,
+                timeout=600,
+                check=False,
             )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    "pip install failed:\n"
+                    + (proc.stdout or "")
+                    + ("\n" + proc.stderr if proc.stderr else "")
+                )
 
-    (tmp_dir / ".rvbbit-ready").write_text(
-        json.dumps(
-            {
-                "name": env.name,
-                "python_version": env.python_version,
-                "requirements_hash": hashlib.sha256(
-                    "\n".join(requirements).encode("utf-8")
-                ).hexdigest(),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    if env_dir.exists():
-        shutil.rmtree(env_dir)
-    tmp_dir.rename(env_dir)
-    _stats["env_builds"] += 1
-    return python_bin
+        _atomic_write_text(
+            tmp_dir / ".rvbbit-ready",
+            json.dumps(
+                {
+                    "name": env.name,
+                    "python_version": env.python_version,
+                    "requirements_hash": _requirements_hash(requirements),
+                },
+                indent=2,
+            ),
+        )
+        if env_dir.exists():
+            shutil.rmtree(env_dir)
+        tmp_dir.rename(env_dir)
+        _stats["env_builds"] += 1
+        return python_bin
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
 
 def _ensure_handler(handler: HandlerSpec) -> Path:
+    _validate_content_hash("code_hash", handler.code_hash, handler.code)
     handler_dir = HANDLERS_DIR / handler.code_hash
     handler_path = handler_dir / "handler.py"
-    if handler_path.exists():
+    if handler_path.exists() and handler_path.read_text(encoding="utf-8") == handler.code:
         return handler_path
     handler_dir.mkdir(parents=True, exist_ok=True)
-    handler_path.write_text(handler.code, encoding="utf-8")
+    _atomic_write_text(handler_path, handler.code)
     _stats["handler_writes"] += 1
     return handler_path
 
@@ -242,8 +251,54 @@ def _parse_protocol(stdout: str) -> dict[str, Any]:
 
 
 def _validate_hash(name: str, value: str) -> None:
-    if not value or any(ch not in "0123456789abcdef" for ch in value.lower()):
+    if (
+        not value
+        or len(value) not in SUPPORTED_HASH_LENGTHS
+        or value.lower() != value
+        or any(ch not in "0123456789abcdef" for ch in value)
+    ):
         raise RuntimeError(f"{name} must be a lowercase hex hash")
+
+
+def _validate_content_hash(name: str, value: str, content: str) -> None:
+    if len(value) == 32:
+        expected = hashlib.md5(content.encode("utf-8")).hexdigest()
+    elif len(value) == 64:
+        expected = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    else:
+        raise RuntimeError(f"{name} must be a lowercase hex hash")
+    if value != expected:
+        raise RuntimeError(f"{name} does not match supplied handler code")
+
+
+def _normalize_requirements(requirements: list[str]) -> list[str]:
+    return [req.strip() for req in requirements if req.strip()]
+
+
+def _requirements_hash(requirements: list[str]) -> str:
+    return hashlib.sha256("\n".join(requirements).encode("utf-8")).hexdigest()
+
+
+def _env_marker_matches(marker: Path, env: EnvSpec, requirements: list[str]) -> bool:
+    try:
+        doc = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return (
+        doc.get("python_version") == env.python_version
+        and doc.get("requirements_hash") == _requirements_hash(requirements)
+    )
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _unique_tmp_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
 
 
 def _version_matches(requested: str) -> bool:

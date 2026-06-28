@@ -172,15 +172,18 @@ This fallback is deliberate for v1 ergonomics. A missing broker should not make
 a first-time install feel broken.
 
 Production operators who care more about resource ceilings than availability
-should treat repeated warnings as an operational fault. A future strict mode
-should make this explicit:
+should treat repeated warnings as an operational fault, or disable local
+sidecar fallback from shared-broker routes:
 
 ```text
 rvbbit.duck_backend_shared_strict = on
 ```
 
-That setting does not exist yet. Until it does, use logs/metrics to detect
-fallbacks, or disable the Duck/Vortex route if the broker is required.
+Strict mode preserves the normal default when off. When on, a shared broker
+connection failure does not start a local persistent or one-shot sidecar. If
+`rvbbit.duck_backend_fail_open` remains on, the query can still fall back to
+native PostgreSQL/Rvbbit execution; set fail-open off as well if a missing
+broker should hard-error the query.
 
 ## Why Postgres Should Not Launch The Broker
 
@@ -365,15 +368,20 @@ Unix socket. A TCP broker would need authentication and transport hardening.
 | `rvbbit.duck_backend` / `RVBBIT_DUCK_BACKEND` | `on` | Enables Duck sidecar routes. |
 | `rvbbit.duck_backend_persistent` / `RVBBIT_DUCK_BACKEND_PERSISTENT` | `on` | Reuse one local sidecar per PG backend. |
 | `rvbbit.duck_backend_shared` / `RVBBIT_DUCK_BACKEND_SHARED` | `off` | Use a shared broker socket first. |
+| `rvbbit.duck_backend_shared_strict` / `RVBBIT_DUCK_BACKEND_SHARED_STRICT` | `off` | If shared broker mode is enabled, do not fall back to per-backend sidecars when the broker is unavailable. |
 | `rvbbit.duck_backend_shared_targets` / `RVBBIT_DUCK_BACKEND_SHARED_TARGETS` | all | Comma-separated shared broker targets such as `duck:vortex`; entries may also be just an engine or layout. Non-matching routes use the local sidecar path directly. |
 | `rvbbit.duck_backend_shared_socket` / `RVBBIT_DUCK_BACKEND_SHARED_SOCKET` | derived path | Explicit broker socket path. |
 | `rvbbit.duck_backend_shared_dir` / `RVBBIT_DUCK_BACKEND_SHARED_DIR` | `/tmp/rvbbit-duck` | Directory for derived socket paths. |
 | `rvbbit.duck_backend_shared_workers` / `RVBBIT_DUCK_BACKEND_SHARED_WORKERS` | `4` | Expected broker worker count; part of derived socket identity. |
 | `rvbbit.duck_backend_shared_launch` / `RVBBIT_DUCK_BACKEND_SHARED_LAUNCH` | `off` | Unsafe/dev-only backend auto-launch of broker. |
+| `RVBBIT_DUCK_BROKER_QUEUE` | `1024` | Maximum queued shared-broker requests before new socket clients get a structured fallback response. |
+| `RVBBIT_DUCK_MAX_REQUEST_BYTES` | `16777216` | Maximum JSONL request line size accepted by local persistent sidecars and shared brokers. |
+| `RVBBIT_DUCK_SOCKET_IO_TIMEOUT_S` | `30` | Shared-broker socket read/write timeout for idle or abandoned client connections. |
 | `rvbbit.duck_threads` / `RVBBIT_DUCK_THREADS` | `4` | DuckDB threads per worker/local sidecar. |
 | `rvbbit.duck_arrow_ipc` / `RVBBIT_DUCK_ARROW_IPC` | `on` | Use Arrow IPC file transport for sidecar results. |
 | `rvbbit.duck_arrow_ipc_fallback` / `RVBBIT_DUCK_ARROW_IPC_FALLBACK` | `on` | Retry JSON transport if Arrow IPC decode fails. |
 | `rvbbit.duck_backend_fail_open` / `RVBBIT_DUCK_BACKEND_FAIL_OPEN` | `on` | Non-Vortex failures can fall back to native execution. |
+| `RVBBIT_DUCK_BACKEND_TIMEOUT_S` | `300` | Query timeout sent to `rvbbit-duck`; local persistent reads, one-shot child processes, and shared-socket reads are aborted after this value plus a short grace window. |
 | `RVBBIT_NODE_ID` / `RVBBIT_DUCK_NODE_ID` | hostname | Logical node identity recorded in sidecar telemetry. |
 | `RVBBIT_DUCK_TELEMETRY` | `on` | Enables best-effort sidecar telemetry writes. |
 | `RVBBIT_DUCK_TELEMETRY_QUEUE` | `8192` | Bounded sidecar telemetry event queue. |
@@ -393,6 +401,10 @@ Unix socket. A TCP broker would need authentication and transport hardening.
 | `--threads N` | DuckDB/DataFusion threads per worker. |
 | `--pgdata-prefix PATH` | Path prefix stored in Rvbbit metadata. |
 | `--visible-pgdata-prefix PATH` | Path prefix visible to the broker. |
+
+The shared broker also honors environment-only guardrails:
+`RVBBIT_DUCK_BROKER_QUEUE`, `RVBBIT_DUCK_MAX_REQUEST_BYTES`, and
+`RVBBIT_DUCK_SOCKET_IO_TIMEOUT_S`.
 
 ## SQL Observability
 

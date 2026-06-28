@@ -141,8 +141,11 @@ Source of truth. One row per registered MCP server.
 | `created_at` | timestamptz | registration time |
 
 Constraints:
+- `name ~ '^[A-Za-z_][A-Za-z0-9_]*$'` because the name is also used in
+  gateway paths and generated wrapper schemas
 - `transport IN ('stdio','http')`
 - stdio rows require `command`; http rows require `url`.
+- `timeout_ms BETWEEN 1 AND 600000`
 
 ```sql
 SELECT * FROM rvbbit.mcp_servers ORDER BY name;

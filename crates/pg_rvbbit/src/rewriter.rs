@@ -9999,6 +9999,8 @@ fn force_heap_scan_enabled() -> bool {
 /// unsafe to apply right now? Returns true when:
 ///   - rvbbit.as_of_generation is set to a positive value (historical
 ///     reads need row-group narrowing the metadata path can't do); OR
+///   - any rvbbit table is dirty (metadata sees only accelerated row
+///     groups and would miss a heap tail); OR
 ///   - any rvbbit table has at least one tombstone (metadata counts
 ///     don't subtract tombstones).
 ///
@@ -10036,6 +10038,18 @@ fn metadata_rewrites_unsafe_for_correctness() -> bool {
             .flatten();
     if !table_exists.unwrap_or(false) {
         return false;
+    }
+    let has_dirty: Option<bool> = pgrx::Spi::get_one(
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM rvbbit.table_dirty_state \
+             WHERE shadow_heap_dirty \
+         )",
+    )
+    .ok()
+    .flatten();
+    if has_dirty.unwrap_or(false) {
+        return true;
     }
     let has_tombstones: Option<bool> = pgrx::Spi::get_one(
         "SELECT EXISTS( \

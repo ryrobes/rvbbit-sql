@@ -872,6 +872,7 @@ struct RvbbitTableMetric {
     heap_bytes: i64,
     shadow_heap_retained: bool,
     shadow_heap_dirty: bool,
+    native_overlay_readable: bool,
     delete_count: i64,
     text_columns: Vec<String>,
     temporal_columns: Vec<String>,
@@ -2337,6 +2338,15 @@ fn choose_route_fast(
         ));
     }
     if !external_available && pg_available {
+        if all_dirty_tables_native_overlay_readable(tables) {
+            return Some(decision(
+                Candidate::RvbbitNative,
+                "eligibility-fast",
+                "parquet vector path ineligible; native read-time overlay is available",
+                None,
+                None,
+            ));
+        }
         return Some(decision(
             Candidate::PgRowstore,
             "eligibility-fast",
@@ -2435,6 +2445,15 @@ fn choose_route(
         );
     }
     if !external_available && pg_available {
+        if all_dirty_tables_native_overlay_readable(tables) {
+            return decision(
+                Candidate::RvbbitNative,
+                "eligibility",
+                "parquet vector path ineligible; native read-time overlay is available",
+                None,
+                None,
+            );
+        }
         return decision(
             Candidate::PgRowstore,
             "eligibility",
@@ -3839,6 +3858,8 @@ pub(crate) fn route_runtime_stamp() -> String {
     if !relations_present(&[
         "rvbbit.tables",
         "rvbbit.route_profiles",
+        "rvbbit.table_dirty_state",
+        "rvbbit.acceleration_state",
         "rvbbit.row_groups",
         "rvbbit.row_groups_visible",
         "rvbbit.delete_log",
@@ -3894,12 +3915,20 @@ fn route_table_state_stamp() -> String {
                     c.oid::text || ':' || (c.relpages::bigint * current_setting('block_size')::bigint)::text || ':' || \
                     coalesce(rg.rows, 0)::text || ':' || coalesce(rg.bytes, 0)::text || ':' || \
                     coalesce(dl.deletes, 0)::text || ':' || \
-                    coalesce(t.shadow_heap_retained, false)::text || ':' || \
-                    rvbbit.shadow_heap_dirty_effective(c.oid)::text, \
+                    coalesce(ds.shadow_heap_retained, false)::text || ':' || \
+                    coalesce(ds.shadow_heap_dirty, false)::text || ':' || \
+                    coalesce(ds.dirty_has_insert, false)::text || ':' || \
+                    coalesce(ds.dirty_has_update, false)::text || ':' || \
+                    coalesce(ds.dirty_has_delete, false)::text || ':' || \
+                    coalesce(ds.dirty_has_truncate, false)::text || ':' || \
+                    coalesce(a.last_refresh_xid, 0)::text || ':' || \
+                    pg_relation_filenode(c.oid)::text, \
                     ',' ORDER BY c.oid \
                 ), 'none') \
 	         FROM rvbbit.tables t \
 	         JOIN pg_class c ON c.oid = t.table_oid \
+	         JOIN rvbbit.table_dirty_state ds ON ds.table_oid = c.oid \
+	         LEFT JOIN rvbbit.acceleration_state a ON a.table_oid = c.oid \
 	         LEFT JOIN ( \
 	             SELECT table_oid, sum(n_rows)::bigint AS rows, sum(n_bytes)::bigint AS bytes \
              FROM rvbbit.row_groups_visible \
@@ -4087,6 +4116,15 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
                     (c.relpages::bigint * current_setting('block_size')::bigint)::bigint, \
                     coalesce(t.shadow_heap_retained, false), \
                     rvbbit.shadow_heap_dirty_effective(c.oid), \
+                    (coalesce(t.shadow_heap_retained, false) \
+                     AND rvbbit.shadow_heap_dirty_effective(c.oid) \
+                     AND coalesce(a.last_refresh_xid, 0) > 0 \
+                     AND ( \
+                          (NOT coalesce(ds.dirty_has_update, false) \
+                           AND NOT coalesce(ds.dirty_has_delete, false) \
+                           AND NOT coalesce(ds.dirty_has_truncate, false)) \
+                          OR rvbbit.accel_overlay_ready(c.oid) \
+                     )), \
                     (SELECT count(*)::bigint \
                        FROM rvbbit.delete_log dl \
                        JOIN rvbbit.row_groups_visible rgv \
@@ -4120,10 +4158,14 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
 	             FROM rvbbit.tables t \
 	             JOIN pg_class c ON c.oid = t.table_oid \
 	             JOIN pg_namespace n ON n.oid = c.relnamespace \
+	             JOIN rvbbit.table_dirty_state ds ON ds.table_oid = c.oid \
+	             LEFT JOIN rvbbit.acceleration_state a ON a.table_oid = c.oid \
 	             LEFT JOIN rvbbit.accel_policy p ON p.table_oid = c.oid \
 	             LEFT JOIN rvbbit.row_groups_visible rg ON rg.table_oid = c.oid \
 	             WHERE coalesce(t.acceleration_enabled, true) AND c.oid IN ({oid_list}) \
              GROUP BY n.nspname, c.relname, c.oid, t.shadow_heap_retained, \
+                      ds.shadow_heap_dirty, ds.dirty_has_update, ds.dirty_has_delete, \
+                      ds.dirty_has_truncate, a.last_refresh_xid, \
                       p.denied_engines, p.denied_layouts"
             ),
             None,
@@ -4143,16 +4185,9 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
                 heap_bytes: row.get(7)?.unwrap_or_default(),
                 shadow_heap_retained: row.get(8)?.unwrap_or_default(),
                 shadow_heap_dirty: row.get(9)?.unwrap_or_default(),
-                delete_count: row.get(10)?.unwrap_or_default(),
+                native_overlay_readable: row.get(10)?.unwrap_or_default(),
+                delete_count: row.get(11)?.unwrap_or_default(),
                 text_columns: row
-                    .get::<String>(11)?
-                    .unwrap_or_default()
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|col| !col.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                temporal_columns: row
                     .get::<String>(12)?
                     .unwrap_or_default()
                     .split(',')
@@ -4160,8 +4195,16 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
                     .filter(|col| !col.is_empty())
                     .map(str::to_string)
                     .collect(),
-                denied_engines: row
+                temporal_columns: row
                     .get::<String>(13)?
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|col| !col.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                denied_engines: row
+                    .get::<String>(14)?
                     .unwrap_or_default()
                     .split(',')
                     .map(str::trim)
@@ -4169,7 +4212,7 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
                     .map(str::to_string)
                     .collect(),
                 denied_layouts: row
-                    .get::<String>(14)?
+                    .get::<String>(15)?
                     .unwrap_or_default()
                     .split(',')
                     .map(str::trim)
@@ -4561,6 +4604,7 @@ fn table_metric_json(t: &RvbbitTableMetric) -> Value {
         "heap_bytes": t.heap_bytes,
         "shadow_heap_retained": t.shadow_heap_retained,
         "shadow_heap_dirty": t.shadow_heap_dirty,
+        "native_overlay_readable": t.native_overlay_readable,
         "text_columns": t.text_columns,
         "temporal_columns": t.temporal_columns,
         "parquet_authoritative": t.delete_count == 0
@@ -4576,7 +4620,39 @@ fn aggregate_metrics_json(tables: &[RvbbitTableMetric]) -> Value {
         "bytes": tables.iter().map(|t| t.bytes).sum::<i64>(),
         "heap_bytes": tables.iter().map(|t| t.heap_bytes).sum::<i64>(),
         "delete_count": tables.iter().map(|t| t.delete_count).sum::<i64>(),
+        "native_overlay_readable_tables": tables.iter().filter(|t| t.native_overlay_readable).count(),
     })
+}
+
+fn native_availability(tables: &[RvbbitTableMetric]) -> (bool, String) {
+    if tables.is_empty() {
+        return (true, "Rvbbit native PostgreSQL path available".to_string());
+    }
+    let dirty = tables.iter().filter(|t| t.shadow_heap_dirty).count();
+    if dirty == 0 {
+        return (
+            true,
+            "Rvbbit native parquet path available for clean accelerated row groups".to_string(),
+        );
+    }
+    let overlay_readable = tables
+        .iter()
+        .filter(|t| t.shadow_heap_dirty && t.native_overlay_readable)
+        .count();
+    if overlay_readable == dirty {
+        return (
+            true,
+            format!(
+                "Rvbbit native read-time overlay available for {dirty} dirty table(s)"
+            ),
+        );
+    }
+    (
+        true,
+        format!(
+            "Rvbbit native path available; {dirty} dirty table(s), {overlay_readable} overlay-readable"
+        ),
+    )
 }
 
 fn duck_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> (bool, String) {
@@ -4598,9 +4674,20 @@ fn duck_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> 
         .map(|t| t.heap_bytes)
         .sum();
     if dirty_heap_bytes > 0 {
+        let overlay_readable = tables
+            .iter()
+            .filter(|t| t.shadow_heap_dirty && t.native_overlay_readable)
+            .count();
+        let overlay_note = if overlay_readable > 0 {
+            format!("; native read-time overlay is available for {overlay_readable} table(s)")
+        } else {
+            String::new()
+        };
         return (
             false,
-            format!("parquet is not authoritative; heap tail has {dirty_heap_bytes} byte(s)"),
+            format!(
+                "parquet is not authoritative; heap tail has {dirty_heap_bytes} byte(s){overlay_note}"
+            ),
         );
     }
     let delete_count: i64 = tables.iter().map(|t| t.delete_count).sum();
@@ -5055,7 +5142,7 @@ fn candidate_availability(
         Candidate::DuckHive | Candidate::DataFusionHive => hive_availability(features, tables),
         Candidate::DuckVortex => duck_vortex_availability(features, tables),
         Candidate::DataFusionVortex => vortex_availability(features, tables),
-        Candidate::RvbbitNative => (true, "Rvbbit native PostgreSQL path available".to_string()),
+        Candidate::RvbbitNative => native_availability(tables),
         Candidate::RvbbitNativeVortex => native_vortex_candidate_availability(features, tables),
         Candidate::PgRowstore => pg_rowstore_availability(tables),
     }
@@ -5180,6 +5267,15 @@ const FALLBACK_COMPLEX_HIVE_FIRST: [Candidate; 3] = [
     Candidate::DuckVector,
     Candidate::DataFusionVector,
 ];
+
+fn all_dirty_tables_native_overlay_readable(tables: &[RvbbitTableMetric]) -> bool {
+    let dirty = tables.iter().filter(|t| t.shadow_heap_dirty).count();
+    dirty > 0
+        && tables
+            .iter()
+            .filter(|t| t.shadow_heap_dirty)
+            .all(|t| t.native_overlay_readable)
+}
 
 fn default_external_candidate(
     features: &RouteFeatures,
@@ -7099,6 +7195,7 @@ mod route_unit_tests {
             heap_bytes: 0,
             shadow_heap_retained: true,
             shadow_heap_dirty: false,
+            native_overlay_readable: false,
             delete_count: 0,
             text_columns: Vec::new(),
             temporal_columns: Vec::new(),

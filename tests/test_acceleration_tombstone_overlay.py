@@ -11,6 +11,12 @@ def _count_with_scan_barrier(rvbbit, table):
     ).fetchone()[0]
 
 
+def _plan_text(rvbbit, sql, analyze=False):
+    opts = "ANALYZE, COSTS OFF, TIMING OFF" if analyze else "FORMAT TEXT"
+    rows = rvbbit.execute(f"EXPLAIN ({opts}) {sql}").fetchall()
+    return "\n".join(row[0] for row in rows)
+
+
 def _dirty_flags(rvbbit, table):
     return rvbbit.execute(
         f"""
@@ -104,6 +110,35 @@ def test_pk_update_delta_refresh_uses_tombstone_overlay(rvbbit, temp_table):
     assert _overlay_state(rvbbit, temp_table) == (True, 4, 1, 2)
 
 
+def test_no_pk_update_dirty_read_time_overlay_uses_custom_scan(rvbbit, temp_table):
+    rvbbit.execute("SET rvbbit.accel_identity_map = 'on'")
+    rvbbit.execute(f"CREATE TABLE {temp_table} (id int, label text) USING rvbbit")
+    rvbbit.execute(
+        f"INSERT INTO {temp_table} VALUES (1, 'one'), (2, 'two'), (3, 'three')"
+    )
+    rvbbit.execute(f"SELECT rvbbit.refresh_acceleration('{temp_table}'::regclass, false)")
+
+    assert _identity_mode(rvbbit, temp_table) == "ctid"
+    rvbbit.execute(f"UPDATE {temp_table} SET label = 'two_v2' WHERE id = 2")
+    assert _dirty_flags(rvbbit, temp_table) == (True, False, True, False, False)
+    assert _overlay_state(rvbbit, temp_table) == (True, 3, 1, 1)
+
+    plan = _plan_text(
+        rvbbit,
+        f"SELECT count(*), string_agg(label, ',' ORDER BY id) "
+        f"FROM {temp_table} WHERE id >= 1",
+        analyze=True,
+    )
+    assert "Custom Scan (RvbbitParquetScan)" in plan
+    assert "Heap Tail: true" in plan
+    assert "Heap Tail Rows: 1" in plan
+    assert rvbbit.execute(
+        f"SELECT count(*), string_agg(label, ',' ORDER BY id) "
+        f"FROM {temp_table} WHERE id >= 1"
+    ).fetchone() == (3, "one,two_v2,three")
+    assert _rows(rvbbit, temp_table) == [(1, "one"), (2, "two_v2"), (3, "three")]
+
+
 def test_pk_delete_delta_refresh_uses_tombstone_overlay(rvbbit, temp_table):
     rvbbit.execute(
         f"CREATE TABLE {temp_table} (id int PRIMARY KEY, label text) USING rvbbit"
@@ -129,6 +164,62 @@ def test_pk_delete_delta_refresh_uses_tombstone_overlay(rvbbit, temp_table):
     assert _count_with_scan_barrier(rvbbit, temp_table) == 2
     assert _dirty_flags(rvbbit, temp_table) == (False, False, False, False, False)
     assert _overlay_state(rvbbit, temp_table) == (True, 3, 1, 1)
+
+
+def test_no_pk_delete_dirty_read_time_overlay_uses_custom_scan(rvbbit, temp_table):
+    rvbbit.execute("SET rvbbit.accel_identity_map = 'on'")
+    rvbbit.execute(f"CREATE TABLE {temp_table} (id int, label text) USING rvbbit")
+    rvbbit.execute(
+        f"INSERT INTO {temp_table} VALUES (1, 'keep'), (2, 'delete_me'), (3, 'keep2')"
+    )
+    rvbbit.execute(f"SELECT rvbbit.refresh_acceleration('{temp_table}'::regclass, false)")
+
+    assert _identity_mode(rvbbit, temp_table) == "ctid"
+    rvbbit.execute(f"DELETE FROM {temp_table} WHERE id = 2")
+    assert _dirty_flags(rvbbit, temp_table) == (True, False, False, True, False)
+    assert _overlay_state(rvbbit, temp_table) == (True, 3, 1, 1)
+
+    plan = _plan_text(
+        rvbbit,
+        f"SELECT count(*), string_agg(label, ',' ORDER BY id) "
+        f"FROM {temp_table} WHERE id >= 1",
+        analyze=True,
+    )
+    assert "Custom Scan (RvbbitParquetScan)" in plan
+    assert "Heap Tail: true" in plan
+    assert "Heap Tail Rows: 0" in plan
+    assert rvbbit.execute(
+        f"SELECT count(*), string_agg(label, ',' ORDER BY id) "
+        f"FROM {temp_table} WHERE id >= 1"
+    ).fetchone() == (2, "keep,keep2")
+    assert _rows(rvbbit, temp_table) == [(1, "keep"), (3, "keep2")]
+
+
+def test_router_marks_dirty_overlay_native_only(rvbbit, temp_table):
+    rvbbit.execute(
+        f"CREATE TABLE {temp_table} (id int PRIMARY KEY, label text) USING rvbbit"
+    )
+    rvbbit.execute(f"INSERT INTO {temp_table} VALUES (1, 'one'), (2, 'two')")
+    rvbbit.execute(f"SELECT rvbbit.refresh_acceleration('{temp_table}'::regclass, false)")
+    rvbbit.execute(f"UPDATE {temp_table} SET label = 'two_v2' WHERE id = 2")
+
+    explained = rvbbit.execute(
+        "SELECT rvbbit.route_explain(%s)",
+        (f"SELECT count(*) FROM {temp_table}",),
+    ).fetchone()[0]
+    assert explained["rvbbit_tables"][0]["native_overlay_readable"] is True
+    native = next(
+        c for c in explained["candidates"] if c["name"] == "rvbbit_native"
+    )
+    assert native["available"] is True
+    assert "read-time overlay" in native["reason"]
+    external = [
+        c
+        for c in explained["candidates"]
+        if c["name"] in {"duck_vector", "datafusion_vector", "duck_vortex", "datafusion_vortex"}
+    ]
+    assert any(c["available"] is False for c in external)
+    assert any("not authoritative" in c["reason"] for c in external)
 
 
 def test_pk_truncate_delta_refresh_tombstones_all_rows(rvbbit, temp_table):

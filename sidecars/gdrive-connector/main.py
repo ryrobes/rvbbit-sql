@@ -40,15 +40,28 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 EXPECTED_TOKEN = os.environ.get("CONNECTOR_TOKEN", "")
 STAGING_DIR = os.environ.get("STAGING_DIR", "/staging")
 SA_KEY = os.environ.get("GDRIVE_SA_KEY", "")
-PAGE_SIZE = int(os.environ.get("GDRIVE_PAGE_SIZE", "200"))
+
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    value = max(minimum, value)
+    return min(value, maximum) if maximum is not None else value
+
+
+MAX_STAGE_BYTES = _env_int("GDRIVE_MAX_STAGE_BYTES", 64 * 1024 * 1024)
+PAGE_SIZE = _env_int("GDRIVE_PAGE_SIZE", 200, maximum=1000)
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/drive.metadata.readonly",
@@ -76,7 +89,11 @@ def _service():
 
     if not SA_KEY:
         raise RuntimeError("GDRIVE_SA_KEY is not set")
-    info = json.loads(SA_KEY) if SA_KEY.lstrip().startswith("{") else json.load(open(SA_KEY))
+    if SA_KEY.lstrip().startswith("{"):
+        info = json.loads(SA_KEY)
+    else:
+        with open(SA_KEY, encoding="utf-8") as fh:
+            info = json.load(fh)
     ctype = (info.get("type") or "").strip()
     if not ctype:
         # Some files lack an explicit "type" (e.g. google-auth's creds.to_json()).
@@ -106,9 +123,9 @@ app = FastAPI()
 
 class SyncRequest(BaseModel):
     source_id: int | None = None
-    folders: list[str] = []
+    folders: list[str] = Field(default_factory=list)
     cursor: str | None = None
-    known: dict[str, str] = {}
+    known: dict[str, str] = Field(default_factory=dict)
 
 
 @app.get("/health")
@@ -168,8 +185,22 @@ def _content_hash(f: dict[str, Any]) -> str:
     return f.get("md5Checksum") or f"{f.get('modifiedTime','')}:{f.get('version','')}"
 
 
+def _declared_size(f: dict[str, Any]) -> int:
+    try:
+        return int(f.get("size") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_stage_name(file_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", file_id or "file")
+
+
 def _stage(svc, f: dict[str, Any], dest_dir: str) -> tuple[str, str, str | None]:
     """Download/export a file to staging. Returns (staged_path, effective_mime, inline_body|None)."""
+    if _declared_size(f) > MAX_STAGE_BYTES:
+        raise RuntimeError("file is larger than the staging byte limit")
+
     from googleapiclient.http import MediaIoBaseDownload
 
     os.makedirs(dest_dir, exist_ok=True)
@@ -182,13 +213,17 @@ def _stage(svc, f: dict[str, Any], dest_dir: str) -> tuple[str, str, str | None]
         eff_mime, ext = mime, os.path.splitext(f.get("name", ""))[1] or ""
         request = svc.files().get_media(fileId=f["id"], supportsAllDrives=True)
 
-    path = os.path.join(dest_dir, f["id"] + ext)
-    buf = io.FileIO(path, "wb")
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    buf.close()
+    path = os.path.join(dest_dir, _safe_stage_name(f["id"]) + ext)
+    with io.FileIO(path, "wb") as buf:
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    if os.path.getsize(path) > MAX_STAGE_BYTES:
+        try:
+            os.remove(path)
+        finally:
+            raise RuntimeError("downloaded file is larger than the staging byte limit")
 
     # Inline text so rvbbit can ingest without an extraction round-trip.
     inline = None

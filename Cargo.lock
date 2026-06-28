@@ -5596,6 +5596,7 @@ dependencies = [
  "lance",
  "lance-index",
  "lance-linalg",
+ "libc",
  "lru",
  "object_store 0.13.2",
  "parking_lot",

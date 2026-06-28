@@ -4,7 +4,8 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -64,7 +65,8 @@ struct DuckSession {
     key: DuckSessionKey,
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: ChildStdout,
+    stdout_buf: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -112,11 +114,12 @@ impl DuckSession {
             key,
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout,
+            stdout_buf: Vec::new(),
         })
     }
 
-    fn request(&mut self, request: &str) -> Result<Value, String> {
+    fn request(&mut self, request: &str, timeout: i32) -> Result<Value, String> {
         self.stdin
             .write_all(request.as_bytes())
             .map_err(|e| format!("persistent rvbbit-duck write failed: {e}"))?;
@@ -126,14 +129,12 @@ impl DuckSession {
         self.stdin
             .flush()
             .map_err(|e| format!("persistent rvbbit-duck flush failed: {e}"))?;
-        let mut response = String::new();
-        let bytes = self
-            .stdout
-            .read_line(&mut response)
-            .map_err(|e| format!("persistent rvbbit-duck read failed: {e}"))?;
-        if bytes == 0 {
-            return Err("persistent rvbbit-duck exited without a response".to_string());
-        }
+        let response = read_line_with_timeout(
+            &mut self.stdout,
+            &mut self.stdout_buf,
+            sidecar_io_timeout(timeout),
+            "persistent rvbbit-duck",
+        )?;
         serde_json::from_str(response.trim_end())
             .map_err(|e| format!("invalid persistent rvbbit-duck JSON: {e}"))
     }
@@ -243,6 +244,18 @@ fn shared_enabled() -> bool {
     guc_setting("rvbbit.duck_backend_shared")
         .map(|value| setting_enabled(&value, false))
         .unwrap_or_else(|| env_enabled("RVBBIT_DUCK_BACKEND_SHARED", false))
+}
+
+fn shared_strict_enabled() -> bool {
+    let value = guc_setting("rvbbit.duck_backend_shared_strict")
+        .or_else(|| std::env::var("RVBBIT_DUCK_BACKEND_SHARED_STRICT").ok());
+    shared_strict_value(value.as_deref())
+}
+
+fn shared_strict_value(value: Option<&str>) -> bool {
+    value
+        .map(|value| setting_enabled(value, false))
+        .unwrap_or(false)
 }
 
 fn shared_target_enabled(engine: &str, layout: &str) -> bool {
@@ -469,6 +482,7 @@ pub(crate) fn accelerator_runtime_status_value(live: bool) -> Value {
         "sidecar": {
             "persistent_enabled": persistent,
             "shared_enabled": shared,
+            "shared_strict": shared_strict_enabled(),
             "shared_targets": raw_shared_targets(),
             "shared_workers": shared_workers(),
             "shared_socket_duck_vortex": shared_socket,
@@ -992,6 +1006,11 @@ fn run_engine_query(
             result_format,
         )
         .or_else(|shared_err| {
+            if shared_strict_enabled() {
+                return Err(format!(
+                    "shared rvbbit-duck failed with rvbbit.duck_backend_shared_strict enabled: {shared_err}"
+                ));
+            }
             pgrx::warning!(
                 "rvbbit.{engine}_query_json: shared rvbbit-duck failed ({shared_err}); falling back to per-backend sidecar"
             );
@@ -1222,7 +1241,7 @@ fn derived_shared_socket_path(dir: &str, key: &DuckSharedKey) -> String {
 fn send_shared_request(socket_path: &str, request: &str, timeout: i32) -> Result<Value, String> {
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|e| format!("connecting to shared rvbbit-duck {socket_path}: {e}"))?;
-    let io_timeout = Duration::from_secs(timeout.max(1) as u64 + 5);
+    let io_timeout = sidecar_io_timeout(timeout);
     let _ = stream.set_read_timeout(Some(io_timeout));
     let _ = stream.set_write_timeout(Some(io_timeout));
     stream
@@ -1338,11 +1357,11 @@ fn execute_persistent(
     .map_err(|e| e.to_string())?;
     DUCK_SESSION.with(|slot| {
         let mut slot = slot.borrow_mut();
-        match send_persistent_request(&mut slot, &key, &request) {
+        match send_persistent_request(&mut slot, &key, &request, timeout) {
             Ok(value) => Ok(value),
             Err(first) => {
                 slot.take();
-                send_persistent_request(&mut slot, &key, &request)
+                send_persistent_request(&mut slot, &key, &request, timeout)
                     .map_err(|second| format!("{first}; retry failed: {second}"))
             }
         }
@@ -1353,6 +1372,7 @@ fn send_persistent_request(
     slot: &mut Option<DuckSession>,
     key: &DuckSessionKey,
     request: &str,
+    timeout: i32,
 ) -> Result<Value, String> {
     let needs_new = slot.as_ref().is_none_or(|session| session.key != *key);
     if needs_new {
@@ -1361,7 +1381,7 @@ fn send_persistent_request(
     }
     slot.as_mut()
         .ok_or_else(|| "persistent rvbbit-duck session unavailable".to_string())?
-        .request(request)
+        .request(request, timeout)
 }
 
 fn execute_engine_oneshot(
@@ -1375,7 +1395,8 @@ fn execute_engine_oneshot(
     threads: usize,
     result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
-    let output = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("--engine")
         .arg(engine)
         .arg("--layout")
@@ -1398,8 +1419,13 @@ fn execute_engine_oneshot(
         .arg(pgdata_prefix())
         .arg("--visible-pgdata-prefix")
         .arg(visible_pgdata_prefix())
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command
+        .spawn()
         .map_err(|e| format!("failed to start rvbbit-duck: {e}"))?;
+    let output = wait_child_output(child, timeout, "rvbbit-duck one-shot")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout).map_err(|e| {
@@ -1409,6 +1435,126 @@ fn execute_engine_oneshot(
             first_line(&stderr)
         )
     })
+}
+
+fn sidecar_io_timeout(timeout: i32) -> Duration {
+    Duration::from_secs(timeout.max(1) as u64 + 5)
+}
+
+fn read_line_with_timeout<R: Read + AsRawFd>(
+    reader: &mut R,
+    pending: &mut Vec<u8>,
+    timeout: Duration,
+    label: &str,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=pos).collect::<Vec<_>>();
+            return String::from_utf8(line).map_err(|e| format!("{label} returned non-UTF8: {e}"));
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "{label} read timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+        poll_readable(
+            reader.as_raw_fd(),
+            deadline.saturating_duration_since(now),
+            label,
+        )?;
+
+        let mut chunk = [0_u8; 8192];
+        match reader.read(&mut chunk) {
+            Ok(0) if pending.is_empty() => {
+                return Err(format!("{label} exited without a response"));
+            }
+            Ok(0) => {
+                let line = std::mem::take(pending);
+                return String::from_utf8(line)
+                    .map_err(|e| format!("{label} returned non-UTF8: {e}"));
+            }
+            Ok(n) => pending.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("{label} read failed: {e}")),
+        }
+    }
+}
+
+fn poll_readable(fd: RawFd, timeout: Duration, label: &str) -> Result<(), String> {
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    let mut fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    loop {
+        let rc = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+        if rc > 0 {
+            return Ok(());
+        }
+        if rc == 0 {
+            return Err(format!("{label} read timed out after {timeout_ms}ms"));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(format!("{label} poll failed: {err}"));
+    }
+}
+
+fn wait_child_output(
+    mut child: Child,
+    timeout_s: i32,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    wait_child_output_with_timeout(&mut child, timeout_s, label, sidecar_io_timeout(timeout_s))
+}
+
+fn wait_child_output_with_timeout(
+    child: &mut Child,
+    timeout_s: i32,
+    label: &str,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    pipe.read_to_end(&mut stdout)
+                        .map_err(|e| format!("reading {label} stdout: {e}"))?;
+                }
+                let mut stderr = Vec::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    pipe.read_to_end(&mut stderr)
+                        .map_err(|e| format!("reading {label} stderr: {e}"))?;
+                }
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) if start.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{label} exceeded timeout_s={timeout_s} (waited {}s including grace)",
+                    timeout.as_secs()
+                ));
+            }
+            Err(e) => return Err(format!("waiting for {label}: {e}")),
+        }
+    }
 }
 
 fn parse_column_names(value: &Value) -> Vec<String> {
@@ -1509,6 +1655,54 @@ mod tests {
             "scan"
         ));
         assert!(shared_target_list_matches("vortex", "duck", "vortex"));
+    }
+
+    #[test]
+    fn shared_strict_value_defaults_off_and_accepts_truthy_settings() {
+        assert!(!shared_strict_value(None));
+        assert!(!shared_strict_value(Some("")));
+        assert!(!shared_strict_value(Some("off")));
+        assert!(!shared_strict_value(Some("false")));
+        assert!(shared_strict_value(Some("on")));
+        assert!(shared_strict_value(Some("true")));
+    }
+
+    #[test]
+    fn wait_child_output_times_out_slow_processes() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 2")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = child;
+        let err =
+            wait_child_output_with_timeout(&mut child, 1, "test child", Duration::from_millis(20))
+                .unwrap_err();
+        assert!(err.contains("test child exceeded timeout_s=1"));
+    }
+
+    #[test]
+    fn persistent_read_times_out_slow_processes() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 2; printf '{\"status\":\"ok\"}\\n'")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut pending = Vec::new();
+        let err = read_line_with_timeout(
+            &mut stdout,
+            &mut pending,
+            Duration::from_millis(20),
+            "test persistent",
+        )
+        .unwrap_err();
+        assert!(err.contains("test persistent read timed out"));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

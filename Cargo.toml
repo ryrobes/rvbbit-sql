@@ -24,6 +24,7 @@ zstd = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 blake3 = "1"
 sha2 = "0.10"
+libc = "0.2"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 postgres = "0.19"

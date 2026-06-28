@@ -59,8 +59,19 @@ STATIC_KEY = os.environ.get("WAREHOUSE_MCP_KEY", "")        # legacy shared-key 
 # validate_config() refuses to start OAuth mode without an independent secret.
 JWT_SECRET = os.environ.get("WAREHOUSE_JWT_SECRET", "")
 JWT_ALG = "HS256"
-ACCESS_TTL = int(os.environ.get("WAREHOUSE_ACCESS_TTL", "3600"))                 # 1h
-REFRESH_TTL = int(os.environ.get("WAREHOUSE_REFRESH_TTL", str(30 * 24 * 3600)))  # 30d
+
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    value = max(minimum, value)
+    return min(value, maximum) if maximum is not None else value
+
+
+ACCESS_TTL = _env_int("WAREHOUSE_ACCESS_TTL", 3600, maximum=24 * 3600)            # 1h
+REFRESH_TTL = _env_int("WAREHOUSE_REFRESH_TTL", 30 * 24 * 3600)                  # 30d
 CODE_TTL = 300                                                                   # 5m
 SCOPE = "warehouse"
 MAX_PENDING = 2000        # caps on the unauthenticated in-memory OAuth state (DoS backstop)
@@ -72,7 +83,7 @@ LOGIN_MAX_FAILS = 5       # per-IP failed logins ...
 LOGIN_WINDOW = 300        # ... within this many seconds → lockout
 MIN_PASSWORD_LEN = 12
 SESSION_COOKIE = "wh_session"
-SESSION_TTL = int(os.environ.get("WAREHOUSE_SESSION_TTL", str(12 * 3600)))   # browser view session
+SESSION_TTL = _env_int("WAREHOUSE_SESSION_TTL", 12 * 3600, maximum=24 * 3600)   # browser view session
 
 
 def validate_config() -> list[str]:
@@ -131,7 +142,8 @@ class WarehouseAuthProvider:
         if not STATE_FILE or not os.path.exists(STATE_FILE):
             return
         try:
-            data = json.loads(open(STATE_FILE).read())
+            with open(STATE_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
             self._clients = {k: OAuthClientInformationFull.model_validate(v)
                              for k, v in data.get("clients", {}).items()}
             self._refresh = {k: v for k, v in data.get("refresh", {}).items() if v.get("exp", 0) > time.time()}
@@ -148,8 +160,9 @@ class WarehouseAuthProvider:
             data = {"clients": {k: v.model_dump(mode="json") for k, v in self._clients.items()},
                     "refresh": self._refresh}
             tmp = f"{STATE_FILE}.tmp"
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f)
+            os.chmod(tmp, 0o600)
             os.replace(tmp, STATE_FILE)   # atomic
         except Exception as e:   # noqa: BLE001 — persistence is best-effort
             print(f"WARNING: could not persist OAuth state: {e}", file=sys.stderr)

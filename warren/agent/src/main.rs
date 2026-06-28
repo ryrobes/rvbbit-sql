@@ -2191,6 +2191,7 @@ fn render_compose(manifest: &Value, safe_name: &str) -> Result<String> {
     );
     if let Some(extra) = runtime.get("env").and_then(Value::as_object) {
         for (k, v) in extra {
+            validate_compose_env_key(k)?;
             envs.insert(k.clone(), v.clone());
         }
     }
@@ -2205,13 +2206,22 @@ fn render_compose(manifest: &Value, safe_name: &str) -> Result<String> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let (volume_mounts, volume_defs) = render_runtime_volumes(runtime);
+    let (volume_mounts, volume_defs) = render_runtime_volumes(runtime)?;
     let runtime_source = render_runtime_source(runtime);
     let runtime_command = render_runtime_command(runtime);
     let runtime_ipc = render_runtime_ipc(runtime);
+    let health_url = format!(
+        "http://localhost:{container_port}{}",
+        normalized_endpoint_path(health_path)
+    );
+    let healthcheck_code = format!(
+        "import urllib.request; urllib.request.urlopen({}).read()",
+        serde_json::to_string(&health_url).unwrap()
+    );
+    let healthcheck_code = serde_json::to_string(&healthcheck_code).unwrap();
 
     Ok(format!(
-        "services:\n  {service}:\n{runtime_source}{runtime_command}{runtime_ipc}    container_name: rvbbit-{service}\n    expose:\n      - \"{container_port}\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://localhost:{container_port}{health_path}').read()\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
+        "services:\n  {service}:\n{runtime_source}{runtime_command}{runtime_ipc}    container_name: rvbbit-{service}\n    expose:\n      - \"{container_port}\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", {healthcheck_code}]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
     ))
 }
 
@@ -2326,7 +2336,7 @@ fn render_runtime_ipc(runtime: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn render_runtime_volumes(runtime: &Value) -> (String, String) {
+fn render_runtime_volumes(runtime: &Value) -> Result<(String, String)> {
     let specs = runtime
         .get("volumes")
         .and_then(Value::as_array)
@@ -2342,6 +2352,8 @@ fn render_runtime_volumes(runtime: &Value) -> (String, String) {
         let Some(mount) = spec.get("mount").and_then(Value::as_str) else {
             continue;
         };
+        validate_compose_volume_name(name)?;
+        validate_container_mount(mount)?;
         mounts.push(format!("      - {name}:{mount}"));
         defs.push(format!("  {name}:"));
     }
@@ -2349,7 +2361,41 @@ fn render_runtime_volumes(runtime: &Value) -> (String, String) {
         mounts.push("      - hf_cache:/root/.cache/huggingface".into());
         defs.push("  hf_cache:".into());
     }
-    (mounts.join("\n"), defs.join("\n"))
+    Ok((mounts.join("\n"), defs.join("\n")))
+}
+
+fn validate_compose_env_key(key: &str) -> Result<()> {
+    if is_env_name_like(key) {
+        Ok(())
+    } else {
+        bail!("runtime.env key {key:?} is not a valid environment variable name")
+    }
+}
+
+fn validate_compose_volume_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => bail!("runtime volume name {name:?} must start with an ASCII letter or digit"),
+    }
+    if chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')) {
+        Ok(())
+    } else {
+        bail!("runtime volume name {name:?} contains unsupported characters")
+    }
+}
+
+fn validate_container_mount(mount: &str) -> Result<()> {
+    if !mount.starts_with('/') {
+        bail!("runtime volume mount {mount:?} must be an absolute container path");
+    }
+    if mount
+        .chars()
+        .any(|c| matches!(c, ':' | '\r' | '\n') || c.is_control())
+    {
+        bail!("runtime volume mount {mount:?} contains unsupported characters");
+    }
+    Ok(())
 }
 
 /// True when this host appears able to expose an NVIDIA GPU to sidecar
@@ -3504,5 +3550,58 @@ mod gpu_tests {
         assert!(manifest_wants_gpu(&json!({
             "resources": {"gpu": {"required": true}}
         })));
+    }
+
+    #[test]
+    fn render_compose_rejects_unsafe_env_keys() {
+        let err = super::render_compose(
+            &json!({
+                "runtime": {
+                    "env": {
+                        "BAD: KEY": "value"
+                    }
+                }
+            }),
+            "bad_env",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("runtime.env key"));
+    }
+
+    #[test]
+    fn render_compose_rejects_unsafe_volume_short_syntax() {
+        let err = super::render_compose(
+            &json!({
+                "runtime": {
+                    "volumes": [
+                        {"name": "hf_cache", "mount": "/cache:ro"}
+                    ]
+                }
+            }),
+            "bad_volume",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("runtime volume mount"));
+    }
+
+    #[test]
+    fn render_compose_quotes_healthcheck_url_as_python_string() {
+        let rendered = super::render_compose(
+            &json!({
+                "runtime": {
+                    "health_path": "/health?probe='quoted'",
+                    "env": {
+                        "SAFE_KEY": "safe"
+                    }
+                }
+            }),
+            "quoted_health",
+        )
+        .unwrap();
+        assert!(rendered.contains(
+            "urllib.request.urlopen(\\\"http://localhost:8080/health?probe='quoted'\\\")"
+        ));
     }
 }

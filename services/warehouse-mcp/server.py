@@ -43,8 +43,19 @@ DSN = os.environ.get(
     "WAREHOUSE_DSN", "host=localhost port=55433 dbname=bench user=postgres password=rvbbit"
 )
 GRAPH = os.environ.get("RVBBIT_CATALOG_GRAPH", "db_catalog")
-ROW_CAP = int(os.environ.get("WAREHOUSE_ROW_CAP", "1000"))
-STMT_TIMEOUT_MS = int(os.environ.get("WAREHOUSE_STMT_TIMEOUT_MS", "30000"))
+
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    value = max(minimum, value)
+    return min(value, maximum) if maximum is not None else value
+
+
+ROW_CAP = _env_int("WAREHOUSE_ROW_CAP", 1000, maximum=100_000)
+STMT_TIMEOUT_MS = _env_int("WAREHOUSE_STMT_TIMEOUT_MS", 30_000, maximum=600_000)
 
 # Schema scoping — the warehouse and rvbbit's own internals share one database, so we
 # expose the data schemas and hide the engine's catalog. _DENY is always hidden;
@@ -2185,7 +2196,7 @@ def _with_api_key(app, key: str):
 def _serve_http():
     import uvicorn
     host = os.environ.get("WAREHOUSE_MCP_HOST", "0.0.0.0")
-    port = int(os.environ.get("WAREHOUSE_MCP_PORT", "8765"))
+    port = _env_int("WAREHOUSE_MCP_PORT", 8765, maximum=65_535)
     public = os.environ.get("WAREHOUSE_PUBLIC_URL", "").rstrip("/")
     if public:
         # OAuth mode: Claude Desktop/Cowork's native connector flow works (login at

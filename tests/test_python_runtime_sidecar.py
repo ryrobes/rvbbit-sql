@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -166,3 +167,83 @@ def test_sidecar_rejects_invalid_hashes_before_reconcile(monkeypatch, tmp_path):
     assert body["ok"] is False
     assert "env_hash must be a lowercase hex hash" in body["error"]
     assert not (tmp_path / "envs").exists()
+
+
+def test_sidecar_rejects_code_hash_mismatch_before_reconcile(monkeypatch, tmp_path):
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    client = TestClient(runtime.app)
+    payload = _payload(
+        handler_name="hash_rule",
+        code="def run(inputs):\n    return inputs\n",
+        inputs={"ok": True},
+    )
+    payload["handler"]["code_hash"] = hashlib.sha256(b"different code").hexdigest()
+
+    res = client.post("/run", json=payload)
+    body = res.json()
+
+    assert res.status_code == 200
+    assert body["ok"] is False
+    assert "code_hash does not match supplied handler code" in body["error"]
+    assert not (tmp_path / "envs").exists()
+    assert not (tmp_path / "handlers").exists()
+
+
+def test_sidecar_rewrites_corrupt_cached_handler(monkeypatch, tmp_path):
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    client = TestClient(runtime.app)
+    code = "def run(inputs):\n    return {'value': inputs['value'] * 2}\n"
+    payload = _payload(handler_name="double_rule", code=code, inputs={"value": 7})
+
+    first = client.post("/run", json=payload)
+    assert first.status_code == 200
+    assert first.json()["ok"] is True
+    assert first.json()["output"] == {"value": 14}
+
+    handler_path = (
+        tmp_path / "handlers" / payload["handler"]["code_hash"] / "handler.py"
+    )
+    handler_path.write_text(
+        "def run(inputs):\n    return {'value': -1}\n",
+        encoding="utf-8",
+    )
+
+    second = client.post("/run", json=payload)
+    assert second.status_code == 200
+    assert second.json()["ok"] is True
+    assert second.json()["output"] == {"value": 14}
+    assert handler_path.read_text(encoding="utf-8") == code
+
+
+def test_env_marker_requires_matching_python_and_requirements(monkeypatch, tmp_path):
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    env = runtime.EnvSpec(
+        name="ops_rules",
+        python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+        requirements=[],
+        env_hash="0" * 32,
+    )
+    marker = tmp_path / ".rvbbit-ready"
+    marker.write_text(
+        json.dumps(
+            {
+                "python_version": env.python_version,
+                "requirements_hash": runtime._requirements_hash([]),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert runtime._env_marker_matches(marker, env, []) is True
+
+    marker.write_text(
+        json.dumps(
+            {
+                "python_version": env.python_version,
+                "requirements_hash": runtime._requirements_hash(["requests==2.32.0"]),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert runtime._env_marker_matches(marker, env, []) is False

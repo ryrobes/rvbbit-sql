@@ -4,7 +4,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process;
@@ -42,6 +42,9 @@ const DEFAULT_TELEMETRY_QUEUE_CAPACITY: usize = 8192;
 const DEFAULT_TELEMETRY_BATCH_SIZE: usize = 64;
 const DEFAULT_TELEMETRY_FLUSH_MS: u64 = 250;
 const DEFAULT_TELEMETRY_HEARTBEAT_MS: u64 = 5000;
+const DEFAULT_BROKER_QUEUE_CAPACITY: usize = 1024;
+const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_SOCKET_IO_TIMEOUT_S: u64 = 30;
 
 static TELEMETRY_SINK: OnceLock<Option<Arc<TelemetrySink>>> = OnceLock::new();
 static TELEMETRY_QUEUE_DEPTH: AtomicI64 = AtomicI64::new(0);
@@ -1505,9 +1508,11 @@ impl ServerState {
 fn run_server(args: Args) -> Result<()> {
     let mut state = ServerState::new(&args, None)?;
     let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
     let mut stdout = io::BufWriter::new(io::stdout().lock());
-    for line in stdin.lock().lines() {
-        let line = line.context("reading server request")?;
+    while let Some(line) =
+        read_bounded_line(&mut reader, max_request_bytes()).context("reading server request")?
+    {
         if line.trim().is_empty() {
             continue;
         }
@@ -1532,17 +1537,23 @@ fn run_socket_server(args: Args) -> Result<()> {
         .serve_socket
         .as_deref()
         .ok_or_else(|| anyhow!("--serve-socket requires a path"))?;
-    if let Some(parent) = Path::new(socket_path).parent() {
+    let socket_path_ref = Path::new(socket_path);
+    if let Some(parent) = socket_path_ref.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating socket directory {}", parent.display()))?;
     }
-    let _ = fs::remove_file(socket_path);
+    remove_stale_socket(socket_path_ref)?;
     let listener =
         UnixListener::bind(socket_path).with_context(|| format!("binding {socket_path}"))?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o777))
         .with_context(|| format!("setting socket permissions on {socket_path}"))?;
     let workers = args.workers.max(1);
-    let (tx, rx) = mpsc::channel::<SocketJob>();
+    let queue_capacity =
+        env_usize("RVBBIT_DUCK_BROKER_QUEUE", DEFAULT_BROKER_QUEUE_CAPACITY).max(workers);
+    let max_request_bytes = max_request_bytes();
+    let socket_timeout = socket_io_timeout();
+    let default_response_timeout_s = args.timeout_s.max(1);
+    let (tx, rx) = mpsc::sync_channel::<SocketJob>(queue_capacity);
     let rx = Arc::new(Mutex::new(rx));
 
     for idx in 0..workers {
@@ -1591,8 +1602,15 @@ fn run_socket_server(args: Args) -> Result<()> {
         match stream {
             Ok(stream) => {
                 let tx = tx.clone();
+                let response_timeout_s = default_response_timeout_s;
                 thread::spawn(move || {
-                    let _ = handle_socket_client(stream, tx);
+                    let _ = handle_socket_client(
+                        stream,
+                        tx,
+                        max_request_bytes,
+                        socket_timeout,
+                        response_timeout_s,
+                    );
                 });
             }
             Err(err) => eprintln!("rvbbit-duck socket accept failed: {err}"),
@@ -1601,27 +1619,95 @@ fn run_socket_server(args: Args) -> Result<()> {
     Ok(())
 }
 
-fn handle_socket_client(mut stream: UnixStream, tx: mpsc::Sender<SocketJob>) -> Result<()> {
+fn remove_stale_socket(socket_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(socket_path)
+            .with_context(|| format!("removing stale socket {}", socket_path.display())),
+        Ok(_) => bail!(
+            "refusing to remove non-socket path {}",
+            socket_path.display()
+        ),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("checking socket {}", socket_path.display())),
+    }
+}
+
+fn handle_socket_client(
+    mut stream: UnixStream,
+    tx: mpsc::SyncSender<SocketJob>,
+    max_request_bytes: usize,
+    socket_timeout: Duration,
+    default_response_timeout_s: u64,
+) -> Result<()> {
     let reader_stream = stream.try_clone().context("cloning Unix stream")?;
+    reader_stream
+        .set_read_timeout(Some(socket_timeout))
+        .context("setting socket read timeout")?;
+    stream
+        .set_write_timeout(Some(socket_timeout))
+        .context("setting socket write timeout")?;
     let mut reader = BufReader::new(reader_stream);
-    let mut line = String::new();
-    let bytes = reader
-        .read_line(&mut line)
-        .context("reading socket request")?;
-    if bytes == 0 || line.trim().is_empty() {
+    let line = match read_bounded_line(&mut reader, max_request_bytes) {
+        Ok(Some(line)) => line,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            let error = format_error_chain(&err);
+            let _ = write_socket_response(
+                &mut stream,
+                &json!({"status": "fallback", "error": error}).to_string(),
+            );
+            return Err(err.context("reading socket request"));
+        }
+    };
+    if line.trim().is_empty() {
         return Ok(());
     }
+    let response_timeout = socket_response_timeout_s(&line, default_response_timeout_s);
     let (respond, response_rx) = mpsc::channel();
     BROKER_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
-    if let Err(err) = tx.send(SocketJob {
+    match tx.try_send(SocketJob {
         line,
         received_at: Instant::now(),
         respond,
     }) {
-        BROKER_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
-        return Err(anyhow!("dispatching socket request: {err}"));
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            BROKER_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+            return write_socket_response(
+                &mut stream,
+                &json!({
+                    "status": "fallback",
+                    "error": "rvbbit-duck broker queue is full"
+                })
+                .to_string(),
+            );
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            BROKER_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+            return Err(anyhow!(
+                "dispatching socket request: broker workers stopped"
+            ));
+        }
     }
-    let response = response_rx.recv().context("waiting for socket response")?;
+    let response = match response_rx.recv_timeout(Duration::from_secs(response_timeout)) {
+        Ok(response) => response,
+        Err(err) => {
+            let error =
+                format!("rvbbit-duck broker response timed out after {response_timeout}s: {err}");
+            let _ = write_socket_response(
+                &mut stream,
+                &json!({"status": "fallback", "error": error}).to_string(),
+            );
+            return Err(anyhow!(
+                "waiting for socket response for {response_timeout}s: {err}"
+            ));
+        }
+    };
+    write_socket_response(&mut stream, &response)?;
+    Ok(())
+}
+
+fn write_socket_response(stream: &mut UnixStream, response: &str) -> Result<()> {
     stream
         .write_all(response.as_bytes())
         .context("writing socket response")?;
@@ -1630,6 +1716,59 @@ fn handle_socket_client(mut stream: UnixStream, tx: mpsc::Sender<SocketJob>) -> 
         .context("writing socket response newline")?;
     stream.flush().context("flushing socket response")?;
     Ok(())
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Option<String>> {
+    let max_bytes = max_bytes.max(1);
+    let mut out = Vec::new();
+    loop {
+        let available = reader.fill_buf().context("filling request buffer")?;
+        if available.is_empty() {
+            break;
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(available.len());
+        if out.len().saturating_add(take) > max_bytes {
+            bail!("request line exceeds {max_bytes} bytes");
+        }
+        out.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if out.ends_with(b"\n") {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    String::from_utf8(out)
+        .map(Some)
+        .context("request line is not valid UTF-8")
+}
+
+fn max_request_bytes() -> usize {
+    env_usize("RVBBIT_DUCK_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES).max(1)
+}
+
+fn socket_io_timeout() -> Duration {
+    Duration::from_secs(
+        env_u64(
+            "RVBBIT_DUCK_SOCKET_IO_TIMEOUT_S",
+            DEFAULT_SOCKET_IO_TIMEOUT_S,
+        )
+        .clamp(1, 3600),
+    )
+}
+
+fn socket_response_timeout_s(line: &str, default_timeout_s: u64) -> u64 {
+    let requested = serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| value.get("timeout_s").and_then(Value::as_u64))
+        .unwrap_or(default_timeout_s)
+        .max(1);
+    requested.saturating_add(5).min(86_400)
 }
 
 fn server_response_json(
@@ -3374,6 +3513,7 @@ fn table_summaries(catalog: &BTreeMap<String, RvbbitDuckTable>) -> Vec<TableSumm
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     fn test_catalog() -> BTreeMap<String, RvbbitDuckTable> {
         let mut catalog = BTreeMap::new();
@@ -3449,5 +3589,86 @@ mod tests {
             "SELECT * FROM hits WHERE EXISTS (SELECT 1 FROM heap_table h)",
             &catalog
         ));
+    }
+
+    #[test]
+    fn bounded_line_preserves_following_bytes() {
+        let mut reader = BufReader::new("abc\nrest".as_bytes());
+        assert_eq!(
+            read_bounded_line(&mut reader, 8).unwrap(),
+            Some("abc\n".to_string())
+        );
+
+        let mut remaining = String::new();
+        reader.read_to_string(&mut remaining).unwrap();
+        assert_eq!(remaining, "rest");
+    }
+
+    #[test]
+    fn bounded_line_rejects_oversized_request() {
+        let mut reader = BufReader::new("abcdef\n".as_bytes());
+        let err = read_bounded_line(&mut reader, 4).unwrap_err().to_string();
+        assert!(err.contains("request line exceeds 4 bytes"));
+    }
+
+    #[test]
+    fn socket_response_timeout_uses_request_timeout_with_grace() {
+        assert_eq!(socket_response_timeout_s(r#"{"timeout_s": 10}"#, 300), 15);
+        assert_eq!(socket_response_timeout_s("not json", 300), 305);
+        assert_eq!(
+            socket_response_timeout_s(r#"{"timeout_s": 999999}"#, 300),
+            86_400
+        );
+    }
+
+    #[test]
+    fn stale_socket_removal_rejects_regular_files() {
+        let path = env::temp_dir().join(format!(
+            "rvbbit-duck-test-{}-regular",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"not a socket").unwrap();
+
+        let err = remove_stale_socket(&path).unwrap_err().to_string();
+        assert!(err.contains("refusing to remove non-socket path"));
+        assert!(path.exists());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stale_socket_removal_removes_socket_files() {
+        let path = env::temp_dir().join(format!(
+            "rvbbit-duck-test-{}-socket",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        drop(listener);
+
+        remove_stale_socket(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn socket_client_returns_fallback_when_broker_queue_is_full() {
+        let before_depth = BROKER_QUEUE_DEPTH.load(Ordering::Relaxed);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (tx, _rx) = mpsc::sync_channel::<SocketJob>(0);
+
+        client.write_all(br#"{"sql":"select 1"}"#).unwrap();
+        client.write_all(b"\n").unwrap();
+
+        handle_socket_client(server, tx, 1024, Duration::from_secs(1), 1).unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.contains("\"status\":\"fallback\""));
+        assert!(response.contains("broker queue is full"));
+        assert_eq!(BROKER_QUEUE_DEPTH.load(Ordering::Relaxed), before_depth);
     }
 }

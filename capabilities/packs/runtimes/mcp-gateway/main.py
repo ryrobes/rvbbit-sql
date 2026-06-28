@@ -22,6 +22,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -30,8 +31,9 @@ from contextlib import AsyncExitStack
 from typing import Any
 
 import asyncpg
+import httpx
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import AnyUrl, BaseModel
+from pydantic import AnyUrl, BaseModel, Field
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -77,6 +79,7 @@ _ENV_REF = re.compile(r"\$\{(\w+)\}")
 
 SECRETS_PATH = os.environ.get("RVBBIT_GATEWAY_SECRETS_PATH", "/app/data/mcp-secrets.bin")
 GATEWAY_TOKEN = os.environ.get("RVBBIT_GATEWAY_TOKEN") or None
+MAX_TIMEOUT_MS = 600_000
 
 try:
     from cryptography.fernet import Fernet
@@ -104,6 +107,7 @@ def _load_fernet():
         k = Fernet.generate_key()
         with open(key_path, "wb") as f:
             f.write(k)
+        os.chmod(key_path, 0o600)
         log.warning("mcp-gateway: generated a secret-store key at %s; set "
                     "RVBBIT_GATEWAY_SECRET_KEY (mounted) for durable production use", key_path)
         return Fernet(k)
@@ -143,6 +147,7 @@ class SecretStore:
             tmp = SECRETS_PATH + ".tmp"
             with open(tmp, "wb") as f:
                 f.write(raw)
+            os.chmod(tmp, 0o600)
             os.replace(tmp, SECRETS_PATH)
         except Exception as e:
             log.warning("mcp-gateway: could not persist secret store: %s", e)
@@ -196,6 +201,37 @@ def resolve_args(args: list | None, server_name: str | None = None) -> list:
     return [_expand_refs(a, server_name) if isinstance(a, str) else a for a in (args or [])]
 
 
+def resolve_auth_headers(config: "MCPServerConfig") -> dict[str, str]:
+    """Resolve the HTTP MCP bearer token named by auth_header_env."""
+    if not config.auth_header_env:
+        return {}
+    store = secrets.for_server(config.name)
+    token = store.get(config.auth_header_env) or os.environ.get(config.auth_header_env)
+    if not token:
+        log.warning(
+            "mcp-gateway: HTTP MCP server %r configured auth_header_env=%r, "
+            "but no matching secret or process env var is set",
+            config.name,
+            config.auth_header_env,
+        )
+        return {}
+    return {"Authorization": f"Bearer {token}"}
+
+
+def streamable_http_client_kwargs(headers: dict[str, str]) -> dict[str, Any]:
+    """Return kwargs compatible with the installed MCP SDK streamable client."""
+    if not headers:
+        return {}
+    params = inspect.signature(streamablehttp_client).parameters
+    if "headers" in params:
+        return {"headers": headers}
+    if "http_client" in params:
+        return {"http_client": httpx.AsyncClient(headers=headers)}
+    raise RuntimeError(
+        "installed mcp SDK streamablehttp_client does not support HTTP headers"
+    )
+
+
 # ---- DB config fetch ------------------------------------------------------
 
 
@@ -221,7 +257,15 @@ class MCPServerConfig:
             self.env = json.loads(self.env)
         self.url = row["url"]
         self.auth_header_env = row["auth_header_env"]
-        self.timeout_ms = row["timeout_ms"]
+        self.timeout_ms = _normalize_timeout_ms(row["timeout_ms"])
+
+
+def _normalize_timeout_ms(value: Any) -> int:
+    try:
+        timeout_ms = int(value or 30_000)
+    except (TypeError, ValueError):
+        timeout_ms = 30_000
+    return max(1, min(timeout_ms, MAX_TIMEOUT_MS))
 
 
 async def fetch_config(server_name: str) -> MCPServerConfig:
@@ -257,6 +301,9 @@ class MCPServerProcess:
         self._shutdown: asyncio.Event | None = None
         self._error: BaseException | None = None
 
+    def _timeout_s(self) -> float:
+        return self.config.timeout_ms / 1000.0
+
     async def _run(self) -> None:
         # Own the session's async-context lifecycle ENTIRELY within this one
         # task — enter AND exit here, never from a caller's task.
@@ -279,21 +326,38 @@ class MCPServerProcess:
                     args=resolve_args(self.config.args, self.config.name),
                     env={**os.environ, **resolve_env(self.config.env, self.config.name)},
                 )
-                read, write = await stack.enter_async_context(stdio_client(params))
+                read, write = await asyncio.wait_for(
+                    stack.enter_async_context(stdio_client(params)),
+                    timeout=self._timeout_s(),
+                )
             elif self.config.transport == "http":
                 if not HAS_HTTP_TRANSPORT:
                     raise RuntimeError(
                         "HTTP MCP transport not available; install a newer mcp SDK"
                     )
-                ctx = await stack.enter_async_context(
-                    streamablehttp_client(self.config.url)
+                stream_kwargs = streamable_http_client_kwargs(
+                    resolve_auth_headers(self.config)
+                )
+                http_client = stream_kwargs.get("http_client")
+                if http_client is not None:
+                    stream_kwargs["http_client"] = await stack.enter_async_context(
+                        http_client
+                    )
+                ctx = await asyncio.wait_for(
+                    stack.enter_async_context(
+                        streamablehttp_client(self.config.url, **stream_kwargs)
+                    ),
+                    timeout=self._timeout_s(),
                 )
                 # streamablehttp_client yields (read, write, get_session_id)
                 read, write = ctx[0], ctx[1]
             else:
                 raise ValueError(f"unknown transport: {self.config.transport!r}")
-            session = await stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
+            session = await asyncio.wait_for(
+                stack.enter_async_context(ClientSession(read, write)),
+                timeout=self._timeout_s(),
+            )
+            await asyncio.wait_for(session.initialize(), timeout=self._timeout_s())
             self.session = session
             log.info("started mcp server %r (transport=%s)",
                      self.config.name, self.config.transport)
@@ -329,7 +393,11 @@ class MCPServerProcess:
         self._ready = asyncio.Event()
         self._shutdown = asyncio.Event()
         self._runner = asyncio.create_task(self._run())
-        await self._ready.wait()
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=self._timeout_s())
+        except asyncio.TimeoutError:
+            await self._reset_locked()
+            raise
         if self._error is not None:
             err = self._error
             await self._reset_locked()
@@ -341,7 +409,7 @@ class MCPServerProcess:
             try:
                 return await asyncio.wait_for(
                     self.session.call_tool(name, arguments),
-                    timeout=self.config.timeout_ms / 1000.0,
+                    timeout=self._timeout_s(),
                 )
             except Exception:
                 # subprocess may be in a bad state — reset so the next
@@ -353,8 +421,15 @@ class MCPServerProcess:
         async with self.lock:
             await self.ensure_started()
             if self._tools_cache is None:
-                result = await self.session.list_tools()
-                self._tools_cache = list(result.tools)
+                try:
+                    result = await asyncio.wait_for(
+                        self.session.list_tools(),
+                        timeout=self._timeout_s(),
+                    )
+                    self._tools_cache = list(result.tools)
+                except Exception:
+                    await self._reset_locked()
+                    raise
             return self._tools_cache
 
     async def list_resources(self) -> list:
@@ -363,8 +438,14 @@ class MCPServerProcess:
         async with self.lock:
             await self.ensure_started()
             try:
-                result = await self.session.list_resources()
+                result = await asyncio.wait_for(
+                    self.session.list_resources(),
+                    timeout=self._timeout_s(),
+                )
                 return list(getattr(result, "resources", []))
+            except asyncio.TimeoutError:
+                await self._reset_locked()
+                return []
             except Exception:
                 return []
 
@@ -374,7 +455,7 @@ class MCPServerProcess:
             try:
                 return await asyncio.wait_for(
                     self.session.read_resource(AnyUrl(uri)),
-                    timeout=self.config.timeout_ms / 1000.0,
+                    timeout=self._timeout_s(),
                 )
             except Exception:
                 await self._reset_locked()
@@ -427,7 +508,7 @@ async def evict_server(name: str) -> None:
 class CallRequest(BaseModel):
     server: str
     tool: str
-    arguments: dict = {}
+    arguments: dict = Field(default_factory=dict)
 
 
 def _serialize_content(c: Any) -> dict:
@@ -514,6 +595,8 @@ async def refresh(server: str, authorization: str | None = Header(default=None))
     proc = await get_server(server)
     try:
         tools = await proc.list_tools()
+    except asyncio.TimeoutError:
+        raise HTTPException(504, f"refresh for '{server}' timed out")
     except Exception as e:
         raise HTTPException(500, f"{type(e).__name__}: {e}")
     # Resources may not be supported — silent fall-through to [].
@@ -537,6 +620,8 @@ async def get_tools(server: str, authorization: str | None = Header(default=None
     proc = await get_server(server)
     try:
         tools = await proc.list_tools()
+    except asyncio.TimeoutError:
+        raise HTTPException(504, f"tools/list for '{server}' timed out")
     except Exception as e:
         raise HTTPException(500, f"{type(e).__name__}: {e}")
     return {"tools": [_serialize_tool(t) for t in tools]}

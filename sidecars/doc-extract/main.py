@@ -22,13 +22,27 @@ the `doc_extractor` capability (upserts the deployed endpoint).
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 EXPECTED_TOKEN = os.environ.get("EXTRACT_TOKEN", "")
-MAX_BYTES = int(os.environ.get("EXTRACT_MAX_BYTES", str(64 * 1024 * 1024)))  # 64 MiB guard
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+MAX_BYTES = _env_int("EXTRACT_MAX_BYTES", 64 * 1024 * 1024)  # 64 MiB guard
+STAGING_DIR = Path(
+    os.environ.get("EXTRACT_STAGING_DIR", os.environ.get("STAGING_DIR", "/staging"))
+)
 _TEXT_EXT = (".md", ".markdown", ".txt", ".rst", ".org", ".log", ".text")
 
 _md = None
@@ -60,16 +74,28 @@ def health() -> dict[str, Any]:
     return {"ok": True}
 
 
+def _staged_file(raw_path: str) -> Path | None:
+    if not raw_path:
+        return None
+    try:
+        base = STAGING_DIR.resolve(strict=False)
+        path = Path(raw_path).resolve(strict=True)
+        path.relative_to(base)
+    except Exception:
+        return None
+    return path if path.is_file() else None
+
+
 def _extract_one(item: dict[str, Any]) -> str:
-    path = str((item or {}).get("staged_path") or "")
-    if not path or not os.path.isfile(path):
+    path = _staged_file(str((item or {}).get("staged_path") or ""))
+    if path is None:
         return ""  # nothing staged → skip
     try:
-        if os.path.getsize(path) > MAX_BYTES:
+        if path.stat().st_size > MAX_BYTES:
             return ""  # too large to extract inline (future: streamed path)
         mime = str((item or {}).get("mime") or "").lower()
         # Plain text / markdown: read directly — cheaper than a parser round-trip.
-        if mime.startswith("text/") or path.lower().endswith(_TEXT_EXT):
+        if mime.startswith("text/") or str(path).lower().endswith(_TEXT_EXT):
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 return fh.read().strip()
         result = _converter().convert(path)

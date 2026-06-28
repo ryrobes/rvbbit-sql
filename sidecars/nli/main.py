@@ -56,17 +56,38 @@ MODEL_NAME = os.environ.get(
     "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli",
 )
 EXPECTED_TOKEN = os.environ.get("NLI_TOKEN", "")
-ENTAIL_THRESHOLD = float(os.environ.get("NLI_ENTAIL_THRESHOLD", "0.4"))
-CONTRADICT_THRESHOLD = float(os.environ.get("NLI_CONTRADICT_THRESHOLD", "0.4"))
 FORCE_DEVICE = os.environ.get("NLI_DEVICE", "").lower()
+
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    value = max(minimum, value)
+    return min(value, maximum) if maximum is not None else value
+
+
+def _env_float(
+    name: str, default: float, minimum: float = 0.0, maximum: float = 1.0
+) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+ENTAIL_THRESHOLD = _env_float("NLI_ENTAIL_THRESHOLD", 0.4)
+CONTRADICT_THRESHOLD = _env_float("NLI_CONTRADICT_THRESHOLD", 0.4)
 
 # Batching knobs. /classify and /entails build NLI premise/hypothesis
 # pairs and push them through the model in GPU batches of this size.
-NLI_BATCH_SIZE = int(os.environ.get("NLI_BATCH_SIZE", "64"))
+NLI_BATCH_SIZE = _env_int("NLI_BATCH_SIZE", 64, maximum=4096)
 # /classify truncates the premise harder than raw NLI: a sentiment or
 # topic label is decided by the opening of a narrative, not its tail.
-CLASSIFY_MAX_LEN = int(os.environ.get("NLI_CLASSIFY_MAX_LEN", "256"))
-NLI_MAX_LEN = int(os.environ.get("NLI_MAX_LEN", "512"))
+CLASSIFY_MAX_LEN = _env_int("NLI_CLASSIFY_MAX_LEN", 256, maximum=8192)
+NLI_MAX_LEN = _env_int("NLI_MAX_LEN", 512, maximum=8192)
 HYPOTHESIS_TEMPLATE = os.environ.get("NLI_HYPOTHESIS_TEMPLATE", "This example is {}.")
 
 _nli_model = None  # bare AutoModelForSequenceClassification

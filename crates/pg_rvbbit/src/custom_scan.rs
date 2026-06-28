@@ -45,6 +45,7 @@ use rvbbit_storage::row_group::RowGroupReader;
 
 const SCAN_LAYOUT: &str = "scan";
 const CLUSTER_LAYOUT_PREFIX: &str = "cluster:";
+const XID_EPOCH_WIDTH: u128 = 4_294_967_296;
 /// The columnar Vortex variant layout name (mirrors compact.rs `VORTEX_SCAN_LAYOUT`).
 /// When `rvbbit.native_vortex` is on and a ready variant exists, the native scan
 /// reads these `.vortex` files instead of canonical parquet (Phase 3 of
@@ -224,6 +225,61 @@ struct RustScanState {
     /// rg_id of the row group whose batch is currently being emitted from.
     /// Updated whenever current_batch transitions to a new row group.
     current_rg_id: i64,
+    /// LSM-style latest read: after parquet row groups are exhausted, emit
+    /// visible retained-heap rows whose inserting xmin is newer than the last
+    /// acceleration watermark. Insert-only dirtiness uses this directly; dirty
+    /// UPDATE/DELETE/TRUNCATE episodes use it only when delete_log tombstones
+    /// are backed by a complete row-identity overlay.
+    heap_tail: Option<HeapTailScan>,
+    heap_tail_active: bool,
+}
+
+struct HeapTailScan {
+    rel: pg_sys::Relation,
+    scan: pg_sys::TableScanDesc,
+    slot: *mut pg_sys::TupleTableSlot,
+    watermark_xid: u128,
+    reference_xmax: u128,
+    emitted: i64,
+}
+
+impl HeapTailScan {
+    unsafe fn reset(&mut self) {
+        if !self.slot.is_null() {
+            pg_sys::ExecClearTuple(self.slot);
+        }
+        if !self.scan.is_null() {
+            pg_sys::table_rescan(self.scan, std::ptr::null_mut());
+        }
+        self.emitted = 0;
+    }
+}
+
+impl Drop for HeapTailScan {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.slot.is_null() {
+                pg_sys::ExecDropSingleTupleTableSlot(self.slot);
+                self.slot = std::ptr::null_mut();
+            }
+            if !self.scan.is_null() {
+                pg_sys::table_endscan(self.scan);
+                self.scan = std::ptr::null_mut();
+            }
+            if !self.rel.is_null() {
+                pg_sys::table_close(
+                    self.rel,
+                    pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                );
+                self.rel = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+struct HeapTailConfig {
+    watermark_xid: u128,
+    reference_xmax: u128,
 }
 
 /// (attnum_idx, reader, has_nulls). attnum_idx is 0-based into pg_attrs.
@@ -470,7 +526,7 @@ unsafe extern "C-unwind" fn create_custom_scan_state(
 #[pg_guard]
 unsafe extern "C-unwind" fn begin_custom_scan(
     node: *mut pg_sys::CustomScanState,
-    _estate: *mut pg_sys::EState,
+    estate: *mut pg_sys::EState,
     _eflags: i32,
 ) {
     let ext = node as *mut RvbbitScanStateExt;
@@ -584,6 +640,12 @@ unsafe extern "C-unwind" fn begin_custom_scan(
         Err(_) => HashMap::new(),
     };
 
+    let heap_tail = match heap_tail_config_for_table(table_oid, asof) {
+        Ok(Some(config)) => Some(open_heap_tail_scan(table_oid, config, estate)),
+        Ok(None) => None,
+        Err(e) => pgrx::error!("rvbbit custom scan: {}", e),
+    };
+
     // Phase 3: native+vortex can't faithfully apply per-row tombstones to the
     // columnar variant (multi-chunk vortex uses synthetic rg_ids that don't line
     // up with the delete log's per-rg bitmaps), so when there are deletes visible
@@ -642,8 +704,164 @@ unsafe extern "C-unwind" fn begin_custom_scan(
         dynamic_quals_dirty: true,
         delete_bitmaps,
         current_rg_id,
+        heap_tail,
+        heap_tail_active: false,
     });
     (*ext).rust_state_ptr = Box::into_raw(rust_state);
+}
+
+fn heap_tail_config_for_table(
+    table_oid: u32,
+    asof: Option<i64>,
+) -> Result<Option<HeapTailConfig>, String> {
+    if asof.is_some() {
+        return Ok(None);
+    }
+    let mut row_seen = false;
+    let mut retained = false;
+    let mut dirty = false;
+    let mut has_update = false;
+    let mut has_delete = false;
+    let mut has_truncate = false;
+    let mut watermark = String::new();
+    let mut reference_xmax = String::new();
+    pgrx::Spi::connect(|client| -> Result<(), String> {
+        let rows = client
+            .select(
+                &format!(
+                    "SELECT coalesce(ds.shadow_heap_retained, false), \
+                            coalesce(ds.shadow_heap_dirty, false), \
+                            coalesce(ds.dirty_has_update, false), \
+                            coalesce(ds.dirty_has_delete, false), \
+                            coalesce(ds.dirty_has_truncate, false), \
+                            coalesce(a.last_refresh_xid, 0)::text, \
+                            (pg_snapshot_xmax(pg_current_snapshot())::text)::numeric::text \
+                     FROM rvbbit.table_dirty_state ds \
+                     LEFT JOIN rvbbit.acceleration_state a \
+                       ON a.table_oid = ds.table_oid \
+                     WHERE ds.table_oid = {table_oid}::oid"
+                ),
+                Some(1),
+                &[],
+            )
+            .map_err(|e| format!("SPI tail state select: {e}"))?;
+        for row in rows {
+            row_seen = true;
+            retained = row
+                .get::<bool>(1)
+                .map_err(|e| format!("SPI tail retained: {e}"))?
+                .unwrap_or(false);
+            dirty = row
+                .get::<bool>(2)
+                .map_err(|e| format!("SPI tail dirty: {e}"))?
+                .unwrap_or(false);
+            has_update = row
+                .get::<bool>(3)
+                .map_err(|e| format!("SPI tail update: {e}"))?
+                .unwrap_or(false);
+            has_delete = row
+                .get::<bool>(4)
+                .map_err(|e| format!("SPI tail delete: {e}"))?
+                .unwrap_or(false);
+            has_truncate = row
+                .get::<bool>(5)
+                .map_err(|e| format!("SPI tail truncate: {e}"))?
+                .unwrap_or(false);
+            watermark = row
+                .get::<String>(6)
+                .map_err(|e| format!("SPI tail watermark: {e}"))?
+                .unwrap_or_else(|| "0".to_string());
+            reference_xmax = row
+                .get::<String>(7)
+                .map_err(|e| format!("SPI tail reference xmax: {e}"))?
+                .unwrap_or_else(|| "0".to_string());
+        }
+        Ok(())
+    })
+    .map_err(|e| format!("SPI tail state connect: {e}"))?;
+
+    if !row_seen || !dirty {
+        return Ok(None);
+    }
+    let append_only = retained && !has_update && !has_delete && !has_truncate;
+    let overlay_readable = retained
+        && (append_only || overlay_ready_for_table(table_oid).map_err(|e| format!("SPI overlay ready: {e}"))?);
+    if overlay_readable {
+        let watermark_xid = parse_xid_numeric(&watermark)
+            .ok_or_else(|| format!("invalid heap-tail watermark {watermark:?}"))?;
+        if watermark_xid == 0 {
+            return Err(
+                "dirty table has no acceleration watermark; use heap scan or refresh"
+                    .to_string(),
+            );
+        }
+        let reference_xmax = parse_xid_numeric(&reference_xmax)
+            .ok_or_else(|| format!("invalid heap-tail reference xmax {reference_xmax:?}"))?;
+        return Ok(Some(HeapTailConfig {
+            watermark_xid,
+            reference_xmax,
+        }));
+    }
+
+    Err(
+        "latest accelerated plan is stale for a dirty table without a complete read overlay; \
+         replan or set rvbbit.force_heap_scan=on"
+            .to_string(),
+    )
+}
+
+fn overlay_ready_for_table(table_oid: u32) -> Result<bool, pgrx::spi::Error> {
+    pgrx::Spi::get_one::<bool>(&format!(
+        "SELECT rvbbit.accel_overlay_ready({table_oid}::oid)"
+    ))
+    .map(|value| value.unwrap_or(false))
+}
+
+fn parse_xid_numeric(raw: &str) -> Option<u128> {
+    raw.trim().parse::<u128>().ok()
+}
+
+unsafe fn open_heap_tail_scan(
+    table_oid: u32,
+    config: HeapTailConfig,
+    estate: *mut pg_sys::EState,
+) -> HeapTailScan {
+    let rel = pg_sys::table_open(
+        pg_sys::Oid::from(table_oid),
+        pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+    );
+    if rel.is_null() {
+        pgrx::error!("rvbbit custom scan: failed to open heap tail relation {table_oid}");
+    }
+    let snapshot = if !estate.is_null() && !(*estate).es_snapshot.is_null() {
+        (*estate).es_snapshot
+    } else {
+        let active = pg_sys::GetActiveSnapshot();
+        if active.is_null() {
+            pg_sys::GetTransactionSnapshot()
+        } else {
+            active
+        }
+    };
+    let scan = pg_sys::table_beginscan(rel, snapshot, 0, std::ptr::null_mut());
+    if scan.is_null() {
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        pgrx::error!("rvbbit custom scan: failed to begin heap tail scan");
+    }
+    let slot = pg_sys::MakeSingleTupleTableSlot((*rel).rd_att, pg_sys::table_slot_callbacks(rel));
+    if slot.is_null() {
+        pg_sys::table_endscan(scan);
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        pgrx::error!("rvbbit custom scan: failed to allocate heap tail slot");
+    }
+    HeapTailScan {
+        rel,
+        scan,
+        slot,
+        watermark_xid: config.watermark_xid,
+        reference_xmax: config.reference_xmax,
+        emitted: 0,
+    }
 }
 
 /// Walk the qual list and build a conservative predicate tree from the
@@ -2942,6 +3160,79 @@ unsafe fn emit_indexed_row(
     std::ptr::null_mut()
 }
 
+unsafe fn emit_heap_tail_row(
+    node: *mut pg_sys::CustomScanState,
+    state: &mut RustScanState,
+    scan_slot: *mut pg_sys::TupleTableSlot,
+) -> Option<*mut pg_sys::TupleTableSlot> {
+    let n_attrs = state.pg_attrs.len();
+    let Some(tail) = state.heap_tail.as_mut() else {
+        return None;
+    };
+    while pg_sys::table_scan_getnextslot(
+        tail.scan,
+        pg_sys::ScanDirection::ForwardScanDirection,
+        tail.slot,
+    ) {
+        let mut should_free = false;
+        let tuple = pg_sys::ExecFetchSlotHeapTuple(tail.slot, false, &mut should_free);
+        if tuple.is_null() || (*tuple).t_data.is_null() {
+            continue;
+        }
+        let raw_xmin = (*(*tuple).t_data).t_choice.t_heap.t_xmin;
+        let full_xmin = reconstruct_full_xid(raw_xmin, tail.reference_xmax);
+        if full_xmin <= tail.watermark_xid {
+            continue;
+        }
+
+        copy_heap_slot_to_virtual_slot(tail.slot, scan_slot, n_attrs);
+        pg_sys::ExecStoreVirtualTuple(scan_slot);
+
+        let ps = &(*node).ss.ps;
+        let econtext = ps.ps_ExprContext;
+        (*econtext).ecxt_scantuple = scan_slot;
+
+        let qual = ps.qual;
+        if !qual.is_null() && !pg_sys::ExecQual(qual, econtext) {
+            continue;
+        }
+
+        tail.emitted += 1;
+        let proj_info = ps.ps_ProjInfo;
+        if !proj_info.is_null() {
+            return Some(pg_sys::ExecProject(proj_info));
+        }
+        return Some(scan_slot);
+    }
+    None
+}
+
+fn reconstruct_full_xid(raw_xid: pg_sys::TransactionId, reference_xmax: u128) -> u128 {
+    let epoch_base = (reference_xmax / XID_EPOCH_WIDTH) * XID_EPOCH_WIDTH;
+    let raw_xid: u32 = raw_xid.into();
+    let candidate = epoch_base + raw_xid as u128;
+    if candidate > reference_xmax && candidate >= XID_EPOCH_WIDTH {
+        candidate - XID_EPOCH_WIDTH
+    } else {
+        candidate
+    }
+}
+
+unsafe fn copy_heap_slot_to_virtual_slot(
+    heap_slot: *mut pg_sys::TupleTableSlot,
+    out_slot: *mut pg_sys::TupleTableSlot,
+    n_attrs: usize,
+) {
+    let values = (*out_slot).tts_values;
+    let nulls = (*out_slot).tts_isnull;
+    for idx in 0..n_attrs {
+        let mut is_null = false;
+        let datum = pg_sys::slot_getattr(heap_slot, (idx + 1) as i32, &mut is_null);
+        *values.add(idx) = datum;
+        *nulls.add(idx) = is_null;
+    }
+}
+
 // --- ExecCustomScan: return one tuple per call -----------------------------
 
 #[pg_guard]
@@ -2958,12 +3249,21 @@ unsafe extern "C-unwind" fn exec_custom_scan(
         state.slot_nulls_initialized = true;
     }
     refresh_dynamic_quals(state, node);
-    prepare_indexed_lookup(state);
+    if state.heap_tail.is_none() {
+        prepare_indexed_lookup(state);
+    }
     if state.indexed_lookup_active {
         return emit_indexed_row(node, state, scan_slot);
     }
 
     loop {
+        if state.heap_tail_active {
+            if let Some(slot) = emit_heap_tail_row(node, state, scan_slot) {
+                return slot;
+            }
+            return std::ptr::null_mut();
+        }
+
         // Need a current batch with rows remaining?
         if let Some(batch) = &state.current_batch {
             if state.row_in_batch < batch.num_rows() {
@@ -3042,7 +3342,10 @@ unsafe extern "C-unwind" fn exec_custom_scan(
         // The cached-replay fast path (re-emitting accumulated batches on rescan)
         // also loses per-row-group ordinals, so skip it when tombstones are
         // visible and re-read parquet instead (correct via batch_base).
-        if !state.dynamic_quals.is_empty() && state.cache_complete && state.delete_bitmaps.is_empty()
+        if state.heap_tail.is_none()
+            && !state.dynamic_quals.is_empty()
+            && state.cache_complete
+            && state.delete_bitmaps.is_empty()
         {
             if state.cached_batch_idx < state.cached_batches.len() {
                 state.current_batch = Some(state.cached_batches[state.cached_batch_idx].clone());
@@ -3124,6 +3427,10 @@ unsafe extern "C-unwind" fn exec_custom_scan(
                         state.cached_batch_idx = state.cached_batches.len();
                         state.indexed_lookup_dirty = false;
                         state.indexed_lookup_active = false;
+                    }
+                    if state.heap_tail.is_some() {
+                        state.heap_tail_active = true;
+                        continue;
                     }
                     return std::ptr::null_mut(); // EOF
                 }
@@ -4014,6 +4321,10 @@ unsafe extern "C-unwind" fn rescan_custom_scan(node: *mut pg_sys::CustomScanStat
     state.qual_readers.clear();
     state.qual_rhs_readers.clear();
     state.dynamic_quals_dirty = true;
+    state.heap_tail_active = false;
+    if let Some(tail) = state.heap_tail.as_mut() {
+        tail.reset();
+    }
 }
 
 #[pg_guard]
@@ -4044,6 +4355,17 @@ unsafe extern "C-unwind" fn explain_custom_scan(
         state.pruned_row_groups as i64,
         es,
     );
+    let label = std::ffi::CString::new("Heap Tail").unwrap();
+    pg_sys::ExplainPropertyBool(label.as_ptr(), state.heap_tail.is_some(), es);
+    if let Some(tail) = state.heap_tail.as_ref() {
+        let label = std::ffi::CString::new("Heap Tail Rows").unwrap();
+        pg_sys::ExplainPropertyInteger(
+            label.as_ptr(),
+            std::ptr::null(),
+            tail.emitted,
+            es,
+        );
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
