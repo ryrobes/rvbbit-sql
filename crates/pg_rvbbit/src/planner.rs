@@ -41,6 +41,9 @@ const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
 
 thread_local! {
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
+    // True-only cache. If the catalog is absent during CREATE EXTENSION or in a
+    // sibling database that only hosts pg_cron, do not cache false forever.
+    static RVBBIT_TABLES_PRESENT: Cell<bool> = const { Cell::new(false) };
     static IS_RVBBIT_CACHE: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::new());
     static ROW_GROUPS_CACHE: RefCell<HashMap<u32, i64>> = RefCell::new(HashMap::new());
     /// Cached `(sum_n_rows, sum_n_bytes)` aggregates per table. Filled on
@@ -454,10 +457,33 @@ fn guc_setting(name: &str) -> Option<String> {
     }
 }
 
+fn rvbbit_tables_catalog_present() -> bool {
+    if RVBBIT_TABLES_PRESENT.with(|c| c.get()) {
+        return true;
+    }
+    let old = IN_HOOK.with(|f| {
+        let old = f.get();
+        f.set(true);
+        old
+    });
+    let present = pgrx::Spi::get_one::<bool>("SELECT to_regclass('rvbbit.tables') IS NOT NULL")
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    IN_HOOK.with(|f| f.set(old));
+    if present {
+        RVBBIT_TABLES_PRESENT.with(|c| c.set(true));
+    }
+    present
+}
+
 /// Cached lookup: is this relation enabled in the rvbbit acceleration registry?
 fn is_rvbbit_table(oid: u32) -> bool {
     if let Some(cached) = IS_RVBBIT_CACHE.with(|c| c.borrow().get(&oid).copied()) {
         return cached;
+    }
+    if !rvbbit_tables_catalog_present() {
+        return false;
     }
     IN_HOOK.with(|f| f.set(true));
     let result: Result<Option<bool>, _> = pgrx::Spi::get_one(&format!(

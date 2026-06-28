@@ -40,6 +40,9 @@ static mut PREV_POST_PARSE_ANALYZE_HOOK: pg_sys::post_parse_analyze_hook_type = 
 
 thread_local! {
     static IN_REWRITER: Cell<bool> = const { Cell::new(false) };
+    // True-only cache. Missing can be transient during CREATE EXTENSION, and
+    // sibling databases such as pg_cron's home DB may never carry rvbbit tables.
+    static RVBBIT_TABLES_PRESENT: Cell<bool> = const { Cell::new(false) };
     static DUCK_REWRITE_DISABLED: Cell<bool> = const { Cell::new(false) };
     static DUCK_ROUTE_CACHE: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
     static NATIVE_REWRITE_CACHE: RefCell<HashMap<String, NativeRewriteCacheEntry>> =
@@ -10019,6 +10022,9 @@ fn metadata_rewrites_unsafe_for_correctness() -> bool {
     if guc_setting("rvbbit.as_of_timestamp").is_some_and(|v| !v.trim().is_empty()) {
         return true;
     }
+    if !rvbbit_tables_catalog_present() {
+        return false;
+    }
     // Existence guard: PG parses BOTH branches of a CASE at plan time, so
     // a single CASE-guarded EXISTS still fails when rvbbit.delete_log
     // doesn't exist yet (CREATE EXTENSION's first CREATE TABLE runs the
@@ -10137,12 +10143,35 @@ thread_local! {
     static IS_RVBBIT_CACHE: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::new());
 }
 
+fn rvbbit_tables_catalog_present() -> bool {
+    if RVBBIT_TABLES_PRESENT.with(|c| c.get()) {
+        return true;
+    }
+    let old = IN_REWRITER.with(|f| {
+        let old = f.get();
+        f.set(true);
+        old
+    });
+    let present = pgrx::Spi::get_one::<bool>("SELECT to_regclass('rvbbit.tables') IS NOT NULL")
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    IN_REWRITER.with(|f| f.set(old));
+    if present {
+        RVBBIT_TABLES_PRESENT.with(|c| c.set(true));
+    }
+    present
+}
+
 fn is_rvbbit_table_cached(oid: u32) -> bool {
     if let Some(&v) = IS_RVBBIT_CACHE
         .with(|c| c.borrow().get(&oid).copied())
         .as_ref()
     {
         return v;
+    }
+    if !rvbbit_tables_catalog_present() {
+        return false;
     }
     let sql = format!(
         "SELECT EXISTS ( \

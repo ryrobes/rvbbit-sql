@@ -3809,7 +3809,6 @@ fn route_profile_selection_by_name(name: String, source: &'static str) -> RouteP
     selection
 }
 
-
 thread_local! {
     /// Per-backend memo of the EXPENSIVE half of the route runtime stamp — the
     /// full-catalog `string_agg` over every rvbbit table's size/rows/bytes/deletes.
@@ -3838,6 +3837,7 @@ fn route_stamp_ttl() -> std::time::Duration {
 
 pub(crate) fn route_runtime_stamp() -> String {
     if !relations_present(&[
+        "rvbbit.tables",
         "rvbbit.route_profiles",
         "rvbbit.row_groups",
         "rvbbit.row_groups_visible",
@@ -3926,7 +3926,11 @@ fn route_table_state_stamp() -> String {
 }
 
 fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTableMetric> {
-    if !relations_present(&["rvbbit.row_groups_visible", "rvbbit.delete_log"]) {
+    if !relations_present(&[
+        "rvbbit.tables",
+        "rvbbit.row_groups_visible",
+        "rvbbit.delete_log",
+    ]) {
         return Vec::new();
     }
     let stringless = sql_stringless(sql).to_lowercase();
@@ -5210,7 +5214,6 @@ fn first_available_candidate(
         .copied()
         .find(|candidate| candidate_availability(*candidate, features, tables).0)
 }
-
 
 fn forced_candidate_setting() -> Option<Candidate> {
     guc_setting("rvbbit.route_force_candidate")
@@ -6921,7 +6924,6 @@ fn shape_family_key(key: &str) -> String {
         .join("|")
 }
 
-
 fn canonical_shape_key(key: &str, features: Option<&Value>) -> String {
     if key.starts_with("native_cap=") {
         return key.to_string();
@@ -6954,7 +6956,6 @@ fn median_f64(mut values: Vec<f64>) -> f64 {
 fn median_option(values: Vec<f64>) -> Option<f64> {
     (!values.is_empty()).then(|| median_f64(values))
 }
-
 
 fn interpolate_predictions(
     lower: RouteCurveSample,
