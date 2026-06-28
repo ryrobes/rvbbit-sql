@@ -4350,7 +4350,7 @@
       "capability_manifest": {
         "api_version": "rvbbit.capability/v1",
         "capability_role": "system_runtime",
-        "description": "Hindsight API service for agent long-term memory, backed by a sibling Postgres database and RVBBIT-compatible embedding config where possible.",
+        "description": "Hindsight API service for agent long-term memory, backed by a dedicated schema in the RVBBIT Postgres database and RVBBIT-compatible embedding config where possible.",
         "kind": "runtime_sidecar",
         "license": "provider",
         "name": "hindsight_slim",
@@ -4522,6 +4522,13 @@
           "device": "cpu",
           "env": {
             "HINDSIGHT_API_AUDIT_LOG_ENABLED": "${HINDSIGHT_API_AUDIT_LOG_ENABLED:-true}",
+            "HINDSIGHT_API_DATABASE_SCHEMA": "${HINDSIGHT_API_DATABASE_SCHEMA:-hindsight}",
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY": "${HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY:-${OPENAI_API_KEY:-${HINDSIGHT_API_LLM_API_KEY:-}}}",
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL": "${HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL:-${RVBBIT_HINDSIGHT_EMBEDDINGS_BASE_URL:-}}",
+            "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL": "${HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL:-${RVBBIT_HINDSIGHT_EMBEDDINGS_MODEL:-text-embedding-3-small}}",
+            "HINDSIGHT_API_EMBEDDINGS_OPENROUTER_API_KEY": "${HINDSIGHT_API_EMBEDDINGS_OPENROUTER_API_KEY:-${OPENROUTER_API_KEY:-}}",
+            "HINDSIGHT_API_EMBEDDINGS_OPENROUTER_MODEL": "${HINDSIGHT_API_EMBEDDINGS_OPENROUTER_MODEL:-${RVBBIT_HINDSIGHT_EMBEDDINGS_OPENROUTER_MODEL:-perplexity/pplx-embed-v1-0.6b}}",
+            "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "${HINDSIGHT_API_EMBEDDINGS_PROVIDER:-${RVBBIT_HINDSIGHT_EMBEDDINGS_PROVIDER:-openai}}",
             "HINDSIGHT_API_HOST": "0.0.0.0",
             "HINDSIGHT_API_LLM_API_KEY": "${HINDSIGHT_API_LLM_API_KEY:-${OPENAI_API_KEY:-}}",
             "HINDSIGHT_API_LLM_BASE_URL": "${HINDSIGHT_API_LLM_BASE_URL:-}",
@@ -4534,10 +4541,14 @@
           },
           "handler": "custom",
           "health_path": "/health",
+          "host_bind": "127.0.0.1",
+          "host_port": 8888,
+          "host_port_env": "RVBBIT_HINDSIGHT_PORT",
           "image": "ghcr.io/vectorize-io/hindsight-api:latest-slim",
           "language": "memory",
           "mode": "image",
           "port": 8888,
+          "publish_host_port": true,
           "pull_policy": "missing",
           "template": "runtime-sidecar"
         },
@@ -4557,7 +4568,9 @@
         },
         "smoke": {
           "sql": [
-            "SELECT name, provider, endpoint_url, status FROM rvbbit.memory_services WHERE name = 'hindsight_default';"
+            "DO $$\nBEGIN\n    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN\n        RAISE EXCEPTION 'Hindsight requires the pgvector extension (CREATE EXTENSION vector)';\n    END IF;\n    IF to_regnamespace('hindsight') IS NULL THEN\n        RAISE EXCEPTION 'Hindsight schema hindsight was not created in database %', current_database();\n    END IF;\nEND\n$$;\n",
+            "SELECT name, provider, endpoint_url, status FROM rvbbit.memory_services WHERE name = 'hindsight_default';",
+            "DO $$\nDECLARE\n    probe jsonb;\n    started timestamptz := clock_timestamp();\n    last_error text;\nBEGIN\n    IF to_regprocedure('rvbbit.hindsight_status(text)') IS NULL THEN\n        RAISE EXCEPTION 'rvbbit.hindsight_status(text) is not installed; redeploy pg_rvbbit 2.7.0+ and run SELECT rvbbit.migrate() before installing hindsight_slim';\n    END IF;\n\n    LOOP\n        BEGIN\n            SELECT rvbbit.hindsight_status('hindsight_default') INTO probe;\n            EXIT WHEN probe IS NOT NULL;\n            last_error := 'rvbbit.hindsight_status returned NULL';\n        EXCEPTION WHEN OTHERS THEN\n            last_error := SQLERRM;\n        END;\n\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rvbbit.hindsight_status did not become ready within 2 minutes: %',\n                coalesce(last_error, 'unknown error');\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\nEND\n$$;\n"
           ]
         },
         "source": {
@@ -4589,7 +4602,9 @@
             "extensions": [
               "vector"
             ],
-            "name": "hindsight",
+            "mode": "schema",
+            "schema": "hindsight",
+            "schema_env": "HINDSIGHT_API_DATABASE_SCHEMA",
             "url_env": "HINDSIGHT_API_DATABASE_URL"
           },
           "service_provider": "hindsight"
@@ -4606,6 +4621,11 @@
           "teardown_sql": [],
           "tests": [
             {
+              "description": "Assert pgvector and the Hindsight schema exist in the current database.",
+              "name": "hindsight_pgvector_ready",
+              "sql": "DO $$\nBEGIN\n    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN\n        RAISE EXCEPTION 'Hindsight requires the pgvector extension (CREATE EXTENSION vector)';\n    END IF;\n    IF to_regnamespace('hindsight') IS NULL THEN\n        RAISE EXCEPTION 'Hindsight schema hindsight was not created in database %', current_database();\n    END IF;\nEND\n$$;\n"
+            },
+            {
               "description": "Assert Hindsight is registered as a ready memory service, and Warren inventory is coherent when Warren owns it.",
               "name": "hindsight_registered_ready",
               "sql": "DO $$\nDECLARE\n    source text;\nBEGIN\n    SELECT service_source\n    INTO source\n    FROM rvbbit.memory_services\n    WHERE name = 'hindsight_default'\n      AND provider = 'hindsight'\n      AND status = 'ready'\n      AND endpoint_url IS NOT NULL\n      AND endpoint_url <> '';\n\n    IF source IS NULL THEN\n        RAISE EXCEPTION 'hindsight_default memory service is not registered as ready';\n    END IF;\n\n    IF source = 'warren' AND NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'hindsight_default'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'hindsight_default deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"
@@ -4613,7 +4633,7 @@
             {
               "description": "Assert the SQL wrapper can resolve and probe the registered Hindsight service.",
               "name": "hindsight_sql_status",
-              "sql": "DO $$\nDECLARE\n    probe jsonb;\nBEGIN\n    probe := rvbbit.hindsight_status();\n    IF probe IS NULL THEN\n        RAISE EXCEPTION 'rvbbit.hindsight_status returned NULL';\n    END IF;\nEND\n$$;\n"
+              "sql": "DO $$\nDECLARE\n    probe jsonb;\n    started timestamptz := clock_timestamp();\n    last_error text;\nBEGIN\n    IF to_regprocedure('rvbbit.hindsight_status(text)') IS NULL THEN\n        RAISE EXCEPTION 'rvbbit.hindsight_status(text) is not installed; redeploy pg_rvbbit 2.7.0+ and run SELECT rvbbit.migrate() before installing hindsight_slim';\n    END IF;\n\n    LOOP\n        BEGIN\n            SELECT rvbbit.hindsight_status('hindsight_default') INTO probe;\n            EXIT WHEN probe IS NOT NULL;\n            last_error := 'rvbbit.hindsight_status returned NULL';\n        EXCEPTION WHEN OTHERS THEN\n            last_error := SQLERRM;\n        END;\n\n        IF clock_timestamp() - started > interval '2 minutes' THEN\n            RAISE EXCEPTION 'rvbbit.hindsight_status did not become ready within 2 minutes: %',\n                coalesce(last_error, 'unknown error');\n        END IF;\n        PERFORM pg_sleep(2);\n    END LOOP;\nEND\n$$;\n"
             },
             {
               "description": "Assert Hindsight SQL operator wrappers are installed and the status wrapper can probe the service.",
@@ -4623,6 +4643,7 @@
           ]
         },
         "acceptance_tests": [
+          "hindsight_pgvector_ready",
           "hindsight_registered_ready",
           "hindsight_sql_status",
           "hindsight_operator_wrappers"
@@ -4631,7 +4652,7 @@
         "backend_transport": "rvbbit",
         "capability_role": "system_runtime",
         "catalog_visibility": "public",
-        "description": "Hindsight API service for agent long-term memory, backed by a sibling Postgres database and RVBBIT-compatible embedding config where possible.",
+        "description": "Hindsight API service for agent long-term memory, backed by a dedicated schema in the RVBBIT Postgres database and RVBBIT-compatible embedding config where possible.",
         "device": "cpu",
         "endpoint_path": "/",
         "gpu_placement": null,

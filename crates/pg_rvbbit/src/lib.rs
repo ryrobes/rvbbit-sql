@@ -195,7 +195,6 @@ fn normalize_probe_sample(spec: &specialists::SpecialistSpec, sample: Value) -> 
 /// implement transparent reads from parquet (Phase 2c) and — eventually —
 /// the SQL-rewriting layer that consumes rvbbit.shreds (Phase 5).
 #[pgrx::pg_guard]
-#[no_mangle]
 pub extern "C-unwind" fn _PG_init() {
     // Shared-memory live call counters — must register its shmem request +
     // startup hooks at preload time (in the postmaster) before shmem is sized.

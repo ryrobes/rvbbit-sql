@@ -12,6 +12,9 @@ default = ["pg18"]
 pg18 = ["pgrx/pg18"]
 pg_test = []
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pg13", "pg14", "pg15", "pg16", "pg17"))'] }
+
 [dependencies]
 pgrx = { workspace = true }
 rvbbit_storage = { path = "../rvbbit_storage" }

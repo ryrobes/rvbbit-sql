@@ -441,6 +441,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0105_hindsight_catalog_visibility",
         include_str!("../sql/migrations/0105_hindsight_catalog_visibility.sql"),
     ),
+    (
+        "0106_hindsight_sql_wrappers",
+        include_str!("../sql/migrations/0106_hindsight_sql_wrappers.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

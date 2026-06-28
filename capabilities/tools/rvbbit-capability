@@ -190,6 +190,30 @@ def runtime_container_port(manifest: dict[str, Any]) -> int:
     return int(warren.get("container_port") or runtime.get("port") or 8080)
 
 
+def runtime_publish_host_port(manifest: dict[str, Any]) -> bool:
+    runtime = manifest.get("runtime") or {}
+    return bool(runtime.get("publish_host_port"))
+
+
+def runtime_host_bind(manifest: dict[str, Any]) -> str:
+    runtime = manifest.get("runtime") or {}
+    return str(runtime.get("host_bind") or "").strip()
+
+
+def runtime_host_port(manifest: dict[str, Any]) -> int:
+    runtime = manifest.get("runtime") or {}
+    try:
+        return int(runtime.get("host_port") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def runtime_host_port_env(manifest: dict[str, Any]) -> str:
+    runtime = manifest.get("runtime") or {}
+    raw = str(runtime.get("host_port_env") or "RVBBIT_CAPABILITY_PORT").strip()
+    return raw if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", raw) else "RVBBIT_CAPABILITY_PORT"
+
+
 def runtime_health_path(manifest: dict[str, Any]) -> str:
     runtime = manifest.get("runtime") or {}
     warren = manifest.get("warren") or {}
@@ -272,8 +296,9 @@ def render_register_sql(manifest: dict[str, Any]) -> str:
         language = registration.get("language") or runtime.get("language") or "python"
         endpoint_path = runtime_endpoint_path(manifest)
         service = manifest["name"].replace("_", "-")
+        container_host = f"rvbbit-{service.strip('-')}"
         port = runtime_container_port(manifest)
-        endpoint = registration.get("endpoint") or f"http://{service}:{port}{endpoint_path}"
+        endpoint = registration.get("endpoint") or f"http://{container_host}:{port}{endpoint_path}"
         labels = registration.get("labels") or {
             "language": language,
             "capability_kind": "runtime_sidecar",
@@ -599,10 +624,14 @@ def render_host_ports_compose(manifest: dict[str, Any]) -> str:
         return f"# {manifest['name']} is external/API-backed; no host port overlay applies.\n"
     service = manifest["name"].replace("_", "-")
     container_port = runtime_container_port(manifest)
+    host_bind = runtime_host_bind(manifest)
+    host_port = runtime_host_port(manifest)
+    host_env = runtime_host_port_env(manifest)
+    bind_prefix = f"{host_bind}:" if host_bind else ""
     return f"""services:
   {service}:
     ports:
-      - "${{RVBBIT_CAPABILITY_PORT:-0}}:{container_port}"
+      - "{bind_prefix}${{{host_env}:-{host_port}}}:{container_port}"
 """
 
 
@@ -833,6 +862,11 @@ This capability registers the remote endpoint from `backend.endpoint`; no local
 Docker sidecar is generated.
 """
     compose_up = "docker compose up -d" if runtime_image(runtime) else "docker compose up -d --build"
+    host_ports_compose_up = (
+        "docker compose -f compose.yaml -f compose.host-ports.yaml up -d"
+        if runtime_image(runtime)
+        else "docker compose -f compose.yaml -f compose.host-ports.yaml up -d --build"
+    )
     gpu_compose_up = (
         "docker compose -f compose.yaml -f compose.gpu.yaml up -d"
         if runtime_image(runtime)
@@ -842,6 +876,23 @@ Docker sidecar is generated.
         endpoint_path = runtime_endpoint_path(manifest)
         container_port = runtime_container_port(manifest)
         runtime_name = (manifest.get("runtime_registration") or {}).get("name", manifest["name"])
+        endpoint_host = f"rvbbit-{service.strip('-')}"
+        publishes_host_port = runtime_publish_host_port(manifest)
+        run_command = host_ports_compose_up if publishes_host_port else compose_up
+        host_bind = runtime_host_bind(manifest) or "127.0.0.1"
+        host_port = runtime_host_port(manifest)
+        host_env = runtime_host_port_env(manifest)
+        local_port = f"${{{host_env}:-{host_port}}}"
+        host_text = (
+            f"The host-port overlay is enabled by default for this pack and binds "
+            f"`{host_bind}:{local_port}` to container port `{container_port}`. "
+            f"Local clients on this server can use `http://127.0.0.1:{local_port}{endpoint_path}`."
+            if publishes_host_port
+            else "The service does not publish a host port by default. If your database is outside\n"
+            "Docker and cannot reach that network URL, run with\n"
+            "`docker compose -f compose.yaml -f compose.host-ports.yaml up -d` and adjust\n"
+            "`register.sql` to the reachable host URL."
+        )
         return f"""# {manifest.get('title') or manifest['name']}
 
 {manifest.get('description') or 'Generated Rvbbit runtime sidecar.'}
@@ -849,7 +900,7 @@ Docker sidecar is generated.
 ## Run
 
 ```bash
-{compose_up}
+{run_command}
 ```
 
 ## Register In Rvbbit
@@ -860,12 +911,9 @@ psql "$RVBBIT_DSN" -f smoke.sql
 ```
 
 The generated service joins `${{RVBBIT_DOCKER_NETWORK:-docker_default}}` so
-the default endpoint `http://{service}:{container_port}{endpoint_path}` is reachable from
+the default endpoint `http://{endpoint_host}:{container_port}{endpoint_path}` is reachable from
 the Rvbbit Postgres container. The runtime is registered as `{runtime_name}`.
-The service does not publish a host port by default. If your database is outside
-Docker and cannot reach that network URL, run with
-`docker compose -f compose.yaml -f compose.host-ports.yaml up -d` and adjust
-`register.sql` to the reachable host URL.
+{host_text}
 """
     return f"""# {manifest.get('title') or manifest['name']}
 
@@ -1962,7 +2010,12 @@ def cmd_install(args: argparse.Namespace) -> None:
                 "was detected; deploying without compose.gpu.yaml",
                 file=sys.stderr,
             )
+        use_host_ports = args.host_ports or (
+            runtime_publish_host_port(manifest) and not args.no_host_ports
+        )
         compose_args = ["-f", "compose.yaml"]
+        if use_host_ports:
+            compose_args.extend(["-f", "compose.host-ports.yaml"])
         if use_gpu:
             compose_args.extend(["-f", "compose.gpu.yaml"])
         compose_args.extend(["up", "-d"])
@@ -2039,6 +2092,16 @@ def main(argv: list[str]) -> int:
     p_install.add_argument("--dsn")
     p_install.add_argument("--force", action="store_true")
     p_install.add_argument("--gpu", action="store_true", help="force compose.gpu.yaml")
+    p_install.add_argument(
+        "--host-ports",
+        action="store_true",
+        help="force compose.host-ports.yaml even when the manifest does not publish by default",
+    )
+    p_install.add_argument(
+        "--no-host-ports",
+        action="store_true",
+        help="skip manifest-default host port publishing",
+    )
     p_install.add_argument(
         "--no-gpu-auto",
         action="store_true",

@@ -73,6 +73,11 @@ struct DeploymentResult {
     health: Value,
 }
 
+struct PreparedPostgresDatabase {
+    env: Map<String, Value>,
+    metadata: Value,
+}
+
 #[derive(Debug)]
 struct LifecycleDeploymentMetadata {
     deployment_id: String,
@@ -1381,18 +1386,11 @@ fn prepare_runtime_manifest(db: &mut Client, config: &Config, manifest: &Value) 
         .pointer("/warren/postgres_database")
         .and_then(Value::as_object)
     {
-        if let Some((env_name, database_url, bootstrap)) =
-            prepare_postgres_database(db, config, pg)?
-        {
-            env_injections.insert(env_name.clone(), json!(database_url));
-            resolved.insert(
-                "postgres_database".into(),
-                json!({
-                    "url_env": env_name,
-                    "database": pg.get("name").and_then(Value::as_str).unwrap_or(""),
-                    "bootstrap": bootstrap,
-                }),
-            );
+        if let Some(prepared_pg) = prepare_postgres_database(db, config, pg)? {
+            for (key, value) in prepared_pg.env {
+                env_injections.insert(key, value);
+            }
+            resolved.insert("postgres_database".into(), prepared_pg.metadata);
         }
     }
 
@@ -1419,13 +1417,14 @@ fn prepare_postgres_database(
     db: &mut Client,
     config: &Config,
     spec: &Map<String, Value>,
-) -> Result<Option<(String, String, Value)>> {
-    let database = spec
-        .get("name")
+) -> Result<Option<PreparedPostgresDatabase>> {
+    let mode = spec
+        .get("mode")
+        .or_else(|| spec.get("scope"))
         .and_then(Value::as_str)
-        .unwrap_or("hindsight");
-    if !is_identifier_like(database) {
-        bail!("warren.postgres_database.name must be identifier-like");
+        .unwrap_or("database");
+    if !matches!(mode, "database" | "schema") {
+        bail!("warren.postgres_database.mode must be 'database' or 'schema'");
     }
     let url_env = spec
         .get("url_env")
@@ -1437,6 +1436,84 @@ fn prepare_postgres_database(
     }
 
     let should_create = spec.get("create").and_then(Value::as_bool).unwrap_or(true);
+    let runtime_base_dsn = config.runtime_dsn.as_deref().unwrap_or(&config.dsn);
+
+    if mode == "schema" {
+        let schema = spec
+            .get("schema")
+            .and_then(Value::as_str)
+            .unwrap_or("hindsight");
+        if !is_identifier_like(schema) {
+            bail!("warren.postgres_database.schema must be identifier-like");
+        }
+        let schema_env = spec
+            .get("schema_env")
+            .and_then(Value::as_str)
+            .unwrap_or("HINDSIGHT_API_DATABASE_SCHEMA")
+            .to_string();
+        if !is_env_name_like(&schema_env) {
+            bail!("warren.postgres_database.schema_env must be environment-variable-like");
+        }
+
+        let active_database: String = db
+            .query_one("SELECT current_database()", &[])
+            .context("resolving active database for schema bootstrap")?
+            .get(0);
+        let mut bootstrap = json!({"created": false, "schema_created": false, "extensions": []});
+        if should_create {
+            let exists: bool = db
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = $1)",
+                    &[&schema],
+                )
+                .context("checking memory-service schema")?
+                .get(0);
+            if !exists {
+                db.execute(
+                    &format!("CREATE SCHEMA IF NOT EXISTS {}", pg_ident(schema)),
+                    &[],
+                )
+                .with_context(|| format!("creating schema {schema}"))?;
+                if let Some(obj) = bootstrap.as_object_mut() {
+                    obj.insert("created".into(), json!(true));
+                    obj.insert("schema_created".into(), json!(true));
+                }
+            }
+
+            let extensions = ensure_postgres_extensions(db, spec, &active_database)?;
+            if let Some(obj) = bootstrap.as_object_mut() {
+                obj.insert("extensions".into(), json!(extensions));
+            }
+        }
+
+        let database_url = spec
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| runtime_base_dsn.to_string());
+        let mut env = Map::new();
+        env.insert(url_env.clone(), json!(database_url));
+        env.insert(schema_env.clone(), json!(schema));
+        return Ok(Some(PreparedPostgresDatabase {
+            env,
+            metadata: json!({
+                "mode": "schema",
+                "url_env": url_env,
+                "schema_env": schema_env,
+                "database": active_database,
+                "schema": schema,
+                "bootstrap": bootstrap,
+            }),
+        }));
+    }
+
+    let database = spec
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("hindsight");
+    if !is_identifier_like(database) {
+        bail!("warren.postgres_database.name must be identifier-like");
+    }
     let mut bootstrap = json!({"created": false, "extensions": []});
     if should_create {
         let exists: bool = db
@@ -1462,33 +1539,50 @@ fn prepare_postgres_database(
         let mut target = target_cfg
             .connect(NoTls)
             .with_context(|| format!("connecting to database {database}"))?;
-        let mut extensions = Vec::new();
-        if let Some(arr) = spec.get("extensions").and_then(Value::as_array) {
-            for ext in arr.iter().filter_map(Value::as_str) {
-                if !is_identifier_like(ext) {
-                    bail!("warren.postgres_database.extensions entries must be identifier-like");
-                }
-                target
-                    .execute(
-                        &format!("CREATE EXTENSION IF NOT EXISTS {}", pg_ident(ext)),
-                        &[],
-                    )
-                    .with_context(|| format!("creating extension {ext} in {database}"))?;
-                extensions.push(ext.to_string());
-            }
-        }
+        let extensions = ensure_postgres_extensions(&mut target, spec, database)?;
         if let Some(obj) = bootstrap.as_object_mut() {
             obj.insert("extensions".into(), json!(extensions));
         }
     }
 
-    let runtime_base_dsn = config.runtime_dsn.as_deref().unwrap_or(&config.dsn);
     let database_url = spec
         .get("url")
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| dsn_with_database(runtime_base_dsn, database));
-    Ok(Some((url_env, database_url, bootstrap)))
+    let mut env = Map::new();
+    env.insert(url_env.clone(), json!(database_url));
+    Ok(Some(PreparedPostgresDatabase {
+        env,
+        metadata: json!({
+            "mode": "database",
+            "url_env": url_env,
+            "database": database,
+            "bootstrap": bootstrap,
+        }),
+    }))
+}
+
+fn ensure_postgres_extensions(
+    db: &mut Client,
+    spec: &Map<String, Value>,
+    database_label: &str,
+) -> Result<Vec<String>> {
+    let mut extensions = Vec::new();
+    if let Some(arr) = spec.get("extensions").and_then(Value::as_array) {
+        for ext in arr.iter().filter_map(Value::as_str) {
+            if !is_identifier_like(ext) {
+                bail!("warren.postgres_database.extensions entries must be identifier-like");
+            }
+            db.execute(
+                &format!("CREATE EXTENSION IF NOT EXISTS {}", pg_ident(ext)),
+                &[],
+            )
+            .with_context(|| format!("creating extension {ext} in {database_label}"))?;
+            extensions.push(ext.to_string());
+        }
+    }
+    Ok(extensions)
 }
 
 fn resolve_embedding_env(db: &mut Client, spec: &Value) -> Result<Value> {
@@ -1542,7 +1636,7 @@ fn merge_runtime_env(manifest: &mut Value, envs: Map<String, Value>) -> Result<(
         .as_object_mut()
         .ok_or_else(|| anyhow!("manifest.runtime.env must be a JSON object"))?;
     for (key, value) in envs {
-        env.entry(key).or_insert(value);
+        env.insert(key, value);
     }
     Ok(())
 }

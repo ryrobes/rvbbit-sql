@@ -30,7 +30,7 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
-use datafusion::catalog::{CatalogProvider, MemorySchemaProvider};
+use datafusion::catalog::MemorySchemaProvider;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,

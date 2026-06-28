@@ -145,6 +145,7 @@ impl Pool {
     /// preserving order. Blocks until all complete. This is the workhorse
     /// for "do N independent things concurrently" — what multi-step
     /// operators with parallel sub-steps will use.
+    #[allow(dead_code)]
     pub fn map_parallel<I, O, F>(&self, items: Vec<I>, f: F) -> Vec<O>
     where
         I: Send + 'static,

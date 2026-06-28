@@ -2,7 +2,7 @@ api_version: rvbbit.pack/v1
 id: memory/hindsight-slim
 name: hindsight_slim
 title: Hindsight Memory Service
-description: Hindsight API service for agent long-term memory, backed by a sibling Postgres database and RVBBIT-compatible embedding config where possible.
+description: Hindsight API service for agent long-term memory, backed by a dedicated schema in the RVBBIT Postgres database and RVBBIT-compatible embedding config where possible.
 license: provider
 catalog_visibility: public
 system_runtime: false
@@ -27,6 +27,10 @@ runtime:
   handler: custom
   device: cpu
   port: 8888
+  publish_host_port: true
+  host_bind: 127.0.0.1
+  host_port: 8888
+  host_port_env: RVBBIT_HINDSIGHT_PORT
   health_path: /health
 exports:
   runtime: hindsight_default
@@ -45,6 +49,19 @@ acceptance:
     docker: true
     gpu: false
   tests:
+  - name: hindsight_pgvector_ready
+    description: Assert pgvector and the Hindsight schema exist in the current database.
+    sql: |
+      DO $$
+      BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+              RAISE EXCEPTION 'Hindsight requires the pgvector extension (CREATE EXTENSION vector)';
+          END IF;
+          IF to_regnamespace('hindsight') IS NULL THEN
+              RAISE EXCEPTION 'Hindsight schema hindsight was not created in database %', current_database();
+          END IF;
+      END
+      $$;
   - name: hindsight_registered_ready
     description: Assert Hindsight is registered as a ready memory service, and Warren inventory is coherent when Warren owns it.
     sql: |
@@ -81,11 +98,28 @@ acceptance:
       DO $$
       DECLARE
           probe jsonb;
+          started timestamptz := clock_timestamp();
+          last_error text;
       BEGIN
-          probe := rvbbit.hindsight_status();
-          IF probe IS NULL THEN
-              RAISE EXCEPTION 'rvbbit.hindsight_status returned NULL';
+          IF to_regprocedure('rvbbit.hindsight_status(text)') IS NULL THEN
+              RAISE EXCEPTION 'rvbbit.hindsight_status(text) is not installed; redeploy pg_rvbbit 2.7.0+ and run SELECT rvbbit.migrate() before installing hindsight_slim';
           END IF;
+
+          LOOP
+              BEGIN
+                  SELECT rvbbit.hindsight_status('hindsight_default') INTO probe;
+                  EXIT WHEN probe IS NOT NULL;
+                  last_error := 'rvbbit.hindsight_status returned NULL';
+              EXCEPTION WHEN OTHERS THEN
+                  last_error := SQLERRM;
+              END;
+
+              IF clock_timestamp() - started > interval '2 minutes' THEN
+                  RAISE EXCEPTION 'rvbbit.hindsight_status did not become ready within 2 minutes: %',
+                      coalesce(last_error, 'unknown error');
+              END IF;
+              PERFORM pg_sleep(2);
+          END LOOP;
       END
       $$;
   - name: hindsight_operator_wrappers
