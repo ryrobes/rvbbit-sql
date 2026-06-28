@@ -14,7 +14,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::providers::{self, ChatRequest, ProviderError};
 
@@ -275,7 +276,12 @@ pub fn run_multistep_seeded(
 ) -> WorkResult {
     let mut scope = Scope::new(inputs.clone(), opts.clone());
     scope.steps.insert(seed_step.to_string(), seed_output);
-    run_multi_step_inner(op, steps, &mut scope, Some((seed_step.to_string(), seed_sub)))
+    run_multi_step_inner(
+        op,
+        steps,
+        &mut scope,
+        Some((seed_step.to_string(), seed_sub)),
+    )
 }
 
 fn run_multi_step_inner(
@@ -490,10 +496,43 @@ fn run_step_llm(
 // (a memoized agent would replay a frozen transcript).
 enum AgentTool {
     Query,
-    Mcp { server: String, tool: String },
+    Mcp {
+        server: String,
+        tool: String,
+    },
+    Memory {
+        action: AgentMemoryAction,
+        config: AgentMemoryConfig,
+    },
 }
 
 const AGENT_QUERY_DESC: &str = "Run a single read-only SQL query against this Postgres database and get the rows back as JSON (capped at 200 rows). Use it to inspect tables, pg_stat_* views, and rvbbit telemetry. SELECT/WITH only — writes and DDL are rejected by the engine.";
+const AGENT_MEMORY_RECALL_DESC: &str = "Search this agent node's scoped long-term memory for facts relevant to a query. The bank is fixed by Rvbbit from operator + node + context; do not include or request a bank id.";
+const AGENT_MEMORY_REFLECT_DESC: &str = "Ask this agent node's scoped long-term memory to synthesize relevant context for a query. The bank is fixed by Rvbbit from operator + node + context; do not include or request a bank id.";
+const AGENT_MEMORY_RETAIN_DESC: &str = "Store durable memory for this agent node's scoped context. Retain only stable facts, decisions, preferences, or useful observations; do not store transient chain-of-thought.";
+
+#[derive(Clone, Copy)]
+enum AgentMemoryAction {
+    Recall,
+    Reflect,
+    Retain,
+}
+
+#[derive(Clone)]
+struct AgentMemoryConfig {
+    service_name: String,
+    context: String,
+    bank_id: String,
+    required: bool,
+    allow_tools: bool,
+    recall_before_run: bool,
+    retain_final: bool,
+    async_retain: bool,
+    limit: i64,
+    max_chars: usize,
+    recall_options: Value,
+    retain_options: Value,
+}
 
 fn run_step_agent(
     op: &OpDef,
@@ -519,14 +558,177 @@ fn run_step_agent(
         .unwrap_or(8)
         .clamp(1, 50) as usize;
     let budget = step.get("budget");
-    let budget_tokens = budget.and_then(|b| b.get("tokens")).and_then(|v| v.as_i64());
-    let budget_cost = budget.and_then(|b| b.get("cost_usd")).and_then(|v| v.as_f64());
-    let budget_wall = budget.and_then(|b| b.get("wall_ms")).and_then(|v| v.as_u64());
+    let budget_tokens = budget
+        .and_then(|b| b.get("tokens"))
+        .and_then(|v| v.as_i64());
+    let budget_cost = budget
+        .and_then(|b| b.get("cost_usd"))
+        .and_then(|v| v.as_f64());
+    let budget_wall = budget
+        .and_then(|b| b.get("wall_ms"))
+        .and_then(|v| v.as_u64());
     let tool_result_max = step
         .get("tool_result_max_chars")
         .and_then(|v| v.as_u64())
         .unwrap_or(8000)
         .max(256) as usize;
+    let memory_requested = agent_memory_config(step, op, step_name, scope, tool_result_max);
+    let run_id = new_agent_run_id();
+    let mut turn_idx: i32 = 0;
+    let total_t0 = Instant::now();
+
+    let mut messages: Vec<providers::ChatMessage> = Vec::new();
+    if !system.is_empty() {
+        messages.push(providers::ChatMessage::system(system.clone()));
+        audit_agent_turn(
+            &run_id,
+            &op.name,
+            &model,
+            &mut turn_idx,
+            "system",
+            Some(&system),
+            None,
+            None,
+            None,
+            0,
+            0,
+            None,
+            0,
+            None,
+        );
+    }
+
+    let memory = match memory_requested {
+        Some(cfg) => match agent_memory_service_available(&cfg) {
+            Ok(()) => Some(cfg),
+            Err(err) => {
+                let msg = format!("agent memory disabled: {err}");
+                audit_agent_turn(
+                    &run_id,
+                    &op.name,
+                    &model,
+                    &mut turn_idx,
+                    if cfg.required { "error" } else { "tool" },
+                    Some(&msg),
+                    Some("memory_status"),
+                    None,
+                    None,
+                    0,
+                    0,
+                    None,
+                    0,
+                    Some(&err),
+                );
+                if cfg.required {
+                    return (
+                        agent_subcall(step_name, &model, None, 0, 0, 0.0, &total_t0, Some(msg)),
+                        Value::Null,
+                        String::new(),
+                    );
+                }
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(cfg) = memory.as_ref() {
+        if cfg.allow_tools {
+            let memory_note = format!(
+                "Scoped long-term memory is available for this agent context. Use memory_recall or memory_reflect before relying on prior facts, and use memory_retain only for stable facts or useful decisions worth remembering. The memory bank is fixed by Rvbbit as {}; never ask the user for a bank id.",
+                cfg.bank_id
+            );
+            messages.push(providers::ChatMessage::system(memory_note.clone()));
+            audit_agent_turn(
+                &run_id,
+                &op.name,
+                &model,
+                &mut turn_idx,
+                "system",
+                Some(&memory_note),
+                None,
+                None,
+                None,
+                0,
+                0,
+                None,
+                0,
+                None,
+            );
+        }
+        if cfg.recall_before_run {
+            let (result_text, err) = agent_run_memory_action(
+                AgentMemoryAction::Recall,
+                cfg,
+                &serde_json::json!({ "query": task.as_str(), "options": cfg.recall_options.clone() }),
+                cfg.max_chars,
+            );
+            audit_agent_turn(
+                &run_id,
+                &op.name,
+                &model,
+                &mut turn_idx,
+                "tool",
+                Some(&result_text),
+                Some("memory_recall"),
+                None,
+                None,
+                0,
+                0,
+                None,
+                0,
+                err.as_deref(),
+            );
+            if let Some(e) = err {
+                if cfg.required {
+                    return (
+                        agent_subcall(step_name, &model, None, 0, 0, 0.0, &total_t0, Some(e)),
+                        Value::Null,
+                        String::new(),
+                    );
+                }
+            } else if !result_text.trim().is_empty() && result_text.trim() != "null" {
+                let memory_context = format!(
+                    "Long-term memory for this agent context (bank: {}):\n{}",
+                    cfg.bank_id, result_text
+                );
+                messages.push(providers::ChatMessage::system(memory_context.clone()));
+                audit_agent_turn(
+                    &run_id,
+                    &op.name,
+                    &model,
+                    &mut turn_idx,
+                    "system",
+                    Some(&memory_context),
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    None,
+                    0,
+                    None,
+                );
+            }
+        }
+    }
+    messages.push(providers::ChatMessage::user(task.clone()));
+    audit_agent_turn(
+        &run_id,
+        &op.name,
+        &model,
+        &mut turn_idx,
+        "user",
+        Some(&task),
+        None,
+        None,
+        None,
+        0,
+        0,
+        None,
+        0,
+        None,
+    );
 
     // Build the tool specs advertised to the model + the name->handler allowlist.
     let mut tool_specs: Vec<providers::ToolSpec> = Vec::new();
@@ -566,25 +768,80 @@ fn run_step_agent(
                     });
                     handlers.insert(
                         tool.into(),
-                        AgentTool::Mcp { server: srv.into(), tool: tool.into() },
+                        AgentTool::Mcp {
+                            server: srv.into(),
+                            tool: tool.into(),
+                        },
                     );
                 }
             }
         }
     }
-
-    let run_id = new_agent_run_id();
-    let mut turn_idx: i32 = 0;
-
-    let mut messages: Vec<providers::ChatMessage> = Vec::new();
-    if !system.is_empty() {
-        messages.push(providers::ChatMessage::system(system.clone()));
-        audit_agent_turn(&run_id, &op.name, &model, &mut turn_idx, "system", Some(&system), None, None, None, 0, 0, None, 0, None);
+    if let Some(cfg) = memory.as_ref().filter(|m| m.allow_tools) {
+        if !handlers.contains_key("memory_recall") {
+            tool_specs.push(providers::ToolSpec {
+                name: "memory_recall".into(),
+                description: AGENT_MEMORY_RECALL_DESC.into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "What to search this agent context's memory for." },
+                        "options": { "type": "object", "description": "Optional Hindsight recall options such as top_k." }
+                    },
+                    "required": ["query"]
+                }),
+            });
+            handlers.insert(
+                "memory_recall".into(),
+                AgentTool::Memory {
+                    action: AgentMemoryAction::Recall,
+                    config: cfg.clone(),
+                },
+            );
+        }
+        if !handlers.contains_key("memory_reflect") {
+            tool_specs.push(providers::ToolSpec {
+                name: "memory_reflect".into(),
+                description: AGENT_MEMORY_REFLECT_DESC.into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "What to synthesize from this agent context's memory." },
+                        "options": { "type": "object", "description": "Optional Hindsight reflect options." }
+                    },
+                    "required": ["query"]
+                }),
+            });
+            handlers.insert(
+                "memory_reflect".into(),
+                AgentTool::Memory {
+                    action: AgentMemoryAction::Reflect,
+                    config: cfg.clone(),
+                },
+            );
+        }
+        if !handlers.contains_key("memory_retain") {
+            tool_specs.push(providers::ToolSpec {
+                name: "memory_retain".into(),
+                description: AGENT_MEMORY_RETAIN_DESC.into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "Stable fact, decision, preference, or observation to remember." },
+                        "options": { "type": "object", "description": "Optional Hindsight retain metadata/tags." }
+                    },
+                    "required": ["content"]
+                }),
+            });
+            handlers.insert(
+                "memory_retain".into(),
+                AgentTool::Memory {
+                    action: AgentMemoryAction::Retain,
+                    config: cfg.clone(),
+                },
+            );
+        }
     }
-    messages.push(providers::ChatMessage::user(task.clone()));
-    audit_agent_turn(&run_id, &op.name, &model, &mut turn_idx, "user", Some(&task), None, None, None, 0, 0, None, 0, None);
-
-    let total_t0 = Instant::now();
     let mut agg_in = 0i32;
     let mut agg_out = 0i32;
     let mut agg_cost = 0f64;
@@ -617,9 +874,33 @@ fn run_step_agent(
                 Ok(r) => r,
                 Err(e) => {
                     let err = e.to_string();
-                    audit_agent_turn(&run_id, &op.name, &model, &mut turn_idx, "error", Some(&err), None, None, None, 0, 0, None, 0, Some(&err));
+                    audit_agent_turn(
+                        &run_id,
+                        &op.name,
+                        &model,
+                        &mut turn_idx,
+                        "error",
+                        Some(&err),
+                        None,
+                        None,
+                        None,
+                        0,
+                        0,
+                        None,
+                        0,
+                        Some(&err),
+                    );
                     return (
-                        agent_subcall(step_name, &model, gen_id, agg_in, agg_out, agg_cost, &total_t0, Some(err)),
+                        agent_subcall(
+                            step_name,
+                            &model,
+                            gen_id,
+                            agg_in,
+                            agg_out,
+                            agg_cost,
+                            &total_t0,
+                            Some(err),
+                        ),
                         Value::Null,
                         String::new(),
                     );
@@ -663,9 +944,14 @@ fn run_step_agent(
             });
             for tc in &resp.tool_calls {
                 let (result_text, err) = match handlers.get(&tc.name) {
-                    Some(AgentTool::Query) => agent_run_readonly_query(&tc.arguments, tool_result_max),
+                    Some(AgentTool::Query) => {
+                        agent_run_readonly_query(&tc.arguments, tool_result_max)
+                    }
                     Some(AgentTool::Mcp { server, tool }) => {
                         agent_run_mcp_tool(server, tool, &tc.arguments, tool_result_max)
+                    }
+                    Some(AgentTool::Memory { action, config }) => {
+                        agent_run_memory_action(*action, config, &tc.arguments, config.max_chars)
                     }
                     None => (
                         format!("ERROR: tool '{}' is not permitted for this agent", tc.name),
@@ -704,6 +990,63 @@ fn run_step_agent(
         break;
     }
 
+    if let Some(cfg) = memory.as_ref().filter(|m| m.retain_final) {
+        if !last_content.trim().is_empty() {
+            let mut options = object_or_empty(&cfg.retain_options);
+            let mut metadata = object_or_empty(options.get("metadata").unwrap_or(&Value::Null));
+            metadata.insert("source".into(), Value::String("rvbbit_agent".into()));
+            metadata.insert("operator".into(), Value::String(op.name.clone()));
+            metadata.insert("step".into(), Value::String(step_name.to_string()));
+            metadata.insert("run_id".into(), Value::String(run_id.clone()));
+            metadata.insert("context".into(), Value::String(cfg.context.clone()));
+            metadata.insert("kind".into(), Value::String("final_answer".into()));
+            options.insert("metadata".into(), Value::Object(metadata));
+            options
+                .entry("source")
+                .or_insert_with(|| Value::String("rvbbit_agent".into()));
+            let args = serde_json::json!({
+                "content": last_content.as_str(),
+                "options": Value::Object(options),
+            });
+            let (result_text, err) =
+                agent_run_memory_action(AgentMemoryAction::Retain, cfg, &args, cfg.max_chars);
+            audit_agent_turn(
+                &run_id,
+                &op.name,
+                &model,
+                &mut turn_idx,
+                "tool",
+                Some(&result_text),
+                Some("memory_retain"),
+                None,
+                None,
+                0,
+                0,
+                None,
+                0,
+                err.as_deref(),
+            );
+            if let Some(e) = err {
+                if cfg.required {
+                    return (
+                        agent_subcall(
+                            step_name,
+                            &model,
+                            gen_id,
+                            agg_in,
+                            agg_out,
+                            agg_cost,
+                            &total_t0,
+                            Some(e),
+                        ),
+                        Value::Null,
+                        String::new(),
+                    );
+                }
+            }
+        }
+    }
+
     let out = serde_json::json!({
         "output": last_content,
         "agent_run_id": run_id,
@@ -711,9 +1054,19 @@ fn run_step_agent(
         "turns": turn_idx,
         "tokens_in": agg_in,
         "tokens_out": agg_out,
+        "memory": memory.as_ref().map(|cfg| serde_json::json!({
+            "provider": "hindsight",
+            "service": cfg.service_name,
+            "bank_id": cfg.bank_id,
+            "context": cfg.context,
+            "tools": cfg.allow_tools,
+            "retain_final": cfg.retain_final,
+        })),
     });
     (
-        agent_subcall(step_name, &model, gen_id, agg_in, agg_out, agg_cost, &total_t0, None),
+        agent_subcall(
+            step_name, &model, gen_id, agg_in, agg_out, agg_cost, &total_t0, None,
+        ),
         out,
         last_content,
     )
@@ -758,6 +1111,283 @@ fn new_agent_run_id() -> String {
         .unwrap_or_else(|| "agent-run".to_string())
 }
 
+fn agent_memory_config(
+    step: &Value,
+    op: &OpDef,
+    step_name: &str,
+    scope: &Scope,
+    tool_result_max: usize,
+) -> Option<AgentMemoryConfig> {
+    let memory = step.get("memory")?;
+    let obj = match memory {
+        Value::Bool(false) | Value::Null => return None,
+        Value::Bool(true) => Map::new(),
+        Value::Object(map) => {
+            if map.get("enabled").and_then(Value::as_bool) == Some(false) {
+                return None;
+            }
+            let provider = map
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("hindsight")
+                .trim()
+                .to_ascii_lowercase();
+            if provider != "hindsight" {
+                return None;
+            }
+            map.clone()
+        }
+        _ => return None,
+    };
+
+    let rendered_string = |keys: &[&str], fallback: &str| {
+        keys.iter()
+            .find_map(|key| obj.get(*key).and_then(Value::as_str))
+            .map(|s| scope.render(s).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    let service_name = rendered_string(&["service", "service_name"], "");
+    let context = rendered_string(&["context", "context_id", "context_name"], "default");
+    let limit = obj
+        .get("limit")
+        .or_else(|| obj.get("top_k"))
+        .and_then(Value::as_i64)
+        .unwrap_or(6)
+        .clamp(1, 50);
+    let max_chars = obj
+        .get("max_chars")
+        .or_else(|| obj.get("memory_max_chars"))
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or_else(|| tool_result_max.min(4000))
+        .clamp(256, 64000);
+    let mut recall_options = obj
+        .get("recall_options")
+        .or_else(|| obj.get("options"))
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    ensure_memory_limit(&mut recall_options, limit);
+
+    Some(AgentMemoryConfig {
+        service_name,
+        context: context.clone(),
+        bank_id: derive_agent_memory_bank(&op.name, step_name, &context),
+        required: obj.get("required").and_then(Value::as_bool).unwrap_or(true),
+        allow_tools: obj
+            .get("allow_tools")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        recall_before_run: obj
+            .get("recall_before_run")
+            .or_else(|| obj.get("auto_recall"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        retain_final: obj
+            .get("retain_final")
+            .or_else(|| obj.get("auto_retain"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        async_retain: obj
+            .get("async_retain")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        limit,
+        max_chars,
+        recall_options,
+        retain_options: obj
+            .get("retain_options")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new())),
+    })
+}
+
+fn derive_agent_memory_bank(operator: &str, step_name: &str, context: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(operator.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(step_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(context.as_bytes());
+    let digest = hasher.finalize();
+    let short = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "rvbbit_agent_{}_{}_{}",
+        memory_bank_segment(operator),
+        memory_bank_segment(step_name),
+        short
+    )
+    .chars()
+    .take(120)
+    .collect()
+}
+
+fn memory_bank_segment(raw: &str) -> String {
+    let mut out = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "agent".to_string()
+    } else {
+        trimmed.chars().take(32).collect()
+    }
+}
+
+fn agent_memory_service_available(cfg: &AgentMemoryConfig) -> Result<(), String> {
+    let arg = if cfg.service_name.trim().is_empty() {
+        "NULL".to_string()
+    } else {
+        sql_lit(cfg.service_name.trim())
+    };
+    let sql = format!("SELECT rvbbit.hindsight_service({arg}) IS NOT NULL");
+    let result: Result<Option<bool>, String> = pgrx::PgTryBuilder::new(move || {
+        pgrx::Spi::get_one::<bool>(&sql).map_err(|e| e.to_string())
+    })
+    .catch_others(|caught| Err(crate::router::caught_error_message(caught)))
+    .execute();
+    match result {
+        Ok(Some(true)) => Ok(()),
+        Ok(_) => Err("no ready Hindsight memory service is registered".into()),
+        Err(e) => Err(e),
+    }
+}
+
+fn agent_run_memory_action(
+    action: AgentMemoryAction,
+    cfg: &AgentMemoryConfig,
+    args: &Value,
+    max_chars: usize,
+) -> (String, Option<String>) {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let content = args
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let mut options = match action {
+        AgentMemoryAction::Recall | AgentMemoryAction::Reflect => {
+            object_or_empty(&cfg.recall_options)
+        }
+        AgentMemoryAction::Retain => object_or_empty(&cfg.retain_options),
+    };
+    merge_object(
+        &mut options,
+        &object_or_empty(args.get("options").unwrap_or(&Value::Null)),
+    );
+
+    let sql = match action {
+        AgentMemoryAction::Recall => {
+            if query.is_empty() {
+                return (
+                    "ERROR: memory_recall requires a non-empty 'query' string".into(),
+                    Some("no query".into()),
+                );
+            }
+            ensure_memory_limit_value(&mut options, cfg.limit);
+            format!(
+                "SELECT rvbbit.hindsight_recall({}, {}, {}::jsonb, {})::text",
+                sql_lit(&cfg.bank_id),
+                sql_lit(query),
+                sql_lit(&Value::Object(options).to_string()),
+                sql_lit(&cfg.service_name),
+            )
+        }
+        AgentMemoryAction::Reflect => {
+            if query.is_empty() {
+                return (
+                    "ERROR: memory_reflect requires a non-empty 'query' string".into(),
+                    Some("no query".into()),
+                );
+            }
+            format!(
+                "SELECT rvbbit.hindsight_reflect({}, {}, {}::jsonb, {})::text",
+                sql_lit(&cfg.bank_id),
+                sql_lit(query),
+                sql_lit(&Value::Object(options).to_string()),
+                sql_lit(&cfg.service_name),
+            )
+        }
+        AgentMemoryAction::Retain => {
+            if content.is_empty() {
+                return (
+                    "ERROR: memory_retain requires a non-empty 'content' string".into(),
+                    Some("no content".into()),
+                );
+            }
+            options
+                .entry("source")
+                .or_insert_with(|| Value::String("rvbbit_agent".into()));
+            format!(
+                "SELECT rvbbit.hindsight_retain({}, {}, {}::jsonb, {}, {})::text",
+                sql_lit(&cfg.bank_id),
+                sql_lit(content),
+                sql_lit(&Value::Object(options).to_string()),
+                sql_lit(&cfg.service_name),
+                if cfg.async_retain { "true" } else { "false" },
+            )
+        }
+    };
+
+    let result: Result<Option<String>, String> = pgrx::PgTryBuilder::new(move || {
+        pgrx::Spi::get_one::<String>(&sql).map_err(|e| e.to_string())
+    })
+    .catch_others(|caught| Err(crate::router::caught_error_message(caught)))
+    .execute();
+    match result {
+        Ok(Some(json)) => (truncate_tool_result(&json, max_chars), None),
+        Ok(None) => ("null".into(), None),
+        Err(e) => {
+            let msg = format!("ERROR: {e}");
+            (truncate_tool_result(&msg, max_chars), Some(e))
+        }
+    }
+}
+
+fn object_or_empty(value: &Value) -> Map<String, Value> {
+    value.as_object().cloned().unwrap_or_default()
+}
+
+fn merge_object(base: &mut Map<String, Value>, overlay: &Map<String, Value>) {
+    for (key, value) in overlay {
+        base.insert(key.clone(), value.clone());
+    }
+}
+
+fn ensure_memory_limit(value: &mut Value, limit: i64) {
+    if let Value::Object(map) = value {
+        ensure_memory_limit_value(map, limit);
+    }
+}
+
+fn ensure_memory_limit_value(map: &mut Map<String, Value>, limit: i64) {
+    if !map.contains_key("top_k") && !map.contains_key("limit") {
+        map.insert("top_k".into(), Value::from(limit));
+    }
+}
+
+fn sql_lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 /// Load an MCP tool's description + input schema so the model can be told how to
 /// call it. Returns None (tool silently skipped) if the server/tool is unknown.
 fn load_mcp_tool_spec(server: &str, tool: &str) -> Option<(String, Value)> {
@@ -768,8 +1398,15 @@ fn load_mcp_tool_spec(server: &str, tool: &str) -> Option<(String, Value)> {
         server.replace('\'', "''"),
         tool.replace('\'', "''"),
     );
-    let row = pgrx::Spi::get_one::<pgrx::JsonB>(&wrapped).ok().flatten()?.0;
-    let desc = row.get("d").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let row = pgrx::Spi::get_one::<pgrx::JsonB>(&wrapped)
+        .ok()
+        .flatten()?
+        .0;
+    let desc = row
+        .get("d")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let schema = row
         .get("s")
         .cloned()
@@ -783,7 +1420,11 @@ fn load_mcp_tool_spec(server: &str, tool: &str) -> Option<(String, Value)> {
 /// inside a subtransaction (a bad query can't abort the agent's operator txn),
 /// capped at 200 rows + a wall timeout, result truncated to `max_chars`.
 fn agent_run_readonly_query(args: &Value, max_chars: usize) -> (String, Option<String>) {
-    let raw = args.get("sql").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let raw = args
+        .get("sql")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     let sql = raw.trim_end_matches(';').trim();
     if sql.is_empty() {
         return (
@@ -877,7 +1518,10 @@ fn audit_agent_turn(
     error: Option<&str>,
 ) {
     let esc = |s: &str| s.replace('\'', "''");
-    let txt = |o: Option<&str>| o.map(|s| format!("'{}'", esc(s))).unwrap_or_else(|| "NULL".into());
+    let txt = |o: Option<&str>| {
+        o.map(|s| format!("'{}'", esc(s)))
+            .unwrap_or_else(|| "NULL".into())
+    };
     let jsn = |o: Option<Value>| {
         o.map(|v| format!("'{}'::jsonb", esc(&v.to_string())))
             .unwrap_or_else(|| "NULL".into())
@@ -1476,3 +2120,87 @@ pub fn render_value_templates(v: &Value, scope: &Scope) -> Value {
 // directly named (we propagate via to_string).
 #[allow(dead_code)]
 fn _silence_unused_err(_: ProviderError) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_op() -> OpDef {
+        OpDef {
+            name: "support_triage".into(),
+            shape: "scalar".into(),
+            return_type: "text".into(),
+            model: "openai/gpt-5.4-mini".into(),
+            system_prompt: String::new(),
+            user_prompt: String::new(),
+            parser: "text".into(),
+            max_tokens: 256,
+            temperature: None,
+            steps: None,
+            retry: None,
+            wards: None,
+            takes: None,
+            cache_policy: "never".into(),
+        }
+    }
+
+    #[test]
+    fn agent_memory_true_uses_scoped_defaults() {
+        let scope = Scope::new(json!({"tenant": "acme"}), Value::Null);
+        let step = json!({"name": "analyst", "kind": "agent", "memory": true});
+        let cfg = agent_memory_config(&step, &test_op(), "analyst", &scope, 8000).unwrap();
+        assert_eq!(cfg.context, "default");
+        assert_eq!(cfg.service_name, "");
+        assert!(cfg.allow_tools);
+        assert!(cfg.recall_before_run);
+        assert!(cfg.retain_final);
+        assert!(cfg.required);
+        assert_eq!(cfg.max_chars, 4000);
+        assert!(cfg
+            .bank_id
+            .starts_with("rvbbit_agent_support_triage_analyst_"));
+        assert_eq!(cfg.recall_options["top_k"], 6);
+    }
+
+    #[test]
+    fn agent_memory_object_renders_context_and_options() {
+        let scope = Scope::new(json!({"tenant": "acme"}), Value::Null);
+        let step = json!({
+            "name": "analyst",
+            "kind": "agent",
+            "memory": {
+                "enabled": true,
+                "context": "{{ inputs.tenant }}",
+                "service": "hindsight_default",
+                "required": true,
+                "allow_tools": false,
+                "recall_before_run": false,
+                "retain_final": false,
+                "limit": 9,
+                "max_chars": 1234,
+                "recall_options": { "top_k": 3 },
+                "retain_options": { "source": "unit" }
+            }
+        });
+        let cfg = agent_memory_config(&step, &test_op(), "analyst", &scope, 8000).unwrap();
+        assert_eq!(cfg.context, "acme");
+        assert_eq!(cfg.service_name, "hindsight_default");
+        assert!(cfg.required);
+        assert!(!cfg.allow_tools);
+        assert!(!cfg.recall_before_run);
+        assert!(!cfg.retain_final);
+        assert_eq!(cfg.limit, 9);
+        assert_eq!(cfg.max_chars, 1234);
+        assert_eq!(cfg.recall_options["top_k"], 3);
+        assert_eq!(cfg.retain_options["source"], "unit");
+    }
+
+    #[test]
+    fn agent_memory_bank_changes_with_context() {
+        let a = derive_agent_memory_bank("support_triage", "analyst", "acme");
+        let b = derive_agent_memory_bank("support_triage", "analyst", "globex");
+        assert_ne!(a, b);
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+}
