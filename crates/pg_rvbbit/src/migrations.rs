@@ -445,6 +445,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0106_hindsight_sql_wrappers",
         include_str!("../sql/migrations/0106_hindsight_sql_wrappers.sql"),
     ),
+    (
+        "0107_viz_blocks",
+        include_str!("../sql/migrations/0107_viz_blocks.sql"),
+    ),
+    (
+        "0108_operator_model_setter",
+        include_str!("../sql/migrations/0108_operator_model_setter.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

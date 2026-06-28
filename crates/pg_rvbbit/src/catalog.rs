@@ -2106,6 +2106,30 @@ BEGIN
     END IF;
 END $$;
 
+-- DDL helper: set an operator's catalog-default LLM model. This is the
+-- per-operator counterpart to set_semantic_model / set_cube_model; step-level
+-- models still win when explicitly set in the operator flow.
+CREATE OR REPLACE FUNCTION rvbbit.set_operator_model(
+    op_name text,
+    p_model text
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_model text := nullif(btrim(p_model), '');
+    v_purged bigint;
+BEGIN
+    IF v_model IS NULL THEN
+        RAISE EXCEPTION 'rvbbit.set_operator_model: model must not be empty';
+    END IF;
+
+    UPDATE rvbbit.operators SET model = v_model WHERE name = op_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'rvbbit.set_operator_model: unknown operator %', op_name;
+    END IF;
+
+    SELECT rvbbit.judgment_purge(op_name) INTO v_purged;
+    RETURN v_model;
+END $$;
+
 -- DDL helper: attach (or clear) pre/post validator gates. Loop 17.
 --   SELECT rvbbit.set_operator_wards('classify', jsonb_build_object(
 --       'pre',  jsonb_build_array(jsonb_build_object(
