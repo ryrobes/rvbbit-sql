@@ -12,7 +12,7 @@
 //! dispatch by `kind`.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -149,7 +149,7 @@ pub fn contains_sql_node(steps: Option<&Value>) -> bool {
 /// worker. SQL nodes use SPI directly. MCP nodes may resolve the active
 /// gateway URL from SQL and log per-call audit rows.
 pub fn contains_leader_node(steps: Option<&Value>) -> bool {
-    contains_sql_node(steps) || contains_step_kind(steps, &["mcp", "agent"])
+    contains_sql_node(steps) || contains_step_kind(steps, &["mcp", "agent", "n8n"])
 }
 
 fn contains_step_kind(steps: Option<&Value>, kinds: &[&str]) -> bool {
@@ -331,6 +331,7 @@ fn run_multi_step_inner(
             "specialist" => run_step_specialist(step, &step_name, scope),
             "sql" => run_step_sql(step, &step_name, scope),
             "mcp" => run_step_mcp(step, &step_name, scope),
+            "n8n" => run_step_n8n(step, &step_name, scope),
             "agent" => run_step_agent(op, step, &step_name, scope),
             other => (
                 SubCall {
@@ -1965,6 +1966,324 @@ fn mcp_error(step_name: &str, server: &str, tool: &str, err: &str) -> (SubCall, 
             } else {
                 format!("{server}.{tool}")
             }),
+            tokens_in: 0,
+            tokens_out: 0,
+            latency_ms: 0,
+            error: Some(err.into()),
+            ..Default::default()
+        },
+        Value::Null,
+        String::new(),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct N8nRuntime {
+    name: String,
+    base_url: String,
+    webhook_path_prefix: String,
+    auth_header_name: Option<String>,
+    auth_header_env: Option<String>,
+}
+
+/// Run an n8n step by posting rendered inputs to a configured production
+/// webhook. The n8n database is intentionally not part of execution; DB
+/// introspection only helps Lens populate workflow/path pickers.
+fn run_step_n8n(step: &Value, step_name: &str, scope: &Scope) -> (SubCall, Value, String) {
+    let runtime_name = step
+        .get("runtime")
+        .or_else(|| step.get("runtime_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .trim()
+        .to_string();
+    let webhook_path = step
+        .get("webhook")
+        .or_else(|| step.get("webhook_path"))
+        .or_else(|| step.get("path"))
+        .and_then(|v| v.as_str())
+        .map(|s| scope.render(s).trim().to_string())
+        .unwrap_or_default();
+    if webhook_path.is_empty() {
+        return n8n_error(step_name, &runtime_name, "", "step missing 'webhook' path");
+    }
+
+    let runtime = match load_n8n_runtime(&runtime_name) {
+        Ok(runtime) => runtime,
+        Err(e) => return n8n_error(step_name, &runtime_name, &webhook_path, &e),
+    };
+    let url = n8n_webhook_url(&runtime, &webhook_path);
+    let method_raw = step
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("POST")
+        .trim()
+        .to_ascii_uppercase();
+    let method = match reqwest::Method::from_bytes(method_raw.as_bytes()) {
+        Ok(method) => method,
+        Err(e) => return n8n_error(step_name, &runtime.name, &webhook_path, &e.to_string()),
+    };
+    let timeout = step
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0)
+        .unwrap_or(60_000)
+        .min(15 * 60_000);
+
+    let payload_raw = step
+        .get("body")
+        .or_else(|| step.get("inputs"))
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let payload = render_value_templates(&payload_raw, scope);
+    let headers_raw = step
+        .get("headers")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let headers = render_value_templates(&headers_raw, scope);
+
+    let t0 = Instant::now();
+    let mut req = crate::specialists::http_client()
+        .request(method.clone(), &url)
+        .timeout(Duration::from_millis(timeout));
+
+    match n8n_auth_header(&runtime) {
+        Ok(Some((header_name, header_value))) => {
+            req = match add_header(req, &header_name, &header_value) {
+                Ok(req) => req,
+                Err(e) => return n8n_error(step_name, &runtime.name, &webhook_path, &e),
+            };
+        }
+        Ok(None) => {}
+        Err(e) => return n8n_error(step_name, &runtime.name, &webhook_path, &e),
+    }
+    if let Value::Object(map) = &headers {
+        for (key, value) in map {
+            let value = value_to_string(value);
+            if value.trim().is_empty() {
+                continue;
+            }
+            req = match add_header(req, key, &value) {
+                Ok(req) => req,
+                Err(e) => return n8n_error(step_name, &runtime.name, &webhook_path, &e),
+            };
+        }
+    }
+
+    req = if method == reqwest::Method::GET || method == reqwest::Method::HEAD {
+        let query = flat_query_params(&payload);
+        req.query(&query)
+    } else {
+        req.json(&payload)
+    };
+
+    let response = match req.send() {
+        Ok(resp) => resp,
+        Err(e) => return n8n_error(step_name, &runtime.name, &webhook_path, &e.to_string()),
+    };
+    let status = response.status();
+    let text = match response.text() {
+        Ok(text) => text,
+        Err(e) => return n8n_error(step_name, &runtime.name, &webhook_path, &e.to_string()),
+    };
+    let latency_ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
+
+    if !status.is_success() {
+        return (
+            SubCall {
+                step: step_name.into(),
+                kind: "n8n".into(),
+                model: Some(n8n_model_label(&runtime.name, &webhook_path)),
+                backend: Some(runtime.name.clone()),
+                transport: Some("http_webhook".into()),
+                upstream_id: step
+                    .get("workflow_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                tokens_in: 0,
+                tokens_out: 0,
+                latency_ms,
+                error: Some(format!(
+                    "n8n webhook returned HTTP {}: {}",
+                    status.as_u16(),
+                    truncate_tool_result(&text, 2000)
+                )),
+                ..Default::default()
+            },
+            Value::Null,
+            String::new(),
+        );
+    }
+
+    let payload =
+        serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text.clone()));
+    let output_text = if payload.is_string() {
+        text
+    } else {
+        payload.to_string()
+    };
+    (
+        SubCall {
+            step: step_name.into(),
+            kind: "n8n".into(),
+            model: Some(n8n_model_label(&runtime.name, &webhook_path)),
+            backend: Some(runtime.name.clone()),
+            transport: Some("http_webhook".into()),
+            upstream_id: step
+                .get("workflow_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            tokens_in: 0,
+            tokens_out: 0,
+            latency_ms,
+            error: None,
+            ..Default::default()
+        },
+        serde_json::json!({
+            "output": payload,
+            "status": status.as_u16(),
+            "runtime": runtime.name,
+            "webhook": webhook_path,
+        }),
+        output_text,
+    )
+}
+
+fn load_n8n_runtime(name: &str) -> Result<N8nRuntime, String> {
+    let wanted = if name.trim().is_empty() {
+        "default"
+    } else {
+        name.trim()
+    };
+    let sql = format!(
+        "WITH picked AS ( \
+             SELECT name, base_url, webhook_path_prefix, auth_header_name, auth_header_env \
+               FROM rvbbit.n8n_runtimes WHERE name = {wanted} \
+             UNION ALL \
+             SELECT name, base_url, webhook_path_prefix, auth_header_name, auth_header_env \
+               FROM rvbbit.n8n_runtimes \
+              WHERE {wanted} = 'default' AND (SELECT count(*) FROM rvbbit.n8n_runtimes) = 1 \
+         ) \
+         SELECT to_jsonb(picked) FROM picked LIMIT 1",
+        wanted = sql_lit(wanted),
+    );
+    let row: Result<Option<Value>, String> = pgrx::PgTryBuilder::new(move || {
+        Ok(pgrx::Spi::get_one::<pgrx::JsonB>(&sql)
+            .map_err(|e| e.to_string())?
+            .map(|j| j.0))
+    })
+    .catch_others(|caught| Err(crate::router::caught_error_message(caught)))
+    .execute();
+    let row = row?;
+    let row = row.ok_or_else(|| format!("no rvbbit.n8n_runtimes row named '{wanted}'"))?;
+    Ok(N8nRuntime {
+        name: row
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(wanted)
+            .to_string(),
+        base_url: row
+            .get("base_url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_string(),
+        webhook_path_prefix: row
+            .get("webhook_path_prefix")
+            .and_then(Value::as_str)
+            .unwrap_or("/webhook")
+            .trim_end_matches('/')
+            .to_string(),
+        auth_header_name: row
+            .get("auth_header_name")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        auth_header_env: row
+            .get("auth_header_env")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    })
+}
+
+fn n8n_webhook_url(runtime: &N8nRuntime, path: &str) -> String {
+    let p = path.trim();
+    if p.starts_with("http://") || p.starts_with("https://") {
+        return p.to_string();
+    }
+    if p.starts_with('/') {
+        return format!("{}{}", runtime.base_url, p);
+    }
+    let prefix = if runtime.webhook_path_prefix.is_empty() {
+        "/webhook"
+    } else {
+        runtime.webhook_path_prefix.as_str()
+    };
+    format!(
+        "{}/{}/{}",
+        runtime.base_url,
+        prefix.trim_matches('/'),
+        p.trim_matches('/')
+    )
+}
+
+fn n8n_auth_header(runtime: &N8nRuntime) -> Result<Option<(String, String)>, String> {
+    let Some(name) = runtime.auth_header_name.as_ref() else {
+        return Ok(None);
+    };
+    let Some(env) = runtime.auth_header_env.as_ref() else {
+        return Ok(None);
+    };
+    let value = std::env::var(env)
+        .map_err(|_| format!("configured n8n auth env '{env}' is not visible to Postgres"))?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        Err(format!("configured n8n auth env '{env}' is empty"))
+    } else {
+        Ok(Some((name.clone(), value)))
+    }
+}
+
+fn add_header(
+    req: reqwest::blocking::RequestBuilder,
+    name: &str,
+    value: &str,
+) -> Result<reqwest::blocking::RequestBuilder, String> {
+    let header_name = reqwest::header::HeaderName::from_bytes(name.trim().as_bytes())
+        .map_err(|e| format!("invalid HTTP header name '{name}': {e}"))?;
+    let header_value = reqwest::header::HeaderValue::from_str(value)
+        .map_err(|e| format!("invalid HTTP header value for '{name}': {e}"))?;
+    Ok(req.header(header_name, header_value))
+}
+
+fn flat_query_params(value: &Value) -> Vec<(String, String)> {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| (k.clone(), value_to_string(v)))
+            .collect(),
+        other => vec![("payload".into(), value_to_string(other))],
+    }
+}
+
+fn n8n_model_label(runtime: &str, webhook: &str) -> String {
+    format!("{runtime}:{}", webhook.trim_matches('/'))
+}
+
+fn n8n_error(step_name: &str, runtime: &str, webhook: &str, err: &str) -> (SubCall, Value, String) {
+    (
+        SubCall {
+            step: step_name.into(),
+            kind: "n8n".into(),
+            model: Some(n8n_model_label(runtime, webhook)),
+            backend: if runtime.is_empty() {
+                None
+            } else {
+                Some(runtime.into())
+            },
+            transport: Some("http_webhook".into()),
             tokens_in: 0,
             tokens_out: 0,
             latency_ms: 0,

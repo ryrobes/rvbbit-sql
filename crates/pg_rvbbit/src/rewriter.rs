@@ -2833,11 +2833,10 @@ unsafe fn rewrite_query(query: *mut pg_sys::Query) {
     // (try_count_star_rule, try_simple_agg_rule, try_groupby_rule, the
     // vector_float_aggregate rule, etc.) compute their answer from
     // rvbbit.row_groups + rvbbit.row_groups.stats / per_group_stats
-    // directly, without scanning parquet — so they don't apply tombstones
-    // and don't honor rvbbit.as_of_generation. When either of those
-    // matters for correctness, fall through to the normal scan path
-    // (custom_scan honors both).
-    if metadata_rewrites_unsafe_for_correctness() {
+    // directly, without scanning parquet. Keep historical reads as a
+    // global opt-out, and check dirty/tombstone/cold state only for the
+    // rvbbit relations referenced by this query.
+    if metadata_rewrites_unsafe_for_correctness(query) {
         CURRENT_QUERY.with(|c| c.set(prev_query));
         return;
     }
@@ -9161,7 +9160,10 @@ fn implicit_prewarm_enabled() -> bool {
     match pgrx::Spi::get_one::<String>(
         "SELECT nullif(current_setting('rvbbit.implicit_prewarm', true), '')",
     ) {
-        Ok(Some(v)) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+        Ok(Some(v)) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
         _ => true,
     }
 }
@@ -9305,8 +9307,8 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
             }
         }
     }
-    let warm_estimate =
-        estimate_distinct_warm_rows(table_oid, &warm_cols, effective_rows).unwrap_or(effective_rows);
+    let warm_estimate = estimate_distinct_warm_rows(table_oid, &warm_cols, effective_rows)
+        .unwrap_or(effective_rows);
     if warm_estimate > cap {
         // Visible (not debug1) so a slow large query explains itself: this is the
         // common "why is this timing out" case — prewarm is skipped and the
@@ -9723,7 +9725,9 @@ unsafe fn const_output_text(datum: pg_sys::Datum, typoid: pg_sys::Oid) -> String
     if cstr.is_null() {
         return String::new();
     }
-    let out = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+    let out = std::ffi::CStr::from_ptr(cstr)
+        .to_string_lossy()
+        .into_owned();
     pg_sys::pfree(cstr as *mut std::ffi::c_void);
     out
 }
@@ -9733,7 +9737,9 @@ unsafe fn const_type_name(typoid: pg_sys::Oid) -> Option<String> {
     if cstr.is_null() {
         return None;
     }
-    let name = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+    let name = std::ffi::CStr::from_ptr(cstr)
+        .to_string_lossy()
+        .into_owned();
     pg_sys::pfree(cstr as *mut std::ffi::c_void);
     Some(name)
 }
@@ -9946,9 +9952,7 @@ fn fetch_total_row_count(table_oid: u32) -> Option<i64> {
 }
 
 fn clean_shadow_heap_retained(table_oid: u32) -> bool {
-    let sql = format!(
-        "SELECT rvbbit.shadow_heap_clean_retained({table_oid}::oid)"
-    );
+    let sql = format!("SELECT rvbbit.shadow_heap_clean_retained({table_oid}::oid)");
     pgrx::Spi::get_one::<bool>(&sql)
         .ok()
         .flatten()
@@ -9995,21 +9999,18 @@ fn force_heap_scan_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Phase 2 followup A: are any of the metadata-only fast path rewrites
-/// unsafe to apply right now? Returns true when:
+/// Phase 2 followup A: are metadata-only fast path rewrites unsafe for this
+/// query? Returns true when:
 ///   - rvbbit.as_of_generation is set to a positive value (historical
 ///     reads need row-group narrowing the metadata path can't do); OR
-///   - any rvbbit table is dirty (metadata sees only accelerated row
+///   - any referenced rvbbit table is dirty (metadata sees only accelerated row
 ///     groups and would miss a heap tail); OR
-///   - any rvbbit table has at least one tombstone (metadata counts
-///     don't subtract tombstones).
-///
-/// Conservative: a query that references no tombstoned table still
-/// falls through when ANY rvbbit table has tombstones. That's the
-/// trade-off for keeping the check to a single cheap EXISTS query
-/// instead of walking the rtable per call. A more precise per-rtable
-/// check is a future refinement.
-fn metadata_rewrites_unsafe_for_correctness() -> bool {
+///   - any referenced rvbbit table has at least one visible tombstone
+///     (metadata counts don't subtract tombstones); OR
+///   - any referenced rvbbit table has cold row groups that should be
+///     routed through the object-store path instead of answered from
+///     local metadata.
+unsafe fn metadata_rewrites_unsafe_for_correctness(query: *mut pg_sys::Query) -> bool {
     if current_source_has_asof_timestamp_directive() {
         return true;
     }
@@ -10027,60 +10028,103 @@ fn metadata_rewrites_unsafe_for_correctness() -> bool {
     if !rvbbit_tables_catalog_present() {
         return false;
     }
-    // Existence guard: PG parses BOTH branches of a CASE at plan time, so
-    // a single CASE-guarded EXISTS still fails when rvbbit.delete_log
-    // doesn't exist yet (CREATE EXTENSION's first CREATE TABLE runs the
-    // planner hook before rvbbit.delete_log is created). Two separate
-    // SPI calls sidestep that — the first never references the table.
-    let table_exists: Option<bool> =
-        pgrx::Spi::get_one("SELECT to_regclass('rvbbit.delete_log') IS NOT NULL")
-            .ok()
-            .flatten();
-    if !table_exists.unwrap_or(false) {
+    metadata_rewrite_relation_oids(query)
+        .into_iter()
+        .any(metadata_table_unsafe_for_rewrite)
+}
+
+unsafe fn metadata_rewrite_relation_oids(query: *mut pg_sys::Query) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    if query.is_null() {
+        return out;
+    }
+    let rtable = (*query).rtable;
+    if rtable.is_null() {
+        return out;
+    }
+    for i in 0..(*rtable).length {
+        let rte = (*(*rtable).elements.add(i as usize)).ptr_value as *mut pg_sys::RangeTblEntry;
+        if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+            continue;
+        }
+        let oid = (*rte).relid.to_u32();
+        if is_rvbbit_table_cached(oid) && seen.insert(oid) {
+            out.push(oid);
+        }
+    }
+    out
+}
+
+fn metadata_table_unsafe_for_rewrite(table_oid: u32) -> bool {
+    if catalog_relation_present("rvbbit.table_dirty_state") {
+        let sql = format!(
+            "SELECT EXISTS( \
+                 SELECT 1 \
+                 FROM rvbbit.table_dirty_state \
+                 WHERE table_oid = {table_oid}::oid \
+                   AND shadow_heap_dirty \
+             )"
+        );
+        match pgrx::Spi::get_one::<bool>(&sql).ok().flatten() {
+            Some(true) => return true,
+            Some(false) => {}
+            None => return true,
+        }
+    }
+
+    if !catalog_relation_present("rvbbit.row_groups_visible") {
         return false;
     }
-    let has_dirty: Option<bool> = pgrx::Spi::get_one(
-        "SELECT EXISTS( \
-             SELECT 1 \
-             FROM rvbbit.table_dirty_state \
-             WHERE shadow_heap_dirty \
-         )",
-    )
-    .ok()
-    .flatten();
-    if has_dirty.unwrap_or(false) {
-        return true;
+
+    // Existence guard: PG parses BOTH branches of a CASE at plan time, so
+    // a single CASE-guarded EXISTS still fails when rvbbit.delete_log
+    // doesn't exist yet during CREATE EXTENSION. Keep the guard separate
+    // before referencing the tombstone catalog.
+    if catalog_relation_present("rvbbit.delete_log") {
+        let sql = format!(
+            "SELECT EXISTS( \
+                 SELECT 1 \
+                 FROM rvbbit.delete_log dl \
+                 JOIN rvbbit.row_groups_visible rgv \
+                   ON rgv.table_oid = dl.table_oid \
+                  AND rgv.rg_id = dl.rg_id \
+                 WHERE dl.table_oid = {table_oid}::oid \
+             )"
+        );
+        match pgrx::Spi::get_one::<bool>(&sql).ok().flatten() {
+            Some(true) => return true,
+            Some(false) => {}
+            None => return true,
+        }
     }
-    let has_tombstones: Option<bool> = pgrx::Spi::get_one(
-        "SELECT EXISTS( \
-             SELECT 1 \
-             FROM rvbbit.delete_log dl \
-             JOIN rvbbit.row_groups_visible rgv \
-               ON rgv.table_oid = dl.table_oid \
-              AND rgv.rg_id = dl.rg_id \
-         )",
-    )
-            .ok()
-            .flatten();
-    if has_tombstones.unwrap_or(false) {
-        return true;
-    }
+
     // Phase 2 ObjectStore: metadata fast paths read rvbbit.row_groups
     // stats and per_group_stats columns, then return without scanning
     // parquet. Those stats are accurate for the LOCAL parquet — but if
-    // the file lives on a cold tier (cold_url IS NOT NULL), the row
-    // group is unreachable via the native scan path anyway, and the
-    // metadata fast path would return stats from a file the operator
-    // intended to be served via the in-process DataFusion route.
-    // Conservative: any cold row group anywhere disables metadata
-    // fast paths. Same one-EXISTS overhead pattern as the tombstone
-    // check above.
-    let has_cold: Option<bool> = pgrx::Spi::get_one(
-        "SELECT EXISTS(SELECT 1 FROM rvbbit.row_groups_visible WHERE cold_url IS NOT NULL)",
-    )
-    .ok()
-    .flatten();
-    has_cold.unwrap_or(false)
+    // the file lives on a cold tier (cold_url IS NOT NULL), keep routing
+    // through the object-store path for that table.
+    let sql = format!(
+        "SELECT EXISTS( \
+             SELECT 1 \
+             FROM rvbbit.row_groups_visible \
+             WHERE table_oid = {table_oid}::oid \
+               AND cold_url IS NOT NULL \
+         )"
+    );
+    pgrx::Spi::get_one::<bool>(&sql)
+        .ok()
+        .flatten()
+        .unwrap_or(true)
+}
+
+fn catalog_relation_present(name: &str) -> bool {
+    let escaped = name.replace('\'', "''");
+    let sql = format!("SELECT to_regclass('{escaped}') IS NOT NULL");
+    pgrx::Spi::get_one::<bool>(&sql)
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 fn current_source_has_asof_timestamp_directive() -> bool {

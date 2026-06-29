@@ -453,6 +453,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0108_operator_model_setter",
         include_str!("../sql/migrations/0108_operator_model_setter.sql"),
     ),
+    (
+        "0109_workload_layout_advisor",
+        include_str!("../sql/migrations/0109_workload_layout_advisor.sql"),
+    ),
+    (
+        "0110_workload_layout_build_status",
+        include_str!("../sql/migrations/0110_workload_layout_build_status.sql"),
+    ),
+    (
+        "0111_n8n_operator_node",
+        include_str!("../sql/migrations/0111_n8n_operator_node.sql"),
+    ),
+    (
+        "0112_drop_table_orphan_files",
+        include_str!("../sql/migrations/0112_drop_table_orphan_files.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

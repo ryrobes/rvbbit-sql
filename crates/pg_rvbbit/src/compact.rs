@@ -37,24 +37,24 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array, Float32Builder,
-    Float64Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
-    LargeStringArray, ListBuilder, RecordBatch, StringArray, StringBuilder, StringViewArray,
-    TimestampMicrosecondBuilder, UInt32Array, make_array,
+    make_array, Array, ArrayRef, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array,
+    Float32Builder, Float64Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array,
+    Int64Builder, LargeStringArray, ListBuilder, RecordBatch, StringArray, StringBuilder,
+    StringViewArray, TimestampMicrosecondBuilder, UInt32Array,
 };
 use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use pgrx::prelude::*;
 use pgrx::JsonB;
 use pgrx::Spi;
-use pgrx::prelude::*;
 use rvbbit_storage::row_group::{RowGroupWriteOptions, RowGroupWriter};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
-use vortex::VortexSessionDefault;
 use vortex::array::arrow::ArrowSessionExt;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
 
 const SCAN_LAYOUT_DIR: &str = "scan";
 const CLUSTER_LAYOUT_PREFIX: &str = "cluster:";
@@ -755,7 +755,7 @@ fn auto_clustering_enabled() -> bool {
 }
 
 fn override_cluster_keys(plans: &[ColumnPlan]) -> Option<Vec<String>> {
-    let raw = std::env::var("RVBBIT_COMPACT_CLUSTER_KEYS").ok()?;
+    let raw = compact_setting("RVBBIT_COMPACT_CLUSTER_KEYS", "rvbbit.compact_cluster_keys")?;
     let mut out = Vec::new();
     for key in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if plans.iter().any(|p| p.base_column && p.name == key) {
@@ -779,12 +779,82 @@ fn override_hive_keys(plans: &[ColumnPlan]) -> Option<Vec<String>> {
     Some(out)
 }
 
+fn accepted_workload_layout_keys(
+    rel_oid: u32,
+    layout_kind: &str,
+    plans: &[ColumnPlan],
+) -> Vec<String> {
+    if table_denies_layout(rel_oid, layout_kind)
+        || !rvbbit_catalog_table_exists("workload_layout_recommendations")
+    {
+        return Vec::new();
+    }
+    let valid = |name: &str| {
+        plans.iter().any(|p| {
+            p.base_column
+                && p.name == name
+                && match layout_kind {
+                    "cluster" => is_clusterable_type(p.pg_type),
+                    "hive" => is_hive_partitionable_type(p.pg_type),
+                    _ => false,
+                }
+        })
+    };
+    let sql = format!(
+        "SELECT column_name \
+         FROM rvbbit.workload_layout_recommendations \
+         WHERE table_oid = {rel_oid}::oid \
+           AND layout_kind = {} \
+           AND status = 'accepted' \
+         ORDER BY score DESC, updated_at DESC, column_name",
+        sql_literal(layout_kind)
+    );
+    let mut out = Vec::new();
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let rows = client.select(&sql, None, &[])?;
+        for row in rows {
+            let Some(name) = row.get::<String>(1)? else {
+                continue;
+            };
+            if valid(&name) && !out.iter().any(|seen| seen == &name) {
+                out.push(name);
+            }
+        }
+        Ok(())
+    });
+    out
+}
+
+fn accepted_workload_layout_exists(rel_oid: u32, layout_kind: &str) -> bool {
+    if table_denies_layout(rel_oid, layout_kind)
+        || !rvbbit_catalog_table_exists("workload_layout_recommendations")
+    {
+        return false;
+    }
+    Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM rvbbit.workload_layout_recommendations \
+             WHERE table_oid = {rel_oid}::oid \
+               AND layout_kind = {} \
+               AND status = 'accepted' \
+         )",
+        sql_literal(layout_kind)
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 /// Pick a small physical clustering key list without user DDL. This is a
 /// storage-layout hint, not a semantic index: queries remain normal SQL, and
 /// row-group min/max pruning consumes the tighter ranges later.
 fn auto_cluster_keys(rel_oid: u32, plans: &[ColumnPlan]) -> Vec<String> {
     if let Some(keys) = override_cluster_keys(plans) {
-        return keys.into_iter().take(3).collect();
+        return keys.into_iter().take(cluster_variant_limit()).collect();
+    }
+    let accepted = accepted_workload_layout_keys(rel_oid, "cluster", plans);
+    if !accepted.is_empty() {
+        return accepted.into_iter().take(cluster_variant_limit()).collect();
     }
     if !auto_clustering_enabled() {
         return Vec::new();
@@ -820,6 +890,10 @@ fn auto_cluster_keys(rel_oid: u32, plans: &[ColumnPlan]) -> Vec<String> {
 fn auto_hive_partition_keys(rel_oid: u32, plans: &[ColumnPlan]) -> Vec<String> {
     if let Some(keys) = override_hive_keys(plans) {
         return keys.into_iter().take(hive_variant_limit()).collect();
+    }
+    let accepted = accepted_workload_layout_keys(rel_oid, "hive", plans);
+    if !accepted.is_empty() {
+        return accepted.into_iter().take(hive_variant_limit()).collect();
     }
     if !hive_layout_enabled(rel_oid) {
         return Vec::new();
@@ -2029,13 +2103,15 @@ fn refresh_layout_variants_impl(
     let scan_chunk_rows = scan_chunk_rows_setting();
     let cluster_keys = auto_cluster_keys(rel_oid, plans);
     let hive_keys = auto_hive_partition_keys(rel_oid, plans);
+    let workload_cluster_enabled = accepted_workload_layout_exists(rel_oid, "cluster");
+    let workload_hive_enabled = accepted_workload_layout_exists(rel_oid, "hive");
     let hive_source = layout_variant_source_setting();
     let hive_parquet_batch_rows =
         layout_variant_parquet_batch_rows_setting(scan_chunk_rows.max(cluster_chunk_rows));
     let hive_metadata_profile = hive_variant_metadata_profile();
     let mut rows_written = 0_i64;
 
-    if dual_layout_enabled(rel_oid) && !cluster_keys.is_empty() {
+    if (dual_layout_enabled(rel_oid) || workload_cluster_enabled) && !cluster_keys.is_empty() {
         for cluster_key in cluster_keys.iter().take(cluster_variant_limit()) {
             let layout = cluster_layout_for_key(cluster_key);
             let phase_id = start_acceleration_phase(
@@ -2111,7 +2187,7 @@ fn refresh_layout_variants_impl(
         }
     }
 
-    if hive_layout_enabled(rel_oid) && !hive_keys.is_empty() {
+    if (hive_layout_enabled(rel_oid) || workload_hive_enabled) && !hive_keys.is_empty() {
         for hive_key in hive_keys.iter().take(hive_variant_limit()) {
             let layout = hive_layout_for_key(hive_key);
             let phase_id = start_acceleration_phase(
@@ -2291,14 +2367,16 @@ fn refresh_layout_variants_delta_impl(
     schema: &Arc<Schema>,
     path_root: &PathBuf,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    if dual_layout_enabled(rel_oid) {
+    if dual_layout_enabled(rel_oid) || accepted_workload_layout_exists(rel_oid, "cluster") {
         return refresh_layout_variants_impl(rel_oid, qualified, plans, schema, path_root);
     }
 
     let chunk_rows = chunk_rows_setting();
     let hive_keys = auto_hive_partition_keys(rel_oid, plans);
     let hive_metadata_profile = hive_variant_metadata_profile();
-    if !hive_layout_enabled(rel_oid) || hive_keys.is_empty() {
+    if !(hive_layout_enabled(rel_oid) || accepted_workload_layout_exists(rel_oid, "hive"))
+        || hive_keys.is_empty()
+    {
         if vortex_layout_enabled(rel_oid) {
             return refresh_vortex_scan_delta_impl(rel_oid, qualified, path_root);
         }
@@ -4201,12 +4279,10 @@ mod tests {
         }
         // user enums are caught by typtype 'e' regardless of (dynamic) oid
         assert!(is_text_surrogate_type(999_999, "e"));
-        assert!(
-            plan_for_pg_type(999_999, "e", "status")
-                .unwrap()
-                .1
-                .contains("::text")
-        );
+        assert!(plan_for_pg_type(999_999, "e", "status")
+            .unwrap()
+            .1
+            .contains("::text"));
         // native types are not surrogates and keep planning natively (int4=23)
         assert!(!is_text_surrogate_type(23, "b"));
         assert!(plan_for_pg_type(23, "b", "i").is_ok());

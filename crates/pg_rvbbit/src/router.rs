@@ -765,9 +765,9 @@ impl Candidate {
         match self {
             Candidate::DuckVector | Candidate::DataFusionVector => "vector",
             Candidate::DuckHive | Candidate::DataFusionHive => "hive",
-            Candidate::DuckVortex
-            | Candidate::DataFusionVortex
-            | Candidate::RvbbitNativeVortex => "vortex",
+            Candidate::DuckVortex | Candidate::DataFusionVortex | Candidate::RvbbitNativeVortex => {
+                "vortex"
+            }
             Candidate::DataFusionMem => "mem",
             Candidate::RvbbitNative | Candidate::PgRowstore => "",
         }
@@ -786,9 +786,9 @@ impl Candidate {
 /// are gated on `row_groups > 0`, so they never see the heap case.
 fn physical_path(candidate: Candidate, tables: &[RvbbitTableMetric]) -> &'static str {
     match candidate {
-        Candidate::RvbbitNativeVortex
-        | Candidate::DuckVortex
-        | Candidate::DataFusionVortex => "vortex",
+        Candidate::RvbbitNativeVortex | Candidate::DuckVortex | Candidate::DataFusionVortex => {
+            "vortex"
+        }
         Candidate::DuckHive | Candidate::DataFusionHive => "hive",
         Candidate::DataFusionMem => "mem",
         Candidate::DuckVector | Candidate::DataFusionVector => "parquet",
@@ -1985,7 +1985,8 @@ fn overlay_map() -> std::collections::HashMap<String, Candidate> {
                 .unwrap_or(true)
         });
     if stale {
-        let mut map: std::collections::HashMap<String, Candidate> = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, Candidate> =
+            std::collections::HashMap::new();
         if relations_present(&["rvbbit.route_overlay"]) {
             let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
                 let rows = client.select(
@@ -2008,13 +2009,21 @@ fn overlay_map() -> std::collections::HashMap<String, Candidate> {
         OVERLAY_MEMO.with(|m| *m.borrow_mut() = Some((Instant::now(), map.clone())));
         return map;
     }
-    OVERLAY_MEMO.with(|m| m.borrow().as_ref().map(|(_, x)| x.clone()).unwrap_or_default())
+    OVERLAY_MEMO.with(|m| {
+        m.borrow()
+            .as_ref()
+            .map(|(_, x)| x.clone())
+            .unwrap_or_default()
+    })
 }
 
 /// The tested-pin layer: a decision iff this shape is pinned AND the pinned engine is
 /// available for this query. Otherwise None -> fall through to base rules. A pin can never
 /// force an unavailable/unsafe engine, so it never affects correctness — only engine choice.
-fn overlay_decision(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> Option<RouteDecision> {
+fn overlay_decision(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<RouteDecision> {
     if OVERLAY_BYPASS.with(|b| b.get()) {
         return None;
     }
@@ -2052,7 +2061,12 @@ fn explain_exec_ms(sql: &str) -> Option<f64> {
             for row in table {
                 let line: String = row.get(1)?.unwrap_or_default();
                 if let Some(rest) = line.trim().strip_prefix("Execution Time:") {
-                    out = rest.trim().trim_end_matches("ms").trim().parse::<f64>().ok();
+                    out = rest
+                        .trim()
+                        .trim_end_matches("ms")
+                        .trim()
+                        .parse::<f64>()
+                        .ok();
                 }
             }
             Ok(())
@@ -2212,7 +2226,9 @@ fn route_optimize_auto(
         "rvbbit.route_optimize_runs",
         "rvbbit.route_optimization_candidates",
     ]) {
-        return JsonB(json!({"ok": false, "reason": "auto-optimizer tables not present (run migrate)"}));
+        return JsonB(
+            json!({"ok": false, "reason": "auto-optimizer tables not present (run migrate)"}),
+        );
     }
     let started = Instant::now();
 
@@ -2303,6 +2319,656 @@ fn route_optimize_auto(
     }))
 }
 
+#[derive(Clone, Debug)]
+struct WorkloadTableRef {
+    oid: u32,
+    schema: String,
+    relname: String,
+    qualified: String,
+}
+
+#[derive(Clone, Debug)]
+struct WorkloadColumn {
+    name: String,
+    lower_name: String,
+    pg_type: i32,
+    n_distinct: f64,
+    correlation_abs: f64,
+    primary: bool,
+    unique: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WorkloadSample {
+    shape_key: String,
+    sql: String,
+    executions: i64,
+    avg_ms: f64,
+}
+
+#[derive(Default, Clone, Debug)]
+struct WorkloadColumnRoles {
+    observations: i64,
+    weighted_ms: f64,
+    where_refs: i64,
+    group_refs: i64,
+    order_refs: i64,
+    count_distinct_refs: i64,
+    sample_shapes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkloadLayoutRecommendation {
+    table_oid: u32,
+    table_name: String,
+    layout_kind: String,
+    column_name: String,
+    layout: String,
+    score: f64,
+    observations: i64,
+    weighted_ms: f64,
+    role_counts: Value,
+    sample_shapes: Vec<String>,
+    existing_status: Option<String>,
+    recommendation_status: Option<String>,
+    reason: String,
+    details: Value,
+}
+
+/// Recommend per-table layout variants from routed workload samples. This is a
+/// shadow/advisor pass: it writes candidate rows by default, but accepted rows
+/// are the only ones consumed by the variant builder.
+#[pg_extern]
+fn recommend_workload_layouts(
+    rel: pg_sys::Oid,
+    lookback_hours: default!(i32, "24"),
+    min_observations: default!(i32, "2"),
+    max_recommendations: default!(i32, "8"),
+    persist: default!(bool, "true"),
+) -> JsonB {
+    if !relations_present(&[
+        "rvbbit.tables",
+        "rvbbit.route_shape_samples",
+        "rvbbit.route_executions",
+        "rvbbit.layout_variant_status",
+        "rvbbit.workload_layout_recommendations",
+    ]) {
+        return JsonB(json!({
+            "ok": false,
+            "reason": "workload layout advisor catalog is not present; run rvbbit.migrate()"
+        }));
+    }
+
+    let rel_oid = rel.to_u32();
+    let table = match workload_table_ref(rel_oid) {
+        Some(table) => table,
+        None => pgrx::error!(
+            "rvbbit.recommend_workload_layouts: relation {rel_oid} is not an enabled rvbbit table"
+        ),
+    };
+    let columns = workload_columns_for_table(rel_oid);
+    if columns.is_empty() {
+        return JsonB(json!({
+            "ok": true,
+            "table": table.qualified,
+            "recommendations": [],
+            "reason": "table has no recommendable columns"
+        }));
+    }
+
+    let samples = workload_samples(lookback_hours.max(1), 1000);
+    let mut roles: BTreeMap<String, WorkloadColumnRoles> = BTreeMap::new();
+    let mut matched_samples = 0_i64;
+    for sample in &samples {
+        let stringless = sql_stringless(&sample.sql).to_lowercase();
+        if !sql_mentions_relation(&stringless, &table.schema, &table.relname) {
+            continue;
+        }
+        matched_samples += 1;
+        merge_workload_roles(sample, &columns, &mut roles);
+    }
+
+    let mut recommendations = score_workload_layouts(
+        &table,
+        &columns,
+        &roles,
+        min_observations.max(1) as i64,
+        max_recommendations.max(1) as usize,
+    );
+    if persist {
+        persist_workload_layout_recommendations(&recommendations);
+    }
+
+    JsonB(json!({
+        "ok": true,
+        "table": table.qualified,
+        "lookback_hours": lookback_hours.max(1),
+        "sample_shapes_seen": samples.len(),
+        "sample_shapes_matched": matched_samples,
+        "persisted": persist,
+        "recommendations": recommendations
+            .drain(..)
+            .map(workload_recommendation_json)
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Mark a workload recommendation as accepted. Accepted rows are explicit
+/// per-table layout hints consumed by refresh_acceleration/refresh_layout_variants.
+#[pg_extern]
+fn accept_workload_layout(rel: pg_sys::Oid, layout_kind: &str, column_name: &str) -> JsonB {
+    set_workload_layout_status(rel, layout_kind, column_name, "accepted")
+}
+
+#[pg_extern]
+fn reject_workload_layout(rel: pg_sys::Oid, layout_kind: &str, column_name: &str) -> JsonB {
+    set_workload_layout_status(rel, layout_kind, column_name, "rejected")
+}
+
+fn set_workload_layout_status(
+    rel: pg_sys::Oid,
+    layout_kind: &str,
+    column_name: &str,
+    status: &str,
+) -> JsonB {
+    if !relations_present(&["rvbbit.workload_layout_recommendations"]) {
+        return JsonB(json!({
+            "ok": false,
+            "reason": "workload layout advisor catalog is not present; run rvbbit.migrate()"
+        }));
+    }
+    let rel_oid = rel.to_u32();
+    let Some(table) = workload_table_ref(rel_oid) else {
+        pgrx::error!(
+            "rvbbit.{status}_workload_layout: relation {rel_oid} is not an enabled rvbbit table"
+        );
+    };
+    let kind = normalize_workload_layout_kind(layout_kind).unwrap_or_else(|| {
+        pgrx::error!("rvbbit.workload_layout: layout_kind must be cluster or hive")
+    });
+    let Some(column) = workload_columns_for_table(rel_oid)
+        .into_iter()
+        .find(|c| c.name.eq_ignore_ascii_case(column_name))
+    else {
+        pgrx::error!(
+            "rvbbit.workload_layout: column {} does not exist on {}",
+            column_name,
+            table.qualified
+        );
+    };
+    let layout = workload_layout_name(&kind, &column.name);
+    let details = json!({
+        "source": "manual_status_update",
+        "status": status,
+    });
+    let _ = Spi::run(&format!(
+        "INSERT INTO rvbbit.workload_layout_recommendations \
+             (table_oid, layout_kind, column_name, layout, status, reason, details, updated_at) \
+         VALUES ({rel_oid}::oid, {}, {}, {}, {}, 'manual workload layout status', {}::jsonb, now()) \
+         ON CONFLICT (table_oid, layout_kind, column_name) DO UPDATE SET \
+             status = EXCLUDED.status, \
+             layout = EXCLUDED.layout, \
+             reason = EXCLUDED.reason, \
+             details = rvbbit.workload_layout_recommendations.details || EXCLUDED.details, \
+             updated_at = now()",
+        sql_lit(&kind),
+        sql_lit(&column.name),
+        sql_lit(&layout),
+        sql_lit(status),
+        sql_json_lit(&details)
+    ));
+    JsonB(json!({
+        "ok": true,
+        "table": table.qualified,
+        "layout_kind": kind,
+        "column_name": column.name,
+        "layout": layout,
+        "status": status,
+    }))
+}
+
+fn workload_table_ref(rel_oid: u32) -> Option<WorkloadTableRef> {
+    let mut out = None;
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let rows = client.select(
+            &format!(
+                "SELECT lower(n.nspname), lower(c.relname), c.oid::regclass::text \
+                 FROM rvbbit.tables t \
+                 JOIN pg_class c ON c.oid = t.table_oid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE t.table_oid = {rel_oid}::oid \
+                   AND coalesce(t.acceleration_enabled, true)"
+            ),
+            Some(1),
+            &[],
+        )?;
+        for row in rows {
+            out = Some(WorkloadTableRef {
+                oid: rel_oid,
+                schema: row.get::<String>(1)?.unwrap_or_default(),
+                relname: row.get::<String>(2)?.unwrap_or_default(),
+                qualified: row.get::<String>(3)?.unwrap_or_else(|| rel_oid.to_string()),
+            });
+        }
+        Ok(())
+    });
+    out
+}
+
+fn workload_columns_for_table(rel_oid: u32) -> Vec<WorkloadColumn> {
+    let mut out = Vec::new();
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let rows = client.select(
+            &format!(
+                "SELECT a.attname::text, a.atttypid::oid::int4, \
+                        coalesce(s.n_distinct::float8, 0), \
+                        abs(coalesce(s.correlation, 0))::float8, \
+                        coalesce(ix.primary_col, false), \
+                        coalesce(ix.unique_col, false) \
+                 FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 LEFT JOIN pg_stats s \
+                   ON s.schemaname = n.nspname \
+                  AND s.tablename = c.relname \
+                  AND s.attname = a.attname::text \
+                 LEFT JOIN LATERAL ( \
+                     SELECT bool_or(i.indisprimary) AS primary_col, \
+                            bool_or(i.indisunique) AS unique_col \
+                     FROM pg_index i \
+                     JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+                     WHERE i.indrelid = a.attrelid \
+                       AND i.indisvalid \
+                       AND i.indisready \
+                       AND k.ord <= i.indnkeyatts \
+                       AND k.attnum = a.attnum \
+                 ) ix ON true \
+                 WHERE a.attrelid = {rel_oid}::oid \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped \
+                 ORDER BY a.attnum"
+            ),
+            None,
+            &[],
+        )?;
+        for row in rows {
+            let Some(name) = row.get::<String>(1)? else {
+                continue;
+            };
+            out.push(WorkloadColumn {
+                lower_name: name.to_ascii_lowercase(),
+                name,
+                pg_type: row.get::<i32>(2)?.unwrap_or_default(),
+                n_distinct: row.get::<f64>(3)?.unwrap_or(0.0),
+                correlation_abs: row.get::<f64>(4)?.unwrap_or(0.0),
+                primary: row.get::<bool>(5)?.unwrap_or(false),
+                unique: row.get::<bool>(6)?.unwrap_or(false),
+            });
+        }
+        Ok(())
+    });
+    out
+}
+
+fn workload_samples(lookback_hours: i32, limit: i32) -> Vec<WorkloadSample> {
+    let mut out = Vec::new();
+    let hours = lookback_hours.clamp(1, 24 * 365);
+    let limit = limit.clamp(1, 10_000);
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let rows = client.select(
+            &format!(
+                "SELECT s.shape_key, s.sql, \
+                        count(e.*)::bigint AS executions, \
+                        avg(e.elapsed_ms)::float8 AS avg_ms \
+                 FROM rvbbit.route_shape_samples s \
+                 JOIN rvbbit.route_executions e ON e.shape_key = s.shape_key \
+                 WHERE e.executed_at > now() - make_interval(hours => {hours}) \
+                   AND e.status = 'ok' \
+                   AND s.sql <> '' \
+                 GROUP BY s.shape_key, s.sql \
+                 ORDER BY count(e.*) * avg(e.elapsed_ms) DESC NULLS LAST \
+                 LIMIT {limit}"
+            ),
+            None,
+            &[],
+        )?;
+        for row in rows {
+            let shape_key: String = row.get(1)?.unwrap_or_default();
+            let sql: String = row.get(2)?.unwrap_or_default();
+            if shape_key.is_empty() || sql.is_empty() {
+                continue;
+            }
+            out.push(WorkloadSample {
+                shape_key,
+                sql,
+                executions: row.get::<i64>(3)?.unwrap_or(0).max(0),
+                avg_ms: row.get::<f64>(4)?.unwrap_or(0.0).max(0.0),
+            });
+        }
+        Ok(())
+    });
+    out
+}
+
+fn merge_workload_roles(
+    sample: &WorkloadSample,
+    columns: &[WorkloadColumn],
+    roles: &mut BTreeMap<String, WorkloadColumnRoles>,
+) {
+    let stringless = sql_stringless(&sample.sql).to_lowercase();
+    let where_clause = top_level_clause(
+        &stringless,
+        "where",
+        &["group by", "order by", "having", "limit", "offset", "union"],
+    );
+    let group_clause = top_level_clause(
+        &stringless,
+        "group by",
+        &["order by", "having", "limit", "offset", "union"],
+    );
+    let order_clause = top_level_clause(&stringless, "order by", &["limit", "offset", "union"]);
+    let count_distinct = count_distinct_expr(&stringless).unwrap_or_default();
+    for column in columns {
+        let in_where = contains_column_identifier(&where_clause, &column.lower_name);
+        let in_group = contains_column_identifier(&group_clause, &column.lower_name);
+        let in_order = contains_column_identifier(&order_clause, &column.lower_name);
+        let in_count_distinct = contains_column_identifier(&count_distinct, &column.lower_name);
+        if !(in_where || in_group || in_order || in_count_distinct) {
+            continue;
+        }
+        let entry = roles.entry(column.name.clone()).or_default();
+        entry.observations += sample.executions.max(1);
+        entry.weighted_ms += sample.executions.max(1) as f64 * sample.avg_ms.max(1.0);
+        if in_where {
+            entry.where_refs += sample.executions.max(1);
+        }
+        if in_group {
+            entry.group_refs += sample.executions.max(1);
+        }
+        if in_order {
+            entry.order_refs += sample.executions.max(1);
+        }
+        if in_count_distinct {
+            entry.count_distinct_refs += sample.executions.max(1);
+        }
+        if !entry
+            .sample_shapes
+            .iter()
+            .any(|shape| shape == &sample.shape_key)
+        {
+            entry.sample_shapes.push(sample.shape_key.clone());
+        }
+    }
+}
+
+fn score_workload_layouts(
+    table: &WorkloadTableRef,
+    columns: &[WorkloadColumn],
+    roles: &BTreeMap<String, WorkloadColumnRoles>,
+    min_observations: i64,
+    max_recommendations: usize,
+) -> Vec<WorkloadLayoutRecommendation> {
+    let mut out = Vec::new();
+    for column in columns {
+        let Some(role) = roles.get(&column.name) else {
+            continue;
+        };
+        if role.observations < min_observations {
+            continue;
+        }
+        if workload_clusterable_type(column.pg_type) {
+            if let Some(rec) = score_cluster_layout(table, column, role) {
+                out.push(rec);
+            }
+        }
+        if workload_hive_partitionable_type(column.pg_type) {
+            if let Some(rec) = score_hive_layout(table, column, role) {
+                out.push(rec);
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.layout.cmp(&b.layout))
+    });
+    out.truncate(max_recommendations);
+    for rec in &mut out {
+        rec.existing_status = layout_variant_status(rec.table_oid, &rec.layout);
+        rec.recommendation_status =
+            workload_recommendation_status(rec.table_oid, &rec.layout_kind, &rec.column_name);
+    }
+    out
+}
+
+fn score_cluster_layout(
+    table: &WorkloadTableRef,
+    column: &WorkloadColumn,
+    role: &WorkloadColumnRoles,
+) -> Option<WorkloadLayoutRecommendation> {
+    let mut score = role.where_refs as f64 * 120.0
+        + role.order_refs as f64 * 90.0
+        + role.group_refs as f64 * 25.0
+        + role.count_distinct_refs as f64 * 20.0
+        + role.weighted_ms * 0.05;
+    if matches!(column.pg_type, 1082 | 1114 | 1184) {
+        score += 500.0;
+    }
+    if column.n_distinct < 0.0 || column.n_distinct >= 1_000.0 {
+        score += 250.0;
+    } else if column.n_distinct > 0.0 && column.n_distinct <= 8.0 {
+        score -= 200.0;
+    }
+    if column.primary || column.unique {
+        score += 150.0;
+    }
+    if column.correlation_abs >= 0.95 {
+        score += 50.0;
+    }
+    if matches!(column.pg_type, 25 | 1042 | 1043) && role.where_refs == 0 && role.order_refs == 0 {
+        return None;
+    }
+    if score <= 0.0 {
+        return None;
+    }
+    Some(workload_recommendation(
+        table,
+        "cluster",
+        column,
+        role,
+        score,
+        "range/order pruning candidate",
+    ))
+}
+
+fn score_hive_layout(
+    table: &WorkloadTableRef,
+    column: &WorkloadColumn,
+    role: &WorkloadColumnRoles,
+) -> Option<WorkloadLayoutRecommendation> {
+    if column.primary || column.unique {
+        return None;
+    }
+    let n_distinct = column.n_distinct;
+    if !(2.0..=256.0).contains(&n_distinct) {
+        return None;
+    }
+    let mut score = role.group_refs as f64 * 120.0
+        + role.where_refs as f64 * 90.0
+        + role.count_distinct_refs as f64 * 50.0
+        + role.weighted_ms * 0.05;
+    if n_distinct <= 32.0 {
+        score += 350.0;
+    } else if n_distinct <= 128.0 {
+        score += 175.0;
+    }
+    if score <= 0.0 {
+        return None;
+    }
+    Some(workload_recommendation(
+        table,
+        "hive",
+        column,
+        role,
+        score,
+        "partition-pruning/grouping candidate",
+    ))
+}
+
+fn workload_recommendation(
+    table: &WorkloadTableRef,
+    layout_kind: &str,
+    column: &WorkloadColumn,
+    role: &WorkloadColumnRoles,
+    score: f64,
+    reason: &str,
+) -> WorkloadLayoutRecommendation {
+    let role_counts = json!({
+        "where": role.where_refs,
+        "group_by": role.group_refs,
+        "order_by": role.order_refs,
+        "count_distinct": role.count_distinct_refs,
+    });
+    let details = json!({
+        "pg_type_oid": column.pg_type,
+        "n_distinct": column.n_distinct,
+        "correlation_abs": column.correlation_abs,
+        "primary": column.primary,
+        "unique": column.unique,
+    });
+    WorkloadLayoutRecommendation {
+        table_oid: table.oid,
+        table_name: table.qualified.clone(),
+        layout_kind: layout_kind.to_string(),
+        column_name: column.name.clone(),
+        layout: workload_layout_name(layout_kind, &column.name),
+        score,
+        observations: role.observations,
+        weighted_ms: role.weighted_ms,
+        role_counts,
+        sample_shapes: role.sample_shapes.iter().take(8).cloned().collect(),
+        existing_status: None,
+        recommendation_status: None,
+        reason: reason.to_string(),
+        details,
+    }
+}
+
+fn workload_recommendation_json(rec: WorkloadLayoutRecommendation) -> Value {
+    json!({
+        "table": rec.table_name,
+        "layout_kind": rec.layout_kind,
+        "column_name": rec.column_name,
+        "layout": rec.layout,
+        "score": rec.score,
+        "observations": rec.observations,
+        "weighted_ms": rec.weighted_ms,
+        "role_counts": rec.role_counts,
+        "sample_shapes": rec.sample_shapes,
+        "layout_status": rec.existing_status,
+        "recommendation_status": rec.recommendation_status,
+        "reason": rec.reason,
+        "details": rec.details,
+        "accept_sql": format!(
+            "SELECT rvbbit.accept_workload_layout('{}'::regclass, '{}', '{}')",
+            rec.table_name.replace('\'', "''"),
+            rec.layout_kind.replace('\'', "''"),
+            rec.column_name.replace('\'', "''"),
+        ),
+    })
+}
+
+fn persist_workload_layout_recommendations(recommendations: &[WorkloadLayoutRecommendation]) {
+    for rec in recommendations {
+        let details = rec.details.clone();
+        let _ = Spi::run(&format!(
+            "INSERT INTO rvbbit.workload_layout_recommendations \
+                 (table_oid, layout_kind, column_name, layout, score, observations, weighted_ms, \
+                  role_counts, sample_shapes, reason, details, status, recommended_at, updated_at) \
+             VALUES ({oid}::oid, {kind}, {col}, {layout}, {score}, {obs}, {weighted}, \
+                     {roles}::jsonb, {shapes}, {reason}, {details}::jsonb, 'candidate', now(), now()) \
+             ON CONFLICT (table_oid, layout_kind, column_name) DO UPDATE SET \
+                 layout = EXCLUDED.layout, \
+                 score = EXCLUDED.score, \
+                 observations = EXCLUDED.observations, \
+                 weighted_ms = EXCLUDED.weighted_ms, \
+                 role_counts = EXCLUDED.role_counts, \
+                 sample_shapes = EXCLUDED.sample_shapes, \
+                 reason = EXCLUDED.reason, \
+                 details = EXCLUDED.details, \
+                 status = CASE \
+                     WHEN rvbbit.workload_layout_recommendations.status IN ('accepted', 'rejected') \
+                     THEN rvbbit.workload_layout_recommendations.status \
+                     ELSE 'candidate' \
+                 END, \
+                 updated_at = now()",
+            oid = rec.table_oid,
+            kind = sql_lit(&rec.layout_kind),
+            col = sql_lit(&rec.column_name),
+            layout = sql_lit(&rec.layout),
+            score = rec.score,
+            obs = rec.observations,
+            weighted = rec.weighted_ms,
+            roles = sql_json_lit(&rec.role_counts),
+            shapes = sql_text_array_lit(&rec.sample_shapes),
+            reason = sql_lit(&rec.reason),
+            details = sql_json_lit(&details),
+        ));
+    }
+}
+
+fn layout_variant_status(table_oid: u32, layout: &str) -> Option<String> {
+    Spi::get_one::<String>(&format!(
+        "SELECT status FROM rvbbit.layout_variant_status \
+         WHERE table_oid = {table_oid}::oid AND layout = {}",
+        sql_lit(layout)
+    ))
+    .ok()
+    .flatten()
+}
+
+fn workload_recommendation_status(
+    table_oid: u32,
+    layout_kind: &str,
+    column_name: &str,
+) -> Option<String> {
+    Spi::get_one::<String>(&format!(
+        "SELECT status FROM rvbbit.workload_layout_recommendations \
+         WHERE table_oid = {table_oid}::oid AND layout_kind = {} AND column_name = {}",
+        sql_lit(layout_kind),
+        sql_lit(column_name)
+    ))
+    .ok()
+    .flatten()
+}
+
+fn normalize_workload_layout_kind(raw: &str) -> Option<String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "cluster" | "clustered" => Some("cluster".to_string()),
+        "hive" | "partition" | "partitioned" => Some("hive".to_string()),
+        _ => None,
+    }
+}
+
+fn workload_layout_name(layout_kind: &str, column_name: &str) -> String {
+    match layout_kind {
+        "hive" => format!("hive:{column_name}"),
+        _ => format!("cluster:{column_name}"),
+    }
+}
+
+fn workload_clusterable_type(pg_type: i32) -> bool {
+    matches!(
+        pg_type,
+        20 | 21 | 23 | 25 | 700 | 701 | 1042 | 1043 | 1082 | 1114 | 1184
+    )
+}
+
+fn workload_hive_partitionable_type(pg_type: i32) -> bool {
+    matches!(pg_type, 16 | 20 | 21 | 23 | 25 | 1042 | 1043)
+}
+
 fn choose_route_fast(
     features: &RouteFeatures,
     tables: &[RvbbitTableMetric],
@@ -2322,6 +2988,9 @@ fn choose_route_fast(
     }
     if let Some(d) = overlay_decision(features, tables) {
         return Some(d);
+    }
+    if let Some(decision) = native_metadata_hard_rule(features, tables, "hard-rule-fast") {
+        return Some(decision);
     }
     let (_vector_available, vector_reason) = duck_availability(features, tables);
     let (pg_available, pg_reason) = pg_rowstore_availability(tables);
@@ -2429,6 +3098,9 @@ fn choose_route(
     }
     if let Some(d) = overlay_decision(features, tables) {
         return d;
+    }
+    if let Some(decision) = native_metadata_hard_rule(features, tables, "hard-rule") {
+        return decision;
     }
     let (_vector_available, vector_reason) = duck_availability(features, tables);
     let (pg_available, pg_reason) = pg_rowstore_availability(tables);
@@ -2603,6 +3275,74 @@ fn choose_route(
         None,
         None,
     )
+}
+
+fn native_metadata_hard_rule(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+    source: &'static str,
+) -> Option<RouteDecision> {
+    if !native_metadata_hard_rule_safe(tables) {
+        return None;
+    }
+    if features.count_count > 0
+        && features.aggregate_count == features.count_count
+        && !features.where_present
+        && !features.group_by
+        && features.count_distinct_count == 0
+    {
+        return Some(decision(
+            Candidate::RvbbitNative,
+            source,
+            "native count metadata",
+            None,
+            None,
+        ));
+    }
+    if simple_metadata_aggregate_should_stay_native(features) {
+        return Some(decision(
+            Candidate::RvbbitNative,
+            source,
+            "native simple aggregate metadata",
+            None,
+            None,
+        ));
+    }
+    if filtered_count_should_stay_native(features) {
+        return Some(decision(
+            Candidate::RvbbitNative,
+            source,
+            "native filtered count metadata",
+            None,
+            None,
+        ));
+    }
+    if features.min_count > 0 && features.max_count > 0 && !features.where_present {
+        return Some(decision(
+            Candidate::RvbbitNative,
+            source,
+            "native min/max metadata",
+            None,
+            None,
+        ));
+    }
+    if features.sum_count >= 16 && !features.where_present {
+        return Some(decision(
+            Candidate::RvbbitNative,
+            source,
+            "native wide aggregate rewrite",
+            None,
+            None,
+        ));
+    }
+    None
+}
+
+fn native_metadata_hard_rule_safe(tables: &[RvbbitTableMetric]) -> bool {
+    !tables.is_empty()
+        && tables
+            .iter()
+            .all(|table| !table.shadow_heap_dirty && table.delete_count == 0)
 }
 
 fn decision(
@@ -4642,9 +5382,7 @@ fn native_availability(tables: &[RvbbitTableMetric]) -> (bool, String) {
     if overlay_readable == dirty {
         return (
             true,
-            format!(
-                "Rvbbit native read-time overlay available for {dirty} dirty table(s)"
-            ),
+            format!("Rvbbit native read-time overlay available for {dirty} dirty table(s)"),
         );
     }
     (

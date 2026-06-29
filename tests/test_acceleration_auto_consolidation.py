@@ -246,6 +246,80 @@ def test_rebuild_stages_fold_and_defers_old_file_reap(rvbbit, temp_table):
     )
 
 
+def test_drop_registered_table_clears_catalog_and_reaps_accel_files(rvbbit, temp_table):
+    rvbbit.execute("SET rvbbit.compact_vortex_layout = 'off'")
+    rvbbit.execute("SET rvbbit.compact_hive_layout = 'off'")
+    rvbbit.execute(
+        f"CREATE TABLE {temp_table} (id int PRIMARY KEY, label text) USING rvbbit"
+    )
+    rvbbit.execute(f"SELECT rvbbit.set_accel_policy('{temp_table}'::regclass, 'scheduled')")
+    rvbbit.execute(f"INSERT INTO {temp_table} VALUES (1, 'one'), (2, 'two')")
+    rvbbit.execute(f"SELECT rvbbit.refresh_acceleration('{temp_table}'::regclass, false)")
+
+    table_oid = rvbbit.execute(f"SELECT '{temp_table}'::regclass::oid").fetchone()[0]
+    file_paths = rvbbit.execute(
+        f"""
+        SELECT array_agg(path ORDER BY path)
+        FROM (
+            SELECT path FROM rvbbit.row_groups
+            WHERE table_oid = '{temp_table}'::regclass
+            UNION ALL
+            SELECT path FROM rvbbit.row_group_variants
+            WHERE table_oid = '{temp_table}'::regclass
+            UNION ALL
+            SELECT path FROM rvbbit.text_dictionaries
+            WHERE table_oid = '{temp_table}'::regclass
+        ) files
+        """
+    ).fetchone()[0]
+    file_paths = sorted(set(file_paths or []))
+    assert file_paths
+
+    rvbbit.execute(f"DROP TABLE {temp_table}")
+
+    catalog_counts = rvbbit.execute(
+        f"""
+        SELECT
+            (SELECT count(*) FROM rvbbit.tables WHERE table_oid = {table_oid}::oid),
+            (SELECT count(*) FROM rvbbit.row_groups WHERE table_oid = {table_oid}::oid),
+            (SELECT count(*) FROM rvbbit.row_group_variants WHERE table_oid = {table_oid}::oid),
+            (SELECT count(*) FROM rvbbit.text_dictionaries WHERE table_oid = {table_oid}::oid),
+            (SELECT count(*) FROM rvbbit.generations WHERE table_oid = {table_oid}::oid),
+            (SELECT count(*) FROM rvbbit.acceleration_state WHERE table_oid = {table_oid}::oid),
+            (SELECT count(*) FROM rvbbit.accel_policy WHERE table_oid = {table_oid}::oid),
+            (SELECT count(*) FROM rvbbit.delete_log WHERE table_oid = {table_oid}::oid),
+            (SELECT count(*) FROM rvbbit.table_dirty_markers WHERE table_oid = {table_oid}::oid),
+            (SELECT count(*) FROM rvbbit.shreds WHERE table_oid = {table_oid}::oid)
+        """
+    ).fetchone()
+    assert catalog_counts == (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    queued = rvbbit.execute(
+        """
+        SELECT path, table_oid, reason
+        FROM rvbbit.orphaned_files
+        WHERE path = ANY(%s)
+        ORDER BY path
+        """,
+        (file_paths,),
+    ).fetchall()
+    assert queued == [(path, None, "drop_table") for path in file_paths]
+
+    dequeued, unlinked = rvbbit.execute(
+        "SELECT files_dequeued, files_unlinked "
+        "FROM rvbbit.reap_orphaned_files(interval '0 seconds', 100)"
+    ).fetchone()
+    assert dequeued >= len(file_paths)
+    assert unlinked >= len(file_paths)
+    assert (
+        rvbbit.execute(
+            "SELECT count(*) FROM rvbbit.orphaned_files WHERE path = ANY(%s)",
+            (file_paths,),
+        ).fetchone()[0]
+        == 0
+    )
+
+
 def test_rebuild_preserves_snapshot_visible_generation(rvbbit, temp_table):
     rvbbit.execute("SET rvbbit.compact_vortex_layout = 'off'")
     rvbbit.execute("SET rvbbit.compact_hive_layout = 'off'")

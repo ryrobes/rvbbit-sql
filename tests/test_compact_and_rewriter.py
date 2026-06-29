@@ -110,6 +110,35 @@ def test_count_star_uses_metadata(rvbbit, llm_table):
     assert row[0] == 200
 
 
+def test_unrelated_dirty_table_does_not_disable_metadata_count(rvbbit, llm_table):
+    dirty_table = f"{llm_table}_dirty"
+    try:
+        rvbbit.execute(
+            f"CREATE TABLE {dirty_table} (id int PRIMARY KEY, label text) USING rvbbit"
+        )
+        rvbbit.execute(
+            f"INSERT INTO {dirty_table} VALUES "
+            "(1, 'one'), (2, 'two'), (3, 'three')"
+        )
+        rvbbit.execute(
+            f"SELECT rvbbit.refresh_acceleration('{dirty_table}'::regclass, false)"
+        )
+        rvbbit.execute(f"DELETE FROM {dirty_table} WHERE id = 2")
+
+        plan = rvbbit.execute(
+            f"EXPLAIN (FORMAT TEXT) SELECT count(*) FROM {llm_table}"
+        ).fetchall()
+        plan_text = "\n".join(r[0] for r in plan)
+        assert "Result" in plan_text
+        assert "Custom Scan" not in plan_text
+        assert "Seq Scan" not in plan_text
+
+        row = rvbbit.execute(f"SELECT count(*) FROM {llm_table}").fetchone()
+        assert row[0] == 200
+    finally:
+        rvbbit.execute(f"DROP TABLE IF EXISTS {dirty_table} CASCADE")
+
+
 def test_count_star_includes_post_compact_heap_delta(rvbbit, llm_table):
     rvbbit.execute(f"""
         INSERT INTO {llm_table}
