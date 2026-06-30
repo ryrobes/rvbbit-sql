@@ -151,7 +151,9 @@ SELECT
         OR coalesce(ss.datafusion_observations, 0) = 0
         OR coalesce(ss.datafusion_vortex_observations, 0) = 0
         OR coalesce(ss.pg_observations, 0) = 0
-    ) AS needs_exploration
+    ) AS needs_exploration,
+    ss.datafusion_vortex_median_ms,
+    ss.datafusion_vortex_observations
 FROM shape_stats ss
 LEFT JOIN ranked r ON r.shape_key = ss.shape_key AND r.rn = 1;
 
