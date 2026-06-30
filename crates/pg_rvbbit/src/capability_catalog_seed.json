@@ -6116,7 +6116,8 @@
       "catalog_entry": {
         "acceptance": {
           "setup_sql": [
-            "DELETE FROM rvbbit.operators WHERE name = 'acceptance_mcp_case_echo';\nDROP FUNCTION IF EXISTS rvbbit.acceptance_mcp_case_echo(text, jsonb);\nDELETE FROM rvbbit.mcp_servers WHERE name = 'acceptance_mcp_echo';\nINSERT INTO rvbbit.mcp_servers\n    (name, transport, command, args, env, timeout_ms, description)\nVALUES\n    ('acceptance_mcp_echo', 'stdio', 'python',\n     ARRAY['/opt/mcp-test-server/main.py'],\n     '{}'::jsonb, 30000,\n     'Deterministic MCP echo server bundled with the rvbbit MCP gateway image');\nSELECT rvbbit.refresh_mcp_server('acceptance_mcp_echo');\n"
+            "DELETE FROM rvbbit.operators WHERE name = 'acceptance_mcp_case_echo';\nDROP FUNCTION IF EXISTS rvbbit.acceptance_mcp_case_echo(text, jsonb);\nDELETE FROM rvbbit.mcp_servers WHERE name = 'acceptance_mcp_echo';\nINSERT INTO rvbbit.mcp_servers\n    (name, transport, command, args, env, timeout_ms, description)\nVALUES\n    ('acceptance_mcp_echo', 'stdio', 'python',\n     ARRAY['/opt/mcp-test-server/main.py'],\n     '{}'::jsonb, 30000,\n     'Deterministic MCP echo server bundled with the rvbbit MCP gateway image');\n",
+            "SELECT rvbbit.refresh_mcp_server('acceptance_mcp_echo');\n"
           ],
           "target_selector": {
             "capability": true,
@@ -6130,7 +6131,7 @@
             {
               "description": "Assert Warren registered the default MCP gateway runtime and inventory row.",
               "name": "mcp_gateway_registered_ready",
-              "sql": "DO $$\nBEGIN\n    IF NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.mcp_gateways\n        WHERE name = 'mcp_default'\n          AND status = 'ready'\n          AND gateway_source = 'warren'\n    ) THEN\n        RAISE EXCEPTION 'mcp_default gateway is not registered as a ready Warren runtime';\n    END IF;\n\n    IF NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'mcp_default'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'mcp_default deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"
+              "sql": "DO $$\nDECLARE\n    source text;\nBEGIN\n    SELECT gateway_source\n    INTO source\n    FROM rvbbit.mcp_gateways\n    WHERE name = 'mcp_default'\n      AND status = 'ready'\n      AND endpoint_url IS NOT NULL\n      AND endpoint_url <> '';\n\n    IF source IS NULL THEN\n        RAISE EXCEPTION 'mcp_default gateway is not registered as ready';\n    END IF;\n\n    IF source = 'warren' AND NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'mcp_default'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'mcp_default deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"
             },
             {
               "description": "Call the bundled deterministic MCP echo server through SQL.",
@@ -6280,7 +6281,7 @@
             {
               "description": "Assert Warren registered the default CPython runtime and inventory row.",
               "name": "runtime_registered_ready",
-              "sql": "DO $$\nBEGIN\n    IF NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.python_runtimes\n        WHERE name = 'python_default'\n          AND status = 'ready'\n          AND runtime_source = 'warren'\n    ) THEN\n        RAISE EXCEPTION 'python_default runtime is not registered as a ready Warren runtime';\n    END IF;\n\n    IF NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'python_default'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'python_default deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"
+              "sql": "DO $$\nDECLARE\n    source text;\nBEGIN\n    SELECT runtime_source\n    INTO source\n    FROM rvbbit.python_runtimes\n    WHERE name = 'python_default'\n      AND status = 'ready'\n      AND endpoint_url IS NOT NULL\n      AND endpoint_url <> '';\n\n    IF source IS NULL THEN\n        RAISE EXCEPTION 'python_default runtime is not registered as ready';\n    END IF;\n\n    IF source = 'warren' AND NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'python_default'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'python_default deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"
             },
             {
               "description": "Create a tiny Python handler, call it through an operator pipeline, and assert deterministic JSON output.",

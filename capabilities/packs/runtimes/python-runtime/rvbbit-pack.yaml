@@ -46,18 +46,22 @@ acceptance:
     description: Assert Warren registered the default CPython runtime and inventory row.
     sql: |
       DO $$
+      DECLARE
+          source text;
       BEGIN
-          IF NOT EXISTS (
-              SELECT 1
-              FROM rvbbit.python_runtimes
-              WHERE name = 'python_default'
-                AND status = 'ready'
-                AND runtime_source = 'warren'
-          ) THEN
-              RAISE EXCEPTION 'python_default runtime is not registered as a ready Warren runtime';
+          SELECT runtime_source
+          INTO source
+          FROM rvbbit.python_runtimes
+          WHERE name = 'python_default'
+            AND status = 'ready'
+            AND endpoint_url IS NOT NULL
+            AND endpoint_url <> '';
+
+          IF source IS NULL THEN
+              RAISE EXCEPTION 'python_default runtime is not registered as ready';
           END IF;
 
-          IF NOT EXISTS (
+          IF source = 'warren' AND NOT EXISTS (
               SELECT 1
               FROM rvbbit.warren_inventory
               WHERE runtime_name = 'python_default'

@@ -316,6 +316,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_profile_entries (
     duck_vortex_ms double precision,
     datafusion_ms double precision,
     datafusion_hive_ms double precision,
+    datafusion_vortex_ms double precision,
     pg_ms         double precision,
     entry         jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at    timestamptz NOT NULL DEFAULT now(),
@@ -340,6 +341,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_profile_points (
     duck_vortex_ms double precision,
     datafusion_ms double precision,
     datafusion_hive_ms double precision,
+    datafusion_vortex_ms double precision,
     pg_ms         double precision,
     point         jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at    timestamptz NOT NULL DEFAULT now(),
@@ -351,6 +353,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_profile_points (
     CHECK (duck_vortex_ms IS NULL OR duck_vortex_ms > 0),
     CHECK (datafusion_ms IS NULL OR datafusion_ms > 0),
     CHECK (datafusion_hive_ms IS NULL OR datafusion_hive_ms > 0),
+    CHECK (datafusion_vortex_ms IS NULL OR datafusion_vortex_ms > 0),
     CHECK (pg_ms IS NULL OR pg_ms > 0)
 );
 
@@ -369,6 +372,9 @@ ALTER TABLE IF EXISTS rvbbit.route_profile_entries
 ALTER TABLE IF EXISTS rvbbit.route_profile_entries
     ADD COLUMN IF NOT EXISTS datafusion_hive_ms double precision;
 
+ALTER TABLE IF EXISTS rvbbit.route_profile_entries
+    ADD COLUMN IF NOT EXISTS datafusion_vortex_ms double precision;
+
 ALTER TABLE IF EXISTS rvbbit.route_profile_points
     ADD COLUMN IF NOT EXISTS pg_ms double precision;
 
@@ -380,6 +386,9 @@ ALTER TABLE IF EXISTS rvbbit.route_profile_points
 
 ALTER TABLE IF EXISTS rvbbit.route_profile_points
     ADD COLUMN IF NOT EXISTS datafusion_hive_ms double precision;
+
+ALTER TABLE IF EXISTS rvbbit.route_profile_points
+    ADD COLUMN IF NOT EXISTS datafusion_vortex_ms double precision;
 
 ALTER TABLE IF EXISTS rvbbit.route_profile_entries
     DROP CONSTRAINT IF EXISTS route_profile_entries_choice_check;
@@ -515,6 +524,7 @@ shape_stats AS (
         max(median_ms) FILTER (WHERE candidate = 'datafusion_mem') AS datafusion_mem_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'datafusion_vector') AS datafusion_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'datafusion_hive') AS datafusion_hive_median_ms,
+        max(median_ms) FILTER (WHERE candidate = 'datafusion_vortex') AS datafusion_vortex_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'pg_rowstore') AS pg_median_ms,
         max(observations) FILTER (WHERE candidate = 'rvbbit_native') AS native_observations,
         max(observations) FILTER (WHERE candidate = 'duck_vector') AS duck_observations,
@@ -523,6 +533,7 @@ shape_stats AS (
         max(observations) FILTER (WHERE candidate = 'datafusion_mem') AS datafusion_mem_observations,
         max(observations) FILTER (WHERE candidate = 'datafusion_vector') AS datafusion_observations,
         max(observations) FILTER (WHERE candidate = 'datafusion_hive') AS datafusion_hive_observations,
+        max(observations) FILTER (WHERE candidate = 'datafusion_vortex') AS datafusion_vortex_observations,
         max(observations) FILTER (WHERE candidate = 'pg_rowstore') AS pg_observations
     FROM candidate_stats
     GROUP BY shape_key, shape_family
@@ -569,6 +580,7 @@ SELECT
                     (ss.datafusion_mem_median_ms),
                     (ss.datafusion_median_ms),
                     (ss.datafusion_hive_median_ms),
+                    (ss.datafusion_vortex_median_ms),
                     (ss.pg_median_ms)
             ) AS med(v)
             WHERE v IS NOT NULL
@@ -585,6 +597,7 @@ SELECT
                         (ss.datafusion_mem_median_ms),
                         (ss.datafusion_median_ms),
                         (ss.datafusion_hive_median_ms),
+                        (ss.datafusion_vortex_median_ms),
                         (ss.pg_median_ms)
                 ) AS med(v)
                 WHERE v IS NOT NULL
@@ -596,9 +609,12 @@ SELECT
         OR coalesce(ss.duck_vortex_observations, 0) = 0
         OR coalesce(ss.datafusion_mem_observations, 0) = 0
         OR coalesce(ss.datafusion_observations, 0) = 0
+        OR coalesce(ss.datafusion_vortex_observations, 0) = 0
         OR coalesce(ss.pg_observations, 0) = 0
     )
-        AS needs_exploration
+        AS needs_exploration,
+    ss.datafusion_vortex_median_ms,
+    ss.datafusion_vortex_observations
 FROM shape_stats ss
 LEFT JOIN ranked r ON r.shape_key = ss.shape_key AND r.rn = 1;
 
@@ -655,7 +671,9 @@ SELECT
     pe.duck_vortex_ms,
     pe.datafusion_ms,
     pe.datafusion_hive_ms,
-    pe.pg_ms
+    pe.pg_ms,
+    pe.native_vortex_ms,
+    pe.datafusion_vortex_ms
 FROM rvbbit.route_profiles rp
 JOIN rvbbit.route_profile_entries pe ON pe.profile_name = rp.name;
 "#,
@@ -981,6 +999,7 @@ struct RouteCurveSample {
     duck_vortex_ms: Option<f64>,
     datafusion_ms: Option<f64>,
     datafusion_hive_ms: Option<f64>,
+    datafusion_vortex_ms: Option<f64>,
     pg_ms: Option<f64>,
 }
 
@@ -993,6 +1012,7 @@ struct CandidateBuckets {
     duck_vortex: Vec<f64>,
     datafusion: Vec<f64>,
     datafusion_hive: Vec<f64>,
+    datafusion_vortex: Vec<f64>,
     pg: Vec<f64>,
 }
 
@@ -1036,6 +1056,7 @@ impl RouteCurveSample {
             self.duck_vortex_ms,
             self.datafusion_ms,
             self.datafusion_hive_ms,
+            self.datafusion_vortex_ms,
             self.pg_ms,
         ]
         .into_iter()
@@ -1416,6 +1437,13 @@ fn route_eval(profile_name: &str) -> JsonB {
     .ok()
     .flatten()
     .unwrap_or(0);
+    let datafusion_vortex_entries: i64 = Spi::get_one(&format!(
+        "SELECT count(*)::bigint FROM rvbbit.route_profile_entries \
+         WHERE profile_name = {name_lit} AND choice = 'datafusion_vortex'"
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or(0);
     let native_entries: i64 = Spi::get_one(&format!(
         "SELECT count(*)::bigint FROM rvbbit.route_profile_entries \
          WHERE profile_name = {name_lit} AND choice = 'rvbbit_native'"
@@ -1471,6 +1499,7 @@ fn route_eval(profile_name: &str) -> JsonB {
         "datafusion_mem_entries": datafusion_mem_entries,
         "datafusion_entries": datafusion_entries,
         "datafusion_hive_entries": datafusion_hive_entries,
+        "datafusion_vortex_entries": datafusion_vortex_entries,
         "native_entries": native_entries,
         "avg_confidence": avg_confidence,
         "low_confidence_entries": low_confidence_entries,
@@ -3038,7 +3067,9 @@ fn choose_route_fast(
             None,
         ));
     }
-    if simple_metadata_aggregate_should_stay_native(features) {
+    if simple_metadata_aggregate_should_stay_native(features)
+        && native_simple_metadata_available(tables)
+    {
         return Some(decision(
             Candidate::RvbbitNative,
             "hard-rule-fast",
@@ -3047,7 +3078,9 @@ fn choose_route_fast(
             None,
         ));
     }
-    if filtered_count_should_stay_native(features) {
+    if filtered_count_should_stay_native(features)
+        && native_filtered_count_metadata_available(tables)
+    {
         return Some(decision(
             Candidate::RvbbitNative,
             "hard-rule-fast",
@@ -3056,7 +3089,11 @@ fn choose_route_fast(
             None,
         ));
     }
-    if features.min_count > 0 && features.max_count > 0 && !features.where_present {
+    if features.min_count > 0
+        && features.max_count > 0
+        && !features.where_present
+        && native_minmax_metadata_available(tables)
+    {
         return Some(decision(
             Candidate::RvbbitNative,
             "hard-rule-fast",
@@ -3163,7 +3200,9 @@ fn choose_route(
             None,
         );
     }
-    if simple_metadata_aggregate_should_stay_native(features) {
+    if simple_metadata_aggregate_should_stay_native(features)
+        && native_simple_metadata_available(tables)
+    {
         return decision(
             Candidate::RvbbitNative,
             "hard-rule",
@@ -3172,7 +3211,9 @@ fn choose_route(
             None,
         );
     }
-    if filtered_count_should_stay_native(features) {
+    if filtered_count_should_stay_native(features)
+        && native_filtered_count_metadata_available(tables)
+    {
         return decision(
             Candidate::RvbbitNative,
             "hard-rule",
@@ -3181,7 +3222,11 @@ fn choose_route(
             None,
         );
     }
-    if features.min_count > 0 && features.max_count > 0 && !features.where_present {
+    if features.min_count > 0
+        && features.max_count > 0
+        && !features.where_present
+        && native_minmax_metadata_available(tables)
+    {
         return decision(
             Candidate::RvbbitNative,
             "hard-rule",
@@ -3242,7 +3287,7 @@ fn choose_route(
         }
     }
 
-    if let Some(reason) = fallback_native_reason(features) {
+    if let Some(reason) = fallback_native_reason_for_tables(features, tables) {
         return decision(
             Candidate::RvbbitNative,
             "default-native",
@@ -3299,7 +3344,9 @@ fn native_metadata_hard_rule(
             None,
         ));
     }
-    if simple_metadata_aggregate_should_stay_native(features) {
+    if simple_metadata_aggregate_should_stay_native(features)
+        && native_simple_metadata_available(tables)
+    {
         return Some(decision(
             Candidate::RvbbitNative,
             source,
@@ -3308,7 +3355,9 @@ fn native_metadata_hard_rule(
             None,
         ));
     }
-    if filtered_count_should_stay_native(features) {
+    if filtered_count_should_stay_native(features)
+        && native_filtered_count_metadata_available(tables)
+    {
         return Some(decision(
             Candidate::RvbbitNative,
             source,
@@ -3317,7 +3366,11 @@ fn native_metadata_hard_rule(
             None,
         ));
     }
-    if features.min_count > 0 && features.max_count > 0 && !features.where_present {
+    if features.min_count > 0
+        && features.max_count > 0
+        && !features.where_present
+        && native_minmax_metadata_available(tables)
+    {
         return Some(decision(
             Candidate::RvbbitNative,
             source,
@@ -3343,6 +3396,101 @@ fn native_metadata_hard_rule_safe(tables: &[RvbbitTableMetric]) -> bool {
         && tables
             .iter()
             .all(|table| !table.shadow_heap_dirty && table.delete_count == 0)
+}
+
+fn native_simple_metadata_available(tables: &[RvbbitTableMetric]) -> bool {
+    native_metadata_hard_rule_safe(tables)
+        && tables
+            .iter()
+            .all(|table| table.row_groups > 0 && table_has_complete_column_stats(table.oid))
+}
+
+fn native_minmax_metadata_available(tables: &[RvbbitTableMetric]) -> bool {
+    native_simple_metadata_available(tables)
+}
+
+fn native_filtered_count_metadata_available(tables: &[RvbbitTableMetric]) -> bool {
+    native_metadata_hard_rule_safe(tables)
+        && tables
+            .iter()
+            .all(|table| table.row_groups > 0 && table_has_complete_column_bitmaps(table.oid))
+}
+
+fn table_has_complete_column_stats(table_oid: u32) -> bool {
+    if table_oid == 0 || !relations_present(&["rvbbit.row_groups_visible"]) {
+        return false;
+    }
+    let variant_sql =
+        if relations_present(&["rvbbit.row_group_variants", "rvbbit.layout_variant_status"]) {
+            format!(
+                " OR EXISTS ( \
+                 SELECT 1 \
+                 FROM rvbbit.row_group_variants v \
+                 JOIN visible rg ON rg.rg_id = v.rg_id \
+                 JOIN rvbbit.layout_variant_status lvs \
+                   ON lvs.table_oid = v.table_oid AND lvs.layout = v.layout \
+                 WHERE v.table_oid = {table_oid}::oid \
+                   AND lvs.status = 'ready' \
+                   AND jsonb_array_length(coalesce(v.stats, '[]'::jsonb)) >= (SELECT n FROM att_count) \
+                 GROUP BY v.layout \
+                 HAVING count(DISTINCT v.rg_id)::bigint = (SELECT row_groups FROM total) \
+             )"
+            )
+        } else {
+            String::new()
+        };
+    let sql = format!(
+        "WITH visible AS ( \
+             SELECT rg_id, stats \
+             FROM rvbbit.row_groups_visible \
+             WHERE table_oid = {table_oid}::oid \
+         ), att_count AS ( \
+             SELECT count(*)::bigint AS n \
+             FROM pg_attribute \
+             WHERE attrelid = {table_oid}::oid \
+               AND attnum > 0 \
+               AND NOT attisdropped \
+         ), total AS ( \
+             SELECT count(*)::bigint AS row_groups FROM visible \
+         ) \
+         SELECT (SELECT row_groups FROM total) > 0 \
+            AND ( \
+                EXISTS ( \
+                    SELECT 1 \
+                    FROM visible \
+                    WHERE jsonb_array_length(coalesce(stats, '[]'::jsonb)) >= (SELECT n FROM att_count) \
+                    HAVING count(*)::bigint = (SELECT row_groups FROM total) \
+                ) \
+                {variant_sql} \
+            )"
+    );
+    Spi::get_one::<bool>(&sql).ok().flatten().unwrap_or(false)
+}
+
+fn table_has_complete_column_bitmaps(table_oid: u32) -> bool {
+    if table_oid == 0 || !relations_present(&["rvbbit.row_groups_visible", "rvbbit.column_bitmaps"])
+    {
+        return false;
+    }
+    let sql = format!(
+        "WITH visible AS ( \
+             SELECT rg_id \
+             FROM rvbbit.row_groups_visible \
+             WHERE table_oid = {table_oid}::oid \
+         ), total AS ( \
+             SELECT count(*)::bigint AS row_groups FROM visible \
+         ) \
+         SELECT (SELECT row_groups FROM total) > 0 \
+            AND EXISTS ( \
+                SELECT 1 \
+                FROM rvbbit.column_bitmaps cb \
+                JOIN visible rg ON rg.rg_id = cb.rg_id \
+                WHERE cb.table_oid = {table_oid}::oid \
+                GROUP BY cb.column_name \
+                HAVING count(DISTINCT cb.rg_id)::bigint = (SELECT row_groups FROM total) \
+            )"
+    );
+    Spi::get_one::<bool>(&sql).ok().flatten().unwrap_or(false)
 }
 
 fn decision(
@@ -3494,6 +3642,7 @@ fn choose_from_observation_curve(
                 "duck_vortex" => entry.duck_vortex.push(elapsed_ms),
                 "datafusion_vector" => entry.datafusion.push(elapsed_ms),
                 "datafusion_hive" => entry.datafusion_hive.push(elapsed_ms),
+                "datafusion_vortex" => entry.datafusion_vortex.push(elapsed_ms),
                 "pg_rowstore" => entry.pg.push(elapsed_ms),
                 _ => {}
             }
@@ -3513,6 +3662,8 @@ fn choose_from_observation_curve(
             datafusion_ms: (!values.datafusion.is_empty()).then(|| median_f64(values.datafusion)),
             datafusion_hive_ms: (!values.datafusion_hive.is_empty())
                 .then(|| median_f64(values.datafusion_hive)),
+            datafusion_vortex_ms: (!values.datafusion_vortex.is_empty())
+                .then(|| median_f64(values.datafusion_vortex)),
             pg_ms: (!values.pg.is_empty()).then(|| median_f64(values.pg)),
         };
         if !sample.has_at_least_two() {
@@ -3549,6 +3700,9 @@ fn route_curve_from_anchors(
                 datafusion_ms: median_option(vals.iter().filter_map(|v| v.datafusion_ms).collect()),
                 datafusion_hive_ms: median_option(
                     vals.iter().filter_map(|v| v.datafusion_hive_ms).collect(),
+                ),
+                datafusion_vortex_ms: median_option(
+                    vals.iter().filter_map(|v| v.datafusion_vortex_ms).collect(),
                 ),
                 pg_ms: median_option(vals.iter().filter_map(|v| v.pg_ms).collect()),
             };
@@ -3590,6 +3744,7 @@ fn route_curve_from_anchors(
             "duck_vortex_ms_predicted": predicted_ms(&predictions, Candidate::DuckVortex),
             "datafusion_ms_predicted": predicted_ms(&predictions, Candidate::DataFusionVector),
             "datafusion_hive_ms_predicted": predicted_ms(&predictions, Candidate::DataFusionHive),
+            "datafusion_vortex_ms_predicted": predicted_ms(&predictions, Candidate::DataFusionVortex),
             "pg_ms_predicted": predicted_ms(&predictions, Candidate::PgRowstore),
             "lower_anchor_rows": r1,
             "upper_anchor_rows": r2,
@@ -3963,6 +4118,7 @@ fn profile_point_from_medians(
         "duck_vortex_ms": get(Candidate::DuckVortex),
         "datafusion_ms": get(Candidate::DataFusionVector),
         "datafusion_hive_ms": get(Candidate::DataFusionHive),
+        "datafusion_vortex_ms": get(Candidate::DataFusionVortex),
         "pg_ms": get(Candidate::PgRowstore),
         "point": {
             "shape_family": shape_family,
@@ -3985,7 +4141,7 @@ fn candidate_median_field(candidate: &str) -> Option<&'static str> {
         Candidate::DataFusionMem => None,
         Candidate::DataFusionVector => Some("datafusion_ms_median"),
         Candidate::DataFusionHive => Some("datafusion_hive_ms_median"),
-        Candidate::DataFusionVortex => None,
+        Candidate::DataFusionVortex => Some("datafusion_vortex_ms_median"),
         Candidate::PgRowstore => Some("pg_ms_median"),
     }
 }
@@ -4003,6 +4159,7 @@ fn parse_training_candidates(value: &str, caller: &str) -> Vec<Candidate> {
             Candidate::DuckVortex,
             Candidate::PgRowstore,
             Candidate::DataFusionHive,
+            Candidate::DataFusionVortex,
             Candidate::DuckHive,
         ]
     } else {
@@ -4408,6 +4565,7 @@ fn route_profiles_json() -> Value {
                 'datafusion_mem_entries', datafusion_mem_entries,
                 'datafusion_entries', datafusion_entries,
                 'datafusion_hive_entries', datafusion_hive_entries,
+                'datafusion_vortex_entries', datafusion_vortex_entries,
                 'native_entries', native_entries,
                 'pg_rowstore_entries', pg_rowstore_entries,
                 'avg_confidence', avg_confidence,
@@ -4430,6 +4588,7 @@ fn route_profiles_json() -> Value {
                 coalesce(e.datafusion_mem_entries, 0) AS datafusion_mem_entries,
                 coalesce(e.datafusion_entries, 0) AS datafusion_entries,
                 coalesce(e.datafusion_hive_entries, 0) AS datafusion_hive_entries,
+                coalesce(e.datafusion_vortex_entries, 0) AS datafusion_vortex_entries,
                 coalesce(e.native_entries, 0) AS native_entries,
                 coalesce(e.pg_rowstore_entries, 0) AS pg_rowstore_entries,
                 coalesce(e.avg_confidence, 0)::double precision AS avg_confidence,
@@ -4446,6 +4605,7 @@ fn route_profiles_json() -> Value {
                     count(*) FILTER (WHERE choice = 'datafusion_mem')::bigint AS datafusion_mem_entries,
                     count(*) FILTER (WHERE choice = 'datafusion_vector')::bigint AS datafusion_entries,
                     count(*) FILTER (WHERE choice = 'datafusion_hive')::bigint AS datafusion_hive_entries,
+                    count(*) FILTER (WHERE choice = 'datafusion_vortex')::bigint AS datafusion_vortex_entries,
                     count(*) FILTER (WHERE choice = 'rvbbit_native')::bigint AS native_entries,
                     count(*) FILTER (WHERE choice = 'pg_rowstore')::bigint AS pg_rowstore_entries,
                     avg(confidence) AS avg_confidence
@@ -4754,23 +4914,36 @@ fn referenced_am_oids(stringless: &str, plan_lower: Option<&str>) -> Vec<i64> {
         let list = fetch_rvbbit_am_relations();
         RVBBIT_AM_RELATIONS_MEMO.with(|m| *m.borrow_mut() = Some((Instant::now(), list)));
     }
-    RVBBIT_AM_RELATIONS_MEMO.with(|m| {
+    let match_refs = |list: &[AmRelation]| -> Vec<i64> {
+        list.iter()
+            .filter(|(oid, schema, relname)| {
+                *oid > 0
+                    && (sql_mentions_relation(stringless, schema, relname)
+                        || plan_lower
+                            .map(|plan| plan_mentions_relation(plan, schema, relname))
+                            .unwrap_or(false))
+            })
+            .map(|(oid, _, _)| *oid)
+            .collect()
+    };
+    let refs = RVBBIT_AM_RELATIONS_MEMO.with(|m| {
         m.borrow()
             .as_ref()
-            .map(|(_, list)| {
-                list.iter()
-                    .filter(|(oid, schema, relname)| {
-                        *oid > 0
-                            && (sql_mentions_relation(stringless, schema, relname)
-                                || plan_lower
-                                    .map(|plan| plan_mentions_relation(plan, schema, relname))
-                                    .unwrap_or(false))
-                    })
-                    .map(|(oid, _, _)| *oid)
-                    .collect()
-            })
+            .map(|(_, list)| match_refs(list))
             .unwrap_or_default()
-    })
+    });
+    if refs.is_empty() && !stale && !ttl.is_zero() {
+        // A training/query backend may create a new rvbbit table and route it
+        // immediately after another route call populated the memo. An empty
+        // match is cheap to re-check once so brand-new tables do not look like
+        // non-rvbbit relations until the TTL expires.
+        let list = fetch_rvbbit_am_relations();
+        let refreshed = match_refs(&list);
+        RVBBIT_AM_RELATIONS_MEMO.with(|m| *m.borrow_mut() = Some((Instant::now(), list)));
+        refreshed
+    } else {
+        refs
+    }
 }
 
 /// One cheap catalog scan: (oid, schema, relname) of every enabled rvbbit relation. No metrics,
@@ -6117,8 +6290,25 @@ fn filtered_count_should_stay_native(features: &RouteFeatures) -> bool {
         && !features.plan_has_subplan
 }
 
+#[cfg(test)]
 fn fallback_native_reason(features: &RouteFeatures) -> Option<&'static str> {
-    if filtered_count_should_stay_native(features) {
+    fallback_native_reason_inner(features, true)
+}
+
+fn fallback_native_reason_for_tables(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<&'static str> {
+    let allow_filtered_count = !filtered_count_should_stay_native(features)
+        || native_filtered_count_metadata_available(tables);
+    fallback_native_reason_inner(features, allow_filtered_count)
+}
+
+fn fallback_native_reason_inner(
+    features: &RouteFeatures,
+    allow_filtered_count: bool,
+) -> Option<&'static str> {
+    if allow_filtered_count && filtered_count_should_stay_native(features) {
         return Some("filtered count metadata stays on native path");
     }
     if selective_single_table_topk_should_stay_native(features)
@@ -6151,8 +6341,33 @@ fn fallback_native_reason(features: &RouteFeatures) -> Option<&'static str> {
     None
 }
 
+#[cfg(test)]
 fn no_profile_native_reason(features: &RouteFeatures) -> Option<&'static str> {
     match fallback_native_reason(features)? {
+        "native PostgreSQL plan rewrite is available" => {
+            Some("no active route profile; native PostgreSQL plan rewrite is available")
+        }
+        "small/simple analytical table stays on native path" => {
+            Some("no active route profile; small/simple analytical table stays on native path")
+        }
+        "row-returning query stays on native path" => {
+            Some("no active route profile; row-returning query stays on native path")
+        }
+        "selective single-table top-k rewrite stays on native path" => Some(
+            "no active route profile; selective single-table top-k rewrite stays on native path",
+        ),
+        "filtered count metadata stays on native path" => {
+            Some("no active route profile; filtered count metadata stays on native path")
+        }
+        _ => Some("no active route profile; using native path"),
+    }
+}
+
+fn no_profile_native_reason_for_tables(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<&'static str> {
+    match fallback_native_reason_for_tables(features, tables)? {
         "native PostgreSQL plan rewrite is available" => {
             Some("no active route profile; native PostgreSQL plan rewrite is available")
         }
@@ -6480,7 +6695,7 @@ fn choose_no_profile_route(
             );
         }
     }
-    if let Some(reason) = no_profile_native_reason(features) {
+    if let Some(reason) = no_profile_native_reason_for_tables(features, tables) {
         return decision(
             Candidate::RvbbitNative,
             "no-profile-native",
@@ -6792,6 +7007,7 @@ fn export_route_profile_value(profile_name: &str, caller: &str) -> Value {
                            'duck_vortex_ms', duck_vortex_ms,
                            'datafusion_ms', datafusion_ms,
                            'datafusion_hive_ms', datafusion_hive_ms,
+                           'datafusion_vortex_ms', datafusion_vortex_ms,
                            'pg_ms', pg_ms,
                            'point', point
                        )
@@ -6836,7 +7052,7 @@ fn persist_profile_tables(
         r#"
         INSERT INTO rvbbit.route_profile_entries
             (profile_name, shape_key, choice, confidence, reason, observations,
-             native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, entry)
+             native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, datafusion_vortex_ms, pg_ms, entry)
         SELECT {name_lit},
                e.key,
                CASE e.value->>'choice'
@@ -6893,6 +7109,12 @@ fn persist_profile_tables(
                    WHERE m->>'candidate' = 'datafusion_hive'
                    LIMIT 1
                )),
+               coalesce(nullif(e.value->>'datafusion_vortex_ms_median', '')::double precision, (
+                   SELECT nullif(m->>'median_ms', '')::double precision
+                   FROM jsonb_array_elements(coalesce(e.value->'candidate_medians', '[]'::jsonb)) AS m
+                   WHERE m->>'candidate' = 'datafusion_vortex'
+                   LIMIT 1
+               )),
                (
                    SELECT nullif(m->>'median_ms', '')::double precision
                    FROM jsonb_array_elements(coalesce(e.value->'candidate_medians', '[]'::jsonb)) AS m
@@ -6908,7 +7130,7 @@ fn persist_profile_tables(
     Spi::run(&format!(
         r#"
         INSERT INTO rvbbit.route_profile_points
-            (profile_name, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point)
+            (profile_name, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, datafusion_vortex_ms, pg_ms, point)
         SELECT {name_lit},
                regexp_replace(
                    regexp_replace(coalesce(obs->'features'->>'shape_key', ''),
@@ -6923,6 +7145,7 @@ fn persist_profile_tables(
                nullif(obs->>'duck_vortex_ms', '')::double precision,
                nullif(obs->>'datafusion_ms', '')::double precision,
                nullif(obs->>'datafusion_hive_ms', '')::double precision,
+               nullif(obs->>'datafusion_vortex_ms', '')::double precision,
                nullif(obs->>'pg_ms', '')::double precision,
                obs
         FROM jsonb_array_elements(coalesce({profile_lit}::jsonb->'observations', '[]'::jsonb)) AS obs
@@ -6937,7 +7160,7 @@ fn persist_profile_tables(
     Spi::run(&format!(
         r#"
         INSERT INTO rvbbit.route_profile_points
-            (profile_name, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point)
+            (profile_name, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, datafusion_vortex_ms, pg_ms, point)
         SELECT {name_lit},
                shape_family,
                table_rows,
@@ -6948,6 +7171,7 @@ fn persist_profile_tables(
                duck_vortex_ms,
                datafusion_ms,
                datafusion_hive_ms,
+               datafusion_vortex_ms,
                pg_ms,
                point
         FROM (
@@ -6997,6 +7221,10 @@ fn persist_profile_tables(
                        nullif(pp->>'datafusion_hive_ms', '')::double precision,
                        nullif(pp->'point'->>'datafusion_hive_ms', '')::double precision
                    ) AS datafusion_hive_ms,
+                   coalesce(
+                       nullif(pp->>'datafusion_vortex_ms', '')::double precision,
+                       nullif(pp->'point'->>'datafusion_vortex_ms', '')::double precision
+                   ) AS datafusion_vortex_ms,
                    coalesce(
                        nullif(pp->>'pg_ms', '')::double precision,
                        nullif(pp->'point'->>'pg_ms', '')::double precision
@@ -7106,9 +7334,9 @@ fn copy_profile_entries(target_profile: &str, source_profile: &str, caller: &str
         r#"
         INSERT INTO rvbbit.route_profile_entries
             (profile_name, shape_key, choice, confidence, reason, observations,
-             native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, entry)
+             native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, datafusion_vortex_ms, pg_ms, entry)
         SELECT {target_lit}, shape_key, choice, confidence, reason, observations,
-               native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, entry
+               native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, datafusion_vortex_ms, pg_ms, entry
         FROM rvbbit.route_profile_entries
         WHERE profile_name = {source_lit}
         ON CONFLICT (profile_name, shape_key) DO UPDATE SET
@@ -7123,6 +7351,7 @@ fn copy_profile_entries(target_profile: &str, source_profile: &str, caller: &str
             duck_vortex_ms = EXCLUDED.duck_vortex_ms,
             datafusion_ms = EXCLUDED.datafusion_ms,
             datafusion_hive_ms = EXCLUDED.datafusion_hive_ms,
+            datafusion_vortex_ms = EXCLUDED.datafusion_vortex_ms,
             pg_ms = EXCLUDED.pg_ms,
             entry = EXCLUDED.entry
         "#
@@ -7136,8 +7365,8 @@ fn copy_profile_points(target_profile: &str, source_profile: &str, caller: &str)
     Spi::run(&format!(
         r#"
         INSERT INTO rvbbit.route_profile_points
-            (profile_name, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point)
-        SELECT {target_lit}, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, pg_ms, point
+            (profile_name, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, datafusion_vortex_ms, pg_ms, point)
+        SELECT {target_lit}, shape_family, table_rows, native_ms, native_vortex_ms, duck_ms, duck_hive_ms, duck_vortex_ms, datafusion_ms, datafusion_hive_ms, datafusion_vortex_ms, pg_ms, point
         FROM rvbbit.route_profile_points
         WHERE profile_name = {source_lit}
         "#
@@ -7819,6 +8048,11 @@ fn interpolate_predictions(
             Candidate::DataFusionHive,
             lower.datafusion_hive_ms,
             upper.datafusion_hive_ms,
+        ),
+        (
+            Candidate::DataFusionVortex,
+            lower.datafusion_vortex_ms,
+            upper.datafusion_vortex_ms,
         ),
         (Candidate::PgRowstore, lower.pg_ms, upper.pg_ms),
     ]

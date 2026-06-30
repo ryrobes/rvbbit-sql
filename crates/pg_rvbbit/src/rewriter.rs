@@ -4052,35 +4052,108 @@ fn fetch_i64_stat_aggregate(
     let col_esc = col_name.replace('\'', "''");
     let agg = stat_name;
     let sql = format!(
-        "WITH vals AS ( \
-             SELECT (s->>'{stat_name}')::bigint AS v \
-             FROM rvbbit.row_groups_visible, jsonb_array_elements(stats) AS s \
-             WHERE table_oid = {table_oid}::oid AND s->>'name' = '{col_esc}' \
-                   AND s->'{stat_name}' IS NOT NULL \
-                   AND jsonb_typeof(s->'{stat_name}') <> 'null' \
+        "WITH visible AS ( \
+             SELECT rg_id, stats \
+             FROM rvbbit.row_groups_visible \
+             WHERE table_oid = {table_oid}::oid \
+         ), total AS ( \
+             SELECT count(*)::bigint AS n FROM visible \
+         ), entries AS ( \
+             SELECT v.rg_id, s->'{stat_name}' AS raw \
+             FROM visible v, jsonb_array_elements(coalesce(v.stats, '[]'::jsonb)) AS s \
+             WHERE s->>'name' = '{col_esc}' \
+         ), vals AS ( \
+             SELECT (raw#>>'{{}}')::bigint AS v \
+             FROM entries \
+             WHERE raw IS NOT NULL AND jsonb_typeof(raw) <> 'null' \
          ) \
-         SELECT count(*)::bigint, {agg}(v)::bigint FROM vals"
+         SELECT \
+             (SELECT n FROM total) AS total_groups, \
+             count(DISTINCT entries.rg_id)::bigint AS covered_groups, \
+             {agg}(vals.v)::bigint \
+         FROM entries \
+         LEFT JOIN vals ON vals.v IS NOT NULL"
     );
 
-    let mut stats_present = false;
+    let mut complete_stats = false;
     let mut value = None;
     pgrx::Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let table = client.select(&sql, Some(1), &[])?;
         for row in table {
-            let n: Option<i64> = row.get(1)?;
-            let v: Option<i64> = row.get(2)?;
-            stats_present = n.unwrap_or(0) > 0;
+            let total: Option<i64> = row.get(1)?;
+            let covered: Option<i64> = row.get(2)?;
+            let v: Option<i64> = row.get(3)?;
+            let total = total.unwrap_or(0);
+            complete_stats = total > 0 && covered.unwrap_or(0) == total;
             value = v;
         }
         Ok(())
     })
     .ok()?;
 
-    if stats_present {
+    if complete_stats {
         Some(value)
     } else {
-        None
+        fetch_i64_variant_stat_aggregate(table_oid, &col_esc, stat_name, agg)
     }
+}
+
+fn fetch_i64_variant_stat_aggregate(
+    table_oid: u32,
+    col_esc: &str,
+    stat_name: &str,
+    agg: &str,
+) -> Option<Option<i64>> {
+    if !catalog_relation_present("rvbbit.row_group_variants")
+        || !catalog_relation_present("rvbbit.layout_variant_status")
+    {
+        return None;
+    }
+    let sql = format!(
+        "WITH visible AS ( \
+             SELECT rg_id \
+             FROM rvbbit.row_groups_visible \
+             WHERE table_oid = {table_oid}::oid \
+         ), total AS ( \
+             SELECT count(*)::bigint AS row_groups \
+             FROM visible \
+         ), variant_entries AS ( \
+             SELECT v.layout, v.rg_id, v.n_rows, s->'{stat_name}' AS raw \
+             FROM rvbbit.row_group_variants v \
+             JOIN visible rg ON rg.rg_id = v.rg_id \
+             JOIN rvbbit.layout_variant_status lvs \
+               ON lvs.table_oid = v.table_oid AND lvs.layout = v.layout \
+             CROSS JOIN LATERAL jsonb_array_elements(coalesce(v.stats, '[]'::jsonb)) AS s \
+             WHERE v.table_oid = {table_oid}::oid \
+               AND lvs.status = 'ready' \
+               AND s->>'name' = '{col_esc}' \
+         ), complete_layout AS ( \
+             SELECT ve.layout \
+             FROM variant_entries ve, total t \
+             GROUP BY ve.layout, t.row_groups \
+             HAVING count(DISTINCT ve.rg_id)::bigint = t.row_groups \
+             ORDER BY CASE WHEN ve.layout = 'vortex_scan' THEN 0 ELSE 1 END, ve.layout \
+             LIMIT 1 \
+         ), vals AS ( \
+             SELECT (ve.raw#>>'{{}}')::bigint AS v \
+             FROM variant_entries ve \
+             JOIN complete_layout cl ON cl.layout = ve.layout \
+             WHERE ve.raw IS NOT NULL AND jsonb_typeof(ve.raw) <> 'null' \
+         ) \
+         SELECT EXISTS(SELECT 1 FROM complete_layout), {agg}(v)::bigint FROM vals"
+    );
+    let mut complete_stats = false;
+    let mut value = None;
+    pgrx::Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(&sql, Some(1), &[])?;
+        for row in table {
+            complete_stats = row.get::<bool>(1)?.unwrap_or(false);
+            value = row.get::<i64>(2)?;
+        }
+        Ok(())
+    })
+    .ok()?;
+    complete_stats.then_some(value)
 }
 
 unsafe fn make_typed_avg_const(typoid: u32, scan: &NumericScan) -> Option<*mut pg_sys::Const> {

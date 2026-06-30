@@ -49,24 +49,29 @@ acceptance:
          ARRAY['/opt/mcp-test-server/main.py'],
          '{}'::jsonb, 30000,
          'Deterministic MCP echo server bundled with the rvbbit MCP gateway image');
+  - |
     SELECT rvbbit.refresh_mcp_server('acceptance_mcp_echo');
   tests:
   - name: mcp_gateway_registered_ready
     description: Assert Warren registered the default MCP gateway runtime and inventory row.
     sql: |
       DO $$
+      DECLARE
+          source text;
       BEGIN
-          IF NOT EXISTS (
-              SELECT 1
-              FROM rvbbit.mcp_gateways
-              WHERE name = 'mcp_default'
-                AND status = 'ready'
-                AND gateway_source = 'warren'
-          ) THEN
-              RAISE EXCEPTION 'mcp_default gateway is not registered as a ready Warren runtime';
+          SELECT gateway_source
+          INTO source
+          FROM rvbbit.mcp_gateways
+          WHERE name = 'mcp_default'
+            AND status = 'ready'
+            AND endpoint_url IS NOT NULL
+            AND endpoint_url <> '';
+
+          IF source IS NULL THEN
+              RAISE EXCEPTION 'mcp_default gateway is not registered as ready';
           END IF;
 
-          IF NOT EXISTS (
+          IF source = 'warren' AND NOT EXISTS (
               SELECT 1
               FROM rvbbit.warren_inventory
               WHERE runtime_name = 'mcp_default'

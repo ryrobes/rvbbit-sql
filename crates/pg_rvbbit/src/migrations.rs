@@ -469,6 +469,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0112_drop_table_orphan_files",
         include_str!("../sql/migrations/0112_drop_table_orphan_files.sql"),
     ),
+    (
+        "0113_datafusion_vortex_profile_metric",
+        include_str!("../sql/migrations/0113_datafusion_vortex_profile_metric.sql"),
+    ),
+    (
+        "0114_route_shape_summary_datafusion_vortex_outputs",
+        include_str!("../sql/migrations/0114_route_shape_summary_datafusion_vortex_outputs.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
@@ -486,8 +494,10 @@ fn sql_quote(s: &str) -> String {
 ///
 /// Runs in the caller's transaction: the pending set is applied atomically — if
 /// any migration fails the whole call aborts and nothing is recorded, so you fix
-/// it and re-run (migrations are idempotent). Safe to call on every deploy; a
-/// no-op once everything is applied.
+/// it and re-run (migrations are idempotent). Safe to call on every deploy;
+/// schema migrations are a no-op once applied, but the embedded curated
+/// capability catalog is refreshed each time so catalog-only fixes ship with
+/// normal extension upgrades.
 #[pg_extern]
 fn migrate() -> String {
     Spi::run(SCHEMA_MIGRATIONS_DDL).expect("rvbbit.migrate: create schema_migrations");
@@ -513,6 +523,10 @@ fn migrate() -> String {
         .unwrap_or_else(|e| pgrx::error!("rvbbit.migrate: recording '{}' failed: {:?}", name, e));
         applied.push(name);
     }
+
+    Spi::run("SELECT rvbbit.seed_capability_catalog()").unwrap_or_else(|e| {
+        pgrx::error!("rvbbit.migrate: seed capability catalog failed: {:?}", e)
+    });
 
     if applied.is_empty() {
         format!(

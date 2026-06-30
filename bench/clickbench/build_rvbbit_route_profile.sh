@@ -17,9 +17,9 @@ OUT_CONTAINER="/bench/${OUT_HOST#bench/}"
 RESULTS_HOST="${RVBBIT_ROUTE_RESULTS_OUT:-bench/clickbench/results/last_run.json}"
 RESULTS_CONTAINER="/bench/${RESULTS_HOST#bench/}"
 
-DEFAULT_SYSTEMS="rvbbit_native_forced,rvbbit_duck_forced,rvbbit_datafusion_mem_forced,rvbbit_datafusion_forced,rvbbit_pg_heap_forced"
+DEFAULT_SYSTEMS="rvbbit_native_forced,rvbbit_duck_forced,rvbbit_duck_vortex_forced,rvbbit_datafusion_mem_forced,rvbbit_datafusion_forced,rvbbit_datafusion_vortex_forced,rvbbit_pg_heap_forced"
 if [ "${RVBBIT_ROUTE_INCLUDE_HIVE:-1}" != "0" ]; then
-    DEFAULT_SYSTEMS="rvbbit_native_forced,rvbbit_duck_forced,rvbbit_duck_hive_forced,rvbbit_datafusion_mem_forced,rvbbit_datafusion_forced,rvbbit_datafusion_hive_forced,rvbbit_pg_heap_forced"
+    DEFAULT_SYSTEMS="rvbbit_native_forced,rvbbit_duck_forced,rvbbit_duck_hive_forced,rvbbit_duck_vortex_forced,rvbbit_datafusion_mem_forced,rvbbit_datafusion_forced,rvbbit_datafusion_hive_forced,rvbbit_datafusion_vortex_forced,rvbbit_pg_heap_forced"
 fi
 
 BENCH_SYSTEMS="${BENCH_SYSTEMS:-${DEFAULT_SYSTEMS}}" \
