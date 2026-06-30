@@ -1,6 +1,6 @@
 
 export RVBBIT_DIRECT_ACCEL_LOAD=1 ;
-export BENCH_LIMIT=60000 ;
+export BENCH_LIMIT=600000 ;
 export BENCH_SYSTEMS=pg_baseline,citus,hydra,alloydb,rvbbit,clickhouse ;
 export RVBBIT_DIRECT_ACCEL_METADATA_PROFILE=minimal ;
 export RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async ;

@@ -477,6 +477,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0114_route_shape_summary_datafusion_vortex_outputs",
         include_str!("../sql/migrations/0114_route_shape_summary_datafusion_vortex_outputs.sql"),
     ),
+    (
+        "0115_system_learning_brain_provider",
+        include_str!("../sql/migrations/0115_system_learning_brain_provider.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

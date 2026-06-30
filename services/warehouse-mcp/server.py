@@ -1249,6 +1249,273 @@ def tool_brain_entity(name, caller_email=None) -> dict:
     return (row["r"] if row else {}) or {}
 
 
+def tool_system_learning_status() -> dict:
+    """What RVBBIT has learned about its own workload and agent corpus: artifact counts, sync state,
+    graph edge handles, concrete breadcrumb examples, and the doc_type/source an MCP caller can
+    search. This is the MCP-friendly mirror of the SQL Desktop's System Learning strip."""
+    with _ro() as c:
+        installed = c.execute(
+            "SELECT to_regclass('rvbbit.system_learning_brain_status') IS NOT NULL AS ok"
+        ).fetchone()["ok"]
+        summary_installed = c.execute(
+            "SELECT to_regclass('rvbbit.system_learning_item_summary') IS NOT NULL AS ok"
+        ).fetchone()["ok"]
+        if not installed:
+            return {
+                "installed": False,
+                "source": "RVBBIT System Learning",
+                "doc_type": "system_learning",
+                "summary": [],
+                "breadcrumbs": [],
+                "graph_edges": [],
+                "agent_tools": ["system_learning_status", "sync_system_learning", "ask_system_learning"],
+                "note": "Run rvbbit.migrate() to install the system-learning Brain provider.",
+            }
+        status = c.execute(
+            "SELECT installed, source_id, enabled, indexed_items, docs, "
+            "last_synced_at::text AS last_synced_at, last_run_at::text AS last_run_at, "
+            "last_run_added, last_run_changed, last_run_removed, last_run_skipped, "
+            "last_run_errors, last_run_elapsed_sec "
+            "FROM rvbbit.system_learning_brain_status"
+        ).fetchone()
+        summary = []
+        if summary_installed:
+            summary = c.execute(
+                "SELECT object_type, items, last_seen_at::text AS last_seen_at "
+                "FROM rvbbit.system_learning_item_summary ORDER BY items DESC, object_type"
+            ).fetchall()
+        provider = c.execute(
+            "SELECT edge_map FROM rvbbit.brain_doc_providers WHERE provider = 'rvbbit-system-learning'"
+        ).fetchone()
+        breadcrumbs = c.execute(
+            """
+            WITH ranked AS (
+                SELECT uri, title, occurred_at, body, props,
+                       coalesce(props->>'object_type', 'unknown') AS object_type,
+                       row_number() OVER (
+                           PARTITION BY coalesce(props->>'object_type', 'unknown')
+                           ORDER BY occurred_at DESC, title
+                       ) AS rn
+                FROM rvbbit.system_learning_items
+            )
+            SELECT uri, title, object_type, occurred_at::text AS occurred_at,
+                   left(body, 700) AS preview,
+                   jsonb_strip_nulls(jsonb_build_object(
+                       'table', props->>'table',
+                       'column', props->>'column',
+                       'layout', props->>'layout',
+                       'layout_kind', props->>'layout_kind',
+                       'layout_status', props->>'layout_status',
+                       'shape_key', props->>'shape_key',
+                       'shape_family', props->>'shape_family',
+                       'engine', props->>'engine',
+                       'operator', props->>'operator',
+                       'status', props->>'status',
+                       'score', props->>'score',
+                       'observations', props->>'observations'
+                   )) AS handles
+            FROM ranked
+            WHERE rn <= 2
+            ORDER BY object_type, occurred_at DESC, title
+            LIMIT 12
+            """
+        ).fetchall()
+    breadcrumbs = [_system_learning_breadcrumb(row) for row in breadcrumbs]
+    return {
+        "installed": bool(status["installed"]) if status else False,
+        "source_id": status["source_id"] if status else None,
+        "enabled": bool(status["enabled"]) if status else False,
+        "source": "RVBBIT System Learning",
+        "doc_type": "system_learning",
+        "indexed_items": status["indexed_items"] if status else 0,
+        "docs": status["docs"] if status else 0,
+        "last_synced_at": status["last_synced_at"] if status else None,
+        "last_run": {
+            "at": status["last_run_at"] if status else None,
+            "added": status["last_run_added"] if status else 0,
+            "changed": status["last_run_changed"] if status else 0,
+            "removed": status["last_run_removed"] if status else 0,
+            "skipped": status["last_run_skipped"] if status else 0,
+            "errors": status["last_run_errors"] if status else 0,
+            "elapsed_sec": status["last_run_elapsed_sec"] if status else None,
+        },
+        "summary": summary,
+        "breadcrumbs": breadcrumbs,
+        "graph_edges": (provider["edge_map"] if provider else []) or [],
+        "agent_tools": ["system_learning_status", "sync_system_learning", "ask_system_learning", "run_sql"],
+        "next_tools": ["ask_system_learning", "sync_system_learning", "run_sql"],
+        "note": "Use breadcrumbs as handles: ask_system_learning for fuzzy context, run_sql for exact rvbbit.system_learning_items rows.",
+    }
+
+
+def _system_learning_breadcrumb(row: dict) -> dict:
+    handles = row.get("handles") or {}
+    queries = []
+    table = handles.get("table")
+    column = handles.get("column")
+    layout = handles.get("layout")
+    shape_key = handles.get("shape_key")
+    operator = handles.get("operator")
+    engine = handles.get("engine")
+    if table:
+        queries.append(f"{table} acceleration workload")
+    if table and column:
+        queries.append(f"{table} {column} layout recommendation")
+    if layout:
+        queries.append(f"workload layout {layout}")
+    if shape_key:
+        queries.append(f"route shape {shape_key}")
+    if engine:
+        queries.append(f"{engine} routing performance")
+    if operator:
+        queries.append(f"operator {operator} trust receipts")
+    if not queries:
+        queries.append(str(row.get("title") or row.get("object_type") or "RVBBIT system learning"))
+    uri = str(row.get("uri") or "")
+    sql_uri = uri.replace("'", "''")
+    return {
+        "uri": uri,
+        "title": row.get("title"),
+        "object_type": row.get("object_type"),
+        "occurred_at": row.get("occurred_at"),
+        "handles": handles,
+        "preview": row.get("preview"),
+        "followups": [
+            {"tool": "ask_system_learning", "query": queries[0]},
+            {
+                "tool": "run_sql",
+                "sql": (
+                    "SELECT uri, title, occurred_at, body, props "
+                    f"FROM rvbbit.system_learning_items WHERE uri = '{sql_uri}'"
+                ),
+            },
+        ],
+    }
+
+
+_SYSTEM_LEARNING_HANDLES_SQL = """
+jsonb_strip_nulls(jsonb_build_object(
+    'table', i.props->>'table',
+    'column', i.props->>'column',
+    'layout', i.props->>'layout',
+    'layout_kind', i.props->>'layout_kind',
+    'layout_status', i.props->>'layout_status',
+    'shape_key', i.props->>'shape_key',
+    'shape_family', i.props->>'shape_family',
+    'engine', i.props->>'engine',
+    'operator', i.props->>'operator',
+    'status', i.props->>'status',
+    'score', i.props->>'score',
+    'observations', i.props->>'observations'
+)) AS handles
+"""
+
+
+def _system_learning_breadcrumbs_for_docs(doc_ids: list[int]) -> dict[int, dict]:
+    ids = sorted({int(doc_id) for doc_id in doc_ids if doc_id is not None})
+    if not ids:
+        return {}
+    with _ro() as c:
+        rows = c.execute(
+            f"""
+            SELECT d.doc_id, i.uri, i.title,
+                   coalesce(i.props->>'object_type', 'unknown') AS object_type,
+                   i.occurred_at::text AS occurred_at,
+                   left(i.body, 700) AS preview,
+                   {_SYSTEM_LEARNING_HANDLES_SQL}
+            FROM rvbbit.brain_documents d
+            JOIN rvbbit.system_learning_items i ON i.uri = d.uri
+            WHERE d.doc_id = ANY(%s::bigint[])
+            """,
+            (ids,),
+        ).fetchall()
+    return {int(row["doc_id"]): _system_learning_breadcrumb(row) for row in rows}
+
+
+def _attach_system_learning_breadcrumbs(result: dict) -> dict:
+    if not isinstance(result, dict) or result.get("error"):
+        return result
+
+    doc_ids: list[int] = []
+    for hit in result.get("hits", []):
+        if isinstance(hit, dict) and hit.get("doc_id") is not None:
+            doc_ids.append(hit["doc_id"])
+    for doc in result.get("documents", []):
+        if isinstance(doc, dict) and doc.get("doc_id") is not None:
+            doc_ids.append(doc["doc_id"])
+
+    try:
+        breadcrumbs_by_doc = _system_learning_breadcrumbs_for_docs(doc_ids)
+    except Exception as e:  # noqa: BLE001
+        result["breadcrumb_error"] = str(e)
+        return result
+
+    seen = set()
+    breadcrumbs = []
+    for hit in result.get("hits", []):
+        if not isinstance(hit, dict):
+            continue
+        artifact = breadcrumbs_by_doc.get(int(hit["doc_id"])) if hit.get("doc_id") is not None else None
+        if artifact:
+            hit["artifact"] = artifact
+            if artifact["uri"] not in seen:
+                seen.add(artifact["uri"])
+                breadcrumbs.append(artifact)
+
+    for doc in result.get("documents", []):
+        if not isinstance(doc, dict):
+            continue
+        artifact = breadcrumbs_by_doc.get(int(doc["doc_id"])) if doc.get("doc_id") is not None else None
+        if artifact:
+            doc["artifact"] = artifact
+            if artifact["uri"] not in seen:
+                seen.add(artifact["uri"])
+                breadcrumbs.append(artifact)
+
+    result["breadcrumbs"] = breadcrumbs
+    result["next_tools"] = ["ask_system_learning", "run_sql", "system_learning_status", "sync_system_learning"]
+    result["note"] = (
+        "Grounded system-learning context, not an answer. Each hit/document may include an `artifact` "
+        "with handles and followups; use run_sql followups for exact rvbbit.system_learning_items rows."
+    )
+    return result
+
+
+def tool_sync_system_learning() -> dict:
+    """Refresh RVBBIT System Learning into the Brain. This syncs learned workload layouts, route
+    shapes, acceleration state/candidates, and operator trust artifacts so MCP agents search the same
+    breadcrumbs the SQL Desktop shows."""
+    with _conn() as c:
+        try:
+            source = c.execute(
+                "SELECT source_id FROM rvbbit.brain_sources WHERE label = 'RVBBIT System Learning'"
+            ).fetchone()
+            if not source:
+                return {"error": {"code": "NOT_INSTALLED", "message": "RVBBIT System Learning source is not installed; run rvbbit.migrate()"}}
+            result = c.execute(
+                "SELECT rvbbit.brain_sync_dispatch(%s, 'mcp') AS r", (source["source_id"],)
+            ).fetchone()["r"]
+        except Exception as e:  # noqa: BLE001
+            return {"error": {"code": "SYNC_SYSTEM_LEARNING_FAILED", "message": str(e)}}
+    status = tool_system_learning_status()
+    return {"source": "RVBBIT System Learning", "result": result or {}, "status": status}
+
+
+def tool_ask_system_learning(query, k=8, caller_email=None) -> dict:
+    """Ask what RVBBIT has learned about this database. This is the agent-safe shortcut over
+    ask_brain(filters={"type":["system_learning"]}) so callers do not need to remember the doc_type
+    name. Results include workload/layout/routing/acceleration/operator breadcrumbs, not a synthesized
+    answer. Compose an answer from the returned chunks and cite titles."""
+    effective_email = caller_email or "mcp-system-learning@rvbbit.local"
+    result = tool_ask_brain(
+        query,
+        k,
+        {"type": ["system_learning"]},
+        effective_email,
+    )
+    return _attach_system_learning_breadcrumbs(result)
+
+
 def tool_brain_ingest(source, title, body, roles=None, folder=None, uri=None,
                       author=None, occurred_at=None) -> dict:
     """Ingest a document into the brain (operator action): chunks + embeds it and assigns access role(s).
@@ -1459,6 +1726,8 @@ def _caller():
 def _objects(tool, args, res):
     if not isinstance(res, dict):
         return None
+    if tool in ("system_learning_status", "sync_system_learning", "ask_system_learning"):
+        return ["rvbbit.system_learning_items"]
     if tool == "search_data":
         return [m.get("object") for m in res.get("matches", []) if m.get("object")] or None
     if tool == "describe_table":
@@ -1482,6 +1751,37 @@ def _summary(tool, res):
         return {"result": res.get("result")}
     if tool == "validate_sql":
         return {"safe_select": res.get("safe_select"), "engine": res.get("engine")}
+    if tool == "system_learning_status":
+        return {
+            "indexed_items": res.get("indexed_items"),
+            "docs": res.get("docs"),
+            "groups": [
+                {"object_type": g.get("object_type"), "items": g.get("items")}
+                for g in res.get("summary", [])
+                if isinstance(g, dict)
+            ],
+            "breadcrumbs": [
+                {"object_type": b.get("object_type"), "title": b.get("title")}
+                for b in res.get("breadcrumbs", [])
+                if isinstance(b, dict)
+            ],
+        }
+    if tool == "sync_system_learning":
+        status = res.get("status") or {}
+        return {
+            "indexed_items": status.get("indexed_items"),
+            "docs": status.get("docs"),
+            "last_run": status.get("last_run"),
+        }
+    if tool == "ask_system_learning":
+        return {
+            "count": res.get("count"),
+            "hits": [
+                {"doc_id": h.get("doc_id"), "title": h.get("title"), "score": h.get("score")}
+                for h in res.get("hits", [])
+                if isinstance(h, dict)
+            ],
+        }
     return None
 
 
@@ -2049,6 +2349,13 @@ def _register(mcp):
     mcp.tool(name="ask_brain")(lambda query, k=8, filters=None: _logged(
         "ask_brain", {"query": query, "k": k, "filters": filters},
         lambda: tool_ask_brain(query, k, filters, _caller()[0])))
+    mcp.tool(name="system_learning_status")(lambda: _logged(
+        "system_learning_status", {}, tool_system_learning_status))
+    mcp.tool(name="sync_system_learning")(lambda: _logged(
+        "sync_system_learning", {}, tool_sync_system_learning))
+    mcp.tool(name="ask_system_learning")(lambda query, k=8: _logged(
+        "ask_system_learning", {"query": query, "k": k},
+        lambda: tool_ask_system_learning(query, k, _caller()[0])))
     mcp.tool(name="brain_facets")(lambda: _logged(
         "brain_facets", {}, lambda: tool_brain_facets(_caller()[0])))
     mcp.tool(name="brain_browse")(lambda: _logged(
@@ -2119,7 +2426,9 @@ def _selftest():
 _INSTRUCTIONS = (
     "rvbbit warehouse — a governed, semantic, time-travel data warehouse. Discover tables/columns "
     "by what their data is about with search_data; get official numbers with metric(); explore SQL "
-    "with validate_sql then run_sql (read-only). "
+    "with validate_sql then run_sql (read-only). Use system_learning_status and ask_system_learning "
+    "before tuning or diagnosing RVBBIT workloads: they expose learned routing, acceleration, layout, "
+    "and operator breadcrumbs from the same Brain corpus the SQL Desktop shows. "
     "TO BUILD A DASHBOARD: call `dashboard_template` FIRST for the proven boilerplate, set its "
     "SERVER_ID to the <id> in your `mcp__<id>__run_sql` tool, and edit only its CONFIG + RENDER "
     "blocks. Live data flows through Cowork's callMcpTool→run_sql bridge (authed by the connector "
