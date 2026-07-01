@@ -1,0 +1,165 @@
+{
+  "schema_version": "live_app.v0",
+  "runtime_kind": "html",
+  "app_kind": "dashboard",
+  "description": "Proof of concept: RVBBIT cube queries compiled through Flint chart specs to Vega-Lite, ECharts, and Chart.js.",
+  "entrypoint": "index.html",
+  "capabilities": {
+    "read_only_sql": true,
+    "rvbbit_query": true,
+    "screenshots": true,
+    "flint_chart": true
+  },
+  "charts": [
+    {
+      "id": "vendor_summary",
+      "query_id": "vendor_summary",
+      "sql": "select vendor, sum(spend) as spend, sum(revenue_booked) as revenue_booked, case when sum(spend) > 0 then sum(revenue_booked) / sum(spend) end as roas from cubes.paid_media_loc_daily_cube where vendor is not null and spend is not null group by vendor order by spend desc limit 8",
+      "source": "cubes.paid_media_loc_daily_cube",
+      "semantic_types": {
+        "vendor": "Category",
+        "spend": "Price",
+        "revenue_booked": "Price",
+        "roas": "Quantity"
+      },
+      "chart_spec": {
+        "chartType": "Bar Chart",
+        "encodings": {
+          "x": {
+            "field": "vendor"
+          },
+          "y": {
+            "field": "spend"
+          },
+          "color": {
+            "field": "vendor"
+          }
+        },
+        "baseSize": {
+          "width": 680,
+          "height": 360
+        },
+        "chartProperties": {
+          "showValues": true
+        }
+      },
+      "compile_targets": [
+        "vegalite",
+        "echarts",
+        "chartjs"
+      ]
+    },
+    {
+      "id": "weekly_spend",
+      "query_id": "weekly_spend",
+      "sql": "select date_day, vendor, sum(spend) as spend, sum(revenue_booked) as revenue_booked from cubes.paid_media_loc_daily_cube where vendor is not null and spend is not null group by date_day, vendor order by date_day, vendor limit 120",
+      "source": "cubes.paid_media_loc_daily_cube",
+      "semantic_types": {
+        "date_day": "Date",
+        "vendor": "Category",
+        "spend": "Price",
+        "revenue_booked": "Price"
+      },
+      "chart_spec": {
+        "chartType": "Line Chart",
+        "encodings": {
+          "x": {
+            "field": "date_day"
+          },
+          "y": {
+            "field": "spend"
+          },
+          "color": {
+            "field": "vendor"
+          }
+        },
+        "baseSize": {
+          "width": 760,
+          "height": 360
+        }
+      },
+      "compile_targets": [
+        "vegalite",
+        "echarts",
+        "chartjs"
+      ]
+    },
+    {
+      "id": "lead_channel",
+      "query_id": "lead_channel",
+      "sql": "select channel, sum(leads_submitted) as leads_submitted, sum(students_enrolled) as students_enrolled from cubes.lead_funnel_daily_cube where channel is not null group by channel order by leads_submitted desc limit 8",
+      "source": "cubes.lead_funnel_daily_cube",
+      "semantic_types": {
+        "channel": "Category",
+        "leads_submitted": "Quantity",
+        "students_enrolled": "Quantity"
+      },
+      "chart_spec": {
+        "chartType": "Bar Chart",
+        "encodings": {
+          "x": {
+            "field": "channel"
+          },
+          "y": {
+            "field": "leads_submitted"
+          },
+          "color": {
+            "field": "channel"
+          }
+        },
+        "baseSize": {
+          "width": 760,
+          "height": 360
+        }
+      },
+      "compile_targets": [
+        "vegalite",
+        "echarts",
+        "chartjs"
+      ]
+    },
+    {
+      "id": "capacity_state",
+      "query_id": "capacity_state",
+      "sql": "select location_state, sum(course_capacity) as capacity, sum(source_enrolled_students_count) as enrolled from cubes.course_capacity_health_cube where location_state is not null and course_capacity is not null group by location_state order by capacity desc limit 10",
+      "source": "cubes.course_capacity_health_cube",
+      "semantic_types": {
+        "location_state": "Category",
+        "capacity": "Quantity",
+        "enrolled": "Quantity"
+      },
+      "chart_spec": {
+        "chartType": "Bar Chart",
+        "encodings": {
+          "x": {
+            "field": "location_state"
+          },
+          "y": {
+            "field": "capacity"
+          },
+          "color": {
+            "field": "location_state"
+          }
+        },
+        "baseSize": {
+          "width": 760,
+          "height": 360
+        }
+      },
+      "compile_targets": [
+        "vegalite",
+        "echarts",
+        "chartjs"
+      ]
+    }
+  ],
+  "default_compile_target": "echarts",
+  "bridge_contract": {
+    "rvbbitQuery_shapes": [
+      "rows_array",
+      "run_sql_object",
+      "cowork_structured_content"
+    ],
+    "updated_for": "hosted live app returns full run_sql object with rows field"
+  }
+}
