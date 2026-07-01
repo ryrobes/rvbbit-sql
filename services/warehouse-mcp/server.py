@@ -32,8 +32,9 @@ from __future__ import annotations
 # (DictRow vs TupleRow covariance); the code is correct at runtime (see --selftest).
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
-import hmac, json, os, re, sys, time
+import asyncio, hmac, json, os, re, shutil, socket, subprocess, sys, tempfile, time
 from decimal import Decimal
+from pathlib import Path
 
 import psycopg
 from psycopg import sql as pgsql
@@ -1249,6 +1250,144 @@ def tool_brain_entity(name, caller_email=None) -> dict:
     return (row["r"] if row else {}) or {}
 
 
+_SYSTEM_LEARNING_SUGGESTED_PROMPTS = [
+    {
+        "label": "Acceleration next steps",
+        "query": "Which regular heap tables should I accelerate next, and why?",
+        "use_when": "Start here when a database feels slow but you do not know which tables deserve acceleration.",
+    },
+    {
+        "label": "Slow query explanation",
+        "query": "What did RVBBIT learn about my slowest query shapes and routing choices?",
+        "use_when": "Use after a workload run or benchmark to explain why some shapes prefer specific engines.",
+    },
+    {
+        "label": "Layout payoff",
+        "query": "Which accepted workload layouts are built, which are still pending, and what evidence supports them?",
+        "use_when": "Use when deciding whether a workload layout should be built, rebuilt, or rejected.",
+    },
+    {
+        "label": "Operator trust",
+        "query": "Which SQL operators have enough receipts to trust, and which need more observation?",
+        "use_when": "Use before leaning on semantic SQL operators in dashboards or agent workflows.",
+    },
+    {
+        "label": "What changed",
+        "query": "What has RVBBIT learned recently about acceleration, routing, layouts, and operators?",
+        "use_when": "Use as a weekly or post-deploy briefing for humans and agents.",
+    },
+]
+
+
+def _system_learning_answer_contract() -> dict:
+    return {
+        "style": "grounded_context_not_synthesis",
+        "required_citations": ["hit.title", "artifact.uri"],
+        "follow_the_breadcrumbs": [
+            "Use hit.artifact.handles for the table/layout/shape/operator handle.",
+            "Use hit.artifact.followups where tool='run_sql' for the exact learned row.",
+            "Use run_sql on rvbbit.system_learning_items when you need the full body/props.",
+        ],
+        "do_not": [
+            "Do not claim a table is accelerated unless the artifact status says so.",
+            "Do not treat absence of a hit as absence of evidence; sync first or broaden the query.",
+        ],
+    }
+
+
+def _system_learning_readiness(status: dict | None) -> dict:
+    if not status or not status.get("installed"):
+        return {
+            "ready": False,
+            "state": "missing",
+            "why": "RVBBIT System Learning is not installed in this database.",
+            "actions": [
+                {"tool": "run_sql", "sql": "SELECT rvbbit.migrate()"},
+            ],
+        }
+    if not status.get("enabled"):
+        return {
+            "ready": False,
+            "state": "paused",
+            "why": "The RVBBIT System Learning Brain source is disabled.",
+            "actions": [
+                {
+                    "tool": "run_sql",
+                    "sql": "UPDATE rvbbit.brain_sources SET enabled = true WHERE source_id = "
+                           f"{int(status.get('source_id') or 0)}",
+                },
+            ],
+        }
+    indexed = int(status.get("indexed_items") or 0)
+    docs = int(status.get("docs") or 0)
+    last_run = status.get("last_run") or {}
+    errors = int(last_run.get("errors") or 0)
+    if indexed <= 0:
+        return {
+            "ready": False,
+            "state": "empty",
+            "why": "The provider is installed, but RVBBIT has not observed learning artifacts yet.",
+            "actions": [
+                {"tool": "run_sql", "sql": "SELECT * FROM rvbbit.system_learning_item_summary ORDER BY items DESC"},
+            ],
+        }
+    if docs <= 0:
+        return {
+            "ready": False,
+            "state": "needs_sync",
+            "why": f"{indexed} learned artifact(s) exist, but none are indexed into Brain yet.",
+            "actions": [{"tool": "sync_system_learning"}],
+        }
+    if errors > 0:
+        return {
+            "ready": False,
+            "state": "degraded",
+            "why": f"The last sync recorded {errors} error(s). Search may be incomplete.",
+            "actions": [{"tool": "sync_system_learning"}, {"tool": "system_learning_status"}],
+        }
+    if docs < indexed:
+        return {
+            "ready": True,
+            "state": "partial",
+            "why": f"{docs} of {indexed} learned artifact(s) are indexed. Search works, but a sync may catch up.",
+            "actions": [{"tool": "sync_system_learning"}],
+        }
+    return {
+        "ready": True,
+        "state": "ready",
+        "why": f"{docs} learned artifact(s) are indexed and searchable.",
+        "actions": [
+            {"tool": "ask_system_learning", "query": _SYSTEM_LEARNING_SUGGESTED_PROMPTS[0]["query"]},
+        ],
+    }
+
+
+def _system_learning_status_sql_followups() -> list[dict]:
+    return [
+        {
+            "tool": "run_sql",
+            "label": "Learning item summary",
+            "sql": (
+                "SELECT object_type, items, last_seen_at "
+                "FROM rvbbit.system_learning_item_summary ORDER BY items DESC, object_type"
+            ),
+        },
+        {
+            "tool": "run_sql",
+            "label": "Recent learned artifacts",
+            "sql": (
+                "SELECT uri, title, occurred_at, props "
+                "FROM rvbbit.system_learning_items ORDER BY occurred_at DESC, title LIMIT 20"
+            ),
+        },
+        {
+            "tool": "run_sql",
+            "label": "Brain sync state",
+            "sql": "SELECT * FROM rvbbit.system_learning_brain_status",
+        },
+    ]
+
+
 def tool_system_learning_status() -> dict:
     """What RVBBIT has learned about its own workload and agent corpus: artifact counts, sync state,
     graph edge handles, concrete breadcrumb examples, and the doc_type/source an MCP caller can
@@ -1261,7 +1400,7 @@ def tool_system_learning_status() -> dict:
             "SELECT to_regclass('rvbbit.system_learning_item_summary') IS NOT NULL AS ok"
         ).fetchone()["ok"]
         if not installed:
-            return {
+            response = {
                 "installed": False,
                 "source": "RVBBIT System Learning",
                 "doc_type": "system_learning",
@@ -1271,6 +1410,11 @@ def tool_system_learning_status() -> dict:
                 "agent_tools": ["system_learning_status", "sync_system_learning", "ask_system_learning"],
                 "note": "Run rvbbit.migrate() to install the system-learning Brain provider.",
             }
+            response["readiness"] = _system_learning_readiness(response)
+            response["suggested_prompts"] = _SYSTEM_LEARNING_SUGGESTED_PROMPTS
+            response["answer_contract"] = _system_learning_answer_contract()
+            response["followups"] = [{"tool": "run_sql", "sql": "SELECT rvbbit.migrate()"}]
+            return response
         status = c.execute(
             "SELECT installed, source_id, enabled, indexed_items, docs, "
             "last_synced_at::text AS last_synced_at, last_run_at::text AS last_run_at, "
@@ -1321,7 +1465,7 @@ def tool_system_learning_status() -> dict:
             """
         ).fetchall()
     breadcrumbs = [_system_learning_breadcrumb(row) for row in breadcrumbs]
-    return {
+    response = {
         "installed": bool(status["installed"]) if status else False,
         "source_id": status["source_id"] if status else None,
         "enabled": bool(status["enabled"]) if status else False,
@@ -1346,6 +1490,11 @@ def tool_system_learning_status() -> dict:
         "next_tools": ["ask_system_learning", "sync_system_learning", "run_sql"],
         "note": "Use breadcrumbs as handles: ask_system_learning for fuzzy context, run_sql for exact rvbbit.system_learning_items rows.",
     }
+    response["readiness"] = _system_learning_readiness(response)
+    response["suggested_prompts"] = _SYSTEM_LEARNING_SUGGESTED_PROMPTS
+    response["answer_contract"] = _system_learning_answer_contract()
+    response["followups"] = _system_learning_status_sql_followups()
+    return response
 
 
 def _system_learning_breadcrumb(row: dict) -> dict:
@@ -1373,6 +1522,10 @@ def _system_learning_breadcrumb(row: dict) -> dict:
         queries.append(str(row.get("title") or row.get("object_type") or "RVBBIT system learning"))
     uri = str(row.get("uri") or "")
     sql_uri = uri.replace("'", "''")
+    inspect_sql = (
+        "SELECT uri, title, occurred_at, body, props "
+        f"FROM rvbbit.system_learning_items WHERE uri = '{sql_uri}'"
+    )
     return {
         "uri": uri,
         "title": row.get("title"),
@@ -1380,14 +1533,12 @@ def _system_learning_breadcrumb(row: dict) -> dict:
         "occurred_at": row.get("occurred_at"),
         "handles": handles,
         "preview": row.get("preview"),
+        "inspect_sql": inspect_sql,
         "followups": [
             {"tool": "ask_system_learning", "query": queries[0]},
             {
                 "tool": "run_sql",
-                "sql": (
-                    "SELECT uri, title, occurred_at, body, props "
-                    f"FROM rvbbit.system_learning_items WHERE uri = '{sql_uri}'"
-                ),
+                "sql": inspect_sql,
             },
         ],
     }
@@ -1473,7 +1624,19 @@ def _attach_system_learning_breadcrumbs(result: dict) -> dict:
                 breadcrumbs.append(artifact)
 
     result["breadcrumbs"] = breadcrumbs
+    result["followups"] = [
+        followup
+        for breadcrumb in breadcrumbs[:5]
+        for followup in breadcrumb.get("followups", [])
+        if followup.get("tool") == "run_sql"
+    ] or _system_learning_status_sql_followups()
     result["next_tools"] = ["ask_system_learning", "run_sql", "system_learning_status", "sync_system_learning"]
+    result["suggested_prompts"] = _SYSTEM_LEARNING_SUGGESTED_PROMPTS
+    result["answer_contract"] = _system_learning_answer_contract()
+    try:
+        result["readiness"] = tool_system_learning_status().get("readiness")
+    except Exception as e:  # noqa: BLE001
+        result["readiness_error"] = str(e)
     result["note"] = (
         "Grounded system-learning context, not an answer. Each hit/document may include an `artifact` "
         "with handles and followups; use run_sql followups for exact rvbbit.system_learning_items rows."
@@ -1728,6 +1891,12 @@ def _objects(tool, args, res):
         return None
     if tool in ("system_learning_status", "sync_system_learning", "ask_system_learning"):
         return ["rvbbit.system_learning_items"]
+    if tool in (
+        "create_live_app", "update_live_app", "get_live_app", "debug_live_app", "live_app_logs",
+        "start_live_app", "stop_live_app", "live_app_status", "capture_live_app",
+    ):
+        slug = res.get("slug") or args.get("slug")
+        return [f"live_app:{slug}"] if slug else None
     if tool == "search_data":
         return [m.get("object") for m in res.get("matches", []) if m.get("object")] or None
     if tool == "describe_table":
@@ -1751,6 +1920,22 @@ def _summary(tool, res):
         return {"result": res.get("result")}
     if tool == "validate_sql":
         return {"safe_select": res.get("safe_select"), "engine": res.get("engine")}
+    if tool in (
+        "create_live_app", "update_live_app", "get_live_app", "debug_live_app",
+        "start_live_app", "stop_live_app", "live_app_status", "capture_live_app",
+    ):
+        return {
+            "slug": res.get("slug"),
+            "runtime_kind": res.get("runtime_kind"),
+            "app_kind": res.get("app_kind"),
+            "url": res.get("url"),
+            "state": res.get("state") or (res.get("health") or {}).get("state"),
+            "path": res.get("path"),
+        }
+    if tool == "list_live_apps":
+        return {"count": len(res.get("live_apps", []))}
+    if tool == "live_app_logs":
+        return {"slug": res.get("slug"), "events": len(res.get("events", []))}
     if tool == "system_learning_status":
         return {
             "indexed_items": res.get("indexed_items"),
@@ -1840,6 +2025,11 @@ CREATE TABLE IF NOT EXISTS rvbbit.dashboards (
   created_at  timestamptz DEFAULT now(),
   updated_at  timestamptz DEFAULT now()
 );
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS runtime_kind text NOT NULL DEFAULT 'html';
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS app_kind text NOT NULL DEFAULT 'dashboard';
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS manifest jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS last_health jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS last_debug_at timestamptz;
 CREATE TABLE IF NOT EXISTS rvbbit.dashboard_versions (
   dashboard_id bigint NOT NULL REFERENCES rvbbit.dashboards(id) ON DELETE CASCADE,
   version      int NOT NULL,
@@ -1848,6 +2038,8 @@ CREATE TABLE IF NOT EXISTS rvbbit.dashboard_versions (
   created_by   text, created_at timestamptz DEFAULT now(), notes text,
   PRIMARY KEY (dashboard_id, version)
 );
+ALTER TABLE rvbbit.dashboard_versions ADD COLUMN IF NOT EXISTS manifest jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE rvbbit.dashboard_versions ADD COLUMN IF NOT EXISTS source_files jsonb NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS dashboards_team_idx ON rvbbit.dashboards (team, updated_at DESC);
 -- the derived dependency index (regenerated by dashboard_crawl; safe to truncate + rebuild)
 CREATE TABLE IF NOT EXISTS rvbbit.dashboard_deps (
@@ -1873,6 +2065,22 @@ CREATE OR REPLACE VIEW rvbbit.dashboard_dependents AS  -- reverse: object -> das
     ON d.id = dd.dashboard_id AND d.latest_version = dd.version
   WHERE dd.kind IN ('table', 'metric') AND dd.object_ref IS NOT NULL
   GROUP BY dd.object_ref, dd.kind;
+CREATE OR REPLACE VIEW rvbbit.live_apps AS
+  SELECT d.id, d.slug, d.name, d.description, d.owner_email, d.team, d.status,
+         d.runtime_kind, d.app_kind, d.latest_version, d.manifest, d.last_health,
+         d.last_debug_at, d.created_at, d.updated_at,
+         coalesce(dep.queries, 0)::int AS queries,
+         coalesce(dep.tables, 0)::int AS tables,
+         coalesce(dep.metrics, 0)::int AS metrics
+  FROM rvbbit.dashboards d
+  LEFT JOIN (
+    SELECT dashboard_id,
+           count(*) FILTER (WHERE kind = 'query') AS queries,
+           count(*) FILTER (WHERE kind = 'table') AS tables,
+           count(*) FILTER (WHERE kind = 'metric') AS metrics
+    FROM rvbbit.dashboard_deps
+    GROUP BY dashboard_id
+  ) dep ON dep.dashboard_id = d.id;
 """
 
 
@@ -1892,6 +2100,386 @@ def _slugify(name):
 def _dash_url(slug):
     public = os.environ.get("WAREHOUSE_PUBLIC_URL", "").rstrip("/")
     return f"{public}/d/{slug}" if public else None
+
+
+def _live_app_url(slug):
+    public = os.environ.get("WAREHOUSE_PUBLIC_URL", "").rstrip("/")
+    return f"{public}/apps/{slug}" if public else None
+
+
+def _coerce_json_object(value, field):
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{field} must be a JSON object: {e}") from e
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError(f"{field} must be a JSON object")
+
+
+def _json_default(obj):
+    return json.dumps(obj or {}, default=str)
+
+
+def _normalize_runtime_kind(runtime_kind):
+    kind = (runtime_kind or "html").strip().lower().replace("_", "-")
+    aliases = {
+        "html-dashboard": "html",
+        "dashboard-html": "html",
+        "static-html": "html",
+        "python": "python-fastapi",
+        "fastapi": "python-fastapi",
+    }
+    kind = aliases.get(kind, kind)
+    if kind not in {"html", "python-fastapi"}:
+        raise ValueError("runtime_kind must be one of: html, python-fastapi")
+    return kind
+
+
+def _normalize_app_kind(app_kind):
+    kind = (app_kind or "dashboard").strip().lower().replace("_", "-")
+    return kind or "dashboard"
+
+
+def _source_files_text(source_files):
+    if not isinstance(source_files, dict):
+        return ""
+    parts = []
+    for name, body in source_files.items():
+        if isinstance(body, str):
+            parts.append(f"\n\n/* file: {name} */\n{body}")
+    return "".join(parts)
+
+
+def _python_placeholder_html(name, slug=None):
+    title = (name or slug or "RVBBIT live app").replace("<", "&lt;").replace(">", "&gt;")
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{ margin: 0; font-family: Inter, system-ui, sans-serif; background: #111827; color: #e5e7eb; }}
+    main {{ max-width: 840px; margin: 10vh auto; padding: 32px; }}
+    h1 {{ font-size: 28px; margin: 0 0 12px; }}
+    p {{ color: #a5b4fc; line-height: 1.55; }}
+    code {{ color: #f9fafb; background: #1f2937; padding: 2px 5px; border-radius: 4px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{title}</h1>
+    <p>This Python FastAPI live app is stored and versioned in RVBBIT. Call <code>start_live_app</code> to run it under the local uvicorn runner.</p>
+    <p>Use <code>get_live_app</code>, <code>debug_live_app</code>, or <code>live_app_status</code> to inspect source, dependencies, and health.</p>
+  </main>
+</body>
+</html>"""
+
+
+def _python_fastapi_files():
+    return {
+        "app.py": """from __future__ import annotations
+
+import os
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from rvbbit_live import rvbbit_query
+
+app = FastAPI(title=os.environ.get("RVBBIT_APP_NAME", "RVBBIT Live App"))
+templates = Jinja2Templates(directory="templates")
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"ok": True}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    result = await rvbbit_query("select now() as generated_at")
+    return templates.TemplateResponse("index.html", {"request": request, "result": result})
+""",
+        "templates/index.html": """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RVBBIT Live App</title>
+</head>
+<body>
+  <main>
+    <h1>RVBBIT Live App</h1>
+    <pre>{{ result | tojson(indent=2) }}</pre>
+  </main>
+</body>
+</html>
+""",
+        "requirements.txt": "fastapi\nuvicorn[standard]\njinja2\npsycopg[binary]\npandas\nplotly\n",
+    }
+
+
+def _html_from_live_app(runtime_kind, name, slug, html, source_files):
+    if runtime_kind == "html":
+        source_html = None
+        if isinstance(source_files, dict):
+            source_html = source_files.get("index.html") or source_files.get("dashboard.html")
+        final_html = html or source_html
+        if not final_html:
+            raise ValueError("html live apps require `html` or source_files['index.html']")
+        return final_html
+    return html or _python_placeholder_html(name, slug)
+
+
+def _live_app_manifest(runtime_kind="html", app_kind="dashboard", manifest=None,
+                       source_files=None, description=None):
+    runtime_kind = _normalize_runtime_kind(runtime_kind)
+    app_kind = _normalize_app_kind(app_kind)
+    user = _coerce_json_object(manifest, "manifest") if manifest is not None else {}
+    base = {
+        "schema_version": "live_app.v0",
+        "runtime_kind": runtime_kind,
+        "app_kind": app_kind,
+        "description": description,
+        "entrypoint": "index.html" if runtime_kind == "html" else "app.py",
+        "capabilities": {
+            "read_only_sql": True,
+            "rvbbit_query": True,
+            "metrics": True,
+            "cubes": True,
+            "screenshots": True,
+        },
+        "lifecycle": {
+            "versioned_in": "rvbbit.dashboard_versions",
+            "served_by": "/apps/{slug}",
+            "python_runner": "local-uvicorn" if runtime_kind == "python-fastapi" else None,
+        },
+    }
+    if source_files:
+        base["source_files"] = sorted(source_files.keys())
+    base.update(user)
+    base["runtime_kind"] = runtime_kind
+    base["app_kind"] = app_kind
+    return base
+
+
+def _live_app_runtime_health(runtime_kind, status="unknown", issues=None):
+    issues = issues or []
+    state = status if status in {"runnable", "running", "stored", "stopped", "exited"} else None
+    runnable = runtime_kind == "html" or state == "running"
+    return {
+        "ok": not any(i.get("severity") == "error" for i in issues) and runnable,
+        "state": state or ("runnable" if runtime_kind == "html" else "stored"),
+        "runtime_kind": runtime_kind,
+        "status": status,
+        "issues": issues,
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+_LIVE_APP_PROCS = {}
+_PLAYWRIGHT_INSTALL_ATTEMPTED = False
+
+
+def _live_app_root():
+    root = os.environ.get("WAREHOUSE_LIVE_APP_ROOT")
+    return Path(root) if root else Path(tempfile.gettempdir()) / "rvbbit-live-apps"
+
+
+def _live_app_capture_root():
+    root = os.environ.get("WAREHOUSE_LIVE_APP_CAPTURE_DIR")
+    return Path(root) if root else Path(tempfile.gettempdir()) / "rvbbit-live-app-captures"
+
+
+def _safe_source_path(name):
+    rel = Path(str(name))
+    if rel.is_absolute() or not rel.parts or any(part in {"", ".", ".."} for part in rel.parts):
+        raise ValueError(f"unsafe source file path: {name}")
+    return rel
+
+
+def _tail_file(path, max_bytes=4000):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return ""
+        with p.open("rb") as f:
+            if p.stat().st_size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+            return f.read().decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _runner_helper_source():
+    return r'''from __future__ import annotations
+
+import os
+import re
+
+import psycopg
+from psycopg.rows import dict_row
+
+DSN = os.environ["RVBBIT_APP_DSN"]
+ROW_CAP = int(os.environ.get("RVBBIT_APP_ROW_CAP", "10000"))
+STMT_TIMEOUT_MS = int(os.environ.get("RVBBIT_APP_STMT_TIMEOUT_MS", "30000"))
+_SAFE_HEAD = re.compile(r"^\s*(?:/\*.*?\*/\s*)*(?:--[^\n]*\n\s*)*(select|with)\b", re.IGNORECASE | re.DOTALL)
+_BLOCKED = re.compile(
+    r"\b(insert|update|delete|drop|alter|create|truncate|copy|call|do|grant|revoke|vacuum|merge)\b",
+    re.IGNORECASE,
+)
+
+
+def _safe_select(sql: str) -> bool:
+    text = (sql or "").strip()
+    return bool(_SAFE_HEAD.search(text)) and not _BLOCKED.search(text)
+
+
+def _with_as_of(sql: str, as_of: str | None = None) -> str:
+    return f"-- rvbbit: as_of {as_of}\n{sql}" if as_of else sql
+
+
+async def rvbbit_query(sql: str, as_of: str | None = None, limit: int | None = None) -> dict:
+    if not _safe_select(sql):
+        return {"error": {"code": "UNSAFE_SQL", "message": "Only read-only SELECT/WITH queries are allowed."}}
+    row_cap = max(1, min(int(limit or ROW_CAP), 100000))
+    with psycopg.connect(DSN, row_factory=dict_row, autocommit=False) as c:
+        c.execute("SET default_transaction_read_only = on")
+        c.execute(f"SET statement_timeout = {STMT_TIMEOUT_MS}")
+        cur = c.execute(_with_as_of(sql, as_of))
+        rows = cur.fetchmany(row_cap + 1)
+        truncated = len(rows) > row_cap
+        rows = rows[:row_cap]
+        columns = [
+            {"name": col.name, "type": str(col.type_code)}
+            for col in (cur.description or [])
+        ]
+        c.rollback()
+    return {"columns": columns, "rows": rows, "row_count": len(rows), "truncated": truncated}
+'''
+
+
+def _materialize_live_app_sources(slug, version, source_files):
+    root = _live_app_root()
+    root.mkdir(parents=True, exist_ok=True)
+    work_dir = root / slug / f"v{version}"
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    for name, body in (source_files or {}).items():
+        if not isinstance(body, str):
+            continue
+        rel = _safe_source_path(name)
+        target = work_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+    (work_dir / "rvbbit_live.py").write_text(_runner_helper_source(), encoding="utf-8")
+    return work_dir
+
+
+def _load_live_app_version(slug, version=None):
+    _ensure_dashboard_tables()
+    with _conn() as c:
+        app = c.execute(
+            "SELECT id, slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
+            "latest_version, manifest, last_health, created_at, updated_at "
+            "FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
+        if not app:
+            return None, None
+        app = dict(app)
+        v = int(version or app["latest_version"])
+        row = c.execute(
+            "SELECT version, html, kind, created_by, created_at, notes, manifest, source_files "
+            "FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
+            (app["id"], v)).fetchone()
+        if not row:
+            return app, None
+        return app, dict(row)
+
+
+def _runner_entrypoint(manifest, source_files):
+    manifest = manifest or {}
+    entrypoint = str(manifest.get("entrypoint") or "app.py")
+    if entrypoint not in (source_files or {}) and "app.py" in (source_files or {}):
+        entrypoint = "app.py"
+    rel = _safe_source_path(entrypoint)
+    module = rel.with_suffix("").as_posix().replace("/", ".")
+    return str(manifest.get("uvicorn_app") or f"{module}:app")
+
+
+def _live_app_runner_status(slug, probe=True):
+    entry = _LIVE_APP_PROCS.get(slug)
+    if not entry:
+        return {"slug": slug, "state": "stopped", "running": False}
+    proc = entry["process"]
+    rc = proc.poll()
+    state = "running" if rc is None else "exited"
+    status = {
+        "slug": slug,
+        "state": state,
+        "running": rc is None,
+        "pid": proc.pid,
+        "port": entry["port"],
+        "endpoint_url": entry["endpoint_url"],
+        "version": entry["version"],
+        "runtime_kind": entry["runtime_kind"],
+        "started_at": entry["started_at"],
+        "work_dir": entry["work_dir"],
+        "log_path": entry["log_path"],
+        "returncode": rc,
+        "log_tail": _tail_file(entry["log_path"]),
+    }
+    if probe and rc is None:
+        try:
+            import httpx
+            r = httpx.get(f'{entry["endpoint_url"].rstrip("/")}/health', timeout=1.5)
+            status["health_http_status"] = r.status_code
+            status["health_ok"] = 200 <= r.status_code < 500
+        except Exception as e:  # noqa: BLE001
+            status["health_ok"] = False
+            status["health_error"] = str(e)
+    return status
+
+
+def _wait_live_app_runner(slug, timeout_s=8.0):
+    deadline = time.time() + timeout_s
+    last = None
+    while time.time() < deadline:
+        status = _live_app_runner_status(slug, probe=True)
+        last = status
+        if status.get("health_ok"):
+            return status
+        if not status.get("running"):
+            return status
+        time.sleep(0.15)
+    return last or _live_app_runner_status(slug, probe=True)
+
+
+def _close_runner_log(entry):
+    try:
+        entry.get("log_handle").close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
 def tool_publish_dashboard(name, html, team=None, description=None, kind="live"):
@@ -1951,6 +2539,580 @@ def tool_get_dashboard(slug, version=None):
             "WHERE dashboard_id=%s ORDER BY kind, object_ref NULLS LAST", (d["id"],)).fetchall()
     d["url"] = _dash_url(slug)
     return d
+
+
+def tool_live_app_template(runtime_kind="html", app_kind="dashboard"):
+    """Return a starter artifact for an agent-authored live app."""
+    try:
+        runtime_kind = _normalize_runtime_kind(runtime_kind)
+        app_kind = _normalize_app_kind(app_kind)
+    except ValueError as e:
+        return {"error": {"code": "INVALID_ARGUMENT", "message": str(e)}}
+
+    if runtime_kind == "html":
+        dashboard = tool_dashboard_template()
+        if dashboard.get("error"):
+            return dashboard
+        manifest = _live_app_manifest(runtime_kind, app_kind)
+        return {
+            "runtime_kind": runtime_kind,
+            "app_kind": app_kind,
+            "manifest": manifest,
+            "template_html": dashboard["template_html"],
+            "how_to_use": [
+                "Build the UI in one HTML artifact and call rvbbitQuery(sql) for live read-only data.",
+                "Use create_live_app(name, html, manifest=manifest) to publish and version it.",
+                "Use debug_live_app(slug) after it runs to reconcile parsed and runtime dependencies.",
+            ] + dashboard.get("how_to_use", []),
+        }
+
+    files = _python_fastapi_files()
+    manifest = _live_app_manifest(runtime_kind, app_kind, source_files=files)
+    return {
+        "runtime_kind": runtime_kind,
+        "app_kind": app_kind,
+        "manifest": manifest,
+        "source_files": files,
+        "how_to_use": [
+            "Python FastAPI apps are stored, versioned, dependency-indexed, and runnable under local uvicorn.",
+            "Call create_live_app(..., runtime_kind='python-fastapi', source_files=source_files), then start_live_app(slug).",
+            "Keep read-only data access behind `from rvbbit_live import rvbbit_query`; the runner injects that helper.",
+            "requirements.txt documents dependencies, but this v1 runner uses the MCP service's current Python environment.",
+        ],
+    }
+
+
+def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboard",
+                         team=None, description=None, manifest=None, source_files=None):
+    """Create a versioned live app. HTML apps are served immediately at /apps/<slug>."""
+    try:
+        runtime_kind = _normalize_runtime_kind(runtime_kind)
+        app_kind = _normalize_app_kind(app_kind)
+        source_files = _coerce_json_object(source_files, "source_files") if source_files is not None else {}
+        if runtime_kind == "python-fastapi" and not source_files:
+            source_files = _python_fastapi_files()
+        html = _html_from_live_app(runtime_kind, name, None, html, source_files)
+        manifest_doc = _live_app_manifest(runtime_kind, app_kind, manifest, source_files, description)
+    except ValueError as e:
+        return {"error": {"code": "INVALID_ARGUMENT", "message": str(e)}}
+
+    _ensure_dashboard_tables()
+    caller, _ = _caller()
+    base = _slugify(name)
+    health = _live_app_runtime_health(runtime_kind, "created")
+    with _conn() as c:
+        slug, n = base, 1
+        while c.execute("SELECT 1 FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone():
+            n += 1
+            slug = f"{base}-{n}"
+        html = _html_from_live_app(runtime_kind, name, slug, html, source_files)
+        d = c.execute(
+            "INSERT INTO rvbbit.dashboards "
+            "(slug,name,description,owner_email,team,status,latest_version,runtime_kind,app_kind,manifest,last_health) "
+            "VALUES (%s,%s,%s,%s,%s,%s,1,%s,%s,%s::jsonb,%s::jsonb) RETURNING id",
+            (slug, name, description, caller, team, "live" if runtime_kind == "html" else "stored",
+             runtime_kind, app_kind, _json_default(manifest_doc), _json_default(health))).fetchone()
+        c.execute(
+            "INSERT INTO rvbbit.dashboard_versions "
+            "(dashboard_id,version,html,kind,created_by,manifest,source_files) "
+            "VALUES (%s,1,%s,%s,%s,%s::jsonb,%s::jsonb)",
+            (d["id"], html, runtime_kind, caller, _json_default(manifest_doc), _json_default(source_files)))
+    crawl = _crawl_safe(slug, use_llm=False)
+    return {
+        "slug": slug,
+        "version": 1,
+        "url": _live_app_url(slug),
+        "owner": caller,
+        "runtime_kind": runtime_kind,
+        "app_kind": app_kind,
+        "manifest": manifest_doc,
+        "health": health,
+        "deps": crawl,
+    }
+
+
+def tool_update_live_app(slug, html=None, notes=None, manifest=None, source_files=None,
+                         runtime_kind=None, app_kind=None):
+    """Publish a new version of a live app, preserving omitted source fields."""
+    _ensure_dashboard_tables()
+    caller, _ = _caller()
+    try:
+        manifest_patch = _coerce_json_object(manifest, "manifest") if manifest is not None else {}
+        source_patch = _coerce_json_object(source_files, "source_files") if source_files is not None else None
+        with _conn() as c:
+            d = c.execute(
+                "SELECT id, name, description, latest_version, runtime_kind, app_kind, manifest "
+                "FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
+            if not d:
+                return {"error": {"code": "NOT_FOUND", "message": slug}}
+            cur = c.execute(
+                "SELECT html, manifest, source_files FROM rvbbit.dashboard_versions "
+                "WHERE dashboard_id=%s AND version=%s", (d["id"], d["latest_version"])).fetchone()
+            next_runtime = _normalize_runtime_kind(runtime_kind or d["runtime_kind"])
+            next_app_kind = _normalize_app_kind(app_kind or d["app_kind"])
+            next_sources = source_patch if source_patch is not None else (cur["source_files"] or {})
+            next_html = html if html is not None else cur["html"]
+            next_html = _html_from_live_app(next_runtime, d["name"], slug, next_html, next_sources)
+            next_manifest = dict(d["manifest"] or {})
+            next_manifest.update(cur["manifest"] or {})
+            next_manifest.update(manifest_patch)
+            next_manifest = _live_app_manifest(
+                next_runtime, next_app_kind, next_manifest, next_sources, d["description"])
+            nv = d["latest_version"] + 1
+            health = _live_app_runtime_health(next_runtime, "updated")
+            c.execute(
+                "INSERT INTO rvbbit.dashboard_versions "
+                "(dashboard_id,version,html,kind,created_by,notes,manifest,source_files) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)",
+                (d["id"], nv, next_html, next_runtime, caller, notes,
+                 _json_default(next_manifest), _json_default(next_sources)))
+            c.execute(
+                "UPDATE rvbbit.dashboards SET latest_version=%s, updated_at=now(), runtime_kind=%s, "
+                "app_kind=%s, manifest=%s::jsonb, last_health=%s::jsonb WHERE id=%s",
+                (nv, next_runtime, next_app_kind, _json_default(next_manifest), _json_default(health), d["id"]))
+    except ValueError as e:
+        return {"error": {"code": "INVALID_ARGUMENT", "message": str(e)}}
+    crawl = _crawl_safe(slug, use_llm=False)
+    return {
+        "slug": slug,
+        "version": nv,
+        "url": _live_app_url(slug),
+        "runtime_kind": next_runtime,
+        "app_kind": next_app_kind,
+        "manifest": next_manifest,
+        "health": health,
+        "deps": crawl,
+    }
+
+
+def tool_list_live_apps(team=None, search=None, runtime_kind=None, app_kind=None):
+    _ensure_dashboard_tables()
+    try:
+        runtime_kind = _normalize_runtime_kind(runtime_kind) if runtime_kind else None
+        app_kind = _normalize_app_kind(app_kind) if app_kind else None
+    except ValueError as e:
+        return {"error": {"code": "INVALID_ARGUMENT", "message": str(e)}}
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
+            "latest_version, manifest, last_health, last_debug_at, queries, tables, metrics, updated_at "
+            "FROM rvbbit.live_apps "
+            "WHERE (%s::text IS NULL OR team=%s::text) "
+            "AND (%s::text IS NULL OR runtime_kind=%s::text) "
+            "AND (%s::text IS NULL OR app_kind=%s::text) "
+            "AND (%s::text IS NULL OR name ILIKE '%%'||%s::text||'%%' "
+            "     OR coalesce(description,'') ILIKE '%%'||%s::text||'%%') "
+            "ORDER BY updated_at DESC LIMIT 100",
+            (team, team, runtime_kind, runtime_kind, app_kind, app_kind, search, search, search)).fetchall()
+    apps = []
+    for row in rows:
+        item = dict(row)
+        item["url"] = _live_app_url(item["slug"])
+        apps.append(item)
+    return {"live_apps": apps}
+
+
+def tool_get_live_app(slug, version=None, include_source=True):
+    _ensure_dashboard_tables()
+    _ensure_activity_table()
+    with _conn() as c:
+        app = c.execute(
+            "SELECT id, slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
+            "latest_version, manifest, last_health, last_debug_at, created_at, updated_at "
+            "FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
+        if not app:
+            return {"error": {"code": "NOT_FOUND", "message": slug}}
+        app = dict(app)
+        v = int(version or app["latest_version"])
+        version_row = c.execute(
+            "SELECT version, html, kind, created_by, created_at, notes, manifest, source_files "
+            "FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
+            (app["id"], v)).fetchone()
+        if not version_row:
+            return {"error": {"code": "NOT_FOUND", "message": f"{slug}@v{v}"}}
+        version_doc = dict(version_row)
+        if not include_source:
+            html = version_doc.pop("html", "") or ""
+            source_files = version_doc.pop("source_files", {}) or {}
+            version_doc["html_bytes"] = len(html)
+            version_doc["source_files"] = sorted(source_files.keys())
+        app["version"] = version_doc
+        app["sources"] = c.execute(
+            "SELECT kind, object_ref, base_sql, source FROM rvbbit.dashboard_deps "
+            "WHERE dashboard_id=%s ORDER BY kind, object_ref NULLS LAST", (app["id"],)).fetchall()
+        app["recent_queries"] = c.execute(
+            "SELECT ts, ok, error, rows, engine, elapsed_ms, args->>'sql' AS sql "
+            f"FROM {ACTIVITY_TABLE} WHERE tool='dashboard_query' AND args->>'dashboard'=%s "
+            "ORDER BY ts DESC LIMIT 20", (slug,)).fetchall()
+    app["url"] = _live_app_url(slug)
+    app["path"] = f"/apps/{slug}"
+    app["runner"] = _live_app_runner_status(slug, probe=False)
+    return app
+
+
+def tool_live_app_logs(slug, limit=50):
+    _ensure_activity_table()
+    try:
+        limit = max(1, min(int(limit or 50), 500))
+    except (TypeError, ValueError):
+        limit = 50
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT ts, caller, ok, error, rows, engine, elapsed_ms, args->>'sql' AS sql "
+            f"FROM {ACTIVITY_TABLE} WHERE tool='dashboard_query' AND args->>'dashboard'=%s "
+            "ORDER BY ts DESC LIMIT %s", (slug, limit)).fetchall()
+    return {"slug": slug, "events": rows}
+
+
+def tool_debug_live_app(slug, run_crawl=True, include_activity=True):
+    _ensure_dashboard_tables()
+    app = tool_get_live_app(slug, include_source=False)
+    if app.get("error"):
+        return app
+    crawl = _crawl_safe(slug, use_llm=False) if run_crawl else None
+    logs = tool_live_app_logs(slug, 50) if include_activity else {"events": []}
+    issues = []
+    runner = _live_app_runner_status(slug, probe=True)
+    if app.get("runtime_kind") != "html" and not runner.get("running"):
+        issues.append({
+            "severity": "warning",
+            "code": "PYTHON_RUNNER_STOPPED" if runner.get("state") == "stopped" else "PYTHON_RUNNER_EXITED",
+            "message": "Python FastAPI source is versioned, but the local runner is not running.",
+        })
+    if runner.get("running") and runner.get("health_ok") is False:
+        issues.append({
+            "severity": "warning",
+            "code": "PYTHON_RUNNER_HEALTH_UNKNOWN",
+            "message": runner.get("health_error") or "The runner process is up, but /health did not respond cleanly.",
+        })
+    deps = crawl or {"queries": app.get("queries", 0), "tables": [], "metrics": []}
+    if not deps.get("queries") and not deps.get("metrics"):
+        issues.append({
+            "severity": "warning",
+            "code": "NO_LIVE_DEPENDENCIES",
+            "message": "No rvbbitQuery/sql literals/metric calls were detected yet.",
+        })
+    error_events = [e for e in logs.get("events", []) if e.get("ok") is False]
+    if error_events:
+        issues.append({
+            "severity": "error",
+            "code": "RECENT_QUERY_ERRORS",
+            "message": f"{len(error_events)} recent live-app query calls failed.",
+        })
+    health_state = "running" if runner.get("running") else app.get("status")
+    health = _live_app_runtime_health(app.get("runtime_kind"), health_state, issues)
+    with _conn() as c:
+        c.execute(
+            "UPDATE rvbbit.dashboards SET last_health=%s::jsonb, last_debug_at=now() WHERE slug=%s",
+            (_json_default(health), slug))
+    return {
+        "slug": slug,
+        "url": app.get("url"),
+        "runtime_kind": app.get("runtime_kind"),
+        "app_kind": app.get("app_kind"),
+        "health": health,
+        "deps": deps,
+        "runner": runner,
+        "recent_activity": logs.get("events", [])[:10],
+        "next_actions": [
+            "For Python apps, call start_live_app before opening or capturing the app.",
+            "Open the URL and exercise the app once so runtime SQL calls are logged.",
+            "Run debug_live_app again after edits to refresh dependencies and health.",
+            "Use update_live_app for source or manifest changes; every update creates a new version.",
+        ],
+    }
+
+
+def tool_start_live_app(slug, version=None, restart=False, port=None):
+    """Start a Python FastAPI live app under local uvicorn. HTML apps are already hosted."""
+    app, row = _load_live_app_version(slug, version)
+    if not app:
+        return {"error": {"code": "NOT_FOUND", "message": slug}}
+    if not row:
+        return {"error": {"code": "NOT_FOUND", "message": f"{slug}@v{version or app['latest_version']}"}}
+    runtime_kind = _normalize_runtime_kind(app.get("runtime_kind"))
+    if runtime_kind == "html":
+        return {
+            "slug": slug,
+            "runtime_kind": runtime_kind,
+            "state": "hosted",
+            "running": True,
+            "url": _live_app_url(slug),
+            "path": f"/apps/{slug}",
+            "version": row["version"],
+        }
+
+    current = _live_app_runner_status(slug, probe=True)
+    if current.get("running") and int(current.get("version") or 0) == int(row["version"]) and not restart:
+        return current | {"url": _live_app_url(slug), "path": f"/apps/{slug}"}
+    if current.get("running"):
+        tool_stop_live_app(slug)
+    elif slug in _LIVE_APP_PROCS:
+        _close_runner_log(_LIVE_APP_PROCS[slug])
+        _LIVE_APP_PROCS.pop(slug, None)
+
+    source_files = row.get("source_files") or {}
+    if not source_files:
+        source_files = _python_fastapi_files()
+    try:
+        work_dir = _materialize_live_app_sources(slug, row["version"], source_files)
+        runner_port = int(port or _free_port())
+        manifest = dict(app.get("manifest") or {})
+        manifest.update(row.get("manifest") or {})
+        uvicorn_app = _runner_entrypoint(manifest, source_files)
+    except Exception as e:  # noqa: BLE001
+        return {"error": {"code": "RUNNER_PREP_FAILED", "message": str(e)}}
+
+    log_path = work_dir / "runner.log"
+    log_handle = log_path.open("a", encoding="utf-8", buffering=1)
+    env = os.environ.copy()
+    env.update({
+        "RVBBIT_APP_NAME": app.get("name") or slug,
+        "RVBBIT_APP_SLUG": slug,
+        "RVBBIT_APP_VERSION": str(row["version"]),
+        "RVBBIT_APP_DSN": os.environ.get("WAREHOUSE_LIVE_APP_DSN", DSN),
+        "RVBBIT_APP_ROW_CAP": os.environ.get("WAREHOUSE_LIVE_APP_ROW_CAP", "10000"),
+        "RVBBIT_APP_STMT_TIMEOUT_MS": str(STMT_TIMEOUT_MS),
+        "PYTHONPATH": str(work_dir) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""),
+    })
+    cmd = [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        uvicorn_app,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(runner_port),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(work_dir),
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        _close_runner_log({"log_handle": log_handle})
+        return {"error": {"code": "RUNNER_START_FAILED", "message": str(e)}}
+
+    endpoint = f"http://127.0.0.1:{runner_port}"
+    _LIVE_APP_PROCS[slug] = {
+        "process": proc,
+        "port": runner_port,
+        "endpoint_url": endpoint,
+        "version": row["version"],
+        "runtime_kind": runtime_kind,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "work_dir": str(work_dir),
+        "log_path": str(log_path),
+        "log_handle": log_handle,
+        "command": cmd,
+    }
+    status = _wait_live_app_runner(slug, float(os.environ.get("WAREHOUSE_LIVE_APP_START_TIMEOUT", "8")))
+    issues = []
+    if not status.get("running"):
+        issues.append({
+            "severity": "error",
+            "code": "RUNNER_EXITED",
+            "message": status.get("log_tail") or "The live app process exited before it became healthy.",
+        })
+    elif status.get("health_ok") is False:
+        issues.append({
+            "severity": "warning",
+            "code": "RUNNER_HEALTH_UNKNOWN",
+            "message": status.get("health_error") or "The runner process is up, but /health did not respond cleanly.",
+        })
+    health = _live_app_runtime_health(runtime_kind, status.get("state") or "running", issues)
+    with _conn() as c:
+        c.execute(
+            "UPDATE rvbbit.dashboards SET last_health=%s::jsonb, last_debug_at=now() WHERE slug=%s",
+            (_json_default(health), slug))
+    return status | {"url": _live_app_url(slug), "path": f"/apps/{slug}", "command": cmd}
+
+
+def tool_stop_live_app(slug):
+    entry = _LIVE_APP_PROCS.get(slug)
+    if not entry:
+        return {"slug": slug, "state": "stopped", "running": False}
+    proc = entry["process"]
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    status = _live_app_runner_status(slug, probe=False)
+    status["state"] = "stopped"
+    status["running"] = False
+    _close_runner_log(entry)
+    _LIVE_APP_PROCS.pop(slug, None)
+    try:
+        with _conn() as c:
+            c.execute(
+                "UPDATE rvbbit.dashboards SET last_health=%s::jsonb, last_debug_at=now() WHERE slug=%s",
+                (_json_default(_live_app_runtime_health(status.get("runtime_kind"), "stopped")), slug))
+    except Exception:  # noqa: BLE001
+        pass
+    return status
+
+
+def tool_live_app_status(slug=None):
+    if slug:
+        return _live_app_runner_status(slug, probe=True)
+    return {"live_apps": [_live_app_runner_status(s, probe=False) for s in sorted(_LIVE_APP_PROCS)]}
+
+
+def _default_capture_path(slug, version):
+    root = _live_app_capture_root()
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    return root / f"{slug}-v{version}-{stamp}.png"
+
+
+def _looks_like_missing_playwright_browser(exc):
+    msg = str(exc).lower()
+    return (
+        "executable doesn't exist" in msg
+        or "playwright install" in msg
+        or "browser has not been installed" in msg
+    )
+
+
+def _install_playwright_chromium():
+    global _PLAYWRIGHT_INSTALL_ATTEMPTED
+    if _PLAYWRIGHT_INSTALL_ATTEMPTED:
+        return {"ok": False, "error": "install already attempted in this process"}
+    _PLAYWRIGHT_INSTALL_ATTEMPTED = True
+    cmd = [sys.executable, "-m", "playwright", "install"]
+    if _env_bool("WAREHOUSE_PLAYWRIGHT_INSTALL_WITH_DEPS", False):
+        cmd.append("--with-deps")
+    cmd.append("chromium")
+    timeout = _env_int("WAREHOUSE_PLAYWRIGHT_INSTALL_TIMEOUT_SEC", 600, minimum=30, maximum=3600)
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "cmd": cmd, "error": str(e)}
+    return {
+        "ok": proc.returncode == 0,
+        "cmd": cmd,
+        "returncode": proc.returncode,
+        "stdout": (proc.stdout or "")[-4000:],
+        "stderr": (proc.stderr or "")[-4000:],
+    }
+
+
+def _launch_playwright_chromium(playwright):
+    try:
+        return playwright.chromium.launch()
+    except Exception as e:  # noqa: BLE001
+        if not _env_bool("WAREHOUSE_PLAYWRIGHT_AUTO_INSTALL", True) or not _looks_like_missing_playwright_browser(e):
+            raise
+        install = _install_playwright_chromium()
+        if not install.get("ok"):
+            raise RuntimeError(
+                "Playwright Chromium is missing and automatic install failed: "
+                + json.dumps(install, default=str)
+            ) from e
+        return playwright.chromium.launch()
+
+
+def _capture_html_with_playwright(html, path, width, height, full_page, wait_ms):
+    from playwright.sync_api import sync_playwright
+
+    def _query(sql, opts=None):
+        opts = opts or {}
+        res = tool_run_sql(str(sql), opts.get("as_of"))
+        return json.loads(json.dumps(res, default=str))
+
+    init = """
+window.rvbbitQuery = async function(sql, opts) { return await window.__rvbbitQuery(sql, opts || {}); };
+window.cowork = window.cowork || {};
+window.cowork.callMcpTool = async function(tool, args) {
+  const d = await window.rvbbitQuery((args && args.sql) || "");
+  return {structuredContent: {rows: (d && d.rows) || []}};
+};
+"""
+    with sync_playwright() as p:
+        browser = _launch_playwright_chromium(p)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.expose_function("__rvbbitQuery", _query)
+        page.add_init_script(init)
+        page.set_content(html or "", wait_until="networkidle", timeout=30_000)
+        if wait_ms:
+            page.wait_for_timeout(wait_ms)
+        page.screenshot(path=str(path), full_page=bool(full_page))
+        browser.close()
+
+
+def _capture_url_with_playwright(url, path, width, height, full_page, wait_ms):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = _launch_playwright_chromium(p)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.goto(url, wait_until="networkidle", timeout=30_000)
+        if wait_ms:
+            page.wait_for_timeout(wait_ms)
+        page.screenshot(path=str(path), full_page=bool(full_page))
+        browser.close()
+
+
+def tool_capture_live_app(slug, path=None, width=1440, height=900, full_page=True, start=True, wait_ms=750):
+    """Capture a PNG screenshot. HTML apps get an injected live rvbbitQuery bridge; Python apps
+    are captured from their running local endpoint and can be auto-started."""
+    app, row = _load_live_app_version(slug)
+    if not app:
+        return {"error": {"code": "NOT_FOUND", "message": slug}}
+    if not row:
+        return {"error": {"code": "NOT_FOUND", "message": f"{slug}@v{app['latest_version']}"}}
+    try:
+        width = max(320, min(int(width or 1440), 3840))
+        height = max(240, min(int(height or 900), 2160))
+        wait_ms = max(0, min(int(wait_ms or 0), 10_000))
+    except (TypeError, ValueError):
+        return {"error": {"code": "INVALID_ARGUMENT", "message": "width, height, and wait_ms must be integers"}}
+    out = Path(path) if path else _default_capture_path(slug, row["version"])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    runtime_kind = _normalize_runtime_kind(app.get("runtime_kind"))
+    try:
+        if runtime_kind == "html":
+            _capture_html_with_playwright(row.get("html") or "", out, width, height, full_page, wait_ms)
+            source = "stored-html"
+        else:
+            status = _live_app_runner_status(slug, probe=True)
+            if not status.get("running") and start:
+                status = tool_start_live_app(slug)
+            if not status.get("running"):
+                return {"error": {"code": "RUNNER_NOT_RUNNING", "message": status}, "status": status}
+            _capture_url_with_playwright(status["endpoint_url"], out, width, height, full_page, wait_ms)
+            source = status["endpoint_url"]
+    except Exception as e:  # noqa: BLE001
+        return {
+            "error": {
+                "code": "CAPTURE_FAILED",
+                "message": str(e),
+                "hint": (
+                    "The warehouse-mcp image installs Chromium at build time. Runtime fallback runs "
+                    "`python -m playwright install chromium` once when the browser is missing; set "
+                    "WAREHOUSE_PLAYWRIGHT_INSTALL_WITH_DEPS=1 if OS dependencies must also be installed, "
+                    "or WAREHOUSE_PLAYWRIGHT_AUTO_INSTALL=0 to disable self-install."
+                ),
+            }
+        }
+    return {
+        "slug": slug,
+        "version": row["version"],
+        "runtime_kind": runtime_kind,
+        "path": str(out),
+        "bytes": out.stat().st_size if out.exists() else None,
+        "width": width,
+        "height": height,
+        "full_page": bool(full_page),
+        "source": source,
+    }
 
 
 # ── dependency extraction (Phase 1: queries → tables/metrics, the derived index) ──
@@ -2036,14 +3198,16 @@ def dashboard_crawl(slug, use_llm=True):
     """Rebuild a dashboard's dependency index: gather its SQL (parse the rvbbitQuery calls +
     the queries it actually ran + an LLM fallback), resolve each to tables via EXPLAIN,
     detect metric() usage, and store the edges. Regenerable — replaces prior deps."""
+    _ensure_dashboard_tables()
+    _ensure_activity_table()
     with _conn() as c:
         d = c.execute("SELECT id, latest_version FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
         if not d:
             return {"error": {"code": "NOT_FOUND", "message": slug}}
         did, ver = d["id"], d["latest_version"]
-        hrow = c.execute("SELECT html FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
+        hrow = c.execute("SELECT html, source_files FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
                          (did, ver)).fetchone()
-        html = hrow["html"] if hrow else ""
+        html = ((hrow["html"] if hrow else "") or "") + _source_files_text((hrow or {}).get("source_files"))
         runtime = [r["sql"] for r in c.execute(
             "SELECT DISTINCT args->>'sql' AS sql FROM rvbbit.mcp_activity "
             "WHERE tool='dashboard_query' AND args->>'dashboard'=%s AND args->>'sql' IS NOT NULL", (slug,)).fetchall()]
@@ -2148,6 +3312,100 @@ def _mcp_dashboard_dependents(object):
                    lambda: tool_dashboard_dependents(object))
 
 
+def _mcp_live_app_template(runtime_kind="html", app_kind="dashboard"):
+    """Return a starter live-app contract. Use html for immediately hosted apps; use
+    python-fastapi to scaffold source that is stored, versioned, and runnable under local uvicorn."""
+    return _logged("live_app_template", {"runtime_kind": runtime_kind, "app_kind": app_kind},
+                   lambda: tool_live_app_template(runtime_kind, app_kind))
+
+
+def _mcp_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboard",
+                         team=None, description=None, manifest=None, source_files=None):
+    """Create a versioned RVBBIT live app. HTML apps are hosted immediately at /d/<slug> and
+    call rvbbitQuery(sql) for live, read-only data from raw tables, metrics, or cubes."""
+    return _logged("create_live_app", {
+        "name": name,
+        "runtime_kind": runtime_kind,
+        "app_kind": app_kind,
+        "team": team,
+        "html_bytes": len(html or ""),
+    }, lambda: tool_create_live_app(name, html, runtime_kind, app_kind, team, description, manifest, source_files))
+
+
+def _mcp_update_live_app(slug, html=None, notes=None, manifest=None, source_files=None,
+                         runtime_kind=None, app_kind=None):
+    """Publish a new version of a live app. Omitted source fields are preserved."""
+    return _logged("update_live_app", {
+        "slug": slug,
+        "html_bytes": len(html or ""),
+        "notes": notes,
+    }, lambda: tool_update_live_app(slug, html, notes, manifest, source_files, runtime_kind, app_kind))
+
+
+def _mcp_list_live_apps(team=None, search=None, runtime_kind=None, app_kind=None):
+    """List versioned live apps with runtime kind, health, dependency counts, and URLs."""
+    return _logged("list_live_apps", {
+        "team": team,
+        "search": search,
+        "runtime_kind": runtime_kind,
+        "app_kind": app_kind,
+    }, lambda: tool_list_live_apps(team, search, runtime_kind, app_kind))
+
+
+def _mcp_get_live_app(slug, version=None, include_source=True):
+    """Fetch a live app's metadata, manifest, versioned source, dependencies, and recent query calls."""
+    return _logged("get_live_app", {"slug": slug, "version": version, "include_source": include_source},
+                   lambda: tool_get_live_app(slug, version, include_source))
+
+
+def _mcp_debug_live_app(slug, run_crawl=True, include_activity=True):
+    """Inspect and refresh a live app's health: dependency crawl, recent query errors, runtime status,
+    and recommended next actions."""
+    return _logged("debug_live_app", {
+        "slug": slug,
+        "run_crawl": run_crawl,
+        "include_activity": include_activity,
+    }, lambda: tool_debug_live_app(slug, run_crawl, include_activity))
+
+
+def _mcp_live_app_logs(slug, limit=50):
+    """Return recent live-app query events from mcp_activity for debugging."""
+    return _logged("live_app_logs", {"slug": slug, "limit": limit},
+                   lambda: tool_live_app_logs(slug, limit))
+
+
+def _mcp_start_live_app(slug, version=None, restart=False, port=None):
+    """Start a Python FastAPI live app locally under uvicorn. HTML apps are already hosted."""
+    return _logged("start_live_app", {"slug": slug, "version": version, "restart": restart, "port": port},
+                   lambda: tool_start_live_app(slug, version, restart, port))
+
+
+def _mcp_stop_live_app(slug):
+    """Stop a locally running Python live app process."""
+    return _logged("stop_live_app", {"slug": slug}, lambda: tool_stop_live_app(slug))
+
+
+def _mcp_live_app_status(slug=None):
+    """Inspect local live-app runner state for one app or every running app."""
+    return _logged("live_app_status", {"slug": slug}, lambda: tool_live_app_status(slug))
+
+
+async def _mcp_capture_live_app(slug, path=None, width=1440, height=900, full_page=True, start=True, wait_ms=750):
+    """Capture a PNG screenshot of a live app. HTML captures inject the live rvbbitQuery bridge;
+    Python captures auto-start the local runner by default."""
+    return await asyncio.to_thread(
+        lambda: _logged("capture_live_app", {
+            "slug": slug,
+            "path": path,
+            "width": width,
+            "height": height,
+            "full_page": full_page,
+            "start": start,
+            "wait_ms": wait_ms,
+        }, lambda: tool_capture_live_app(slug, path, width, height, full_page, start, wait_ms))
+    )
+
+
 _TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_template.html")
 
 
@@ -2212,6 +3470,34 @@ def register_dashboard_routes(m):
     def _json(obj, status=200):   # default=str handles Decimal / datetime in query rows
         return Response(json.dumps(obj, default=str), media_type="application/json", status_code=status)
 
+    async def _proxy_runner(request, subpath=""):
+        email = auth.read_session(request)
+        if not email:
+            return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
+        slug = request.path_params["slug"]
+        status = _live_app_runner_status(slug, probe=False)
+        if not status.get("running"):
+            return None
+        import httpx
+        target = status["endpoint_url"].rstrip("/") + "/" + (subpath or "")
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        body = await request.body()
+        headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in {"host", "content-length", "connection", "accept-encoding"}
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as cli:
+                proxied = await cli.request(request.method, target, content=body, headers=headers)
+        except Exception as e:  # noqa: BLE001
+            return _json({"error": {"code": "RUNNER_PROXY_FAILED", "message": str(e)}}, 502)
+        out_headers = {
+            k: v for k, v in proxied.headers.items()
+            if k.lower() in {"content-type", "cache-control", "etag", "last-modified"}
+        }
+        return Response(proxied.content, status_code=proxied.status_code, headers=out_headers)
+
     @m.custom_route("/d/{slug}", methods=["GET"])
     async def _view(request):
         if not auth.read_session(request):
@@ -2245,7 +3531,21 @@ def register_dashboard_routes(m):
                 res, res.get("error"), int((time.time() - t0) * 1000), caller_override=email)
         return _json(res, 400 if res.get("error") else 200)
 
-    return _view, _data
+    @m.custom_route("/apps/{slug}", methods=["GET"])
+    async def _view_app(request):
+        proxied = await _proxy_runner(request)
+        return proxied if proxied is not None else await _view(request)
+
+    @m.custom_route("/apps/{slug}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+    async def _proxy_app_path(request):
+        proxied = await _proxy_runner(request, request.path_params.get("path") or "")
+        return proxied if proxied is not None else await _view(request)
+
+    @m.custom_route("/api/apps/{slug}/q", methods=["POST"])
+    async def _data_app(request):
+        return await _data(request)
+
+    return _view, _data, _view_app, _proxy_app_path, _data_app
 
 
 # ── MCP server ───────────────────────────────────────────────────────────────
@@ -2396,6 +3696,17 @@ def _register(mcp):
     mcp.tool(name="dashboard_crawl")(_mcp_dashboard_crawl)
     mcp.tool(name="dashboard_dependents")(_mcp_dashboard_dependents)
     mcp.tool(name="dashboard_template")(_mcp_dashboard_template)
+    mcp.tool(name="live_app_template")(_mcp_live_app_template)
+    mcp.tool(name="create_live_app")(_mcp_create_live_app)
+    mcp.tool(name="update_live_app")(_mcp_update_live_app)
+    mcp.tool(name="list_live_apps")(_mcp_list_live_apps)
+    mcp.tool(name="get_live_app")(_mcp_get_live_app)
+    mcp.tool(name="debug_live_app")(_mcp_debug_live_app)
+    mcp.tool(name="live_app_logs")(_mcp_live_app_logs)
+    mcp.tool(name="start_live_app")(_mcp_start_live_app)
+    mcp.tool(name="stop_live_app")(_mcp_stop_live_app)
+    mcp.tool(name="live_app_status")(_mcp_live_app_status)
+    mcp.tool(name="capture_live_app")(_mcp_capture_live_app)
 
 
 def _selftest():
@@ -2429,11 +3740,14 @@ _INSTRUCTIONS = (
     "with validate_sql then run_sql (read-only). Use system_learning_status and ask_system_learning "
     "before tuning or diagnosing RVBBIT workloads: they expose learned routing, acceleration, layout, "
     "and operator breadcrumbs from the same Brain corpus the SQL Desktop shows. "
-    "TO BUILD A DASHBOARD: call `dashboard_template` FIRST for the proven boilerplate, set its "
-    "SERVER_ID to the <id> in your `mcp__<id>__run_sql` tool, and edit only its CONFIG + RENDER "
-    "blocks. Live data flows through Cowork's callMcpTool→run_sql bridge (authed by the connector "
-    "you already granted — no fetch, no login); compose each view into ONE run_sql. To persist or "
-    "share a dashboard outside Cowork, also call publish_dashboard."
+    "TO BUILD A LIVE APP: call `live_app_template(runtime_kind='html')` FIRST, edit the template, "
+    "and call create_live_app. Hosted HTML apps live at /d/<slug>, are versioned, and call "
+    "rvbbitQuery(sql) for live read-only data; compose each view into ONE run_sql-shaped query. "
+    "Use list_live_apps, get_live_app, update_live_app, live_app_logs, and debug_live_app to "
+    "maintain them. For Python FastAPI apps, call start_live_app to run the current version under "
+    "local uvicorn, stop_live_app to stop it, live_app_status to inspect runner state, and "
+    "capture_live_app to create a PNG screenshot. The legacy dashboard_template/publish_dashboard "
+    "tools remain for compatibility."
 )
 
 

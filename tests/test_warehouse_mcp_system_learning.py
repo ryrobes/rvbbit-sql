@@ -51,6 +51,11 @@ def test_system_learning_tools_are_registered_and_summarized(rvbbit, monkeypatch
     assert status["indexed_items"] >= 1
     assert "run_sql" in status["agent_tools"]
     assert status["graph_edges"]
+    assert status["readiness"]["state"] in {"ready", "partial", "needs_sync"}
+    assert status["suggested_prompts"]
+    assert any("accelerate" in p["query"].lower() for p in status["suggested_prompts"])
+    assert status["answer_contract"]["required_citations"] == ["hit.title", "artifact.uri"]
+    assert any("rvbbit.system_learning_item_summary" in f.get("sql", "") for f in status["followups"])
 
     groups = {row["object_type"]: row["items"] for row in status["summary"]}
     assert any(
@@ -69,6 +74,7 @@ def test_system_learning_tools_are_registered_and_summarized(rvbbit, monkeypatch
     assert breadcrumb["title"]
     assert breadcrumb["object_type"] in groups
     assert breadcrumb["handles"]
+    assert "rvbbit.system_learning_items" in breadcrumb["inspect_sql"]
     assert breadcrumb["followups"][0]["tool"] == "ask_system_learning"
     assert breadcrumb["followups"][1]["tool"] == "run_sql"
     assert "rvbbit.system_learning_items" in breadcrumb["followups"][1]["sql"]
@@ -99,7 +105,12 @@ def test_system_learning_mcp_sync_and_search_shortcut(rvbbit, monkeypatch):
     assert all(hit["doc_type"] == "system_learning" for hit in result["hits"])
     assert result["breadcrumbs"]
     assert "run_sql" in result["next_tools"]
+    assert result["readiness"]["ready"] is True
+    assert result["suggested_prompts"]
+    assert result["answer_contract"]["style"] == "grounded_context_not_synthesis"
+    assert any("rvbbit.system_learning_items" in f.get("sql", "") for f in result["followups"])
     assert all(hit.get("artifact", {}).get("uri", "").startswith("rvbbit:") for hit in result["hits"])
+    assert all("rvbbit.system_learning_items" in hit.get("artifact", {}).get("inspect_sql", "") for hit in result["hits"])
     assert any(
         followup.get("tool") == "run_sql" and "rvbbit.system_learning_items" in followup.get("sql", "")
         for breadcrumb in result["breadcrumbs"]

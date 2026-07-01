@@ -2,7 +2,7 @@
 --
 -- 0046 gave us the manifest contract + reconciler (pure SQL). This adds the orchestration surface:
 --   • brain_sync_request(source_id)      → the JSON a connector /sync call needs (endpoint, auth env,
---                                           folders, cursor, and the known uri→hash map so the
+--                                           configured Drive folder/doc locations, cursor, and the known uri→hash map so the
 --                                           connector only re-downloads CHANGED files).
 --   • brain_sync_write_manifest(...)      → land the connector's returned listing (full current set)
 --                                           + pending grants + cursor. One writer: rvbbit.

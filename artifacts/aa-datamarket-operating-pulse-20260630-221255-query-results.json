@@ -1,0 +1,77 @@
+{
+  "select count(*) as students from application_data_public.students": [
+    {
+      "students": 72509
+    }
+  ],
+  "select active, count(*) as courses from application_data_public.courses group by active order by count(*) desc": [
+    {
+      "active": true,
+      "courses": 1610
+    },
+    {
+      "active": false,
+      "courses": 1251
+    }
+  ],
+  "select status, count(*) as transactions from application_data_public.transactions group by status order by count(*) desc limit 6": [
+    {
+      "status": "cancelled",
+      "transactions": 311849
+    },
+    {
+      "status": "successful",
+      "transactions": 263662
+    },
+    {
+      "status": "scheduled",
+      "transactions": 59360
+    },
+    {
+      "status": "failed",
+      "transactions": 44165
+    },
+    {
+      "status": "pending",
+      "transactions": 5
+    }
+  ],
+  "select status, count(*) as students from application_data_public.students group by status order by count(*) desc limit 6": [
+    {
+      "status": "applying",
+      "students": 25133
+    },
+    {
+      "status": "graduated",
+      "students": 17663
+    },
+    {
+      "status": "application_approved",
+      "students": 16120
+    },
+    {
+      "status": "withdrawn",
+      "students": 5868
+    },
+    {
+      "status": "application_rejected",
+      "students": 2359
+    },
+    {
+      "status": "active",
+      "students": 2191
+    }
+  ],
+  "select count(*) as scores, avg(score) as avg_score from application_data_public.scores where score is not null": [
+    {
+      "scores": 581629,
+      "avg_score": 9.121707662944491
+    }
+  ],
+  "select count(*) as payments, sum(amount) as amount from application_data_public.transactions where amount is not null": [
+    {
+      "payments": 679041,
+      "amount": 14909441435
+    }
+  ]
+}

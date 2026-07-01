@@ -8,6 +8,7 @@
 //!
 //! Flow (per source):
 //!   1. SELECT rvbbit.brain_sync_request(id)  → {endpoint, auth_env, payload{folders,cursor,known}}
+//!      (`folders` is the legacy key for configured Drive folder/doc locations)
 //!   2. POST {endpoint} payload               → {files[], pending_grants[], cursor}
 //!   3. SELECT rvbbit.brain_sync_write_manifest(id, files, pending, cursor)
 //!   4. SELECT rvbbit.brain_sync_extract_bodies(id)        (new/changed binaries → markdown)
