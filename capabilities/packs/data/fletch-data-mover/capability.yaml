@@ -1,0 +1,56 @@
+api_version: rvbbit.capability/v1
+kind: runtime_sidecar
+name: fletch_data_mover
+title: Fletch Data Mover
+description: "Warren-managed ADBC import/export sidecar powered by the Fletch CLI."
+license: apache-2.0
+capability_role: data_mover
+tags: [runtime, data-mover, import, export, adbc, fletch, postgres, parquet, s3, cpu]
+source:
+  provider: github
+  model: early-signal-tech/fletch
+  revision: v0.2.0
+runtime:
+  template: fletch-data-mover
+  language: data_mover
+  handler: fletch
+  device: cpu
+  port: 9181
+  health_path: /health
+  publish_host_port: true
+  host_bind: 127.0.0.1
+  host_port: 9181
+  host_port_env: RVBBIT_FLETCH_DATA_MOVER_PORT
+  env:
+    RVBBIT_FLETCH_DATA_DIR: /var/lib/rvbbit/fletch
+    RVBBIT_FLETCH_ALLOW_DRIVER_INSTALL: ${RVBBIT_FLETCH_ALLOW_DRIVER_INSTALL:-true}
+    RVBBIT_FLETCH_ALLOW_CUSTOM_DRIVERS: ${RVBBIT_FLETCH_ALLOW_CUSTOM_DRIVERS:-false}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    AWS_REGION: ${AWS_REGION:-}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
+    GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+    GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+    MOTHERDUCK_TOKEN: ${MOTHERDUCK_TOKEN:-}
+  volumes:
+    - name: fletch_data
+      mount: /var/lib/rvbbit/fletch
+    - name: fletch_staging
+      mount: /staging
+runtime_registration:
+  name: fletch_data_mover
+  language: data_mover
+  endpoint_path: /
+  set_default: false
+  labels:
+    language: data_mover
+    capability_kind: runtime_sidecar
+    capability_role: data_mover
+    runtime_handler: fletch
+warren:
+  endpoint_path: /
+  health_path: /health
+smoke:
+  sql:
+    - "SELECT name, endpoint_url, status FROM rvbbit.python_runtimes WHERE name = 'fletch_data_mover';"

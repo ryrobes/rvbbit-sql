@@ -604,6 +604,83 @@
         "setup_sql": [],
         "target_selector": {
           "capability": true,
+          "docker": true,
+          "gpu": false
+        },
+        "teardown_sql": [],
+        "tests": [
+          {
+            "description": "Assert Warren registered the Fletch data mover runtime.",
+            "name": "fletch_data_mover_registered_ready",
+            "sql": "DO $$\nDECLARE\n    source text;\nBEGIN\n    SELECT runtime_source\n    INTO source\n    FROM rvbbit.python_runtimes\n    WHERE name = 'fletch_data_mover'\n      AND language = 'data_mover'\n      AND status = 'ready'\n      AND endpoint_url IS NOT NULL\n      AND endpoint_url <> '';\n\n    IF source IS NULL THEN\n        RAISE EXCEPTION 'fletch_data_mover runtime is not registered as ready';\n    END IF;\n\n    IF source = 'warren' AND NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'fletch_data_mover'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'fletch_data_mover deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"
+          }
+        ]
+      },
+      "acceptance_tests": [
+        "fletch_data_mover_registered_ready"
+      ],
+      "backend_name": null,
+      "backend_transport": "rvbbit",
+      "capability_role": "data_mover",
+      "catalog_visibility": "public",
+      "description": "Optional ADBC import/export utility sidecar powered by Fletch.",
+      "device": "cpu",
+      "endpoint_path": "/",
+      "gpu_placement": null,
+      "gpu_required": false,
+      "health_path": "/health",
+      "id": "data/fletch-data-mover",
+      "install_docker": true,
+      "install_mode": "build",
+      "install_warren": true,
+      "kind": "runtime_sidecar",
+      "license": "apache-2.0",
+      "manifest_path": "capabilities/packs/data/fletch-data-mover/capability.yaml",
+      "model_size_bytes": null,
+      "name": "fletch_data_mover",
+      "operators": [],
+      "pack_api_version": "rvbbit.pack/v1",
+      "pack_id": "data/fletch-data-mover",
+      "pack_manifest_path": "capabilities/packs/data/fletch-data-mover/rvbbit-pack.yaml",
+      "pack_path": "capabilities/packs/data/fletch-data-mover",
+      "provider_model": null,
+      "provider_name": null,
+      "provider_set_default": false,
+      "repo_url": null,
+      "resources": {},
+      "runtime_handler": "fletch",
+      "runtime_image": null,
+      "runtime_language": "data_mover",
+      "runtime_mode": "build",
+      "runtime_name": "fletch_data_mover",
+      "runtime_port": 9181,
+      "runtime_template": "fletch-data-mover",
+      "source_model": "early-signal-tech/fletch",
+      "source_provider": "github",
+      "source_revision": "v0.2.0",
+      "source_url": null,
+      "system_runtime": false,
+      "tags": [
+        "runtime",
+        "data-mover",
+        "import",
+        "export",
+        "adbc",
+        "fletch",
+        "postgres",
+        "parquet",
+        "s3",
+        "cpu"
+      ],
+      "title": "Fletch Data Mover",
+      "vram_headroom_pct": null,
+      "vram_required_bytes": null
+    },
+    {
+      "acceptance": {
+        "setup_sql": [],
+        "target_selector": {
+          "capability": true,
           "docker": true
         },
         "teardown_sql": [],

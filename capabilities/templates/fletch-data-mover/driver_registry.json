@@ -1,0 +1,56 @@
+{
+  "postgresql": {
+    "label": "PostgreSQL",
+    "packages": ["libadbc-driver-postgresql-dev"],
+    "built_in": true
+  },
+  "postgres": {
+    "label": "PostgreSQL",
+    "alias_for": "postgresql"
+  },
+  "sqlite": {
+    "label": "SQLite",
+    "packages": ["libadbc-driver-sqlite-dev"],
+    "built_in": true
+  },
+  "sqlite3": {
+    "label": "SQLite",
+    "alias_for": "sqlite"
+  },
+  "flightsql": {
+    "label": "Flight SQL",
+    "packages": ["libadbc-driver-flightsql-dev"],
+    "built_in": true
+  },
+  "snowflake": {
+    "label": "Snowflake",
+    "packages": ["libadbc-driver-snowflake-dev"],
+    "built_in": true
+  },
+  "duckdb": {
+    "label": "DuckDB",
+    "packages": [],
+    "notes": "Fletch can address DuckDB, but an installable Linux ADBC package is not available in the default Apache Arrow apt repo."
+  },
+  "motherduck": {
+    "label": "MotherDuck",
+    "alias_for": "duckdb"
+  },
+  "parquet": {
+    "label": "Parquet file",
+    "packages": [],
+    "built_in": true,
+    "destination_only": true
+  },
+  "s3": {
+    "label": "Amazon S3 Parquet",
+    "packages": [],
+    "built_in": true,
+    "destination_only": true
+  },
+  "bigquery": {
+    "label": "BigQuery",
+    "packages": [],
+    "notes": "Install with a custom ADBC driver only when RVBBIT_FLETCH_ALLOW_CUSTOM_DRIVERS=true."
+  }
+}

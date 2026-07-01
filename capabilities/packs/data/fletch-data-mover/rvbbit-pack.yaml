@@ -1,0 +1,72 @@
+api_version: rvbbit.pack/v1
+id: data/fletch-data-mover
+name: fletch_data_mover
+title: Fletch Data Mover
+description: "Optional ADBC import/export utility sidecar powered by Fletch."
+license: apache-2.0
+capability_role: data_mover
+tags:
+- runtime
+- data-mover
+- import
+- export
+- adbc
+- fletch
+- postgres
+- parquet
+- s3
+- cpu
+capability: capability.yaml
+source:
+  provider: github
+  model: early-signal-tech/fletch
+  revision: v0.2.0
+runtime:
+  mode: build
+  template: fletch-data-mover
+  handler: fletch
+  device: cpu
+  port: 9181
+  health_path: /health
+exports:
+  runtime: fletch_data_mover
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  tests:
+  - name: fletch_data_mover_registered_ready
+    description: Assert Warren registered the Fletch data mover runtime.
+    sql: |
+      DO $$
+      DECLARE
+          source text;
+      BEGIN
+          SELECT runtime_source
+          INTO source
+          FROM rvbbit.python_runtimes
+          WHERE name = 'fletch_data_mover'
+            AND language = 'data_mover'
+            AND status = 'ready'
+            AND endpoint_url IS NOT NULL
+            AND endpoint_url <> '';
+
+          IF source IS NULL THEN
+              RAISE EXCEPTION 'fletch_data_mover runtime is not registered as ready';
+          END IF;
+
+          IF source = 'warren' AND NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.warren_inventory
+              WHERE runtime_name = 'fletch_data_mover'
+                AND deployment_status = 'running'
+          ) THEN
+              RAISE EXCEPTION 'fletch_data_mover deployment is not running in Warren inventory';
+          END IF;
+      END
+      $$;
