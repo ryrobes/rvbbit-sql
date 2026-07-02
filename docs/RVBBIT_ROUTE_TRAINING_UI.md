@@ -246,6 +246,8 @@ For each shape:
   - `pg_rowstore`: 25 percent.
   - Hive candidates: `RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE` or
     `rvbbit.route_hive_min_confidence`, default 8 percent.
+  - `gpu_gqe`: `RVBBIT_ROUTE_GPU_GQE_MIN_CONFIDENCE` or
+    `rvbbit.route_gpu_gqe_min_confidence`, default 5 percent.
   - Other candidates: 5 percent.
 
 Accepted shapes become `rvbbit.route_profile_entries`. Rejected shapes are

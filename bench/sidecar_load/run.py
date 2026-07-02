@@ -107,6 +107,8 @@ def apply_session_settings(cur: psycopg.Cursor[Any], args: argparse.Namespace, a
         set_guc(cur, "rvbbit.duck_threads", str(args.duck_threads))
     if args.candidate != "auto":
         set_guc(cur, "rvbbit.route_force_candidate", args.candidate)
+        if args.candidate == "gpu_gqe":
+            set_guc(cur, "rvbbit.route_gpu_gqe", "on")
     if args.persistent != "default":
         set_guc(cur, "rvbbit.duck_backend_persistent", args.persistent)
     if args.shared != "default":

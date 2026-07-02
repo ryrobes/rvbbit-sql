@@ -153,6 +153,58 @@ Use `SELECT rvbbit.accelerator_runtime_status(false);` or the
 `accelerator/runtime` row from `rvbbit.doctor(false)` to see which runtime tier is
 active and what, if anything, is missing.
 
+GPU/GQE is exposed as an experimental, disabled-by-default route candidate. Enable
+selection with `rvbbit.route_gpu_gqe=on` or `RVBBIT_ROUTE_GPU_GQE=1`; install the
+bridge at `/usr/local/bin/rvbbit-gqe`, set `RVBBIT_GQE_BIN`, set
+`rvbbit.gqe_bin`, or put `rvbbit-gqe` on the postmaster `PATH`. The bridge is expected to implement the same
+JSON/Arrow IPC sidecar protocol as `rvbbit-duck`.
+
+The packaged Docker image installs `/usr/local/bin/rvbbit-gqe` as a lightweight
+launcher/probe and `/opt/rvbbit/gqe/bin/rvbbit-gqe-bridge` as the RVBBIT-side
+adapter. The adapter maps authoritative RVBBIT parquet row groups into GQE
+`CREATE OR REPLACE EXTERNAL TABLE ... STORED AS PARQUET LOCATION ...` statements,
+executes `gqe-cli --parquet`, and returns the same JSON/Arrow IPC sidecar
+contract as `rvbbit-duck`.
+
+The adapter still requires a real NVIDIA GQE install. By default it looks for
+`/opt/gqe/rust/target/release/gqe-cli`,
+`/opt/gqe/build/src/node_manager/gqe_node_manager`, and
+`/opt/gqe/build/src/task_manager/gqe_task_manager`; override these with
+`RVBBIT_GQE_CLI`, `RVBBIT_GQE_NODE_MANAGER`, and `RVBBIT_GQE_TASK_MANAGER`.
+`RVBBIT_GQE_SERVER_URL` defaults to `http://127.0.0.1:50051`. If the server is
+not reachable and the node/task manager binaries are present, the adapter
+auto-starts a local node manager unless `RVBBIT_GQE_AUTO_START=off`. For remote
+or separately managed GQE, set `RVBBIT_GQE_SERVER_URL` and
+`RVBBIT_GQE_AUTO_START=off`.
+
+For local ClickBench runs that include `rvbbit_gpu_gqe_forced`,
+`run_offline.sh` automatically requests Docker GPU access when host `nvidia-smi`
+detects a GPU and Docker exposes the NVIDIA runtime. Host-mounted GQE uses
+`docker/docker-compose.gpu.yml`; the optional GQE image carries its own `gpus`
+setting. Set `RVBBIT_GPU_GQE_COMPOSE=off` to suppress GPU compose
+auto-selection, or pass `RVBBIT_REQUIRE_GPU_GQE=1` to fail instead of reporting
+`SKIP`.
+
+GQE can be supplied two ways:
+
+- Set `RVBBIT_GQE_HOME=/path/to/gqe` to mount a host-built GQE checkout/build at
+  `/opt/gqe` inside `pg-rvbbit`.
+- Build the optional `pg-rvbbit` GQE image with
+  `docker/docker-compose.gqe-image.yml`. This extends the normal `pg-rvbbit`
+  image with NVIDIA GQE's CUDA/RAPIDS build environment, source-builds libcudf
+  and MLIR, builds GQE, and installs `gqe-cli` plus the node/task managers under
+  `/opt/gqe`.
+
+The benchmark runner controls image selection with `RVBBIT_GPU_GQE_INSTALL`:
+`auto` is the default and selects the optional image only when
+`rvbbit_gpu_gqe_forced` is in `BENCH_SYSTEMS`, no `RVBBIT_GQE_HOME` is set, host
+`nvidia-smi` reports a GPU, Docker exposes the NVIDIA runtime, and
+`RVBBIT_GPU_GQE_COMPOSE` is not disabled; `image` forces the optional image;
+`off` leaves the normal image in place so the GQE path reports `SKIP`; `host`
+expects `RVBBIT_GQE_HOME` to be provided. With
+`--rebuild` and image mode selected, the runner first rebuilds the normal
+`pg-rvbbit` image, then builds the GQE image on top of it.
+
 See [DUCK_SIDECAR.md](DUCK_SIDECAR.md) for the full deployment model, fallback
 semantics, production caveats, and load-test commands.
 

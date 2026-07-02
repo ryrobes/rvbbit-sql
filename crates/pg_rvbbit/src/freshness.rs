@@ -164,7 +164,7 @@ CREATE TABLE rvbbit.accel_policy (
     -- reduces the router's pathways (and stops the rebuilder materializing the
     -- denied layouts) without touching the global GUCs. native + pg_rowstore are
     -- the correctness floor and are never gated. Empty = nothing denied.
-    --   engines: duck, datafusion        layouts: vortex, hive, vector, mem, cluster
+    --   engines: duck, datafusion, gpu_gqe        layouts: vortex, hive, vector, mem, cluster
     denied_engines           text[] NOT NULL DEFAULT '{}',
     denied_layouts           text[] NOT NULL DEFAULT '{}',
     note                     text,
@@ -288,8 +288,8 @@ END;
 $$;
 
 -- UI-friendly single toggle: enable/disable one engine or layout for a table.
--- target is an engine (duck, datafusion) or a layout (vortex, hive, vector, mem,
--- cluster). enabled=false adds it to the matching deny-set; enabled=true removes
+-- target is an engine (duck, datafusion, gpu_gqe) or a layout (vortex, hive,
+-- vector, mem, cluster). enabled=false adds it to the matching deny-set; enabled=true removes
 -- it. native + pg_rowstore are the correctness floor and cannot be disabled. The
 -- router re-checks availability on every decision, so the effect is immediate;
 -- the next rebuild stops materializing a denied build-layout (vortex/hive/cluster).
@@ -306,12 +306,12 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM rvbbit.tables WHERE table_oid = rel) THEN
         RAISE EXCEPTION '% is not a registered rvbbit table', rel;
     END IF;
-    is_engine := tgt IN ('duck', 'datafusion');
+    is_engine := tgt IN ('duck', 'datafusion', 'gpu_gqe');
     IF tgt IN ('native', 'pg_rowstore', 'rvbbit_native') THEN
         RAISE EXCEPTION 'native / pg_rowstore is the fallback engine and cannot be disabled';
     END IF;
     IF NOT is_engine AND tgt NOT IN ('vortex', 'hive', 'vector', 'mem', 'cluster') THEN
-        RAISE EXCEPTION 'unknown engine/layout target %; expected duck, datafusion, vortex, hive, vector, mem, cluster', target;
+        RAISE EXCEPTION 'unknown engine/layout target %; expected duck, datafusion, gpu_gqe, vortex, hive, vector, mem, cluster', target;
     END IF;
 
     INSERT INTO rvbbit.accel_policy (table_oid) VALUES (rel)
@@ -750,7 +750,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(drift >= 2, "two tombstones should make drift >= 2, got {drift}");
+        assert!(
+            drift >= 2,
+            "two tombstones should make drift >= 2, got {drift}"
+        );
     }
 
     #[pg_test]
@@ -782,7 +785,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(stamped, "first write should stamp dirty_since and last_write_at");
+        assert!(
+            stamped,
+            "first write should stamp dirty_since and last_write_at"
+        );
         let since1: String = Spi::get_one(
             "SELECT dirty_since::text FROM rvbbit.tables WHERE table_oid = 'dt_demo'::regclass",
         )
@@ -797,7 +803,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(since1, since2, "dirty_since must be stable across writes in one episode");
+        assert_eq!(
+            since1, since2,
+            "dirty_since must be stable across writes in one episode"
+        );
         let ordered: bool = Spi::get_one(
             "SELECT last_write_at >= dirty_since FROM rvbbit.tables WHERE table_oid = 'dt_demo'::regclass",
         )
@@ -815,7 +824,10 @@ mod tests {
             "SELECT dirty_since::text FROM rvbbit.accel_freshness WHERE table_name = 'dt_demo'",
         )
         .unwrap();
-        assert!(view_since.is_none(), "accel_freshness should NULL dirty_since when clean");
+        assert!(
+            view_since.is_none(),
+            "accel_freshness should NULL dirty_since when clean"
+        );
         let view_dirty: bool = Spi::get_one(
             "SELECT shadow_heap_dirty FROM rvbbit.accel_freshness WHERE table_name = 'dt_demo'",
         )
@@ -862,11 +874,10 @@ mod tests {
     fn set_accel_policy_upserts_and_is_effective() {
         register("pol_up");
         // First set: target SLO of 300s.
-        let j: pgrx::JsonB = Spi::get_one(
-            "SELECT rvbbit.set_accel_policy('pol_up'::regclass, 'target', 300)",
-        )
-        .unwrap()
-        .unwrap();
+        let j: pgrx::JsonB =
+            Spi::get_one("SELECT rvbbit.set_accel_policy('pol_up'::regclass, 'target', 300)")
+                .unwrap()
+                .unwrap();
         assert_eq!(j.0.get("strategy").and_then(|v| v.as_str()), Some("target"));
         assert_eq!(
             j.0.get("freshness_target_secs").and_then(|v| v.as_i64()),
@@ -897,8 +908,9 @@ mod tests {
         assert_eq!(strat, "continuous");
 
         // Clear resets to the manual default.
-        let cleared: bool =
-            Spi::get_one("SELECT rvbbit.clear_accel_policy('pol_up'::regclass)").unwrap().unwrap();
+        let cleared: bool = Spi::get_one("SELECT rvbbit.clear_accel_policy('pol_up'::regclass)")
+            .unwrap()
+            .unwrap();
         assert!(cleared);
         let strat2: String = Spi::get_one(
             "SELECT strategy FROM rvbbit.accel_policy_effective WHERE table_name = 'pol_up'",
@@ -922,6 +934,7 @@ mod tests {
 
         // Disable the duck engine and the vortex layout.
         Spi::run("SELECT rvbbit.set_table_engine('eng_demo'::regclass, 'duck', false)").unwrap();
+        Spi::run("SELECT rvbbit.set_table_engine('eng_demo'::regclass, 'gpu_gqe', false)").unwrap();
         Spi::run("SELECT rvbbit.set_table_engine('eng_demo'::regclass, 'vortex', false)").unwrap();
         // Idempotent: disabling vortex again must not duplicate.
         Spi::run("SELECT rvbbit.set_table_engine('eng_demo'::regclass, 'vortex', false)").unwrap();
@@ -936,8 +949,16 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(de, vec!["duck".to_string()], "duck engine denied");
-        assert_eq!(dl, vec!["vortex".to_string()], "vortex layout denied, no dup");
+        assert_eq!(
+            de,
+            vec!["duck".to_string(), "gpu_gqe".to_string()],
+            "duck and gpu_gqe engines denied"
+        );
+        assert_eq!(
+            dl,
+            vec!["vortex".to_string()],
+            "vortex layout denied, no dup"
+        );
 
         // Re-enable duck -> removed from the deny-set.
         Spi::run("SELECT rvbbit.set_table_engine('eng_demo'::regclass, 'duck', true)").unwrap();
@@ -946,14 +967,19 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(de2.is_empty(), "duck re-enabled, deny-set empty: {de2:?}");
+        assert_eq!(
+            de2,
+            vec!["gpu_gqe".to_string()],
+            "duck re-enabled, gpu_gqe denial remains: {de2:?}"
+        );
     }
 
     #[pg_test]
     #[should_panic(expected = "cannot be disabled")]
     fn set_table_engine_rejects_native() {
         register("eng_native");
-        Spi::run("SELECT rvbbit.set_table_engine('eng_native'::regclass, 'native', false)").unwrap();
+        Spi::run("SELECT rvbbit.set_table_engine('eng_native'::regclass, 'native', false)")
+            .unwrap();
     }
 
     // --- Layer 3 (executor) decision-logic tests. All dry_run, so deterministic
@@ -1069,7 +1095,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(planned, 3);
-        let logged: i64 = Spi::get_one("SELECT count(*) FROM rvbbit.accel_tick_runs").unwrap().unwrap();
+        let logged: i64 = Spi::get_one("SELECT count(*) FROM rvbbit.accel_tick_runs")
+            .unwrap()
+            .unwrap();
         assert_eq!(logged, 0, "dry_run must not write history");
     }
 
@@ -1129,11 +1157,13 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(planned_name, "tk_b1", "higher-value table is chosen first");
-        let deferred_reason: String = Spi::get_one(
-            "SELECT reason FROM rvbbit.accel_tick(1, true) WHERE status = 'deferred'",
-        )
-        .unwrap()
-        .unwrap();
-        assert!(deferred_reason.contains("budget"), "reason was: {deferred_reason}");
+        let deferred_reason: String =
+            Spi::get_one("SELECT reason FROM rvbbit.accel_tick(1, true) WHERE status = 'deferred'")
+                .unwrap()
+                .unwrap();
+        assert!(
+            deferred_reason.contains("budget"),
+            "reason was: {deferred_reason}"
+        );
     }
 }

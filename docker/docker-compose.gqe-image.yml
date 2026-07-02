@@ -1,0 +1,29 @@
+# Optional GPU/GQE image override for pg-rvbbit.
+#
+# This replaces the normal pg-rvbbit service image with a GPU/GQE-capable image
+# that extends the ordinary pg-rvbbit build. It is intentionally separate from
+# docker-compose.yml because the NVIDIA GQE build pulls in a large CUDA/RAPIDS
+# toolchain and source-builds libcudf + MLIR.
+
+services:
+  pg-rvbbit:
+    image: ${RVBBIT_GQE_PG_IMAGE:-docker-pg-rvbbit-gqe}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.rvbbit-gqe
+      args:
+        RVBBIT_BASE_IMAGE: ${RVBBIT_BASE_IMAGE:-docker-pg-rvbbit}
+        GQE_REPO: ${GQE_REPO:-https://github.com/rapidsai/gqe.git}
+        GQE_REF: ${GQE_REF:-main}
+        CUDF_REF: ${CUDF_REF:-v26.06.01}
+        PARALLEL_LEVEL: ${PARALLEL_LEVEL:-}
+        SCCACHE_VERSION: ${SCCACHE_VERSION:-0.15.0}
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      RVBBIT_GQE_CLI: ${RVBBIT_GQE_CLI:-/opt/gqe/rust/target/release/gqe-cli}
+      RVBBIT_GQE_NODE_MANAGER: ${RVBBIT_GQE_NODE_MANAGER:-/opt/gqe/build/src/node_manager/gqe_node_manager}
+      RVBBIT_GQE_TASK_MANAGER: ${RVBBIT_GQE_TASK_MANAGER:-/opt/gqe/build/src/task_manager/gqe_task_manager}
+      RVBBIT_GQE_SERVER_URL: ${RVBBIT_GQE_SERVER_URL:-http://127.0.0.1:50051}
+      RVBBIT_GQE_AUTO_START: ${RVBBIT_GQE_AUTO_START:-true}

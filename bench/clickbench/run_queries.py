@@ -56,8 +56,24 @@ def fmt_ms(ms: float) -> str:
     return f"{ms/1000:.2f}s"
 
 
+def is_skip_status(status: str) -> bool:
+    return status.lower().startswith("skip")
+
+
+def status_label(ms: float | None, status: str) -> str:
+    if ms is not None:
+        return fmt_ms(ms)
+    if is_skip_status(status):
+        return "SKIP"
+    return f"FAIL ({status})"
+
+
 def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
     try:
+        if system == "rvbbit_gpu_gqe_forced":
+            skip_reason = os.environ.get("RVBBIT_GPU_GQE_SKIP_REASON", "").strip()
+            if skip_reason:
+                return None, f"skip: {skip_reason}"
         if system == "duckdb":
             return run_duckdb(sql, REPEATS), "ok"
         if system == "clickhouse":
@@ -172,7 +188,7 @@ def main() -> None:
             took = time.perf_counter() - t0
             results[qid][sys_] = (ms, status)
             details[qid][sys_] = detail
-            label = fmt_ms(ms) if ms is not None else f"FAIL ({status})"
+            label = status_label(ms, status)
             suffix = ""
             if REPORT_COLD_WARM and detail and "first_ms" in detail:
                 suffix = f" cold {fmt_ms(detail['first_ms'])}"
@@ -194,8 +210,10 @@ def main() -> None:
             ms, status = results[qid].get(sys_, (None, "missing"))
             if ms is not None:
                 row.append(fmt_ms(ms))
+            elif is_skip_status(status):
+                row.append("SKIP")
             else:
-                row.append(f"FAIL")
+                row.append("FAIL")
         print("| " + " | ".join(row) + " |")
 
     # Final flush (also written incrementally above).

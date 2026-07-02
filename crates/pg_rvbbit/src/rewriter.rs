@@ -735,6 +735,7 @@ unsafe fn try_duck_backend_rewrite(
             | "duck_vortex"
             | "datafusion_hive"
             | "datafusion_vortex"
+            | "gpu_gqe"
             | "datafusion_mem"
     ) {
         log_route_probe(query_source, route_doc, route_probe.cache_hit, false);
@@ -807,6 +808,7 @@ fn candidate_runtime_available(candidate: &str) -> (bool, String) {
         "datafusion_mem" | "datafusion_vector" | "datafusion_hive" | "datafusion_vortex" => {
             duck_backend::datafusion_routes_available()
         }
+        "gpu_gqe" => duck_backend::gqe_routes_available(),
         _ => (
             true,
             "candidate does not require an external runtime".to_string(),
@@ -947,6 +949,7 @@ fn build_duck_backend_sql(
         "duck_vortex" => "rvbbit.duck_vortex_query_json",
         "datafusion_hive" => "rvbbit.datafusion_hive_query_json",
         "datafusion_vortex" => "rvbbit.datafusion_vortex_query_json",
+        "gpu_gqe" => "rvbbit.gpu_gqe_query_json",
         _ => "rvbbit.duck_query_json",
     };
     format!(

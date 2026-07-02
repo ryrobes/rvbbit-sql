@@ -101,6 +101,7 @@ start_shared_broker() {
         datafusion_vortex) engine="datafusion"; layout="vortex" ;;
         datafusion_hive) engine="datafusion"; layout="hive" ;;
         datafusion_vector) engine="datafusion"; layout="scan" ;;
+        gpu_gqe) engine="gpu_gqe"; layout="scan" ;;
         *)
             echo "shared broker autostart skipped for candidate=${candidate}" >&2
             return 0

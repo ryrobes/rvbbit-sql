@@ -481,6 +481,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0115_system_learning_brain_provider",
         include_str!("../sql/migrations/0115_system_learning_brain_provider.sql"),
     ),
+    (
+        "0116_gpu_gqe_route_candidate",
+        include_str!("../sql/migrations/0116_gpu_gqe_route_candidate.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

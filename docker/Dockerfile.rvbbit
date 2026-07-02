@@ -66,8 +66,11 @@ RUN --mount=type=cache,target=/build/target \
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/build/crates/rvbbit_duck/target \
     cargo build --release --locked --manifest-path crates/rvbbit_duck/Cargo.toml \
+        --bin rvbbit-duck \
     && cp crates/rvbbit_duck/target/release/rvbbit-duck /build/rvbbit-duck \
+    && cp crates/rvbbit_duck/target/release/rvbbit-duck /build/rvbbit-gqe-bridge \
     && strip --strip-unneeded /build/rvbbit-duck
+RUN strip --strip-unneeded /build/rvbbit-gqe-bridge
 
 # Runtime stage: clean PG18 image with the extension files dropped in.
 FROM postgres:18
@@ -87,7 +90,11 @@ COPY --from=builder /usr/share/postgresql/18/extension/pg_rvbbit* \
         /usr/share/postgresql/18/extension/
 COPY --from=builder /usr/lib/postgresql/18/lib/pg_rvbbit* \
         /usr/lib/postgresql/18/lib/
+RUN mkdir -p /opt/rvbbit/gqe/bin
 COPY --from=builder /build/rvbbit-duck /usr/local/bin/rvbbit-duck
+COPY --from=builder /build/rvbbit-gqe-bridge /opt/rvbbit/gqe/bin/rvbbit-gqe-bridge
+COPY docker/bin/rvbbit-gqe /usr/local/bin/rvbbit-gqe
+RUN chmod 0755 /usr/local/bin/rvbbit-gqe /opt/rvbbit/gqe/bin/rvbbit-gqe-bridge
 
 # Ship the built-in capability source packs alongside the catalog seed. The
 # database stores deploy manifests inline, but these files give packaged

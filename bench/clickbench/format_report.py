@@ -36,6 +36,7 @@ def c(code: str, s: str) -> str:
 
 BOLD_GREEN = "1;32"
 DIM_RED = "2;31"
+DIM_YELLOW = "2;33"
 DIM = "2"
 BOLD = "1"
 CYAN = "36"
@@ -68,6 +69,10 @@ def fmt_signed_seconds(ms: float | None) -> str:
         return "-"
     sign = "+" if ms >= 0 else "-"
     return f"{sign}{abs(ms) / 1000:.1f}s"
+
+
+def is_skip_status(status: str) -> bool:
+    return status.lower().startswith("skip")
 
 
 def load(path: str) -> dict[str, Any]:
@@ -105,6 +110,7 @@ def main() -> int:
     near_5_by_sys: dict[str, int] = {s: 0 for s in systems}
     near_10_by_sys: dict[str, int] = {s: 0 for s in systems}
     fails_by_sys: dict[str, int] = {s: 0 for s in systems}
+    skips_by_sys: dict[str, int] = {s: 0 for s in systems}
 
     # ---- Build the grid ---------------------------------------------
     headers = ["Query", "Description"] + systems
@@ -121,6 +127,8 @@ def main() -> int:
             if ms is not None:
                 valid.append((s, float(ms)))
                 times_by_sys[s].append(float(ms))
+            elif is_skip_status(str(status)):
+                skips_by_sys[s] += 1
             else:
                 fails_by_sys[s] += 1
         winner: str | None = None
@@ -132,7 +140,10 @@ def main() -> int:
         for s in systems:
             ms, status = q["results"].get(s, (None, "missing"))
             if ms is None:
-                cell = c(DIM_RED, "FAIL")
+                if is_skip_status(str(status)):
+                    cell = c(DIM_YELLOW, "SKIP")
+                else:
+                    cell = c(DIM_RED, "FAIL")
             else:
                 ms_f = float(ms)
                 if best_ms and best_ms > 0:
@@ -150,7 +161,7 @@ def main() -> int:
     print()
     print(c(BOLD, f"=== ClickBench results — {data.get('repeats', '?')} runs, median ==="))
     print(c(DIM, f"   systems: {', '.join(systems)}"))
-    print(c(DIM, f"   queries: {len(queries)}  (best per-row in green, FAIL in red)"))
+    print(c(DIM, f"   queries: {len(queries)}  (best per-row in green, SKIP in yellow, FAIL in red)"))
     print()
     print(tabulate(rows, headers=headers, tablefmt="rounded_grid", stralign="right",
                    maxcolwidths=[None, 40] + [None] * len(systems)))
@@ -203,6 +214,13 @@ def main() -> int:
         ],
     ))
     # Failures
+    summary_rows.append(_row(
+        "skipped",
+        [
+            c(DIM_YELLOW, str(skips_by_sys[s])) if skips_by_sys[s] > 0 else "0"
+            for s in systems
+        ],
+    ))
     summary_rows.append(_row(
         "failures",
         [

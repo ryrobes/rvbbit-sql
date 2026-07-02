@@ -37,6 +37,7 @@ PG_DSNS = {
     "rvbbit_datafusion_hive_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_hive",
     "rvbbit_datafusion_mem_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_mem",
     "rvbbit_datafusion_vortex_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Ddatafusion_vortex",
+    "rvbbit_gpu_gqe_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.route_force_candidate%3Dgpu_gqe%20-c%20rvbbit.route_gpu_gqe%3Don%20-c%20rvbbit.duck_backend_fail_open%3Doff",
     "rvbbit_pg_heap_forced": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
     "rvbbit_pg_heap": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
     "pg_heap": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
@@ -52,6 +53,7 @@ FORCED_SQL_CANDIDATES = {
     "rvbbit_datafusion_hive_forced": "datafusion_hive",
     "rvbbit_datafusion_mem_forced": "datafusion_mem",
     "rvbbit_datafusion_vortex_forced": "datafusion_vortex",
+    "rvbbit_gpu_gqe_forced": "gpu_gqe",
     # Native engine, vortex columnar layout. Same router Candidate as
     # rvbbit_native (no separate candidate until Phase 4) — the route assertion
     # confirms native was chosen; the native_vortex=on GUC in the DSN makes it
@@ -74,10 +76,12 @@ ROUTE_GUCS = {
     "RVBBIT_ROUTE_DATAFUSION_HIVE": "rvbbit.route_datafusion_hive",
     "RVBBIT_ROUTE_DATAFUSION_VORTEX": "rvbbit.route_datafusion_vortex",
     "RVBBIT_ROUTE_DATAFUSION_VORTEX_ALLOW_TEMPORAL": "rvbbit.route_datafusion_vortex_allow_temporal",
+    "RVBBIT_ROUTE_GPU_GQE": "rvbbit.route_gpu_gqe",
     "RVBBIT_ROUTE_HIVE": "rvbbit.route_hive",
     "RVBBIT_ROUTE_PG_ROWSTORE": "rvbbit.route_pg_rowstore",
     "RVBBIT_ROUTE_RVBBIT_NATIVE": "rvbbit.route_rvbbit_native",
     "RVBBIT_ROUTE_FORCE_CANDIDATE": "rvbbit.route_force_candidate",
+    "RVBBIT_GQE_BIN": "rvbbit.gqe_bin",
     "RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE": "rvbbit.route_hive_min_confidence",
     "RVBBIT_HOT_STORE_BUDGET_MB": "rvbbit.hot_store_budget_mb",
     "RVBBIT_HOT_STORE_ROUTE_MAX_ROWS": "rvbbit.hot_store_route_max_rows",

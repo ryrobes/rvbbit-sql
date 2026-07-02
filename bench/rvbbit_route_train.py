@@ -3,8 +3,8 @@
 Expected input is a normal benchmark `last_run.json` containing forced Rvbbit
 execution candidates (`rvbbit_native_forced` or legacy `rvbbit_native`,
 `rvbbit_duck_forced`,
-`rvbbit_datafusion_forced`, `rvbbit_datafusion_mem_forced`, and optionally
-`rvbbit_pg_heap_forced`). The output
+`rvbbit_datafusion_forced`, `rvbbit_datafusion_mem_forced`,
+`rvbbit_gpu_gqe_forced`, and optionally `rvbbit_pg_heap_forced`). The output
 is a JSON profile keyed by query shape, not by benchmark query id.
 """
 from __future__ import annotations
@@ -47,6 +47,7 @@ CANDIDATE_SYSTEMS = {
     "rvbbit_datafusion_mem_forced": "datafusion_mem",
     "rvbbit_datafusion_forced": "datafusion_vector",
     "rvbbit_datafusion_hive_forced": "datafusion_hive",
+    "rvbbit_gpu_gqe_forced": "gpu_gqe",
     "rvbbit_pg_heap_forced": "pg_rowstore",
     "rvbbit_pg_heap": "pg_rowstore",
     "pg_heap": "pg_rowstore",
@@ -292,6 +293,7 @@ def build_profile(
                         "datafusion_mem_ms": candidate_ms.get("datafusion_mem"),
                         "datafusion_ms": candidate_ms.get("datafusion_vector"),
                         "datafusion_hive_ms": candidate_ms.get("datafusion_hive"),
+                        "gpu_gqe_ms": candidate_ms.get("gpu_gqe"),
                         "pg_ms": candidate_ms.get("pg_rowstore"),
                         "winner": winner,
                         "routable_winner": choice,
@@ -363,6 +365,11 @@ def build_profile(
                 if "datafusion_hive" in candidate_medians
                 else None
             ),
+            "gpu_gqe_ms_median": (
+                round(candidate_medians["gpu_gqe"], 4)
+                if "gpu_gqe" in candidate_medians
+                else None
+            ),
             "pg_ms_median": (
                 round(candidate_medians["pg_rowstore"], 4)
                 if "pg_rowstore" in candidate_medians
@@ -403,6 +410,7 @@ def build_profile(
         "datafusion_mem_system": "rvbbit_datafusion_mem_forced",
         "datafusion_system": "rvbbit_datafusion_forced",
         "datafusion_hive_system": "rvbbit_datafusion_hive_forced",
+        "gpu_gqe_system": "rvbbit_gpu_gqe_forced",
         "pg_heap_system": "rvbbit_pg_heap_forced",
         "pg_heap_observation_only": not ALLOW_PG_HEAP_CHOICES,
         "min_gain_pct": min_gain_pct,
@@ -451,6 +459,7 @@ def main() -> None:
             f"datafusion_mem={entry.get('datafusion_mem_ms_median')}ms "
             f"datafusion={entry.get('datafusion_ms_median')}ms "
             f"datafusion_hive={entry.get('datafusion_hive_ms_median')}ms "
+            f"gpu_gqe={entry.get('gpu_gqe_ms_median')}ms "
             f"pg_heap={entry.get('pg_ms_median')}ms "
             f"oracle={entry.get('oracle_choice')} qids={qids} key={key}"
         )

@@ -1,0 +1,12 @@
+# Optional GPU override for local GPU/GQE experiments.
+#
+# Use only on hosts with the NVIDIA container toolkit installed. The default
+# compose files deliberately omit this so CPU-only machines keep starting
+# pg-rvbbit normally.
+
+services:
+  pg-rvbbit:
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}

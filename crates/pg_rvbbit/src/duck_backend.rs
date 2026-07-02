@@ -30,6 +30,7 @@ use serde_json::{json, Map, Value};
 use std::ffi::{CStr, CString, OsStr};
 
 const DEFAULT_DUCK_BIN: &str = "/usr/local/bin/rvbbit-duck";
+const DEFAULT_GQE_BIN: &str = "/usr/local/bin/rvbbit-gqe";
 const DEFAULT_MAX_ROWS: i32 = 100_000;
 const DEFAULT_TIMEOUT_S: i32 = 300;
 
@@ -154,6 +155,12 @@ pub(crate) fn duck_backend_config_enabled() -> bool {
     enabled
 }
 
+pub(crate) fn gqe_backend_config_enabled() -> bool {
+    guc_setting("rvbbit.gpu_gqe_backend")
+        .map(|value| setting_enabled(&value, true))
+        .unwrap_or_else(|| env_enabled("RVBBIT_GPU_GQE_BACKEND", true))
+}
+
 pub(crate) fn backend_enabled() -> bool {
     duck_backend_config_enabled() && duck_binary().is_some()
 }
@@ -199,12 +206,30 @@ pub(crate) fn datafusion_routes_available() -> (bool, String) {
     }
 }
 
+pub(crate) fn gqe_routes_available() -> (bool, String) {
+    if !gqe_backend_config_enabled() {
+        return (
+            false,
+            "GPU/GQE routes are disabled by rvbbit.gpu_gqe_backend".to_string(),
+        );
+    }
+    match gqe_binary() {
+        Some(path) => probe_gqe_binary(&path),
+        None => (
+            false,
+            "rvbbit-gqe binary not found; GPU/GQE routes are unavailable".to_string(),
+        ),
+    }
+}
+
 pub(crate) fn accelerator_route_runtime_stamp() -> String {
     format!(
-        "duck_cfg:{}|duck_bin:{}|df_inproc:{}|shared:{}|native_vortex:{}",
+        "duck_cfg:{}|duck_bin:{}|df_inproc:{}|gqe_cfg:{}|gqe_bin:{}|shared:{}|native_vortex:{}",
         duck_backend_config_enabled(),
         duck_binary().as_deref().unwrap_or("missing"),
         datafusion_inprocess_enabled(),
+        gqe_backend_config_enabled(),
+        gqe_binary().as_deref().unwrap_or("missing"),
         shared_enabled(),
         native_vortex_enabled()
     )
@@ -390,6 +415,85 @@ fn duck_binary() -> Option<String> {
     find_executable_on_path("rvbbit-duck", std::env::var_os("PATH").as_deref())
 }
 
+fn gqe_binary() -> Option<String> {
+    if let Some(configured) = guc_setting("rvbbit.gqe_bin").filter(|value| !value.trim().is_empty())
+    {
+        return resolve_duck_binary_candidate(&configured);
+    }
+    if let Some(configured) = std::env::var("RVBBIT_GQE_BIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return resolve_duck_binary_candidate(&configured);
+    }
+    if executable_file(Path::new(DEFAULT_GQE_BIN)) {
+        return Some(DEFAULT_GQE_BIN.to_string());
+    }
+    find_executable_on_path("rvbbit-gqe", std::env::var_os("PATH").as_deref())
+}
+
+fn probe_gqe_binary(path: &str) -> (bool, String) {
+    let mut child = match Command::new(path)
+        .arg("--rvbbit-probe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => return (false, format!("rvbbit-gqe probe failed to start: {err}")),
+    };
+    let output = match wait_child_output_with_timeout(
+        &mut child,
+        5,
+        "rvbbit-gqe probe",
+        Duration::from_secs(5),
+    ) {
+        Ok(output) => output,
+        Err(err) => return (false, err),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed = serde_json::from_str::<Value>(stdout.trim()).ok();
+    if let Some(value) = parsed {
+        let status = value.get("status").and_then(Value::as_str).unwrap_or("");
+        let detail = value
+            .get("detail")
+            .or_else(|| value.get("reason"))
+            .or_else(|| value.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("rvbbit-gqe probe returned no detail");
+        return match status {
+            "ok" | "available" => (true, detail.to_string()),
+            "unavailable" | "error" => (false, detail.to_string()),
+            other => (
+                false,
+                format!("rvbbit-gqe probe returned unknown status {other:?}: {detail}"),
+            ),
+        };
+    }
+    if output.status.success() {
+        (
+            false,
+            "rvbbit-gqe probe succeeded but returned no JSON status".to_string(),
+        )
+    } else {
+        let stderr_line = first_line(&stderr);
+        let detail = if stderr_line.is_empty() {
+            "no stderr"
+        } else {
+            stderr_line
+        };
+        (false, format!("rvbbit-gqe probe failed: {detail}"))
+    }
+}
+
+fn gqe_route_gate_enabled() -> bool {
+    guc_setting("rvbbit.route_gpu_gqe")
+        .map(|value| setting_enabled(&value, false))
+        .unwrap_or_else(|| env_enabled("RVBBIT_ROUTE_GPU_GQE", false))
+}
+
 fn raw_shared_targets() -> String {
     guc_setting("rvbbit.duck_backend_shared_targets")
         .or_else(|| std::env::var("RVBBIT_DUCK_BACKEND_SHARED_TARGETS").ok())
@@ -400,6 +504,23 @@ pub(crate) fn accelerator_runtime_status_value(live: bool) -> Value {
     let duck_config_enabled = duck_backend_config_enabled();
     let duck_binary = duck_binary();
     let duck_routes_available = duck_config_enabled && duck_binary.is_some();
+    let gqe_config_enabled = gqe_backend_config_enabled();
+    let gqe_binary = gqe_binary();
+    let (gqe_routes_available, gqe_reason) = if gqe_config_enabled {
+        match gqe_binary.as_deref() {
+            Some(path) => probe_gqe_binary(path),
+            None => (
+                false,
+                "rvbbit-gqe binary not found; GPU/GQE routes are unavailable".to_string(),
+            ),
+        }
+    } else {
+        (
+            false,
+            "GPU/GQE routes are disabled by rvbbit.gpu_gqe_backend".to_string(),
+        )
+    };
+    let gqe_route_gate_enabled = gqe_route_gate_enabled();
     let df_inprocess = datafusion_inprocess_enabled();
     let datafusion_routes_available = df_inprocess || duck_routes_available;
     let shared = shared_enabled();
@@ -418,6 +539,13 @@ pub(crate) fn accelerator_runtime_status_value(live: bool) -> Value {
             "severity": "warn",
             "action": "enable_datafusion_or_install_sidecar",
             "detail": "Enable rvbbit.df_inprocess or install rvbbit-duck; otherwise DataFusion routes are unavailable and routing falls back to native/PostgreSQL paths."
+        }));
+    }
+    if gqe_route_gate_enabled && gqe_config_enabled && !gqe_routes_available {
+        recommendations.push(json!({
+            "severity": "warn",
+            "action": "install_rvbbit_gqe",
+            "detail": format!("GPU/GQE routing is enabled but unavailable: {gqe_reason}")
         }));
     }
 
@@ -447,6 +575,7 @@ pub(crate) fn accelerator_runtime_status_value(live: bool) -> Value {
 
     let status = if (!datafusion_routes_available && !duck_routes_available)
         || (shared && duck_routes_available && live && shared_online == Some(false))
+        || (gqe_route_gate_enabled && !gqe_routes_available)
     {
         "warn"
     } else {
@@ -474,6 +603,16 @@ pub(crate) fn accelerator_runtime_status_value(live: bool) -> Value {
                 "unavailable"
             },
             "impact_if_unavailable": "DataFusion candidates are skipped; routing falls back to Duck, native Rvbbit, or PostgreSQL rowstore when available."
+        },
+        "gpu_gqe": {
+            "config_enabled": gqe_config_enabled,
+            "route_gate_enabled": gqe_route_gate_enabled,
+            "binary_found": gqe_binary.is_some(),
+            "binary_path": gqe_binary,
+            "routes_available": gqe_routes_available,
+            "reason": gqe_reason,
+            "protocol": "rvbbit sidecar JSON/Arrow IPC bridge",
+            "impact_if_unavailable": "gpu_gqe is skipped unless forced; native Rvbbit and PostgreSQL rowstore remain available."
         },
         "native": {
             "custom_scan_available": true,
@@ -585,6 +724,11 @@ fn datafusion_mem_query_json(query: &str, column_names: JsonB, max_rows: i32) ->
     engine_query_json("datafusion", "mem", query, column_names, max_rows)
 }
 
+#[pg_extern(volatile)]
+fn gpu_gqe_query_json(query: &str, column_names: JsonB, max_rows: i32) -> JsonB {
+    engine_query_json("gpu_gqe", "scan", query, column_names, max_rows)
+}
+
 fn engine_query_json(
     engine: &str,
     layout: &str,
@@ -632,37 +776,81 @@ fn engine_query_json(
     let mut payload = if let Some(p) = inprocess_payload {
         p
     } else {
-        if !duck_backend_config_enabled() {
-            return fail_open_or_error(
+        if engine == "gpu_gqe" {
+            if !gqe_backend_config_enabled() {
+                return fail_open_or_error(
+                    engine,
+                    query,
+                    max_rows,
+                    "GPU/GQE sidecar routes are disabled by rvbbit.gpu_gqe_backend",
+                );
+            }
+            let binary = match gqe_binary() {
+                Some(binary) => binary,
+                None => {
+                    return fail_open_or_error(
+                        engine,
+                        query,
+                        max_rows,
+                        "rvbbit-gqe binary not found",
+                    );
+                }
+            };
+            let dsn = duck_dsn();
+            let timeout = timeout_s();
+            sidecar_context = Some((binary.clone(), dsn.clone(), timeout));
+            match run_engine_query(
                 engine,
+                layout,
+                &binary,
+                &dsn,
                 query,
                 max_rows,
-                "rvbbit-duck sidecar routes are disabled by rvbbit.duck_backend",
-            );
-        }
-        let binary = match duck_binary() {
-            Some(binary) => binary,
-            None => {
-                return fail_open_or_error(engine, query, max_rows, "rvbbit-duck binary not found");
+                timeout,
+                threads,
+                result_format,
+            ) {
+                Ok(p) => p,
+                Err(err) => return fail_open_or_error(engine, query, max_rows, &err),
             }
-        };
-        let dsn = duck_dsn();
-        let timeout = timeout_s();
-        sidecar_context = Some((binary.clone(), dsn.clone(), timeout));
-        match run_engine_query(
-            engine,
-            layout,
-            &binary,
-            &dsn,
-            query,
-            max_rows,
-            timeout,
-            threads,
-            result_format,
-        ) {
-            Ok(p) => p,
-            // ops-03: vortex sidecar errors fall open to native/heap like every other layout.
-            Err(err) => return fail_open_or_error(engine, query, max_rows, &err),
+        } else {
+            if !duck_backend_config_enabled() {
+                return fail_open_or_error(
+                    engine,
+                    query,
+                    max_rows,
+                    "rvbbit-duck sidecar routes are disabled by rvbbit.duck_backend",
+                );
+            }
+            let binary = match duck_binary() {
+                Some(binary) => binary,
+                None => {
+                    return fail_open_or_error(
+                        engine,
+                        query,
+                        max_rows,
+                        "rvbbit-duck binary not found",
+                    );
+                }
+            };
+            let dsn = duck_dsn();
+            let timeout = timeout_s();
+            sidecar_context = Some((binary.clone(), dsn.clone(), timeout));
+            match run_engine_query(
+                engine,
+                layout,
+                &binary,
+                &dsn,
+                query,
+                max_rows,
+                timeout,
+                threads,
+                result_format,
+            ) {
+                Ok(p) => p,
+                // ops-03: vortex sidecar errors fall open to native/heap like every other layout.
+                Err(err) => return fail_open_or_error(engine, query, max_rows, &err),
+            }
         }
     };
 
@@ -760,6 +948,7 @@ fn engine_query_json(
             ("datafusion", "hive") => "datafusion_hive",
             ("datafusion", "vortex") => "datafusion_vortex",
             ("datafusion", _) => "datafusion_vector",
+            ("gpu_gqe", _) => "gpu_gqe",
             ("duck", "vortex") => "duck_vortex",
             (_, "hive") => "duck_hive",
             _ => "duck_vector",

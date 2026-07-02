@@ -1,0 +1,126 @@
+# Optional GPU/GQE-enabled pg-rvbbit image.
+#
+# This extends a previously built pg-rvbbit image with NVIDIA GQE's build and
+# runtime environment. The normal pg-rvbbit image deliberately stays CPU-safe and
+# small; use this Dockerfile only for GPU/GQE experiments.
+#
+# Build order:
+#   1. docker compose -f docker/docker-compose.yml build pg-rvbbit
+#   2. docker compose -f docker/docker-compose.yml -f docker/docker-compose.gqe-image.yml build pg-rvbbit
+#
+# GQE's upstream Dockerfile is a development image that builds libcudf and MLIR
+# before building GQE itself. This file adapts that flow onto the pg-rvbbit
+# runtime image so /usr/local/bin/rvbbit-gqe can run gqe-cli and auto-start the
+# GQE node manager from inside the PostgreSQL container.
+
+ARG RVBBIT_BASE_IMAGE=docker-pg-rvbbit
+FROM ${RVBBIT_BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PARALLEL_LEVEL
+ARG GQE_REPO=https://github.com/rapidsai/gqe.git
+ARG GQE_REF=main
+ARG CUDF_REF=v26.06.01
+ARG SCCACHE_VERSION=0.15.0
+
+WORKDIR /
+
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        build-essential \
+        ninja-build \
+        wget \
+        sudo \
+        gosu \
+        git \
+        vim \
+        ccache \
+        libpciaccess-dev \
+        pciutils \
+        ca-certificates \
+        gnupg \
+        file \
+        pkg-config \
+        binutils \
+        binutils-dev \
+        openssh-client \
+        openmpi-bin \
+        libopenmpi-dev \
+        gcc-14 \
+        g++-14 \
+        gdb \
+        sqlite3 \
+        ncat \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh" -O /miniforge.sh \
+    && sh /miniforge.sh -b -p /conda \
+    && rm /miniforge.sh \
+    && /conda/bin/conda init bash --system
+
+ENV PATH="/conda/bin:${PATH}"
+SHELL ["/bin/bash", "-c"]
+
+RUN git clone --depth 1 --branch "${GQE_REF}" "${GQE_REPO}" /opt/gqe-src
+
+# Compile libcudf with PTDS enabled, matching NVIDIA GQE's Dockerfile. GQE uses
+# libcudf heavily, and the upstream docs call out PTDS as required for overlap.
+# cudf/build.sh expects literal quotes inside the --cmake-args token.
+RUN git clone --branch "${CUDF_REF}" https://github.com/rapidsai/cudf.git /cudf \
+    && cd /cudf \
+    && git submodule update --init --recursive \
+    && mamba env create -q --name gqe --file "/opt/gqe-src/conda/docker-$(uname -m).yml" \
+    && source activate gqe \
+    && conda install -y libnvcomp-dev=5.2.0.10 \
+    && PARALLEL_LEVEL=${PARALLEL_LEVEL:-$(nproc)} CUDF_CMAKE_CUDA_ARCHITECTURES="80-real;90-real;100-real;120" ./build.sh libcudf --ptds '--cmake-args=" -DCUDF_ENABLE_ARROW_S3=OFF -DBUILD_BENCHMARKS=OFF -DCUDA_ENABLE_LINEINFO=ON "' \
+    && conda remove libnvcomp-dev libnvcomp -y \
+    && conda clean --all
+
+RUN git clone https://github.com/llvm/llvm-project.git /llvm-project \
+    && cd /llvm-project \
+    && git checkout llvmorg-20.1.2 \
+    && mkdir build \
+    && cd build \
+    && source activate gqe \
+    && cmake -G Ninja ../llvm \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLVM_ENABLE_PROJECTS=mlir \
+        -DLLVM_BUILD_EXAMPLES=OFF \
+        -DLLVM_TARGETS_TO_BUILD="Native;NVPTX" \
+        -DLLVM_ENABLE_ASSERTIONS=ON \
+        -DLLVM_USE_SPLIT_DWARF=ON \
+        -DLLVM_ENABLE_RTTI=ON \
+        -DMLIR_ENABLE_CUDA_CONVERSIONS=ON \
+        -DMLIR_ENABLE_CUDA_RUNNER=ON \
+    && cmake --build . --target install \
+    && rm -rf /llvm-project
+
+RUN source activate gqe \
+    && cargo install sccache --version "${SCCACHE_VERSION}" --locked --root /usr/local --no-default-features \
+    && mkdir -p /root/.config/sccache \
+    && touch /root/.config/sccache/config
+
+RUN mv /opt/gqe-src /opt/gqe \
+    && mkdir -p /opt/gqe/build \
+    && cd /opt/gqe/build \
+    && source activate gqe \
+    && cmake -G Ninja -DCMAKE_BUILD_TYPE=Release .. \
+    && cmake --build . \
+    && cd /opt/gqe/rust \
+    && source activate gqe \
+    && cargo build --release -p gqe-cli \
+    && test -x /opt/gqe/rust/target/release/gqe-cli \
+    && test -x /opt/gqe/build/src/node_manager/gqe_node_manager \
+    && test -x /opt/gqe/build/src/task_manager/gqe_task_manager
+
+ENV PATH="/conda/envs/gqe/bin:/conda/bin:/opt/gqe/rust/target/release:${PATH}"
+ENV LD_LIBRARY_PATH="/conda/envs/gqe/lib:/usr/local/lib"
+ENV RVBBIT_GQE_CLI=/opt/gqe/rust/target/release/gqe-cli
+ENV RVBBIT_GQE_NODE_MANAGER=/opt/gqe/build/src/node_manager/gqe_node_manager
+ENV RVBBIT_GQE_TASK_MANAGER=/opt/gqe/build/src/task_manager/gqe_task_manager
+ENV RVBBIT_GQE_SERVER_URL=http://127.0.0.1:50051
+ENV RVBBIT_GQE_AUTO_START=true
+
+RUN echo "source activate gqe" >> /root/.bashrc

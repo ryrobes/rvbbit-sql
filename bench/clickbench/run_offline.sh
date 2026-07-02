@@ -66,15 +66,84 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${REPO_ROOT}"
 
-COMPOSE="docker compose -f docker/docker-compose.yml -f docker/docker-compose.competitors.yml"
 DATA_DIR="bench/columnar_comparison/data"
 HITS_URL="https://datasets.clickhouse.com/hits_compatible/hits.parquet"
 HITS="${DATA_DIR}/hits.parquet"
 
 LIMIT="${BENCH_LIMIT:-10000000}"
 SYSTEMS="${BENCH_SYSTEMS:-rvbbit,duckdb,clickhouse,pg_baseline,citus,hydra,alloydb}"
+GPU_GQE_SELECTED=0
+if [[ ",${SYSTEMS}," == *",rvbbit_gpu_gqe_forced,"* ]]; then
+    GPU_GQE_SELECTED=1
+fi
+HOST_NVIDIA_GPU=0
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    HOST_NVIDIA_GPU=1
+fi
+DOCKER_NVIDIA_RUNTIME=0
+if command -v docker >/dev/null 2>&1 \
+    && docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi '"nvidia"'; then
+    DOCKER_NVIDIA_RUNTIME=1
+fi
+GPU_COMPOSE_READY=0
+if [ "${HOST_NVIDIA_GPU}" = "1" ] && [ "${DOCKER_NVIDIA_RUNTIME}" = "1" ]; then
+    GPU_COMPOSE_READY=1
+fi
+COMPOSE="docker compose -f docker/docker-compose.yml -f docker/docker-compose.competitors.yml"
+GPU_COMPOSE_DISPLAY="off"
+GPU_COMPOSE_ALLOWED=1
+GQE_HOST_MOUNT_DISPLAY="off"
+GQE_IMAGE_DISPLAY="off"
+GQE_IMAGE_SELECTED=0
+case "${RVBBIT_GPU_GQE_COMPOSE:-auto}" in
+    0|false|FALSE|no|NO|off|OFF|disabled|DISABLED)
+        GPU_COMPOSE_ALLOWED=0
+        ;;
+    *) ;;
+esac
+if [ "${GPU_GQE_SELECTED}" = "1" ]; then
+    if [ -n "${RVBBIT_GQE_HOME:-}" ]; then
+        COMPOSE="${COMPOSE} -f docker/docker-compose.gqe-host.yml"
+        GQE_HOST_MOUNT_DISPLAY="${RVBBIT_GQE_HOME}"
+    else
+        case "${RVBBIT_GPU_GQE_INSTALL:-auto}" in
+            0|false|FALSE|no|NO|off|OFF|disabled|DISABLED)
+                GQE_IMAGE_DISPLAY="off"
+                ;;
+            host|HOST)
+                GQE_IMAGE_DISPLAY="host-missing"
+                ;;
+            1|true|TRUE|yes|YES|on|ON|image|IMAGE)
+                COMPOSE="${COMPOSE} -f docker/docker-compose.gqe-image.yml"
+                GQE_IMAGE_DISPLAY="${RVBBIT_GQE_PG_IMAGE:-docker-pg-rvbbit-gqe}"
+                GQE_IMAGE_SELECTED=1
+                ;;
+            *)
+                if [ "${GPU_COMPOSE_READY}" = "1" ] && [ "${GPU_COMPOSE_ALLOWED}" = "1" ]; then
+                    COMPOSE="${COMPOSE} -f docker/docker-compose.gqe-image.yml"
+                    GQE_IMAGE_DISPLAY="${RVBBIT_GQE_PG_IMAGE:-docker-pg-rvbbit-gqe} (auto)"
+                    GQE_IMAGE_SELECTED=1
+                elif [ "${GPU_COMPOSE_READY}" = "1" ]; then
+                    GQE_IMAGE_DISPLAY="auto-gpu-compose-off"
+                elif [ "${HOST_NVIDIA_GPU}" = "1" ]; then
+                    GQE_IMAGE_DISPLAY="auto-no-docker-gpu"
+                else
+                    GQE_IMAGE_DISPLAY="auto-no-gpu"
+                fi
+                ;;
+        esac
+    fi
+fi
+if [ "${GPU_GQE_SELECTED}" = "1" ]; then
+    if [ "${GQE_IMAGE_SELECTED}" = "1" ]; then
+        GPU_COMPOSE_DISPLAY="gqe-image"
+    elif [ "${GPU_COMPOSE_READY}" = "1" ] && [ "${GPU_COMPOSE_ALLOWED}" = "1" ]; then
+        COMPOSE="${COMPOSE} -f docker/docker-compose.gpu.yml"
+        GPU_COMPOSE_DISPLAY="on"
+    fi
+fi
 RVBBIT_SELECTED=0
-if [[ ",${SYSTEMS}," == *",rvbbit,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hot,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_auto,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_mem_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_vortex,"* ]]; then
+if [[ ",${SYSTEMS}," == *",rvbbit,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hot,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_auto,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_duck_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_hive_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_vortex_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_datafusion_mem_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_gpu_gqe_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap_forced,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",pg_heap,"* ]] || [[ ",${SYSTEMS}," == *",rvbbit_native_vortex,"* ]]; then
     RVBBIT_SELECTED=1
 fi
 HIVE_FORCED_SELECTED=0
@@ -125,6 +194,7 @@ DUCK_HOT_ENV=()
 [ -n "${RVBBIT_ROUTE_PG_ROWSTORE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_PG_ROWSTORE=${RVBBIT_ROUTE_PG_ROWSTORE}")
 [ -n "${RVBBIT_ROUTE_RVBBIT_NATIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_RVBBIT_NATIVE=${RVBBIT_ROUTE_RVBBIT_NATIVE}")
 [ -n "${RVBBIT_ROUTE_FORCE_CANDIDATE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_FORCE_CANDIDATE=${RVBBIT_ROUTE_FORCE_CANDIDATE}")
+[ -n "${RVBBIT_GQE_BIN:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_GQE_BIN=${RVBBIT_GQE_BIN}")
 [ -n "${RVBBIT_NATIVE_ROUTER:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_NATIVE_ROUTER=${RVBBIT_NATIVE_ROUTER}")
 [ -n "${RVBBIT_ROUTE_OBSERVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_OBSERVE=${RVBBIT_ROUTE_OBSERVE}")
 [ -n "${RVBBIT_ROUTE_EXPLORE_PCT:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_EXPLORE_PCT=${RVBBIT_ROUTE_EXPLORE_PCT}")
@@ -189,6 +259,14 @@ REPORT_FILE="bench/clickbench/results/clickbench_${LIMIT}_${STAMP}.txt"
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m!! %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[1;31mXX %s\033[0m\n' "$*" >&2; exit 1; }
+system_selected() {
+    [[ ",${SYSTEMS}," == *",$1,"* ]]
+}
+sql_literal() {
+    local value
+    value="$(printf "%s" "${1:-}" | sed "s/'/''/g")"
+    printf "'%s'" "${value}"
+}
 env_on() {
     case "${1:-}" in
         1|true|TRUE|yes|YES|on|ON) return 0 ;;
@@ -265,6 +343,45 @@ SELECT rvbbit.refresh_layout_variants('hits'::regclass);
 SQL
     if [ "$(clickbench_hive_variants_ready)" != "t" ]; then
         die "forced-Hive variants are still missing for public.hits after refresh"
+    fi
+}
+ensure_clickbench_gpu_gqe_available() {
+    system_selected "rvbbit_gpu_gqe_forced" || return 0
+    say "checking GPU/GQE bridge availability"
+    local status_line routes_available binary_found binary_path reason
+    local gqe_bin_lit
+    gqe_bin_lit="$(sql_literal "${RVBBIT_GQE_BIN:-}")"
+    if ! status_line="$(${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -Atq -F '|' -v ON_ERROR_STOP=1 -c "
+        WITH configured AS (
+            SELECT pg_catalog.set_config('rvbbit.gqe_bin', ${gqe_bin_lit}, false)
+            WHERE ${gqe_bin_lit} <> ''
+        ),
+        status AS (
+            SELECT rvbbit.accelerator_runtime_status(false) AS value
+        )
+        SELECT coalesce(value->'gpu_gqe'->>'routes_available', 'false'),
+               coalesce(value->'gpu_gqe'->>'binary_found', 'false'),
+               coalesce(value->'gpu_gqe'->>'binary_path', ''),
+               coalesce(value->'gpu_gqe'->>'reason', '')
+        FROM status, (SELECT count(*) FROM configured) AS applied;
+    " | tr -d '\r')"; then
+        if env_on "${RVBBIT_REQUIRE_GPU_GQE:-}"; then
+            die "rvbbit_gpu_gqe_forced selected, but GPU/GQE status could not be read"
+        fi
+        warn "rvbbit_gpu_gqe_forced selected, but GPU/GQE status could not be read; marking it SKIP"
+        QUERIES_ENV+=(-e "RVBBIT_GPU_GQE_SKIP_REASON=GPU/GQE status unavailable")
+    else
+        IFS='|' read -r routes_available binary_found binary_path reason <<< "${status_line}"
+        if [ "${routes_available}" = "true" ] || [ "${routes_available}" = "t" ]; then
+            echo "   gpu_gqe    : available (${binary_path:-rvbbit-gqe on PATH})"
+            return 0
+        fi
+        if env_on "${RVBBIT_REQUIRE_GPU_GQE:-}"; then
+            die "rvbbit_gpu_gqe_forced selected, but gpu_gqe is unavailable (binary_found=${binary_found}, binary_path=${binary_path:-missing}, reason=${reason:-unknown})"
+        fi
+        warn "rvbbit_gpu_gqe_forced selected, but gpu_gqe is unavailable; marking it SKIP (${reason:-unknown})"
+        warn "set RVBBIT_REQUIRE_GPU_GQE=1 to fail instead, or install GQE under /opt/gqe / set RVBBIT_GQE_CLI and RVBBIT_GQE_SERVER_URL"
+        QUERIES_ENV+=(-e "RVBBIT_GPU_GQE_SKIP_REASON=${reason:-rvbbit-gqe bridge unavailable}")
     fi
 }
 record_benchmark_history() {
@@ -363,6 +480,9 @@ echo "   route import: $(env_on "${RVBBIT_LOAD_ROUTE_PROFILE}" && echo yes || ec
 echo "   rebuild     : $(env_on "${BENCH_REBUILD}" && echo yes || echo no)"
 echo "   persist     : $(env_on "${BENCH_PERSIST_RESULTS}" && echo yes || echo no)"
 echo "   df_inprocess: ${RVBBIT_DF_INPROCESS:-on (default)}"
+echo "   gpu compose : ${GPU_COMPOSE_DISPLAY}"
+echo "   gqe image   : ${GQE_IMAGE_DISPLAY}"
+echo "   gqe home    : ${GQE_HOST_MOUNT_DISPLAY}"
 echo "   hive refresh: ${HIVE_REFRESH_DISPLAY}"
 echo "   vortex      : ${VORTEX_LAYOUT_DISPLAY}"
 echo "   hot store   : budget=${RVBBIT_HOT_STORE_BUDGET_MB:-512}MB route_max_rows=${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS:-500000}"
@@ -396,6 +516,10 @@ say "hits.parquet present: ${HITS_SIZE}"
 
 # ---- 2. Bring up containers ------------------------------------------------
 if env_on "${BENCH_REBUILD}"; then
+    if [ "${GQE_IMAGE_SELECTED}" = "1" ]; then
+        say "rebuilding base pg-rvbbit image for GPU/GQE image"
+        docker compose -f docker/docker-compose.yml build pg-rvbbit
+    fi
     say "rebuilding pg-rvbbit + bench images from current source"
     # Build serially: pg-rvbbit's cargo build pulls a large dep graph;
     # bench is small. No need to parallelize.
@@ -437,6 +561,8 @@ SQL
             --name bench-combined
     fi
 fi
+
+ensure_clickbench_gpu_gqe_available
 
 # ---- 4. Load --------------------------------------------------------------
 if [ -z "${SKIP_LOAD:-}" ]; then

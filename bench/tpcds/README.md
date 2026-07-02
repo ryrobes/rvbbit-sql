@@ -27,7 +27,9 @@ Environment:
   `rvbbit_duck_forced`, `rvbbit_datafusion_forced`,
   `rvbbit_datafusion_hive_forced`, `rvbbit_duck_hive_forced`,
   `rvbbit_datafusion_vortex_forced`, `rvbbit_duck_vortex_forced`,
-  `rvbbit_datafusion_mem_forced`, and `rvbbit_pg_heap_forced`.
+  `rvbbit_datafusion_mem_forced`, `rvbbit_gpu_gqe_forced`, and
+  `rvbbit_pg_heap_forced`. `rvbbit_gpu_gqe_forced` requires `rvbbit-gqe`
+  or `RVBBIT_GQE_BIN`.
   `clickhouse` is available as an explicit opt-in, but DuckDB's bundled
   TPC-DS templates contain some query forms ClickHouse does not currently
   accept without deeper query rewrites.

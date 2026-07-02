@@ -1,0 +1,14 @@
+# Optional host-built NVIDIA GQE mount for local GPU/GQE experiments.
+#
+# Build GQE on the host or in NVIDIA's GQE development container, then run
+# ClickBench with RVBBIT_GQE_HOME=/path/to/gqe. The pg-rvbbit container will see
+# the build at /opt/gqe, matching the bridge defaults.
+
+services:
+  pg-rvbbit:
+    volumes:
+      - ${RVBBIT_GQE_HOME:?set RVBBIT_GQE_HOME to a host GQE checkout/build}:/opt/gqe:ro
+    environment:
+      RVBBIT_GQE_CLI: ${RVBBIT_GQE_CLI:-/opt/gqe/rust/target/release/gqe-cli}
+      RVBBIT_GQE_NODE_MANAGER: ${RVBBIT_GQE_NODE_MANAGER:-/opt/gqe/build/src/node_manager/gqe_node_manager}
+      RVBBIT_GQE_TASK_MANAGER: ${RVBBIT_GQE_TASK_MANAGER:-/opt/gqe/build/src/task_manager/gqe_task_manager}

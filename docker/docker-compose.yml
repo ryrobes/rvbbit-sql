@@ -59,6 +59,7 @@ services:
       retries: 20
 
   pg-rvbbit:
+    image: ${RVBBIT_PG_IMAGE:-docker-pg-rvbbit}
     build:
       context: ..
       dockerfile: docker/Dockerfile.rvbbit
@@ -74,6 +75,15 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       RVBBIT_DUCK_BACKEND: ${RVBBIT_DUCK_BACKEND:-true}
+      RVBBIT_GPU_GQE_BACKEND: ${RVBBIT_GPU_GQE_BACKEND:-true}
+      RVBBIT_GQE_BIN: ${RVBBIT_GQE_BIN:-}
+      RVBBIT_GQE_BRIDGE_BIN: ${RVBBIT_GQE_BRIDGE_BIN:-}
+      RVBBIT_GQE_CLI: ${RVBBIT_GQE_CLI:-}
+      RVBBIT_GQE_NODE_MANAGER: ${RVBBIT_GQE_NODE_MANAGER:-}
+      RVBBIT_GQE_TASK_MANAGER: ${RVBBIT_GQE_TASK_MANAGER:-}
+      RVBBIT_GQE_SERVER_URL: ${RVBBIT_GQE_SERVER_URL:-}
+      RVBBIT_GQE_AUTO_START: ${RVBBIT_GQE_AUTO_START:-true}
+      RVBBIT_GQE_NUM_GPUS: ${RVBBIT_GQE_NUM_GPUS:-}
       # security-01: when set, the backend sends this bearer token on every MCP
       # gateway request; set the SAME value on the mcp-gateway service to enforce
       # auth. Empty (dev default) = the gateway runs open on the internal network.

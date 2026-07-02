@@ -666,6 +666,10 @@ PATH_TO_CANDIDATE = {
     "datafusion_hive": "datafusion_hive",
     "datafusion-hive": "datafusion_hive",
     "df_hive": "datafusion_hive",
+    "gpu_gqe": "gpu_gqe",
+    "gpu-gqe": "gpu_gqe",
+    "gqe": "gpu_gqe",
+    "gqe_parquet": "gpu_gqe",
     "pg": "pg_rowstore",
     "heap": "pg_rowstore",
     "pg_heap": "pg_rowstore",
@@ -681,6 +685,7 @@ CANDIDATE_TO_PATH = {
     "datafusion_mem": "datafusion_mem",
     "datafusion_vector": "datafusion",
     "datafusion_hive": "datafusion_hive",
+    "gpu_gqe": "gpu_gqe",
     "pg_rowstore": "pg_heap",
 }
 ROUTABLE_CANDIDATES = {
@@ -691,6 +696,7 @@ ROUTABLE_CANDIDATES = {
     "datafusion_mem",
     "datafusion_vector",
     "datafusion_hive",
+    "gpu_gqe",
     "pg_rowstore",
 }
 
@@ -720,6 +726,8 @@ def candidate_enabled(candidate: str | None) -> bool:
         return _env_enabled("RVBBIT_ROUTE_HIVE", True) and _env_enabled(
             "RVBBIT_ROUTE_DATAFUSION_HIVE", True
         )
+    if candidate == "gpu_gqe":
+        return _env_enabled("RVBBIT_ROUTE_GPU_GQE", False)
     if candidate == "pg_rowstore":
         return _env_enabled("RVBBIT_ROUTE_PG_ROWSTORE", True)
     if candidate == "rvbbit_native":
@@ -773,6 +781,7 @@ def observation_candidate_ms(observation: dict[str, Any]) -> dict[str, float]:
         "datafusion_mem_ms": "datafusion_mem",
         "datafusion_ms": "datafusion_vector",
         "datafusion_hive_ms": "datafusion_hive",
+        "gpu_gqe_ms": "gpu_gqe",
         "pg_ms": "pg_rowstore",
     }
     for field, candidate in legacy_fields.items():
@@ -870,6 +879,7 @@ class RouteProfile:
                         "datafusion_mem_ms": candidate_medians.get("datafusion_mem"),
                         "datafusion_ms": candidate_medians.get("datafusion_vector"),
                         "datafusion_hive_ms": candidate_medians.get("datafusion_hive"),
+                        "gpu_gqe_ms": candidate_medians.get("gpu_gqe"),
                         "pg_ms": candidate_medians.get("pg_rowstore"),
                         "observations": len(values),
                     }
@@ -899,7 +909,16 @@ class RouteProfile:
         if not entry:
             return None
         choice = path_for_candidate(entry.get("choice"))
-        if choice not in {"native", "duck", "duck_hive", "duck_vortex", "datafusion", "datafusion_hive", "pg_heap"}:
+        if choice not in {
+            "native",
+            "duck",
+            "duck_hive",
+            "duck_vortex",
+            "datafusion",
+            "datafusion_hive",
+            "gpu_gqe",
+            "pg_heap",
+        }:
             return None
         if not candidate_enabled(entry.get("choice")):
             return None
@@ -982,6 +1001,7 @@ class RouteProfile:
             "datafusion_mem_ms_predicted": predicted.get("datafusion_mem"),
             "datafusion_ms_predicted": predicted.get("datafusion_vector"),
             "datafusion_hive_ms_predicted": predicted.get("datafusion_hive"),
+            "gpu_gqe_ms_predicted": predicted.get("gpu_gqe"),
             "pg_ms_predicted": predicted.get("pg_rowstore"),
             "lower_anchor": lower,
             "upper_anchor": upper,

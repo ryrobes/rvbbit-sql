@@ -146,6 +146,11 @@ def build_profile_from_observations(
                 if "datafusion_hive" in candidate_medians
                 else None
             ),
+            "gpu_gqe_ms_median": (
+                round(candidate_medians["gpu_gqe"], 4)
+                if "gpu_gqe" in candidate_medians
+                else None
+            ),
             "pg_ms_median": (
                 round(candidate_medians["pg_rowstore"], 4)
                 if "pg_rowstore" in candidate_medians
@@ -187,6 +192,7 @@ def build_profile_from_observations(
         "datafusion_mem_system": "rvbbit_datafusion_mem_forced",
         "datafusion_system": "rvbbit_datafusion_forced",
         "datafusion_hive_system": "rvbbit_datafusion_hive_forced",
+        "gpu_gqe_system": "rvbbit_gpu_gqe_forced",
         "pg_heap_system": "rvbbit_pg_heap_forced",
         "pg_heap_observation_only": not _allow_pg_heap_choices(),
         "min_gain_pct": min_gain_pct,

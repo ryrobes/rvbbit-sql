@@ -4,10 +4,11 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
-use std::process;
+use std::path::{Path, PathBuf};
+use std::process::{self, Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
@@ -38,6 +39,11 @@ const DEFAULT_DSN: &str = "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench";
 const DEFAULT_DUCK_BIN: &str = "/usr/local/bin/rvbbit-duck";
 const DEFAULT_PGDATA_PREFIX: &str = "/var/lib/postgresql";
 const DEFAULT_VISIBLE_PGDATA_PREFIX: &str = "/rvbbit_pgdata";
+const DEFAULT_GQE_SERVER_URL: &str = "http://127.0.0.1:50051";
+const DEFAULT_GQE_CLI: &str = "/opt/gqe/rust/target/release/gqe-cli";
+const DEFAULT_GQE_NODE_MANAGER: &str = "/opt/gqe/build/src/node_manager/gqe_node_manager";
+const DEFAULT_GQE_TASK_MANAGER: &str = "/opt/gqe/build/src/task_manager/gqe_task_manager";
+const DEFAULT_GQE_WORK_DIR: &str = "/tmp/rvbbit-gqe";
 const DEFAULT_TELEMETRY_QUEUE_CAPACITY: usize = 8192;
 const DEFAULT_TELEMETRY_BATCH_SIZE: usize = 64;
 const DEFAULT_TELEMETRY_FLUSH_MS: u64 = 250;
@@ -77,6 +83,7 @@ struct Args {
 enum Engine {
     Duck,
     DataFusion,
+    GpuGqe,
 }
 
 impl Engine {
@@ -84,6 +91,7 @@ impl Engine {
         match self {
             Engine::Duck => "duck",
             Engine::DataFusion => "datafusion",
+            Engine::GpuGqe => "gpu_gqe",
         }
     }
 }
@@ -216,6 +224,11 @@ struct QueryTelemetryEvent {
 }
 
 fn main() {
+    if env::args().skip(1).any(|arg| arg == "--rvbbit-probe") {
+        println!("{}", serde_json::to_string(&gqe_probe_status()).unwrap());
+        return;
+    }
+
     let args = match parse_args() {
         Ok(args) => args,
         Err(err) => {
@@ -733,6 +746,7 @@ fn run_once_from_args(args: &Args) -> Result<QuerySummary> {
     match args.engine {
         Engine::Duck => run_duck_once(args, sql, catalog, cache),
         Engine::DataFusion => run_datafusion_once(args, sql, catalog, cache),
+        Engine::GpuGqe => run_gqe_once(args, sql, catalog, cache),
     }
 }
 
@@ -853,6 +867,542 @@ async fn run_datafusion_once_async(
         &catalog,
         cache,
     ))
+}
+
+fn run_gqe_once(
+    args: &Args,
+    sql: &str,
+    catalog: BTreeMap<String, RvbbitDuckTable>,
+    cache: CacheSummary,
+) -> Result<QuerySummary> {
+    prepare_gqe_catalog(&catalog)?;
+    if args.explain_only {
+        return Ok(empty_query_summary(args.timeout_s, &catalog, cache));
+    }
+
+    let mut elapsed = Vec::with_capacity(args.repeat.max(1));
+    let mut last = QueryRows::default();
+    for _ in 0..args.repeat.max(1) {
+        cleanup_query_rows(&mut last);
+        let start = Instant::now();
+        last = execute_gqe_query_result(sql, args.max_rows, args.result_format, args.timeout_s)?;
+        elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    elapsed.sort_by(|a, b| a.total_cmp(b));
+    Ok(query_summary_from_rows(
+        elapsed[elapsed.len() / 2],
+        args.repeat.max(1),
+        args.timeout_s,
+        last,
+        &catalog,
+        cache,
+    ))
+}
+
+fn prepare_gqe_catalog(catalog: &BTreeMap<String, RvbbitDuckTable>) -> Result<()> {
+    ensure_gqe_server_ready()?;
+    let root = gqe_catalog_root(catalog)?;
+    let rel_counts = relation_counts(catalog);
+    let mut script = String::new();
+    for table in catalog.values() {
+        if table_uses_vortex(table) {
+            bail!(
+                "GPU/GQE bridge can only expose parquet-backed tables; {}.{} uses {:?}",
+                table.schema,
+                table.relname,
+                table.layout
+            );
+        }
+        let location = prepare_gqe_table_dir(&root, table)?;
+        script.push_str(&format!(
+            "CREATE OR REPLACE EXTERNAL TABLE {} (\n{}\n) STORED AS PARQUET LOCATION {};\n",
+            gqe_quote_ident(&gqe_table_name(table, &rel_counts)),
+            table
+                .columns
+                .iter()
+                .map(|(name, typ)| format!("  {} {}", gqe_quote_ident(name), gqe_sql_type(typ)))
+                .collect::<Vec<_>>()
+                .join(",\n"),
+            gqe_quote_string(&location)
+        ));
+    }
+    run_gqe_cli_sql(&script, None, 60)?;
+    Ok(())
+}
+
+fn execute_gqe_query_result(
+    sql: &str,
+    max_rows: usize,
+    result_format: ResultFormat,
+    timeout_s: u64,
+) -> Result<QueryRows> {
+    ensure_gqe_server_ready()?;
+    let result_path = gqe_result_path()?;
+    run_gqe_cli_sql(sql, Some(&result_path), timeout_s)?;
+    let batches = read_parquet_batches_from_path(Path::new(&result_path))?;
+    let result = match result_format {
+        ResultFormat::Json => record_batches_to_query_rows(&batches, max_rows),
+        ResultFormat::ArrowIpcFile => record_batches_to_arrow_ipc_rows(&batches, max_rows),
+    };
+    let _ = remove_path_best_effort(Path::new(&result_path));
+    result
+}
+
+fn gqe_probe_status() -> Value {
+    if !gpu_visible() {
+        return json!({
+            "status": "unavailable",
+            "reason": "no NVIDIA GPU is visible to the GQE bridge"
+        });
+    }
+    let Some(cli) = gqe_cli() else {
+        return json!({
+            "status": "unavailable",
+            "reason": "gqe-cli is not installed; set RVBBIT_GQE_CLI or install GQE under /opt/gqe"
+        });
+    };
+    let server_url = gqe_server_url();
+    if gqe_server_reachable(&server_url) {
+        return json!({
+            "status": "ok",
+            "detail": "GQE server is reachable",
+            "gqe_cli": cli,
+            "server_url": server_url
+        });
+    }
+    if gqe_auto_start_enabled() && gqe_node_manager().is_some() && gqe_task_manager().is_some() {
+        return json!({
+            "status": "ok",
+            "detail": "GQE server is not running yet, but auto-start is available",
+            "gqe_cli": cli,
+            "server_url": server_url
+        });
+    }
+    json!({
+        "status": "unavailable",
+        "reason": "GQE server is not reachable and auto-start binaries are not installed",
+        "gqe_cli": cli,
+        "server_url": server_url
+    })
+}
+
+fn ensure_gqe_server_ready() -> Result<()> {
+    let server_url = gqe_server_url();
+    if gqe_server_reachable(&server_url) {
+        return Ok(());
+    }
+    if !gqe_auto_start_enabled() {
+        bail!("GQE server {server_url} is not reachable and RVBBIT_GQE_AUTO_START is disabled");
+    }
+    start_gqe_server(&server_url)
+}
+
+fn run_gqe_cli_sql(sql: &str, parquet_output: Option<&str>, timeout_s: u64) -> Result<()> {
+    let cli = gqe_cli().ok_or_else(|| {
+        anyhow!("gqe-cli is not installed; set RVBBIT_GQE_CLI or install GQE under /opt/gqe")
+    })?;
+    let mut command = Command::new(&cli);
+    command
+        .arg("--server-url")
+        .arg(gqe_server_url())
+        .arg("--sql-file")
+        .arg("-");
+    if let Some(path) = parquet_output {
+        command.arg("--parquet").arg(path);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("starting gqe-cli at {cli}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("gqe-cli stdin unavailable"))?
+        .write_all(sql.as_bytes())
+        .context("writing SQL to gqe-cli")?;
+    let output = wait_child_output(child, Duration::from_secs(timeout_s.max(1) + 5), "gqe-cli")?;
+    if !output.status.success() {
+        bail!(
+            "gqe-cli failed: stdout={} stderr={}",
+            first_line_bytes(&output.stdout),
+            first_line_bytes(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn start_gqe_server(server_url: &str) -> Result<()> {
+    let (address, port) = gqe_server_endpoint(server_url)?;
+    if !matches!(address.as_str(), "127.0.0.1" | "localhost" | "0.0.0.0") {
+        bail!("GQE auto-start only supports local server URLs, got {server_url}");
+    }
+    let node_manager = gqe_node_manager().ok_or_else(|| {
+        anyhow!(
+            "gqe_node_manager is not installed; set RVBBIT_GQE_NODE_MANAGER or install GQE under /opt/gqe"
+        )
+    })?;
+    let task_manager = gqe_task_manager().ok_or_else(|| {
+        anyhow!(
+            "gqe_task_manager is not installed; set RVBBIT_GQE_TASK_MANAGER or install GQE under /opt/gqe"
+        )
+    })?;
+    let work_dir = gqe_work_dir()?;
+    let lock_path = work_dir.join("node-manager-start.lock");
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(_lock) => {
+            let log_path = work_dir.join("node-manager.log");
+            let log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .with_context(|| format!("opening GQE node manager log {}", log_path.display()))?;
+            let child = Command::new(&node_manager)
+                .arg("--address")
+                .arg(&address)
+                .arg("--port")
+                .arg(port.to_string())
+                .arg("--num-gpus")
+                .arg(gqe_num_gpus().to_string())
+                .arg("--task-manager-binary")
+                .arg(&task_manager)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log.try_clone()?))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .with_context(|| format!("starting GQE node manager at {node_manager}"))?;
+            fs::write(work_dir.join("node-manager.pid"), child.id().to_string()).ok();
+            let result = wait_for_gqe_server(server_url, Duration::from_secs(60));
+            let _ = fs::remove_file(&lock_path);
+            result
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            wait_for_gqe_server(server_url, Duration::from_secs(60))
+        }
+        Err(err) => Err(err).with_context(|| format!("creating {}", lock_path.display())),
+    }
+}
+
+fn wait_for_gqe_server(server_url: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if gqe_server_reachable(server_url) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    bail!("GQE server {server_url} did not become reachable")
+}
+
+fn gqe_server_reachable(server_url: &str) -> bool {
+    let Ok((host, port)) = gqe_server_endpoint(server_url) else {
+        return false;
+    };
+    let Ok(mut addrs) = format!("{host}:{port}").to_socket_addrs() else {
+        return false;
+    };
+    addrs.any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok())
+}
+
+fn gqe_server_endpoint(server_url: &str) -> Result<(String, u16)> {
+    let without_scheme = server_url
+        .strip_prefix("http://")
+        .or_else(|| server_url.strip_prefix("https://"))
+        .unwrap_or(server_url);
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("GQE server URL must include host:port, got {server_url}"))?;
+    Ok((host.to_string(), port.parse()?))
+}
+
+fn gqe_server_url() -> String {
+    env::var("RVBBIT_GQE_SERVER_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_GQE_SERVER_URL.to_string())
+}
+
+fn gqe_auto_start_enabled() -> bool {
+    env_enabled("RVBBIT_GQE_AUTO_START", true)
+}
+
+fn gqe_cli() -> Option<String> {
+    configured_executable("RVBBIT_GQE_CLI", DEFAULT_GQE_CLI, "gqe-cli")
+}
+
+fn gqe_node_manager() -> Option<String> {
+    configured_executable(
+        "RVBBIT_GQE_NODE_MANAGER",
+        DEFAULT_GQE_NODE_MANAGER,
+        "gqe_node_manager",
+    )
+}
+
+fn gqe_task_manager() -> Option<String> {
+    configured_executable(
+        "RVBBIT_GQE_TASK_MANAGER",
+        DEFAULT_GQE_TASK_MANAGER,
+        "gqe_task_manager",
+    )
+}
+
+fn configured_executable(env_name: &str, default_path: &str, path_name: &str) -> Option<String> {
+    if let Ok(value) = env::var(env_name) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && executable_file(Path::new(trimmed)) {
+            return Some(trimmed.to_string());
+        }
+    }
+    if executable_file(Path::new(default_path)) {
+        return Some(default_path.to_string());
+    }
+    find_executable_on_path(path_name)
+}
+
+fn executable_file(path: &Path) -> bool {
+    path.is_file()
+        && fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+fn find_executable_on_path(name: &str) -> Option<String> {
+    env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| executable_file(candidate))
+            .map(|path| path.display().to_string())
+    })
+}
+
+fn gpu_visible() -> bool {
+    if env_enabled("RVBBIT_GQE_ASSUME_GPU", false) {
+        return true;
+    }
+    if Command::new("nvidia-smi")
+        .arg("-L")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return true;
+    }
+    Path::new("/dev/nvidiactl").exists()
+        || fs::read_dir("/proc/driver/nvidia/gpus")
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
+}
+
+fn gqe_num_gpus() -> usize {
+    env_usize("RVBBIT_GQE_NUM_GPUS", detected_gpu_count().unwrap_or(1)).max(1)
+}
+
+fn detected_gpu_count() -> Option<usize> {
+    let output = Command::new("nvidia-smi")
+        .arg("-L")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let count = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.trim_start().starts_with("GPU "))
+        .count();
+    (count > 0).then_some(count)
+}
+
+fn gqe_work_dir() -> Result<PathBuf> {
+    let dir = env::var("RVBBIT_GQE_WORK_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_GQE_WORK_DIR));
+    fs::create_dir_all(&dir).with_context(|| format!("creating GQE work dir {}", dir.display()))?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777))
+        .with_context(|| format!("setting GQE work dir permissions on {}", dir.display()))?;
+    Ok(dir)
+}
+
+fn gqe_catalog_root(catalog: &BTreeMap<String, RvbbitDuckTable>) -> Result<PathBuf> {
+    let root = gqe_work_dir()?
+        .join("catalog")
+        .join(stable_hash_hex(&catalog_signature(catalog)));
+    fs::create_dir_all(&root)
+        .with_context(|| format!("creating GQE catalog root {}", root.display()))?;
+    Ok(root)
+}
+
+fn prepare_gqe_table_dir(root: &Path, table: &RvbbitDuckTable) -> Result<String> {
+    let table_dir = root.join(format!(
+        "{}__{}",
+        sanitize_path_segment(&table.schema),
+        sanitize_path_segment(&table.relname)
+    ));
+    fs::create_dir_all(&table_dir)
+        .with_context(|| format!("creating GQE table dir {}", table_dir.display()))?;
+    for (idx, source) in table.paths.iter().enumerate() {
+        let link = table_dir.join(format!("part-{idx:05}.parquet"));
+        if link.exists() {
+            continue;
+        }
+        if env_enabled("RVBBIT_GQE_COPY_PARQUET", false) {
+            fs::copy(source, &link)
+                .with_context(|| format!("copying parquet {source} to {}", link.display()))?;
+        } else {
+            std::os::unix::fs::symlink(source, &link)
+                .with_context(|| format!("symlinking parquet {source} to {}", link.display()))?;
+        }
+    }
+    Ok(table_dir.display().to_string())
+}
+
+fn gqe_result_path() -> Result<String> {
+    let dir = gqe_work_dir()?.join("results");
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(dir
+        .join(format!("result-{}-{nanos}", process::id()))
+        .display()
+        .to_string())
+}
+
+fn read_parquet_batches_from_path(path: &Path) -> Result<Vec<RecordBatch>> {
+    let mut files = Vec::new();
+    if path.is_dir() {
+        for entry in fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
+            let entry = entry?;
+            let candidate = entry.path();
+            if candidate.extension().is_some_and(|ext| ext == "parquet") {
+                files.push(candidate);
+            }
+        }
+        files.sort();
+    } else if path.exists() {
+        files.push(path.to_path_buf());
+    } else {
+        return Ok(Vec::new());
+    }
+
+    let mut batches = Vec::new();
+    for file_path in files {
+        let file = File::open(&file_path)
+            .with_context(|| format!("opening GQE result {}", file_path.display()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("reading GQE result footer {}", file_path.display()))?
+            .build()
+            .with_context(|| format!("building GQE result reader {}", file_path.display()))?;
+        for batch in reader {
+            batches
+                .push(batch.with_context(|| {
+                    format!("reading GQE result batch {}", file_path.display())
+                })?);
+        }
+    }
+    Ok(batches)
+}
+
+fn remove_path_best_effort(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else if path.exists() {
+        fs::remove_file(path)
+    } else {
+        Ok(())
+    }
+}
+
+fn relation_counts(catalog: &BTreeMap<String, RvbbitDuckTable>) -> BTreeMap<String, usize> {
+    let mut rel_counts = BTreeMap::<String, usize>::new();
+    for table in catalog.values() {
+        *rel_counts.entry(table.relname.clone()).or_default() += 1;
+    }
+    rel_counts
+}
+
+fn gqe_table_name(table: &RvbbitDuckTable, rel_counts: &BTreeMap<String, usize>) -> String {
+    if rel_counts.get(&table.relname).copied().unwrap_or(0) == 1 {
+        table.relname.clone()
+    } else {
+        format!("{}__{}", table.schema, table.relname)
+    }
+}
+
+fn gqe_sql_type(typname: &str) -> &'static str {
+    match typname {
+        "boolean" => "BOOLEAN",
+        "smallint" => "SMALLINT",
+        "integer" => "INTEGER",
+        "bigint" => "BIGINT",
+        "real" => "REAL",
+        "double precision" | "numeric" => "DOUBLE",
+        "date" => "DATE",
+        "timestamp" | "timestamp without time zone" | "timestamp with time zone" => "TIMESTAMP",
+        "character" | "character varying" | "text" => "VARCHAR",
+        _ => "VARCHAR",
+    }
+}
+
+fn gqe_quote_ident(ident: &str) -> String {
+    quote_ident(ident)
+}
+
+fn gqe_quote_string(value: &str) -> String {
+    quote_sql_string(value)
+}
+
+fn sanitize_path_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn wait_child_output(mut child: Child, timeout: Duration, label: &str) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().context("collecting child output"),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("{label} timed out after {}s", timeout.as_secs());
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err).with_context(|| format!("waiting for {label}"));
+            }
+        }
+    }
+}
+
+fn first_line_bytes(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 async fn create_datafusion_views(
@@ -1240,6 +1790,7 @@ enum ServerExecutor {
         runtime: Runtime,
         ctx: SessionContext,
     },
+    GpuGqe,
 }
 
 impl ServerState {
@@ -1379,6 +1930,29 @@ impl ServerState {
                     cache,
                 ))
             }),
+            ServerExecutor::GpuGqe => {
+                if explain_only {
+                    return Ok(empty_query_summary(timeout_s, &catalog, cache));
+                }
+
+                let mut elapsed = Vec::with_capacity(repeat);
+                let mut last = QueryRows::default();
+                for _ in 0..repeat {
+                    cleanup_query_rows(&mut last);
+                    let start = Instant::now();
+                    last = execute_gqe_query_result(sql, max_rows, result_format, timeout_s)?;
+                    elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                elapsed.sort_by(|a, b| a.total_cmp(b));
+                Ok(query_summary_from_rows(
+                    elapsed[elapsed.len() / 2],
+                    repeat,
+                    timeout_s,
+                    last,
+                    &catalog,
+                    cache,
+                ))
+            }
         }
     }
 
@@ -1500,6 +2074,10 @@ impl ServerState {
                 let ctx = datafusion_context(threads);
                 runtime.block_on(async { create_datafusion_views(&ctx, catalog).await })?;
                 Ok(ServerExecutor::DataFusion { runtime, ctx })
+            }
+            Engine::GpuGqe => {
+                prepare_gqe_catalog(catalog)?;
+                Ok(ServerExecutor::GpuGqe)
             }
         }
     }
@@ -1953,7 +2531,7 @@ fn parse_args() -> Result<Args> {
         .as_deref()
         .map(parse_engine)
         .transpose()?
-        .unwrap_or(Engine::Duck);
+        .unwrap_or_else(default_engine_for_binary);
     let mut dsn = env::var("RVBBIT_DSN").unwrap_or_else(|_| DEFAULT_DSN.to_string());
     let mut sql = None;
     let mut repeat = 1usize;
@@ -2080,8 +2658,22 @@ fn parse_engine(raw: &str) -> Result<Engine> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "duck" | "duckdb" => Ok(Engine::Duck),
         "datafusion" | "df" => Ok(Engine::DataFusion),
+        "gpu_gqe" | "gpu-gqe" | "gqe" => Ok(Engine::GpuGqe),
         other => bail!("unsupported engine: {other}"),
     }
+}
+
+fn default_engine_for_binary() -> Engine {
+    env::args()
+        .next()
+        .and_then(|arg| {
+            Path::new(&arg)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .filter(|name| name.contains("gqe"))
+        .map(|_| Engine::GpuGqe)
+        .unwrap_or(Engine::Duck)
 }
 
 fn parse_result_format(raw: &str) -> Result<ResultFormat> {
@@ -2098,10 +2690,11 @@ fn need_value(it: &mut impl Iterator<Item = String>, name: &str) -> Result<Strin
 
 fn print_help() {
     println!(
-        "rvbbit-duck --sql SQL [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--repeat N] [--timeout-s N] [--threads N] [--max-rows N] [--result-format json|arrow_ipc_file]\n\
-         rvbbit-duck --serve [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
-         rvbbit-duck --serve-socket PATH [--workers N] [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
-         rvbbit-duck --serve-derived-socket [--workers N] [--engine duck|datafusion] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
+        "rvbbit-duck --sql SQL [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--repeat N] [--timeout-s N] [--threads N] [--max-rows N] [--result-format json|arrow_ipc_file]\n\
+         rvbbit-duck --serve [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
+         rvbbit-duck --serve-socket PATH [--workers N] [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
+         rvbbit-duck --serve-derived-socket [--workers N] [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
+         rvbbit-gqe-bridge --rvbbit-probe\n\
          Server JSONL requests: {{\"sql\":\"SELECT ...\",\"result_format\":\"json|arrow_ipc_file\"}} or {{\"command\":\"prewarm\"}}"
     );
 }

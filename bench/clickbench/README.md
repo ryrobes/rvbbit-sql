@@ -105,12 +105,29 @@ Override env vars:
   `rvbbit_duck_forced`,
   `rvbbit_datafusion_mem_forced`, `rvbbit_datafusion_forced`,
   `rvbbit_duck_hive_forced`,
-  `rvbbit_datafusion_hive_forced`, and `rvbbit_pg_heap_forced` for executor
+  `rvbbit_datafusion_hive_forced`, `rvbbit_gpu_gqe_forced`, and
+  `rvbbit_pg_heap_forced` for executor
   comparison over the same compacted table. `rvbbit_native_forced` uses the
   router's `rvbbit.route_force_candidate=rvbbit_native`; `rvbbit_native` is the
   older `rvbbit.duck_backend=off` baseline.
   `rvbbit_datafusion_mem_forced` also loads `rvbbit.hot_objects` after compact
   so the forced memory route has a hot all-column object to use.
+  `rvbbit_gpu_gqe_forced` requires a visible NVIDIA GPU plus NVIDIA GQE tooling
+  visible to the `pg-rvbbit` container. The Rvbbit image includes the
+  `/usr/local/bin/rvbbit-gqe` launcher and
+  `/opt/rvbbit/gqe/bin/rvbbit-gqe-bridge`; the bridge expects `gqe-cli` under
+  `/opt/gqe/rust/target/release/gqe-cli` or `RVBBIT_GQE_CLI`, and either a
+  reachable `RVBBIT_GQE_SERVER_URL` or local GQE node/task manager binaries.
+  Set `RVBBIT_GQE_HOME=/path/to/gqe` to mount a host-built GQE checkout/build at
+  `/opt/gqe` during the benchmark. Without `RVBBIT_GQE_HOME`, the runner's
+  default `RVBBIT_GPU_GQE_INSTALL=auto` mode selects the optional
+  `docker/docker-compose.gqe-image.yml` pg-rvbbit image on hosts where
+  `nvidia-smi` reports a GPU and Docker exposes the NVIDIA runtime. Use
+  `RVBBIT_GPU_GQE_INSTALL=image` to force that image, or
+  `RVBBIT_GPU_GQE_INSTALL=off` to keep the normal image and report the GQE
+  pathway as `SKIP`.
+  If those pieces are missing it remains in the report as `SKIP` with the probe
+  reason.
   Rvbbit benchmark loads refresh hive/cluster layouts synchronously by default,
   so auto routing can consider segmented variants during the measured query
   run. Set `RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async` to restore

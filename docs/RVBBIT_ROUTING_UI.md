@@ -23,7 +23,8 @@ profile rebuild actions, see `docs/RVBBIT_ROUTE_TRAINING_UI.md`.
   `rvbbit.route_train_query(...)`. These runs preserve the source query,
   candidate timings, validation status, errors, and generated profile updates.
   `duck_hive`/`datafusion_hive` require Hive parquet variants, and can be
-  disabled with `RVBBIT_ROUTE_HIVE=0`. `pg_rowstore` is routable when the
+  disabled with `RVBBIT_ROUTE_HIVE=0`. `gpu_gqe` is experimental and requires
+  `RVBBIT_ROUTE_GPU_GQE=1` plus a `rvbbit-gqe` bridge binary. `pg_rowstore` is routable when the
   referenced Rvbbit tables have retained shadow heaps; the router applies a
   higher confidence bar before selecting it.
 - **Effective profile**: the route profile used for a decision. By default this

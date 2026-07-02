@@ -30,12 +30,14 @@ Environment:
   `rvbbit_duck_forced`,
   `rvbbit_datafusion_mem_forced`, `rvbbit_datafusion_forced`,
   `rvbbit_duck_hive_forced`,
-  `rvbbit_datafusion_hive_forced`, and `rvbbit_pg_heap_forced` for executor
+  `rvbbit_datafusion_hive_forced`, `rvbbit_gpu_gqe_forced`, and
+  `rvbbit_pg_heap_forced` for executor
   comparison over the same compacted tables. `rvbbit_native_forced` uses the
   router's `rvbbit.route_force_candidate=rvbbit_native`; `rvbbit_native` is the
   older `rvbbit.duck_backend=off` baseline.
   `rvbbit_datafusion_mem_forced` also loads `rvbbit.hot_objects` after compact
   so the forced memory route has hot all-column objects to use.
+  `rvbbit_gpu_gqe_forced` requires `rvbbit-gqe` or `RVBBIT_GQE_BIN`.
   Rvbbit benchmark loads refresh hive/cluster layouts synchronously by default,
   so auto routing can consider segmented variants during the measured query
   run. Set `RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async` to restore

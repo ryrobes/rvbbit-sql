@@ -1,0 +1,61 @@
+#!/usr/bin/env sh
+set -eu
+
+real_bin="${RVBBIT_GQE_BRIDGE_BIN:-/opt/rvbbit/gqe/bin/rvbbit-gqe-bridge}"
+
+json_unavailable() {
+    reason="$1"
+    printf '{"status":"unavailable","reason":"%s"}\n' "$reason"
+}
+
+json_error() {
+    reason="$1"
+    printf '{"status":"error","error":"%s"}\n' "$reason"
+}
+
+enabled() {
+    case "${RVBBIT_GPU_GQE_BACKEND:-true}" in
+        0|false|FALSE|no|NO|off|OFF|disabled|DISABLED) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+gpu_visible() {
+    case "${RVBBIT_GQE_ASSUME_GPU:-}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) ;;
+    esac
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ -e /dev/nvidiactl ] && ls /dev/nvidia[0-9]* >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ -d /proc/driver/nvidia/gpus ] && find /proc/driver/nvidia/gpus -mindepth 1 -maxdepth 1 -type d | grep -q .; then
+        return 0
+    fi
+    return 1
+}
+
+if [ "${1:-}" = "--rvbbit-probe" ]; then
+    if ! enabled; then
+        json_unavailable "GPU/GQE backend disabled by RVBBIT_GPU_GQE_BACKEND"
+        exit 0
+    fi
+    if ! gpu_visible; then
+        json_unavailable "no NVIDIA GPU is visible inside the pg-rvbbit container"
+        exit 0
+    fi
+    if [ ! -x "${real_bin}" ]; then
+        json_unavailable "rvbbit-gqe bridge adapter is not installed"
+        exit 0
+    fi
+    exec "${real_bin}" "$@"
+fi
+
+if [ ! -x "${real_bin}" ]; then
+    json_error "rvbbit-gqe bridge adapter is not installed; set RVBBIT_GQE_BRIDGE_BIN or install /opt/rvbbit/gqe/bin/rvbbit-gqe-bridge"
+    exit 1
+fi
+
+exec "${real_bin}" "$@"
