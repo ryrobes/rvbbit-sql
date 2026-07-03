@@ -6308,6 +6308,7 @@ AS $$
 DECLARE
     identity_mode text := rvbbit.accel_identity_mode(reloid);
     is_partition boolean := false;
+    trg record;
 BEGIN
     SELECT coalesce(c.relispartition, false)
       INTO is_partition
@@ -6345,6 +6346,18 @@ BEGIN
                  EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
             reloid
         );
+
+        -- Fire even under session_replication_role = 'replica' (logical-repl
+        -- apply, pg_restore --disable-triggers, some ETL). ORIGIN/LOCAL triggers
+        -- are skipped in that mode, so heap writes would bypass dirty tracking
+        -- and the accelerator would go silently stale. ENABLE ALWAYS forces it.
+        FOR trg IN
+            SELECT tgname FROM pg_trigger
+            WHERE tgrelid = reloid AND NOT tgisinternal
+              AND starts_with(tgname, 'rvbbit_shadow_heap_')
+        LOOP
+            EXECUTE format('ALTER TABLE %s ENABLE ALWAYS TRIGGER %I', reloid, trg.tgname);
+        END LOOP;
         RETURN;
     END IF;
 
@@ -6409,6 +6422,18 @@ BEGIN
              EXECUTE FUNCTION rvbbit.mark_shadow_heap_dirty()',
         reloid
     );
+
+    -- Fire even under session_replication_role = 'replica' (logical-repl apply,
+    -- pg_restore --disable-triggers, some ETL). ORIGIN/LOCAL triggers are
+    -- skipped in that mode, so heap writes would bypass dirty tracking and the
+    -- accelerator would go silently stale. ENABLE ALWAYS forces it.
+    FOR trg IN
+        SELECT tgname FROM pg_trigger
+        WHERE tgrelid = reloid AND NOT tgisinternal
+          AND starts_with(tgname, 'rvbbit_shadow_heap_')
+    LOOP
+        EXECUTE format('ALTER TABLE %s ENABLE ALWAYS TRIGGER %I', reloid, trg.tgname);
+    END LOOP;
 END;
 $$;
 
@@ -7363,8 +7388,27 @@ BEGIN
         SELECT (SELECT count(*) FROM del_gen), (SELECT count(*) FROM del_rg)
         INTO gens, rgs;
 
-        -- catalog rows are gone; unlinking the files now is orphan-safe
-        nfiles := coalesce(rvbbit.reap_unlink_files(paths), 0);
+        -- Do NOT unlink files in-txn. File deletion is not transactional: if
+        -- this txn rolls back (an error in a later loop iteration, or the
+        -- caller aborting) the row_groups/generations DELETEs are undone but the
+        -- files are already gone -> catalog rows dangle. Queue them for the
+        -- background reaper (rvbbit.reap_orphaned_files), which re-checks that no
+        -- catalog row still references the path, honors a grace period, and
+        -- unlinks in its own txn. Mirrors rebuild_acceleration.
+        nfiles := 0;
+        IF paths IS NOT NULL THEN
+            INSERT INTO rvbbit.orphaned_files (path, table_oid, reason, operation_id)
+            SELECT DISTINCT p, rec.table_oid, 'reap_generations', NULL::bigint
+            FROM unnest(paths) AS p
+            WHERE p IS NOT NULL AND btrim(p) <> ''
+            ON CONFLICT (path) DO UPDATE
+               SET table_oid = EXCLUDED.table_oid,
+                   reason = EXCLUDED.reason,
+                   operation_id = EXCLUDED.operation_id,
+                   queued_at = clock_timestamp(),
+                   last_error = NULL;
+            GET DIAGNOSTICS nfiles = ROW_COUNT;
+        END IF;
 
         IF coalesce(gens, 0) > 0 OR coalesce(rgs, 0) > 0 THEN
             relname := rec.table_oid::regclass::text;

@@ -1042,11 +1042,25 @@ fn execute_gqe_query_result(
     if let Some(reason) = gqe_unsupported_grouping_reason(&gqe_sql) {
         bail!("{reason}");
     }
+    if let Some(reason) = gqe_lossy_type_reason(&gqe_sql, catalog) {
+        bail!("{reason}");
+    }
     stats.rewrite_ms = rewrite_start.elapsed().as_secs_f64() * 1000.0;
 
     let result_path = gqe_result_path()?;
     let cli_start = Instant::now();
     run_gqe_cli_sql(&gqe_sql, Some(&result_path), timeout_s)?;
+    // The CLI exited 0, but it must have written the result at `result_path`
+    // (we passed --parquet). If nothing is there, this is a failed run, NOT an
+    // authoritative empty answer — returning empty would silently drop every
+    // row for a query that actually matches. Bail so fail-open falls back to an
+    // exact engine.
+    if !Path::new(&result_path).exists() {
+        bail!(
+            "GPU/GQE reported success but wrote no result file at {result_path}; \
+             refusing to treat a missing result as an empty answer"
+        );
+    }
     stats.cli_ms = cli_start.elapsed().as_secs_f64() * 1000.0;
 
     let read_start = Instant::now();
@@ -2232,6 +2246,15 @@ fn rewrite_gqe_sql(sql: &str, catalog: &BTreeMap<String, RvbbitDuckTable>) -> St
 
 fn rewrite_gqe_group_by_first_literal(sql: &str) -> String {
     let lowered = sql_stringless(sql).to_ascii_lowercase();
+    // Byte offsets found in `lowered` are only valid to slice `sql` when the two
+    // have identical byte lengths. sql_stringless collapses each char inside a
+    // string literal/comment to a single-byte space, so a multibyte char there
+    // (e.g. WHERE note='café') shortens `lowered` and misaligns the offsets —
+    // slicing `sql` at them would split a UTF-8 char and panic. When the lengths
+    // differ, skip this cosmetic rewrite (the query still runs correctly).
+    if lowered.len() != sql.len() {
+        return sql.to_string();
+    }
     let trimmed = lowered.trim_start();
     if !(trimmed.starts_with("select 1,") || trimmed.starts_with("select 1 ,")) {
         return sql.to_string();
@@ -2443,6 +2466,59 @@ fn gqe_unsupported_grouping_reason(sql: &str) -> Option<String> {
         return Some("GPU/GQE does not safely support GROUP BY ordinal expressions".to_string());
     }
     None
+}
+
+/// GQE has no exact-decimal type — `numeric` is declared to it as DOUBLE, so
+/// sum()/avg() over a numeric column drift from Postgres's exact result — and it
+/// renders `timestamp with time zone` through a lossy string transform that
+/// shifts under a non-UTC session. When the query references such a column by
+/// name, veto GQE so it falls back (fail-open) to an exact engine. `timestamp
+/// without time zone` is timezone-agnostic and stays eligible.
+fn gqe_lossy_type_reason(
+    sql: &str,
+    catalog: &BTreeMap<String, RvbbitDuckTable>,
+) -> Option<String> {
+    let lowered = sql_stringless(sql).to_ascii_lowercase();
+    for table in catalog.values() {
+        for (name, typ) in &table.columns {
+            let hit = || identifier_referenced(&lowered, &name.to_ascii_lowercase());
+            if typ == "numeric" && hit() {
+                return Some(format!(
+                    "GPU/GQE cannot represent exact numeric column {name:?} without precision loss"
+                ));
+            }
+            if typ == "timestamp with time zone" && hit() {
+                return Some(format!(
+                    "GPU/GQE cannot safely render timestamptz column {name:?} (timezone loss)"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// True if `ident_lower` appears in `lowered_sql` as a whole identifier (not a
+/// substring of a longer word). Quote characters count as boundaries, so it
+/// matches both bare and double-quoted references.
+fn identifier_referenced(lowered_sql: &str, ident_lower: &str) -> bool {
+    if ident_lower.is_empty() {
+        return false;
+    }
+    let mut start = 0usize;
+    while let Some(pos) = lowered_sql[start..].find(ident_lower) {
+        let abs = start + pos;
+        let before = if abs == 0 {
+            None
+        } else {
+            lowered_sql[..abs].chars().next_back()
+        };
+        let after = lowered_sql[abs + ident_lower.len()..].chars().next();
+        if !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char) {
+            return true;
+        }
+        start = abs + ident_lower.len();
+    }
+    false
 }
 
 fn gqe_group_by_ordinal_present(sql: &str) -> bool {
@@ -5433,6 +5509,62 @@ mod tests {
             true
         )
         .is_none());
+    }
+
+    fn lossy_type_catalog() -> BTreeMap<String, RvbbitDuckTable> {
+        let mut catalog = BTreeMap::new();
+        catalog.insert(
+            "public.sales".to_string(),
+            RvbbitDuckTable {
+                schema: "public".to_string(),
+                relname: "sales".to_string(),
+                paths: Vec::new(),
+                columns: vec![
+                    ("id".to_string(), "bigint".to_string()),
+                    ("amount".to_string(), "numeric".to_string()),
+                    ("booked_at".to_string(), "timestamp with time zone".to_string()),
+                    ("event_at".to_string(), "timestamp without time zone".to_string()),
+                    ("region".to_string(), "text".to_string()),
+                ],
+                layout: None,
+                partition_cols: Vec::new(),
+                row_group_rows: 0,
+                row_group_bytes: 0,
+            },
+        );
+        catalog
+    }
+
+    #[test]
+    fn gqe_lossy_type_gate_vetoes_numeric_and_timestamptz() {
+        let catalog = lossy_type_catalog();
+        // Exact numeric aggregate -> precision loss -> veto.
+        assert!(gqe_lossy_type_reason("SELECT sum(amount) FROM sales", &catalog)
+            .is_some_and(|r| r.contains("numeric")));
+        // Bare timestamptz projection -> timezone loss -> veto.
+        assert!(gqe_lossy_type_reason("SELECT booked_at FROM sales", &catalog)
+            .is_some_and(|r| r.contains("timestamptz")));
+        // timestamp WITHOUT time zone is safe; plain int/text queries are safe.
+        assert!(gqe_lossy_type_reason("SELECT event_at, region FROM sales", &catalog).is_none());
+        assert!(gqe_lossy_type_reason("SELECT id, region FROM sales", &catalog).is_none());
+        // Substring of a wider identifier must NOT false-veto (region vs regional).
+        assert!(gqe_lossy_type_reason("SELECT count(*) FROM sales", &catalog).is_none());
+    }
+
+    #[test]
+    fn gqe_group_by_rewrite_is_utf8_safe_with_multibyte_string_literals() {
+        // A multibyte char inside a string literal before GROUP BY shortens
+        // sql_stringless output; the rewrite must not panic-slice the original.
+        let sql = "SELECT 1, count(*) FROM hits WHERE note='café' GROUP BY 1, x";
+        let out = rewrite_gqe_group_by_first_literal(sql);
+        // Length mismatch -> rewrite skipped, original returned unchanged.
+        assert_eq!(out, sql);
+        // Pure-ASCII case still rewrites as before.
+        let ascii = "SELECT 1, count(*) FROM hits GROUP BY 1, x";
+        assert_eq!(
+            rewrite_gqe_group_by_first_literal(ascii),
+            "SELECT 1, count(*) FROM hits GROUP BY x"
+        );
     }
 
     #[test]

@@ -602,6 +602,13 @@ fn flow(spec: &str) -> TableIterator<'static, (name!(value, JsonB),)> {
                 );
             }
             Err(e) => {
+                // NOTE: graceful degradation here (return the prior stage's rows
+                // instead of failing) is a DELIBERATE, tested contract
+                // (synth_bad_cached_sql_fails_stage_gracefully). It is also a
+                // footgun for guard-style stages: `... THEN redact_pii THEN
+                // publish` would publish raw rows if redact_pii errors. A strict
+                // per-stage fail policy is a design decision left to the owner;
+                // do not blanket-convert this to a hard error.
                 pgrx::warning!("rvbbit.flow: stage '{}' failed: {e}", stage.name);
                 break;
             }

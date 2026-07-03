@@ -501,6 +501,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0120_html_block_turn_operator",
         include_str!("../sql/migrations/0120_html_block_turn_operator.sql"),
     ),
+    (
+        "0121_reap_generations_defer_unlink",
+        include_str!("../sql/migrations/0121_reap_generations_defer_unlink.sql"),
+    ),
+    (
+        "0122_shadow_heap_triggers_enable_always",
+        include_str!("../sql/migrations/0122_shadow_heap_triggers_enable_always.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -19,13 +19,111 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::{OnceLock, RwLock};
 
+/// Max characters of an upstream provider body to surface in a PG-visible error.
+const PROVIDER_ERR_BODY_MAX: usize = 500;
+
+/// Advance over a credential-value run starting at ASCII byte `from`, stopping
+/// at whitespace, common JSON/quote delimiters, or ANY non-ASCII byte (so every
+/// returned index lands on a char boundary — safe to slice with).
+fn secret_token_end(s: &str, from: usize) -> usize {
+    let b = s.as_bytes();
+    let mut j = from;
+    while j < b.len() {
+        match b[j] {
+            0x80..=0xFF => break, // non-ASCII lead/continuation: stop on boundary
+            b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b',' | b';' | b'(' | b')' | b'{'
+            | b'}' | b'[' | b']' | b'<' | b'>' | b'&' | b'`' => break,
+            _ => j += 1,
+        }
+    }
+    j
+}
+
+/// Redact credential-shaped tokens (`sk-…`, `Bearer …`, `api_key=…`/`:` …) and
+/// truncate an upstream provider response body before it is interpolated into a
+/// Postgres-visible error. Upstream error bodies can echo the prompt (PII) and
+/// leak credentials; they must never be surfaced verbatim. The HTTP status is
+/// kept separately by the caller and is unaffected.
+pub(crate) fn redact_body(body: &str) -> String {
+    // Bound redaction cost even for pathologically large bodies.
+    let window: String = body.chars().take(PROVIDER_ERR_BODY_MAX * 4).collect();
+    let lower = window.to_ascii_lowercase(); // same byte layout: ASCII-only change
+    let mut secrets: Vec<String> = Vec::new();
+
+    // sk-… (OpenAI / Anthropic keys, incl. sk-ant-…, sk-proj-…)
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("sk-") {
+        let start = i + rel;
+        let end = secret_token_end(&window, start + 3);
+        secrets.push(window[start..end].to_string());
+        i = end.max(start + 3);
+    }
+
+    // Bearer <token>
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("bearer ") {
+        let mut start = i + rel + "bearer ".len();
+        while window.as_bytes().get(start) == Some(&b' ') {
+            start += 1;
+        }
+        let end = secret_token_end(&window, start);
+        if end > start {
+            secrets.push(window[start..end].to_string());
+        }
+        i = end.max(start);
+    }
+
+    // api_key / api-key / apikey / access_token / authorization  (= | :)  <token>
+    for marker in ["api_key", "api-key", "apikey", "access_token", "authorization"] {
+        let mut i = 0usize;
+        while let Some(rel) = lower[i..].find(marker) {
+            let after = i + rel + marker.len();
+            let b = window.as_bytes();
+            let mut p = after;
+            // Skip whitespace and a closing quote before the delimiter so a JSON
+            // key like "api_key": … is matched, not just api_key=….
+            while matches!(b.get(p), Some(&b' ') | Some(&b'"') | Some(&b'\'')) {
+                p += 1;
+            }
+            if matches!(b.get(p), Some(&b'=') | Some(&b':')) {
+                p += 1;
+                while matches!(b.get(p), Some(&b' ') | Some(&b'"') | Some(&b'\'')) {
+                    p += 1;
+                }
+                let end = secret_token_end(&window, p);
+                if end > p {
+                    secrets.push(window[p..end].to_string());
+                }
+                i = end.max(after);
+            } else {
+                i = after;
+            }
+        }
+    }
+
+    let mut redacted = window;
+    for tok in secrets {
+        if tok.len() >= 4 {
+            redacted = redacted.replace(&tok, "***REDACTED***");
+        }
+    }
+
+    // Final char-safe length cap.
+    let count = redacted.chars().count();
+    let mut out: String = redacted.chars().take(PROVIDER_ERR_BODY_MAX).collect();
+    if count > PROVIDER_ERR_BODY_MAX {
+        out.push_str("…[+truncated]");
+    }
+    out
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("provider config missing: {0}")]
     Config(String),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("API returned status {status}: {body}")]
+    #[error("API returned status {status}: {}", redact_body(.body))]
     ApiStatus { status: u16, body: String },
     #[error("API response malformed: {0}")]
     BadResponse(String),
@@ -270,4 +368,33 @@ pub fn chat_with_tools(
         resp.provider = provider;
     }
     Ok(resp)
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_body;
+
+    #[test]
+    fn masks_credentials_and_truncates() {
+        // sk- keys, Bearer tokens, and api_key=/: values are masked.
+        let body = r#"{"error":"bad key sk-ant-abc123XYZ","auth":"Bearer tok_9f8e7d6c"}"#;
+        let out = redact_body(body);
+        assert!(!out.contains("sk-ant-abc123XYZ"), "sk- key leaked: {out}");
+        assert!(!out.contains("tok_9f8e7d6c"), "bearer token leaked: {out}");
+        assert!(out.contains("***REDACTED***"));
+
+        let out2 = redact_body(r#"{"api_key": "supersecretvalue123", "x": 1}"#);
+        assert!(!out2.contains("supersecretvalue123"), "api_key value leaked: {out2}");
+
+        // Long bodies are truncated with a marker.
+        let long = "x".repeat(5000);
+        let out3 = redact_body(&long);
+        assert!(out3.chars().count() <= super::PROVIDER_ERR_BODY_MAX + 16);
+        assert!(out3.ends_with("…[+truncated]"));
+
+        // Non-secret text is preserved; multibyte input never panics.
+        let out4 = redact_body("rate limit exceeded for café ☕ — retry later");
+        assert!(out4.contains("rate limit exceeded"));
+        assert!(!out4.contains("***REDACTED***"));
+    }
 }
