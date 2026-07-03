@@ -134,6 +134,18 @@ pub(crate) fn maybe_reoffload_cold(rel_oid: u32) {
 /// plain copy). Credentials come from the environment / instance metadata.
 #[pg_extern]
 fn cold_put(local_path: &str, dest_uri: &str) -> i64 {
+    // cold_put reads an arbitrary local file (as the postgres OS user) and
+    // uploads it to object storage with the server's ambient cloud creds — a
+    // file-read + exfiltration primitive. Gate it behind superuser, stricter
+    // than the pg_execute_server_program role that `COPY ... TO PROGRAM`
+    // requires. Without this a non-superuser holding only USAGE on the rvbbit
+    // schema could read e.g. /etc/passwd or SSL keys.
+    if !unsafe { pgrx::pg_sys::superuser() } {
+        pgrx::error!(
+            "rvbbit.cold_put: permission denied — requires superuser (reads a local \
+             file and uploads it to object storage)"
+        );
+    }
     let data = std::fs::read(local_path)
         .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_put: read {local_path}: {e}"));
     let n = data.len() as i64;

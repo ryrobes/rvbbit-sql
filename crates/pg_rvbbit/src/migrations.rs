@@ -489,6 +489,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0117_clickbench_gpu_stock_route_overlay",
         include_str!("../sql/migrations/0117_clickbench_gpu_stock_route_overlay.sql"),
     ),
+    (
+        "0118_rebuild_acceleration_dataloss_guard",
+        include_str!("../sql/migrations/0118_rebuild_acceleration_dataloss_guard.sql"),
+    ),
+    (
+        "0119_clickbench_1m_route_overlay_refresh",
+        include_str!("../sql/migrations/0119_clickbench_1m_route_overlay_refresh.sql"),
+    ),
+    (
+        "0120_html_block_turn_operator",
+        include_str!("../sql/migrations/0120_html_block_turn_operator.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

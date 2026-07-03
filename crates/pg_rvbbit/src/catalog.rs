@@ -1175,6 +1175,21 @@ BEGIN
         RAISE EXCEPTION '% is not an rvbbit table', reloid;
     END IF;
 
+    -- Data-loss guard. rebuild regenerates the accelerator FROM the heap. If the
+    -- heap is not authoritative (shadow_heap_retained = false — e.g. a legacy
+    -- compact(keep_heap := false) truncated it) AND accelerator row groups already
+    -- exist, exporting from the empty/partial heap would delete the only surviving
+    -- copy of the data (the zero-rows branch below drops every generation and
+    -- queues every parquet file for the reaper). Refuse instead. Fresh tables have
+    -- no row groups yet (guard skipped); retained-heap tables are unaffected.
+    IF EXISTS (SELECT 1 FROM rvbbit.row_groups WHERE table_oid = reloid)
+       AND NOT coalesce(
+             (SELECT t.shadow_heap_retained FROM rvbbit.tables t
+               WHERE t.table_oid = reloid),
+             true) THEN
+        RAISE EXCEPTION 'rvbbit.rebuild_acceleration: % has a non-authoritative (truncated) heap but existing accelerator row groups; rebuilding from the heap would destroy data. Restore the heap contents or use rvbbit.refresh_acceleration instead.', reloid;
+    END IF;
+
     -- Define the logical fold snapshot without taking a table lock. The long
     -- baseline scan exports only rows visible to this snapshot; after it
     -- finishes, a short final lock appends rows not visible to this snapshot

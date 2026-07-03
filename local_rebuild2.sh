@@ -1,9 +1,9 @@
 
 export RVBBIT_DIRECT_ACCEL_LOAD=1
-export BENCH_LIMIT=10000
+export BENCH_LIMIT=10000000
 export BENCH_REPEATS=3
-#export BENCH_SYSTEMS=pg_baseline,citus,hydra,alloydb,rvbbit,clickhouse
-export BENCH_SYSTEMS=rvbbit_datafusion_forced,rvbbit_native_forced,rvbbit_datafusion_vortex_forced,rvbbit_duck_vortex_forced,rvbbit_duck_forced,rvbbit_gpu_gqe_forced,rvbbit
+export BENCH_SYSTEMS=pg_baseline,citus,hydra,alloydb,rvbbit,clickhouse
+#export BENCH_SYSTEMS=rvbbit_datafusion_forced,rvbbit_native_forced,rvbbit_datafusion_vortex_forced,rvbbit_duck_vortex_forced,rvbbit_duck_forced,rvbbit_gpu_gqe_forced,rvbbit
 #export BENCH_SYSTEMS=rvbbit_datafusion_forced,rvbbit_native_forced,rvbbit_duck_vortex_forced,rvbbit_duck_forced,rvbbit_gpu_gqe_forced,rvbbit
 #export BENCH_SYSTEMS=rvbbit_datafusion_forced,rvbbit_native_forced,rvbbit_duck_vortex_forced,rvbbit_gpu_gqe_forced,rvbbit
 export RVBBIT_DIRECT_ACCEL_METADATA_PROFILE=rich
@@ -23,11 +23,11 @@ export RVBBIT_ROUTE_DATAFUSION_VORTEX_ALLOW_TEMPORAL=1
 
 #export SKIP_LOAD=1
 unset SKIP_LOAD
-./bench/clickbench/run_offline.sh --test-name gpu_bench_test  --rebuild --reset-rvbbit-extension
+./bench/clickbench/run_offline.sh --test-name gpu_bench_test --rebuild --reset-rvbbit-extension 
 
 ## --rebuild --reset-rvbbit-extension
 # 5m - 600mb, 2 files - 23m - wins 8
 # 1m
 #
-#TPCH_SCALE=1
-#./bench/tpch/run_offline.sh --test-name gpu_bench2
+TPCH_SCALE=5
+./bench/tpch/run_offline.sh --test-name gpu_bench2

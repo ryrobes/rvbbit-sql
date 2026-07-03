@@ -633,11 +633,16 @@ unsafe extern "C-unwind" fn begin_custom_scan(
 
     // Phase 2 slice 4: load the tombstone bitmap for this scan, honoring
     // either rvbbit.as_of_generation or a statement timestamp directive.
-    // On any error we treat as "no tombstones" — better to over-include rows
-    // than to fail the query.
+    // load_for_table short-circuits to an empty map when the table has no
+    // tombstones (count == 0), so a genuine Err here means the tombstone
+    // catalog could not be read. Swallowing that to "no tombstones" would
+    // resurrect deleted/superseded parquet rows alongside the heap-tail
+    // overlay's newer versions (silent heap≠engine divergence). Fail loudly
+    // instead — correctness over availability; the caller can retry or the
+    // planner replans onto a heap scan.
     let delete_bitmaps = match crate::delete_log::load_for_table(table_oid, asof) {
         Ok(m) => m,
-        Err(_) => HashMap::new(),
+        Err(e) => pgrx::error!("rvbbit custom scan: tombstone bitmap load failed: {}", e),
     };
 
     let heap_tail = match heap_tail_config_for_table(table_oid, asof) {
