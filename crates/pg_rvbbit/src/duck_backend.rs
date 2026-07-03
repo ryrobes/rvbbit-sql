@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -81,6 +82,16 @@ struct DuckSharedKey {
     pgdata_prefix: String,
     visible_pgdata_prefix: String,
 }
+
+#[derive(Clone, Debug)]
+struct GqeProbeCacheEntry {
+    key: String,
+    expires_at: Instant,
+    available: bool,
+    reason: String,
+}
+
+static GQE_PROBE_CACHE: OnceLock<Mutex<Option<GqeProbeCacheEntry>>> = OnceLock::new();
 
 impl DuckSession {
     fn spawn(key: DuckSessionKey) -> Result<Self, String> {
@@ -214,7 +225,7 @@ pub(crate) fn gqe_routes_available() -> (bool, String) {
         );
     }
     match gqe_binary() {
-        Some(path) => probe_gqe_binary(&path),
+        Some(path) => cached_probe_gqe_binary(&path),
         None => (
             false,
             "rvbbit-gqe binary not found; GPU/GQE routes are unavailable".to_string(),
@@ -488,6 +499,59 @@ fn probe_gqe_binary(path: &str) -> (bool, String) {
     }
 }
 
+fn cached_probe_gqe_binary(path: &str) -> (bool, String) {
+    let ttl = gqe_probe_cache_ttl();
+    if ttl.is_zero() {
+        return probe_gqe_binary(path);
+    }
+
+    let key = gqe_probe_cache_key(path);
+    let now = Instant::now();
+    let cache = GQE_PROBE_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some(entry) = guard.as_ref() {
+            if entry.key == key && now < entry.expires_at {
+                return (entry.available, entry.reason.clone());
+            }
+        }
+    }
+
+    let (available, reason) = probe_gqe_binary(path);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(GqeProbeCacheEntry {
+            key,
+            expires_at: now + ttl,
+            available,
+            reason: reason.clone(),
+        });
+    }
+    (available, reason)
+}
+
+fn gqe_probe_cache_ttl() -> Duration {
+    Duration::from_millis(gqe_probe_cache_ttl_ms())
+}
+
+fn gqe_probe_cache_ttl_ms() -> u64 {
+    guc_setting("rvbbit.gqe_probe_cache_ttl_ms")
+        .or_else(|| std::env::var("RVBBIT_GQE_PROBE_CACHE_TTL_MS").ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(10_000)
+}
+
+fn gqe_probe_cache_key(path: &str) -> String {
+    format!(
+        "path:{}|backend:{}|server:{}|cli:{}|node:{}|task:{}|num_gpus:{}",
+        path,
+        gqe_backend_config_enabled(),
+        std::env::var("RVBBIT_GQE_SERVER_URL").unwrap_or_default(),
+        std::env::var("RVBBIT_GQE_CLI").unwrap_or_default(),
+        std::env::var("RVBBIT_GQE_NODE_MANAGER").unwrap_or_default(),
+        std::env::var("RVBBIT_GQE_TASK_MANAGER").unwrap_or_default(),
+        std::env::var("RVBBIT_GQE_NUM_GPUS").unwrap_or_default(),
+    )
+}
+
 fn gqe_route_gate_enabled() -> bool {
     guc_setting("rvbbit.route_gpu_gqe")
         .map(|value| setting_enabled(&value, false))
@@ -508,7 +572,8 @@ pub(crate) fn accelerator_runtime_status_value(live: bool) -> Value {
     let gqe_binary = gqe_binary();
     let (gqe_routes_available, gqe_reason) = if gqe_config_enabled {
         match gqe_binary.as_deref() {
-            Some(path) => probe_gqe_binary(path),
+            Some(path) if live => probe_gqe_binary(path),
+            Some(path) => cached_probe_gqe_binary(path),
             None => (
                 false,
                 "rvbbit-gqe binary not found; GPU/GQE routes are unavailable".to_string(),
@@ -609,6 +674,7 @@ pub(crate) fn accelerator_runtime_status_value(live: bool) -> Value {
             "route_gate_enabled": gqe_route_gate_enabled,
             "binary_found": gqe_binary.is_some(),
             "binary_path": gqe_binary,
+            "probe_cache_ttl_ms": gqe_probe_cache_ttl_ms(),
             "routes_available": gqe_routes_available,
             "reason": gqe_reason,
             "protocol": "rvbbit sidecar JSON/Arrow IPC bridge",

@@ -64,6 +64,19 @@ def fmt_seconds(ms: float | None) -> str:
     return f"{ms / 1000:.1f}s"
 
 
+def fmt_bytes(n: float | int | None) -> str:
+    if n is None:
+        return "-"
+    value = float(n)
+    for suffix in ("B", "KiB", "MiB", "GiB"):
+        if abs(value) < 1024.0 or suffix == "GiB":
+            if suffix == "B":
+                return f"{value:.0f}{suffix}"
+            return f"{value:.1f}{suffix}"
+        value /= 1024.0
+    return f"{value:.1f}GiB"
+
+
 def fmt_signed_seconds(ms: float | None) -> str:
     if ms is None:
         return "-"
@@ -81,9 +94,10 @@ def load(path: str) -> dict[str, Any]:
 
 
 def _gmean(xs: list[float]) -> float | None:
-    if not xs:
+    positive = [x for x in xs if x > 0]
+    if not positive:
         return None
-    return math.exp(sum(math.log(x) for x in xs) / len(xs))
+    return math.exp(sum(math.log(x) for x in positive) / len(positive))
 
 
 def _percentile(xs: list[float], pct: float) -> float | None:
@@ -92,6 +106,178 @@ def _percentile(xs: list[float], pct: float) -> float | None:
     ordered = sorted(xs)
     idx = min(len(ordered) - 1, max(0, math.ceil((pct / 100.0) * len(ordered)) - 1))
     return ordered[idx]
+
+
+def _float_or_none(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _env_enabled(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _gqe_breakdown_limit() -> int | None:
+    raw = os.environ.get("BENCH_GQE_BREAKDOWN_ROWS", "12").strip().lower()
+    if raw in {"all", "full"}:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 12
+
+
+def _print_gqe_breakdown(data: dict[str, Any], queries: list[dict]) -> None:
+    if not _env_enabled("BENCH_GQE_BREAKDOWN", True):
+        return
+    details = data.get("details", {})
+    if not isinstance(details, dict):
+        return
+
+    rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    repeats = data.get("repeats", "?")
+    for q in queries:
+        qid = q["qid"]
+        per_system = details.get(qid, {})
+        if not isinstance(per_system, dict):
+            continue
+        detail = per_system.get("rvbbit_gpu_gqe_forced", {})
+        if not isinstance(detail, dict):
+            continue
+        result = q.get("results", {}).get("rvbbit_gpu_gqe_forced")
+        status = result[1] if isinstance(result, list) and len(result) > 1 else None
+        error = detail.get("error")
+        if isinstance(error, str) and error.strip():
+            route = detail.get("route") if isinstance(detail.get("route"), dict) else {}
+            failures.append({
+                "qid": qid,
+                "description": q.get("description", "")[:34],
+                "route": route.get("chosen_candidate") or route.get("route") or "-",
+                "status": "SKIP" if isinstance(status, str) and status.lower().startswith("skip") else "FAIL",
+                "error": error.strip(),
+            })
+        gqe = detail.get("gqe")
+        if not isinstance(gqe, dict):
+            continue
+
+        median_ms = _float_or_none(detail.get("median_ms"))
+        sidecar_ms = _float_or_none(detail.get("sidecar_execute_ms"))
+        cli_ms = _float_or_none(gqe.get("median_cli_ms"))
+        flight_ms = _float_or_none(gqe.get("median_flight_ms"))
+        exec_ms = flight_ms if flight_ms is not None and flight_ms > 0 else cli_ms
+        read_ms = _float_or_none(gqe.get("median_result_read_ms"))
+        materialize_ms = _float_or_none(gqe.get("median_materialize_ms"))
+        rows.append({
+            "qid": qid,
+            "description": q.get("description", "")[:34],
+            "median_ms": median_ms,
+            "sidecar_ms": sidecar_ms,
+            "mode": gqe.get("client_mode") or ("flight" if flight_ms else "cli"),
+            "exec_ms": exec_ms,
+            "cli_ms": cli_ms,
+            "flight_ms": flight_ms,
+            "read_ms": read_ms,
+            "materialize_ms": materialize_ms,
+            "events": detail.get("sidecar_event_count"),
+            "result_rows": gqe.get("result_rows"),
+            "result_bytes": gqe.get("result_bytes"),
+        })
+
+    if not rows and not failures:
+        return
+
+    cli_values = [r["cli_ms"] for r in rows if r["cli_ms"] is not None]
+    flight_values = [r["flight_ms"] for r in rows if r["flight_ms"] is not None and r["flight_ms"] > 0]
+    exec_values = [r["exec_ms"] for r in rows if r["exec_ms"] is not None]
+    sidecar_values = [r["sidecar_ms"] for r in rows if r["sidecar_ms"] is not None]
+    exec_shares = [
+        r["exec_ms"] / r["sidecar_ms"]
+        for r in rows
+        if r["exec_ms"] is not None and r["sidecar_ms"] is not None and r["sidecar_ms"] > 0
+    ]
+    read_mat_values = [
+        (r["read_ms"] or 0.0) + (r["materialize_ms"] or 0.0)
+        for r in rows
+        if r["read_ms"] is not None or r["materialize_ms"] is not None
+    ]
+
+    limit = _gqe_breakdown_limit()
+    top_rows = sorted(rows, key=lambda r: r["exec_ms"] if r["exec_ms"] is not None else -1, reverse=True)
+    if limit is not None:
+        top_rows = top_rows[:limit]
+
+    print(c(BOLD, "=== GQE diagnostic breakdown ==="))
+    if rows:
+        print(c(DIM, "   diagnostic sidecar samples; event counts may be lower than benchmark repeats"))
+        print(c(DIM, f"   captured queries: {len(rows)}; showing slowest by GQE execution time"))
+        print()
+        diag_rows = [
+            [c(BOLD, "captured queries"), str(len(rows))],
+            [c(BOLD, "geomean GQE exec"), fmt_ms(_gmean(exec_values)) if exec_values else "-"],
+            [c(BOLD, "geomean GQE Flight"), fmt_ms(_gmean(flight_values)) if flight_values else "-"],
+            [c(BOLD, "geomean GQE CLI"), fmt_ms(_gmean(cli_values)) if cli_values else "-"],
+            [c(BOLD, "geomean sidecar execute"), fmt_ms(_gmean(sidecar_values)) if sidecar_values else "-"],
+            [
+                c(BOLD, "GQE exec share of sidecar"),
+                f"{(_gmean(exec_shares) or 0) * 100:.0f}%" if exec_shares else "-",
+            ],
+            [c(BOLD, "geomean read+materialize"), fmt_ms(_gmean(read_mat_values)) if read_mat_values else "-"],
+        ]
+        print(tabulate(diag_rows, headers=["Metric", "Value"], tablefmt="rounded_grid", stralign="right"))
+        print()
+
+        headers = ["Query", "Description", "query median", "sidecar sample", "mode", "gqe exec", "flight", "cli", "read", "mat", "events", "output"]
+        body = []
+        for row in top_rows:
+            events = row["events"]
+            if isinstance(events, int):
+                event_text = f"{events}/{repeats}"
+            else:
+                event_text = "-"
+            result_rows = row["result_rows"] if isinstance(row["result_rows"], int) else None
+            output = f"{result_rows if result_rows is not None else '?'} rows / {fmt_bytes(_float_or_none(row['result_bytes']))}"
+            body.append([
+                c(BOLD, str(row["qid"])),
+                c(DIM, str(row["description"])),
+                fmt_ms(row["median_ms"]),
+                fmt_ms(row["sidecar_ms"]),
+                str(row["mode"]),
+                fmt_ms(row["exec_ms"]),
+                fmt_ms(row["flight_ms"]),
+                fmt_ms(row["cli_ms"]),
+                fmt_ms(row["read_ms"]),
+                fmt_ms(row["materialize_ms"]),
+                event_text,
+                output,
+            ])
+        print(tabulate(body, headers=headers, tablefmt="rounded_grid", stralign="right",
+                       maxcolwidths=[None, 36, None, None, None, None, None, None, None, None, None, None]))
+    if failures:
+        if rows:
+            print()
+        fail_body = []
+        for failure in failures:
+            fail_body.append([
+                c(BOLD, str(failure["qid"])),
+                c(DIM, str(failure["description"])),
+                str(failure["route"]),
+                str(failure["status"]),
+                str(failure["error"]),
+            ])
+        print(c(BOLD, "GQE failures"))
+        print(tabulate(
+            fail_body,
+            headers=["Query", "Description", "route", "status", "error"],
+            tablefmt="rounded_grid",
+            stralign="right",
+            maxcolwidths=[None, 36, None, 28, 90],
+        ))
+    print()
 
 
 def main() -> int:
@@ -235,6 +421,7 @@ def main() -> int:
     print(tabulate(summary_rows, headers=summary_headers, tablefmt="rounded_grid",
                    stralign="right"))
     print()
+    _print_gqe_breakdown(data, queries)
     if "rvbbit" in systems and "alloydb" in systems:
         paired: list[tuple[float, float]] = []
         for q in queries:

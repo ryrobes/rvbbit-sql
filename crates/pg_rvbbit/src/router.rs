@@ -918,6 +918,8 @@ struct RvbbitTableMetric {
     delete_count: i64,
     text_columns: Vec<String>,
     temporal_columns: Vec<String>,
+    date_columns: Vec<String>,
+    timestamp_columns: Vec<String>,
     /// Per-table engine/layout deny-sets from rvbbit.accel_policy. A candidate is
     /// gated out for this table if its engine() ∈ denied_engines or its layout()
     /// ∈ denied_layouts. Empty for tables with no policy row.
@@ -2029,7 +2031,7 @@ thread_local! {
     // overlay changes only on an explicit train, so this is a hashmap hit per query. A
     // <=TTL-stale map only affects which engine is CHOSEN — the pin still passes
     // candidate_availability in overlay_decision, so it never changes correctness.
-    static OVERLAY_MEMO: std::cell::RefCell<Option<(Instant, std::collections::HashMap<String, Candidate>)>> =
+    static OVERLAY_MEMO: std::cell::RefCell<Option<(Instant, std::collections::HashMap<String, OverlayPin>)>> =
         const { std::cell::RefCell::new(None) };
 
     // Set by the trainer while it computes the TRUE base decision (what base rules would pick
@@ -2037,9 +2039,34 @@ thread_local! {
     static OVERLAY_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// All enabled overlay pins as shape_key -> engine, refreshed at most once per TTL. Empty (no
+#[derive(Clone, Debug)]
+struct OverlayPin {
+    engine: Candidate,
+    sample_order: Vec<Candidate>,
+}
+
+fn overlay_sample_order(sample_ms: &str) -> Vec<Candidate> {
+    let Ok(Value::Object(samples)) = serde_json::from_str::<Value>(sample_ms) else {
+        return Vec::new();
+    };
+    let mut ordered: Vec<(Candidate, f64)> = samples
+        .iter()
+        .filter_map(|(name, value)| {
+            let candidate = Candidate::from_str(name)?;
+            let ms = value.as_f64()?;
+            ms.is_finite().then_some((candidate, ms))
+        })
+        .collect();
+    ordered.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    ordered
+        .into_iter()
+        .map(|(candidate, _)| candidate)
+        .collect()
+}
+
+/// All enabled overlay pins as shape_key -> pin, refreshed at most once per TTL. Empty (no
 /// behavior change) until the route_overlay table exists and has rows.
-fn overlay_map() -> std::collections::HashMap<String, Candidate> {
+fn overlay_map() -> std::collections::HashMap<String, OverlayPin> {
     let ttl = route_stamp_ttl();
     let stale = ttl.is_zero()
         || OVERLAY_MEMO.with(|m| {
@@ -2049,21 +2076,29 @@ fn overlay_map() -> std::collections::HashMap<String, Candidate> {
                 .unwrap_or(true)
         });
     if stale {
-        let mut map: std::collections::HashMap<String, Candidate> =
+        let mut map: std::collections::HashMap<String, OverlayPin> =
             std::collections::HashMap::new();
         if relations_present(&["rvbbit.route_overlay"]) {
             let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
                 let rows = client.select(
-                    "SELECT shape_key, engine FROM rvbbit.route_overlay WHERE enabled",
+                    "SELECT shape_key, engine, COALESCE(sample_ms, '{}'::jsonb)::text \
+                     FROM rvbbit.route_overlay WHERE enabled",
                     None,
                     &[],
                 )?;
                 for row in rows {
                     let key: String = row.get(1)?.unwrap_or_default();
                     let eng: String = row.get(2)?.unwrap_or_default();
+                    let sample_ms: String = row.get(3)?.unwrap_or_else(|| "{}".to_string());
                     if !key.is_empty() {
                         if let Some(c) = Candidate::from_str(&eng) {
-                            map.insert(key, c);
+                            map.insert(
+                                key,
+                                OverlayPin {
+                                    engine: c,
+                                    sample_order: overlay_sample_order(&sample_ms),
+                                },
+                            );
                         }
                     }
                 }
@@ -2091,18 +2126,30 @@ fn overlay_decision(
     if OVERLAY_BYPASS.with(|b| b.get()) {
         return None;
     }
-    let cand = *overlay_map().get(&features.shape_key)?;
-    let (available, reason) = candidate_availability(cand, features, tables);
-    if !available {
-        return None;
+    let pin = overlay_map().get(&features.shape_key)?.clone();
+    let mut candidates = Vec::with_capacity(pin.sample_order.len() + 1);
+    candidates.push(pin.engine);
+    for candidate in pin.sample_order {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
     }
-    Some(decision(
-        cand,
-        "overlay",
-        &format!("tested overlay pin; {reason}"),
-        Some(1.0),
-        None,
-    ))
+    for cand in candidates {
+        let (available, reason) = candidate_availability(cand, features, tables);
+        if available {
+            let reason = if cand == pin.engine {
+                format!("tested overlay pin; {reason}")
+            } else {
+                format!(
+                    "tested overlay fallback from {} to {}; {reason}",
+                    pin.engine.as_str(),
+                    cand.as_str()
+                )
+            };
+            return Some(decision(cand, "overlay", &reason, Some(1.0), None));
+        }
+    }
+    None
 }
 
 /// Drop the per-backend overlay memo so the next lookup re-reads the table — called by the
@@ -5113,6 +5160,25 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
                               'time with time zone'::regtype \
                           ) \
                     ), ''), \
+                    coalesce(( \
+                        SELECT string_agg(lower(a.attname::text), ',' ORDER BY a.attnum) \
+                        FROM pg_attribute a \
+                        WHERE a.attrelid = c.oid \
+                          AND a.attnum > 0 \
+                          AND NOT a.attisdropped \
+                          AND a.atttypid = 'date'::regtype \
+                    ), ''), \
+                    coalesce(( \
+                        SELECT string_agg(lower(a.attname::text), ',' ORDER BY a.attnum) \
+                        FROM pg_attribute a \
+                        WHERE a.attrelid = c.oid \
+                          AND a.attnum > 0 \
+                          AND NOT a.attisdropped \
+                          AND a.atttypid IN ( \
+                              'timestamp without time zone'::regtype, \
+                              'timestamp with time zone'::regtype \
+                          ) \
+                    ), ''), \
                     array_to_string(coalesce(p.denied_engines, '{{}}'), ','), \
                     array_to_string(coalesce(p.denied_layouts, '{{}}'), ',') \
 	             FROM rvbbit.tables t \
@@ -5163,8 +5229,24 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
                     .filter(|col| !col.is_empty())
                     .map(str::to_string)
                     .collect(),
-                denied_engines: row
+                date_columns: row
                     .get::<String>(14)?
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|col| !col.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                timestamp_columns: row
+                    .get::<String>(15)?
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|col| !col.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                denied_engines: row
+                    .get::<String>(16)?
                     .unwrap_or_default()
                     .split(',')
                     .map(str::trim)
@@ -5172,7 +5254,7 @@ fn fetch_table_metrics(ref_oids: &[i64]) -> Vec<RvbbitTableMetric> {
                     .map(str::to_string)
                     .collect(),
                 denied_layouts: row
-                    .get::<String>(15)?
+                    .get::<String>(17)?
                     .unwrap_or_default()
                     .split(',')
                     .map(str::trim)
@@ -5567,6 +5649,8 @@ fn table_metric_json(t: &RvbbitTableMetric) -> Value {
         "native_overlay_readable": t.native_overlay_readable,
         "text_columns": t.text_columns,
         "temporal_columns": t.temporal_columns,
+        "date_columns": t.date_columns,
+        "timestamp_columns": t.timestamp_columns,
         "parquet_authoritative": t.delete_count == 0
             && (t.heap_bytes == 0 || (t.shadow_heap_retained && !t.shadow_heap_dirty)),
         "delete_count": t.delete_count,
@@ -6139,6 +6223,18 @@ fn vector_availability(
 }
 
 fn gpu_gqe_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> (bool, String) {
+    if let Some(reason) = gpu_gqe_unsupported_shape_reason(features, tables) {
+        return (false, reason);
+    }
+    if let Some(reason) = gpu_gqe_unsupported_function_reason(features) {
+        return (false, reason);
+    }
+    if let Some(reason) = gpu_gqe_unsupported_grouping_reason(features) {
+        return (false, reason);
+    }
+    if let Some(reason) = gpu_gqe_temporal_reference_reason(features, tables) {
+        return (false, reason);
+    }
     let (available, reason) = duck_availability(features, tables);
     if available {
         (
@@ -6148,6 +6244,262 @@ fn gpu_gqe_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) 
     } else {
         (false, reason)
     }
+}
+
+fn gpu_gqe_allow_risky_shapes() -> bool {
+    route_enabled(
+        "RVBBIT_GQE_ALLOW_RISKY_SHAPES",
+        "rvbbit.gqe_allow_risky_shapes",
+        false,
+    )
+}
+
+fn gpu_gqe_unsupported_shape_reason(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<String> {
+    gpu_gqe_unsupported_shape_reason_inner(features, tables, gpu_gqe_allow_risky_shapes())
+}
+
+fn gpu_gqe_unsupported_shape_reason_inner(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+    allow_risky: bool,
+) -> Option<String> {
+    if allow_risky {
+        return None;
+    }
+
+    if gpu_gqe_unsupported_join_shape(features) {
+        return Some(
+            "GPU/GQE supports only simple inner/left/cross joins with explicit ON predicates"
+                .to_string(),
+        );
+    }
+    if gpu_gqe_schema_qualified_table_ref(features, tables) {
+        return Some(
+            "GPU/GQE does not safely support schema-qualified table references yet".to_string(),
+        );
+    }
+    if gpu_gqe_qualified_star_projection(features) {
+        return Some("GPU/GQE does not support qualified SELECT * projections".to_string());
+    }
+    if features.select_star
+        && (features.from_count > 1 || features.join_count > 0 || features.plan_has_join)
+    {
+        return Some("GPU/GQE does not support SELECT * over multiple tables".to_string());
+    }
+    if gpu_gqe_wide_row_retrieval_shape(features) {
+        return Some(
+            "GPU/GQE wide SELECT * text-filter/order/limit shapes are disabled to avoid high RMM memory pressure"
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn gpu_gqe_unsupported_join_shape(features: &RouteFeatures) -> bool {
+    let sql = &features.normalized_sql;
+    [
+        "full join",
+        "full outer join",
+        "right join",
+        "right outer join",
+        "natural join",
+        " lateral ",
+        " using ",
+    ]
+    .iter()
+    .any(|needle| sql.contains(needle))
+}
+
+fn gpu_gqe_schema_qualified_table_ref(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> bool {
+    tables.iter().any(|table| {
+        let schema = table.schema.to_ascii_lowercase();
+        let relname = table.relname.to_ascii_lowercase();
+        features
+            .normalized_sql
+            .contains(&format!("{schema}.{relname}"))
+            || features
+                .normalized_sql
+                .contains(&format!("\"{schema}\".\"{relname}\""))
+    })
+}
+
+fn gpu_gqe_qualified_star_projection(features: &RouteFeatures) -> bool {
+    features.normalized_sql.contains(".*") || features.normalized_sql.contains(". *")
+}
+
+fn gpu_gqe_wide_row_retrieval_shape(features: &RouteFeatures) -> bool {
+    features.select_star
+        && features.where_present
+        && features.like_count > 0
+        && features.order_by
+        && features.normalized_sql.contains(" limit ")
+}
+
+fn gpu_gqe_unsupported_function_reason(features: &RouteFeatures) -> Option<String> {
+    let _ = features;
+    None
+}
+
+fn gpu_gqe_unsupported_grouping_reason(features: &RouteFeatures) -> Option<String> {
+    if sql_group_by_ordinal_present(&features.normalized_sql) {
+        if gpu_gqe_literal_first_group_by_rewriteable(&features.normalized_sql) {
+            return None;
+        }
+        return Some("GPU/GQE does not safely support GROUP BY ordinal expressions".to_string());
+    }
+    None
+}
+
+fn gpu_gqe_literal_first_group_by_rewriteable(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    if !(trimmed.starts_with("select ?,") || trimmed.starts_with("select ? ,")) {
+        return false;
+    }
+    top_level_clause(
+        sql,
+        "group by",
+        &["having", "order by", "limit", "offset", "union"],
+    )
+    .split(',')
+    .next()
+    .is_some_and(|expr| matches!(expr.trim(), "?" | "1"))
+}
+
+fn gpu_gqe_temporal_reference_reason(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<String> {
+    let timestamp_columns = tables
+        .iter()
+        .flat_map(|table| {
+            table
+                .timestamp_columns
+                .iter()
+                .map(|column| format!("{}.{}.{}", table.schema, table.relname, column))
+        })
+        .collect::<Vec<_>>();
+    if timestamp_columns.is_empty() {
+        return None;
+    }
+    let referenced = timestamp_columns
+        .iter()
+        .filter(|qualified| {
+            let column = qualified.rsplit('.').next().unwrap_or(qualified.as_str());
+            contains_column_identifier(&features.normalized_sql, column)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if referenced.is_empty() {
+        None
+    } else if gpu_gqe_timestamp_references_order_only(features, &referenced)
+        || gpu_gqe_timestamp_references_rewriteable(features)
+    {
+        None
+    } else {
+        Some(format!(
+            "GPU/GQE does not support referenced timestamp column(s): {}",
+            referenced.join(", ")
+        ))
+    }
+}
+
+fn gpu_gqe_timestamp_references_rewriteable(features: &RouteFeatures) -> bool {
+    sql_function_call_present(&features.normalized_sql, "extract")
+        || sql_function_call_present(&features.normalized_sql, "date_trunc")
+}
+
+fn gpu_gqe_timestamp_references_order_only(
+    features: &RouteFeatures,
+    referenced: &[String],
+) -> bool {
+    let sql = &features.normalized_sql;
+    let select_clause = normalized_select_clause(sql);
+    let where_clause = top_level_clause(
+        sql,
+        "where",
+        &["group by", "order by", "having", "limit", "offset", "union"],
+    );
+    let group_clause = top_level_clause(
+        sql,
+        "group by",
+        &["having", "order by", "limit", "offset", "union"],
+    );
+    let having_clause = top_level_clause(sql, "having", &["order by", "limit", "offset", "union"]);
+    let order_clause = top_level_clause(sql, "order by", &["limit", "offset", "union"]);
+    if order_clause.is_empty() {
+        return false;
+    }
+    referenced.iter().all(|qualified| {
+        let column = qualified.rsplit('.').next().unwrap_or(qualified.as_str());
+        contains_column_identifier(&order_clause, column)
+            && !contains_column_identifier(&select_clause, column)
+            && !contains_column_identifier(&where_clause, column)
+            && !contains_column_identifier(&group_clause, column)
+            && !contains_column_identifier(&having_clause, column)
+    })
+}
+
+fn normalized_select_clause(sql: &str) -> String {
+    let trimmed = sql.trim_start();
+    let Some(after_select) = trimmed.strip_prefix("select") else {
+        return String::new();
+    };
+    let Some(from_pos) = find_top_level_keyword(after_select, "from") else {
+        return String::new();
+    };
+    after_select[..from_pos].trim().to_string()
+}
+
+fn sql_function_call_present(sql: &str, function_name: &str) -> bool {
+    let mut start = 0usize;
+    while let Some(pos) = sql[start..].find(function_name) {
+        let abs = start + pos;
+        let before = if abs == 0 {
+            None
+        } else {
+            sql[..abs].chars().next_back()
+        };
+        let after_name = abs + function_name.len();
+        let after_name_char = sql[after_name..].chars().next();
+        if !before.is_some_and(is_ident_char)
+            && !after_name_char.is_some_and(is_ident_char)
+            && sql[after_name..].trim_start().starts_with('(')
+        {
+            return true;
+        }
+        start = after_name;
+    }
+    false
+}
+
+fn sql_group_by_ordinal_present(sql: &str) -> bool {
+    let Some(group_pos) = sql.find("group by") else {
+        return false;
+    };
+    let after_group = &sql[group_pos + "group by".len()..];
+    let end = [
+        " having ",
+        " order by ",
+        " limit ",
+        " offset ",
+        " union ",
+        " except ",
+        " intersect ",
+    ]
+    .iter()
+    .filter_map(|marker| after_group.find(marker))
+    .min()
+    .unwrap_or(after_group.len());
+    after_group[..end].split(',').any(|expr| {
+        let expr = expr.trim();
+        expr == "?" || (!expr.is_empty() && expr.chars().all(|ch| ch.is_ascii_digit()))
+    })
 }
 
 fn hot_mem_availability(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> (bool, String) {
@@ -8254,6 +8606,8 @@ mod route_unit_tests {
             delete_count: 0,
             text_columns: Vec::new(),
             temporal_columns: Vec::new(),
+            date_columns: Vec::new(),
+            timestamp_columns: Vec::new(),
             denied_engines: Vec::new(),
             denied_layouts: Vec::new(),
         }
@@ -8298,6 +8652,56 @@ mod route_unit_tests {
         let mut table = test_table(rows);
         table.text_columns = text_columns.iter().map(|col| col.to_string()).collect();
         build_features(sql, None, &[table])
+    }
+
+    #[test]
+    fn gpu_gqe_shape_gate_rejects_known_risky_shapes() {
+        let mut lineitem = test_table(1_000_000);
+        lineitem.relname = "lineitem".to_string();
+        let tables = [test_table(1_000_000), lineitem];
+
+        let multi_star = build_features(
+            "SELECT * FROM hits h JOIN lineitem l ON h.id = l.id",
+            None,
+            &tables,
+        );
+        assert!(
+            gpu_gqe_unsupported_shape_reason_inner(&multi_star, &tables, false)
+                .is_some_and(|reason| reason.contains("multiple tables"))
+        );
+
+        let qualified_star = test_features("SELECT h.* FROM hits h", 1_000_000);
+        assert!(gpu_gqe_unsupported_shape_reason_inner(
+            &qualified_star,
+            &[test_table(1_000_000)],
+            false
+        )
+        .is_some_and(|reason| reason.contains("qualified SELECT *")));
+
+        let schema_qualified = test_features("SELECT count(*) FROM public.hits", 1_000_000);
+        assert!(gpu_gqe_unsupported_shape_reason_inner(
+            &schema_qualified,
+            &[test_table(1_000_000)],
+            false
+        )
+        .is_some_and(|reason| reason.contains("schema-qualified")));
+
+        let q23_like = test_features(
+            r#"SELECT * FROM hits WHERE "URL" LIKE '%google%' ORDER BY "EventTime" LIMIT 10"#,
+            1_000_000,
+        );
+        assert!(
+            gpu_gqe_unsupported_shape_reason_inner(&q23_like, &[test_table(1_000_000)], false)
+                .is_some_and(|reason| reason.contains("wide SELECT *"))
+        );
+
+        let simple_join = build_features(
+            "SELECT h.id, l.id FROM hits h JOIN lineitem l ON h.id = l.id",
+            None,
+            &tables,
+        );
+        assert!(gpu_gqe_unsupported_shape_reason_inner(&simple_join, &tables, false).is_none());
+        assert!(gpu_gqe_unsupported_shape_reason_inner(&multi_star, &tables, true).is_none());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
@@ -15,25 +16,45 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
+use arrow_flight::flight_descriptor::DescriptorType;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::sql::{
+    CommandGetTables, CommandStatementSubstraitPlan, ProstMessageExt, SubstraitPlan,
+};
+use arrow_flight::{FlightData, FlightDescriptor};
 use datafusion::arrow::array::{
     cast::{as_boolean_array, as_primitive_array, as_string_array},
-    Array, ArrayRef,
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray,
 };
 use datafusion::arrow::datatypes::{
-    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef,
-    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    DataType, Date32Type, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    Int8Type, Schema, SchemaRef, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
-use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::stats::Precision;
+use datafusion::common::Statistics;
+use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::{Expr, ParquetReadOptions, SessionConfig, SessionContext};
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion::sql::sqlparser::parser::Parser;
 use duckdb::types::ValueRef;
 use duckdb::Connection;
+use futures::TryStreamExt;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter;
 use postgres::{Client, NoTls};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
+use tonic::transport::Channel;
 
 const DEFAULT_DSN: &str = "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench";
 const DEFAULT_DUCK_BIN: &str = "/usr/local/bin/rvbbit-duck";
@@ -44,6 +65,10 @@ const DEFAULT_GQE_CLI: &str = "/opt/gqe/rust/target/release/gqe-cli";
 const DEFAULT_GQE_NODE_MANAGER: &str = "/opt/gqe/build/src/node_manager/gqe_node_manager";
 const DEFAULT_GQE_TASK_MANAGER: &str = "/opt/gqe/build/src/task_manager/gqe_task_manager";
 const DEFAULT_GQE_WORK_DIR: &str = "/tmp/rvbbit-gqe";
+const GQE_CATALOG_VERSION: &str = "gqe-adapter-v4-date-year-sidecar";
+const GQE_ADAPTER_VERSION: &str = GQE_CATALOG_VERSION;
+const GQE_FLIGHT_SUBSTRAIT_VERSION: &str = "0.63.0";
+const GQE_FLIGHT_MAX_DECODING_MESSAGE_SIZE: usize = 512 * 1024 * 1024;
 const DEFAULT_TELEMETRY_QUEUE_CAPACITY: usize = 8192;
 const DEFAULT_TELEMETRY_BATCH_SIZE: usize = 64;
 const DEFAULT_TELEMETRY_FLUSH_MS: u64 = 250;
@@ -140,6 +165,51 @@ struct CacheSummary {
     parquet_footer_columns: usize,
     parquet_footer_schema_bytes: usize,
     parquet_prewarm_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gqe: Option<GqeQueryStats>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct GqeQueryStats {
+    runs: usize,
+    client_mode: String,
+    median_total_ms: f64,
+    median_server_ready_ms: f64,
+    median_rewrite_ms: f64,
+    median_cli_ms: f64,
+    median_flight_ms: f64,
+    median_result_read_ms: f64,
+    median_materialize_ms: f64,
+    median_cleanup_ms: f64,
+    result_files: usize,
+    result_bytes: u64,
+    result_batches: usize,
+    result_rows: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GqeRunStats {
+    client_mode: &'static str,
+    total_ms: f64,
+    server_ready_ms: f64,
+    rewrite_ms: f64,
+    cli_ms: f64,
+    flight_ms: f64,
+    result_read_ms: f64,
+    materialize_ms: f64,
+    cleanup_ms: f64,
+    result_files: usize,
+    result_bytes: u64,
+    result_batches: usize,
+    result_rows: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GqeResultReadStats {
+    files: usize,
+    bytes: u64,
+    batches: usize,
+    rows: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -873,7 +943,7 @@ fn run_gqe_once(
     args: &Args,
     sql: &str,
     catalog: BTreeMap<String, RvbbitDuckTable>,
-    cache: CacheSummary,
+    mut cache: CacheSummary,
 ) -> Result<QuerySummary> {
     prepare_gqe_catalog(&catalog)?;
     if args.explain_only {
@@ -882,13 +952,23 @@ fn run_gqe_once(
 
     let mut elapsed = Vec::with_capacity(args.repeat.max(1));
     let mut last = QueryRows::default();
+    let mut gqe_runs = Vec::with_capacity(args.repeat.max(1));
     for _ in 0..args.repeat.max(1) {
         cleanup_query_rows(&mut last);
         let start = Instant::now();
-        last = execute_gqe_query_result(sql, args.max_rows, args.result_format, args.timeout_s)?;
+        let (rows, stats) = execute_gqe_query_result(
+            sql,
+            &catalog,
+            args.max_rows,
+            args.result_format,
+            args.timeout_s,
+        )?;
+        last = rows;
+        gqe_runs.push(stats);
         elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     elapsed.sort_by(|a, b| a.total_cmp(b));
+    cache.gqe = GqeQueryStats::from_runs(&gqe_runs);
     Ok(query_summary_from_rows(
         elapsed[elapsed.len() / 2],
         args.repeat.max(1),
@@ -916,48 +996,120 @@ fn prepare_gqe_catalog(catalog: &BTreeMap<String, RvbbitDuckTable>) -> Result<()
         let location = prepare_gqe_table_dir(&root, table)?;
         script.push_str(&format!(
             "CREATE OR REPLACE EXTERNAL TABLE {} (\n{}\n) STORED AS PARQUET LOCATION {};\n",
-            gqe_quote_ident(&gqe_table_name(table, &rel_counts)),
-            table
-                .columns
-                .iter()
-                .map(|(name, typ)| format!("  {} {}", gqe_quote_ident(name), gqe_sql_type(typ)))
-                .collect::<Vec<_>>()
-                .join(",\n"),
+            gqe_table_ddl_name(&gqe_table_name(table, &rel_counts)),
+            gqe_table_columns(table).join(",\n"),
             gqe_quote_string(&location)
         ));
     }
-    run_gqe_cli_sql(&script, None, 60)?;
+    if let Err(err) = run_gqe_cli_sql(&script, None, 60) {
+        if !gqe_table_already_exists_error(&err) {
+            return Err(err);
+        }
+    }
     Ok(())
+}
+
+fn gqe_table_already_exists_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("already exists")
 }
 
 fn execute_gqe_query_result(
     sql: &str,
+    catalog: &BTreeMap<String, RvbbitDuckTable>,
     max_rows: usize,
     result_format: ResultFormat,
     timeout_s: u64,
-) -> Result<QueryRows> {
+) -> Result<(QueryRows, GqeRunStats)> {
+    let total_start = Instant::now();
+    let mut stats = GqeRunStats::default();
+    stats.client_mode = "cli";
+
+    let server_ready_start = Instant::now();
     ensure_gqe_server_ready()?;
+    stats.server_ready_ms = server_ready_start.elapsed().as_secs_f64() * 1000.0;
+
+    let rewrite_start = Instant::now();
+    if let Some(reason) = gqe_shape_gate_reason(sql, catalog) {
+        bail!("{reason}");
+    }
+    let gqe_sql = rewrite_gqe_sql(sql, catalog);
+    if let Some(reason) = gqe_unsupported_temporal_reason(&gqe_sql, catalog) {
+        bail!("{reason}");
+    }
+    if let Some(reason) = gqe_unsupported_function_reason(&gqe_sql) {
+        bail!("{reason}");
+    }
+    if let Some(reason) = gqe_unsupported_grouping_reason(&gqe_sql) {
+        bail!("{reason}");
+    }
+    stats.rewrite_ms = rewrite_start.elapsed().as_secs_f64() * 1000.0;
+
     let result_path = gqe_result_path()?;
-    run_gqe_cli_sql(sql, Some(&result_path), timeout_s)?;
-    let batches = read_parquet_batches_from_path(Path::new(&result_path))?;
+    let cli_start = Instant::now();
+    run_gqe_cli_sql(&gqe_sql, Some(&result_path), timeout_s)?;
+    stats.cli_ms = cli_start.elapsed().as_secs_f64() * 1000.0;
+
+    let read_start = Instant::now();
+    let (batches, read_stats) = read_parquet_batches_from_path(Path::new(&result_path))?;
+    stats.result_read_ms = read_start.elapsed().as_secs_f64() * 1000.0;
+    stats.result_files = read_stats.files;
+    stats.result_bytes = read_stats.bytes;
+    stats.result_batches = read_stats.batches;
+    stats.result_rows = read_stats.rows;
+
+    let materialize_start = Instant::now();
     let result = match result_format {
         ResultFormat::Json => record_batches_to_query_rows(&batches, max_rows),
         ResultFormat::ArrowIpcFile => record_batches_to_arrow_ipc_rows(&batches, max_rows),
-    };
+    }?;
+    if result_format == ResultFormat::Json {
+        reject_nul_text_rows(&result)?;
+    }
+    stats.materialize_ms = materialize_start.elapsed().as_secs_f64() * 1000.0;
+
+    let cleanup_start = Instant::now();
     let _ = remove_path_best_effort(Path::new(&result_path));
-    result
+    stats.cleanup_ms = cleanup_start.elapsed().as_secs_f64() * 1000.0;
+    stats.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+    Ok((result, stats))
+}
+
+fn reject_nul_text_rows(rows: &QueryRows) -> Result<()> {
+    for (row_idx, row) in rows.rows.iter().enumerate() {
+        for (col_idx, value) in row.iter().enumerate() {
+            if value_contains_nul_text(value) {
+                bail!(
+                    "GPU/GQE returned text containing NUL bytes at row {}, column {}; refusing JSON result",
+                    row_idx + 1,
+                    col_idx + 1
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn value_contains_nul_text(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains('\0'),
+        Value::Array(items) => items.iter().any(value_contains_nul_text),
+        Value::Object(map) => map.values().any(value_contains_nul_text),
+        _ => false,
+    }
 }
 
 fn gqe_probe_status() -> Value {
     if !gpu_visible() {
         return json!({
             "status": "unavailable",
+            "adapter_version": GQE_ADAPTER_VERSION,
             "reason": "no NVIDIA GPU is visible to the GQE bridge"
         });
     }
     let Some(cli) = gqe_cli() else {
         return json!({
             "status": "unavailable",
+            "adapter_version": GQE_ADAPTER_VERSION,
             "reason": "gqe-cli is not installed; set RVBBIT_GQE_CLI or install GQE under /opt/gqe"
         });
     };
@@ -965,6 +1117,7 @@ fn gqe_probe_status() -> Value {
     if gqe_server_reachable(&server_url) {
         return json!({
             "status": "ok",
+            "adapter_version": GQE_ADAPTER_VERSION,
             "detail": "GQE server is reachable",
             "gqe_cli": cli,
             "server_url": server_url
@@ -973,6 +1126,7 @@ fn gqe_probe_status() -> Value {
     if gqe_auto_start_enabled() && gqe_node_manager().is_some() && gqe_task_manager().is_some() {
         return json!({
             "status": "ok",
+            "adapter_version": GQE_ADAPTER_VERSION,
             "detail": "GQE server is not running yet, but auto-start is available",
             "gqe_cli": cli,
             "server_url": server_url
@@ -980,6 +1134,7 @@ fn gqe_probe_status() -> Value {
     }
     json!({
         "status": "unavailable",
+        "adapter_version": GQE_ADAPTER_VERSION,
         "reason": "GQE server is not reachable and auto-start binaries are not installed",
         "gqe_cli": cli,
         "server_url": server_url
@@ -1026,9 +1181,10 @@ fn run_gqe_cli_sql(sql: &str, parquet_output: Option<&str>, timeout_s: u64) -> R
     let output = wait_child_output(child, Duration::from_secs(timeout_s.max(1) + 5), "gqe-cli")?;
     if !output.status.success() {
         bail!(
-            "gqe-cli failed: stdout={} stderr={}",
-            first_line_bytes(&output.stdout),
-            first_line_bytes(&output.stderr)
+            "gqe-cli failed ({}): stdout={} stderr={}",
+            output.status,
+            child_output_snippet(&output.stdout),
+            child_output_snippet(&output.stderr)
         );
     }
     Ok(())
@@ -1134,6 +1290,17 @@ fn gqe_auto_start_enabled() -> bool {
     env_enabled("RVBBIT_GQE_AUTO_START", true)
 }
 
+fn gqe_flight_client_enabled() -> bool {
+    !env::var("RVBBIT_GQE_CLIENT_MODE")
+        .ok()
+        .map(|value| value.trim().eq_ignore_ascii_case("cli"))
+        .unwrap_or(false)
+}
+
+fn gqe_flight_fallback_enabled() -> bool {
+    env_enabled("RVBBIT_GQE_FLIGHT_FALLBACK", true)
+}
+
 fn gqe_cli() -> Option<String> {
     configured_executable("RVBBIT_GQE_CLI", DEFAULT_GQE_CLI, "gqe-cli")
 }
@@ -1229,15 +1396,29 @@ fn gqe_work_dir() -> Result<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_GQE_WORK_DIR));
     fs::create_dir_all(&dir).with_context(|| format!("creating GQE work dir {}", dir.display()))?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777))
-        .with_context(|| format!("setting GQE work dir permissions on {}", dir.display()))?;
+    match fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777)) {
+        Ok(()) => {}
+        Err(err)
+            if err.kind() == io::ErrorKind::PermissionDenied && gqe_work_dir_is_shared(&dir) => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("setting GQE work dir permissions on {}", dir.display()));
+        }
+    }
     Ok(dir)
 }
 
+fn gqe_work_dir_is_shared(dir: &Path) -> bool {
+    fs::metadata(dir)
+        .map(|meta| meta.is_dir() && (meta.permissions().mode() & 0o007) == 0o007)
+        .unwrap_or(false)
+}
+
 fn gqe_catalog_root(catalog: &BTreeMap<String, RvbbitDuckTable>) -> Result<PathBuf> {
+    let signature = format!("{GQE_CATALOG_VERSION}\n{}", catalog_signature(catalog));
     let root = gqe_work_dir()?
         .join("catalog")
-        .join(stable_hash_hex(&catalog_signature(catalog)));
+        .join(stable_hash_hex(&signature));
     fs::create_dir_all(&root)
         .with_context(|| format!("creating GQE catalog root {}", root.display()))?;
     Ok(root)
@@ -1251,12 +1432,15 @@ fn prepare_gqe_table_dir(root: &Path, table: &RvbbitDuckTable) -> Result<String>
     ));
     fs::create_dir_all(&table_dir)
         .with_context(|| format!("creating GQE table dir {}", table_dir.display()))?;
+    let needs_temporal_transform = table_needs_gqe_temporal_transform(table);
     for (idx, source) in table.paths.iter().enumerate() {
         let link = table_dir.join(format!("part-{idx:05}.parquet"));
         if link.exists() {
             continue;
         }
-        if env_enabled("RVBBIT_GQE_COPY_PARQUET", false) {
+        if needs_temporal_transform {
+            write_gqe_temporal_parquet(source, &link, table)?;
+        } else if env_enabled("RVBBIT_GQE_COPY_PARQUET", false) {
             fs::copy(source, &link)
                 .with_context(|| format!("copying parquet {source} to {}", link.display()))?;
         } else {
@@ -1265,6 +1449,274 @@ fn prepare_gqe_table_dir(root: &Path, table: &RvbbitDuckTable) -> Result<String>
         }
     }
     Ok(table_dir.display().to_string())
+}
+
+fn table_needs_gqe_temporal_transform(table: &RvbbitDuckTable) -> bool {
+    table
+        .columns
+        .iter()
+        .any(|(_, typ)| typ == "date" || typ.starts_with("timestamp") || pg_type_is_text(typ))
+}
+
+fn gqe_table_columns(table: &RvbbitDuckTable) -> Vec<String> {
+    let mut out = table
+        .columns
+        .iter()
+        .map(|(name, typ)| format!("  {} {}", gqe_quote_ident(name), gqe_sql_type(typ)))
+        .collect::<Vec<_>>();
+    for (name, typ) in &table.columns {
+        if pg_type_is_text(typ) {
+            out.push(format!(
+                "  {} INTEGER",
+                gqe_quote_ident(&gqe_len_column(name))
+            ));
+        }
+        if typ.starts_with("timestamp") {
+            out.push(format!(
+                "  {} INTEGER",
+                gqe_quote_ident(&gqe_minute_column(name))
+            ));
+            out.push(format!(
+                "  {} VARCHAR",
+                gqe_quote_ident(&gqe_minute_ts_column(name))
+            ));
+        }
+        if typ == "date" {
+            out.push(format!(
+                "  {} INTEGER",
+                gqe_quote_ident(&gqe_year_column(name))
+            ));
+        }
+    }
+    out
+}
+
+fn write_gqe_temporal_parquet(source: &str, target: &Path, table: &RvbbitDuckTable) -> Result<()> {
+    let input = File::open(source).with_context(|| format!("opening parquet {source}"))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(input)
+        .with_context(|| format!("reading parquet footer {source}"))?
+        .build()
+        .with_context(|| format!("building parquet reader {source}"))?;
+    let mut output = Some(
+        File::create(target)
+            .with_context(|| format!("creating transformed GQE parquet {}", target.display()))?,
+    );
+    let mut writer: Option<ArrowWriter<File>> = None;
+    for batch in reader {
+        let batch = batch.with_context(|| format!("reading parquet batch {source}"))?;
+        let transformed = transform_gqe_temporal_batch(&batch, table)?;
+        if writer.is_none() {
+            writer = Some(
+                ArrowWriter::try_new(
+                    output
+                        .take()
+                        .expect("output file available before writer init"),
+                    transformed.schema(),
+                    None,
+                )
+                .with_context(|| format!("opening parquet writer {}", target.display()))?,
+            );
+        }
+        writer
+            .as_mut()
+            .expect("writer initialized")
+            .write(&transformed)
+            .with_context(|| format!("writing transformed GQE parquet {}", target.display()))?;
+    }
+    if let Some(writer) = writer {
+        writer
+            .close()
+            .with_context(|| format!("closing transformed GQE parquet {}", target.display()))?;
+    }
+    Ok(())
+}
+
+fn transform_gqe_temporal_batch(
+    batch: &RecordBatch,
+    table: &RvbbitDuckTable,
+) -> Result<RecordBatch> {
+    let type_by_column = table
+        .columns
+        .iter()
+        .map(|(name, typ)| (name.as_str(), typ.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let pg_type = type_by_column.get(field.name().as_str()).copied();
+        match pg_type {
+            Some("date") => {
+                fields.push(Field::new(
+                    field.name(),
+                    DataType::Utf8,
+                    field.is_nullable(),
+                ));
+                let days = date_column_to_days_values(column)?;
+                columns.push(Arc::new(StringArray::from(
+                    days.iter()
+                        .map(|value| value.map(format_date32))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef);
+                fields.push(Field::new(
+                    gqe_year_column(field.name()),
+                    DataType::Int32,
+                    field.is_nullable(),
+                ));
+                columns.push(Arc::new(Int32Array::from(
+                    days.iter()
+                        .map(|value| value.map(date32_year))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef);
+            }
+            Some(typ) if typ.starts_with("timestamp") => {
+                fields.push(Field::new(
+                    field.name(),
+                    DataType::Utf8,
+                    field.is_nullable(),
+                ));
+                let micros = timestamp_column_to_micros_values(column)?;
+                columns.push(Arc::new(StringArray::from(
+                    micros
+                        .iter()
+                        .map(|value| value.map(format_timestamp_micros))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef);
+                fields.push(Field::new(
+                    gqe_minute_column(field.name()),
+                    DataType::Int32,
+                    field.is_nullable(),
+                ));
+                columns.push(Arc::new(Int32Array::from(
+                    micros
+                        .iter()
+                        .map(|value| value.map(timestamp_minute))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef);
+                fields.push(Field::new(
+                    gqe_minute_ts_column(field.name()),
+                    DataType::Utf8,
+                    field.is_nullable(),
+                ));
+                columns.push(Arc::new(StringArray::from(
+                    micros
+                        .iter()
+                        .map(|value| value.map(format_timestamp_minute_micros))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef);
+            }
+            Some(typ) if pg_type_is_text(typ) => {
+                fields.push(field.as_ref().clone());
+                columns.push(Arc::clone(column));
+                fields.push(Field::new(
+                    gqe_len_column(field.name()),
+                    DataType::Int32,
+                    field.is_nullable(),
+                ));
+                columns.push(text_length_column(column)?);
+            }
+            _ => {
+                fields.push(field.as_ref().clone());
+                columns.push(Arc::clone(column));
+            }
+        }
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .context("building transformed GQE record batch")
+}
+
+fn date_column_to_days_values(column: &ArrayRef) -> Result<Vec<Option<i32>>> {
+    let values = match column.data_type() {
+        DataType::Date32 => {
+            let array = as_primitive_array::<Date32Type>(column.as_ref());
+            (0..array.len())
+                .map(|idx| {
+                    if array.is_null(idx) {
+                        None
+                    } else {
+                        Some(array.value(idx))
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+        DataType::Int32 => {
+            let array = as_primitive_array::<Int32Type>(column.as_ref());
+            (0..array.len())
+                .map(|idx| {
+                    if array.is_null(idx) {
+                        None
+                    } else {
+                        Some(array.value(idx))
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+        other => bail!("cannot expose GQE date column from Arrow type {other:?}"),
+    };
+    Ok(values)
+}
+
+fn text_length_column(column: &ArrayRef) -> Result<ArrayRef> {
+    let array = as_string_array(column.as_ref());
+    let values = (0..array.len())
+        .map(|idx| {
+            if array.is_null(idx) {
+                None
+            } else {
+                Some(array.value(idx).chars().count() as i32)
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+}
+
+fn timestamp_column_to_micros_values(column: &ArrayRef) -> Result<Vec<Option<i64>>> {
+    let values = match column.data_type() {
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            timestamp_values_to_micros::<TimestampSecondType>(column, 1_000_000)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            timestamp_values_to_micros::<TimestampMillisecondType>(column, 1_000)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            timestamp_values_to_micros::<TimestampMicrosecondType>(column, 1)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            timestamp_values_to_micros::<TimestampNanosecondType>(column, 1)
+                .into_iter()
+                .map(|value| value.map(|micros| micros / 1_000))
+                .collect()
+        }
+        DataType::Int64 => {
+            let array = as_primitive_array::<Int64Type>(column.as_ref());
+            (0..array.len())
+                .map(|idx| {
+                    if array.is_null(idx) {
+                        None
+                    } else {
+                        Some(array.value(idx))
+                    }
+                })
+                .collect()
+        }
+        other => bail!("cannot expose GQE timestamp column from Arrow type {other:?}"),
+    };
+    Ok(values)
+}
+
+fn timestamp_values_to_micros<T>(column: &ArrayRef, multiplier: i64) -> Vec<Option<i64>>
+where
+    T: datafusion::arrow::datatypes::ArrowPrimitiveType<Native = i64>,
+{
+    let array = as_primitive_array::<T>(column.as_ref());
+    (0..array.len())
+        .map(|idx| {
+            if array.is_null(idx) {
+                None
+            } else {
+                Some(array.value(idx) * multiplier)
+            }
+        })
+        .collect()
 }
 
 fn gqe_result_path() -> Result<String> {
@@ -1280,7 +1732,7 @@ fn gqe_result_path() -> Result<String> {
         .to_string())
 }
 
-fn read_parquet_batches_from_path(path: &Path) -> Result<Vec<RecordBatch>> {
+fn read_parquet_batches_from_path(path: &Path) -> Result<(Vec<RecordBatch>, GqeResultReadStats)> {
     let mut files = Vec::new();
     if path.is_dir() {
         for entry in fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
@@ -1294,11 +1746,16 @@ fn read_parquet_batches_from_path(path: &Path) -> Result<Vec<RecordBatch>> {
     } else if path.exists() {
         files.push(path.to_path_buf());
     } else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), GqeResultReadStats::default()));
     }
 
     let mut batches = Vec::new();
+    let mut stats = GqeResultReadStats::default();
     for file_path in files {
+        stats.files += 1;
+        stats.bytes += fs::metadata(&file_path)
+            .with_context(|| format!("statting GQE result {}", file_path.display()))?
+            .len();
         let file = File::open(&file_path)
             .with_context(|| format!("opening GQE result {}", file_path.display()))?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -1306,11 +1763,333 @@ fn read_parquet_batches_from_path(path: &Path) -> Result<Vec<RecordBatch>> {
             .build()
             .with_context(|| format!("building GQE result reader {}", file_path.display()))?;
         for batch in reader {
-            batches
-                .push(batch.with_context(|| {
-                    format!("reading GQE result batch {}", file_path.display())
-                })?);
+            let batch = batch
+                .with_context(|| format!("reading GQE result batch {}", file_path.display()))?;
+            stats.batches += 1;
+            stats.rows += batch.num_rows();
+            batches.push(batch);
         }
+    }
+    Ok((batches, stats))
+}
+
+struct GqeFlightExecutor {
+    runtime: Runtime,
+    client: GqeFlightClient,
+}
+
+impl GqeFlightExecutor {
+    fn connect(threads: usize) -> Result<Self> {
+        ensure_gqe_server_ready()?;
+        let runtime = RuntimeBuilder::new_multi_thread()
+            .enable_all()
+            .worker_threads(threads.max(1))
+            .build()
+            .context("creating GQE Flight runtime")?;
+        let client = runtime.block_on(GqeFlightClient::connect(&gqe_server_url()))?;
+        Ok(Self { runtime, client })
+    }
+
+    fn execute_query(
+        &mut self,
+        sql: &str,
+        catalog: &BTreeMap<String, RvbbitDuckTable>,
+        max_rows: usize,
+        result_format: ResultFormat,
+    ) -> Result<(QueryRows, GqeRunStats)> {
+        let total_start = Instant::now();
+        let mut stats = GqeRunStats::default();
+        stats.client_mode = "flight";
+
+        let rewrite_start = Instant::now();
+        if let Some(reason) = gqe_shape_gate_reason(sql, catalog) {
+            bail!("{reason}");
+        }
+        let gqe_sql = rewrite_gqe_sql(sql, catalog);
+        if let Some(reason) = gqe_unsupported_temporal_reason(&gqe_sql, catalog) {
+            bail!("{reason}");
+        }
+        if let Some(reason) = gqe_unsupported_function_reason(&gqe_sql) {
+            bail!("{reason}");
+        }
+        if let Some(reason) = gqe_unsupported_grouping_reason(&gqe_sql) {
+            bail!("{reason}");
+        }
+        stats.rewrite_ms = rewrite_start.elapsed().as_secs_f64() * 1000.0;
+
+        let flight_start = Instant::now();
+        let batches = self
+            .runtime
+            .block_on(self.client.execute_select(&gqe_sql))
+            .context("executing GQE query through persistent Flight client")?;
+        stats.flight_ms = flight_start.elapsed().as_secs_f64() * 1000.0;
+        stats.result_batches = batches.len();
+        stats.result_rows = batches.iter().map(RecordBatch::num_rows).sum();
+        stats.result_bytes = batches
+            .iter()
+            .map(|batch| batch.get_array_memory_size() as u64)
+            .sum();
+
+        let materialize_start = Instant::now();
+        let result = match result_format {
+            ResultFormat::Json => record_batches_to_query_rows(&batches, max_rows),
+            ResultFormat::ArrowIpcFile => record_batches_to_arrow_ipc_rows(&batches, max_rows),
+        }?;
+        if result_format == ResultFormat::Json {
+            reject_nul_text_rows(&result)?;
+        }
+        stats.materialize_ms = materialize_start.elapsed().as_secs_f64() * 1000.0;
+        stats.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        Ok((result, stats))
+    }
+}
+
+struct GqeFlightClient {
+    client: FlightServiceClient<Channel>,
+    ctx: SessionContext,
+}
+
+impl GqeFlightClient {
+    async fn connect(server_url: &str) -> Result<Self> {
+        let channel = tonic::transport::Endpoint::new(server_url.to_string())
+            .with_context(|| format!("configuring GQE Flight endpoint {server_url}"))?
+            .connect()
+            .await
+            .with_context(|| format!("connecting to GQE Flight endpoint {server_url}"))?;
+        let mut client = FlightServiceClient::new(channel)
+            .max_decoding_message_size(GQE_FLIGHT_MAX_DECODING_MESSAGE_SIZE);
+        let discovered = gqe_flight_discover_tables(&mut client).await?;
+        let ctx = SessionContext::new();
+        for table in discovered {
+            ctx.register_table(
+                &table.name,
+                Arc::new(GqeSchemaOnlyTable {
+                    schema: table.schema,
+                    row_count: table.row_count,
+                }),
+            )
+            .with_context(|| format!("registering GQE planning table {}", table.name))?;
+        }
+        Ok(Self { client, ctx })
+    }
+
+    async fn execute_select(&mut self, sql: &str) -> Result<Vec<RecordBatch>> {
+        let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .context("parsing GQE SQL for Flight planning")?;
+        if statements.is_empty() {
+            bail!("GQE Flight query contains no statements");
+        }
+
+        let mut last = Vec::new();
+        for statement in statements {
+            let sql_text = statement.to_string();
+            let df = self
+                .ctx
+                .sql(&sql_text)
+                .await
+                .with_context(|| format!("planning GQE SQL through DataFusion: {sql_text}"))?;
+            let plan = df
+                .into_optimized_plan()
+                .context("optimizing GQE Flight SQL plan")?;
+            let substrait_plan = datafusion_substrait::logical_plan::producer::to_substrait_plan(
+                &plan,
+                &self.ctx.state(),
+            )
+            .context("converting GQE query to Substrait")?;
+            let mut plan_bytes = Vec::new();
+            substrait_plan
+                .encode(&mut plan_bytes)
+                .context("encoding GQE Substrait plan")?;
+            last = gqe_flight_execute_substrait_plan(&mut self.client, plan_bytes).await?;
+        }
+        Ok(last)
+    }
+}
+
+struct GqeDiscoveredTable {
+    name: String,
+    schema: SchemaRef,
+    row_count: Option<usize>,
+}
+
+#[derive(Debug)]
+struct GqeSchemaOnlyTable {
+    schema: SchemaRef,
+    row_count: Option<usize>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for GqeSchemaOnlyTable {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> datafusion::logical_expr::TableType {
+        datafusion::logical_expr::TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let projected_schema = match projection {
+            Some(indices) => Arc::new(self.schema.project(indices)?),
+            None => self.schema.clone(),
+        };
+        Ok(Arc::new(EmptyExec::new(projected_schema)))
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.row_count.map(|n| Statistics {
+            num_rows: Precision::Exact(n),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![],
+        })
+    }
+}
+
+impl fmt::Display for GqeSchemaOnlyTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GqeSchemaOnlyTable")
+    }
+}
+
+async fn gqe_flight_discover_tables(
+    client: &mut FlightServiceClient<Channel>,
+) -> Result<Vec<GqeDiscoveredTable>> {
+    let get_tables = CommandGetTables {
+        catalog: None,
+        db_schema_filter_pattern: None,
+        table_name_filter_pattern: None,
+        table_types: vec![],
+        include_schema: true,
+    };
+    let descriptor = FlightDescriptor {
+        r#type: DescriptorType::Cmd as i32,
+        cmd: get_tables.as_any().encode_to_vec().into(),
+        path: vec![],
+    };
+    let flight_info = client
+        .get_flight_info(tonic::Request::new(descriptor))
+        .await
+        .map_err(|status| gqe_flight_status_error("requesting GQE Flight table metadata", status))?
+        .into_inner();
+    let ticket = flight_info
+        .endpoint
+        .first()
+        .and_then(|endpoint| endpoint.ticket.clone())
+        .ok_or_else(|| anyhow!("GQE Flight GetTables returned no endpoint ticket"))?;
+    let stream = client
+        .do_get(tonic::Request::new(ticket))
+        .await
+        .map_err(|status| gqe_flight_status_error("fetching GQE Flight table metadata", status))?
+        .into_inner();
+    let batches = gqe_flight_decode_stream(stream).await?;
+
+    let mut tables = Vec::new();
+    for batch in batches {
+        let table_names = batch
+            .column_by_name("table_name")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| anyhow!("GQE Flight metadata is missing table_name"))?;
+        let table_schemas = batch
+            .column_by_name("table_schema")
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or_else(|| anyhow!("GQE Flight metadata is missing table_schema"))?;
+        let row_counts = batch
+            .column_by_name("row_count")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>());
+        for idx in 0..batch.num_rows() {
+            let row_count = row_counts
+                .filter(|array| !array.is_null(idx))
+                .map(|array| array.value(idx) as usize);
+            tables.push(GqeDiscoveredTable {
+                name: table_names.value(idx).to_string(),
+                schema: Arc::new(
+                    datafusion::arrow::ipc::convert::try_schema_from_ipc_buffer(
+                        table_schemas.value(idx),
+                    )
+                    .context("decoding GQE Flight table schema")?,
+                ),
+                row_count,
+            });
+        }
+    }
+    Ok(tables)
+}
+
+async fn gqe_flight_execute_substrait_plan(
+    client: &mut FlightServiceClient<Channel>,
+    plan_bytes: Vec<u8>,
+) -> Result<Vec<RecordBatch>> {
+    let substrait_msg = SubstraitPlan {
+        plan: plan_bytes.into(),
+        version: GQE_FLIGHT_SUBSTRAIT_VERSION.to_string(),
+    };
+    let cmd = CommandStatementSubstraitPlan {
+        plan: Some(substrait_msg),
+        transaction_id: None,
+    };
+    let descriptor = FlightDescriptor {
+        r#type: DescriptorType::Cmd as i32,
+        cmd: cmd.as_any().encode_to_vec().into(),
+        path: vec![],
+    };
+    let flight_info = client
+        .get_flight_info(tonic::Request::new(descriptor))
+        .await
+        .map_err(|status| gqe_flight_status_error("requesting GQE Flight query execution", status))?
+        .into_inner();
+    let ticket = flight_info
+        .endpoint
+        .first()
+        .and_then(|endpoint| endpoint.ticket.clone())
+        .ok_or_else(|| anyhow!("GQE Flight query returned no endpoint ticket"))?;
+    let stream = client
+        .do_get(tonic::Request::new(ticket))
+        .await
+        .map_err(|status| gqe_flight_status_error("fetching GQE Flight query results", status))?
+        .into_inner();
+    gqe_flight_decode_stream(stream).await
+}
+
+fn gqe_flight_status_error(action: &str, status: tonic::Status) -> anyhow::Error {
+    let details_len = status.details().len();
+    if details_len == 0 {
+        anyhow!(
+            "{action}: code={:?} message={:?}",
+            status.code(),
+            status.message()
+        )
+    } else {
+        anyhow!(
+            "{action}: code={:?} message={:?} details_len={details_len}",
+            status.code(),
+            status.message()
+        )
+    }
+}
+
+async fn gqe_flight_decode_stream(
+    stream: tonic::Streaming<FlightData>,
+) -> Result<Vec<RecordBatch>> {
+    let mut stream = FlightRecordBatchStream::new_from_flight_data(
+        stream.map_err(|err| FlightError::Tonic(Box::new(err))),
+    );
+    let mut batches = Vec::new();
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .context("decoding GQE Flight record batch stream")?
+    {
+        batches.push(batch);
     }
     Ok(batches)
 }
@@ -1349,15 +2128,378 @@ fn gqe_sql_type(typname: &str) -> &'static str {
         "bigint" => "BIGINT",
         "real" => "REAL",
         "double precision" | "numeric" => "DOUBLE",
-        "date" => "DATE",
-        "timestamp" | "timestamp without time zone" | "timestamp with time zone" => "TIMESTAMP",
+        "date" => "VARCHAR",
+        "timestamp" | "timestamp without time zone" | "timestamp with time zone" => "VARCHAR",
         "character" | "character varying" | "text" => "VARCHAR",
         _ => "VARCHAR",
     }
 }
 
+fn pg_type_is_text(typname: &str) -> bool {
+    matches!(typname, "character" | "character varying" | "text" | "name")
+}
+
+fn gqe_len_column(column: &str) -> String {
+    format!("__rvbbit_len_{}", sanitize_path_segment(column))
+}
+
+fn gqe_minute_column(column: &str) -> String {
+    format!("__rvbbit_minute_{}", sanitize_path_segment(column))
+}
+
+fn gqe_minute_ts_column(column: &str) -> String {
+    format!("__rvbbit_minute_ts_{}", sanitize_path_segment(column))
+}
+
+fn gqe_year_column(column: &str) -> String {
+    format!("__rvbbit_year_{}", sanitize_path_segment(column))
+}
+
+fn timestamp_minute(micros_since_epoch: i64) -> i32 {
+    ((micros_since_epoch.rem_euclid(86_400_000_000) / 60_000_000) % 60) as i32
+}
+
+fn format_timestamp_minute_micros(micros_since_epoch: i64) -> String {
+    let minute_bucket = micros_since_epoch.div_euclid(60_000_000) * 60_000_000;
+    format_timestamp_micros(minute_bucket)
+}
+
+fn rewrite_gqe_sql(sql: &str, catalog: &BTreeMap<String, RvbbitDuckTable>) -> String {
+    let mut rewritten = sql.to_string();
+    let rel_counts = relation_counts(catalog);
+    for table in catalog.values() {
+        let table_name = gqe_table_ddl_name(&gqe_table_name(table, &rel_counts));
+        let select_list = table
+            .columns
+            .iter()
+            .map(|(name, _)| gqe_quote_ident(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        rewritten = replace_ci(
+            &rewritten,
+            &format!("SELECT * FROM {table_name}"),
+            &format!("SELECT {select_list} FROM {table_name}"),
+        );
+        for (column, typ) in &table.columns {
+            if pg_type_is_text(typ) {
+                let derived = gqe_quote_ident(&gqe_len_column(column));
+                for function_name in ["length", "character_length"] {
+                    let pattern = format!("{function_name}({})", gqe_quote_ident(column));
+                    rewritten = replace_ci(&rewritten, &pattern, &derived);
+                }
+            }
+            if typ.starts_with("timestamp") {
+                let minute = gqe_quote_ident(&gqe_minute_column(column));
+                let minute_ts = gqe_quote_ident(&gqe_minute_ts_column(column));
+                let ident = gqe_quote_ident(column);
+                for pattern in [
+                    format!("extract(minute FROM {ident})"),
+                    format!("extract(minute from {ident})"),
+                    format!("EXTRACT(minute FROM {ident})"),
+                    format!("EXTRACT(MINUTE FROM {ident})"),
+                ] {
+                    rewritten = replace_ci(&rewritten, &pattern, &minute);
+                }
+                for pattern in [
+                    format!("date_trunc('minute', {ident})"),
+                    format!("DATE_TRUNC('minute', {ident})"),
+                    format!("date_trunc('MINUTE', {ident})"),
+                    format!("DATE_TRUNC('MINUTE', {ident})"),
+                ] {
+                    rewritten = replace_ci(&rewritten, &pattern, &minute_ts);
+                }
+            }
+            if typ == "date" {
+                let year = gqe_quote_ident(&gqe_year_column(column));
+                let mut ident_forms = vec![gqe_quote_ident(column), column.to_string()];
+                ident_forms.sort();
+                ident_forms.dedup();
+                for ident in ident_forms {
+                    for pattern in [
+                        format!("extract(year FROM {ident})"),
+                        format!("extract(year from {ident})"),
+                        format!("EXTRACT(year FROM {ident})"),
+                        format!("EXTRACT(YEAR FROM {ident})"),
+                    ] {
+                        rewritten = replace_ci(&rewritten, &pattern, &year);
+                    }
+                }
+            }
+        }
+    }
+    rewrite_gqe_group_by_first_literal(&rewritten)
+}
+
+fn rewrite_gqe_group_by_first_literal(sql: &str) -> String {
+    let lowered = sql_stringless(sql).to_ascii_lowercase();
+    let trimmed = lowered.trim_start();
+    if !(trimmed.starts_with("select 1,") || trimmed.starts_with("select 1 ,")) {
+        return sql.to_string();
+    }
+    let Some(group_pos) = lowered.find("group by 1,") else {
+        return sql.to_string();
+    };
+    let remove_start = group_pos + "group by ".len();
+    let remove_end = group_pos + "group by 1,".len();
+    format!("{}{}", &sql[..remove_start], sql[remove_end..].trim_start())
+}
+
+fn replace_ci(input: &str, pattern: &str, replacement: &str) -> String {
+    let lowered = input.to_ascii_lowercase();
+    let pattern_lower = pattern.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut start = 0usize;
+    while let Some(pos) = lowered[start..].find(&pattern_lower) {
+        let abs = start + pos;
+        out.push_str(&input[start..abs]);
+        out.push_str(replacement);
+        start = abs + pattern.len();
+    }
+    out.push_str(&input[start..]);
+    out
+}
+
+fn gqe_shape_gate_reason(sql: &str, catalog: &BTreeMap<String, RvbbitDuckTable>) -> Option<String> {
+    gqe_shape_gate_reason_inner(
+        sql,
+        catalog,
+        env_enabled("RVBBIT_GQE_ALLOW_RISKY_SHAPES", false),
+    )
+}
+
+fn gqe_shape_gate_reason_inner(
+    sql: &str,
+    catalog: &BTreeMap<String, RvbbitDuckTable>,
+    allow_risky: bool,
+) -> Option<String> {
+    if allow_risky {
+        return None;
+    }
+
+    let lowered = sql_stringless(sql).to_ascii_lowercase();
+    let refs = query_relation_refs(sql, catalog);
+    let ref_count = refs.len();
+
+    if sql_has_unsupported_gqe_join(&lowered) {
+        return Some(
+            "GPU/GQE supports only simple inner/left/cross joins with explicit ON predicates"
+                .to_string(),
+        );
+    }
+    if refs.iter().any(|(schema, _)| schema.is_some()) {
+        return Some(
+            "GPU/GQE does not safely support schema-qualified table references yet".to_string(),
+        );
+    }
+    if gqe_query_selects_qualified_star(&lowered) {
+        return Some("GPU/GQE does not support qualified SELECT * projections".to_string());
+    }
+    if gqe_query_selects_star(sql) && ref_count > 1 {
+        return Some("GPU/GQE does not support SELECT * over multiple tables".to_string());
+    }
+    if gqe_wide_row_retrieval_shape(&lowered) {
+        return Some(
+            "GPU/GQE wide SELECT * text-filter/order/limit shapes are disabled to avoid high RMM memory pressure"
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn sql_has_unsupported_gqe_join(lowered: &str) -> bool {
+    [
+        "full join",
+        "full outer join",
+        "right join",
+        "right outer join",
+        "natural join",
+        " lateral ",
+        " using ",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn gqe_query_selects_qualified_star(lowered: &str) -> bool {
+    lowered.contains(".*") || lowered.contains(". *")
+}
+
+fn gqe_wide_row_retrieval_shape(lowered: &str) -> bool {
+    gqe_query_selects_star(lowered)
+        && lowered.contains(" where ")
+        && lowered.contains(" like ")
+        && lowered.contains(" order by ")
+        && lowered.contains(" limit ")
+}
+
+fn query_relation_refs(
+    sql: &str,
+    catalog: &BTreeMap<String, RvbbitDuckTable>,
+) -> Vec<(Option<String>, String)> {
+    let tokens = tokenize_sql_for_refs(&sql_stringless(sql));
+    let mut refs = Vec::new();
+    let mut expect_relation = false;
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        match &tokens[idx] {
+            SqlTok::LParen => {
+                depth += 1;
+                idx += 1;
+            }
+            SqlTok::RParen => {
+                depth = depth.saturating_sub(1);
+                idx += 1;
+            }
+            SqlTok::Ident(word) if word == "from" || word == "join" => {
+                expect_relation = true;
+                idx += 1;
+            }
+            SqlTok::Comma if expect_relation => {
+                idx += 1;
+            }
+            SqlTok::Ident(word) if expect_relation && (word == "only" || word == "lateral") => {
+                idx += 1;
+            }
+            _ if expect_relation => {
+                if matches!(&tokens[idx], SqlTok::LParen) || depth > 0 {
+                    expect_relation = false;
+                    idx += 1;
+                    continue;
+                }
+                if let Some((schema, relname, consumed)) = read_relation_name(&tokens[idx..]) {
+                    if catalog_contains_relation(catalog, schema.as_deref(), &relname) {
+                        let item = (schema, relname);
+                        if !refs.contains(&item) {
+                            refs.push(item);
+                        }
+                    }
+                    idx += consumed;
+                } else {
+                    idx += 1;
+                }
+                expect_relation = false;
+            }
+            _ => {
+                idx += 1;
+            }
+        }
+    }
+    refs
+}
+
+fn gqe_unsupported_temporal_reason(
+    sql: &str,
+    _catalog: &BTreeMap<String, RvbbitDuckTable>,
+) -> Option<String> {
+    if gqe_query_selects_star(sql) {
+        return Some("GPU/GQE SELECT * must be rewritten before execution".to_string());
+    }
+    None
+}
+
+fn gqe_unsupported_function_reason(sql: &str) -> Option<String> {
+    let lowered = sql_stringless(sql).to_ascii_lowercase();
+    if gqe_function_call_present(&lowered, "length")
+        || gqe_function_call_present(&lowered, "character_length")
+    {
+        return Some(
+            "GPU/GQE does not support character_length/length scalar functions".to_string(),
+        );
+    }
+    if gqe_function_call_present(&lowered, "extract")
+        || gqe_function_call_present(&lowered, "date_trunc")
+    {
+        return Some("GPU/GQE does not support temporal scalar functions".to_string());
+    }
+    None
+}
+
+fn gqe_function_call_present(sql: &str, function_name: &str) -> bool {
+    let mut start = 0usize;
+    while let Some(pos) = sql[start..].find(function_name) {
+        let abs = start + pos;
+        let before = if abs == 0 {
+            None
+        } else {
+            sql[..abs].chars().next_back()
+        };
+        let after_name = abs + function_name.len();
+        let after_name_char = sql[after_name..].chars().next();
+        if !before.is_some_and(is_identifier_char)
+            && !after_name_char.is_some_and(is_identifier_char)
+            && sql[after_name..].trim_start().starts_with('(')
+        {
+            return true;
+        }
+        start = after_name;
+    }
+    false
+}
+
+fn gqe_unsupported_grouping_reason(sql: &str) -> Option<String> {
+    let lowered = sql_stringless(sql).to_ascii_lowercase();
+    if gqe_group_by_ordinal_present(&lowered) {
+        return Some("GPU/GQE does not safely support GROUP BY ordinal expressions".to_string());
+    }
+    None
+}
+
+fn gqe_group_by_ordinal_present(sql: &str) -> bool {
+    let Some(group_pos) = sql.find("group by") else {
+        return false;
+    };
+    let after_group = &sql[group_pos + "group by".len()..];
+    let end = [
+        " having ",
+        " order by ",
+        " limit ",
+        " offset ",
+        " union ",
+        " except ",
+        " intersect ",
+    ]
+    .iter()
+    .filter_map(|marker| after_group.find(marker))
+    .min()
+    .unwrap_or(after_group.len());
+    after_group[..end].split(',').any(|expr| {
+        let expr = expr.trim();
+        !expr.is_empty() && expr.chars().all(|ch| ch.is_ascii_digit())
+    })
+}
+
+fn gqe_query_selects_star(sql: &str) -> bool {
+    let lowered = sql_stringless(sql).to_ascii_lowercase();
+    let Some(after_select) = lowered.trim_start().strip_prefix("select") else {
+        return false;
+    };
+    let mut rest = after_select.trim_start();
+    if let Some(after_distinct) = rest.strip_prefix("distinct") {
+        rest = after_distinct.trim_start();
+    }
+    rest.starts_with('*')
+}
+
 fn gqe_quote_ident(ident: &str) -> String {
     quote_ident(ident)
+}
+
+fn gqe_table_ddl_name(ident: &str) -> String {
+    if is_simple_gqe_identifier(ident) {
+        ident.to_string()
+    } else {
+        gqe_quote_ident(ident)
+    }
+}
+
+fn is_simple_gqe_identifier(ident: &str) -> bool {
+    let mut chars = ident.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first == '_')
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 fn gqe_quote_string(value: &str) -> String {
@@ -1397,12 +2539,15 @@ fn wait_child_output(mut child: Child, timeout: Duration, label: &str) -> Result
     }
 }
 
-fn first_line_bytes(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string()
+fn child_output_snippet(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" | ")
+        .chars()
+        .take(600)
+        .collect()
 }
 
 async fn create_datafusion_views(
@@ -1771,6 +2916,34 @@ impl CacheSummary {
     }
 }
 
+impl GqeQueryStats {
+    fn from_runs(runs: &[GqeRunStats]) -> Option<Self> {
+        let last = runs.last()?;
+        Some(Self {
+            runs: runs.len(),
+            client_mode: last.client_mode.to_string(),
+            median_total_ms: median_gqe_metric(runs, |run| run.total_ms),
+            median_server_ready_ms: median_gqe_metric(runs, |run| run.server_ready_ms),
+            median_rewrite_ms: median_gqe_metric(runs, |run| run.rewrite_ms),
+            median_cli_ms: median_gqe_metric(runs, |run| run.cli_ms),
+            median_flight_ms: median_gqe_metric(runs, |run| run.flight_ms),
+            median_result_read_ms: median_gqe_metric(runs, |run| run.result_read_ms),
+            median_materialize_ms: median_gqe_metric(runs, |run| run.materialize_ms),
+            median_cleanup_ms: median_gqe_metric(runs, |run| run.cleanup_ms),
+            result_files: last.result_files,
+            result_bytes: last.result_bytes,
+            result_batches: last.result_batches,
+            result_rows: last.result_rows,
+        })
+    }
+}
+
+fn median_gqe_metric(runs: &[GqeRunStats], metric: impl Fn(&GqeRunStats) -> f64) -> f64 {
+    let mut values = runs.iter().map(metric).collect::<Vec<_>>();
+    values.sort_by(|a, b| a.total_cmp(b));
+    values[values.len() / 2]
+}
+
 struct ServerState {
     pg: Client,
     engine: Engine,
@@ -1790,7 +2963,9 @@ enum ServerExecutor {
         runtime: Runtime,
         ctx: SessionContext,
     },
-    GpuGqe,
+    GpuGqe {
+        flight: Option<GqeFlightExecutor>,
+    },
 }
 
 impl ServerState {
@@ -1930,20 +3105,45 @@ impl ServerState {
                     cache,
                 ))
             }),
-            ServerExecutor::GpuGqe => {
+            ServerExecutor::GpuGqe { flight } => {
                 if explain_only {
                     return Ok(empty_query_summary(timeout_s, &catalog, cache));
                 }
 
                 let mut elapsed = Vec::with_capacity(repeat);
                 let mut last = QueryRows::default();
+                let mut gqe_runs = Vec::with_capacity(repeat);
                 for _ in 0..repeat {
                     cleanup_query_rows(&mut last);
                     let start = Instant::now();
-                    last = execute_gqe_query_result(sql, max_rows, result_format, timeout_s)?;
+                    let (rows, stats) = if let Some(flight) = flight.as_mut() {
+                        match flight.execute_query(sql, &catalog, max_rows, result_format) {
+                            Ok(result) => result,
+                            Err(flight_err) if gqe_flight_fallback_enabled() => {
+                                eprintln!(
+                                    "GQE Flight client failed ({flight_err:#}); falling back to gqe-cli"
+                                );
+                                let (rows, mut stats) = execute_gqe_query_result(
+                                    sql,
+                                    &catalog,
+                                    max_rows,
+                                    result_format,
+                                    timeout_s,
+                                )?;
+                                stats.client_mode = "flight_fallback_cli";
+                                (rows, stats)
+                            }
+                            Err(flight_err) => return Err(flight_err),
+                        }
+                    } else {
+                        execute_gqe_query_result(sql, &catalog, max_rows, result_format, timeout_s)?
+                    };
+                    last = rows;
+                    gqe_runs.push(stats);
                     elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
                 }
                 elapsed.sort_by(|a, b| a.total_cmp(b));
+                cache.gqe = GqeQueryStats::from_runs(&gqe_runs);
                 Ok(query_summary_from_rows(
                     elapsed[elapsed.len() / 2],
                     repeat,
@@ -2077,7 +3277,12 @@ impl ServerState {
             }
             Engine::GpuGqe => {
                 prepare_gqe_catalog(catalog)?;
-                Ok(ServerExecutor::GpuGqe)
+                let flight = if gqe_flight_client_enabled() {
+                    Some(GqeFlightExecutor::connect(threads)?)
+                } else {
+                    None
+                };
+                Ok(ServerExecutor::GpuGqe { flight })
             }
         }
     }
@@ -4039,6 +5244,10 @@ fn format_date32(days_since_epoch: i32) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+fn date32_year(days_since_epoch: i32) -> i32 {
+    civil_from_days(days_since_epoch as i64).0 as i32
+}
+
 fn format_timestamp_micros(micros_since_epoch: i64) -> String {
     let days = micros_since_epoch.div_euclid(86_400_000_000);
     let micros_of_day = micros_since_epoch.rem_euclid(86_400_000_000);
@@ -4182,6 +5391,79 @@ mod tests {
             "SELECT * FROM hits WHERE EXISTS (SELECT 1 FROM heap_table h)",
             &catalog
         ));
+    }
+
+    #[test]
+    fn gqe_shape_gate_rejects_known_risky_shapes() {
+        let catalog = test_catalog();
+        assert!(gqe_shape_gate_reason_inner(
+            "SELECT * FROM hits h JOIN lineitem l ON h.id = l.id",
+            &catalog,
+            false
+        )
+        .is_some_and(|reason| reason.contains("multiple tables")));
+        assert!(
+            gqe_shape_gate_reason_inner("SELECT h.* FROM hits h", &catalog, false)
+                .is_some_and(|reason| reason.contains("qualified SELECT *"))
+        );
+        assert!(
+            gqe_shape_gate_reason_inner("SELECT count(*) FROM public.hits", &catalog, false)
+                .is_some_and(|reason| reason.contains("schema-qualified"))
+        );
+        assert!(gqe_shape_gate_reason_inner(
+            r#"SELECT * FROM hits WHERE "URL" LIKE '%google%' ORDER BY "EventTime" LIMIT 10"#,
+            &catalog,
+            false
+        )
+        .is_some_and(|reason| reason.contains("wide SELECT *")));
+        assert!(gqe_shape_gate_reason_inner(
+            "SELECT h.id, l.id FROM hits h JOIN lineitem l ON h.id = l.id",
+            &catalog,
+            false
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn gqe_shape_gate_can_be_overridden_for_experiments() {
+        let catalog = test_catalog();
+        assert!(gqe_shape_gate_reason_inner(
+            "SELECT * FROM hits h JOIN lineitem l ON h.id = l.id",
+            &catalog,
+            true
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn gqe_rewrites_date_extract_year_to_derived_column() {
+        let mut catalog = BTreeMap::new();
+        catalog.insert(
+            "public.orders".to_string(),
+            RvbbitDuckTable {
+                schema: "public".to_string(),
+                relname: "orders".to_string(),
+                paths: Vec::new(),
+                columns: vec![
+                    ("o_orderdate".to_string(), "date".to_string()),
+                    ("o_orderkey".to_string(), "bigint".to_string()),
+                ],
+                layout: None,
+                partition_cols: Vec::new(),
+                row_group_rows: 0,
+                row_group_bytes: 0,
+            },
+        );
+
+        let rewritten = rewrite_gqe_sql(
+            "SELECT extract(year FROM o_orderdate) AS o_year FROM orders",
+            &catalog,
+        );
+        assert_eq!(
+            rewritten,
+            "SELECT \"__rvbbit_year_o_orderdate\" AS o_year FROM orders"
+        );
+        assert!(gqe_unsupported_function_reason(&rewritten).is_none());
     }
 
     #[test]

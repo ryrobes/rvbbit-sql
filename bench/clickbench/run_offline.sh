@@ -21,6 +21,8 @@
 #                                                            # pre-Phase-1 (sidecar DataFusion era);
 #                                                            # numbers are stale, retraining recommended.
 #   BENCH_SYSTEMS=rvbbit,rvbbit_native_forced,rvbbit_datafusion_mem_forced ./bench/clickbench/run_offline.sh
+#   BENCH_SYSTEMS=rvbbit_datafusion_forced,rvbbit_datafusion_vortex_forced,rvbbit_duck_vortex_forced ./bench/clickbench/run_offline.sh
+#                                                            # forced-route coverage over canonical/vortex layouts
 #   RVBBIT_DUCK_HOT_VALIDATE=1 BENCH_SYSTEMS=rvbbit,rvbbit_native_forced ./bench/clickbench/run_offline.sh
 #   RVBBIT_DF_INPROCESS=off ./bench/clickbench/run_offline.sh # force legacy sidecar route (A/B vs new)
 #   RVBBIT_ACCEL_IDENTITY_MAP=on ./bench/clickbench/run_offline.sh
@@ -29,6 +31,8 @@
 #                                                            # bulk-load profile: overlap canonical parquet chunk writes
 #   RVBBIT_DIRECT_ACCEL_LOAD=1 RVBBIT_DIRECT_ACCEL_CHUNK_ROWS=250000 ./bench/clickbench/run_offline.sh
 #                                                            # build canonical files from source chunks instead of heap rescan
+#   RVBBIT_GQE_LARGE_ROW_GROUPS=1 RVBBIT_DIRECT_ACCEL_LOAD=1 ./bench/clickbench/run_offline.sh
+#                                                            # GQE experiment: fewer/larger parquet files without changing normal defaults
 #   RVBBIT_DIRECT_ACCEL_LOAD=1 RVBBIT_DIRECT_ACCEL_METADATA_PROFILE=minimal ./bench/clickbench/run_offline.sh
 #                                                            # faster direct-load canonical files with thin metadata
 #   RVBBIT_DIRECT_ACCEL_LOAD=1 RVBBIT_DIRECT_ACCEL_METADATA_PROFILE=minimal RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async ./bench/clickbench/run_offline.sh
@@ -69,6 +73,7 @@ cd "${REPO_ROOT}"
 DATA_DIR="bench/columnar_comparison/data"
 HITS_URL="https://datasets.clickhouse.com/hits_compatible/hits.parquet"
 HITS="${DATA_DIR}/hits.parquet"
+GQE_ADAPTER_VERSION_REQUIRED="${RVBBIT_GQE_ADAPTER_VERSION_REQUIRED:-gqe-adapter-v4-date-year-sidecar}"
 
 LIMIT="${BENCH_LIMIT:-10000000}"
 SYSTEMS="${BENCH_SYSTEMS:-rvbbit,duckdb,clickhouse,pg_baseline,citus,hydra,alloydb}"
@@ -76,6 +81,7 @@ GPU_GQE_SELECTED=0
 if [[ ",${SYSTEMS}," == *",rvbbit_gpu_gqe_forced,"* ]]; then
     GPU_GQE_SELECTED=1
 fi
+GPU_GQE_SKIP_ACTIVE=0
 HOST_NVIDIA_GPU=0
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     HOST_NVIDIA_GPU=1
@@ -172,6 +178,15 @@ VORTEX_LAYOUT_DISPLAY="${RVBBIT_COMPACT_VORTEX_LAYOUT:-off}"
 if { [ "${VORTEX_FORCED_SELECTED}" = "1" ] || [ "${VORTEX_AUTO_SELECTED}" = "1" ]; } && [ -z "${RVBBIT_COMPACT_VORTEX_LAYOUT:-}" ]; then
     VORTEX_LAYOUT_DISPLAY="on"
 fi
+case "${RVBBIT_GQE_LARGE_ROW_GROUPS:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+        RVBBIT_GQE_ROW_GROUP_CHUNK_ROWS="${RVBBIT_GQE_ROW_GROUP_CHUNK_ROWS:-1000000}"
+        RVBBIT_DIRECT_ACCEL_CHUNK_ROWS="${RVBBIT_DIRECT_ACCEL_CHUNK_ROWS:-${RVBBIT_GQE_ROW_GROUP_CHUNK_ROWS}}"
+        RVBBIT_COMPACT_SCAN_CHUNK_ROWS="${RVBBIT_COMPACT_SCAN_CHUNK_ROWS:-${RVBBIT_GQE_ROW_GROUP_CHUNK_ROWS}}"
+        export RVBBIT_DIRECT_ACCEL_CHUNK_ROWS RVBBIT_COMPACT_SCAN_CHUNK_ROWS
+        ;;
+    *) ;;
+esac
 QUERIES_ENV=()
 [ -n "${BENCH_QUERIES:-}" ] && QUERIES_ENV=(-e "BENCH_QUERIES=${BENCH_QUERIES}")
 DUCK_HOT_ENV=()
@@ -190,11 +205,13 @@ DUCK_HOT_ENV=()
 [ -n "${RVBBIT_ROUTE_DATAFUSION_VECTOR:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_VECTOR=${RVBBIT_ROUTE_DATAFUSION_VECTOR}")
 [ -n "${RVBBIT_ROUTE_DATAFUSION_HIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_HIVE=${RVBBIT_ROUTE_DATAFUSION_HIVE}")
 [ -n "${RVBBIT_ROUTE_DATAFUSION_VORTEX:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_VORTEX=${RVBBIT_ROUTE_DATAFUSION_VORTEX}")
+[ -n "${RVBBIT_ROUTE_DATAFUSION_VORTEX_ALLOW_TEMPORAL:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_DATAFUSION_VORTEX_ALLOW_TEMPORAL=${RVBBIT_ROUTE_DATAFUSION_VORTEX_ALLOW_TEMPORAL}")
 [ -n "${RVBBIT_ROUTE_HIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_HIVE=${RVBBIT_ROUTE_HIVE}")
 [ -n "${RVBBIT_ROUTE_PG_ROWSTORE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_PG_ROWSTORE=${RVBBIT_ROUTE_PG_ROWSTORE}")
 [ -n "${RVBBIT_ROUTE_RVBBIT_NATIVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_RVBBIT_NATIVE=${RVBBIT_ROUTE_RVBBIT_NATIVE}")
 [ -n "${RVBBIT_ROUTE_FORCE_CANDIDATE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_FORCE_CANDIDATE=${RVBBIT_ROUTE_FORCE_CANDIDATE}")
 [ -n "${RVBBIT_GQE_BIN:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_GQE_BIN=${RVBBIT_GQE_BIN}")
+[ -n "${RVBBIT_GQE_ALLOW_RISKY_SHAPES:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_GQE_ALLOW_RISKY_SHAPES=${RVBBIT_GQE_ALLOW_RISKY_SHAPES}")
 [ -n "${RVBBIT_NATIVE_ROUTER:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_NATIVE_ROUTER=${RVBBIT_NATIVE_ROUTER}")
 [ -n "${RVBBIT_ROUTE_OBSERVE:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_OBSERVE=${RVBBIT_ROUTE_OBSERVE}")
 [ -n "${RVBBIT_ROUTE_EXPLORE_PCT:-}" ] && DUCK_HOT_ENV+=(-e "RVBBIT_ROUTE_EXPLORE_PCT=${RVBBIT_ROUTE_EXPLORE_PCT}")
@@ -273,13 +290,167 @@ env_on() {
         *) return 1 ;;
     esac
 }
+configure_gqe_pooled_sidecar_defaults() {
+    [ "${GPU_GQE_SELECTED}" = "1" ] || return 0
+    export RVBBIT_GQE_CLIENT_MODE="${RVBBIT_GQE_CLIENT_MODE:-flight}"
+    case "${RVBBIT_GQE_SHARED_BACKEND:-true}" in
+        0|false|FALSE|no|NO|off|OFF|disabled|DISABLED) return 0 ;;
+        *) ;;
+    esac
+    export RVBBIT_DUCK_BACKEND_SHARED="${RVBBIT_DUCK_BACKEND_SHARED:-true}"
+    export RVBBIT_DUCK_BACKEND_SHARED_LAUNCH="${RVBBIT_DUCK_BACKEND_SHARED_LAUNCH:-true}"
+    local targets="${RVBBIT_DUCK_BACKEND_SHARED_TARGETS:-}"
+    if [ -z "${targets}" ]; then
+        targets="gpu_gqe"
+    elif [[ ",${targets}," != *",gpu_gqe,"* ]] \
+        && [[ ",${targets}," != *",all,"* ]] \
+        && [[ ",${targets}," != *",\*,"* ]]; then
+        targets="${targets},gpu_gqe"
+    fi
+    export RVBBIT_DUCK_BACKEND_SHARED_TARGETS="${targets}"
+    # ClickBench runs each system serially. A multi-worker shared sidecar gives
+    # each worker its own GQE Flight client/catalog state, so the first query can
+    # measure per-worker warmup instead of steady-state execution.
+    export RVBBIT_DUCK_BACKEND_SHARED_WORKERS="${RVBBIT_DUCK_BACKEND_SHARED_WORKERS:-1}"
+    export RVBBIT_DUCK_TELEMETRY_BATCH="${RVBBIT_DUCK_TELEMETRY_BATCH:-1}"
+}
+gqe_rebuild_mode_is_full() {
+    case "${RVBBIT_GPU_GQE_REBUILD_MODE:-refresh}" in
+        full|FULL|toolchain|TOOLCHAIN) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+backup_clickbench_gqe_image_before_full_rebuild() {
+    local gqe_image backup_tag
+    if ! env_on "${RVBBIT_GQE_BACKUP_BEFORE_FULL_REBUILD:-1}"; then
+        return 0
+    fi
+    gqe_image="${RVBBIT_GQE_PG_IMAGE:-docker-pg-rvbbit-gqe}"
+    if ! docker image inspect "${gqe_image}" >/dev/null 2>&1; then
+        return 0
+    fi
+    backup_tag="${RVBBIT_GQE_BACKUP_TAG:-${gqe_image}-backup-$(date -u +%Y%m%dT%H%M%SZ)}"
+    say "tagging existing GPU/GQE image backup as ${backup_tag}"
+    docker tag "${gqe_image}" "${backup_tag}"
+}
+flatten_clickbench_gqe_image_if_needed() {
+    local source_image target_image threshold layers container_id
+    source_image="$1"
+    target_image="$2"
+    threshold="${RVBBIT_GQE_FLATTEN_LAYER_THRESHOLD:-110}"
+    layers="$(docker image inspect "${source_image}" --format '{{len .RootFS.Layers}}' 2>/dev/null || printf '0')"
+    if [ "${layers:-0}" -lt "${threshold}" ]; then
+        printf "%s" "${source_image}"
+        return 0
+    fi
+
+    say "flattening GPU/GQE refresh base ${source_image} (${layers} layers) as ${target_image}" >&2
+    container_id="$(docker create "${source_image}")"
+    if ! docker export "${container_id}" | docker import \
+        --change 'ENTRYPOINT ["docker-entrypoint.sh"]' \
+        --change 'CMD ["postgres"]' \
+        --change 'EXPOSE 5432' \
+        --change 'VOLUME ["/var/lib/postgresql"]' \
+        --change 'WORKDIR /' \
+        --change 'ENV PATH=/conda/envs/gqe/bin:/conda/bin:/opt/gqe/rust/target/release:/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/18/bin' \
+        --change 'ENV GOSU_VERSION=1.19' \
+        --change 'ENV LANG=en_US.utf8' \
+        --change 'ENV PG_MAJOR=18' \
+        --change 'ENV PG_VERSION=18.3-1.pgdg13+1' \
+        --change 'ENV PGDATA=/var/lib/postgresql/18/docker' \
+        --change 'ENV RVBBIT_CAPABILITY_ROOT=/usr/share/rvbbit/capabilities' \
+        --change 'ENV RVBBIT_CAPABILITY_PACKS_DIR=/usr/share/rvbbit/capabilities/packs' \
+        --change 'ENV NVIDIA_VISIBLE_DEVICES=all' \
+        --change 'ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility' \
+        --change 'ENV LD_LIBRARY_PATH=/conda/envs/gqe/lib:/usr/local/lib' \
+        --change 'ENV RVBBIT_GQE_CLI=/opt/gqe/rust/target/release/gqe-cli' \
+        --change 'ENV RVBBIT_GQE_NODE_MANAGER=/opt/gqe/build/src/node_manager/gqe_node_manager' \
+        --change 'ENV RVBBIT_GQE_TASK_MANAGER=/opt/gqe/build/src/task_manager/gqe_task_manager' \
+        --change 'ENV RVBBIT_GQE_SERVER_URL=http://127.0.0.1:50051' \
+        --change 'ENV RVBBIT_GQE_AUTO_START=true' \
+        - "${target_image}" >/dev/null; then
+        docker rm -f "${container_id}" >/dev/null 2>&1 || true
+        return 1
+    fi
+    docker rm -f "${container_id}" >/dev/null
+    printf "%s" "${target_image}"
+}
+refresh_clickbench_gqe_image() {
+    local gqe_image base_image refresh_base explicit_refresh_base
+    local flattened_base
+    gqe_image="${RVBBIT_GQE_PG_IMAGE:-docker-pg-rvbbit-gqe}"
+    base_image="${RVBBIT_BASE_IMAGE:-${RVBBIT_PG_IMAGE:-docker-pg-rvbbit}}"
+    refresh_base="${gqe_image}-pre-refresh"
+    explicit_refresh_base="${RVBBIT_GQE_REFRESH_BASE_IMAGE:-}"
+    if [ -n "${explicit_refresh_base}" ] && docker image inspect "${explicit_refresh_base}" >/dev/null 2>&1; then
+        say "refreshing GPU/GQE image from explicit base ${explicit_refresh_base}"
+        refresh_base="${explicit_refresh_base}"
+    elif docker image inspect "${gqe_image}" >/dev/null 2>&1; then
+        docker tag "${gqe_image}" "${refresh_base}"
+    elif docker image inspect "${refresh_base}" >/dev/null 2>&1; then
+        say "refreshing GPU/GQE image from preserved backup ${refresh_base}"
+    else
+        return 2
+    fi
+    flattened_base="$(
+        flatten_clickbench_gqe_image_if_needed \
+            "${refresh_base}" \
+            "${RVBBIT_GQE_FLAT_REFRESH_BASE_IMAGE:-${gqe_image}-flat-refresh-base}"
+    )" || return 1
+    docker build \
+        -f docker/Dockerfile.rvbbit-gqe-refresh \
+        --build-arg "RVBBIT_BASE_IMAGE=${base_image}" \
+        --build-arg "RVBBIT_GQE_BASE_IMAGE=${flattened_base}" \
+        -t "${gqe_image}" .
+}
+gqe_bridge_has_required_marker() {
+    local marker
+    marker="${GQE_ADAPTER_VERSION_REQUIRED}"
+    ${COMPOSE} exec -T pg-rvbbit sh -lc \
+        "grep -a -q -- '${marker}' /opt/rvbbit/gqe/bin/rvbbit-gqe-bridge"
+}
+wait_for_pg_rvbbit_ready() {
+    local timeout_s="${RVBBIT_PG_READY_TIMEOUT:-120}"
+    local start_s now_s
+    start_s="$(date +%s)"
+    while true; do
+        if ${COMPOSE} exec -T pg-rvbbit pg_isready -U postgres -d bench >/dev/null 2>&1; then
+            return 0
+        fi
+        now_s="$(date +%s)"
+        if [ $((now_s - start_s)) -ge "${timeout_s}" ]; then
+            die "timed out waiting for pg-rvbbit to accept connections after ${timeout_s}s"
+        fi
+        sleep 1
+    done
+}
+wait_for_bench_session_drain() {
+    local timeout_s="${RVBBIT_RESET_DRAIN_TIMEOUT:-30}"
+    local start_s now_s remaining
+    start_s="$(date +%s)"
+    while true; do
+        remaining="$(${COMPOSE} exec -T pg-rvbbit psql -U postgres -d postgres -Atq -v ON_ERROR_STOP=1 -c "
+            SELECT count(*)
+            FROM pg_stat_activity
+            WHERE datname = 'bench'
+              AND pid <> pg_backend_pid();
+        " | tr -d '[:space:]')"
+        [ "${remaining:-0}" = "0" ] && return 0
+        now_s="$(date +%s)"
+        if [ $((now_s - start_s)) -ge "${timeout_s}" ]; then
+            warn "bench session drain timed out with ${remaining} session(s) still visible; continuing with reset lock timeout"
+            return 0
+        fi
+        sleep 1
+    done
+}
 hive_refresh_explicitly_disabled() {
     case "${RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD:-}" in
         0|false|FALSE|no|NO|off|OFF|disabled|DISABLED) return 0 ;;
         *) return 1 ;;
     esac
 }
-wait_for_hive_variant_refresh() {
+wait_for_layout_variant_refresh() {
     local timeout_s="${RVBBIT_HIVE_VARIANT_WAIT_TIMEOUT:-3600}"
     local start_s now_s active
     start_s="$(date +%s)"
@@ -297,10 +468,13 @@ wait_for_hive_variant_refresh() {
         [ "${active}" != "t" ] && break
         now_s="$(date +%s)"
         if [ $((now_s - start_s)) -ge "${timeout_s}" ]; then
-            die "timed out waiting for async Hive variant refresh after ${timeout_s}s"
+            die "timed out waiting for async layout variant refresh after ${timeout_s}s"
         fi
         sleep 5
     done
+}
+wait_for_hive_variant_refresh() {
+    wait_for_layout_variant_refresh
 }
 clickbench_hive_variants_ready() {
     ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -Atq -v ON_ERROR_STOP=1 -c "
@@ -311,6 +485,19 @@ clickbench_hive_variants_ready() {
               ON s.table_oid = rg.table_oid AND s.layout = rg.layout
             WHERE rg.table_oid = 'hits'::regclass
               AND rg.layout LIKE 'hive:%'
+              AND s.status = 'ready'
+        );
+    " | tr -d '[:space:]'
+}
+clickbench_vortex_variants_ready() {
+    ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -Atq -v ON_ERROR_STOP=1 -c "
+        SELECT EXISTS (
+            SELECT 1
+            FROM rvbbit.row_group_variants rg
+            JOIN rvbbit.layout_variant_status s
+              ON s.table_oid = rg.table_oid AND s.layout = rg.layout
+            WHERE rg.table_oid = 'hits'::regclass
+              AND rg.layout = 'vortex_scan'
               AND s.status = 'ready'
         );
     " | tr -d '[:space:]'
@@ -345,10 +532,172 @@ SQL
         die "forced-Hive variants are still missing for public.hits after refresh"
     fi
 }
+ensure_clickbench_vortex_variants_ready() {
+    [ "${VORTEX_FORCED_SELECTED}" = "1" ] || return 0
+    say "ensuring Vortex variants are ready for forced-Vortex systems"
+    wait_for_layout_variant_refresh
+    if [ "$(clickbench_vortex_variants_ready)" = "t" ]; then
+        return 0
+    fi
+    if hive_refresh_explicitly_disabled; then
+        die "forced-Vortex variants are missing for public.hits and RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD disables refresh"
+    fi
+    if [ -n "${RVBBIT_COMPACT_KEEP_HEAP:-}" ] && ! env_on "${RVBBIT_COMPACT_KEEP_HEAP}"; then
+        die "forced-Vortex benchmarks need retained heap until variant refresh can rebuild from canonical parquet; unset RVBBIT_COMPACT_KEEP_HEAP or set it to 1"
+    fi
+    ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 \
+        -v vortex_layout="${VORTEX_LAYOUT_DISPLAY}" <<'SQL'
+SELECT set_config('rvbbit.compact_vortex_layout', :'vortex_layout', false);
+SELECT rvbbit.refresh_layout_variants('hits'::regclass);
+SQL
+    if [ "$(clickbench_vortex_variants_ready)" != "t" ]; then
+        die "forced-Vortex variants are still missing for public.hits after refresh"
+    fi
+}
+ensure_clickbench_route_shape_samples() {
+    [ "${RVBBIT_SELECTED}" = "1" ] || return 0
+    ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 <<'SQL'
+CREATE TABLE IF NOT EXISTS rvbbit.route_shape_samples (
+    shape_key     text PRIMARY KEY,
+    shape_family  text NOT NULL,
+    sql           text NOT NULL,
+    captured_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS route_shape_samples_family_idx ON rvbbit.route_shape_samples (shape_family);
+SQL
+}
+mark_clickbench_gpu_gqe_skip() {
+    local reason="$1"
+    reason="$(printf "%s" "${reason}" | tr '\r\n' '  ' | cut -c1-500)"
+    if env_on "${RVBBIT_REQUIRE_GPU_GQE:-}"; then
+        die "rvbbit_gpu_gqe_forced selected, but gpu_gqe is unavailable (${reason:-unknown})"
+    fi
+    GPU_GQE_SKIP_ACTIVE=1
+    warn "rvbbit_gpu_gqe_forced selected, but gpu_gqe is unavailable; marking it SKIP (${reason:-unknown})"
+    warn "set RVBBIT_REQUIRE_GPU_GQE=1 to fail instead"
+    QUERIES_ENV+=(-e "RVBBIT_GPU_GQE_SKIP_REASON=${reason:-rvbbit-gqe bridge unavailable}")
+}
+prestart_clickbench_gpu_gqe() {
+    ${COMPOSE} exec -T \
+        -e "RVBBIT_GQE_WORK_DIR=${RVBBIT_GQE_WORK_DIR:-/tmp/rvbbit-gqe}" \
+        pg-rvbbit bash -s <<'SH'
+set -euo pipefail
+work_dir="${RVBBIT_GQE_WORK_DIR:-/tmp/rvbbit-gqe}"
+mkdir -p "${work_dir}"
+chown -R postgres:postgres "${work_dir}" 2>/dev/null || true
+chmod 1777 "${work_dir}" 2>/dev/null || true
+SH
+    ${COMPOSE} exec -T \
+        -u postgres \
+        -e "RVBBIT_GQE_PREFLIGHT_TIMEOUT_S=${RVBBIT_GQE_PREFLIGHT_TIMEOUT_S:-75}" \
+        -e "RVBBIT_GQE_MIN_SHM_BYTES=${RVBBIT_GQE_MIN_SHM_BYTES:-6442450944}" \
+        -e "RVBBIT_GQE_WORK_DIR=${RVBBIT_GQE_WORK_DIR:-/tmp/rvbbit-gqe}" \
+        pg-rvbbit bash -s <<'SH'
+set -euo pipefail
+
+min_shm_bytes="${RVBBIT_GQE_MIN_SHM_BYTES:-6442450944}"
+shm_bytes="$(df -B1 /dev/shm | awk 'NR==2 {print $2}')"
+if [ -z "${shm_bytes}" ] || [ "${shm_bytes}" -lt "${min_shm_bytes}" ]; then
+    echo "GQE /dev/shm too small (${shm_bytes:-unknown} bytes; need >= ${min_shm_bytes}; set RVBBIT_GQE_SHM_SIZE=8gb and recreate pg-rvbbit)"
+    exit 20
+fi
+
+server_url="${RVBBIT_GQE_SERVER_URL:-http://127.0.0.1:50051}"
+endpoint="${server_url#http://}"
+endpoint="${endpoint#https://}"
+endpoint="${endpoint%%/*}"
+host="${endpoint%:*}"
+port="${endpoint##*:}"
+if [ "${host}" = "${endpoint}" ] || ! [[ "${port}" =~ ^[0-9]+$ ]]; then
+    echo "GQE server URL must include host:port, got ${server_url}"
+    exit 21
+fi
+listen_host="${host}"
+connect_host="${host}"
+if [ "${connect_host}" = "0.0.0.0" ]; then
+    connect_host="127.0.0.1"
+fi
+
+tcp_check() {
+    timeout 1 bash -lc ":</dev/tcp/${connect_host}/${port}" >/dev/null 2>&1
+}
+
+if tcp_check; then
+    echo "server already listening at ${connect_host}:${port}"
+    exit 0
+fi
+
+node="${RVBBIT_GQE_NODE_MANAGER:-/opt/gqe/build/src/node_manager/gqe_node_manager}"
+task="${RVBBIT_GQE_TASK_MANAGER:-/opt/gqe/build/src/task_manager/gqe_task_manager}"
+cli="${RVBBIT_GQE_CLI:-/opt/gqe/rust/target/release/gqe-cli}"
+for binary in "${node}" "${task}" "${cli}"; do
+    if [ ! -x "${binary}" ]; then
+        echo "GQE binary is missing or not executable: ${binary}"
+        exit 22
+    fi
+done
+
+work_dir="${RVBBIT_GQE_WORK_DIR:-/tmp/rvbbit-gqe}"
+mkdir -p "${work_dir}"
+chmod 1777 "${work_dir}" 2>/dev/null || true
+log_path="${work_dir}/node-manager.log"
+pidfile="${work_dir}/node-manager.pid"
+
+if [ -s "${pidfile}" ]; then
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+        echo "GQE node manager pid ${pid} is running but ${connect_host}:${port} is not reachable"
+        tail -40 "${log_path}" 2>/dev/null || true
+        exit 23
+    fi
+fi
+
+rm -f "${work_dir}/node-manager-start.lock"
+nohup "${node}" \
+    --address "${listen_host}" \
+    --port "${port}" \
+    --num-gpus "${RVBBIT_GQE_NUM_GPUS:-1}" \
+    --task-manager-binary "${task}" \
+    >>"${log_path}" 2>&1 &
+pid="$!"
+echo "${pid}" > "${pidfile}"
+
+timeout_s="${RVBBIT_GQE_PREFLIGHT_TIMEOUT_S:-75}"
+for _ in $(seq 1 "${timeout_s}"); do
+    if tcp_check; then
+        echo "server listening at ${connect_host}:${port}"
+        exit 0
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        echo "GQE node manager exited while starting"
+        tail -80 "${log_path}" 2>/dev/null || true
+        exit 24
+    fi
+    sleep 1
+done
+
+echo "GQE server ${server_url} did not become reachable after ${timeout_s}s"
+tail -80 "${log_path}" 2>/dev/null || true
+exit 25
+SH
+}
 ensure_clickbench_gpu_gqe_available() {
     system_selected "rvbbit_gpu_gqe_forced" || return 0
     say "checking GPU/GQE bridge availability"
     local status_line routes_available binary_found binary_path reason
+    local preflight_output
+    if env_on "${RVBBIT_GQE_PREFLIGHT_START:-true}"; then
+        if preflight_output="$(prestart_clickbench_gpu_gqe 2>&1)"; then
+            echo "   gpu_gqe    : ${preflight_output}"
+        else
+            mark_clickbench_gpu_gqe_skip "${preflight_output}"
+            return 0
+        fi
+    fi
+    if ! env_on "${RVBBIT_GQE_ALLOW_STALE_BRIDGE:-}" && ! gqe_bridge_has_required_marker; then
+        mark_clickbench_gpu_gqe_skip "stale rvbbit-gqe bridge in ${RVBBIT_GQE_PG_IMAGE:-docker-pg-rvbbit-gqe}; missing ${GQE_ADAPTER_VERSION_REQUIRED}; rerun with --rebuild (fast refresh) or set RVBBIT_GPU_GQE_REBUILD_MODE=full for a full GQE rebuild"
+        return 0
+    fi
     local gqe_bin_lit
     gqe_bin_lit="$(sql_literal "${RVBBIT_GQE_BIN:-}")"
     if ! status_line="$(${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -Atq -F '|' -v ON_ERROR_STOP=1 -c "
@@ -365,23 +714,71 @@ ensure_clickbench_gpu_gqe_available() {
                coalesce(value->'gpu_gqe'->>'reason', '')
         FROM status, (SELECT count(*) FROM configured) AS applied;
     " | tr -d '\r')"; then
-        if env_on "${RVBBIT_REQUIRE_GPU_GQE:-}"; then
-            die "rvbbit_gpu_gqe_forced selected, but GPU/GQE status could not be read"
-        fi
-        warn "rvbbit_gpu_gqe_forced selected, but GPU/GQE status could not be read; marking it SKIP"
-        QUERIES_ENV+=(-e "RVBBIT_GPU_GQE_SKIP_REASON=GPU/GQE status unavailable")
+        mark_clickbench_gpu_gqe_skip "GPU/GQE status unavailable"
     else
         IFS='|' read -r routes_available binary_found binary_path reason <<< "${status_line}"
         if [ "${routes_available}" = "true" ] || [ "${routes_available}" = "t" ]; then
             echo "   gpu_gqe    : available (${binary_path:-rvbbit-gqe on PATH})"
             return 0
         fi
-        if env_on "${RVBBIT_REQUIRE_GPU_GQE:-}"; then
-            die "rvbbit_gpu_gqe_forced selected, but gpu_gqe is unavailable (binary_found=${binary_found}, binary_path=${binary_path:-missing}, reason=${reason:-unknown})"
-        fi
-        warn "rvbbit_gpu_gqe_forced selected, but gpu_gqe is unavailable; marking it SKIP (${reason:-unknown})"
-        warn "set RVBBIT_REQUIRE_GPU_GQE=1 to fail instead, or install GQE under /opt/gqe / set RVBBIT_GQE_CLI and RVBBIT_GQE_SERVER_URL"
-        QUERIES_ENV+=(-e "RVBBIT_GPU_GQE_SKIP_REASON=${reason:-rvbbit-gqe bridge unavailable}")
+        mark_clickbench_gpu_gqe_skip "${reason:-rvbbit-gqe bridge unavailable}"
+    fi
+}
+gqe_prewarm_enabled() {
+    case "${RVBBIT_GQE_PREWARM:-auto}" in
+        0|false|FALSE|no|NO|off|OFF|disabled|DISABLED) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+prewarm_clickbench_gpu_gqe_catalog() {
+    system_selected "rvbbit_gpu_gqe_forced" || return 0
+    [ "${GPU_GQE_SKIP_ACTIVE}" = "0" ] || return 0
+    gqe_prewarm_enabled || return 0
+
+    say "prewarming GPU/GQE catalog"
+    local prewarm_output
+    if prewarm_output="$(${COMPOSE} exec -T \
+        -u postgres \
+        -e "RVBBIT_GQE_PREFLIGHT_TIMEOUT_S=${RVBBIT_GQE_PREFLIGHT_TIMEOUT_S:-75}" \
+        -e "RVBBIT_GQE_WORK_DIR=${RVBBIT_GQE_WORK_DIR:-/tmp/rvbbit-gqe}" \
+        -e "RVBBIT_GQE_PREWARM_SQL=${RVBBIT_GQE_PREWARM_SQL:-}" \
+        -e "RVBBIT_GQE_PREWARM_DSN=${RVBBIT_GQE_PREWARM_DSN:-}" \
+        pg-rvbbit bash -s 2>&1 <<'SH'
+set -euo pipefail
+
+work_dir="${RVBBIT_GQE_WORK_DIR:-/tmp/rvbbit-gqe}"
+mkdir -p "${work_dir}"
+chmod 1777 "${work_dir}" 2>/dev/null || true
+
+pgdata="${PGDATA:-/var/lib/postgresql/18/docker}"
+dsn="${RVBBIT_GQE_PREWARM_DSN:-postgresql://postgres:rvbbit@127.0.0.1:5432/bench}"
+sql="${RVBBIT_GQE_PREWARM_SQL:-SELECT 1 FROM hits LIMIT 0}"
+timeout_s="${RVBBIT_GQE_PREFLIGHT_TIMEOUT_S:-75}"
+json_path="${work_dir}/prewarm.json"
+
+/usr/local/bin/rvbbit-gqe \
+    --engine gpu_gqe \
+    --layout scan \
+    --dsn "${dsn}" \
+    --sql "${sql}" \
+    --explain-only \
+    --timeout-s "${timeout_s}" \
+    --max-rows 1 \
+    --pgdata-prefix "${pgdata}" \
+    --visible-pgdata-prefix "${pgdata}" \
+    >"${json_path}"
+
+elapsed="$(tr -d '\n' < "${json_path}" | sed -n 's/.*"elapsed_ms"[[:space:]]*:[[:space:]]*\([0-9.][0-9.]*\).*/\1/p')"
+if [ -n "${elapsed}" ]; then
+    echo "catalog ready (${elapsed}ms explain-only)"
+else
+    echo "catalog ready"
+fi
+SH
+    )"; then
+        echo "   gpu_gqe    : ${prewarm_output}"
+    else
+        mark_clickbench_gpu_gqe_skip "GQE prewarm failed: ${prewarm_output}"
     fi
 }
 record_benchmark_history() {
@@ -462,6 +859,7 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+configure_gqe_pooled_sidecar_defaults
 
 # ---- 0. Sanity --------------------------------------------------------------
 command -v docker >/dev/null || die "docker not found in PATH"
@@ -483,8 +881,11 @@ echo "   df_inprocess: ${RVBBIT_DF_INPROCESS:-on (default)}"
 echo "   gpu compose : ${GPU_COMPOSE_DISPLAY}"
 echo "   gqe image   : ${GQE_IMAGE_DISPLAY}"
 echo "   gqe home    : ${GQE_HOST_MOUNT_DISPLAY}"
+echo "   gqe client  : ${RVBBIT_GQE_CLIENT_MODE:-flight}"
+echo "   gqe shared  : ${RVBBIT_DUCK_BACKEND_SHARED:-default} targets=${RVBBIT_DUCK_BACKEND_SHARED_TARGETS:-default}"
 echo "   hive refresh: ${HIVE_REFRESH_DISPLAY}"
 echo "   vortex      : ${VORTEX_LAYOUT_DISPLAY}"
+echo "   chunks      : direct=${RVBBIT_DIRECT_ACCEL_CHUNK_ROWS:-default} compact=${RVBBIT_COMPACT_SCAN_CHUNK_ROWS:-default} gqe_large=$(env_on "${RVBBIT_GQE_LARGE_ROW_GROUPS:-}" && echo yes || echo no)"
 echo "   hot store   : budget=${RVBBIT_HOT_STORE_BUDGET_MB:-512}MB route_max_rows=${RVBBIT_HOT_STORE_ROUTE_MAX_ROWS:-500000}"
 
 if [ "${RVBBIT_SELECTED:-1}" = "1" ] && ! env_on "${BENCH_REBUILD}" && ! env_on "${RVBBIT_RESET_EXTENSION}"; then
@@ -519,22 +920,67 @@ if env_on "${BENCH_REBUILD}"; then
     if [ "${GQE_IMAGE_SELECTED}" = "1" ]; then
         say "rebuilding base pg-rvbbit image for GPU/GQE image"
         docker compose -f docker/docker-compose.yml build pg-rvbbit
+        case "${RVBBIT_GPU_GQE_REBUILD_MODE:-refresh}" in
+            full|FULL|toolchain|TOOLCHAIN)
+                say "rebuilding full GPU/GQE image"
+                backup_clickbench_gqe_image_before_full_rebuild
+                ${COMPOSE} --profile bench build pg-rvbbit
+                ;;
+            refresh|REFRESH|adapter|ADAPTER)
+                say "refreshing GPU/GQE image with current pg_rvbbit + bridge artifacts"
+                refresh_rc=0
+                refresh_clickbench_gqe_image || refresh_rc=$?
+                if [ "${refresh_rc}" -eq 2 ]; then
+                    die "existing ${RVBBIT_GQE_PG_IMAGE:-docker-pg-rvbbit-gqe} image not found; refusing to recompile the full GPU/GQE toolchain in refresh mode. Run once with RVBBIT_GPU_GQE_REBUILD_MODE=full if you intentionally need the toolchain image rebuilt."
+                elif [ "${refresh_rc}" -ne 0 ]; then
+                    die "GPU/GQE image refresh failed even though a reusable base image was found. Check the Docker error above; set RVBBIT_GPU_GQE_REBUILD_MODE=full only if the base image is actually unusable."
+                fi
+                ;;
+            *)
+                die "unknown RVBBIT_GPU_GQE_REBUILD_MODE=${RVBBIT_GPU_GQE_REBUILD_MODE}; use refresh or full"
+                ;;
+        esac
+        say "rebuilding bench image from current source"
+        ${COMPOSE} --profile bench build bench
+    else
+        say "rebuilding pg-rvbbit + bench images from current source"
+        # Build serially: pg-rvbbit's cargo build pulls a large dep graph;
+        # bench is small. No need to parallelize.
+        ${COMPOSE} --profile bench build pg-rvbbit bench
     fi
-    say "rebuilding pg-rvbbit + bench images from current source"
-    # Build serially: pg-rvbbit's cargo build pulls a large dep graph;
-    # bench is small. No need to parallelize.
-    ${COMPOSE} --profile bench build pg-rvbbit bench
+fi
+
+UP_BUILD_ARGS=()
+if [ "${GQE_IMAGE_SELECTED}" = "1" ] && ! gqe_rebuild_mode_is_full; then
+    # docker compose up can implicitly build a missing service image. For GQE
+    # that means a multi-hour CUDA/RAPIDS toolchain build, so refresh/default
+    # mode makes implicit builds impossible. Full mode remains explicit.
+    UP_BUILD_ARGS+=(--no-build)
 fi
 
 say "starting competitor containers (profile=bench)"
-${COMPOSE} --profile bench up -d
-sleep 5
+if [ "${GPU_GQE_SELECTED}" = "1" ]; then
+    say "recreating pg-rvbbit to apply GPU/GQE runtime settings"
+    ${COMPOSE} --profile bench up -d "${UP_BUILD_ARGS[@]}" --force-recreate pg-rvbbit
+fi
+${COMPOSE} --profile bench up -d "${UP_BUILD_ARGS[@]}"
+wait_for_pg_rvbbit_ready
 
 # ---- 3. Prepare rvbbit extension ------------------------------------------
 if [ "${RVBBIT_SELECTED}" = "1" ]; then
     if env_on "${RVBBIT_RESET_EXTENSION}"; then
+        say "draining existing bench sessions before pg_rvbbit reset"
+        ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = 'bench'
+  AND pid <> pg_backend_pid();
+SQL
+        wait_for_bench_session_drain
         say "resetting pg_rvbbit extension (DESTRUCTIVE: drops rvbbit system/catalog data)"
         ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 <<'SQL'
+SET lock_timeout = '30s';
+SET statement_timeout = '5min';
 DROP EXTENSION IF EXISTS pg_rvbbit CASCADE;
 DROP EVENT TRIGGER IF EXISTS rvbbit_on_create_table;
 DROP EVENT TRIGGER IF EXISTS rvbbit_on_drop_table;
@@ -553,6 +999,9 @@ CREATE EXTENSION IF NOT EXISTS pg_rvbbit;
 ALTER EXTENSION pg_rvbbit UPDATE;
 SQL
     fi
+
+    say "ensuring route shape sample table"
+    ensure_clickbench_route_shape_samples
 
     if env_on "${RVBBIT_LOAD_ROUTE_PROFILE}" && [ -f "bench/rvbbit_route_profile.json" ]; then
         say "loading Rvbbit route profile"
@@ -575,6 +1024,8 @@ else
 fi
 
 ensure_clickbench_hive_variants_ready
+ensure_clickbench_vortex_variants_ready
+prewarm_clickbench_gpu_gqe_catalog
 
 # ---- 5. Run queries -------------------------------------------------------
 say "running queries"

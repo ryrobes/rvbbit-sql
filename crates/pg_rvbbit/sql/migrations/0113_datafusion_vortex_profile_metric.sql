@@ -31,12 +31,14 @@ ALTER TABLE IF EXISTS rvbbit.route_profile_points
     ADD COLUMN IF NOT EXISTS pg_ms double precision;
 
 DO $$
+DECLARE
+    route_profile_points_oid oid := to_regclass('rvbbit.route_profile_points');
 BEGIN
-    IF to_regclass('rvbbit.route_profile_points') IS NOT NULL
+    IF route_profile_points_oid IS NOT NULL
        AND NOT EXISTS (
            SELECT 1
            FROM pg_constraint
-           WHERE conrelid = 'rvbbit.route_profile_points'::regclass
+           WHERE conrelid = route_profile_points_oid
              AND conname = 'route_profile_points_datafusion_vortex_ms_check'
        ) THEN
         ALTER TABLE rvbbit.route_profile_points
@@ -49,7 +51,7 @@ CREATE OR REPLACE VIEW rvbbit.route_shape_summary AS
 WITH candidate_stats AS (
     SELECT *
     FROM rvbbit.route_observation_summary
-    WHERE candidate IN ('rvbbit_native', 'rvbbit_native_vortex', 'duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'pg_rowstore')
+    WHERE candidate IN ('rvbbit_native', 'rvbbit_native_vortex', 'duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'gpu_gqe', 'pg_rowstore')
 ),
 shape_stats AS (
     SELECT
@@ -65,6 +67,7 @@ shape_stats AS (
         max(median_ms) FILTER (WHERE candidate = 'datafusion_vector') AS datafusion_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'datafusion_hive') AS datafusion_hive_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'datafusion_vortex') AS datafusion_vortex_median_ms,
+        max(median_ms) FILTER (WHERE candidate = 'gpu_gqe') AS gpu_gqe_median_ms,
         max(median_ms) FILTER (WHERE candidate = 'pg_rowstore') AS pg_median_ms,
         max(observations) FILTER (WHERE candidate = 'rvbbit_native') AS native_observations,
         max(observations) FILTER (WHERE candidate = 'duck_vector') AS duck_observations,
@@ -74,6 +77,7 @@ shape_stats AS (
         max(observations) FILTER (WHERE candidate = 'datafusion_vector') AS datafusion_observations,
         max(observations) FILTER (WHERE candidate = 'datafusion_hive') AS datafusion_hive_observations,
         max(observations) FILTER (WHERE candidate = 'datafusion_vortex') AS datafusion_vortex_observations,
+        max(observations) FILTER (WHERE candidate = 'gpu_gqe') AS gpu_gqe_observations,
         max(observations) FILTER (WHERE candidate = 'pg_rowstore') AS pg_observations
     FROM candidate_stats
     GROUP BY shape_key, shape_family
@@ -121,6 +125,7 @@ SELECT
                     (ss.datafusion_median_ms),
                     (ss.datafusion_hive_median_ms),
                     (ss.datafusion_vortex_median_ms),
+                    (ss.gpu_gqe_median_ms),
                     (ss.pg_median_ms)
             ) AS med(v)
             WHERE v IS NOT NULL
@@ -138,6 +143,7 @@ SELECT
                         (ss.datafusion_median_ms),
                         (ss.datafusion_hive_median_ms),
                         (ss.datafusion_vortex_median_ms),
+                        (ss.gpu_gqe_median_ms),
                         (ss.pg_median_ms)
                 ) AS med(v)
                 WHERE v IS NOT NULL
@@ -150,10 +156,13 @@ SELECT
         OR coalesce(ss.datafusion_mem_observations, 0) = 0
         OR coalesce(ss.datafusion_observations, 0) = 0
         OR coalesce(ss.datafusion_vortex_observations, 0) = 0
+        OR coalesce(ss.gpu_gqe_observations, 0) = 0
         OR coalesce(ss.pg_observations, 0) = 0
     ) AS needs_exploration,
     ss.datafusion_vortex_median_ms,
-    ss.datafusion_vortex_observations
+    ss.datafusion_vortex_observations,
+    ss.gpu_gqe_median_ms,
+    ss.gpu_gqe_observations
 FROM shape_stats ss
 LEFT JOIN ranked r ON r.shape_key = ss.shape_key AND r.rn = 1;
 
@@ -212,6 +221,7 @@ SELECT
     pe.datafusion_hive_ms,
     pe.pg_ms,
     pe.native_vortex_ms,
-    pe.datafusion_vortex_ms
+    pe.datafusion_vortex_ms,
+    NULL::double precision AS gpu_gqe_ms
 FROM rvbbit.route_profiles rp
 JOIN rvbbit.route_profile_entries pe ON pe.profile_name = rp.name;

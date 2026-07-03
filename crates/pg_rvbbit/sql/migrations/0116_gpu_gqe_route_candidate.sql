@@ -40,12 +40,14 @@ ALTER TABLE IF EXISTS rvbbit.route_profile_points
     ADD COLUMN IF NOT EXISTS gpu_gqe_ms double precision;
 
 DO $$
+DECLARE
+    route_profile_points_oid oid := to_regclass('rvbbit.route_profile_points');
 BEGIN
-    IF to_regclass('rvbbit.route_profile_points') IS NOT NULL
+    IF route_profile_points_oid IS NOT NULL
        AND NOT EXISTS (
            SELECT 1
            FROM pg_constraint
-           WHERE conrelid = 'rvbbit.route_profile_points'::regclass
+           WHERE conrelid = route_profile_points_oid
              AND conname = 'route_profile_points_gpu_gqe_ms_check'
        ) THEN
         ALTER TABLE rvbbit.route_profile_points

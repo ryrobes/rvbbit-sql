@@ -1,0 +1,33 @@
+# Fast refresh layer for an already-built GPU/GQE image.
+#
+# Rebuilding docker/Dockerfile.rvbbit-gqe recompiles libcudf, MLIR, and GQE.
+# For normal pg_rvbbit/bridge iteration we only need to copy the freshly built
+# Postgres extension and RVBBIT bridge binaries from docker-pg-rvbbit into the
+# existing docker-pg-rvbbit-gqe image.
+
+ARG RVBBIT_BASE_IMAGE=docker-pg-rvbbit
+ARG RVBBIT_GQE_BASE_IMAGE=docker-pg-rvbbit-gqe
+
+FROM ${RVBBIT_BASE_IMAGE} AS rvbbit_payload
+
+RUN set -eux; \
+    tar -C / -cf /tmp/rvbbit-refresh-payload.tar \
+        usr/share/postgresql/18/extension/pg_rvbbit.control \
+        usr/share/postgresql/18/extension/pg_rvbbit--*.sql \
+        usr/lib/postgresql/18/lib/pg_rvbbit.so \
+        usr/local/bin/rvbbit-duck \
+        opt/rvbbit/gqe/bin/rvbbit-gqe-bridge \
+        usr/local/bin/rvbbit-gqe \
+        usr/share/rvbbit/capabilities \
+        docker-entrypoint-initdb.d \
+        etc/rvbbit/tuning.conf
+
+FROM ${RVBBIT_GQE_BASE_IMAGE}
+
+COPY --from=rvbbit_payload /tmp/rvbbit-refresh-payload.tar /tmp/rvbbit-refresh-payload.tar
+
+RUN set -eux; \
+    tar -C / -xf /tmp/rvbbit-refresh-payload.tar; \
+    rm -f /tmp/rvbbit-refresh-payload.tar; \
+    chmod 0755 /usr/local/bin/rvbbit-duck /usr/local/bin/rvbbit-gqe \
+        /opt/rvbbit/gqe/bin/rvbbit-gqe-bridge

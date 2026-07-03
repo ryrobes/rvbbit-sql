@@ -22,6 +22,9 @@
       --enrollment: #5a58a8;
       --cluster: #d14c47;
       --spend: #0f8f7d;
+      --capacity: #2f7d8c;
+      --ads: #6f55b5;
+      --action: #d97b1e;
       --pharmacy: #287b4f;
       --shadow: 0 16px 42px rgba(32, 38, 36, 0.18);
     }
@@ -118,6 +121,26 @@
       min-height: 36px;
     }
 
+    .toggles {
+      flex-wrap: wrap;
+      justify-content: flex-start;
+    }
+
+    .toggle-label {
+      display: inline-flex;
+      align-items: center;
+      height: 28px;
+      padding: 0 9px 0 7px;
+      border-right: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
     button,
     select {
       font: inherit;
@@ -136,11 +159,46 @@
       cursor: pointer;
     }
 
+    .toggles button {
+      position: relative;
+      padding-left: 22px;
+      border: 1px solid transparent;
+      opacity: 0.62;
+    }
+
+    .toggles button::before {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 50%;
+      width: 7px;
+      height: 7px;
+      border: 1px solid currentColor;
+      border-radius: 50%;
+      transform: translateY(-50%);
+      opacity: 0.72;
+    }
+
+    .toggles button:hover {
+      background: var(--panel-soft);
+      opacity: 0.9;
+    }
+
     .segmented button.active,
     .toggles button.active,
     .theme-toggle.active {
       background: var(--panel-solid);
       box-shadow: 0 1px 4px rgba(20, 26, 22, 0.14);
+    }
+
+    .toggles button.active {
+      border-color: var(--line);
+      opacity: 1;
+    }
+
+    .toggles button.active::before {
+      background: currentColor;
+      opacity: 1;
     }
 
     .toggles button[data-layer="locations"].active { color: var(--location); }
@@ -150,6 +208,9 @@
     .toggles button[data-layer="spend"].active { color: var(--spend); }
     .toggles button[data-layer="clouds"].active { color: var(--spend); }
     .toggles button[data-layer="cpl"].active { color: var(--lead); }
+    .toggles button[data-layer="capacity"].active { color: var(--capacity); }
+    .toggles button[data-layer="ads"].active { color: var(--ads); }
+    .toggles button[data-layer="actions"].active { color: var(--action); }
 
     .radius label {
       font-size: 12px;
@@ -293,32 +354,47 @@
     .status.show { display: block; }
 
     .mapboxgl-popup-content {
-      padding: 10px 12px;
+      padding: 0;
       color: var(--ink);
       background: var(--panel-solid);
       box-shadow: var(--shadow);
       border: 1px solid var(--line);
+      overflow: hidden;
     }
 
     .popup-stack {
       display: grid;
       gap: 8px;
-      max-width: 330px;
+      width: min(440px, calc(100vw - 34px));
+      max-height: min(72vh, 720px);
+      padding: 10px;
+      overflow: auto;
     }
 
-    .popup-item {
-      display: grid;
-      gap: 3px;
-      padding-top: 8px;
-      border-top: 1px solid var(--line);
+    .popup-stack > .popup-card:first-child {
+      margin-top: 10px;
     }
 
-    .popup-item:first-child {
-      padding-top: 0;
-      border-top: 0;
+    .popup-stack-head {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 2px 22px 8px 4px;
+      border-bottom: 1px solid var(--line);
     }
 
-    .popup-kicker {
+    .popup-stack-title {
+      font-size: 13px;
+      line-height: 1.2;
+      font-weight: 800;
+    }
+
+    .popup-stack-subtitle,
+    .popup-kicker,
+    .popup-detail span,
+    .popup-zip-label,
+    .popup-metric span {
       color: var(--muted);
       font-size: 10px;
       line-height: 1.1;
@@ -326,17 +402,149 @@
       letter-spacing: 0.04em;
     }
 
+    .popup-stack-subtitle {
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .popup-card {
+      --accent: var(--muted);
+      display: grid;
+      gap: 8px;
+      padding: 10px 11px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      background: var(--panel-soft);
+    }
+
+    .popup-card.tone-location { --accent: var(--location); }
+    .popup-card.tone-lead { --accent: var(--lead); }
+    .popup-card.tone-enrollment { --accent: var(--enrollment); }
+    .popup-card.tone-cluster { --accent: var(--cluster); }
+    .popup-card.tone-spend { --accent: var(--spend); }
+    .popup-card.tone-cpl { --accent: #d97b1e; }
+    .popup-card.tone-capacity { --accent: var(--capacity); }
+    .popup-card.tone-ads { --accent: var(--ads); }
+    .popup-card.tone-action { --accent: var(--action); }
+
+    .popup-card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
     .popup-title {
       font-size: 13px;
       font-weight: 760;
       line-height: 1.25;
-      margin-bottom: 4px;
+      overflow-wrap: anywhere;
     }
 
-    .popup-meta {
-      color: var(--muted);
+    .popup-chipset,
+    .popup-zip-list {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 4px;
+    }
+
+    .popup-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 19px;
+      max-width: 180px;
+      padding: 3px 6px;
+      border: 1px solid var(--line);
+      background: var(--control-bg);
+      color: var(--ink);
+      font-size: 10px;
+      line-height: 1.1;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .popup-chip.course { color: var(--location); }
+    .popup-chip.hot { color: #d14c47; }
+    .popup-chip.warm { color: #d97b1e; }
+    .popup-chip.cool,
+    .popup-chip.cold { color: var(--spend); }
+    .popup-chip.good { color: var(--spend); }
+    .popup-chip.warn { color: var(--action); }
+    .popup-chip.bad { color: var(--cluster); }
+    .popup-chip.ads { color: var(--ads); }
+
+    .popup-metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .popup-metric {
+      min-width: 0;
+      padding: 6px;
+      border: 1px solid var(--line);
+      background: var(--control-bg);
+    }
+
+    .popup-metric strong {
+      display: block;
+      margin-top: 3px;
+      font-size: 13px;
+      line-height: 1.15;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+
+    .popup-details {
+      display: grid;
+      gap: 4px;
+    }
+
+    .popup-detail {
+      display: grid;
+      grid-template-columns: 76px minmax(0, 1fr);
+      gap: 8px;
       font-size: 12px;
-      line-height: 1.35;
+      line-height: 1.25;
+    }
+
+    .popup-detail strong {
+      font-weight: 560;
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
+
+    .popup-zips {
+      display: grid;
+      gap: 5px;
+      padding-top: 7px;
+      border-top: 1px solid var(--line);
+    }
+
+    .popup-zips .popup-zip-list {
+      justify-content: flex-start;
+    }
+
+    .popup-zip {
+      display: inline-flex;
+      max-width: 100%;
+      padding: 4px 6px;
+      background: var(--control-bg);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.15;
+      overflow-wrap: anywhere;
+    }
+
+    .market-popup .mapboxgl-popup-close-button {
+      top: 4px;
+      right: 5px;
+      color: var(--muted);
+      font-size: 16px;
     }
 
     .insights {
@@ -506,13 +714,17 @@
         <button data-course="pharmacy">Pharmacy</button>
       </div>
       <div class="toggles" aria-label="Map layers">
-        <button data-layer="locations" class="active">Locations</button>
-        <button data-layer="leads" class="active">Leads</button>
-        <button data-layer="enrollments" class="active">Enrollments</button>
-        <button data-layer="clusters" class="active">Clusters</button>
-        <button data-layer="spend" class="active">Spend</button>
-        <button data-layer="clouds" class="active">Clouds</button>
-        <button data-layer="cpl" class="active">CPL</button>
+        <span class="toggle-label">Layers</span>
+        <button data-layer="locations" class="active" aria-pressed="true">Locations</button>
+        <button data-layer="capacity" class="active" aria-pressed="true">Capacity</button>
+        <button data-layer="leads" class="active" aria-pressed="true">Leads</button>
+        <button data-layer="enrollments" class="active" aria-pressed="true">Enrollments</button>
+        <button data-layer="clusters" aria-pressed="false">Clusters</button>
+        <button data-layer="spend" class="active" aria-pressed="true">Spend</button>
+        <button data-layer="clouds" class="active" aria-pressed="true">Clouds</button>
+        <button data-layer="cpl" class="active" aria-pressed="true">CPL</button>
+        <button data-layer="ads" class="active" aria-pressed="true">Ads</button>
+        <button data-layer="actions" class="active" aria-pressed="true">Actions</button>
       </div>
       <div class="radius">
         <label for="radiusMiles">Radius</label>
@@ -564,6 +776,16 @@
         <canvas id="channelChart"></canvas>
       </div>
       <div class="demand-grid" id="spendGrid"></div>
+      <div class="insights-head">
+        <h2>Capacity actions</h2>
+        <div class="insights-meta" id="capacityMeta">Loading seats</div>
+      </div>
+      <div class="demand-grid" id="capacityGrid"></div>
+      <div class="insights-head">
+        <h2>Active ad QA</h2>
+        <div class="insights-meta" id="adQualityMeta">Loading active ads</div>
+      </div>
+      <div class="demand-grid" id="adQualityGrid"></div>
     </div>
 
     <div class="status" id="status"></div>
@@ -572,20 +794,50 @@
   <script>
     const state = {
       course: "all",
-      layers: { locations: true, leads: true, enrollments: true, clusters: true, spend: true, clouds: true, cpl: true },
-      raw: { locations: [], leads: [], enrollments: [], clusters: [], spend: [], clouds: [], cplClouds: [] },
-      filtered: { locations: [], leads: [], enrollments: [], clusters: [], spend: [], clouds: [], cplClouds: [] },
+      layers: { locations: true, capacity: true, leads: true, enrollments: true, clusters: false, spend: true, clouds: true, cpl: true, ads: true, actions: true },
+      raw: {
+        locations: [],
+        capacity: [],
+        leads: [],
+        enrollments: [],
+        clusters: [],
+        clusterPolygons: [],
+        spend: [],
+        clouds: [],
+        cloudPolygons: [],
+        cplClouds: [],
+        cplCloudPolygons: [],
+        adFootprints: []
+      },
+      filtered: {
+        locations: [],
+        capacity: [],
+        leads: [],
+        enrollments: [],
+        clusters: [],
+        clusterPolygons: [],
+        spend: [],
+        clouds: [],
+        cloudPolygons: [],
+        cplClouds: [],
+        cplCloudPolygons: [],
+        adFootprints: []
+      },
       channelPerformance: [],
       spendSummary: [],
+      capacitySummary: [],
+      adQuality: [],
       summary: {},
       radiusCache: {},
       focusRequest: 0,
-      theme: "light",
+      theme: "dark",
       popup: null,
       signalChart: null,
       channelChart: null,
       insightRows: [],
       spendRows: [],
+      capacityRows: [],
+      adQualityRows: [],
       map: null,
       selected: null
     };
@@ -598,6 +850,9 @@
       enrollment: "#5a58a8",
       cluster: "#d14c47",
       spend: "#0f8f7d",
+      capacity: "#2f7d8c",
+      ads: "#6f55b5",
+      action: "#d97b1e",
       pharmacy: "#287b4f"
     };
     const signalColors = {
@@ -615,14 +870,34 @@
       geo_expansion: "#6f55b5",
       monitor: "#58623f"
     };
+    const capacityColors = {
+      scale_to_fill: "#0f8f7d",
+      protect_winner: "#2f7d8c",
+      undercovered_capacity: "#6f55b5",
+      inspect_spend_no_return: "#d14c47",
+      throttle_near_full: "#d97b1e",
+      heavy_spend_capacity: "#c6652b",
+      balanced_or_monitor: "#58623f",
+      capacity_unknown: "#66726c"
+    };
+    const vendorColors = {
+      meta: "#116d6e",
+      tiktok: "#c6652b",
+      google: "#5a58a8"
+    };
+    const cplColorExpression = [
+      "interpolate",
+      ["linear"],
+      ["to-number", ["get", "cpl_norm"], 0.5],
+      0.00, "#2f7d8c",
+      0.25, "#0f8f7d",
+      0.50, "#d9b44a",
+      0.75, "#d97b1e",
+      1.00, "#d14c47"
+    ];
     const embeddedMapboxToken = "__MAPBOX_PUBLIC_TOKEN__";
 
     const sql = {
-      token: `
-        SELECT value #>> '{}' AS mapbox_access_token
-        FROM rvbbit.settings
-        WHERE key = 'mapbox_public_token'
-      `,
       locations: `
         SELECT
           location_id,
@@ -700,6 +975,40 @@
         ORDER BY opportunity_score DESC
         LIMIT 900
       `,
+      clusterPolygons: `
+        SELECT
+          shape_id,
+          course_type,
+          cluster_signal,
+          cluster_id,
+          anchor_city,
+          anchor_state,
+          anchor_zip,
+          state_count,
+          states,
+          top_zips,
+          zip_count,
+          lead_count,
+          lead_count_365d,
+          converted_count,
+          enrollment_count,
+          enrollment_count_365d,
+          nearest_matching_location_miles,
+          demand_score,
+          opportunity_score,
+          shape_weight,
+          white_space_zips,
+          conversion_gap_zips,
+          enrollment_pull_zips,
+          edge_market_zips,
+          area_sq_miles,
+          lat,
+          lon,
+          ST_AsGeoJSON(shape_geom, 5)::text AS geojson
+        FROM marketing.geo_demand_cluster_polygons
+        ORDER BY opportunity_score DESC
+        LIMIT 650
+      `,
       spendMarkets: `
         SELECT
           zip,
@@ -742,12 +1051,16 @@
             cmo_action,
             paid_leads,
             allocated_spend,
+            allocated_cpl,
             enrollment_count_365d,
             estimated_recent_revenue,
             roas_proxy,
             budget_index,
             opportunity_score,
             cmo_priority_score,
+            market_signal,
+            nearest_matching_location_title,
+            nearest_matching_location_miles,
             CASE
               WHEN cmo_action IN ('scale_winner', 'test_budget', 'geo_expansion')
                 OR (opportunity_score >= 500 AND COALESCE(budget_index, 0) < 0.8)
@@ -786,18 +1099,54 @@
           cmo_action,
           paid_leads,
           allocated_spend,
+          allocated_cpl,
           enrollment_count_365d,
           estimated_recent_revenue,
           roas_proxy,
           budget_index,
           opportunity_score,
           cmo_priority_score,
+          market_signal,
+          nearest_matching_location_title,
+          nearest_matching_location_miles,
           cloud_type,
           cloud_weight
         FROM ranked
         WHERE cloud_rank <= 450
         ORDER BY cloud_type, cloud_weight DESC
         LIMIT 900
+      `,
+      cloudPolygons: `
+        SELECT
+          shape_id,
+          course_type,
+          cloud_type,
+          cluster_id,
+          anchor_city,
+          anchor_state,
+          anchor_zip,
+          state_count,
+          states,
+          top_zips,
+          market_count,
+          paid_leads,
+          allocated_spend,
+          enrollment_count_365d,
+          estimated_recent_revenue,
+          roas_proxy,
+          budget_index,
+          opportunity_score,
+          cmo_priority_score,
+          cloud_weight,
+          cmo_actions,
+          primary_channels,
+          area_sq_miles,
+          lat,
+          lon,
+          ST_AsGeoJSON(shape_geom, 5)::text AS geojson
+        FROM marketing.geo_budget_cloud_polygons
+        ORDER BY cloud_weight DESC
+        LIMIT 450
       `,
       cplCloudSignals: `
         WITH base AS (
@@ -814,46 +1163,73 @@
             allocated_cpl,
             roas_proxy,
             cmo_action,
-            cmo_priority_score
+            cmo_priority_score,
+            market_signal,
+            nearest_matching_location_title,
+            nearest_matching_location_miles
           FROM marketing.geo_spend_roas_markets
           WHERE allocated_cpl IS NOT NULL
             AND allocated_cpl > 0
             AND paid_leads >= 2
             AND allocated_spend > 0
         ),
-        med AS (
+        stats AS (
           SELECT
             course_type,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY allocated_cpl)::numeric AS median_cpl
+            min(allocated_cpl)::numeric AS cpl_min,
+            percentile_cont(0.10) WITHIN GROUP (ORDER BY allocated_cpl)::numeric AS cpl_p10,
+            percentile_cont(0.25) WITHIN GROUP (ORDER BY allocated_cpl)::numeric AS cpl_p25,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY allocated_cpl)::numeric AS median_cpl,
+            percentile_cont(0.75) WITHIN GROUP (ORDER BY allocated_cpl)::numeric AS cpl_p75,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY allocated_cpl)::numeric AS cpl_p90,
+            max(allocated_cpl)::numeric AS cpl_max
           FROM base
           GROUP BY course_type
         ),
         signals AS (
           SELECT
             b.*,
-            m.median_cpl,
-            round((b.allocated_cpl / NULLIF(m.median_cpl, 0))::numeric, 2) AS cpl_index,
-            CASE
-              WHEN b.allocated_cpl <= m.median_cpl * 0.75 THEN 'below_median_cpl'
-              WHEN b.allocated_cpl >= m.median_cpl * 1.35 THEN 'above_median_cpl'
-              ELSE NULL
-            END AS cpl_cloud_type,
-            CASE
-              WHEN b.allocated_cpl <= m.median_cpl * 0.75
-                THEN GREATEST((m.median_cpl - b.allocated_cpl) * b.paid_leads, b.cmo_priority_score, 1)
-              WHEN b.allocated_cpl >= m.median_cpl * 1.35
-                THEN GREATEST((b.allocated_cpl - m.median_cpl) * b.paid_leads, b.allocated_spend, 1)
-              ELSE 0
-            END AS cpl_cloud_weight
+            s.cpl_min,
+            s.cpl_p10,
+            s.cpl_p25,
+            s.median_cpl,
+            s.cpl_p75,
+            s.cpl_p90,
+            s.cpl_max,
+            round((b.allocated_cpl / NULLIF(s.median_cpl, 0))::numeric, 2) AS cpl_index,
+            round(
+              LEAST(1.0, GREATEST(0.0,
+                CASE
+                  WHEN b.allocated_cpl <= s.median_cpl AND s.median_cpl > s.cpl_p10
+                    THEN 0.5 * ((b.allocated_cpl - s.cpl_p10) / NULLIF(s.median_cpl - s.cpl_p10, 0))
+                  WHEN b.allocated_cpl > s.median_cpl AND s.cpl_p90 > s.median_cpl
+                    THEN 0.5 + 0.5 * ((b.allocated_cpl - s.median_cpl) / NULLIF(s.cpl_p90 - s.median_cpl, 0))
+                  ELSE 0.5
+                END
+              ))::numeric,
+              4
+            ) AS cpl_norm,
+            GREATEST(b.allocated_cpl * b.paid_leads, b.allocated_spend, b.cmo_priority_score, 1) AS cpl_cloud_weight
           FROM base b
-          JOIN med m ON m.course_type = b.course_type
+          JOIN stats s ON s.course_type = b.course_type
+        ),
+        typed AS (
+          SELECT
+            *,
+            CASE
+              WHEN cpl_norm <= 0.25 THEN 'cold_cpl'
+              WHEN cpl_norm <= 0.50 THEN 'cool_cpl'
+              WHEN cpl_norm <= 0.75 THEN 'warm_cpl'
+              ELSE 'hot_cpl'
+            END AS cpl_cloud_type
+          FROM signals
         ),
         ranked AS (
           SELECT
             *,
-            row_number() OVER (PARTITION BY cpl_cloud_type ORDER BY cpl_cloud_weight DESC) AS cpl_cloud_rank
-          FROM signals
-          WHERE cpl_cloud_type IS NOT NULL
+            row_number() OVER (PARTITION BY course_type, cpl_cloud_type ORDER BY cpl_cloud_weight DESC) AS cpl_cloud_rank
+          FROM typed
+          WHERE cpl_cloud_weight > 0
         )
         SELECT
           zip,
@@ -866,17 +1242,197 @@
           paid_leads,
           allocated_spend,
           allocated_cpl,
+          cpl_min,
+          cpl_p10,
+          cpl_p25,
           median_cpl,
+          cpl_p75,
+          cpl_p90,
+          cpl_max,
           cpl_index,
+          cpl_norm,
           roas_proxy,
           cmo_action,
           cmo_priority_score,
+          market_signal,
+          nearest_matching_location_title,
+          nearest_matching_location_miles,
           cpl_cloud_type,
           cpl_cloud_weight
         FROM ranked
-        WHERE cpl_cloud_rank <= 450
-        ORDER BY cpl_cloud_type, cpl_cloud_weight DESC
-        LIMIT 900
+        WHERE cpl_cloud_rank <= 750
+        ORDER BY cpl_norm DESC, cpl_cloud_weight DESC
+        LIMIT 1600
+      `,
+      cplCloudPolygons: `
+        SELECT
+          shape_id,
+          course_type,
+          cpl_cloud_type,
+          cluster_id,
+          anchor_city,
+          anchor_state,
+          anchor_zip,
+          state_count,
+          states,
+          top_zips,
+          market_count,
+          paid_leads,
+          allocated_spend,
+          allocated_cpl,
+          cpl_min,
+          cpl_p10,
+          cpl_p25,
+          median_cpl,
+          cpl_p75,
+          cpl_p90,
+          cpl_max,
+          cpl_index,
+          cpl_norm,
+          roas_proxy,
+          cmo_priority_score,
+          cpl_cloud_weight,
+          cmo_actions,
+          primary_channels,
+          area_sq_miles,
+          lat,
+          lon,
+          ST_AsGeoJSON(shape_geom, 5)::text AS geojson
+        FROM marketing.geo_cpl_cloud_polygons
+        ORDER BY cpl_norm DESC, cpl_cloud_weight DESC
+        LIMIT 650
+      `,
+      capacityCoverage: `
+        SELECT
+          location_code,
+          location_id,
+          location_name,
+          course_type,
+          city,
+          state,
+          zip,
+          dma,
+          region,
+          lat,
+          lon,
+          active_future_courses,
+          seats,
+          enrolled,
+          seats_remaining,
+          open_seat_ratio,
+          next_start_date,
+          days_to_start,
+          spend_30d,
+          spend_7d,
+          clicks_30d,
+          impressions_30d,
+          conversions_30d,
+          students_30d,
+          revenue_30d,
+          active_ad_groups_30d,
+          active_campaigns_30d,
+          mapping_statuses,
+          mapping_methods,
+          top_channel,
+          top_vendor,
+          top_channel_spend_30d,
+          top_channel_ad_groups_30d,
+          spend_per_open_seat,
+          roas_30d,
+          cac_30d,
+          ctr_pct_30d,
+          capacity_signal,
+          action_score
+        FROM marketing.geo_active_ad_capacity_coverage
+        ORDER BY action_score DESC NULLS LAST
+        LIMIT 1000
+      `,
+      adFootprints: `
+        SELECT
+          shape_id,
+          vendor,
+          platform_ad_group_id,
+          platform_ad_group_name,
+          platform_campaign_id,
+          status,
+          effective_status,
+          mapping_statuses,
+          mapping_methods,
+          location_count,
+          course_type,
+          seats_remaining,
+          spend_30d,
+          students_30d,
+          revenue_30d,
+          roas_30d,
+          candidate_location_count,
+          top_locations,
+          area_sq_miles,
+          lat,
+          lon,
+          ST_AsGeoJSON(shape_geom, 5)::text AS geojson
+        FROM marketing.geo_active_ad_target_polygons
+        ORDER BY spend_30d DESC NULLS LAST, seats_remaining DESC NULLS LAST
+        LIMIT 700
+      `,
+      adQuality: `
+        SELECT
+          vendor,
+          platform_ad_group_id,
+          platform_ad_group_name,
+          platform_campaign_id,
+          status,
+          effective_status,
+          mapping_statuses,
+          mapping_methods,
+          mapped_location_count,
+          unmapped_rows,
+          candidate_location_count,
+          spend_30d,
+          students_30d,
+          revenue_30d,
+          roas_30d,
+          mapping_action
+        FROM marketing.active_ad_mapping_quality
+        WHERE mapping_action <> 'mapped'
+           OR spend_30d > 0
+        ORDER BY
+          CASE mapping_action
+            WHEN 'fix_mapping' THEN 1
+            WHEN 'inspect_no_return' THEN 2
+            WHEN 'review_multi_target' THEN 3
+            ELSE 4
+          END,
+          spend_30d DESC NULLS LAST
+        LIMIT 140
+      `,
+      capacitySummary: `
+        SELECT
+          course_type,
+          capacity_signal,
+          count(*)::int AS locations,
+          sum(seats_remaining)::numeric(18,2) AS seats_remaining,
+          sum(spend_30d)::numeric(18,2) AS spend_30d,
+          sum(revenue_30d)::numeric(18,2) AS revenue_30d,
+          sum(students_30d)::numeric(18,2) AS students_30d,
+          avg(roas_30d)::numeric(18,2) AS avg_roas,
+          avg(spend_per_open_seat)::numeric(18,2) AS avg_spend_per_open_seat
+        FROM marketing.geo_active_ad_capacity_coverage
+        GROUP BY course_type, capacity_signal
+        UNION ALL
+        SELECT
+          'all'::text AS course_type,
+          capacity_signal,
+          count(*)::int AS locations,
+          sum(seats_remaining)::numeric(18,2) AS seats_remaining,
+          sum(spend_30d)::numeric(18,2) AS spend_30d,
+          sum(revenue_30d)::numeric(18,2) AS revenue_30d,
+          sum(students_30d)::numeric(18,2) AS students_30d,
+          avg(roas_30d)::numeric(18,2) AS avg_roas,
+          avg(spend_per_open_seat)::numeric(18,2) AS avg_spend_per_open_seat
+        FROM marketing.geo_active_ad_capacity_coverage
+        GROUP BY capacity_signal
+        ORDER BY course_type, spend_30d DESC NULLS LAST
       `,
       channelPerformance: `
         SELECT
@@ -1042,12 +1598,203 @@
         .replace(/'/g, "&#39;");
     }
 
+    function titleLabel(value, fallback = "") {
+      return String(value || fallback)
+        .replace(/_/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .replace(/\b\w/g, (char) => char.toUpperCase());
+    }
+
     function signalLabel(value) {
-      return String(value || "demand_cluster").replace(/_/g, " ");
+      return titleLabel(value, "demand cluster");
     }
 
     function actionLabel(value) {
-      return String(value || "monitor").replace(/_/g, " ");
+      return titleLabel(value, "monitor");
+    }
+
+    function capacitySignalLabel(value) {
+      const labels = {
+        scale_to_fill: "Scale to fill",
+        protect_winner: "Protect winner",
+        undercovered_capacity: "Undercovered capacity",
+        inspect_spend_no_return: "Spend, no return",
+        throttle_near_full: "Throttle near full",
+        heavy_spend_capacity: "Heavy spend per seat",
+        balanced_or_monitor: "Balanced / monitor",
+        capacity_unknown: "Capacity unknown"
+      };
+      return labels[value] || titleLabel(value, "capacity signal");
+    }
+
+    function mappingActionLabel(value) {
+      const labels = {
+        fix_mapping: "Fix mapping",
+        review_multi_target: "Review multi-target",
+        inspect_no_return: "Inspect no return",
+        mapped: "Mapped"
+      };
+      return labels[value] || titleLabel(value, "active ad");
+    }
+
+    function cplLabel(value) {
+      const labels = {
+        cold_cpl: "Cold CPL area",
+        cool_cpl: "Cool CPL area",
+        warm_cpl: "Warm CPL area",
+        hot_cpl: "Hot CPL area",
+        below_median_cpl: "Below-median CPL",
+        above_median_cpl: "Above-median CPL"
+      };
+      return labels[value] || String(value || "CPL area").replace(/_/g, " ");
+    }
+
+    function cleanText(value) {
+      return String(value ?? "").trim();
+    }
+
+    function displayLabel(value) {
+      return cleanText(value).replace(/_/g, " ");
+    }
+
+    function displayListLabel(value) {
+      return cleanText(value)
+        .split(",")
+        .map((item) => displayLabel(item).trim())
+        .filter(Boolean)
+        .join(", ");
+    }
+
+    function placeText(props, useAnchor = false) {
+      const city = cleanText(useAnchor ? props.anchor_city : props.city);
+      const stateName = cleanText(useAnchor ? props.anchor_state : props.state);
+      const zip = cleanText(useAnchor ? props.anchor_zip : props.zip);
+      const cityState = [city, stateName].filter(Boolean).join(", ");
+      return [cityState, zip ? `ZIP ${zip}` : ""].filter(Boolean).join(" | ");
+    }
+
+    function compactDate(value) {
+      const text = cleanText(value);
+      const match = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (!match) return text;
+      const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+      const month = months[Math.max(0, Math.min(11, Number(match[2]) - 1))];
+      return `${month} ${Number(match[3])}, ${match[1]}`;
+    }
+
+    function cplTone(value) {
+      const text = cleanText(value);
+      if (text.includes("hot")) return "hot";
+      if (text.includes("warm")) return "warm";
+      if (text.includes("cool")) return "cool";
+      if (text.includes("cold")) return "cold";
+      return "";
+    }
+
+    function capacityTone(value) {
+      const text = cleanText(value);
+      if (text === "scale_to_fill" || text === "protect_winner") return "good";
+      if (text === "undercovered_capacity" || text === "heavy_spend_capacity" || text === "throttle_near_full") return "warn";
+      if (text === "inspect_spend_no_return") return "bad";
+      return "";
+    }
+
+    function cplChipText(props) {
+      const label = cplLabel(props.cpl_cloud_type)
+        .replace(/\s*CPL area$/i, "")
+        .replace(/\s*CPL$/i, "");
+      return `${label} ${Math.round(num(props.cpl_norm) * 100)}%`;
+    }
+
+    function popupTone(props) {
+      const type = props.point_type || "";
+      if (type === "location") return "tone-location";
+      if (type === "lead") return "tone-lead";
+      if (type === "enrollment") return "tone-enrollment";
+      if (type === "spend" || type === "cloud" || type === "cloudShape") return "tone-spend";
+      if (type === "cplCloud" || type === "cplCloudShape") return "tone-cpl";
+      if (type === "capacity") return "tone-capacity";
+      if (type === "adFootprint") return "tone-ads";
+      if (type === "action") return "tone-action";
+      if (type === "cluster" || type === "clusterShape") return "tone-cluster";
+      return "";
+    }
+
+    function chipHtml(value, tone = "") {
+      const text = cleanText(value);
+      return text ? `<span class="popup-chip ${esc(tone)}">${esc(text)}</span>` : "";
+    }
+
+    function courseChip(props) {
+      return chipHtml(String(props.course_type || "").toUpperCase(), "course");
+    }
+
+    function metricHtml(label, value) {
+      const text = cleanText(value);
+      return text ? `<div class="popup-metric"><span>${esc(label)}</span><strong>${esc(text)}</strong></div>` : "";
+    }
+
+    function metricsHtml(items) {
+      const html = items.filter(Boolean).join("");
+      return html ? `<div class="popup-metrics">${html}</div>` : "";
+    }
+
+    function detailHtml(label, value) {
+      const text = cleanText(value);
+      return text ? `<div class="popup-detail"><span>${esc(label)}</span><strong>${esc(text)}</strong></div>` : "";
+    }
+
+    function detailsHtml(items) {
+      const html = items.filter(Boolean).join("");
+      return html ? `<div class="popup-details">${html}</div>` : "";
+    }
+
+    function pillListHtml(label, value) {
+      const items = cleanText(value)
+        .split("|")
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .slice(0, 5);
+      if (!items.length) return "";
+      return `<div class="popup-zips">
+        <div class="popup-zip-label">${esc(label)}</div>
+        <div class="popup-zip-list">${items.map((item) => `<span class="popup-zip">${esc(item)}</span>`).join("")}</div>
+      </div>`;
+    }
+
+    function topZipsHtml(value) {
+      return pillListHtml("Top ZIPs", value);
+    }
+
+    function nearestLocationText(props) {
+      const title = cleanText(props.nearest_matching_location_title);
+      const miles = num(props.nearest_matching_location_miles);
+      const distance = miles > 0 ? `${miles.toFixed(1)} mi` : "";
+      return [title, distance].filter(Boolean).join(" | ");
+    }
+
+    function stateCoverageText(props) {
+      const stateCount = num(props.state_count);
+      const states = cleanText(props.states);
+      if (!states) return "";
+      return stateCount > 1 ? `${fmt.format(stateCount)} states: ${states}` : states;
+    }
+
+    function popupCardHtml(props, title, chips, metrics, details, extra = "") {
+      const chipMarkup = chips.filter(Boolean).join("");
+      return `<div class="popup-card ${popupTone(props)}">
+        <div class="popup-card-head">
+          <div>
+            <div class="popup-kicker">${esc(popupHeading(props.point_type))}</div>
+            <div class="popup-title">${esc(title)}</div>
+          </div>
+          ${chipMarkup ? `<div class="popup-chipset">${chipMarkup}</div>` : ""}
+        </div>
+        ${metricsHtml(metrics)}
+        ${detailsHtml(details)}
+        ${extra}
+      </div>`;
     }
 
     function styleForTheme(theme) {
@@ -1090,29 +1837,59 @@
       return Number.isFinite(num(row.lat)) && Number.isFinite(num(row.lon));
     }
 
-    function featureCollection(rows, type) {
-      return {
-        type: "FeatureCollection",
-        features: rows.filter(validPoint).map((row) => {
-          const count = type === "location"
-            ? Math.max(1, num(row.active_courses))
-            : type === "lead"
-              ? Math.max(1, num(row.lead_count))
-              : type === "cluster"
-                ? Math.max(1, num(row.opportunity_score))
-                : type === "spend"
-                  ? Math.max(1, num(row.cmo_priority_score))
-                  : type === "cloud"
-                    ? Math.max(1, num(row.cloud_weight))
-                    : type === "cplCloud"
-                      ? Math.max(1, num(row.cpl_cloud_weight))
-                  : Math.max(1, num(row.enrollment_count));
-          return {
-            type: "Feature",
-            geometry: { type: "Point", coordinates: [num(row.lon), num(row.lat)] },
+	    function featureCollection(rows, type) {
+	      return {
+	        type: "FeatureCollection",
+	        features: rows.filter(validPoint).map((row) => {
+	          let count = Math.max(1, num(row.enrollment_count));
+	          if (type === "location") count = Math.max(1, num(row.active_courses));
+	          if (type === "lead") count = Math.max(1, num(row.lead_count));
+	          if (type === "cluster") count = Math.max(1, num(row.opportunity_score));
+	          if (type === "spend") count = Math.max(1, num(row.cmo_priority_score));
+	          if (type === "cloud") count = Math.max(1, num(row.cloud_weight));
+	          if (type === "cplCloud") count = Math.max(1, num(row.cpl_cloud_weight));
+	          if (type === "capacity") count = Math.max(1, num(row.action_score), num(row.seats_remaining));
+	          return {
+	            type: "Feature",
+	            geometry: { type: "Point", coordinates: [num(row.lon), num(row.lat)] },
             properties: { ...row, point_type: type, count }
           };
         })
+      };
+    }
+
+    function parseGeometry(value) {
+      if (!value) return null;
+      if (typeof value === "object" && value.type) return value;
+      if (typeof value !== "string") return null;
+      try {
+        const parsed = JSON.parse(value);
+        return parsed && parsed.type ? parsed : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+	    function geometryFeatureCollection(rows, type) {
+	      return {
+	        type: "FeatureCollection",
+	        features: rows.map((row) => {
+	          const geometry = parseGeometry(row.geojson || row.shape_geojson || row.geometry);
+	          if (!geometry) return null;
+	          let count = Math.max(1, num(row.cpl_cloud_weight));
+	          if (type === "clusterShape") count = Math.max(1, num(row.opportunity_score));
+	          if (type === "cloudShape") count = Math.max(1, num(row.cloud_weight));
+	          if (type === "adFootprint") count = Math.max(1, num(row.spend_30d), num(row.seats_remaining), num(row.location_count) * 100);
+	          const props = { ...row };
+          delete props.geojson;
+          delete props.shape_geojson;
+          delete props.geometry;
+          return {
+            type: "Feature",
+            geometry,
+            properties: { ...props, point_type: type, count, is_polygon_shape: true }
+          };
+        }).filter(Boolean)
       };
     }
 
@@ -1127,12 +1904,17 @@
       if (state.map) {
         const map = state.map;
         if (map.getSource("locations")) map.getSource("locations").setData(featureCollection(state.filtered.locations, "location"));
+        if (map.getSource("capacity")) map.getSource("capacity").setData(featureCollection(state.filtered.capacity, "capacity"));
         if (map.getSource("leads")) map.getSource("leads").setData(featureCollection(state.filtered.leads, "lead"));
         if (map.getSource("enrollments")) map.getSource("enrollments").setData(featureCollection(state.filtered.enrollments, "enrollment"));
         if (map.getSource("clusters")) map.getSource("clusters").setData(featureCollection(state.filtered.clusters, "cluster"));
+        if (map.getSource("clusterPolygons")) map.getSource("clusterPolygons").setData(geometryFeatureCollection(state.filtered.clusterPolygons, "clusterShape"));
         if (map.getSource("spend")) map.getSource("spend").setData(featureCollection(state.filtered.spend, "spend"));
         if (map.getSource("clouds")) map.getSource("clouds").setData(featureCollection(state.filtered.clouds, "cloud"));
+        if (map.getSource("cloudPolygons")) map.getSource("cloudPolygons").setData(geometryFeatureCollection(state.filtered.cloudPolygons, "cloudShape"));
         if (map.getSource("cplClouds")) map.getSource("cplClouds").setData(featureCollection(state.filtered.cplClouds, "cplCloud"));
+        if (map.getSource("cplCloudPolygons")) map.getSource("cplCloudPolygons").setData(geometryFeatureCollection(state.filtered.cplCloudPolygons, "cplCloudShape"));
+        if (map.getSource("adFootprints")) map.getSource("adFootprints").setData(geometryFeatureCollection(state.filtered.adFootprints, "adFootprint"));
         syncVisibility();
         if (state.selected) updateFocus(state.selected);
       }
@@ -1147,23 +1929,32 @@
       for (const id of ["location-circles", "location-labels"]) {
         if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(state.layers.locations));
       }
+      for (const id of ["capacity-rings", "capacity-labels"]) {
+        if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(state.layers.capacity));
+      }
+      for (const id of ["action-hotspots", "action-labels"]) {
+        if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(state.layers.actions));
+      }
       for (const id of ["lead-heat", "lead-circles"]) {
         if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(state.layers.leads));
       }
       for (const id of ["enrollment-heat", "enrollment-circles"]) {
         if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(state.layers.enrollments));
       }
-      for (const id of ["cluster-circles", "cluster-labels"]) {
+      for (const id of ["cluster-polygons", "cluster-polygon-lines", "cluster-circles", "cluster-labels"]) {
         if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(state.layers.clusters));
       }
       for (const id of ["spend-circles", "spend-labels"]) {
         if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(state.layers.spend));
       }
-      for (const id of ["underfunded-clouds", "overspend-clouds"]) {
+      for (const id of ["underfunded-cloud-shapes", "underfunded-cloud-lines", "overspend-cloud-shapes", "overspend-cloud-lines", "underfunded-clouds", "overspend-clouds"]) {
         if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(state.layers.clouds));
       }
-      for (const id of ["low-cpl-clouds", "high-cpl-clouds"]) {
+      for (const id of ["cpl-cloud-shapes", "cpl-cloud-lines", "cpl-cloud-points", "cpl-cloud-heat", "low-cpl-cloud-shapes", "low-cpl-cloud-lines", "high-cpl-cloud-shapes", "high-cpl-cloud-lines", "low-cpl-clouds", "high-cpl-clouds"]) {
         if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(state.layers.cpl));
+      }
+      for (const id of ["ad-footprint-fills", "ad-footprint-lines", "ad-footprint-labels", "active-ad-location-points"]) {
+        if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visibility(state.layers.ads));
       }
     }
 
@@ -1177,14 +1968,18 @@
       document.getElementById("statLeads").textContent = fmt.format(leads);
       document.getElementById("statEnrollments").textContent = fmt.format(enrollments);
       document.getElementById("statOpportunity").textContent = fmt.format(Math.round(opportunity));
-      document.getElementById("subtitle").textContent = `${fmt.format(locations)} active locations | ${fmt.format(num(summary.cluster_count))} demand clusters`;
+      const areaCount = state.filtered.clusterPolygons.length || num(summary.cluster_count);
+      const openSeats = state.filtered.capacity.reduce((sum, row) => sum + num(row.seats_remaining), 0);
+      const activeAds = state.filtered.capacity.reduce((sum, row) => sum + num(row.active_ad_groups_30d), 0);
+      document.getElementById("subtitle").textContent = `${fmt.format(locations)} active locations | ${fmt.format(areaCount)} PostGIS areas | ${fmt.format(Math.round(openSeats))} open seats | ${fmt.format(activeAds)} active ad links`;
     }
 
     function updateSignalChart() {
       const canvas = document.getElementById("signalChart");
       if (!canvas || typeof Chart === "undefined") return;
       const grouped = new Map();
-      state.filtered.clusters.forEach((row) => {
+      const signalRows = state.filtered.clusterPolygons.length ? state.filtered.clusterPolygons : state.filtered.clusters;
+      signalRows.forEach((row) => {
         const key = row.cluster_signal || "demand_cluster";
         grouped.set(key, (grouped.get(key) || 0) + num(row.opportunity_score));
       });
@@ -1285,7 +2080,9 @@
       const meta = document.getElementById("spendMeta");
       if (meta) {
         const roas = totalSpend > 0 ? totalRevenue / totalSpend : 0;
-        meta.textContent = `$${shortFmt.format(totalSpend)} allocated | ${roas.toFixed(1)}x ROAS | CPL blue low / amber high`;
+        const budgetAreas = state.filtered.cloudPolygons.length;
+        const cplAreas = state.filtered.cplCloudPolygons.length;
+        meta.textContent = `$${shortFmt.format(totalSpend)} allocated | ${roas.toFixed(1)}x ROAS | CPL p10 cold / median neutral / p90 hot | ${fmt.format(budgetAreas + cplAreas)} geo areas`;
       }
       updateChannelChart();
       const grid = document.getElementById("spendGrid");
@@ -1315,8 +2112,100 @@
       });
     }
 
+    function updateCapacityGrid() {
+      const rows = state.filtered.capacity
+        .slice()
+        .sort((a, b) => num(b.action_score) - num(a.action_score))
+        .slice(0, 6);
+      state.capacityRows = rows;
+      const allRows = state.filtered.capacity || [];
+      const openSeats = allRows.reduce((sum, row) => sum + num(row.seats_remaining), 0);
+      const spend = allRows.reduce((sum, row) => sum + num(row.spend_30d), 0);
+      const noReturn = allRows.filter((row) => row.capacity_signal === "inspect_spend_no_return").length;
+      const meta = document.getElementById("capacityMeta");
+      if (meta) {
+        const courseLabel = state.course === "all" ? "all programs" : state.course;
+        meta.textContent = `${fmt.format(Math.round(openSeats))} open seats | $${shortFmt.format(spend)} 30d spend | ${fmt.format(noReturn)} no-return spend flags | ${courseLabel}`;
+      }
+      const grid = document.getElementById("capacityGrid");
+      if (!grid) return;
+      const body = rows.map((row, index) => `
+        <button class="demand-row" type="button" data-capacity-index="${index}">
+          <span title="${esc(row.location_name || row.location_code || "")}">${esc(row.location_name || row.location_code || "Location")}</span>
+          <span><span class="signal-chip" style="color:${esc(capacityColors[row.capacity_signal] || capacityColors.balanced_or_monitor)}">${esc(capacitySignalLabel(row.capacity_signal))}</span></span>
+          <span>${fmt.format(Math.round(num(row.seats_remaining)))}</span>
+          <span>$${shortFmt.format(num(row.spend_30d))}</span>
+          <span>${num(row.roas_30d).toFixed(1)}x</span>
+        </button>
+      `).join("");
+      grid.innerHTML = `
+        <div class="demand-row header">
+          <span>Location</span><span>Action</span><span>Seats</span><span>Spend</span><span>ROAS</span>
+        </div>
+        ${body || '<div class="demand-row header"><span>No capacity signals</span><span></span><span></span><span></span><span></span></div>'}
+      `;
+      grid.querySelectorAll("[data-capacity-index]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const row = state.capacityRows[Number(button.dataset.capacityIndex)];
+          if (!row || !state.map) return;
+          state.map.flyTo({ center: [num(row.lon), num(row.lat)], zoom: Math.max(state.map.getZoom(), 6.8), duration: 650 });
+          showSinglePopup(row, "capacity", [num(row.lon), num(row.lat)]);
+        });
+      });
+    }
+
+    function updateAdQualityGrid() {
+      const rows = (state.adQuality || [])
+        .slice()
+        .sort((a, b) => {
+          const priority = { fix_mapping: 0, inspect_no_return: 1, review_multi_target: 2, mapped: 3 };
+          return (priority[a.mapping_action] ?? 4) - (priority[b.mapping_action] ?? 4) || num(b.spend_30d) - num(a.spend_30d);
+        })
+        .slice(0, 6);
+      state.adQualityRows = rows;
+      const flagged = (state.adQuality || []).filter((row) => row.mapping_action !== "mapped");
+      const flaggedSpend = flagged.reduce((sum, row) => sum + num(row.spend_30d), 0);
+      const unmappedSpend = flagged
+        .filter((row) => row.mapping_action === "fix_mapping")
+        .reduce((sum, row) => sum + num(row.spend_30d), 0);
+      const meta = document.getElementById("adQualityMeta");
+      if (meta) {
+        meta.textContent = `${fmt.format(flagged.length)} flagged active ad groups | $${shortFmt.format(flaggedSpend)} flagged spend | $${shortFmt.format(unmappedSpend)} mapping gaps`;
+      }
+      const grid = document.getElementById("adQualityGrid");
+      if (!grid) return;
+      const body = rows.map((row, index) => `
+        <button class="demand-row" type="button" data-ad-quality-index="${index}">
+          <span title="${esc(row.platform_ad_group_name || row.platform_ad_group_id || "")}">${esc(row.platform_ad_group_name || row.platform_ad_group_id || "Ad group")}</span>
+          <span><span class="signal-chip" style="color:${esc(capacityColors[row.mapping_action === "fix_mapping" ? "inspect_spend_no_return" : row.mapping_action === "review_multi_target" ? "undercovered_capacity" : "throttle_near_full"] || layerColors.ads)}">${esc(mappingActionLabel(row.mapping_action))}</span></span>
+          <span>$${shortFmt.format(num(row.spend_30d))}</span>
+          <span>${fmt.format(num(row.mapped_location_count))}</span>
+          <span>${num(row.roas_30d).toFixed(1)}x</span>
+        </button>
+      `).join("");
+      grid.innerHTML = `
+        <div class="demand-row header">
+          <span>Ad group</span><span>Action</span><span>Spend</span><span>Locs</span><span>ROAS</span>
+        </div>
+        ${body || '<div class="demand-row header"><span>No active ad QA flags</span><span></span><span></span><span></span><span></span></div>'}
+      `;
+      grid.querySelectorAll("[data-ad-quality-index]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const row = state.adQualityRows[Number(button.dataset.adQualityIndex)];
+          if (!row || !state.map) return;
+          const footprint = state.filtered.adFootprints.find((item) =>
+            item.vendor === row.vendor && String(item.platform_ad_group_id) === String(row.platform_ad_group_id)
+          );
+          if (!footprint || !validPoint(footprint)) return;
+          state.map.flyTo({ center: [num(footprint.lon), num(footprint.lat)], zoom: Math.max(state.map.getZoom(), 6.2), duration: 650 });
+          showSinglePopup(footprint, "adFootprint", [num(footprint.lon), num(footprint.lat)]);
+        });
+      });
+    }
+
     function updateInsights() {
-      const rows = state.filtered.clusters
+      const sourceRows = state.filtered.clusterPolygons.length ? state.filtered.clusterPolygons : state.filtered.clusters;
+      const rows = sourceRows
         .slice()
         .sort((a, b) => num(b.opportunity_score) - num(a.opportunity_score))
         .slice(0, 6);
@@ -1324,7 +2213,7 @@
       const meta = document.getElementById("insightsMeta");
       if (meta) {
         const label = state.course === "all" ? "all programs" : state.course;
-        meta.textContent = `${fmt.format(state.filtered.clusters.length)} clusters | ${label}`;
+        meta.textContent = `${fmt.format(sourceRows.length)} PostGIS areas | ${label}`;
       }
       updateSignalChart();
       const grid = document.getElementById("demandGrid");
@@ -1349,10 +2238,12 @@
           const row = state.insightRows[Number(button.dataset.index)];
           if (!row || !state.map) return;
           state.map.flyTo({ center: [num(row.lon), num(row.lat)], zoom: Math.max(state.map.getZoom(), 6.2), duration: 650 });
-          showSinglePopup(row, "cluster", [num(row.lon), num(row.lat)]);
+          showSinglePopup(row, row.shape_id ? "clusterShape" : "cluster", [num(row.lon), num(row.lat)]);
         });
       });
       updateSpendGrid();
+      updateCapacityGrid();
+      updateAdQualityGrid();
     }
 
     function milesBetween(a, b) {
@@ -1471,73 +2362,263 @@
     function popupHeading(type) {
       if (type === "location") return "Location";
       if (type === "cluster") return "Demand cluster";
+      if (type === "clusterShape") return "Demand area";
       if (type === "lead") return "Lead origin";
       if (type === "spend") return "Spend action";
+      if (type === "capacity") return "Capacity action";
+      if (type === "adFootprint") return "Active ad footprint";
       if (type === "cloud") return "Budget cloud";
+      if (type === "cloudShape") return "Budget area";
       if (type === "cplCloud") return "Median CPL cloud";
+      if (type === "cplCloudShape") return "Median CPL area";
       return "Enrollment origin";
     }
 
     function popupHtml(props) {
       if (props.point_type === "location") {
-        return `<div class="popup-title">${esc(props.title || "Location")}</div>
-          <div class="popup-meta">${esc([props.city, props.state].filter(Boolean).join(", "))}<br>
-          ${esc(String(props.course_type || "").toUpperCase())} | ${fmt.format(num(props.active_courses))} active courses | ${fmt.format(num(props.enrolled_students))} students</div>`;
+        return popupCardHtml(
+          props,
+          props.title || "Location",
+          [courseChip(props), chipHtml(displayLabel(props.status))],
+          [
+            metricHtml("Courses", fmt.format(num(props.active_courses))),
+            metricHtml("Students", fmt.format(num(props.enrolled_students)))
+          ],
+          [
+            detailHtml("Place", placeText(props)),
+            detailHtml("Source", displayLabel(props.geocode_source)),
+            detailHtml("ID", props.location_id)
+          ]
+        );
+      }
+      if (props.point_type === "capacity") {
+        return popupCardHtml(
+          props,
+          props.location_name || props.title || props.location_code || "Capacity action",
+          [courseChip(props), chipHtml(capacitySignalLabel(props.capacity_signal), capacityTone(props.capacity_signal)), chipHtml(props.top_channel)],
+          [
+            metricHtml("Open seats", fmt.format(Math.round(num(props.seats_remaining)))),
+            metricHtml("Spend", `$${shortFmt.format(num(props.spend_30d))}`),
+            metricHtml("$/Seat", `$${fmt.format(Math.round(num(props.spend_per_open_seat)))}`),
+            metricHtml("ROAS", `${num(props.roas_30d).toFixed(1)}x`),
+            metricHtml("Students", fmt.format(Math.round(num(props.students_30d)))),
+            metricHtml("Days", props.days_to_start === null || props.days_to_start === undefined ? "" : fmt.format(num(props.days_to_start)))
+          ],
+          [
+            detailHtml("Place", placeText(props)),
+            detailHtml("Next start", compactDate(props.next_start_date)),
+            detailHtml("Capacity", `${fmt.format(Math.round(num(props.enrolled)))} enrolled / ${fmt.format(Math.round(num(props.seats)))} seats`),
+            detailHtml("Active ads", `${fmt.format(num(props.active_ad_groups_30d))} groups | ${fmt.format(num(props.active_campaigns_30d))} campaigns`),
+            detailHtml("Mapping", displayListLabel(props.mapping_statuses)),
+            detailHtml("Code", props.location_code)
+          ]
+        );
       }
       if (props.point_type === "lead") {
-        return `<div class="popup-title">${esc(props.city || props.zip || "Lead origin")}</div>
-          <div class="popup-meta">${esc([props.state, props.zip].filter(Boolean).join(" "))}<br>
-          ${esc(String(props.course_type || "unknown").toUpperCase())} | ${fmt.format(num(props.lead_count))} leads | ${fmt.format(num(props.converted_count))} converted</div>`;
+        return popupCardHtml(
+          props,
+          props.city || props.zip || "Lead origin",
+          [courseChip(props)],
+          [
+            metricHtml("Leads", fmt.format(num(props.lead_count))),
+            metricHtml("Converted", fmt.format(num(props.converted_count))),
+            metricHtml("Conv", `${num(props.conversion_rate_pct).toFixed(1)}%`)
+          ],
+          [
+            detailHtml("Place", placeText(props)),
+            detailHtml("Last lead", compactDate(props.last_lead_date))
+          ]
+        );
       }
       if (props.point_type === "cluster") {
-        return `<div class="popup-title">${esc(signalLabel(props.cluster_signal))}</div>
-          <div class="popup-meta">${esc(String(props.course_type || "").toUpperCase())} | ${fmt.format(num(props.zip_count))} ZIPs<br>
-          ${fmt.format(num(props.lead_count))} leads | ${fmt.format(num(props.enrollment_count))} enrollments | ${fmt.format(Math.round(num(props.opportunity_score)))} opp</div>`;
+        return popupCardHtml(
+          props,
+          signalLabel(props.cluster_signal),
+          [courseChip(props)],
+          [
+            metricHtml("ZIPs", fmt.format(num(props.zip_count))),
+            metricHtml("Leads", shortFmt.format(num(props.lead_count))),
+            metricHtml("Enroll", shortFmt.format(num(props.enrollment_count))),
+            metricHtml("Opp", shortFmt.format(Math.round(num(props.opportunity_score))))
+          ],
+          [
+            detailHtml("Nearest", num(props.nearest_matching_location_miles) ? `${num(props.nearest_matching_location_miles).toFixed(1)} mi` : "")
+          ]
+        );
+      }
+      if (props.point_type === "clusterShape") {
+        return popupCardHtml(
+          props,
+          signalLabel(props.cluster_signal),
+          [courseChip(props)],
+          [
+            metricHtml("ZIPs", fmt.format(num(props.zip_count))),
+            metricHtml("Leads", shortFmt.format(num(props.lead_count))),
+            metricHtml("Enroll", shortFmt.format(num(props.enrollment_count))),
+            metricHtml("Opp", shortFmt.format(Math.round(num(props.opportunity_score))))
+          ],
+          [
+            detailHtml("Anchor", placeText(props, true)),
+            detailHtml("Coverage", stateCoverageText(props)),
+            detailHtml("Area", `${fmt.format(Math.round(num(props.area_sq_miles)))} sq mi`)
+          ],
+          topZipsHtml(props.top_zips)
+        );
       }
       if (props.point_type === "spend") {
-        return `<div class="popup-title">${esc(actionLabel(props.cmo_action))}</div>
-          <div class="popup-meta">${esc([props.city, props.state, props.zip].filter(Boolean).join(" "))}<br>
-          ${esc(props.primary_channel || "Paid media")} | $${shortFmt.format(num(props.allocated_spend))} spend | ${num(props.roas_proxy).toFixed(1)}x ROAS proxy<br>
-          ${shortFmt.format(num(props.paid_leads))} paid leads | ${fmt.format(num(props.enrollment_count_365d))} recent enrollments</div>`;
+        return popupCardHtml(
+          props,
+          actionLabel(props.cmo_action),
+          [courseChip(props), chipHtml(props.primary_channel)],
+          [
+            metricHtml("Spend", `$${shortFmt.format(num(props.allocated_spend))}`),
+            metricHtml("ROAS", `${num(props.roas_proxy).toFixed(1)}x`),
+            metricHtml("CPL", `$${fmt.format(Math.round(num(props.allocated_cpl)))}`),
+            metricHtml("Leads", shortFmt.format(num(props.paid_leads)))
+          ],
+          [
+            detailHtml("Place", placeText(props)),
+            detailHtml("Market", displayLabel(props.market_signal)),
+            detailHtml("Nearest", nearestLocationText(props))
+          ]
+        );
       }
       if (props.point_type === "cloud") {
-        return `<div class="popup-title">${esc(props.cloud_type === "overspend" ? "Overspend / repair cloud" : "Underfunded opportunity cloud")}</div>
-          <div class="popup-meta">${esc([props.city, props.state, props.zip].filter(Boolean).join(" "))}<br>
-          ${esc(actionLabel(props.cmo_action))} | ${esc(props.primary_channel || "Paid media")} | $${shortFmt.format(num(props.allocated_spend))} spend<br>
-          ${num(props.roas_proxy).toFixed(1)}x ROAS proxy | ${shortFmt.format(Math.round(num(props.cloud_weight)))} cloud weight</div>`;
+        return popupCardHtml(
+          props,
+          props.cloud_type === "overspend" ? "Overspend / repair cloud" : "Underfunded opportunity cloud",
+          [courseChip(props), chipHtml(actionLabel(props.cmo_action)), chipHtml(props.primary_channel)],
+          [
+            metricHtml("Spend", `$${shortFmt.format(num(props.allocated_spend))}`),
+            metricHtml("ROAS", `${num(props.roas_proxy).toFixed(1)}x`),
+            metricHtml("Weight", shortFmt.format(Math.round(num(props.cloud_weight)))),
+            metricHtml("Leads", shortFmt.format(num(props.paid_leads)))
+          ],
+          [
+            detailHtml("Place", placeText(props)),
+            detailHtml("Market", displayLabel(props.market_signal)),
+            detailHtml("Nearest", nearestLocationText(props))
+          ]
+        );
+      }
+      if (props.point_type === "cloudShape") {
+        return popupCardHtml(
+          props,
+          props.cloud_type === "overspend" ? "Overspend / repair area" : "Underfunded opportunity area",
+          [courseChip(props), chipHtml(titleLabel(props.cloud_type, "cloud"))],
+          [
+            metricHtml("Markets", fmt.format(num(props.market_count))),
+            metricHtml("Spend", `$${shortFmt.format(num(props.allocated_spend))}`),
+            metricHtml("ROAS", `${num(props.roas_proxy).toFixed(1)}x`),
+            metricHtml("Weight", shortFmt.format(Math.round(num(props.cloud_weight))))
+          ],
+          [
+            detailHtml("Anchor", placeText(props, true)),
+            detailHtml("Coverage", stateCoverageText(props)),
+            detailHtml("Area", `${fmt.format(Math.round(num(props.area_sq_miles)))} sq mi`),
+            detailHtml("Actions", displayListLabel(props.cmo_actions)),
+            detailHtml("Channels", props.primary_channels || "paid media")
+          ],
+          topZipsHtml(props.top_zips)
+        );
       }
       if (props.point_type === "cplCloud") {
-        return `<div class="popup-title">${esc(props.cpl_cloud_type === "above_median_cpl" ? "Above-median CPL cloud" : "Below-median CPL cloud")}</div>
-          <div class="popup-meta">${esc([props.city, props.state, props.zip].filter(Boolean).join(" "))}<br>
-          ${esc(props.primary_channel || "Paid media")} | $${fmt.format(Math.round(num(props.allocated_cpl)))} CPL | $${fmt.format(Math.round(num(props.median_cpl)))} median<br>
-          ${num(props.cpl_index).toFixed(2)}x median | ${shortFmt.format(num(props.paid_leads))} paid leads</div>`;
+        return popupCardHtml(
+          props,
+          cplLabel(props.cpl_cloud_type),
+          [courseChip(props), chipHtml(cplChipText(props), cplTone(props.cpl_cloud_type)), chipHtml(props.primary_channel)],
+          [
+            metricHtml("CPL", `$${fmt.format(Math.round(num(props.allocated_cpl)))}`),
+            metricHtml("Median", `$${fmt.format(Math.round(num(props.median_cpl)))}`),
+            metricHtml("Index", `${num(props.cpl_index).toFixed(2)}x`),
+            metricHtml("Leads", shortFmt.format(num(props.paid_leads)))
+          ],
+          [
+            detailHtml("Place", placeText(props)),
+            detailHtml("Market", displayLabel(props.market_signal)),
+            detailHtml("Nearest", nearestLocationText(props))
+          ]
+        );
       }
-      return `<div class="popup-title">${esc(props.city || props.zip || "Enrollment origin")}</div>
-        <div class="popup-meta">${esc([props.state, props.zip].filter(Boolean).join(" "))}<br>
-        ${esc(String(props.course_type || "unknown").toUpperCase())} | ${fmt.format(num(props.enrollment_count))} enrollments</div>`;
+      if (props.point_type === "cplCloudShape") {
+        return popupCardHtml(
+          props,
+          cplLabel(props.cpl_cloud_type),
+          [courseChip(props), chipHtml(cplChipText(props), cplTone(props.cpl_cloud_type))],
+          [
+            metricHtml("Markets", fmt.format(num(props.market_count))),
+            metricHtml("CPL", `$${fmt.format(Math.round(num(props.allocated_cpl)))}`),
+            metricHtml("Median", `$${fmt.format(Math.round(num(props.median_cpl)))}`),
+            metricHtml("Index", `${num(props.cpl_index).toFixed(2)}x`),
+            metricHtml("Leads", shortFmt.format(num(props.paid_leads)))
+          ],
+          [
+            detailHtml("Anchor", placeText(props, true)),
+            detailHtml("Coverage", stateCoverageText(props)),
+            detailHtml("Area", `${fmt.format(Math.round(num(props.area_sq_miles)))} sq mi`),
+            detailHtml("Actions", displayListLabel(props.cmo_actions)),
+            detailHtml("Channels", props.primary_channels || "paid media")
+          ],
+          topZipsHtml(props.top_zips)
+        );
+      }
+      if (props.point_type === "adFootprint") {
+        return popupCardHtml(
+          props,
+          props.platform_ad_group_name || props.platform_ad_group_id || "Active ad group",
+          [chipHtml(titleLabel(props.vendor, "vendor"), "ads"), courseChip(props), chipHtml(displayListLabel(props.mapping_statuses))],
+          [
+            metricHtml("Locations", fmt.format(num(props.location_count))),
+            metricHtml("Seats", fmt.format(Math.round(num(props.seats_remaining)))),
+            metricHtml("Spend", `$${shortFmt.format(num(props.spend_30d))}`),
+            metricHtml("ROAS", `${num(props.roas_30d).toFixed(1)}x`),
+            metricHtml("Students", fmt.format(Math.round(num(props.students_30d))))
+          ],
+          [
+            detailHtml("Status", displayListLabel([props.status, props.effective_status].filter(Boolean).join(", "))),
+            detailHtml("Mapping", displayListLabel(props.mapping_methods)),
+            detailHtml("Candidates", fmt.format(num(props.candidate_location_count))),
+            detailHtml("Area", `${fmt.format(Math.round(num(props.area_sq_miles)))} sq mi`),
+            detailHtml("Campaign", props.platform_campaign_id),
+            detailHtml("Ad group", props.platform_ad_group_id)
+          ],
+          pillListHtml("Top locations", props.top_locations)
+        );
+      }
+      return popupCardHtml(
+        { ...props, point_type: "enrollment" },
+        props.city || props.zip || "Enrollment origin",
+        [courseChip(props)],
+        [
+          metricHtml("Enroll", fmt.format(num(props.enrollment_count))),
+          metricHtml("Recent", fmt.format(num(props.enrollment_count_365d))),
+          metricHtml("Active", fmt.format(num(props.active_or_grad_count)))
+        ],
+        [
+          detailHtml("Place", placeText(props)),
+          detailHtml("Last", compactDate(props.last_enrolled_at))
+        ]
+      );
     }
 
     function popupItemHtml(props) {
-      return `<div class="popup-item">
-        <div class="popup-kicker">${esc(popupHeading(props.point_type))}</div>
-        ${popupHtml(props)}
-      </div>`;
+      return popupHtml(props);
     }
 
     function popupStackHtml(features) {
       const count = features.length;
       return `<div class="popup-stack">
-        <div>
-          <div class="popup-title">${count === 1 ? "1 record" : `${count} records`}</div>
-          <div class="popup-meta">Sorted by map hierarchy</div>
-        </div>
+        ${count > 1 ? `<div class="popup-stack-head">
+          <div class="popup-stack-title">${fmt.format(count)} records</div>
+          <div class="popup-stack-subtitle">Highest priority first</div>
+        </div>` : ""}
         ${features.map((feature) => popupItemHtml(feature.properties || {})).join("")}
       </div>`;
     }
 
     function showPopup(html, lngLat) {
       if (state.popup) state.popup.remove();
-      state.popup = new mapboxgl.Popup({ closeButton: true, maxWidth: "360px" })
+      state.popup = new mapboxgl.Popup({ closeButton: true, maxWidth: "460px", className: "market-popup" })
         .setLngLat(lngLat)
         .setHTML(html)
         .addTo(state.map);
@@ -1552,18 +2633,33 @@
       const type = props.point_type || "unknown";
       return [
         type,
-        props.location_id || props.zip || props.cell_lat || "",
+        props.shape_id || props.platform_ad_group_id || props.location_code || props.location_id || props.zip || props.cell_lat || "",
         props.course_type || "",
-        props.cluster_signal || ""
+        props.cluster_signal || props.cloud_type || props.cpl_cloud_type || props.capacity_signal || props.vendor || ""
       ].join("|");
     }
 
     function showFeatureStack(event) {
-      const layers = ["location-circles", "spend-circles", "low-cpl-clouds", "high-cpl-clouds", "underfunded-clouds", "overspend-clouds", "cluster-circles", "lead-circles", "enrollment-circles"]
+      const layers = [
+        "location-circles",
+        "action-hotspots",
+        "capacity-rings",
+        "active-ad-location-points",
+        "ad-footprint-fills",
+        "spend-circles",
+        "cpl-cloud-points",
+        "cpl-cloud-shapes",
+        "underfunded-cloud-shapes",
+        "overspend-cloud-shapes",
+        "cluster-polygons",
+        "cluster-circles",
+        "lead-circles",
+        "enrollment-circles"
+      ]
         .filter((layer) => state.map.getLayer(layer) && state.map.getLayoutProperty(layer, "visibility") !== "none");
       const rawFeatures = state.map.queryRenderedFeatures(event.point, { layers });
       if (!rawFeatures.length) return;
-      const rank = { location: 0, spend: 1, cplCloud: 2, cloud: 3, cluster: 4, lead: 5, enrollment: 6 };
+      const rank = { location: 0, capacity: 1, adFootprint: 2, spend: 3, cplCloudShape: 4, cloudShape: 5, clusterShape: 6, cplCloud: 7, cloud: 8, cluster: 9, lead: 10, enrollment: 11 };
       const seen = new Set();
       const features = rawFeatures
         .filter((feature) => {
@@ -1588,51 +2684,203 @@
     function addMapLayers(map) {
       if (map.getSource("locations")) return;
       map.addSource("locations", { type: "geojson", data: featureCollection([], "location") });
+      map.addSource("capacity", { type: "geojson", data: featureCollection([], "capacity") });
       map.addSource("leads", { type: "geojson", data: featureCollection([], "lead") });
       map.addSource("enrollments", { type: "geojson", data: featureCollection([], "enrollment") });
       map.addSource("clusters", { type: "geojson", data: featureCollection([], "cluster") });
+      map.addSource("clusterPolygons", { type: "geojson", data: geometryFeatureCollection([], "clusterShape") });
       map.addSource("spend", { type: "geojson", data: featureCollection([], "spend") });
       map.addSource("clouds", { type: "geojson", data: featureCollection([], "cloud") });
+      map.addSource("cloudPolygons", { type: "geojson", data: geometryFeatureCollection([], "cloudShape") });
       map.addSource("cplClouds", { type: "geojson", data: featureCollection([], "cplCloud") });
+      map.addSource("cplCloudPolygons", { type: "geojson", data: geometryFeatureCollection([], "cplCloudShape") });
+      map.addSource("adFootprints", { type: "geojson", data: geometryFeatureCollection([], "adFootprint") });
       map.addSource("radius", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
 
       map.addLayer({
-        id: "low-cpl-clouds",
-        type: "heatmap",
-        source: "cplClouds",
-        filter: ["==", ["get", "cpl_cloud_type"], "below_median_cpl"],
+        id: "cluster-polygons",
+        type: "fill",
+        source: "clusterPolygons",
         paint: {
-          "heatmap-weight": ["interpolate", ["linear"], ["get", "count"], 1, 0.12, 100, 0.45, 500, 0.9],
-          "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 3, 0.75, 7, 1.55, 10, 2.0],
-          "heatmap-color": [
-            "interpolate", ["linear"], ["heatmap-density"],
-            0, "rgba(47,125,140,0)",
-            0.25, "rgba(47,125,140,0.20)",
-            0.6, "rgba(15,143,125,0.42)",
-            1, "rgba(15,143,125,0.66)"
+          "fill-color": [
+            "match",
+            ["get", "cluster_signal"],
+            "white_space_cluster", "#d14c47",
+            "conversion_gap_cluster", "#d97b1e",
+            "enrollment_pull_cluster", "#6f55b5",
+            "edge_market_cluster", "#2f7d8c",
+            "#58623f"
           ],
-          "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 3, 38, 6, 82, 9, 146],
-          "heatmap-opacity": 0.78
+          "fill-opacity": ["interpolate", ["linear"], ["get", "count"], 1, 0.08, 1000, 0.16, 6000, 0.24]
         }
       });
 
       map.addLayer({
-        id: "high-cpl-clouds",
+        id: "cluster-polygon-lines",
+        type: "line",
+        source: "clusterPolygons",
+        paint: {
+          "line-color": [
+            "match",
+            ["get", "cluster_signal"],
+            "white_space_cluster", "#d14c47",
+            "conversion_gap_cluster", "#d97b1e",
+            "enrollment_pull_cluster", "#6f55b5",
+            "edge_market_cluster", "#2f7d8c",
+            "#58623f"
+          ],
+          "line-opacity": 0.38,
+          "line-width": ["interpolate", ["linear"], ["get", "zip_count"], 1, 1, 20, 1.8, 80, 2.6]
+        }
+      });
+
+      map.addLayer({
+        id: "ad-footprint-fills",
+        type: "fill",
+        source: "adFootprints",
+        paint: {
+          "fill-color": [
+            "match",
+            ["get", "vendor"],
+            "meta", vendorColors.meta,
+            "tiktok", vendorColors.tiktok,
+            "google", vendorColors.google,
+            layerColors.ads
+          ],
+          "fill-opacity": ["interpolate", ["linear"], ["get", "count"], 1, 0.05, 1000, 0.10, 6000, 0.17, 18000, 0.24]
+        }
+      });
+
+      map.addLayer({
+        id: "ad-footprint-lines",
+        type: "line",
+        source: "adFootprints",
+        paint: {
+          "line-color": [
+            "match",
+            ["get", "vendor"],
+            "meta", vendorColors.meta,
+            "tiktok", vendorColors.tiktok,
+            "google", vendorColors.google,
+            layerColors.ads
+          ],
+          "line-opacity": 0.58,
+          "line-width": ["interpolate", ["linear"], ["get", "location_count"], 1, 1.1, 8, 1.8, 30, 2.8]
+        }
+      });
+
+      map.addLayer({
+        id: "ad-footprint-labels",
+        type: "symbol",
+        source: "adFootprints",
+        minzoom: 6.4,
+        layout: {
+          "text-field": ["concat", ["get", "vendor"], " ", ["to-string", ["get", "location_count"]], " loc"],
+          "text-size": 10,
+          "text-allow-overlap": false
+        },
+        paint: {
+          "text-color": "#ffffff",
+          "text-halo-color": "rgba(23, 33, 28, 0.50)",
+          "text-halo-width": 1.4
+        }
+      });
+
+      map.addLayer({
+        id: "cpl-cloud-shapes",
+        type: "fill",
+        source: "cplCloudPolygons",
+        paint: {
+          "fill-color": cplColorExpression,
+          "fill-opacity": ["interpolate", ["linear"], ["get", "count"], 1, 0.12, 1000, 0.22, 8000, 0.32]
+        }
+      });
+
+      map.addLayer({
+        id: "cpl-cloud-lines",
+        type: "line",
+        source: "cplCloudPolygons",
+        paint: {
+          "line-color": cplColorExpression,
+          "line-opacity": 0.56,
+          "line-width": ["interpolate", ["linear"], ["get", "market_count"], 1, 1.2, 20, 1.8, 80, 2.6]
+        }
+      });
+
+      map.addLayer({
+        id: "underfunded-cloud-shapes",
+        type: "fill",
+        source: "cloudPolygons",
+        filter: ["==", ["get", "cloud_type"], "underfunded"],
+        paint: {
+          "fill-color": "#0f8f7d",
+          "fill-opacity": ["interpolate", ["linear"], ["get", "count"], 1, 0.11, 1000, 0.22, 8000, 0.30]
+        }
+      });
+
+      map.addLayer({
+        id: "underfunded-cloud-lines",
+        type: "line",
+        source: "cloudPolygons",
+        filter: ["==", ["get", "cloud_type"], "underfunded"],
+        paint: { "line-color": "#0f8f7d", "line-opacity": 0.48, "line-width": 1.5 }
+      });
+
+      map.addLayer({
+        id: "overspend-cloud-shapes",
+        type: "fill",
+        source: "cloudPolygons",
+        filter: ["==", ["get", "cloud_type"], "overspend"],
+        paint: {
+          "fill-color": "#d14c47",
+          "fill-opacity": ["interpolate", ["linear"], ["get", "count"], 1, 0.11, 1000, 0.22, 8000, 0.30]
+        }
+      });
+
+      map.addLayer({
+        id: "overspend-cloud-lines",
+        type: "line",
+        source: "cloudPolygons",
+        filter: ["==", ["get", "cloud_type"], "overspend"],
+        paint: { "line-color": "#d14c47", "line-opacity": 0.48, "line-width": 1.5 }
+      });
+
+      map.addLayer({
+        id: "cpl-cloud-heat",
         type: "heatmap",
         source: "cplClouds",
-        filter: ["==", ["get", "cpl_cloud_type"], "above_median_cpl"],
         paint: {
-          "heatmap-weight": ["interpolate", ["linear"], ["get", "count"], 1, 0.12, 100, 0.48, 500, 0.95],
-          "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 3, 0.75, 7, 1.6, 10, 2.05],
+          "heatmap-weight": [
+            "interpolate", ["linear"], ["*", ["get", "count"], ["to-number", ["get", "cpl_norm"], 0.5]],
+            1, 0.08,
+            100, 0.34,
+            1000, 0.95
+          ],
+          "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 3, 0.55, 7, 1.25, 10, 1.75],
           "heatmap-color": [
             "interpolate", ["linear"], ["heatmap-density"],
-            0, "rgba(217,123,30,0)",
-            0.25, "rgba(217,123,30,0.22)",
-            0.6, "rgba(217,123,30,0.46)",
-            1, "rgba(209,76,71,0.68)"
+            0, "rgba(47,125,140,0)",
+            0.2, "rgba(47,125,140,0.20)",
+            0.45, "rgba(217,180,74,0.34)",
+            0.7, "rgba(217,123,30,0.52)",
+            1, "rgba(209,76,71,0.72)"
           ],
-          "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 3, 38, 6, 82, 9, 146],
-          "heatmap-opacity": 0.78
+          "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 3, 34, 6, 74, 9, 130],
+          "heatmap-opacity": 0.62
+        }
+      });
+
+      map.addLayer({
+        id: "cpl-cloud-points",
+        type: "circle",
+        source: "cplClouds",
+        minzoom: 5,
+        paint: {
+          "circle-color": cplColorExpression,
+          "circle-opacity": 0.58,
+          "circle-radius": ["interpolate", ["linear"], ["get", "count"], 1, 3, 250, 7, 1000, 12, 3000, 18],
+          "circle-stroke-color": "#ffffff",
+          "circle-stroke-width": 1
         }
       });
 
@@ -1822,6 +3070,110 @@
       });
 
       map.addLayer({
+        id: "capacity-rings",
+        type: "circle",
+        source: "capacity",
+        paint: {
+          "circle-color": [
+            "match",
+            ["get", "capacity_signal"],
+            "scale_to_fill", capacityColors.scale_to_fill,
+            "protect_winner", capacityColors.protect_winner,
+            "undercovered_capacity", capacityColors.undercovered_capacity,
+            "inspect_spend_no_return", capacityColors.inspect_spend_no_return,
+            "throttle_near_full", capacityColors.throttle_near_full,
+            "heavy_spend_capacity", capacityColors.heavy_spend_capacity,
+            "capacity_unknown", capacityColors.capacity_unknown,
+            capacityColors.balanced_or_monitor
+          ],
+          "circle-opacity": 0.30,
+          "circle-radius": ["interpolate", ["linear"], ["to-number", ["get", "seats_remaining"], 0], 0, 8, 10, 13, 25, 20, 60, 31, 120, 44],
+          "circle-stroke-color": [
+            "match",
+            ["get", "capacity_signal"],
+            "scale_to_fill", capacityColors.scale_to_fill,
+            "protect_winner", capacityColors.protect_winner,
+            "undercovered_capacity", capacityColors.undercovered_capacity,
+            "inspect_spend_no_return", capacityColors.inspect_spend_no_return,
+            "throttle_near_full", capacityColors.throttle_near_full,
+            "heavy_spend_capacity", capacityColors.heavy_spend_capacity,
+            "capacity_unknown", capacityColors.capacity_unknown,
+            capacityColors.balanced_or_monitor
+          ],
+          "circle-stroke-opacity": 0.72,
+          "circle-stroke-width": ["interpolate", ["linear"], ["get", "count"], 1, 1.1, 800, 1.8, 2000, 2.8]
+        }
+      });
+
+      map.addLayer({
+        id: "action-hotspots",
+        type: "circle",
+        source: "capacity",
+        filter: [
+          "in",
+          ["get", "capacity_signal"],
+          ["literal", ["inspect_spend_no_return", "scale_to_fill", "protect_winner", "undercovered_capacity", "heavy_spend_capacity", "throttle_near_full"]]
+        ],
+        paint: {
+          "circle-color": [
+            "match",
+            ["get", "capacity_signal"],
+            "scale_to_fill", capacityColors.scale_to_fill,
+            "protect_winner", capacityColors.protect_winner,
+            "undercovered_capacity", capacityColors.undercovered_capacity,
+            "inspect_spend_no_return", capacityColors.inspect_spend_no_return,
+            "throttle_near_full", capacityColors.throttle_near_full,
+            "heavy_spend_capacity", capacityColors.heavy_spend_capacity,
+            capacityColors.balanced_or_monitor
+          ],
+          "circle-opacity": ["interpolate", ["linear"], ["get", "count"], 1, 0.16, 1000, 0.24, 2600, 0.34],
+          "circle-radius": ["interpolate", ["linear"], ["get", "count"], 1, 13, 700, 20, 1400, 30, 2800, 50],
+          "circle-stroke-color": "#ffffff",
+          "circle-stroke-opacity": 0.58,
+          "circle-stroke-width": 1
+        }
+      });
+
+      map.addLayer({
+        id: "active-ad-location-points",
+        type: "circle",
+        source: "capacity",
+        filter: [">", ["to-number", ["get", "active_ad_groups_30d"], 0], 0],
+        minzoom: 4.5,
+        paint: {
+          "circle-color": [
+            "match",
+            ["get", "top_vendor"],
+            "meta", vendorColors.meta,
+            "tiktok", vendorColors.tiktok,
+            "google", vendorColors.google,
+            layerColors.ads
+          ],
+          "circle-opacity": 0.82,
+          "circle-radius": ["interpolate", ["linear"], ["to-number", ["get", "spend_30d"], 0], 0, 4, 250, 7, 1000, 12, 2500, 18],
+          "circle-stroke-color": "#ffffff",
+          "circle-stroke-width": 1.5
+        }
+      });
+
+      map.addLayer({
+        id: "capacity-labels",
+        type: "symbol",
+        source: "capacity",
+        minzoom: 6.3,
+        layout: {
+          "text-field": ["case", [">", ["to-number", ["get", "seats_remaining"], 0], 0], ["to-string", ["round", ["to-number", ["get", "seats_remaining"], 0]]], ""],
+          "text-size": 10,
+          "text-allow-overlap": false
+        },
+        paint: {
+          "text-color": "#ffffff",
+          "text-halo-color": "rgba(23, 33, 28, 0.36)",
+          "text-halo-width": 1.2
+        }
+      });
+
+      map.addLayer({
         id: "location-circles",
         type: "circle",
         source: "locations",
@@ -1854,7 +3206,22 @@
     }
 
     function bindInteractions(map) {
-      for (const layer of ["location-circles", "lead-circles", "enrollment-circles", "cluster-circles", "spend-circles"]) {
+      for (const layer of [
+        "location-circles",
+        "capacity-rings",
+        "action-hotspots",
+        "active-ad-location-points",
+        "ad-footprint-fills",
+        "lead-circles",
+        "enrollment-circles",
+        "cluster-polygons",
+        "cluster-circles",
+        "spend-circles",
+        "cpl-cloud-shapes",
+        "cpl-cloud-points",
+        "underfunded-cloud-shapes",
+        "overspend-cloud-shapes"
+      ]) {
         map.on("mouseenter", layer, () => { map.getCanvas().style.cursor = "pointer"; });
         map.on("mouseleave", layer, () => { map.getCanvas().style.cursor = ""; });
       }
@@ -1874,6 +3241,7 @@
           const layer = button.dataset.layer;
           state.layers[layer] = !state.layers[layer];
           button.classList.toggle("active", state.layers[layer]);
+          button.setAttribute("aria-pressed", state.layers[layer] ? "true" : "false");
           syncVisibility();
         });
       });
@@ -1904,19 +3272,14 @@
     async function init() {
       try {
         await waitForQueryBridge();
-        let initialTheme = "light";
+        let initialTheme = "dark";
         try {
-          initialTheme = localStorage.getItem("aaMarketMapTheme")
-            || (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          initialTheme = localStorage.getItem("aaMarketMapTheme") || "dark";
         } catch (_) {}
         setTheme(initialTheme, false);
 
         let token = configuredMapboxToken();
-        if (!token) {
-          const tokenRows = await queryRows(sql.token);
-          token = tokenRows[0] && tokenRows[0].mapbox_access_token;
-        }
-        if (!token) throw new Error("Mapbox token not found");
+        if (!token) throw new Error("Mapbox token not configured");
 
         mapboxgl.accessToken = token;
         const map = new mapboxgl.Map({
@@ -1938,22 +3301,54 @@
           queryRows(sql.leads),
           queryRows(sql.enrollments),
           queryRows(sql.clusters),
+          queryRows(sql.clusterPolygons),
           queryRows(sql.spendMarkets),
           queryRows(sql.cloudSignals),
-          queryRows(sql.cplCloudSignals),
-          queryRows(sql.channelPerformance),
-          queryRows(sql.spendSummary),
-          queryRows(sql.summary)
+	          queryRows(sql.cloudPolygons),
+	          queryRows(sql.cplCloudSignals),
+	          queryRows(sql.cplCloudPolygons),
+	          queryRows(sql.capacityCoverage),
+	          queryRows(sql.adFootprints),
+	          queryRows(sql.adQuality),
+	          queryRows(sql.capacitySummary),
+	          queryRows(sql.channelPerformance),
+	          queryRows(sql.spendSummary),
+	          queryRows(sql.summary)
         ]);
-        const [, [locations, leads, enrollments, clusters, spendMarkets, cloudSignals, cplCloudSignals, channelPerformance, spendSummary, summaryRows]] = await Promise.all([mapLoaded, dataLoaded]);
+        const [, [
+          locations,
+          leads,
+          enrollments,
+          clusters,
+          clusterPolygons,
+          spendMarkets,
+          cloudSignals,
+	          cloudPolygons,
+	          cplCloudSignals,
+	          cplCloudPolygons,
+	          capacityCoverage,
+	          adFootprints,
+	          adQuality,
+	          capacitySummary,
+	          channelPerformance,
+	          spendSummary,
+	          summaryRows
+        ]] = await Promise.all([mapLoaded, dataLoaded]);
         state.raw.locations = locations;
         state.raw.leads = leads;
         state.raw.enrollments = enrollments;
         state.raw.clusters = clusters;
+        state.raw.clusterPolygons = clusterPolygons;
         state.raw.spend = spendMarkets;
         state.raw.clouds = cloudSignals;
-        state.raw.cplClouds = cplCloudSignals;
-        state.channelPerformance = channelPerformance;
+	        state.raw.cloudPolygons = cloudPolygons;
+	        state.raw.cplClouds = cplCloudSignals;
+	        state.raw.cplCloudPolygons = cplCloudPolygons;
+	        state.raw.capacity = capacityCoverage;
+	        state.raw.adFootprints = adFootprints;
+	        state.adQuality = adQuality;
+	        state.capacitySummary = capacitySummary;
+	        state.channelPerformance = channelPerformance;
         state.spendSummary = spendSummary;
         state.summary = {};
         summaryRows.forEach((row) => {

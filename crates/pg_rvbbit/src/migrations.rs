@@ -485,6 +485,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0116_gpu_gqe_route_candidate",
         include_str!("../sql/migrations/0116_gpu_gqe_route_candidate.sql"),
     ),
+    (
+        "0117_clickbench_gpu_stock_route_overlay",
+        include_str!("../sql/migrations/0117_clickbench_gpu_stock_route_overlay.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
@@ -509,6 +513,11 @@ fn sql_quote(s: &str) -> String {
 #[pg_extern]
 fn migrate() -> String {
     Spi::run(SCHEMA_MIGRATIONS_DDL).expect("rvbbit.migrate: create schema_migrations");
+    // Migration SQL creates/replaces catalog views and may run while extension
+    // catalog state is still being normalized. Keep the planner/rewriter hooks
+    // out of this transaction; they are user-query optimizers, not DDL helpers.
+    Spi::run("SET LOCAL rvbbit.force_heap_scan = on")
+        .expect("rvbbit.migrate: disable planner/rewriter hooks");
 
     let mut applied: Vec<&str> = Vec::new();
     for (name, sql) in MIGRATIONS {

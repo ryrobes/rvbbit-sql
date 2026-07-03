@@ -163,8 +163,16 @@ The packaged Docker image installs `/usr/local/bin/rvbbit-gqe` as a lightweight
 launcher/probe and `/opt/rvbbit/gqe/bin/rvbbit-gqe-bridge` as the RVBBIT-side
 adapter. The adapter maps authoritative RVBBIT parquet row groups into GQE
 `CREATE OR REPLACE EXTERNAL TABLE ... STORED AS PARQUET LOCATION ...` statements,
-executes `gqe-cli --parquet`, and returns the same JSON/Arrow IPC sidecar
-contract as `rvbbit-duck`.
+prepares the GQE catalog, and returns the same JSON/Arrow IPC sidecar contract as
+`rvbbit-duck`. In server mode the `gpu_gqe` executor defaults to a persistent
+Flight SQL client for SELECT queries, avoiding the old per-query `gqe-cli`
+process cost. Set `RVBBIT_GQE_CLIENT_MODE=cli` to force the legacy path, or
+`RVBBIT_GQE_FLIGHT_FALLBACK=0` to make Flight-client errors fail instead of
+falling back to `gqe-cli`.
+The ClickBench forced-GQE runner sets `RVBBIT_DUCK_BACKEND_SHARED_WORKERS=1` by
+default because the suite is serial; this avoids measuring one-time GQE
+Flight/catalog warmup across several independent worker states. Raise the worker
+count explicitly when benchmarking concurrent shared-sidecar behavior.
 
 The adapter still requires a real NVIDIA GQE install. By default it looks for
 `/opt/gqe/rust/target/release/gqe-cli`,
@@ -177,13 +185,15 @@ auto-starts a local node manager unless `RVBBIT_GQE_AUTO_START=off`. For remote
 or separately managed GQE, set `RVBBIT_GQE_SERVER_URL` and
 `RVBBIT_GQE_AUTO_START=off`.
 
-For local ClickBench runs that include `rvbbit_gpu_gqe_forced`,
+For local ClickBench or TPC-H runs that include `rvbbit_gpu_gqe_forced`,
 `run_offline.sh` automatically requests Docker GPU access when host `nvidia-smi`
 detects a GPU and Docker exposes the NVIDIA runtime. Host-mounted GQE uses
 `docker/docker-compose.gpu.yml`; the optional GQE image carries its own `gpus`
 setting. Set `RVBBIT_GPU_GQE_COMPOSE=off` to suppress GPU compose
 auto-selection, or pass `RVBBIT_REQUIRE_GPU_GQE=1` to fail instead of reporting
-`SKIP`.
+`SKIP`. The benchmark runners also default forced GQE to the shared
+`rvbbit-duck` socket sidecar; set `RVBBIT_GQE_SHARED_BACKEND=off` to keep the
+per-backend sidecar behavior.
 
 GQE can be supplied two ways:
 
@@ -195,6 +205,52 @@ GQE can be supplied two ways:
   and MLIR, builds GQE, and installs `gqe-cli` plus the node/task managers under
   `/opt/gqe`.
 
+The GPU compose overlays set `shm_size` to `RVBBIT_GQE_SHM_SIZE` (default
+`8gb`) plus `memlock`/stack ulimits. This matters for GQE because its node/task
+manager uses NVSHMEM during startup; Docker's default 64 MB `/dev/shm` is too
+small and can leave every forced GQE query waiting for the server startup
+timeout. The benchmark runners preflight `/dev/shm`, start the GQE node
+manager once, and mark `rvbbit_gpu_gqe_forced` as `SKIP` before the measured
+queries if the server cannot listen. Set `RVBBIT_GQE_PREFLIGHT_START=off` to
+disable that startup probe.
+
+The overlays also default `NVSHMEM_DISABLE_CUDA_VMM=1`,
+`NVSHMEM_SYMMETRIC_SIZE=6G`, and `GQE_MAX_QUERY_MEMORY=6442450944`. On the
+local RTX 3090 Ti test host, default NVSHMEM CUDA VMM allocation failed during
+node-manager startup; disabling CUDA VMM allowed the GQE server to listen on
+`127.0.0.1:50051`. The packaged default now gives GQE a 6 GiB query pool under
+the default 8 GB `/dev/shm` container setting. Keep `NVSHMEM_SYMMETRIC_SIZE` at
+least as large as `GQE_MAX_QUERY_MEMORY`: with the old 512 MB symmetric heap,
+2/4/6 GiB query pools failed during `pgas_memory_resource` allocation. Lower
+both values if startup fails on a constrained host, or raise both plus
+`RVBBIT_GQE_SHM_SIZE` on larger GPUs.
+
+The ClickBench and TPC-H runners default `RVBBIT_GQE_PREWARM=auto`: after
+loading data and refreshing layout variants, they run an explain-only GQE query
+against a benchmark table (`hits` for ClickBench, `lineitem` for TPC-H) so the
+GQE catalog and adapter sidecar files are ready before measured query timing.
+Set `RVBBIT_GQE_PREWARM=off` when intentionally measuring cold catalog/setup
+overhead.
+
+The current GQE bridge avoids shapes this GQE/Substrait path does not execute
+correctly by building a GQE-specific parquet sidecar when needed. Date columns
+are exposed as ISO text, timestamp columns are exposed as ISO text plus derived
+minute helpers, and text columns get derived character-length helpers. The
+bridge rewrites simple `SELECT *`, `length(...)`/`character_length(...)`,
+`extract(minute FROM ...)`, `date_trunc('minute', ...)`, and literal
+`GROUP BY 1, ...` shapes onto those safe columns before sending SQL to GQE.
+PostgreSQL regex semantics are still routed away from GQE.
+
+The GQE route has explicit shape gates in both the Postgres router and the
+GQE bridge. Simple multi-table inner/left/cross joins with explicit predicates
+are allowed, but the route is rejected for right/full/natural/lateral/USING
+joins, schema-qualified table references, qualified star projections,
+multi-table `SELECT *`, and wide `SELECT *` + text filter + order/limit row
+retrieval. The wide row retrieval gate is intentionally defensive after the
+10M-row ClickBench Q23 RMM allocation failure. For controlled benchmark
+experiments only, set `RVBBIT_GQE_ALLOW_RISKY_SHAPES=1` or
+`SET rvbbit.gqe_allow_risky_shapes = on` to bypass these gates.
+
 The benchmark runner controls image selection with `RVBBIT_GPU_GQE_INSTALL`:
 `auto` is the default and selects the optional image only when
 `rvbbit_gpu_gqe_forced` is in `BENCH_SYSTEMS`, no `RVBBIT_GQE_HOME` is set, host
@@ -203,7 +259,11 @@ The benchmark runner controls image selection with `RVBBIT_GPU_GQE_INSTALL`:
 `off` leaves the normal image in place so the GQE path reports `SKIP`; `host`
 expects `RVBBIT_GQE_HOME` to be provided. With
 `--rebuild` and image mode selected, the runner first rebuilds the normal
-`pg-rvbbit` image, then builds the GQE image on top of it.
+`pg-rvbbit` image. If an existing GQE image is present, the default
+`RVBBIT_GPU_GQE_REBUILD_MODE=refresh` then overlays the current extension,
+`rvbbit-duck`, and `rvbbit-gqe` bridge into that image without rebuilding
+libcudf, MLIR, or GQE. Set `RVBBIT_GPU_GQE_REBUILD_MODE=full` when the GPU
+toolchain itself needs to be rebuilt.
 
 See [DUCK_SIDECAR.md](DUCK_SIDECAR.md) for the full deployment model, fallback
 semantics, production caveats, and load-test commands.

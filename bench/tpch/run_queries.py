@@ -34,7 +34,13 @@ REPEATS = int(os.environ.get("BENCH_REPEATS", "3"))
 TIMEOUT_S = int(os.environ.get("BENCH_TIMEOUT", "300"))
 WALL_TIMEOUT_S = float(os.environ.get("BENCH_WALL_TIMEOUT", str(TIMEOUT_S)))
 WALL_TIMEOUT_GRACE_S = float(os.environ.get("BENCH_WALL_TIMEOUT_GRACE", "5"))
-WALL_TIMEOUT_SYSTEMS = {"duckdb", "clickhouse", "rvbbit_duck_vortex_forced", "rvbbit_gpu_gqe_forced"}
+WALL_TIMEOUT_SYSTEMS = {
+    "duckdb",
+    "clickhouse",
+    "rvbbit_duck_vortex_forced",
+    "rvbbit_datafusion_vortex_forced",
+    "rvbbit_gpu_gqe_forced",
+}
 SELECTED = os.environ.get("BENCH_QUERIES")
 SELECTED_SET = set(SELECTED.split(",")) if SELECTED else None
 REPORT_COLD_WARM = os.environ.get("BENCH_REPORT_COLD_WARM", "").strip().lower() in {
@@ -55,6 +61,10 @@ def fmt_ms(ms: float) -> str:
 
 def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
     try:
+        if system == "rvbbit_gpu_gqe_forced":
+            skip_reason = os.environ.get("RVBBIT_GPU_GQE_SKIP_REASON", "").strip()
+            if skip_reason:
+                return None, f"SKIP: {skip_reason[:110]}"
         if system == "duckdb":
             return run_duckdb(sql, REPEATS), "ok"
         if system == "clickhouse":

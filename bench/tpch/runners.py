@@ -81,6 +81,7 @@ ROUTE_GUCS = {
     "RVBBIT_ROUTE_RVBBIT_NATIVE": "rvbbit.route_rvbbit_native",
     "RVBBIT_ROUTE_FORCE_CANDIDATE": "rvbbit.route_force_candidate",
     "RVBBIT_GQE_BIN": "rvbbit.gqe_bin",
+    "RVBBIT_GQE_ALLOW_RISKY_SHAPES": "rvbbit.gqe_allow_risky_shapes",
     "RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE": "rvbbit.route_hive_min_confidence",
     "RVBBIT_HOT_STORE_BUDGET_MB": "rvbbit.hot_store_budget_mb",
     "RVBBIT_HOT_STORE_ROUTE_MAX_ROWS": "rvbbit.hot_store_route_max_rows",

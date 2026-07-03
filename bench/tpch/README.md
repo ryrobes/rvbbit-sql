@@ -18,6 +18,10 @@ TPCH_SCALE=1 BENCH_SYSTEMS=rvbbit,duckdb,clickhouse,hydra,citus ./bench/tpch/run
 SKIP_LOAD=1 BENCH_QUERIES=Q1,Q6,Q14 ./bench/tpch/run_offline.sh
 RVBBIT_RESET_EXTENSION=1 ./bench/tpch/run_offline.sh
 RVBBIT_LOAD_ROUTE_PROFILE=1 ./bench/tpch/run_offline.sh
+BENCH_SYSTEMS=rvbbit_gpu_gqe_forced,rvbbit_duck_vortex_forced \
+  RVBBIT_GQE_LARGE_ROW_GROUPS=1 ./bench/tpch/run_offline.sh
+BENCH_SYSTEMS=rvbbit_datafusion_forced,rvbbit_datafusion_vortex_forced,rvbbit_duck_vortex_forced \
+  ./bench/tpch/run_offline.sh
 ./bench/tpch/run_offline.sh --reset-rvbbit-extension
 ./bench/tpch/run_offline.sh --load-route-profile
 ```
@@ -29,15 +33,48 @@ Environment:
   Rvbbit aliases include `rvbbit_native_forced`, legacy `rvbbit_native`,
   `rvbbit_duck_forced`,
   `rvbbit_datafusion_mem_forced`, `rvbbit_datafusion_forced`,
-  `rvbbit_duck_hive_forced`,
-  `rvbbit_datafusion_hive_forced`, `rvbbit_gpu_gqe_forced`, and
+  `rvbbit_duck_hive_forced`, `rvbbit_duck_vortex_forced`,
+  `rvbbit_datafusion_hive_forced`, `rvbbit_datafusion_vortex_forced`,
+  `rvbbit_gpu_gqe_forced`, and
   `rvbbit_pg_heap_forced` for executor
   comparison over the same compacted tables. `rvbbit_native_forced` uses the
   router's `rvbbit.route_force_candidate=rvbbit_native`; `rvbbit_native` is the
   older `rvbbit.duck_backend=off` baseline.
   `rvbbit_datafusion_mem_forced` also loads `rvbbit.hot_objects` after compact
   so the forced memory route has hot all-column objects to use.
-  `rvbbit_gpu_gqe_forced` requires `rvbbit-gqe` or `RVBBIT_GQE_BIN`.
+  `rvbbit_gpu_gqe_forced` requires a visible NVIDIA GPU plus NVIDIA GQE tooling
+  visible to the `pg-rvbbit` container. Set `RVBBIT_GQE_HOME=/path/to/gqe` to
+  mount a host-built GQE checkout/build at `/opt/gqe`, or let
+  `RVBBIT_GPU_GQE_INSTALL=auto` select the optional
+  `docker/docker-compose.gqe-image.yml` image on hosts where `nvidia-smi`
+  reports a GPU and Docker exposes the NVIDIA runtime. Use
+  `RVBBIT_GPU_GQE_INSTALL=image` to force the optional image,
+  `RVBBIT_GPU_GQE_INSTALL=off` to keep the normal image and report the GQE path
+  as `SKIP`, or `RVBBIT_REQUIRE_GPU_GQE=1` to fail instead of skipping when
+  preflight fails.
+  The TPC-H runner defaults forced GQE to `RVBBIT_GQE_CLIENT_MODE=flight` and a
+  shared `rvbbit-duck` socket sidecar scoped to `gpu_gqe`, so measured queries
+  reuse the GQE Flight client and catalog state. Set
+  `RVBBIT_GQE_SHARED_BACKEND=off` to use per-backend sidecars,
+  `RVBBIT_GQE_CLIENT_MODE=cli` to restore per-query CLI execution, or
+  `RVBBIT_GQE_FLIGHT_FALLBACK=0` to fail instead of falling back to CLI when
+  Flight rejects a query.
+  The runner preflights `/dev/shm`, starts the GQE node manager once, validates
+  that the packaged bridge is current, and prewarms the GQE catalog with
+  `SELECT 1 FROM lineitem LIMIT 0` after loading data. Set
+  `RVBBIT_GQE_PREWARM=off` when intentionally measuring cold catalog/setup
+  cost, or `RVBBIT_GQE_PREWARM_SQL=...` to use a different prewarm query.
+  For scale sweeps that should reduce parquet file count, set
+  `RVBBIT_GQE_LARGE_ROW_GROUPS=1`; it fills unset
+  `RVBBIT_DIRECT_ACCEL_CHUNK_ROWS` and `RVBBIT_COMPACT_SCAN_CHUNK_ROWS` with
+  `1000000` rows, or with `RVBBIT_GQE_ROW_GROUP_CHUNK_ROWS` when provided.
+  GQE shape gates allow simple multi-table inner/left/cross joins with explicit
+  predicates, which covers the rewritten TPC-H join workload, but reject risky
+  shapes such as right/full/natural/lateral/USING joins, schema-qualified table
+  refs, qualified star projections, multi-table `SELECT *`, and wide
+  `SELECT *` + text filter + order/limit row retrieval. Set
+  `RVBBIT_GQE_ALLOW_RISKY_SHAPES=1` only for controlled experiments that need
+  to reproduce those rejected shapes.
   Rvbbit benchmark loads refresh hive/cluster layouts synchronously by default,
   so auto routing can consider segmented variants during the measured query
   run. Set `RVBBIT_REFRESH_LAYOUT_VARIANTS_AFTER_LOAD=async` to restore

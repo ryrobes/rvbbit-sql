@@ -31,6 +31,8 @@ BENCH_LIMIT=100000000 ./bench/clickbench/run_offline.sh
 # Smaller scale or subset of systems / queries
 BENCH_LIMIT=1000000 BENCH_SYSTEMS=rvbbit,duckdb,clickhouse \
   ./bench/clickbench/run_offline.sh
+BENCH_SYSTEMS=rvbbit_datafusion_forced,rvbbit_datafusion_vortex_forced,rvbbit_duck_vortex_forced \
+  ./bench/clickbench/run_offline.sh
 
 # Reuse already-loaded data, just re-run queries
 SKIP_LOAD=1 ./bench/clickbench/run_offline.sh
@@ -104,8 +106,9 @@ Override env vars:
   Rvbbit aliases include `rvbbit_native_forced`, legacy `rvbbit_native`,
   `rvbbit_duck_forced`,
   `rvbbit_datafusion_mem_forced`, `rvbbit_datafusion_forced`,
-  `rvbbit_duck_hive_forced`,
-  `rvbbit_datafusion_hive_forced`, `rvbbit_gpu_gqe_forced`, and
+  `rvbbit_duck_hive_forced`, `rvbbit_duck_vortex_forced`,
+  `rvbbit_datafusion_hive_forced`, `rvbbit_datafusion_vortex_forced`,
+  `rvbbit_gpu_gqe_forced`, and
   `rvbbit_pg_heap_forced` for executor
   comparison over the same compacted table. `rvbbit_native_forced` uses the
   router's `rvbbit.route_force_candidate=rvbbit_native`; `rvbbit_native` is the
@@ -125,7 +128,63 @@ Override env vars:
   `nvidia-smi` reports a GPU and Docker exposes the NVIDIA runtime. Use
   `RVBBIT_GPU_GQE_INSTALL=image` to force that image, or
   `RVBBIT_GPU_GQE_INSTALL=off` to keep the normal image and report the GQE
-  pathway as `SKIP`.
+  pathway as `SKIP`. The GPU compose overlays default
+  `RVBBIT_GQE_SHM_SIZE=8gb`; the GQE preflight checks `/dev/shm`, starts the
+  node manager once, and skips the pathway before query timing if the server
+  cannot become reachable. They also default `NVSHMEM_DISABLE_CUDA_VMM=1`,
+  `NVSHMEM_SYMMETRIC_SIZE=6G`, and `GQE_MAX_QUERY_MEMORY=6442450944`, giving
+  GQE a 6 GiB query pool under the default 8 GB shared-memory container setting.
+  The runner defaults forced GQE to the shared `rvbbit-duck` socket sidecar and
+  `RVBBIT_GQE_CLIENT_MODE=flight`, so benchmarked queries reuse a persistent
+  Flight client instead of spawning `gqe-cli` per query. Because ClickBench runs
+  query repeats serially, forced GQE also defaults
+  `RVBBIT_DUCK_BACKEND_SHARED_WORKERS=1`; set it higher when intentionally
+  measuring concurrent shared-sidecar behavior. Set
+  `RVBBIT_GQE_SHARED_BACKEND=off` to disable the shared sidecar,
+  `RVBBIT_GQE_CLIENT_MODE=cli` to restore the legacy per-query CLI path, or
+  `RVBBIT_GQE_FLIGHT_FALLBACK=0` to fail instead of falling back to CLI when the
+  Flight client rejects a query. The runner also prewarms the GQE catalog after
+  loading data and before timing queries; set `RVBBIT_GQE_PREWARM=off` to
+  measure cold catalog/setup cost.
+  GQE shape gates reject currently risky shapes such as unsupported join forms,
+  schema-qualified refs, qualified star projections, multi-table `SELECT *`,
+  and wide `SELECT *` + text filter + order/limit row retrieval. Set
+  `RVBBIT_GQE_ALLOW_RISKY_SHAPES=1` only for controlled experiments that need
+  to reproduce those rejected shapes.
+  ClickBench also captures best-effort GQE sidecar telemetry into
+  `last_run.json` and prints
+  `gqe[mode ... flight ... cli ... read ... mat ...]` beside successful
+  forced-GQE rows; set `BENCH_REPORT_GQE_TELEMETRY=0` to hide the console suffix,
+  `BENCH_GQE_BREAKDOWN=0` to hide the report footer breakdown, or
+  `BENCH_CAPTURE_SIDECAR_TELEMETRY=0` to skip the telemetry read. The report
+  footer shows the slowest captured GQE sidecar samples by execution time;
+  `BENCH_GQE_BREAKDOWN_ROWS=all` prints every captured query.
+  Keep `NVSHMEM_SYMMETRIC_SIZE` at least as large as `GQE_MAX_QUERY_MEMORY`;
+  lower both on constrained hosts, or raise both plus `RVBBIT_GQE_SHM_SIZE` when
+  the GPU and host have enough free memory.
+  For the file-count experiment, set `RVBBIT_GQE_LARGE_ROW_GROUPS=1`; it leaves
+  normal defaults alone but fills unset `RVBBIT_DIRECT_ACCEL_CHUNK_ROWS` and
+  `RVBBIT_COMPACT_SCAN_CHUNK_ROWS` with `1000000` rows, or with
+  `RVBBIT_GQE_ROW_GROUP_CHUNK_ROWS` when provided.
+  When the optional GQE image already exists, `--rebuild` defaults to
+  `RVBBIT_GPU_GQE_REBUILD_MODE=refresh`: it rebuilds the normal `pg-rvbbit`
+  image, then overlays the current extension and `rvbbit-gqe` bridge into the
+  existing GQE image without recompiling libcudf, MLIR, or GQE. Refresh mode
+  can recover from the preserved `docker-pg-rvbbit-gqe-pre-refresh` base or an
+  explicit `RVBBIT_GQE_REFRESH_BASE_IMAGE`, but otherwise refuses to fall back
+  to the full toolchain build if the existing GQE image is missing.
+  If a reusable GQE base has too many Docker layers from repeated refreshes,
+  the runner flattens it into `docker-pg-rvbbit-gqe-flat-refresh-base` before
+  overlaying the current RVBBIT artifacts; set
+  `RVBBIT_GQE_FLATTEN_LAYER_THRESHOLD` or `RVBBIT_GQE_FLAT_REFRESH_BASE_IMAGE`
+  to tune that behavior.
+  `docker compose up` is run with `--no-build` for the GQE image in
+  default/refresh mode. Use `RVBBIT_GPU_GQE_REBUILD_MODE=full` only when the GQE
+  toolchain itself needs rebuilding. Before an explicit full rebuild, the
+  script tags any existing GQE image as
+  `docker-pg-rvbbit-gqe-backup-<utc-timestamp>` by default; set
+  `RVBBIT_GQE_BACKUP_BEFORE_FULL_REBUILD=0` to disable this or
+  `RVBBIT_GQE_BACKUP_TAG=<tag>` to choose the backup tag.
   If those pieces are missing it remains in the report as `SKIP` with the probe
   reason.
   Rvbbit benchmark loads refresh hive/cluster layouts synchronously by default,

@@ -82,6 +82,7 @@ ROUTE_GUCS = {
     "RVBBIT_ROUTE_RVBBIT_NATIVE": "rvbbit.route_rvbbit_native",
     "RVBBIT_ROUTE_FORCE_CANDIDATE": "rvbbit.route_force_candidate",
     "RVBBIT_GQE_BIN": "rvbbit.gqe_bin",
+    "RVBBIT_GQE_ALLOW_RISKY_SHAPES": "rvbbit.gqe_allow_risky_shapes",
     "RVBBIT_ROUTE_HIVE_MIN_CONFIDENCE": "rvbbit.route_hive_min_confidence",
     "RVBBIT_HOT_STORE_BUDGET_MB": "rvbbit.hot_store_budget_mb",
     "RVBBIT_HOT_STORE_ROUTE_MAX_ROWS": "rvbbit.hot_store_route_max_rows",
@@ -91,11 +92,18 @@ ROUTE_GUCS = {
     # dispatch hook; SETting it here propagates to every query run.
     "RVBBIT_DF_INPROCESS": "rvbbit.df_inprocess",
 }
+SIDECAR_ENGINE_BY_CANDIDATE = {
+    "gpu_gqe": "gpu_gqe",
+}
 
 
 def clear_run_detail() -> None:
     _LAST_RUN_DETAIL.clear()
     clear_rvbbit_duck_hot_detail()
+
+
+def record_run_error(error: str) -> None:
+    _LAST_RUN_DETAIL["error"] = error
 
 
 def last_run_detail() -> dict[str, object]:
@@ -121,6 +129,106 @@ def _apply_route_gucs(cur) -> None:
             continue
         safe_value = value.replace("'", "''")
         cur.execute(f"SET {guc_name} = '{safe_value}'".encode())  # type: ignore[arg-type]
+
+
+def _sidecar_telemetry_enabled() -> bool:
+    return os.environ.get("BENCH_CAPTURE_SIDECAR_TELEMETRY", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _sidecar_event_floor(cur, engine: str) -> int | None:
+    if not _sidecar_telemetry_enabled():
+        return None
+    try:
+        cur.execute(
+            "SELECT coalesce(max(id), 0) FROM rvbbit.duck_sidecar_query_events WHERE engine = %s",
+            (engine,),
+        )
+        value = cur.fetchone()
+        return int(value[0] or 0) if value else 0
+    except Exception:
+        try:
+            cur.connection.rollback()
+            cur.execute("SET statement_timeout = 300000")
+            _apply_route_gucs(cur)
+        except Exception:
+            pass
+        return None
+
+
+def _median_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(statistics.median(values))
+
+
+def _capture_sidecar_telemetry(cur, engine: str, floor_id: int) -> None:
+    wait_s = float(os.environ.get("BENCH_SIDECAR_TELEMETRY_WAIT_S", "1.0"))
+    deadline = time.perf_counter() + max(0.0, wait_s)
+    rows = []
+    while True:
+        try:
+            cur.execute(
+                """
+                SELECT id, elapsed_ms, execute_ms, row_count, result_format, arrow_ipc_bytes,
+                       repeat_count, cache::text
+                FROM rvbbit.duck_sidecar_query_events
+                WHERE engine = %s AND id > %s
+                ORDER BY id
+                """,
+                (engine, floor_id),
+            )
+            rows = cur.fetchall()
+        except Exception:
+            try:
+                cur.connection.rollback()
+            except Exception:
+                pass
+            return
+        if rows or time.perf_counter() >= deadline:
+            break
+        time.sleep(0.05)
+    if not rows:
+        return
+
+    elapsed_ms = [float(row[1]) for row in rows if row[1] is not None]
+    execute_ms = [float(row[2]) for row in rows if row[2] is not None]
+    _LAST_RUN_DETAIL["sidecar_engine"] = engine
+    _LAST_RUN_DETAIL["sidecar_event_count"] = len(rows)
+    median_elapsed = _median_or_none(elapsed_ms)
+    median_execute = _median_or_none(execute_ms)
+    if median_elapsed is not None:
+        _LAST_RUN_DETAIL["sidecar_elapsed_ms"] = median_elapsed
+    if median_execute is not None:
+        _LAST_RUN_DETAIL["sidecar_execute_ms"] = median_execute
+
+    gqe_samples: dict[str, list[float]] = {}
+    last_gqe: dict[str, object] | None = None
+    for row in rows:
+        try:
+            cache = json.loads(row[7] or "{}")
+        except Exception:
+            continue
+        gqe = cache.get("gqe")
+        if not isinstance(gqe, dict):
+            continue
+        last_gqe = gqe
+        for key, value in gqe.items():
+            if isinstance(value, (int, float)):
+                gqe_samples.setdefault(key, []).append(float(value))
+    if not gqe_samples:
+        return
+    gqe_summary: dict[str, object] = {}
+    for key, values in sorted(gqe_samples.items()):
+        if key.startswith("median_"):
+            gqe_summary[key] = float(statistics.median(values))
+        elif last_gqe is not None and key in last_gqe:
+            gqe_summary[key] = last_gqe[key]
+    _LAST_RUN_DETAIL["gqe"] = gqe_summary
 
 
 def _route_explain(cur, sql: str):
@@ -149,12 +257,16 @@ def run_pg(
 ) -> float:
     times: list[float] = []
     route_doc = None
+    sidecar_engine = SIDECAR_ENGINE_BY_CANDIDATE.get(expect_candidate or "")
+    sidecar_floor_id: int | None = None
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(f"SET statement_timeout = {timeout_s * 1000}".encode())  # type: ignore[arg-type]
             _apply_route_gucs(cur)
             if capture_route or expect_candidate:
                 route_doc = _route_explain(cur, sql)
+                if route_doc is not None:
+                    _LAST_RUN_DETAIL["route"] = route_doc
                 if isinstance(route_doc, dict) and route_doc.get("error"):
                     cur.execute(f"SET statement_timeout = {timeout_s * 1000}".encode())  # type: ignore[arg-type]
                     _apply_route_gucs(cur)
@@ -185,12 +297,16 @@ def run_pg(
                         f"expected layout {expect_layout!r} not used: {layout_lines[0].strip()!r} "
                         "(vortex variant missing? load via run_offline.sh so .vortex is built)"
                     )
+            if sidecar_engine:
+                sidecar_floor_id = _sidecar_event_floor(cur, sidecar_engine)
             for _ in range(repeat):
                 t0 = time.perf_counter()
                 cur.execute(sql.encode())  # type: ignore[arg-type]
                 cur.fetchall()
                 times.append(time.perf_counter() - t0)
-    _record_times(times)
+            _record_times(times)
+            if sidecar_engine and sidecar_floor_id is not None:
+                _capture_sidecar_telemetry(cur, sidecar_engine, sidecar_floor_id)
     if route_doc is not None:
         _LAST_RUN_DETAIL["route"] = route_doc
     return _median_ms(times)

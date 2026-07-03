@@ -7,6 +7,18 @@
 services:
   pg-rvbbit:
     gpus: all
+    shm_size: ${RVBBIT_GQE_SHM_SIZE:-8gb}
+    cap_add:
+      - IPC_LOCK
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack: 67108864
     environment:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      NVSHMEM_DISABLE_CUDA_VMM: ${NVSHMEM_DISABLE_CUDA_VMM:-1}
+      NVSHMEM_SYMMETRIC_SIZE: ${NVSHMEM_SYMMETRIC_SIZE:-6G}
+      GQE_MAX_QUERY_MEMORY: ${GQE_MAX_QUERY_MEMORY:-6442450944}
+      RVBBIT_GQE_ALLOW_RISKY_SHAPES: ${RVBBIT_GQE_ALLOW_RISKY_SHAPES:-}

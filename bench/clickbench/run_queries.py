@@ -21,6 +21,7 @@ from runners import (  # noqa: E402
     rvbbit_duck_hot_status,
     clear_run_detail,
     last_run_detail,
+    record_run_error,
     record_rvbbit_route_observation,
     FORCED_SQL_CANDIDATES,
     run_rvbbit_duck_hot,
@@ -45,6 +46,12 @@ REPORT_COLD_WARM = os.environ.get("BENCH_REPORT_COLD_WARM", "").strip().lower() 
     "true",
     "yes",
     "on",
+}
+REPORT_GQE_TELEMETRY = os.environ.get("BENCH_REPORT_GQE_TELEMETRY", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
 }
 
 
@@ -144,7 +151,9 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
             return run_pg(PG_DSNS[system], sql, REPEATS, TIMEOUT_S), "ok"
         return None, "unknown system"
     except Exception as e:
-        return None, str(e).splitlines()[0][:80]
+        error = str(e).splitlines()[0][:240]
+        record_run_error(error)
+        return None, error[:80]
 
 
 def _write_json(path: str, systems: list, queries: list, results: dict, details: dict) -> None:
@@ -194,6 +203,27 @@ def main() -> None:
                 suffix = f" cold {fmt_ms(detail['first_ms'])}"
                 if "warm_median_ms" in detail:
                     suffix += f" warm {fmt_ms(detail['warm_median_ms'])}"
+            if REPORT_GQE_TELEMETRY and isinstance(detail.get("gqe"), dict):
+                gqe = detail["gqe"]
+                parts = []
+                mode = gqe.get("client_mode")
+                if isinstance(mode, str) and mode:
+                    parts.append(f"mode {mode}")
+                if isinstance(gqe.get("median_flight_ms"), (int, float)) and float(gqe["median_flight_ms"]) > 0:
+                    parts.append(f"flight {fmt_ms(float(gqe['median_flight_ms']))}")
+                if isinstance(gqe.get("median_cli_ms"), (int, float)):
+                    cli_ms = float(gqe["median_cli_ms"])
+                    if cli_ms > 0 or not parts:
+                        parts.append(f"cli {fmt_ms(cli_ms)}")
+                if isinstance(gqe.get("median_result_read_ms"), (int, float)):
+                    parts.append(f"read {fmt_ms(float(gqe['median_result_read_ms']))}")
+                if isinstance(gqe.get("median_materialize_ms"), (int, float)):
+                    parts.append(f"mat {fmt_ms(float(gqe['median_materialize_ms']))}")
+                event_count = detail.get("sidecar_event_count")
+                if isinstance(event_count, int):
+                    parts.append(f"events {event_count}")
+                if parts:
+                    suffix += " gqe[" + " ".join(parts) + "]"
             print(f"     {sys_:<14} {label:>10}    (wall {took:.1f}s){suffix}")
         # Incremental write — any later crash still leaves a usable JSON.
         _write_json(out_path, SYSTEMS, queries, results, details)
