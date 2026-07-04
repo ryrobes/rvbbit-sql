@@ -927,7 +927,8 @@ struct RvbbitTableMetric {
     denied_layouts: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct RouteFeatures {
     normalized_sql: String,
     sql_hash: String,
@@ -2034,6 +2035,20 @@ thread_local! {
     static OVERLAY_MEMO: std::cell::RefCell<Option<(Instant, std::collections::HashMap<String, OverlayPin>)>> =
         const { std::cell::RefCell::new(None) };
 
+    // gpu-gqe warm-prior: is the GQE server confirmed warm & functional (fresh
+    // rvbbit.gqe_warm_state)? Memoized per-backend under the same TTL contract as
+    // OVERLAY_MEMO. Only read when rvbbit.route_gpu_gqe_prior is enabled, so it
+    // adds nothing for the default (prior-off) config.
+    static GQE_WARM_MEMO: std::cell::RefCell<Option<(Instant, bool)>> =
+        const { std::cell::RefCell::new(None) };
+
+    // ML routing layer: engine-name -> latency model, loaded from
+    // rvbbit.route_model and memoized per-backend under the route memo TTL. Only
+    // touched when rvbbit.route_ml_enabled is on. None until first load; an empty
+    // map (no trained models) means the ML layer is a no-op.
+    static ML_MODEL_MEMO: std::cell::RefCell<Option<(Instant, std::rc::Rc<std::collections::HashMap<String, crate::route_model::EngineModel>>)>> =
+        const { std::cell::RefCell::new(None) };
+
     // Set by the trainer while it computes the TRUE base decision (what base rules would pick
     // with no pin present). Never set on the normal query path.
     static OVERLAY_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2228,6 +2243,11 @@ fn route_optimize_query(
     }
     // Backstop so a pathological query can't pin the box during benchmarking.
     let _ = Spi::run("SET LOCAL statement_timeout = '30s'");
+    // Force-fail (no fail-open) while benching: if a forced engine can't actually
+    // run this query it must return no timing, not silently fall back to native
+    // and record native's latency under the forced engine's name — that would
+    // poison the per-engine training labels (e.g. a mislabeled fast "gpu_gqe").
+    let _ = Spi::run("SET LOCAL rvbbit.duck_backend_fail_open = off");
 
     let plan = explain_sql(sql).ok();
     let tables = referenced_rvbbit_tables(sql, plan.as_deref());
@@ -2245,11 +2265,30 @@ fn route_optimize_query(
     let base_cand = base.candidate.unwrap_or(Candidate::RvbbitNative);
 
     // Bench every AVAILABLE candidate (forcing an unavailable one would silently fall back).
+    // Log each replay's timing into route_observations (source 'optimize') so it
+    // becomes ML training data. This replay is UNBIASED — it times every engine,
+    // not just the router's pick — so it also feeds engines the live router
+    // currently avoids (e.g. GQE), breaking the auto-run feedback loop.
+    let features_json = features.to_json();
+    let log_obs = relations_present(&["rvbbit.route_observations"]);
     let mut results: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
     for cand in Candidate::all() {
         if candidate_availability(cand, &features, &tables).0 {
             if let Some(ms) = bench_candidate(sql, cand, samples) {
                 results.insert(cand.as_str().to_string(), ms);
+                if log_obs && ms.is_finite() && ms >= 0.0 {
+                    let _ = Spi::run(&format!(
+                        "INSERT INTO rvbbit.route_observations \
+                             (source, query_hash, shape_key, shape_family, features, candidate, elapsed_ms, status) \
+                         VALUES ('optimize', {}, {}, {}, {}::jsonb, {}, {}, 'ok')",
+                        sql_lit(&features.sql_hash),
+                        sql_lit(&features.shape_key),
+                        sql_lit(&features.shape_family),
+                        sql_json_lit(&features_json),
+                        sql_lit(cand.as_str()),
+                        ms,
+                    ));
+                }
             }
         }
     }
@@ -6053,7 +6092,13 @@ fn candidate_gate_enabled(candidate: Candidate) -> bool {
             "rvbbit.route_datafusion_vortex",
             true,
         ),
-        Candidate::GpuGqe => route_enabled("RVBBIT_ROUTE_GPU_GQE", "rvbbit.route_gpu_gqe", false),
+        // Default ON: GQE is eligible wherever it can actually run. On a box with
+        // no GPU/GQE binary the downstream runtime check (gqe_routes_available ->
+        // gqe_binary() == None) makes it ineligible anyway, so an on-by-default
+        // gate is inert there — it just lets GQE-capable machines route to and
+        // (self-)train on GQE without a manual opt-in. Set rvbbit.route_gpu_gqe =
+        // off to disable it even where a GPU is present.
+        Candidate::GpuGqe => route_enabled("RVBBIT_ROUTE_GPU_GQE", "rvbbit.route_gpu_gqe", true),
         Candidate::RvbbitNative => route_enabled(
             "RVBBIT_ROUTE_RVBBIT_NATIVE",
             "rvbbit.route_rvbbit_native",
@@ -6252,6 +6297,512 @@ fn gpu_gqe_allow_risky_shapes() -> bool {
         "rvbbit.gqe_allow_risky_shapes",
         false,
     )
+}
+
+/// Warm-prior: when enabled (default off), the cold/no-profile router prefers
+/// GPU/GQE for large analytical shapes on machines that support it — the engine
+/// is otherwise never chosen cold (it's absent from the FALLBACK_* orders) and so
+/// never gathers timings. Gated additionally on GQE eligibility AND a fresh
+/// rvbbit.gqe_warm_state, so a user query never pays a GQE cold-start.
+fn route_gpu_gqe_prior_enabled() -> bool {
+    route_enabled(
+        "RVBBIT_ROUTE_GPU_GQE_PRIOR",
+        "rvbbit.route_gpu_gqe_prior",
+        false,
+    )
+}
+
+fn route_gpu_gqe_prior_min_rows() -> i64 {
+    let configured = {
+        #[cfg(not(test))]
+        {
+            guc_setting("rvbbit.route_gpu_gqe_prior_min_rows")
+                .or_else(|| std::env::var("RVBBIT_ROUTE_GPU_GQE_PRIOR_MIN_ROWS").ok())
+        }
+        #[cfg(test)]
+        {
+            std::env::var("RVBBIT_ROUTE_GPU_GQE_PRIOR_MIN_ROWS").ok()
+        }
+    };
+    configured
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(1_000_000)
+}
+
+/// Pure shape test for the GQE prior: a large, scan-heavy analytical shape
+/// (aggregate or GROUP BY over >= min_rows) — the regime GPU query engines win.
+/// Eligibility (join limits, unsupported functions, etc.) is enforced separately
+/// by candidate_availability; this only screens the shape.
+fn gpu_gqe_prior_shape_applies(features: &RouteFeatures, min_rows: i64) -> bool {
+    features.table_rows >= min_rows && (features.aggregate_count > 0 || features.group_by)
+}
+
+/// Is the GQE server confirmed warm & functional (fresh rvbbit.gqe_warm_state,
+/// written only by a successful forced-GQE probe)? Memoized per-backend under the
+/// route memo TTL. Returns false when the state table is absent or stale, so the
+/// prior deactivates automatically if GQE goes down.
+fn gqe_prior_warm() -> bool {
+    let ttl = route_stamp_ttl();
+    let cached = if ttl.is_zero() {
+        None
+    } else {
+        GQE_WARM_MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < ttl)
+                .map(|(_, warm)| *warm)
+        })
+    };
+    if let Some(warm) = cached {
+        return warm;
+    }
+    let warm = if relations_present(&["rvbbit.gqe_warm_state"]) {
+        Spi::get_one::<bool>(
+            "SELECT coalesce(max(warm_at) > clock_timestamp() - interval '3 minutes', false) \
+             FROM rvbbit.gqe_warm_state",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    } else {
+        false
+    };
+    GQE_WARM_MEMO.with(|m| *m.borrow_mut() = Some((Instant::now(), warm)));
+    warm
+}
+
+// ── ML routing layer ────────────────────────────────────────────────────────
+// A per-engine latency model (rvbbit.route_model) ranks the ELIGIBLE candidates
+// and picks the predicted-fastest, inserted at the top of the cold/no-profile
+// path. Off by default; a no-op when no models are loaded, so it cannot regress
+// routing. Eligibility stays deterministic (candidate_availability) — the model
+// only ranks safe candidates, so a misprediction costs latency, never a wrong
+// answer. See docs/ML_ROUTING_PLAN.md.
+
+fn route_ml_enabled() -> bool {
+    route_enabled("RVBBIT_ROUTE_ML_ENABLED", "rvbbit.route_ml_enabled", false)
+}
+
+/// Fraction faster than native a non-native winner must be predicted to be before
+/// the ML layer leaves the native default (default 0.15). Keeps the layer
+/// conservative: it only moves off native when confidently faster.
+fn route_ml_min_margin() -> f64 {
+    let raw = {
+        #[cfg(not(test))]
+        {
+            guc_setting("rvbbit.route_ml_min_margin")
+                .or_else(|| std::env::var("RVBBIT_ROUTE_ML_MIN_MARGIN").ok())
+        }
+        #[cfg(test)]
+        {
+            std::env::var("RVBBIT_ROUTE_ML_MIN_MARGIN").ok()
+        }
+    };
+    raw.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v < 1.0)
+        .unwrap_or(0.15)
+}
+
+fn engine_name_to_candidate(name: &str) -> Option<Candidate> {
+    Some(match name {
+        "native" => Candidate::RvbbitNative,
+        "native_vortex" => Candidate::RvbbitNativeVortex,
+        "duck" | "duck_vector" => Candidate::DuckVector,
+        "duck_hive" => Candidate::DuckHive,
+        "duck_vortex" => Candidate::DuckVortex,
+        "datafusion" | "datafusion_vector" => Candidate::DataFusionVector,
+        "datafusion_hive" => Candidate::DataFusionHive,
+        "datafusion_vortex" => Candidate::DataFusionVortex,
+        "gpu_gqe" => Candidate::GpuGqe,
+        "pg" | "pg_rowstore" | "postgres_rowstore" => Candidate::PgRowstore,
+        _ => return None,
+    })
+}
+
+/// Resolve one model feature name to a numeric value from RouteFeatures. Unknown
+/// names → 0.0 (the trainer and evaluator share this vocabulary; a name the
+/// evaluator doesn't know is treated as a zeroed feature, never a panic).
+fn feature_value(f: &RouteFeatures, name: &str) -> f64 {
+    let b = |x: bool| if x { 1.0 } else { 0.0 };
+    match name {
+        "ln_table_rows" => ((f.table_rows.max(0) as f64) + 1.0).ln(),
+        "ln_table_bytes" => ((f.table_bytes.max(0) as f64) + 1.0).ln(),
+        "ln_row_group_count" => ((f.row_group_count.max(0) as f64) + 1.0).ln(),
+        "table_rows" => f.table_rows as f64,
+        "table_bytes" => f.table_bytes as f64,
+        "aggregate_count" => f.aggregate_count as f64,
+        "count_count" => f.count_count as f64,
+        "count_distinct_count" => f.count_distinct_count as f64,
+        "sum_count" => f.sum_count as f64,
+        "avg_count" => f.avg_count as f64,
+        "min_count" => f.min_count as f64,
+        "max_count" => f.max_count as f64,
+        "from_count" => f.from_count as f64,
+        "join_count" => f.join_count as f64,
+        "in_count" => f.in_count as f64,
+        "between_count" => f.between_count as f64,
+        "or_count" => f.or_count as f64,
+        "and_count" => f.and_count as f64,
+        "comparison_count" => f.comparison_count as f64,
+        "like_count" => f.like_count as f64,
+        "not_like_count" => f.not_like_count as f64,
+        "fixed_contains_like_count" => f.fixed_contains_like_count as f64,
+        "regex_count" => f.regex_count as f64,
+        "exists_count" => f.exists_count as f64,
+        "referenced_text_col_count" => f.referenced_text_col_count as f64,
+        "group_text_col_count" => f.group_text_col_count as f64,
+        "order_text_col_count" => f.order_text_col_count as f64,
+        "count_distinct_text_count" => f.count_distinct_text_count as f64,
+        "row_group_count" => f.row_group_count as f64,
+        "group_by" => b(f.group_by),
+        "order_by" => b(f.order_by),
+        "having" => b(f.having),
+        "distinct" => b(f.distinct),
+        "where" => b(f.where_present),
+        "select_star" => b(f.select_star),
+        "offset_present" => b(f.offset_present),
+        "starts_with_with" => b(f.starts_with_with),
+        "has_native_function" => b(f.has_native_function),
+        "plan_has_group" => b(f.plan_has_group),
+        "plan_has_hash" => b(f.plan_has_hash),
+        "plan_has_join" => b(f.plan_has_join),
+        "plan_has_sort" => b(f.plan_has_sort),
+        "plan_has_subplan" => b(f.plan_has_subplan),
+        _ => 0.0,
+    }
+}
+
+/// Load per-engine models from rvbbit.route_model, memoized per-backend under the
+/// route memo TTL. Empty map when the table is absent or has no rows.
+fn ml_models() -> std::rc::Rc<std::collections::HashMap<String, crate::route_model::EngineModel>> {
+    let ttl = route_stamp_ttl();
+    if !ttl.is_zero() {
+        if let Some(m) = ML_MODEL_MEMO.with(|c| {
+            c.borrow()
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < ttl)
+                .map(|(_, m)| m.clone())
+        }) {
+            return m;
+        }
+    }
+    let mut map: std::collections::HashMap<String, crate::route_model::EngineModel> =
+        std::collections::HashMap::new();
+    if relations_present(&["rvbbit.route_model"]) {
+        let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+            let rows = client.select("SELECT engine, params::text FROM rvbbit.route_model", None, &[])?;
+            for row in rows {
+                let engine: String = row.get(1)?.unwrap_or_default();
+                let params: String = row.get(2)?.unwrap_or_default();
+                if engine.is_empty() || params.is_empty() {
+                    continue;
+                }
+                if let Ok(model) = serde_json::from_str::<crate::route_model::EngineModel>(&params) {
+                    map.insert(engine, model);
+                }
+            }
+            Ok(())
+        });
+    }
+    let rc = std::rc::Rc::new(map);
+    ML_MODEL_MEMO.with(|c| *c.borrow_mut() = Some((Instant::now(), rc.clone())));
+    rc
+}
+
+/// The ML decision layer. Predicts log-latency for every eligible engine that has
+/// a model, and returns the predicted-fastest — but only leaves native when a
+/// non-native engine is predicted at least `route_ml_min_margin` faster. Returns
+/// None (fall through to heuristics) when disabled, unmodeled, or no eligible
+/// modeled engine exists.
+fn ml_route_decision(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> Option<RouteDecision> {
+    if !route_ml_enabled() {
+        return None;
+    }
+    let models = ml_models();
+    if models.is_empty() {
+        return None;
+    }
+    let mut best: Option<(Candidate, f64)> = None;
+    let mut native_pred: Option<f64> = None;
+    for (engine_name, model) in models.iter() {
+        let Some(cand) = engine_name_to_candidate(engine_name) else {
+            continue;
+        };
+        if !candidate_availability(cand, features, tables).0 {
+            continue;
+        }
+        let x: Vec<f64> = model
+            .feature_names
+            .iter()
+            .map(|n| feature_value(features, n))
+            .collect();
+        let Some(pred) = model.predict(&x) else {
+            continue;
+        };
+        if cand == Candidate::RvbbitNative {
+            native_pred = Some(pred);
+        }
+        if best.map(|(_, b)| pred < b).unwrap_or(true) {
+            best = Some((cand, pred));
+        }
+    }
+    let (cand, pred) = best?;
+    // log-space margin: exp(pred - native) is the winner/native latency ratio;
+    // require it below (1 - margin) to leave native.
+    if cand != Candidate::RvbbitNative {
+        if let Some(np) = native_pred {
+            let leave_native = pred < np + (1.0 - route_ml_min_margin()).ln();
+            if !leave_native && candidate_availability(Candidate::RvbbitNative, features, tables).0 {
+                return Some(decision(
+                    Candidate::RvbbitNative,
+                    "ml",
+                    "ML latency model: no eligible engine confidently beats native",
+                    None,
+                    None,
+                ));
+            }
+        }
+    }
+    Some(decision(
+        cand,
+        "ml",
+        &format!("ML latency model: predicted-fastest eligible engine (score {pred:.3})"),
+        None,
+        None,
+    ))
+}
+
+/// The canonical feature vocabulary for route models. Must stay in sync with
+/// `feature_value` above (every name here must resolve) and with the FEATURE_NAMES
+/// list in scripts/train_route_model.py.
+const ROUTE_FEATURE_NAMES: &[&str] = &[
+    "ln_table_rows", "ln_table_bytes", "ln_row_group_count",
+    "aggregate_count", "count_count", "count_distinct_count",
+    "sum_count", "avg_count", "min_count", "max_count",
+    "join_count", "from_count", "in_count", "between_count", "or_count",
+    "and_count", "comparison_count", "like_count", "not_like_count",
+    "regex_count", "exists_count",
+    "referenced_text_col_count", "group_text_col_count",
+    "order_text_col_count", "count_distinct_text_count",
+    "group_by", "order_by", "having", "distinct", "where", "select_star",
+    "offset_present", "plan_has_join", "plan_has_sort", "plan_has_group",
+    "plan_has_subplan", "plan_has_hash",
+];
+
+/// Build the SQL that yields (engine, features_json, median_ms) training rows from
+/// whichever sources are present:
+///   * route_observations — unbiased per-engine timings from the optimizer
+///     replaying real logged queries across ALL engines (the preferred source).
+///   * bench_history forced runs — per-engine timings from rvbbit_<engine>_forced
+///     bench sweeps (features joined from the query's sibling rows).
+///   * bench_history auto runs (when `include_auto`) — the one engine the router
+///     chose per query (biased; a bootstrap supplement).
+/// Returns None when no source table exists.
+fn training_query(obs_present: bool, bench_present: bool, include_auto: bool) -> Option<String> {
+    let engine_allowlist = "'native','native_vortex','duck','duck_hive','duck_vortex',\
+         'datafusion','datafusion_hive','datafusion_vortex','gpu_gqe','pg'";
+    let mut parts: Vec<String> = Vec::new();
+
+    if obs_present {
+        // route_observations.candidate uses Candidate::as_str() names; map to the
+        // model engine names.
+        parts.push(
+            "SELECT (CASE candidate \
+                   WHEN 'rvbbit_native' THEN 'native' \
+                   WHEN 'rvbbit_native_vortex' THEN 'native_vortex' \
+                   WHEN 'duck_vector' THEN 'duck' \
+                   WHEN 'duck_hive' THEN 'duck_hive' \
+                   WHEN 'duck_vortex' THEN 'duck_vortex' \
+                   WHEN 'datafusion_vector' THEN 'datafusion' \
+                   WHEN 'datafusion_hive' THEN 'datafusion_hive' \
+                   WHEN 'datafusion_vortex' THEN 'datafusion_vortex' \
+                   WHEN 'gpu_gqe' THEN 'gpu_gqe' \
+                   WHEN 'pg_rowstore' THEN 'pg' END) AS engine, \
+                 features::text AS features, elapsed_ms AS median_ms \
+             FROM rvbbit.route_observations WHERE status='ok' AND elapsed_ms > 0"
+                .to_string(),
+        );
+    }
+    if bench_present {
+        parts.push(
+            "SELECT (CASE q.system \
+                   WHEN 'rvbbit_native_forced' THEN 'native' \
+                   WHEN 'rvbbit_native_vortex_forced' THEN 'native_vortex' \
+                   WHEN 'rvbbit_duck_forced' THEN 'duck' \
+                   WHEN 'rvbbit_duck_hive_forced' THEN 'duck_hive' \
+                   WHEN 'rvbbit_duck_vortex_forced' THEN 'duck_vortex' \
+                   WHEN 'rvbbit_datafusion_forced' THEN 'datafusion' \
+                   WHEN 'rvbbit_datafusion_hive_forced' THEN 'datafusion_hive' \
+                   WHEN 'rvbbit_datafusion_vortex_forced' THEN 'datafusion_vortex' \
+                   WHEN 'rvbbit_gpu_gqe_forced' THEN 'gpu_gqe' \
+                   WHEN 'rvbbit_pg_heap_forced' THEN 'pg' END) AS engine, \
+                 f.features::text AS features, q.median_ms \
+             FROM bench_history.query_results q JOIN feats f USING (run_id, qid) \
+             WHERE q.status='ok' AND q.median_ms > 0 AND q.system LIKE 'rvbbit%\\_forced'"
+                .to_string(),
+        );
+        if include_auto {
+            parts.push(
+                "SELECT (CASE q.detail->'route'->>'route' \
+                       WHEN 'postgres_rowstore' THEN 'pg' WHEN 'pg_rowstore' THEN 'pg' \
+                       WHEN 'duck_vector' THEN 'duck' WHEN 'datafusion_vector' THEN 'datafusion' \
+                       ELSE q.detail->'route'->>'route' END) AS engine, \
+                     (q.detail->'route'->'features')::text AS features, q.median_ms \
+                 FROM bench_history.query_results q \
+                 WHERE q.status='ok' AND q.median_ms > 0 \
+                   AND q.system LIKE 'rvbbit%' AND q.system NOT LIKE '%\\_forced' \
+                   AND q.detail->'route'->'features' IS NOT NULL"
+                    .to_string(),
+            );
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+    // The forced/auto branches reference the feats CTE; only emit it when bench
+    // sources are in play.
+    let feats_cte = if bench_present {
+        "WITH feats AS (\
+           SELECT DISTINCT ON (run_id, qid) run_id, qid, detail->'route'->'features' AS features \
+           FROM bench_history.query_results WHERE detail->'route'->'features' IS NOT NULL) "
+    } else {
+        ""
+    };
+    Some(format!(
+        "{feats_cte}SELECT engine, features, median_ms FROM ({}) rows \
+         WHERE engine IN ({engine_allowlist})",
+        parts.join(" UNION ALL ")
+    ))
+}
+
+/// rvbbit.train_route_model(min_samples, include_auto) — SQL-native trainer for
+/// the ML routing layer. Fits a per-engine gradient-boosted latency model from
+/// bench_history and writes rvbbit.route_model. Returns a per-engine summary.
+/// The Python script (scripts/train_route_model.py) is an offline equivalent.
+#[pg_extern]
+fn train_route_model(
+    min_samples: default!(i32, "20"),
+    include_auto: default!(bool, "true"),
+) -> JsonB {
+    if !relations_present(&["rvbbit.route_model"]) {
+        return JsonB(json!({
+            "status": "no_table",
+            "detail": "rvbbit.route_model missing — run rvbbit.migrate()"
+        }));
+    }
+    let obs_present = relations_present(&["rvbbit.route_observations"]);
+    let bench_present = relations_present(&["bench_history.query_results"]);
+    let min_samples = min_samples.max(1) as usize;
+    let sql = match training_query(obs_present, bench_present, include_auto) {
+        Some(s) => s,
+        None => {
+            return JsonB(json!({
+                "status": "no_data",
+                "detail": "no training source — populate rvbbit.route_observations \
+                           (run rvbbit.route_optimize_auto) or run a benchmark first"
+            }))
+        }
+    };
+
+    let mut per_engine: std::collections::HashMap<String, Vec<crate::route_model::Sample>> =
+        std::collections::HashMap::new();
+    let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let rows = client.select(&sql, None, &[])?;
+        for row in rows {
+            let engine: String = row.get(1)?.unwrap_or_default();
+            let features_txt: String = row.get(2)?.unwrap_or_default();
+            let ms: f64 = row.get::<f64>(3)?.unwrap_or(0.0);
+            if engine.is_empty() || features_txt.is_empty() || !(ms > 0.0) {
+                continue;
+            }
+            let rf: RouteFeatures = match serde_json::from_str(&features_txt) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let x: Vec<f64> = ROUTE_FEATURE_NAMES
+                .iter()
+                .map(|n| feature_value(&rf, n))
+                .collect();
+            per_engine
+                .entry(engine)
+                .or_default()
+                .push(crate::route_model::Sample { x, y: ms.ln() });
+        }
+        Ok(())
+    });
+
+    let feature_names: Vec<String> = ROUTE_FEATURE_NAMES.iter().map(|s| s.to_string()).collect();
+    let cfg = crate::route_model::GbmConfig::default();
+    let mut summary = Map::new();
+    let mut written = 0i64;
+    for (engine, samples) in per_engine.iter() {
+        let n = samples.len();
+        if n < min_samples {
+            summary.insert(engine.clone(), json!({"n": n, "status": "skipped_low_samples"}));
+            continue;
+        }
+        let model = crate::route_model::train_gbm(samples, feature_names.clone(), &cfg);
+        let r2 = crate::route_model::r2(&model, samples);
+        let params = serde_json::to_string(&model).unwrap_or_else(|_| "{}".to_string());
+        let esc = |s: &str| s.replace('\'', "''");
+        let notes = format!("rvbbit.train_route_model n={n} r2={r2:.3}");
+        let up = format!(
+            "INSERT INTO rvbbit.route_model (engine, params, feature_schema, n_samples, trained_at, notes) \
+             VALUES ('{}', '{}'::jsonb, 1, {}, clock_timestamp(), '{}') \
+             ON CONFLICT (engine) DO UPDATE \
+               SET params=EXCLUDED.params, n_samples=EXCLUDED.n_samples, \
+                   trained_at=EXCLUDED.trained_at, notes=EXCLUDED.notes",
+            esc(engine), esc(&params), n, esc(&notes)
+        );
+        if Spi::run(&up).is_ok() {
+            written += 1;
+            summary.insert(
+                engine.clone(),
+                json!({"n": n, "r2": (r2 * 1000.0).round() / 1000.0, "trees": model.trees.len()}),
+            );
+        } else {
+            summary.insert(engine.clone(), json!({"n": n, "status": "write_failed"}));
+        }
+    }
+    let mut sources: Vec<&str> = Vec::new();
+    if obs_present {
+        sources.push("route_observations");
+    }
+    if bench_present {
+        sources.push("bench_history(forced)");
+        if include_auto {
+            sources.push("bench_history(auto)");
+        }
+    }
+    JsonB(json!({
+        "status": "ok",
+        "written": written,
+        "min_samples": min_samples as i64,
+        "include_auto": include_auto,
+        "sources": sources,
+        "engines": Value::Object(summary),
+    }))
+}
+
+/// rvbbit.route_self_train(...) — the closed self-improving loop in one call,
+/// intended for a nightly pg_cron job: replay the hottest real logged query
+/// shapes across every eligible engine (route_optimize_auto — read-only,
+/// timeout- and budget-bounded, logging each engine's timing to
+/// route_observations), then refit the per-engine latency models
+/// (train_route_model). No forced bench sweeps, no Python — the router learns
+/// from real traffic on its own.
+#[pg_extern]
+fn route_self_train(
+    top_k: default!(i32, "20"),
+    max_seconds: default!(i32, "600"),
+    samples: default!(i32, "3"),
+    min_samples: default!(i32, "20"),
+) -> JsonB {
+    let optimize = route_optimize_auto(top_k, max_seconds, samples).0;
+    let train = train_route_model(min_samples, true).0;
+    JsonB(json!({ "status": "ok", "optimize": optimize, "train": train }))
 }
 
 fn gpu_gqe_unsupported_shape_reason(
@@ -7101,6 +7652,13 @@ fn choose_no_profile_route(
     tables: &[RvbbitTableMetric],
     profile: &RouteProfileSelection,
 ) -> RouteDecision {
+    // ML routing layer (docs/ML_ROUTING_PLAN.md). When enabled and trained, a
+    // per-engine latency model ranks the eligible candidates and picks the
+    // predicted-fastest, superseding the hand rules + GQE prior below. No-op
+    // (returns None) when disabled or untrained, so this is a pure addition.
+    if let Some(ml) = ml_route_decision(features, tables) {
+        return ml;
+    }
     if hot_store_no_profile_enabled() && hot_store_prefers_mem(features) {
         if let Some(candidate) =
             first_available_candidate(&[Candidate::DataFusionMem], features, tables)
@@ -7109,6 +7667,29 @@ fn choose_no_profile_route(
                 candidate,
                 "no-profile-hot",
                 "no active route profile; manually loaded hot columnar object uses in-memory DataFusion",
+                None,
+                None,
+            );
+        }
+    }
+    // GPU/GQE warm-prior. GQE is absent from every FALLBACK_* order, so the cold
+    // router never picks it and it never gathers timings. When the operator opts
+    // in (route_gpu_gqe_prior) on a GQE-capable machine, prefer GQE for large
+    // analytical shapes — but only when GQE is actually eligible for THIS query
+    // AND confirmed warm, so no user query pays a cold-start. Trained shapes never
+    // reach here (overlay/profile layers run first), so this only affects the
+    // untrained cold path.
+    if route_gpu_gqe_prior_enabled()
+        && gpu_gqe_prior_shape_applies(features, route_gpu_gqe_prior_min_rows())
+        && gqe_prior_warm()
+    {
+        if let Some(candidate) =
+            first_available_candidate(&[Candidate::GpuGqe], features, tables)
+        {
+            return decision(
+                candidate,
+                "no-profile-gpu-gqe-prior",
+                "no active route profile; large analytical shape routed to warm GPU/GQE (route_gpu_gqe_prior)",
                 None,
                 None,
             );
@@ -8999,6 +9580,49 @@ mod route_unit_tests {
             fallback_external_candidate_order(&features).map(|order| order[0]),
             Some(Candidate::DuckVortex)
         );
+    }
+
+    #[test]
+    fn gpu_gqe_prior_shape_screens_large_analytical_only() {
+        let min = 1_000_000;
+        // Large grouped aggregate -> applies.
+        let grouped = test_features(
+            "SELECT \"AdvEngineID\", count(*) FROM hits GROUP BY \"AdvEngineID\"",
+            5_000_000,
+        );
+        assert!(gpu_gqe_prior_shape_applies(&grouped, min));
+        // Large bare aggregate (no group) -> applies.
+        let agg = test_features("SELECT count(*) FROM hits", 5_000_000);
+        assert!(gpu_gqe_prior_shape_applies(&agg, min));
+        // Small grouped aggregate -> below the row floor, does NOT apply.
+        let small = test_features(
+            "SELECT \"AdvEngineID\", count(*) FROM hits GROUP BY \"AdvEngineID\"",
+            10_000,
+        );
+        assert!(!gpu_gqe_prior_shape_applies(&small, min));
+        // Large non-analytical scan (no aggregate, no group) -> does NOT apply.
+        let scan = test_features("SELECT \"URL\" FROM hits WHERE \"UserID\" = 42", 5_000_000);
+        assert!(!gpu_gqe_prior_shape_applies(&scan, min));
+    }
+
+    #[test]
+    fn ml_feature_value_and_engine_mapping() {
+        let f = test_features(
+            "SELECT \"AdvEngineID\", count(*) FROM hits GROUP BY \"AdvEngineID\"",
+            2_000_000,
+        );
+        assert_eq!(feature_value(&f, "group_by"), 1.0);
+        assert!(feature_value(&f, "aggregate_count") >= 1.0);
+        assert!((feature_value(&f, "ln_table_rows") - (2_000_000f64 + 1.0).ln()).abs() < 1e-9);
+        assert_eq!(feature_value(&f, "select_star"), 0.0);
+        assert_eq!(feature_value(&f, "unknown_feature_xyz"), 0.0);
+        assert_eq!(engine_name_to_candidate("gpu_gqe"), Some(Candidate::GpuGqe));
+        assert_eq!(
+            engine_name_to_candidate("duck_vortex"),
+            Some(Candidate::DuckVortex)
+        );
+        assert_eq!(engine_name_to_candidate("pg"), Some(Candidate::PgRowstore));
+        assert_eq!(engine_name_to_candidate("nope"), None);
     }
 
     #[test]

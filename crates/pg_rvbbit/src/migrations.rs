@@ -509,6 +509,26 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0122_shadow_heap_triggers_enable_always",
         include_str!("../sql/migrations/0122_shadow_heap_triggers_enable_always.sql"),
     ),
+    (
+        "0123_refresh_watermark_visibility_guard",
+        include_str!("../sql/migrations/0123_refresh_watermark_visibility_guard.sql"),
+    ),
+    (
+        "0124_gqe_warm_prior_routing",
+        include_str!("../sql/migrations/0124_gqe_warm_prior_routing.sql"),
+    ),
+    (
+        "0125_route_model",
+        include_str!("../sql/migrations/0125_route_model.sql"),
+    ),
+    (
+        "0126_train_route_model_binding",
+        include_str!("../sql/migrations/0126_train_route_model_binding.sql"),
+    ),
+    (
+        "0127_route_self_train_binding",
+        include_str!("../sql/migrations/0127_route_self_train_binding.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

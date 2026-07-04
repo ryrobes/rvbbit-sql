@@ -6685,6 +6685,8 @@ DECLARE
     table_name_text text := reloid::text;
     last_xid numeric;
     safe_upper_xid numeric;
+    frontier_fxid numeric := 0;
+    has_pending_above boolean := false;
     rows_written bigint := 0;
     row_groups_written bigint := 0;
     variants_rows bigint;
@@ -6727,6 +6729,15 @@ BEGIN
     safe_upper_xid := greatest(
         0::numeric,
         (pg_snapshot_xmin(pg_current_snapshot())::text)::numeric - 1
+    );
+
+    -- The live XID frontier (highest possibly-assigned xid). When an unrelated
+    -- long-lived snapshot pins pg_snapshot_xmin far below this, safe_upper_xid is
+    -- held back below rows that are already committed to THIS table — see the
+    -- pending-above-ceiling probe before the dirty-clear below.
+    frontier_fxid := greatest(
+        0::numeric,
+        (pg_snapshot_xmax(pg_current_snapshot())::text)::numeric - 1
     );
 
     SELECT count(*)::bigint, coalesce(max(rg_id), -1)::bigint,
@@ -6914,17 +6925,46 @@ BEGIN
         PERFORM set_config('rvbbit.acceleration_operation_id', '', true);
     END IF;
 
+    -- Watermark-visibility guard: if an unrelated long-lived snapshot pinned
+    -- pg_snapshot_xmin (thus safe_upper_xid) below rows that are already
+    -- committed to this table, those rows sit ABOVE the export ceiling and were
+    -- not captured. Clearing the dirty flag would drop them from every
+    -- accelerated route AND disable the heap-tail overlay, so the accelerated
+    -- read silently loses rows until the next unrelated write re-dirties the
+    -- table. Detect that case and KEEP the table dirty instead: the heap-tail
+    -- overlay serves the pending rows correctly, and the freshness plane retries
+    -- once the pinning snapshot ends and safe_upper_xid rises past them. Probe
+    -- only when the ceiling was actually held back (frontier check cheap-outs the
+    -- common no-pin path so we don't add a scan to every refresh).
+    has_pending_above := false;
+    IF shadow_dirty AND safe_upper_xid < frontier_fxid THEN
+        EXECUTE format(
+            'SELECT EXISTS (SELECT 1 FROM %s WHERE rvbbit.xid_to_fxid(xmin) > %s::numeric)',
+            reloid::text, safe_upper_xid::text
+        ) INTO has_pending_above;
+    END IF;
+
     IF existing_rgs > 0 OR row_groups_written > 0 THEN
-        UPDATE rvbbit.tables
-           SET shadow_heap_retained = true,
-               shadow_heap_dirty = false,
-               dirty_has_insert = false,
-               dirty_has_update = false,
-               dirty_has_delete = false,
-               dirty_has_truncate = false
-         WHERE table_oid = reloid;
-        PERFORM rvbbit.clear_table_dirty_markers(reloid::oid);
-        PERFORM rvbbit.install_shadow_heap_dirty_triggers(reloid);
+        IF has_pending_above THEN
+            -- Mark retained (so the overlay can serve) but KEEP the dirty flag +
+            -- markers: this leaves the heap-tail overlay active for correct reads
+            -- and signals the freshness plane to retry the delta later.
+            UPDATE rvbbit.tables
+               SET shadow_heap_retained = true
+             WHERE table_oid = reloid;
+            PERFORM rvbbit.install_shadow_heap_dirty_triggers(reloid);
+        ELSE
+            UPDATE rvbbit.tables
+               SET shadow_heap_retained = true,
+                   shadow_heap_dirty = false,
+                   dirty_has_insert = false,
+                   dirty_has_update = false,
+                   dirty_has_delete = false,
+                   dirty_has_truncate = false
+             WHERE table_oid = reloid;
+            PERFORM rvbbit.clear_table_dirty_markers(reloid::oid);
+            PERFORM rvbbit.install_shadow_heap_dirty_triggers(reloid);
+        END IF;
     END IF;
 
     UPDATE rvbbit.acceleration_state

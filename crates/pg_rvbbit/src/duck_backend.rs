@@ -553,9 +553,13 @@ fn gqe_probe_cache_key(path: &str) -> String {
 }
 
 fn gqe_route_gate_enabled() -> bool {
+    // Default ON, in sync with the router's candidate gate (router.rs
+    // candidate_gate_enabled). The gate is inert without a GQE binary — the
+    // runtime check gates actual availability — so defaulting on just avoids a
+    // manual opt-in on GQE-capable machines.
     guc_setting("rvbbit.route_gpu_gqe")
-        .map(|value| setting_enabled(&value, false))
-        .unwrap_or_else(|| env_enabled("RVBBIT_ROUTE_GPU_GQE", false))
+        .map(|value| setting_enabled(&value, true))
+        .unwrap_or_else(|| env_enabled("RVBBIT_ROUTE_GPU_GQE", true))
 }
 
 fn raw_shared_targets() -> String {
@@ -606,11 +610,18 @@ pub(crate) fn accelerator_runtime_status_value(live: bool) -> Value {
             "detail": "Enable rvbbit.df_inprocess or install rvbbit-duck; otherwise DataFusion routes are unavailable and routing falls back to native/PostgreSQL paths."
         }));
     }
-    if gqe_route_gate_enabled && gqe_config_enabled && !gqe_routes_available {
+    // GQE is an OPTIONAL accelerator: when it's unavailable, native/duck/datafusion
+    // still route, so its absence never degrades the system and must not raise the
+    // overall status to "warn". With the route gate now default-on, "gate on but
+    // GQE unavailable" is the normal state on every non-GPU box — so this is only
+    // an informational note, and only when a binary is actually present but won't
+    // serve routes (a probe failure worth surfacing on a GPU box).
+    if gqe_route_gate_enabled && gqe_config_enabled && gqe_binary.is_some() && !gqe_routes_available
+    {
         recommendations.push(json!({
-            "severity": "warn",
-            "action": "install_rvbbit_gqe",
-            "detail": format!("GPU/GQE routing is enabled but unavailable: {gqe_reason}")
+            "severity": "info",
+            "action": "check_rvbbit_gqe",
+            "detail": format!("GPU/GQE binary is present but routes are unavailable: {gqe_reason}")
         }));
     }
 
@@ -638,9 +649,12 @@ pub(crate) fn accelerator_runtime_status_value(live: bool) -> Value {
         }));
     }
 
+    // GQE availability is deliberately NOT part of the warn condition: it's an
+    // optional accelerator with a full native/duck/datafusion fallback, so its
+    // absence (the norm on any non-GPU box, now that the gate defaults on) is not
+    // a degraded state. Its status is surfaced under "gpu_gqe" + the info note above.
     let status = if (!datafusion_routes_available && !duck_routes_available)
         || (shared && duck_routes_available && live && shared_online == Some(false))
-        || (gqe_route_gate_enabled && !gqe_routes_available)
     {
         "warn"
     } else {

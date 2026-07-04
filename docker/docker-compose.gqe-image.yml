@@ -41,3 +41,6 @@ services:
       RVBBIT_GQE_CLIENT_MODE: ${RVBBIT_GQE_CLIENT_MODE:-flight}
       RVBBIT_GQE_FLIGHT_FALLBACK: ${RVBBIT_GQE_FLIGHT_FALLBACK:-true}
       RVBBIT_GQE_ALLOW_RISKY_SHAPES: ${RVBBIT_GQE_ALLOW_RISKY_SHAPES:-}
+      # Note: the GPU/GQE routing gate (rvbbit.route_gpu_gqe) now defaults ON in
+      # the extension — it's inert without a GQE binary, so no per-image override
+      # is needed here. Set RVBBIT_ROUTE_GPU_GQE=0 to force it off even on GPU boxes.

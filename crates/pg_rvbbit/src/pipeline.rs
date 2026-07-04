@@ -569,20 +569,20 @@ fn stage_arg_spec(arg: &StageArg) -> String {
 /// final row. Each step is recorded in rvbbit.flow_steps.
 #[pg_extern(volatile)]
 fn flow(spec: &str) -> TableIterator<'static, (name!(value, JsonB),)> {
+    // A pipeline that can't be run must FAIL LOUDLY, not silently return an
+    // empty/partial rowset that reads as success. Returning empty (or a prior
+    // stage's rows) hides the failure from the caller — dangerous for guard
+    // stages (e.g. `... THEN redact_pii THEN publish` must never publish raw
+    // rows when redact_pii errors). pgrx::error! raises a Postgres ERROR naming
+    // the failure point and aborts the query.
     let pipeline = match parse_pipeline(spec) {
         Ok(p) => p,
-        Err(e) => {
-            pgrx::warning!("rvbbit.flow: {e}");
-            return rows_to_iter(Vec::new());
-        }
+        Err(e) => pgrx::error!("rvbbit.flow: {e}"),
     };
 
     let mut rows = match run_query_to_rows(&pipeline.head) {
         Ok(r) => r,
-        Err(e) => {
-            pgrx::warning!("rvbbit.flow: base query failed: {e}");
-            return rows_to_iter(Vec::new());
-        }
+        Err(e) => pgrx::error!("rvbbit.flow: base query failed: {e}"),
     };
 
     let run_id = new_run_id();
@@ -602,15 +602,12 @@ fn flow(spec: &str) -> TableIterator<'static, (name!(value, JsonB),)> {
                 );
             }
             Err(e) => {
-                // NOTE: graceful degradation here (return the prior stage's rows
-                // instead of failing) is a DELIBERATE, tested contract
-                // (synth_bad_cached_sql_fails_stage_gracefully). It is also a
-                // footgun for guard-style stages: `... THEN redact_pii THEN
-                // publish` would publish raw rows if redact_pii errors. A strict
-                // per-stage fail policy is a design decision left to the owner;
-                // do not blanket-convert this to a hard error.
-                pgrx::warning!("rvbbit.flow: stage '{}' failed: {e}", stage.name);
-                break;
+                // A stage failure fails the whole flow (owner decision
+                // 2026-07-03): silently returning the previous stage's rows
+                // hides the failure and is unsafe for guard stages (a failed
+                // `redact_pii` must not let `publish` ship raw rows). Raise a
+                // Postgres ERROR naming the stage and the underlying cause.
+                pgrx::error!("rvbbit.flow: stage '{}' failed: {e}", stage.name);
             }
         }
     }
@@ -1263,25 +1260,34 @@ mod tests {
         );
     }
 
-    #[pg_test]
-    fn synth_bad_cached_sql_fails_stage_gracefully() {
-        // A cached SQL that references a missing column must fail the stage (via
-        // the PgTry subtransaction) without poisoning the surrounding query: flow
-        // returns the prior (base) rowset.
+    #[pg_test(error = "flow raised on stage failure as expected")]
+    fn synth_bad_cached_sql_fails_stage_loudly() {
+        // A cached SQL that references a missing column must FAIL THE FLOW with a
+        // clear error naming the stage — not silently degrade to the prior
+        // stage's rows (owner decision 2026-07-03). pg_test's `error` attribute
+        // matches EXACTLY, and the flow error carries an unpredictable cause tail,
+        // so we catch it in a DO block, assert SQLERRM names the failing stage,
+        // and re-raise a stable sentinel the attribute can match. If the flow did
+        // NOT raise (regression to silent degradation), the sentinel never fires
+        // and the test fails.
         Spi::run(
             "SELECT rvbbit.synth_put('pivot', 'oops', '[{\"class\":\"A\"},{\"class\":\"B\"}]'::jsonb, \
              'SELECT nonexistent_col FROM _input')",
         )
         .unwrap();
-        let n: i64 = Spi::get_one(
-            "SELECT count(*)::bigint FROM rvbbit.flow($q$ select class from (values ('A'),('B')) v(class) then pivot('oops') $q$)",
+        Spi::run(
+            "DO $$
+             BEGIN
+                 PERFORM count(*) FROM rvbbit.flow($q$ select class from (values ('A'),('B')) v(class) then pivot('oops') $q$);
+                 RAISE EXCEPTION 'flow silently degraded (regression): no error raised';
+             EXCEPTION WHEN OTHERS THEN
+                 IF SQLERRM LIKE '%stage ''pivot'' failed%' THEN
+                     RAISE EXCEPTION 'flow raised on stage failure as expected';
+                 END IF;
+                 RAISE EXCEPTION 'flow raised WRONG error: %', SQLERRM;
+             END $$",
         )
-        .unwrap()
         .unwrap();
-        assert_eq!(
-            n, 2,
-            "flow should return the base rowset when a stage fails"
-        );
     }
 
     #[pg_test]

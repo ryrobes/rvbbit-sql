@@ -79,6 +79,7 @@ mod route_log {
     }
 }
 mod mcp;
+mod route_model;
 mod router;
 mod scan;
 mod scan_types;

@@ -1000,6 +1000,16 @@ ALTER EXTENSION pg_rvbbit UPDATE;
 SQL
     fi
 
+    # Apply stacked schema migrations after (re)creating the extension. CREATE
+    # EXTENSION only installs the base SQL — the migrations (route_model, route
+    # bindings, brain/cubes/metrics schema, etc.) are applied by rvbbit.migrate(),
+    # which a --reset-rvbbit-extension wipes. Idempotent ("up to date" when
+    # nothing pending), so it's safe on the non-reset path too. Mirrors
+    # `make reload-extension`.
+    say "applying rvbbit.migrate() (idempotent schema migrations)"
+    ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 -tA \
+        -f - < crates/pg_rvbbit/sql/migrate.sql | tail -1 | cut -c1-100
+
     say "ensuring route shape sample table"
     ensure_clickbench_route_shape_samples
 
