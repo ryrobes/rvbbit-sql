@@ -30,6 +30,33 @@ services:
       timeout: 3s
       retries: 30
 
+  # One-shot: apply stacked schema migrations on EVERY `up`. First boot already
+  # migrates via docker-entrypoint-initdb.d, but initdb only runs on an EMPTY
+  # volume — so an UPGRADE (new image, existing data volume) would otherwise
+  # never receive new migrations (route bindings, route_model factory seed,
+  # etc.). rvbbit.migrate() is idempotent ("up to date" when nothing pending).
+  migrate:
+    image: ${RVBBIT_POSTGRES_IMAGE:-ghcr.io/ryrobes/rvbbit-postgres:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-rvbbit}
+    entrypoint: ["psql"]
+    command:
+      - -h
+      - postgres
+      - -U
+      - postgres
+      - -d
+      - ${POSTGRES_DB:-rvbbit}
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - CREATE EXTENSION IF NOT EXISTS pg_rvbbit; ALTER EXTENSION pg_rvbbit UPDATE; SELECT rvbbit.migrate();
+    restart: "no"
+
   lens:
     image: ${RVBBIT_LENS_IMAGE:-ghcr.io/ryrobes/rvbbit-lens:${RVBBIT_VERSION:-latest}}
     container_name: rvbbit-lens

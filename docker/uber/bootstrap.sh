@@ -281,6 +281,14 @@ fi
 log "waiting for database"
 wait_sql_true "database" "SELECT true;"
 
+# Upgrade-safety: the initdb migrate only runs on an EMPTY volume, so a new
+# image over an existing volume would otherwise never apply new migrations
+# (route bindings, route_model factory seed, ...). Idempotent no-op otherwise.
+log "applying schema migrations"
+psql "$dsn" -X -v ON_ERROR_STOP=1 -Atq -c \
+    "CREATE EXTENSION IF NOT EXISTS pg_rvbbit; ALTER EXTENSION pg_rvbbit UPDATE; SELECT rvbbit.migrate();" \
+    | tail -1 | while read -r line; do log "migrate: $line"; done
+
 log "seeding capability catalog"
 psql_scalar -c "SELECT rvbbit.seed_capability_catalog();" >/dev/null
 bootstrap_lens_connection

@@ -537,6 +537,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0129_route_shape_samples_test_memory",
         include_str!("../sql/migrations/0129_route_shape_samples_test_memory.sql"),
     ),
+    (
+        "0130_route_model_factory_seed",
+        include_str!("../sql/migrations/0130_route_model_factory_seed.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

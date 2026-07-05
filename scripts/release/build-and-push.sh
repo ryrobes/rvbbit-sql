@@ -32,6 +32,7 @@ SKIP_LENS=0
 SKIP_WARREN=0
 SKIP_WAREHOUSE_MCP=0
 BUILD_CAPABILITIES=0
+BUILD_GQE=0
 DRY_RUN=0
 CHECK_PUBLIC=0
 CORE_CAPABILITY_IDS=("runtimes/python-runtime" "runtimes/mcp-gateway" "smoke/warren-echo")
@@ -61,6 +62,11 @@ Options:
   --skip-warren
   --skip-warehouse-mcp     Skip the Warehouse MCP server image.
   --with-capabilities      Also build/push all catalog capability images.
+  --with-gqe               Also build rvbbit-postgres-gqe LOCALLY from the release
+                           base (NEVER pushed: its CUDA/RAPIDS layer is >40GB,
+                           over GHCR's per-layer limit — GPU deploy boxes build it
+                           from the published base via the shipped
+                           docker-compose.release-gqe.yml instead).
   --skip-capabilities      Deprecated no-op; full catalog images are skipped by default.
   --check-public          After push, verify anonymous pull access with a clean Docker config.
   --dry-run                Print commands without running Docker builds.
@@ -83,6 +89,7 @@ while [[ $# -gt 0 ]]; do
         --skip-warren) SKIP_WARREN=1; shift ;;
         --skip-warehouse-mcp) SKIP_WAREHOUSE_MCP=1; shift ;;
         --with-capabilities) BUILD_CAPABILITIES=1; shift ;;
+        --with-gqe) BUILD_GQE=1; shift ;;
         --skip-capabilities) BUILD_CAPABILITIES=0; shift ;;
         --check-public) CHECK_PUBLIC=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -267,6 +274,60 @@ if [[ "$SKIP_WAREHOUSE_MCP" -eq 0 ]]; then
         --label "org.opencontainers.image.title=rvbbit-warehouse-mcp"
 fi
 
+# GPU/GQE image — LOCAL ONLY. The CUDA/RAPIDS toolchain layer is >40GB (over
+# GHCR's per-layer limit), so this can never be pushed; GPU deploy boxes build
+# it themselves from the PUBLISHED base via docker-compose.release-gqe.yml
+# (Dockerfile.rvbbit-gqe copies nothing from its context, so those two files
+# are all a GPU box needs). This flag builds/refreshes the same image here for
+# release validation on this machine.
+if [[ "$BUILD_GQE" -eq 1 ]]; then
+    if [[ "$SKIP_DB" -eq 1 ]]; then
+        echo "--with-gqe requires the rvbbit-postgres build (drop --skip-db)" >&2
+        exit 2
+    fi
+    run docker buildx build \
+        -f "$CONTEXT_DIR/docker/Dockerfile.rvbbit-gqe" \
+        -t "rvbbit-postgres-gqe:${VERSION}" \
+        --build-arg "RVBBIT_BASE_IMAGE=${IMAGE_PREFIX}/rvbbit-postgres:${VERSION}" \
+        --load \
+        "$CONTEXT_DIR/docker"
+fi
+
+# Deploy kit: everything a fresh box needs, in one folder. The GQE overlay +
+# Dockerfile ride along so a GPU box can build its engine from the published
+# base without cloning the repo.
+DEPLOY_DIR="$RELEASE_DIR/deploy"
+run mkdir -p "$DEPLOY_DIR"
+for f in docker-compose.release.yml docker-compose.release-gqe.yml docker-compose.uber.yml Dockerfile.rvbbit-gqe; do
+    run cp "$ROOT/docker/$f" "$DEPLOY_DIR/$f"
+done
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    cat > "$DEPLOY_DIR/README.md" <<DEPLOY
+# Rvbbit ${VERSION} — deploy kit
+
+Fresh box (CPU):
+    RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.release.yml up -d
+
+Fresh box (NVIDIA GPU — needs driver + nvidia-container-toolkit):
+    # one-time GQE engine build from the published base (~hours, cached after):
+    RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.release.yml -f docker-compose.release-gqe.yml build postgres
+    RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.release.yml -f docker-compose.release-gqe.yml up -d
+
+Turnkey (lens + warren + bootstrap + capabilities):
+    RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.uber.yml up -d
+
+Notes:
+- First boot creates the extension and applies all schema migrations
+  (including the factory-trained routing models). The 'migrate' one-shot
+  service re-applies pending migrations on every 'up', so image upgrades over
+  an existing data volume are safe.
+- GPU routing (gpu_gqe) is enabled by default and self-gates on runtime
+  availability: the plain compose behaves identically on non-GPU boxes.
+- Set OPENAI_API_KEY / ANTHROPIC_API_KEY / etc. in the environment (or a .env
+  file next to the compose files) to enable semantic operators.
+DEPLOY
+fi
+
 if [[ "$BUILD_CAPABILITIES" -eq 1 ]]; then
     build_capability_images "$CAPABILITY_PLAN"
 else
@@ -310,8 +371,14 @@ Capability images:
   core: ${CORE_CAPABILITY_IDS[*]}
   full catalog: $(if [[ "$BUILD_CAPABILITIES" -eq 1 ]]; then printf 'included'; else printf 'skipped (use --with-capabilities to build it)'; fi)
 
+Deploy kit (copy this folder to target boxes):
+  $DEPLOY_DIR
+
 Clean-slate compose:
   RVBBIT_VERSION=$VERSION docker compose -f docker/docker-compose.release.yml up -d
+
+GPU box (builds GQE engine from the published base; see deploy/README.md):
+  RVBBIT_VERSION=$VERSION docker compose -f docker/docker-compose.release.yml -f docker/docker-compose.release-gqe.yml up -d
 
 Turnkey uber compose:
   RVBBIT_VERSION=$VERSION docker compose -f docker/docker-compose.uber.yml up -d
