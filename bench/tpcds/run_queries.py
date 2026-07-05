@@ -82,6 +82,10 @@ def fmt_ms(ms: float) -> str:
 
 def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
     try:
+        if system == "rvbbit_gpu_gqe_forced":
+            skip_reason = os.environ.get("RVBBIT_GPU_GQE_SKIP_REASON", "").strip()
+            if skip_reason:
+                return None, f"SKIP: {skip_reason[:110]}"
         if system == "duckdb":
             return run_duckdb(sql, REPEATS), "ok"
         if system == "clickhouse":

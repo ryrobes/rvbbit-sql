@@ -107,6 +107,26 @@ case "${RVBBIT_GPU_GQE_COMPOSE:-auto}" in
         ;;
     *) ;;
 esac
+# GQE capability for AUTO-routed runs: the auto 'rvbbit' system should run on the
+# GQE-capable image whenever this box can actually serve GQE, so the router and
+# rvbbit.route_self_train() can measure/choose gpu_gqe (the routing gate now
+# defaults on and self-gates on runtime availability). Previously the GQE overlay
+# was only selected when rvbbit_gpu_gqe_forced was benched, so auto runs always
+# used the plain image and GQE was invisible to routing + training. Deliberately
+# conservative: requires host GPU + docker nvidia runtime + an ALREADY-BUILT gqe
+# image (or RVBBIT_GQE_HOME) — never triggers the multi-hour CUDA toolchain
+# build. Opt out with RVBBIT_GPU_GQE_COMPOSE=off.
+if [ "${GPU_GQE_SELECTED}" = "0" ] \
+    && [[ ",${SYSTEMS}," == *",rvbbit,"* ]] \
+    && [ "${GPU_COMPOSE_READY}" = "1" ] \
+    && [ "${GPU_COMPOSE_ALLOWED}" = "1" ]; then
+    if [ -n "${RVBBIT_GQE_HOME:-}" ] \
+        || docker image inspect "${RVBBIT_GQE_PG_IMAGE:-docker-pg-rvbbit-gqe}" >/dev/null 2>&1; then
+        # (say() is defined later in the script; plain printf here)
+        printf 'auto rvbbit run on a GQE-capable box: using the GPU/GQE image so gpu_gqe can participate in routing + self-training\n'
+        GPU_GQE_SELECTED=1
+    fi
+fi
 if [ "${GPU_GQE_SELECTED}" = "1" ]; then
     if [ -n "${RVBBIT_GQE_HOME:-}" ]; then
         COMPOSE="${COMPOSE} -f docker/docker-compose.gqe-host.yml"
@@ -558,11 +578,17 @@ ensure_clickbench_route_shape_samples() {
     [ "${RVBBIT_SELECTED}" = "1" ] || return 0
     ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 <<'SQL'
 CREATE TABLE IF NOT EXISTS rvbbit.route_shape_samples (
-    shape_key     text PRIMARY KEY,
-    shape_family  text NOT NULL,
-    sql           text NOT NULL,
-    captured_at   timestamptz NOT NULL DEFAULT now()
+    shape_key      text PRIMARY KEY,
+    shape_family   text NOT NULL,
+    sql            text NOT NULL,
+    search_path    text,
+    last_tested_at timestamptz,
+    last_result    text,
+    captured_at    timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE rvbbit.route_shape_samples ADD COLUMN IF NOT EXISTS search_path text;
+ALTER TABLE rvbbit.route_shape_samples ADD COLUMN IF NOT EXISTS last_tested_at timestamptz;
+ALTER TABLE rvbbit.route_shape_samples ADD COLUMN IF NOT EXISTS last_result text;
 CREATE INDEX IF NOT EXISTS route_shape_samples_family_idx ON rvbbit.route_shape_samples (shape_family);
 SQL
 }
@@ -1057,6 +1083,13 @@ ${COMPOSE} exec -T -e FORCE_COLOR=1 bench \
     python /bench/clickbench/format_report.py
 
 record_benchmark_history
+
+# Regenerate the interactive HTML bench browser (dark-mode, per-query engine
+# badges) from bench_history — best-effort, never fails the run.
+if command -v python3 >/dev/null 2>&1; then
+    python3 bench/report/generate_report.py 2>/dev/null \
+        || warn "HTML report generation failed (bench/report/generate_report.py)"
+fi
 
 say "report saved to ${REPORT_FILE}"
 echo "raw JSON at bench/clickbench/results/last_run.json"

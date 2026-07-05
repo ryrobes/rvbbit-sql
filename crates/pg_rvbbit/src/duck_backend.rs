@@ -255,10 +255,19 @@ pub(crate) fn max_rows() -> i32 {
 }
 
 fn timeout_s() -> i32 {
-    std::env::var("RVBBIT_DUCK_BACKEND_TIMEOUT_S")
-        .ok()
-        .and_then(|s| s.parse::<i32>().ok())
+    // GUC first so callers can bound a single sidecar call transactionally
+    // (SET LOCAL) — statement_timeout can't interrupt a blocking sidecar wait,
+    // so e.g. the route optimizer pins this to its bench budget; otherwise a
+    // heavy candidate runs to the full default despite the 60s bench cap.
+    guc_setting("rvbbit.duck_backend_timeout_s")
+        .and_then(|s| s.trim().parse::<i32>().ok())
         .filter(|v| *v > 0)
+        .or_else(|| {
+            std::env::var("RVBBIT_DUCK_BACKEND_TIMEOUT_S")
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|v| *v > 0)
+        })
         .unwrap_or(DEFAULT_TIMEOUT_S)
 }
 
@@ -360,6 +369,23 @@ fn sidecar_result_format() -> SidecarResultFormat {
     }
 }
 
+/// The calling session's search_path as a normalized CSV, forwarded to the
+/// sidecar so unqualified table names in the query SQL resolve to the same
+/// schema Postgres would pick (e.g. public.customer vs tpcds.customer — the
+/// sidecar only creates an unqualified alias view when a relname is unique
+/// across schemas, so without this an ambiguous name errors and fails open to
+/// native). Unresolvable entries like "$user" are passed through; the sidecar
+/// filters to schemas that actually exist in its catalog.
+fn session_search_path_csv() -> Option<String> {
+    guc_setting("search_path").map(|raw| {
+        raw.split(',')
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
 pub(crate) fn fail_open_enabled() -> bool {
     guc_setting("rvbbit.duck_backend_fail_open")
         .map(|value| setting_enabled(&value, true))
@@ -406,7 +432,7 @@ fn setting_enabled(value: &str, default: bool) -> bool {
     )
 }
 
-fn guc_setting(name: &str) -> Option<String> {
+pub(crate) fn guc_setting(name: &str) -> Option<String> {
     let cname = CString::new(name).ok()?;
     let ptr = unsafe { pg_sys::GetConfigOption(cname.as_ptr(), true, false) };
     if ptr.is_null() {
@@ -1447,6 +1473,7 @@ fn execute_shared(
         "max_rows": max_rows,
         "threads": threads,
         "result_format": result_format.as_str(),
+        "search_path": session_search_path_csv(),
     }))
     .map_err(|e| e.to_string())?;
     let socket_path = shared_socket_path(&key)?;
@@ -1622,6 +1649,7 @@ fn execute_persistent(
         "max_rows": max_rows,
         "threads": threads,
         "result_format": result_format.as_str(),
+        "search_path": session_search_path_csv(),
     }))
     .map_err(|e| e.to_string())?;
     DUCK_SESSION.with(|slot| {
@@ -1691,6 +1719,9 @@ fn execute_engine_oneshot(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(sp) = session_search_path_csv() {
+        command.arg("--search-path").arg(sp);
+    }
     let child = command
         .spawn()
         .map_err(|e| format!("failed to start rvbbit-duck: {e}"))?;

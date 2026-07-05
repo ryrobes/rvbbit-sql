@@ -94,6 +94,13 @@ CREATE INDEX IF NOT EXISTS hot_objects_updated_idx
 thread_local! {
     static RT: RefCell<Option<Runtime>> = const { RefCell::new(None) };
     static CTX: RefCell<Option<SessionContext>> = const { RefCell::new(None) };
+    // The Postgres default schema the CTX was built with (first resolvable
+    // entry of the session's search_path). DataFusion resolves unqualified
+    // table names against ONE default schema, so a session whose search_path
+    // starts with e.g. 'tpcds' must not resolve `customer` to public.customer
+    // — that's a different table when the relname exists in both schemas.
+    // When the session's effective default changes, the CTX is rebuilt.
+    static CTX_DEFAULT_SCHEMA: RefCell<String> = RefCell::new(String::new());
     // Phase 1 hot-path optimization: remember which qualified-name we've
     // already registered with what file-set signature, so we can skip the
     // deregister + infer_schema + register round-trip when the catalog
@@ -210,16 +217,46 @@ fn ensure_runtime() {
         }
     });
     CTX.with(|cell| {
-        if cell.borrow().is_none() {
+        let desired = session_default_schema();
+        let needs_build = match cell.borrow().as_ref() {
+            None => true,
+            // search_path changed mid-session (rare; e.g. SET search_path):
+            // rebuild so unqualified names can't resolve to the OLD default
+            // schema's same-named table — that would be silently wrong data.
+            Some(_) => CTX_DEFAULT_SCHEMA.with(|s| *s.borrow() != desired),
+        };
+        if needs_build {
             // The Utf8View-vs-Utf8 forcing happens on the ParquetFormat
             // we wire up in register_tables, not on the SessionContext.
             // ParquetFormat doesn't honor SessionConfig for that flag
             // (verified against DF 53.1's parquet datasource source).
             let target_partitions = worker_threads().max(1);
-            let config = SessionConfig::new().with_target_partitions(target_partitions);
+            let config = SessionConfig::new()
+                .with_target_partitions(target_partitions)
+                .with_default_catalog_and_schema("datafusion", desired.clone());
             *cell.borrow_mut() = Some(SessionContext::new_with_config(config));
+            CTX_DEFAULT_SCHEMA.with(|s| *s.borrow_mut() = desired);
+            // Fresh context knows no tables; force full re-registration.
+            REG_CACHE.with(|c| c.borrow_mut().clear());
         }
     });
+}
+
+/// First resolvable entry of the session's search_path — the schema Postgres
+/// would resolve an unqualified table name into first. "$user" and pg_catalog
+/// are skipped ("$user" schemas rarely exist; pg_catalog never holds rvbbit
+/// tables). Falls back to "public".
+fn session_default_schema() -> String {
+    if let Some(raw) = crate::duck_backend::guc_setting("search_path") {
+        for entry in raw.split(',') {
+            let name = entry.trim().trim_matches('"');
+            if name.is_empty() || name == "$user" || name == "pg_catalog" {
+                continue;
+            }
+            return name.to_string();
+        }
+    }
+    "public".to_string()
 }
 
 fn with_rt_ctx<R>(f: impl FnOnce(&Runtime, &SessionContext) -> R) -> R {
@@ -764,9 +801,13 @@ fn table_signature(t: &RvbbitTable, asof: Option<&AsOf>) -> u64 {
 /// `cubes.*` tables — the only schema with materialized row groups — but it applies to every
 /// non-`public` schema.) No-op once the schema is present.
 fn ensure_df_schema(ctx: &SessionContext, schema: &str) {
-    if schema.is_empty() || schema == "public" {
+    if schema.is_empty() {
         return;
     }
+    // NOTE: no early-return for "public" — when the session's search_path makes
+    // a non-public schema the CTX default (see session_default_schema), the
+    // fresh catalog only auto-creates THAT schema, so "public" itself may need
+    // registering here.
     // "datafusion" is the default catalog name (SessionConfig::new()).
     if let Some(catalog) = ctx.catalog("datafusion") {
         if catalog.schema(schema).is_none() {

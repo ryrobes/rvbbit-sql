@@ -13,10 +13,17 @@ from schema import ddl_clickhouse, table_names  # noqa: E402
 
 CH_HOST = os.environ.get("CH_HOST", "bench-clickhouse")
 CH_PORT = int(os.environ.get("CH_PORT", "8123"))
+# Dedicated database: TPC-H and TPC-DS both define `customer` (with different
+# columns), so the shared default database would let one suite clobber the
+# other. The query runner (runners.py CH_DATABASE) connects to the same one.
+CH_DATABASE = "tpcds"
 
 
 def _client():
-    return clickhouse_connect.get_client(host=CH_HOST, port=CH_PORT)
+    bootstrap = clickhouse_connect.get_client(host=CH_HOST, port=CH_PORT)
+    bootstrap.command(f"CREATE DATABASE IF NOT EXISTS {CH_DATABASE}")
+    bootstrap.close()
+    return clickhouse_connect.get_client(host=CH_HOST, port=CH_PORT, database=CH_DATABASE)
 
 
 def _ch_file_path(data_dir: str, table: str) -> str:

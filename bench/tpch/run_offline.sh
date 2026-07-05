@@ -71,6 +71,22 @@ case "${RVBBIT_GPU_GQE_COMPOSE:-auto}" in
         ;;
     *) ;;
 esac
+# GQE capability for AUTO-routed runs (mirrors bench/clickbench/run_offline.sh):
+# run the auto 'rvbbit' system on the GQE-capable image whenever this box can
+# actually serve GQE, so the router + rvbbit.route_self_train() can measure and
+# choose gpu_gqe. Conservative: requires host GPU + docker nvidia runtime + an
+# ALREADY-BUILT gqe image (or RVBBIT_GQE_HOME) — never triggers the CUDA
+# toolchain build. Opt out with RVBBIT_GPU_GQE_COMPOSE=off.
+if [ "${GPU_GQE_SELECTED}" = "0" ] \
+    && [[ ",${SYSTEMS}," == *",rvbbit,"* ]] \
+    && [ "${GPU_COMPOSE_READY}" = "1" ] \
+    && [ "${GPU_COMPOSE_ALLOWED}" = "1" ]; then
+    if [ -n "${RVBBIT_GQE_HOME:-}" ] \
+        || docker image inspect "${RVBBIT_GQE_PG_IMAGE:-docker-pg-rvbbit-gqe}" >/dev/null 2>&1; then
+        printf 'auto rvbbit run on a GQE-capable box: using the GPU/GQE image so gpu_gqe can participate in routing + self-training\n'
+        GPU_GQE_SELECTED=1
+    fi
+fi
 if [ "${GPU_GQE_SELECTED}" = "1" ]; then
     if [ -n "${RVBBIT_GQE_HOME:-}" ]; then
         COMPOSE="${COMPOSE} -f docker/docker-compose.gqe-host.yml"
@@ -941,6 +957,16 @@ ALTER EXTENSION pg_rvbbit UPDATE;
 SQL
     fi
 
+    # Apply stacked schema migrations after (re)creating the extension. CREATE
+    # EXTENSION only installs the base SQL — the migrations (route_model, route
+    # bindings, brain/cubes/metrics schema, etc.) are applied by rvbbit.migrate(),
+    # which a --reset-rvbbit-extension wipes. Idempotent ("up to date" when
+    # nothing pending), so it's safe on the non-reset path too. Mirrors
+    # `make reload-extension`.
+    say "applying rvbbit.migrate() (idempotent schema migrations)"
+    ${COMPOSE} exec -T pg-rvbbit psql -U postgres -d bench -v ON_ERROR_STOP=1 -tA \
+        -f - < crates/pg_rvbbit/sql/migrate.sql | tail -1 | cut -c1-100
+
     if env_on "${RVBBIT_LOAD_ROUTE_PROFILE}" && [ -f "bench/rvbbit_route_profile.json" ]; then
         say "loading Rvbbit route profile"
         ${COMPOSE} exec -T bench python /bench/rvbbit_route_load_profile.py \
@@ -985,6 +1011,13 @@ ${COMPOSE} exec -T -e FORCE_COLOR=1 bench \
     python /bench/tpch/format_report.py
 
 record_benchmark_history
+
+# Regenerate the interactive HTML bench browser (dark-mode, per-query engine
+# badges) from bench_history — best-effort, never fails the run.
+if command -v python3 >/dev/null 2>&1; then
+    python3 bench/report/generate_report.py 2>/dev/null \
+        || warn "HTML report generation failed (bench/report/generate_report.py)"
+fi
 
 say "report saved to ${REPORT_FILE}"
 echo "raw JSON at bench/tpch/results/last_run.json"

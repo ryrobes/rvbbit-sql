@@ -18,3 +18,7 @@ bench/**/_SUCCESS
 test_runs
 # Playwright MCP test artifacts (screenshots / page snapshots / console logs)
 .playwright-mcp/
+# Generated/downloaded benchmark data — never commit (GitHub 100MB limit;
+# tpch.duckdb at sf1 alone is ~250MB). *.duckdb isn't caught by *.db above.
+bench/**/*.duckdb
+bench/columnar_comparison/data/

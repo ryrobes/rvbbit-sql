@@ -46,8 +46,23 @@ PG_DSNS = {
     "rvbbit_pg_heap": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
     "pg_heap": "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench?options=-c%20rvbbit.duck_backend%3Doff%20-c%20rvbbit.force_heap_scan%3Don",
 }
+
+
+def _with_tpcds_search_path(dsn: str) -> str:
+    """TPC-DS tables live in the tpcds schema (TPC-H and TPC-DS both define
+    `customer`, so public would collide in the shared bench DB). Resolve the
+    unqualified table names in the standard TPC-DS query SQL via search_path."""
+    if "options=" in dsn:
+        return dsn.replace("options=", "options=-c%20search_path%3Dtpcds%20", 1)
+    sep = "&" if "?" in dsn else "?"
+    return f"{dsn}{sep}options=-c%20search_path%3Dtpcds"
+
+
+PG_DSNS = {name: _with_tpcds_search_path(dsn) for name, dsn in PG_DSNS.items()}
 CH_HOST = "bench-clickhouse"
 CH_PORT = 8123
+# ClickHouse likewise gets a dedicated tpcds database (the loader creates it).
+CH_DATABASE = "tpcds"
 FORCED_SQL_CANDIDATES = {
     "rvbbit_duck_forced": "duck_vector",
     "rvbbit_duck_hive_forced": "duck_hive",
@@ -211,7 +226,7 @@ def run_pg(
 
 
 def run_clickhouse(sql: str, repeat: int = 3) -> float:
-    client = clickhouse_connect.get_client(host=CH_HOST, port=CH_PORT)
+    client = clickhouse_connect.get_client(host=CH_HOST, port=CH_PORT, database=CH_DATABASE)
     times: list[float] = []
     last_rows = None
     for _ in range(repeat):

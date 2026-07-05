@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1383 1383'><rect width='1383' height='1383' rx='240' fill='%230b0908'/><g transform='translate(0 337)' fill='%23ffb454' fill-rule='evenodd'><path d='M 0 458 L 0 708 L 36 708 L 36 458 Z'/><path d='M 81 458 L 81 708 L 144 708 L 193 702 L 233 692 L 271 678 L 314 656 L 378 608 L 406 579 L 435 541 L 623 541 L 654 536 L 681 528 L 717 511 L 746 491 L 773 465 L 789 486 L 814 509 L 849 529 L 873 537 L 896 541 L 1175 541 L 1271 589 L 1382 365 L 1274 310 L 1288 270 L 1289 232 L 1282 188 L 1262 135 L 1237 96 L 1204 61 L 1163 32 L 1124 14 L 1097 6 L 1057 0 L 672 0 L 672 50 L 678 96 L 641 86 L 589 83 L 552 88 L 516 99 L 500 59 L 483 37 L 468 24 L 444 10 L 427 4 L 406 0 L 380 0 L 359 4 L 332 15 L 313 28 L 296 45 L 277 77 L 268 115 L 272 158 L 285 189 L 298 207 L 331 234 L 360 246 L 381 250 L 373 291 L 247 292 L 247 345 L 242 370 L 232 393 L 212 420 L 182 443 L 155 454 L 134 458 Z M 831 364 L 843 331 L 863 309 L 889 295 L 926 292 L 953 301 L 975 318 L 990 340 L 1002 375 L 1216 375 L 1270 403 L 1233 476 L 1197 458 L 905 458 L 874 448 L 849 427 L 834 399 Z M 722 230 L 735 253 L 744 280 L 747 298 L 745 340 L 737 367 L 725 390 L 707 413 L 685 432 L 653 449 L 614 458 L 387 458 L 345 521 L 295 568 L 264 588 L 231 604 L 191 617 L 164 621 L 164 538 L 205 525 L 235 509 L 259 491 L 285 464 L 303 438 L 318 406 L 327 375 L 462 375 L 456 327 L 456 297 L 461 272 L 481 230 L 492 216 L 519 192 L 544 178 L 573 169 L 625 168 L 654 176 L 678 188 L 698 203 Z M 763 84 L 1048 83 L 1076 87 L 1104 96 L 1146 122 L 1167 143 L 1185 169 L 1195 190 L 1204 223 L 1206 254 L 1203 265 L 1188 284 L 1172 291 L 1111 292 L 1073 285 L 1044 268 L 1020 240 L 1008 210 L 1002 167 L 882 167 L 840 160 L 815 148 L 800 137 L 776 110 Z M 389 83 L 406 85 L 421 94 L 428 102 L 435 121 L 434 134 L 427 149 L 414 161 L 401 166 L 385 166 L 368 158 L 356 144 L 352 133 L 352 116 L 359 101 L 372 89 Z'/></g></svg>">
+<title>rvbbit · bench report</title>
+<style>
+  :root {
+    --bg: #0b0908;
+    --panel: #14100d;
+    --panel2: #1a1512;
+    --line: #2c241c;
+    --text: #e8e0d4;
+    --dim: #9a8d7c;
+    --faint: #6b6155;
+    --amber: #ffb454;
+    --amber-glow: rgba(255, 180, 84, 0.25);
+    --green: #67e88b;
+    --red: #ff6b6b;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { background: var(--bg); }
+  body {
+    font-family: var(--mono);
+    background:
+      radial-gradient(1200px 500px at 20% -10%, rgba(255,180,84,0.05), transparent 60%),
+      radial-gradient(900px 400px at 90% 0%, rgba(103,232,139,0.03), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.45;
+    min-height: 100vh;
+    padding-bottom: 60px;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px; }
+
+  /* ---------- header ---------- */
+  header { padding: 22px 0 14px; }
+  .brandline { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .brand {
+    font-size: 20px; font-weight: 700; letter-spacing: 0.06em; color: var(--amber);
+    text-shadow: 0 0 18px var(--amber-glow);
+    display: inline-flex; align-items: center; gap: 10px;
+  }
+  .brand svg {
+    height: 24px; width: auto; flex: none;
+    filter: drop-shadow(0 0 10px var(--amber-glow));
+  }
+  .brand .dim { color: var(--faint); font-weight: 400; }
+  .runmeta { color: var(--dim); font-size: 12px; }
+  .runmeta b { color: var(--text); font-weight: 600; }
+  .headctl { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+  select, button.ctl {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    font-family: var(--mono); font-size: 12px; padding: 5px 9px; border-radius: 6px;
+    cursor: pointer; outline: none;
+  }
+  select:hover, button.ctl:hover { border-color: var(--amber); }
+  button.ctl.active { border-color: var(--amber); color: var(--amber); box-shadow: 0 0 10px var(--amber-glow); }
+
+  /* ---------- summary cards ---------- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 10px; margin: 16px 0 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 13px; position: relative; overflow: hidden;
+  }
+  .card.hero { border-color: rgba(255,180,84,0.55); box-shadow: 0 0 24px rgba(255,180,84,0.10), inset 0 0 30px rgba(255,180,84,0.04); }
+  .card .sys { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; margin-bottom: 6px; display:flex; align-items:center; gap:6px;}
+  .card .sys .swatch { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  .card .big { font-size: 21px; font-weight: 700; color: var(--text); }
+  .card .big small { font-size: 12px; color: var(--dim); font-weight: 400; }
+  .card .sub { color: var(--dim); font-size: 11px; margin-top: 4px; }
+  .card .sub .win { color: var(--amber); }
+  .card .sub .fail { color: var(--red); }
+  .card .rank { position: absolute; top: 9px; right: 11px; color: var(--faint); font-size: 10px; }
+  .card.hero .rank { color: var(--amber); }
+  .card.incomplete { opacity: 0.75; border-style: dashed; }
+  .card.incomplete .rank { color: var(--red); }
+
+  /* ---------- engine mix ---------- */
+  .mixrow { margin: 14px 0 4px; }
+  .mixlabel { color: var(--dim); font-size: 11px; letter-spacing: 0.1em; margin-bottom: 6px; }
+  .mixlabel b { color: var(--text); }
+  .mixbar { display: flex; height: 26px; border-radius: 7px; overflow: hidden; border: 1px solid var(--line); }
+  .mixseg { display: flex; align-items: center; justify-content: center; gap: 5px; font-size: 11px; font-weight: 700; color: #0b0908; min-width: 0; white-space: nowrap; overflow: hidden; }
+  .mixlegend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px; font-size: 11px; color: var(--dim); }
+  .mixlegend .k { display: inline-flex; align-items: center; gap: 5px; }
+  .mixlegend .swatch { width: 8px; height: 8px; border-radius: 2px; }
+
+  /* ---------- controls ---------- */
+  .controls {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    padding: 12px 0 10px; margin-top: 8px; border-top: 1px solid var(--line);
+    color: var(--dim); font-size: 12px;
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 20px;
+    border: 1px solid var(--line); cursor: pointer; user-select: none; font-size: 11px; color: var(--dim);
+  }
+  .chip .swatch { width: 8px; height: 8px; border-radius: 2px; }
+  .chip.on { color: var(--text); border-color: var(--faint); }
+  .chip.off { opacity: 0.38; }
+
+  /* ---------- query rows ---------- */
+  .queries { margin-top: 10px; display: grid; grid-template-columns: 1fr; gap: 8px; align-items: start; }
+  body.twocol .queries { grid-template-columns: 1fr 1fr; }
+  body.twocol .wrap { max-width: 1460px; }
+  .qrow {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 14px 11px;
+  }
+  .qhead { display: flex; align-items: baseline; gap: 10px; margin-bottom: 7px; }
+  .qid { color: var(--amber); font-weight: 700; font-size: 13px; min-width: 34px; }
+  .qdesc { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bars { display: grid; grid-template-columns: 118px 1fr; row-gap: 3px; align-items: center; }
+  .bsys { font-size: 11px; color: var(--dim); display: flex; align-items: center; gap: 6px; padding-right: 8px; }
+  .bsys .swatch { width: 7px; height: 7px; border-radius: 2px; flex: none; }
+  .btrack { display: flex; align-items: center; gap: 8px; min-width: 0; height: 16px; }
+  .bar { height: 12px; border-radius: 3px; min-width: 2px; position: relative; transition: width 0.25s ease; }
+  .bar.winner { box-shadow: 0 0 10px currentColor; }
+  .bms { font-size: 11px; color: var(--text); white-space: nowrap; }
+  .bms .x { color: var(--faint); margin-left: 5px; }
+  .bms .x.fast { color: var(--green); }
+  .bms .x.slow { color: var(--red); }
+  .crown { color: var(--amber); font-size: 10px; }
+  .failtag { color: var(--red); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .ebadge {
+    display: inline-flex; align-items: center; font-size: 9.5px; font-weight: 800; letter-spacing: 0.05em;
+    padding: 1px 6px; border-radius: 4px; color: #0b0908; line-height: 1.5; flex: none;
+  }
+
+  /* ---------- tooltip ---------- */
+  #tip {
+    position: fixed; z-index: 50; pointer-events: none; display: none;
+    background: #201a15; border: 1px solid var(--line); border-radius: 8px;
+    padding: 9px 11px; font-size: 11px; max-width: 380px; color: var(--dim);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+  }
+  #tip b { color: var(--text); }
+  #tip .route { color: var(--amber); }
+
+  /* ---------- footer ---------- */
+  footer { margin-top: 26px; color: var(--faint); font-size: 11px; display: flex; gap: 16px; flex-wrap: wrap; }
+
+  /* ---------- screenshot mode ---------- */
+  body.shot .controls, body.shot .headctl, body.shot footer .genline { display: none; }
+  body.shot .qrow { break-inside: avoid; }
+  body.shot header { padding-top: 30px; }
+  .shotbanner { display: none; }
+  body.shot .shotbanner {
+    display: block; color: var(--dim); font-size: 12px; margin-top: 4px;
+  }
+  body.shot .shotbanner b { color: var(--amber); }
+
+  @media (max-width: 950px) {
+    body.twocol .queries { grid-template-columns: 1fr; }  /* never cram 2-col on narrow screens */
+  }
+  @media (max-width: 700px) {
+    .bars { grid-template-columns: 92px 1fr; }
+    .cards { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brandline">
+      <div class="brand"><!-- rvbbit mark (rvbbit-lens/src/components/desktop/rvbbit-logo.tsx) -->
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1383 709" fill="none" aria-hidden="true">
+          <path d="M 0 458 L 0 708 L 36 708 L 36 458 Z" fill="currentColor" fill-rule="evenodd"/>
+          <path d="M 81 458 L 81 708 L 144 708 L 193 702 L 233 692 L 271 678 L 314 656 L 378 608 L 406 579 L 435 541 L 623 541 L 654 536 L 681 528 L 717 511 L 746 491 L 773 465 L 789 486 L 814 509 L 849 529 L 873 537 L 896 541 L 1175 541 L 1271 589 L 1382 365 L 1274 310 L 1288 270 L 1289 232 L 1282 188 L 1262 135 L 1237 96 L 1204 61 L 1163 32 L 1124 14 L 1097 6 L 1057 0 L 672 0 L 672 50 L 678 96 L 641 86 L 589 83 L 552 88 L 516 99 L 500 59 L 483 37 L 468 24 L 444 10 L 427 4 L 406 0 L 380 0 L 359 4 L 332 15 L 313 28 L 296 45 L 277 77 L 268 115 L 272 158 L 285 189 L 298 207 L 331 234 L 360 246 L 381 250 L 373 291 L 247 292 L 247 345 L 242 370 L 232 393 L 212 420 L 182 443 L 155 454 L 134 458 Z M 831 364 L 843 331 L 863 309 L 889 295 L 926 292 L 953 301 L 975 318 L 990 340 L 1002 375 L 1216 375 L 1270 403 L 1233 476 L 1197 458 L 905 458 L 874 448 L 849 427 L 834 399 Z M 722 230 L 735 253 L 744 280 L 747 298 L 745 340 L 737 367 L 725 390 L 707 413 L 685 432 L 653 449 L 614 458 L 387 458 L 345 521 L 295 568 L 264 588 L 231 604 L 191 617 L 164 621 L 164 538 L 205 525 L 235 509 L 259 491 L 285 464 L 303 438 L 318 406 L 327 375 L 462 375 L 456 327 L 456 297 L 461 272 L 481 230 L 492 216 L 519 192 L 544 178 L 573 169 L 625 168 L 654 176 L 678 188 L 698 203 Z M 763 84 L 1048 83 L 1076 87 L 1104 96 L 1146 122 L 1167 143 L 1185 169 L 1195 190 L 1204 223 L 1206 254 L 1203 265 L 1188 284 L 1172 291 L 1111 292 L 1073 285 L 1044 268 L 1020 240 L 1008 210 L 1002 167 L 882 167 L 840 160 L 815 148 L 800 137 L 776 110 Z M 389 83 L 406 85 L 421 94 L 428 102 L 435 121 L 434 134 L 427 149 L 414 161 L 401 166 L 385 166 L 368 158 L 356 144 L 352 133 L 352 116 L 359 101 L 372 89 Z" fill="currentColor" fill-rule="evenodd"/>
+        </svg>
+        rvbbit <span class="dim">/ bench</span></div>
+      <div class="runmeta" id="runmeta"></div>
+      <div class="headctl">
+        <select id="runsel" title="pick a run"></select>
+        <button class="ctl" id="shotbtn" title="hide chrome for a clean screenshot">📷 screenshot</button>
+      </div>
+    </div>
+    <div class="shotbanner" id="shotbanner"></div>
+  </header>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="mixrow" id="mixrow" style="display:none">
+    <div class="mixlabel">AUTO-ROUTER ENGINE MIX — <b id="mixtitle"></b></div>
+    <div class="mixbar" id="mixbar"></div>
+    <div class="mixlegend" id="mixlegend"></div>
+  </div>
+
+  <div class="controls">
+    <span>layout</span>
+    <button class="ctl" id="colbtn">1 col</button>
+    <span>scale</span>
+    <button class="ctl" id="scalebtn">linear</button>
+    <span>sort</span>
+    <select id="sortsel">
+      <option value="qid">query order</option>
+      <option value="rvbbit">rvbbit time ↑</option>
+      <option value="adv">biggest rvbbit wins</option>
+    </select>
+    <span>vs</span>
+    <select id="basesel"><option value="">— baseline —</option></select>
+    <span id="syschips" style="display:flex;gap:6px;flex-wrap:wrap"></span>
+  </div>
+
+  <div class="queries" id="queries"></div>
+
+  <footer>
+    <span id="footsuite"></span>
+    <span class="genline" id="genline"></span>
+  </footer>
+</div>
+<div id="tip"></div>
+
+<script>
+window.BENCH_DATA = /*__BENCH_DATA__*/null;
+</script>
+<script>
+(function () {
+  "use strict";
+  const DATA = window.BENCH_DATA;
+  if (!DATA || !DATA.runs || !DATA.runs.length) {
+    document.getElementById("queries").innerHTML =
+      '<div class="qrow">no bench data embedded — run bench/report/generate_report.py</div>';
+    return;
+  }
+
+  /* ---------- engine + system palettes ---------- */
+  const ENGINE = {
+    native:            { s: "NAT",  c: "#ffb454" },
+    duck:              { s: "DUCK", c: "#d7ba51" },
+    duck_vector:       { s: "DUCK", c: "#d7ba51" },
+    duck_hive:         { s: "DK·H", c: "#b09b45" },
+    duck_vortex:       { s: "DK·V", c: "#9ece6a" },
+    datafusion:        { s: "DF",   c: "#7aa2f7" },
+    datafusion_vector: { s: "DF",   c: "#7aa2f7" },
+    datafusion_hive:   { s: "DF·H", c: "#5d84cf" },
+    datafusion_vortex: { s: "DF·V", c: "#bb9af7" },
+    gpu_gqe:           { s: "GQE",  c: "#67e88b" },
+    pg:                { s: "PG",   c: "#8a8f98" },
+    pg_rowstore:       { s: "PG",   c: "#8a8f98" },
+    postgres_rowstore: { s: "PG",   c: "#8a8f98" },
+  };
+  const engineOf = (r) => ENGINE[r] || { s: (r || "?").toUpperCase().slice(0, 5), c: "#8a8f98" };
+
+  const SYSCOLOR = {
+    rvbbit: "#ffb454", clickhouse: "#f7df3e", duckdb: "#a3be5c",
+    pg_baseline: "#8595a8", citus: "#37c2b4", hydra: "#a486e8", alloydb: "#63a8f0",
+  };
+  const AMBERS = ["#ff8f54", "#ffcf87", "#e09a3e", "#ffe3b0", "#c97f2e"];
+  let amberIdx = 0;
+  const syscolors = {};
+  function sysColor(name) {
+    if (syscolors[name]) return syscolors[name];
+    let c = SYSCOLOR[name];
+    if (!c && name.startsWith("rvbbit")) c = AMBERS[amberIdx++ % AMBERS.length];
+    if (!c) c = "#8a8f98";
+    syscolors[name] = c;
+    return c;
+  }
+
+  /* ---------- helpers ---------- */
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  function fmtMs(ms) {
+    if (ms == null) return "—";
+    if (ms >= 10000) return (ms / 1000).toFixed(2) + "s";
+    if (ms >= 100) return Math.round(ms) + "ms";
+    if (ms >= 10) return ms.toFixed(1) + "ms";
+    return ms.toFixed(2) + "ms";
+  }
+  function fmtS(ms) { return ms == null ? "—" : (ms / 1000).toFixed(2) + "s"; }
+  function fmtRows(n) {
+    if (n == null) return "";
+    if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, "") + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(0) + "k";
+    return String(n);
+  }
+  const qnum = (q) => { const m = /(\d+)/.exec(q || ""); return m ? +m[1] : 0; };
+
+  /* ---------- state ---------- */
+  let run = DATA.runs[0];
+  let logScale = false;
+  let sortMode = "qid";
+  let baseline = "";
+  let hidden = new Set();
+
+  /* ---------- run selector ---------- */
+  const runsel = $("runsel");
+  DATA.runs.forEach((r, i) => {
+    const o = document.createElement("option");
+    const d = (r.started_at || "").slice(0, 16).replace("T", " ");
+    const sc = r.suite === "TPC-H" ? "sf" + r.scale : fmtRows(r.row_count || +r.scale);
+    o.value = i;
+    o.textContent = `${r.suite} ${sc} · ${r.test_name} · ${d}`;
+    runsel.appendChild(o);
+  });
+  runsel.onchange = () => { run = DATA.runs[+runsel.value]; hidden = new Set(); baseline = ""; renderAll(); };
+
+  /* ---------- render: header meta ---------- */
+  function renderMeta() {
+    const d = (run.started_at || "").slice(0, 10);
+    const sc = run.suite === "TPC-H" ? "SF " + run.scale : fmtRows(run.row_count || +run.scale) + " rows";
+    const commit = run.git_commit ? run.git_commit.slice(0, 7) + (run.git_dirty ? "*" : "") : "";
+    $("runmeta").innerHTML =
+      `<b>${esc(run.suite)}</b> · ${esc(sc)} · ${run.query_count} queries · ×${run.repeats} · ${esc(d)}` +
+      (commit ? ` · <span title="git commit">${esc(commit)}</span>` : "");
+    const auto = autoSystem();
+    $("shotbanner").innerHTML = auto
+      ? `one PostgreSQL extension · <b>auto-routed</b> across native / DuckDB / DataFusion / vortex / <b>GPU</b> engines — per query, per shape`
+      : `multi-engine benchmark · ${esc(run.suite)}`;
+  }
+
+  function autoSystem() {
+    // the auto-routed rvbbit system (has route info, isn't a *_forced pin)
+    const cands = (run.systems || []).filter((s) => s.startsWith("rvbbit") && !s.endsWith("_forced"));
+    for (const s of cands) {
+      if (run.queries.some((q) => q.results[s] && q.results[s].route)) return s;
+    }
+    return null;
+  }
+
+  /* ---------- render: summary cards ---------- */
+  function renderCards() {
+    const sums = (run.summaries || []).slice().filter((s) => !hidden.has(s.system));
+    // clean runs rank first — a system that failed queries has a smaller (thus
+    // unfairly flattering) suite total, so it can't outrank complete runs.
+    sums.sort((a, b) =>
+      ((a.failures > 0) - (b.failures > 0)) ||
+      ((a.suite_time_ms || 1e18) - (b.suite_time_ms || 1e18)));
+    $("cards").innerHTML = sums.map((s, i) => {
+      const hero = s.system.startsWith("rvbbit");
+      const incomplete = s.failures > 0;
+      const fails = incomplete ? ` · <span class="fail">${s.failures} fail</span>` : "";
+      return `<div class="card${hero ? " hero" : ""}${incomplete ? " incomplete" : ""}">
+        <div class="rank">${incomplete ? "✕" : "#" + (i + 1)}</div>
+        <div class="sys"><span class="swatch" style="background:${sysColor(s.system)}"></span>${esc(s.system)}</div>
+        <div class="big">${fmtS(s.suite_time_ms)} <small>total${incomplete ? "*" : ""}</small></div>
+        <div class="sub">geo ${fmtMs(s.geomean_ms)} · <span class="win">★${s.wins}</span> wins${fails}</div>
+      </div>`;
+    }).join("");
+  }
+
+  /* ---------- render: engine mix ---------- */
+  function renderMix() {
+    const auto = autoSystem();
+    const row = $("mixrow");
+    if (!auto) { row.style.display = "none"; return; }
+    const counts = {};
+    run.queries.forEach((q) => {
+      const r = q.results[auto];
+      if (r && r.route) counts[r.route] = (counts[r.route] || 0) + 1;
+    });
+    const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    if (!entries.length) { row.style.display = "none"; return; }
+    const total = entries.reduce((a, e) => a + e[1], 0);
+    row.style.display = "";
+    $("mixtitle").textContent = `${auto} picked per query (${total})`;
+    $("mixbar").innerHTML = entries.map(([r, n]) => {
+      const e = engineOf(r);
+      return `<div class="mixseg" style="background:${e.c};flex:${n}" title="${esc(r)}: ${n}">${e.s} ${n}</div>`;
+    }).join("");
+    $("mixlegend").innerHTML = entries.map(([r, n]) => {
+      const e = engineOf(r);
+      return `<span class="k"><span class="swatch" style="background:${e.c}"></span>${esc(r)} ×${n}</span>`;
+    }).join("");
+  }
+
+  /* ---------- render: controls ---------- */
+  function renderControls() {
+    const chips = $("syschips");
+    chips.innerHTML = (run.systems || []).map((s) =>
+      `<span class="chip ${hidden.has(s) ? "off" : "on"}" data-sys="${esc(s)}">
+        <span class="swatch" style="background:${sysColor(s)}"></span>${esc(s)}</span>`
+    ).join("");
+    chips.querySelectorAll(".chip").forEach((ch) => {
+      ch.onclick = () => {
+        const s = ch.dataset.sys;
+        hidden.has(s) ? hidden.delete(s) : hidden.add(s);
+        renderCards(); renderControls(); renderQueries();
+      };
+    });
+    const bs = $("basesel");
+    const keep = baseline;
+    bs.innerHTML = '<option value="">— baseline —</option>' + (run.systems || [])
+      .map((s) => `<option value="${esc(s)}"${s === keep ? " selected" : ""}>${esc(s)}</option>`).join("");
+  }
+
+  /* ---------- render: queries ---------- */
+  function renderQueries() {
+    const systems = (run.systems || []).filter((s) => !hidden.has(s));
+    const auto = autoSystem();
+    let qs = run.queries.slice();
+
+    if (sortMode === "rvbbit" && auto) {
+      qs.sort((a, b) => ((a.results[auto] || {}).ms ?? 1e18) - ((b.results[auto] || {}).ms ?? 1e18));
+    } else if (sortMode === "adv" && auto) {
+      const adv = (q) => {
+        const mine = (q.results[auto] || {}).ms;
+        if (mine == null) return -1e18;
+        let best = null;
+        systems.forEach((s) => {
+          if (s === auto) return;
+          const v = (q.results[s] || {}).ms;
+          if (v != null && (best == null || v < best)) best = v;
+        });
+        return best == null ? -1e18 : best / mine;
+      };
+      qs.sort((a, b) => adv(b) - adv(a));
+    } else {
+      qs.sort((a, b) => qnum(a.qid) - qnum(b.qid));
+    }
+
+    $("queries").innerHTML = qs.map((q) => {
+      const vals = systems.map((s) => (q.results[s] || {}).ms).filter((v) => v != null && v > 0);
+      if (!vals.length) return "";
+      const max = Math.max(...vals), min = Math.min(...vals);
+      const lmin = Math.log10(Math.max(min, 0.01)), lmax = Math.log10(Math.max(max, 0.011));
+      const baseMs = baseline && !hidden.has(baseline) ? (q.results[baseline] || {}).ms : null;
+
+      const rows = systems.map((s) => {
+        const r = q.results[s];
+        if (!r) return "";
+        const color = sysColor(s);
+        if (r.status !== "ok" || r.ms == null) {
+          return `<div class="bsys"><span class="swatch" style="background:${color}"></span>${esc(s)}</div>
+                  <div class="btrack"><span class="failtag" title="${esc(r.status || "fail")}">✕ ${esc(r.status || "fail")}</span></div>`;
+        }
+        let pct;
+        if (logScale && lmax > lmin) pct = 4 + 96 * (Math.log10(Math.max(r.ms, 0.01)) - lmin) / (lmax - lmin);
+        else pct = Math.max(100 * r.ms / max, 1.2);
+        const win = r.ms === min;
+        const badge = r.route
+          ? `<span class="ebadge" style="background:${engineOf(r.route).c}">${engineOf(r.route).s}</span>` : "";
+        let xlab = "";
+        if (baseMs != null && s !== baseline) {
+          const x = baseMs / r.ms;
+          xlab = `<span class="x ${x >= 1 ? "fast" : "slow"}">${x >= 1 ? x.toFixed(1) : (1 / x).toFixed(1)}× ${x >= 1 ? "faster" : "slower"}</span>`;
+        }
+        return `<div class="bsys"><span class="swatch" style="background:${color}"></span>${esc(s)}</div>
+          <div class="btrack" data-tip="${esc(tipFor(s, q, r))}">
+            <div class="bar${win ? " winner" : ""}" style="width:${pct.toFixed(1)}%;background:${color};color:${color}"></div>
+            <span class="bms">${win ? '<span class="crown">★</span> ' : ""}${fmtMs(r.ms)}${xlab}</span>
+            ${badge}
+          </div>`;
+      }).join("");
+
+      return `<div class="qrow">
+        <div class="qhead"><span class="qid">${esc(q.qid)}</span><span class="qdesc">${esc(q.description || "")}</span></div>
+        <div class="bars">${rows}</div>
+      </div>`;
+    }).join("");
+  }
+
+  function tipFor(s, q, r) {
+    let t = `<b>${esc(s)}</b> · ${esc(q.qid)}\nmedian ${fmtMs(r.ms)}`;
+    if (r.first_ms != null) t += ` · first ${fmtMs(r.first_ms)}`;
+    if (r.warm_ms != null) t += ` · warm ${fmtMs(r.warm_ms)}`;
+    if (r.route) {
+      t += `\n<span class="route">route: ${esc(r.route)}</span>`;
+      if (r.route_source) t += ` (${esc(r.route_source)})`;
+      if (r.reason) t += `\n${esc(r.reason)}`;
+    }
+    return t;
+  }
+
+  /* ---------- tooltip wiring ---------- */
+  const tip = $("tip");
+  document.addEventListener("mousemove", (e) => {
+    const el = e.target.closest("[data-tip]");
+    if (!el) { tip.style.display = "none"; return; }
+    tip.innerHTML = el.dataset.tip.replace(/\n/g, "<br>");
+    tip.style.display = "block";
+    const x = Math.min(e.clientX + 14, window.innerWidth - tip.offsetWidth - 12);
+    const y = Math.min(e.clientY + 14, window.innerHeight - tip.offsetHeight - 12);
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  });
+
+  /* ---------- footer ---------- */
+  function renderFoot() {
+    $("footsuite").textContent = `${run.suite} · run ${run.run_id}` + (run.host ? ` · ${run.host}` : "");
+    $("genline").textContent = `generated ${DATA.generated_at} · bench/report/generate_report.py · ${DATA.runs.length} runs embedded`;
+  }
+
+  /* ---------- control wiring ---------- */
+  // 2-column query grid: default on for wide viewports, toggleable.
+  let twoCol = window.innerWidth >= 1100;
+  function applyCols() {
+    document.body.classList.toggle("twocol", twoCol);
+    $("colbtn").textContent = twoCol ? "2 col" : "1 col";
+    $("colbtn").classList.toggle("active", twoCol);
+  }
+  $("colbtn").onclick = () => { twoCol = !twoCol; applyCols(); };
+  applyCols();
+
+  $("scalebtn").onclick = () => {
+    logScale = !logScale;
+    $("scalebtn").textContent = logScale ? "log" : "linear";
+    $("scalebtn").classList.toggle("active", logScale);
+    renderQueries();
+  };
+  $("sortsel").onchange = (e) => { sortMode = e.target.value; renderQueries(); };
+  $("basesel").onchange = (e) => { baseline = e.target.value; renderQueries(); };
+  $("shotbtn").onclick = () => document.body.classList.toggle("shot");
+
+  function renderAll() {
+    renderMeta(); renderCards(); renderMix(); renderControls(); renderQueries(); renderFoot();
+  }
+  renderAll();
+})();
+</script>
+</body>
+</html>

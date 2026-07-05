@@ -94,6 +94,10 @@ struct RouteDecisionEvent {
 struct RouteExecutionTemplate {
     dsn: String,
     query_text: String, // representative SQL captured per shape for the auto-optimizer
+    // The caller's search_path at capture time — the optimizer replays the
+    // sample under it so unqualified table names (e.g. a tpcds-schema
+    // workload) resolve like they did for the original session.
+    search_path: String,
     backend_pid: i32,
     database_name: String,
     role_name: String,
@@ -272,6 +276,7 @@ fn build_execution_template(
         } else {
             String::new()
         },
+        search_path: crate::duck_backend::guc_setting("search_path").unwrap_or_default(),
         backend_pid: unsafe { pg_sys::MyProcPid },
         database_name: current_database_name().unwrap_or_else(|| "unknown".to_string()),
         role_name: current_user_name().unwrap_or_else(|| "unknown".to_string()),
@@ -564,7 +569,7 @@ fn write_batch(
     let mut executions = 0;
     // One representative SQL per (new) shape, deduped within the batch; upserted AFTER commit
     // (best-effort, autocommit) so a missing route_shape_samples table can't poison the logs.
-    let mut shape_samples: std::collections::HashMap<String, (String, String)> =
+    let mut shape_samples: std::collections::HashMap<String, (String, String, String)> =
         std::collections::HashMap::new();
     for event in batch {
         match event {
@@ -623,7 +628,11 @@ fn write_batch(
                 executions += 1;
                 if !template.query_text.is_empty() && !template.shape_key.is_empty() {
                     shape_samples.entry(template.shape_key.clone()).or_insert_with(|| {
-                        (template.shape_family.clone(), template.query_text.clone())
+                        (
+                            template.shape_family.clone(),
+                            template.query_text.clone(),
+                            template.search_path.clone(),
+                        )
                     });
                 }
             }
@@ -633,12 +642,23 @@ fn write_batch(
 
     // Best-effort, isolated from the committed logs: capture a representative SQL per shape.
     // Each upsert is its own autocommit statement; a missing table just errors harmlessly.
-    for (shape_key, (shape_family, sql)) in shape_samples {
-        let _ = client.execute(
-            "INSERT INTO rvbbit.route_shape_samples (shape_key, shape_family, sql) \
-             VALUES ($1, $2, $3) ON CONFLICT (shape_key) DO NOTHING",
-            &[&shape_key, &shape_family, &sql],
-        );
+    // The search_path column arrives with migration 0128 — fall back to the
+    // 3-column insert on installs that haven't migrated yet.
+    for (shape_key, (shape_family, sql, search_path)) in shape_samples {
+        if client
+            .execute(
+                "INSERT INTO rvbbit.route_shape_samples (shape_key, shape_family, sql, search_path) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (shape_key) DO NOTHING",
+                &[&shape_key, &shape_family, &sql, &search_path],
+            )
+            .is_err()
+        {
+            let _ = client.execute(
+                "INSERT INTO rvbbit.route_shape_samples (shape_key, shape_family, sql) \
+                 VALUES ($1, $2, $3) ON CONFLICT (shape_key) DO NOTHING",
+                &[&shape_key, &shape_family, &sql],
+            );
+        }
     }
     Ok((decisions, executions))
 }

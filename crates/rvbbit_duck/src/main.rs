@@ -102,6 +102,10 @@ struct Args {
     serve: bool,
     serve_socket: Option<String>,
     workers: usize,
+    // Calling Postgres session's search_path (CSV), so unqualified table names
+    // resolve to the same schema PG would pick when the same relname exists in
+    // more than one schema (e.g. public.customer vs tpcds.customer).
+    search_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,7 +805,7 @@ fn run_once_from_args(args: &Args) -> Result<QuerySummary> {
 
     let mut pg = connect_pg(args)?;
     let catalog = rvbbit_row_group_catalog(&mut pg, args)?;
-    ensure_query_tables_authoritative(&mut pg, sql, &catalog)?;
+    ensure_query_tables_authoritative(&mut pg, sql, &catalog, args.search_path.as_deref())?;
     if catalog.is_empty() {
         bail!("no authoritative compacted Rvbbit parquet tables are visible");
     }
@@ -835,6 +839,7 @@ fn run_duck_once(
 ) -> Result<QuerySummary> {
     let con = open_duck(args.threads)?;
     create_duck_views(&con, &catalog)?;
+    apply_duck_search_path(&con, &catalog, args.search_path.as_deref())?;
     let mut explain = con
         .prepare(&format!("EXPLAIN {sql}"))
         .context("preparing DuckDB EXPLAIN")?;
@@ -2918,6 +2923,7 @@ struct ServerRequest {
     max_rows: Option<usize>,
     result_format: Option<String>,
     explain_only: Option<bool>,
+    search_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -3098,6 +3104,7 @@ impl ServerState {
             sql,
             &cache.catalog_fingerprint,
             &catalog,
+            req.search_path.as_deref().or(args.search_path.as_deref()),
         )?;
         cache.apply_route_safety_stats(safety_stats);
         if catalog.is_empty() {
@@ -3124,6 +3131,11 @@ impl ServerState {
             .ok_or_else(|| anyhow!("persistent executor unavailable"))?
         {
             ServerExecutor::Duck(con) => {
+                apply_duck_search_path(
+                    con,
+                    &catalog,
+                    req.search_path.as_deref().or(args.search_path.as_deref()),
+                )?;
                 if explain_only {
                     let mut explain = con
                         .prepare(&format!("EXPLAIN {sql}"))
@@ -3287,10 +3299,14 @@ impl ServerState {
         sql: &str,
         catalog_fingerprint: &str,
         catalog: &BTreeMap<String, RvbbitDuckTable>,
+        search_path: Option<&str>,
     ) -> Result<RouteSafetyStats> {
         let start = Instant::now();
+        // The same SQL can reference different tables under different
+        // search_paths, so the path is part of the cache identity.
+        let cache_key = format!("{}\u{1}{}", search_path.unwrap_or(""), sql);
         if !route_safety_cache_enabled() {
-            ensure_query_tables_authoritative(&mut self.pg, sql, catalog)?;
+            ensure_query_tables_authoritative(&mut self.pg, sql, catalog, search_path)?;
             return Ok(RouteSafetyStats {
                 hit: false,
                 local: false,
@@ -3304,7 +3320,7 @@ impl ServerState {
             self.route_safety_cache.entries.clear();
         }
 
-        if self.route_safety_cache.entries.contains_key(sql) {
+        if self.route_safety_cache.entries.contains_key(&cache_key) {
             return Ok(RouteSafetyStats {
                 hit: true,
                 local: false,
@@ -3317,14 +3333,14 @@ impl ServerState {
         if route_safety_local_enabled() && ensure_query_tables_authoritative_local(sql, catalog) {
             local = true;
         } else {
-            ensure_query_tables_authoritative(&mut self.pg, sql, catalog)?;
+            ensure_query_tables_authoritative(&mut self.pg, sql, catalog, search_path)?;
         }
         let max_entries = route_safety_cache_max_entries();
         if max_entries > 0 {
             if self.route_safety_cache.entries.len() >= max_entries {
                 self.route_safety_cache.entries.clear();
             }
-            self.route_safety_cache.entries.insert(sql.to_string(), ());
+            self.route_safety_cache.entries.insert(cache_key, ());
         }
         Ok(RouteSafetyStats {
             hit: false,
@@ -3834,6 +3850,7 @@ fn parse_args() -> Result<Args> {
     let mut serve = false;
     let mut serve_socket = None;
     let mut serve_derived_socket = false;
+    let mut search_path: Option<String> = None;
     let mut workers = env::var("RVBBIT_DUCK_WORKERS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -3859,6 +3876,7 @@ fn parse_args() -> Result<Args> {
                 result_format = parse_result_format(&need_value(&mut it, "--result-format")?)?
             }
             "--explain-only" => explain_only = true,
+            "--search-path" => search_path = Some(need_value(&mut it, "--search-path")?),
             "--serve" => serve = true,
             "--serve-socket" => serve_socket = Some(need_value(&mut it, "--serve-socket")?),
             "--serve-derived-socket" => serve_derived_socket = true,
@@ -3887,6 +3905,7 @@ fn parse_args() -> Result<Args> {
         serve,
         serve_socket,
         workers,
+        search_path,
     };
 
     if serve_derived_socket {
@@ -4957,7 +4976,27 @@ fn ensure_query_tables_authoritative(
     pg: &mut Client,
     sql: &str,
     catalog: &BTreeMap<String, RvbbitDuckTable>,
+    search_path: Option<&str>,
 ) -> Result<()> {
+    // The safety probe replans the caller's SQL on the sidecar's OWN Postgres
+    // connection — pin it to the caller's search_path so unqualified table
+    // names resolve to the same schema the caller sees (public.customer vs
+    // tpcds.customer). Reset when the caller sent none: this connection is
+    // long-lived, so a previous request's path must never leak.
+    let quoted: Vec<String> = search_path
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
+        .collect();
+    let set_sql = if quoted.is_empty() {
+        "RESET search_path".to_string()
+    } else {
+        format!("SET search_path = {}", quoted.join(", "))
+    };
+    pg.simple_query(&set_sql)
+        .context("pinning search_path for Rvbbit route safety check")?;
     let row = pg
         .query_one("SELECT rvbbit.route_explain($1)::text", &[&sql])
         .context("checking Rvbbit route safety")?;
@@ -5073,6 +5112,41 @@ fn ensure_duck_vortex(con: &Connection) -> Result<()> {
         .context("installing DuckDB vortex extension")?;
     con.execute_batch("LOAD vortex")
         .context("loading DuckDB vortex extension")?;
+    Ok(())
+}
+
+/// Resolve unqualified table names the way the CALLING Postgres session would:
+/// apply its search_path (CSV) to this DuckDB session. Without this, a relname
+/// that exists in more than one schema (e.g. public.customer vs tpcds.customer)
+/// has no unqualified alias view (see create_duck_views) and unqualified SQL
+/// fails with an ambiguity error -> fail-open to native, silently losing the
+/// duck engines. Only schemas present in the catalog are included (DuckDB
+/// errors on unknown schemas) and 'main' is always appended so the unique-name
+/// alias views keep resolving. Applied on EVERY request so a pooled/persistent
+/// session can never leak the previous caller's path.
+fn apply_duck_search_path(
+    con: &Connection,
+    catalog: &BTreeMap<String, RvbbitDuckTable>,
+    requested: Option<&str>,
+) -> Result<()> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(raw) = requested {
+        for entry in raw.split(',') {
+            let name = entry.trim().trim_matches('"').to_string();
+            if name.is_empty() || parts.iter().any(|p| *p == name) {
+                continue;
+            }
+            if catalog.values().any(|t| t.schema == name) {
+                parts.push(name);
+            }
+        }
+    }
+    if !parts.iter().any(|p| p == "main") {
+        parts.push("main".to_string());
+    }
+    let csv = parts.join(",");
+    con.execute_batch(&format!("SET search_path = {}", quote_sql_string(&csv)))
+        .context("applying session search_path to DuckDB")?;
     Ok(())
 }
 

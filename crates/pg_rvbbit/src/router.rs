@@ -2207,19 +2207,49 @@ fn explain_exec_ms(sql: &str) -> Option<f64> {
 /// Force `cand`, then benchmark `sql`: one warmup + `samples` measured runs, median ms. Returns
 /// None if the engine couldn't be exercised (unavailable / timed out / errored every run).
 /// Always restores the prior `route_force_candidate`.
+/// True when a caught bench error left the transaction wedged in parallel
+/// mode. When a benched query runs a parallel plan (EXPLAIN ANALYZE with
+/// Gather workers) and statement_timeout fires mid-execution, the caught
+/// error can leave the leader's parallel-mode counter non-zero — after which
+/// every GUC write in the TRANSACTION fails with 25000 "parameter ... cannot
+/// be set during a parallel operation". The counter is transaction-local, so
+/// the correct response is to STOP the optimizer pass gracefully (the next
+/// call runs in a fresh transaction and is clean) — force-unwinding it with
+/// ExitParallelMode() crashes the backend (verified: SIGSEGV) because live
+/// parallel contexts may still be registered.
+fn parallel_mode_wedged() -> bool {
+    unsafe { pg_sys::IsInParallelMode() }
+}
+
 fn bench_candidate(sql: &str, cand: Candidate, samples: i32) -> Option<f64> {
     let prev = guc_setting("rvbbit.route_force_candidate").unwrap_or_default();
-    if set_route_force_candidate(cand.as_str()).is_err() {
-        return None;
-    }
-    let _ = explain_exec_ms(sql); // warmup
-    let mut times: Vec<f64> = Vec::new();
-    for _ in 0..samples.max(1) {
-        if let Some(ms) = explain_exec_ms(sql) {
-            times.push(ms);
+    // Any PG error while benching ONE candidate — statement timeout on a heavy
+    // shape, an engine hard-error (fail_open is off during optimize), or a bad
+    // logged SQL — must cost only this candidate's timing, never unwind the
+    // whole optimizer pass. The subtransaction rollback also reverts the
+    // force-candidate GUC (GUC assignments are transactional).
+    let sql_owned = sql.to_string();
+    let mut times: Vec<f64> = pgrx::PgTryBuilder::new(move || {
+        if set_route_force_candidate(cand.as_str()).is_err() {
+            return Vec::new();
         }
+        let _ = explain_exec_ms(&sql_owned); // warmup
+        let mut times = Vec::new();
+        for _ in 0..samples.max(1) {
+            if let Some(ms) = explain_exec_ms(&sql_owned) {
+                times.push(ms);
+            }
+        }
+        times
+    })
+    .catch_others(|_| Vec::new())
+    .execute();
+    // NOTE: if the caught error left the txn in parallel mode (see
+    // parallel_mode_wedged), the restore below raises 25000 and unwinds to the
+    // caller's per-shape catch; the optimizer loop then stops gracefully.
+    if !parallel_mode_wedged() {
+        let _ = set_route_force_candidate(&prev);
     }
-    let _ = set_route_force_candidate(&prev);
     if times.is_empty() {
         return None;
     }
@@ -2242,7 +2272,30 @@ fn route_optimize_query(
         return JsonB(json!({"ok": false, "reason": "not a read-only SELECT"}));
     }
     // Backstop so a pathological query can't pin the box during benchmarking.
-    let _ = Spi::run("SET LOCAL statement_timeout = '30s'");
+    // Configurable because heavy warehouse shapes (e.g. TPC-DS Q4-class multi-
+    // fact CTEs) legitimately need ~40s+ on their BEST engine — a too-small
+    // bound means the optimizer can never learn them at all.
+    let bench_timeout_s = guc_setting("rvbbit.route_optimize_timeout_s")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(60);
+    let _ = Spi::run(&format!(
+        "SET LOCAL statement_timeout = '{bench_timeout_s}s'"
+    ));
+    // statement_timeout can't interrupt a blocking sidecar wait — pin the
+    // sidecar's own timeout to the same budget so one heavy candidate can't
+    // hold a bench slot for the sidecar default (300s) per execution.
+    let _ = Spi::run(&format!(
+        "SET LOCAL rvbbit.duck_backend_timeout_s = '{bench_timeout_s}'"
+    ));
+    // NO PG-parallel plans while benching. A statement_timeout firing inside a
+    // parallel EXPLAIN ANALYZE, caught by the per-candidate subtransaction, can
+    // deadlock leader+worker on LWLock/ParallelQueryDSA — uninterruptible
+    // (observed live twice; survives pg_terminate_backend, needs a restart).
+    // Cost: native/pg heap benches lose PG parallel workers (a conservative
+    // bias toward the vectorized engines); duck/DF/GQE parallelize internally
+    // and are unaffected.
+    let _ = Spi::run("SET LOCAL max_parallel_workers_per_gather = 0");
     // Force-fail (no fail-open) while benching: if a forced engine can't actually
     // run this query it must return no timing, not silently fall back to native
     // and record native's latency under the forced engine's name — that would
@@ -2273,6 +2326,13 @@ fn route_optimize_query(
     let log_obs = relations_present(&["rvbbit.route_observations"]);
     let mut results: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
     for cand in Candidate::all() {
+        // Once a caught bench error wedges the txn's parallel state, running
+        // ANOTHER parallel query in it can deadlock on ParallelQueryDSA
+        // (leader+worker stuck on an uninterruptible LWLock — statement_timeout
+        // can't fire; observed live as a 5h hang). Stop benching this shape.
+        if parallel_mode_wedged() {
+            break;
+        }
         if candidate_availability(cand, &features, &tables).0 {
             if let Some(ms) = bench_candidate(sql, cand, samples) {
                 results.insert(cand.as_str().to_string(), ms);
@@ -2397,13 +2457,49 @@ fn route_optimize_auto(
     });
 
     // hot, base-routed shapes that have a captured sample SQL, ranked by potential (freq × latency)
-    let mut candidates: Vec<(String, String)> = Vec::new();
+    // search_path (0128) and last_tested_at/last_result (0129) are added by
+    // migrations; probe so a not-yet-migrated install still optimizes.
+    let extra_cols = Spi::get_one::<i64>(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema='rvbbit' AND table_name='route_shape_samples' \
+           AND column_name IN ('search_path','last_tested_at')",
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+    let has_search_path_col = extra_cols >= 1;
+    let has_test_memory = extra_cols >= 2;
+    let sp_col = if has_search_path_col {
+        "coalesce(s.search_path, '')"
+    } else {
+        "''"
+    };
+    // Test-memory: don't re-bench a shape on every pass. A shape qualifies when
+    // it has never been tested, or its retest cooldown elapsed AND it has
+    // executed again since the last test (c.last_seen is max(executed_at) from
+    // the candidates view). Dormant shapes are never replayed again; active
+    // shapes are revalidated at most once per cooldown window.
+    let retest_hours = guc_setting("rvbbit.route_optimize_retest_hours")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(24);
+    let test_filter = if has_test_memory {
+        format!(
+            "WHERE s.last_tested_at IS NULL \
+                OR (s.last_tested_at < now() - make_interval(hours => {retest_hours}) \
+                    AND c.last_seen > s.last_tested_at)"
+        )
+    } else {
+        String::new()
+    };
+    let mut candidates: Vec<(String, String, String)> = Vec::new();
     let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let rows = client.select(
             &format!(
-                "SELECT c.shape_key, s.sql \
+                "SELECT c.shape_key, s.sql, {sp_col} \
                  FROM rvbbit.route_optimization_candidates c \
                  JOIN rvbbit.route_shape_samples s ON s.shape_key = c.shape_key \
+                 {test_filter} \
                  ORDER BY c.potential_ms DESC NULLS LAST \
                  LIMIT {}",
                 top_k.max(1)
@@ -2414,8 +2510,9 @@ fn route_optimize_auto(
         for row in rows {
             let sk: String = row.get(1)?.unwrap_or_default();
             let sql: String = row.get(2)?.unwrap_or_default();
+            let sp: String = row.get(3)?.unwrap_or_default();
             if !sk.is_empty() && !sql.is_empty() {
-                candidates.push((sk, sql));
+                candidates.push((sk, sql, sp));
             }
         }
         Ok(())
@@ -2425,28 +2522,101 @@ fn route_optimize_auto(
     let mut pinned = 0i32;
     let mut errors = 0i32;
     let mut detail: Vec<Value> = Vec::new();
-    for (sk, sql) in candidates {
+    let prev_search_path = guc_setting("search_path").unwrap_or_default();
+    for (sk, sql, sample_sp) in candidates {
         if started.elapsed().as_secs() as i32 >= max_seconds {
             break;
         }
-        let r = route_optimize_query(&sql, samples, 15.0).0;
+        // A prior caught bench error can wedge this transaction in parallel
+        // mode (see parallel_mode_wedged) — every further GUC write would fail,
+        // so stop cleanly with partial results; the next pass starts a fresh
+        // transaction and picks up where the test-memory left off.
+        if parallel_mode_wedged() {
+            detail.push(json!({
+                "note": "pass stopped early: transaction wedged in parallel mode by a caught bench error; remaining shapes deferred to the next pass"
+            }));
+            break;
+        }
+        // Replay each shape under the search_path it was CAPTURED with, so
+        // unqualified table names (e.g. a tpcds-schema workload) resolve like
+        // they did for the original caller instead of 42P01-ing here.
+        let apply_sp = !sample_sp.is_empty() && sample_sp != prev_search_path;
+        if apply_sp {
+            let _ = Spi::run(&format!(
+                "SELECT set_config('search_path', {}, false)",
+                sql_lit(&sample_sp)
+            ));
+        }
+        // One bad logged query (dropped table, changed schema, syntax the
+        // engines reject) must be counted + skipped — never abort the pass.
+        let sql_cl = sql.clone();
+        let r: Value = pgrx::PgTryBuilder::new(move || route_optimize_query(&sql_cl, samples, 15.0).0)
+            .catch_others(|caught| {
+                json!({"ok": false, "reason": format!("shape replay failed: {caught:?}")})
+            })
+            .execute();
+        if apply_sp && !parallel_mode_wedged() {
+            let _ = Spi::run(&format!(
+                "SELECT set_config('search_path', {}, false)",
+                sql_lit(&prev_search_path)
+            ));
+        }
         tested += 1;
         let was_pinned = r.get("pinned").and_then(Value::as_bool).unwrap_or(false);
         if was_pinned {
             pinned += 1;
         }
-        if r.get("ok").and_then(Value::as_bool) != Some(true) {
+        let was_ok = r.get("ok").and_then(Value::as_bool) == Some(true);
+        if !was_ok {
             errors += 1;
+        }
+        // If this shape's bench wedged the txn in parallel mode, NO further
+        // SQL (the UPDATE below, the run-row UPDATE, train) can run — stop.
+        if parallel_mode_wedged() {
+            detail.push(json!({
+                "shape_key": sk,
+                "error": "bench left transaction in parallel mode; pass stopped early",
+            }));
+            break;
+        }
+        if has_test_memory {
+            let result = if was_pinned {
+                format!(
+                    "pinned:{}",
+                    r.get("winner").and_then(Value::as_str).unwrap_or("?")
+                )
+            } else if was_ok {
+                "base_ok".to_string()
+            } else {
+                format!(
+                    "error:{}",
+                    r.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                )
+            };
+            let _ = Spi::run(&format!(
+                "UPDATE rvbbit.route_shape_samples \
+                 SET last_tested_at = now(), last_result = {} WHERE shape_key = {}",
+                sql_lit(&result),
+                sql_lit(&sk),
+            ));
         }
         detail.push(json!({
             "shape_key": sk,
             "pinned": was_pinned,
             "winner": r.get("winner").cloned().unwrap_or(Value::Null),
             "margin_pct": r.get("margin_pct").cloned().unwrap_or(Value::Null),
+            "error": r.get("reason").cloned().unwrap_or(Value::Null),
         }));
     }
 
-    let _ = Spi::run(&format!(
+    let wedged = parallel_mode_wedged();
+    if !wedged {
+        let _ = Spi::run(&format!(
         "UPDATE rvbbit.route_optimize_runs \
          SET finished_at = now(), shapes_tested = {}, pinned = {}, errors = {}, elapsed_sec = {}, \
              detail = {}::jsonb \
@@ -2458,6 +2628,7 @@ fn route_optimize_auto(
         sql_lit(&json!(detail).to_string()),
         run_id,
     ));
+    }
 
     JsonB(json!({
         "ok": true,
@@ -2466,6 +2637,7 @@ fn route_optimize_auto(
         "pinned": pinned,
         "errors": errors,
         "elapsed_sec": started.elapsed().as_secs(),
+        "parallel_mode_wedged": wedged,
     }))
 }
 
@@ -6801,7 +6973,13 @@ fn route_self_train(
     min_samples: default!(i32, "20"),
 ) -> JsonB {
     let optimize = route_optimize_auto(top_k, max_seconds, samples).0;
-    let train = train_route_model(min_samples, true).0;
+    // A wedged (parallel-mode) transaction can't run the trainer's SQL either;
+    // skip it — the next (fresh-transaction) pass trains on the accumulated data.
+    let train = if parallel_mode_wedged() {
+        json!({"status": "skipped", "reason": "transaction wedged in parallel mode by a caught bench error; next pass will train"})
+    } else {
+        train_route_model(min_samples, true).0
+    };
     JsonB(json!({ "status": "ok", "optimize": optimize, "train": train }))
 }
 

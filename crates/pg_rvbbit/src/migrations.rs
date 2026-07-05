@@ -529,6 +529,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0127_route_self_train_binding",
         include_str!("../sql/migrations/0127_route_self_train_binding.sql"),
     ),
+    (
+        "0128_route_shape_samples_search_path",
+        include_str!("../sql/migrations/0128_route_shape_samples_search_path.sql"),
+    ),
+    (
+        "0129_route_shape_samples_test_memory",
+        include_str!("../sql/migrations/0129_route_shape_samples_test_memory.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
