@@ -29,6 +29,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
+    # Without this, a host reboot (or docker daemon restart) leaves the whole
+    # stack headless: lens/warren restart but postgres stays down and warren
+    # crash-loops. Found live in the v3.0.0 fresh-deploy test.
+    restart: unless-stopped
 
   # One-shot: apply stacked schema migrations on EVERY `up`. First boot already
   # migrates via docker-entrypoint-initdb.d, but initdb only runs on an EMPTY

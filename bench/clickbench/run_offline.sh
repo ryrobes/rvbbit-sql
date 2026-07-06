@@ -982,6 +982,13 @@ if [ "${GQE_IMAGE_SELECTED}" = "1" ] && ! gqe_rebuild_mode_is_full; then
     # that means a multi-hour CUDA/RAPIDS toolchain build, so refresh/default
     # mode makes implicit builds impossible. Full mode remains explicit.
     UP_BUILD_ARGS+=(--no-build)
+    # --no-build must not strand a fresh box that has never built the BENCH
+    # image (observed on a clean deploy: "No such image: docker-bench").
+    # Build just that one explicitly; it never triggers the CUDA toolchain.
+    if ! docker image inspect docker-bench >/dev/null 2>&1; then
+        say "building missing bench image (no-build mode active for GQE)"
+        ${COMPOSE} --profile bench build bench
+    fi
 fi
 
 say "starting competitor containers (profile=bench)"

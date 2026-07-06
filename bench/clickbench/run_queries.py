@@ -28,6 +28,7 @@ from runners import (  # noqa: E402
     run_clickhouse,
     run_duckdb,
     run_pg,
+    run_sirius,
     runner_for,
 )
 
@@ -83,6 +84,10 @@ def run_one(system: str, sql: str, qid: str) -> tuple[float | None, str]:
                 return None, f"skip: {skip_reason}"
         if system == "duckdb":
             return run_duckdb(sql, REPEATS), "ok"
+        if system == "sirius":
+            # GPU duckdb (sirius extension) over the SAME rvbbit parquet row
+            # groups, via the shim in the rvbbit-sirius container.
+            return run_sirius(sql, REPEATS), "ok"
         if system == "clickhouse":
             return run_clickhouse(sql, REPEATS), "ok"
         if system == "rvbbit":

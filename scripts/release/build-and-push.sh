@@ -308,15 +308,33 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
 Fresh box (CPU):
     RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.release.yml up -d
 
-Fresh box (NVIDIA GPU — needs driver + nvidia-container-toolkit):
-    # one-time GQE engine build from the published base (~hours, cached after):
+Fresh box (NVIDIA GPU) — PREFLIGHT first (validated on GCP g4/Blackwell):
+    # 1. driver present? (if not: install + REBOOT — modprobe alone leaves
+    #    NVML "driver/library version mismatch")
+    nvidia-smi -L || { sudo apt-get install -y nvidia-driver-580-open nvidia-utils-580 && sudo reboot; }
+    # 2. docker GPU runtime present? (if not: nvidia-container-toolkit)
+    docker info --format '{{json .Runtimes}}' | grep -q nvidia || {
+      # add NVIDIA's apt repo, then:
+      sudo apt-get install -y nvidia-container-toolkit
+      sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker; }
+    # 3. sanity: GPU visible inside the release image
+    docker run --rm --gpus all ghcr.io/ryrobes/rvbbit-postgres:${VERSION} nvidia-smi -L
+    # 4. one-time GQE engine build from the published base (~1-2h, cached after):
     RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.release.yml -f docker-compose.release-gqe.yml build postgres
     RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.release.yml -f docker-compose.release-gqe.yml up -d
 
 Turnkey (lens + warren + bootstrap + capabilities):
     RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.uber.yml up -d
 
+Your first accelerated table (the part everyone hits):
+    psql postgresql://postgres:rvbbit@localhost:55433/rvbbit
+    CREATE TABLE t USING rvbbit AS SELECT ...;   -- note: USING rvbbit
+    SELECT rvbbit.refresh_acceleration('t'::regclass, true);
+    -- plain-heap tables work normally but are not accelerated;
+    -- refresh_acceleration on one errors with "not an rvbbit table".
+
 Notes:
+- If docker requires sudo: sudo usermod -aG docker \$USER (re-login).
 - First boot creates the extension and applies all schema migrations
   (including the factory-trained routing models). The 'migrate' one-shot
   service re-applies pending migrations on every 'up', so image upgrades over

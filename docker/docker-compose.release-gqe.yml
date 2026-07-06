@@ -43,6 +43,10 @@ services:
     environment:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      # NVSHMEM VMM: =1 (disable) is required on some older cards, but BREAKS
+      # Blackwell (InitNvshmem: pgas_memory_resource allocation failed ->
+      # every GQE query times out + falls back). On Blackwell-class GPUs set
+      # NVSHMEM_DISABLE_CUDA_VMM=0 (validated: RTX PRO 6000 / driver 580).
       NVSHMEM_DISABLE_CUDA_VMM: ${NVSHMEM_DISABLE_CUDA_VMM:-1}
       NVSHMEM_SYMMETRIC_SIZE: ${NVSHMEM_SYMMETRIC_SIZE:-6G}
       GQE_MAX_QUERY_MEMORY: ${GQE_MAX_QUERY_MEMORY:-6442450944}

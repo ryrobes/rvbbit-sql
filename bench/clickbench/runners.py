@@ -335,6 +335,34 @@ def run_duckdb(sql: str, repeat: int = 3) -> float:
     return _median_ms(times)
 
 
+def run_sirius(sql: str, repeat: int = 3) -> float:
+    """Sirius (GPU duckdb extension) via the rvbbit_shim.py TCP server running
+    in the sirius container. The shim serves the SAME rvbbit parquet row groups
+    the other engines read (views built from rvbbit.row_groups), so this is an
+    apples-to-apples engine comparison. Timing is measured shim-side (server
+    perf_counter around execute+fetch) to exclude the TCP hop."""
+    import json as _json
+    import socket as _socket
+
+    host = os.environ.get("SIRIUS_SHIM_HOST", "rvbbit-sirius")
+    port = int(os.environ.get("SIRIUS_SHIM_PORT", "7777"))
+    with _socket.create_connection((host, port), timeout=10) as s:
+        s.settimeout(float(os.environ.get("SIRIUS_SHIM_TIMEOUT_S", "300")))
+        s.sendall((_json.dumps({"sql": sql, "repeat": repeat}) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                raise RuntimeError("sirius shim closed connection mid-response")
+            buf += chunk
+    resp = _json.loads(buf)
+    if not resp.get("ok"):
+        raise RuntimeError(f"sirius: {resp.get('error', 'unknown error')}")
+    times = [t / 1000.0 for t in resp["times_ms"]]
+    _record_times(times)
+    return _median_ms(times)
+
+
 def runner_for(system: str) -> Callable[..., float]:
     if system == "rvbbit":
         return lambda sql, repeat=3: run_pg(PG_DSNS["rvbbit"], sql, repeat)
