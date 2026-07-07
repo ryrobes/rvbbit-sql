@@ -541,6 +541,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0130_route_model_factory_seed",
         include_str!("../sql/migrations/0130_route_model_factory_seed.sql"),
     ),
+    (
+        "0131_refresh_same_txn_pending_visibility",
+        include_str!("../sql/migrations/0131_refresh_same_txn_pending_visibility.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
