@@ -1,5 +1,7 @@
 # rvbbit
 
+[![CI](https://github.com/ryrobes/rvbbit-sql/actions/workflows/ci.yml/badge.svg)](https://github.com/ryrobes/rvbbit-sql/actions/workflows/ci.yml)
+
 **The AI primitives Snowflake Cortex and Databricks AI Functions
 didn't ship. In your Postgres.**
 
