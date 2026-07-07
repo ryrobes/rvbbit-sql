@@ -14,13 +14,24 @@ be read from the client machine.
 examples/bigfoot/run_all.sh
 ```
 
-The capability-operator section (`06_capability_operators.sql`) expects these
-Warren packs to be installed:
+The capability-operator section (`06_capability_operators.sql`) expects three
+local-model packs. Installing them is SQL — the packs ship in
+`rvbbit.capability_catalog` and Warren pulls the model, builds the sidecar,
+and registers the operators:
 
-```bash
-make capability-test MANIFEST=capabilities/packs/extract/gliner-medium-v2.1 TARGET='{"capability":true,"docker":true}'
-make capability-test MANIFEST=capabilities/packs/rerank/bge-reranker-v2-m3 TARGET='{"capability":true,"docker":true}'
-make capability-test MANIFEST=capabilities/packs/classify/emotion-distilroberta TARGET='{"capability":true,"docker":true}'
+```sql
+SELECT rvbbit.deploy_catalog_capability(
+  catalog_id      => 'extract/gliner-medium-v2.1',
+  target_selector => '{"capability":true,"docker":true}'::jsonb);
+SELECT rvbbit.deploy_catalog_capability(
+  catalog_id      => 'rerank/bge-reranker-v2-m3',
+  target_selector => '{"capability":true,"docker":true}'::jsonb);
+SELECT rvbbit.deploy_catalog_capability(
+  catalog_id      => 'classify/emotion-distilroberta',
+  target_selector => '{"capability":true,"docker":true}'::jsonb);
+-- watch until all three report 'completed':
+SELECT name, status, coalesce(phase,'') AS phase
+FROM rvbbit.warren_jobs ORDER BY created_at DESC LIMIT 3;
 ```
 
 Set `BIGFOOT_SKIP_CAPABILITIES=1` to run only the non-capability sections.

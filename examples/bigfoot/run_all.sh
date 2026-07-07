@@ -66,11 +66,14 @@ SQL
     cat >&2 <<'EOF'
 
 Missing capability operators for 06_capability_operators.sql.
-Install the required Warren packs first:
+Install the required Warren packs first (plain SQL, via psql):
 
-  make capability-test MANIFEST=capabilities/packs/extract/gliner-medium-v2.1 TARGET='{"capability":true,"docker":true}'
-  make capability-test MANIFEST=capabilities/packs/rerank/bge-reranker-v2-m3 TARGET='{"capability":true,"docker":true}'
-  make capability-test MANIFEST=capabilities/packs/classify/emotion-distilroberta TARGET='{"capability":true,"docker":true}'
+  SELECT rvbbit.deploy_catalog_capability('extract/gliner-medium-v2.1',     '{"capability":true,"docker":true}'::jsonb);
+  SELECT rvbbit.deploy_catalog_capability('rerank/bge-reranker-v2-m3',      '{"capability":true,"docker":true}'::jsonb);
+  SELECT rvbbit.deploy_catalog_capability('classify/emotion-distilroberta', '{"capability":true,"docker":true}'::jsonb);
+
+  -- watch until all three report 'completed':
+  SELECT name, status, coalesce(phase,'') FROM rvbbit.warren_jobs ORDER BY created_at DESC LIMIT 3;
 
 To run only the non-capability notebook sections, set BIGFOOT_SKIP_CAPABILITIES=1.
 EOF
