@@ -24,7 +24,7 @@ unset BENCH_QUERIES
 export RVBBIT_ROUTE_DATAFUSION_VORTEX_ALLOW_TEMPORAL=1
 export RVBBIT_ROUTE_ML_ENABLED=1
 
-export TEST_NAME=gpu_bench_test16
+export TEST_NAME=gpu_bench_test18
 
 #export SKIP_LOAD=1
 unset SKIP_LOAD
@@ -33,11 +33,11 @@ unset SKIP_LOAD
 
 ## --rebuild --reset-rvbbit-extension
 
-export BENCH_LIMIT=5000000
-./bench/clickbench/run_offline.sh --test-name $TEST_NAME
+export BENCH_LIMIT=1000000
+./bench/clickbench/run_offline.sh --test-name $TEST_NAME --rebuild --reset-rvbbit-extension
 
-export TPCH_SCALE=1
+export TPCH_SCALE=0.5
 ./bench/tpch/run_offline.sh --test-name $TEST_NAME
 
-#export TPCDS_SCALE=1
-#./bench/tpcds/run_offline.sh --test-name $TEST_NAME
+export TPCDS_SCALE=0.5
+./bench/tpcds/run_offline.sh --test-name $TEST_NAME
