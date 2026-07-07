@@ -24,3 +24,9 @@ test_runs
 bench/**/*.duckdb
 bench/columnar_comparison/data/
 examples/bigfoot/bigfoot_sightings.csv
+
+# personal scratch + local dev-loop output
+scratch/
+kg-console.log
+local_rebuild*.sh
+cb-*.txt
