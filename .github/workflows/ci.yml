@@ -55,10 +55,11 @@ jobs:
       - name: Install test deps
         run: pip install -q pytest "psycopg[binary]" pyarrow
 
-      # Two tests are deselected: they need path parity between the test
-      # runner and the Postgres container's filesystem (/rvbbit_import direct
-      # parquet import) that only the dev bench container provides. They run
-      # locally via `make test`.
+      # Two tests are excluded (-k, not --deselect: tests/pytest.ini makes
+      # rootdir=tests/ so path-prefixed deselect node IDs never match): they
+      # need path parity between the test runner and the Postgres container's
+      # filesystem (/rvbbit_import direct parquet import) that only the dev
+      # bench container provides. They run locally via `make test`.
       - name: Run acceleration E2E suite
         env:
           RVBBIT_DSN: postgresql://postgres:rvbbit@localhost:55599/bench
@@ -70,8 +71,7 @@ jobs:
             tests/test_acceleration_tombstone_overlay.py \
             tests/test_acceleration_production_edges.py \
             tests/test_acceleration_auto_consolidation.py \
-            --deselect tests/test_acceleration_observability.py::test_direct_canonical_parquet_import_uses_threaded_writer_and_logs_timing \
-            --deselect tests/test_acceleration_auto_consolidation.py::test_rebuild_stages_fold_and_defers_old_file_reap
+            -k "not test_direct_canonical_parquet_import_uses_threaded_writer_and_logs_timing and not test_rebuild_stages_fold_and_defers_old_file_reap"
 
       - name: Stack logs on failure
         if: failure()
