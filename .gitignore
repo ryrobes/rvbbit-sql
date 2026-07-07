@@ -22,3 +22,4 @@ test_runs
 # tpch.duckdb at sf1 alone is ~250MB). *.duckdb isn't caught by *.db above.
 bench/**/*.duckdb
 bench/columnar_comparison/data/
+examples/bigfoot/bigfoot_sightings.csv

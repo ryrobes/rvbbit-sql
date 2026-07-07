@@ -115,6 +115,47 @@ tail progress — watch `docker ps`/load instead). Result:
     should catch InitNvshmem failure and mark the engine unavailable instead
     of letting queries eat the timeout.
 
+## v3.0.1 CPU-only SPOT deploy (n2-standard-48, 2026-07-06)
+
+Fresh SPOT box, docker via get.docker.com, **uber compose + `--profile
+warehouse`**: postgres→lens→warren→bootstrap all healthy first try.
+
+12. **REAL BUG (fixed): capability bootstrap failed on fresh 3.0.1** —
+    `runtimes/python-runtime` probe: the runtime now VALIDATES `code_hash`
+    against the canary code (md5), but warren-agent's probe sent a
+    placeholder (`1111…`) → "code_hash does not match supplied handler code"
+    → bootstrap exit 1 (while the runtime container was healthy and serving).
+    Fixed in `warren/agent/src/main.rs` (precomputed md5 of the canary);
+    needs a warren-agent image republish (validated on-box with a locally
+    built image: bootstrap exit 0, all three capabilities verified).
+13. Warehouse MCP validated over real MCP protocol (streamable HTTP):
+    initialize → session id → tools/list (full catalog) → `run_sql` tool call
+    executes. Bad bearer key → 401. Note: subsequent calls REQUIRE the
+    `mcp-session-id` header from initialize.
+14. `compose down` while capability containers (deployed by warren, outside
+    compose) share the network → "Resource is still in use"; the uber-managed
+    teardown leaves warren-deployed containers running. Fine operationally,
+    but a `rvbbit-uber-teardown` helper would be tidier.
+15. c4-standard-48 SPOT had no quota in us-east4; n2-standard-48 fine.
+16. **REAL BUG (fixed): clickhouse 24.10 exits at startup on fresh boxes** —
+    its entrypoint `chown -R`s /var/lib/clickhouse and dies on our read-only
+    bench-data bind (`user_files/data`): "Read-only file system" → every CH
+    bench query fails with connection errors (seen on BOTH cloud boxes; local
+    long-lived containers predate the behavior). Fix:
+    `CLICKHOUSE_DO_NOT_CHOWN: "1"` on the service (competitors.yml, patched).
+
+### CPU-box results (n2-standard-48 SPOT, ClickBench 5M ×3)
+
+| | clickhouse | **rvbbit** | alloydb | hydra | pg_baseline | citus |
+|---|---|---|---|---|---|---|
+| suite | **2.1s** | 6.2s | 56.8s | 75.4s | 78.8s | 110.4s |
+| geomean | **31ms** | 53ms | 251ms | 424ms | 1.11s | 1.11s |
+
+(CH from a supplemental solo run after the chown fix.) rvbbit engine mix on
+the no-GPU box: duck_vortex 27 / native 14 / duck 2 — zero GQE attempts, the
+default-on gate self-gated exactly as designed. rvbbit ≈ 9× AlloyDB and
+within ~2× of ClickHouse while remaining full Postgres.
+
 ## Bottom line
 
 The shipped "orchestra" works on a virgin cloud box: CPU stack is

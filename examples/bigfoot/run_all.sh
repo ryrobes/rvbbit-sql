@@ -14,6 +14,13 @@ LIVE_ROWS="${BIGFOOT_LIVE_ROWS:-3}"
 TRAIN_ESTIMATORS="${BIGFOOT_TRAIN_ESTIMATORS:-64}"
 TRAIN_SEED="${BIGFOOT_TRAIN_SEED:-13}"
 TRAIN_WAIT="${BIGFOOT_TRAIN_WAIT:-180}"
+CSV_PATH="${BIGFOOT_CSV:-${ROOT}/examples/bigfoot/bigfoot_sightings.csv}"
+CSV_URL="${BIGFOOT_CSV_URL:-https://rvbbit.ai/data/bigfoot_sightings.csv}"
+
+if [[ ! -f "${CSV_PATH}" ]]; then
+  echo "== fetching BFRO sightings CSV (~14MB) -> ${CSV_PATH}"
+  curl -fsSL "${CSV_URL}" -o "${CSV_PATH}"
+fi
 
 run_sql() {
   local file="$1"
@@ -21,6 +28,7 @@ run_sql() {
   echo
   echo "== ${file}"
   psql "${DSN}" \
+    -v "csv_path=${CSV_PATH}" \
     -v "sample_rows=${SAMPLE_ROWS}" \
     -v "classify_rows=${CLASSIFY_ROWS}" \
     -v "extract_rows=${EXTRACT_ROWS}" \

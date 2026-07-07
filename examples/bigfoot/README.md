@@ -104,7 +104,7 @@ and registers the operator, and you watch progress with `rvbbit.training_queue`
 | `07_live_triples_receipts.sql` | Optional live model triples and receipt/cost inspection. |
 | `08_predict_class.sql` | Optional: train a tabular classifier from SQL (needs an `rvbbit-trainer` worker), then predict and evaluate on a holdout. |
 
-Current note: `00_load.sql` uses `psql \copy` with the local path
-`/home/ryanr/csv-files/bigfoot_sightings.csv`. If this demo needs to run on
-another machine, update that path or run the loader from a wrapper that expands
-the path before invoking `psql`.
+The dataset: `run_all.sh` auto-downloads the BFRO sightings CSV (~14MB,
+5,035 rows) from `https://rvbbit.ai/data/bigfoot_sightings.csv` on first run.
+To use a local copy instead, set `BIGFOOT_CSV=/path/to/bigfoot_sightings.csv`
+(or pass `-v csv_path=...` when invoking `00_load.sql` directly).

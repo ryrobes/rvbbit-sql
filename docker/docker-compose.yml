@@ -229,7 +229,7 @@ services:
       - rvbbit_data:/rvbbit_pgdata:ro
       # Mount host CSV directory read-only for benchmarks against
       # real-world datasets (e.g. bigfoot sightings).
-      - /home/ryanr/csv-files:/csv-files:ro
+      - ${RVBBIT_CSV_DIR:-./csv-files}:/csv-files:ro
     working_dir: /bench
     # Idle by default so you can `docker compose exec bench python run.py …`.
     command: ["sleep", "infinity"]

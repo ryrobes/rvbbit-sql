@@ -2966,7 +2966,13 @@ fn probe_runtime(manifest: &Value, result: &DeploymentResult) -> Result<Value> {
         },
         "handler": {
             "name": "warren_probe",
-            "code_hash": "11111111111111111111111111111111",
+            // md5 of the canary `code` below — python-runtime >= 3.0.1 VALIDATES
+            // code_hash against the supplied code (md5 for 32-hex, sha256 for
+            // 64-hex) and rejects placeholders ("code_hash does not match
+            // supplied handler code" — found live on a fresh 3.0.1 deploy).
+            // Recompute if the canary code string ever changes:
+            //   printf 'def run(inputs):\n    return {'"'"'ok'"'"': ...}\n' | md5sum
+            "code_hash": "2f2e8c1670746e8e7f8fd5c2d2adaed8",
             "entrypoint": "run",
             "code": "def run(inputs):\n    return {'ok': bool(inputs.get('ok')), 'runtime': 'python'}\n"
         },

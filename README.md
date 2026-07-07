@@ -75,6 +75,17 @@ queryable. All in your backup.
 
 ## Quick start
 
+The full stack — Postgres 18 + rvbbit, the [Data Rabbit SQL
+Desktop](https://rvbbit.ai/docs/data-rabbit), and the warren capability
+agent — in one line (the script is short; read it first if that's your
+style):
+
+```bash
+curl -fsSL https://rvbbit.ai/install.sh | bash
+```
+
+Just the database, no UI:
+
 ```bash
 docker run -d --name rvbbit \
     -p 55433:5432 \
@@ -86,6 +97,7 @@ psql postgresql://postgres:rvbbit@localhost:55433/demo \
     -c 'SELECT rvbbit.rvbbit_version();'
 ```
 
+Full walkthrough: [rvbbit.ai/docs/quickstart](https://rvbbit.ai/docs/quickstart).
 Tarball + bare-metal install paths are in [PACKAGING.md](./PACKAGING.md).
 
 ## Rvbbit tables: the storage layer that backs all of this
@@ -122,16 +134,21 @@ small point lookups. Runs every TPC-H query the competitors crash on.
 ## Bigfoot demo
 
 If "ticket triage" reads as boring-money, run
-[`make bigfoot-demo`](./docs/BIGFOOT-DEMO.md) — 5,000 BFRO sasquatch
-encounter reports, every semantic primitive exercised on real data,
-no faked outputs. Topic clustering, semantic diff between Texas and
-Washington sightings, k-nearest-neighbor over witness narratives, the
-whole operator stack. ~3 minutes start to finish on a GPU box.
+[`examples/bigfoot/run_all.sh`](./examples/bigfoot/) — 5,000 BFRO
+sasquatch encounter reports (the CSV auto-downloads), every semantic
+primitive exercised on real data, no faked outputs. Topic clustering,
+semantic diff between Texas and Washington sightings,
+k-nearest-neighbor over witness narratives, the whole operator stack.
+Annotated walkthrough:
+[the Bigfoot Field Notebook](https://rvbbit.ai/docs/examples/bigfoot-field-notebook).
+GPU-sidecar variant: [BIGFOOT-DEMO.md](./docs/BIGFOOT-DEMO.md).
 
 ## Documentation
 
-The README is the elevator pitch. Everything serious is in
-[`docs/`](./docs/):
+The README is the elevator pitch. The full guide lives at
+**[rvbbit.ai/docs](https://rvbbit.ai/docs)** — quickstart, semantic SQL,
+acceleration, routing, GPU/GQE, MCP, receipts, all of it. Deeper
+engineering references are in [`docs/`](./docs/):
 
 - **[OPERATORS.md](./docs/OPERATORS.md)** — every flow primitive
   (steps, takes, retry, wards), every templating rule, the full

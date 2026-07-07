@@ -1,0 +1,50 @@
+# Slim GQE *runtime* image — extracts the runtime closure from a previously
+# built fat GQE image (Dockerfile.rvbbit-gqe) onto the published pg-rvbbit
+# base. No compilation happens here; this is a COPY-only stage that turns the
+# ~70GB dev build into a ~8GB publishable image.
+#
+#   docker build -f docker/Dockerfile.rvbbit-gqe-runtime \
+#     --build-arg GQE_FAT_IMAGE=docker-pg-rvbbit-gqe:latest \
+#     --build-arg RVBBIT_BASE_IMAGE=ghcr.io/ryrobes/rvbbit-postgres:3.0.2 \
+#     -t ghcr.io/ryrobes/rvbbit-postgres-gqe:3.0.2 docker/
+#
+# GPU coverage comes from the fat build's arch list (80-real;90-real;100-real;120):
+# every CC 8.0+ card — A100/30-series/40-series (sm_8x runs sm_80 SASS),
+# H100/H200 (90), B100/B200/GB200 (100), RTX 50-series / RTX PRO Blackwell /
+# DGX Spark (120 SASS + PTX forward-compat). Turing and older are not covered
+# (cudf 26.x dropped them).
+
+ARG GQE_FAT_IMAGE=docker-pg-rvbbit-gqe:latest
+ARG RVBBIT_BASE_IMAGE=ghcr.io/ryrobes/rvbbit-postgres:latest
+
+FROM ${GQE_FAT_IMAGE} AS fat
+# gqe-cli carries ~1.5GB of debug symbols; the C++ managers a few MB.
+# libcudf stays unstripped — its bulk is device code, not symbols.
+RUN strip -S /opt/gqe/rust/target/release/gqe-cli \
+             /opt/gqe/build/src/node_manager/gqe_node_manager \
+             /opt/gqe/build/src/task_manager/gqe_task_manager || true
+
+FROM ${RVBBIT_BASE_IMAGE}
+
+# Full conda env: runtime libs (libcudf, nvshmem, grpc, arrow deps) plus the
+# CUDA JIT toolchain (ptxas/nvvm) GQE's MLIR codegen uses at query time.
+COPY --from=fat /conda/envs/gqe /conda/envs/gqe
+
+# Build-tree shared libs the managers link via RPATH — kept at identical paths.
+COPY --from=fat /opt/gqe/build/_deps/arrowflightsql-build/release/ /opt/gqe/build/_deps/arrowflightsql-build/release/
+COPY --from=fat /opt/gqe/build/_deps/nvcomp-src/lib/ /opt/gqe/build/_deps/nvcomp-src/lib/
+
+# The three runtime binaries, at the paths the extension defaults expect.
+COPY --from=fat /opt/gqe/build/src/node_manager/gqe_node_manager /opt/gqe/build/src/node_manager/gqe_node_manager
+COPY --from=fat /opt/gqe/build/src/task_manager/gqe_task_manager /opt/gqe/build/src/task_manager/gqe_task_manager
+COPY --from=fat /opt/gqe/rust/target/release/gqe-cli /opt/gqe/rust/target/release/gqe-cli
+
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV PATH="/conda/envs/gqe/bin:/opt/gqe/rust/target/release:${PATH}"
+ENV LD_LIBRARY_PATH="/conda/envs/gqe/lib:/usr/local/lib"
+ENV RVBBIT_GQE_CLI=/opt/gqe/rust/target/release/gqe-cli
+ENV RVBBIT_GQE_NODE_MANAGER=/opt/gqe/build/src/node_manager/gqe_node_manager
+ENV RVBBIT_GQE_TASK_MANAGER=/opt/gqe/build/src/task_manager/gqe_task_manager
+ENV RVBBIT_GQE_SERVER_URL=http://127.0.0.1:50051
+ENV RVBBIT_GQE_AUTO_START=true

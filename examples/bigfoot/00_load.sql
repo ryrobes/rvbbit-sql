@@ -7,11 +7,18 @@
 \set sample_rows 500
 \endif
 
+-- CSV location: pass -v csv_path=/path/to/bigfoot_sightings.csv, or fetch it:
+--   curl -fsSL https://rvbbit.ai/data/bigfoot_sightings.csv -o bigfoot_sightings.csv
+\if :{?csv_path}
+\else
+\set csv_path 'bigfoot_sightings.csv'
+\endif
+
 \echo
 \echo ====================================================================
 \echo 00. Load full BFRO CSV and build the notebook working table
 \echo ====================================================================
-\echo CSV path: /home/ryanr/csv-files/bigfoot_sightings.csv
+\echo CSV path: :csv_path
 \echo Sample rows for semantic notebook table: :sample_rows
 
 CREATE EXTENSION IF NOT EXISTS pg_rvbbit;
@@ -48,7 +55,7 @@ CREATE TABLE bigfoot.sightings_all (
     sketch text
 ) USING rvbbit;
 
-\copy bigfoot.sightings_all (bfroid, submitted, submitted_date, title, class, month, fixed_month, date, year, fixed_year, season, state, county, locationdetails, nearesttown, nearestroad, observed, alsonoticed, otherwitnesses, otherstories, timeandconditions, environment, url, run_id, run_time, sketch) FROM '/home/ryanr/csv-files/bigfoot_sightings.csv' WITH (FORMAT csv, HEADER true)
+\copy bigfoot.sightings_all (bfroid, submitted, submitted_date, title, class, month, fixed_month, date, year, fixed_year, season, state, county, locationdetails, nearesttown, nearestroad, observed, alsonoticed, otherwitnesses, otherstories, timeandconditions, environment, url, run_id, run_time, sketch) FROM :'csv_path' WITH (FORMAT csv, HEADER true)
 
 CREATE INDEX bigfoot_sightings_all_state_idx ON bigfoot.sightings_all (state);
 CREATE INDEX bigfoot_sightings_all_county_idx ON bigfoot.sightings_all (county);

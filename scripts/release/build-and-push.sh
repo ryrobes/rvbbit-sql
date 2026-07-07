@@ -319,9 +319,11 @@ Fresh box (NVIDIA GPU) — PREFLIGHT first (validated on GCP g4/Blackwell):
       sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker; }
     # 3. sanity: GPU visible inside the release image
     docker run --rm --gpus all ghcr.io/ryrobes/rvbbit-postgres:${VERSION} nvidia-smi -L
-    # 4. one-time GQE engine build from the published base (~1-2h, cached after):
-    RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.release.yml -f docker-compose.release-gqe.yml build postgres
+    # 4. start with the GPU overlay — pulls the prebuilt GQE image (~9GB,
+    #    covers all CUDA CC 8.0+ GPUs: RTX 30/40/50-series, A100/H100/B200):
     RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.release.yml -f docker-compose.release-gqe.yml up -d
+    # (building GQE from source instead stays supported — see the comments in
+    #  docker-compose.release-gqe.yml)
 
 Turnkey (lens + warren + bootstrap + capabilities):
     RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.uber.yml up -d

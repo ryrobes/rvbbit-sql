@@ -101,6 +101,11 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.10
+    environment:
+      # The 24.10 entrypoint chown -R's /var/lib/clickhouse and EXITS when it
+      # hits the read-only bench-data bind at user_files/data (fresh boxes;
+      # long-lived local containers predate the behavior). Skip the chown.
+      CLICKHOUSE_DO_NOT_CHOWN: "1"
     container_name: bench-clickhouse
     profiles: ["bench"]
     ports:
