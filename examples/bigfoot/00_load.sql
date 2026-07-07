@@ -55,7 +55,13 @@ CREATE TABLE bigfoot.sightings_all (
     sketch text
 ) USING rvbbit;
 
-\copy bigfoot.sightings_all (bfroid, submitted, submitted_date, title, class, month, fixed_month, date, year, fixed_year, season, state, county, locationdetails, nearesttown, nearestroad, observed, alsonoticed, otherwitnesses, otherstories, timeandconditions, environment, url, run_id, run_time, sketch) FROM :'csv_path' WITH (FORMAT csv, HEADER true)
+-- psql's \copy performs NO variable interpolation (a documented quirk), so
+-- render the command into a temp script with \qecho (which does interpolate)
+-- and execute it with \i.
+\o /tmp/rvbbit_bigfoot_copy.psql
+\qecho '\\copy bigfoot.sightings_all (bfroid, submitted, submitted_date, title, class, month, fixed_month, date, year, fixed_year, season, state, county, locationdetails, nearesttown, nearestroad, observed, alsonoticed, otherwitnesses, otherstories, timeandconditions, environment, url, run_id, run_time, sketch) FROM ' :'csv_path' ' WITH (FORMAT csv, HEADER true)'
+\o
+\i /tmp/rvbbit_bigfoot_copy.psql
 
 CREATE INDEX bigfoot_sightings_all_state_idx ON bigfoot.sightings_all (state);
 CREATE INDEX bigfoot_sightings_all_county_idx ON bigfoot.sightings_all (county);

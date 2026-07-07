@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Everything resolves relative to this script, so it works both from a repo
+# checkout and as a standalone download (curl -fsSL https://rvbbit.ai/bigfoot/run_all.sh):
+# any notebook SQL file not sitting next to it is fetched on first run.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_URL="${BIGFOOT_BASE_URL:-https://rvbbit.ai/bigfoot}"
 DSN="${RVBBIT_DSN:-postgresql://postgres:rvbbit@localhost:55433/bench}"
 SAMPLE_ROWS="${BIGFOOT_SAMPLE_ROWS:-500}"
 CLASSIFY_ROWS="${BIGFOOT_CLASSIFY_ROWS:-250}"
@@ -14,8 +18,18 @@ LIVE_ROWS="${BIGFOOT_LIVE_ROWS:-3}"
 TRAIN_ESTIMATORS="${BIGFOOT_TRAIN_ESTIMATORS:-64}"
 TRAIN_SEED="${BIGFOOT_TRAIN_SEED:-13}"
 TRAIN_WAIT="${BIGFOOT_TRAIN_WAIT:-180}"
-CSV_PATH="${BIGFOOT_CSV:-${ROOT}/examples/bigfoot/bigfoot_sightings.csv}"
+CSV_PATH="${BIGFOOT_CSV:-${SCRIPT_DIR}/bigfoot_sightings.csv}"
 CSV_URL="${BIGFOOT_CSV_URL:-https://rvbbit.ai/data/bigfoot_sightings.csv}"
+
+SQL_FILES=(00_load.sql 01_profile.sql 02_retrieval.sql 03_semantic_map.sql
+           04_knowledge_graph.sql 06_capability_operators.sql
+           07_live_triples_receipts.sql 08_predict_class.sql)
+for f in "${SQL_FILES[@]}"; do
+  if [[ ! -f "${SCRIPT_DIR}/${f}" ]]; then
+    echo "== fetching ${f}"
+    curl -fsSL "${BASE_URL}/${f}" -o "${SCRIPT_DIR}/${f}"
+  fi
+done
 
 if [[ ! -f "${CSV_PATH}" ]]; then
   echo "== fetching BFRO sightings CSV (~14MB) -> ${CSV_PATH}"
@@ -41,7 +55,7 @@ run_sql() {
     -v "train_seed=${TRAIN_SEED}" \
     -v "train_wait_seconds=${TRAIN_WAIT}" \
     "$@" \
-    -f "${ROOT}/examples/bigfoot/${file}"
+    -f "${SCRIPT_DIR}/${file}"
 }
 
 require_capability_operators() {
