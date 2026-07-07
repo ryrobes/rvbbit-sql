@@ -106,30 +106,43 @@ Tarball + bare-metal install paths are in [PACKAGING.md](./PACKAGING.md).
 
 The same engine that hosts the operators also rewrites scans against
 `USING rvbbit` tables through a learned router — picking between
-native PG, DuckDB, DataFusion, and parquet layouts on a per-query
-basis, transparently. The numbers:
+native PG, DuckDB, DataFusion, Vortex layouts, and (when the hardware
+exists) an NVIDIA GPU engine, per query, transparently. The numbers,
+all six systems on one desktop (8-core i7-11700K, RTX 3090 Ti,
+median of 3 runs):
 
-**ClickBench, 10M rows, geomean of 43 queries** (median of 3 runs):
+**ClickBench, 5M rows, 43 queries:**
 
 | System  | geomean | sum of medians | wins (best of 43) |
 |---|---:|---:|---:|
-| **rvbbit** | **80ms** | **8.1s** | **31** |
-| AlloyDB | 231ms | 62.6s | 12 |
-| Hydra | 422ms | 73.4s | 0 |
-| Citus | 1.09s | 118.1s | 0 |
+| **rvbbit** | **46ms** | **3.9s** | **22** |
+| ClickHouse | 53ms | 5.0s | 12 |
+| AlloyDB | 161ms | 37.4s | 9 |
+| Hydra | 293ms | 46.3s | 0 |
+| Citus | 672ms | 67.0s | 0 |
+| Postgres 18 (heap) | 1.06s | 62.6s | 0 |
 
-**TPC-H scale 1, 22 queries, 4-way vs AlloyDB:**
+Yes — faster than ClickHouse on its own benchmark, from inside
+Postgres. The router's picks for those 43 queries: GPU 16,
+Duck/Vortex 12, native scan 12, DataFusion 3.
+
+**TPC-H scale 1, 22 queries:**
 
 | System | geomean | sum of medians | wins | failures |
 |---|---:|---:|---:|---:|
-| **rvbbit** | **66ms** | **1.7s** | **14** | **0** |
-| AlloyDB | 139ms | 11.5s | 8 | 1 |
-| Hydra | 232ms | 8.6s | 0 | 2 |
-| Citus | 804ms | 46.4s | 0 | 2 |
+| ClickHouse | 156ms | 8.8s | 8 | 0 |
+| AlloyDB | 160ms | 9.9s | 6 | 1 |
+| **rvbbit** | **165ms** | **9.0s** | **7** | **0** |
+| Hydra | 306ms | 13.9s | 0 | 1 |
+| Postgres 18 (heap) | 339ms | 15.5s | 1 | 0 |
+| Citus | 776ms | 22.1s | 0 | 0 |
 
-Beats Hydra and Citus consistently across 100k–10M scales. Beats
-AlloyDB on geomean at every scale tested; trades query-by-query on
-small point lookups. Runs every TPC-H query the competitors crash on.
+A statistical three-way tie with ClickHouse and AlloyDB at the top —
+except rvbbit runs all 22 (Q22 kills AlloyDB and Hydra) and remains a
+plain Postgres the whole time. The router even sent two TPC-H queries
+to the ordinary Postgres rowstore, because that *was* the fastest
+engine for them. At 50M rows on a Blackwell GPU box the ClickBench gap
+widens to ~15× over AlloyDB.
 
 [Full benchmark output →](./bench/clickbench/README.md)
 
