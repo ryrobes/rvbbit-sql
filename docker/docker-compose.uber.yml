@@ -103,6 +103,11 @@ services:
     environment:
       <<: *rvbbit-secret-env
       RVBBIT_LENS_HOME: /data
+      # First-boot convenience: seed a working connection to this stack's own
+      # Postgres so the desktop connects with zero typing (server-side
+      # resolution means the service name, not localhost). Only applies when
+      # no connections.json exists yet — user edits/deletions stick.
+      RVBBIT_LENS_SEED_DSN: ${RVBBIT_LENS_SEED_DSN:-postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}}
       RVBBIT_LOCAL_WORK_ROOT: ${RVBBIT_LOCAL_WORK_ROOT:-/data}
       RVBBIT_CAPABILITY_ROOT: ${RVBBIT_CAPABILITY_ROOT:-/usr/share/rvbbit/capabilities}
       RVBBIT_CAPABILITY_CLI: ${RVBBIT_CAPABILITY_CLI:-/usr/share/rvbbit/capabilities/tools/rvbbit-capability}
