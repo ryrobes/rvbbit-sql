@@ -16,14 +16,14 @@ Auth is the connector authorization the user grants once when adding the MCP ser
 ## The three rules baked into the template
 
 1. **Wait for the bridge.** `window.cowork.callMcpTool` is injected a moment after the inline script runs; calling it immediately hangs. `waitForBridge()` polls for it first.
-2. **Minimize round trips, not rows.** Each `callMcpTool` adds ~1.5s of fixed host overhead, and several fired in parallel can hit a concurrency/timeout cap. Compose every piece of a view's data into **one** `run_sql` with `json_build_object`; the database does all the aggregation in ~100ms. `composePayload()` builds that SQL for you.
+2. **One round trip, many flat queries.** Each `callMcpTool` adds ~1.5s of fixed host overhead, and several fired in parallel can hit a concurrency/timeout cap — so `composePayload()` batches every part into **one** `run_sql_multi` call. But each part stays its own FLAT query on the wire: routable by the accelerated engines, visible to the catalog/source map, and individually promotable later. Never hand-write a `json_build_object` payload query.
 3. **Declare the tool.** The fully-qualified `mcp__<server-id>__run_sql` must be listed in the artifact's `mcp_tools`, and the id must match your server.
 
 ## Engine gotchas (rvbbit_native read-only guard)
 
 - `::type` casts are rejected (`unsupported token: ::json`). Use `json_agg` / `row_to_json` bare, or `cast(x as t)` only if unavoidable.
 - Reserved words can't be bare column aliases — `month` fails, use `ym`. Sanity-check aliases you template.
-- Through the bridge, numbers come back as real JSON numbers (`4649793.4`), not the stringified `"4649793.4000"` of raw `run_sql` rows — so no `parseFloat` needed when you go through `composePayload`.
+- Numeric columns may arrive stringified (`"4649793.4000"`) depending on the path — `fmt.*` helpers coerce with `+x`, or `parseFloat` where you do math.
 
 ## Allowed libraries
 
@@ -39,7 +39,7 @@ The sandbox CDN allowlist is integrity-pinned. Only these load; anything else is
 
 Edit only the two marked blocks:
 
-- **EDIT 1 — CONFIG:** set `SERVER_ID`, the title, and the `composePayload({...})` map. Each part is `{ shape:'row'|'list', sql:'select ...' }`. `row` → one object (`row_to_json`), `list` → array preserving the sub-SELECT's `ORDER BY` (`json_agg`).
+- **EDIT 1 — CONFIG:** set `SERVER_ID`, the title, and the `PARTS` map. Each part is `{ shape:'row'|'list', sql:'select ...' }` — one FLAT query per concern. `row` → first row as an object, `list` → array of row objects (preserves the query's `ORDER BY`).
 - **EDIT 2 — RENDER:** read `p.<name>` (object or array) and lay out KPIs / `chart()` / `table()`.
 
 The `load()` boot logic, bridge helpers, formatters, and chart/table wrappers between the `FRAMEWORK` markers stay as-is.

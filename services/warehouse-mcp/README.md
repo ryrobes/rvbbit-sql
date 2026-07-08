@@ -138,8 +138,11 @@ Its dual-mode data bridge means the *same* artifact runs live in **two places, n
   serves it at `<WAREHOUSE_PUBLIC_URL>/d/<slug>` behind the login cookie, and injects
   `rvbbitQuery()` (→ `/api/d/<slug>/q`, read-only on the mirror, logged to `mcp_activity`).
 
-Key rule: compose each view into **one** `run_sql` via `composePayload` (each bridge call has
-~1.5s overhead; the DB aggregates in ~100ms). Never bake data in — that's a 'dead tree'.
+Key rule: one **flat** query per data concern in the `composePayload` parts map — the framework
+batches them into **one** `run_sql_multi` round trip (each bridge call has ~1.5s overhead), but
+each query stays flat on the wire: routable by the accelerated engines, visible to the catalog,
+and individually promotable. Never hand-write a `json_build_object` payload query, and never
+bake data in — that's a 'dead tree'.
 Tools: `dashboard_template` / `publish_dashboard` / `update_dashboard` / `list_dashboards` /
 `get_dashboard`. Tables auto-create on startup (no migration). Design: [`docs/DASHBOARDS_PLAN.md`](../../docs/DASHBOARDS_PLAN.md).
 

@@ -1827,6 +1827,24 @@ def tool_run_sql(sql: str, as_of=None, limit=None) -> dict:
             "as_of_applied": as_of}
 
 
+def tool_run_sql_multi(queries, as_of=None, limit=None) -> dict:
+    """Governed read-only BATCH: many named FLAT queries, one round trip.
+    This exists so dashboards/apps never glue multi-concern payloads together
+    inside SQL (top-level json_build_object) just to save bridge calls — each
+    concern stays a flat rowset the router can accelerate, the catalog can
+    mine, and Promote can later lift into a metric/cube. Per-query errors are
+    isolated under their name; one bad query doesn't sink the batch."""
+    if not isinstance(queries, dict) or not queries:
+        return {"error": {"code": "BAD_QUERIES",
+                          "message": "queries must be a non-empty {name: sql} object"}}
+    if len(queries) > 24:
+        return {"error": {"code": "TOO_MANY_QUERIES", "message": "max 24 queries per batch"}}
+    t0 = time.time()
+    results = {str(name): tool_run_sql(sql, as_of, limit) for name, sql in queries.items()}
+    return {"results": results, "elapsed_ms": int((time.time() - t0) * 1000),
+            "as_of_applied": as_of}
+
+
 # ── activity log (audit + a substrate for usage-learning) ────────────────────
 # Every tool call is recorded to a system table: who (the token's email), the tool,
 # the args (incl. the SQL/query), outcome, the objects it touched, rows, engine, ms.
@@ -1916,6 +1934,11 @@ def _summary(tool, res):
     if tool == "run_sql":
         return {"columns": [c.get("name") for c in res.get("columns", [])],
                 "row_count": res.get("row_count"), "truncated": res.get("truncated")}
+    if tool == "run_sql_multi":
+        rs = res.get("results") or {}
+        return {"queries": {k: {"row_count": (v or {}).get("row_count"),
+                                "error": bool((v or {}).get("error"))}
+                            for k, v in rs.items()}}
     if tool == "metric":
         return {"result": res.get("result")}
     if tool == "validate_sql":
@@ -3275,9 +3298,11 @@ def _mcp_publish_dashboard(name, html, team=None, description=None, kind="live")
     """Persist a dashboard so it lives + works OUTSIDE Cowork (a shareable URL + the lens app).
     Build `html` from the `dashboard_template` boilerplate (call that tool FIRST): it gets LIVE
     data through Cowork's callMcpTool→run_sql bridge in-app, and the host's injected rvbbitQuery
-    when served — the SAME artifact works both places, no login. Compose each view into ONE
-    run_sql (composePayload). NEVER bake query results into the HTML — that's a 'dead tree' with
-    no live data or inspectability."""
+    when served — the SAME artifact works both places, no login. Keep each data concern its
+    OWN FLAT query in the composePayload parts map — the framework batches them into ONE
+    run_sql_multi round trip. NEVER hand-write a json_build_object payload query (it hides the
+    SQL from the catalog and the accelerated engines), and NEVER bake query results into the
+    HTML — that's a 'dead tree' with no live data or inspectability."""
     return _logged("publish_dashboard", {"name": name, "team": team, "kind": kind, "html_bytes": len(html or "")},
                    lambda: tool_publish_dashboard(name, html, team, description, kind))
 
@@ -3419,8 +3444,10 @@ def tool_dashboard_template():
         "template_html": html,
         "how_to_use": [
             "Set SERVER_ID to the <id> in your `mcp__<id>__run_sql` tool name.",
-            "Compose ALL of a view's data into ONE run_sql via composePayload() — each callMcpTool "
-            "adds ~1.5s host overhead; the DB aggregates the whole payload in ~100ms.",
+            "Give composePayload() one FLAT sub-SELECT per data concern — it batches them into ONE "
+            "run_sql_multi round trip (each callMcpTool adds ~1.5s host overhead, so ONE call — but "
+            "each query stays flat/inspectable on the wire; never hand-write a json_build_object "
+            "payload query).",
             "Edit only the two `>>> EDIT` blocks (CONFIG: title + composePayload map; RENDER: KPIs / "
             "chart() / table()). Leave everything between the FRAMEWORK markers as-is.",
             "Live data is the Cowork callMcpTool→run_sql bridge (authed by the connector you already "
@@ -3689,6 +3716,9 @@ def _register(mcp):
     mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(
         "run_sql", {"sql": sql, "as_of": as_of, "limit": limit},
         lambda: tool_run_sql(sql, as_of, limit)))
+    mcp.tool(name="run_sql_multi")(lambda queries, as_of=None, limit=None: _logged(
+        "run_sql_multi", {"queries": queries, "as_of": as_of, "limit": limit},
+        lambda: tool_run_sql_multi(queries, as_of, limit)))
     mcp.tool(name="publish_dashboard")(_mcp_publish_dashboard)
     mcp.tool(name="update_dashboard")(_mcp_update_dashboard)
     mcp.tool(name="list_dashboards")(_mcp_list_dashboards)
@@ -3742,7 +3772,8 @@ _INSTRUCTIONS = (
     "and operator breadcrumbs from the same Brain corpus the SQL Desktop shows. "
     "TO BUILD A LIVE APP: call `live_app_template(runtime_kind='html')` FIRST, edit the template, "
     "and call create_live_app. Hosted HTML apps live at /d/<slug>, are versioned, and call "
-    "rvbbitQuery(sql) for live read-only data; compose each view into ONE run_sql-shaped query. "
+    "rvbbitQuery(sql) for live read-only data — one FLAT query per data concern (batch them with "
+    "run_sql_multi in-Cowork; never assemble app JSON inside SQL with json_build_object). "
     "Use list_live_apps, get_live_app, update_live_app, live_app_logs, and debug_live_app to "
     "maintain them. For Python FastAPI apps, call start_live_app to run the current version under "
     "local uvicorn, stop_live_app to stop it, live_app_status to inspect runner state, and "

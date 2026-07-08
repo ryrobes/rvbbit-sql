@@ -17,8 +17,9 @@
   THREE RULES (each one cost us a debugging round; don't skip):
    1) WAIT FOR THE BRIDGE. window.cowork.callMcpTool is injected a beat after
       the inline script runs. Calling it immediately hangs. waitForBridge() polls.
-   2) MINIMIZE ROUND TRIPS, NOT ROWS. Each callMcpTool adds ~1.5s host overhead;
-      several in parallel can trip a concurrency/timeout cap. Compose ALL of a
+   2) ONE ROUND TRIP, MANY FLAT QUERIES. Each callMcpTool adds ~1.5s host overhead,
+      so composePayload batches all parts into one run_sql_multi call — but every
+      part stays its own FLAT query (never hand-write a json_build_object payload).
       view's data into ONE run_sql via json_build_object and make a single call.
       The DB does the work in ~100ms regardless.
    3) DECLARE THE TOOL. The fully-qualified 'mcp__<server-id>__run_sql' must be
@@ -89,7 +90,7 @@
 <body>
 <div class="wrap">
   <h1 id="title">Dashboard</h1>
-  <p class="subtitle" id="subtitle">Live via <code>callMcpTool → run_sql</code></p>
+  <p class="subtitle" id="subtitle">Live via <code>run_sql_multi</code> — flat queries, one round trip</p>
   <div class="status" id="status"><span class="dotp"></span><span id="statustext">connecting…</span><button class="btn" id="reload">Reload</button></div>
   <div id="root"></div>
 </div>
@@ -142,17 +143,44 @@ function makeRunSql(serverId){
     return data.rows || [];
   };
 }
-/* Compose many sub-SELECTs into ONE round trip.
+/* Fetch many sub-SELECTs in ONE round trip — WITHOUT gluing them into a single
+   json_build_object mega-query. Each part stays a FLAT query on the wire, so the
+   warehouse can route it to the accelerated engines, the catalog can mine it, and
+   a human can open/promote any single query later.
    parts = { name: {sql:'select ...', shape:'row'|'list'} }
-   shape 'row'  -> single object   (row_to_json)
-   shape 'list' -> array of objects (json_agg, preserves the sub-SELECT's ORDER BY)
-   returns: { name: object|array, ... } */
-function composePayload(parts){
-  const entries = Object.entries(parts).map(([k,v])=>{
-    const wrap = v.shape==='row' ? 'row_to_json(t)' : 'json_agg(t)';
-    return `'${k}', (select ${wrap} from (${v.sql}) t)`;
-  });
-  return `select json_build_object(${entries.join(',\n')}) as payload`;
+   shape 'row'  -> single object (first row) ; 'list' -> array of objects
+   returns: Promise<{ name: object|array, ... }> */
+async function composePayload(parts){
+  const names = Object.keys(parts);
+  const byName = {};
+  if(typeof window.rvbbitQuery==='function' && !(window.cowork && window.cowork.callMcpTool)){
+    /* hosted /d/<slug>: the injected bridge is a direct host call — run in parallel */
+    const settled = await Promise.all(names.map(n=>window.rvbbitQuery(parts[n].sql)));
+    names.forEach((n,i)=>byName[n]=rowsToObjects(settled[i]));
+  } else {
+    const queries = {}; names.forEach(n=>queries[n]=parts[n].sql);
+    let data = null;
+    try{
+      const r = await window.cowork.callMcpTool('mcp__'+SERVER_ID+'__run_sql_multi', { queries });
+      if(!(r && r.isError)){
+        data = r && r.structuredContent;
+        if(!data && r && r.content && r.content[0] && r.content[0].text) data = JSON.parse(r.content[0].text);
+      }
+    }catch(e){ data = null; }
+    if(data && data.results){
+      for(const n of names){
+        const one = data.results[n]||{};
+        if(one.error) throw new Error('QUERY_ERROR ['+n+']: '+String(one.error.message||JSON.stringify(one.error)).slice(0,200));
+        byName[n]=rowsToObjects(one);
+      }
+    } else {
+      /* older server without run_sql_multi: sequential flat calls (slower, still never a mega-query) */
+      for(const n of names) byName[n]=rowsToObjects(await runSql(parts[n].sql));
+    }
+  }
+  const payload={};
+  names.forEach(n=>{ const rows=byName[n]||[]; payload[n]=parts[n].shape==='row'?(rows[0]||null):rows; });
+  return payload;
 }
 
 /* --- chart + table helpers (thin wrappers over Chart.js / Grid.js) --- */
@@ -178,10 +206,11 @@ const SERVER_ID = 'REPLACE_WITH_YOUR_SERVER_ID';   // <-- the <id> from your `mc
 const runSql = makeRunSql(SERVER_ID);
 
 $('title').textContent = 'Marketing Attribution — live demo';
-$('subtitle').innerHTML = 'One <code>callMcpTool → run_sql</code> round trip · <code>marts.mart_blended_cac_by_channel</code> + <code>marts.mart_unified_leads_rebuilt</code>';
+$('subtitle').innerHTML = 'Flat queries · one <code>run_sql_multi</code> round trip · <code>marts.mart_blended_cac_by_channel</code> + <code>marts.mart_unified_leads_rebuilt</code>';
 
-/* All of this view's data, composed into ONE query. Add/remove parts freely. */
-const PAYLOAD_SQL = composePayload({
+/* One FLAT query per data concern — the framework batches them into ONE round
+   trip. Add/remove parts freely; never merge concerns into one JSON query. */
+const PARTS = ({
   kpi: { shape:'row', sql:`
     select sum(revenue_booked) revenue, sum(spend) spend, sum(students_enrolled) students,
            sum(leads_submitted) leads,
@@ -257,10 +286,10 @@ async function load(){
     await waitForBridge();
     setStatus('running live query…');
     const t0 = performance.now();
-    const rows = await runSql(PAYLOAD_SQL);
+    const payload = await composePayload(PARTS);
     const ms = Math.round(performance.now()-t0);
-    render(rows[0].payload);
-    setStatus(`live · 1 round trip in ${ms} ms · ${new Date().toLocaleTimeString()}`, 'ok');
+    render(payload);
+    setStatus(`live · ${Object.keys(PARTS).length} flat queries · 1 round trip in ${ms} ms · ${new Date().toLocaleTimeString()}`, 'ok');
   }catch(e){
     const msg = e && e.message ? e.message : String(e);
     setStatus('failed: '+msg, 'err');
