@@ -545,6 +545,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0131_refresh_same_txn_pending_visibility",
         include_str!("../sql/migrations/0131_refresh_same_txn_pending_visibility.sql"),
     ),
+    (
+        "0132_gqe_warm_public_tables",
+        include_str!("../sql/migrations/0132_gqe_warm_public_tables.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

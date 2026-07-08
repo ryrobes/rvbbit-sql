@@ -42,6 +42,11 @@ services:
       RVBBIT_GQE_TASK_MANAGER: ${RVBBIT_GQE_TASK_MANAGER:-/opt/gqe/build/src/task_manager/gqe_task_manager}
       RVBBIT_GQE_SERVER_URL: ${RVBBIT_GQE_SERVER_URL:-http://127.0.0.1:50051}
       RVBBIT_GQE_AUTO_START: ${RVBBIT_GQE_AUTO_START:-true}
+      # This overlay IS the explicit GPU opt-in, so enable the GQE router prior:
+      # the accel_tick heartbeat keeps the engine warm (rvbbit.warm_gpu_gqe) and
+      # the router may pick GQE for large shapes without a profile — never cold
+      # (gated on fresh gqe_warm_state). Set to "off" to revert to lazy start.
+      RVBBIT_ROUTE_GPU_GQE_PRIOR: ${RVBBIT_ROUTE_GPU_GQE_PRIOR:-on}
       RVBBIT_GQE_CLIENT_MODE: ${RVBBIT_GQE_CLIENT_MODE:-flight}
       RVBBIT_GQE_FLIGHT_FALLBACK: ${RVBBIT_GQE_FLIGHT_FALLBACK:-true}
       RVBBIT_GQE_ALLOW_RISKY_SHAPES: ${RVBBIT_GQE_ALLOW_RISKY_SHAPES:-}
