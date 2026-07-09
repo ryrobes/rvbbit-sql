@@ -3716,6 +3716,87 @@ def _register(mcp):
     mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(
         "run_sql", {"sql": sql, "as_of": as_of, "limit": limit},
         lambda: tool_run_sql(sql, as_of, limit)))
+
+    # ── tool discovery: search the catalog instead of "tasting" tools ────────
+    # This server exposes ~80 tools; agents burn calls (and context) probing
+    # them one by one. search_tools ranks the catalog for a task description;
+    # get_tool_help returns full descriptions + schemas for the shortlist.
+    # Index is built lazily from the SAME registry agents see (the FastMCP
+    # tool manager), so it can never drift from reality.
+    def _tool_index():
+        out = []
+        for t in mcp._tool_manager.list_tools():
+            params = []
+            try:
+                params = list(((t.parameters or {}).get("properties") or {}).keys())
+            except Exception:
+                pass
+            out.append({"name": t.name, "description": t.description or "", "params": params})
+        return out
+
+    def tool_search_tools(query, limit=8):
+        import re as _re
+        limit = max(1, min(int(limit or 8), 25))
+        index = [t for t in _tool_index() if t["name"] not in ("search_tools", "get_tool_help")]
+        words = [w for w in _re.split(r"[^a-z0-9]+", (query or "").lower()) if len(w) > 1]
+        if not words:
+            names = sorted(t["name"] for t in index)
+            return {"tools": names, "count": len(names),
+                    "hint": "pass a task description, e.g. search_tools('build a live dashboard')"}
+        scored = []
+        for t in index:
+            name_toks = set(_re.split(r"[^a-z0-9]+", t["name"].lower()))
+            desc = t["description"].lower()
+            score = 0
+            for w in words:
+                if w in name_toks:
+                    score += 5
+                elif any(w in nt for nt in name_toks):
+                    score += 3
+                if w in desc:
+                    score += 1
+                if any(w in p.lower() for p in t["params"]):
+                    score += 1
+            if score > 0:
+                scored.append((score, t))
+        scored.sort(key=lambda x: (-x[0], x[1]["name"]))
+        return {
+            "matches": [{
+                "name": t["name"],
+                "score": sc,
+                "description": t["description"].split("\n")[0][:180],
+                "params": t["params"][:10],
+            } for sc, t in scored[:limit]],
+            "hint": "call get_tool_help(names=[...]) for full descriptions and argument schemas; "
+                    "for reads, ONE run_sql (or run_sql_multi) usually beats several small tool calls",
+        }
+
+    def tool_get_tool_help(names):
+        if isinstance(names, str):
+            names = [names]
+        if not isinstance(names, list) or not names:
+            return {"error": {"code": "BAD_NAMES", "message": "names must be a non-empty list of tool names"}}
+        by_name = {}
+        for t in mcp._tool_manager.list_tools():
+            by_name[t.name] = t
+        out, missing = [], []
+        for n in [str(x) for x in names][:16]:
+            t = by_name.get(n)
+            if not t:
+                missing.append(n)
+                continue
+            out.append({"name": t.name, "description": t.description or "", "schema": t.parameters})
+        res = {"tools": out}
+        if missing:
+            res["missing"] = missing
+        return res
+
+    mcp.tool(name="search_tools")(lambda query, limit=8: _logged(
+        "search_tools", {"query": query, "limit": limit},
+        lambda: tool_search_tools(query, limit)))
+    mcp.tool(name="get_tool_help")(lambda names: _logged(
+        "get_tool_help", {"names": names},
+        lambda: tool_get_tool_help(names)))
     mcp.tool(name="run_sql_multi")(lambda queries, as_of=None, limit=None: _logged(
         "run_sql_multi", {"queries": queries, "as_of": as_of, "limit": limit},
         lambda: tool_run_sql_multi(queries, as_of, limit)))
@@ -3770,6 +3851,10 @@ _INSTRUCTIONS = (
     "with validate_sql then run_sql (read-only). Use system_learning_status and ask_system_learning "
     "before tuning or diagnosing RVBBIT workloads: they expose learned routing, acceleration, layout, "
     "and operator breadcrumbs from the same Brain corpus the SQL Desktop shows. "
+    "TOOL DISCOVERY: this server exposes ~80 tools — when unsure which to use, call "
+    "search_tools('what you want to do') and then get_tool_help(names) for the shortlist, instead "
+    "of probing tools one by one. For reads, prefer ONE run_sql / run_sql_multi — nearly everything "
+    "readable here has a SQL analog. "
     "TO BUILD A LIVE APP: call `live_app_template(runtime_kind='html')` FIRST, edit the template, "
     "and call create_live_app. Hosted HTML apps live at /d/<slug>, are versioned, and call "
     "rvbbitQuery(sql) for live read-only data — one FLAT query per data concern (batch them with "
