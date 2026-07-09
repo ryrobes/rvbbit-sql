@@ -24,6 +24,25 @@
 # compose — the extension's GQE routing gate is on by default but self-gates
 # on runtime availability, so a non-GPU box behaves identically either way.
 services:
+  # On every `up`, persist the GQE router-prior GUC to match the overlay env.
+  # The env var alone reaches the Rust router, but rvbbit.warm_gpu_gqe() is
+  # plpgsql and reads only the GUC — without this, heartbeat warm stays
+  # "disabled" even though the overlay asked for it.
+  migrate:
+    command:
+      - -h
+      - postgres
+      - -U
+      - postgres
+      - -d
+      - ${POSTGRES_DB:-rvbbit}
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - CREATE EXTENSION IF NOT EXISTS pg_rvbbit; ALTER EXTENSION pg_rvbbit UPDATE; SELECT rvbbit.migrate();
+      - -c
+      - ALTER SYSTEM SET rvbbit.route_gpu_gqe_prior = '${RVBBIT_ROUTE_GPU_GQE_PRIOR:-on}'; SELECT pg_reload_conf();
+
   postgres:
     image: ${RVBBIT_POSTGRES_GQE_IMAGE:-ghcr.io/ryrobes/rvbbit-postgres-gqe:${RVBBIT_VERSION:-latest}}
     build:
