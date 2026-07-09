@@ -200,11 +200,18 @@ BEGIN
 
     -- Reap old accelerator files only after their metadata swap has committed
     -- and aged past the grace period. This protects readers that planned
-    -- against the previous row-group set while a fold was committing.
+    -- against the previous row-group set while a fold was committing — and,
+    -- once remote engine workers exist, files a warren may be mid-scan on:
+    -- the grace (settings key reap_grace_minutes, default 30) must exceed the
+    -- max remote query time.
     BEGIN
         SELECT to_jsonb(r)
           INTO orphaned_files_reaped
-          FROM rvbbit.reap_orphaned_files() AS r;
+          FROM rvbbit.reap_orphaned_files(
+              make_interval(mins => coalesce((
+                  SELECT (value #>> '{}')::int FROM rvbbit.settings
+                  WHERE key = 'reap_grace_minutes'), 30))
+          ) AS r;
     EXCEPTION WHEN OTHERS THEN
         errors := errors || jsonb_build_array(
             jsonb_build_object('phase', 'reap_orphaned_files', 'error', SQLERRM)

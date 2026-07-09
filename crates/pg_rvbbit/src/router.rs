@@ -205,6 +205,9 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_decisions (
     rewritten     boolean NOT NULL DEFAULT false,
     features      jsonb NOT NULL DEFAULT '{}'::jsonb,
     route_doc     jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- Fleet identity: which node/endpoint executed the candidate (NULL = the
+    -- brain's local engines). Populated once remote warren candidates exist.
+    node          text,
     CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'gpu_gqe', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore')),
     CHECK (confidence IS NULL OR confidence >= 0)
 );

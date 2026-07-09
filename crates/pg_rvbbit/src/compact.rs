@@ -1984,6 +1984,9 @@ fn export_to_parquet_impl_at(
     // Keep-cold: if this table is pinned to a cold tier, re-upload the freshly
     // written local row groups so it stays on object storage automatically.
     crate::storage::maybe_reoffload_cold(rel_oid);
+    // Read fleet: publish the new generation to the shared store (dual-presence
+    // — local files keep serving this node; the published copies serve warrens).
+    crate::storage::maybe_publish(rel_oid);
     let post_export_seconds = elapsed_seconds_since(post_export_start);
 
     update_current_acceleration_phase_details(serde_json::json!({

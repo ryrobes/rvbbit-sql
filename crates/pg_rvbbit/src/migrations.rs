@@ -553,6 +553,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0133_html_block_turn_data_contract",
         include_str!("../sql/migrations/0133_html_block_turn_data_contract.sql"),
     ),
+    (
+        "0134_read_fleet_prework",
+        include_str!("../sql/migrations/0134_read_fleet_prework.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

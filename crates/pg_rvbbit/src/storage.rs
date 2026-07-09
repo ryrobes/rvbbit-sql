@@ -128,6 +128,50 @@ pub(crate) fn maybe_reoffload_cold(rel_oid: u32) {
     .execute();
 }
 
+/// If a publish store is configured (`rvbbit.settings` key `publish_store`) and
+/// the table hasn't opted out, upload the freshly written row groups to shared
+/// object storage — KEEPING local files and local reads (`published_url`, not
+/// `cold_url`). This is the read fleet's publication hook: warrens consume the
+/// published copies; the brain never depends on the network for its own scans.
+/// Best-effort, same contract as maybe_reoffload_cold: a store hiccup logs a
+/// warning and leaves the generation unpublished rather than failing a
+/// compaction that already succeeded.
+pub(crate) fn maybe_publish(rel_oid: u32) {
+    // Tolerate pre-0134 backends (function/table not migrated yet).
+    let has_fn = pgrx::Spi::get_one::<bool>(
+        "SELECT to_regprocedure('rvbbit.publish_row_groups(regclass)') IS NOT NULL",
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if !has_fn {
+        return;
+    }
+    // Cheap pre-check so unconfigured installs pay one indexed SELECT, not a
+    // subtransaction, on every compact.
+    let configured = pgrx::Spi::get_one::<bool>(
+        "SELECT coalesce((value->>'enabled')::boolean, false) \
+         FROM rvbbit.settings WHERE key = 'publish_store'",
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if !configured {
+        return;
+    }
+    pgrx::PgTryBuilder::new(move || {
+        let _ = pgrx::Spi::run(&format!(
+            "SELECT rvbbit.publish_row_groups({rel_oid}::oid::regclass)"
+        ));
+    })
+    .catch_others(move |caught| {
+        pgrx::warning!(
+            "rvbbit: publication for table oid {rel_oid} failed (generation left unpublished; local reads unaffected): {caught:?}"
+        );
+    })
+    .execute();
+}
+
 /// rvbbit.cold_put(local_path, dest_uri) — upload a local row-group file to an
 /// object-store URI (`s3://` / `gs://`); returns bytes uploaded. The WRITE side of
 /// the cold tier for remote prefixes (`rvbbit.migrate_to_cold` keeps `file://` as a
