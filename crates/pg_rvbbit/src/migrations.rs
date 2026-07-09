@@ -549,6 +549,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0132_gqe_warm_public_tables",
         include_str!("../sql/migrations/0132_gqe_warm_public_tables.sql"),
     ),
+    (
+        "0133_html_block_turn_data_contract",
+        include_str!("../sql/migrations/0133_html_block_turn_data_contract.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
