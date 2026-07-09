@@ -58,7 +58,9 @@ services:
       - -v
       - ON_ERROR_STOP=1
       - -c
-      - CREATE EXTENSION IF NOT EXISTS pg_rvbbit; ALTER EXTENSION pg_rvbbit UPDATE; SELECT rvbbit.migrate();
+      - CREATE EXTENSION IF NOT EXISTS pg_rvbbit; SELECT rvbbit.migrate();
+      - -c
+      - ALTER EXTENSION pg_rvbbit UPDATE
     restart: "no"
 
   lens:

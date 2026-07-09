@@ -91,6 +91,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /usr/share/postgresql/18/extension/pg_rvbbit* \
         /usr/share/postgresql/18/extension/
+# Catch-up edges: field databases can be stranded on ANY historical extversion
+# (real schema is maintained by the version-decoupled rvbbit.migrate(); the
+# edge chain is bookkeeping). Old multi-hop edges can collide with
+# migration-created objects ("... is not a member of extension" aborts the
+# whole walk — seen in prod on a 2.2.1 catalog). Emit a direct no-op edge from
+# every known FROM-version to the current default_version: Postgres prefers
+# the shortest path, so ALTER EXTENSION UPDATE is always one safe hop.
+RUN set -e; \
+    EXTDIR=/usr/share/postgresql/18/extension; \
+    DEFVER=$(sed -n "s/^default_version *= *'\(.*\)'/\1/p" $EXTDIR/pg_rvbbit.control); \
+    for f in $EXTDIR/pg_rvbbit--*--*.sql; do \
+        base=$(basename "$f" .sql); vers=${base#pg_rvbbit--}; from=${vers%%--*}; \
+        [ "$from" = "$DEFVER" ] && continue; \
+        edge="$EXTDIR/pg_rvbbit--${from}--${DEFVER}.sql"; \
+        [ -f "$edge" ] || printf '/* no-op catch-up edge to %s: schema is maintained by rvbbit.migrate() */\n' "$DEFVER" > "$edge"; \
+    done
 COPY --from=builder /usr/lib/postgresql/18/lib/pg_rvbbit* \
         /usr/lib/postgresql/18/lib/
 RUN mkdir -p /opt/rvbbit/gqe/bin

@@ -50,7 +50,9 @@ services:
       - -v
       - ON_ERROR_STOP=1
       - -c
-      - CREATE EXTENSION IF NOT EXISTS pg_rvbbit; ALTER EXTENSION pg_rvbbit UPDATE; SELECT rvbbit.migrate();
+      - CREATE EXTENSION IF NOT EXISTS pg_rvbbit; SELECT rvbbit.migrate();
+      - -c
+      - ALTER EXTENSION pg_rvbbit UPDATE
       - -c
       - ALTER SYSTEM SET rvbbit.route_gpu_gqe_prior = '${RVBBIT_ROUTE_GPU_GQE_PRIOR:-on}'
       - -c

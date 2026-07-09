@@ -286,7 +286,8 @@ wait_sql_true "database" "SELECT true;"
 # (route bindings, route_model factory seed, ...). Idempotent no-op otherwise.
 log "applying schema migrations"
 psql "$dsn" -X -v ON_ERROR_STOP=1 -Atq -c \
-    "CREATE EXTENSION IF NOT EXISTS pg_rvbbit; ALTER EXTENSION pg_rvbbit UPDATE; SELECT rvbbit.migrate();" \
+    "CREATE EXTENSION IF NOT EXISTS pg_rvbbit; SELECT rvbbit.migrate();" \
+    -c "ALTER EXTENSION pg_rvbbit UPDATE" \
     | tail -1 | while read -r line; do log "migrate: $line"; done
 
 log "seeding capability catalog"
