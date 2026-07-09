@@ -27,8 +27,19 @@ services:
   # On every `up`, persist the GQE router-prior GUC to match the overlay env.
   # The env var alone reaches the Rust router, but rvbbit.warm_gpu_gqe() is
   # plpgsql and reads only the GUC — without this, heartbeat warm stays
-  # "disabled" even though the overlay asked for it.
+  # "disabled" even though the overlay asked for it. Fully self-contained so
+  # the overlay works over BOTH the release compose (which has a migrate
+  # service) and the uber compose (which doesn't). Each -c is its own
+  # transaction: ALTER SYSTEM refuses to run inside one.
   migrate:
+    image: ${RVBBIT_POSTGRES_GQE_IMAGE:-ghcr.io/ryrobes/rvbbit-postgres-gqe:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-rvbbit}
+    entrypoint: ["psql"]
     command:
       - -h
       - postgres
@@ -41,7 +52,10 @@ services:
       - -c
       - CREATE EXTENSION IF NOT EXISTS pg_rvbbit; ALTER EXTENSION pg_rvbbit UPDATE; SELECT rvbbit.migrate();
       - -c
-      - ALTER SYSTEM SET rvbbit.route_gpu_gqe_prior = '${RVBBIT_ROUTE_GPU_GQE_PRIOR:-on}'; SELECT pg_reload_conf();
+      - ALTER SYSTEM SET rvbbit.route_gpu_gqe_prior = '${RVBBIT_ROUTE_GPU_GQE_PRIOR:-on}'
+      - -c
+      - SELECT pg_reload_conf()
+    restart: "no"
 
   postgres:
     image: ${RVBBIT_POSTGRES_GQE_IMAGE:-ghcr.io/ryrobes/rvbbit-postgres-gqe:${RVBBIT_VERSION:-latest}}
