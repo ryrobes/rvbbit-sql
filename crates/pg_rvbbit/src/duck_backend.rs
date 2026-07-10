@@ -1647,6 +1647,10 @@ fn send_fleet_request(
     threads: usize,
     result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
+    // Fleet transport is ALWAYS inline JSON: arrow_ipc_file hands back a path
+    // on the worker's filesystem, which the brain can't read across machines.
+    // (Arrow Flight replaces this wholesale in the transport productization.)
+    let _ = result_format;
     send_fleet_json(
         endpoint,
         json!({
@@ -1655,7 +1659,7 @@ fn send_fleet_request(
             "timeout_s": timeout,
             "max_rows": max_rows,
             "threads": threads,
-            "result_format": result_format.as_str(),
+            "result_format": SidecarResultFormat::Json.as_str(),
             "search_path": session_search_path_csv(),
         }),
         timeout,
