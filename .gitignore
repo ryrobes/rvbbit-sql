@@ -17,6 +17,7 @@ bench/**/*.db
 bench/**/_SUCCESS
 test_runs
 .firecrawl/
+target-trixie/release
 # Playwright MCP test artifacts (screenshots / page snapshots / console logs)
 .playwright-mcp/
 # Generated/downloaded benchmark data — never commit (GitHub 100MB limit;

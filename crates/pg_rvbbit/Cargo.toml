@@ -42,6 +42,8 @@ datafusion = { workspace = true }
 # register cleanly with its runtime_env. aws/gcp enable the S3 + GCS backends
 # (credentials from env / instance metadata).
 object_store = { version = "0.13", features = ["aws", "gcp"] }
+# dyn-safe ObjectStore calls (delete_stream) need BoxStream construction.
+futures = "0.3"
 url = "2"
 tokio = { workspace = true }
 vortex = { workspace = true }

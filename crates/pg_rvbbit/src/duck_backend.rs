@@ -1288,6 +1288,22 @@ fn run_engine_query(
     threads: usize,
     result_format: SidecarResultFormat,
 ) -> Result<Value, String> {
+    // Fleet mode: an explicit remote engine endpoint overrides BOTH local
+    // topologies (shared daemon / per-backend sidecar) — the request goes to a
+    // rvbbit-duck --serve-tcp worker on another node, which reads PUBLISHED
+    // artifacts from shared object storage. A remote failure falls through to
+    // the normal local paths below — fail-open: a dead warren is a slower
+    // query, never an error the user sees.
+    if let Some(endpoint) = fleet_endpoint() {
+        match send_fleet_request(&endpoint, query, max_rows, timeout, threads, result_format) {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                pgrx::warning!(
+                    "rvbbit: fleet endpoint {endpoint} failed ({err}); falling back to local engine"
+                );
+            }
+        }
+    }
     if shared_enabled() && shared_target_enabled(engine, layout) {
         execute_shared(
             engine,
@@ -1532,6 +1548,154 @@ fn derived_shared_socket_path(dir: &str, key: &DuckSharedKey) -> String {
         dir.trim_end_matches('/'),
         hasher.finish()
     )
+}
+
+/// Fleet mode gate. Resolution order:
+///   1. `SET rvbbit.duck_fleet_endpoint = 'host:port'` — session override/pin
+///      (same pattern as route_force_candidate).
+///   2. The registry (rvbbit.fleet_endpoints): the enabled endpoint whose last
+///      probe succeeded, most recently probed first — so a node that failed
+///      its health check stops receiving work without operator action.
+/// Empty/absent = local execution.
+pub(crate) fn fleet_endpoint() -> Option<String> {
+    let cname = std::ffi::CString::new("rvbbit.duck_fleet_endpoint").ok()?;
+    let ptr = unsafe { pgrx::pg_sys::GetConfigOption(cname.as_ptr(), true, false) };
+    if !ptr.is_null() {
+        let value = unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned() };
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    // Registry fallback — tolerate pre-0136 catalogs. One indexed read per
+    // routed engine query; cheap relative to the scan it precedes.
+    pgrx::Spi::get_one::<String>(
+        "SELECT endpoint FROM rvbbit.fleet_endpoints \
+         WHERE enabled AND last_probe_ok \
+         ORDER BY last_probe_at DESC NULLS LAST, name LIMIT 1",
+    )
+    .ok()
+    .flatten()
+}
+
+/// rvbbit.fleet_probe(name) — send `SELECT 1` through the fleet transport to a
+/// registered endpoint and record the outcome on its registry row. The health
+/// half of the registry: a failed probe takes the node out of the dispatch
+/// rotation (see fleet_endpoint) until a later probe succeeds.
+#[pg_extern]
+fn fleet_probe(node_name: &str) -> pgrx::JsonB {
+    let endpoint = pgrx::Spi::get_one_with_args::<String>(
+        "SELECT endpoint FROM rvbbit.fleet_endpoints WHERE name = $1",
+        &[node_name.into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| pgrx::error!("rvbbit.fleet_probe: unknown fleet node '{node_name}'"));
+    let started = std::time::Instant::now();
+    // prewarm is the health check with teeth: it proves transport, token,
+    // the worker's DSN back to this catalog, AND artifact visibility — not
+    // just a TCP accept. (Plain SELECT 1 would be rejected by the engine's
+    // safety gate anyway: no rvbbit tables referenced.)
+    let result = send_fleet_json(&endpoint, json!({"command": "prewarm"}), 15);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let (ok, error) = match &result {
+        Ok(value) => {
+            let status_ok = value.get("status").and_then(|s| s.as_str()) == Some("ok");
+            if status_ok {
+                (true, None)
+            } else {
+                let err = value
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("engine returned non-ok status")
+                    .to_string();
+                (false, Some(err))
+            }
+        }
+        Err(e) => (false, Some(e.clone())),
+    };
+    let _ = pgrx::Spi::run_with_args(
+        "UPDATE rvbbit.fleet_endpoints \
+         SET last_probe_at = clock_timestamp(), last_probe_ms = $2, \
+             last_probe_ok = $3, last_probe_error = $4 \
+         WHERE name = $1",
+        &[
+            node_name.into(),
+            elapsed_ms.into(),
+            ok.into(),
+            error.clone().into(),
+        ],
+    );
+    pgrx::JsonB(serde_json::json!({
+        "name": node_name,
+        "endpoint": endpoint,
+        "ok": ok,
+        "probe_ms": (elapsed_ms * 10.0).round() / 10.0,
+        "error": error,
+    }))
+}
+
+/// One JSONL request/response over TCP to a fleet engine worker. The shared
+/// token rides in the request body (from the brain's environment, never PG);
+/// the remote's own DSN/catalog resolves paths, so the request carries only
+/// the query envelope — same contract as the local daemon.
+fn send_fleet_request(
+    endpoint: &str,
+    query: &str,
+    max_rows: i32,
+    timeout: i32,
+    threads: usize,
+    result_format: SidecarResultFormat,
+) -> Result<Value, String> {
+    send_fleet_json(
+        endpoint,
+        json!({
+            "sql": query,
+            "repeat": 1,
+            "timeout_s": timeout,
+            "max_rows": max_rows,
+            "threads": threads,
+            "result_format": result_format.as_str(),
+            "search_path": session_search_path_csv(),
+        }),
+        timeout,
+    )
+}
+
+/// Send one JSONL body to a fleet endpoint, injecting the shared token from
+/// the brain's environment. Command bodies (prewarm probes) and query bodies
+/// share this transport.
+fn send_fleet_json(endpoint: &str, mut body: Value, timeout: i32) -> Result<Value, String> {
+    let token = std::env::var("RVBBIT_ENGINE_TOKEN")
+        .map_err(|_| "fleet endpoint configured but RVBBIT_ENGINE_TOKEN is not in the server environment".to_string())?;
+    if let Some(map) = body.as_object_mut() {
+        map.insert("token".to_string(), Value::String(token));
+    }
+    let request = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    let io_timeout = sidecar_io_timeout(timeout);
+    let mut stream = std::net::TcpStream::connect(endpoint)
+        .map_err(|e| format!("connecting to fleet engine {endpoint}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(io_timeout));
+    let _ = stream.set_write_timeout(Some(io_timeout));
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("fleet engine write failed: {e}"))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|e| format!("fleet engine write failed: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("fleet engine flush failed: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    let bytes = reader
+        .read_line(&mut response)
+        .map_err(|e| format!("fleet engine read failed: {e}"))?;
+    if bytes == 0 {
+        return Err("fleet engine returned no response".to_string());
+    }
+    serde_json::from_str(response.trim_end())
+        .map_err(|e| format!("invalid fleet engine JSON: {e}"))
 }
 
 fn send_shared_request(socket_path: &str, request: &str, timeout: i32) -> Result<Value, String> {

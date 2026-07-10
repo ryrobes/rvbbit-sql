@@ -128,6 +128,77 @@ pub(crate) fn maybe_reoffload_cold(rel_oid: u32) {
     .execute();
 }
 
+/// rvbbit.cold_stat(uri) — HEAD an object-store URI, returning its size in
+/// bytes (or erroring if absent). The verification half of eviction and the
+/// read probe of the storage doctor. `file://` stats the local path so the
+/// same SQL works in dev. Read-only; no superuser gate needed.
+#[pg_extern]
+fn cold_stat(uri: &str) -> i64 {
+    if let Some(path) = uri.strip_prefix("file://") {
+        return std::fs::metadata(path)
+            .map(|m| m.len() as i64)
+            .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_stat: stat {path}: {e}"));
+    }
+    let url = Url::parse(uri)
+        .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_stat: bad URI '{uri}': {e}"));
+    let (store, key) =
+        object_store_for(&url).unwrap_or_else(|e| pgrx::error!("rvbbit.cold_stat: {e}"));
+    let size = crate::df::with_lance_runtime(|rt| {
+        rt.block_on(async move {
+            // get_opts(head: true) is the dyn-safe HEAD (`head` is RPITIT —
+            // same reason cold_put uses put_opts).
+            let opts = object_store::GetOptions {
+                head: true,
+                ..Default::default()
+            };
+            store
+                .get_opts(&key, opts)
+                .await
+                .map(|r| r.meta.size as i64)
+                .map_err(|e| e.to_string())
+        })
+    })
+    .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_stat: head '{uri}': {e}"));
+    size
+}
+
+/// rvbbit.cold_delete(uri) — remove an object from the store (or a local file
+/// for `file://`). Superuser-gated like cold_put: this is the destructive half
+/// of republish cleanup and future bucket GC. Returns true when the object was
+/// deleted (idempotent: absent = false, not an error).
+#[pg_extern]
+fn cold_delete(uri: &str) -> bool {
+    if !unsafe { pgrx::pg_sys::superuser() } {
+        pgrx::error!("rvbbit.cold_delete: permission denied — requires superuser");
+    }
+    if let Some(path) = uri.strip_prefix("file://") {
+        return match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => pgrx::error!("rvbbit.cold_delete: unlink {path}: {e}"),
+        };
+    }
+    let url = Url::parse(uri)
+        .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_delete: bad URI '{uri}': {e}"));
+    let (store, key) =
+        object_store_for(&url).unwrap_or_else(|e| pgrx::error!("rvbbit.cold_delete: {e}"));
+    crate::df::with_lance_runtime(|rt| {
+        rt.block_on(async move {
+            // delete_stream is the dyn-safe deletion path (`delete` is RPITIT).
+            use futures::StreamExt;
+            let locations = futures::stream::iter([Ok(key)]).boxed();
+            let mut results = store.delete_stream(locations);
+            match results.next().await {
+                Some(Ok(_)) => Ok(true),
+                Some(Err(object_store::Error::NotFound { .. })) => Ok(false),
+                Some(Err(e)) => Err(e.to_string()),
+                None => Ok(false),
+            }
+        })
+    })
+    .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_delete: delete '{uri}': {e}"))
+}
+
 /// If a publish store is configured (`rvbbit.settings` key `publish_store`) and
 /// the table hasn't opted out, upload the freshly written row groups to shared
 /// object storage — KEEPING local files and local reads (`published_url`, not
@@ -193,6 +264,17 @@ fn cold_put(local_path: &str, dest_uri: &str) -> i64 {
     let data = std::fs::read(local_path)
         .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_put: read {local_path}: {e}"));
     let n = data.len() as i64;
+    // file:// parity with cold_stat/cold_delete — dev + NFS prefixes work
+    // through the same primitive the object-store path uses.
+    if let Some(dest) = dest_uri.strip_prefix("file://") {
+        if let Some(parent) = std::path::Path::new(dest).parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_put: mkdir {}: {e}", parent.display()));
+        }
+        std::fs::write(dest, &data)
+            .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_put: write {dest}: {e}"));
+        return n;
+    }
     let url = Url::parse(dest_uri)
         .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_put: bad URI '{dest_uri}': {e}"));
     let (store, key) =

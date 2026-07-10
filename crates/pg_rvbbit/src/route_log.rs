@@ -88,6 +88,7 @@ struct RouteDecisionEvent {
     rewritten: bool,
     features_json: String,
     route_doc_json: String,
+    node: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +116,10 @@ struct RouteExecutionTemplate {
     rewritten: bool,
     features_json: String,
     route_doc_json: String,
+    // Fleet identity: the remote engine endpoint this query would dispatch to
+    // (NULL = the brain's local engines). Resolved at event-build time in the
+    // backend (the writer thread has no SPI).
+    node: Option<String>,
 }
 
 #[derive(Debug)]
@@ -241,6 +246,7 @@ fn build_event(
         rewritten: template.rewritten,
         features_json: template.features_json,
         route_doc_json: template.route_doc_json,
+        node: template.node,
     })
 }
 
@@ -300,6 +306,11 @@ fn build_execution_template(
             .get("chosen_candidate")
             .and_then(Value::as_str)
             .map(str::to_string),
+        node: route_doc
+            .get("chosen_candidate")
+            .and_then(Value::as_str)
+            .filter(|c| c.starts_with("duck") || c.starts_with("datafusion"))
+            .and_then(|_| crate::duck_backend::fleet_endpoint()),
         profile_name: route_doc
             .get("profile_name")
             .and_then(Value::as_str)
@@ -555,15 +566,15 @@ fn write_batch(
         "INSERT INTO rvbbit.route_decisions \
          (backend_pid, database_name, role_name, query_hash, shape_key, shape_family, \
           route, candidate, profile_name, profile_source, route_source, reason, confidence, \
-          cache_hit, rewritten, features, route_doc) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::text::jsonb, $17::text::jsonb)",
+          cache_hit, rewritten, features, route_doc, node) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::text::jsonb, $17::text::jsonb, $18)",
     )?;
     let execution_stmt = tx.prepare(
         "INSERT INTO rvbbit.route_executions \
          (backend_pid, database_name, role_name, query_hash, shape_key, shape_family, \
           route, candidate, profile_name, profile_source, route_source, reason, confidence, cache_hit, rewritten, \
-          elapsed_ms, rows_returned, status, features, route_doc) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::text::jsonb, $20::text::jsonb)",
+          elapsed_ms, rows_returned, status, features, route_doc, node) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::text::jsonb, $20::text::jsonb, $21)",
     )?;
     let mut decisions = 0;
     let mut executions = 0;
@@ -594,6 +605,7 @@ fn write_batch(
                         &event.rewritten,
                         &event.features_json,
                         &event.route_doc_json,
+                        &event.node,
                     ],
                 )?;
                 decisions += 1;
@@ -623,6 +635,7 @@ fn write_batch(
                         &event.status,
                         &template.features_json,
                         &template.route_doc_json,
+                        &template.node,
                     ],
                 )?;
                 executions += 1;

@@ -253,6 +253,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.route_executions (
     status        text NOT NULL DEFAULT 'ok',
     features      jsonb NOT NULL DEFAULT '{}'::jsonb,
     route_doc     jsonb NOT NULL DEFAULT '{}'::jsonb,
+    node          text,
     CHECK (candidate IS NULL OR candidate IN ('duck_vector', 'duck_hive', 'duck_vortex', 'datafusion_mem', 'datafusion_vector', 'datafusion_hive', 'datafusion_vortex', 'gpu_gqe', 'rvbbit_native', 'rvbbit_native_vortex', 'pg_rowstore')),
     CHECK (confidence IS NULL OR confidence >= 0),
     CHECK (elapsed_ms >= 0),

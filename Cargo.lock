@@ -5592,6 +5592,7 @@ dependencies = [
  "crossbeam-channel",
  "datafusion",
  "fastembed",
+ "futures",
  "jsonwebtoken",
  "lance",
  "lance-index",

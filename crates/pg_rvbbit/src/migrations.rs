@@ -557,6 +557,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0134_read_fleet_prework",
         include_str!("../sql/migrations/0134_read_fleet_prework.sql"),
     ),
+    (
+        "0135_publish_lifecycle",
+        include_str!("../sql/migrations/0135_publish_lifecycle.sql"),
+    ),
+    (
+        "0136_fleet_endpoints",
+        include_str!("../sql/migrations/0136_fleet_endpoints.sql"),
+    ),
+    (
+        "0137_route_executions_node",
+        include_str!("../sql/migrations/0137_route_executions_node.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

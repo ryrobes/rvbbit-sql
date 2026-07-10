@@ -1,0 +1,5 @@
+# DEV-ONLY (uncommitted): fleet token for the read-fleet window/probe testing.
+services:
+  pg-rvbbit:
+    environment:
+      RVBBIT_ENGINE_TOKEN: tok1

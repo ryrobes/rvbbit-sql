@@ -101,6 +101,9 @@ struct Args {
     explain_only: bool,
     serve: bool,
     serve_socket: Option<String>,
+    /// Fleet mode: listen on TCP (host:port) for JSONL requests from a remote
+    /// brain. Requests must carry a "token" matching RVBBIT_ENGINE_TOKEN.
+    serve_tcp: Option<String>,
     workers: usize,
     // Calling Postgres session's search_path (CSV), so unqualified table names
     // resolve to the same schema PG would pick when the same relname exists in
@@ -317,6 +320,13 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if args.serve_tcp.is_some() {
+        if let Err(err) = run_tcp_server(args) {
+            eprintln!("rvbbit-duck tcp server error: {err:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.serve_socket.is_some() {
         if let Err(err) = run_socket_server(args) {
             eprintln!("rvbbit-duck socket server error: {err:#}");
@@ -469,7 +479,9 @@ impl TelemetryConfig {
                 started_nanos
             )
         });
-        let mode = if args.serve_socket.is_some() {
+        let mode = if args.serve_tcp.is_some() {
+            "fleet_tcp"
+        } else if args.serve_socket.is_some() {
             "shared_broker"
         } else if args.serve {
             "local_persistent"
@@ -3494,6 +3506,185 @@ fn run_socket_server(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Fleet TCP server: same JSONL request/response protocol and worker broker as
+/// the Unix-socket server, listening on a TCP address for a REMOTE brain.
+/// Fail-closed auth: refuses to start without RVBBIT_ENGINE_TOKEN, and every
+/// request line must carry a matching "token" field. TLS/mTLS is deliberately
+/// NOT terminated here — run inside a private network (VPC) or behind a mesh;
+/// the brain-as-CA productization replaces this with real channel security.
+fn run_tcp_server(args: Args) -> Result<()> {
+    let addr = args
+        .serve_tcp
+        .as_deref()
+        .ok_or_else(|| anyhow!("--serve-tcp requires host:port"))?;
+    let token = env::var("RVBBIT_ENGINE_TOKEN").unwrap_or_default();
+    if token.trim().is_empty() {
+        bail!("--serve-tcp requires RVBBIT_ENGINE_TOKEN to be set (fail-closed)");
+    }
+    let listener =
+        std::net::TcpListener::bind(addr).with_context(|| format!("binding tcp {addr}"))?;
+    eprintln!("rvbbit-duck fleet server listening on {addr}");
+    let workers = args.workers.max(1);
+    let queue_capacity =
+        env_usize("RVBBIT_DUCK_BROKER_QUEUE", DEFAULT_BROKER_QUEUE_CAPACITY).max(workers);
+    let max_request_bytes = max_request_bytes();
+    let socket_timeout = socket_io_timeout();
+    let default_response_timeout_s = args.timeout_s.max(1);
+    let (tx, rx) = mpsc::sync_channel::<SocketJob>(queue_capacity);
+    let rx = Arc::new(Mutex::new(rx));
+
+    for idx in 0..workers {
+        let worker_args = args.clone();
+        let rx = Arc::clone(&rx);
+        thread::Builder::new()
+            .name(format!("rvbbit-duck-fleet-worker-{idx}"))
+            .spawn(move || {
+                let mut state = match ServerState::new(&worker_args, Some(idx)) {
+                    Ok(state) => state,
+                    Err(err) => {
+                        eprintln!("rvbbit-duck fleet worker startup failed: {err:#}");
+                        return;
+                    }
+                };
+                loop {
+                    let job = {
+                        let guard = match rx.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => return,
+                        };
+                        guard.recv()
+                    };
+                    match job {
+                        Ok(job) => {
+                            BROKER_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                            BROKER_ACTIVE_WORKERS.fetch_add(1, Ordering::Relaxed);
+                            let queue_wait_ms = job.received_at.elapsed().as_secs_f64() * 1000.0;
+                            let response = server_response_json(
+                                &mut state,
+                                &worker_args,
+                                &job.line,
+                                Some(queue_wait_ms),
+                            );
+                            BROKER_ACTIVE_WORKERS.fetch_sub(1, Ordering::Relaxed);
+                            let _ = job.respond.send(response);
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+            .context("spawning rvbbit-duck fleet worker")?;
+    }
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let tx = tx.clone();
+                let token = token.clone();
+                let response_timeout_s = default_response_timeout_s;
+                thread::spawn(move || {
+                    let _ = handle_tcp_client(
+                        stream,
+                        tx,
+                        &token,
+                        max_request_bytes,
+                        socket_timeout,
+                        response_timeout_s,
+                    );
+                });
+            }
+            Err(err) => eprintln!("rvbbit-duck tcp accept failed: {err}"),
+        }
+    }
+    Ok(())
+}
+
+fn handle_tcp_client(
+    mut stream: std::net::TcpStream,
+    tx: mpsc::SyncSender<SocketJob>,
+    token: &str,
+    max_request_bytes: usize,
+    socket_timeout: Duration,
+    default_response_timeout_s: u64,
+) -> Result<()> {
+    let reader_stream = stream.try_clone().context("cloning TCP stream")?;
+    reader_stream
+        .set_read_timeout(Some(socket_timeout))
+        .context("setting tcp read timeout")?;
+    stream
+        .set_write_timeout(Some(socket_timeout))
+        .context("setting tcp write timeout")?;
+    let mut reader = BufReader::new(reader_stream);
+    let line = match read_bounded_line(&mut reader, max_request_bytes) {
+        Ok(Some(line)) => line,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            let error = format_error_chain(&err);
+            let _ = write_socket_response(
+                &mut stream,
+                &json!({"status": "fallback", "error": error}).to_string(),
+            );
+            return Err(err.context("reading tcp request"));
+        }
+    };
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    // Fail-closed request auth: constant shared token, checked before the line
+    // is allowed anywhere near a worker.
+    let authed = serde_json::from_str::<Value>(&line)
+        .ok()
+        .and_then(|v| v.get("token").and_then(Value::as_str).map(str::to_string))
+        .map(|t| t == token)
+        .unwrap_or(false);
+    if !authed {
+        return write_socket_response(
+            &mut stream,
+            &json!({"status": "fallback", "error": "invalid or missing token"}).to_string(),
+        );
+    }
+    let response_timeout = socket_response_timeout_s(&line, default_response_timeout_s);
+    let (respond, response_rx) = mpsc::channel();
+    BROKER_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
+    match tx.try_send(SocketJob {
+        line,
+        received_at: Instant::now(),
+        respond,
+    }) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            BROKER_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+            return write_socket_response(
+                &mut stream,
+                &json!({
+                    "status": "fallback",
+                    "error": "rvbbit-duck broker queue is full"
+                })
+                .to_string(),
+            );
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            BROKER_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+            return write_socket_response(
+                &mut stream,
+                &json!({
+                    "status": "fallback",
+                    "error": "rvbbit-duck broker is shut down"
+                })
+                .to_string(),
+            );
+        }
+    }
+    let response = match response_rx.recv_timeout(Duration::from_secs(response_timeout)) {
+        Ok(response) => response,
+        Err(_) => json!({
+            "status": "fallback",
+            "error": format!("rvbbit-duck worker timed out after {response_timeout}s")
+        })
+        .to_string(),
+    };
+    write_socket_response(&mut stream, &response)
+}
+
 fn remove_stale_socket(socket_path: &Path) -> Result<()> {
     match fs::symlink_metadata(socket_path) {
         Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(socket_path)
@@ -3582,7 +3773,7 @@ fn handle_socket_client(
     Ok(())
 }
 
-fn write_socket_response(stream: &mut UnixStream, response: &str) -> Result<()> {
+fn write_socket_response<W: Write>(stream: &mut W, response: &str) -> Result<()> {
     stream
         .write_all(response.as_bytes())
         .context("writing socket response")?;
@@ -3787,6 +3978,14 @@ fn open_duck(threads: usize) -> Result<Connection> {
     Ok(con)
 }
 
+/// A published object-store URL (vs a brain-local filesystem path).
+fn is_remote_artifact_path(path: &str) -> bool {
+    path.starts_with("s3://")
+        || path.starts_with("gs://")
+        || path.starts_with("http://")
+        || path.starts_with("https://")
+}
+
 /// Fleet remote mode: RVBBIT_SIDECAR_REMOTE=1 — resolve row groups via their
 /// published object-store URLs (rvbbit.row_groups.published_url, migration
 /// 0134) instead of brain-local paths, and skip local-visibility checks for
@@ -3891,6 +4090,7 @@ fn parse_args() -> Result<Args> {
     let mut explain_only = false;
     let mut serve = false;
     let mut serve_socket = None;
+    let mut serve_tcp = None;
     let mut serve_derived_socket = false;
     let mut search_path: Option<String> = None;
     let mut workers = env::var("RVBBIT_DUCK_WORKERS")
@@ -3921,6 +4121,7 @@ fn parse_args() -> Result<Args> {
             "--search-path" => search_path = Some(need_value(&mut it, "--search-path")?),
             "--serve" => serve = true,
             "--serve-socket" => serve_socket = Some(need_value(&mut it, "--serve-socket")?),
+            "--serve-tcp" => serve_tcp = Some(need_value(&mut it, "--serve-tcp")?),
             "--serve-derived-socket" => serve_derived_socket = true,
             "--workers" => workers = need_value(&mut it, "--workers")?.parse()?,
             "-h" | "--help" => {
@@ -3946,6 +4147,7 @@ fn parse_args() -> Result<Args> {
         explain_only,
         serve,
         serve_socket,
+        serve_tcp,
         workers,
         search_path,
     };
@@ -3957,7 +4159,7 @@ fn parse_args() -> Result<Args> {
         args.serve_socket = Some(derived_shared_socket_path(&args)?);
     }
 
-    if !args.serve && args.serve_socket.is_none() && args.sql.is_none() {
+    if !args.serve && args.serve_socket.is_none() && args.serve_tcp.is_none() && args.sql.is_none() {
         bail!("--sql is required unless --serve is set");
     }
     Ok(args)
@@ -4035,6 +4237,7 @@ fn print_help() {
         "rvbbit-duck --sql SQL [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--repeat N] [--timeout-s N] [--threads N] [--max-rows N] [--result-format json|arrow_ipc_file]\n\
          rvbbit-duck --serve [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
          rvbbit-duck --serve-socket PATH [--workers N] [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
+         rvbbit-duck --serve-tcp HOST:PORT [--workers N] [--engine ...] [--dsn DSN]   (fleet mode: requires RVBBIT_ENGINE_TOKEN; requests carry \"token\")\n\
          rvbbit-duck --serve-derived-socket [--workers N] [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
          rvbbit-gqe-bridge --rvbbit-probe\n\
          Server JSONL requests: {{\"sql\":\"SELECT ...\",\"result_format\":\"json|arrow_ipc_file\"}} or {{\"command\":\"prewarm\"}}"
@@ -4476,12 +4679,7 @@ fn rvbbit_row_group_catalog(
         for path in paths {
             // Fleet mode: published object-store URLs pass through as-is —
             // there is no local file to remap or stat on this node.
-            if sidecar_remote_mode()
-                && (path.starts_with("s3://")
-                    || path.starts_with("gs://")
-                    || path.starts_with("http://")
-                    || path.starts_with("https://"))
-            {
+            if sidecar_remote_mode() && is_remote_artifact_path(&path) {
                 mapped.push(path);
                 continue;
             }
@@ -4741,6 +4939,12 @@ fn prewarm_parquet_metadata(
 
     for table in catalog.values().filter(|table| !table_uses_vortex(table)) {
         for path in &table.paths {
+            // Remote (fleet) artifacts can't be stat'ed or footer-read from
+            // local disk — DuckDB's httpfs handles them at query time. Skip
+            // rather than fail; prewarm is an optimization, not a contract.
+            if is_remote_artifact_path(path) {
+                continue;
+            }
             stats.files += 1;
             let (hit, entry) = cache.ensure(path)?;
             if hit {
