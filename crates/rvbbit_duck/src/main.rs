@@ -3753,7 +3753,49 @@ fn open_duck(threads: usize) -> Result<Connection> {
     let con = Connection::open_in_memory().context("opening DuckDB")?;
     con.execute_batch(&format!("PRAGMA threads={}", threads.max(1)))
         .context("setting DuckDB threads")?;
+    // Remote (fleet) mode: this sidecar reads PUBLISHED artifacts from object
+    // storage instead of brain-local files. Configure httpfs from the same
+    // AWS_* env contract the brain's publisher uses (GCS via its S3-interop
+    // endpoint included).
+    if sidecar_remote_mode() {
+        con.execute_batch("INSTALL httpfs; LOAD httpfs;")
+            .context("loading httpfs for remote artifact reads")?;
+        let esc = |s: String| s.replace('\'', "''");
+        if let Ok(ep) = std::env::var("AWS_ENDPOINT") {
+            let host = ep.trim_start_matches("https://").trim_start_matches("http://");
+            con.execute_batch(&format!(
+                "SET s3_endpoint='{}'; SET s3_url_style='path';",
+                esc(host.to_string())
+            ))
+            .context("setting s3 endpoint")?;
+        }
+        if let (Ok(k), Ok(s)) = (
+            std::env::var("AWS_ACCESS_KEY_ID"),
+            std::env::var("AWS_SECRET_ACCESS_KEY"),
+        ) {
+            con.execute_batch(&format!(
+                "SET s3_access_key_id='{}'; SET s3_secret_access_key='{}';",
+                esc(k),
+                esc(s)
+            ))
+            .context("setting s3 credentials")?;
+        }
+        if let Ok(r) = std::env::var("AWS_DEFAULT_REGION") {
+            let _ = con.execute_batch(&format!("SET s3_region='{}';", esc(r)));
+        }
+    }
     Ok(con)
+}
+
+/// Fleet remote mode: RVBBIT_SIDECAR_REMOTE=1 — resolve row groups via their
+/// published object-store URLs (rvbbit.row_groups.published_url, migration
+/// 0134) instead of brain-local paths, and skip local-visibility checks for
+/// remote schemes. This is what lets a warren with no access to the brain's
+/// disk serve queries over the same catalog.
+fn sidecar_remote_mode() -> bool {
+    std::env::var("RVBBIT_SIDECAR_REMOTE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn datafusion_runtime(threads: usize) -> Result<Runtime> {
@@ -4432,6 +4474,17 @@ fn rvbbit_row_group_catalog(
         }
         let mut mapped = Vec::with_capacity(paths.len());
         for path in paths {
+            // Fleet mode: published object-store URLs pass through as-is —
+            // there is no local file to remap or stat on this node.
+            if sidecar_remote_mode()
+                && (path.starts_with("s3://")
+                    || path.starts_with("gs://")
+                    || path.starts_with("http://")
+                    || path.starts_with("https://"))
+            {
+                mapped.push(path);
+                continue;
+            }
             let suffix = path
                 .strip_prefix(&format!("{}/", args.pgdata_prefix.trim_end_matches('/')))
                 .ok_or_else(|| anyhow!("path {path} is outside {}", args.pgdata_prefix))?;
@@ -4509,12 +4562,12 @@ fn catalog_sql_for_layout(layout: &str) -> Result<String> {
     let trimmed = layout.trim();
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
-        "" | "scan" | "canonical" | "default" => Ok(
+        "" | "scan" | "canonical" | "default" => Ok(format!(
             "
             SELECT n.nspname,
                    c.relname,
                    NULL::text AS layout,
-                   array_agg(rg.path ORDER BY rg.rg_id) AS paths,
+                   array_agg({path_expr} ORDER BY rg.rg_id) AS paths,
                    sum(rg.n_rows)::bigint AS row_group_rows,
                    sum(rg.n_bytes)::bigint AS row_group_bytes,
                    pg_relation_size(c.oid)::bigint AS heap_bytes,
@@ -4527,9 +4580,15 @@ fn catalog_sql_for_layout(layout: &str) -> Result<String> {
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE coalesce(t.acceleration_enabled, true)
             GROUP BY n.nspname, c.oid, c.relname, t.shadow_heap_retained, t.shadow_heap_dirty
-            "
-            .to_string(),
-        ),
+            ",
+            path_expr = if sidecar_remote_mode() {
+                // Fleet mode: prefer the published object-store copy; a row
+                // group without one is invisible to this (remote) sidecar.
+                "coalesce(rg.published_url, rg.path)"
+            } else {
+                "rg.path"
+            }
+        )),
         "hive" | "cluster" => {
             let prefix = format!("{lower}:%");
             Ok(variant_catalog_sql(&format!(
@@ -5077,6 +5136,7 @@ fn supported_pg_type(typname: &str) -> bool {
             | "character"
             | "character varying"
             | "date"
+            | "time without time zone"
             | "timestamp without time zone"
             | "timestamp with time zone"
     )
