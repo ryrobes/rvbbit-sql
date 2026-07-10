@@ -569,6 +569,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0137_route_executions_node",
         include_str!("../sql/migrations/0137_route_executions_node.sql"),
     ),
+    (
+        "0138_metadata_maintenance",
+        include_str!("../sql/migrations/0138_metadata_maintenance.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

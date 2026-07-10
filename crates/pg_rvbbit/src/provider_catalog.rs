@@ -116,6 +116,7 @@ DECLARE
     errors jsonb := '[]'::jsonb;
     logs_reaped jsonb := '[]'::jsonb;
     orphaned_files_reaped jsonb := '{}'::jsonb;
+    tombstones_pruned jsonb := '[]'::jsonb;
     cap bigint := greatest(coalesce(max_tables, 0), 0);
 BEGIN
     IF cap = 0 THEN
@@ -126,6 +127,17 @@ BEGIN
             'skipped', 'max_tables is zero'
         );
     END IF;
+
+    -- Keep per-table autovacuum tuning asserted (no-op once applied; picks up
+    -- tables that bootstrap lazily after install). Never stomps operator
+    -- overrides — see rvbbit.tune_metadata_autovacuum.
+    BEGIN
+        PERFORM rvbbit.tune_metadata_autovacuum();
+    EXCEPTION WHEN OTHERS THEN
+        errors := errors || jsonb_build_array(
+            jsonb_build_object('phase', 'tune_metadata_autovacuum', 'error', SQLERRM)
+        );
+    END;
 
     FOR rec IN
         SELECT t.table_oid::regclass AS rel
@@ -198,6 +210,20 @@ BEGIN
         );
     END;
 
+    -- Drop tombstones stranded by generation reaping or trigger-less table
+    -- drops. Cost scales with distinct row groups, not tombstone count.
+    BEGIN
+        SELECT coalesce(
+                   jsonb_agg(jsonb_build_object('table', table_name, 'tombstones', p.tombstones_pruned)),
+                   '[]'::jsonb)
+          INTO tombstones_pruned
+          FROM rvbbit.prune_delete_log() AS p;
+    EXCEPTION WHEN OTHERS THEN
+        errors := errors || jsonb_build_array(
+            jsonb_build_object('phase', 'prune_delete_log', 'error', SQLERRM)
+        );
+    END;
+
     -- Reap old accelerator files only after their metadata swap has committed
     -- and aged past the grace period. This protects readers that planned
     -- against the previous row-group set while a fold was committing — and,
@@ -222,6 +248,7 @@ BEGIN
         'compacted', compacted,
         'refreshed_variants', refreshed,
         'logs_reaped', logs_reaped,
+        'tombstones_pruned', tombstones_pruned,
         'orphaned_files_reaped', coalesce(orphaned_files_reaped, '{}'::jsonb),
         'errors', errors
     );
