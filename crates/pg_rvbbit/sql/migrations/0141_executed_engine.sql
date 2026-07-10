@@ -1,0 +1,21 @@
+-- 0141: truthful placement + engine breadcrumbs.
+--
+-- Two lies fixed in the companion Rust:
+--   1. Fleet workers ran their RESIDENT engine (--engine duck) regardless of
+--      the router's chosen candidate — a datafusion_vector execution on a
+--      warren actually ran DuckDB. The brain now transmits engine/layout in
+--      the fleet request and the worker executes the decision (cross-engine
+--      requests serve via its oneshot path; an engine the host can't run
+--      errors and the brain fails open to local).
+--   2. route_executions.node was re-resolved from the registry at event-build
+--      time; under uniform rotation (0140) that's a second independent draw,
+--      not where the query went. Placement is now captured at dispatch time
+--      and stamped at ExecutorEnd. Decision events no longer carry a
+--      speculative node (placement is unknowable pre-dispatch): decisions
+--      answer "what was chosen", executions answer "where and on what".
+--
+-- executed_engine records the engine the worker REPORTS having used (echoed
+-- in its response; assumed = requested for pre-echo workers). NULL = local
+-- execution, as labeled by `candidate`.
+ALTER TABLE IF EXISTS rvbbit.route_executions
+    ADD COLUMN IF NOT EXISTS executed_engine text;

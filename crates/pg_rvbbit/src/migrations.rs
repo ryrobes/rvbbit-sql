@@ -573,6 +573,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0138_metadata_maintenance",
         include_str!("../sql/migrations/0138_metadata_maintenance.sql"),
     ),
+    (
+        "0139_hare_capsule",
+        include_str!("../sql/migrations/0139_hare_capsule.sql"),
+    ),
+    (
+        "0140_hare_observability",
+        include_str!("../sql/migrations/0140_hare_observability.sql"),
+    ),
+    (
+        "0141_executed_engine",
+        include_str!("../sql/migrations/0141_executed_engine.sql"),
+    ),
+    (
+        "0142_sidecar_mode_check",
+        include_str!("../sql/migrations/0142_sidecar_mode_check.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

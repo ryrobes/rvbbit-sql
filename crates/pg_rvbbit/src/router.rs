@@ -278,6 +278,12 @@ ALTER TABLE IF EXISTS rvbbit.route_executions
 ALTER TABLE IF EXISTS rvbbit.route_executions
     ADD COLUMN IF NOT EXISTS profile_source text NOT NULL DEFAULT 'unknown';
 
+-- The engine that PHYSICALLY executed this query (worker echo for fleet
+-- dispatches; NULL = as-labeled local execution). `candidate` remains the
+-- router's intent — the two diverge exactly when dispatch overrides matter.
+ALTER TABLE IF EXISTS rvbbit.route_executions
+    ADD COLUMN IF NOT EXISTS executed_engine text;
+
 ALTER TABLE IF EXISTS rvbbit.route_observations
     DROP CONSTRAINT IF EXISTS route_observations_candidate_check;
 ALTER TABLE IF EXISTS rvbbit.route_observations
@@ -1293,7 +1299,11 @@ fn route_train_query(
         }
 
         for repeat_idx in 1..=repeats {
-            let execution = execute_candidate_once(query, *candidate, features.order_by);
+            // Training measures the BRAIN (engine-relative curves) — fleet
+            // dispatch would fold network + remote cache noise into them.
+            let execution = crate::duck_backend::force_local_scope(|| {
+                execute_candidate_once(query, *candidate, features.order_by)
+            });
             let result = match execution {
                 Ok(outcome) => {
                     let validation_status =
@@ -2226,6 +2236,12 @@ fn parallel_mode_wedged() -> bool {
 }
 
 fn bench_candidate(sql: &str, cand: Candidate, samples: i32) -> Option<f64> {
+    // Curves are brain-relative by design: never let optimizer benches ride
+    // the fleet (remote latency is non-stationary and would pollute them).
+    crate::duck_backend::force_local_scope(|| bench_candidate_local(sql, cand, samples))
+}
+
+fn bench_candidate_local(sql: &str, cand: Candidate, samples: i32) -> Option<f64> {
     let prev = guc_setting("rvbbit.route_force_candidate").unwrap_or_default();
     // Any PG error while benching ONE candidate — statement timeout on a heavy
     // shape, an engine hard-error (fail_open is off during optimize), or a bad
@@ -5161,6 +5177,28 @@ fn route_table_state_stamp() -> String {
             .with(|memo| *memo.borrow_mut() = Some((Instant::now(), table_state.clone())));
     }
     table_state
+}
+
+/// Narrow view of a referenced accelerated table for the capsule builder
+/// (capsule.rs) — identity only. Freshness (tombstones, dirty shadow heap)
+/// is deliberately NOT taken from here: these metrics are memoized with a
+/// TTL, and a capsule gate must see a just-executed DELETE. capsule.rs
+/// re-queries live. Kept as a wrapper so RvbbitTableMetric stays private.
+pub(crate) struct CapsuleTableRef {
+    pub(crate) schema: String,
+    pub(crate) relname: String,
+    pub(crate) oid: u32,
+}
+
+pub(crate) fn capsule_table_refs(sql: &str) -> Vec<CapsuleTableRef> {
+    referenced_rvbbit_tables(sql, None)
+        .into_iter()
+        .map(|t| CapsuleTableRef {
+            schema: t.schema,
+            relname: t.relname,
+            oid: t.oid,
+        })
+        .collect()
 }
 
 fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTableMetric> {

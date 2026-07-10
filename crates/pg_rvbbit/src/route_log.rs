@@ -116,10 +116,13 @@ struct RouteExecutionTemplate {
     rewritten: bool,
     features_json: String,
     route_doc_json: String,
-    // Fleet identity: the remote engine endpoint this query would dispatch to
-    // (NULL = the brain's local engines). Resolved at event-build time in the
-    // backend (the writer thread has no SPI).
+    // Fleet identity, stamped at ExecutorEnd from the dispatch-time record
+    // (duck_backend::last_fleet_dispatch): the endpoint that ACTUALLY served
+    // the query (NULL = the brain), and the engine the worker reports having
+    // used. Never re-resolved from the registry — under random rotation that
+    // is a fresh draw, not where the query went.
     node: Option<String>,
+    executed_engine: Option<String>,
 }
 
 #[derive(Debug)]
@@ -203,6 +206,9 @@ pub(crate) fn record_pending_execution(
     if !enabled() {
         return;
     }
+    // Fresh query → no dispatch has happened yet; a stale record from the
+    // previous query on this backend must never leak into this one's stamp.
+    crate::duck_backend::clear_fleet_dispatch();
     let Some(template) = build_execution_template(query_sql, route_doc, cache_hit, rewritten)
     else {
         return;
@@ -306,11 +312,12 @@ fn build_execution_template(
             .get("chosen_candidate")
             .and_then(Value::as_str)
             .map(str::to_string),
-        node: route_doc
-            .get("chosen_candidate")
-            .and_then(Value::as_str)
-            .filter(|c| c.starts_with("duck") || c.starts_with("datafusion"))
-            .and_then(|_| crate::duck_backend::fleet_endpoint()),
+        // Placement is unknown until dispatch actually happens — stamped in
+        // enqueue_execution from the dispatch-time record. (This used to
+        // re-resolve fleet_endpoint() speculatively; with rotation that's a
+        // second independent draw and labels lie.)
+        node: None,
+        executed_engine: None,
         profile_name: route_doc
             .get("profile_name")
             .and_then(Value::as_str)
@@ -395,8 +402,24 @@ fn enqueue_execution(active: ActiveRouteExecution, rows_returned: i64, status: &
         return;
     }
     let logger = LOGGER.get_or_init(start_logger);
+    let mut template = active.template;
+    // Stamp placement truth: if this query's engine dispatch actually went to
+    // a fleet node, record the endpoint + the engine the worker reports. The
+    // candidate-prefix gate keeps a (cleared-per-query, but belt-and-
+    // suspenders) record from ever landing on a native/rowstore row.
+    if template
+        .candidate
+        .as_deref()
+        .map(|c| c.starts_with("duck") || c.starts_with("datafusion"))
+        .unwrap_or(false)
+    {
+        if let Some((endpoint, engine_used)) = crate::duck_backend::last_fleet_dispatch() {
+            template.node = Some(endpoint);
+            template.executed_engine = Some(engine_used);
+        }
+    }
     let event = RouteExecutionEvent {
-        template: active.template,
+        template,
         elapsed_ms: active.started_at.elapsed().as_secs_f64() * 1000.0,
         rows_returned,
         status: status.to_string(),
@@ -573,8 +596,8 @@ fn write_batch(
         "INSERT INTO rvbbit.route_executions \
          (backend_pid, database_name, role_name, query_hash, shape_key, shape_family, \
           route, candidate, profile_name, profile_source, route_source, reason, confidence, cache_hit, rewritten, \
-          elapsed_ms, rows_returned, status, features, route_doc, node) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::text::jsonb, $20::text::jsonb, $21)",
+          elapsed_ms, rows_returned, status, features, route_doc, node, executed_engine) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::text::jsonb, $20::text::jsonb, $21, $22)",
     )?;
     let mut decisions = 0;
     let mut executions = 0;
@@ -636,6 +659,7 @@ fn write_batch(
                         &template.features_json,
                         &template.route_doc_json,
                         &template.node,
+                        &template.executed_engine,
                     ],
                 )?;
                 executions += 1;

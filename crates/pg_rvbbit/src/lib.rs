@@ -14,6 +14,7 @@ use std::time::Instant;
 mod bitmap;
 mod brain;
 mod cache;
+mod capsule;
 mod catalog;
 mod catalog_kg;
 mod catalog_drift;

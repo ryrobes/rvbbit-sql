@@ -104,6 +104,10 @@ struct Args {
     /// Fleet mode: listen on TCP (host:port) for JSONL requests from a remote
     /// brain. Requests must carry a "token" matching RVBBIT_ENGINE_TOKEN.
     serve_tcp: Option<String>,
+    /// Hare mode: HTTP server (host:port) accepting self-contained query
+    /// capsules (POST /capsule) — no DSN, no store credentials; manifests
+    /// arrive presigned. Bearer auth against RVBBIT_ENGINE_TOKEN, fail-closed.
+    serve_http: Option<String>,
     workers: usize,
     // Calling Postgres session's search_path (CSV), so unqualified table names
     // resolve to the same schema PG would pick when the same relname exists in
@@ -327,6 +331,13 @@ fn main() {
         }
         return;
     }
+    if args.serve_http.is_some() {
+        if let Err(err) = run_http_server(args) {
+            eprintln!("rvbbit-duck http server error: {err:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.serve_socket.is_some() {
         if let Err(err) = run_socket_server(args) {
             eprintln!("rvbbit-duck socket server error: {err:#}");
@@ -481,6 +492,8 @@ impl TelemetryConfig {
         });
         let mode = if args.serve_tcp.is_some() {
             "fleet_tcp"
+        } else if args.serve_http.is_some() {
+            "hare_http"
         } else if args.serve_socket.is_some() {
             "shared_broker"
         } else if args.serve {
@@ -2936,6 +2949,12 @@ struct ServerRequest {
     result_format: Option<String>,
     explain_only: Option<bool>,
     search_path: Option<String>,
+    /// The brain's chosen engine/layout for this query (fleet dispatch). The
+    /// router already made the decision — the worker executes it rather than
+    /// silently substituting its resident engine. Absent (old brains) = the
+    /// worker's --engine, exactly the old behavior.
+    engine: Option<String>,
+    layout: Option<String>,
 }
 
 #[derive(Clone)]
@@ -3092,6 +3111,36 @@ impl ServerState {
             .is_some_and(|command| command.eq_ignore_ascii_case("prewarm"))
         {
             return self.prewarm(args, req);
+        }
+
+        // Cross-engine request: the brain chose an engine/layout other than
+        // this worker's resident one. Serve it via the oneshot path — cold
+        // (fresh PG + engine per request) but CORRECT and honestly labeled;
+        // the warm ServerState keeps serving the resident engine. An engine
+        // this host can't run (gpu_gqe on a CPU box) errors here and the
+        // brain fails open to local execution.
+        let requested_engine = req
+            .engine
+            .as_deref()
+            .map(parse_engine)
+            .transpose()?
+            .unwrap_or(args.engine);
+        let requested_layout = req.layout.clone().unwrap_or_else(|| args.layout.clone());
+        if requested_engine != args.engine || requested_layout != args.layout {
+            let mut one = args.clone();
+            one.engine = requested_engine;
+            one.layout = requested_layout;
+            one.sql = req.sql.clone();
+            one.repeat = req.repeat.unwrap_or(args.repeat).max(1);
+            one.timeout_s = req.timeout_s.unwrap_or(args.timeout_s);
+            one.max_rows = req.max_rows.unwrap_or(args.max_rows);
+            one.threads = req.threads.unwrap_or(args.threads).max(1);
+            one.explain_only = req.explain_only.unwrap_or(args.explain_only);
+            one.search_path = req.search_path.clone().or_else(|| args.search_path.clone());
+            if let Some(fmt) = req.result_format.as_deref() {
+                one.result_format = parse_result_format(fmt)?;
+            }
+            return run_once_from_args(&one);
         }
 
         let sql = req
@@ -3278,10 +3327,27 @@ impl ServerState {
         Ok(empty_query_summary(timeout_s, &catalog, cache))
     }
 
+    /// The DSN connection is long-lived and the brain's Postgres restarts
+    /// (upgrades, .so reloads) silently kill it — without this check every
+    /// later prewarm/catalog load fails with "connection closed" until the
+    /// WORKER is restarted, which reads as "warren down" in the Fleet window
+    /// even though the engine is healthy. Validate cheaply per catalog load
+    /// and reconnect in place; drop the catalog snapshot so the fresh
+    /// connection re-fingerprints.
+    fn ensure_pg(&mut self, args: &Args) -> Result<()> {
+        if self.pg.is_valid(Duration::from_secs(5)).is_err() {
+            eprintln!("rvbbit-duck: postgres connection lost (brain restart?) — reconnecting");
+            self.pg = connect_pg(args)?;
+            self.catalog = None;
+        }
+        Ok(())
+    }
+
     fn load_catalog(
         &mut self,
         args: &Args,
     ) -> Result<(BTreeMap<String, RvbbitDuckTable>, CacheSummary)> {
+        self.ensure_pg(args)?;
         let mut cache = CacheSummary::default();
         if !metadata_cache_enabled() {
             let catalog = rvbbit_row_group_catalog(&mut self.pg, args)?;
@@ -3512,6 +3578,329 @@ fn run_socket_server(args: Args) -> Result<()> {
 /// request line must carry a matching "token" field. TLS/mTLS is deliberately
 /// NOT terminated here — run inside a private network (VPC) or behind a mesh;
 /// the brain-as-CA productization replaces this with real channel security.
+// ── hare mode: capsule-over-HTTP (serverless query offload) ─────────────────
+//
+// A capsule is the fleet request turned inside-out: instead of the worker
+// fetching its catalog slice over a DSN, the brain PRE-COMPUTES it
+// (rvbbit.capsule() on the extension side) and ships it in the request —
+// table manifests, row-group URLs (presigned for object stores), column PG
+// types, limits. The worker therefore needs zero credentials, zero
+// callbacks, zero state: exactly what scale-to-zero platforms (Cloud Run)
+// want. See docs/HARE_PLAN.md. Deliberately NOT wired into the brain's
+// router yet — the experiment drives it manually.
+
+#[derive(serde::Deserialize)]
+struct CapsuleRequest {
+    capsule: u32,
+    sql: String,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    max_rows: Option<usize>,
+    #[serde(default)]
+    timeout_s: Option<u64>,
+    tables: Vec<CapsuleTable>,
+}
+
+#[derive(serde::Deserialize)]
+struct CapsuleTable {
+    schema: String,
+    relname: String,
+    /// [name, pg_type] pairs in attnum order — the worker applies its own
+    /// supported_pg_type gate so type policy stays in ONE place (here).
+    columns: Vec<(String, String)>,
+    paths: Vec<String>,
+    #[serde(default)]
+    row_group_rows: Option<i64>,
+    #[serde(default)]
+    row_group_bytes: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)] // observability pin today; AS-OF capsules later
+    generation: Option<i64>,
+}
+
+fn hare_max_rows_cap() -> usize {
+    env_usize("RVBBIT_HARE_MAX_ROWS", 100_000).max(1)
+}
+
+/// Manifest → the same catalog map the DSN loader produces, so execution
+/// reuses run_duck_once unchanged. file:// paths (loopback dev) get the
+/// pgdata-prefix remap + an existence check; remote URLs pass through for
+/// DuckDB's httpfs to fetch at query time.
+fn catalog_from_capsule(
+    req: &CapsuleRequest,
+    args: &Args,
+) -> Result<BTreeMap<String, RvbbitDuckTable>> {
+    let mut catalog = BTreeMap::new();
+    for t in &req.tables {
+        if t.paths.is_empty() {
+            bail!("capsule table {}.{} has no artifact paths", t.schema, t.relname);
+        }
+        let mut columns = Vec::with_capacity(t.columns.len());
+        for (name, typ) in &t.columns {
+            if !supported_pg_type(typ) {
+                bail!(
+                    "capsule table {}.{}: column {} has unsupported PG type '{}' — \
+                     the brain should not have offered this table",
+                    t.schema,
+                    t.relname,
+                    name,
+                    typ
+                );
+            }
+            columns.push((name.clone(), typ.clone()));
+        }
+        if columns.is_empty() {
+            bail!("capsule table {}.{} has no columns", t.schema, t.relname);
+        }
+        let mut mapped = Vec::with_capacity(t.paths.len());
+        for raw in &t.paths {
+            if is_remote_artifact_path(raw) {
+                mapped.push(raw.clone());
+                continue;
+            }
+            // Local loopback dev: file:// or bare path, remapped when it sits
+            // under the advertised pgdata prefix (same contract as the DSN
+            // loader), passed through otherwise.
+            let path = raw.strip_prefix("file://").unwrap_or(raw);
+            let visible = match path
+                .strip_prefix(&format!("{}/", args.pgdata_prefix.trim_end_matches('/')))
+            {
+                Some(suffix) => format!(
+                    "{}/{}",
+                    args.visible_pgdata_prefix.trim_end_matches('/'),
+                    suffix
+                ),
+                None => path.to_string(),
+            };
+            if !Path::new(&visible).exists() {
+                bail!(
+                    "capsule table {}.{}: local artifact '{}' not found on this worker \
+                     (unpublished row group? hares can only serve published artifacts)",
+                    t.schema,
+                    t.relname,
+                    visible
+                );
+            }
+            mapped.push(visible);
+        }
+        catalog.insert(
+            format!("{}.{}", t.schema, t.relname),
+            RvbbitDuckTable {
+                schema: t.schema.clone(),
+                relname: t.relname.clone(),
+                paths: mapped,
+                columns,
+                layout: None,
+                partition_cols: Vec::new(),
+                row_group_rows: t.row_group_rows.unwrap_or(0),
+                row_group_bytes: t.row_group_bytes.unwrap_or(0),
+            },
+        );
+    }
+    Ok(catalog)
+}
+
+fn run_capsule(server_args: &Args, req: &CapsuleRequest) -> Result<QuerySummary> {
+    if req.capsule != 1 {
+        bail!("unsupported capsule version {}", req.capsule);
+    }
+    match req.engine.as_deref().unwrap_or("duck") {
+        "duck" => {}
+        other => bail!("capsule engine '{other}' not supported (v1 is duck-only)"),
+    }
+    // Defense in depth: the brain vetted the SQL when it minted the capsule,
+    // but a hare on the open network re-checks — same gate as every mode.
+    guarded_safe_select(&req.sql)?;
+    let catalog = catalog_from_capsule(req, server_args)?;
+
+    let mut args = server_args.clone();
+    // JSON transport only: an arrow-ipc PATH is worker-local and useless to
+    // the caller (same reasoning as fleet dispatch).
+    args.result_format = ResultFormat::Json;
+    args.engine = Engine::Duck;
+    args.repeat = 1;
+    args.explain_only = false;
+    args.max_rows = req
+        .max_rows
+        .unwrap_or(10_000)
+        .clamp(1, hare_max_rows_cap());
+    args.timeout_s = req.timeout_s.unwrap_or(60).clamp(1, 3600);
+
+    let mut footer_cache = ParquetFooterCache::default();
+    let mut cache = CacheSummary {
+        catalog_fingerprint: catalog_signature(&catalog),
+        ..CacheSummary::default()
+    };
+    // Prewarm skips remote artifacts internally; on loopback manifests it
+    // fills footer stats exactly like the DSN path.
+    let footer = prewarm_parquet_metadata(&catalog, &mut footer_cache)?;
+    cache.apply_footer_stats(footer);
+    run_duck_once(&args, &req.sql, catalog, cache)
+}
+
+fn run_http_server(args: Args) -> Result<()> {
+    let addr = args
+        .serve_http
+        .as_deref()
+        .ok_or_else(|| anyhow!("--serve-http requires host:port"))?;
+    let token = env::var("RVBBIT_ENGINE_TOKEN").unwrap_or_default();
+    if token.trim().is_empty() {
+        bail!("--serve-http requires RVBBIT_ENGINE_TOKEN to be set (fail-closed)");
+    }
+    let server = tiny_http::Server::http(addr)
+        .map_err(|e| anyhow!("binding http {addr}: {e}"))?;
+    let server = std::sync::Arc::new(server);
+    eprintln!("rvbbit-duck hare server listening on {addr}");
+    let workers = args.workers.max(1);
+    let max_request_bytes = max_request_bytes();
+    let mut handles = Vec::with_capacity(workers);
+    for idx in 0..workers {
+        let server = std::sync::Arc::clone(&server);
+        let args = args.clone();
+        let token = token.clone();
+        handles.push(
+            thread::Builder::new()
+                .name(format!("rvbbit-hare-worker-{idx}"))
+                .spawn(move || loop {
+                    let request = match server.recv() {
+                        Ok(r) => r,
+                        Err(err) => {
+                            eprintln!("rvbbit-duck hare accept failed: {err}");
+                            continue;
+                        }
+                    };
+                    handle_http_request(request, &args, &token, max_request_bytes);
+                })
+                .context("spawning rvbbit-duck hare worker")?,
+        );
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    Ok(())
+}
+
+fn http_json_response(status: u16, body: serde_json::Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let payload = body.to_string().into_bytes();
+    tiny_http::Response::from_data(payload)
+        .with_status_code(status)
+        .with_header(
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                .expect("static header"),
+        )
+}
+
+fn handle_http_request(
+    mut request: tiny_http::Request,
+    args: &Args,
+    token: &str,
+    max_request_bytes: usize,
+) {
+    let url = request.url().to_string();
+    let method = request.method().clone();
+    if method == tiny_http::Method::Get && (url == "/healthz" || url == "/") {
+        let _ = request.respond(http_json_response(200, json!({"status": "ok"})));
+        return;
+    }
+    if !(method == tiny_http::Method::Post && url == "/capsule") {
+        let _ = request.respond(http_json_response(
+            404,
+            json!({"status": "error", "error": "POST /capsule or GET /healthz"}),
+        ));
+        return;
+    }
+    // Two token spellings, one secret: `Authorization: Bearer` for direct /
+    // fleet callers, `X-Rvbbit-Token` for Cloud Run — whose frontend
+    // intercepts ANY Authorization header and tries to verify it as a Google
+    // IAM token, 401ing before the container ever sees the request (even on
+    // allUsers-public services).
+    let bearer_ok = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .map(|h| h.value.as_str())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| constant_time_token_eq(t.trim(), token))
+        .unwrap_or(false);
+    let xtoken_ok = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("X-Rvbbit-Token"))
+        .map(|h| constant_time_token_eq(h.value.as_str().trim(), token))
+        .unwrap_or(false);
+    let authorized = bearer_ok || xtoken_ok;
+    if !authorized {
+        let _ = request.respond(http_json_response(
+            401,
+            json!({"status": "error", "error": "missing or invalid bearer token"}),
+        ));
+        return;
+    }
+    let mut body = String::new();
+    {
+        let reader: &mut dyn std::io::Read = request.as_reader();
+        let mut limited: std::io::Take<&mut dyn std::io::Read> =
+            std::io::Read::take(reader, max_request_bytes as u64 + 1);
+        if let Err(err) = std::io::Read::read_to_string(&mut limited, &mut body) {
+            let _ = request.respond(http_json_response(
+                400,
+                json!({"status": "error", "error": format!("reading request body: {err}")}),
+            ));
+            return;
+        }
+    }
+    if body.len() > max_request_bytes {
+        let _ = request.respond(http_json_response(
+            413,
+            json!({"status": "error", "error": format!("capsule exceeds {max_request_bytes} bytes")}),
+        ));
+        return;
+    }
+    let capsule: CapsuleRequest = match serde_json::from_str(&body) {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = request.respond(http_json_response(
+                400,
+                json!({"status": "error", "error": format!("bad capsule JSON: {err}")}),
+            ));
+            return;
+        }
+    };
+    let started = Instant::now();
+    match run_capsule(args, &capsule) {
+        Ok(summary) => {
+            let mut value = serde_json::to_value(&summary).unwrap_or_else(
+                |e| json!({"status": "error", "error": format!("serializing summary: {e}")}),
+            );
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "server_elapsed_ms".to_string(),
+                    json!(started.elapsed().as_secs_f64() * 1000.0),
+                );
+                obj.insert("mode".to_string(), json!("hare_http"));
+                obj.insert("engine".to_string(), json!("duck"));
+            }
+            let _ = request.respond(http_json_response(200, value));
+        }
+        Err(err) => {
+            let _ = request.respond(http_json_response(
+                422,
+                json!({"status": "error", "error": format_error_chain(&err)}),
+            ));
+        }
+    }
+}
+
+/// Constant-time-ish token compare (same helper contract as the TCP path).
+fn constant_time_token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn run_tcp_server(args: Args) -> Result<()> {
     let addr = args
         .serve_tcp
@@ -3851,9 +4240,16 @@ fn server_response_json(
             let repeat_count = req.repeat.unwrap_or(args.repeat).max(1) as i32;
             let timeout_s = req.timeout_s.unwrap_or(args.timeout_s) as i32;
             let max_rows = req.max_rows.unwrap_or(args.max_rows) as i32;
+            // Echoed in the response so the brain's breadcrumbs record the
+            // engine that ACTUALLY ran, never an assumption.
+            let engine_used = req
+                .engine
+                .clone()
+                .unwrap_or_else(|| args.engine.as_str().to_string());
             let metadata_json = json!({
                 "explain_only": req.explain_only.unwrap_or(args.explain_only),
                 "requested_threads": req.threads.unwrap_or(args.threads),
+                "engine": engine_used,
             })
             .to_string();
             match state.execute(args, req) {
@@ -3879,9 +4275,13 @@ fn server_response_json(
                         tables_json: json_string(&summary.tables, "[]"),
                         metadata_json,
                     });
-                    serde_json::to_value(summary).unwrap_or_else(
+                    let mut value = serde_json::to_value(summary).unwrap_or_else(
                         |err| json!({"status": "fallback", "error": err.to_string()}),
-                    )
+                    );
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("engine".to_string(), json!(engine_used));
+                    }
+                    value
                 }
                 Err(err) => {
                     let error = format_error_chain(&err);
@@ -4091,6 +4491,7 @@ fn parse_args() -> Result<Args> {
     let mut serve = false;
     let mut serve_socket = None;
     let mut serve_tcp = None;
+    let mut serve_http = None;
     let mut serve_derived_socket = false;
     let mut search_path: Option<String> = None;
     let mut workers = env::var("RVBBIT_DUCK_WORKERS")
@@ -4122,6 +4523,7 @@ fn parse_args() -> Result<Args> {
             "--serve" => serve = true,
             "--serve-socket" => serve_socket = Some(need_value(&mut it, "--serve-socket")?),
             "--serve-tcp" => serve_tcp = Some(need_value(&mut it, "--serve-tcp")?),
+            "--serve-http" => serve_http = Some(need_value(&mut it, "--serve-http")?),
             "--serve-derived-socket" => serve_derived_socket = true,
             "--workers" => workers = need_value(&mut it, "--workers")?.parse()?,
             "-h" | "--help" => {
@@ -4148,6 +4550,7 @@ fn parse_args() -> Result<Args> {
         serve,
         serve_socket,
         serve_tcp,
+        serve_http,
         workers,
         search_path,
     };
@@ -4159,7 +4562,12 @@ fn parse_args() -> Result<Args> {
         args.serve_socket = Some(derived_shared_socket_path(&args)?);
     }
 
-    if !args.serve && args.serve_socket.is_none() && args.serve_tcp.is_none() && args.sql.is_none() {
+    if !args.serve
+        && args.serve_socket.is_none()
+        && args.serve_tcp.is_none()
+        && args.serve_http.is_none()
+        && args.sql.is_none()
+    {
         bail!("--sql is required unless --serve is set");
     }
     Ok(args)
@@ -4238,6 +4646,7 @@ fn print_help() {
          rvbbit-duck --serve [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
          rvbbit-duck --serve-socket PATH [--workers N] [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
          rvbbit-duck --serve-tcp HOST:PORT [--workers N] [--engine ...] [--dsn DSN]   (fleet mode: requires RVBBIT_ENGINE_TOKEN; requests carry \"token\")\n\
+         rvbbit-duck --serve-http HOST:PORT [--workers N]   (hare mode: POST /capsule with Bearer RVBBIT_ENGINE_TOKEN; no DSN — manifests ride in the capsule)\n\
          rvbbit-duck --serve-derived-socket [--workers N] [--engine duck|datafusion|gpu_gqe] [--layout scan|hive|cluster|vortex|hive:col] [--dsn DSN] [--threads N]\n\
          rvbbit-gqe-bridge --rvbbit-probe\n\
          Server JSONL requests: {{\"sql\":\"SELECT ...\",\"result_format\":\"json|arrow_ipc_file\"}} or {{\"command\":\"prewarm\"}}"

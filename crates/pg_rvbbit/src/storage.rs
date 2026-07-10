@@ -56,6 +56,62 @@ pub(crate) fn object_store_for(url: &Url) -> Result<(Arc<dyn ObjectStore>, ObjPa
     Ok((store, key))
 }
 
+/// Presign a GET for an object-store URI so a credential-less worker (a hare)
+/// can fetch the artifact directly. `s3://` covers real S3 AND GCS via the
+/// S3-interop endpoint (our deployed publish path); native `gs://` signing
+/// needs a literal service-account key file (object_store's GCS from_env has
+/// no metadata fallback for signing). `file://` / bare paths / already-https
+/// URIs pass through untouched — that's the local-loopback dev mode.
+pub(crate) fn presign_get(uri: &str, ttl: std::time::Duration) -> Result<String, String> {
+    if uri.starts_with("file://")
+        || uri.starts_with("http://")
+        || uri.starts_with("https://")
+        || !uri.contains("://")
+    {
+        return Ok(uri.to_string());
+    }
+    let url = Url::parse(uri).map_err(|e| format!("bad URI '{uri}': {e}"))?;
+    let bucket = url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| format!("no bucket/host in URI '{uri}'"))?;
+    let key = ObjPath::from(url.path().trim_start_matches('/'));
+    fn sign<S: object_store::signer::Signer>(
+        store: &S,
+        key: &ObjPath,
+        ttl: std::time::Duration,
+    ) -> Result<String, String> {
+        crate::df::with_lance_runtime(|rt| {
+            rt.block_on(async move {
+                store
+                    .signed_url(reqwest::Method::GET, key, ttl)
+                    .await
+                    .map(|u| u.to_string())
+                    .map_err(|e| e.to_string())
+            })
+        })
+    }
+    match url.scheme() {
+        "s3" => {
+            let store = AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|e| format!("S3 store for '{bucket}': {e}"))?;
+            sign(&store, &key, ttl).map_err(|e| format!("presign '{uri}': {e}"))
+        }
+        "gs" => {
+            let store = GoogleCloudStorageBuilder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|e| format!("GCS store for '{bucket}': {e}"))?;
+            sign(&store, &key, ttl).map_err(|e| format!("presign '{uri}': {e}"))
+        }
+        other => Err(format!(
+            "unsupported scheme '{other}://' for presigning (use s3:// or gs://)"
+        )),
+    }
+}
+
 /// Register the object stores referenced by these cold-tier paths on a DataFusion
 /// runtime so it can read `s3://` / `gs://` row groups. Bare paths and `file://`
 /// use the default store and are skipped. Idempotent per (scheme, bucket). Called

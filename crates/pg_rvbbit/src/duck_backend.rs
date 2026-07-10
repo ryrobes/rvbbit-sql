@@ -856,10 +856,54 @@ fn engine_query_json(
     let threads = duck_threads();
     let mut sidecar_context: Option<(String, String, i32)> = None;
 
+    // Fleet gate for the IN-PROCESS DataFusion path: in-process used to
+    // return before run_engine_query's gate, making datafusion candidates
+    // structurally unreachable by the fleet (and the old speculative node
+    // stamping painted remote labels on those local runs). The gate fires
+    // uniformly for engine candidates; a remote failure falls through to
+    // in-process exactly like every other fail-open edge. Duck candidates
+    // keep hitting the identical gate inside run_engine_query.
+    let fleet_payload = if engine == "datafusion" && datafusion_inprocess_enabled() {
+        clear_fleet_dispatch();
+        match fleet_endpoint() {
+            Some(endpoint) => match send_fleet_request(
+                &endpoint,
+                engine,
+                layout,
+                query,
+                max_rows,
+                timeout_s(),
+                threads,
+                result_format,
+            ) {
+                Ok(value) => {
+                    let engine_used = value
+                        .get("engine")
+                        .and_then(Value::as_str)
+                        .unwrap_or(engine)
+                        .to_string();
+                    record_fleet_dispatch(&endpoint, &engine_used);
+                    Some(value)
+                }
+                Err(err) => {
+                    pgrx::warning!(
+                        "rvbbit: fleet endpoint {endpoint} failed ({err}); falling back to in-process DataFusion"
+                    );
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Phase 1: in-process DataFusion path. Only takes the datafusion engine
     // (DuckDB still goes through the sidecar). If we hit an error, fall
     // through to the sidecar path — safe rollback by design.
-    let inprocess_payload = if engine == "datafusion" && datafusion_inprocess_enabled() {
+    let inprocess_payload = if fleet_payload.is_some() {
+        fleet_payload
+    } else if engine == "datafusion" && datafusion_inprocess_enabled() {
         match crate::df::query_engine(layout, query, max_rows) {
             Ok(payload) => Some(payload),
             Err(err) => {
@@ -1294,9 +1338,33 @@ fn run_engine_query(
     // artifacts from shared object storage. A remote failure falls through to
     // the normal local paths below — fail-open: a dead warren is a slower
     // query, never an error the user sees.
+    clear_fleet_dispatch();
     if let Some(endpoint) = fleet_endpoint() {
-        match send_fleet_request(&endpoint, query, max_rows, timeout, threads, result_format) {
-            Ok(value) => return Ok(value),
+        match send_fleet_request(
+            &endpoint,
+            engine,
+            layout,
+            query,
+            max_rows,
+            timeout,
+            threads,
+            result_format,
+        ) {
+            Ok(value) => {
+                // Breadcrumb truth: record where this query ACTUALLY ran and
+                // the engine the worker reports having used (old workers
+                // don't echo — assume the requested engine, their pinned
+                // behavior predates engine transmission). route_log stamps
+                // this at ExecutorEnd instead of re-resolving the endpoint,
+                // which under rotation would be a second independent draw.
+                let engine_used = value
+                    .get("engine")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(engine)
+                    .to_string();
+                record_fleet_dispatch(&endpoint, &engine_used);
+                return Ok(value);
+            }
             Err(err) => {
                 pgrx::warning!(
                     "rvbbit: fleet endpoint {endpoint} failed ({err}); falling back to local engine"
@@ -1550,14 +1618,65 @@ fn derived_shared_socket_path(dir: &str, key: &DuckSharedKey) -> String {
     )
 }
 
+thread_local! {
+    /// Training/optimize runs must measure the BRAIN, not the network: the
+    /// learned curves are engine-relative and per-node latency is
+    /// non-stationary (cache warmth, container age, jitter — and hares are
+    /// ephemeral by design). This scope pins execution local so fleet
+    /// dispatch can never leak remote latency into observations. See the
+    /// targeting design discussion in docs/READ_FLEET_PLAN.md.
+    static FORCE_LOCAL_EXECUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Where the current query's fleet dispatch ACTUALLY landed, and the
+    /// engine the worker reports using: (endpoint, engine). Set on successful
+    /// dispatch, cleared at query start (route_log) and at run_engine_query
+    /// entry. route_log stamps breadcrumbs from THIS — never by re-resolving
+    /// the endpoint, which under random rotation is a fresh draw and lies.
+    static LAST_FLEET_DISPATCH: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn clear_fleet_dispatch() {
+    LAST_FLEET_DISPATCH.with(|c| *c.borrow_mut() = None);
+}
+
+fn record_fleet_dispatch(endpoint: &str, engine_used: &str) {
+    LAST_FLEET_DISPATCH
+        .with(|c| *c.borrow_mut() = Some((endpoint.to_string(), engine_used.to_string())));
+}
+
+pub(crate) fn last_fleet_dispatch() -> Option<(String, String)> {
+    LAST_FLEET_DISPATCH.with(|c| c.borrow().clone())
+}
+
+/// Run `f` with fleet dispatch disabled (brain-local execution). Drop-guarded
+/// so the flag restores even when `f` unwinds via a PG error — a stuck flag
+/// would silently disable fleet dispatch for the rest of the backend's life.
+pub(crate) fn force_local_scope<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_LOCAL_EXECUTION.with(|c| c.set(self.0));
+        }
+    }
+    let prev = FORCE_LOCAL_EXECUTION.with(|c| c.replace(true));
+    let _guard = Restore(prev);
+    f()
+}
+
 /// Fleet mode gate. Resolution order:
+///   0. force_local_scope (training/optimize) — never dispatch remotely.
 ///   1. `SET rvbbit.duck_fleet_endpoint = 'host:port'` — session override/pin
 ///      (same pattern as route_force_candidate).
-///   2. The registry (rvbbit.fleet_endpoints): the enabled endpoint whose last
-///      probe succeeded, most recently probed first — so a node that failed
-///      its health check stops receiving work without operator action.
+///   2. The registry (rvbbit.fleet_endpoints): a UNIFORM random pick among
+///      enabled endpoints whose last probe succeeded. Deliberately naive —
+///      per the targeting design, healthy workers are treated as
+///      interchangeable (no per-node scores); rotation exists so heat and
+///      benchmark distribution spread instead of pinning one node.
 /// Empty/absent = local execution.
 pub(crate) fn fleet_endpoint() -> Option<String> {
+    if FORCE_LOCAL_EXECUTION.with(|c| c.get()) {
+        return None;
+    }
     let cname = std::ffi::CString::new("rvbbit.duck_fleet_endpoint").ok()?;
     let ptr = unsafe { pgrx::pg_sys::GetConfigOption(cname.as_ptr(), true, false) };
     if !ptr.is_null() {
@@ -1572,7 +1691,7 @@ pub(crate) fn fleet_endpoint() -> Option<String> {
     pgrx::Spi::get_one::<String>(
         "SELECT endpoint FROM rvbbit.fleet_endpoints \
          WHERE enabled AND last_probe_ok \
-         ORDER BY last_probe_at DESC NULLS LAST, name LIMIT 1",
+         ORDER BY random() LIMIT 1",
     )
     .ok()
     .flatten()
@@ -1641,6 +1760,8 @@ fn fleet_probe(node_name: &str) -> pgrx::JsonB {
 /// the query envelope — same contract as the local daemon.
 fn send_fleet_request(
     endpoint: &str,
+    engine: &str,
+    layout: &str,
     query: &str,
     max_rows: i32,
     timeout: i32,
@@ -1661,6 +1782,11 @@ fn send_fleet_request(
             "threads": threads,
             "result_format": SidecarResultFormat::Json.as_str(),
             "search_path": session_search_path_csv(),
+            // The router already chose the engine — the worker executes the
+            // decision instead of substituting its resident engine. Old
+            // workers ignore these fields (their pinned behavior).
+            "engine": engine,
+            "layout": layout,
         }),
         timeout,
     )

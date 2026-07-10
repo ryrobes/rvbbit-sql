@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.duck_sidecar_instances (
     last_heartbeat_at timestamptz,
     status            text NOT NULL DEFAULT 'starting',
     metadata          jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (mode IN ('local_oneshot', 'local_persistent', 'shared_broker')),
+    CHECK (mode IN ('local_oneshot', 'local_persistent', 'shared_broker', 'fleet_tcp', 'hare_http')),
     CHECK (status IN ('starting', 'online', 'offline', 'stale', 'error')),
     CHECK (worker_count IS NULL OR worker_count >= 0),
     CHECK (duck_threads IS NULL OR duck_threads >= 0)
@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.duck_sidecar_heartbeats (
     events_written  bigint,
     events_dropped  bigint,
     metadata        jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (mode IN ('local_oneshot', 'local_persistent', 'shared_broker'))
+    CHECK (mode IN ('local_oneshot', 'local_persistent', 'shared_broker', 'fleet_tcp', 'hare_http'))
 );
 
 CREATE INDEX IF NOT EXISTS duck_sidecar_heartbeats_time_idx
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS rvbbit.duck_sidecar_query_events (
     cache                jsonb NOT NULL DEFAULT '{}'::jsonb,
     tables               jsonb NOT NULL DEFAULT '[]'::jsonb,
     metadata             jsonb NOT NULL DEFAULT '{}'::jsonb,
-    CHECK (mode IN ('local_oneshot', 'local_persistent', 'shared_broker')),
+    CHECK (mode IN ('local_oneshot', 'local_persistent', 'shared_broker', 'fleet_tcp', 'hare_http')),
     CHECK (elapsed_ms >= 0),
     CHECK (queue_wait_ms IS NULL OR queue_wait_ms >= 0),
     CHECK (execute_ms IS NULL OR execute_ms >= 0)

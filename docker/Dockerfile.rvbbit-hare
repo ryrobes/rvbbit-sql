@@ -1,0 +1,36 @@
+# rvbbit-hare — the serverless query sprinter (docs/HARE_PLAN.md).
+#
+# One binary, one port, no Postgres, no extension, no credentials: the brain
+# ships self-contained query capsules (vetted SQL + presigned artifact
+# manifest) and the hare answers over plain HTTP. Built for scale-to-zero
+# platforms — Cloud Run first:
+#
+#   docker build -f docker/Dockerfile.rvbbit-hare -t ghcr.io/ryrobes/rvbbit-hare:dev .
+#   gcloud run deploy rvbbit-hare --image ghcr.io/ryrobes/rvbbit-hare:X \
+#     --set-env-vars RVBBIT_ENGINE_TOKEN=... --concurrency 4 --min-instances 0
+#
+# Build context is the REPO ROOT (the engine crate lives in crates/rvbbit_duck).
+# bookworm keeps glibc ≤ every runtime we target; the runtime stage is slim +
+# ca-certificates (DuckDB httpfs needs a trust store for presigned HTTPS GETs
+# — learned the hard way on the fleet images).
+
+FROM rust:1-bookworm AS build
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends g++ cmake pkg-config libssl-dev protobuf-compiler libprotobuf-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY crates/rvbbit_duck /src/crates/rvbbit_duck
+WORKDIR /src/crates/rvbbit_duck
+RUN cargo build --release --bin rvbbit-duck
+
+FROM debian:bookworm-slim
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/crates/rvbbit_duck/target/release/rvbbit-duck /usr/local/bin/rvbbit-duck
+
+# Cloud Run injects PORT; the shell-form entrypoint expands it. RVBBIT_ENGINE_TOKEN
+# is fail-closed: the server refuses to start without it.
+ENV RVBBIT_DUCK_WORKERS=4
+EXPOSE 8080
+ENTRYPOINT ["/bin/sh", "-c", "exec rvbbit-duck --serve-http 0.0.0.0:${PORT:-8080} --workers ${RVBBIT_DUCK_WORKERS:-4}"]
