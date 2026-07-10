@@ -32,7 +32,7 @@ from __future__ import annotations
 # (DictRow vs TupleRow covariance); the code is correct at runtime (see --selftest).
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
-import asyncio, hmac, json, os, re, shutil, socket, subprocess, sys, tempfile, time
+import asyncio, hashlib, hmac, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, time
 from decimal import Decimal
 from pathlib import Path
 
@@ -250,9 +250,11 @@ def tool_describe_table(table: str, lean: bool = False) -> dict:
             out["samples"] = _samples(cur, schema, rel, 5)
         st = _col_stats(cur, schema, rel, max_cols=128)
         if st:
-            # lean: drop the (potentially long) top-values, keep null%/distinct
+            # lean: drop the (potentially long) top-values, keep ndv/null%.
+            # NB: _col_stats returns a dict keyed by column name (not a row list) —
+            # iterating it as rows was the "string indices must be integers" crash.
             out["column_stats"] = (
-                [{"attname": s["attname"], "n_distinct": s["n_distinct"], "null_pct": s["null_pct"]} for s in st]
+                {name: {k: v for k, v in s.items() if k != "top"} for name, s in st.items()}
                 if lean else st
             )
         fr = _freshness(cur, schema, rel)
@@ -1827,21 +1829,49 @@ def tool_run_sql(sql: str, as_of=None, limit=None) -> dict:
             "as_of_applied": as_of}
 
 
-def tool_run_sql_multi(queries, as_of=None, limit=None) -> dict:
+def tool_run_sql_multi(queries, as_of=None, limit=None, result_mode="full", preview_rows=3) -> dict:
     """Governed read-only BATCH: many named FLAT queries, one round trip.
     This exists so dashboards/apps never glue multi-concern payloads together
     inside SQL (top-level json_build_object) just to save bridge calls — each
     concern stays a flat rowset the router can accelerate, the catalog can
     mine, and Promote can later lift into a metric/cube. Per-query errors are
-    isolated under their name; one bad query doesn't sink the batch."""
+    isolated under their name; one bad query doesn't sink the batch.
+
+    result_mode='summary' returns per-query row_count/columns/truncated/
+    elapsed/error plus the first preview_rows rows — use it to VALIDATE a
+    dashboard's query set without hauling hundreds of KB of rows back through
+    the conversation. Re-run individual queries in full mode when you need
+    the data itself."""
     if not isinstance(queries, dict) or not queries:
         return {"error": {"code": "BAD_QUERIES",
                           "message": "queries must be a non-empty {name: sql} object"}}
     if len(queries) > 24:
         return {"error": {"code": "TOO_MANY_QUERIES", "message": "max 24 queries per batch"}}
+    if result_mode not in ("full", "summary"):
+        return {"error": {"code": "BAD_RESULT_MODE", "message": "result_mode must be 'full' or 'summary'"}}
+    try:
+        preview_rows = max(0, min(int(preview_rows), 25))
+    except (TypeError, ValueError):
+        preview_rows = 3
     t0 = time.time()
     results = {str(name): tool_run_sql(sql, as_of, limit) for name, sql in queries.items()}
-    return {"results": results, "elapsed_ms": int((time.time() - t0) * 1000),
+    if result_mode == "summary":
+        compact = {}
+        for name, r in results.items():
+            if r.get("error"):
+                compact[name] = {"error": r["error"]}
+                continue
+            compact[name] = {
+                "row_count": r.get("row_count"),
+                "columns": [c["name"] for c in r.get("columns", [])],
+                "truncated": r.get("truncated"),
+                "engine": r.get("engine"),
+                "elapsed_ms": r.get("elapsed_ms"),
+                "preview": (r.get("rows") or [])[:preview_rows],
+            }
+        results = compact
+    return {"results": results, "result_mode": result_mode,
+            "elapsed_ms": int((time.time() - t0) * 1000),
             "as_of_applied": as_of}
 
 
@@ -2023,8 +2053,16 @@ def _logged(tool, args, thunk):
             err = res["error"]
         return res
     except Exception as e:  # noqa: BLE001
-        err = {"code": "EXCEPTION", "message": str(e)}
-        raise
+        # Degrade to the same structured {"error": ...} shape every tool already
+        # returns, instead of raising a protocol-level tool error. Client
+        # harnesses circuit-break on repeated protocol errors and mark the WHOLE
+        # server unreachable — a bug in one tool must not take down the other
+        # forty (field report: a describe_table crash benched the entire
+        # connector mid-build).
+        err = {"code": "EXCEPTION", "message": f"{type(e).__name__}: {e}",
+               "hint": "unexpected server-side failure in this one tool; other tools are unaffected"}
+        res = {"error": err}
+        return res
     finally:
         _record(tool, args, res, err, int((time.time() - t0) * 1000))
 
@@ -2064,6 +2102,18 @@ CREATE TABLE IF NOT EXISTS rvbbit.dashboard_versions (
 ALTER TABLE rvbbit.dashboard_versions ADD COLUMN IF NOT EXISTS manifest jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE rvbbit.dashboard_versions ADD COLUMN IF NOT EXISTS source_files jsonb NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS dashboards_team_idx ON rvbbit.dashboards (team, updated_at DESC);
+-- staged artifact uploads: lets an agent ship a large HTML/source payload once
+-- (optionally in chunks) and then publish by handle, instead of re-transmitting
+-- the whole document through every publish/update call. Short-lived by design.
+CREATE TABLE IF NOT EXISTS rvbbit.mcp_artifacts (
+  artifact_id text PRIMARY KEY,
+  name        text,
+  content     text NOT NULL,
+  sha256      text NOT NULL,
+  bytes       int NOT NULL,
+  created_by  text,
+  created_at  timestamptz DEFAULT now()
+);
 -- the derived dependency index (regenerated by dashboard_crawl; safe to truncate + rebuild)
 CREATE TABLE IF NOT EXISTS rvbbit.dashboard_deps (
   dashboard_id bigint NOT NULL REFERENCES rvbbit.dashboards(id) ON DELETE CASCADE,
@@ -2505,7 +2555,73 @@ def _env_bool(name, default=False):
     return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
-def tool_publish_dashboard(name, html, team=None, description=None, kind="live"):
+_ARTIFACT_MAX_BYTES = _env_int("WAREHOUSE_ARTIFACT_MAX_BYTES", 8_000_000, maximum=64_000_000)
+_ARTIFACT_TTL_HOURS = _env_int("WAREHOUSE_ARTIFACT_TTL_HOURS", 48, maximum=24 * 14)
+
+
+def tool_upload_artifact(content, name=None, artifact_id=None, append=False):
+    """Stage content server-side and get back a handle. One upload (or several
+    append chunks for very large payloads), then publish/update by
+    source_artifact_id — no re-transmitting a 33KB+ document through every call."""
+    if not isinstance(content, str) or not content:
+        return {"error": {"code": "EMPTY_CONTENT", "message": "content must be a non-empty string"}}
+    _ensure_dashboard_tables()
+    caller, _ = _caller()
+    with _conn() as c:
+        # opportunistic TTL sweep — artifacts are a staging area, not storage
+        c.execute("DELETE FROM rvbbit.mcp_artifacts WHERE created_at < now() - make_interval(hours => %s)",
+                  (_ARTIFACT_TTL_HOURS,))
+        if append:
+            if not artifact_id:
+                return {"error": {"code": "MISSING_ARTIFACT_ID", "message": "append=true requires artifact_id"}}
+            row = c.execute("SELECT content FROM rvbbit.mcp_artifacts WHERE artifact_id=%s",
+                            (artifact_id,)).fetchone()
+            if not row:
+                return {"error": {"code": "ARTIFACT_NOT_FOUND",
+                                  "message": f"{artifact_id} (expired after {_ARTIFACT_TTL_HOURS}h?)"}}
+            content = row["content"] + content
+        else:
+            artifact_id = artifact_id or secrets.token_urlsafe(9)
+        nbytes = len(content.encode("utf-8"))
+        if nbytes > _ARTIFACT_MAX_BYTES:
+            return {"error": {"code": "ARTIFACT_TOO_LARGE",
+                              "message": f"{nbytes} bytes exceeds cap of {_ARTIFACT_MAX_BYTES}"}}
+        sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        c.execute(
+            "INSERT INTO rvbbit.mcp_artifacts (artifact_id, name, content, sha256, bytes, created_by) "
+            "VALUES (%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (artifact_id) DO UPDATE SET content=EXCLUDED.content, sha256=EXCLUDED.sha256, "
+            "bytes=EXCLUDED.bytes, name=coalesce(EXCLUDED.name, rvbbit.mcp_artifacts.name)",
+            (artifact_id, name, content, sha, nbytes, caller))
+    return {"artifact_id": artifact_id, "bytes": nbytes, "sha256": sha,
+            "expires_after_hours": _ARTIFACT_TTL_HOURS,
+            "next": "pass source_artifact_id to publish_dashboard / update_dashboard / "
+                    "create_live_app / update_live_app"}
+
+
+def _resolve_source(html, source_artifact_id):
+    """html-or-handle: a provided source_artifact_id wins; returns (html, error)."""
+    if not source_artifact_id:
+        return html, None
+    _ensure_dashboard_tables()
+    with _conn() as c:
+        row = c.execute("SELECT content FROM rvbbit.mcp_artifacts WHERE artifact_id=%s",
+                        (source_artifact_id,)).fetchone()
+    if not row:
+        return None, {"error": {"code": "ARTIFACT_NOT_FOUND",
+                                "message": f"{source_artifact_id} — upload_artifact first "
+                                           f"(artifacts expire after {_ARTIFACT_TTL_HOURS}h)"}}
+    return row["content"], None
+
+
+def tool_publish_dashboard(name, html=None, team=None, description=None, kind="live",
+                           source_artifact_id=None):
+    html, aerr = _resolve_source(html, source_artifact_id)
+    if aerr:
+        return aerr
+    if not html:
+        return {"error": {"code": "EMPTY_HTML",
+                          "message": "pass html, or upload_artifact + source_artifact_id"}}
     caller, _ = _caller()
     base = _slugify(name)
     with _conn() as c:
@@ -2522,7 +2638,13 @@ def tool_publish_dashboard(name, html, team=None, description=None, kind="live")
     return {"slug": slug, "version": 1, "url": _dash_url(slug), "owner": caller, "kind": kind, "deps": crawl}
 
 
-def tool_update_dashboard(slug, html, notes=None):
+def tool_update_dashboard(slug, html=None, notes=None, source_artifact_id=None):
+    html, aerr = _resolve_source(html, source_artifact_id)
+    if aerr:
+        return aerr
+    if not html:
+        return {"error": {"code": "EMPTY_HTML",
+                          "message": "pass html, or upload_artifact + source_artifact_id"}}
     caller, _ = _caller()
     with _conn() as c:
         d = c.execute("SELECT id, latest_version FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
@@ -2606,8 +2728,12 @@ def tool_live_app_template(runtime_kind="html", app_kind="dashboard"):
 
 
 def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboard",
-                         team=None, description=None, manifest=None, source_files=None):
+                         team=None, description=None, manifest=None, source_files=None,
+                         source_artifact_id=None):
     """Create a versioned live app. HTML apps are served immediately at /apps/<slug>."""
+    html, aerr = _resolve_source(html, source_artifact_id)
+    if aerr:
+        return aerr
     try:
         runtime_kind = _normalize_runtime_kind(runtime_kind)
         app_kind = _normalize_app_kind(app_kind)
@@ -2655,8 +2781,11 @@ def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
 
 
 def tool_update_live_app(slug, html=None, notes=None, manifest=None, source_files=None,
-                         runtime_kind=None, app_kind=None):
+                         runtime_kind=None, app_kind=None, source_artifact_id=None):
     """Publish a new version of a live app, preserving omitted source fields."""
+    html, aerr = _resolve_source(html, source_artifact_id)
+    if aerr:
+        return aerr
     _ensure_dashboard_tables()
     caller, _ = _caller()
     try:
@@ -3044,31 +3173,61 @@ def _launch_playwright_chromium(playwright):
 
 
 def _capture_html_with_playwright(html, path, width, height, full_page, wait_ms):
+    """Render + screenshot the stored HTML with the LIVE rvbbitQuery bridge injected.
+    Returns a telemetry dict — every bridge query that ran (ok/rows/ms) plus console
+    and page errors — so a capture doubles as a health check of the data bridge,
+    not just a picture of whatever happened to render."""
     from playwright.sync_api import sync_playwright
+
+    telemetry = {"queries": [], "console_errors": [], "page_errors": []}
 
     def _query(sql, opts=None):
         opts = opts or {}
+        t0 = time.time()
         res = tool_run_sql(str(sql), opts.get("as_of"))
+        entry = {"sql": str(sql)[:200], "ms": int((time.time() - t0) * 1000)}
+        if isinstance(res, dict) and res.get("error"):
+            entry["error"] = res["error"]
+        else:
+            entry["rows"] = res.get("row_count")
+        telemetry["queries"].append(entry)
         return json.loads(json.dumps(res, default=str))
 
-    init = """
+    init = """<script>
 window.rvbbitQuery = async function(sql, opts) { return await window.__rvbbitQuery(sql, opts || {}); };
 window.cowork = window.cowork || {};
 window.cowork.callMcpTool = async function(tool, args) {
   const d = await window.rvbbitQuery((args && args.sql) || "");
   return {structuredContent: {rows: (d && d.rows) || []}};
 };
-"""
+</script>"""
+    # The bridge shim must be INLINED into the document, not add_init_script'd:
+    # Playwright init scripts do not fire for set_content() documents (verified
+    # empirically — the wrapper was undefined and every parse-time rvbbitQuery
+    # call threw, which is why captures used to report no query activity).
+    # Exposed bindings (__rvbbitQuery) ARE installed for set_content, so only
+    # the wrapper definition needs to ride inside the HTML, ahead of any
+    # content script.
+    doc = html or ""
+    m = re.search(r"<head[^>]*>", doc, re.IGNORECASE)
+    if m:
+        doc = doc[:m.end()] + init + doc[m.end():]
+    else:
+        doc = init + doc
     with sync_playwright() as p:
         browser = _launch_playwright_chromium(p)
         page = browser.new_page(viewport={"width": width, "height": height})
         page.expose_function("__rvbbitQuery", _query)
-        page.add_init_script(init)
-        page.set_content(html or "", wait_until="networkidle", timeout=30_000)
+        page.on("console", lambda msg: telemetry["console_errors"].append(msg.text[:500])
+                if msg.type in ("error", "warning") and len(telemetry["console_errors"]) < 20 else None)
+        page.on("pageerror", lambda exc: telemetry["page_errors"].append(str(exc)[:500])
+                if len(telemetry["page_errors"]) < 20 else None)
+        page.set_content(doc, wait_until="networkidle", timeout=30_000)
         if wait_ms:
             page.wait_for_timeout(wait_ms)
         page.screenshot(path=str(path), full_page=bool(full_page))
         browser.close()
+    return telemetry
 
 
 def _capture_url_with_playwright(url, path, width, height, full_page, wait_ms):
@@ -3100,9 +3259,11 @@ def tool_capture_live_app(slug, path=None, width=1440, height=900, full_page=Tru
     out = Path(path) if path else _default_capture_path(slug, row["version"])
     out.parent.mkdir(parents=True, exist_ok=True)
     runtime_kind = _normalize_runtime_kind(app.get("runtime_kind"))
+    telemetry = None
     try:
         if runtime_kind == "html":
-            _capture_html_with_playwright(row.get("html") or "", out, width, height, full_page, wait_ms)
+            telemetry = _capture_html_with_playwright(
+                row.get("html") or "", out, width, height, full_page, wait_ms)
             source = "stored-html"
         else:
             status = _live_app_runner_status(slug, probe=True)
@@ -3125,7 +3286,7 @@ def tool_capture_live_app(slug, path=None, width=1440, height=900, full_page=Tru
                 ),
             }
         }
-    return {
+    res = {
         "slug": slug,
         "version": row["version"],
         "runtime_kind": runtime_kind,
@@ -3136,6 +3297,17 @@ def tool_capture_live_app(slug, path=None, width=1440, height=900, full_page=Tru
         "full_page": bool(full_page),
         "source": source,
     }
+    if telemetry is not None:
+        q = telemetry["queries"]
+        res["bridge"] = {
+            "queries_ran": len(q),
+            "queries_failed": sum(1 for e in q if e.get("error")),
+            "queries": q[:24],
+            "console_errors": telemetry["console_errors"],
+            "page_errors": telemetry["page_errors"],
+            "healthy": not any(e.get("error") for e in q) and not telemetry["page_errors"],
+        }
+    return res
 
 
 # ── dependency extraction (Phase 1: queries → tables/metrics, the derived index) ──
@@ -3294,23 +3466,42 @@ def tool_dashboard_dependents(object_ref):
 
 
 # MCP wrappers (named, so their docstring becomes the tool description Claude reads)
-def _mcp_publish_dashboard(name, html, team=None, description=None, kind="live"):
+def _mcp_upload_artifact(content, name=None, artifact_id=None, append=False):
+    """Stage a large HTML/source payload server-side and get an artifact_id handle back.
+    Then publish WITHOUT re-transmitting the document: pass source_artifact_id to
+    publish_dashboard / update_dashboard / create_live_app / update_live_app. For very large
+    payloads, send chunks: first call returns the artifact_id, subsequent calls pass it with
+    append=true. Returns bytes + sha256 for integrity checking. Artifacts expire after ~48h —
+    they are a staging area, not storage."""
+    return _logged("upload_artifact",
+                   {"name": name, "artifact_id": artifact_id, "append": append,
+                    "content_bytes": len(content or "")},
+                   lambda: tool_upload_artifact(content, name, artifact_id, append))
+
+
+def _mcp_publish_dashboard(name, html=None, team=None, description=None, kind="live",
+                           source_artifact_id=None):
     """Persist a dashboard so it lives + works OUTSIDE Cowork (a shareable URL + the lens app).
     Build `html` from the `dashboard_template` boilerplate (call that tool FIRST): it gets LIVE
     data through Cowork's callMcpTool→run_sql bridge in-app, and the host's injected rvbbitQuery
-    when served — the SAME artifact works both places, no login. Keep each data concern its
-    OWN FLAT query in the composePayload parts map — the framework batches them into ONE
-    run_sql_multi round trip. NEVER hand-write a json_build_object payload query (it hides the
+    when served — the SAME artifact works both places, no login. Instead of inlining a large
+    document, you can upload_artifact once and pass source_artifact_id here. Keep each data
+    concern its OWN FLAT query in the composePayload parts map — the framework batches them into
+    ONE run_sql_multi round trip. NEVER hand-write a json_build_object payload query (it hides the
     SQL from the catalog and the accelerated engines), and NEVER bake query results into the
     HTML — that's a 'dead tree' with no live data or inspectability."""
-    return _logged("publish_dashboard", {"name": name, "team": team, "kind": kind, "html_bytes": len(html or "")},
-                   lambda: tool_publish_dashboard(name, html, team, description, kind))
+    return _logged("publish_dashboard", {"name": name, "team": team, "kind": kind,
+                                         "html_bytes": len(html or ""),
+                                         "source_artifact_id": source_artifact_id},
+                   lambda: tool_publish_dashboard(name, html, team, description, kind, source_artifact_id))
 
 
-def _mcp_update_dashboard(slug, html, notes=None):
-    """Publish a new version of an existing dashboard (by slug)."""
-    return _logged("update_dashboard", {"slug": slug, "html_bytes": len(html or ""), "notes": notes},
-                   lambda: tool_update_dashboard(slug, html, notes))
+def _mcp_update_dashboard(slug, html=None, notes=None, source_artifact_id=None):
+    """Publish a new version of an existing dashboard (by slug). Accepts inline html or an
+    upload_artifact handle via source_artifact_id."""
+    return _logged("update_dashboard", {"slug": slug, "html_bytes": len(html or ""), "notes": notes,
+                                        "source_artifact_id": source_artifact_id},
+                   lambda: tool_update_dashboard(slug, html, notes, source_artifact_id))
 
 
 def _mcp_list_dashboards(team=None, search=None):
@@ -3345,26 +3536,33 @@ def _mcp_live_app_template(runtime_kind="html", app_kind="dashboard"):
 
 
 def _mcp_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboard",
-                         team=None, description=None, manifest=None, source_files=None):
+                         team=None, description=None, manifest=None, source_files=None,
+                         source_artifact_id=None):
     """Create a versioned RVBBIT live app. HTML apps are hosted immediately at /d/<slug> and
-    call rvbbitQuery(sql) for live, read-only data from raw tables, metrics, or cubes."""
+    call rvbbitQuery(sql) for live, read-only data from raw tables, metrics, or cubes. Accepts
+    inline html or an upload_artifact handle via source_artifact_id."""
     return _logged("create_live_app", {
         "name": name,
         "runtime_kind": runtime_kind,
         "app_kind": app_kind,
         "team": team,
         "html_bytes": len(html or ""),
-    }, lambda: tool_create_live_app(name, html, runtime_kind, app_kind, team, description, manifest, source_files))
+        "source_artifact_id": source_artifact_id,
+    }, lambda: tool_create_live_app(name, html, runtime_kind, app_kind, team, description,
+                                    manifest, source_files, source_artifact_id))
 
 
 def _mcp_update_live_app(slug, html=None, notes=None, manifest=None, source_files=None,
-                         runtime_kind=None, app_kind=None):
-    """Publish a new version of a live app. Omitted source fields are preserved."""
+                         runtime_kind=None, app_kind=None, source_artifact_id=None):
+    """Publish a new version of a live app. Omitted source fields are preserved. Accepts inline
+    html or an upload_artifact handle via source_artifact_id."""
     return _logged("update_live_app", {
         "slug": slug,
         "html_bytes": len(html or ""),
         "notes": notes,
-    }, lambda: tool_update_live_app(slug, html, notes, manifest, source_files, runtime_kind, app_kind))
+        "source_artifact_id": source_artifact_id,
+    }, lambda: tool_update_live_app(slug, html, notes, manifest, source_files, runtime_kind,
+                                    app_kind, source_artifact_id))
 
 
 def _mcp_list_live_apps(team=None, search=None, runtime_kind=None, app_kind=None):
@@ -3415,10 +3613,15 @@ def _mcp_live_app_status(slug=None):
     return _logged("live_app_status", {"slug": slug}, lambda: tool_live_app_status(slug))
 
 
-async def _mcp_capture_live_app(slug, path=None, width=1440, height=900, full_page=True, start=True, wait_ms=750):
-    """Capture a PNG screenshot of a live app. HTML captures inject the live rvbbitQuery bridge;
-    Python captures auto-start the local runner by default."""
-    return await asyncio.to_thread(
+async def _mcp_capture_live_app(slug, path=None, width=1440, height=900, full_page=True, start=True,
+                                wait_ms=750, return_image=False):
+    """Capture a PNG screenshot of a live app. HTML captures inject the live rvbbitQuery bridge
+    and report per-query bridge health (queries run/failed, console + page errors) in the result;
+    Python captures auto-start the local runner by default. return_image=true additionally returns
+    the PNG itself as image content for direct visual inspection (the saved path is on the MCP
+    host, so remote agents should use return_image; keep the viewport modest — a full-page
+    1440px capture can be megabytes)."""
+    res = await asyncio.to_thread(
         lambda: _logged("capture_live_app", {
             "slug": slug,
             "path": path,
@@ -3427,8 +3630,16 @@ async def _mcp_capture_live_app(slug, path=None, width=1440, height=900, full_pa
             "full_page": full_page,
             "start": start,
             "wait_ms": wait_ms,
+            "return_image": return_image,
         }, lambda: tool_capture_live_app(slug, path, width, height, full_page, start, wait_ms))
     )
+    if return_image and isinstance(res, dict) and not res.get("error") and res.get("path"):
+        try:
+            from mcp.server.fastmcp import Image
+            return [res, Image(path=res["path"])]
+        except Exception as e:  # noqa: BLE001 — the capture itself succeeded; degrade gracefully
+            res["image_error"] = str(e)
+    return res
 
 
 _TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_template.html")
@@ -3797,9 +4008,10 @@ def _register(mcp):
     mcp.tool(name="get_tool_help")(lambda names: _logged(
         "get_tool_help", {"names": names},
         lambda: tool_get_tool_help(names)))
-    mcp.tool(name="run_sql_multi")(lambda queries, as_of=None, limit=None: _logged(
-        "run_sql_multi", {"queries": queries, "as_of": as_of, "limit": limit},
-        lambda: tool_run_sql_multi(queries, as_of, limit)))
+    mcp.tool(name="run_sql_multi")(lambda queries, as_of=None, limit=None, result_mode="full", preview_rows=3: _logged(
+        "run_sql_multi", {"queries": queries, "as_of": as_of, "limit": limit, "result_mode": result_mode},
+        lambda: tool_run_sql_multi(queries, as_of, limit, result_mode, preview_rows)))
+    mcp.tool(name="upload_artifact")(_mcp_upload_artifact)
     mcp.tool(name="publish_dashboard")(_mcp_publish_dashboard)
     mcp.tool(name="update_dashboard")(_mcp_update_dashboard)
     mcp.tool(name="list_dashboards")(_mcp_list_dashboards)
@@ -3834,6 +4046,30 @@ def _selftest():
     show("validate_sql(a write — must be unsafe)", tool_validate_sql("DELETE FROM public._demo_revenue"))
     show("run_sql(good SELECT)", tool_run_sql("SELECT region, drop_pct FROM public._demo_revenue", limit=3))
     show("run_sql(a write — must be blocked)", tool_run_sql("DELETE FROM public._demo_revenue"))
+    # regression: lean=True iterated _col_stats (a dict) as rows → TypeError
+    show("describe_table(lean=True) — must not crash", tool_describe_table("public._demo_revenue", lean=True))
+    show("run_sql_multi(result_mode='summary')", tool_run_sql_multi(
+        {"a": "SELECT region, drop_pct FROM public._demo_revenue",
+         "b": "SELECT bogus_col FROM public._demo_revenue"},
+        result_mode="summary", preview_rows=2))
+    # artifact staging round trip: upload (2 chunks) → publish by handle → read back
+    art = tool_upload_artifact("<html><body>selftest", name="selftest-artifact")
+    art2 = tool_upload_artifact(" dashboard</body></html>", artifact_id=art.get("artifact_id"), append=True)
+    show("upload_artifact (chunked)", art2)
+    pub = tool_publish_dashboard("selftest artifact dash", source_artifact_id=art.get("artifact_id"))
+    show("publish_dashboard(source_artifact_id=...)", pub)
+    if not pub.get("error"):
+        got = tool_get_dashboard(pub["slug"])
+        v = (got.get("version") or {}) if isinstance(got, dict) else {}
+        ok = "selftest dashboard" in (v.get("html") or "")
+        show("published html matches staged artifact", {"match": ok, "version": v.get("version")})
+        with _conn() as c:   # selftest tidiness — don't leave the fixture dashboard behind
+            c.execute("DELETE FROM rvbbit.dashboards WHERE slug=%s", (pub["slug"],))
+    show("publish_dashboard(no html, no handle) — must be a structured error",
+         tool_publish_dashboard("selftest empty dash"))
+    # _logged must degrade exceptions to {"error": ...}, never raise (circuit-breaker fix)
+    show("_logged(exception) — structured error, no raise",
+         _logged("selftest_boom", {}, lambda: (_ for _ in ()).throw(TypeError("boom"))))
     # activity log: ensure the table, log one call through the wrapper, read it back
     _ensure_activity_table()
     _logged("search_data", {"query": "orders"}, lambda: tool_search_data("orders", 2))
@@ -3863,7 +4099,12 @@ _INSTRUCTIONS = (
     "maintain them. For Python FastAPI apps, call start_live_app to run the current version under "
     "local uvicorn, stop_live_app to stop it, live_app_status to inspect runner state, and "
     "capture_live_app to create a PNG screenshot. The legacy dashboard_template/publish_dashboard "
-    "tools remain for compatibility."
+    "tools remain for compatibility. "
+    "NO LOCAL GLUE NEEDED: to publish a large document, upload_artifact(content) once and pass "
+    "source_artifact_id to publish/update tools (no local file reads, no re-transmission). To "
+    "VALIDATE a query set, run_sql_multi(queries, result_mode='summary') returns row counts + "
+    "tiny previews instead of full rowsets. capture_live_app(return_image=true) returns the PNG "
+    "as viewable image content plus bridge health (queries run/failed, console + page errors)."
 )
 
 
