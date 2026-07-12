@@ -190,3 +190,40 @@ def test_e1m1_scripted_walk_changes_position_height_and_heading(
     assert len({(camera.x, camera.y) for camera in cameras}) == 12
     assert len({camera.z for camera in cameras}) > 1
     assert len({camera.heading for camera in cameras}) == 12
+
+
+def test_episode_surface_metadata_tags_doors_lighting_and_real_texels():
+    if not WAD_PATH.exists():
+        pytest.skip(f"missing optional Doom shareware WAD: {WAD_PATH}")
+    world = rasterize_map(
+        read_wad_map(WAD_PATH, "E1M1"),
+        16,
+        episode_details=True,
+    )
+
+    assert len(world.surfaces) == 40_416
+    assert {-16, 16} <= {surface.face_light for surface in world.surfaces}
+    assert any(surface.door_id >= 0 for surface in world.surfaces)
+    texture = next(
+        material_texture
+        for material_texture in world.material_textures.values()
+        if material_texture.width > 1 and material_texture.height > 1
+    )
+    sampled_colors = {
+        texture.sample(x, y, 0)
+        for y in range(min(8, texture.height))
+        for x in range(min(8, texture.width))
+    }
+    assert len(sampled_colors - {None}) > 1
+
+    door_id, line_ids = next(iter(world.door_lines.items()))
+    line = world.doom_map.lines[line_ids[0]]
+    start = world.doom_map.vertices[line.v1]
+    end = world.doom_map.vertices[line.v2]
+    grid_x, grid_y = world.to_grid(
+        round((start.x + end.x) / 2),
+        round((start.y + end.y) / 2),
+    )
+    assert world.nearest_door(grid_x, grid_y) == door_id
+    assert world.line_blocks_player(line)
+    assert not world.line_blocks_player(line, frozenset({door_id}))

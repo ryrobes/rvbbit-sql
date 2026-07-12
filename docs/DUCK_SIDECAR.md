@@ -377,7 +377,7 @@ Unix socket. A TCP broker would need authentication and transport hardening.
 | `RVBBIT_DUCK_BROKER_QUEUE` | `1024` | Maximum queued shared-broker requests before new socket clients get a structured fallback response. |
 | `RVBBIT_DUCK_MAX_REQUEST_BYTES` | `16777216` | Maximum JSONL request line size accepted by local persistent sidecars and shared brokers. |
 | `RVBBIT_DUCK_SOCKET_IO_TIMEOUT_S` | `30` | Shared-broker socket read/write timeout for idle or abandoned client connections. |
-| `rvbbit.duck_threads` / `RVBBIT_DUCK_THREADS` | `4` | DuckDB threads per worker/local sidecar. |
+| `rvbbit.duck_threads` / `RVBBIT_DUCK_THREADS` | auto | DuckDB threads per worker/local sidecar. Unset or `0` = core-derived: every core up to 4 cores, cores minus 2 above that. Set an explicit count to pin it; keep the value consistent across sessions (a mismatch re-keys the worker and forces an executor rebuild). |
 | `rvbbit.duck_arrow_ipc` / `RVBBIT_DUCK_ARROW_IPC` | `on` | Use Arrow IPC file transport for sidecar results. |
 | `rvbbit.duck_arrow_ipc_fallback` / `RVBBIT_DUCK_ARROW_IPC_FALLBACK` | `on` | Retry JSON transport if Arrow IPC decode fails. |
 | `rvbbit.duck_backend_fail_open` / `RVBBIT_DUCK_BACKEND_FAIL_OPEN` | `on` | Non-Vortex failures can fall back to native execution. |

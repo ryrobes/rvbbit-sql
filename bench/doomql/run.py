@@ -28,8 +28,11 @@ try:
     from .load import DEFAULT_WAD, WORLD_COLUMNS, simple_identifier
     from .wad_world import (
         DEFAULT_GRID_SCALE,
+        EPISODE_MAPS,
         MaterialColorRamp,
+        MaterialTexture,
         RasterizedWorld,
+        rasterize_episode,
         rasterize_map,
         read_wad_map,
     )
@@ -47,8 +50,11 @@ except ImportError:
     from load import DEFAULT_WAD, WORLD_COLUMNS, simple_identifier
     from wad_world import (
         DEFAULT_GRID_SCALE,
+        EPISODE_MAPS,
         MaterialColorRamp,
+        MaterialTexture,
         RasterizedWorld,
+        rasterize_episode,
         rasterize_map,
         read_wad_map,
     )
@@ -161,13 +167,15 @@ class SystemResult:
     error: str | None = None
 
 
-def camera_payload(camera: Camera) -> dict[str, int]:
+def camera_payload(camera: Camera) -> dict[str, object]:
     return {
         "x": camera.x,
         "y": camera.y,
         "z": camera.z,
         "heading": camera.heading,
         "draw_distance": camera.draw_distance,
+        "map_name": camera.map_name,
+        "open_doors": list(camera.open_doors),
     }
 
 
@@ -182,6 +190,7 @@ def write_session(
         "world": args.world,
         "wad": str(args.wad.expanduser().resolve()),
         "map_name": args.map_name,
+        "maps": getattr(args, "maps", ",".join(EPISODE_MAPS)),
         "grid_scale": args.grid_scale,
         "table": args.table,
         "parquet": str(args.parquet.expanduser().resolve()),
@@ -243,6 +252,14 @@ def load_session(path: Path) -> tuple[dict[str, Any], list[Camera], str]:
                 z=int(frame["z"]),
                 heading=int(frame["heading"]) % 360,
                 draw_distance=int(frame["draw_distance"]),
+                map_name=(
+                    str(frame["map_name"]).upper()
+                    if frame.get("map_name") is not None
+                    else None
+                ),
+                open_doors=tuple(
+                    sorted({int(door_id) for door_id in frame.get("open_doors", [])})
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"session frame {index} is invalid") from exc
@@ -268,6 +285,8 @@ def apply_session_settings(
         else:
             value = str(value)
         setattr(args, field, value)
+    if "maps" in settings:
+        args.maps = str(settings["maps"])
 
 
 def percentile(values: list[float], pct: float) -> float | None:
@@ -328,6 +347,7 @@ def run_pg_system(
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
     material_color_ramps: dict[int, MaterialColorRamp] | None = None,
+    material_textures: dict[int, MaterialTexture] | None = None,
 ) -> SystemResult:
     candidate = CANDIDATES[system]
     latencies: list[float] = []
@@ -376,6 +396,7 @@ def run_pg_system(
                     grid_scale=grid_scale,
                     render_type=render_type,
                     material_color_ramps=material_color_ramps,
+                    material_textures=material_textures,
                 )
                 hashes.append(frame_hash(frame))
                 route = str(doc.get("chosen_candidate") or doc.get("route") or "")
@@ -409,6 +430,7 @@ def run_duckdb_system(
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
     material_color_ramps: dict[int, MaterialColorRamp] | None = None,
+    material_textures: dict[int, MaterialTexture] | None = None,
 ) -> SystemResult:
     if not parquet.exists():
         return SystemResult("duckdb", "skip", None, None, None, None, None, None, 0, [], f"missing {parquet}")
@@ -450,6 +472,7 @@ def run_duckdb_system(
                             grid_scale=grid_scale,
                             render_type=render_type,
                             material_color_ramps=material_color_ramps,
+                            material_textures=material_textures,
                         )
                     )
                 )
@@ -485,6 +508,7 @@ def run_postgres_system(
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
     material_color_ramps: dict[int, MaterialColorRamp] | None = None,
+    material_textures: dict[int, MaterialTexture] | None = None,
 ) -> SystemResult:
     latencies: list[float] = []
     hashes: list[str] = []
@@ -522,6 +546,7 @@ def run_postgres_system(
                             grid_scale=grid_scale,
                             render_type=render_type,
                             material_color_ramps=material_color_ramps,
+                            material_textures=material_textures,
                         )
                     )
                 )
@@ -568,6 +593,7 @@ def run_clickhouse_system(
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
     material_color_ramps: dict[int, MaterialColorRamp] | None = None,
+    material_textures: dict[int, MaterialTexture] | None = None,
 ) -> SystemResult:
     latencies: list[float] = []
     hashes: list[str] = []
@@ -608,6 +634,7 @@ def run_clickhouse_system(
                         grid_scale=grid_scale,
                         render_type=render_type,
                         material_color_ramps=material_color_ramps,
+                        material_textures=material_textures,
                     )
                 )
             )
@@ -824,6 +851,7 @@ def render_once(
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
     material_color_ramps: dict[int, MaterialColorRamp] | None = None,
+    material_textures: dict[int, MaterialTexture] | None = None,
 ) -> tuple[str, float, str]:
     candidate = CANDIDATES[system]
     with psycopg.connect(dsn, autocommit=True) as conn:
@@ -845,6 +873,7 @@ def render_once(
         grid_scale=grid_scale,
         render_type=render_type,
         material_color_ramps=material_color_ramps,
+        material_textures=material_textures,
     )
     route = str(doc.get("chosen_candidate") or doc.get("route") or system)
     return frame, elapsed_ms, route
@@ -855,6 +884,7 @@ def render_selected_once(
     system: str,
     camera: Camera,
     material_color_ramps: dict[int, MaterialColorRamp] | None = None,
+    material_textures: dict[int, MaterialTexture] | None = None,
 ) -> tuple[str, float, str]:
     if system in CANDIDATES:
         return render_once(
@@ -869,6 +899,7 @@ def render_selected_once(
             args.grid_scale,
             args.render_type,
             material_color_ramps,
+            material_textures,
         )
     pg_dsns = {
         "postgres": args.postgres_dsn,
@@ -897,6 +928,7 @@ def render_selected_once(
             grid_scale=args.grid_scale,
             render_type=args.render_type,
             material_color_ramps=material_color_ramps,
+            material_textures=material_textures,
         )
         return frame, elapsed_ms, PG_COMPETITOR_ROUTES[system]
     if system == "clickhouse":
@@ -924,6 +956,7 @@ def render_selected_once(
             grid_scale=args.grid_scale,
             render_type=args.render_type,
             material_color_ramps=material_color_ramps,
+            material_textures=material_textures,
         )
         return frame, elapsed_ms, "clickhouse_mergetree"
     escaped = str(args.parquet).replace("'", "''")
@@ -948,6 +981,7 @@ def render_selected_once(
         grid_scale=args.grid_scale,
         render_type=args.render_type,
         material_color_ramps=material_color_ramps,
+        material_textures=material_textures,
     )
     return frame, elapsed_ms, "duckdb"
 
@@ -962,11 +996,25 @@ def move_camera(
     direction_x, direction_y = camera_vector(camera.heading)
     target_x = round(camera.x + direction_x * amount / CAMERA_VECTOR_SCALE)
     target_y = round(camera.y + direction_y * amount / CAMERA_VECTOR_SCALE)
-    moved = world_map.try_move(camera.x, camera.y, target_x, target_y)
+    moved = world_map.try_move(
+        camera.x,
+        camera.y,
+        target_x,
+        target_y,
+        frozenset(camera.open_doors),
+    )
     if moved is None:
         return camera
     x, y, z = moved
-    return Camera(x, y, z, camera.heading, camera.draw_distance)
+    return Camera(
+        x,
+        y,
+        z,
+        camera.heading,
+        camera.draw_distance,
+        camera.map_name,
+        camera.open_doors,
+    )
 
 
 def strafe_camera(
@@ -976,7 +1024,15 @@ def strafe_camera(
 ) -> Camera:
     sideways = camera.turned(90)
     moved = move_camera(sideways, amount, world_map)
-    return Camera(moved.x, moved.y, moved.z, camera.heading, camera.draw_distance)
+    return Camera(
+        moved.x,
+        moved.y,
+        moved.z,
+        camera.heading,
+        camera.draw_distance,
+        camera.map_name,
+        camera.open_doors,
+    )
 
 
 def e1m1_scripted_cameras(
@@ -996,16 +1052,64 @@ def e1m1_scripted_cameras(
     return [keyframes[index % len(keyframes)] for index in range(frames)]
 
 
-def interactive(args: argparse.Namespace, world_map: RasterizedWorld | None = None) -> int:
+def episode_scripted_cameras(
+    world_maps: dict[str, RasterizedWorld],
+    frames: int,
+    draw_distance: int,
+) -> list[Camera]:
+    if frames <= 0:
+        raise ValueError("frames must be positive")
+    map_names = tuple(world_maps)
+    walkers = {
+        map_name: Camera(
+            *world_maps[map_name].player_camera(draw_distance),
+            map_name=map_name,
+        )
+        for map_name in map_names
+    }
+    offsets = (0, -15, 15, -30, 30, -45, 45, 90)
+    cameras = []
+    for index in range(frames):
+        map_name = map_names[index % len(map_names)]
+        walker = walkers[map_name]
+        cameras.append(walker.turned(offsets[index % len(offsets)]))
+        walkers[map_name] = move_camera(walker, 2, world_maps[map_name])
+    return cameras
+
+
+def _active_world(
+    camera: Camera,
+    world_maps: dict[str, RasterizedWorld] | None,
+) -> RasterizedWorld | None:
+    if world_maps is None:
+        return None
+    if camera.map_name is not None:
+        return world_maps[camera.map_name]
+    return next(iter(world_maps.values()))
+
+
+def interactive(
+    args: argparse.Namespace,
+    world_maps: dict[str, RasterizedWorld] | None = None,
+) -> int:
     if args.system not in CANDIDATES:
         raise SystemExit("--interactive requires a PostgreSQL-backed --system")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise SystemExit("--interactive requires a terminal")
+    first_map_name = next(iter(world_maps)) if world_maps is not None else None
+    first_world = world_maps[first_map_name] if first_map_name is not None else None
     camera = (
-        Camera(*world_map.player_camera(args.draw_distance))
-        if world_map is not None
+        Camera(
+            *first_world.player_camera(args.draw_distance),
+            map_name=first_map_name if args.world == "episode1" else None,
+        )
+        if first_world is not None
         else Camera(draw_distance=args.draw_distance)
     )
+    map_names = tuple(world_maps) if args.world == "episode1" and world_maps else ()
+    map_door_states: dict[str, tuple[int, ...]] = {
+        map_name: () for map_name in map_names
+    }
     old_settings = termios.tcgetattr(sys.stdin)
     queries_run = 0
     session_commands: list[dict[str, Any]] = []
@@ -1015,6 +1119,7 @@ def interactive(args: argparse.Namespace, world_map: RasterizedWorld | None = No
         with psycopg.connect(args.dsn, autocommit=True) as conn:
             pg_session(conn, CANDIDATES[args.system], args.timeout)
             while True:
+                world_map = _active_world(camera, world_maps)
                 rows, elapsed_ms, doc = execute_pg_frame(
                     conn,
                     camera,
@@ -1037,11 +1142,17 @@ def interactive(args: argparse.Namespace, world_map: RasterizedWorld | None = No
                         if world_map is not None
                         else None
                     ),
+                    material_textures=(
+                        world_map.material_textures
+                        if world_map is not None and args.world == "episode1"
+                        else None
+                    ),
                 )
                 route = str(doc.get("chosen_candidate") or doc.get("route") or args.system)
                 header = (
                     f"DOOMQL  {route}  {elapsed_ms:.1f}ms  {1000.0 / elapsed_ms:.2f}fps  "
                     f"queries={queries_run}  "
+                    f"map={camera.map_name or args.map_name} doors={len(camera.open_doors)}  "
                     f"camera=({camera.x},{camera.y},{camera.z}) heading={camera.heading}deg  "
                     f"hash={frame_hash(frame)}"
                 )
@@ -1076,6 +1187,41 @@ def interactive(args: argparse.Namespace, world_map: RasterizedWorld | None = No
                 elif key == "c":
                     action = "strafe_right"
                     camera = strafe_camera(camera, -2, world_map)
+                    adds_frame = True
+                elif key == " " and world_map is not None and args.world == "episode1":
+                    action = "toggle_door"
+                    door_id = world_map.nearest_door(camera.x, camera.y)
+                    if door_id is not None:
+                        open_doors = set(camera.open_doors)
+                        if door_id in open_doors:
+                            open_doors.remove(door_id)
+                        else:
+                            open_doors.add(door_id)
+                        camera = Camera(
+                            camera.x,
+                            camera.y,
+                            camera.z,
+                            camera.heading,
+                            camera.draw_distance,
+                            camera.map_name,
+                            tuple(sorted(open_doors)),
+                        )
+                        if camera.map_name is not None:
+                            map_door_states[camera.map_name] = camera.open_doors
+                    adds_frame = True
+                elif key in {"[", "]"} and map_names:
+                    action = "previous_map" if key == "[" else "next_map"
+                    assert camera.map_name is not None
+                    map_door_states[camera.map_name] = camera.open_doors
+                    offset = -1 if key == "[" else 1
+                    map_index = (map_names.index(camera.map_name) + offset) % len(map_names)
+                    next_map_name = map_names[map_index]
+                    next_world = world_maps[next_map_name]
+                    camera = Camera(
+                        *next_world.player_camera(args.draw_distance),
+                        map_name=next_map_name,
+                        open_doors=map_door_states[next_map_name],
+                    )
                     adds_frame = True
                 elif key in {"q", "\x03"}:
                     action = "quit"
@@ -1121,6 +1267,7 @@ def main() -> int:
     parser.add_argument("--world", choices=sorted(WORLD_COLUMNS), default="synthetic")
     parser.add_argument("--wad", type=Path, default=DEFAULT_WAD)
     parser.add_argument("--map-name", default="E1M1")
+    parser.add_argument("--maps", default=",".join(EPISODE_MAPS))
     parser.add_argument("--grid-scale", type=int, default=DEFAULT_GRID_SCALE)
     parser.add_argument("--parquet", type=Path)
     parser.add_argument("--systems", default=DEFAULT_SYSTEMS)
@@ -1178,19 +1325,50 @@ def main() -> int:
     if args.width <= 0 or args.height <= 0 or args.draw_distance <= 0:
         parser.error("width, height, and draw distance must be positive")
     world_map = None
-    if args.world == "e1m1":
+    world_maps: dict[str, RasterizedWorld] | None = None
+    if args.world in {"e1m1", "episode1"}:
         wad_path = args.wad.expanduser()
         if not wad_path.exists():
             parser.error(f"missing WAD: {wad_path}")
         try:
-            world_map = rasterize_map(
-                read_wad_map(wad_path, args.map_name),
-                args.grid_scale,
-            )
+            if args.world == "episode1":
+                map_names = tuple(
+                    dict.fromkeys(
+                        name.strip().upper()
+                        for name in args.maps.split(",")
+                        if name.strip()
+                    )
+                )
+                unknown_maps = sorted(set(map_names) - set(EPISODE_MAPS))
+                if not map_names:
+                    parser.error("--maps must contain at least one map")
+                if unknown_maps:
+                    parser.error(f"unsupported Episode 1 maps: {', '.join(unknown_maps)}")
+                world_maps = rasterize_episode(wad_path, map_names, args.grid_scale)
+                if replay_cameras is not None:
+                    missing_maps = sorted(
+                        {
+                            camera.map_name
+                            for camera in replay_cameras
+                            if camera.map_name not in world_maps
+                        },
+                        key=str,
+                    )
+                    if missing_maps:
+                        parser.error(
+                            "replay references maps outside --maps: "
+                            + ", ".join(str(name) for name in missing_maps)
+                        )
+            else:
+                world_map = rasterize_map(
+                    read_wad_map(wad_path, args.map_name),
+                    args.grid_scale,
+                )
+                world_maps = {args.map_name.upper(): world_map}
         except ValueError as exc:
             parser.error(str(exc))
     if args.interactive:
-        return interactive(args, world_map)
+        return interactive(args, world_maps)
 
     systems = [item.strip() for item in args.systems.split(",") if item.strip()]
     unknown = sorted(set(systems) - set(CANDIDATES) - VANILLA_SYSTEMS - {"duckdb"})
@@ -1199,13 +1377,38 @@ def main() -> int:
     if replay_cameras is not None:
         cameras = replay_cameras
     else:
-        cameras = (
-            e1m1_scripted_cameras(world_map, args.frames, args.draw_distance)
-            if world_map is not None
-            else scripted_cameras(args.frames, args.draw_distance)
-        )
+        if args.world == "episode1":
+            assert world_maps is not None
+            cameras = episode_scripted_cameras(
+                world_maps,
+                args.frames,
+                args.draw_distance,
+            )
+        elif world_map is not None:
+            cameras = e1m1_scripted_cameras(
+                world_map,
+                args.frames,
+                args.draw_distance,
+            )
+        else:
+            cameras = scripted_cameras(args.frames, args.draw_distance)
     material_color_ramps = (
-        world_map.material_color_ramps if world_map is not None else None
+        {
+            material: ramp
+            for current_world in world_maps.values()
+            for material, ramp in current_world.material_color_ramps.items()
+        }
+        if world_maps is not None
+        else None
+    )
+    material_textures = (
+        {
+            material: texture
+            for current_world in world_maps.values()
+            for material, texture in current_world.material_textures.items()
+        }
+        if world_maps is not None and args.world == "episode1"
+        else None
     )
     pg_competitor_dsns = {
         "postgres": args.postgres_dsn,
@@ -1227,6 +1430,7 @@ def main() -> int:
                 args.grid_scale,
                 args.render_type,
                 material_color_ramps,
+                material_textures,
             )
         elif system in PG_COMPETITOR_ROUTES:
             result = run_postgres_system(
@@ -1243,6 +1447,7 @@ def main() -> int:
                 args.grid_scale,
                 args.render_type,
                 material_color_ramps,
+                material_textures,
             )
         elif system == "clickhouse":
             result = run_clickhouse_system(
@@ -1258,6 +1463,7 @@ def main() -> int:
                 args.grid_scale,
                 args.render_type,
                 material_color_ramps,
+                material_textures,
             )
         else:
             result = run_pg_system(
@@ -1273,6 +1479,7 @@ def main() -> int:
                 args.grid_scale,
                 args.render_type,
                 material_color_ramps,
+                material_textures,
             )
         results.append(result)
     parity_reference = enforce_parity(results)
@@ -1286,6 +1493,7 @@ def main() -> int:
                 successful.system,
                 cameras[0],
                 material_color_ramps,
+                material_textures,
             )
             print(f"\nDOOMQL | {route} | {elapsed_ms:.1f}ms | hash {frame_hash(frame)}")
             print(frame)
@@ -1301,9 +1509,10 @@ def main() -> int:
         "clickhouse": f"{args.clickhouse_host}:{args.clickhouse_port}",
         "table": args.table,
         "world": args.world,
-        "wad": str(args.wad.expanduser()) if args.world == "e1m1" else None,
+        "wad": str(args.wad.expanduser()) if args.world in {"e1m1", "episode1"} else None,
         "map_name": args.map_name if args.world == "e1m1" else None,
-        "grid_scale": args.grid_scale if args.world == "e1m1" else None,
+        "maps": list(world_maps) if args.world == "episode1" and world_maps else None,
+        "grid_scale": args.grid_scale if args.world in {"e1m1", "episode1"} else None,
         "parquet": str(args.parquet),
         "frames": len(cameras),
         "replay_session": (

@@ -1,6 +1,6 @@
 # DoomQL: an analytical SQL raycaster
 
-DoomQL turns either a deterministic voxel world or the real Doom E1M1 geometry
+DoomQL turns either a deterministic voxel world or real Doom Episode 1 geometry
 into a 120x40 terminal frame using one scan/filter/project/group query per
 frame. It is deliberately a visual benchmark rather than a claim that
 databases should be game engines.
@@ -32,7 +32,7 @@ shaded wall slices.
 - Optional GQE runtime for the `gpu_gqe` system
 - Optional vanilla PostgreSQL and ClickHouse services for the cross-database
   targets
-- The Doom shareware IWAD for `--world e1m1`; the default lookup is
+- The Doom shareware IWAD for `--world e1m1` or `--world episode1`; the default lookup is
   `~/repos2026/diffoom/assets/DOOM1.WAD`, overrideable with `DOOMQL_WAD`
 
 The table name must remain unqualified because the current GQE safety gate does
@@ -91,6 +91,48 @@ their real sector heights. Masked middle textures use a perforated ASCII surface
 instead of incorrectly closing the portal. Outdoor sky samples participate in
 the SQL workload but remain visually open.
 
+### Full Episode 1
+
+The additive `episode1` world leaves every existing E1M1 table and Parquet file
+alone. It imports E1M1 through E1M9 into a separate schema with `map_name`,
+linedef and texture coordinates, directional face light, and door identity:
+
+```bash
+python3 bench/doomql/load.py \
+  --world episode1 \
+  --wad ~/repos2026/diffoom/assets/DOOM1.WAD \
+  --dsn postgresql://postgres:rvbbit@localhost:55433/bench \
+  --table doomql_episode1 \
+  --rows 5000000
+```
+
+At grid scale 16 the enriched nine-map schema contributes 709,818 unique
+surfaces per complete episode scan. Map sizes remain naturally uneven, from
+40,416 surfaces in E1M1 to 218,227 in E1M8. Requested row counts repeat the
+complete episode stream,
+so 5M and 50M exercise the same geometry at different analytical depth while
+retaining map-size variability. Use `--maps E1M1,E1M2,E1M3` to generate a
+subset. The default headless camera sequence changes maps between frames, which
+changes both the map predicate and the amount of qualifying data.
+
+This is a read-only state model: an open door is a camera-side set of door IDs,
+and SQL excludes those tagged surfaces. No table is mutated when a door opens.
+Entity billboards are intentionally not part of this schema yet.
+
+Run or record a multi-map session against the separate table:
+
+```bash
+python3 bench/doomql/run.py \
+  --world episode1 \
+  --wad ~/repos2026/diffoom/assets/DOOM1.WAD \
+  --dsn postgresql://postgres:rvbbit@localhost:55433/bench \
+  --table doomql_episode1 \
+  --parquet bench/doomql/data/doomql_episode1_5000000.parquet \
+  --draw-distance 96 --turn-degrees 5 \
+  --render-type ansi-half --interactive --system auto \
+  --record-session bench/doomql/scripts/episode1-tour.json
+```
+
 ### Vanilla database targets
 
 The existing competitor compose provides suitable adjacent services:
@@ -122,6 +164,16 @@ python3 bench/doomql/load_competitors.py \
   --world e1m1 \
   --table doomql_e1m1 \
   --parquet bench/doomql/data/doomql_e1m1_5000000.parquet
+```
+
+For the full episode use the separate dataset and table:
+
+```bash
+python3 bench/doomql/load_competitors.py \
+  --world episode1 \
+  --table doomql_episode1 \
+  --parquet bench/doomql/data/doomql_episode1_5000000.parquet \
+  --targets postgres,citus,hydra,alloydb,clickhouse
 ```
 
 ## Benchmark
@@ -170,7 +222,8 @@ python3 bench/doomql/run.py \
 ```
 
 Use `W`/`S` to move forward/backward, `A`/`D` to turn, `Z`/`C` to strafe
-left/right, and `Q` to exit. Turns default to 15 degrees; pass
+left/right, and `Q` to exit. In Episode 1 mode, `[`/`]` selects the previous or
+next map and space opens or closes the nearest door. Turns default to 15 degrees; pass
 `--turn-degrees 5` for finer movement or any value from 1 to 90. The camera
 moves only through cells classified as open by the same deterministic world
 function used to generate the dataset.
@@ -234,8 +287,10 @@ geometry behind walls.
 `--render-type ascii` is the portable default. `--render-type ansi-half` uses
 24-bit ANSI foreground/background colors and a Unicode upper-half block (`▀`)
 to encode two independently shaded vertical pixels in every terminal cell.
-Colors are stable material families rather than extracted Doom textures; sector
-light and distance attenuation provide the depth gradient.
+Episode 1 colors are sampled from the authored wall textures and 64x64 flats;
+sector light, directional face light, the original `COLORMAP`, and distance
+attenuation provide the depth gradient. E1M1 compatibility mode retains its
+existing representative material colors.
 
 ```bash
 python3 bench/doomql/run.py \
@@ -252,11 +307,10 @@ python3 bench/doomql/run.py \
 Width and height still describe terminal columns and rows. ANSI half-block mode
 renders an internal `width x (height * 2)` color buffer, so `120x40` becomes
 120x80 addressable color pixels without regenerating or reloading any data. A
-truecolor terminal is required for the intended appearance. In WAD mode, wall
-textures and flats are decoded through the original `PLAYPAL` and 32 normal
-`COLORMAP` tables. Their representative colors follow the actual Doom assets,
-while sector brightness and view distance select the light band for each
-surface.
+truecolor terminal is required for the intended appearance. In Episode 1 mode,
+wall textures and flats are decoded through the original `PLAYPAL` and 32 normal
+`COLORMAP` tables. Texture coordinates and directional face-light values remain
+SQL columns and grouping inputs rather than renderer-only metadata.
 
 ## Reading the result
 
@@ -330,8 +384,9 @@ python3 bench/doomql/sweep.py \
 ```
 
 Scale values accept raw integers or `k`/`m`/`b` suffixes. Without a replay
-session, add `--world e1m1 --table doomql_e1m1` and the WAD path to sweep WAD
-surfaces.
+session, add `--world e1m1 --table doomql_e1m1` for E1M1, or
+`--world episode1 --table doomql_episode1` for the full episode, plus the WAD
+path.
 
 The sweep reuses generated source Parquet files, but it reloads, compacts, and
 benchmarks every selected target at each scale. `--keep-loaded` gives every

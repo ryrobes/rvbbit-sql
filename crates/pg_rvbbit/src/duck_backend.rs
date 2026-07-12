@@ -276,7 +276,30 @@ fn duck_threads() -> usize {
         .or_else(|| std::env::var("RVBBIT_DUCK_THREADS").ok())
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(4)
+        .unwrap_or_else(auto_duck_threads)
+}
+
+/// Auto thread budget when rvbbit.duck_threads / RVBBIT_DUCK_THREADS is unset.
+///
+/// One duck worker is shared per (dsn, engine, layout) — this is a box-level
+/// budget, not per-backend like RVBBIT_DF_THREADS, so it can afford to be
+/// generous: idle workers park at zero CPU, and small scans fan out by row
+/// group so they never occupy the full pool anyway. Small boxes get every
+/// core; larger ones keep two in reserve for PG backends and sidecar IO.
+///
+/// The value must be STABLE for a given host: threads is part of the worker
+/// session key, and a mismatch across sessions forces a full executor rebuild
+/// (fresh DuckDB instance + catalog attach + parquet footer prewarm) on every
+/// alternation.
+fn auto_duck_threads() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    if cores <= 4 {
+        cores
+    } else {
+        cores - 2
+    }
 }
 
 fn persistent_enabled() -> bool {

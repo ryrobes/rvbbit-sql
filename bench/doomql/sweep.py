@@ -26,7 +26,7 @@ try:
         load_session,
         system_label,
     )
-    from .wad_world import DEFAULT_GRID_SCALE
+    from .wad_world import DEFAULT_GRID_SCALE, EPISODE_MAPS
     from .workload import RENDER_TYPES
 except ImportError:
     from load import DEFAULT_WAD, WORLD_COLUMNS, simple_identifier
@@ -43,7 +43,7 @@ except ImportError:
         load_session,
         system_label,
     )
-    from wad_world import DEFAULT_GRID_SCALE
+    from wad_world import DEFAULT_GRID_SCALE, EPISODE_MAPS
     from workload import RENDER_TYPES
 
 
@@ -138,6 +138,7 @@ def main() -> int:
     parser.add_argument("--world", choices=sorted(WORLD_COLUMNS), default="synthetic")
     parser.add_argument("--wad", type=Path, default=DEFAULT_WAD)
     parser.add_argument("--map-name", default="E1M1")
+    parser.add_argument("--maps", default=",".join(EPISODE_MAPS))
     parser.add_argument("--grid-scale", type=int, default=DEFAULT_GRID_SCALE)
     parser.add_argument("--scales", type=parse_scales, default=parse_scales("1000000,5000000,10000000"))
     parser.add_argument("--systems", default=DEFAULT_SYSTEMS)
@@ -163,6 +164,7 @@ def main() -> int:
         args.world = str(replay_settings["world"])
         args.wad = Path(str(replay_settings["wad"]))
         args.map_name = str(replay_settings["map_name"])
+        args.maps = str(replay_settings.get("maps", args.maps))
         args.grid_scale = int(replay_settings["grid_scale"])
         args.table = simple_identifier(str(replay_settings["table"]))
         args.width = int(replay_settings["width"])
@@ -181,11 +183,12 @@ def main() -> int:
     for scale in args.scales:
         table = scale_table(args.table, scale) if args.keep_loaded else args.table
         tables[scale] = table
-        parquet_name = (
-            f"doomql_world_{scale}.parquet"
-            if args.world == "synthetic"
-            else f"doomql_{args.map_name.lower()}_{scale}.parquet"
-        )
+        if args.world == "synthetic":
+            parquet_name = f"doomql_world_{scale}.parquet"
+        elif args.world == "episode1":
+            parquet_name = f"doomql_episode1_{scale}.parquet"
+        else:
+            parquet_name = f"doomql_{args.map_name.lower()}_{scale}.parquet"
         parquet = HERE / "data" / parquet_name
         result_path = HERE / "results" / f"scale-{args.world}-{scale}.json"
         if not args.skip_load:
@@ -208,6 +211,8 @@ def main() -> int:
                 str(args.wad.expanduser()),
                 "--map-name",
                 args.map_name,
+                "--maps",
+                args.maps,
                 "--grid-scale",
                 str(args.grid_scale),
             ]
@@ -295,6 +300,8 @@ def main() -> int:
                     str(args.wad.expanduser()),
                     "--map-name",
                     args.map_name,
+                    "--maps",
+                    args.maps,
                     "--grid-scale",
                     str(args.grid_scale),
                     "--parquet",
@@ -320,6 +327,7 @@ def main() -> int:
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "world": args.world,
         "map_name": args.map_name if args.world == "e1m1" else None,
+        "maps": args.maps.split(",") if args.world == "episode1" else None,
         "scales": args.scales,
         "tables": {str(scale): table for scale, table in tables.items()},
         "systems": args.systems,

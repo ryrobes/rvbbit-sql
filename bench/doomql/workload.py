@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 try:
     from .wad_world import (
         DEFAULT_GRID_SCALE,
+        MaterialTexture,
         SURFACE_CEILING,
         SURFACE_FLOOR,
         SURFACE_MASKED,
@@ -20,6 +21,7 @@ try:
 except ImportError:
     from wad_world import (
         DEFAULT_GRID_SCALE,
+        MaterialTexture,
         SURFACE_CEILING,
         SURFACE_FLOOR,
         SURFACE_MASKED,
@@ -53,6 +55,8 @@ class Camera:
     z: int = 8
     heading: int = 0
     draw_distance: int = 128
+    map_name: str | None = None
+    open_doors: tuple[int, ...] = ()
 
     def moved(self, amount: int) -> "Camera":
         direction_x, direction_y = camera_vector(self.heading)
@@ -62,10 +66,26 @@ class Camera:
         target_y = min(WORLD_SIZE - 2, max(1, target_y))
         if wall_material(target_x, target_y) != 0:
             return self
-        return Camera(target_x, target_y, self.z, self.heading, self.draw_distance)
+        return Camera(
+            target_x,
+            target_y,
+            self.z,
+            self.heading,
+            self.draw_distance,
+            self.map_name,
+            self.open_doors,
+        )
 
     def turned(self, amount: int) -> "Camera":
-        return Camera(self.x, self.y, self.z, (self.heading + amount) % 360, self.draw_distance)
+        return Camera(
+            self.x,
+            self.y,
+            self.z,
+            (self.heading + amount) % 360,
+            self.draw_distance,
+            self.map_name,
+            self.open_doors,
+        )
 
 
 @dataclass(frozen=True)
@@ -89,6 +109,11 @@ class SurfaceHit:
     avg_light: float
     samples: int
     surface_id: int
+    linedef_id: int = -1
+    texture_u: int = 0
+    texture_v: int = 0
+    face_light: int = 0
+    door_id: int = -1
 
 
 def wall_material(x: int, y: int) -> int:
@@ -207,14 +232,34 @@ def frame_sql(
         raise ValueError("frame dimensions must be positive")
     if dialect not in {"postgres", "duckdb", "clickhouse"}:
         raise ValueError(f"unsupported dialect: {dialect}")
-    if world not in {"synthetic", "e1m1"}:
+    if world not in {"synthetic", "e1m1", "episode1"}:
         raise ValueError(f"unsupported world: {world}")
     depth_scaled, lateral_scaled, coarse_filter = _camera_expressions(camera)
     half_width = width // 2
     focal_length = projection_focal_length(width)
-    if world == "e1m1":
+    if world in {"e1m1", "episode1"}:
+        episode_filter = ""
+        dynamic_filter = ""
+        extra_columns = ""
+        light_expression = "light"
+        if world == "episode1":
+            if camera.map_name is None or not camera.map_name.replace("_", "").isalnum():
+                raise ValueError("episode1 camera requires a simple map name")
+            open_doors = ", ".join(str(int(door_id)) for door_id in camera.open_doors) or "-1"
+            episode_filter = f"map_name = '{camera.map_name}' AND "
+            dynamic_filter = (
+                f"AND (door_id = -1 OR door_id NOT IN ({open_doors}))"
+            )
+            extra_columns = """,
+        linedef_id,
+        texture_u,
+        texture_v,
+        face_light,
+        door_id"""
+            light_expression = "light + face_light"
         surface_filter = (
-            f"world_x BETWEEN {camera.x - camera.draw_distance} "
+            episode_filter
+            + f"world_x BETWEEN {camera.x - camera.draw_distance} "
             f"AND {camera.x + camera.draw_distance} "
             f"AND world_y BETWEEN {camera.y - camera.draw_distance} "
             f"AND {camera.y + camera.draw_distance}"
@@ -229,8 +274,8 @@ WITH camera_space AS (
         z_top,
         surface_kind,
         material,
-        light,
-        sector_id
+        {light_expression} AS effective_light,
+        sector_id{extra_columns}
     FROM {table_expr}
     WHERE {surface_filter}
 ), visible_space AS (
@@ -241,6 +286,7 @@ WITH camera_space AS (
       AND lateral_scaled * {focal_length}
           BETWEEN (0 - {half_width}) * depth_scaled
               AND {int(width) - half_width} * depth_scaled
+      {dynamic_filter}
 )
 SELECT
     lateral_scaled,
@@ -250,9 +296,9 @@ SELECT
     surface_kind,
     material,
     sector_id,
-    avg(light) AS avg_light,
+    avg(effective_light) AS avg_light,
     count(*) AS samples,
-    surface_id
+    surface_id{extra_columns}
 FROM visible_space
 GROUP BY
     lateral_scaled,
@@ -262,7 +308,7 @@ GROUP BY
     surface_kind,
     material,
     sector_id,
-    surface_id
+    surface_id{extra_columns}
 ORDER BY depth_scaled, lateral_scaled, surface_kind, surface_id
 """.strip()
     return f"""
@@ -309,8 +355,9 @@ def coerce_hits(rows: Iterable[Sequence[object]]) -> list[RayHit]:
 
 
 def coerce_surface_hits(rows: Iterable[Sequence[object]]) -> list[SurfaceHit]:
-    return [
-        SurfaceHit(
+    hits = []
+    for row in rows:
+        hit = SurfaceHit(
             lateral_scaled=int(row[0]),
             depth_scaled=int(row[1]),
             z_bottom=int(row[2]),
@@ -322,8 +369,17 @@ def coerce_surface_hits(rows: Iterable[Sequence[object]]) -> list[SurfaceHit]:
             samples=int(row[8]),
             surface_id=int(row[9]),
         )
-        for row in rows
-    ]
+        if len(row) >= 15:
+            hit = replace(
+                hit,
+                linedef_id=int(row[10]),
+                texture_u=int(row[11]),
+                texture_v=int(row[12]),
+                face_light=int(row[13]),
+                door_id=int(row[14]),
+            )
+        hits.append(hit)
+    return hits
 
 
 def render_frame(
@@ -336,10 +392,11 @@ def render_frame(
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
     material_color_ramps: Mapping[int, Sequence[tuple[int, int, int]]] | None = None,
+    material_textures: Mapping[int, MaterialTexture] | None = None,
 ) -> str:
     if render_type not in RENDER_TYPES:
         raise ValueError(f"unsupported render type: {render_type}")
-    if world == "e1m1":
+    if world in {"e1m1", "episode1"}:
         return render_surface_frame(
             rows,
             camera,
@@ -348,6 +405,7 @@ def render_frame(
             grid_scale=grid_scale,
             render_type=render_type,
             material_color_ramps=material_color_ramps,
+            material_textures=material_textures,
         )
     if world != "synthetic":
         raise ValueError(f"unsupported world: {world}")
@@ -485,6 +543,16 @@ def _trunc_div(numerator: int, denominator: int) -> int:
     return -((-numerator) // denominator)
 
 
+def _fragment_texture_offset(
+    screen_offset: int,
+    projected_half_size: int,
+    world_span: int,
+) -> int:
+    if projected_half_size <= 0:
+        return 0
+    return round(screen_offset * world_span / (projected_half_size * 2))
+
+
 def _doom_light_level(avg_light: float, distance_ratio: float) -> int:
     sector_level = round((255.0 - max(0.0, min(255.0, avg_light))) / 8.0)
     distance_level = round(max(0.0, min(1.0, distance_ratio)) * 8.0)
@@ -500,6 +568,7 @@ def render_surface_frame(
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
     material_color_ramps: Mapping[int, Sequence[tuple[int, int, int]]] | None = None,
+    material_textures: Mapping[int, MaterialTexture] | None = None,
 ) -> str:
     hits = list(rows)
     if hits and not isinstance(hits[0], SurfaceHit):
@@ -561,13 +630,19 @@ def render_surface_frame(
             )
             return horizon - offset * vertical_scale
 
+        wall_top = None
+        wall_span = None
+        plane_screen_y = None
+        projected_half_height = 0
         if hit.surface_kind in {SURFACE_WALL, SURFACE_MASKED}:
             y_top = project_y(hit.z_top)
             y_bottom = project_y(hit.z_bottom)
-            y_start = max(0, min(y_top, y_bottom))
+            wall_top = min(y_top, y_bottom)
+            wall_span = max(1, abs(y_bottom - y_top))
+            y_start = max(0, wall_top)
             y_stop = min(pixel_height, max(y_top, y_bottom) + 1)
         else:
-            screen_y = project_y(hit.z_bottom)
+            plane_screen_y = project_y(hit.z_bottom)
             projected_half_height = max(
                 0,
                 math.ceil(
@@ -578,8 +653,8 @@ def render_surface_frame(
                     / 2
                 ),
             )
-            y_start = max(0, screen_y - projected_half_height)
-            y_stop = min(pixel_height, screen_y + projected_half_height + 1)
+            y_start = max(0, plane_screen_y - projected_half_height)
+            y_stop = min(pixel_height, plane_screen_y + projected_half_height + 1)
         if y_start >= y_stop:
             continue
 
@@ -628,19 +703,59 @@ def render_surface_frame(
                 max(0, min(255, round(component * color_factor)))
                 for component in base_color
             )
+        material_texture = (
+            material_textures.get(hit.material)
+            if material_textures is not None
+            else None
+        )
         for screen_y in range(y_start, y_stop):
             for projected_x in range(x_start, x_stop):
-                if hit.surface_kind == SURFACE_MASKED and (
-                    projected_x + screen_y + hit.material
-                ) % 2:
+                if (
+                    hit.surface_kind == SURFACE_MASKED
+                    and material_texture is None
+                    and (
+                        projected_x + screen_y + hit.material
+                    ) % 2
+                ):
                     continue
                 current = (depth_buffer[screen_y][projected_x], priority_buffer[screen_y][projected_x])
                 candidate = (hit.depth_scaled, priority)
                 if candidate < current:
+                    pixel_color = color
+                    if material_texture is not None:
+                        texture_u = hit.texture_u + _fragment_texture_offset(
+                            projected_x - screen_x,
+                            projected_half_width,
+                            grid_scale,
+                        )
+                        if hit.surface_kind in {SURFACE_WALL, SURFACE_MASKED}:
+                            assert wall_top is not None and wall_span is not None
+                            texture_v = hit.texture_v + round(
+                                (screen_y - wall_top)
+                                * max(1, hit.z_top - hit.z_bottom)
+                                / wall_span
+                            )
+                        else:
+                            assert plane_screen_y is not None
+                            texture_v = hit.texture_v + _fragment_texture_offset(
+                                screen_y - plane_screen_y,
+                                projected_half_height,
+                                grid_scale,
+                            )
+                        sampled_color = material_texture.sample(
+                            texture_u,
+                            texture_v,
+                            light_level,
+                        )
+                        if sampled_color is None:
+                            if hit.surface_kind == SURFACE_MASKED:
+                                continue
+                        else:
+                            pixel_color = sampled_color
                     depth_buffer[screen_y][projected_x] = hit.depth_scaled
                     priority_buffer[screen_y][projected_x] = priority
                     canvas[screen_y][projected_x] = character
-                    colors[screen_y][projected_x] = color  # type: ignore[assignment]
+                    colors[screen_y][projected_x] = pixel_color  # type: ignore[assignment]
     if render_type == "ansi-half":
         return _encode_ansi_half(colors)
     return "\n".join("".join(row) for row in canvas)

@@ -4474,6 +4474,37 @@ fn cleanup_query_rows(rows: &mut QueryRows) {
     }
 }
 
+/// Auto thread budget: every core on small boxes, cores minus 2 above 4 so PG
+/// backends and sidecar IO keep headroom. Matches the extension's
+/// auto_duck_threads — a bare worker and an extension-driven one must agree on
+/// the pool size, because threads keys the worker socket and a per-request
+/// mismatch forces a full executor rebuild on shared sessions.
+fn auto_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| {
+            let cores = n.get();
+            if cores <= 4 {
+                cores
+            } else {
+                cores - 2
+            }
+        })
+        .unwrap_or(4)
+}
+
+/// `--threads` accepts a positive count, or `0` / `auto` / empty for the
+/// core-derived default (compose files can't conditionally omit the flag).
+fn parse_threads_value(raw: &str) -> Result<usize> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(auto_threads());
+    }
+    let parsed: usize = trimmed
+        .parse()
+        .with_context(|| format!("invalid --threads value: {raw}"))?;
+    Ok(if parsed == 0 { auto_threads() } else { parsed })
+}
+
 fn parse_args() -> Result<Args> {
     let mut engine = env::var("RVBBIT_ENGINE")
         .ok()
@@ -4485,7 +4516,7 @@ fn parse_args() -> Result<Args> {
     let mut sql = None;
     let mut repeat = 1usize;
     let mut timeout_s = 300u64;
-    let mut threads = 4usize;
+    let mut threads = auto_threads();
     let mut max_rows = 20usize;
     let mut pgdata_prefix =
         env::var("RVBBIT_PGDATA_PREFIX").unwrap_or_else(|_| DEFAULT_PGDATA_PREFIX.to_string());
@@ -4519,7 +4550,7 @@ fn parse_args() -> Result<Args> {
             "--sql" => sql = Some(need_value(&mut it, "--sql")?),
             "--repeat" => repeat = need_value(&mut it, "--repeat")?.parse()?,
             "--timeout-s" => timeout_s = need_value(&mut it, "--timeout-s")?.parse()?,
-            "--threads" => threads = need_value(&mut it, "--threads")?.parse()?,
+            "--threads" => threads = parse_threads_value(&need_value(&mut it, "--threads")?)?,
             "--max-rows" => max_rows = need_value(&mut it, "--max-rows")?.parse()?,
             "--pgdata-prefix" => pgdata_prefix = need_value(&mut it, "--pgdata-prefix")?,
             "--visible-pgdata-prefix" => {

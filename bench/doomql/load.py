@@ -13,10 +13,24 @@ import duckdb
 import psycopg
 
 try:
-    from .wad_world import DEFAULT_GRID_SCALE, SURFACE_COLUMNS, create_wad_parquet
+    from .wad_world import (
+        DEFAULT_GRID_SCALE,
+        EPISODE_MAPS,
+        EPISODE_SURFACE_COLUMNS,
+        SURFACE_COLUMNS,
+        create_episode_parquet,
+        create_wad_parquet,
+    )
     from .workload import TABLE_COLUMNS, create_parquet
 except ImportError:
-    from wad_world import DEFAULT_GRID_SCALE, SURFACE_COLUMNS, create_wad_parquet
+    from wad_world import (
+        DEFAULT_GRID_SCALE,
+        EPISODE_MAPS,
+        EPISODE_SURFACE_COLUMNS,
+        SURFACE_COLUMNS,
+        create_episode_parquet,
+        create_wad_parquet,
+    )
     from workload import TABLE_COLUMNS, create_parquet
 
 
@@ -31,6 +45,7 @@ DEFAULT_WAD = Path(
 WORLD_COLUMNS = {
     "synthetic": TABLE_COLUMNS,
     "e1m1": SURFACE_COLUMNS,
+    "episode1": EPISODE_SURFACE_COLUMNS,
 }
 WORLD_POSTGRES_COLUMNS = {
     "synthetic": """
@@ -55,6 +70,25 @@ WORLD_POSTGRES_COLUMNS = {
         material smallint,
         light smallint,
         sector_id smallint
+    """,
+    "episode1": """
+        sample_id bigint,
+        scan_id integer,
+        map_name text,
+        surface_id integer,
+        world_x smallint,
+        world_y smallint,
+        z_bottom smallint,
+        z_top smallint,
+        surface_kind smallint,
+        material smallint,
+        light smallint,
+        sector_id smallint,
+        linedef_id smallint,
+        texture_u integer,
+        texture_v integer,
+        face_light smallint,
+        door_id smallint
     """,
 }
 
@@ -151,6 +185,7 @@ def main() -> int:
     parser.add_argument("--parquet", type=Path)
     parser.add_argument("--wad", type=Path, default=DEFAULT_WAD)
     parser.add_argument("--map-name", default="E1M1")
+    parser.add_argument("--maps", default=",".join(EPISODE_MAPS))
     parser.add_argument("--grid-scale", type=int, default=DEFAULT_GRID_SCALE)
     parser.add_argument("--reuse-parquet", action="store_true")
     parser.add_argument("--skip-variants", action="store_true")
@@ -158,12 +193,30 @@ def main() -> int:
     if args.rows <= 0:
         parser.error("--rows must be positive")
 
-    default_name = "doomql_world" if args.world == "synthetic" else f"doomql_{args.map_name.lower()}"
+    if args.world == "synthetic":
+        default_name = "doomql_world"
+    elif args.world == "episode1":
+        default_name = "doomql_episode1"
+    else:
+        default_name = f"doomql_{args.map_name.lower()}"
     parquet = args.parquet or HERE / "data" / f"{default_name}_{args.rows}.parquet"
     if not args.reuse_parquet or not parquet.exists():
         print(f"Generating {args.rows:,} {args.world} observations -> {parquet}")
         started = time.perf_counter()
-        if args.world == "e1m1":
+        if args.world == "episode1":
+            map_names = tuple(
+                name.strip().upper() for name in args.maps.split(",") if name.strip()
+            )
+            metadata = create_episode_parquet(
+                parquet,
+                args.wad.expanduser(),
+                map_names,
+                args.rows,
+                args.row_group_size,
+                args.grid_scale,
+            )
+            print(json.dumps(metadata, indent=2))
+        elif args.world == "e1m1":
             metadata = create_wad_parquet(
                 parquet,
                 args.wad.expanduser(),

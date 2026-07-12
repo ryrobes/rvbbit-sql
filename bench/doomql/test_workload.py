@@ -18,6 +18,7 @@ from .run import (
 from .sweep import parse_scales, scale_table
 from .workload import (
     Camera,
+    _fragment_texture_offset,
     camera_vector,
     frame_hash,
     frame_sql,
@@ -43,6 +44,15 @@ def test_camera_turns_and_moves_on_sub_cardinal_headings():
     assert Camera(18, 112, heading=45).moved(2) == Camera(19, 113, heading=45)
 
 
+def test_projected_texture_fragment_interpolates_one_grid_cell():
+    offsets = [
+        _fragment_texture_offset(screen_x, 2, 16)
+        for screen_x in range(-2, 3)
+    ]
+    assert offsets == [-8, -4, 0, 4, 8]
+    assert _fragment_texture_offset(0, 0, 16) == 0
+
+
 def test_gqe_query_avoids_known_unsupported_projection_functions():
     sql = frame_sql(Camera()).lower()
     assert "floor(" not in sql
@@ -55,6 +65,62 @@ def test_clickhouse_uses_the_portable_postgres_query_shape():
     assert frame_sql(Camera(), dialect="clickhouse") == frame_sql(
         Camera(), dialect="postgres"
     )
+
+
+def test_episode_query_filters_maps_doors_and_aggregates_face_light():
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            """
+            CREATE TABLE surfaces (
+                sample_id BIGINT,
+                scan_id INTEGER,
+                map_name VARCHAR,
+                surface_id INTEGER,
+                world_x SMALLINT,
+                world_y SMALLINT,
+                z_bottom SMALLINT,
+                z_top SMALLINT,
+                surface_kind SMALLINT,
+                material SMALLINT,
+                light SMALLINT,
+                sector_id SMALLINT,
+                linedef_id SMALLINT,
+                texture_u INTEGER,
+                texture_v INTEGER,
+                face_light SMALLINT,
+                door_id SMALLINT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO surfaces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (0, 0, "E1M1", 1, 10, 0, 0, 64, 1, 1, 160, 1, 10, 3, 4, 16, -1),
+                (1, 0, "E1M1", 2, 12, 0, 0, 64, 1, 2, 128, 2, 11, 5, 6, -16, 7),
+                (2, 0, "E1M2", 3, 14, 0, 0, 64, 1, 3, 255, 3, 12, 7, 8, 0, -1),
+            ],
+        )
+        closed_rows = conn.execute(
+            frame_sql(
+                Camera(0, 0, 41, 0, 32, map_name="E1M1"),
+                table_expr="surfaces",
+                dialect="duckdb",
+                world="episode1",
+            )
+        ).fetchall()
+        open_rows = conn.execute(
+            frame_sql(
+                Camera(0, 0, 41, 0, 32, map_name="E1M1", open_doors=(7,)),
+                table_expr="surfaces",
+                dialect="duckdb",
+                world="episode1",
+            )
+        ).fetchall()
+
+    assert len(closed_rows) == 2
+    assert len(open_rows) == 1
+    assert float(open_rows[0][7]) == 176
+    assert tuple(int(value) for value in open_rows[0][10:15]) == (10, 3, 4, 16, -1)
 
 
 def test_camera_space_preserves_left_and_right_orientation():
@@ -197,3 +263,32 @@ def test_interactive_session_round_trips_resolved_camera_frames(tmp_path: Path):
         "blocked_movements": 0,
         "interactive_queries": 9,
     }
+
+
+def test_session_round_trips_episode_map_and_door_state(tmp_path: Path):
+    session_path = tmp_path / "episode-tour.json"
+    args = argparse.Namespace(
+        world="episode1",
+        wad=Path("/tmp/DOOM1.WAD"),
+        map_name="E1M1",
+        maps="E1M1,E1M2",
+        grid_scale=16,
+        table="doomql_episode1",
+        parquet=Path("/tmp/doomql_episode1_5000000.parquet"),
+        width=120,
+        height=40,
+        draw_distance=96,
+        turn_degrees=15,
+        render_type="ansi-half",
+        system="auto",
+    )
+    cameras = [
+        Camera(114, 78, 41, 90, 96, "E1M1", (7,)),
+        Camera(42, 61, 41, 180, 96, "E1M2", ()),
+    ]
+
+    write_session(session_path, args, [], cameras, queries_run=2)
+    settings, loaded_cameras, _ = load_session(session_path)
+
+    assert settings["maps"] == "E1M1,E1M2"
+    assert loaded_cameras == cameras

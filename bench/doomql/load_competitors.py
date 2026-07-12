@@ -144,6 +144,27 @@ def load_clickhouse(
                 sector_id Int16
             ) ENGINE = MergeTree ORDER BY sample_id
         """,
+        "episode1": """
+            CREATE TABLE {table} (
+                sample_id Int64,
+                scan_id Int32,
+                map_name String,
+                surface_id Int32,
+                world_x Int16,
+                world_y Int16,
+                z_bottom Int16,
+                z_top Int16,
+                surface_kind Int16,
+                material Int16,
+                light Int16,
+                sector_id Int16,
+                linedef_id Int16,
+                texture_u Int32,
+                texture_v Int32,
+                face_light Int16,
+                door_id Int16
+            ) ENGINE = MergeTree ORDER BY (map_name, sample_id)
+        """,
     }
     client.command(clickhouse_columns[world].format(table=table))
     started = time.perf_counter()
