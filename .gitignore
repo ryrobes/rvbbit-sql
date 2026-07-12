@@ -19,6 +19,8 @@ test_runs
 .firecrawl/
 target-trixie/release
 target-trixie-duck/release
+target-trixie/debug
+target-trixie-duck/debug
 
 # Playwright MCP test artifacts (screenshots / page snapshots / console logs)
 .playwright-mcp/

@@ -766,7 +766,12 @@ pub(crate) fn invoke_with_cache_seeded(
     // instead of returning a frozen prior output for identical inputs. Receipts are still
     // logged below for audit/cost. (Gating only the read is insufficient: the receipt we'd
     // write becomes the L2 entry; gating the read means a 'never' op never consults it.)
-    let cacheable = op.cache_policy != "never";
+    //
+    // The `rvbbit.cache_bypass` GUC forces the same bypass transiently WITHOUT touching an
+    // operator's production cache_policy — Semantic Tests sets it (txn-local) so every
+    // battery run re-exercises the model instead of re-serving cached verdicts, which is
+    // what makes drift detection meaningful.
+    let cacheable = op.cache_policy != "never" && !cache_bypass_active();
 
     if cacheable {
         // L1: in-memory LRU cache. ~5μs lookup. Skips SPI entirely.
@@ -831,6 +836,16 @@ pub(crate) fn invoke_with_cache_seeded(
 }
 
 // ---- Parsers (unchanged from previous session) ---------------------------
+
+/// True when `rvbbit.cache_bypass` is set on — the operator result cache is
+/// bypassed (READ + WRITE) for this call. Read via GetConfigOption (no SPI),
+/// so it is safe on the leader operator-exec path. Set txn-locally by the
+/// Semantic Tests runner so batteries re-exercise the model each run.
+fn cache_bypass_active() -> bool {
+    crate::duck_backend::guc_setting("rvbbit.cache_bypass")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
 
 fn parse_bool(s: &str, parser: &str) -> bool {
     match parser {

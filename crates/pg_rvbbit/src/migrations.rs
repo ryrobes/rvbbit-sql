@@ -589,6 +589,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0142_sidecar_mode_check",
         include_str!("../sql/migrations/0142_sidecar_mode_check.sql"),
     ),
+    (
+        "0143_secrets",
+        include_str!("../sql/migrations/0143_secrets.sql"),
+    ),
+    (
+        "0144_operator_test_runs",
+        include_str!("../sql/migrations/0144_operator_test_runs.sql"),
+    ),
+    (
+        "0145_test_cache_bypass",
+        include_str!("../sql/migrations/0145_test_cache_bypass.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -51,13 +51,22 @@ pub struct SpecialistSpec {
     pub timeout_ms: u64,
     /// Name of env var holding a bearer token (NOT the token itself).
     pub auth_header_env: Option<String>,
+    /// Auth token resolved at spec-load time (leader, SPI-safe) from the env
+    /// var OR the rvbbit.secrets table. Cached here so `auth_token()` on a
+    /// pool thread never needs SPI. `None` = resolve lazily from env at call.
+    pub resolved_token: Option<String>,
     /// Transport-specific knobs (gradio fn_index, openai model name, …).
     pub transport_opts: Value,
 }
 
 impl SpecialistSpec {
-    /// Resolved Authorization header value, or None.
+    /// Resolved Authorization header value, or None. Prefers the load-time
+    /// resolution (env or secrets table); falls back to a call-time env read
+    /// (no SPI, so pool-thread safe) for specs built outside the SPI path.
     pub fn auth_token(&self) -> Option<String> {
+        if let Some(t) = self.resolved_token.as_ref().filter(|v| !v.is_empty()) {
+            return Some(t.clone());
+        }
         let var = self.auth_header_env.as_ref()?;
         std::env::var(var).ok().filter(|v| !v.is_empty())
     }
@@ -348,6 +357,8 @@ fn load_spec_from_spi(name: &str) -> Result<SpecialistSpec, ProviderError> {
                     max_concurrent: max_concurrent.unwrap_or(4).max(1) as usize,
                     timeout_ms: timeout_ms.unwrap_or(30_000).max(100) as u64,
                     auth_header_env: auth_env,
+                    // Resolved below, after the SPI closure returns.
+                    resolved_token: None,
                     transport_opts: opts
                         .map(|j| j.0)
                         .unwrap_or_else(|| Value::Object(Default::default())),
@@ -356,6 +367,21 @@ fn load_spec_from_spi(name: &str) -> Result<SpecialistSpec, ProviderError> {
         }
         Ok(())
     });
+    // Resolve the auth token on the leader (SPI-legal): env var FIRST
+    // (deploy-time wins), then the SQL-settable rvbbit.secrets table via the
+    // SECURITY DEFINER resolver. Cached in the spec so pool threads never SPI.
+    if let Some(spec) = result.as_mut() {
+        if let Some(var) = spec.auth_header_env.clone().filter(|v| !v.is_empty()) {
+            let from_env = std::env::var(&var).ok().filter(|v| !v.is_empty());
+            spec.resolved_token = from_env.or_else(|| {
+                let esc = var.replace('\'', "''");
+                Spi::get_one::<String>(&format!("SELECT rvbbit.get_secret('{esc}')"))
+                    .ok()
+                    .flatten()
+                    .filter(|v| !v.is_empty())
+            });
+        }
+    }
     result.ok_or_else(|| {
         ProviderError::Config(format!(
             "specialist '{}' not registered or Warren deployment is not callable",

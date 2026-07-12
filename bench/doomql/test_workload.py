@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import re
+
 import duckdb
 
 from .run import SystemResult, enforce_parity, percentile
 from .sweep import parse_scales
 from .workload import (
     Camera,
+    camera_vector,
     frame_hash,
     frame_sql,
     render_frame,
@@ -22,12 +25,20 @@ def test_starting_camera_and_scripted_corridor_are_open():
     assert all(wall_material(camera.x, camera.y) == 0 for camera in scripted_cameras(12))
 
 
+def test_camera_turns_and_moves_on_sub_cardinal_headings():
+    camera = Camera().turned(15)
+    assert camera.heading == 15
+    assert camera_vector(camera.heading)[0] > camera_vector(camera.heading)[1] > 0
+    assert Camera().turned(-15).heading == 345
+    assert Camera(18, 112, heading=45).moved(2) == Camera(19, 113, heading=45)
+
+
 def test_gqe_query_avoids_known_unsupported_projection_functions():
     sql = frame_sql(Camera()).lower()
     assert "floor(" not in sql
     assert "%" not in sql
     assert "//" not in sql
-    assert "group by lateral_offset, material" in sql
+    assert "group by lateral_scaled, material" in sql
 
 
 def test_clickhouse_uses_the_portable_postgres_query_shape():
@@ -40,12 +51,27 @@ def test_duckdb_query_executes_and_renders_stable_dimensions():
     with duckdb.connect(":memory:") as conn:
         conn.execute(f"CREATE VIEW doomql_world AS {world_select_sql(300_000)}")
         rows = conn.execute(frame_sql(Camera(), dialect="duckdb")).fetchall()
+        angled_rows = conn.execute(
+            frame_sql(Camera(heading=15), dialect="duckdb")
+        ).fetchall()
     frame = render_frame(rows, Camera())
+    angled_frame = render_frame(angled_rows, Camera(heading=15))
     lines = frame.splitlines()
     assert rows
     assert len(lines) == 40
     assert all(len(line) == 120 for line in lines)
     assert len(frame_hash(frame)) == 12
+    assert frame_hash(angled_frame) != frame_hash(frame)
+    ansi_frame = render_frame(
+        rows,
+        Camera(),
+        width=120,
+        height=40,
+        render_type="ansi-half",
+    )
+    plain_ansi = re.sub(r"\x1b\[[0-9;]*m", "", ansi_frame)
+    assert len(plain_ansi.splitlines()) == 40
+    assert all(len(line) == 120 for line in plain_ansi.splitlines())
 
 
 def test_parity_and_nearest_rank_percentile_are_enforced():

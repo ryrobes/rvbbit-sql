@@ -14,11 +14,9 @@ import duckdb
 import psycopg
 
 try:
-    from .load import simple_identifier
-    from .workload import TABLE_COLUMNS
+    from .load import WORLD_COLUMNS, WORLD_POSTGRES_COLUMNS, simple_identifier
 except ImportError:
-    from load import simple_identifier
-    from workload import TABLE_COLUMNS
+    from load import WORLD_COLUMNS, WORLD_POSTGRES_COLUMNS, simple_identifier
 
 
 HERE = Path(__file__).resolve().parent
@@ -35,18 +33,12 @@ def load_postgres(
     table: str,
     parquet: Path,
     batch_rows: int,
+    world: str = "synthetic",
 ) -> dict[str, object]:
-    columns = ", ".join(TABLE_COLUMNS)
+    columns = ", ".join(WORLD_COLUMNS[world])
     ddl = f"""
 CREATE TABLE {table} (
-    sample_id bigint,
-    scan_id integer,
-    world_x smallint,
-    world_y smallint,
-    world_z smallint,
-    solid smallint,
-    material smallint,
-    light smallint
+    {WORLD_POSTGRES_COLUMNS[world]}
 )
 """
     source = duckdb.connect(":memory:")
@@ -90,24 +82,40 @@ def load_clickhouse(
     port: int,
     table: str,
     parquet: Path,
+    world: str = "synthetic",
 ) -> dict[str, object]:
     client = clickhouse_connect.get_client(host=host, port=port)
     client.command(f"DROP TABLE IF EXISTS {table}")
-    client.command(
-        f"""
-        CREATE TABLE {table} (
-            sample_id Int64,
-            scan_id Int32,
-            world_x Int16,
-            world_y Int16,
-            world_z Int16,
-            solid Int16,
-            material Int16,
-            light Int16
-        ) ENGINE = MergeTree
-        ORDER BY sample_id
-        """
-    )
+    clickhouse_columns = {
+        "synthetic": """
+            CREATE TABLE {table} (
+                sample_id Int64,
+                scan_id Int32,
+                world_x Int16,
+                world_y Int16,
+                world_z Int16,
+                solid Int16,
+                material Int16,
+                light Int16
+            ) ENGINE = MergeTree ORDER BY sample_id
+        """,
+        "e1m1": """
+            CREATE TABLE {table} (
+                sample_id Int64,
+                scan_id Int32,
+                surface_id Int32,
+                world_x Int16,
+                world_y Int16,
+                z_bottom Int16,
+                z_top Int16,
+                surface_kind Int16,
+                material Int16,
+                light Int16,
+                sector_id Int16
+            ) ENGINE = MergeTree ORDER BY sample_id
+        """,
+    }
+    client.command(clickhouse_columns[world].format(table=table))
     started = time.perf_counter()
     with parquet.open("rb") as source:
         client.raw_insert(table, insert_block=source, fmt="Parquet")
@@ -130,6 +138,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--parquet", type=Path, required=True)
     parser.add_argument("--table", type=simple_identifier, default="doomql_world")
+    parser.add_argument("--world", choices=sorted(WORLD_COLUMNS), default="synthetic")
     parser.add_argument("--targets", default="postgres,clickhouse")
     parser.add_argument("--postgres-dsn", default=DEFAULT_POSTGRES_DSN)
     parser.add_argument("--clickhouse-host", default=DEFAULT_CLICKHOUSE_HOST)
@@ -139,6 +148,18 @@ def main() -> int:
     args = parser.parse_args()
     if not args.parquet.exists():
         parser.error(f"missing source Parquet: {args.parquet}")
+    actual_columns = tuple(
+        row[0]
+        for row in duckdb.sql(
+            "DESCRIBE SELECT * FROM read_parquet(?)",
+            params=[str(args.parquet)],
+        ).fetchall()
+    )
+    if actual_columns != WORLD_COLUMNS[args.world]:
+        parser.error(
+            f"{args.parquet} has columns for a different world: "
+            f"{', '.join(actual_columns)}"
+        )
     targets = [target.strip() for target in args.targets.split(",") if target.strip()]
     unknown = sorted(set(targets) - {"postgres", "clickhouse"})
     if unknown:
@@ -153,6 +174,7 @@ def main() -> int:
                 args.table,
                 args.parquet,
                 args.copy_batch_rows,
+                args.world,
             )
         else:
             result = load_clickhouse(
@@ -160,6 +182,7 @@ def main() -> int:
                 args.clickhouse_port,
                 args.table,
                 args.parquet,
+                args.world,
             )
         results.append(result)
         print(json.dumps(result, indent=2))
@@ -170,6 +193,7 @@ def main() -> int:
             {
                 "source_parquet": str(args.parquet),
                 "source_parquet_bytes": args.parquet.stat().st_size,
+                "world": args.world,
                 "results": results,
             },
             indent=2,
@@ -183,4 +207,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

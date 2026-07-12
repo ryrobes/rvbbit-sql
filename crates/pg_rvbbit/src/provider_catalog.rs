@@ -934,6 +934,7 @@ fn refresh_gemini() -> Result<RefreshStats, String> {
             max_concurrent: 1,
             timeout_ms: catalog_timeout().as_millis().min(u64::MAX as u128) as u64,
             auth_header_env: Some("GOOGLE_APPLICATION_CREDENTIALS".to_string()),
+            resolved_token: None,
             transport_opts: json!({"auth_mode": "google_adc"}),
         };
         let (token, user_project) =

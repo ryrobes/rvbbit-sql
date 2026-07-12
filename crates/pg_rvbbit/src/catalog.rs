@@ -2314,6 +2314,10 @@ DECLARE
     test_ok   boolean;
     err_msg   text;
 BEGIN
+    -- Force the operator result cache to bypass for the duration of this
+    -- transaction, so every test genuinely re-runs the model instead of
+    -- re-serving a cached verdict. Txn-local; production caching is untouched.
+    PERFORM set_config('rvbbit.cache_bypass', 'on', true);
     SELECT * INTO op_row FROM rvbbit.operators WHERE name = operator_name;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'rvbbit.run_tests: operator % not found', operator_name;

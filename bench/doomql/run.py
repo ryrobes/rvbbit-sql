@@ -24,11 +24,31 @@ import duckdb
 import psycopg
 
 try:
-    from .load import simple_identifier
-    from .workload import Camera, frame_hash, frame_sql, render_frame, scripted_cameras
+    from .load import DEFAULT_WAD, WORLD_COLUMNS, simple_identifier
+    from .wad_world import DEFAULT_GRID_SCALE, RasterizedWorld, rasterize_map, read_wad_map
+    from .workload import (
+        CAMERA_VECTOR_SCALE,
+        RENDER_TYPES,
+        Camera,
+        camera_vector,
+        frame_hash,
+        frame_sql,
+        render_frame,
+        scripted_cameras,
+    )
 except ImportError:
-    from load import simple_identifier
-    from workload import Camera, frame_hash, frame_sql, render_frame, scripted_cameras
+    from load import DEFAULT_WAD, WORLD_COLUMNS, simple_identifier
+    from wad_world import DEFAULT_GRID_SCALE, RasterizedWorld, rasterize_map, read_wad_map
+    from workload import (
+        CAMERA_VECTOR_SCALE,
+        RENDER_TYPES,
+        Camera,
+        camera_vector,
+        frame_hash,
+        frame_sql,
+        render_frame,
+        scripted_cameras,
+    )
 
 
 HERE = Path(__file__).resolve().parent
@@ -109,8 +129,9 @@ def execute_pg_frame(
     table: str,
     width: int,
     height: int,
+    world: str = "synthetic",
 ) -> tuple[list[tuple[Any, ...]], float, dict[str, Any]]:
-    sql = frame_sql(camera, width=width, height=height, table_expr=table)
+    sql = frame_sql(camera, width=width, height=height, table_expr=table, world=world)
     doc = route_explain(conn, sql)
     started = time.perf_counter()
     rows = conn.execute(sql).fetchall()
@@ -126,6 +147,9 @@ def run_pg_system(
     height: int,
     warmups: int,
     timeout_s: int,
+    world: str = "synthetic",
+    grid_scale: int = DEFAULT_GRID_SCALE,
+    render_type: str = "ascii",
 ) -> SystemResult:
     candidate = CANDIDATES[system]
     latencies: list[float] = []
@@ -137,7 +161,13 @@ def run_pg_system(
     try:
         with psycopg.connect(dsn, autocommit=True) as conn:
             pg_session(conn, candidate, timeout_s)
-            first_sql = frame_sql(cameras[0], width=width, height=height, table_expr=table)
+            first_sql = frame_sql(
+                cameras[0],
+                width=width,
+                height=height,
+                table_expr=table,
+                world=world,
+            )
             first_doc = route_explain(conn, first_sql)
             available, reason = candidate_available(first_doc, candidate)
             if not available:
@@ -145,14 +175,29 @@ def run_pg_system(
 
             for i in range(warmups + len(cameras)):
                 camera = cameras[0] if i < warmups else cameras[i - warmups]
-                rows, elapsed_ms, doc = execute_pg_frame(conn, camera, table, width, height)
+                rows, elapsed_ms, doc = execute_pg_frame(
+                    conn,
+                    camera,
+                    table,
+                    width,
+                    height,
+                    world,
+                )
                 if first_ms is None:
                     first_ms = elapsed_ms
                 if i < warmups:
                     continue
                 latencies.append(elapsed_ms)
                 output_rows += len(rows)
-                frame = render_frame(rows, camera, width=width, height=height)
+                frame = render_frame(
+                    rows,
+                    camera,
+                    width=width,
+                    height=height,
+                    world=world,
+                    grid_scale=grid_scale,
+                    render_type=render_type,
+                )
                 hashes.append(frame_hash(frame))
                 route = str(doc.get("chosen_candidate") or doc.get("route") or "")
                 route_source = str(doc.get("route_source") or "")
@@ -181,6 +226,9 @@ def run_duckdb_system(
     width: int,
     height: int,
     warmups: int,
+    world: str = "synthetic",
+    grid_scale: int = DEFAULT_GRID_SCALE,
+    render_type: str = "ascii",
 ) -> SystemResult:
     if not parquet.exists():
         return SystemResult("duckdb", "skip", None, None, None, None, None, None, 0, [], f"missing {parquet}")
@@ -200,6 +248,7 @@ def run_duckdb_system(
                     height=height,
                     table_expr=table_expr,
                     dialect="duckdb",
+                    world=world,
                 )
                 started = time.perf_counter()
                 rows = conn.execute(sql).fetchall()
@@ -210,7 +259,19 @@ def run_duckdb_system(
                     continue
                 latencies.append(elapsed_ms)
                 output_rows += len(rows)
-                hashes.append(frame_hash(render_frame(rows, camera, width=width, height=height)))
+                hashes.append(
+                    frame_hash(
+                        render_frame(
+                            rows,
+                            camera,
+                            width=width,
+                            height=height,
+                            world=world,
+                            grid_scale=grid_scale,
+                            render_type=render_type,
+                        )
+                    )
+                )
     except Exception as exc:
         return SystemResult("duckdb", "fail", "duckdb", "standalone", first_ms, None, None, None, output_rows, hashes, str(exc))
     median_ms = statistics.median(latencies)
@@ -237,6 +298,9 @@ def run_postgres_system(
     height: int,
     warmups: int,
     timeout_s: int,
+    world: str = "synthetic",
+    grid_scale: int = DEFAULT_GRID_SCALE,
+    render_type: str = "ascii",
 ) -> SystemResult:
     latencies: list[float] = []
     hashes: list[str] = []
@@ -247,7 +311,13 @@ def run_postgres_system(
             conn.execute("SELECT set_config('statement_timeout', %s, false)", (f"{timeout_s}s",))
             for i in range(warmups + len(cameras)):
                 camera = cameras[0] if i < warmups else cameras[i - warmups]
-                sql = frame_sql(camera, width=width, height=height, table_expr=table)
+                sql = frame_sql(
+                    camera,
+                    width=width,
+                    height=height,
+                    table_expr=table,
+                    world=world,
+                )
                 started = time.perf_counter()
                 rows = conn.execute(sql).fetchall()
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -257,7 +327,19 @@ def run_postgres_system(
                     continue
                 latencies.append(elapsed_ms)
                 output_rows += len(rows)
-                hashes.append(frame_hash(render_frame(rows, camera, width=width, height=height)))
+                hashes.append(
+                    frame_hash(
+                        render_frame(
+                            rows,
+                            camera,
+                            width=width,
+                            height=height,
+                            world=world,
+                            grid_scale=grid_scale,
+                            render_type=render_type,
+                        )
+                    )
+                )
     except Exception as exc:
         return SystemResult(
             "postgres",
@@ -297,6 +379,9 @@ def run_clickhouse_system(
     height: int,
     warmups: int,
     timeout_s: int,
+    world: str = "synthetic",
+    grid_scale: int = DEFAULT_GRID_SCALE,
+    render_type: str = "ascii",
 ) -> SystemResult:
     latencies: list[float] = []
     hashes: list[str] = []
@@ -312,6 +397,7 @@ def run_clickhouse_system(
                 height=height,
                 table_expr=table,
                 dialect="clickhouse",
+                world=world,
             )
             started = time.perf_counter()
             rows = client.query(
@@ -325,7 +411,19 @@ def run_clickhouse_system(
                 continue
             latencies.append(elapsed_ms)
             output_rows += len(rows)
-            hashes.append(frame_hash(render_frame(rows, camera, width=width, height=height)))
+            hashes.append(
+                frame_hash(
+                    render_frame(
+                        rows,
+                        camera,
+                        width=width,
+                        height=height,
+                        world=world,
+                        grid_scale=grid_scale,
+                        render_type=render_type,
+                    )
+                )
+            )
     except Exception as exc:
         return SystemResult(
             "clickhouse",
@@ -507,12 +605,30 @@ def render_once(
     width: int,
     height: int,
     timeout_s: int,
+    world: str = "synthetic",
+    grid_scale: int = DEFAULT_GRID_SCALE,
+    render_type: str = "ascii",
 ) -> tuple[str, float, str]:
     candidate = CANDIDATES[system]
     with psycopg.connect(dsn, autocommit=True) as conn:
         pg_session(conn, candidate, timeout_s)
-        rows, elapsed_ms, doc = execute_pg_frame(conn, camera, table, width, height)
-    frame = render_frame(rows, camera, width=width, height=height)
+        rows, elapsed_ms, doc = execute_pg_frame(
+            conn,
+            camera,
+            table,
+            width,
+            height,
+            world,
+        )
+    frame = render_frame(
+        rows,
+        camera,
+        width=width,
+        height=height,
+        world=world,
+        grid_scale=grid_scale,
+        render_type=render_type,
+    )
     route = str(doc.get("chosen_candidate") or doc.get("route") or system)
     return frame, elapsed_ms, route
 
@@ -531,14 +647,31 @@ def render_selected_once(
             args.width,
             args.height,
             args.timeout,
+            args.world,
+            args.grid_scale,
+            args.render_type,
         )
     if system == "postgres":
         with psycopg.connect(args.postgres_dsn, autocommit=True) as conn:
-            sql = frame_sql(camera, width=args.width, height=args.height, table_expr=args.table)
+            sql = frame_sql(
+                camera,
+                width=args.width,
+                height=args.height,
+                table_expr=args.table,
+                world=args.world,
+            )
             started = time.perf_counter()
             rows = conn.execute(sql).fetchall()
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        frame = render_frame(rows, camera, width=args.width, height=args.height)
+        frame = render_frame(
+            rows,
+            camera,
+            width=args.width,
+            height=args.height,
+            world=args.world,
+            grid_scale=args.grid_scale,
+            render_type=args.render_type,
+        )
         return frame, elapsed_ms, "postgres_heap"
     if system == "clickhouse":
         client = clickhouse_connect.get_client(
@@ -551,11 +684,20 @@ def render_selected_once(
             height=args.height,
             table_expr=args.table,
             dialect="clickhouse",
+            world=args.world,
         )
         started = time.perf_counter()
         rows = client.query(sql).result_rows
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        frame = render_frame(rows, camera, width=args.width, height=args.height)
+        frame = render_frame(
+            rows,
+            camera,
+            width=args.width,
+            height=args.height,
+            world=args.world,
+            grid_scale=args.grid_scale,
+            render_type=args.render_type,
+        )
         return frame, elapsed_ms, "clickhouse_mergetree"
     escaped = str(args.parquet).replace("'", "''")
     with duckdb.connect(":memory:") as conn:
@@ -565,34 +707,97 @@ def render_selected_once(
             height=args.height,
             table_expr=f"read_parquet('{escaped}')",
             dialect="duckdb",
+            world=args.world,
         )
         started = time.perf_counter()
         rows = conn.execute(sql).fetchall()
     elapsed_ms = (time.perf_counter() - started) * 1000.0
-    frame = render_frame(rows, camera, width=args.width, height=args.height)
+    frame = render_frame(
+        rows,
+        camera,
+        width=args.width,
+        height=args.height,
+        world=args.world,
+        grid_scale=args.grid_scale,
+        render_type=args.render_type,
+    )
     return frame, elapsed_ms, "duckdb"
 
 
-def interactive(args: argparse.Namespace) -> int:
+def move_camera(
+    camera: Camera,
+    amount: int,
+    world_map: RasterizedWorld | None,
+) -> Camera:
+    if world_map is None:
+        return camera.moved(amount)
+    direction_x, direction_y = camera_vector(camera.heading)
+    target_x = round(camera.x + direction_x * amount / CAMERA_VECTOR_SCALE)
+    target_y = round(camera.y + direction_y * amount / CAMERA_VECTOR_SCALE)
+    moved = world_map.try_move(camera.x, camera.y, target_x, target_y)
+    if moved is None:
+        return camera
+    x, y, z = moved
+    return Camera(x, y, z, camera.heading, camera.draw_distance)
+
+
+def e1m1_scripted_cameras(
+    world_map: RasterizedWorld,
+    frames: int,
+    draw_distance: int,
+) -> list[Camera]:
+    if frames <= 0:
+        raise ValueError("frames must be positive")
+    start = Camera(*world_map.player_camera(draw_distance))
+    offsets = (0, -5, 5, -15, 15, -30, 30, -45, 45, -60, 60, 90)
+    keyframes = []
+    walker = start
+    for offset in offsets:
+        keyframes.append(walker.turned(offset))
+        walker = move_camera(walker, 2, world_map)
+    return [keyframes[index % len(keyframes)] for index in range(frames)]
+
+
+def interactive(args: argparse.Namespace, world_map: RasterizedWorld | None = None) -> int:
     if args.system not in CANDIDATES:
         raise SystemExit("--interactive requires a PostgreSQL-backed --system")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise SystemExit("--interactive requires a terminal")
-    camera = Camera(draw_distance=args.draw_distance)
+    camera = (
+        Camera(*world_map.player_camera(args.draw_distance))
+        if world_map is not None
+        else Camera(draw_distance=args.draw_distance)
+    )
     old_settings = termios.tcgetattr(sys.stdin)
+    queries_run = 0
     try:
         tty.setcbreak(sys.stdin.fileno())
         with psycopg.connect(args.dsn, autocommit=True) as conn:
             pg_session(conn, CANDIDATES[args.system], args.timeout)
             while True:
                 rows, elapsed_ms, doc = execute_pg_frame(
-                    conn, camera, args.table, args.width, args.height
+                    conn,
+                    camera,
+                    args.table,
+                    args.width,
+                    args.height,
+                    args.world,
                 )
-                frame = render_frame(rows, camera, width=args.width, height=args.height)
+                queries_run += 1
+                frame = render_frame(
+                    rows,
+                    camera,
+                    width=args.width,
+                    height=args.height,
+                    world=args.world,
+                    grid_scale=args.grid_scale,
+                    render_type=args.render_type,
+                )
                 route = str(doc.get("chosen_candidate") or doc.get("route") or args.system)
                 header = (
                     f"DOOMQL  {route}  {elapsed_ms:.1f}ms  {1000.0 / elapsed_ms:.2f}fps  "
-                    f"camera=({camera.x},{camera.y},{camera.z}) heading={camera.heading}  "
+                    f"queries={queries_run}  "
+                    f"camera=({camera.x},{camera.y},{camera.z}) heading={camera.heading}deg  "
                     f"hash={frame_hash(frame)}"
                 )
                 print("\x1b[2J\x1b[H" + header[: args.width] + "\n" + frame, end="", flush=True)
@@ -603,13 +808,13 @@ def interactive(args: argparse.Namespace) -> int:
                 if key in {"q", "\x03"}:
                     break
                 if key == "w":
-                    camera = camera.moved(2)
+                    camera = move_camera(camera, 2, world_map)
                 elif key == "s":
-                    camera = camera.moved(-2)
+                    camera = move_camera(camera, -2, world_map)
                 elif key == "a":
-                    camera = camera.turned(-1)
+                    camera = camera.turned(-args.turn_degrees)
                 elif key == "d":
-                    camera = camera.turned(1)
+                    camera = camera.turned(args.turn_degrees)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         print()
@@ -623,6 +828,10 @@ def main() -> int:
     parser.add_argument("--clickhouse-host", default=DEFAULT_CLICKHOUSE_HOST)
     parser.add_argument("--clickhouse-port", type=int, default=DEFAULT_CLICKHOUSE_PORT)
     parser.add_argument("--table", type=simple_identifier, default="doomql_world")
+    parser.add_argument("--world", choices=sorted(WORLD_COLUMNS), default="synthetic")
+    parser.add_argument("--wad", type=Path, default=DEFAULT_WAD)
+    parser.add_argument("--map-name", default="E1M1")
+    parser.add_argument("--grid-scale", type=int, default=DEFAULT_GRID_SCALE)
     parser.add_argument("--parquet", type=Path, required=True)
     parser.add_argument("--systems", default=DEFAULT_SYSTEMS)
     parser.add_argument("--system", default="auto", choices=sorted(CANDIDATES))
@@ -631,24 +840,55 @@ def main() -> int:
     parser.add_argument("--width", type=int, default=120)
     parser.add_argument("--height", type=int, default=40)
     parser.add_argument("--draw-distance", type=int, default=128)
+    parser.add_argument("--turn-degrees", type=int, default=15)
+    parser.add_argument("--render-type", choices=sorted(RENDER_TYPES), default="ascii")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--output", type=Path, default=HERE / "results" / "last_run.json")
     args = parser.parse_args()
+    if not 1 <= args.turn_degrees <= 90:
+        parser.error("--turn-degrees must be between 1 and 90")
+    if args.grid_scale <= 0:
+        parser.error("--grid-scale must be positive")
+    world_map = None
+    if args.world == "e1m1":
+        wad_path = args.wad.expanduser()
+        if not wad_path.exists():
+            parser.error(f"missing WAD: {wad_path}")
+        try:
+            world_map = rasterize_map(
+                read_wad_map(wad_path, args.map_name),
+                args.grid_scale,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.interactive:
-        return interactive(args)
+        return interactive(args, world_map)
 
     systems = [item.strip() for item in args.systems.split(",") if item.strip()]
     unknown = sorted(set(systems) - set(CANDIDATES) - VANILLA_SYSTEMS - {"duckdb"})
     if unknown:
         parser.error(f"unknown systems: {', '.join(unknown)}")
-    cameras = scripted_cameras(args.frames, args.draw_distance)
+    cameras = (
+        e1m1_scripted_cameras(world_map, args.frames, args.draw_distance)
+        if world_map is not None
+        else scripted_cameras(args.frames, args.draw_distance)
+    )
     results: list[SystemResult] = []
     for system in systems:
         print(f"Running {system}...", flush=True)
         if system == "duckdb":
-            result = run_duckdb_system(args.parquet, cameras, args.width, args.height, args.warmups)
+            result = run_duckdb_system(
+                args.parquet,
+                cameras,
+                args.width,
+                args.height,
+                args.warmups,
+                args.world,
+                args.grid_scale,
+                args.render_type,
+            )
         elif system == "postgres":
             result = run_postgres_system(
                 args.postgres_dsn,
@@ -658,6 +898,9 @@ def main() -> int:
                 args.height,
                 args.warmups,
                 args.timeout,
+                args.world,
+                args.grid_scale,
+                args.render_type,
             )
         elif system == "clickhouse":
             result = run_clickhouse_system(
@@ -669,6 +912,9 @@ def main() -> int:
                 args.height,
                 args.warmups,
                 args.timeout,
+                args.world,
+                args.grid_scale,
+                args.render_type,
             )
         else:
             result = run_pg_system(
@@ -680,6 +926,9 @@ def main() -> int:
                 args.height,
                 args.warmups,
                 args.timeout,
+                args.world,
+                args.grid_scale,
+                args.render_type,
             )
         results.append(result)
     parity_reference = enforce_parity(results)
@@ -703,11 +952,17 @@ def main() -> int:
         "postgres_dsn": args.postgres_dsn.rsplit("@", 1)[-1],
         "clickhouse": f"{args.clickhouse_host}:{args.clickhouse_port}",
         "table": args.table,
+        "world": args.world,
+        "wad": str(args.wad.expanduser()) if args.world == "e1m1" else None,
+        "map_name": args.map_name if args.world == "e1m1" else None,
+        "grid_scale": args.grid_scale if args.world == "e1m1" else None,
         "parquet": str(args.parquet),
         "frames": args.frames,
         "width": args.width,
         "height": args.height,
         "draw_distance": args.draw_distance,
+        "turn_degrees": args.turn_degrees,
+        "render_type": args.render_type,
         "warmups": args.warmups,
         "parity_reference": parity_reference,
         "environment": collect_environment(
