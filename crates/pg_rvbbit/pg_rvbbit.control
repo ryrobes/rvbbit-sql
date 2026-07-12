@@ -1,5 +1,5 @@
 comment = 'Columnar storage for Postgres via immutable Parquet row groups + heap catcher'
-default_version = '3.3.2'
+default_version = '3.3.3'
 module_pathname = '$libdir/pg_rvbbit'
 relocatable = false
 superuser = true
