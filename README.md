@@ -146,6 +146,11 @@ widens to ~15× over AlloyDB.
 
 [Full benchmark output →](./bench/clickbench/README.md)
 
+For a deliberately non-standard visual workload, [DoomQL](./bench/doomql/)
+raycasts a terminal world by reducing millions of voxel observations through
+the same learned engine router, with frame-hash parity against standalone
+DuckDB.
+
 ## Bigfoot demo
 
 If "ticket triage" reads as boring-money, run

@@ -1,0 +1,26 @@
+# The Hutch box — gateway (+ zoo when the GPU box lands).
+# Phase 1 dev: gateway in mock mode. Phase 2: un-comment zoo, flip
+# hutch.yaml upstream to {mode: proxy, base_url: "http://zoo:8000"}.
+services:
+  hutch:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.rvbbit-hutch
+    image: rvbbit-hutch:dev
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./hutch-config:/etc/hutch:ro
+      - hutch-meter:/var/lib/hutch
+
+  # zoo:
+  #   image: rvbbit-zoo:dev          # resurrected specialist_zoo (NGC PyTorch)
+  #   restart: unless-stopped
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+volumes:
+  hutch-meter:

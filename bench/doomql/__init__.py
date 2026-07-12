@@ -1,0 +1,2 @@
+"""DoomQL analytical raycaster benchmark."""
+

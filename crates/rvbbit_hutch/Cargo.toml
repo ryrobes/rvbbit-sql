@@ -1,0 +1,27 @@
+[package]
+name = "rvbbit_hutch"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The Hutch — managed-warren gateway: auth, entitlements, lanes, metering in front of model backends"
+
+# Standalone on purpose (same pattern as rvbbit_duck): the pgrx workspace
+# must never pick up tokio/axum, and this binary ships on its own cadence.
+[workspace]
+
+[[bin]]
+name = "rvbbit-hutch"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

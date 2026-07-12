@@ -1,0 +1,23 @@
+# rvbbit-hutch — the managed-warren gateway (docs/HUTCH_PLAN.md).
+# Same shape as Dockerfile.rvbbit-hare: fat rust builder → slim runtime.
+# Build from repo root:
+#   docker build -f docker/Dockerfile.rvbbit-hutch -t rvbbit-hutch .
+
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY crates/rvbbit_hutch ./rvbbit_hutch
+RUN cd rvbbit_hutch && cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/rvbbit_hutch/target/release/rvbbit-hutch /usr/local/bin/rvbbit-hutch
+COPY crates/rvbbit_hutch/hutch.example.yaml /etc/hutch/hutch.yaml
+COPY crates/rvbbit_hutch/tenants.example.yaml /etc/hutch/tenants.yaml
+WORKDIR /var/lib/hutch
+EXPOSE 8090
+# Mount real configs over /etc/hutch and a volume at /var/lib/hutch for the
+# meter ledger. HUTCH_TENANTS overrides the tenants path if needed.
+ENTRYPOINT ["/usr/local/bin/rvbbit-hutch"]
+CMD ["--config", "/etc/hutch/hutch.yaml"]

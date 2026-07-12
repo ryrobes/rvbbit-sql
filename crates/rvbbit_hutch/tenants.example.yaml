@@ -1,0 +1,19 @@
+# Tenant store — the Polar seam. When billing lands, a webhook handler
+# rewrites this file and POSTs /admin/reload-tenants; nothing else changes.
+# Generate key_sha256 with:  rvbbit-hutch hash-key <raw-key>
+tenants:
+  # Dev fixtures so the image boots OOTB in mock mode. The raw keys are
+  # documented on purpose (mock upstream, nothing real behind them) —
+  # replace the whole file before pointing at real backends.
+  # raw key: hutch_dev_acme
+  - id: acme
+    key_sha256: "27b93a6ffe09c0a0035d96f40dd6cccb7320159e777a274d630a1728f7914390"
+    lanes: 3
+    status: active
+    entitlements: [clover, gemma]
+  # raw key: hutch_dev_lapsed
+  - id: lapsed-co
+    key_sha256: "c12c206503721bd60f3b90b04acb6c52a7dcf720733438d74ef8349775d1d3f7"
+    lanes: 2
+    status: expired
+    entitlements: [clover]

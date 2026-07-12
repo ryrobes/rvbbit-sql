@@ -1,0 +1,65 @@
+# rvbbit-hutch service config. Tenants live in tenants.yaml (separate file:
+# key rotation must never touch service config).
+bind: "0.0.0.0:8090"
+tenants_file: "tenants.yaml"
+meter_db: "hutch_meter.sqlite"
+# admin_token: "change-me"        # gates /metrics and /admin/* when set
+max_body_bytes: 2097152
+lane_grace_ms: 250
+
+# mock = deterministic outputs, no GPU anywhere — proves the middleware
+# chain end-to-end. Flip to proxy when the zoo container is up:
+#   upstream: { mode: proxy, base_url: "http://zoo:8000" }
+upstream:
+  mode: mock
+
+# The Clover v0 menu. In proxy mode each backend needs upstream_path.
+# unit_microusd = would-have-been à la carte price per input (receipts).
+backends:
+  - name: sentiment
+    entitlement: clover
+    model_version: clover-v0-mock
+    unit_microusd: 20
+    mock_output: 0.42
+    mock_delay_ms: 40
+  - name: embed
+    entitlement: clover
+    model_version: clover-v0-mock
+    unit_microusd: 10
+    mock_output: [0.1, 0.2, 0.3, 0.4]
+    mock_delay_ms: 40
+  - name: rerank
+    entitlement: clover
+    model_version: clover-v0-mock
+    unit_microusd: 30
+    mock_output: 0.5
+    mock_delay_ms: 40
+  - name: classify
+    entitlement: clover
+    model_version: clover-v0-mock
+    unit_microusd: 30
+    mock_output: {"label": "mock", "score": 0.9}
+    mock_delay_ms: 40
+  - name: nli
+    entitlement: clover
+    model_version: clover-v0-mock
+    unit_microusd: 30
+    mock_output: {"label": "entailment", "score": 0.93}
+    mock_delay_ms: 40
+  - name: gemma
+    entitlement: gemma
+    model_version: gemma4-mock
+    unit_microusd: 900
+    mock_output: "mock generalist answer"
+    mock_delay_ms: 400
+
+# Hosted LLMs on the OpenAI-compatible surface (/v1/chat/completions,
+# routed by the request's `model` field; GET /v1/models lists entitled).
+# llms:
+#   - name: gemma4
+#     entitlement: gemma
+#     upstream_base: "http://localhost:8000"
+#     upstream_model: "nvidia/Gemma-4-31B-IT-NVFP4"
+#     model_version: "gemma-4-31b-it-nvfp4"
+#     prompt_microusd_per_1k: 100
+#     completion_microusd_per_1k: 300
