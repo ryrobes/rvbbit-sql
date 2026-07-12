@@ -98,20 +98,21 @@ The existing competitor compose provides suitable adjacent services:
 ```bash
 docker compose -f docker/docker-compose.yml \
   -f docker/docker-compose.competitors.yml \
-  --profile bench up -d pg-baseline clickhouse
+  --profile bench up -d pg-baseline citus hydra alloydb-omni clickhouse
 
 python3 bench/doomql/load_competitors.py \
   --table doomql_world \
-  --parquet bench/doomql/data/doomql_world_5000000.parquet
+  --parquet bench/doomql/data/doomql_world_5000000.parquet \
+  --targets postgres,citus,hydra,alloydb,clickhouse
 ```
 
-Defaults are vanilla PostgreSQL on `localhost:5440` and ClickHouse HTTP on
-`localhost:8123`; both can be overridden with CLI flags or
-`DOOMQL_POSTGRES_DSN`, `DOOMQL_CLICKHOUSE_HOST`, and
-`DOOMQL_CLICKHOUSE_PORT`. PostgreSQL receives the rows through ordinary `COPY`
-into an unindexed heap. ClickHouse receives the exact Parquet stream into a
-`MergeTree ORDER BY sample_id`, preserving a neutral source order instead of
-choosing a benchmark-specific clustering key.
+Defaults are vanilla PostgreSQL on `localhost:5440`, Citus on `5441`, Hydra on
+`5442`, AlloyDB Omni on `5443`, and ClickHouse HTTP on `8123`. Each has a
+matching CLI flag and `DOOMQL_*` environment variable. PostgreSQL receives an
+unindexed heap; Citus and Hydra receive `USING columnar` tables; AlloyDB's heap
+is registered and force-refreshed into `google_columnar_engine`; ClickHouse
+receives a `MergeTree ORDER BY sample_id`. All loaders use the identical source
+Parquet and avoid benchmark-specific clustering keys.
 
 For the WAD surface schema, add `--world e1m1` and use the E1M1 table and
 Parquet names:
@@ -146,7 +147,7 @@ python3 bench/doomql/run.py \
   --dsn postgresql://postgres:rvbbit@localhost:55433/bench \
   --table doomql_world \
   --parquet bench/doomql/data/doomql_world_5000000.parquet \
-  --systems auto,datafusion_vortex,duck_vortex,gpu_gqe,duckdb,postgres,clickhouse
+  --systems auto,datafusion_vortex,duck_vortex,duckdb,postgres,citus,hydra,alloydb,clickhouse
 ```
 
 A forced candidate whose variant or runtime is unavailable is reported as
@@ -173,6 +174,37 @@ left/right, and `Q` to exit. Turns default to 15 degrees; pass
 `--turn-degrees 5` for finer movement or any value from 1 to 90. The camera
 moves only through cells classified as open by the same deterministic world
 function used to generate the dataset.
+
+Record an interactive route as a reusable headless benchmark:
+
+```bash
+python3 bench/doomql/run.py \
+  --world e1m1 \
+  --wad ~/repos2026/diffoom/assets/DOOM1.WAD \
+  --dsn postgresql://postgres:rvbbit@localhost:55433/bench \
+  --table doomql_e1m1 \
+  --parquet bench/doomql/data/doomql_e1m1_5000000.parquet \
+  --render-type ansi-half --interactive --system auto \
+  --record-session bench/doomql/scripts/e1m1-tour.json
+```
+
+The session JSON contains the rendering/world settings, every key and resolved
+before/after camera, blocked movement flags, the initial frame, and one frame
+for every navigation command. It intentionally excludes connection strings.
+Replay restores the recorded world and rendering settings while leaving engine
+selection, database endpoints, warmups, timeout, and output configurable:
+
+```bash
+python3 bench/doomql/run.py \
+  --replay-session bench/doomql/scripts/e1m1-tour.json \
+  --dsn postgresql://postgres:rvbbit@localhost:55433/bench \
+  --systems auto,duck_vortex,datafusion_vector,duckdb,postgres,clickhouse
+```
+
+Replay uses the exact recorded camera frames instead of recalculating movement,
+and writes the session path and SHA-256 hash into the benchmark result JSON.
+Use `--replay-table` and `--replay-parquet` to run the same recorded tour at a
+different data scale without editing or re-signing the session file.
 
 To walk the actual E1M1 start room and staircase:
 
@@ -292,15 +324,17 @@ To load and test multiple scales in sequence:
 ```bash
 python3 bench/doomql/sweep.py \
   --dsn postgresql://postgres:rvbbit@localhost:55433/bench \
-  --scales 1000000,5000000,10000000,50000000 \
-  --systems auto,datafusion_vortex,gpu_gqe,duckdb,postgres,clickhouse
+  --scales 5m,50m --keep-loaded \
+  --replay-session bench/doomql/scripts/e1m1-tour1.json \
+  --systems auto,duck_vortex,duckdb,postgres,citus,hydra,alloydb,clickhouse
 ```
 
-Add `--world e1m1 --table doomql_e1m1 --wad ~/repos2026/diffoom/assets/DOOM1.WAD`
-to run the same scale sweep over WAD surfaces.
+Scale values accept raw integers or `k`/`m`/`b` suffixes. Without a replay
+session, add `--world e1m1 --table doomql_e1m1` and the WAD path to sweep WAD
+surfaces.
 
 The sweep reuses generated source Parquet files, but it reloads, compacts, and
-benchmarks the RVBBIT table at every scale. When `postgres` or `clickhouse`
-appears in `--systems`, their loader is run at every scale too. Individual run
-documents and a combined warm-median matrix are written under
+benchmarks every selected target at each scale. `--keep-loaded` gives every
+scale its own suffixed table; use `--skip-load` for later back-to-back reruns.
+Individual run documents and a combined warm-median matrix are written under
 `bench/doomql/results/`.

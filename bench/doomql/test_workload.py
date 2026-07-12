@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import argparse
+import json
 import re
+from pathlib import Path
 
 import duckdb
 
-from .run import SystemResult, enforce_parity, percentile
-from .sweep import parse_scales
+from .run import (
+    SystemResult,
+    enforce_parity,
+    load_session,
+    percentile,
+    system_label,
+    write_session,
+)
+from .sweep import parse_scales, scale_table
 from .workload import (
     Camera,
     camera_vector,
@@ -119,3 +129,71 @@ def test_parity_and_nearest_rank_percentile_are_enforced():
     assert mismatch.status == "mismatch"
     assert percentile([1, 2, 3, 4], 0.95) == 4
     assert parse_scales("1_000_000, 5000000") == [1_000_000, 5_000_000]
+    assert parse_scales("5m,50M") == [5_000_000, 50_000_000]
+    assert scale_table("doomql_e1m1", 50_000_000) == "doomql_e1m1_50m"
+
+
+def test_benchmark_display_labels_distinguish_rvbbit_engines():
+    assert system_label("auto") == "RVBBIT Auto"
+    assert system_label("datafusion_vortex") == "RVBBIT DataFusion Vortex"
+    assert system_label("duckdb") == "DuckDB"
+    assert system_label("postgres") == "PostgreSQL"
+    assert system_label("citus") == "Citus Columnar"
+    assert system_label("hydra") == "Hydra Columnar"
+    assert system_label("alloydb") == "AlloyDB Omni"
+
+
+def test_interactive_session_round_trips_resolved_camera_frames(tmp_path: Path):
+    session_path = tmp_path / "tour.json"
+    args = argparse.Namespace(
+        world="e1m1",
+        wad=Path("/tmp/DOOM1.WAD"),
+        map_name="E1M1",
+        grid_scale=16,
+        table="doomql_e1m1",
+        parquet=Path("/tmp/doomql_e1m1_5000000.parquet"),
+        width=120,
+        height=40,
+        draw_distance=96,
+        turn_degrees=15,
+        render_type="ansi-half",
+        system="auto",
+    )
+    cameras = [
+        Camera(114, 78, 41, 90, 96),
+        Camera(114, 80, 41, 90, 96),
+        Camera(114, 80, 41, 75, 96),
+    ]
+    commands = [
+        {
+            "index": 0,
+            "key": "w",
+            "action": "forward",
+            "before": {},
+            "after": {},
+            "blocked": False,
+        },
+        {
+            "index": 1,
+            "key": "d",
+            "action": "turn_right",
+            "before": {},
+            "after": {},
+            "blocked": False,
+        },
+    ]
+
+    write_session(session_path, args, commands, cameras, queries_run=9)
+    settings, loaded_cameras, digest = load_session(session_path)
+    document = json.loads(session_path.read_text())
+
+    assert settings["render_type"] == "ansi-half"
+    assert loaded_cameras == cameras
+    assert len(digest) == 64
+    assert document["summary"] == {
+        "commands": 2,
+        "frames": 3,
+        "unique_cameras": 3,
+        "blocked_movements": 0,
+        "interactive_queries": 9,
+    }

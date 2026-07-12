@@ -2844,7 +2844,16 @@ fn record_batches_to_arrow_ipc_rows(batches: &[RecordBatch], max_rows: usize) ->
             arrow_ipc_bytes: None,
         });
     }
-    let (path, bytes) = write_arrow_ipc_file(first.schema(), &capped)?;
+    // The batches are already executed and in memory: an IPC transport failure
+    // must degrade to JSON here, not bubble an error that makes the extension
+    // re-run the whole query through a second sidecar round trip.
+    let (path, bytes) = match write_arrow_ipc_file(first.schema(), &capped) {
+        Ok(written) => written,
+        Err(err) => {
+            eprintln!("rvbbit-duck: Arrow IPC transport failed ({err:#}); returning JSON rows");
+            return record_batches_to_query_rows(batches, max_rows);
+        }
+    };
     Ok(QueryRows {
         columns,
         rows: Vec::new(),
@@ -2885,8 +2894,10 @@ fn write_arrow_ipc_file(schema: SchemaRef, batches: &[RecordBatch]) -> Result<(S
     let dir =
         env::var("RVBBIT_ARROW_IPC_DIR").unwrap_or_else(|_| "/tmp/rvbbit-arrow-ipc".to_string());
     fs::create_dir_all(&dir).with_context(|| format!("creating Arrow IPC dir {dir}"))?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777))
-        .with_context(|| format!("setting Arrow IPC dir permissions on {dir}"))?;
+    // The dir may pre-exist owned by another uid (e.g. a root-run sidecar made
+    // it first); chmod then fails with EPERM even when the dir is already
+    // usable. The create_new open below is the real gate, so chmod is advisory.
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o777));
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -6021,7 +6032,18 @@ fn execute_duck_query_arrow_ipc(con: &Connection, sql: &str, max_rows: usize) ->
             arrow_ipc_bytes: None,
         });
     }
-    let (path, bytes) = write_arrow_ipc_file(schema, &capped)?;
+    // Same degradation contract as record_batches_to_arrow_ipc_rows: the rows
+    // are already in memory, so an IPC transport failure returns JSON instead
+    // of forcing the extension into a full re-execution round trip.
+    let (path, bytes) = match write_arrow_ipc_file(schema, &capped) {
+        Ok(written) => written,
+        Err(err) => {
+            eprintln!("rvbbit-duck: Arrow IPC transport failed ({err:#}); returning JSON rows");
+            let mut out = record_batches_to_query_rows(&capped, max_rows)?;
+            out.row_count = row_count;
+            return Ok(out);
+        }
+    };
     Ok(QueryRows {
         columns,
         rows: Vec::new(),

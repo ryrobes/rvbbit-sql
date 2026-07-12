@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -72,6 +73,18 @@ DEFAULT_POSTGRES_DSN = os.environ.get(
     "DOOMQL_POSTGRES_DSN",
     "postgresql://postgres:bench@localhost:5440/bench",
 )
+DEFAULT_CITUS_DSN = os.environ.get(
+    "DOOMQL_CITUS_DSN",
+    "postgresql://postgres:bench@localhost:5441/bench",
+)
+DEFAULT_HYDRA_DSN = os.environ.get(
+    "DOOMQL_HYDRA_DSN",
+    "postgresql://postgres:bench@localhost:5442/bench",
+)
+DEFAULT_ALLOYDB_DSN = os.environ.get(
+    "DOOMQL_ALLOYDB_DSN",
+    "postgresql://postgres:bench@localhost:5443/postgres",
+)
 DEFAULT_CLICKHOUSE_HOST = os.environ.get("DOOMQL_CLICKHOUSE_HOST", "localhost")
 DEFAULT_CLICKHOUSE_PORT = int(os.environ.get("DOOMQL_CLICKHOUSE_PORT", "8123"))
 CANDIDATES = {
@@ -87,7 +100,50 @@ DEFAULT_SYSTEMS = (
     "auto,rvbbit_native,duck_vector,duck_vortex,"
     "datafusion_vector,datafusion_vortex,gpu_gqe,duckdb"
 )
-VANILLA_SYSTEMS = {"postgres", "clickhouse"}
+PG_COMPETITOR_ROUTES = {
+    "postgres": "postgres_heap",
+    "citus": "citus_columnar",
+    "hydra": "hydra_columnar",
+    "alloydb": "alloydb_omni",
+}
+VANILLA_SYSTEMS = {*PG_COMPETITOR_ROUTES, "clickhouse"}
+SYSTEM_LABELS = {
+    "auto": "RVBBIT Auto",
+    "rvbbit_native": "RVBBIT Native",
+    "duck_vector": "RVBBIT Duck Vector",
+    "duck_vortex": "RVBBIT Duck Vortex",
+    "datafusion_vector": "RVBBIT DataFusion Vector",
+    "datafusion_vortex": "RVBBIT DataFusion Vortex",
+    "gpu_gqe": "RVBBIT NVIDIA GQE",
+    "duckdb": "DuckDB",
+    "postgres": "PostgreSQL",
+    "citus": "Citus Columnar",
+    "hydra": "Hydra Columnar",
+    "alloydb": "AlloyDB Omni",
+    "clickhouse": "ClickHouse",
+}
+SESSION_FORMAT = "doomql-session-v1"
+REPLAY_SETTING_FIELDS = (
+    "world",
+    "wad",
+    "map_name",
+    "grid_scale",
+    "table",
+    "parquet",
+    "width",
+    "height",
+    "draw_distance",
+    "turn_degrees",
+    "render_type",
+)
+SESSION_PATH_FIELDS = {"wad", "parquet"}
+SESSION_INTEGER_FIELDS = {
+    "grid_scale",
+    "width",
+    "height",
+    "draw_distance",
+    "turn_degrees",
+}
 
 
 @dataclass
@@ -103,6 +159,115 @@ class SystemResult:
     output_rows: int
     frame_hashes: list[str]
     error: str | None = None
+
+
+def camera_payload(camera: Camera) -> dict[str, int]:
+    return {
+        "x": camera.x,
+        "y": camera.y,
+        "z": camera.z,
+        "heading": camera.heading,
+        "draw_distance": camera.draw_distance,
+    }
+
+
+def write_session(
+    path: Path,
+    args: argparse.Namespace,
+    commands: list[dict[str, Any]],
+    cameras: list[Camera],
+    queries_run: int,
+) -> None:
+    settings = {
+        "world": args.world,
+        "wad": str(args.wad.expanduser().resolve()),
+        "map_name": args.map_name,
+        "grid_scale": args.grid_scale,
+        "table": args.table,
+        "parquet": str(args.parquet.expanduser().resolve()),
+        "width": args.width,
+        "height": args.height,
+        "draw_distance": args.draw_distance,
+        "turn_degrees": args.turn_degrees,
+        "render_type": args.render_type,
+        "movement_step": 2,
+        "capture_system": args.system,
+    }
+    document = {
+        "format": SESSION_FORMAT,
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "settings": settings,
+        "commands": commands,
+        "frames": [camera_payload(camera) for camera in cameras],
+        "summary": {
+            "commands": len(commands),
+            "frames": len(cameras),
+            "unique_cameras": len(set(cameras)),
+            "blocked_movements": sum(
+                bool(command.get("blocked")) for command in commands
+            ),
+            "interactive_queries": queries_run,
+        },
+    }
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
+def load_session(path: Path) -> tuple[dict[str, Any], list[Camera], str]:
+    path = path.expanduser()
+    raw = path.read_bytes()
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid session JSON: {exc}") from exc
+    if not isinstance(document, dict) or document.get("format") != SESSION_FORMAT:
+        raise ValueError(f"session format must be {SESSION_FORMAT}")
+    settings = document.get("settings")
+    frames = document.get("frames")
+    if not isinstance(settings, dict):
+        raise ValueError("session settings must be an object")
+    missing = [field for field in REPLAY_SETTING_FIELDS if field not in settings]
+    if missing:
+        raise ValueError(f"session settings missing: {', '.join(missing)}")
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("session must contain at least one frame")
+    cameras: list[Camera] = []
+    for index, frame in enumerate(frames):
+        if not isinstance(frame, dict):
+            raise ValueError(f"session frame {index} must be an object")
+        try:
+            camera = Camera(
+                x=int(frame["x"]),
+                y=int(frame["y"]),
+                z=int(frame["z"]),
+                heading=int(frame["heading"]) % 360,
+                draw_distance=int(frame["draw_distance"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"session frame {index} is invalid") from exc
+        if camera.draw_distance <= 0:
+            raise ValueError(f"session frame {index} has invalid draw distance")
+        cameras.append(camera)
+    digest = hashlib.sha256(raw).hexdigest()
+    return settings, cameras, digest
+
+
+def apply_session_settings(
+    args: argparse.Namespace,
+    settings: dict[str, Any],
+) -> None:
+    for field in REPLAY_SETTING_FIELDS:
+        value = settings[field]
+        if field in SESSION_PATH_FIELDS:
+            value = Path(str(value))
+        elif field in SESSION_INTEGER_FIELDS:
+            value = int(value)
+        elif field == "table":
+            value = simple_identifier(str(value))
+        else:
+            value = str(value)
+        setattr(args, field, value)
 
 
 def percentile(values: list[float], pct: float) -> float | None:
@@ -307,6 +472,8 @@ def run_duckdb_system(
 
 
 def run_postgres_system(
+    system: str,
+    route: str,
     dsn: str,
     cameras: list[Camera],
     table: str,
@@ -360,9 +527,9 @@ def run_postgres_system(
                 )
     except Exception as exc:
         return SystemResult(
-            "postgres",
+            system,
             "fail",
-            "postgres_heap",
+            route,
             "vanilla",
             first_ms,
             None,
@@ -375,9 +542,9 @@ def run_postgres_system(
     median_ms = statistics.median(latencies)
     p95_ms = percentile(latencies, 0.95)
     return SystemResult(
-        "postgres",
+        system,
         "ok",
-        "postgres_heap",
+        route,
         "vanilla",
         first_ms,
         median_ms,
@@ -484,6 +651,10 @@ def fmt_ms(value: float | None) -> str:
     return f"{value / 1000:.2f}s"
 
 
+def system_label(system: str) -> str:
+    return SYSTEM_LABELS.get(system, system)
+
+
 def enforce_parity(results: list[SystemResult]) -> str | None:
     reference = next(
         (result for result in results if result.system == "duckdb" and result.status == "ok"),
@@ -502,7 +673,11 @@ def enforce_parity(results: list[SystemResult]) -> str | None:
 
 def print_results(results: list[SystemResult], parity_reference: str | None) -> None:
     print("\nDoomQL analytical frame benchmark")
-    print(f"{'system':<22} {'status':<7} {'route':<19} {'cold':>10} {'median':>10} {'p95':>10} {'fps':>8}  parity")
+    system_width = max(22, *(len(system_label(result.system)) for result in results))
+    print(
+        f"{'system':<{system_width}} {'status':<7} {'route':<19} "
+        f"{'cold':>10} {'median':>10} {'p95':>10} {'fps':>8}  parity"
+    )
     reference = next((result for result in results if result.system == parity_reference), None)
     baseline = reference.frame_hashes if reference is not None else None
     for result in results:
@@ -511,7 +686,8 @@ def print_results(results: list[SystemResult], parity_reference: str | None) -> 
             parity = "ok" if result.frame_hashes == baseline else "MISMATCH"
         fps = f"{result.fps:.2f}" if result.fps is not None else "-"
         print(
-            f"{result.system:<22} {result.status:<7} {(result.route or '-'):<19} "
+            f"{system_label(result.system):<{system_width}} "
+            f"{result.status:<7} {(result.route or '-'):<19} "
             f"{fmt_ms(result.first_ms):>10} {fmt_ms(result.median_ms):>10} "
             f"{fmt_ms(result.p95_ms):>10} {fps:>8}  {parity}"
         )
@@ -524,6 +700,9 @@ def collect_environment(
     table: str,
     parquet: Path,
     postgres_dsn: str,
+    citus_dsn: str,
+    hydra_dsn: str,
+    alloydb_dsn: str,
     clickhouse_host: str,
     clickhouse_port: int,
     systems: set[str],
@@ -563,21 +742,33 @@ def collect_environment(
             )
     except Exception as exc:
         environment["postgres_probe_error"] = str(exc)
-    if "postgres" in systems:
+    pg_competitors = {
+        "postgres": postgres_dsn,
+        "citus": citus_dsn,
+        "hydra": hydra_dsn,
+        "alloydb": alloydb_dsn,
+    }
+    for system, competitor_dsn in pg_competitors.items():
+        if system not in systems:
+            continue
         try:
-            with psycopg.connect(postgres_dsn, autocommit=True) as conn:
+            with psycopg.connect(competitor_dsn, autocommit=True) as conn:
                 row = conn.execute(
                     f"""
                     SELECT version(), count(*)::bigint,
                            pg_total_relation_size(%s::regclass)::bigint,
                            current_setting('shared_buffers'),
                            current_setting('work_mem'),
-                           current_setting('max_parallel_workers_per_gather')
+                           current_setting('max_parallel_workers_per_gather'),
+                           (SELECT am.amname
+                            FROM pg_class c
+                            JOIN pg_am am ON am.oid = c.relam
+                            WHERE c.oid = %s::regclass)
                     FROM {table}
                     """,
-                    (table,),
+                    (table, table),
                 ).fetchone()
-                environment["vanilla_postgres"] = dict(
+                details = dict(
                     zip(
                         (
                             "version",
@@ -586,12 +777,16 @@ def collect_environment(
                             "shared_buffers",
                             "work_mem",
                             "max_parallel_workers_per_gather",
+                            "access_method",
                         ),
                         row,
                     )
                 )
+                environment[system] = details
+                if system == "postgres":
+                    environment["vanilla_postgres"] = details
         except Exception as exc:
-            environment["vanilla_postgres_probe_error"] = str(exc)
+            environment[f"{system}_probe_error"] = str(exc)
     if "clickhouse" in systems:
         try:
             client = clickhouse_connect.get_client(host=clickhouse_host, port=clickhouse_port)
@@ -675,8 +870,14 @@ def render_selected_once(
             args.render_type,
             material_color_ramps,
         )
-    if system == "postgres":
-        with psycopg.connect(args.postgres_dsn, autocommit=True) as conn:
+    pg_dsns = {
+        "postgres": args.postgres_dsn,
+        "citus": args.citus_dsn,
+        "hydra": args.hydra_dsn,
+        "alloydb": args.alloydb_dsn,
+    }
+    if system in PG_COMPETITOR_ROUTES:
+        with psycopg.connect(pg_dsns[system], autocommit=True) as conn:
             sql = frame_sql(
                 camera,
                 width=args.width,
@@ -697,7 +898,7 @@ def render_selected_once(
             render_type=args.render_type,
             material_color_ramps=material_color_ramps,
         )
-        return frame, elapsed_ms, "postgres_heap"
+        return frame, elapsed_ms, PG_COMPETITOR_ROUTES[system]
     if system == "clickhouse":
         client = clickhouse_connect.get_client(
             host=args.clickhouse_host,
@@ -807,6 +1008,8 @@ def interactive(args: argparse.Namespace, world_map: RasterizedWorld | None = No
     )
     old_settings = termios.tcgetattr(sys.stdin)
     queries_run = 0
+    session_commands: list[dict[str, Any]] = []
+    session_cameras = [camera]
     try:
         tty.setcbreak(sys.stdin.fileno())
         with psycopg.connect(args.dsn, autocommit=True) as conn:
@@ -847,23 +1050,61 @@ def interactive(args: argparse.Namespace, world_map: RasterizedWorld | None = No
                 if not ready:
                     continue
                 key = sys.stdin.read(1).lower()
-                if key in {"q", "\x03"}:
-                    break
+                before = camera
+                action = "ignored"
+                adds_frame = False
                 if key == "w":
+                    action = "forward"
                     camera = move_camera(camera, 2, world_map)
+                    adds_frame = True
                 elif key == "s":
+                    action = "backward"
                     camera = move_camera(camera, -2, world_map)
+                    adds_frame = True
                 elif key == "a":
+                    action = "turn_left"
                     camera = camera.turned(args.turn_degrees)
+                    adds_frame = True
                 elif key == "d":
+                    action = "turn_right"
                     camera = camera.turned(-args.turn_degrees)
+                    adds_frame = True
                 elif key == "z":
+                    action = "strafe_left"
                     camera = strafe_camera(camera, 2, world_map)
+                    adds_frame = True
                 elif key == "c":
+                    action = "strafe_right"
                     camera = strafe_camera(camera, -2, world_map)
+                    adds_frame = True
+                elif key in {"q", "\x03"}:
+                    action = "quit"
+                session_commands.append(
+                    {
+                        "index": len(session_commands),
+                        "key": key,
+                        "action": action,
+                        "before": camera_payload(before),
+                        "after": camera_payload(camera),
+                        "blocked": adds_frame and camera == before,
+                    }
+                )
+                if adds_frame:
+                    session_cameras.append(camera)
+                if action == "quit":
+                    break
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         print()
+        if args.record_session is not None:
+            write_session(
+                args.record_session,
+                args,
+                session_commands,
+                session_cameras,
+                queries_run,
+            )
+            print(f"Wrote session {args.record_session.expanduser()}")
     return 0
 
 
@@ -871,6 +1112,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dsn", default=DEFAULT_DSN)
     parser.add_argument("--postgres-dsn", default=DEFAULT_POSTGRES_DSN)
+    parser.add_argument("--citus-dsn", default=DEFAULT_CITUS_DSN)
+    parser.add_argument("--hydra-dsn", default=DEFAULT_HYDRA_DSN)
+    parser.add_argument("--alloydb-dsn", default=DEFAULT_ALLOYDB_DSN)
     parser.add_argument("--clickhouse-host", default=DEFAULT_CLICKHOUSE_HOST)
     parser.add_argument("--clickhouse-port", type=int, default=DEFAULT_CLICKHOUSE_PORT)
     parser.add_argument("--table", type=simple_identifier, default="doomql_world")
@@ -878,7 +1122,7 @@ def main() -> int:
     parser.add_argument("--wad", type=Path, default=DEFAULT_WAD)
     parser.add_argument("--map-name", default="E1M1")
     parser.add_argument("--grid-scale", type=int, default=DEFAULT_GRID_SCALE)
-    parser.add_argument("--parquet", type=Path, required=True)
+    parser.add_argument("--parquet", type=Path)
     parser.add_argument("--systems", default=DEFAULT_SYSTEMS)
     parser.add_argument("--system", default="auto", choices=sorted(CANDIDATES))
     parser.add_argument("--frames", type=int, default=12)
@@ -891,12 +1135,48 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--record-session", type=Path)
+    parser.add_argument("--replay-session", type=Path)
+    parser.add_argument("--replay-table", type=simple_identifier)
+    parser.add_argument("--replay-parquet", type=Path)
     parser.add_argument("--output", type=Path, default=HERE / "results" / "last_run.json")
     args = parser.parse_args()
+    if args.record_session is not None and args.replay_session is not None:
+        parser.error("--record-session and --replay-session cannot be combined")
+    if args.record_session is not None and not args.interactive:
+        parser.error("--record-session requires --interactive")
+    if args.replay_session is not None and args.interactive:
+        parser.error("--replay-session is headless and cannot use --interactive")
+    if args.replay_session is None and (
+        args.replay_table is not None or args.replay_parquet is not None
+    ):
+        parser.error("--replay-table and --replay-parquet require --replay-session")
+    replay_cameras: list[Camera] | None = None
+    replay_digest = None
+    if args.replay_session is not None:
+        try:
+            replay_settings, replay_cameras, replay_digest = load_session(
+                args.replay_session
+            )
+            apply_session_settings(args, replay_settings)
+            if args.replay_table is not None:
+                args.table = args.replay_table
+            if args.replay_parquet is not None:
+                args.parquet = args.replay_parquet
+        except (OSError, TypeError, ValueError) as exc:
+            parser.error(str(exc))
+    if args.parquet is None:
+        parser.error("--parquet is required unless supplied by --replay-session")
+    if args.world not in WORLD_COLUMNS:
+        parser.error(f"unsupported session world: {args.world}")
+    if args.render_type not in RENDER_TYPES:
+        parser.error(f"unsupported session render type: {args.render_type}")
     if not 1 <= args.turn_degrees <= 90:
         parser.error("--turn-degrees must be between 1 and 90")
     if args.grid_scale <= 0:
         parser.error("--grid-scale must be positive")
+    if args.width <= 0 or args.height <= 0 or args.draw_distance <= 0:
+        parser.error("width, height, and draw distance must be positive")
     world_map = None
     if args.world == "e1m1":
         wad_path = args.wad.expanduser()
@@ -916,14 +1196,23 @@ def main() -> int:
     unknown = sorted(set(systems) - set(CANDIDATES) - VANILLA_SYSTEMS - {"duckdb"})
     if unknown:
         parser.error(f"unknown systems: {', '.join(unknown)}")
-    cameras = (
-        e1m1_scripted_cameras(world_map, args.frames, args.draw_distance)
-        if world_map is not None
-        else scripted_cameras(args.frames, args.draw_distance)
-    )
+    if replay_cameras is not None:
+        cameras = replay_cameras
+    else:
+        cameras = (
+            e1m1_scripted_cameras(world_map, args.frames, args.draw_distance)
+            if world_map is not None
+            else scripted_cameras(args.frames, args.draw_distance)
+        )
     material_color_ramps = (
         world_map.material_color_ramps if world_map is not None else None
     )
+    pg_competitor_dsns = {
+        "postgres": args.postgres_dsn,
+        "citus": args.citus_dsn,
+        "hydra": args.hydra_dsn,
+        "alloydb": args.alloydb_dsn,
+    }
     results: list[SystemResult] = []
     for system in systems:
         print(f"Running {system}...", flush=True)
@@ -939,9 +1228,11 @@ def main() -> int:
                 args.render_type,
                 material_color_ramps,
             )
-        elif system == "postgres":
+        elif system in PG_COMPETITOR_ROUTES:
             result = run_postgres_system(
-                args.postgres_dsn,
+                system,
+                PG_COMPETITOR_ROUTES[system],
+                pg_competitor_dsns[system],
                 cameras,
                 args.table,
                 args.width,
@@ -1004,6 +1295,9 @@ def main() -> int:
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "dsn": args.dsn.rsplit("@", 1)[-1],
         "postgres_dsn": args.postgres_dsn.rsplit("@", 1)[-1],
+        "citus_dsn": args.citus_dsn.rsplit("@", 1)[-1],
+        "hydra_dsn": args.hydra_dsn.rsplit("@", 1)[-1],
+        "alloydb_dsn": args.alloydb_dsn.rsplit("@", 1)[-1],
         "clickhouse": f"{args.clickhouse_host}:{args.clickhouse_port}",
         "table": args.table,
         "world": args.world,
@@ -1011,7 +1305,13 @@ def main() -> int:
         "map_name": args.map_name if args.world == "e1m1" else None,
         "grid_scale": args.grid_scale if args.world == "e1m1" else None,
         "parquet": str(args.parquet),
-        "frames": args.frames,
+        "frames": len(cameras),
+        "replay_session": (
+            str(args.replay_session.expanduser())
+            if args.replay_session is not None
+            else None
+        ),
+        "replay_session_sha256": replay_digest,
         "width": args.width,
         "height": args.height,
         "draw_distance": args.draw_distance,
@@ -1024,6 +1324,9 @@ def main() -> int:
             args.table,
             args.parquet,
             args.postgres_dsn,
+            args.citus_dsn,
+            args.hydra_dsn,
+            args.alloydb_dsn,
             args.clickhouse_host,
             args.clickhouse_port,
             set(systems),

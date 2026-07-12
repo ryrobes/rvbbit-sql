@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load DoomQL source Parquet into vanilla PostgreSQL and ClickHouse."""
+"""Load DoomQL source Parquet into adjacent benchmark databases."""
 
 from __future__ import annotations
 
@@ -24,22 +24,38 @@ DEFAULT_POSTGRES_DSN = os.environ.get(
     "DOOMQL_POSTGRES_DSN",
     "postgresql://postgres:bench@localhost:5440/bench",
 )
+DEFAULT_CITUS_DSN = os.environ.get(
+    "DOOMQL_CITUS_DSN",
+    "postgresql://postgres:bench@localhost:5441/bench",
+)
+DEFAULT_HYDRA_DSN = os.environ.get(
+    "DOOMQL_HYDRA_DSN",
+    "postgresql://postgres:bench@localhost:5442/bench",
+)
+DEFAULT_ALLOYDB_DSN = os.environ.get(
+    "DOOMQL_ALLOYDB_DSN",
+    "postgresql://postgres:bench@localhost:5443/postgres",
+)
 DEFAULT_CLICKHOUSE_HOST = os.environ.get("DOOMQL_CLICKHOUSE_HOST", "localhost")
 DEFAULT_CLICKHOUSE_PORT = int(os.environ.get("DOOMQL_CLICKHOUSE_PORT", "8123"))
 
 
 def load_postgres(
+    system: str,
     dsn: str,
     table: str,
     parquet: Path,
     batch_rows: int,
     world: str = "synthetic",
+    using: str | None = None,
+    pre_sql: tuple[str, ...] = (),
+    post_sql: tuple[str, ...] = (),
 ) -> dict[str, object]:
     columns = ", ".join(WORLD_COLUMNS[world])
     ddl = f"""
 CREATE TABLE {table} (
     {WORLD_POSTGRES_COLUMNS[world]}
-)
+) {f"USING {using}" if using else ""}
 """
     source = duckdb.connect(":memory:")
     source.execute(f"SELECT {columns} FROM read_parquet(?)", [str(parquet)])
@@ -48,6 +64,8 @@ CREATE TABLE {table} (
     started = time.perf_counter()
     try:
         with psycopg.connect(dsn, autocommit=True) as conn:
+            for sql in pre_sql:
+                conn.execute(sql)
             conn.execute(f"DROP TABLE IF EXISTS {table}")
             conn.execute(ddl)
             with conn.cursor().copy(f"COPY {table} ({columns}) FROM STDIN") as copy:
@@ -59,21 +77,33 @@ CREATE TABLE {table} (
                         copy.write_row(row)
                     copied += len(batch)
                     if copied >= next_progress:
-                        print(f"  postgres copied {copied:,} rows", flush=True)
+                        print(f"  {system} copied {copied:,} rows", flush=True)
                         while next_progress <= copied:
                             next_progress += 1_000_000
             conn.execute(f"ANALYZE {table}")
+            for sql in post_sql:
+                conn.execute(sql.format(table=table))
             size_bytes = conn.execute(
                 "SELECT pg_total_relation_size(%s::regclass)::bigint",
+                (table,),
+            ).fetchone()[0]
+            access_method = conn.execute(
+                """
+                SELECT am.amname
+                FROM pg_class c
+                JOIN pg_am am ON am.oid = c.relam
+                WHERE c.oid = %s::regclass
+                """,
                 (table,),
             ).fetchone()[0]
     finally:
         source.close()
     return {
-        "system": "postgres",
+        "system": system,
         "rows": copied,
         "load_seconds": round(time.perf_counter() - started, 3),
         "size_bytes": size_bytes,
+        "access_method": access_method,
     }
 
 
@@ -141,6 +171,9 @@ def main() -> int:
     parser.add_argument("--world", choices=sorted(WORLD_COLUMNS), default="synthetic")
     parser.add_argument("--targets", default="postgres,clickhouse")
     parser.add_argument("--postgres-dsn", default=DEFAULT_POSTGRES_DSN)
+    parser.add_argument("--citus-dsn", default=DEFAULT_CITUS_DSN)
+    parser.add_argument("--hydra-dsn", default=DEFAULT_HYDRA_DSN)
+    parser.add_argument("--alloydb-dsn", default=DEFAULT_ALLOYDB_DSN)
     parser.add_argument("--clickhouse-host", default=DEFAULT_CLICKHOUSE_HOST)
     parser.add_argument("--clickhouse-port", type=int, default=DEFAULT_CLICKHOUSE_PORT)
     parser.add_argument("--copy-batch-rows", type=int, default=100_000)
@@ -161,20 +194,47 @@ def main() -> int:
             f"{', '.join(actual_columns)}"
         )
     targets = [target.strip() for target in args.targets.split(",") if target.strip()]
-    unknown = sorted(set(targets) - {"postgres", "clickhouse"})
+    pg_targets = {
+        "postgres": {
+            "dsn": args.postgres_dsn,
+        },
+        "citus": {
+            "dsn": args.citus_dsn,
+            "using": "columnar",
+            "pre_sql": ("CREATE EXTENSION IF NOT EXISTS citus",),
+        },
+        "hydra": {
+            "dsn": args.hydra_dsn,
+            "using": "columnar",
+        },
+        "alloydb": {
+            "dsn": args.alloydb_dsn,
+            "pre_sql": ("CREATE EXTENSION IF NOT EXISTS google_columnar_engine",),
+            "post_sql": (
+                "SELECT google_columnar_engine_add('{table}')",
+                "SELECT google_columnar_engine_refresh('{table}')",
+            ),
+        },
+    }
+    unknown = sorted(set(targets) - {*pg_targets, "clickhouse"})
     if unknown:
         parser.error(f"unknown targets: {', '.join(unknown)}")
 
     results: list[dict[str, object]] = []
     for target in targets:
         print(f"Loading {target} from {args.parquet}", flush=True)
-        if target == "postgres":
+        if target in pg_targets:
+            target_config = pg_targets[target]
             result = load_postgres(
-                args.postgres_dsn,
+                target,
+                str(target_config["dsn"]),
                 args.table,
                 args.parquet,
                 args.copy_batch_rows,
                 args.world,
+                using=target_config.get("using"),
+                pre_sql=target_config.get("pre_sql", ()),
+                post_sql=target_config.get("post_sql", ()),
             )
         else:
             result = load_clickhouse(
