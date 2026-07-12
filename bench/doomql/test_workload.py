@@ -30,6 +30,12 @@ def test_gqe_query_avoids_known_unsupported_projection_functions():
     assert "group by lateral_offset, material" in sql
 
 
+def test_clickhouse_uses_the_portable_postgres_query_shape():
+    assert frame_sql(Camera(), dialect="clickhouse") == frame_sql(
+        Camera(), dialect="postgres"
+    )
+
+
 def test_duckdb_query_executes_and_renders_stable_dimensions():
     with duckdb.connect(":memory:") as conn:
         conn.execute(f"CREATE VIEW doomql_world AS {world_select_sql(300_000)}")

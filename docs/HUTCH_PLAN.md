@@ -191,6 +191,29 @@ antivirus-definitions feed — packs require it anyway.
   (image incl. build-essential or reference_compile=false for
   ModernBERT; GCP disk image as the usual deploy) — end-of-tinkering.
 
+**STOREFRONT LIVE (2026-07-12 night):** the catalog IS the marketing
+surface. `rvbbit-docs/public/catalog.json` (canonical; deploys to
+https://rvbbit.ai/catalog.json with the next site deploy) carries 3
+managed entries in the EXISTING CatalogDoc interchange format: clover-ml
+(35 install stmts incl. tests, key_env RVBBIT_CLOVER_KEY, verified 55/56
+block), gemma-lanes (RVBBIT_GEMMA_KEY), hare-slots (coming_soon).
+Imported through the EXISTING lens import-catalog route →
+`rvbbit.upsert_capability_catalog_entry` accepted kind='managed'
+unchanged — the package manager was already built. Lens gold treatment
+(uncommitted): CapabilityTypeKey 'managed' + --cap-type-managed gold var
+(both themes) + card: gold rail, Sparkles icon, verified-battery chip
+(tooltip = regime+date+note), price pill → opens checkout, coming-soon
+chip. Kind='managed' classify is strict (kind, not tags). VERIFIED live:
+48 packs, sources facet shows 'rvbbit.ai 3', and the Clover card shows
+REGISTERED·USED + live call stats because the install-state join
+recognized the real backends — the store card displays the product
+WORKING. GOTCHA: capabilities window doesn't auto-refetch after import
+from outside its own import UI — reopen/reload. Hare banked as
+capability: gaps = duck sandbox hardening (non-negotiable), router
+auto-offload (pressure gate + size floor), tmpfs artifact cache
+(latency AND egress); economics ≈ $0.00004/query compute, risk = data
+gravity (bucket region vs pool region).
+
 **REMAINS:** caddy/TLS + hostname; Polar webhook for instant revocation
 (TTL covers it meanwhile); per-entitlement lane pools (Clover unlaned vs
 LLM laned — currently one per-tenant pool); stream usage metering; lens

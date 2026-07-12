@@ -19,12 +19,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import clickhouse_connect
 import duckdb
 import psycopg
 
 try:
+    from .load import simple_identifier
     from .workload import Camera, frame_hash, frame_sql, render_frame, scripted_cameras
 except ImportError:
+    from load import simple_identifier
     from workload import Camera, frame_hash, frame_sql, render_frame, scripted_cameras
 
 
@@ -33,6 +36,12 @@ DEFAULT_DSN = os.environ.get(
     "RVBBIT_DSN",
     "postgresql://postgres:rvbbit@localhost:55433/bench",
 )
+DEFAULT_POSTGRES_DSN = os.environ.get(
+    "DOOMQL_POSTGRES_DSN",
+    "postgresql://postgres:bench@localhost:5440/bench",
+)
+DEFAULT_CLICKHOUSE_HOST = os.environ.get("DOOMQL_CLICKHOUSE_HOST", "localhost")
+DEFAULT_CLICKHOUSE_PORT = int(os.environ.get("DOOMQL_CLICKHOUSE_PORT", "8123"))
 CANDIDATES = {
     "auto": None,
     "rvbbit_native": "rvbbit_native",
@@ -46,6 +55,7 @@ DEFAULT_SYSTEMS = (
     "auto,rvbbit_native,duck_vector,duck_vortex,"
     "datafusion_vector,datafusion_vortex,gpu_gqe,duckdb"
 )
+VANILLA_SYSTEMS = {"postgres", "clickhouse"}
 
 
 @dataclass
@@ -219,6 +229,133 @@ def run_duckdb_system(
     )
 
 
+def run_postgres_system(
+    dsn: str,
+    cameras: list[Camera],
+    table: str,
+    width: int,
+    height: int,
+    warmups: int,
+    timeout_s: int,
+) -> SystemResult:
+    latencies: list[float] = []
+    hashes: list[str] = []
+    output_rows = 0
+    first_ms = None
+    try:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute("SELECT set_config('statement_timeout', %s, false)", (f"{timeout_s}s",))
+            for i in range(warmups + len(cameras)):
+                camera = cameras[0] if i < warmups else cameras[i - warmups]
+                sql = frame_sql(camera, width=width, height=height, table_expr=table)
+                started = time.perf_counter()
+                rows = conn.execute(sql).fetchall()
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                if first_ms is None:
+                    first_ms = elapsed_ms
+                if i < warmups:
+                    continue
+                latencies.append(elapsed_ms)
+                output_rows += len(rows)
+                hashes.append(frame_hash(render_frame(rows, camera, width=width, height=height)))
+    except Exception as exc:
+        return SystemResult(
+            "postgres",
+            "fail",
+            "postgres_heap",
+            "vanilla",
+            first_ms,
+            None,
+            None,
+            None,
+            output_rows,
+            hashes,
+            str(exc),
+        )
+    median_ms = statistics.median(latencies)
+    p95_ms = percentile(latencies, 0.95)
+    return SystemResult(
+        "postgres",
+        "ok",
+        "postgres_heap",
+        "vanilla",
+        first_ms,
+        median_ms,
+        p95_ms,
+        1000.0 / median_ms if median_ms else None,
+        output_rows,
+        hashes,
+    )
+
+
+def run_clickhouse_system(
+    host: str,
+    port: int,
+    cameras: list[Camera],
+    table: str,
+    width: int,
+    height: int,
+    warmups: int,
+    timeout_s: int,
+) -> SystemResult:
+    latencies: list[float] = []
+    hashes: list[str] = []
+    output_rows = 0
+    first_ms = None
+    try:
+        client = clickhouse_connect.get_client(host=host, port=port)
+        for i in range(warmups + len(cameras)):
+            camera = cameras[0] if i < warmups else cameras[i - warmups]
+            sql = frame_sql(
+                camera,
+                width=width,
+                height=height,
+                table_expr=table,
+                dialect="clickhouse",
+            )
+            started = time.perf_counter()
+            rows = client.query(
+                sql,
+                settings={"max_execution_time": timeout_s},
+            ).result_rows
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            if first_ms is None:
+                first_ms = elapsed_ms
+            if i < warmups:
+                continue
+            latencies.append(elapsed_ms)
+            output_rows += len(rows)
+            hashes.append(frame_hash(render_frame(rows, camera, width=width, height=height)))
+    except Exception as exc:
+        return SystemResult(
+            "clickhouse",
+            "fail",
+            "clickhouse_mergetree",
+            "vanilla",
+            first_ms,
+            None,
+            None,
+            None,
+            output_rows,
+            hashes,
+            str(exc),
+        )
+    median_ms = statistics.median(latencies)
+    p95_ms = percentile(latencies, 0.95)
+    return SystemResult(
+        "clickhouse",
+        "ok",
+        "clickhouse_mergetree",
+        "vanilla",
+        first_ms,
+        median_ms,
+        p95_ms,
+        1000.0 / median_ms if median_ms else None,
+        output_rows,
+        hashes,
+    )
+
+
 def fmt_ms(value: float | None) -> str:
     if value is None:
         return "-"
@@ -264,7 +401,15 @@ def print_results(results: list[SystemResult], parity_reference: str | None) -> 
             print(f"  {result.error.splitlines()[0][:180]}")
 
 
-def collect_environment(dsn: str, table: str, parquet: Path) -> dict[str, Any]:
+def collect_environment(
+    dsn: str,
+    table: str,
+    parquet: Path,
+    postgres_dsn: str,
+    clickhouse_host: str,
+    clickhouse_port: int,
+    systems: set[str],
+) -> dict[str, Any]:
     environment: dict[str, Any] = {
         "platform": platform.platform(),
         "cpu_count": os.cpu_count(),
@@ -300,6 +445,57 @@ def collect_environment(dsn: str, table: str, parquet: Path) -> dict[str, Any]:
             )
     except Exception as exc:
         environment["postgres_probe_error"] = str(exc)
+    if "postgres" in systems:
+        try:
+            with psycopg.connect(postgres_dsn, autocommit=True) as conn:
+                row = conn.execute(
+                    f"""
+                    SELECT version(), count(*)::bigint,
+                           pg_total_relation_size(%s::regclass)::bigint,
+                           current_setting('shared_buffers'),
+                           current_setting('work_mem'),
+                           current_setting('max_parallel_workers_per_gather')
+                    FROM {table}
+                    """,
+                    (table,),
+                ).fetchone()
+                environment["vanilla_postgres"] = dict(
+                    zip(
+                        (
+                            "version",
+                            "rows",
+                            "bytes",
+                            "shared_buffers",
+                            "work_mem",
+                            "max_parallel_workers_per_gather",
+                        ),
+                        row,
+                    )
+                )
+        except Exception as exc:
+            environment["vanilla_postgres_probe_error"] = str(exc)
+    if "clickhouse" in systems:
+        try:
+            client = clickhouse_connect.get_client(host=clickhouse_host, port=clickhouse_port)
+            version = client.query("SELECT version()").result_rows[0][0]
+            rows = client.query(f"SELECT count(*) FROM {table}").result_rows[0][0]
+            size_bytes = client.query(
+                "SELECT coalesce(sum(bytes_on_disk), 0) FROM system.parts "
+                f"WHERE active AND database = currentDatabase() AND table = '{table}'"
+            ).result_rows[0][0]
+            table_meta = client.query(
+                "SELECT engine, sorting_key FROM system.tables "
+                f"WHERE database = currentDatabase() AND name = '{table}'"
+            ).result_rows[0]
+            environment["clickhouse"] = {
+                "version": version,
+                "rows": int(rows),
+                "bytes": int(size_bytes),
+                "engine": table_meta[0],
+                "sorting_key": table_meta[1],
+            }
+        except Exception as exc:
+            environment["clickhouse_probe_error"] = str(exc)
     return environment
 
 
@@ -319,6 +515,62 @@ def render_once(
     frame = render_frame(rows, camera, width=width, height=height)
     route = str(doc.get("chosen_candidate") or doc.get("route") or system)
     return frame, elapsed_ms, route
+
+
+def render_selected_once(
+    args: argparse.Namespace,
+    system: str,
+    camera: Camera,
+) -> tuple[str, float, str]:
+    if system in CANDIDATES:
+        return render_once(
+            args.dsn,
+            system,
+            camera,
+            args.table,
+            args.width,
+            args.height,
+            args.timeout,
+        )
+    if system == "postgres":
+        with psycopg.connect(args.postgres_dsn, autocommit=True) as conn:
+            sql = frame_sql(camera, width=args.width, height=args.height, table_expr=args.table)
+            started = time.perf_counter()
+            rows = conn.execute(sql).fetchall()
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        frame = render_frame(rows, camera, width=args.width, height=args.height)
+        return frame, elapsed_ms, "postgres_heap"
+    if system == "clickhouse":
+        client = clickhouse_connect.get_client(
+            host=args.clickhouse_host,
+            port=args.clickhouse_port,
+        )
+        sql = frame_sql(
+            camera,
+            width=args.width,
+            height=args.height,
+            table_expr=args.table,
+            dialect="clickhouse",
+        )
+        started = time.perf_counter()
+        rows = client.query(sql).result_rows
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        frame = render_frame(rows, camera, width=args.width, height=args.height)
+        return frame, elapsed_ms, "clickhouse_mergetree"
+    escaped = str(args.parquet).replace("'", "''")
+    with duckdb.connect(":memory:") as conn:
+        sql = frame_sql(
+            camera,
+            width=args.width,
+            height=args.height,
+            table_expr=f"read_parquet('{escaped}')",
+            dialect="duckdb",
+        )
+        started = time.perf_counter()
+        rows = conn.execute(sql).fetchall()
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    frame = render_frame(rows, camera, width=args.width, height=args.height)
+    return frame, elapsed_ms, "duckdb"
 
 
 def interactive(args: argparse.Namespace) -> int:
@@ -367,7 +619,10 @@ def interactive(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dsn", default=DEFAULT_DSN)
-    parser.add_argument("--table", default="doomql_world")
+    parser.add_argument("--postgres-dsn", default=DEFAULT_POSTGRES_DSN)
+    parser.add_argument("--clickhouse-host", default=DEFAULT_CLICKHOUSE_HOST)
+    parser.add_argument("--clickhouse-port", type=int, default=DEFAULT_CLICKHOUSE_PORT)
+    parser.add_argument("--table", type=simple_identifier, default="doomql_world")
     parser.add_argument("--parquet", type=Path, required=True)
     parser.add_argument("--systems", default=DEFAULT_SYSTEMS)
     parser.add_argument("--system", default="auto", choices=sorted(CANDIDATES))
@@ -385,7 +640,7 @@ def main() -> int:
         return interactive(args)
 
     systems = [item.strip() for item in args.systems.split(",") if item.strip()]
-    unknown = sorted(set(systems) - set(CANDIDATES) - {"duckdb"})
+    unknown = sorted(set(systems) - set(CANDIDATES) - VANILLA_SYSTEMS - {"duckdb"})
     if unknown:
         parser.error(f"unknown systems: {', '.join(unknown)}")
     cameras = scripted_cameras(args.frames, args.draw_distance)
@@ -394,6 +649,27 @@ def main() -> int:
         print(f"Running {system}...", flush=True)
         if system == "duckdb":
             result = run_duckdb_system(args.parquet, cameras, args.width, args.height, args.warmups)
+        elif system == "postgres":
+            result = run_postgres_system(
+                args.postgres_dsn,
+                cameras,
+                args.table,
+                args.width,
+                args.height,
+                args.warmups,
+                args.timeout,
+            )
+        elif system == "clickhouse":
+            result = run_clickhouse_system(
+                args.clickhouse_host,
+                args.clickhouse_port,
+                cameras,
+                args.table,
+                args.width,
+                args.height,
+                args.warmups,
+                args.timeout,
+            )
         else:
             result = run_pg_system(
                 args.dsn,
@@ -410,16 +686,12 @@ def main() -> int:
     print_results(results, parity_reference)
 
     if args.render:
-        successful = next((result for result in results if result.status == "ok" and result.system != "duckdb"), None)
+        successful = next((result for result in results if result.status == "ok"), None)
         if successful:
-            frame, elapsed_ms, route = render_once(
-                args.dsn,
+            frame, elapsed_ms, route = render_selected_once(
+                args,
                 successful.system,
                 cameras[0],
-                args.table,
-                args.width,
-                args.height,
-                args.timeout,
             )
             print(f"\nDOOMQL | {route} | {elapsed_ms:.1f}ms | hash {frame_hash(frame)}")
             print(frame)
@@ -428,6 +700,8 @@ def main() -> int:
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "dsn": args.dsn.rsplit("@", 1)[-1],
+        "postgres_dsn": args.postgres_dsn.rsplit("@", 1)[-1],
+        "clickhouse": f"{args.clickhouse_host}:{args.clickhouse_port}",
         "table": args.table,
         "parquet": str(args.parquet),
         "frames": args.frames,
@@ -436,7 +710,15 @@ def main() -> int:
         "draw_distance": args.draw_distance,
         "warmups": args.warmups,
         "parity_reference": parity_reference,
-        "environment": collect_environment(args.dsn, args.table, args.parquet),
+        "environment": collect_environment(
+            args.dsn,
+            args.table,
+            args.parquet,
+            args.postgres_dsn,
+            args.clickhouse_host,
+            args.clickhouse_port,
+            set(systems),
+        ),
         "results": [asdict(result) for result in results],
     }
     args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

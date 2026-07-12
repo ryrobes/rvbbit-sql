@@ -12,9 +12,25 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .run import DEFAULT_DSN, DEFAULT_SYSTEMS, fmt_ms
+    from .load import simple_identifier
+    from .run import (
+        DEFAULT_CLICKHOUSE_HOST,
+        DEFAULT_CLICKHOUSE_PORT,
+        DEFAULT_DSN,
+        DEFAULT_POSTGRES_DSN,
+        DEFAULT_SYSTEMS,
+        fmt_ms,
+    )
 except ImportError:
-    from run import DEFAULT_DSN, DEFAULT_SYSTEMS, fmt_ms
+    from load import simple_identifier
+    from run import (
+        DEFAULT_CLICKHOUSE_HOST,
+        DEFAULT_CLICKHOUSE_PORT,
+        DEFAULT_DSN,
+        DEFAULT_POSTGRES_DSN,
+        DEFAULT_SYSTEMS,
+        fmt_ms,
+    )
 
 
 HERE = Path(__file__).resolve().parent
@@ -32,9 +48,10 @@ def parse_scales(value: str) -> list[int]:
 
 def run_command(command: list[str]) -> None:
     display = list(command)
-    if "--dsn" in display:
-        dsn_index = display.index("--dsn") + 1
-        display[dsn_index] = display[dsn_index].rsplit("@", 1)[-1]
+    for flag in ("--dsn", "--postgres-dsn"):
+        if flag in display:
+            dsn_index = display.index(flag) + 1
+            display[dsn_index] = display[dsn_index].rsplit("@", 1)[-1]
     printable = " ".join(display)
     print(f"\n$ {printable}", flush=True)
     subprocess.run(command, cwd=HERE.parents[1], check=True)
@@ -63,7 +80,10 @@ def print_matrix(runs: list[dict[str, Any]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dsn", default=DEFAULT_DSN)
-    parser.add_argument("--table", default="doomql_world")
+    parser.add_argument("--postgres-dsn", default=DEFAULT_POSTGRES_DSN)
+    parser.add_argument("--clickhouse-host", default=DEFAULT_CLICKHOUSE_HOST)
+    parser.add_argument("--clickhouse-port", type=int, default=DEFAULT_CLICKHOUSE_PORT)
+    parser.add_argument("--table", type=simple_identifier, default="doomql_world")
     parser.add_argument("--scales", type=parse_scales, default=parse_scales("1000000,5000000,10000000"))
     parser.add_argument("--systems", default=DEFAULT_SYSTEMS)
     parser.add_argument("--frames", type=int, default=12)
@@ -78,6 +98,10 @@ def main() -> int:
     args = parser.parse_args()
 
     runs: list[dict[str, Any]] = []
+    selected_systems = [item.strip() for item in args.systems.split(",") if item.strip()]
+    competitor_targets = [
+        system for system in ("postgres", "clickhouse") if system in selected_systems
+    ]
     for scale in args.scales:
         parquet = HERE / "data" / f"doomql_world_{scale}.parquet"
         result_path = HERE / "results" / f"scale-{scale}.json"
@@ -101,6 +125,30 @@ def main() -> int:
             load_command.append("--skip-variants")
         run_command(load_command)
 
+        if competitor_targets:
+            run_command(
+                [
+                    sys.executable,
+                    str(HERE / "load_competitors.py"),
+                    "--parquet",
+                    str(parquet),
+                    "--table",
+                    args.table,
+                    "--targets",
+                    ",".join(competitor_targets),
+                    "--postgres-dsn",
+                    args.postgres_dsn,
+                    "--clickhouse-host",
+                    args.clickhouse_host,
+                    "--clickhouse-port",
+                    str(args.clickhouse_port),
+                    "--copy-batch-rows",
+                    str(args.copy_batch_rows),
+                    "--output",
+                    str(HERE / "results" / f"competitor-load-{scale}.json"),
+                ]
+            )
+
         run_command(
             [
                 sys.executable,
@@ -109,6 +157,12 @@ def main() -> int:
                 args.dsn,
                 "--table",
                 args.table,
+                "--postgres-dsn",
+                args.postgres_dsn,
+                "--clickhouse-host",
+                args.clickhouse_host,
+                "--clickhouse-port",
+                str(args.clickhouse_port),
                 "--parquet",
                 str(parquet),
                 "--systems",

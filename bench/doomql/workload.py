@@ -164,7 +164,7 @@ def frame_sql(
     """Build one analytical frame query for PostgreSQL/GQE or DuckDB."""
     if width <= 0 or height <= 0:
         raise ValueError("frame dimensions must be positive")
-    if dialect not in {"postgres", "duckdb"}:
+    if dialect not in {"postgres", "duckdb", "clickhouse"}:
         raise ValueError(f"unsupported dialect: {dialect}")
     depth, lateral_offset, coarse_filter = _camera_expressions(camera)
     half_width = width // 2
