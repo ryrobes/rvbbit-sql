@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import struct
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -21,6 +22,8 @@ PLAYER_HEIGHT = 56
 PLAYER_EYE_HEIGHT = 41
 PLAYER_RADIUS = 16
 MAX_STEP_HEIGHT = 24
+RGBColor = tuple[int, int, int]
+MaterialColorRamp = tuple[RGBColor, ...]
 SURFACE_COLUMNS = (
     "sample_id",
     "scan_id",
@@ -130,6 +133,7 @@ class DoomMap:
     subsectors: list[SubSector]
     nodes: list[Node]
     things: list[Thing]
+    material_color_ramps: dict[str, MaterialColorRamp]
 
     @property
     def bounds(self) -> tuple[int, int, int, int]:
@@ -198,6 +202,7 @@ class RasterizedWorld:
     blocked_cells: set[tuple[int, int]]
     surfaces: list[SurfaceSample]
     material_names: dict[int, str]
+    material_color_ramps: dict[int, MaterialColorRamp]
 
     def to_grid(self, x: int, y: int) -> tuple[int, int]:
         return (
@@ -294,6 +299,163 @@ def _records(blob: bytes, fmt: str) -> Iterable[tuple[object, ...]]:
         yield struct.unpack_from(fmt, blob, offset)
 
 
+def _decode_patch(blob: bytes) -> tuple[int, int, list[int | None]]:
+    if len(blob) < 8:
+        raise ValueError("patch lump is too short")
+    width, height = struct.unpack_from("<hh", blob, 0)
+    if width <= 0 or height <= 0 or len(blob) < 8 + width * 4:
+        raise ValueError("patch lump has invalid dimensions")
+    column_offsets = struct.unpack_from(f"<{width}I", blob, 8)
+    pixels: list[int | None] = [None] * (width * height)
+    for x, column_offset in enumerate(column_offsets):
+        cursor = column_offset
+        while cursor < len(blob):
+            top = blob[cursor]
+            cursor += 1
+            if top == 255:
+                break
+            if cursor + 2 > len(blob):
+                raise ValueError("patch column has a truncated post")
+            length = blob[cursor]
+            cursor += 2
+            if cursor + length + 1 > len(blob):
+                raise ValueError("patch column pixels are truncated")
+            for offset, palette_index in enumerate(blob[cursor : cursor + length]):
+                y = top + offset
+                if y < height:
+                    pixels[y * width + x] = palette_index
+            cursor += length + 1
+    return width, height, pixels
+
+
+def _decode_wall_textures(lumps: dict[str, bytes]) -> dict[str, list[int]]:
+    pnames_blob = lumps.get("PNAMES")
+    if pnames_blob is None or len(pnames_blob) < 4:
+        return {}
+    patch_count = struct.unpack_from("<i", pnames_blob, 0)[0]
+    if patch_count < 0 or len(pnames_blob) < 4 + patch_count * 8:
+        raise ValueError("PNAMES lump is truncated")
+    patch_names = [
+        _decode_name(pnames_blob[4 + index * 8 : 12 + index * 8])
+        for index in range(patch_count)
+    ]
+    decoded_patches: dict[str, tuple[int, int, list[int | None]]] = {}
+    textures: dict[str, list[int]] = {}
+    for lump_name in ("TEXTURE1", "TEXTURE2"):
+        texture_blob = lumps.get(lump_name)
+        if texture_blob is None:
+            continue
+        if len(texture_blob) < 4:
+            raise ValueError(f"{lump_name} lump is truncated")
+        texture_count = struct.unpack_from("<i", texture_blob, 0)[0]
+        if texture_count < 0 or len(texture_blob) < 4 + texture_count * 4:
+            raise ValueError(f"{lump_name} directory is truncated")
+        offsets = struct.unpack_from(f"<{texture_count}I", texture_blob, 4)
+        for texture_offset in offsets:
+            if texture_offset + 22 > len(texture_blob):
+                raise ValueError(f"{lump_name} texture header is truncated")
+            raw_name, _masked, width, height, _column_dir, texture_patch_count = (
+                struct.unpack_from("<8sihhih", texture_blob, texture_offset)
+            )
+            if width <= 0 or height <= 0 or texture_patch_count < 0:
+                raise ValueError(f"{lump_name} texture has invalid dimensions")
+            records_offset = texture_offset + 22
+            if records_offset + texture_patch_count * 10 > len(texture_blob):
+                raise ValueError(f"{lump_name} texture patches are truncated")
+            canvas: list[int | None] = [None] * (width * height)
+            for patch_offset in range(texture_patch_count):
+                origin_x, origin_y, patch_index, _step_dir, _color_map = (
+                    struct.unpack_from(
+                        "<hhhhh",
+                        texture_blob,
+                        records_offset + patch_offset * 10,
+                    )
+                )
+                if not 0 <= patch_index < len(patch_names):
+                    continue
+                patch_name = patch_names[patch_index].upper()
+                patch_blob = lumps.get(patch_name)
+                if patch_blob is None:
+                    continue
+                patch = decoded_patches.get(patch_name)
+                if patch is None:
+                    patch = _decode_patch(patch_blob)
+                    decoded_patches[patch_name] = patch
+                patch_width, patch_height, patch_pixels = patch
+                for patch_y in range(patch_height):
+                    target_y = origin_y + patch_y
+                    if not 0 <= target_y < height:
+                        continue
+                    for patch_x in range(patch_width):
+                        target_x = origin_x + patch_x
+                        palette_index = patch_pixels[patch_y * patch_width + patch_x]
+                        if 0 <= target_x < width and palette_index is not None:
+                            canvas[target_y * width + target_x] = palette_index
+            textures[_decode_name(raw_name)] = [
+                palette_index
+                for palette_index in canvas
+                if palette_index is not None
+            ]
+    return textures
+
+
+def _average_color_ramp(
+    palette_indices: Iterable[int],
+    palette: tuple[RGBColor, ...],
+    color_maps: tuple[bytes, ...],
+) -> MaterialColorRamp:
+    histogram = Counter(palette_indices)
+    total = sum(histogram.values())
+    if not total:
+        return ()
+    ramp: list[RGBColor] = []
+    for color_map in color_maps:
+        channels = [0, 0, 0]
+        for palette_index, count in histogram.items():
+            color = palette[color_map[palette_index]]
+            for channel, value in enumerate(color):
+                channels[channel] += value * count
+        ramp.append(tuple(round(value / total) for value in channels))
+    return tuple(ramp)
+
+
+def _read_material_color_ramps(
+    data: bytes,
+    directory: list[tuple[str, int, int]],
+    material_names: set[str],
+) -> dict[str, MaterialColorRamp]:
+    lumps = {
+        name: data[offset : offset + size]
+        for name, offset, size in directory
+        if size > 0
+    }
+    playpal = lumps.get("PLAYPAL", b"")
+    colormap = lumps.get("COLORMAP", b"")
+    if len(playpal) < 256 * 3 or len(colormap) < 32 * 256:
+        return {}
+    palette = tuple(
+        tuple(playpal[index : index + 3])
+        for index in range(0, 256 * 3, 3)
+    )
+    color_maps = tuple(
+        colormap[level * 256 : (level + 1) * 256]
+        for level in range(32)
+    )
+    wall_textures = _decode_wall_textures(lumps)
+    ramps: dict[str, MaterialColorRamp] = {}
+    for material_name in material_names:
+        surface_kind, texture_name = material_name.split(":", 1)
+        if surface_kind == "wall":
+            palette_indices = wall_textures.get(texture_name, [])
+        else:
+            flat = lumps.get(texture_name, b"")
+            palette_indices = flat if len(flat) == 64 * 64 else []
+        ramp = _average_color_ramp(palette_indices, palette, color_maps)
+        if ramp:
+            ramps[material_name] = ramp
+    return ramps
+
+
 def read_wad_map(path: Path, map_name: str = "E1M1") -> DoomMap:
     data = path.read_bytes()
     if len(data) < 12:
@@ -373,7 +535,40 @@ def read_wad_map(path: Path, map_name: str = "E1M1") -> DoomMap:
         Thing(int(x), int(y), int(angle), int(kind), int(flags))
         for x, y, angle, kind, flags in _records(lumps["THINGS"], "<hhhhh")
     ]
-    return DoomMap(normalized_map, vertices, sectors, sides, lines, segs, subsectors, nodes, things)
+    material_names = {
+        *(f"floor:{sector.floor_texture}" for sector in sectors),
+        *(f"ceiling:{sector.ceiling_texture}" for sector in sectors),
+        *(
+            f"wall:{texture}"
+            for side in sides
+            for texture in (
+                side.upper_texture,
+                side.lower_texture,
+                side.middle_texture,
+            )
+            if texture != "-"
+        ),
+    }
+    try:
+        material_color_ramps = _read_material_color_ramps(
+            data,
+            directory,
+            material_names,
+        )
+    except (IndexError, KeyError, struct.error, ValueError):
+        material_color_ramps = {}
+    return DoomMap(
+        normalized_map,
+        vertices,
+        sectors,
+        sides,
+        lines,
+        segs,
+        subsectors,
+        nodes,
+        things,
+        material_color_ramps,
+    )
 
 
 def _point_on_segment(x: int, y: int, a: Vertex, b: Vertex) -> bool:
@@ -540,6 +735,11 @@ def rasterize_map(doom_map: DoomMap, grid_scale: int = DEFAULT_GRID_SCALE) -> Ra
         blocked_cells=blocked_cells,
         surfaces=surfaces,
         material_names={identifier: name for name, identifier in material_ids.items()},
+        material_color_ramps={
+            identifier: doom_map.material_color_ramps[name]
+            for name, identifier in material_ids.items()
+            if name in doom_map.material_color_ramps
+        },
     )
 
 

@@ -168,10 +168,11 @@ python3 bench/doomql/run.py \
   --interactive --system auto --turn-degrees 15
 ```
 
-Use `W`/`S` to move, `A`/`D` to turn, and `Q` to exit. Turns default to 15
-degrees; pass `--turn-degrees 5` for finer movement or any value from 1 to 90.
-The camera moves only through cells classified as open by the same deterministic
-world function used to generate the dataset.
+Use `W`/`S` to move forward/backward, `A`/`D` to turn, `Z`/`C` to strafe
+left/right, and `Q` to exit. Turns default to 15 degrees; pass
+`--turn-degrees 5` for finer movement or any value from 1 to 90. The camera
+moves only through cells classified as open by the same deterministic world
+function used to generate the dataset.
 
 To walk the actual E1M1 start room and staircase:
 
@@ -219,7 +220,11 @@ python3 bench/doomql/run.py \
 Width and height still describe terminal columns and rows. ANSI half-block mode
 renders an internal `width x (height * 2)` color buffer, so `120x40` becomes
 120x80 addressable color pixels without regenerating or reloading any data. A
-truecolor terminal is required for the intended appearance.
+truecolor terminal is required for the intended appearance. In WAD mode, wall
+textures and flats are decoded through the original `PLAYPAL` and 32 normal
+`COLORMAP` tables. Their representative colors follow the actual Doom assets,
+while sector brightness and view distance select the light band for each
+surface.
 
 ## Reading the result
 

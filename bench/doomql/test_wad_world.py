@@ -8,7 +8,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from .run import e1m1_scripted_cameras
+from .run import e1m1_scripted_cameras, strafe_camera
 from .wad_world import (
     SURFACE_CEILING,
     SURFACE_FLOOR,
@@ -42,6 +42,11 @@ def test_e1m1_wad_geometry_and_player_start(e1m1_world: RasterizedWorld):
     assert len(doom_map.subsectors) == 237
     assert e1m1_world.player_camera(96) == (114, 78, 41, 90, 96)
     assert e1m1_world.doom_map.point_sector(1056, -3616) == 38
+    assert set(e1m1_world.material_color_ramps) == set(e1m1_world.material_names)
+    assert all(
+        len(ramp) == 32 for ramp in e1m1_world.material_color_ramps.values()
+    )
+    assert len({ramp[0] for ramp in e1m1_world.material_color_ramps.values()}) > 20
 
 
 def test_e1m1_query_keeps_the_gqe_portable_integer_shape():
@@ -78,6 +83,14 @@ def test_e1m1_player_radius_blocks_wall_crossing_without_closing_portals(
     assert e1m1_world.try_move(114, 76, 114, 74) is None
     assert not e1m1_world.position_is_clear(114, 74)
     assert e1m1_world.try_move(114, 78, 114, 100) == (114, 100, 25)
+
+
+def test_e1m1_strafing_preserves_heading_and_uses_collision_path(
+    e1m1_world: RasterizedWorld,
+):
+    camera = Camera(*e1m1_world.player_camera(96))
+    assert strafe_camera(camera, 2, e1m1_world) == Camera(112, 78, 41, 90, 96)
+    assert strafe_camera(camera, -2, e1m1_world) == Camera(116, 78, 41, 90, 96)
 
 
 def test_e1m1_sql_projects_height_spans_and_renders_a_z_buffer(
@@ -149,6 +162,16 @@ def test_e1m1_sql_projects_height_spans_and_renders_a_z_buffer(
         world="e1m1",
         grid_scale=16,
         render_type="ansi-half",
+        material_color_ramps=e1m1_world.material_color_ramps,
+    )
+    fallback_ansi_frame = render_frame(
+        rows,
+        camera,
+        width=80,
+        height=28,
+        world="e1m1",
+        grid_scale=16,
+        render_type="ansi-half",
     )
     plain_ansi = re.sub(r"\x1b\[[0-9;]*m", "", ansi_frame)
     assert "\x1b[38;2;" in ansi_frame
@@ -157,6 +180,7 @@ def test_e1m1_sql_projects_height_spans_and_renders_a_z_buffer(
     assert len(plain_ansi.splitlines()) == 28
     assert all(len(line) == 80 for line in plain_ansi.splitlines())
     assert len(frame_hash(ansi_frame)) == 12
+    assert frame_hash(ansi_frame) != frame_hash(fallback_ansi_frame)
 
 
 def test_e1m1_scripted_walk_changes_position_height_and_heading(

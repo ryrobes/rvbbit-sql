@@ -47,6 +47,44 @@ def test_clickhouse_uses_the_portable_postgres_query_shape():
     )
 
 
+def test_camera_space_preserves_left_and_right_orientation():
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            """
+            CREATE TABLE surfaces (
+                surface_id INTEGER,
+                world_x SMALLINT,
+                world_y SMALLINT,
+                z_bottom SMALLINT,
+                z_top SMALLINT,
+                surface_kind SMALLINT,
+                material SMALLINT,
+                light SMALLINT,
+                sector_id SMALLINT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO surfaces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (1, 10, -1, 0, 64, 1, 1, 192, 1),
+                (2, 10, 1, 0, 64, 1, 2, 192, 1),
+            ],
+        )
+        rows = conn.execute(
+            frame_sql(
+                Camera(0, 0, 41, 0, 32),
+                table_expr="surfaces",
+                dialect="duckdb",
+                world="e1m1",
+            )
+        ).fetchall()
+
+    lateral_by_material = {int(row[5]): int(row[0]) for row in rows}
+    assert lateral_by_material[1] > 0  # South is screen-right when facing east.
+    assert lateral_by_material[2] < 0  # North is screen-left when facing east.
+
+
 def test_duckdb_query_executes_and_renders_stable_dimensions():
     with duckdb.connect(":memory:") as conn:
         conn.execute(f"CREATE VIEW doomql_world AS {world_select_sql(300_000)}")

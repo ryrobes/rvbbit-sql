@@ -6,7 +6,7 @@ import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 try:
     from .wad_world import (
@@ -183,7 +183,7 @@ def _camera_expressions(camera: Camera) -> tuple[str, str, str]:
     delta_x = f"(CAST(world_x AS INTEGER) - {camera.x})"
     delta_y = f"(CAST(world_y AS INTEGER) - {camera.y})"
     depth_scaled = f"({delta_x} * {direction_x} + {delta_y} * {direction_y})"
-    lateral_scaled = f"({delta_y} * {direction_x} - {delta_x} * {direction_y})"
+    lateral_scaled = f"({delta_x} * {direction_y} - {delta_y} * {direction_x})"
     coarse_filter = (
         f"world_x BETWEEN {max(0, camera.x - camera.draw_distance)} "
         f"AND {min(WORLD_SIZE - 1, camera.x + camera.draw_distance)} "
@@ -335,6 +335,7 @@ def render_frame(
     world: str = "synthetic",
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
+    material_color_ramps: Mapping[int, Sequence[tuple[int, int, int]]] | None = None,
 ) -> str:
     if render_type not in RENDER_TYPES:
         raise ValueError(f"unsupported render type: {render_type}")
@@ -346,6 +347,7 @@ def render_frame(
             height=height,
             grid_scale=grid_scale,
             render_type=render_type,
+            material_color_ramps=material_color_ramps,
         )
     if world != "synthetic":
         raise ValueError(f"unsupported world: {world}")
@@ -483,6 +485,12 @@ def _trunc_div(numerator: int, denominator: int) -> int:
     return -((-numerator) // denominator)
 
 
+def _doom_light_level(avg_light: float, distance_ratio: float) -> int:
+    sector_level = round((255.0 - max(0.0, min(255.0, avg_light))) / 8.0)
+    distance_level = round(max(0.0, min(1.0, distance_ratio)) * 8.0)
+    return min(31, sector_level + distance_level)
+
+
 def render_surface_frame(
     rows: Iterable[Sequence[object]] | Iterable[RayHit] | Iterable[SurfaceHit],
     camera: Camera,
@@ -491,6 +499,7 @@ def render_surface_frame(
     height: int = 40,
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
+    material_color_ramps: Mapping[int, Sequence[tuple[int, int, int]]] | None = None,
 ) -> str:
     hits = list(rows)
     if hits and not isinstance(hits[0], SurfaceHit):
@@ -575,7 +584,7 @@ def render_surface_frame(
             continue
 
         distance_ratio = min(1.0, depth / max(1, camera.draw_distance))
-        darkness = max(0.0, min(1.0, (192.0 - hit.avg_light) / 256.0))
+        light_level = _doom_light_level(hit.avg_light, distance_ratio)
         if hit.surface_kind == SURFACE_WALL:
             palette = wall_palettes[hit.material % len(wall_palettes)]
             priority = 0
@@ -584,7 +593,7 @@ def render_surface_frame(
             priority = 1 if hit.surface_kind == SURFACE_MASKED else 2
         shade = min(
             len(palette) - 1,
-            int((distance_ratio * 0.7 + darkness * 0.3) * len(palette)),
+            round(light_level / 31 * (len(palette) - 1)),
         )
         character = palette[shade]
         base_colors = {
@@ -605,13 +614,20 @@ def render_surface_frame(
             if hit.surface_kind == SURFACE_WALL
             else base_colors.get(hit.surface_kind, (104, 99, 85))
         )
-        light_factor = 0.25 + 0.75 * max(0.0, min(1.0, hit.avg_light / 255.0))
-        depth_factor = 1.0 - distance_ratio * 0.68
-        color_factor = light_factor * depth_factor
-        color = tuple(
-            max(0, min(255, round(component * color_factor)))
-            for component in base_color
+        material_ramp = (
+            material_color_ramps.get(hit.material)
+            if material_color_ramps is not None
+            else None
         )
+        if material_ramp:
+            ramp_index = min(len(material_ramp) - 1, light_level)
+            color = tuple(material_ramp[ramp_index])
+        else:
+            color_factor = max(0.08, 1.0 - light_level / 34.0)
+            color = tuple(
+                max(0, min(255, round(component * color_factor)))
+                for component in base_color
+            )
         for screen_y in range(y_start, y_stop):
             for projected_x in range(x_start, x_stop):
                 if hit.surface_kind == SURFACE_MASKED and (

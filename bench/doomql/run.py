@@ -25,7 +25,13 @@ import psycopg
 
 try:
     from .load import DEFAULT_WAD, WORLD_COLUMNS, simple_identifier
-    from .wad_world import DEFAULT_GRID_SCALE, RasterizedWorld, rasterize_map, read_wad_map
+    from .wad_world import (
+        DEFAULT_GRID_SCALE,
+        MaterialColorRamp,
+        RasterizedWorld,
+        rasterize_map,
+        read_wad_map,
+    )
     from .workload import (
         CAMERA_VECTOR_SCALE,
         RENDER_TYPES,
@@ -38,7 +44,13 @@ try:
     )
 except ImportError:
     from load import DEFAULT_WAD, WORLD_COLUMNS, simple_identifier
-    from wad_world import DEFAULT_GRID_SCALE, RasterizedWorld, rasterize_map, read_wad_map
+    from wad_world import (
+        DEFAULT_GRID_SCALE,
+        MaterialColorRamp,
+        RasterizedWorld,
+        rasterize_map,
+        read_wad_map,
+    )
     from workload import (
         CAMERA_VECTOR_SCALE,
         RENDER_TYPES,
@@ -150,6 +162,7 @@ def run_pg_system(
     world: str = "synthetic",
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
+    material_color_ramps: dict[int, MaterialColorRamp] | None = None,
 ) -> SystemResult:
     candidate = CANDIDATES[system]
     latencies: list[float] = []
@@ -197,6 +210,7 @@ def run_pg_system(
                     world=world,
                     grid_scale=grid_scale,
                     render_type=render_type,
+                    material_color_ramps=material_color_ramps,
                 )
                 hashes.append(frame_hash(frame))
                 route = str(doc.get("chosen_candidate") or doc.get("route") or "")
@@ -229,6 +243,7 @@ def run_duckdb_system(
     world: str = "synthetic",
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
+    material_color_ramps: dict[int, MaterialColorRamp] | None = None,
 ) -> SystemResult:
     if not parquet.exists():
         return SystemResult("duckdb", "skip", None, None, None, None, None, None, 0, [], f"missing {parquet}")
@@ -269,6 +284,7 @@ def run_duckdb_system(
                             world=world,
                             grid_scale=grid_scale,
                             render_type=render_type,
+                            material_color_ramps=material_color_ramps,
                         )
                     )
                 )
@@ -301,6 +317,7 @@ def run_postgres_system(
     world: str = "synthetic",
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
+    material_color_ramps: dict[int, MaterialColorRamp] | None = None,
 ) -> SystemResult:
     latencies: list[float] = []
     hashes: list[str] = []
@@ -337,6 +354,7 @@ def run_postgres_system(
                             world=world,
                             grid_scale=grid_scale,
                             render_type=render_type,
+                            material_color_ramps=material_color_ramps,
                         )
                     )
                 )
@@ -382,6 +400,7 @@ def run_clickhouse_system(
     world: str = "synthetic",
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
+    material_color_ramps: dict[int, MaterialColorRamp] | None = None,
 ) -> SystemResult:
     latencies: list[float] = []
     hashes: list[str] = []
@@ -421,6 +440,7 @@ def run_clickhouse_system(
                         world=world,
                         grid_scale=grid_scale,
                         render_type=render_type,
+                        material_color_ramps=material_color_ramps,
                     )
                 )
             )
@@ -608,6 +628,7 @@ def render_once(
     world: str = "synthetic",
     grid_scale: int = DEFAULT_GRID_SCALE,
     render_type: str = "ascii",
+    material_color_ramps: dict[int, MaterialColorRamp] | None = None,
 ) -> tuple[str, float, str]:
     candidate = CANDIDATES[system]
     with psycopg.connect(dsn, autocommit=True) as conn:
@@ -628,6 +649,7 @@ def render_once(
         world=world,
         grid_scale=grid_scale,
         render_type=render_type,
+        material_color_ramps=material_color_ramps,
     )
     route = str(doc.get("chosen_candidate") or doc.get("route") or system)
     return frame, elapsed_ms, route
@@ -637,6 +659,7 @@ def render_selected_once(
     args: argparse.Namespace,
     system: str,
     camera: Camera,
+    material_color_ramps: dict[int, MaterialColorRamp] | None = None,
 ) -> tuple[str, float, str]:
     if system in CANDIDATES:
         return render_once(
@@ -650,6 +673,7 @@ def render_selected_once(
             args.world,
             args.grid_scale,
             args.render_type,
+            material_color_ramps,
         )
     if system == "postgres":
         with psycopg.connect(args.postgres_dsn, autocommit=True) as conn:
@@ -671,6 +695,7 @@ def render_selected_once(
             world=args.world,
             grid_scale=args.grid_scale,
             render_type=args.render_type,
+            material_color_ramps=material_color_ramps,
         )
         return frame, elapsed_ms, "postgres_heap"
     if system == "clickhouse":
@@ -697,6 +722,7 @@ def render_selected_once(
             world=args.world,
             grid_scale=args.grid_scale,
             render_type=args.render_type,
+            material_color_ramps=material_color_ramps,
         )
         return frame, elapsed_ms, "clickhouse_mergetree"
     escaped = str(args.parquet).replace("'", "''")
@@ -720,6 +746,7 @@ def render_selected_once(
         world=args.world,
         grid_scale=args.grid_scale,
         render_type=args.render_type,
+        material_color_ramps=material_color_ramps,
     )
     return frame, elapsed_ms, "duckdb"
 
@@ -739,6 +766,16 @@ def move_camera(
         return camera
     x, y, z = moved
     return Camera(x, y, z, camera.heading, camera.draw_distance)
+
+
+def strafe_camera(
+    camera: Camera,
+    amount: int,
+    world_map: RasterizedWorld | None,
+) -> Camera:
+    sideways = camera.turned(90)
+    moved = move_camera(sideways, amount, world_map)
+    return Camera(moved.x, moved.y, moved.z, camera.heading, camera.draw_distance)
 
 
 def e1m1_scripted_cameras(
@@ -792,6 +829,11 @@ def interactive(args: argparse.Namespace, world_map: RasterizedWorld | None = No
                     world=args.world,
                     grid_scale=args.grid_scale,
                     render_type=args.render_type,
+                    material_color_ramps=(
+                        world_map.material_color_ramps
+                        if world_map is not None
+                        else None
+                    ),
                 )
                 route = str(doc.get("chosen_candidate") or doc.get("route") or args.system)
                 header = (
@@ -812,9 +854,13 @@ def interactive(args: argparse.Namespace, world_map: RasterizedWorld | None = No
                 elif key == "s":
                     camera = move_camera(camera, -2, world_map)
                 elif key == "a":
-                    camera = camera.turned(-args.turn_degrees)
-                elif key == "d":
                     camera = camera.turned(args.turn_degrees)
+                elif key == "d":
+                    camera = camera.turned(-args.turn_degrees)
+                elif key == "z":
+                    camera = strafe_camera(camera, 2, world_map)
+                elif key == "c":
+                    camera = strafe_camera(camera, -2, world_map)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         print()
@@ -875,6 +921,9 @@ def main() -> int:
         if world_map is not None
         else scripted_cameras(args.frames, args.draw_distance)
     )
+    material_color_ramps = (
+        world_map.material_color_ramps if world_map is not None else None
+    )
     results: list[SystemResult] = []
     for system in systems:
         print(f"Running {system}...", flush=True)
@@ -888,6 +937,7 @@ def main() -> int:
                 args.world,
                 args.grid_scale,
                 args.render_type,
+                material_color_ramps,
             )
         elif system == "postgres":
             result = run_postgres_system(
@@ -901,6 +951,7 @@ def main() -> int:
                 args.world,
                 args.grid_scale,
                 args.render_type,
+                material_color_ramps,
             )
         elif system == "clickhouse":
             result = run_clickhouse_system(
@@ -915,6 +966,7 @@ def main() -> int:
                 args.world,
                 args.grid_scale,
                 args.render_type,
+                material_color_ramps,
             )
         else:
             result = run_pg_system(
@@ -929,6 +981,7 @@ def main() -> int:
                 args.world,
                 args.grid_scale,
                 args.render_type,
+                material_color_ramps,
             )
         results.append(result)
     parity_reference = enforce_parity(results)
@@ -941,6 +994,7 @@ def main() -> int:
                 args,
                 successful.system,
                 cameras[0],
+                material_color_ramps,
             )
             print(f"\nDOOMQL | {route} | {elapsed_ms:.1f}ms | hash {frame_hash(frame)}")
             print(frame)
