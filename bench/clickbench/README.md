@@ -246,107 +246,103 @@ folding.
 
 ## Results
 
-### 1M rows (smoke pass)
+### 5M rows (2026-07-14, current engine)
 
-Median of 3 runs, 300s timeout. DuckDB FAILs on Q18/Q36-Q42 are
-DuckDB's own dialect issues, not rvbbit's. Q-id list at
+Median of 3 runs, 300s timeout, all seven systems on one desktop
+(8-core i7-11700K, RTX 3090 Ti). DuckDB FAILs on Q18/Q36–Q42 are
+DuckDB's own dialect issues with the upstream `postgresql/queries.sql`
+(UINT16 `EventDate` vs date literals, `date_part` on string), not
+rvbbit's. Q-id list at
 https://github.com/ClickHouse/ClickBench/blob/main/postgresql/queries.sql.
 
 | Query | rvbbit | duckdb | clickhouse | pg_baseline | citus | hydra | alloydb |
 |---|---|---|---|---|---|---|---|
-| Q0 | **189µs** ← | 2ms | 4ms | 94ms | 54ms | 13ms | 1ms |
-| Q1 | 48ms | 899µs | 5ms | 123ms | 32ms | 9ms | **452µs** ← |
-| Q2 | 90ms | **801µs** ← | 6ms | 119ms | 71ms | 24ms | 5ms |
-| Q3 | 84ms | **1ms** ← | 7ms | 117ms | 69ms | 21ms | 3ms |
-| Q4 | 168ms | **6ms** ← | 12ms | 231ms | 95ms | 139ms | 191ms |
-| Q5 | 334ms | **8ms** ← | 20ms | 563ms | 194ms | 266ms | 235ms |
-| Q6 | 76ms | **967µs** ← | 6ms | 102ms | 50ms | 15ms | 2ms |
-| Q7 | 46ms | 1ms | 5ms | 103ms | 32ms | 12ms | **993µs** ← |
-| Q8 | 289ms | **7ms** ← | 14ms | 431ms | 324ms | 234ms | 252ms |
-| Q9 | 379ms | **13ms** ← | 17ms | 562ms | 309ms | 239ms | 298ms |
-| Q10 | 82ms | **4ms** ← | 8ms | 105ms | 58ms | 21ms | 11ms |
-| Q11 | 107ms | **8ms** ← | 14ms | 155ms | 73ms | 24ms | 17ms |
-| Q12 | 91ms | **4ms** ← | 25ms | 110ms | 56ms | 25ms | 13ms |
-| Q13 | 232ms | **8ms** ← | 33ms | 178ms | 175ms | 144ms | 63ms |
-| Q14 | 95ms | **6ms** ← | 25ms | 124ms | 65ms | 32ms | 11ms |
-| Q15 | 145ms | **7ms** ← | 11ms | 227ms | 101ms | 49ms | 36ms |
-| Q16 | 217ms | **13ms** ← | 33ms | 382ms | 192ms | 130ms | 61ms |
-| Q17 | 206ms | **10ms** ← | 25ms | 174ms | 161ms | 57ms | 51ms |
-| Q18 | 499ms | FAIL | **58ms** ← | 849ms | 534ms | 401ms | 494ms |
-| Q19 | 13ms | 890µs | 10ms | 92ms | 35ms | 12ms | **163µs** ← |
-| Q20 | 92ms | **16ms** ← | 19ms | 76ms | 176ms | 34ms | 36ms |
-| Q21 | 104ms | **12ms** ← | 29ms | 93ms | 191ms | 48ms | 36ms |
-| Q22 | 218ms | **17ms** ← | 90ms | 108ms | 370ms | 123ms | 42ms |
-| Q23 | 141ms | 65ms | 84ms | 90ms | 1.16s | 381ms | **36ms** ← |
-| Q24 | 124ms | **3ms** ← | 11ms | 68ms | 64ms | 17ms | 3ms |
-| Q25 | 116ms | **4ms** ← | 13ms | 68ms | 50ms | 17ms | 4ms |
-| Q26 | 126ms | **7ms** ← | 11ms | 69ms | 65ms | 19ms | 8ms |
-| Q27 | 364ms | **17ms** ← | 29ms | 91ms | 327ms | 55ms | 94ms |
-| Q28 | 3.97s | **178ms** ← | 161ms | 1.12s | 3.99s | 904ms | 1.55s |
-| Q29 | 365ms | **10ms** ← | 61ms | 247ms | 654ms | 146ms | 132ms |
-| Q30 | 114ms | **7ms** ← | 30ms | 162ms | 93ms | 40ms | 20ms |
-| Q31 | 163ms | **9ms** ← | 24ms | 135ms | 112ms | 68ms | 59ms |
-| Q32 | 863ms | **57ms** ← | 74ms | 1.06s | 714ms | 658ms | 584ms |
-| Q33 | 375ms | **36ms** ← | 72ms | 403ms | 378ms | 1.69s | 281ms |
-| Q34 | 410ms | **38ms** ← | 70ms | 438ms | 311ms | 1.63s | 302ms |
-| Q35 | 178ms | **8ms** ← | 14ms | 127ms | 159ms | 81ms | 137ms |
-| Q36 | 121ms | FAIL | **24ms** ← | 229ms | 190ms | 1.25s | 233ms |
-| Q37 | 128ms | FAIL | **12ms** ← | 145ms | 99ms | 53ms | 28ms |
-| Q38 | 158ms | FAIL | 20ms | 138ms | 83ms | 56ms | **10ms** ← |
-| Q39 | 243ms | FAIL | **40ms** ← | 581ms | 307ms | 1.36s | 672ms |
-| Q40 | 25ms | FAIL | **12ms** ← | 113ms | 58ms | 31ms | 13ms |
-| Q41 | 29ms | FAIL | 11ms | 225ms | 52ms | 25ms | **7ms** ← |
-| Q42 | 35ms | FAIL | **9ms** ← | 164ms | 81ms | 67ms | 30ms |
+| Q0 | 934µs | **349µs** ← | 2ms | 378ms | 175ms | 17ms | 1ms |
+| Q1 | 1ms | **851µs** ← | 5ms | 536ms | 148ms | 17ms | 2ms |
+| Q2 | 2ms | **2ms** ← | 7ms | 525ms | 316ms | 42ms | 14ms |
+| Q3 | **2ms** ← | 2ms | 7ms | 382ms | 227ms | 33ms | 6ms |
+| Q4 | 94ms | **30ms** ← | 64ms | 1.13s | 567ms | 735ms | 979ms |
+| Q5 | 98ms | **40ms** ← | 68ms | 4.52s | 3.33s | 3.86s | 2.04s |
+| Q6 | 7ms | **457µs** ← | 4ms | 411ms | 243ms | 36ms | 3ms |
+| Q7 | 2ms | **2ms** ← | 6ms | 593ms | 161ms | 22ms | 2ms |
+| Q8 | 52ms | **38ms** ← | 78ms | 2.90s | 1.94s | 1.08s | 1.34s |
+| Q9 | **41ms** ← | 49ms | 81ms | 3.27s | 2.09s | 1.12s | 2.00s |
+| Q10 | 16ms | **10ms** ← | 18ms | 547ms | 338ms | 93ms | 113ms |
+| Q11 | 18ms | **9ms** ← | 22ms | 632ms | 442ms | 106ms | 159ms |
+| Q12 | 115ms | **53ms** ← | 88ms | 1.72s | 655ms | 473ms | 487ms |
+| Q13 | 110ms | **83ms** ← | 113ms | 2.24s | 3.44s | 1.66s | 1.21s |
+| Q14 | 109ms | **45ms** ← | 93ms | 1.73s | 673ms | 551ms | 552ms |
+| Q15 | 39ms | **31ms** ← | 45ms | 1.02s | 857ms | 533ms | 803ms |
+| Q16 | 109ms | **80ms** ← | 137ms | 2.24s | 1.25s | 917ms | 1.09s |
+| Q17 | 112ms | **56ms** ← | 91ms | 948ms | 951ms | 185ms | 621ms |
+| Q18 | **115ms** ← | FAIL | 244ms | 3.45s | 2.94s | 1.63s | 2.36s |
+| Q19 | 5ms | 609µs | 8ms | 360ms | 163ms | 20ms | **234µs** ← |
+| Q20 | 84ms | **34ms** ← | 103ms | 459ms | 901ms | 159ms | 206ms |
+| Q21 | 40ms | **33ms** ← | 137ms | 589ms | 993ms | 147ms | 210ms |
+| Q22 | **48ms** ← | 59ms | 365ms | 647ms | 1.64s | 329ms | 439ms |
+| Q23 | 575ms | **39ms** ← | 456ms | 521ms | 5.11s | 1.55s | 215ms |
+| Q24 | 198ms | **7ms** ← | 36ms | 523ms | 410ms | 70ms | 18ms |
+| Q25 | 109ms | **11ms** ← | 48ms | 539ms | 322ms | 60ms | 53ms |
+| Q26 | 59ms | **7ms** ← | 34ms | 529ms | 409ms | 72ms | 18ms |
+| Q27 | 95ms | **42ms** ← | 132ms | 549ms | 1.44s | 253ms | 434ms |
+| Q28 | 1.02s | **684ms** ← | 818ms | 4.98s | 20.83s | 4.77s | 7.90s |
+| Q29 | 25ms | **8ms** ← | 259ms | 1.23s | 1.87s | 641ms | 595ms |
+| Q30 | 112ms | **37ms** ← | 90ms | 1.97s | 855ms | 534ms | 412ms |
+| Q31 | 125ms | **58ms** ← | 117ms | 2.33s | 1.42s | 1.00s | 531ms |
+| Q32 | **67ms** ← | 240ms | 362ms | 7.73s | 4.61s | 2.72s | 2.87s |
+| Q33 | **180ms** ← | 268ms | 408ms | 2.33s | 2.49s | 7.84s | 2.97s |
+| Q34 | **168ms** ← | 322ms | 423ms | 2.28s | 2.38s | 7.82s | 3.03s |
+| Q35 | 94ms | **38ms** ← | 47ms | 1.17s | 1.06s | 614ms | 1.18s |
+| Q36 | **50ms** ← | FAIL | 58ms | 1.01s | 296ms | 3.97s | 425ms |
+| Q37 | 28ms | FAIL | 30ms | 953ms | 156ms | 947ms | **25ms** ← |
+| Q38 | 27ms | FAIL | 28ms | 653ms | 108ms | 39ms | **9ms** ← |
+| Q39 | 116ms | FAIL | **112ms** ← | 1.01s | 518ms | 484ms | 1.28s |
+| Q40 | **14ms** ← | FAIL | 17ms | 864ms | 84ms | 36ms | 23ms |
+| Q41 | 23ms | FAIL | 14ms | 818ms | 83ms | 37ms | **11ms** ← |
+| Q42 | 16ms | FAIL | **15ms** ← | 660ms | 136ms | 67ms | 72ms |
 
 | summary | rvbbit | duckdb | clickhouse | pg_baseline | citus | hydra | alloydb |
 |---|---|---|---|---|---|---|---|
-| geomean (ms) | 126 | **7** | 19 | 179 | 139 | 76 | 30 |
-| sum of medians (s) | 11.7 | **0.6** | 1.3 | 10.8 | 12.4 | 10.6 | 6.1 |
-| wins (best in row) | 1 | 27 | 7 | 0 | 0 | 0 | 8 |
+| geomean (ms) | 41 | **19** | 54 | 1052 | 690 | 294 | 157 |
+| sum of medians (s) | 4.3 | 2.4 | 5.3 | 63.9 | 69.1 | 47.3 | 36.7 |
+| wins (best in row) | 9 | 28 | 2 | 0 | 0 | 0 | 4 |
 | failures | 0 | 8 | 0 | 0 | 0 | 0 | 0 |
 
 ### Reading these numbers
 
-**Rvbbit vs plain Postgres (the headline win)**: rvbbit beats
-pg_baseline on every query — geomean 126ms vs 179ms — and crushes it
-on Q0 (metadata aggregate, 500×). Plain PG has no columnar story;
-rvbbit gives Postgres users genuine columnar performance.
+**Rvbbit vs ClickHouse (the headline)**: geomean 41ms vs 54ms, zero
+failures on both sides — faster than ClickHouse on its own benchmark,
+from inside a stock Postgres 18. The router's picks across the 43
+queries: GPU/GQE 16, native scan 15, Duck/Vortex 12. Nothing was
+forced; that mix is the learned router doing its job.
 
-**Rvbbit vs Hydra/Citus**: roughly competitive on geomean (126ms vs
-76/139ms). Rvbbit wins on metadata aggregates (Q0), narrow group-bys,
-and the high-OFFSET queries Q40-Q42. Hydra wins on text-heavy
-group-bys (Q20-Q26 LIKE/ORDER BY) because its vectorized text path is
-mature; RYR-284 LIKE pushdown closed about half the Q20/Q21 gap (235ms
-→ 92ms, 262ms → 104ms).
+**Rvbbit vs DuckDB**: DuckDB's geomean still leads (19ms vs 41ms) and
+it takes the most per-row wins, but the gap that used to be 5–50× is
+now ~2× — and 8 of the 43 queries FAIL outright under DuckDB's SQL
+dialect. The 2026-07 result-path fix (`rvbbit._engine_rows`, Arrow →
+Datum direct, no jsonb intermediate) closed most of the wrapper tax:
+Q28 (regex) went from 3.97s to 1.02s, within 1.5× of DuckDB's 684ms.
 
-**Rvbbit vs DuckDB/ClickHouse**: rvbbit trails by 5-50× on most
-queries. These are best-in-class standalone columnar engines and our
-v1 custom-scan emits one PG tuple at a time. The fact that rvbbit is
-competitive on query shapes the rewriter understands (Q0) and within
-2-10× on many others is a reasonable v1 showing — and the trade-off
-is "still a Postgres extension with arbitrary semantic operators."
+**Rvbbit vs plain Postgres**: geomean 41ms vs 1.05s — 25× — while
+remaining a plain Postgres the whole time. Hydra (294ms) and Citus
+(691ms) sit in between.
 
-**Rvbbit vs AlloyDB Omni**: AlloyDB's columnar engine, with the
-populated-in-memory hot copy, beats rvbbit on most "single point
-lookup with hot table" queries (Q0/Q1/Q7/Q19 sub-ms). The cost is
-RAM: AlloyDB needs the columnar in-memory hot copy *plus* the row
-store on disk. Rvbbit holds geomean 126ms while keeping disk
-footprint at 706MB and no extra RAM for the columnar copy.
-
-**Q28 (regex)** is still rvbbit's worst showing (3.97s vs DuckDB's
-178ms). PG regex on TEXT columns through per-row Arrow→Datum dispatch
-is brutal. RYR-284 covered LIKE/ILIKE but not REGEXP_REPLACE — a real
-fix needs Arrow string kernels and/or a bulk varlena allocator.
+**Rvbbit vs AlloyDB Omni**: 41ms vs 157ms. AlloyDB's columnar engine
+needs its in-memory hot copy populated *and resident* to hit that
+number — its columnar pool is a fixed-size arena
+(`google_columnar_engine.memory_size_in_mb`, 4GB here), and any table
+that doesn't fit silently falls back to the row store (~1.3s geomean
+on this suite). When you benchmark it, verify residency in
+`g_columnar_relations` first; we do, and we evict our own tables from
+its pool before measuring. Sub-ms point lookups on hot tables
+(Q0/Q1/Q19) remain AlloyDB's best surface.
 
 ### Larger scales
 
-Bumping to `BENCH_LIMIT=10000000` (10M) or `BENCH_LIMIT=100000000`
-(full) is straightforward — see the disk budget table above. At
-larger scale we expect:
-- rvbbit's column-projection wins compound (105 cols → reading 3
-  columns means ~3% of the I/O of pg_baseline)
-- group-by queries with low-cardinality columns stay sub-ms via
-  per-group stats
-- text-heavy queries become harder as full rows materialize
-
-Full-scale numbers will land in a follow-up commit.
+`BENCH_LIMIT=10000000` (10M) or `BENCH_LIMIT=100000000` (full 100M)
+work the same way — see the disk budget table above. Column-projection
+wins compound with scale (105 cols → reading 3 columns is ~3% of
+pg_baseline's I/O), and at 50M on a Blackwell GPU box the gap over
+AlloyDB widens to ~15×. Multi-scale history lives in `bench_history`
+(see `bench/BENCHMARK_HISTORY.md`) and the interactive browser at
+`bench/report/bench_report.html`.

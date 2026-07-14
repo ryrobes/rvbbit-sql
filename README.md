@@ -115,27 +115,27 @@ median of 3 runs):
 
 | System  | geomean | sum of medians | wins (best of 43) |
 |---|---:|---:|---:|
-| **rvbbit** | **46ms** | **3.9s** | **22** |
-| ClickHouse | 53ms | 5.0s | 12 |
-| AlloyDB | 161ms | 37.4s | 9 |
-| Hydra | 293ms | 46.3s | 0 |
-| Citus | 672ms | 67.0s | 0 |
-| Postgres 18 (heap) | 1.06s | 62.6s | 0 |
+| **rvbbit** | **41ms** | **4.3s** | **23** |
+| ClickHouse | 54ms | 5.3s | 12 |
+| AlloyDB | 157ms | 36.7s | 8 |
+| Hydra | 294ms | 47.3s | 0 |
+| Citus | 691ms | 69.1s | 0 |
+| Postgres 18 (heap) | 1.05s | 63.9s | 0 |
 
 Yes — faster than ClickHouse on its own benchmark, from inside
 Postgres. The router's picks for those 43 queries: GPU 16,
-Duck/Vortex 12, native scan 12, DataFusion 3.
+native scan 15, Duck/Vortex 12.
 
 **TPC-H scale 1, 22 queries:**
 
 | System | geomean | sum of medians | wins | failures |
 |---|---:|---:|---:|---:|
-| ClickHouse | 156ms | 8.8s | 8 | 0 |
-| AlloyDB | 160ms | 9.9s | 6 | 1 |
-| **rvbbit** | **165ms** | **9.0s** | **7** | **0** |
-| Hydra | 306ms | 13.9s | 0 | 1 |
-| Postgres 18 (heap) | 339ms | 15.5s | 1 | 0 |
-| Citus | 776ms | 22.1s | 0 | 0 |
+| AlloyDB | 145ms | 8.9s | 4 | 1 |
+| ClickHouse | 150ms | 8.2s | 8 | 0 |
+| **rvbbit** | **158ms** | **9.2s** | **9** | **0** |
+| Hydra | 283ms | 13.2s | 0 | 1 |
+| Postgres 18 (heap) | 314ms | 14.9s | 1 | 0 |
+| Citus | 748ms | 21.5s | 0 | 0 |
 
 A statistical three-way tie with ClickHouse and AlloyDB at the top —
 except rvbbit runs all 22 (Q22 kills AlloyDB and Hydra) and remains a
