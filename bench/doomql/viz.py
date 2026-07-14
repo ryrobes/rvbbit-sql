@@ -232,7 +232,7 @@ HTML = r'''<!doctype html>
   .tip-meta { margin-top: 3px; color: var(--muted); font-size: 12px; }
   .legend {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
     gap: 7px 14px;
     padding: 16px 0;
   }

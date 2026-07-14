@@ -30,6 +30,7 @@ mod delete_log;
 mod df;
 mod duck_backend;
 mod duck_telemetry;
+mod engine_rows;
 mod embeddings;
 mod evidence;
 mod explain;

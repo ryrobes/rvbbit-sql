@@ -858,6 +858,85 @@ fn gpu_gqe_query_json(query: &str, column_names: JsonB, max_rows: i32) -> JsonB 
     engine_query_json("gpu_gqe", "scan", query, column_names, max_rows)
 }
 
+/// Whether the rewriter emits the direct arrow→Datum result path
+/// (`rvbbit._engine_rows`, engine_rows.rs) instead of jsonb_to_recordset over
+/// `*_query_json`. Kill switch for the 11µs/row result-tax fix.
+pub(crate) fn rows_direct_enabled() -> bool {
+    guc_setting("rvbbit.rows_direct")
+        .map(|value| setting_enabled(&value, true))
+        .unwrap_or(true)
+}
+
+/// Happy-path payload acquisition for the direct result path: arrow transport
+/// through the local sidecar (or in-process DF), NO retries and NO fail-open —
+/// any wrinkle returns Err and the caller degrades to the engine_query_json
+/// pipeline, which owns those contracts.
+pub(crate) fn engine_query_payload_direct(
+    engine: &str,
+    layout: &str,
+    query: &str,
+    max_rows: i32,
+) -> Result<Value, String> {
+    let max_rows = if max_rows > 0 { max_rows } else { self::max_rows() };
+    if sidecar_result_format() != SidecarResultFormat::ArrowIpcFile {
+        return Err("arrow transport disabled".to_string());
+    }
+    // Fleet workers reply with inline JSON (their arrow file lives on a
+    // remote filesystem) — let the fallback pipeline own fleet dispatch.
+    if fleet_endpoint().is_some() {
+        return Err("fleet endpoint configured".to_string());
+    }
+    if engine == "datafusion" && datafusion_inprocess_enabled() {
+        // In-process DF returns json rows, never an arrow file — running it
+        // here would DOUBLE-EXECUTE the query (direct attempt + fallback).
+        // Err WITHOUT executing; the fallback owns the single run, and its
+        // objects still bypass jsonb_to_recordset via the typinput path.
+        return Err("in-process DataFusion uses the json pipeline".to_string());
+    }
+    if engine == "gpu_gqe" {
+        return Err("gpu_gqe uses the json pipeline".to_string());
+    }
+    if !duck_backend_config_enabled() {
+        return Err("duck backend disabled".to_string());
+    }
+    let binary = duck_binary().ok_or_else(|| "rvbbit-duck binary not found".to_string())?;
+    let dsn = duck_dsn();
+    let payload = run_engine_query(
+        engine,
+        layout,
+        &binary,
+        &dsn,
+        query,
+        max_rows,
+        timeout_s(),
+        duck_threads(),
+        SidecarResultFormat::ArrowIpcFile,
+    )?;
+    if payload.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err(payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("rvbbit-duck returned non-ok status")
+            .to_string());
+    }
+    Ok(payload)
+}
+
+/// The full json pipeline (retries + heap fail-open) exposed for
+/// engine_rows.rs's degradation path: returns the row OBJECTS directly.
+pub(crate) fn engine_query_json_objects(
+    engine: &str,
+    layout: &str,
+    query: &str,
+    column_names: JsonB,
+    max_rows: i32,
+) -> Vec<Value> {
+    match engine_query_json(engine, layout, query, column_names, max_rows).0 {
+        Value::Array(rows) => rows,
+        _ => Vec::new(),
+    }
+}
+
 fn engine_query_json(
     engine: &str,
     layout: &str,
@@ -912,6 +991,7 @@ fn engine_query_json(
                     pgrx::warning!(
                         "rvbbit: fleet endpoint {endpoint} failed ({err}); falling back to in-process DataFusion"
                     );
+                    mark_fleet_endpoint_failed(&endpoint);
                     None
                 }
             },
@@ -1392,6 +1472,7 @@ fn run_engine_query(
                 pgrx::warning!(
                     "rvbbit: fleet endpoint {endpoint} failed ({err}); falling back to local engine"
                 );
+                mark_fleet_endpoint_failed(&endpoint);
             }
         }
     }
@@ -1700,6 +1781,14 @@ pub(crate) fn fleet_endpoint() -> Option<String> {
     if FORCE_LOCAL_EXECUTION.with(|c| c.get()) {
         return None;
     }
+    // No token, no fleet — full stop. Without RVBBIT_ENGINE_TOKEN every
+    // dispatch is guaranteed to fail, so resolving an endpoint at all just
+    // buys a failed attempt + a warning + an ORDER BY random() SPI read on
+    // EVERY routed engine query (observed polluting a whole benchmark run
+    // via stale fleet_endpoints rows). Cheap getenv; checked first.
+    if std::env::var("RVBBIT_ENGINE_TOKEN").is_err() {
+        return None;
+    }
     let cname = std::ffi::CString::new("rvbbit.duck_fleet_endpoint").ok()?;
     let ptr = unsafe { pgrx::pg_sys::GetConfigOption(cname.as_ptr(), true, false) };
     if !ptr.is_null() {
@@ -1781,6 +1870,25 @@ fn fleet_probe(node_name: &str) -> pgrx::JsonB {
 /// token rides in the request body (from the brain's environment, never PG);
 /// the remote's own DSN/catalog resolves paths, so the request carries only
 /// the query envelope — same contract as the local daemon.
+/// A failed dispatch retires the endpoint (last_probe_ok=false) so dead
+/// workers stop being drawn from the registry — self-healing instead of a
+/// per-query failure loop. Best-effort: never let bookkeeping break a query.
+fn mark_fleet_endpoint_failed(endpoint: &str) {
+    let sql = format!(
+        "UPDATE rvbbit.fleet_endpoints SET last_probe_ok = false WHERE endpoint = {}",
+        sql_quote_literal(endpoint)
+    );
+    let _ = pgrx::PgTryBuilder::new(|| {
+        let _ = pgrx::Spi::run(&sql);
+    })
+    .catch_others(|_| {})
+    .execute();
+}
+
+fn sql_quote_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 fn send_fleet_request(
     endpoint: &str,
     engine: &str,

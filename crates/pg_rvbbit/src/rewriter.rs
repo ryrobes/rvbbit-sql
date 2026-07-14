@@ -942,6 +942,29 @@ fn build_duck_backend_sql(
         .map(|column| format!("{} {}", quote_ident(&column.name), column.type_sql))
         .collect::<Vec<_>>()
         .join(", ");
+    // Direct result path (rvbbit.rows_direct, default on): Arrow decodes
+    // straight to Datums against the column definition list — skips the
+    // arrow→jsonb→jsonb_to_recordset triple materialization (~11µs/output
+    // row). The json pipeline below remains both the kill-switch shape and
+    // the in-function fallback.
+    if crate::duck_backend::rows_direct_enabled() {
+        let (engine, layout) = match chosen_candidate {
+            "datafusion_mem" => ("datafusion", "mem"),
+            "datafusion_vector" => ("datafusion", "scan"),
+            "duck_hive" => ("duck", "hive"),
+            "duck_vortex" => ("duck", "vortex"),
+            "datafusion_hive" => ("datafusion", "hive"),
+            "datafusion_vortex" => ("datafusion", "vortex"),
+            "gpu_gqe" => ("gpu_gqe", "scan"),
+            _ => ("duck", "scan"),
+        };
+        return format!(
+            "SELECT * FROM rvbbit._engine_rows('{engine}', '{layout}', {}, {}) AS rvbbit_duck_result({})",
+            sql_text_literal(query_source),
+            max_rows,
+            defs
+        );
+    }
     let engine_fn = match chosen_candidate {
         "datafusion_mem" => "rvbbit.datafusion_mem_query_json",
         "datafusion_vector" => "rvbbit.datafusion_query_json",
