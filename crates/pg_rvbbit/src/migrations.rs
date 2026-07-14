@@ -601,6 +601,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0145_test_cache_bypass",
         include_str!("../sql/migrations/0145_test_cache_bypass.sql"),
     ),
+    (
+        "0146_desktop_assistant_turn_operator",
+        include_str!("../sql/migrations/0146_desktop_assistant_turn_operator.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

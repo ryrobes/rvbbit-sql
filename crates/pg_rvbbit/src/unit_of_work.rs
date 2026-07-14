@@ -507,7 +507,12 @@ enum AgentTool {
     },
 }
 
-const AGENT_QUERY_DESC: &str = "Run a single read-only SQL query against this Postgres database and get the rows back as JSON (capped at 200 rows). Use it to inspect tables, pg_stat_* views, and rvbbit telemetry. SELECT/WITH only — writes and DDL are rejected by the engine.";
+const AGENT_QUERY_DESC: &str = "Run a single read-only SQL query against this Postgres database. Returns a JSON envelope {rows_returned, truncated, cap, rows}. When truncated=true, MORE rows matched than the cap returned — never treat a truncated result as the complete set; narrow or aggregate instead. Use it to inspect tables, pg_stat_* views, and rvbbit telemetry. SELECT/WITH only — writes and DDL are rejected by the engine.";
+
+/// Row cap for the builtin agent query tool. The envelope announces the cap and
+/// whether it was hit, so a capped result can never silently masquerade as the
+/// complete set ("asked for top 100, got 30 — guess there are only 30").
+const AGENT_QUERY_ROW_CAP: usize = 500;
 const AGENT_MEMORY_RECALL_DESC: &str = "Search this agent node's scoped long-term memory for facts relevant to a query. The bank is fixed by Rvbbit from operator + node + context; do not include or request a bank id.";
 const AGENT_MEMORY_REFLECT_DESC: &str = "Ask this agent node's scoped long-term memory to synthesize relevant context for a query. The bank is fixed by Rvbbit from operator + node + context; do not include or request a bank id.";
 const AGENT_MEMORY_RETAIN_DESC: &str = "Store durable memory for this agent node's scoped context. Retain only stable facts, decisions, preferences, or useful observations; do not store transient chain-of-thought.";
@@ -1441,12 +1446,21 @@ fn agent_run_readonly_query(args: &Value, max_chars: usize) -> (String, Option<S
             Some("not a select".into()),
         );
     }
-    // jsonb_agg wrapper -> one text payload; LIMIT caps rows. SELECT shape forces
-    // a read; SPI read-only is the real write guard.
+    // jsonb envelope -> one text payload; LIMIT cap+1 detects truncation so the
+    // envelope can say so explicitly. SELECT shape forces a read; SPI read-only
+    // is the real write guard.
+    let cap = AGENT_QUERY_ROW_CAP;
     let wrapped = format!(
-        "SELECT coalesce(jsonb_agg(t), '[]'::jsonb)::text \
-         FROM (SELECT * FROM ({}) _agent_q LIMIT 200) t",
-        sql
+        "WITH _agent_rows AS (SELECT * FROM ({sql}) _agent_q LIMIT {probe}), \
+              _agent_count AS (SELECT count(*)::int AS n FROM _agent_rows) \
+         SELECT jsonb_build_object( \
+             'rows_returned', least(n, {cap}), \
+             'truncated', n > {cap}, \
+             'cap', {cap}, \
+             'rows', (SELECT coalesce(jsonb_agg(t), '[]'::jsonb) \
+                      FROM (SELECT * FROM _agent_rows LIMIT {cap}) t) \
+         )::text FROM _agent_count",
+        probe = cap + 1,
     );
     let result: Result<Option<String>, String> = pgrx::PgTryBuilder::new(move || {
         let _ = pgrx::Spi::run("SET LOCAL statement_timeout = '15s'");

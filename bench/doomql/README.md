@@ -393,3 +393,28 @@ benchmarks every selected target at each scale. `--keep-loaded` gives every
 scale its own suffixed table; use `--skip-load` for later back-to-back reruns.
 Individual run documents and a combined warm-median matrix are written under
 `bench/doomql/results/`.
+
+## Scale curve viewer
+
+Build a self-contained HTML/JavaScript chart from compatible individual scale
+results:
+
+```bash
+python3 bench/doomql/viz.py \
+  bench/doomql/results/scale-episode1-5000000.json \
+  bench/doomql/results/scale-episode1-15000000.json \
+  bench/doomql/results/scale-episode1-50000000.json \
+  bench/doomql/results/scale-episode1-100000000.json \
+  bench/doomql/results/scale-episode1-200000000.json
+```
+
+With no positional inputs, the viewer uses every
+`scale-episode1-*.json` document. It rejects runs whose frame count, viewport,
+draw distance, render type, map set, warmup policy, or other benchmark-shape
+settings differ, so unrelated timings cannot silently become one curve.
+
+The command writes `bench/doomql/results/episode1-scale-curves.html`, which
+opens directly from disk without a web server or external JavaScript, plus
+`episode1-scale-curves.json`, a compact combined data document. The viewer can
+switch between median, p95, cold latency, and FPS, use linear or logarithmic
+axes, toggle individual engines, and display the exact values in a table.
