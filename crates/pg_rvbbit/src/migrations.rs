@@ -605,6 +605,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0146_desktop_assistant_turn_operator",
         include_str!("../sql/migrations/0146_desktop_assistant_turn_operator.sql"),
     ),
+    (
+        "0147_capability_kg",
+        include_str!("../sql/migrations/0147_capability_kg.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
