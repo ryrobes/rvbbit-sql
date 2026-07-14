@@ -92,6 +92,20 @@ pub enum Adapter {
     /// Zoo /extract (GLiNER): {"text","labels"} → entity array. One
     /// upstream call per input (labels may differ per row).
     ZooExtract,
+    /// Generic structured route: each input object IS the upstream request
+    /// body (after upstream_params merge + JSON-string coercion for array/
+    /// object fields that arrive as SQL text), and the WHOLE upstream
+    /// response object is the output. One upstream call per input. Covers
+    /// /document/ocr, /transcribe, /forecast, /tabular/fit, /tabular/predict,
+    /// /anomaly/fit, /anomaly/score — anything single-shot request/response.
+    ZooJson,
+    /// Zoo /relations (REBEL): {"texts":[...]} → results[] aligned per text.
+    ZooRelations,
+    /// Zoo /v1/image_embeddings (SigLIP 2 dual-tower): inputs are bare
+    /// strings (image URL / data URI / b64 / plain text — the zoo
+    /// classifies which tower) → bare float arrays, same convention as
+    /// OpenaiEmbeddings so embedding parse paths work unchanged.
+    ZooImageEmbeddings,
 }
 
 #[derive(Debug, Clone, Deserialize)]

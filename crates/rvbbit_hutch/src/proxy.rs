@@ -158,6 +158,48 @@ pub async fn forward(
                     }
                     outs
                 }
+                Adapter::ZooJson => {
+                    let mut outs = Vec::with_capacity(inputs.len());
+                    for (i, v) in inputs.iter().enumerate() {
+                        let mut body = v.clone();
+                        if !body.is_object() {
+                            return Err(ForwardErr::Transport(format!(
+                                "input[{i}] must be a JSON object for this backend"
+                            )));
+                        }
+                        coerce_json_strings(&mut body);
+                        merge_params(&mut body, backend);
+                        outs.push(post_json(http, &url, backend, &body).await?);
+                    }
+                    outs
+                }
+                Adapter::ZooRelations => {
+                    let texts = input_texts(inputs)?;
+                    let mut body = json!({ "texts": texts });
+                    merge_params(&mut body, backend);
+                    let parsed = post_json(http, &url, backend, &body).await?;
+                    json_array(&parsed, "results")?
+                }
+                Adapter::ZooImageEmbeddings => {
+                    let items: Vec<String> = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| input_text(v, i))
+                        .collect::<Result<_, _>>()?;
+                    let mut body = json!({ "input": items });
+                    merge_params(&mut body, backend);
+                    let parsed = post_json(http, &url, backend, &body).await?;
+                    json_array(&parsed, "data")?
+                        .iter()
+                        .map(|item| {
+                            item.get("embedding").cloned().ok_or_else(|| {
+                                ForwardErr::Transport(
+                                    "image_embeddings item missing 'embedding'".into(),
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
             };
             if outputs.len() != inputs.len() {
                 return Err(ForwardErr::Transport(format!(
@@ -221,6 +263,26 @@ fn input_text(v: &Value, i: usize) -> Result<String, ForwardErr> {
                 "input[{i}] is neither a string nor an object with a 'text' field"
             ))
         })
+}
+
+/// SQL operator args are text, so array/object-valued fields (tabular X/y,
+/// forecast context, feature_names) often arrive as JSON *strings*. Any
+/// top-level string value that looks like a JSON array/object and parses
+/// cleanly is replaced with the parsed value; everything else (URLs, b64
+/// documents, labels) passes through untouched.
+fn coerce_json_strings(body: &mut Value) {
+    if let Some(obj) = body.as_object_mut() {
+        for (_, v) in obj.iter_mut() {
+            if let Some(s) = v.as_str() {
+                let t = s.trim_start();
+                if t.starts_with('[') || t.starts_with('{') {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                        *v = parsed;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn merge_params(body: &mut Value, backend: &BackendCfg) {

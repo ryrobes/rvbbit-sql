@@ -74,6 +74,10 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Managed-capability keys (hutch tenants) — names referenced from
+      # rvbbit.backends.auth_header_env, values live in docker/.env.
+      RVBBIT_CLOVER_KEY: ${RVBBIT_CLOVER_KEY:-}
+      RVBBIT_GEMMA_KEY: ${RVBBIT_GEMMA_KEY:-}
       RVBBIT_DUCK_BACKEND: ${RVBBIT_DUCK_BACKEND:-true}
       RVBBIT_DUCK_BACKEND_SHARED: ${RVBBIT_DUCK_BACKEND_SHARED:-}
       RVBBIT_DUCK_BACKEND_SHARED_STRICT: ${RVBBIT_DUCK_BACKEND_SHARED_STRICT:-}
