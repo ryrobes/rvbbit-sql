@@ -953,7 +953,15 @@ def main() -> int:
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--width", type=int, default=120)
     parser.add_argument("--height", type=int, default=40)
-    parser.add_argument("--draw-distance", type=int, default=768)
+    parser.add_argument(
+        "--render-distance",
+        "--draw-distance",
+        dest="draw_distance",
+        type=int,
+        default=768,
+        metavar="UNITS",
+        help="far clipping distance in Quake world units (default: 768)",
+    )
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--sample-step", type=float, default=16.0)
     parser.add_argument("--brush-sample-step", type=float, default=4.0)
@@ -1054,7 +1062,7 @@ def main() -> int:
         or args.use_distance <= 0
     ):
         parser.error(
-            "--draw-distance, --layers, --sample-step, --brush-sample-step, and "
+            "--render-distance, --layers, --sample-step, --brush-sample-step, and "
             "--use-distance must be positive"
         )
     try:

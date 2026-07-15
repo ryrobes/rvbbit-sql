@@ -197,6 +197,17 @@ Explore E1M1 in the terminal:
 python3 bench/quakeql/run.py --interactive --system auto
 ```
 
+Set the SQL prefilter and far clipping distance in Quake world units with
+`--render-distance` (default `768`). Larger values expose more of the map but
+scan and project more candidate geometry:
+
+```bash
+python3 bench/quakeql/run.py --interactive --episode1 --map-name E1M1 \
+  --renderer sql-texture --render-distance 1536
+```
+
+`--draw-distance` remains available as a compatibility alias.
+
 Controls:
 
 | Key | Action |
