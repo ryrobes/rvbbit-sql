@@ -9793,8 +9793,69 @@ unsafe fn render_op_arg(
             // jsonb value (and input_hash) the per-row call produces.
             Some(format!("{}::{}", sql_literal(&text), typename))
         }
-        _ => None,
+        // Arbitrary expression over the base relation — `'prompt: ' || col`,
+        // `left(col, 280)`, `lower(a || b)` — the dominant real-world arg
+        // shape for LLM operators. Deparse it with Postgres's own deparser
+        // so the prewarm projection evaluates the exact same expression per
+        // row: same values → same input_hash → the executor's per-row calls
+        // hit the warmed cache. Before this arm, ANY expression arg silently
+        // disqualified the whole query from implicit prewarm (found via the
+        // tier-bench hose queries, 2026-07-15).
+        _ => render_expr_via_deparse(query, table_oid, inner),
     }
+}
+
+/// Deparse an argument expression back to SQL against the single base
+/// relation. Bails (None → no implicit prewarm) on: volatile functions
+/// (values wouldn't replay), aggregates (per-row warming would be wrong),
+/// or any Var not referencing range-table entry 1 = the base relation
+/// (deparse_context_for builds a one-entry context where varno 1 is the
+/// relation, so anything else would deparse against the wrong scope).
+unsafe fn render_expr_via_deparse(
+    query: *mut pg_sys::Query,
+    table_oid: u32,
+    node: *mut pg_sys::Node,
+) -> Option<String> {
+    if pg_sys::contain_volatile_functions(node) || pg_sys::contain_agg_clause(node) {
+        return None;
+    }
+    // The base relation must be rtable entry 1 and every Var must point at it.
+    let rtable = (*query).rtable;
+    if rtable.is_null() || (*rtable).length < 1 {
+        return None;
+    }
+    let first = (*(*rtable).elements.add(0)).ptr_value as *mut pg_sys::RangeTblEntry;
+    if first.is_null()
+        || (*first).rtekind != pg_sys::RTEKind::RTE_RELATION
+        || (*first).relid.to_u32() != table_oid
+    {
+        return None;
+    }
+    let vars = pg_sys::pull_var_clause(node, 0);
+    if !vars.is_null() {
+        for i in 0..(*vars).length {
+            let v = (*(*vars).elements.add(i as usize)).ptr_value as *mut pg_sys::Var;
+            if v.is_null() || (*v).varno != 1 || (*v).varlevelsup != 0 {
+                return None;
+            }
+        }
+    }
+    // Alias = bare relation name, so if the deparser ever qualifies a
+    // column it matches the prewarm query's `FROM schema.relname`.
+    let relname_c = pg_sys::get_rel_name(pg_sys::Oid::from(table_oid));
+    if relname_c.is_null() {
+        return None;
+    }
+    let context = pg_sys::deparse_context_for(relname_c, pg_sys::Oid::from(table_oid));
+    let deparsed = pg_sys::deparse_expression(node, context, false, false);
+    if deparsed.is_null() {
+        return None;
+    }
+    let sql = std::ffi::CStr::from_ptr(deparsed).to_string_lossy().into_owned();
+    if sql.trim().is_empty() {
+        return None;
+    }
+    Some(sql)
 }
 
 /// Peel implicit-cast wrappers (RelabelType / CoerceViaIO) to reach the inner
