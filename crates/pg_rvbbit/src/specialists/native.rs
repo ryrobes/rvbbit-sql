@@ -53,7 +53,7 @@ impl Transport for RvbbitTransport {
         }
 
         let t0 = std::time::Instant::now();
-        let resp = req.send()?;
+        let resp = super::send_with_lane_retry(req)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().unwrap_or_default();

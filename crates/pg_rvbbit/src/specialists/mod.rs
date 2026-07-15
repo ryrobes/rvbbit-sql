@@ -441,6 +441,60 @@ pub(crate) fn http_client() -> &'static reqwest::blocking::Client {
     })
 }
 
+/// Send a request, honoring HTTP 429 lane backpressure. A managed gateway
+/// (the hutch) rejects over-cap calls immediately with 429 + a
+/// `retry_after_ms` hint rather than queueing unboundedly — that hint means
+/// "come back shortly," which is semantically distinct from a hard failure
+/// (403/500/down node → degrade). Retrying here turns a saturated lane into
+/// serialize-and-succeed instead of bounce: a Free (1-lane) tier's parallel
+/// calls all complete, just slower. Bounded so a genuinely wedged backend
+/// still surfaces the 429 after a capped total wait.
+pub(crate) fn send_with_lane_retry(
+    req: reqwest::blocking::RequestBuilder,
+) -> Result<reqwest::blocking::Response, reqwest::Error> {
+    const RETRY_MAX: u32 = 6;
+    const DELAY_CAP_MS: u64 = 2000;
+    let mut attempt: u32 = 0;
+    loop {
+        // Clone for all but the final attempt; consume the original last so
+        // a non-cloneable body (shouldn't happen for JSON) still sends once.
+        let this = match req.try_clone() {
+            Some(clone) if attempt < RETRY_MAX => clone,
+            _ => return req.send(),
+        };
+        let resp = this.send()?;
+        if resp.status().as_u16() != 429 {
+            return Ok(resp);
+        }
+        let delay = lane_retry_after_ms(resp).min(DELAY_CAP_MS);
+        // small per-attempt jitter so N parallel workers don't wake in lockstep
+        std::thread::sleep(Duration::from_millis(delay + attempt as u64 * 40));
+        attempt += 1;
+    }
+}
+
+/// Extract the retry delay from a 429: `Retry-After` header (seconds) first,
+/// then the gateway's JSON `{error:{retry_after_ms}}`, defaulting to 500ms.
+fn lane_retry_after_ms(resp: reqwest::blocking::Response) -> u64 {
+    let header_ms = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|secs| secs.saturating_mul(1000).max(1));
+    if let Some(ms) = header_ms {
+        return ms;
+    }
+    resp.text()
+        .ok()
+        .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+        .and_then(|j| {
+            j.pointer("/error/retry_after_ms")
+                .and_then(|v| v.as_u64())
+        })
+        .unwrap_or(500)
+}
+
 // ---------------------------------------------------------------------------
 // Shared wire types — most transports reuse these
 // ---------------------------------------------------------------------------
