@@ -334,19 +334,24 @@ async fn predict(
     }
     let n = inputs.len();
 
-    // 4. lane
-    let permit = state
-        .lanes
-        .acquire(&tenant.id, tenant.lanes, state.cfg.lane_grace_ms)
-        .await;
-    let _permit = match permit {
-        Some(p) => p,
-        None => {
-            return refuse(
-                HutchError::lanes_saturated(&tenant.id, tenant.lanes),
-                "lanes_saturated",
-                &state,
-            )
+    // 4. lane — skipped for unlaned backends (cheap encoders: batching is
+    // already the throttle; lanes price generation, not classification).
+    let _permit = if backend.unlaned {
+        None
+    } else {
+        match state
+            .lanes
+            .acquire(&tenant.id, tenant.lanes, state.cfg.lane_grace_ms)
+            .await
+        {
+            Some(p) => Some(p),
+            None => {
+                return refuse(
+                    HutchError::lanes_saturated(&tenant.id, tenant.lanes),
+                    "lanes_saturated",
+                    &state,
+                )
+            }
         }
     };
 

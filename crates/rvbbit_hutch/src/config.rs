@@ -131,6 +131,12 @@ pub struct BackendCfg {
     /// records it so receipts can show utilization value under flat subs.
     #[serde(default)]
     pub unit_microusd: i64,
+    /// Skip the per-tenant lane semaphore for this backend. For cheap
+    /// batched encoders lane-gating adds friction but controls no real
+    /// cost — lanes price generation (LLM / heavy media), not
+    /// classification. Metering still records every call.
+    #[serde(default)]
+    pub unlaned: bool,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     /// Mock mode: the output emitted per input (default {"mock": true}).
