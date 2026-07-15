@@ -613,6 +613,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0148_engine_rows",
         include_str!("../sql/migrations/0148_engine_rows.sql"),
     ),
+    (
+        "0149_backend_health_llm_usage",
+        include_str!("../sql/migrations/0149_backend_health_llm_usage.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
