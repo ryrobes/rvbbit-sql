@@ -101,7 +101,7 @@ impl OpenAiChatTransport {
         // backend; _permit caps total openai_chat fan-out in this process.
         let _backend_permit = super::acquire_backend_permit(spec);
         let _permit = self.semaphore.acquire();
-        let resp = super::send_with_lane_retry(req)?;
+        let resp = super::send_with_lane_retry(req, spec.timeout_ms)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(ProviderError::ApiStatus {
@@ -240,7 +240,7 @@ impl Transport for OpenAiChatTransport {
 
         let _backend_permit = super::acquire_backend_permit(spec);
         let _permit = self.semaphore.acquire();
-        let resp = super::send_with_lane_retry(req)?;
+        let resp = super::send_with_lane_retry(req, spec.timeout_ms)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(ProviderError::ApiStatus {

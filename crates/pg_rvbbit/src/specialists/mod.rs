@@ -444,31 +444,39 @@ pub(crate) fn http_client() -> &'static reqwest::blocking::Client {
 /// Send a request, honoring HTTP 429 lane backpressure. A managed gateway
 /// (the hutch) rejects over-cap calls immediately with 429 + a
 /// `retry_after_ms` hint rather than queueing unboundedly — that hint means
-/// "come back shortly," which is semantically distinct from a hard failure
-/// (403/500/down node → degrade). Retrying here turns a saturated lane into
-/// serialize-and-succeed instead of bounce: a Free (1-lane) tier's parallel
-/// calls all complete, just slower. Bounded so a genuinely wedged backend
-/// still surfaces the 429 after a capped total wait.
+/// "come back shortly": FLOW CONTROL, not failure (403/500/no-answer are
+/// failures → degrade). Retrying turns a saturated lane into
+/// serialize-and-succeed: the pinched-garden-hose contract — a 500-row
+/// scalar query at a 1-lane tier returns 500 real answers slowly, never
+/// 500-minus-some. Patience is bounded by the CALL'S OWN configured
+/// timeout (`total_timeout_ms` = the backend's timeout_ms, which the query
+/// writer controls), not an arbitrary attempt count. A genuinely wedged
+/// gateway stops answering 429s and surfaces through the transport error
+/// path instead.
 pub(crate) fn send_with_lane_retry(
     req: reqwest::blocking::RequestBuilder,
+    total_timeout_ms: u64,
 ) -> Result<reqwest::blocking::Response, reqwest::Error> {
-    const RETRY_MAX: u32 = 6;
     const DELAY_CAP_MS: u64 = 2000;
-    let mut attempt: u32 = 0;
+    let deadline = std::time::Instant::now() + Duration::from_millis(total_timeout_ms.max(1));
+    let mut attempt: u64 = 0;
     loop {
-        // Clone for all but the final attempt; consume the original last so
-        // a non-cloneable body (shouldn't happen for JSON) still sends once.
+        // Clone while we can still afford another attempt; consume the
+        // original on the final send so the last 429 surfaces to the caller.
         let this = match req.try_clone() {
-            Some(clone) if attempt < RETRY_MAX => clone,
+            Some(clone) if std::time::Instant::now() < deadline => clone,
             _ => return req.send(),
         };
         let resp = this.send()?;
         if resp.status().as_u16() != 429 {
             return Ok(resp);
         }
-        let delay = lane_retry_after_ms(resp).min(DELAY_CAP_MS);
-        // small per-attempt jitter so N parallel workers don't wake in lockstep
-        std::thread::sleep(Duration::from_millis(delay + attempt as u64 * 40));
+        // small per-attempt jitter so N parallel calls don't wake in lockstep
+        let delay = lane_retry_after_ms(resp).min(DELAY_CAP_MS) + (attempt % 8) * 40;
+        if std::time::Instant::now() + Duration::from_millis(delay) >= deadline {
+            return req.send(); // out of patience: surface the final 429
+        }
+        std::thread::sleep(Duration::from_millis(delay));
         attempt += 1;
     }
 }
