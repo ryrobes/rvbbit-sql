@@ -166,14 +166,14 @@ fn build_transports() -> HashMap<&'static str, Box<dyn Transport>> {
 }
 
 /// Concurrency cap on a single LLM provider's in-flight calls, from
-/// `RVBBIT_PROVIDER_MAX_CONCURRENT` (default 8). Each chat transport holds
+/// `RVBBIT_PROVIDER_MAX_CONCURRENT` (default 32). Each chat transport holds
 /// one semaphore sized by this so a bulk query cannot exceed a provider's
 /// rate limit.
 pub(crate) fn provider_max_concurrent() -> usize {
     std::env::var("RVBBIT_PROVIDER_MAX_CONCURRENT")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(8)
+        .unwrap_or(32)
         .max(1)
 }
 

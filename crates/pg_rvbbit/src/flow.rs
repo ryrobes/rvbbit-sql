@@ -181,14 +181,14 @@ impl Drop for Pool {
 static POOL: OnceLock<Pool> = OnceLock::new();
 
 /// Get-or-init the backend-local thread pool. Size from
-/// `RVBBIT_POOL_SIZE` env var (default 8). Lazy so backends that
+/// `RVBBIT_POOL_SIZE` env var (default 32). Lazy so backends that
 /// never call any operator pay zero cost.
 pub fn pool() -> &'static Pool {
     POOL.get_or_init(|| {
         let size = std::env::var("RVBBIT_POOL_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(8)
+            .unwrap_or(32)
             .max(1)
             .min(128);
         Pool::new(size)

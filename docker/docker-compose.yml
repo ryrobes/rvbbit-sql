@@ -111,10 +111,10 @@ services:
       # Flow control: how many concurrent provider calls allowed per backend.
       # Default 8 — bump for high-throughput workloads, lower for tight
       # rate limits.
-      RVBBIT_PROVIDER_MAX_CONCURRENT: ${RVBBIT_PROVIDER_MAX_CONCURRENT:-8}
+      RVBBIT_PROVIDER_MAX_CONCURRENT: ${RVBBIT_PROVIDER_MAX_CONCURRENT:-32}
       # Thread pool size per backend. Mostly infrastructure today; used
       # by future multi-step parallel sub-steps and custom-scan batching.
-      RVBBIT_POOL_SIZE: ${RVBBIT_POOL_SIZE:-8}
+      RVBBIT_POOL_SIZE: ${RVBBIT_POOL_SIZE:-32}
       # In-memory cache capacity (entries). Tune for repeated workloads.
       RVBBIT_CACHE_SIZE: ${RVBBIT_CACHE_SIZE:-30000}
       # DataFusion in-process tokio worker threads (df_inprocess route).
