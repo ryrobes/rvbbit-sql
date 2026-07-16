@@ -96,8 +96,9 @@ pub enum Adapter {
     /// body (after upstream_params merge + JSON-string coercion for array/
     /// object fields that arrive as SQL text), and the WHOLE upstream
     /// response object is the output. One upstream call per input. Covers
-    /// /document/ocr, /transcribe, /forecast, /tabular/fit, /tabular/predict,
-    /// /anomaly/fit, /anomaly/score — anything single-shot request/response.
+    /// /document/ocr, /transcribe, /forecast, /cluster, /tabular/fit,
+    /// /tabular/predict, /tabular/explain, /anomaly/fit, /anomaly/score —
+    /// anything single-shot request/response.
     ZooJson,
     /// Zoo /relations (REBEL): {"texts":[...]} → results[] aligned per text.
     ZooRelations,
@@ -241,5 +242,36 @@ impl HutchConfig {
 
     pub fn llm(&self, name: &str) -> Option<&LlmCfg> {
         self.llms.iter().find(|l| l.name == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_clover_example_covers_heavy_zoo_routes() {
+        let cfg: HutchConfig = serde_yaml::from_str(include_str!("../hutch.clover.example.yaml"))
+            .expect("production-shaped Clover example should parse");
+
+        assert_eq!(cfg.backends.len(), 20);
+        assert_eq!(cfg.llms.len(), 1);
+
+        let cluster = cfg.backend("cluster").expect("cluster backend");
+        assert_eq!(cluster.adapter, Adapter::ZooJson);
+        assert_eq!(cluster.upstream_path.as_deref(), Some("/cluster"));
+        assert_eq!(cluster.timeout_ms, 300_000);
+
+        let explain = cfg
+            .backend("tabular_explain")
+            .expect("tabular_explain backend");
+        assert_eq!(explain.adapter, Adapter::ZooJson);
+        assert_eq!(explain.upstream_path.as_deref(), Some("/tabular/explain"));
+        assert_eq!(explain.timeout_ms, 600_000);
+
+        let gemma = cfg.llm("gemma4").expect("Gemma LLM");
+        assert_eq!(gemma.upstream_model, "nvidia/Gemma-4-31B-IT-NVFP4");
+        assert_eq!(gemma.prompt_microusd_per_1k, 100);
+        assert_eq!(gemma.completion_microusd_per_1k, 200);
     }
 }

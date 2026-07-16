@@ -3,7 +3,17 @@
 *A hutch is where the domesticated rabbits live: enclosed, fed, someone else's
 problem. This is the deployable GCP box that fronts every managed capability.*
 
-## STATUS (2026-07-11)
+## STATUS (2026-07-16)
+
+**CLOVER v1.2 MODEL/OPERATOR AUDIT COMPLETE:** all 15 resident specialist
+model slots plus the Gemma vLLM sibling are exposed through managed backends,
+mapped to SQL, and proven by successful meter history. Hutch now also exposes
+the zoo's previously stranded `/cluster` and `/tabular/explain` routes. The
+canonical catalog contains 49 public operators (28 ML + 21 LLM), 107 embedded
+tests, and a truthful 106/107 verified result with the known NLI red case kept
+visible. See [CLOVER_MODEL_OPERATOR_AUDIT.md](CLOVER_MODEL_OPERATOR_AUDIT.md)
+for the model-by-model evidence and the operators recovered from the legacy
+semantic-SQL cascades.
 
 **BUILT + PROVEN E2E (mock upstream):** `crates/rvbbit_hutch` (Rust, axum —
 standalone crate like rvbbit_duck), `docker/Dockerfile.rvbbit-hutch` (93MB

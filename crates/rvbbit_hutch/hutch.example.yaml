@@ -1,4 +1,6 @@
-# rvbbit-hutch service config. Tenants live in tenants.yaml (separate file:
+# rvbbit-hutch service config. This compact mock proves middleware without a
+# GPU. See hutch.clover.example.yaml for the production-shaped Clover route
+# matrix. Tenants live in tenants.yaml (separate file:
 # key rotation must never touch service config).
 bind: "0.0.0.0:8090"
 tenants_file: "tenants.yaml"

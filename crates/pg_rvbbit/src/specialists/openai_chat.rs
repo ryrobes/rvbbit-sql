@@ -140,6 +140,10 @@ impl OpenAiChatTransport {
     }
 }
 
+fn tool_completion_budget(max_tokens: Option<u32>) -> u32 {
+    max_tokens.unwrap_or(4096).max(16)
+}
+
 impl Transport for OpenAiChatTransport {
     fn name(&self) -> &'static str {
         "openai_chat"
@@ -175,6 +179,7 @@ impl Transport for OpenAiChatTransport {
         model: &str,
         messages: &[crate::providers::ChatMessage],
         tools: &[crate::providers::ToolSpec],
+        max_tokens: Option<u32>,
     ) -> Result<crate::providers::ChatToolsResponse, ProviderError> {
         use crate::providers::{ChatToolsResponse, ToolCall};
         let t0 = std::time::Instant::now();
@@ -218,7 +223,10 @@ impl Transport for OpenAiChatTransport {
                 .collect();
             body["tools"] = Value::Array(wire_tools);
         }
-        // Generous completion headroom — agents write reports; cap field varies.
+        // Agent nodes inherit their operator/step completion budget. Keeping a
+        // transport-local constant here silently truncated large structured
+        // outputs (notably HTML app artifacts) even when the operator asked for
+        // substantially more headroom.
         let use_mct = spec
             .transport_opts
             .get("max_tokens_field")
@@ -226,7 +234,7 @@ impl Transport for OpenAiChatTransport {
             .map(|field| field == "max_completion_tokens")
             .unwrap_or_else(|| spec.endpoint_url.contains("api.openai.com"));
         body[if use_mct { "max_completion_tokens" } else { "max_tokens" }] =
-            serde_json::json!(4096);
+            serde_json::json!(tool_completion_budget(max_tokens));
 
         let mut req = http_client()
             .post(&spec.endpoint_url)
@@ -383,4 +391,16 @@ struct RespUsage {
     /// and cost is derived from rvbbit.model_rates downstream.
     #[serde(default)]
     cost: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_completion_budget;
+
+    #[test]
+    fn tool_chat_honors_operator_completion_budget() {
+        assert_eq!(tool_completion_budget(Some(32_768)), 32_768);
+        assert_eq!(tool_completion_budget(None), 4_096);
+        assert_eq!(tool_completion_budget(Some(1)), 16);
+    }
 }

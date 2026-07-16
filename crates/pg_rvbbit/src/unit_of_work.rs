@@ -563,6 +563,11 @@ fn run_step_agent(
         .and_then(|v| v.as_u64())
         .unwrap_or(8)
         .clamp(1, 50) as usize;
+    let max_tokens = step
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32)
+        .unwrap_or(op.max_tokens.max(16) as u32);
     let budget = step.get("budget");
     let budget_tokens = budget
         .and_then(|b| b.get("tokens"))
@@ -876,7 +881,13 @@ fn run_step_agent(
         }
 
         let resp =
-            match providers::chat_with_tools(&model, provider.as_deref(), &messages, &tool_specs) {
+            match providers::chat_with_tools(
+                &model,
+                provider.as_deref(),
+                &messages,
+                &tool_specs,
+                Some(max_tokens),
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     let err = e.to_string();
@@ -990,9 +1001,14 @@ fn run_step_agent(
             continue;
         }
 
-        // No tool call -> the model is done.
+        // No tool call -> the model is done. Preserve a provider length stop as
+        // a distinct terminal state: an incomplete structured answer must not
+        // be mistaken for a successful prose response by a downstream parser.
         last_content = resp.content.unwrap_or_default();
-        status = "done";
+        status = match resp.finish_reason.as_deref() {
+            Some("length" | "max_tokens" | "max_output_tokens") => "output_truncated",
+            _ => "done",
+        };
         break;
     }
 

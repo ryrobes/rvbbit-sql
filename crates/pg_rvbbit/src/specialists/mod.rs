@@ -132,6 +132,7 @@ pub trait Transport: Send + Sync {
         _model: &str,
         _messages: &[crate::providers::ChatMessage],
         _tools: &[crate::providers::ToolSpec],
+        _max_tokens: Option<u32>,
     ) -> Result<crate::providers::ChatToolsResponse, ProviderError> {
         Err(ProviderError::NotImplemented(format!(
             "transport '{}' does not support tool-calling chat",

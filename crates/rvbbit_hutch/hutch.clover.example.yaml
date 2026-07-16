@@ -1,0 +1,165 @@
+# Production-shaped Clover proxy configuration. Tenant keys and Polar
+# benefit mappings intentionally live outside this file; see tenants.example.yaml.
+bind: "0.0.0.0:8090"
+tenants_file: "tenants.yaml"
+meter_db: "/var/lib/hutch/hutch_meter.sqlite"
+max_body_bytes: 67108864
+lane_grace_ms: 250
+
+upstream:
+  mode: proxy
+  # The deployed zoo publishes its FastAPI gateway on host port 8085.
+  base_url: "http://localhost:8085"
+
+backends:
+  - name: embed
+    entitlement: clover
+    unlaned: true
+    adapter: openai-embeddings
+    upstream_path: /v1/embeddings
+    model_version: "clover-v1/arctic-embed-l-v2.0"
+    unit_microusd: 10
+  - name: sentiment
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-sentiment
+    upstream_path: /sentiment
+    model_version: "clover-v1.0/twitter-xlm-roberta-sentiment"
+    unit_microusd: 20
+  - name: rerank
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-rerank
+    upstream_path: /rerank
+    model_version: "clover-v1/bge-reranker-v2-m3"
+    unit_microusd: 30
+  - name: nli
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-nli
+    upstream_path: /nli
+    model_version: "clover-v1/deberta-v3-large-zeroshot-v2"
+    unit_microusd: 30
+  - name: nli3
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-nli
+    upstream_path: /nli
+    upstream_params: {model: 3class}
+    model_version: "clover-v1/deberta-v3-large-mnli-3class"
+    unit_microusd: 30
+  - name: classify
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-classify
+    upstream_path: /classify
+    model_version: "clover-v1/deberta-v3-large-zeroshot-v2"
+    unit_microusd: 40
+  - name: toxicity
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-toxicity
+    upstream_path: /toxicity
+    model_version: "clover-v1/toxic-bert"
+    unit_microusd: 20
+  - name: language
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-language
+    upstream_path: /language
+    model_version: "clover-v1/xlm-roberta-langdetect"
+    unit_microusd: 10
+  - name: extract
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-extract
+    upstream_path: /extract
+    upstream_params: {threshold: 0.3}
+    model_version: "clover-v1/gliner-large-v2.1"
+    unit_microusd: 60
+  - name: ocr
+    entitlement: clover
+    adapter: zoo-json
+    upstream_path: /document/ocr
+    model_version: "clover-v1/got-ocr-2.0"
+    unit_microusd: 500
+    timeout_ms: 180000
+  - name: transcribe
+    entitlement: clover
+    adapter: zoo-json
+    upstream_path: /transcribe
+    model_version: "clover-v1/whisper-large-v3-turbo"
+    unit_microusd: 300
+    timeout_ms: 300000
+  - name: forecast
+    entitlement: clover
+    adapter: zoo-json
+    upstream_path: /forecast
+    model_version: "clover-v1/chronos-bolt-base"
+    unit_microusd: 100
+    timeout_ms: 60000
+  - name: image_embed
+    entitlement: clover
+    adapter: zoo-image-embeddings
+    upstream_path: /v1/image_embeddings
+    model_version: "clover-v1/siglip2-so400m-patch16-384"
+    unit_microusd: 20
+    timeout_ms: 120000
+  - name: tabular_fit
+    entitlement: clover
+    adapter: zoo-json
+    upstream_path: /tabular/fit
+    model_version: "clover-v1/tabpfn-v2"
+    unit_microusd: 1000
+    timeout_ms: 300000
+  - name: tabular_predict
+    entitlement: clover
+    adapter: zoo-json
+    upstream_path: /tabular/predict
+    model_version: "clover-v1/tabpfn-v2"
+    unit_microusd: 200
+    timeout_ms: 180000
+  - name: tabular_explain
+    entitlement: clover
+    adapter: zoo-json
+    upstream_path: /tabular/explain
+    model_version: "clover-v1/tabpfn-v2+shap"
+    unit_microusd: 500
+    timeout_ms: 600000
+  - name: anomaly_fit
+    entitlement: clover
+    adapter: zoo-json
+    upstream_path: /anomaly/fit
+    model_version: "clover-v1/sklearn-anomaly"
+    unit_microusd: 200
+    timeout_ms: 120000
+  - name: anomaly_score
+    entitlement: clover
+    adapter: zoo-json
+    upstream_path: /anomaly/score
+    model_version: "clover-v1/sklearn-anomaly"
+    unit_microusd: 50
+    timeout_ms: 60000
+  - name: relations
+    entitlement: clover
+    adapter: zoo-relations
+    upstream_path: /relations
+    model_version: "clover-v1/rebel-large"
+    unit_microusd: 60
+    timeout_ms: 120000
+  - name: cluster
+    entitlement: clover
+    adapter: zoo-json
+    upstream_path: /cluster
+    model_version: "clover-v1/arctic-embed-l-v2.0+kmeans-hdbscan"
+    unit_microusd: 200
+    timeout_ms: 300000
+
+llms:
+  - name: gemma4
+    entitlement: clover_llm
+    upstream_base: "http://localhost:8000"
+    upstream_model: "nvidia/Gemma-4-31B-IT-NVFP4"
+    model_version: "gemma-4-31b-it-nvfp4"
+    prompt_microusd_per_1k: 100
+    completion_microusd_per_1k: 200

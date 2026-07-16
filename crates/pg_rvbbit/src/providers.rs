@@ -353,6 +353,7 @@ pub fn chat_with_tools(
     provider: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
+    max_tokens: Option<u32>,
 ) -> Result<ChatToolsResponse, ProviderError> {
     let provider = provider.map(|s| s.to_string()).unwrap_or_else(default_provider_name);
     let spec = match crate::specialists::get_cached_spec(&provider) {
@@ -360,7 +361,7 @@ pub fn chat_with_tools(
         None => crate::specialists::load_spec(&provider)?,
     };
     let mut resp = crate::specialists::transport_for(&spec.transport)?
-        .chat_with_tools(&spec, model, messages, tools)?;
+        .chat_with_tools(&spec, model, messages, tools, max_tokens)?;
     if resp.model.is_empty() {
         resp.model = model.to_string();
     }
