@@ -739,7 +739,7 @@ fn run_step_agent(
             }
         }
     }
-    messages.push(providers::ChatMessage::user(task.clone()));
+    messages.push(agent_user_message(step, scope, task.clone()));
     audit_agent_turn(
         &run_id,
         &op.name,
@@ -874,6 +874,7 @@ fn run_step_agent(
     let mut agg_cost = 0f64;
     let mut gen_id: Option<String> = None;
     let mut last_content = String::new();
+    let mut last_images: Vec<Value> = Vec::new();
     let mut status = "max_iters";
 
     for _iter in 0..max_iters {
@@ -979,6 +980,7 @@ fn run_step_agent(
             messages.push(providers::ChatMessage {
                 role: "assistant".into(),
                 content: resp.content.clone(),
+                content_parts: None,
                 tool_calls: resp.raw_tool_calls.clone(),
                 tool_call_id: None,
             });
@@ -1017,6 +1019,7 @@ fn run_step_agent(
                 messages.push(providers::ChatMessage {
                     role: "tool".into(),
                     content: Some(result_text),
+                    content_parts: None,
                     tool_calls: None,
                     tool_call_id: Some(tc.id.clone()),
                 });
@@ -1027,6 +1030,7 @@ fn run_step_agent(
         // No tool call -> the model is done. Preserve a provider length stop as
         // a distinct terminal state: an incomplete structured answer must not
         // be mistaken for a successful prose response by a downstream parser.
+        last_images = agent_response_attachments(&resp.images);
         last_content = resp.content.unwrap_or_default();
         status = match resp.finish_reason.as_deref() {
             Some("length" | "max_tokens" | "max_output_tokens") => "output_truncated",
@@ -1099,6 +1103,7 @@ fn run_step_agent(
         "turns": turn_idx,
         "tokens_in": agg_in,
         "tokens_out": agg_out,
+        "attachments": last_images,
         "memory": memory.as_ref().map(|cfg| serde_json::json!({
             "provider": "hindsight",
             "service": cfg.service_name,
@@ -1115,6 +1120,84 @@ fn run_step_agent(
         out,
         last_content,
     )
+}
+
+fn agent_user_message(step: &Value, scope: &Scope, text: String) -> providers::ChatMessage {
+    let Some(vision_template) = step.get("vision") else {
+        return providers::ChatMessage::user(text);
+    };
+    let rendered = render_value_templates(vision_template, scope);
+    let Some(images) = rendered.as_array() else {
+        return providers::ChatMessage::user(text);
+    };
+
+    let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
+    let mut total_chars = 0usize;
+    for image in images.iter().take(4) {
+        let Some(data_url) = image
+            .get("dataUrl")
+            .or_else(|| image.get("data_url"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let supported = [
+            "data:image/png;base64,",
+            "data:image/jpeg;base64,",
+            "data:image/webp;base64,",
+            "data:image/gif;base64,",
+        ]
+        .iter()
+        .any(|prefix| data_url.starts_with(prefix));
+        if !supported || data_url.len() > 8 * 1024 * 1024 {
+            continue;
+        }
+        total_chars = total_chars.saturating_add(data_url.len());
+        if total_chars > 20 * 1024 * 1024 {
+            break;
+        }
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": data_url },
+        }));
+    }
+
+    let plain_text = parts
+        .first()
+        .and_then(|part| part.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut message = providers::ChatMessage::user(plain_text);
+    if parts.len() > 1 {
+        message.content_parts = Some(Value::Array(parts));
+    }
+    message
+}
+
+fn agent_response_attachments(images: &[Value]) -> Vec<Value> {
+    images
+        .iter()
+        .enumerate()
+        .filter_map(|(index, image)| {
+            let data_url = image
+                .get("dataUrl")
+                .or_else(|| image.get("data_url"))
+                .or_else(|| image.get("url"))
+                .or_else(|| image.get("image_url").and_then(|value| value.get("url")))
+                .and_then(Value::as_str)?;
+            let mime_type = ["image/png", "image/jpeg", "image/webp", "image/gif"]
+                .into_iter()
+                .find(|mime| data_url.starts_with(&format!("data:{mime};base64,")))?;
+            Some(serde_json::json!({
+                "id": format!("assistant-image-{index}"),
+                "kind": "image",
+                "data_url": data_url,
+                "mime_type": mime_type,
+                "name": format!("Assistant image {}", index + 1),
+            }))
+        })
+        .collect()
 }
 
 /// The aggregate sub-call for an agent step: kind "llm" (so its summed tokens/cost

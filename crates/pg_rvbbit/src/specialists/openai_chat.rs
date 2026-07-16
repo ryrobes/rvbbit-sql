@@ -194,7 +194,9 @@ impl Transport for OpenAiChatTransport {
                 // role=assistant with tool_calls may carry null content; keep the key.
                 o.insert(
                     "content".into(),
-                    m.content.clone().map(Value::String).unwrap_or(Value::Null),
+                    m.content_parts
+                        .clone()
+                        .unwrap_or_else(|| m.content.clone().map(Value::String).unwrap_or(Value::Null)),
                 );
                 if let Some(tc) = &m.tool_calls {
                     o.insert("tool_calls".into(), tc.clone());
@@ -288,11 +290,37 @@ impl Transport for OpenAiChatTransport {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let msg = choice.get("message").cloned().unwrap_or(Value::Null);
-        let content = msg
-            .get("content")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let content = match msg.get("content") {
+            Some(Value::String(text)) if !text.is_empty() => Some(text.clone()),
+            Some(Value::Array(parts)) => {
+                let text = parts
+                    .iter()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        };
+        let mut images = msg
+            .get("images")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(parts) = msg.get("content").and_then(Value::as_array) {
+            images.extend(
+                parts
+                    .iter()
+                    .filter(|part| {
+                        matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("image" | "image_url")
+                        )
+                    })
+                    .cloned(),
+            );
+        }
         let raw_tool_calls = msg
             .get("tool_calls")
             .filter(|v| !v.is_null())
@@ -327,6 +355,7 @@ impl Transport for OpenAiChatTransport {
 
         Ok(ChatToolsResponse {
             content,
+            images,
             tool_calls,
             raw_tool_calls,
             finish_reason,

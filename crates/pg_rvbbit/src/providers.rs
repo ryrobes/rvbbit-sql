@@ -294,16 +294,20 @@ pub fn chat(req: ChatRequest) -> Result<ChatResponse, ProviderError> {
 pub struct ChatMessage {
     pub role: String, // "system" | "user" | "assistant" | "tool"
     pub content: Option<String>,
+    /// OpenAI-compatible multimodal content array. When present this replaces
+    /// the scalar `content` string on the wire while the audit transcript keeps
+    /// the human-readable text separately.
+    pub content_parts: Option<Value>,
     pub tool_calls: Option<Value>,
     pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
     pub fn system(s: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: Some(s.into()), tool_calls: None, tool_call_id: None }
+        Self { role: "system".into(), content: Some(s.into()), content_parts: None, tool_calls: None, tool_call_id: None }
     }
     pub fn user(s: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: Some(s.into()), tool_calls: None, tool_call_id: None }
+        Self { role: "user".into(), content: Some(s.into()), content_parts: None, tool_calls: None, tool_call_id: None }
     }
 }
 
@@ -327,6 +331,10 @@ pub struct ToolCall {
 #[derive(Debug)]
 pub struct ChatToolsResponse {
     pub content: Option<String>,
+    /// Best-effort image attachments returned alongside a chat response.
+    /// Current Desktop Assistant models are text-output models, but retaining
+    /// this field keeps the transcript contract multimodal in both directions.
+    pub images: Vec<Value>,
     pub tool_calls: Vec<ToolCall>,
     pub raw_tool_calls: Option<Value>, // echoed verbatim into the next assistant message
     pub finish_reason: Option<String>,
