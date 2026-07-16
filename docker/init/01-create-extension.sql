@@ -1,6 +1,10 @@
 -- Auto-run on first boot of the rvbbit container.
 CREATE EXTENSION IF NOT EXISTS pg_rvbbit;
 
+-- Query-history evidence: preloaded in tuning.conf; the extension exposes
+-- the pg_stat_statements view in this database.
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
 -- Apply the stacked SQL migrations (sql/migrations/NNNN_*.sql), tracked in
 -- rvbbit.schema_migrations and decoupled from the extension version. The binding
 -- exists from CREATE EXTENSION on a fresh install; this is a no-op once applied.

@@ -137,5 +137,5 @@ RUN chmod 0755 /usr/local/bin/rvbbit-uber-bootstrap
 # Belt-and-suspenders: also stamp shared_preload_libraries into the
 # stock conf sample. Only kicks in if someone runs the image without
 # `-c config_file=...` (in which case the data-dir conf is read).
-RUN echo "shared_preload_libraries = 'pg_rvbbit,pg_cron'" \
+RUN echo "shared_preload_libraries = 'pg_rvbbit,pg_cron,pg_stat_statements'" \
         >> /usr/share/postgresql/postgresql.conf.sample
