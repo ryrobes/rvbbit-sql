@@ -304,10 +304,22 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn system(s: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: Some(s.into()), content_parts: None, tool_calls: None, tool_call_id: None }
+        Self {
+            role: "system".into(),
+            content: Some(s.into()),
+            content_parts: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
     pub fn user(s: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: Some(s.into()), content_parts: None, tool_calls: None, tool_call_id: None }
+        Self {
+            role: "user".into(),
+            content: Some(s.into()),
+            content_parts: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
 }
 

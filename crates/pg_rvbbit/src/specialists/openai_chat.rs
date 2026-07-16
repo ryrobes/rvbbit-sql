@@ -194,9 +194,9 @@ impl Transport for OpenAiChatTransport {
                 // role=assistant with tool_calls may carry null content; keep the key.
                 o.insert(
                     "content".into(),
-                    m.content_parts
-                        .clone()
-                        .unwrap_or_else(|| m.content.clone().map(Value::String).unwrap_or(Value::Null)),
+                    m.content_parts.clone().unwrap_or_else(|| {
+                        m.content.clone().map(Value::String).unwrap_or(Value::Null)
+                    }),
                 );
                 if let Some(tc) = &m.tool_calls {
                     o.insert("tool_calls".into(), tc.clone());

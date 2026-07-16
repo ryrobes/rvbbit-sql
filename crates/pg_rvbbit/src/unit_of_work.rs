@@ -2712,4 +2712,37 @@ mod tests {
             &json!({"continue_on_error": "true"})
         ));
     }
+
+    #[test]
+    fn agent_vision_builds_text_first_multimodal_content() {
+        let scope = Scope::new(
+            json!({
+                "vision": [{
+                    "dataUrl": "data:image/webp;base64,YWJj",
+                    "name": "dashboard"
+                }]
+            }),
+            json!({}),
+        );
+        let message = agent_user_message(
+            &json!({"vision": "{{ inputs.vision }}"}),
+            &scope,
+            "Please inspect this".into(),
+        );
+        assert_eq!(message.content.as_deref(), Some("Please inspect this"));
+        let parts = message.content_parts.unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/webp;base64,YWJj");
+    }
+
+    #[test]
+    fn agent_response_images_are_bounded_to_data_urls() {
+        let attachments = agent_response_attachments(&[
+            json!({"image_url": {"url": "data:image/png;base64,YWJj"}}),
+            json!({"image_url": {"url": "https://example.test/image.png"}}),
+        ]);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0]["mime_type"], "image/png");
+    }
 }

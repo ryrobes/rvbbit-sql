@@ -1,7 +1,7 @@
 -- 0153_assistant_vision.sql
--- Give the Desktop Assistant a four-argument overload whose final jsonb input
--- carries private, base64-encoded screenshots for the current turn. The old
--- three-argument wrapper remains usable by older Lens clients and text-only
+-- Give the Desktop Assistant a vision-capable overload whose fourth operator
+-- input carries private, base64-encoded screenshots for the current turn. The
+-- old three-argument wrapper remains usable by older Lens clients and text-only
 -- turns. The agent transport validates and caps the image parts before placing
 -- them on the OpenAI-compatible multimodal message.
 
@@ -43,7 +43,7 @@ BEGIN
             to_jsonb(
                 coalesce(next_steps->0->>'system', '')
                 || E'\n\nVISUAL FEEDBACK\n'
-                || E'- A user turn may include screenshots of a block current rendered viewport. Treat them as direct visual evidence of what the user sees, including layout, clipping, empty states, legibility, and styling.\n'
+                || E'- A user turn may include screenshots of a block''s currently rendered viewport. Treat them as direct visual evidence of what the user sees, including layout, clipping, empty states, legibility, and styling.\n'
                 || E'- The screenshot metadata in recent conversation is historical context; only images attached to the current turn are actually visible to you.\n'
                 || E'- When repairing an app from a screenshot, update the existing block and preserve its stable query ids unless the data contract genuinely changes.'
             ),
@@ -54,7 +54,7 @@ BEGIN
     result_sql := next_steps->1->>'sql';
     IF result_sql NOT LIKE '%assistant_attachments%' THEN
         result_sql := format(
-            'SELECT (_assistant_result.result || jsonb_build_object(''attachments'', coalesce($5::jsonb, ''[]''::jsonb))) AS result FROM (%s) _assistant_result',
+            'SELECT /* assistant_attachments */ (_assistant_result.result || jsonb_build_object(''attachments'', coalesce($5::jsonb, ''[]''::jsonb))) AS result FROM (%s) _assistant_result',
             result_sql
         );
         next_steps := jsonb_set(next_steps, '{1,sql}', to_jsonb(result_sql), true);
