@@ -3122,7 +3122,7 @@ INSERT INTO rvbbit.backends
 VALUES
     ('openrouter', 'openai_chat',
      'https://openrouter.ai/api/v1/chat/completions',
-     8, 120000, 'OPENROUTER_API_KEY',
+     8, 300000, 'OPENROUTER_API_KEY',
      'Default LLM provider — OpenRouter multi-model gateway.')
 ON CONFLICT (name) DO NOTHING;
 

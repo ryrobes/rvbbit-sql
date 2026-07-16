@@ -621,6 +621,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0150_assistant_output_guard",
         include_str!("../sql/migrations/0150_assistant_output_guard.sql"),
     ),
+    (
+        "0151_assistant_execution_feedback",
+        include_str!("../sql/migrations/0151_assistant_execution_feedback.sql"),
+    ),
+    (
+        "0152_assistant_provider_failures",
+        include_str!("../sql/migrations/0152_assistant_provider_failures.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

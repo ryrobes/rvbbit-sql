@@ -355,6 +355,16 @@ fn run_multi_step_inner(
         sub_calls.push(sub);
 
         if let Some(err) = had_error {
+            // Some orchestration surfaces need to turn a failed step into a
+            // structured result (for example the Desktop Assistant must show
+            // the provider failure instead of collapsing to SQL NULL). The
+            // failing SubCall remains in the receipt/audit trail; only the
+            // pipeline-level early return is suppressed explicitly.
+            if step_continues_on_error(step) {
+                scope.steps.insert(step_name, step_output);
+                last_output_text = output_text;
+                continue;
+            }
             return WorkResult {
                 output: String::new(),
                 sub_calls,
@@ -469,6 +479,12 @@ fn run_step_llm(
             String::new(),
         ),
     }
+}
+
+fn step_continues_on_error(step: &Value) -> bool {
+    step.get("continue_on_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -880,49 +896,56 @@ fn run_step_agent(
             }
         }
 
-        let resp =
-            match providers::chat_with_tools(
-                &model,
-                provider.as_deref(),
-                &messages,
-                &tool_specs,
-                Some(max_tokens),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    let err = e.to_string();
-                    audit_agent_turn(
-                        &run_id,
-                        &op.name,
+        let resp = match providers::chat_with_tools(
+            &model,
+            provider.as_deref(),
+            &messages,
+            &tool_specs,
+            Some(max_tokens),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = e.to_string();
+                audit_agent_turn(
+                    &run_id,
+                    &op.name,
+                    &model,
+                    &mut turn_idx,
+                    "error",
+                    Some(&err),
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    None,
+                    0,
+                    Some(&err),
+                );
+                let (step_output, output_text) = agent_failure_output(
+                    &run_id,
+                    "provider_error",
+                    &err,
+                    turn_idx,
+                    agg_in,
+                    agg_out,
+                );
+                return (
+                    agent_subcall(
+                        step_name,
                         &model,
-                        &mut turn_idx,
-                        "error",
-                        Some(&err),
-                        None,
-                        None,
-                        None,
-                        0,
-                        0,
-                        None,
-                        0,
-                        Some(&err),
-                    );
-                    return (
-                        agent_subcall(
-                            step_name,
-                            &model,
-                            gen_id,
-                            agg_in,
-                            agg_out,
-                            agg_cost,
-                            &total_t0,
-                            Some(err),
-                        ),
-                        Value::Null,
-                        String::new(),
-                    );
-                }
-            };
+                        gen_id,
+                        agg_in,
+                        agg_out,
+                        agg_cost,
+                        &total_t0,
+                        Some(err),
+                    ),
+                    step_output,
+                    output_text,
+                );
+            }
+        };
 
         agg_in += resp.prompt_tokens;
         agg_out += resp.completion_tokens;
@@ -1122,6 +1145,34 @@ fn agent_subcall(
         error,
         ..Default::default()
     }
+}
+
+fn agent_failure_output(
+    run_id: &str,
+    status: &str,
+    error: &str,
+    turns: i32,
+    tokens_in: i32,
+    tokens_out: i32,
+) -> (Value, String) {
+    let output = match status {
+        "provider_error" => {
+            format!("The model provider failed before completing this turn: {error}")
+        }
+        _ => format!("The assistant could not complete this turn: {error}"),
+    };
+    (
+        serde_json::json!({
+            "output": output,
+            "agent_run_id": run_id,
+            "status": status,
+            "error": error,
+            "turns": turns,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+        }),
+        output,
+    )
 }
 
 /// Fresh transcript id. The agent step always runs on the leader
@@ -2551,5 +2602,31 @@ mod tests {
         let b = derive_agent_memory_bank("support_triage", "analyst", "globex");
         assert_ne!(a, b);
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+
+    #[test]
+    fn agent_failure_output_preserves_run_and_error() {
+        let (value, text) = agent_failure_output(
+            "run-123",
+            "provider_error",
+            "HTTP response timed out",
+            7,
+            120,
+            30,
+        );
+        assert_eq!(value["agent_run_id"], "run-123");
+        assert_eq!(value["status"], "provider_error");
+        assert_eq!(value["error"], "HTTP response timed out");
+        assert_eq!(value["output"], text);
+        assert!(text.contains("HTTP response timed out"));
+    }
+
+    #[test]
+    fn continue_on_error_is_explicit() {
+        assert!(step_continues_on_error(&json!({"continue_on_error": true})));
+        assert!(!step_continues_on_error(&json!({})));
+        assert!(!step_continues_on_error(
+            &json!({"continue_on_error": "true"})
+        ));
     }
 }
