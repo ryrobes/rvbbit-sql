@@ -633,6 +633,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0153_assistant_vision",
         include_str!("../sql/migrations/0153_assistant_vision.sql"),
     ),
+    (
+        "0154_time_travel_retention",
+        include_str!("../sql/migrations/0154_time_travel_retention.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

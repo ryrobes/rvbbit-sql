@@ -117,6 +117,7 @@ DECLARE
     logs_reaped jsonb := '[]'::jsonb;
     orphaned_files_reaped jsonb := '{}'::jsonb;
     tombstones_pruned jsonb := '[]'::jsonb;
+    generations_reaped_j jsonb := '[]'::jsonb;
     cap bigint := greatest(coalesce(max_tables, 0), 0);
 BEGIN
     IF cap = 0 THEN
@@ -210,6 +211,24 @@ BEGIN
         );
     END;
 
+    -- Time-travel retention: reap generations past each table's policy
+    -- (accel_policy.time_travel_keep_days, else the time_travel_keep_days
+    -- setting, default 30; 0 = unbounded). Runs BEFORE prune_delete_log so
+    -- tombstones stranded by this sweep's reaps are pruned in the same pass.
+    BEGIN
+        SELECT coalesce(
+                   jsonb_agg(jsonb_build_object(
+                       'table', g.relname, 'keep_days', g.keep_days,
+                       'generations', g.generations_reaped)),
+                   '[]'::jsonb)
+          INTO generations_reaped_j
+          FROM rvbbit.reap_generations_by_policy() AS g;
+    EXCEPTION WHEN OTHERS THEN
+        errors := errors || jsonb_build_array(
+            jsonb_build_object('phase', 'reap_generations_by_policy', 'error', SQLERRM)
+        );
+    END;
+
     -- Drop tombstones stranded by generation reaping or trigger-less table
     -- drops. Cost scales with distinct row groups, not tombstone count.
     BEGIN
@@ -249,6 +268,7 @@ BEGIN
         'refreshed_variants', refreshed,
         'logs_reaped', logs_reaped,
         'tombstones_pruned', tombstones_pruned,
+        'generations_reaped', generations_reaped_j,
         'orphaned_files_reaped', coalesce(orphaned_files_reaped, '{}'::jsonb),
         'errors', errors
     );
