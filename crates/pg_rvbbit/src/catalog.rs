@@ -4213,9 +4213,13 @@ CREATE TABLE rvbbit.warren_nodes (
     CONSTRAINT warren_nodes_capacity_is_object CHECK (jsonb_typeof(capacity) = 'object'),
     CONSTRAINT warren_nodes_inventory_is_array CHECK (jsonb_typeof(inventory) = 'array'),
     CONSTRAINT warren_nodes_auth_config_is_object CHECK (jsonb_typeof(auth_config) = 'object')
-);
+)
+-- Heartbeats UPDATE this table constantly; keep those updates HOT (no index
+-- may contain last_heartbeat — see migration 0156) and give pages pruning
+-- headroom, or autovacuum trips on it every minute. Readers seq-scan a
+-- handful of rows, so a status index buys nothing.
+WITH (fillfactor = 70, autovacuum_vacuum_threshold = 500, autovacuum_vacuum_scale_factor = 0);
 
-CREATE INDEX warren_nodes_status_idx ON rvbbit.warren_nodes (status, last_heartbeat DESC);
 CREATE INDEX warren_nodes_labels_idx ON rvbbit.warren_nodes USING gin (labels);
 
 CREATE OR REPLACE FUNCTION rvbbit.touch_warren_nodes_updated_at()

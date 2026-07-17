@@ -641,6 +641,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0155_disambiguate_maintain",
         include_str!("../sql/migrations/0155_disambiguate_maintain.sql"),
     ),
+    (
+        "0156_warren_heartbeat_churn",
+        include_str!("../sql/migrations/0156_warren_heartbeat_churn.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

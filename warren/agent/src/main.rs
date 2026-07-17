@@ -21,6 +21,11 @@ struct Config {
     advertise_base_url: Option<String>,
     docker_network: String,
     poll_ms: u64,
+    /// Minimum ms between same-status heartbeats. Job polling can spin at
+    /// poll_ms without turning warren_nodes into an autovacuum treadmill —
+    /// the effective-status view only distinguishes freshness at 30s anyway.
+    /// Status transitions (ready↔busy) always send immediately.
+    heartbeat_ms: u64,
     once: bool,
     dry_run: bool,
     labels: Value,
@@ -132,8 +137,9 @@ fn main() -> Result<()> {
         config.work_dir.display()
     );
 
+    let mut heartbeat_gate = HeartbeatGate::new();
     loop {
-        heartbeat(&mut db, &config, "ready")?;
+        heartbeat_gate.maybe_send(&mut db, &config, "ready")?;
         maybe_record_metrics(&mut db, &config, &mut metrics, &mut last_metrics_at);
         maybe_reconcile_deployments(&mut db, &config, &mut last_reconcile_at);
         let mut failed_once_job: Option<String> = None;
@@ -143,7 +149,7 @@ fn main() -> Result<()> {
                     "claimed job={} kind={} name={} desired={}",
                     job.job_id, job.kind, job.name, job.desired_state
                 );
-                heartbeat(&mut db, &config, "busy")?;
+                heartbeat_gate.maybe_send(&mut db, &config, "busy")?;
                 maybe_record_metrics(&mut db, &config, &mut metrics, &mut last_metrics_at);
                 maybe_reconcile_deployments(&mut db, &config, &mut last_reconcile_at);
                 if let Err(err) = process_job(&mut db, &config, &job) {
@@ -211,6 +217,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8300),
+            heartbeat_ms: env::var("WARREN_HEARTBEAT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
             metrics_ms: env::var("WARREN_METRICS_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -249,6 +259,9 @@ impl Config {
                     config.docker_network = take_arg(&mut args, "--docker-network")?
                 }
                 "--poll-ms" => config.poll_ms = take_arg(&mut args, "--poll-ms")?.parse()?,
+                "--heartbeat-ms" => {
+                    config.heartbeat_ms = take_arg(&mut args, "--heartbeat-ms")?.parse()?
+                }
                 "--port-base" => config.port_base = take_arg(&mut args, "--port-base")?.parse()?,
                 "--metrics-ms" => {
                     config.metrics_ms = take_arg(&mut args, "--metrics-ms")?.parse()?
@@ -328,6 +341,9 @@ fn print_help() {
            --metrics-ms <ms>                  Metrics interval, 0 disables\n\
            --reconcile-ms <ms>                Deployment reconciliation interval, 0 disables\n\
            --poll-ms <ms>                     Poll interval\n\
+           --heartbeat-ms <ms>                Min interval between same-status heartbeats\n\
+                                              (or WARREN_HEARTBEAT_MS; default 10000 — status\n\
+                                              transitions always send immediately)\n\
            --trainer-cmd <argv>               Command to run the trainer for model_training jobs\n\
                                               (or WARREN_TRAINER_CMD; default 'rvbbit-trainer')\n\
            --trainer-dsn <postgres-url>       DSN the trainer uses (or WARREN_TRAINER_DSN; default --dsn)\n\
@@ -369,6 +385,38 @@ fn heartbeat(db: &mut Client, config: &Config, status: &str) -> Result<()> {
     )
     .context("sending Warren heartbeat")?;
     Ok(())
+}
+
+/// Dampens heartbeat writes: every UPDATE on warren_nodes is a dead tuple
+/// (last_heartbeat churn), so a 2s poll loop that heartbeats each iteration
+/// tripped autovacuum every minute or two. Same-status beats are throttled to
+/// heartbeat_ms; a status transition always writes through immediately.
+struct HeartbeatGate {
+    last_sent: Option<Instant>,
+    last_status: String,
+}
+
+impl HeartbeatGate {
+    fn new() -> Self {
+        Self { last_sent: None, last_status: String::new() }
+    }
+
+    fn maybe_send(&mut self, db: &mut Client, config: &Config, status: &str) -> Result<()> {
+        let due = match self.last_sent {
+            None => true,
+            Some(at) => {
+                status != self.last_status
+                    || at.elapsed() >= Duration::from_millis(config.heartbeat_ms.max(1))
+            }
+        };
+        if !due {
+            return Ok(());
+        }
+        heartbeat(db, config, status)?;
+        self.last_sent = Some(Instant::now());
+        self.last_status = status.to_string();
+        Ok(())
+    }
 }
 
 #[derive(Default)]
