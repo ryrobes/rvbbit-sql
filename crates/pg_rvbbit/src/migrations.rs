@@ -637,6 +637,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0154_time_travel_retention",
         include_str!("../sql/migrations/0154_time_travel_retention.sql"),
     ),
+    (
+        "0155_disambiguate_maintain",
+        include_str!("../sql/migrations/0155_disambiguate_maintain.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
