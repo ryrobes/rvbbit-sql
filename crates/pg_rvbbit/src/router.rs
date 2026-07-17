@@ -5135,11 +5135,17 @@ fn route_table_state_stamp() -> String {
     // is free (already in the catalog) and good enough: this string is ONLY a route-cache
     // key, the precise rvbbit data size is still captured by rg.bytes, and routing is
     // correctness-neutral so a slightly-stale heap-fork estimate at worst delays a re-route.
+    //
+    // The per-table tombstone count met the same fate (2026-07-17, field evidence: 46% of
+    // a client's total DB runtime — 107k calls, each scanning a 365M-row delete_log). The
+    // stamp is ONE GLOBAL string, so per-table precision adds no invalidation power over a
+    // global monotonic marker: max(deleted_xid) is an O(1) backward index descent and bumps
+    // on every tombstone insert. Tombstone REMOVAL (reap/rebuild) doesn't bump it, but those
+    // paths already move filenode / row-group sums / last_refresh_xid in the same stamp.
     let table_state = Spi::get_one::<String>(
         "SELECT coalesce(string_agg( \
                     c.oid::text || ':' || (c.relpages::bigint * current_setting('block_size')::bigint)::text || ':' || \
                     coalesce(rg.rows, 0)::text || ':' || coalesce(rg.bytes, 0)::text || ':' || \
-                    coalesce(dl.deletes, 0)::text || ':' || \
                     coalesce(ds.shadow_heap_retained, false)::text || ':' || \
                     coalesce(ds.shadow_heap_dirty, false)::text || ':' || \
                     coalesce(ds.dirty_has_insert, false)::text || ':' || \
@@ -5150,6 +5156,7 @@ fn route_table_state_stamp() -> String {
                     pg_relation_filenode(c.oid)::text, \
                     ',' ORDER BY c.oid \
                 ), 'none') \
+                || '|dl:' || coalesce((SELECT max(deleted_xid) FROM rvbbit.delete_log)::text, '0') \
 	         FROM rvbbit.tables t \
 	         JOIN pg_class c ON c.oid = t.table_oid \
 	         JOIN rvbbit.table_dirty_state ds ON ds.table_oid = c.oid \
@@ -5159,14 +5166,6 @@ fn route_table_state_stamp() -> String {
              FROM rvbbit.row_groups_visible \
              GROUP BY table_oid \
          ) rg ON rg.table_oid = c.oid \
-         LEFT JOIN ( \
-             SELECT dl.table_oid, count(*)::bigint AS deletes \
-             FROM rvbbit.delete_log dl \
-             JOIN rvbbit.row_groups_visible rg \
-               ON rg.table_oid = dl.table_oid \
-              AND rg.rg_id = dl.rg_id \
-             GROUP BY dl.table_oid \
-         ) dl ON dl.table_oid = c.oid \
 	         WHERE coalesce(t.acceleration_enabled, true)",
     )
     .ok()
