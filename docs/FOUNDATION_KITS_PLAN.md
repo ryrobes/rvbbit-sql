@@ -70,9 +70,15 @@ lead triage rules over free-text notes.
 
 ## Sequencing
 
-1. Canon specs above — agree/adjust (this document).
-2. Build scheduling v0 via the assistant-builder protocol (the crime-kit
-   experiment loop: prompt → grade → teach), on a synthetic shop.
+1. Canon specs above — agreed 2026-07-18.
+2. ~~Build scheduling v0 via the assistant-builder protocol~~ **DONE
+   2026-07-18**: scaffold in `docs/examples/plates/seed_scheduling_kit.sql`
+   (+ `seed_scheduling_shop.sql` — Beacon Hill Heating & Air, planted
+   rule violations), assistant built today/week/intake from one prompt,
+   full write path proven in-browser, validate_kit green. Findings and
+   fixes (submitter FormData + button name allowlist; 0176 grouped-feed
+   + nullif-cast teachings; fresh-shop self-fit doctrine) in
+   KIT_PLATES_PLAN §23.
 3. crm v0 same way; wire the cross-kit overlay demo (job card shows
    customer history via listens).
 4. First domain kit (HVAC or Construction) = requires both + seeds +

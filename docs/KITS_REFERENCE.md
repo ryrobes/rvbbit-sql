@@ -217,12 +217,20 @@ computed is a column.
 | Open SQL | `rv-open-sql="{{ row.script }}" rv-open-sql-title="…"` | Opens a SQL window BUILT-NOT-RUN. The remedy gesture. |
 | Open plate | `rv-open="plate:<id>" rv-open-title="…"` | Navigation (drill-through, switchboard → module). |
 | Action form | `<form rv-action="name">` + inputs named after args | The ONLY write path. `confirm` from the action def. |
+| Per-row action button | `<button type="submit" name="arg" value="{{ row.id }}">` inside the form | The clicked submitter's name/value rides into the args (per-row Done/Cancel on cards and tables). |
 
 **Idioms (logic lives in SQL):** tones — `'ok'|'warn'|'bad' AS tone` →
 `class="plate-card {{ row.tone }}"`. Selection —
 `CASE WHEN v = {{ params.v }} THEN 'active' ELSE '' END AS sel` →
 `class="{{ row.sel }}"`. Pagination — prev/next/pageno/has_next are
 COLUMNS of a pager query; emit back via `rv-value="{{ row.next }}"`.
+Grouped feed — per-entity sections come from ONE query, never from
+hardcoded entity names: `ORDER BY entity, starts_at` + a
+`row_number() OVER (PARTITION BY entity …) = 1` header flag, then
+`<h3 rv-if="row.first_of_group">{{ row.entity }}</h3>` inside `rv-each`.
+Action arg casts — always `nullif({{arg}},'')::date` (validate_kit
+EXPLAINs actions with empty-string dummies; a bare `''::date` fails at
+parse).
 
 **CSS palette (native look only):** `plate-section`, `plate-cards`,
 `plate-card` (+`ok/warn/bad`; children `-title/-value/-note`),

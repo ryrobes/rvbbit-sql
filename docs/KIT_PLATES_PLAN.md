@@ -724,3 +724,53 @@ live; travels in export v7). Doctrine: tweaks are ROWS — foundations
 expose config tables, domain kits seed them, forks are forbidden.
 
 Canon drafts for both foundations: docs/FOUNDATION_KITS_PLAN.md.
+
+## 23. Assistant-builder round 2 — the scheduling foundation kit (2026-07-18)
+
+Protocol repeat of the crime experiment, now canon-first: operator
+scaffolds (kit + setup DDL + target w/ status values contract + two
+contracts + day_check rules + switchboard; seed_scheduling_kit.sql),
+synthetic shop seeded (Beacon Hill Heating & Air, 122 appointments,
+every rule violation planted; seed_scheduling_shop.sql), then ONE
+prompt to the assistant produced today-board / week-list / intake —
+installed, opened, zero render errors, validate_kit green after
+polish. Write path proven end-to-end in-browser: mark_done, confirm-
+gated cancel, and a booking whose ends_at came from job_types.default_
+minutes — with the board self-refreshing after each action.
+
+Unprompted wins: canon-view reads with base-table writes; per-assignee
+rv-if active gates; confirm on the destructive action; a defaults
+query prefilling date/time; durations in dropdown labels; validation-
+by-join in the INSERT (invalid assignee/job type = clean no-op).
+
+Findings → fixes:
+1. MACHINERY (fixed, lens): per-row action args ride the submit
+   BUTTON's name/value — the native HTML idiom — but the sanitizer
+   stripped button `name` and the client built `FormData(form)`
+   without the submitter, so args vanished. Allowlisted name/value on
+   buttons + `FormData(form, submitter)`. The assistant's instinct was
+   right; the machinery caught up.
+2. VOCABULARY GAP (taught, 0176): it HARDCODED the five crew names as
+   five template columns + ten near-identical queries (and 14
+   copy-pasted day queries in week) — config-as-rows violated at the
+   surface; a new hire needs plate re-authoring. No nested rv-each
+   exists, so 0176 teaches the GROUPED FEED pattern (one query,
+   partition header flag, rv-if header inside rv-each). True dynamic
+   side-by-side columns = banked island (<rv-board>-shaped, with
+   <rv-schedule> later).
+3. SHARP EDGE (taught, 0176): bare `{{arg}}::date` in action SQL works
+   live but fails validate_kit's empty-dummy EXPLAIN — teach
+   `nullif({{arg}},'')::date`.
+4. NOTES: week plate guessed `extract(isodow)` against hours.dow
+   (documented 0=Sunday) — harmless Mon–Sat, silently wrong for
+   Sunday hours; config tables carry no machine-readable column docs,
+   so conventions must ride the target/prompt. v0 treats the DB
+   TimeZone as shop-local. Windows opened by open_plate stack exactly
+   on top of each other (placement cascade = lens polish, banked).
+
+Fresh-shop SELF-FIT doctrine (new): setup_sql creates the canon view
+over the kit's own table only if absent AND records a kit_fittings row
+only if none exists — a customer's accepted fitting is never clobbered
+by setup re-runs. fitting_violations requires a RECORDED fitting, so
+the guarded insert is what turns the switchboard green on day one.
+Candidate engine nicety: rvbbit.self_fit(kit, target, select_sql).
