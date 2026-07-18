@@ -635,3 +635,51 @@ an earlier bash heredoc (inside a template literal, where a space
 belonged) — TypeScript compiled it without a murmur; an anchored-replace
 assert was what finally caught it. Heredoc-written source deserves a
 NUL-byte sweep.
+
+## 21. The Fitting (2026-07-18)
+
+Naming settled (Ryan): kits ship TARGETS, the FITTING ROOM adapts them,
+an accepted mapping is a FITTING — the tailor's session and the
+pipefitter's connector in one word. Kit, plate, fitting: quartermaster
+energy.
+
+**Division of labor (settled §"native vs plate"):** the adapt workbench
+is a NATIVE lens app, not a plate — it browses the whole schema, streams
+proposals, previews data, edits SQL: it thinks, and plates trigger,
+never think. It is one generic app serving every kit, stateless by
+doctrine: expectations (`kit_targets`) and accepted connections
+(`kit_fittings`, with proposal provenance) are rows; the canonical VIEW
+is the artifact.
+
+**Engine (0171):** `upsert_kit_target` (schema-qualified view name +
+columns jsonb w/ name/type/description/required); `fitting_candidates`
+(catalog-KG ranking via data_search over the target's semantic
+descriptions — freshness follows the crawl); `fitting_check` (temp-view
+probe: does the SELECT run, does it produce the target's columns —
+required missing = fail, optional absent = ok, type mismatch = verify
+hint); `fitting_apply` (checks → CREATE OR REPLACE VIEW → record the
+fitting, fail-loud); `fitting_violations(kit)` — contract fuel: kits
+gate modules on it with one line. export_kit v6 ships targets; fittings
+stay per-box.
+
+**Lens:** the Fitting Room window (target rail w/ fitted dots → expected
+columns → candidate chips + any-table picker → drafted mapping SELECT
+(exact-name columns map through; missing required become
+`/* TODO map this */ NULL::type` placeholders) → Preview & check →
+Accept). `rv-open` gains the `app:` scheme
+(`app:fitting?kit=field-kit`) so switchboards link out; Accept fires the
+plate-data event so switchboards and the shelf flip live.
+
+**Loop proven end-to-end on bench:** field-kit shipped a
+`demo_kit.v_field_notes` target + a `targets_fitted` contract → insights
+gated red → switchboard → Fitting Room → picked field_notes, fixed the
+TODO (`created_at AS noted_at`) → all checks pass → Accept → view
+created, fitting recorded, BOTH switchboard contracts GREEN and the
+shelf ungated without a manual refresh.
+
+Design note: fitting_check validates SHAPE (a NULL::type placeholder
+passes). Data QUALITY is the contracts' job — a kit wanting populated
+columns ships a contract like "v_field_notes.noted_at must not be all
+NULL". Next in this arc: clover_llm-assisted drafting for non-obvious
+column matches, and metric_defs/cube_defs bound to canonical views
+filling their reserved manifest sections.

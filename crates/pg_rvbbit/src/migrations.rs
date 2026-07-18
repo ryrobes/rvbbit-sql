@@ -701,6 +701,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0170_assistant_plate_optin",
         include_str!("../sql/migrations/0170_assistant_plate_optin.sql"),
     ),
+    (
+        "0171_kit_fitting",
+        include_str!("../sql/migrations/0171_kit_fitting.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
