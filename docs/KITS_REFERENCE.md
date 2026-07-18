@@ -181,7 +181,14 @@ dropped. The catalog entry survives: uninstalling returns the kit to
 ```sql
 rvbbit.grant_kit(p_kit text, p_role text, p_level text DEFAULT 'read')
   → TABLE(granted text)
+rvbbit.set_plate_listens(p_plate_id text, p_kits text[]) → void
+-- cross-kit reactivity: the plate also refreshes on these kits' data events
 ```
+
+Composition: `requires.kits: ["scheduling>=0.3.0", "crm"]` gates setup on
+foundation kits being present at version; `remove_kit` refuses to strand
+dependents (`p_force := true` overrides). Foundations expose variability
+as config TABLES; domain kits seed rows — never fork.
 The GRANT choreography as one call: `CREATE ROLE` if absent, `USAGE` on
 the kit's schemas (parsed from setup_sql), `SELECT` for `'read'`, plus
 `INSERT/UPDATE/DELETE` and sequence usage for `'write'` (identity columns

@@ -706,3 +706,21 @@ ofns_desc/pd_desc → 'violent', and the overview's violent count went
 (metadata only; contracts/targets/setup stay operator work; downgrade
 refusals surface in apply_report) — maiden flight registered Crime
 Analytics v0.2.0 in the same turn that fixed the metric.
+
+## 22. Kit composition — foundation kits (2026-07-18)
+
+Strategy settled (Ryan): scheduling + CRM are the common substrate of
+every small/medium trade vertical; build each ONCE as a foundation kit,
+domain kits depend on and extend them, differentiation = the ML/LLM
+weave (they're on Clover anyway). Not-Salesforce is enforced by the
+vocabulary's ceiling. v0 = simple + a UX test; richer islands
+(<rv-schedule>) only when a design partner proves them load-bearing.
+
+Mechanics (0175): requires.kits in preflight ("scheduling>=0.3.0" —
+missing/version-behind failures speak human); remove_kit refuses to
+strand dependents (p_force override); plates.listens jsonb +
+set_plate_listens() = cross-kit reactivity for overlay plates (verified
+live; travels in export v7). Doctrine: tweaks are ROWS — foundations
+expose config tables, domain kits seed them, forks are forbidden.
+
+Canon drafts for both foundations: docs/FOUNDATION_KITS_PLAN.md.
