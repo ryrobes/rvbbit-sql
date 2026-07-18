@@ -431,3 +431,28 @@ Engineering notes that will matter later:
 
 `demo/casebook` exercises the whole batch: tabs, SQL pagination, radio
 class filter, live title search, and rv-open into demo/report-finder.
+
+## 15. The editor arrives + plates ship by default (2026-07-18)
+
+**Assistant authoring (doctrine §1.7 realized).** The Desktop Assistant's
+command protocol gains `upsert_plate` / `open_plate` (0160 patches the
+0146 prompt with the full vocabulary via anchored replaces that fail loudly
+on drift). The lens apply pipeline went async with a serial pending phase:
+a plate install round-trips through /api/plate/upsert →
+rvbbit.upsert_plate before its open_plate runs, and apply_report carries
+the installer's verbatim verdict — a rejected template is the feedback
+loop an agent iterates on. First live test: one prompt ("compact notes
+leaderboard — chart of notes per author + latest 10") produced a valid
+banner + plate-columns + chart-island + grid-island plate, installed and
+opened in a single turn. There is no visual builder; this is the editor.
+
+**System plates ship with the product (0159).** Plates are data, so
+shipping them is a migration of idempotent upsert_plate() calls:
+`system/health` (the full maintenance surface) and `rvbbit/welcome` (the
+product's own switchboard — readiness cards + built-not-run starters,
+including an accelerate-your-largest-table script computed by SQL against
+the actual database). The blank-slate first-run now lands on a surface
+instead of an empty desk. The TS System Health window's retirement is
+unblocked but not executed.
+
+All of the above rides release 4.0.12 (migrations 0157–0160).
