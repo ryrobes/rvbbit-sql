@@ -10,6 +10,9 @@
 --     selected="" into bare selected = on)
 --   * NO nested rv-each: sibling rv-each blocks over the single-row
 --     "appt" query per field group; option loops stand alone
+--   * CROSS-KIT lookup: customer options come from crm.v_customers
+--     (scheduling reading the crm kit's canon); an appointment whose
+--     customer is unknown to CRM stays selectable as "(not in CRM)"
 
 BEGIN;
 
@@ -30,7 +33,8 @@ SELECT rvbbit.upsert_plate(
 <div rv-if="!appt.appt_id" class="plate-empty">nothing loaded &#8212; double-click an appointment on the Dispatch board</div>
 <div rv-if="appt.appt_id" class="plate-section">
   <form rv-action="update_appointment" class="plate-form">
-    <label rv-each="appt" class="plate-field">Customer<input name="customer_name" type="text" value="{{ row.customer_id }}" required /><input type="hidden" name="appt_id" value="{{ row.appt_id }}" /></label>
+    <label class="plate-field">Customer<select name="customer_name" required query="customer_opts" value="v" label="l"></select></label>
+    <div rv-each="appt" class="plate-field-inline"><input type="hidden" name="appt_id" value="{{ row.appt_id }}" /></div>
     <label class="plate-field">Job type<select name="job_type" required query="job_type_opts" value="v" label="l"></select></label>
     <label class="plate-field">Assignee<select name="assignee" required query="assignee_opts" value="v"></select></label>
     <label class="plate-field">Status<select name="status" required query="status_opts" value="v"></select></label>
@@ -47,6 +51,7 @@ $tpl$,
     $q$
 {
   "appt": {"sql": "SELECT appt_id, customer_id, to_char(starts_at, 'YYYY-MM-DD') AS d, to_char(starts_at, 'HH24:MI') AS t, coalesce(address, '') AS address, coalesce(notes, '') AS notes FROM scheduling.v_appointments WHERE appt_id = nullif({{ params.appt_id }}, '')"},
+  "customer_opts": {"sql": "SELECT c.name AS v, c.name || ' — ' || c.status AS l, (c.name = a.customer_id) AS selected FROM crm.v_customers c LEFT JOIN scheduling.v_appointments a ON a.appt_id = nullif({{ params.appt_id }}, '') UNION ALL SELECT a2.customer_id, a2.customer_id || ' — (not in CRM)', true FROM scheduling.v_appointments a2 WHERE a2.appt_id = nullif({{ params.appt_id }}, '') AND NOT EXISTS (SELECT 1 FROM crm.v_customers cc WHERE cc.name = a2.customer_id) ORDER BY 1"},
   "job_type_opts": {"sql": "SELECT j.name AS v, j.name || ' · ' || j.default_minutes || ' min' AS l, (j.name = a.job_type) AS selected FROM scheduling.job_types j LEFT JOIN scheduling.v_appointments a ON a.appt_id = nullif({{ params.appt_id }}, '') ORDER BY j.name"},
   "assignee_opts": {"sql": "SELECT s.name AS v, (s.name = a.assignee) AS selected FROM scheduling.assignees s LEFT JOIN scheduling.v_appointments a ON a.appt_id = nullif({{ params.appt_id }}, '') WHERE s.active OR s.name = a.assignee ORDER BY s.name"},
   "status_opts": {"sql": "SELECT u.s AS v, (u.s = a.status) AS selected FROM unnest(ARRAY['booked','confirmed','in_progress','done','cancelled','no_show']) WITH ORDINALITY AS u(s, ord) LEFT JOIN scheduling.v_appointments a ON a.appt_id = nullif({{ params.appt_id }}, '') ORDER BY u.ord"}

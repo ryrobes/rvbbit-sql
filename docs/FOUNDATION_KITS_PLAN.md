@@ -79,7 +79,20 @@ lead triage rules over free-text notes.
    fixes (submitter FormData + button name allowlist; 0176 grouped-feed
    + nullif-cast teachings; fresh-shop self-fit doctrine) in
    KIT_PLATES_PLAN §23.
-3. crm v0 same way; wire the cross-kit overlay demo (job card shows
-   customer history via listens).
+3. ~~crm v0 same way; wire the cross-kit overlay demo~~ **DONE
+   2026-07-18**: scaffold `seed_crm_kit.sql` + book `seed_crm_book.sql`
+   (customers derived from the shop's appointment names — cross-kit
+   joins are real); assistant built directory/card/follow-ups from one
+   prompt with ZERO missteps, composing the new vocabulary unprompted
+   (plate-dot tones, plate-empty, query-driven form select for the
+   channel dropdown, from_bus card, rule_verdict LATERALs, CTE
+   insert + last_seen touch). THE CROSS-KIT CIRCLE, all three planes
+   proven in one gesture: scheduling/intake + /edit look customers up
+   in crm.v_customers (READ; unknown customers stay selectable as
+   "(not in CRM)"), completed jobs surface in crm.v_interactions via a
+   union FITTING (DATA — and the follow-up rules got smarter for free:
+   gone_quiet 6→0 because jobs now count as touchpoints), and
+   crm/customer-card listens=['scheduling'] refreshed live when a
+   booking landed (REACTIVITY). Details: KIT_PLATES_PLAN §27.
 4. First domain kit (HVAC or Construction) = requires both + seeds +
    overlay plates. Design partner drives what generalizes.

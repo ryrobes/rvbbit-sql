@@ -869,3 +869,41 @@ re-densifies every plate ever shipped, retroactively.
 rule. Banked (again, now with evidence): window placement cascade —
 open_plate stacks windows dead-center on top of each other, which cost
 three overlap-blocked clicks this round.
+
+## 27. CRM v0 + the cross-kit circle (2026-07-18)
+
+Assistant round 3 (crm directory / customer-card / follow-ups from one
+prompt): ZERO missteps — and it composed the vocabulary shipped hours
+earlier unprompted: plate-dot status tones, plate-empty no-selection
+state, a query-driven FORM select for the channel dropdown, from_bus
+on the card's customer_id, rule_verdict CROSS JOIN LATERALs in the
+house style, and a CTE INSERT..RETURNING → UPDATE last_seen write.
+The teaching loop compounds: every prompt patch raises the floor of
+the next build.
+
+The cross-kit circle — Ryan's stated test ("can the calendar app pull
+up client data, use it for lookups, cross-kit") — proven on all three
+composition planes in one gesture:
+1. READ: scheduling/intake + /edit customer fields are query-driven
+   selects over crm.v_customers (status + phone in labels); an
+   appointment whose customer is unknown to CRM stays selectable as
+   "(not in CRM)".
+2. DATA: crm.v_interactions re-fitted as a UNION of crm.interactions
+   and scheduling.appointments-as-'job' rows (fitting_check's values
+   probe passed 'job' against the channel vocabulary). Side effect
+   that IS the thesis: the follow_up rules got smarter without
+   touching a rule — gone_quiet went 6→0 because completed jobs now
+   count as touchpoints. Composition upgraded the verdicts.
+3. REACTIVITY: crm/customer-card listens=['scheduling'] — booking
+   Grace Chen from intake (picked from the CRM dropdown) put the new
+   job at the top of her card's feed via the cross-kit event.
+
+v0 joins on customer NAME (scheduling.customer_id holds display names
+— the canon draft anticipated this); a domain kit tightens the weld to
+real ids. Multiplayer note: Ryan drove the same desktop live during
+the whole build (his windows and drags kept appearing in the playwright
+session via homebase sync) — no conflicts, no confusion.
+
+Both foundation kits now stand. NEXT: the first domain kit
+(requires: ["scheduling", "crm"] + seeds + overlay plates) with a
+design partner.
