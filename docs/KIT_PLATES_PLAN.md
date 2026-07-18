@@ -984,3 +984,11 @@ requires.kits, cross-kit reads, a union fitting, and cross-kit
 listens. The teaching loop's compounding is the story: round 1
 needed two machinery fixes and two prompt patches; round 4 needed
 nothing.
+
+§29 addendum — invoices styling pass (same day): a pure look-pass
+prompt ("read like a finance surface") restyled sales/invoices into a
+proper AR ledger — destructive-tinted past-due card, muted header
+band, two-line invoice cells, verdict pills, aligned money column —
+with queries/actions byte-identical, zero scrubbed tokens, and full
+retheme-fidelity through Ryan's second wallpaper swap of the day.
+Styling is now prompt-deep; no machinery was touched.
