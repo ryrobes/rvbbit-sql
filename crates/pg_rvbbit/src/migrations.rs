@@ -669,6 +669,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0162_kit_packaging",
         include_str!("../sql/migrations/0162_kit_packaging.sql"),
     ),
+    (
+        "0163_system_kit_grouping",
+        include_str!("../sql/migrations/0163_system_kit_grouping.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
