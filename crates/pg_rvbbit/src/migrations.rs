@@ -729,6 +729,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0177_assistant_layout_palette",
         include_str!("../sql/migrations/0177_assistant_layout_palette.sql"),
     ),
+    (
+        "0178_assistant_board_island",
+        include_str!("../sql/migrations/0178_assistant_board_island.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

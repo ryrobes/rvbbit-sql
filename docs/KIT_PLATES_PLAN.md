@@ -809,3 +809,28 @@ Ladder status: Tier 1 (palette) ✓, Tier 2 (rv-group) ✓; Tier 3 =
 interaction islands (<rv-board> drag-between-columns → named action,
 <rv-schedule> drag-to-reschedule, <rv-map>) — build when a kit needs
 the INTERACTION, not the look.
+
+## 25. Tier 3, island 1: rv-board (2026-07-18)
+
+Design collapse: the kanban board and the day-granular schedule are ONE
+island — <rv-board> grouped by assignee is dispatch, grouped by date is
+reschedule. Hour-precision <rv-schedule> (time-axis, duration-height
+chips) and <rv-map> stay banked until a kit needs that interaction.
+
+Contract: columns from rows (group-by, SQL ORDER BY = column order;
+group-label for display), LEFT-JOIN NULL-id rows = empty-column
+placeholders so idle groups remain drop targets, card fields via
+title/value/note/tone column attrs, drop fires the plate's named action
+with args {id, to} through the SAME runAction wall as forms (confirm
+honored, apply errors land in the action note, plate-data event +
+refresh on success). No action attr = read-only board. Islands ban
+inside rv-each/rv-group extends to rv-board.
+
+Proof (scheduling/dispatch, seed committed): crew board drag t003
+Chris→Marcus (action log {id, to:"Marcus Webb"}), day board drag
+Sat→Sun preserved the time and day_check IMMEDIATELY flagged the drop
+"outside hours" — the drag surface and the decision-table tier compose
+with zero extra wiring. Both boards on one plate stay coherent (the
+reassign refreshed the day board's notes live). Playwright's dragTo
+drives HTML5 DnD fine — no hover caveat like Vega clicks. 0178 teaches
+the assistant the island.
