@@ -90,6 +90,7 @@ HTML plus:
 | Island | `<rv-grid query="q"/>`, `<rv-chart query="q" spec="col"/>`, `<rv-metric query="q" value="col" label="col"/>` | Replaced with hydration stubs; the lens mounts its REAL components (ResultGrid, Vega chart view, metric card). The DataWindow layer. |
 | Action form | `<form rv-action="name">` + plain inputs | Input `name=` maps to action args. Server validates types. `confirm` from the action def. |
 | Param emit | `rv-emit="param_name"` on a clickable | Publishes to the desktop param bus (same bus as everything else). |
+| Param control | `rv-emit` on `<select>` / `<input type="search\|range\|date\|number\|checkbox">` | Emits on the native change event. Selects can source options from a query (`query`/`value`/`label`/`placeholder` attrs); the server marks `selected`/`checked` from resolved params — control state comes from SQL, never client state. |
 | Refresh | *(none in v1)* | After any action or bus param change, the whole plate re-renders. Fragment targeting (`rv-target`) is v1.1 — earn it with a real need. |
 
 **Explicitly not in v1:** expressions, custom CSS/style attributes, inline
@@ -356,3 +357,31 @@ limits, on purpose: same browser only, and only plate ACTIONS trigger it —
 mutations from SQL windows or external writers don't. The upgrade path if
 that ever matters is LISTEN/NOTIFY under a server-sent stream, not polling;
 the event contract stays the same.
+
+
+## 13. Control primitives (2026-07-18)
+
+Dropdown, slider, datepicker, search box, and checkbox are not new nouns —
+they are `rv-emit` on form controls, firing on the native change event
+through the same emit path as buttons and chart marks (loop-back, bus,
+from_bus, toggle semantics all inherited). Two server-side services keep
+them controlled-by-SQL:
+
+- `<select rv-emit="state" query="state_opts" value="state" label="label"
+  placeholder="All states">` builds its options from a query's rows and
+  marks the option matching the resolved param `selected`. Authored static
+  options get the same selected-marking.
+- `<input type="checkbox" rv-emit="class_a" rv-value="Class A">` is marked
+  `checked` when the param holds its rv-value.
+
+Text-ish inputs reflect state via plain interpolation
+(`value="{{ params.q }}"`). Numbers coerce client-side (range/number →
+Number). Search boxes emit on change (blur/Enter) — no keystroke storms by
+construction. `demo/report-finder` exercises all six against the bigfoot
+locations table; because its state/season are `from_bus`, a freshly opened
+finder arrives already scoped to whatever the desktop's chips say.
+
+Field notes: `''::date` fails at Postgres PARSE time even in a dead branch
+(constants fold early) — write `nullif({{ params.x }}, '')::date`. And a
+click on a `<select>` must not run the click-emit path (it would swallow
+the dropdown) — form controls are excluded there; change owns them.
