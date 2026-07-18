@@ -1000,6 +1000,13 @@ fn run_step_agent(
                         Some("tool not permitted".to_string()),
                     ),
                 };
+                // Live progress: the audit INSERT below is invisible to other
+                // connections until this turn's transaction commits (MVCC), so
+                // bump the shared-memory tally too — a poller (the assistant
+                // window's thinking dots) reads it via live_call_counts().
+                // Agent loops run on the leader (SQL tools need SPI), so this
+                // is always a valid backend.
+                crate::live_counters::tick("assistant:tool", 1);
                 audit_agent_turn(
                     &run_id,
                     &op.name,
