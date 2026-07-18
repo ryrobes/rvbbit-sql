@@ -11,6 +11,10 @@ iframe, native theme, direct data path. This is the PowerBuilder/Lotus-forms
 layer that kits (mapping surfaces, onboarding checklists, audit queues) are
 authored on.
 
+**Reference companion:** the complete SQL API, tables, template
+vocabulary, and lifecycle live in `KITS_REFERENCE.md` — this document is
+the rationale and the as-built history; that one is the lookup.
+
 **This document is the ABI.** Kits are versioned artifacts sitting in customer
 databases rendering against whatever lens they run. Everything else in the kit
 stack can be wrong and fixed later; the plate contract compounds. Argue here,
