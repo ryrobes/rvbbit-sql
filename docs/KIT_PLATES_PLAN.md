@@ -519,3 +519,32 @@ INSERTs (column-drift tolerant both directions). Round-trip proven again:
 4 triage rules + a private operator installed on a fresh 4.0.12 box and
 "URGENT: injured hiker" hit the priority-10 rule first try. 0166 teaches
 the assistant the whole tier (columns → rules → operators, cost-projected).
+
+## 18. Rule observability — two planes (2026-07-18)
+
+Rules deliberately do NOT write receipts (set-based evaluation would
+firehose the receipt system — the delete_log lesson). Observability is
+two planes instead (0167):
+
+- **LIVE** — `kit_rule_sets` registers each set's `subject_sql`;
+  `rule_set_distribution(kit, set)` re-evaluates the decision table over
+  CURRENT data on demand. Read-only safe, zero storage, never stale. This
+  is what the shipped `system/rules` plate renders.
+- **PERSISTENT** — `kit_rule_stats` (one bounded row per rule: matches,
+  errors, last error, last matching subject as a specimen, plus a
+  '(no match)' fall-through counter) and `kit_rule_log` (errors always;
+  full trace only under `SET rvbbit.rule_log = 'all'`). Captured only in
+  WRITE-context evaluations — plate renders run in READ ONLY transactions
+  and self-disable via a cheap `transaction_read_only` GUC check, NOT
+  caught exceptions (a caught exception is a subtransaction per row on a
+  hot path). `prune_kit_rule_log()` keeps the log bounded.
+
+The admin UI is a plate, naturally: `system/rules` ships with the product
+(kit dropdown → live distribution with shares → the decision table with
+dead-rule ambers and error reds carrying last-error tooltips → recent log
+→ debug-trace and prune scripts built-not-run). export_kit v3 ships
+rule-set registrations so the live plane arrives with the kit.
+
+plpgsql scar for the record: an `ON CONFLICT (…, rule_id)` target inside
+a function whose OUT param is also named rule_id is ambiguous —
+`#variable_conflict use_column` resolves it without renaming the API.
