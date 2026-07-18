@@ -335,6 +335,9 @@ rvbbit.fitting_apply(p_kit text, p_target text, p_select_sql text,
                      p_proposal jsonb DEFAULT '{}')
   → TABLE(check_name, ok, detail)   -- checks → CREATE VIEW → record fitting
 rvbbit.fitting_violations(p_kit text) → TABLE(target, problem)
+rvbbit.fitting_draft(p_kit text, p_target text, p_schema text, p_rel text,
+                     p_use_llm boolean DEFAULT true)
+  → TABLE(draft, drafted_by, note)   -- clover_llm mapping; name-match fallback
 ```
 
 Tables: `rvbbit.kit_targets` (shipped expectations — travel in exports),

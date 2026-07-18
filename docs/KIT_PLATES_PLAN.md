@@ -683,3 +683,14 @@ columns ships a contract like "v_field_notes.noted_at must not be all
 NULL". Next in this arc: clover_llm-assisted drafting for non-obvious
 column matches, and metric_defs/cube_defs bound to canonical views
 filling their reserved manifest sections.
+
+**LLM drafting (0172):** `fitting_draft(kit, target, schema, rel)` is now
+the one drafting entry point — clover_llm maps the source onto the spec
+(the created_at → noted_at rename came back correct with zero human
+edits), with the deterministic name-match draft as the built-in fallback
+whenever Clover is unavailable or replies with anything that isn't a
+plain SELECT. The reply is fence-stripped and shape-checked; the human
+still reviews and fitting_check remains the judge. The Fitting Room shows
+a "drafted by clover_llm / name-match" badge so you always know which
+hand drew the map. A few truncated sample values ride in the prompt —
+same trust boundary as every clover_* operator.
