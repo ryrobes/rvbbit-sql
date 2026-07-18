@@ -385,3 +385,49 @@ Field notes: `''::date` fails at Postgres PARSE time even in a dead branch
 (constants fold early) — write `nullif({{ params.x }}, '')::date`. And a
 click on a `<select>` must not run the click-emit path (it would swallow
 the dropdown) — form controls are excluded there; change owns them.
+
+## 14. Navigation, tabs, pagination, live search (2026-07-18)
+
+The second batch of primitives, still zero new nouns:
+
+- **`rv-open="plate:<id>"`** (+ optional `rv-open-title`) — the desktop
+  verb: open another plate. Switchboard → module, drill-through, "see the
+  full finder". `plate:` is the only scheme v1.
+- **Tabs** — a `tab` param whose sections are `rv-if`s. This needed the one
+  vocabulary extension of the batch: `rv-if="query.column"` is now legal
+  OUTSIDE rv-each, evaluated against the query's first row (still no
+  expressions — the SQL computes `show_browse` because it received the
+  param). `.plate-tabs` styles the strip; active is a `sel` column.
+- **Pagination** — a number-typed `page` param; prev/next/pageno/has_prev
+  are COLUMNS of a pager query (`greatest(page-1,0) AS prev` — the math
+  lives in SQL), emitted back via `rv-value="{{ row.next }}"`. Declared
+  param types now coerce (`"type": "number"`), so `OFFSET {{ params.page }}
+  * 12` is sound. `.plate-pager` styles the strip.
+- **Radio groups** — `rv-emit` radios; the server checks the one whose
+  value matches the param.
+- **Live search** — `rv-live` on a search input emits while typing
+  (debounced 400ms). The renderer preserves the focused control's value,
+  focus, and caret across the refetch swap, so typing is continuous.
+- **`rv-confirm`** on emit buttons — window.confirm before firing.
+
+Engineering notes that will matter later:
+- **Islands moved from relocation to PORTALS.** React unmounts a node via
+  its tracked parent; when tabs removed an island that relocation had
+  moved into a plate-body host, removeChild threw and took down the tree.
+  With the HTML imperatively owned, portals are safe again (the original
+  portal failure was React rewriting innerHTML behind them — impossible
+  now). Pattern: apply innerHTML → collect hosts → setState → portals
+  render into hosts on the follow-up pass.
+- **sanitize-html drops empty attribute values** (`value=""` vanishes; a
+  value-less radio then reports "on" through cheerio's DOM emulation).
+  Empty values are real vocabulary ("All" options clear a param), so they
+  ride through both sanitize passes as a `__rv_blank__` marker restored at
+  the end. Bare `rv-live` is normalized to `rv-live="live"` pre-sanitize.
+- **Toggle is a click gesture.** Click-again-to-unselect applies to chips
+  and chart marks only; change-driven controls just SET. (A refetch swaps
+  the DOM under a focused input; the detached node fires a stray change on
+  blur which would re-emit the same value and toggle the filter straight
+  back off. Detached nodes are also ignored outright.)
+
+`demo/casebook` exercises the whole batch: tabs, SQL pagination, radio
+class filter, live title search, and rv-open into demo/report-finder.
