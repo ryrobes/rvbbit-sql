@@ -992,3 +992,13 @@ band, two-line invoice cells, verdict pills, aligned money column —
 with queries/actions byte-identical, zero scrubbed tokens, and full
 retheme-fidelity through Ryan's second wallpaper swap of the day.
 Styling is now prompt-deep; no machinery was touched.
+
+§29 addendum 2 — reports dashboard pass: given design latitude PLUS
+query latitude ("adjust queries where it serves presentation"), the
+assistant produced owner-dashboard analytics unprompted: MoM revenue
+delta w/ arrow + tone (6-CTE metrics query), share-of-total on aging/
+customers/stages, a per-stage breakdown grid under the pipeline chart,
+'Mon YY' month labels (fixing the ISO-axis nit banked in §29 — the
+chart island's sort:null already honored SQL order), area mark for
+the trend. Read-only preserved. Styling AND presentation analytics
+are now prompt-deep.
