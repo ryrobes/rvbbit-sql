@@ -657,6 +657,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0159_system_plates",
         include_str!("../sql/migrations/0159_system_plates.sql"),
     ),
+    (
+        "0160_assistant_plates",
+        include_str!("../sql/migrations/0160_assistant_plates.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
