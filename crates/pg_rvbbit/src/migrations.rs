@@ -693,6 +693,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0168_kit_lifecycle",
         include_str!("../sql/migrations/0168_kit_lifecycle.sql"),
     ),
+    (
+        "0169_kit_roles",
+        include_str!("../sql/migrations/0169_kit_roles.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -601,3 +601,33 @@ preflight evaluated UPFRONT (via requires, the functional truth of
 up a kit standing on a capability that isn't there; the mental model
 holds: install the capability → its kit asks for setup → setup does the
 kit's install work.
+
+## 20. Opt-in role gating (2026-07-18)
+
+Settled posture (Ryan): the less there is to DO, the better — but the
+guardrails exist. Default: roles don't exist for you. Plates render for
+everyone, actions run for everyone, and the connection user's GRANTs are
+the real allow/deny (DBA territory). Kit objects are owned by whoever ran
+setup; on shared-connection shops that's the whole story.
+
+Three orthogonal OPT-IN layers (0169 + lens):
+1. **Surface** — `set_plate_role(plate_id, role)`: shelf shows 🔒 with the
+   role name (and the grant_kit hint in the tooltip), render and action
+   APIs refuse with a human sentence. Checked before the contract gate —
+   person-gate, then data-gate. Travels with the kit (export v5).
+2. **Action** — `requires_role` in the action def (0168-era): form swaps
+   to a note, API refuses.
+3. **Grants** — `grant_kit(kit, role, read|write)`: the choreography as
+   one call — CREATE ROLE if absent, USAGE on the kit's schemas (parsed
+   from setup_sql, same honest regex as remove_kit), SELECT for read,
+   +INSERT/UPDATE/DELETE + sequence usage for write (identity columns).
+   Existing objects only; rerun after kit upgrades.
+
+All affordance layers sit ON TOP of the GRANT wall, never instead of it.
+Unknown role = not allowed, everywhere.
+
+War story for the file: a literal NUL byte had ridden into plates.ts via
+an earlier bash heredoc (inside a template literal, where a space
+belonged) — TypeScript compiled it without a murmur; an anchored-replace
+assert was what finally caught it. Heredoc-written source deserves a
+NUL-byte sweep.
