@@ -709,6 +709,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0172_fitting_llm_draft",
         include_str!("../sql/migrations/0172_fitting_llm_draft.sql"),
     ),
+    (
+        "0173_fitting_value_contracts",
+        include_str!("../sql/migrations/0173_fitting_value_contracts.sql"),
+    ),
+    (
+        "0174_assistant_register_kit",
+        include_str!("../sql/migrations/0174_assistant_register_kit.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

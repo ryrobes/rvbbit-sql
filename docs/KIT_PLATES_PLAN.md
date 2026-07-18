@@ -694,3 +694,15 @@ still reviews and fitting_check remains the judge. The Fitting Room shows
 a "drafted by clover_llm / name-match" badge so you always know which
 hand drew the map. A few truncated sample values ride in the prompt —
 same trust boundary as every clover_* operator.
+
+**Crime-kit experiment fixes (0173/0174):** finding #2 → target columns
+may declare `"values": [...]` (a closed vocabulary); fitting_check
+samples 1000 rows and FAILS out-of-vocabulary emissions (the old NYC
+mapping's raw law_cat_cd now fails with "9, F, I, M, V — derive with a
+CASE"); fitting_draft teaches clover to DERIVE values-constrained
+columns — the redraft produced a classifier-style CASE over
+ofns_desc/pd_desc → 'violent', and the overview's violent count went
+0 → 27,469. Finding #1 → the assistant gained the register_kit command
+(metadata only; contracts/targets/setup stay operator work; downgrade
+refusals surface in apply_report) — maiden flight registered Crime
+Analytics v0.2.0 in the same turn that fixed the metric.

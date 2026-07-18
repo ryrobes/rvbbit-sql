@@ -326,7 +326,10 @@ lens app; switchboards link out via `rv-open="app:fitting?kit=…"`).
 ```sql
 rvbbit.upsert_kit_target(p_kit text, p_target text, p_description text,
                          p_columns jsonb) → void
--- target = schema-qualified view name; columns = [{name, type, description, required}]
+-- target = schema-qualified view name
+-- columns = [{name, type, description, required, values?}] — `values` declares
+-- a CLOSED vocabulary: fitting_check samples the mapping and fails
+-- out-of-vocabulary emissions; fitting_draft derives such columns via CASE
 rvbbit.fitting_candidates(p_kit text, p_target text, p_k integer DEFAULT 8)
   → TABLE(schema_name, rel_name, score, matched_on)   -- catalog-KG ranked
 rvbbit.fitting_check(p_kit text, p_target text, p_select_sql text)
