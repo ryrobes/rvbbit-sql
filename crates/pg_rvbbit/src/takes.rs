@@ -7,6 +7,15 @@
 //!   vote        — majority of the (trimmed) outputs; no extra model call.
 //!   first_valid — the first attempt that passed the filter.
 //!   evaluator   — an LLM judge picks the best, given an instructions prompt.
+//!   consensus   — for JSON-ARRAY outputs (triples, entity lists): keep the
+//!                 items that appear in >= min_agree independent takes,
+//!                 matched on `consensus_keys` (case/space-insensitive).
+//!                 Whole-output voting never converges on generative JSON;
+//!                 per-item voting is what actually kills hallucinations —
+//!                 a fabricated fact rarely repeats across decorrelated
+//!                 samples, a real one nearly always does. Pair with a
+//!                 nonzero `temperature` in the plan or the takes are
+//!                 identical and the ensemble is theater.
 //!
 //! The N attempts run in parallel on the backend-local thread pool. Takes
 //! orchestration is LEADER ONLY (the pool, filter validators, the evaluator
@@ -42,6 +51,7 @@ enum Reduce {
     Vote,
     FirstValid,
     Evaluator,
+    Consensus,
 }
 
 struct TakesPlan {
@@ -57,6 +67,15 @@ struct TakesPlan {
     filter: Option<ValidatorRef>,
     evaluator_model: Option<String>,
     evaluator_instructions: Option<String>,
+    /// consensus: how many takes an item must appear in to survive.
+    /// Default = a strict majority of the parseable takes.
+    min_agree: Option<usize>,
+    /// consensus: object fields forming an item's identity (e.g.
+    /// ["subject","predicate","object"]). Empty = the whole item.
+    consensus_keys: Vec<String>,
+    /// Per-take temperature override (rides the opts override the same way
+    /// a model-pool entry does). Consensus wants this nonzero.
+    temperature: Option<f64>,
 }
 
 fn parse_takes(v: &Value) -> Option<TakesPlan> {
@@ -83,6 +102,7 @@ fn parse_takes(v: &Value) -> Option<TakesPlan> {
     let reduce = match o.get("reduce").and_then(|x| x.as_str()).unwrap_or("vote") {
         "evaluator" => Reduce::Evaluator,
         "first_valid" => Reduce::FirstValid,
+        "consensus" => Reduce::Consensus,
         _ => Reduce::Vote,
     };
     let filter = o.get("filter").and_then(ValidatorRef::parse);
@@ -98,6 +118,20 @@ fn parse_takes(v: &Value) -> Option<TakesPlan> {
             ),
             None => (None, None),
         };
+    let min_agree = o
+        .get("min_agree")
+        .and_then(|x| x.as_u64())
+        .map(|n| (n as usize).max(1));
+    let consensus_keys = o
+        .get("consensus_keys")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let temperature = o.get("temperature").and_then(|x| x.as_f64());
     Some(TakesPlan {
         factor,
         models,
@@ -106,6 +140,9 @@ fn parse_takes(v: &Value) -> Option<TakesPlan> {
         filter,
         evaluator_model,
         evaluator_instructions,
+        min_agree,
+        consensus_keys,
+        temperature,
     })
 }
 
@@ -125,11 +162,14 @@ fn execute_takes(op: &OpDef, inputs: &Value, opts: &Value, feedback: Option<&str
         None => {
             // factor 1 with no model pool is just a plain attempt.
             if plan.factor <= 1 && plan.models.len() <= 1 {
-                let opts1 = with_model(opts, plan.models.first());
+                let opts1 = with_take_overrides(opts, plan.models.first(), plan.temperature);
                 return unit_of_work::execute_with_feedback(op, inputs, &opts1, feedback);
             }
             (0..plan.factor)
-                .map(|i| TakeKind::Body(take_model(&plan, i)))
+                .map(|i| TakeKind::Body {
+                    model: take_model(&plan, i),
+                    temperature: plan.temperature,
+                })
                 .collect()
         }
     };
@@ -170,14 +210,32 @@ fn execute_takes(op: &OpDef, inputs: &Value, opts: &Value, feedback: Option<&str
         }
     }
 
-    // Reduce N -> 1.
+    // Reduce N -> 1. Consensus is the odd one out: it synthesizes a NEW
+    // output (the per-item merge) rather than choosing a take, so it
+    // overrides the assembled output afterwards.
+    let consensus_output = match plan.reduce {
+        Reduce::Consensus => consensus_merge(&takes, &alive, &plan),
+        _ => None,
+    };
     let (chosen, eval_sub) = match plan.reduce {
         Reduce::FirstValid => (alive[0], None),
         Reduce::Vote => (vote(&takes, &alive), None),
+        // No parseable JSON-array take → fall back to plain voting.
+        Reduce::Consensus => (
+            if consensus_output.is_some() {
+                alive[0]
+            } else {
+                vote(&takes, &alive)
+            },
+            None,
+        ),
         Reduce::Evaluator => evaluator_pick(op, inputs, &takes, &alive, &plan),
     };
 
     let mut result = assemble(takes, chosen);
+    if let Some(merged) = consensus_output {
+        result.output = merged;
+    }
     if let Some(sc) = eval_sub {
         result.total_tokens_in += sc.tokens_in;
         result.total_tokens_out += sc.tokens_out;
@@ -187,10 +245,13 @@ fn execute_takes(op: &OpDef, inputs: &Value, opts: &Value, feedback: Option<&str
     result
 }
 
-/// One take's work: re-run the operator body with a model override
-/// (homogeneous), or run a single explicit node (heterogeneous).
+/// One take's work: re-run the operator body with model/temperature
+/// overrides (homogeneous), or run a single explicit node (heterogeneous).
 enum TakeKind {
-    Body(Option<String>),
+    Body {
+        model: Option<String>,
+        temperature: Option<f64>,
+    },
     Node(Value),
 }
 
@@ -252,8 +313,8 @@ fn run_one_take(
     job: &TakeKind,
 ) -> WorkResult {
     match job {
-        TakeKind::Body(model) => {
-            let o = with_model(opts, model.as_ref());
+        TakeKind::Body { model, temperature } => {
+            let o = with_take_overrides(opts, model.as_ref(), *temperature);
             unit_of_work::execute_with_feedback(op, inputs, &o, feedback)
         }
         TakeKind::Node(node) => {
@@ -272,17 +333,121 @@ fn take_model(plan: &TakesPlan, i: usize) -> Option<String> {
     }
 }
 
-/// Clone `opts` and set/override `model` when one is given.
-fn with_model(opts: &Value, model: Option<&String>) -> Value {
-    let mut o = opts.clone();
-    if let Some(m) = model {
-        if let Value::Object(map) = &mut o {
+/// Clone `opts` and set/override the per-take `model` / `temperature` —
+/// both ride the same opts-beats-operator override the executor honors.
+fn with_take_overrides(opts: &Value, model: Option<&String>, temperature: Option<f64>) -> Value {
+    let mut o = if opts.is_object() {
+        opts.clone()
+    } else {
+        serde_json::json!({})
+    };
+    if let Value::Object(map) = &mut o {
+        if let Some(m) = model {
             map.insert("model".to_string(), Value::String(m.clone()));
-        } else {
-            o = serde_json::json!({ "model": m });
+        }
+        if let Some(t) = temperature {
+            if let Some(num) = serde_json::Number::from_f64(t) {
+                map.insert("temperature".to_string(), Value::Number(num));
+            }
         }
     }
     o
+}
+
+/// Per-item consensus over JSON-array takes. An item's identity is the
+/// case/whitespace-insensitive join of `consensus_keys` (or the whole item
+/// when none are given); an item survives when it appears in >= min_agree
+/// DISTINCT takes (default: strict majority of the parseable takes).
+/// Survivors keep their first-seen full object, in first-seen order, with
+/// numeric `confidence` averaged across the agreeing takes. Returns None
+/// when no take parses as a JSON array (caller falls back to voting).
+fn consensus_merge(takes: &[WorkResult], alive: &[usize], plan: &TakesPlan) -> Option<String> {
+    fn item_key(item: &Value, keys: &[String]) -> String {
+        fn norm(v: &Value) -> String {
+            let s = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            s.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        }
+        if keys.is_empty() || !item.is_object() {
+            return norm(item);
+        }
+        keys.iter()
+            .map(|k| item.get(k).map(norm).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\u{1f}")
+    }
+
+    let parsed: Vec<Vec<Value>> = alive
+        .iter()
+        .filter_map(|&i| {
+            serde_json::from_str::<Value>(takes[i].output.trim())
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+        })
+        .collect();
+    if parsed.is_empty() {
+        return None;
+    }
+    let min_agree = plan
+        .min_agree
+        .unwrap_or(parsed.len() / 2 + 1)
+        .clamp(1, parsed.len());
+
+    struct Tally {
+        count: usize,
+        first: Value,
+        first_order: usize,
+        confidences: Vec<f64>,
+    }
+    let mut tallies: HashMap<String, Tally> = HashMap::new();
+    let mut order = 0usize;
+    for take_items in &parsed {
+        let mut seen_this_take: std::collections::HashSet<String> = Default::default();
+        for item in take_items {
+            let key = item_key(item, &plan.consensus_keys);
+            if key.is_empty() {
+                continue;
+            }
+            let conf = item.get("confidence").and_then(|c| c.as_f64());
+            let entry = tallies.entry(key.clone()).or_insert_with(|| {
+                order += 1;
+                Tally { count: 0, first: item.clone(), first_order: order, confidences: Vec::new() }
+            });
+            // A duplicate within ONE take is not extra agreement.
+            if seen_this_take.insert(key) {
+                entry.count += 1;
+                if let Some(c) = conf {
+                    entry.confidences.push(c);
+                }
+            }
+        }
+    }
+
+    let mut survivors: Vec<&Tally> = tallies.values().filter(|t| t.count >= min_agree).collect();
+    survivors.sort_by_key(|t| t.first_order);
+    let merged: Vec<Value> = survivors
+        .into_iter()
+        .map(|t| {
+            let mut item = t.first.clone();
+            if !t.confidences.is_empty() {
+                if let (Value::Object(map), Some(num)) = (
+                    &mut item,
+                    serde_json::Number::from_f64(
+                        t.confidences.iter().sum::<f64>() / t.confidences.len() as f64,
+                    ),
+                ) {
+                    map.insert("confidence".to_string(), Value::Number(num));
+                }
+            }
+            item
+        })
+        .collect();
+    Some(Value::Array(merged).to_string())
 }
 
 /// Majority vote over the trimmed output strings. Ties break toward the
