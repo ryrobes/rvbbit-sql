@@ -591,3 +591,13 @@ enforcement — this is the affordance layer from the settled design.
 
 Follow-up parked: teach the assistant requires_role + validate_kit via a
 prompt-patch migration when the next batch of assistant lessons lands.
+
+**Language settled (2026-07-18, Ryan's reframe):** capabilities get
+INSTALLED; kits get SET UP. The shelf section reads "shipped kits — run
+setup to activate", the button says Set up, and a kit whose capability
+isn't installed shows an amber "needs <requirement>" chip instead — the
+preflight evaluated UPFRONT (via requires, the functional truth of
+"capability installed") rather than as a click-time error. You cannot set
+up a kit standing on a capability that isn't there; the mental model
+holds: install the capability → its kit asks for setup → setup does the
+kit's install work.
