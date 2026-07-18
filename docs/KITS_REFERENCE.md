@@ -205,6 +205,7 @@ computed is a column.
 |---|---|---|
 | Interpolate | `{{ row.col }}`, `{{ params.x }}` | Escaped. `row.*` only inside `rv-each`. |
 | Loop | `rv-each="query"` | Element repeats per row (cap 500). Islands may NOT sit inside. |
+| Group loop | `rv-group="query:column"` | Wrapper repeats once per distinct column value (SQL ORDER BY = layout order). `{{ group.key }}` / `{{ group.count }}` interpolate; inside, `rv-each="group"` iterates that group's rows. May not nest; composes with `plate-columns`/`plate-cal` — boards get columns from ROWS. |
 | Show/hide (row) | `rv-if="row.flag"`, `rv-if="!row.flag"` | Single-field truthiness, inside `rv-each`. |
 | Show/hide (top) | `rv-if="query.column"` | First-row truthiness of another query — how TABS work (tab param + query computing `show_*` booleans). |
 | Grid island | `<rv-grid query="q"></rv-grid>` | Hydrates the real lens ResultGrid. |
@@ -224,10 +225,22 @@ computed is a column.
 `CASE WHEN v = {{ params.v }} THEN 'active' ELSE '' END AS sel` →
 `class="{{ row.sel }}"`. Pagination — prev/next/pageno/has_next are
 COLUMNS of a pager query; emit back via `rv-value="{{ row.next }}"`.
-Grouped feed — per-entity sections come from ONE query, never from
-hardcoded entity names: `ORDER BY entity, starts_at` + a
-`row_number() OVER (PARTITION BY entity …) = 1` header flag, then
-`<h3 rv-if="row.first_of_group">{{ row.entity }}</h3>` inside `rv-each`.
+Per-entity sections come from ONE query, never from hardcoded entity
+names: `rv-group` (above) is the primitive; the grouped feed
+(`row_number() OVER (PARTITION BY entity …) = 1` header flag + an
+`rv-if` header inside `rv-each`) remains the inline alternative.
+Placement-as-data — layout classes are COLUMNS, exactly like tones:
+`plate-cal` is a 7-column calendar grid (children take `c1..c7` day
+cells, `r1..r8` month rows; `plate-cal-head` pins to the top row;
+`plate-cal-chip` = compact card); `plate-bar` + inner
+`<div class="w45 ok">` is a capacity/progress bar (`w0..w100` in 5%
+steps — SQL rounds the pct; tones color the fill). `plate-avatar`
+(SQL-computed initials), `plate-dot` + tones, `plate-empty` (pair with
+an `rv-if` flag), `hue-1..hue-8` category accents. Unknown classes
+style as nothing — the palette is the dialect for looks.
+PG gotcha: `LEAST/GREATEST` IGNORE NULLs — a NULL percentage slips
+through `least(100, …)` as 100; make closed/empty states explicit CASE
+branches.
 Action arg casts — always `nullif({{arg}},'')::date` (validate_kit
 EXPLAINs actions with empty-string dummies; a bare `''::date` fails at
 parse).

@@ -774,3 +774,38 @@ only if none exists — a customer's accepted fitting is never clobbered
 by setup re-runs. fitting_violations requires a RECORDED fitting, so
 the guarded insert is what turns the switchboard green on day one.
 Candidate engine nicety: rvbbit.self_fit(kit, target, select_sql).
+
+## 24. Tier-1 layout palette + rv-group (2026-07-18)
+
+Ryan's question — "is plate plainness a CSS limit or a dialect limit?"
+— resolved: neither; the PALETTE is the dialect for looks, and it was
+deliberately tiny. The sanitizer wall (no style attrs, no URLs) stays;
+looks grow by growing the versioned class palette, and since `class`
+is already data-driven, the tones-as-data idiom generalizes to
+PLACEMENT-AS-DATA: SQL computes layout classes.
+
+Shipped (lens): plate-cal 7-col grid + c1..c7/r1..r8 cells (dense flow
+stacks chips under their day), plate-cal-head/-chip, plate-bar +
+w0..w100 (5% steps) + toned fills, hue-1..8 category accents,
+plate-avatar, plate-dot, plate-empty. Renderer: rv-group="query:column"
+— partitions one query's rows by first-appearance order, clones the
+wrapper per group ({{ group.key }}/{{ group.count }}; rv-each="group"
+inside; no nesting; islands forbidden) via synthetic per-group results
+feeding the existing rv-each pass.
+
+Proof: week rebuilt as a real calendar — TWO queries replace fourteen
+(day columns as cell classes, capacity bars per day incl. explicit
+closed state); today rebuilt on rv-group + plate-columns — crew columns
+from ROWS (hire/deactivate = zero re-authoring), idle techs get
+plate-empty. Both live on bench, validate_kit green. 0177 teaches the
+assistant rv-group + the palette and upgrades 0176's "not expressible
+yet" caveat.
+
+GOTCHA (SQL): PG LEAST/GREATEST ignore NULLs — least(100, NULL) = 100.
+The closed-Sunday bar rendered full-red by accident; make closed/empty
+states explicit CASE branches.
+
+Ladder status: Tier 1 (palette) ✓, Tier 2 (rv-group) ✓; Tier 3 =
+interaction islands (<rv-board> drag-between-columns → named action,
+<rv-schedule> drag-to-reschedule, <rv-map>) — build when a kit needs
+the INTERACTION, not the look.
