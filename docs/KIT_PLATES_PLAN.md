@@ -488,3 +488,34 @@ plates generate the BINDING (mapping views over the customer's real
 tables), not the definitions. Shipping stays deterministic; the moment
 the mapping contract goes green, every shipped metric lights up at once.
 Those definitions will ride the reserved manifest sections.
+
+## 17. The switchboard logic tier lands (2026-07-18)
+
+**Tier 2 — `rvbbit.kit_rules` decision tables (0164).** A rule set is a
+priority-ordered decision table: each rule is one boolean SQL EXPRESSION
+over a jsonb `subject` (semicolons rejected — expressions, not statements)
+plus the verdict it decides. `rule_verdict(kit, set, subject)` is
+first-match-wins; the winning `rule_id` rides with the verdict (provenance
+— surface it in a title attribute), and a BROKEN rule wins loudly with
+`{"rule_error": true}` instead of silently falling through. Consumption is
+set-based: `CROSS JOIN LATERAL rvbbit.rule_verdict('kit','set',
+to_jsonb(row))`. Dogfood: field-kit's `triage` table (urgent / sighting /
+sparse / routine) renders as tone chips on the switchboard's notes table
+via the new `plate-chip` class.
+
+**Tier 3 — kit-scoped operators (0165).** `operators.kit` +
+`operators.visibility` ('public' | 'kit'); `set_operator_kit()` hides a
+kit's helper operators from DISCOVERY — capability_crawl excludes them
+(anchored patch of the LIVE crawl definition: the prompt-patch pattern
+applied to a function), their search docs are deleted on hide, and the
+lens pickers filter them with a `to_jsonb(o)->>'visibility'` predicate
+that stays parseable on pre-0165 databases. Scoping is hygiene, not an
+execution wall: the operator still runs anywhere — plate ACTIONS call
+operators/flows by name (that was always true; it's the tie-in).
+
+**Both travel.** export_kit v2 fills two more reserved sections: rules as
+upsert_kit_rule calls, kit operators as DELETE + jsonb_populate_record
+INSERTs (column-drift tolerant both directions). Round-trip proven again:
+4 triage rules + a private operator installed on a fresh 4.0.12 box and
+"URGENT: injured hiker" hit the priority-10 rule first try. 0166 teaches
+the assistant the whole tier (columns → rules → operators, cost-projected).

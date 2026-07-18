@@ -673,6 +673,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0163_system_kit_grouping",
         include_str!("../sql/migrations/0163_system_kit_grouping.sql"),
     ),
+    (
+        "0164_kit_rules",
+        include_str!("../sql/migrations/0164_kit_rules.sql"),
+    ),
+    (
+        "0165_operator_kit_scope",
+        include_str!("../sql/migrations/0165_operator_kit_scope.sql"),
+    ),
+    (
+        "0166_assistant_kit_logic",
+        include_str!("../sql/migrations/0166_assistant_kit_logic.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
