@@ -456,3 +456,35 @@ instead of an empty desk. The TS System Health window's retirement is
 unblocked but not executed.
 
 All of the above rides release 4.0.12 (migrations 0157–0160).
+
+## 16. Kit packaging — kits are artifacts (2026-07-18)
+
+`rvbbit.kits` (0162) gives kits identity beyond a tag: version, title,
+description, and `setup_sql` — the idempotent DDL prologue (schemas,
+kit-owned tables/views, roles) that the author owns. Three verbs:
+
+- **`export_kit(kit)`** renders everything the kit owns as ONE ordered,
+  idempotent SQL script: upsert_kit (metadata + setup travel together) →
+  setup DDL → upsert_plate per plate (collision-proof dollar-quoting) →
+  module assignments → upsert_kit_contract per contract → RESERVED
+  sections (operators / rules / metric_defs / cube_defs) so the format
+  never needs a v2 when the switchboard logic tier lands.
+- **`publish_kit(kit)`** wraps that script in a kind='kit'
+  capability_catalog entry (manifest.install_sql, api rvbbit.capability/v1)
+  — kits ride the exact channels Clover does: capability_search finds
+  them, catalog.json import carries them, and the script doubles as a
+  downloadable `<kit>-install.sql`.
+- **Install** is running the script in one transaction — validate with
+  ROLLBACK first (house policy since FUNCTIONrvbbit).
+
+Round-trip proven: field-kit exported from bench, installed on a fresh
+4.0.12 container (+0162), arrived complete — plates with module
+assignments, contract gating RED on the empty box with its own violation
+text, GREEN after three notes. The kit lifecycle travels as SQL.
+
+Cubes/metrics doctrine (settled with Ryan): kits ship metric/cube
+DEFINITIONS bound to canonical kit-owned VIEW names; the onboarding
+plates generate the BINDING (mapping views over the customer's real
+tables), not the definitions. Shipping stays deterministic; the moment
+the mapping contract goes green, every shipped metric lights up at once.
+Those definitions will ride the reserved manifest sections.
