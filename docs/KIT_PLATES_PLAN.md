@@ -249,3 +249,40 @@ backspace — use `\y`), and React portals targeting nodes inside a
 `dangerouslySetInnerHTML` subtree silently dropped children — islands are
 React-owned nodes physically relocated into their hosts in a layout effect
 instead (robust: React keeps updating the node wherever it lives).
+
+## 11. Contracts + dogfood as built (2026-07-18)
+
+Migration `0158_kit_contracts`: `plates.module` column,
+`rvbbit.kit_contracts` (kit, module, contract_id, violations_sql —
+SELECT-shaped, empty result = green), and `kit_contract_status(kit)` which
+EXECUTEs each contract and **fails closed** (a contract that errors counts
+as one violation carrying the error text). Enforcement is two-layer: the
+shelf greys gated plates with a `gated · N` badge (courtesy), and
+`renderPlate` re-checks the gate and refuses with the contract's own
+violation sample (the wall). The refusal names the switchboard as the way
+out — the switchboard itself has no module, so it always renders.
+
+Verified end-to-end with `field-kit`: contract `has_enough_notes`
+(< 3 notes = violation) gated `field-kit/insights` red → three notes logged
+through the switchboard's own intake form → status flipped green → the wall
+opened and the insights islands rendered. The gate text a user sees is the
+contract's own row: "only 0 field note(s) logged — need at least 3".
+
+Dogfood #2 — **full System Health parity as `system/health` plate rows**:
+the seven status cards (metadata weight w/ db-size ratio, tombstones,
+generations, catalog snapshots, orphaned files, vacuum, maintenance crons),
+tombstone top-10 with per-row `Rebuild SQL`, and all six remedies as
+SQL-built-by-SQL (`string_agg` over the same top-N the TS window computed)
+opened built-not-run. The TS System Health window can eventually retire in
+favor of this row — it ships to clients as data.
+
+Renderer hardening that fell out of it: **(a)** each plate query now runs in
+its own try/catch — a failing query degrades to an inline `plate-error`
+where it's consumed instead of killing the surface; **(b)** a query def may
+carry `"database": "..."` to run against a sibling db on the same server.
+Both were forced by pg_cron: `cron.job` exists only in cron's home db
+(`postgres` here), and a plain reference fails at parse time on any other
+db — no `to_regclass()` guard can save a query that names a missing
+relation. The cron card + jobs list route to the home db; the install-jobs
+remedy branches on `cron.database_name` and emits `schedule_in_database`
+targeting the current db when it isn't the home.
