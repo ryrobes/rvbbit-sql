@@ -83,6 +83,8 @@ ENV RVBBIT_CAPABILITY_PACKS_DIR=/usr/share/rvbbit/capabilities/packs
 # + pgvector/PostGIS for semantic/vector and geographic workloads.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libzstd1 \
+        ca-certificates \
+        curl \
         postgresql-18-cron \
         postgresql-18-postgis-3 \
         postgresql-18-postgis-3-scripts \
