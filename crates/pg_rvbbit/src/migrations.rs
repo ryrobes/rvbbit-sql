@@ -689,6 +689,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0167_rule_observability",
         include_str!("../sql/migrations/0167_rule_observability.sql"),
     ),
+    (
+        "0168_kit_lifecycle",
+        include_str!("../sql/migrations/0168_kit_lifecycle.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

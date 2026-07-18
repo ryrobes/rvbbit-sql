@@ -548,3 +548,46 @@ rule-set registrations so the live plane arrives with the kit.
 plpgsql scar for the record: an `ON CONFLICT (…, rule_id)` target inside
 a function whose OUT param is also named rule_id is ambiguous —
 `#variable_conflict use_column` resolves it without renaming the API.
+
+## 19. Kit lifecycle hardening (2026-07-18)
+
+Four holes closed in one pass (0168 + lens):
+
+- **Preflight.** Kits declare `requires` ({min_migration, extensions,
+  operators}); exported scripts open with `kit_preflight_assert()` which
+  fails with a human sentence before touching anything. Live proof: the
+  first install attempt on bench failed CORRECTLY — the box couldn't prove
+  it had 0167 because hand-applied psql migrations bypass the
+  schema_migrations ledger (now recorded; the dev-loop lesson: psql -f
+  applies must be ledgered or preflight will rightly refuse). Floor:
+  preflight protects targets ≥ 0168; older boxes still die on the first
+  missing function.
+- **Version regression guard.** upsert_kit refuses to downgrade
+  (numeric-aware compare; non-numeric versions exempt). The old 5-arg
+  signature is DROPPED, not overloaded — the psycopg ambiguity trap.
+- **Uninstall.** remove_kit() strips every kit-owned ROW (plates,
+  contracts, rules, rule sets, stats, log, operators, registry) with an
+  itemized report, and REPORTS data objects named by setup_sql as "left
+  in place" — never drops them. The catalog entry survives: uninstalling
+  returns the kit to "available" (the store listing outlives the install).
+- **Self-test.** validate_kit() dry-runs every plate query with defaults
+  bound, EXPLAINs every action with dummy args (parses + plans, never
+  executes), evaluates every rule against an empty subject, probes rule-set
+  subjects, and checks contract evaluability — the FUNCTIONrvbbit lesson
+  as a function. Exported scripts close with the self-test hint.
+
+**The store loop is closed.** The Plates shelf lists catalog kits not
+currently installed ("available to install") with one-click Install:
+preflight → validate in an explicit BEGIN/ROLLBACK pass → install (one
+multi-statement call = one implicit transaction, all-or-nothing) →
+validate_kit self-test → shelf regroups. Verified end-to-end on bench:
+publish → remove_kit → Install → "installed field-kit — self-test clean".
+
+**requires_role affordances (§ action auth, now built).** An action may
+declare requires_role; renderPlate replaces its form with a quiet note
+when pg_has_role() says no (unknown role = not allowed), and
+runPlateAction refuses server-side. The GRANT wall remains the real
+enforcement — this is the affordance layer from the settled design.
+
+Follow-up parked: teach the assistant requires_role + validate_kit via a
+prompt-patch migration when the next batch of assistant lessons lands.
