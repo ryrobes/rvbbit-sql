@@ -309,8 +309,11 @@ all just rows — customize or fork them like any plate.
 
 The Desktop Assistant speaks `upsert_plate` / `open_plate` commands and
 knows the vocabulary, idioms, kit-reactivity rule, and the logic tier
-(prompt migrations 0160/0161/0166 — anchored patches with fail-loud
-drift detection). Iteration loop: a rejected install returns the
+(prompt migrations 0160/0161/0166/0170 — anchored patches with fail-loud
+drift detection). **Plates are an explicit pathway**: generic "build me
+an X" defaults to blocks/app artifacts; the assistant installs a plate
+only when the user says plate/kit (it may offer the route in one
+sentence when a request smells durable, never install uninvited). Iteration loop: a rejected install returns the
 tripwire's verbatim message in `apply_report`; the agent reads it and
 re-upserts the same `plate_id`. There is no visual builder; this is the
 editor.
