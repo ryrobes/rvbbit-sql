@@ -17,8 +17,8 @@ SELECT rvbbit.upsert_plate(
 </div>
 
 <div class="plate-toolbar">
-  <button type="button" rv-emit="author" rv-value="">All authors</button>
-  <button rv-each="authors" type="button" rv-emit="author" rv-value="{{ row.author }}">{{ row.author }} · {{ row.n }}</button>
+  <button rv-each="all_chip" class="{{ row.sel }}" type="button" rv-emit="author" rv-value="">All authors</button>
+  <button rv-each="authors" class="{{ row.sel }}" type="button" rv-emit="author" rv-value="{{ row.author }}">{{ row.author }} · {{ row.n }}</button>
 </div>
 
 <div class="plate-feed">
@@ -37,7 +37,12 @@ FROM demo_kit.field_notes
 WHERE (nullif({{ params.author }}, '') IS NULL OR author = {{ params.author }})
     $q$),
     'authors', jsonb_build_object('sql', $q$
-SELECT author, count(*)::int AS n FROM demo_kit.field_notes GROUP BY author ORDER BY n DESC, author LIMIT 12
+SELECT author, count(*)::int AS n,
+       CASE WHEN author = {{ params.author }} THEN 'active' ELSE '' END AS sel
+FROM demo_kit.field_notes GROUP BY author ORDER BY n DESC, author LIMIT 12
+    $q$),
+    'all_chip', jsonb_build_object('sql', $q$
+SELECT CASE WHEN nullif({{ params.author }}, '') IS NULL THEN 'active' ELSE '' END AS sel
     $q$),
     'notes', jsonb_build_object('sql', $q$
 SELECT author, note, to_char(created_at, 'HH24:MI:SS') AS at
@@ -60,7 +65,7 @@ SELECT rvbbit.upsert_plate(
 <div class="plate-split">
   <div class="plate-rail">
     <h3>States</h3>
-    <button rv-each="states" type="button" rv-emit="state" rv-value="{{ row.state }}">{{ row.state }}<small>{{ row.n }}</small></button>
+    <button rv-each="states" class="{{ row.sel }}" type="button" rv-emit="state" rv-value="{{ row.state }}">{{ row.state }}<small>{{ row.n }}</small></button>
   </div>
   <div>
     <h2>{{ params.state }}</h2>
@@ -84,7 +89,9 @@ SELECT rvbbit.upsert_plate(
 $tpl$,
   jsonb_build_object(
     'states', jsonb_build_object('sql', $q$
-SELECT state, count(*)::int AS n FROM public.bigfoot_sightings
+SELECT state, count(*)::int AS n,
+       CASE WHEN state = {{ params.state }} THEN 'active' ELSE '' END AS sel
+FROM public.bigfoot_sightings
 WHERE state IS NOT NULL GROUP BY state ORDER BY n DESC LIMIT 12
     $q$),
     'summary', jsonb_build_object('sql', $q$
@@ -100,7 +107,7 @@ WHERE state = {{ params.state }} ORDER BY bfroid DESC LIMIT 15
     $q$)
   ),
   '{}'::jsonb,
-  '[{"name": "state", "default": "Washington"}]'::jsonb,
+  '[{"name": "state", "default": "Washington", "from_bus": true}]'::jsonb,
   NULL,
   'Master-detail split: state rail (rv-emit loop-back) + kv summary + detail table — no islands, all server-rendered'
 );

@@ -307,6 +307,26 @@ itself with the new value. That one rule makes master-detail work inside a
 single plate with no new vocabulary — the render response includes resolved
 `params` so the client knows which fields loop back.
 
+**from_bus — cross-plate (and cross-window) filtering.** A param declared
+`{"name": "state", "from_bus": true}` is SUBSCRIBED to the desktop param
+bus: any window's cascading eq emit of that field re-renders the plate with
+the value. Clicking a state chip in `demo/bigfoot-dashboard` drives
+`demo/sightings-console`'s whole master-detail — two plates, no coupling
+beyond the field name. For from_bus fields the local loop-back copy is
+skipped; the bus round-trip is the single source of truth, so toggle-off
+(re-clicking the same value clears the bus entry) falls the plate back to
+its declared default, consistent with every other desktop param. The window
+re-fetches only when ITS declared bus fields change value.
+
+**Selection state is a column.** No client-side "active" tracking: the
+query compares against its own param — `CASE WHEN state = {{ params.state }}
+THEN 'active' ELSE '' END AS sel` — and the template writes it into
+`class="{{ row.sel }}"`; `.plate-rail button.active` / `.plate-toolbar
+button.active` are part of the sanctioned vocabulary. Static affordances
+get the same treatment via a one-row query (the notes-wall "All authors"
+chip). Same idiom as tones-as-data: the SQL knows what's selected because
+the SQL received the param.
+
 **Plate reactivity (the cheap kind).** After any successful plate action,
 the window broadcasts `rvbbit:plate-data-changed {plateId, kit}`. Every
 open plate in the SAME KIT re-renders (kit = the sharing scope; plates in
