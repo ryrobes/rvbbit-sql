@@ -286,3 +286,33 @@ db — no `to_regclass()` guard can save a query that names a missing
 relation. The cron card + jobs list route to the home db; the install-jobs
 remedy branches on `cron.database_name` and emits `schedule_in_database`
 targeting the current db when it isn't the home.
+
+## 12. Layout vocabulary + plate reactivity (2026-07-18)
+
+**Bespoke arrangements, sanctioned classes.** Templates still carry no
+styles (the sanitizer strips them); arrangement comes from a small layout
+vocabulary in the lens stylesheet: `plate-split` (fixed rail + fluid main),
+`plate-columns` (auto-fit equal columns), `plate-rail` (stacked nav buttons
+with `<small>` badges), `plate-kv` (dl/dt/dd definition grid),
+`plate-toolbar` (chip row), `plate-feed`/`plate-feed-item`/`plate-feed-meta`
+(timeline), `plate-banner` (`-big`/`-note` spans). Proven by two seeds in
+`docs/examples/plates/seed_layout_plates.sql`: `demo/sightings-console`
+(master-detail: state rail → kv summary + detail table, zero islands) and
+`demo/notes-wall` (banner + filter chips + feed).
+
+**Param loop-back.** `rv-emit` now serves both hands: it still publishes to
+the desktop param bus (other windows cross-filter), and if the emitted
+field is one the plate DECLARES in its own params, the window re-renders
+itself with the new value. That one rule makes master-detail work inside a
+single plate with no new vocabulary — the render response includes resolved
+`params` so the client knows which fields loop back.
+
+**Plate reactivity (the cheap kind).** After any successful plate action,
+the window broadcasts `rvbbit:plate-data-changed {plateId, kit}`. Every
+open plate in the SAME KIT re-renders (kit = the sharing scope; plates in
+one kit are presumed to watch the same tables; kit-less plates form their
+own bucket), and the shelf re-lists so contract gates flip live. Honest
+limits, on purpose: same browser only, and only plate ACTIONS trigger it —
+mutations from SQL windows or external writers don't. The upgrade path if
+that ever matters is LISTEN/NOTIFY under a server-sent stream, not polling;
+the event contract stays the same.
