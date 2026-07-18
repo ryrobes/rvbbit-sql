@@ -36,6 +36,10 @@ not in code review.
    vocabulary (the System Health look) plus the desktop's theme tokens.
    Uniformity is a feature (the Lotus lesson), and it's also the smaller
    sanitizer.
+7. **No visual builder — ever.** Authoring is agent-composed iteration
+   (Calliope + SQL) and hand-written rows. We are not building a Retool/VB
+   drag surface; the composition loop the assistant already runs IS the
+   editor. This is a doctrine, not a deferral.
 
 ## 2. Storage (engine-side, migration)
 
@@ -147,17 +151,32 @@ window, not on a construction company.
 Second dogfood: a fake "kit onboarding" checklist panel exercising actions
 (one harmless write w/ confirm) and bus params.
 
-## 8. Open questions (argue here)
+## 8. Decisions & remaining questions
+
+**SETTLED — panel state (2026-07-18):** kit-owned real tables, no generic
+k/v store. Simpler, nothing new to depend on inside a machine we don't
+control, and rule 2 stays pure. Eat the latency; revisit only if it hurts in
+practice.
+
+**SETTLED — action authorization (2026-07-18): Postgres-native, two layers.**
+The hard wall is GRANTs: actions execute server-side as the connection's own
+user, so an action touching `kit_construction.payapp_reviews` fails unless
+that user holds INSERT on it — enforcement we get for free, no new auth
+surface. On top, an action def may declare `requires_role`; the renderer
+checks `pg_has_role(current_user, role, 'member')` and hides/disables the
+affordance. Kits ship their roles (`CREATE ROLE IF NOT EXISTS
+kit_construction_approver`). This serves both real deployment shapes without
+an SSO roadmap: shops with a handful of shared logins grant roles to those
+logins; shops with SSO→Postgres mapping already resolve people to roles.
+Honest limit, documented: on a shared Data Rabbit connection the grain is the
+connection user, not the human — which matches how shared-login shops already
+think.
+
+**OPEN:**
 
 1. **Template syntax bikeshed**: `rv-*` attributes as drafted, or `<template>`
    elements? Attributes sanitize and read better; templates nest better.
 2. **Pagination/limits**: islands inherit component behavior; but raw
    `rv-each` needs a hard row cap (500?) — panels are surfaces, not exports.
-3. **Action authorization**: v1 ships actions runnable by anyone who can open
-   the panel (the connection's own grants still apply). Do kits need a
-   role gate in the action def (`requires_role`) from day one?
-4. **Where does panel state live** (e.g. checklist "dismissed" flags)? A
-   `rvbbit.panel_state` k/v per (panel, key)? Or insist state = real tables
-   the kit owns (purer, rule 2)? Leaning: kit-owned tables, no generic k/v.
-5. **Naming**: `panels` vs `surfaces` vs `forms`. `panels` drafted; "forms"
-   is the most Lotus-honest but collides with HTML forms in every sentence.
+3. **Naming**: "panel" is the safe self-describing default; candidates from
+   the elder design systems under consideration — see the naming note.
