@@ -229,3 +229,23 @@ think.
 plates: prepared surfaces pressed from data; zero modern-tooling collision;
 on-metaphor with the lens/scene-photography language). A kit's entry/onboarding
 plate is its **switchboard**.
+
+## 10. v1 as built (2026-07-18)
+
+Shipped against this contract, same day: migration `0157_plates`
+(`rvbbit.plates` + `upsert_plate` install tripwires + `plate_action_log`
+audit), lens renderer (`src/lib/server/plates.ts`: sanitize-before-expand,
+values entity-escaped, belt sanitize after; cheerio expansion; islands
+manifest), `/api/plate/{render,action,list}`, `PlateWindow`/`PlatesWindow` +
+desktop wiring, and the built-in class vocabulary. Three sample plates prove
+the styles compose: `demo/health-mini` (status cards, tones as data,
+build-not-run remedies via rv-open-sql), `demo/bigfoot-dashboard`
+(metric/chart/grid islands + rv-emit chips → the param bus),
+`demo/field-notes` (kit-owned table, validated action, confirm-gated
+destructive action, audit rows).
+
+Two implementation notes for the record: PG regex has no `\b` (it's
+backspace — use `\y`), and React portals targeting nodes inside a
+`dangerouslySetInnerHTML` subtree silently dropped children — islands are
+React-owned nodes physically relocated into their hosts in a layout effect
+instead (robust: React keeps updating the node wherever it lives).
