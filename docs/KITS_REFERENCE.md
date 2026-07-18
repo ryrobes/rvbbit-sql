@@ -211,10 +211,10 @@ computed is a column.
 | Grid island | `<rv-grid query="q"></rv-grid>` | Hydrates the real lens ResultGrid. |
 | Chart island | `<rv-chart query="q" x="col" y="col" mark="bar\|line\|area" rv-emit="col"></rv-chart>` | Vega-lite. `rv-emit` makes marks clickable (emits `datum[col]`; click again = unselect). A `sel` column ('active'/'') dims unselected marks. |
 | Metric island | `<rv-metric query="q" value="col" title="Label"></rv-metric>` | Big-number card. |
-| Board island | `<rv-board query="q" group-by="col" group-label="col" id="col" title="col" value="col" note="col" tone="col" action="name"></rv-board>` | Kanban: one column per distinct `group-by` value (SQL ORDER BY = column order); LEFT-JOIN rows with NULL id = empty-column placeholders (idle groups stay drop targets). Dropping a card on another column fires the named action with args `{id, to}` — same wall as forms; `nullif`-cast `to` when it is a date. No `action` = read-only. |
+| Board island | `<rv-board query="q" group-by="col" group-label="col" id="col" title="col" value="col" note="col" tone="col" action="name" rv-emit="field" rv-open="plate:<id>"></rv-board>` | Kanban: one column per distinct `group-by` value (SQL ORDER BY = column order); LEFT-JOIN rows with NULL id = empty-column placeholders (idle groups stay drop targets). Dropping a card on another column fires the named action with args `{id, to}` — same wall as forms; `nullif`-cast `to` when it is a date. No `action` = read-only. Double-click a card: `rv-emit` publishes its id to the bus, then `rv-open` opens the target plate — the edit-loop gesture. |
 | Emit (click) | `rv-emit="param" rv-value="…"` on `<button>` | Publishes to the desktop bus + loops back if the plate declares the param. Click-again-to-unselect. `rv-confirm="text"` gates with a confirm dialog. |
 | Emit (change) | `rv-emit` on `<select>` / `<input type="search\|text\|range\|date\|number\|checkbox\|radio">` | Emits on change; values coerced by type. Server marks `selected`/`checked` from resolved params; radios auto-group by field. |
-| Query-driven select | `<select rv-emit="x" query="opts" value="valcol" label="labelcol" placeholder="All"></select>` | Options from a query; current value selected. |
+| Query-driven select | `<select rv-emit="x" query="opts" value="valcol" label="labelcol" placeholder="All"></select>` | Options from a query; current value selected. FORM selects (`name=`, no rv-emit) may be query-driven too — selection comes from a boolean `selected` COLUMN in the options query. NEVER template a boolean attribute (`selected`/`checked`): the sanitizer turns `attr=""` into a BARE attr, which reads as ON. |
 | Live search | `rv-live` on a search input | Debounced emit-while-typing (400ms); focus/caret survive the refetch. |
 | Open SQL | `rv-open-sql="{{ row.script }}" rv-open-sql-title="…"` | Opens a SQL window BUILT-NOT-RUN. The remedy gesture. |
 | Open plate | `rv-open="plate:<id>" rv-open-title="…"` | Navigation (drill-through, switchboard → module). |
@@ -239,6 +239,14 @@ steps — SQL rounds the pct; tones color the fill). `plate-avatar`
 (SQL-computed initials), `plate-dot` + tones, `plate-empty` (pair with
 an `rv-if` flag), `hue-1..hue-8` category accents. Unknown classes
 style as nothing — the palette is the dialect for looks.
+Edit loop — pair a board/list with an edit plate: the edit plate's
+record-id param declares `"from_bus": true`; the board's `rv-emit`
+publishes the id on double-click and `rv-open` opens it. Prefill via a
+single-row query keyed on the param — text inputs `value="{{ row.x }}"`
+in SIBLING `rv-each` blocks per field group (`rv-each` never nests: an
+outer loop consumes the inner loop's tokens), selects query-driven with
+a `selected` column, the id shipped back in a hidden input, the UPDATE
+action re-deriving computed fields. Reference: `scheduling/edit`.
 PG gotcha: `LEAST/GREATEST` IGNORE NULLs — a NULL percentage slips
 through `least(100, …)` as 100; make closed/empty states explicit CASE
 branches.

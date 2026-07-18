@@ -834,3 +834,38 @@ with zero extra wiring. Both boards on one plate stay coherent (the
 reassign refreshed the day board's notes live). Playwright's dragTo
 drives HTML5 DnD fine — no hover caveat like Vega clicks. 0178 teaches
 the assistant the island.
+
+## 26. The edit loop + the density pass (2026-07-18)
+
+Dispatch closes its loop: DOUBLE-CLICK a board card -> the board's
+rv-emit publishes the card id to the desktop bus and rv-open opens
+scheduling/edit, whose from_bus appt_id param loads the record into
+the same form shape as intake. Save re-derives ends_at and the kit
+refreshes everywhere. Proven live end-to-end (including a mid-session
+surprise: Ryan drove the board WHILE the machinery was being built —
+his drags and a "Bobby Shrimp" 22:00 emergency booking appeared in the
+action log between my test steps, and homebase desktop sync replayed
+his edit window into the playwright session).
+
+Two vocabulary truths the round surfaced:
+1. BOOLEAN ATTRIBUTES CANNOT BE TEMPLATED. selected="{{ row.sel }}"
+   with an empty value gets its value dropped by sanitize-html leaving
+   a BARE selected — which reads as ON, so every option lit up. Fix:
+   FORM selects (name=, no rv-emit) may now be query-driven exactly
+   like emit selects, with selection from a boolean `selected` COLUMN.
+   The idiom generalizes: presence-style attrs come from machinery or
+   columns-as-classes, never from interpolation.
+2. rv-each NEVER NESTS (outer expansion consumes inner tokens) — the
+   edit form is the reference for the sibling-rv-each-per-field-group
+   prefill pattern.
+
+Density pass: the entire plate palette tightened to SQL-block density
+(42 rule edits: body 8x10, sections 10, cards 6x8, banner 16px,
+toolbar 1.5x9, forms 6x8, tables 2.5x6, board/cal/bar all compact) —
+"the palette is the dialect for looks" also means one CSS commit
+re-densifies every plate ever shipped, retroactively.
+
+0179 teaches the edit loop, board dblclick attrs, and the boolean-attr
+rule. Banked (again, now with evidence): window placement cascade —
+open_plate stacks windows dead-center on top of each other, which cost
+three overlap-blocked clicks this round.

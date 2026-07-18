@@ -2,6 +2,7 @@
 -- One island, two semantics:
 --   board by ASSIGNEE: drag a card to another tech -> reassign {id, to}
 --   board by DAY:      drag a card to another day  -> reschedule {id, to}
+-- Double-click any card: emits appt_id to the bus + opens scheduling/edit.
 -- Empty columns come from LEFT JOINs (rows with NULL appt_id are
 -- placeholders), so idle techs and open days are still drop targets.
 
@@ -26,13 +27,13 @@ SELECT rvbbit.upsert_plate(
   <h3>Today&#8217;s crew &#8212; drag to reassign</h3>
   <rv-board query="crew_board" group-by="assignee" id="appt_id"
             title="time_range" value="customer" note="job_note" tone="tone"
-            action="reassign"></rv-board>
+            action="reassign" rv-emit="appt_id" rv-open="plate:scheduling/edit"></rv-board>
 </div>
 <div class="plate-section">
   <h3>This week &#8212; drag to another day to reschedule</h3>
   <rv-board query="day_board" group-by="day" group-label="day_label" id="appt_id"
             title="start_time" value="customer" note="job_note" tone="tone"
-            action="reschedule"></rv-board>
+            action="reschedule" rv-emit="appt_id" rv-open="plate:scheduling/edit"></rv-board>
 </div>
 $tpl$,
     $q$
