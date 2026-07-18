@@ -907,3 +907,46 @@ session via homebase sync) — no conflicts, no confusion.
 Both foundation kits now stand. NEXT: the first domain kit
 (requires: ["scheduling", "crm"] + seeds + overlay plates) with a
 design partner.
+
+## 28. The utility palette — pretrained vocabulary as design headroom (2026-07-18)
+
+Ryan's question ("what if we included something like shadcn as the
+trusted class set?") resolved into: adopt the VOCABULARY, not the
+library. shadcn is React components (that's the island lane); the
+class half is a curated Tailwind subset with shadcn's semantic token
+names mapped onto lens theme vars. The win is pretrained fluency —
+the model already speaks this dialect from millions of repos, so ONE
+prompt line (0180) replaces pages of palette teaching.
+
+Mechanics: `plate-utilities.css` (375 rules, GENERATED, committed) —
+Tailwind-compatible names, scoped `.plate-body .cls`, semantic colors
+only (text-muted-foreground → color-mix over --foreground; bg-primary
+→ var(--main); tints as /10 /20 color-mix). The FILE is the allowlist:
+no JIT, no scanner — plate templates live in the DB where Tailwind's
+scanner can't see them, so anything not in the file styles as nothing.
+Excluded on purpose: positioning, z-*, transforms, screen sizing,
+pointer-events, arbitrary values (inline styles in a class costume).
+
+SECURITY FIX the work surfaced: the app's OWN compiled utilities are
+global, so plates could always borrow fixed/z-50/inset-0 from the lens
+stylesheet and overlay desktop chrome — a leak that PREDATES this
+round. renderPlate now scrubs dangerous class tokens (positioning,
+z/inset/transform, screen sizing, pointer-events, !important prefix,
+any [bracket] class) from every element. Belt and suspenders: the
+scoped file defines what works, the scrub removes what must not.
+
+THE TEST: "look pass on crm/customer-card, change no behavior" — the
+assistant restructured it with flex/space-y hierarchy, a real badge
+(inline-flex rounded-full border bg-muted px-3 py-1), tabular-nums
+dates, quiet muted-foreground metadata, a one-row form with flex-1
+fields — keeping every query/action/rv-* byte-identical, plate-*
+components as the skeleton, zero raw colors, zero scrubbed tokens.
+The doctrine line ("utilities for arrangement and emphasis, not
+decoration; plate-* remains the component layer") held unprompted.
+
+Ceiling status: viability proven end-to-end (Ryan), and the look/
+flexibility ceiling now rests on: utility fluency (shipped), the
+palette component layer (growing), and interaction islands (on
+demand). Retheme-proofness preserved throughout — semantic tokens
+mean the wallpaper/theme swap Ryan did mid-round restyled every
+plate including the polished one.

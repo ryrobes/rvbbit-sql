@@ -254,6 +254,21 @@ Action arg casts — always `nullif({{arg}},'')::date` (validate_kit
 EXPLAINs actions with empty-string dummies; a bare `''::date` fails at
 parse).
 
+**Utility palette (curated Tailwind subset, shadcn tokens):** plates
+also speak `flex/grid/gap/p/m/space-y` (scales 0–8), `text-xs..2xl`,
+`font-medium..bold`, `uppercase/tracking/leading`, `truncate`,
+`tabular-nums`, `line-clamp-1..3`, semantic colors ONLY
+(`text-muted-foreground`, `text-primary`, `bg-card`, `bg-muted`,
+`bg-primary/10`, `border-border`, tone colors), `border-*`,
+`rounded-*`, `opacity`, `overflow`. Defined in the lens's generated
+`plate-utilities.css`, scoped under `.plate-body` — that file IS the
+allowlist. NOT available (uncompiled AND renderer-scrubbed):
+positioning, `z-*`, `inset/top/left`, transforms, screen sizing,
+`pointer-events`, all arbitrary-value `[bracket]` classes, raw color
+scales (`bg-blue-500` does not exist — semantic tokens keep plates
+theme-proof). Doctrine: `plate-*` classes are the COMPONENT layer;
+utilities are for arrangement and emphasis between them.
+
 **CSS palette (native look only):** `plate-section`, `plate-cards`,
 `plate-card` (+`ok/warn/bad`; children `-title/-value/-note`),
 `plate-table`, `plate-row-flag`, `plate-form`, `plate-field(-inline)`,
