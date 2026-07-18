@@ -250,6 +250,17 @@ backspace — use `\y`), and React portals targeting nodes inside a
 React-owned nodes physically relocated into their hosts in a layout effect
 instead (robust: React keeps updating the node wherever it lives).
 
+Follow-on (2026-07-18): the plate HTML is no longer passed through
+`dangerouslySetInnerHTML` at all — it is applied imperatively in a layout
+effect, only when the string actually changes. Because island relocation
+mutates the subtree, React's innerHTML handling re-applied the whole body
+on unrelated prop commits — including the focus bump when you mousedown an
+unfocused window. Replacing the mousedown target mid-click makes the
+browser suppress the click, which surfaced as "first click only focuses,
+second click works". With React never owning those children, one click on
+an unfocused plate both focuses the window and runs the control — buttons,
+forms, and chart marks alike.
+
 ## 11. Contracts + dogfood as built (2026-07-18)
 
 Migration `0158_kit_contracts`: `plates.module` column,
