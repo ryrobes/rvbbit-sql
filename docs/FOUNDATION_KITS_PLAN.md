@@ -94,5 +94,21 @@ lead triage rules over free-text notes.
    gone_quiet 6→0 because jobs now count as touchpoints), and
    crm/customer-card listens=['scheduling'] refreshed live when a
    booking landed (REACTIVITY). Details: KIT_PLATES_PLAN §27.
-4. First domain kit (HVAC or Construction) = requires both + seeds +
-   overlay plates. Design partner drives what generalizes.
+4. **sales v0 — DONE 2026-07-18** (the trinity's third leg, unplanned
+   in this doc's first draft but demanded by "table stakes"): scaffold
+   `seed_sales_kit.sql` (v_quotes/v_invoices targets with values
+   contracts, deal_watch + ar_watch rule sets, sales.thresholds
+   config-as-rows, switchboard) + `seed_sales_book.sql` (80 quotes /
+   $300K, aged invoices). FIRST SHIPPED requires.kits: sales declares
+   ["crm"] and preflight enforces it. The assistant built pipeline
+   (rv-board with stage columns from a VALUES CTE, drag = move_quote
+   stamping decided_at, dblclick = edit loop), quote editor (from_bus,
+   CRM customer lookup, create-invoice action with thresholds CROSS
+   JOIN + NOT EXISTS dupe guard), new-quote, invoice ledger (per-row
+   submit-button mark-paid, ar_watch tones), and a reports surface
+   (metric cards, two chart islands, top customers, AR aging) — five
+   plates, one prompt, zero missteps, designed with the utility
+   palette from the start. KIT_PLATES_PLAN §29.
+5. First domain kit (HVAC or Construction) = requires scheduling +
+   crm + sales + seeds + overlay plates. Design partner drives what
+   generalizes.

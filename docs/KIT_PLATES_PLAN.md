@@ -950,3 +950,37 @@ palette component layer (growing), and interaction islands (on
 demand). Retheme-proofness preserved throughout — semantic tokens
 mean the wallpaper/theme swap Ryan did mid-round restyled every
 plate including the polished one.
+
+## 29. Sales v0 — the trinity completes (2026-07-18)
+
+Assistant round 4, the biggest cold ask yet (five plates, one prompt):
+pipeline / quote-edit / new-quote / invoices / reports — zero
+missteps, everything composed from vocabulary taught earlier the SAME
+DAY. The pipeline board independently reproduced the dispatch
+reference implementation: stages as a VALUES CTE LEFT JOIN so all
+four columns exist as drop targets, rule verdicts folded into card
+notes/tones, move_quote stamping (and clearing) decided_at with a
+whitelist guard, rv-emit + rv-open for the dblclick edit loop. The
+invoice ledger used per-row submit-button args; quote-edit's
+create_invoice reads sales.thresholds via CROSS JOIN and guards
+duplicates with NOT EXISTS; reports composed two chart islands +
+metric cards + tables inside utility-styled cards. Live-verified:
+drag sent->accepted stamped decided_at; renders all clean;
+validate_kit green.
+
+Composition firsts: sales is the first SHIPPED kit with
+requires.kits (["crm"]) — preflight showed "kit crm | t | set up
+(v0.1.0)". Cross-kit customer lookups (crm.v_customers) appear in
+three of its five plates because the PROMPT said "composes the crm
+kit" — the assistant needed no further instruction.
+
+Nit banked: rv-chart renders raw ISO timestamps on temporal axes
+(the month axis reads 2026-04-01T04:00:00.000Z) — chart island
+formatting polish, not a plate bug.
+
+The trinity stands: scheduling + crm + sales, all three built
+canon-first + assistant-surfaced in ONE DAY, composing through
+requires.kits, cross-kit reads, a union fitting, and cross-kit
+listens. The teaching loop's compounding is the story: round 1
+needed two machinery fixes and two prompt patches; round 4 needed
+nothing.
