@@ -1,7 +1,11 @@
-# Kit Panels — the contract (draft for argument, v0)
+# Kit Plates — the contract (draft, v0.1)
 
-The second app species. Iframe apps stay forever as the unlimited sandbox;
-panels are the curated shelf: server-rendered, sanitized, SQL-driven surfaces
+The second app species — **plates**: a prepared surface an image is pressed
+from, which is exactly what these are (templates pressed from data), and it
+extends the photography metaphor the product already owns — the lens, the
+photographed scenes. Each kit's gated entry plate is its **switchboard**
+(thanks, Access '95). Iframe apps stay forever as the unlimited sandbox;
+plates are the curated shelf: server-rendered, sanitized, SQL-driven surfaces
 that ship **as rows in the database** and render natively in Data Rabbit — no
 iframe, native theme, direct data path. This is the PowerBuilder/Lotus-forms
 layer that kits (mapping surfaces, onboarding checklists, audit queues) are
@@ -9,14 +13,14 @@ authored on.
 
 **This document is the ABI.** Kits are versioned artifacts sitting in customer
 databases rendering against whatever lens they run. Everything else in the kit
-stack can be wrong and fixed later; the panel contract compounds. Argue here,
+stack can be wrong and fixed later; the plate contract compounds. Argue here,
 not in code review.
 
 ---
 
 ## 1. Doctrine (the decisions that shape everything)
 
-1. **Panels live in the database, not in lens state.** Back up the DB, the
+1. **Plates live in the database, not in lens state.** Back up the DB, the
    kit's surfaces travel with it. Lens is the renderer — the Notes client, not
    the NSF file.
 2. **Logic lives in SQL.** The template has no expression language. If you
@@ -27,12 +31,12 @@ not in code review.
    server-side, receipted. The sanitizer never has to reason about SQL because
    SQL can't appear.
 4. **Safe by construction, not by review.** The vocabulary's ceiling is low
-   enough that a Calliope-authored panel is safe for the same reason a
+   enough that a Calliope-authored plate is safe for the same reason a
    hand-authored one is: there is nothing dangerous to say in the language.
-5. **Versioned from day one.** Every panel row carries `template_version`.
+5. **Versioned from day one.** Every plate row carries `template_version`.
    The renderer supports old versions; kits pin what they were authored
    against.
-6. **Panels look native by default.** No custom CSS in v1 — a built-in class
+6. **Plates look native by default.** No custom CSS in v1 — a built-in class
    vocabulary (the System Health look) plus the desktop's theme tokens.
    Uniformity is a feature (the Lotus lesson), and it's also the smaller
    sanitizer.
@@ -44,9 +48,9 @@ not in code review.
 ## 2. Storage (engine-side, migration)
 
 ```sql
-CREATE TABLE rvbbit.panels (
-    panel_id          text PRIMARY KEY,      -- 'system-health/overview', 'kit.construction/onboarding'
-    kit               text,                  -- NULL = standalone panel
+CREATE TABLE rvbbit.plates (
+    plate_id          text PRIMARY KEY,      -- 'system-health/overview', 'kit.construction/onboarding'
+    kit               text,                  -- NULL = standalone plate
     title             text NOT NULL,
     description       text,
     template_version  integer NOT NULL DEFAULT 1,
@@ -66,11 +70,11 @@ CREATE TABLE rvbbit.panels (
   description } }` — parameterized writes. Executed server-side; every
   invocation lands in the receipts/audit trail. `confirm: true` renders a
   confirmation affordance before firing.
-- `params`: declared panel inputs `[{ name, type, default?, from_bus? }]` —
+- `params`: declared plate inputs `[{ name, type, default?, from_bus? }]` —
   the only values interpolation and queries can reference.
 
-Install/upsert via `rvbbit.upsert_panel(...)` (validates template against the
-sanitizer + vocabulary at write time, so a bad panel fails at install, not at
+Install/upsert via `rvbbit.upsert_plate(...)` (validates template against the
+sanitizer + vocabulary at write time, so a bad plate fails at install, not at
 render).
 
 ## 3. Template vocabulary v1 (count it on two hands)
@@ -86,7 +90,7 @@ HTML plus:
 | Island | `<rv-grid query="q"/>`, `<rv-chart query="q" spec="col"/>`, `<rv-metric query="q" value="col" label="col"/>` | Replaced with hydration stubs; the lens mounts its REAL components (ResultGrid, Vega chart view, metric card). The DataWindow layer. |
 | Action form | `<form rv-action="name">` + plain inputs | Input `name=` maps to action args. Server validates types. `confirm` from the action def. |
 | Param emit | `rv-emit="param_name"` on a clickable | Publishes to the desktop param bus (same bus as everything else). |
-| Refresh | *(none in v1)* | After any action or bus param change, the whole panel re-renders. Fragment targeting (`rv-target`) is v1.1 — earn it with a real need. |
+| Refresh | *(none in v1)* | After any action or bus param change, the whole plate re-renders. Fragment targeting (`rv-target`) is v1.1 — earn it with a real need. |
 
 **Explicitly not in v1:** expressions, custom CSS/style attributes, inline
 event handlers, includes/partials, client-side state, arbitrary custom
@@ -101,14 +105,14 @@ through when a real kit surface can't be built without it.
 - **Attribute allowlist**: `class` (from the built-in vocabulary), `rv-*`,
   form basics (`name`, `value`, `type`, `placeholder`), `title`, `colspan`
   and friends. **No `on*`, no `style`, no `href` except same-app routes**
-  (`href` v1: only `rv-open` verbs that map to desktop actions — open panel,
+  (`href` v1: only `rv-open` verbs that map to desktop actions — open plate,
   open SQL window with provided text; never raw URLs).
 - Sanitized **twice**: at install (fail loudly) and at render (defense in
   depth — a row edited by hand in psql still can't escape).
 - Interpolated values are escaped after sanitation; islands receive data as
   JSON props, never as markup.
 
-Threat model to hold ourselves to: *a malicious panel row, inserted by
+Threat model to hold ourselves to: *a malicious plate row, inserted by
 someone with DB write access, renders in the victim's desktop.* It must not be
 able to execute script, exfiltrate via requests (no URLs), invoke actions that
 weren't declared alongside it, or read anything the viewer's governed
@@ -117,43 +121,44 @@ connection couldn't already read.
 ## 5. Rendering pipeline (lens-side)
 
 ```
-GET  /api/panel/render   {connectionId, panelId, params}
+GET  /api/plate/render   {connectionId, plateId, params}
   → load row → sanitize → run named queries (read-only, bound params)
   → expand rv-each/rv-if → escape interpolations
   → emit HTML + island manifest [{id, kind, query, props, data}]
-POST /api/panel/action   {connectionId, panelId, action, args}
+POST /api/plate/action   {connectionId, plateId, action, args}
   → validate against action def → execute → receipt → client re-renders
 ```
 
-Desktop side: window kind `"panel"` mounts the HTML, hydrates islands into
+Desktop side: window kind `"plate"` mounts the HTML, hydrates islands into
 real components, subscribes declared `from_bus` params, re-renders on bus
 changes and after actions. Theme is native — no materialization needed.
 
 ## 6. Modules & contracts (phase 2 — pointer, not spec)
 
-A kit manifest groups panels/cubes/metrics into **modules**, each gated by
+A kit manifest groups plates/cubes/metrics into **modules**, each gated by
 **contracts**: named read-only queries returning violations, in the spirit of
 operator tests and KPI checks. Module green → children enabled (visible on
-the desktop); red → the module's onboarding panel is the only thing offered.
+the desktop); red → the kit's **switchboard** (its onboarding/launcher plate)
+is the only thing offered.
 The gate state itself is just a query — the System Health pattern promoted to
-an installable object. Spec'd separately once panels v1 exists, because the
-onboarding checklist and the contract report ARE panels.
+an installable object. Spec'd separately once plates v1 exists, because the
+onboarding checklist and the contract report ARE plates.
 
 ## 7. Dogfood & acceptance
 
-**Rebuild the System Health window as a panel shipped as rows.** Acceptance
-for v1 = the panel version reaches parity: status cards from queries,
+**Rebuild the System Health window as a plate shipped as rows.** Acceptance
+for v1 = the plate version reaches parity: status cards from queries,
 red/green from data (rule 2: colors are columns), remedy buttons that open a
 SQL window with built-not-run SQL (`rv-open`), zero writes. If the vocabulary
 can't express System Health, the vocabulary is wrong — find out on our own
 window, not on a construction company.
 
-Second dogfood: a fake "kit onboarding" checklist panel exercising actions
+Second dogfood: a fake "kit onboarding" checklist plate exercising actions
 (one harmless write w/ confirm) and bus params.
 
 ## 8. Decisions & remaining questions
 
-**SETTLED — panel state (2026-07-18):** kit-owned real tables, no generic
+**SETTLED — plate state (2026-07-18):** kit-owned real tables, no generic
 k/v store. Simpler, nothing new to depend on inside a machine we don't
 control, and rule 2 stays pure. Eat the latency; revisit only if it hurts in
 practice.
@@ -177,6 +182,8 @@ think.
 1. **Template syntax bikeshed**: `rv-*` attributes as drafted, or `<template>`
    elements? Attributes sanitize and read better; templates nest better.
 2. **Pagination/limits**: islands inherit component behavior; but raw
-   `rv-each` needs a hard row cap (500?) — panels are surfaces, not exports.
-3. **Naming**: "panel" is the safe self-describing default; candidates from
-   the elder design systems under consideration — see the naming note.
+   `rv-each` needs a hard row cap (500?) — plates are surfaces, not exports.
+**SETTLED — naming (2026-07-18):** the species is **plates** (photographic
+plates: prepared surfaces pressed from data; zero modern-tooling collision;
+on-metaphor with the lens/scene-photography language). A kit's entry/onboarding
+plate is its **switchboard**.
