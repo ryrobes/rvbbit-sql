@@ -318,7 +318,34 @@ tripwire's verbatim message in `apply_report`; the agent reads it and
 re-upserts the same `plate_id`. There is no visual builder; this is the
 editor.
 
-## 10. Sharp edges (the short list)
+## 10. The Fitting (targets → fittings → canonical views)
+
+Kits adapt to the customer's schema through the **Fitting Room** (native
+lens app; switchboards link out via `rv-open="app:fitting?kit=…"`).
+
+```sql
+rvbbit.upsert_kit_target(p_kit text, p_target text, p_description text,
+                         p_columns jsonb) → void
+-- target = schema-qualified view name; columns = [{name, type, description, required}]
+rvbbit.fitting_candidates(p_kit text, p_target text, p_k integer DEFAULT 8)
+  → TABLE(schema_name, rel_name, score, matched_on)   -- catalog-KG ranked
+rvbbit.fitting_check(p_kit text, p_target text, p_select_sql text)
+  → TABLE(check_name, ok, detail)   -- SHAPE check: runs? columns present?
+rvbbit.fitting_apply(p_kit text, p_target text, p_select_sql text,
+                     p_proposal jsonb DEFAULT '{}')
+  → TABLE(check_name, ok, detail)   -- checks → CREATE VIEW → record fitting
+rvbbit.fitting_violations(p_kit text) → TABLE(target, problem)
+```
+
+Tables: `rvbbit.kit_targets` (shipped expectations — travel in exports),
+`rvbbit.kit_fittings` (accepted mappings + proposal provenance — per-box,
+never exported). The one-line mapping contract every kit with targets
+should ship: `SELECT * FROM rvbbit.fitting_violations('<kit>')` — modules
+gate red until everything is fitted. fitting_check validates SHAPE (a
+`NULL::type` placeholder passes); data QUALITY belongs to contracts.
+Candidate quality follows catalog freshness — crawl to refresh.
+
+## 11. Sharp edges (the short list)
 
 - `rv-each` row cap: 500. Plates are surfaces, not exports.
 - Plate renders run `BEGIN READ ONLY` — rule instrumentation self-disables
