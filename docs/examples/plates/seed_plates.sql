@@ -70,6 +70,7 @@ SELECT rvbbit.upsert_plate(
   $tpl$
 <div rv-each="scope" class="plate-toolbar">
   <button class="{{ row.all_sel }}" type="button" rv-emit="state" rv-value="">All states</button>
+  <button class="{{ row.season_sel }}" type="button" rv-emit="season" rv-value="">All seasons</button>
   <span class="plate-banner-note">scope: {{ row.scope }}</span>
 </div>
 <div class="plate-section">
@@ -80,8 +81,8 @@ SELECT rvbbit.upsert_plate(
   </div>
 </div>
 <div class="plate-section">
-  <h3>Sightings by season</h3>
-  <rv-chart query="by_season" x="season" y="n" mark="bar"></rv-chart>
+  <h3>Sightings by season — click a bar to scope, click again to clear</h3>
+  <rv-chart query="by_season" x="season" y="n" mark="bar" rv-emit="season"></rv-chart>
 </div>
 <div class="plate-section">
   <h3>Top states <span rv-each="top_states"><button class="{{ row.sel }}" type="button" rv-emit="state" rv-value="{{ row.state }}">{{ row.state }} ({{ row.n }})</button></span></h3>
@@ -89,15 +90,15 @@ SELECT rvbbit.upsert_plate(
 </div>
 $tpl$,
   jsonb_build_object(
-    'scope', jsonb_build_object('sql', $q$SELECT CASE WHEN nullif({{ params.state }}, '') IS NULL THEN 'all states' ELSE {{ params.state }} END AS scope, CASE WHEN nullif({{ params.state }}, '') IS NULL THEN 'active' ELSE '' END AS all_sel$q$),
-    'total', jsonb_build_object('sql', $q$SELECT count(*)::int AS n FROM public.bigfoot_sightings_locations WHERE (nullif({{ params.state }}, '') IS NULL OR state = {{ params.state }})$q$),
-    'states', jsonb_build_object('sql', $q$SELECT count(DISTINCT state)::int AS n FROM public.bigfoot_sightings_locations WHERE state IS NOT NULL AND (nullif({{ params.state }}, '') IS NULL OR state = {{ params.state }})$q$),
+    'scope', jsonb_build_object('sql', $q$SELECT coalesce(nullif({{ params.state }}, ''), 'all states') || ' · ' || coalesce(nullif({{ params.season }}, ''), 'all seasons') AS scope, CASE WHEN nullif({{ params.state }}, '') IS NULL THEN 'active' ELSE '' END AS all_sel, CASE WHEN nullif({{ params.season }}, '') IS NULL THEN 'active' ELSE '' END AS season_sel$q$),
+    'total', jsonb_build_object('sql', $q$SELECT count(*)::int AS n FROM public.bigfoot_sightings_locations WHERE (nullif({{ params.state }}, '') IS NULL OR state = {{ params.state }}) AND (nullif({{ params.season }}, '') IS NULL OR season = {{ params.season }})$q$),
+    'states', jsonb_build_object('sql', $q$SELECT count(DISTINCT state)::int AS n FROM public.bigfoot_sightings_locations WHERE state IS NOT NULL AND (nullif({{ params.state }}, '') IS NULL OR state = {{ params.state }}) AND (nullif({{ params.season }}, '') IS NULL OR season = {{ params.season }})$q$),
     'peak', jsonb_build_object('sql', $q$SELECT season FROM public.bigfoot_sightings_locations WHERE season IS NOT NULL AND season <> 'Unknown' AND (nullif({{ params.state }}, '') IS NULL OR state = {{ params.state }}) GROUP BY season ORDER BY count(*) DESC LIMIT 1$q$),
-    'by_season', jsonb_build_object('sql', $q$SELECT season, count(*)::int AS n FROM public.bigfoot_sightings_locations WHERE season IS NOT NULL AND season <> 'Unknown' AND (nullif({{ params.state }}, '') IS NULL OR state = {{ params.state }}) GROUP BY season ORDER BY n DESC$q$),
-    'top_states', jsonb_build_object('sql', $q$SELECT state, count(*)::int AS n, CASE WHEN state = {{ params.state }} THEN 'active' ELSE '' END AS sel FROM public.bigfoot_sightings_locations WHERE state IS NOT NULL GROUP BY state ORDER BY n DESC LIMIT 6$q$),
-    'recent', jsonb_build_object('sql', $q$SELECT bfroid, title, state, county, season, fixed_year AS year FROM public.bigfoot_sightings_locations WHERE title IS NOT NULL AND (nullif({{ params.state }}, '') IS NULL OR state = {{ params.state }}) ORDER BY submitted_date DESC NULLS LAST LIMIT 50$q$)
+    'by_season', jsonb_build_object('sql', $q$SELECT season, count(*)::int AS n, CASE WHEN season = {{ params.season }} THEN 'active' ELSE '' END AS sel FROM public.bigfoot_sightings_locations WHERE season IS NOT NULL AND season <> 'Unknown' AND (nullif({{ params.state }}, '') IS NULL OR state = {{ params.state }}) GROUP BY season ORDER BY n DESC$q$),
+    'top_states', jsonb_build_object('sql', $q$SELECT state, count(*)::int AS n, CASE WHEN state = {{ params.state }} THEN 'active' ELSE '' END AS sel FROM public.bigfoot_sightings_locations WHERE state IS NOT NULL AND (nullif({{ params.season }}, '') IS NULL OR season = {{ params.season }}) GROUP BY state ORDER BY n DESC LIMIT 6$q$),
+    'recent', jsonb_build_object('sql', $q$SELECT bfroid, title, state, county, season, fixed_year AS year FROM public.bigfoot_sightings_locations WHERE title IS NOT NULL AND (nullif({{ params.state }}, '') IS NULL OR state = {{ params.state }}) AND (nullif({{ params.season }}, '') IS NULL OR season = {{ params.season }}) ORDER BY submitted_date DESC NULLS LAST LIMIT 50$q$)
   ),
-  '{}'::jsonb, '[{"name": "state", "default": "", "from_bus": true}]'::jsonb,
+  '{}'::jsonb, '[{"name": "state", "default": "", "from_bus": true}, {"name": "season", "default": "", "from_bus": true}]'::jsonb,
   NULL, 'Dashboard style: metric/chart/grid islands + param-emitting chips; state is from_bus — drive it from any plate or window'
 );
 

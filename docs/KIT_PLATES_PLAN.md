@@ -318,6 +318,15 @@ skipped; the bus round-trip is the single source of truth, so toggle-off
 its declared default, consistent with every other desktop param. The window
 re-fetches only when ITS declared bus fields change value.
 
+**Charts emit too.** `rv-emit="field"` on an `<rv-chart>` opts the chart
+into the same emit path as buttons: clicking a mark publishes
+`datum[field]` (bus toggle = click-again-to-unselect; from_bus round-trip
+re-renders the plate). When the chart's query also ships a `sel` column,
+the active mark stays full-opacity and the rest dim — the chart edition of
+selection-as-a-column. Test-harness note: Vega resolves the clicked item
+from hover state, so synthetic clicks without a preceding pointermove
+always miss — drive chart tests with trusted mouse input.
+
 **Selection state is a column.** No client-side "active" tracking: the
 query compares against its own param — `CASE WHEN state = {{ params.state }}
 THEN 'active' ELSE '' END AS sel` — and the template writes it into
