@@ -133,7 +133,49 @@ Desktop side: window kind `"plate"` mounts the HTML, hydrates islands into
 real components, subscribes declared `from_bus` params, re-renders on bus
 changes and after actions. Theme is native — no materialization needed.
 
-## 6. Modules & contracts (phase 2 — pointer, not spec)
+## 6. Switchboard logic — no new runtime
+
+Kits will carry genuinely weird vertical business logic. The failure mode to
+design against is not complexity — it is *a medium where complexity can
+hide*. So: **there is no client-side logic runtime, and there never will be
+one** (doctrine 3 and 7's sibling). No embedded JS workflow engine, no FBP
+runner, no rules DSL. The graph runtime the switchboard needs already exists:
+operator `steps` are a typed, acyclic, explicitly-wired DAG stored as rows,
+executed server-side, receipted per node, and already visualized + replayable
+in the operator-flow window. Any work kits demand of that system compounds
+for everything else that uses it.
+
+Logic lives in exactly three tiers plus one new object:
+
+- **Tier 1 — verdicts are columns.** Most vertical logic is a CASE expression
+  and a join wearing a trench coat. It stays SQL (rule 2).
+- **Tier 1.5 — decision tables as rows** (the one new object).
+  `rvbbit.kit_rules`: `{rule_id, kit, module, applies_when (SQL predicate),
+  verdict, priority, description}` — priority-ordered, non-recursive by
+  construction. Every rule is independently readable; an agent authoring
+  rules can only append rows; "visualizing the logic" is rendering the table
+  (on a plate). A controller can read a rule aloud.
+- **Tier 2 — operators & flows** for anything multi-step or model-assisted:
+  escalations, LLM-in-the-loop judgments, sequenced actions. Kit operators
+  are **kit-scoped/private** — namespaced (`kit.construction/…` or a
+  `scope` marker on `rvbbit.operators`) so they never pollute user-facing
+  pickers, autocomplete, or the operator pool; needs a small engine
+  affordance (operator visibility flag) noted here as a v1 dependency.
+- **Tier 3 — plates trigger, never think.** The client's entire logic budget
+  is `rv-if` on a column. Actions may invoke an operator or flow; the plate
+  renders whatever verdict comes back. All "workflow" is action → engine →
+  re-render.
+
+**Every verdict carries its why.** Rows a kit flags are stamped with the
+`rule_id` that fired and, when a rule leaned on a model, the `receipt_id` —
+so "why is this pay application in the exception queue?" is a right-click
+(the semantic-lineage gesture) landing on either a human-readable rule row or
+a full model trace. Spaghetti is structurally impossible rather than merely
+discouraged: decision tables cannot recurse, steps DAGs are acyclic, plates
+have no expression language, and every layer is rows in one database rendered
+by one graph viewer.
+
+## 7. Modules & contracts (phase 2 — pointer, not spec)
 
 A kit manifest groups plates/cubes/metrics into **modules**, each gated by
 **contracts**: named read-only queries returning violations, in the spirit of
@@ -144,7 +186,7 @@ The gate state itself is just a query — the System Health pattern promoted to
 an installable object. Spec'd separately once plates v1 exists, because the
 onboarding checklist and the contract report ARE plates.
 
-## 7. Dogfood & acceptance
+## 8. Dogfood & acceptance
 
 **Rebuild the System Health window as a plate shipped as rows.** Acceptance
 for v1 = the plate version reaches parity: status cards from queries,
@@ -156,7 +198,7 @@ window, not on a construction company.
 Second dogfood: a fake "kit onboarding" checklist plate exercising actions
 (one harmless write w/ confirm) and bus params.
 
-## 8. Decisions & remaining questions
+## 9. Decisions & remaining questions
 
 **SETTLED — plate state (2026-07-18):** kit-owned real tables, no generic
 k/v store. Simpler, nothing new to depend on inside a machine we don't
