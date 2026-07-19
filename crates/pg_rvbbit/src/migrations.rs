@@ -757,6 +757,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0184_assistant_config_comments",
         include_str!("../sql/migrations/0184_assistant_config_comments.sql"),
     ),
+    (
+        "0185_assistant_editable_grid",
+        include_str!("../sql/migrations/0185_assistant_editable_grid.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

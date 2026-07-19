@@ -1063,3 +1063,42 @@ Banked for later rounds: LISTEN/NOTIFY cross-client reactivity (the
 multiplayer dispatch board), auto-refresh plates (if a real deployment
 wants wall dashboards), fragment re-render, headless capture routes,
 metric_defs/cube_defs manifest sections.
+
+## 31. Editable grid + render instrumentation (2026-07-18)
+
+Two Retool-inspired picks from Ryan ("Editable grid! Yes!... Debug tool!
+YES!"), built the plates way:
+
+**Editable grid.** ResultGrid grows an opt-in `editable` prop — the
+SHAREABLE surface: `{columns, onEdit({row, rowIndex, column, value,
+previous}) → boolean}`. Double-click edits in place, Enter commits,
+Esc/blur cancels; commits are keyed by SOURCE row index (filter/sort
+reshuffles can't misdirect a write); no-op edits never hit the write
+path; pending cells pulse; optimistic overrides clear when `rows`
+identity changes. Normal mode only — transposed stays read-only.
+Plates wire it via `<rv-grid edit-action="name" id="key" edit="a,b">`:
+the commit fires the named action with {id, column, value} — the write
+wall unchanged, what persists is the action's SQL. Taught idiom (0185):
+ONE UPDATE with a CASE per editable column, because {{column}} must
+never be interpolated as an identifier. Verified end-to-end in a real
+browser: dblclick → input → Enter → action → DB row updated → plate
+refresh shows the new value; both invocations in plate_action_log.
+Desktop adoption (SSMS-style table editing: single-table detection →
+PK-keyed UPDATE, likely built-not-run first) is the next consumer of
+the same prop — that design is its own round.
+
+**Render instrumentation.** renderPlate times every query (ms + rows +
+error) and the whole render; the strip shows totalMs always (hover =
+per-query breakdown), the source menu shows `ms · rows` beside each
+query name. The invisible made visible — when a plate feels slow the
+answer is now one glance, and the same numbers ride the render response
+for anything else that wants them.
+
+Also banked this session (Ryan, on standalone routes): a tmux-style
+"plate layout" surface — named layouts composing existing plates into
+a full-screen mode with the desktop behind it. Direction sketch:
+layouts-as-rows (splits/ratios/plate-ids/pinned-params as data) so kits
+ship mission-control surfaces and the assistant composes them; panes
+host the SAME PlateWindow (param bus + reactivity free); tmux zoom =
+maximize-a-pane. Name TBD (candidates: the Pass, Spread, Deck).
+Waiting on Ryan's think.
