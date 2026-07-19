@@ -387,6 +387,20 @@ tripwire's verbatim message in `apply_report`; the agent reads it and
 re-upserts the same `plate_id`. There is no visual builder; this is the
 editor.
 
+**Incremental authoring (0186).** Large plates are never one giant
+command — that fails two ways (output overflow, JSON-escaping mistakes
+in a huge template string). The protocol: `upsert_plate` a WORKING
+SKELETON (template + only the queries it references), then `patch_plate`
+the rest. `patch_plate` updates an existing plate: template/title/
+description/kit replace when present, queries/actions **merge per key**
+(`null` removes a key), params replaces whole; every patch rides the
+0182 revision ledger. Routine edits use it too — changing one query
+sends one query. The lens closes the loop with a bounded **auto-repair
+turn**: a truncated or unparseable command envelope triggers an
+automatic follow-up carrying the JSON parse diagnosis (error + position
++ context snippet) and the recovery protocol, at most twice per user
+request.
+
 ## 10. The Fitting (targets → fittings → canonical views)
 
 Kits adapt to the customer's schema through the **Fitting Room** (native

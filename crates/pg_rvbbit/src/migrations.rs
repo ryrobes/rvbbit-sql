@@ -761,6 +761,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0185_assistant_editable_grid",
         include_str!("../sql/migrations/0185_assistant_editable_grid.sql"),
     ),
+    (
+        "0186_assistant_patch_plate",
+        include_str!("../sql/migrations/0186_assistant_patch_plate.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

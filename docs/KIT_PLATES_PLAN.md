@@ -1102,3 +1102,38 @@ ship mission-control surfaces and the assistant composes them; panes
 host the SAME PlateWindow (param bus + reactivity free); tmux zoom =
 maximize-a-pane. Name TBD (candidates: the Pass, Spread, Deck).
 Waiting on Ryan's think.
+
+## 32. The output gap: patch_plate + auto-repair (2026-07-18)
+
+Watched live in Ryan's session while §31 was being built: two
+consecutive calendar-plate asks died with "could not finish a valid
+desktop command." Diagnosis: the operator's cap is already 32k output
+tokens — the killer is the SHAPE, one Google-Calendar-sized plate as
+one giant JSON string. Giant single commands fail two ways: output
+overflow (truncated envelope) and JSON-escaping fumbles (envelope ends
+in `}` but won't parse — a literal newline in a template string is all
+it takes). Both previously ended as "discarded, try again."
+
+Three-part fix:
+
+**patch_plate** (lens `patchPlate()` + `/api/plate/patch` + command op):
+partial update of an existing plate — template/title/description/kit
+replace when present, queries/actions merge per key (null removes),
+params replaces whole. The merged row goes back through
+`rvbbit.upsert_plate`, so every tripwire still applies, and each patch
+lands in the 0182 revision ledger. Verified: additive merge, replace +
+null-remove, non-SELECT rejection verbatim with plate intact,
+not-found returns "use upsert_plate to create it."
+
+**Incremental doctrine (0186)**: skeleton first (template + only the
+queries it references), remainder via patch_plate across commands or
+turns; routine edits patch one query instead of resending the plate —
+which also shrinks EVERY routine edit turn, not just the big ones.
+
+**Auto-repair turn** (assistant-window): a turn ending
+output_truncated / invalid_structured_output triggers a bounded (2 per
+request) visible synthetic follow-up carrying a real diagnosis —
+`diagnoseEnvelope()` gives the JSON error, position, and a ±90-char
+context snippet, so she SEES the literal-newline mistake instead of
+guessing — plus the recovery protocol. Mirrors the visual self-check
+continuation machinery.
