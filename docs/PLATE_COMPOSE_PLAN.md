@@ -1,9 +1,21 @@
-# The Plate Compose Layer — "the Pass" (working name)
+# The Plate Compose Layer — Layouts
 
 *Drafted 2026-07-19 from the layout conversations in KIT_PLATES_PLAN §30–§32.
-Candidates for the name: the Pass (expo station where finished plates are
-arranged for service), Spread, Deck, Screen. "Layout" is the neutral word
-used below.*
+Ryan settled the name: plainly, **layouts**.*
+
+**STATUS (2026-07-19): P0–P2 BUILT AND BROWSER-VERIFIED** — 0187 schema +
+upsert/patch/restore + revisions; wall mode (chromeless panes, fraction
+translation, z, ESC ladder modal→zoom→wall, hover pill w/ zoom + pop-out,
+wall-local modals, slot targeting via `@pane`); stamp mode; save-arrangement
+round trip; shelf front-door rows; assistant `upsert_layout`/`patch_layout`/
+`open_layout` + 0188 teaching. `crm/home` is the first live layout
+(`kits.default_layout='crm/home'`). Remaining: P3 (min_width auto-pick,
+phone variants), P4 polish (capture target `layout:x`, per-wall bus if
+earned, role-gated panes). As-built deltas from the plan: modals are
+WALL-LOCAL windows (a desktop window can't stack above the fixed wall
+overlay — same stacking-tree reality as the markup editor); pane params
+merge UNDER bus/local values (a pin is a default, never a lock); the
+`upsert_layout` validator rejects non-arrangement pane keys at install.
 
 ## 1. Thesis
 

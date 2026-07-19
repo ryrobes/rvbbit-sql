@@ -1155,3 +1155,34 @@ master-detail = slot panes running zero queries until rv-open
 @pane-targeted); orchestration = the existing param bus. Kit icon →
 kits.default_layout answers "what does CRM open with"; many layouts
 per kit is the point. Not yet built — plan is the artifact.
+
+## 34. Layouts BUILT — the compose layer ships (2026-07-19)
+
+Ryan greenlit end-to-end ("just calling the plane a 'layout'"). P0–P2 of
+PLATE_COMPOSE_PLAN built and browser-verified in one round: 0187
+(plate_layouts + upsert_layout w/ the no-behavior-keys validator +
+revisions/restore mirroring 0182 + kits.default_layout), lens wall mode
+(chromeless PlateWindow prop + pinnedParams; percentage rects do the
+fraction translation; z; ESC ladder; zoom; hover pill; wall-local
+modals; @pane slot targeting), stamp mode, save-arrangement (the
+desktop-is-the-editor round trip), shelf front-door rows + save form,
+assistant upsert_layout/patch_layout/open_layout + 0188 teaching.
+
+Browser receipts: crm/home wall renders 3 chromeless panes as ONE
+composed surface; follow-ups "Select" drove the Customer 360 pane via
+the ordinary bus (param chip WALL·FOLLOWUPS visible on the desktop
+bar); "Open" spawned a wall-local modal; ESC unwound modal→wall;
+zoom collapsed to one pane; empty slot filled and RETARGETED via
+rv-open="plate:x@pane"; stamp spawned 3 windows at layout geometry;
+dragging one + saving produced a row whose fractions captured the drag
+while untouched panes round-tripped byte-exact. Bugs caught live:
+impure setState updater (onClose inside updater double-fired under
+StrictMode — ESC-unzoom also closed the wall; fixed w/ refs), and
+react-codemirror's default light theme (previous round's lesson,
+avoided here).
+
+Kept honest: opening a DESKTOP window above the fixed wall is a
+stacking-tree impossibility, so transient plates open wall-LOCAL
+modals — same conclusion the markup editor forced. rv-open-sql from a
+wall pane opens a desktop window BEHIND the wall (chromeless hides the
+affordances that would invoke it; acceptable, noted).
