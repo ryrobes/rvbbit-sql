@@ -777,6 +777,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0189_assistant_block_sizing",
         include_str!("../sql/migrations/0189_assistant_block_sizing.sql"),
     ),
+    (
+        "0190_desktop_panels",
+        include_str!("../sql/migrations/0190_desktop_panels.sql"),
+    ),
+    (
+        "0191_assistant_open_panel",
+        include_str!("../sql/migrations/0191_assistant_open_panel.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
