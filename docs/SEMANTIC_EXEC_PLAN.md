@@ -186,3 +186,38 @@ for realistic runs. Speedups below assume the live timings above.
    filtered scans.
 3. **Phase ordering** — Phase 1 alone fixes the reported timeout; 3 and 4 are the
    throughput multipliers. Recommended sequence: 0 → 1 → 3 → 4 → 2 → 5.
+
+---
+
+## Phase 5 — AS BUILT (2026-07-18): INSERT..SELECT + CTE chains
+
+Trigger: a production enrichment job (`lead_semantic_intent_queue.sql` —
+WITH chain w/ window fns + joins, clover ops in a CTE selecting FROM
+another CTE, INSERT..ON CONFLICT on top) ran ONE serial LLM lane for
+hours on a 25-lane sub. Root causes stacked: the post-parse hook
+returned early for all non-SELECT statements (the INSERT never reached
+the rule at all), and the rule bailed on CTEs regardless.
+
+Design (no tree rewriting): `try_implicit_prewarm_complex`
+(rewriter.rs) enumerates query LEVELS — each top-level CTE body plus
+the final select (or the INSERT's single RTE_SUBQUERY source) — and
+finds op calls at levels whose FROM is a single relation or single CTE
+reference. Args render as Var (colname via catalog for relations,
+rte->eref->colnames for CTEs) or Const (typed literal, hash-identical);
+arbitrary expressions keep the relation-only deparse path. For a CTE
+source, the prewarm input query is `WITH <prefix> SELECT DISTINCT args
+FROM <cte> LIMIT cap`, where <prefix> is lifted VERBATIM from the
+statement source bytes (CommonTableExpr.location → `cte_body_end`, an
+SQL-aware scanner handling strings/E-strings/quoted idents/dollar
+quotes/nested comments). Verbatim lifting is what guarantees identical
+input values → identical input_hash → L2 hits for the executor's
+per-row calls.
+
+Deliberate bails (per-row fallback; explicit prewarm always available):
+data-modifying CTEs, nested WITH in a CTE body, set-ops at the op
+level, non-Var/Const args over CTE sources, semantic ops inside the
+lifted prefix (collecting inputs would itself pay serial op cost),
+missing parse locations, non-UTF8 source. The hook's INSERT branch
+runs ONLY the prewarm rule (no scan rewrites for DML) under
+IN_REWRITER + extern-param guards; INSERT..VALUES costs one empty
+level enumeration.

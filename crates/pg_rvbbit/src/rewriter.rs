@@ -163,6 +163,28 @@ unsafe extern "C-unwind" fn rvbbit_post_parse_analyze_hook(
     router::set_pg_rowstore_route_selected(false);
     router::set_native_vortex_route_selected(false);
     if (*query).commandType != pg_sys::CmdType::CMD_SELECT {
+        // INSERT..SELECT is the canonical semantic enrichment job (batch
+        // upserts with clover_* calls in a CTE chain). None of the scan or
+        // aggregate rewrites below apply to DML, but the implicit prewarm
+        // pass does — without it every semantic call runs per-row SERIAL
+        // (the "one lane in Prometheus for hours" symptom).
+        if (*query).commandType == pg_sys::CmdType::CMD_INSERT
+            && !IN_REWRITER.with(|f| f.get())
+            && !query_has_extern_params(query)
+        {
+            let previous_source = CURRENT_SOURCE_SQL.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                let previous = slot.take();
+                *slot = source_sql_from_parse_state(pstate);
+                previous
+            });
+            IN_REWRITER.with(|f| f.set(true));
+            try_implicit_prewarm_rule(query);
+            IN_REWRITER.with(|f| f.set(false));
+            CURRENT_SOURCE_SQL.with(|cell| {
+                *cell.borrow_mut() = previous_source;
+            });
+        }
         return;
     }
     if force_heap_scan_enabled() {
@@ -9268,18 +9290,27 @@ fn implicit_prewarm_enabled() -> bool {
 }
 
 unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
+    // INSERT..SELECT and CTE chains take the complex path (phase 5):
+    // level-wise analysis with verbatim WITH-prefix lifting.
+    if (*query).commandType == pg_sys::CmdType::CMD_INSERT {
+        try_implicit_prewarm_complex(query);
+        return;
+    }
     if (*query).commandType != pg_sys::CmdType::CMD_SELECT {
         return;
     }
+    if !(*query).cteList.is_null() {
+        try_implicit_prewarm_complex(query);
+        return;
+    }
     // Bail only on shapes where a semantic op's inputs can't be safely warmed
-    // over a single base relation: CTEs, sub-selects in expressions, set-ops,
+    // over a single base relation: sub-selects in expressions, set-ops,
     // window functions, row locking. Aggregates / GROUP BY / DISTINCT / HAVING
     // are fine — the operator is evaluated per base row *before* any of those
     // apply, so we warm it over the relation regardless of the outer shape
     // (e.g. `SELECT count(*) FROM t WHERE about(x)>0.5`,
     //  `SELECT region, avg(about(blurb,'t')) FROM t GROUP BY region`).
-    if !(*query).cteList.is_null()
-        || !(*query).setOperations.is_null()
+    if !(*query).setOperations.is_null()
         || !(*query).rowMarks.is_null()
         || (*query).hasWindowFuncs
         || (*query).hasSubLinks
@@ -9472,6 +9503,834 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
             pgrx::debug1!("rvbbit: implicit prewarm failed for {op_name}: {err}");
         }
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Rule B, phase 5: implicit prewarm for INSERT..SELECT and CTE chains
+// ---------------------------------------------------------------------------
+//
+// The canonical semantic-ETL job is `WITH staged AS (...) INSERT INTO q
+// SELECT clover_x(staged.text, ...) FROM staged` — and until this pass it
+// silently ran every operator call per-row serial (the simple rule bails on
+// the INSERT before it even sees the CTEs). Strategy here: NO tree
+// rewriting. Enumerate query LEVELS (each top-level CTE body plus the final
+// select / INSERT source select), find semantic op calls at levels whose
+// FROM is a single relation or a single CTE reference, and synthesize a
+// prewarm input query. For a CTE source the WITH prefix is lifted VERBATIM
+// from the statement source text (CommonTableExpr locations + a
+// quote/comment-aware paren matcher) so the warmed rows are exactly the
+// rows the real query feeds the operator — same values, same input_hash,
+// guaranteed L2 hits when the executor then runs per-row.
+//
+// Deliberate bails (fall back to per-row, explicit prewarm still works):
+// data-modifying CTEs, nested WITH inside a CTE body, set-ops at a level,
+// op args that aren't Var/Const over a CTE source (full expression deparse
+// stays relation-only), semantic ops inside the lifted PREFIX (collecting
+// inputs would itself pay the serial op cost), missing/negative parse
+// locations, and non-UTF8 source bytes.
+
+struct ComplexCte {
+    name: String,
+    loc: usize,
+    body_end: usize,
+    q: *mut pg_sys::Query,
+    has_ops: bool,
+}
+
+enum LevelSource {
+    Relation { oid: u32, rtindex: i32 },
+    Cte { name: String, rtindex: i32, colnames: Vec<String> },
+}
+
+unsafe fn try_implicit_prewarm_complex(query: *mut pg_sys::Query) {
+    if !(*query).setOperations.is_null() || !(*query).rowMarks.is_null() {
+        return;
+    }
+
+    // CTE inventory (top-level WITH). Any irregularity → whole pass bails.
+    let mut ctes: Vec<ComplexCte> = Vec::new();
+    let cte_list = (*query).cteList;
+    if !cte_list.is_null() {
+        let src = match statement_source_bytes() {
+            Some(b) => b,
+            None => return,
+        };
+        for i in 0..(*cte_list).length {
+            let cte = (*(*cte_list).elements.add(i as usize)).ptr_value
+                as *mut pg_sys::CommonTableExpr;
+            if cte.is_null() || (*cte).ctequery.is_null() || (*cte).ctename.is_null() {
+                return;
+            }
+            let cq = (*cte).ctequery as *mut pg_sys::Query;
+            if (*cq).commandType != pg_sys::CmdType::CMD_SELECT {
+                return; // data-modifying CTE — never replay
+            }
+            let loc = (*cte).location;
+            if loc < 0 || loc as usize >= src.len() {
+                return;
+            }
+            let body_end = match cte_body_end(&src, loc as usize) {
+                Some(e) => e,
+                None => return,
+            };
+            let name = match core::ffi::CStr::from_ptr((*cte).ctename).to_str() {
+                Ok(n) => n.to_string(),
+                Err(_) => return,
+            };
+            ctes.push(ComplexCte {
+                name,
+                loc: loc as usize,
+                body_end,
+                q: cq,
+                has_ops: level_contains_op_call(cq),
+            });
+        }
+        ctes.sort_by_key(|c| c.loc);
+    }
+
+    // Levels to scan for op calls: every CTE body + the final select.
+    let mut levels: Vec<*mut pg_sys::Query> = ctes.iter().map(|c| c.q).collect();
+    if (*query).commandType == pg_sys::CmdType::CMD_SELECT {
+        levels.push(query);
+    } else {
+        // INSERT: the single RTE_SUBQUERY is the source select.
+        let rtable = (*query).rtable;
+        if !rtable.is_null() {
+            let mut found: Option<*mut pg_sys::Query> = None;
+            let mut ambiguous = false;
+            for i in 0..(*rtable).length {
+                let rte = (*(*rtable).elements.add(i as usize)).ptr_value
+                    as *mut pg_sys::RangeTblEntry;
+                if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_SUBQUERY {
+                    if found.replace((*rte).subquery).is_some() {
+                        ambiguous = true;
+                    }
+                }
+            }
+            if !ambiguous {
+                if let Some(sq) = found {
+                    if !sq.is_null() {
+                        levels.push(sq);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut any_calls = false;
+    let mut plans: Vec<(String, Vec<String>, LevelSource)> = Vec::new();
+    for lvl in levels {
+        if lvl.is_null()
+            || !(*lvl).setOperations.is_null()
+            || !(*lvl).cteList.is_null() // nested WITH: name shadowing risk
+        {
+            continue;
+        }
+        let source = match single_from_source(lvl) {
+            Some(sf) => sf,
+            None => continue,
+        };
+        let mut calls: Vec<(String, Vec<String>)> = Vec::new();
+        collect_level_op_calls(lvl, &source, &mut calls);
+        for (op, frags) in calls {
+            any_calls = true;
+            plans.push((op, frags, clone_level_source(&source)));
+        }
+    }
+    if !any_calls {
+        return;
+    }
+    if !implicit_prewarm_enabled() {
+        return;
+    }
+
+    let cap = implicit_prewarm_max_rows();
+    let max_conc = implicit_prewarm_max_concurrent();
+    let mut seen: HashSet<(String, Vec<String>, String)> = HashSet::new();
+
+    for (op_name, arg_frags, source) in plans {
+        let arg_names = match fetch_op_arg_names(&op_name) {
+            Some(n) if n.len() == arg_frags.len() => n,
+            _ => continue,
+        };
+        let select_cols = arg_frags
+            .iter()
+            .zip(arg_names.iter())
+            .map(|(frag, name)| format!("{frag} AS \"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let outer_cols = arg_names
+            .iter()
+            .map(|name| quote_ident(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let input_sql = match &source {
+            LevelSource::Relation { oid, .. } => {
+                let table_name = match fetch_qualified_name(*oid) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let est = estimate_relation_rows(*oid);
+                if est > cap {
+                    pgrx::notice!(
+                        "rvbbit: semantic prewarm skipped for {op_name} — estimated {est} rows \
+                         exceeds cap {cap}; running per-row (slow). Raise \
+                         RVBBIT_IMPLICIT_PREWARM_MAX_ROWS or prewarm explicitly."
+                    );
+                    continue;
+                }
+                format!(
+                    "SELECT DISTINCT {outer_cols} FROM (SELECT {select_cols} FROM {table_name}) \
+                     AS rvbbit_prewarm_input"
+                )
+            }
+            LevelSource::Cte { name, .. } => {
+                let idx = match ctes.iter().position(|c| &c.name == name) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                // Any semantic op inside the prefix would make COLLECTING the
+                // inputs itself pay the serial cost — bail to per-row instead.
+                if ctes[..=idx].iter().any(|c| c.has_ops) {
+                    pgrx::debug1!(
+                        "rvbbit: implicit prewarm skipped for {op_name} — a prefix CTE \
+                         contains a semantic operator"
+                    );
+                    continue;
+                }
+                let src = match statement_source_bytes() {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let start = ctes[0].loc;
+                let end = ctes[idx].body_end;
+                if end <= start || end > src.len() {
+                    continue;
+                }
+                let prefix = match core::str::from_utf8(&src[start..end]) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let with_kw = if (*query).hasRecursive {
+                    "WITH RECURSIVE "
+                } else {
+                    "WITH "
+                };
+                // No stats exist for a CTE — bound the warm set with LIMIT
+                // (applied after DISTINCT) instead of an estimate check.
+                format!(
+                    "{with_kw}{prefix} SELECT DISTINCT {outer_cols} FROM \
+                     (SELECT {select_cols} FROM {}) AS rvbbit_prewarm_input LIMIT {cap}",
+                    quote_ident(name)
+                )
+            }
+        };
+
+        let dedupe_key = (
+            op_name.clone(),
+            arg_frags.clone(),
+            match &source {
+                LevelSource::Relation { oid, .. } => format!("rel:{oid}"),
+                LevelSource::Cte { name, .. } => format!("cte:{name}"),
+            },
+        );
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+
+        let op_literal = sql_literal(&op_name);
+        let prewarm_sql = format!(
+            "SELECT * FROM rvbbit.prewarm_operator(\
+                 {op_literal}, \
+                 $rvbbitprewarm${input_sql}$rvbbitprewarm$, \
+                 {max_conc})"
+        );
+        if let Err(err) = pgrx::Spi::run(&prewarm_sql) {
+            pgrx::debug1!("rvbbit: complex implicit prewarm failed for {op_name}: {err}");
+        }
+    }
+}
+
+fn clone_level_source(s: &LevelSource) -> LevelSource {
+    match s {
+        LevelSource::Relation { oid, rtindex } => LevelSource::Relation {
+            oid: *oid,
+            rtindex: *rtindex,
+        },
+        LevelSource::Cte {
+            name,
+            rtindex,
+            colnames,
+        } => LevelSource::Cte {
+            name: name.clone(),
+            rtindex: *rtindex,
+            colnames: colnames.clone(),
+        },
+    }
+}
+
+/// The current statement's ORIGINAL source bytes. Parse locations are byte
+/// offsets into this exact string, so no lossy conversion is allowed here.
+unsafe fn statement_source_bytes() -> Option<Vec<u8>> {
+    let p = pg_sys::debug_query_string;
+    if p.is_null() {
+        return None;
+    }
+    Some(core::ffi::CStr::from_ptr(p).to_bytes().to_vec())
+}
+
+/// A level's FROM must be exactly one RangeTblRef to a relation or CTE.
+unsafe fn single_from_source(lvl: *mut pg_sys::Query) -> Option<LevelSource> {
+    let jt = (*lvl).jointree;
+    if jt.is_null() {
+        return None;
+    }
+    let fl = (*jt).fromlist;
+    if fl.is_null() || (*fl).length != 1 {
+        return None;
+    }
+    let node = (*(*fl).elements).ptr_value as *mut pg_sys::Node;
+    if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_RangeTblRef {
+        return None;
+    }
+    let rtindex = (*(node as *mut pg_sys::RangeTblRef)).rtindex;
+    let rtable = (*lvl).rtable;
+    if rtable.is_null() || rtindex < 1 || rtindex > (*rtable).length {
+        return None;
+    }
+    let rte = (*(*rtable).elements.add((rtindex - 1) as usize)).ptr_value
+        as *mut pg_sys::RangeTblEntry;
+    if rte.is_null() {
+        return None;
+    }
+    match (*rte).rtekind {
+        pg_sys::RTEKind::RTE_RELATION => Some(LevelSource::Relation {
+            oid: (*rte).relid.to_u32(),
+            rtindex,
+        }),
+        pg_sys::RTEKind::RTE_CTE => {
+            if (*rte).ctename.is_null() {
+                return None;
+            }
+            let name = core::ffi::CStr::from_ptr((*rte).ctename)
+                .to_str()
+                .ok()?
+                .to_string();
+            Some(LevelSource::Cte {
+                name,
+                rtindex,
+                colnames: rte_eref_colnames(rte)?,
+            })
+        }
+        _ => None,
+    }
+}
+
+unsafe fn rte_eref_colnames(rte: *mut pg_sys::RangeTblEntry) -> Option<Vec<String>> {
+    let eref = (*rte).eref;
+    if eref.is_null() {
+        return None;
+    }
+    let list = (*eref).colnames;
+    if list.is_null() {
+        return None;
+    }
+    let mut out = Vec::with_capacity((*list).length as usize);
+    for i in 0..(*list).length {
+        let node = (*(*list).elements.add(i as usize)).ptr_value as *mut pg_sys::Node;
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_String {
+            return None;
+        }
+        let sval = (*(node as *mut pg_sys::String)).sval;
+        if sval.is_null() {
+            return None;
+        }
+        out.push(core::ffi::CStr::from_ptr(sval).to_str().ok()?.to_string());
+    }
+    Some(out)
+}
+
+/// Collect op calls in a level's target list + WHERE quals, rendering args
+/// against the level's single FROM source. Var/Const args work for both
+/// source kinds; arbitrary expressions keep the existing relation-only
+/// deparse path (deparse_context_for needs a real relation).
+unsafe fn collect_level_op_calls(
+    lvl: *mut pg_sys::Query,
+    source: &LevelSource,
+    out: &mut Vec<(String, Vec<String>)>,
+) {
+    let tlist = (*lvl).targetList;
+    if !tlist.is_null() {
+        for i in 0..(*tlist).length {
+            let tle = (*(*tlist).elements.add(i as usize)).ptr_value as *mut pg_sys::TargetEntry;
+            if !tle.is_null() {
+                walk_level_for_op_calls(lvl, source, (*tle).expr as *mut pg_sys::Node, out);
+            }
+        }
+    }
+    let jt = (*lvl).jointree;
+    if !jt.is_null() && !(*jt).quals.is_null() {
+        walk_level_for_op_calls(lvl, source, (*jt).quals, out);
+    }
+}
+
+unsafe fn walk_level_for_op_calls(
+    lvl: *mut pg_sys::Query,
+    source: &LevelSource,
+    node: *mut pg_sys::Node,
+    out: &mut Vec<(String, Vec<String>)>,
+) {
+    if node.is_null() {
+        return;
+    }
+    if let Some(call) = classify_level_op_call(lvl, source, node) {
+        out.push(call);
+        return;
+    }
+    match (*node).type_ {
+        pg_sys::NodeTag::T_OpExpr => {
+            walk_level_list(lvl, source, (*(node as *mut pg_sys::OpExpr)).args, out)
+        }
+        pg_sys::NodeTag::T_FuncExpr => {
+            walk_level_list(lvl, source, (*(node as *mut pg_sys::FuncExpr)).args, out)
+        }
+        pg_sys::NodeTag::T_CoerceViaIO => walk_level_for_op_calls(
+            lvl,
+            source,
+            (*(node as *mut pg_sys::CoerceViaIO)).arg as *mut pg_sys::Node,
+            out,
+        ),
+        pg_sys::NodeTag::T_RelabelType => walk_level_for_op_calls(
+            lvl,
+            source,
+            (*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node,
+            out,
+        ),
+        pg_sys::NodeTag::T_BoolExpr => {
+            walk_level_list(lvl, source, (*(node as *mut pg_sys::BoolExpr)).args, out)
+        }
+        pg_sys::NodeTag::T_CaseExpr => {
+            let ce = node as *mut pg_sys::CaseExpr;
+            walk_level_for_op_calls(lvl, source, (*ce).arg as *mut pg_sys::Node, out);
+            walk_level_list(lvl, source, (*ce).args, out);
+            walk_level_for_op_calls(lvl, source, (*ce).defresult as *mut pg_sys::Node, out);
+        }
+        pg_sys::NodeTag::T_Aggref => {
+            let args = (*(node as *mut pg_sys::Aggref)).args;
+            if !args.is_null() {
+                for i in 0..(*args).length {
+                    let tle =
+                        (*(*args).elements.add(i as usize)).ptr_value as *mut pg_sys::TargetEntry;
+                    if !tle.is_null() {
+                        walk_level_for_op_calls(lvl, source, (*tle).expr as *mut pg_sys::Node, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+unsafe fn walk_level_list(
+    lvl: *mut pg_sys::Query,
+    source: &LevelSource,
+    list: *mut pg_sys::List,
+    out: &mut Vec<(String, Vec<String>)>,
+) {
+    if list.is_null() {
+        return;
+    }
+    for i in 0..(*list).length {
+        walk_level_for_op_calls(
+            lvl,
+            source,
+            (*(*list).elements.add(i as usize)).ptr_value as *mut pg_sys::Node,
+            out,
+        );
+    }
+}
+
+unsafe fn classify_level_op_call(
+    lvl: *mut pg_sys::Query,
+    source: &LevelSource,
+    node: *mut pg_sys::Node,
+) -> Option<(String, Vec<String>)> {
+    if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_FuncExpr {
+        return None;
+    }
+    let fe = node as *mut pg_sys::FuncExpr;
+    let op_name = rvbbit_op_for_funcid((*fe).funcid.to_u32())?;
+    let arg_count = fetch_op_arg_count(&op_name)?;
+    let args = (*fe).args;
+    if args.is_null() || ((*args).length as usize) < arg_count {
+        return None;
+    }
+    let mut arg_frags: Vec<String> = Vec::with_capacity(arg_count);
+    for i in 0..arg_count {
+        let arg = pg_sys::list_nth(args, i as i32) as *mut pg_sys::Node;
+        if arg.is_null() {
+            return None;
+        }
+        arg_frags.push(render_level_op_arg(lvl, source, arg)?);
+    }
+    Some((op_name, arg_frags))
+}
+
+unsafe fn render_level_op_arg(
+    lvl: *mut pg_sys::Query,
+    source: &LevelSource,
+    node: *mut pg_sys::Node,
+) -> Option<String> {
+    let inner = peel_casts(node);
+    if inner.is_null() {
+        return None;
+    }
+    match (*inner).type_ {
+        pg_sys::NodeTag::T_Var => {
+            let var = inner as *mut pg_sys::Var;
+            if (*var).varlevelsup != 0 {
+                return None;
+            }
+            let varno = (*var).varno as i32;
+            let attno = (*var).varattno as i32;
+            if attno < 1 {
+                return None;
+            }
+            match source {
+                LevelSource::Relation { oid, rtindex } => {
+                    if varno != *rtindex {
+                        return None;
+                    }
+                    Some(format!("\"{}\"", fetch_attname(*oid, attno)?))
+                }
+                LevelSource::Cte {
+                    rtindex, colnames, ..
+                } => {
+                    if varno != *rtindex {
+                        return None;
+                    }
+                    let name = colnames.get((attno - 1) as usize)?;
+                    Some(quote_ident(name))
+                }
+            }
+        }
+        pg_sys::NodeTag::T_Const => {
+            let c = inner as *mut pg_sys::Const;
+            if (*c).constisnull {
+                return Some("NULL".to_string());
+            }
+            let typ = (*c).consttype;
+            let text = const_output_text((*c).constvalue, typ);
+            let typename = const_type_name(typ)?;
+            Some(format!("{}::{}", sql_literal(&text), typename))
+        }
+        _ => match source {
+            // Arbitrary expressions deparse against a real relation only.
+            LevelSource::Relation { oid, rtindex } if *rtindex == 1 => {
+                render_expr_via_deparse(lvl, *oid, inner)
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Does this query level (target list, WHERE, HAVING) contain any rvbbit
+/// semantic op call? Used to refuse lifting a CTE prefix whose execution
+/// would itself invoke operators.
+unsafe fn level_contains_op_call(q: *mut pg_sys::Query) -> bool {
+    unsafe fn node_has_op(node: *mut pg_sys::Node) -> bool {
+        if node.is_null() {
+            return false;
+        }
+        if (*node).type_ == pg_sys::NodeTag::T_FuncExpr {
+            let fe = node as *mut pg_sys::FuncExpr;
+            if rvbbit_op_for_funcid((*fe).funcid.to_u32()).is_some() {
+                return true;
+            }
+            return list_has_op((*fe).args);
+        }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_OpExpr => list_has_op((*(node as *mut pg_sys::OpExpr)).args),
+            pg_sys::NodeTag::T_BoolExpr => list_has_op((*(node as *mut pg_sys::BoolExpr)).args),
+            pg_sys::NodeTag::T_CoerceViaIO => {
+                node_has_op((*(node as *mut pg_sys::CoerceViaIO)).arg as *mut pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_RelabelType => {
+                node_has_op((*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_CaseExpr => {
+                let ce = node as *mut pg_sys::CaseExpr;
+                node_has_op((*ce).arg as *mut pg_sys::Node)
+                    || list_has_op((*ce).args)
+                    || node_has_op((*ce).defresult as *mut pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_CaseWhen => {
+                let cw = node as *mut pg_sys::CaseWhen;
+                node_has_op((*cw).expr as *mut pg_sys::Node)
+                    || node_has_op((*cw).result as *mut pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_Aggref => {
+                let args = (*(node as *mut pg_sys::Aggref)).args;
+                if args.is_null() {
+                    return false;
+                }
+                for i in 0..(*args).length {
+                    let tle =
+                        (*(*args).elements.add(i as usize)).ptr_value as *mut pg_sys::TargetEntry;
+                    if !tle.is_null() && node_has_op((*tle).expr as *mut pg_sys::Node) {
+                        return true;
+                    }
+                }
+                false
+            }
+            pg_sys::NodeTag::T_WindowFunc => {
+                list_has_op((*(node as *mut pg_sys::WindowFunc)).args)
+            }
+            _ => false,
+        }
+    }
+    unsafe fn list_has_op(list: *mut pg_sys::List) -> bool {
+        if list.is_null() {
+            return false;
+        }
+        for i in 0..(*list).length {
+            if node_has_op((*(*list).elements.add(i as usize)).ptr_value as *mut pg_sys::Node) {
+                return true;
+            }
+        }
+        false
+    }
+    if q.is_null() {
+        return false;
+    }
+    let tlist = (*q).targetList;
+    if !tlist.is_null() {
+        for i in 0..(*tlist).length {
+            let tle = (*(*tlist).elements.add(i as usize)).ptr_value as *mut pg_sys::TargetEntry;
+            if !tle.is_null() && node_has_op((*tle).expr as *mut pg_sys::Node) {
+                return true;
+            }
+        }
+    }
+    let jt = (*q).jointree;
+    if !jt.is_null() && node_has_op((*jt).quals) {
+        return true;
+    }
+    if node_has_op((*q).havingQual) {
+        return true;
+    }
+    false
+}
+
+/// Given the byte offset of a CTE's NAME token, return the offset just past
+/// the closing ')' of its body: `name [(cols)] AS [[NOT] MATERIALIZED] ( body )`.
+/// The scan is SQL-aware: strings ('' doubling, E'\' escapes), quoted
+/// idents, dollar quotes, line and nested block comments.
+fn cte_body_end(src: &[u8], name_loc: usize) -> Option<usize> {
+    let mut i = name_loc;
+    // The name itself may be a quoted identifier.
+    if *src.get(i)? == b'"' {
+        i = skip_quoted_ident(src, i)?;
+    } else {
+        while i < src.len() && is_ident_byte(src[i]) {
+            i += 1;
+        }
+    }
+    i = skip_sql_space(src, i)?;
+    // Optional column list.
+    if *src.get(i)? == b'(' {
+        i = sql_match_paren(src, i)? + 1;
+        i = skip_sql_space(src, i)?;
+    }
+    // AS
+    if !kw_at_bytes(src, i, b"AS") {
+        return None;
+    }
+    i = skip_sql_space(src, i + 2)?;
+    // [NOT] MATERIALIZED
+    if kw_at_bytes(src, i, b"NOT") {
+        i = skip_sql_space(src, i + 3)?;
+        if !kw_at_bytes(src, i, b"MATERIALIZED") {
+            return None;
+        }
+        i = skip_sql_space(src, i + 12)?;
+    } else if kw_at_bytes(src, i, b"MATERIALIZED") {
+        i = skip_sql_space(src, i + 12)?;
+    }
+    if *src.get(i)? != b'(' {
+        return None;
+    }
+    Some(sql_match_paren(src, i)? + 1)
+}
+
+fn kw_at_bytes(src: &[u8], i: usize, kw: &[u8]) -> bool {
+    if i + kw.len() > src.len() {
+        return false;
+    }
+    if !src[i..i + kw.len()].eq_ignore_ascii_case(kw) {
+        return false;
+    }
+    match src.get(i + kw.len()) {
+        Some(&b) => !is_ident_byte(b),
+        None => true,
+    }
+}
+
+fn skip_quoted_ident(src: &[u8], open: usize) -> Option<usize> {
+    let mut i = open + 1;
+    while i < src.len() {
+        if src[i] == b'"' {
+            if src.get(i + 1) == Some(&b'"') {
+                i += 2;
+                continue;
+            }
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Skip whitespace and comments; None on end-of-input.
+fn skip_sql_space(src: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        while i < src.len() && src[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < src.len() && src[i] == b'-' && src[i + 1] == b'-' {
+            while i < src.len() && src[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < src.len() && src[i] == b'/' && src[i + 1] == b'*' {
+            let mut depth = 1;
+            i += 2;
+            while i + 1 < src.len() && depth > 0 {
+                if src[i] == b'/' && src[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if src[i] == b'*' && src[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if depth > 0 {
+                return None;
+            }
+            continue;
+        }
+        break;
+    }
+    if i < src.len() {
+        Some(i)
+    } else {
+        None
+    }
+}
+
+/// Byte offset of the ')' matching the '(' at `open`, honoring strings,
+/// quoted idents, dollar quotes, and comments.
+fn sql_match_paren(src: &[u8], open: usize) -> Option<usize> {
+    if *src.get(open)? != b'(' {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    let mut i = open;
+    while i < src.len() {
+        match src[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            b'\'' => {
+                // E'...' allows backslash escapes; plain '...' only '' doubling.
+                let estr = i >= 1
+                    && (src[i - 1] == b'E' || src[i - 1] == b'e')
+                    && (i < 2 || !is_ident_byte(src[i - 2]));
+                i += 1;
+                while i < src.len() {
+                    if estr && src[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if src[i] == b'\'' {
+                        if src.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i = skip_quoted_ident(src, i)?;
+            }
+            b'$' => {
+                // Dollar quote? $tag$ ... $tag$ (tag = ident chars or empty).
+                let mut j = i + 1;
+                while j < src.len() && is_ident_byte(src[j]) {
+                    j += 1;
+                }
+                if j < src.len() && src[j] == b'$' {
+                    let tag = &src[i..=j];
+                    let mut k = j + 1;
+                    let mut closed = false;
+                    while k + tag.len() <= src.len() {
+                        if &src[k..k + tag.len()] == tag {
+                            i = k + tag.len();
+                            closed = true;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if !closed {
+                        return None;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            b'-' if src.get(i + 1) == Some(&b'-') => {
+                while i < src.len() && src[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if src.get(i + 1) == Some(&b'*') => {
+                let mut depth_c = 1;
+                i += 2;
+                while i + 1 < src.len() && depth_c > 0 {
+                    if src[i] == b'/' && src[i + 1] == b'*' {
+                        depth_c += 1;
+                        i += 2;
+                    } else if src[i] == b'*' && src[i + 1] == b'/' {
+                        depth_c -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if depth_c > 0 {
+                    return None;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 unsafe fn sort_clause_contains_rvbbit_op(query: *mut pg_sys::Query, table_oid: u32) -> bool {
