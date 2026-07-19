@@ -34,6 +34,7 @@ migrations 0157–0169.
 | `rvbbit.kit_rule_stats` | Bounded telemetry: one row per `(kit, rule_set, rule_id)` — matches, errors, last_matched_at, last_error, last_subject specimen. `'(no match)'` counts fall-throughs |
 | `rvbbit.kit_rule_log` | Append log: errors always; every match when `rvbbit.rule_log = 'all'`. Prune with `prune_kit_rule_log()` |
 | `rvbbit.plate_action_log` | Audit: every action invocation (plate_id, action, args, error) |
+| `rvbbit.plate_revisions` | Safety net (0182): a `BEFORE UPDATE OR DELETE` trigger snapshots the outgoing row (`snapshot` jsonb = whole row) on every content change; idempotent rewrites captured nothing; last 20 kept per plate. `rvbbit.restore_plate(plate_id, rev DEFAULT NULL)` re-materializes a revision (delete-then-insert, so the replaced state is itself ledgered — restores are undoable). The plate window's source menu lists revisions with built-not-run restore statements |
 | `rvbbit.operators` (+cols) | `kit` and `visibility` (`'public'` \| `'kit'`) — kit-private operators leave discovery, keep executing |
 | `rvbbit.capability_catalog` | Kits publish as `kind='kit'` entries; `manifest.install_sql` carries the artifact |
 
@@ -52,6 +53,20 @@ Installs or replaces a plate. Tripwires at install: template rejected on
 `javascript:`; every query must be SELECT-shaped (PG regex note: `\y` is
 the word boundary — `\b` is backspace). `module` is set separately
 (`UPDATE rvbbit.plates SET module = …`) to avoid signature churn.
+
+```sql
+rvbbit.restore_plate(p_plate_id text, p_rev integer DEFAULT NULL) → text
+```
+Restores a `rvbbit.plate_revisions` snapshot (latest when `p_rev` is NULL).
+Delete-then-insert, so the capture trigger ledgers the state being
+replaced — a restore is always reversible.
+
+**Config-table conventions (0184):** kit config tables document their
+encodings with `COMMENT ON COLUMN` (`scheduling.hours.dow` says
+`0=Sunday .. 6=Saturday (NOT isodow)`). The assistant is taught to read
+`col_description()` before assuming, and to comment the config tables it
+creates. Author kits the same way — the catalog is the only channel a
+later session sees.
 
 ```sql
 rvbbit.set_plate_role(p_plate_id text, p_role text) → void   -- NULL/'' clears
@@ -209,7 +224,8 @@ computed is a column.
 | Show/hide (row) | `rv-if="row.flag"`, `rv-if="!row.flag"` | Single-field truthiness, inside `rv-each`. |
 | Show/hide (top) | `rv-if="query.column"` | First-row truthiness of another query — how TABS work (tab param + query computing `show_*` booleans). |
 | Grid island | `<rv-grid query="q"></rv-grid>` | Hydrates the real lens ResultGrid. |
-| Chart island | `<rv-chart query="q" x="col" y="col" mark="bar\|line\|area" rv-emit="col"></rv-chart>` | Vega-lite. `rv-emit` makes marks clickable (emits `datum[col]`; click again = unselect). A `sel` column ('active'/'') dims unselected marks. |
+| Chart island | `<rv-chart query="q" x="col" y="col" mark="bar\|line\|area" rv-emit="col"></rv-chart>` | Vega-lite. `rv-emit` makes marks clickable (emits `datum[col]`; click again = unselect). A `sel` column ('active'/'') dims unselected marks. Quick attrs (0183): `color="col"` (series+legend), `stack="true\|normalize"`, `x-format`/`y-format` (d3 format strings, e.g. `y-format="$,.0f"`), `height="260"` (default 220, clamped 80–800). |
+| Chart spec passthrough | `<rv-chart query="q" spec='{"mark":…,"encoding":…}'></rv-chart>` | Full Vega-Lite latitude: single-quoted attribute holding JSON — `mark`/`encoding`/`transform`/`layer` vocabulary. The island **force-injects** `data`, `width`, `autosize`, `background`, and theme `config`, so a spec can never detach a chart from its query or container; `height` inside spec is honored (clamped). Malformed JSON renders an inline error, not a blank. `rv-emit` click-wiring still works. |
 | Metric island | `<rv-metric query="q" value="col" title="Label"></rv-metric>` | Big-number card. |
 | Board island | `<rv-board query="q" group-by="col" group-label="col" id="col" title="col" value="col" note="col" tone="col" action="name" rv-emit="field" rv-open="plate:<id>"></rv-board>` | Kanban: one column per distinct `group-by` value (SQL ORDER BY = column order); LEFT-JOIN rows with NULL id = empty-column placeholders (idle groups stay drop targets). Dropping a card on another column fires the named action with args `{id, to}` — same wall as forms; `nullif`-cast `to` when it is a date. No `action` = read-only. Double-click a card: `rv-emit` publishes its id to the bus, then `rv-open` opens the target plate — the edit-loop gesture. |
 | Emit (click) | `rv-emit="param" rv-value="…"` on `<button>` | Publishes to the desktop bus + loops back if the plate declares the param. Click-again-to-unselect. `rv-confirm="text"` gates with a confirm dialog. |

@@ -1002,3 +1002,64 @@ customers/stages, a per-stage breakdown grid under the pipeline chart,
 chart island's sort:null already honored SQL order), area mark for
 the trend. Read-only preserved. Styling AND presentation analytics
 are now prompt-deep.
+
+## 30. Real-things round: revisions, source loop, focus, chart latitude (2026-07-18)
+
+Ryan graded the §1–§29 platform against "making more real things" and
+picked five (auto-refresh skipped — reactivity already covers it):
+
+**Plate revisions (0182) — the safety gap.** A restyle session had
+overwritten `sales/reports` unrecoverably (§29 addendum). Now a
+`BEFORE UPDATE OR DELETE` trigger on `rvbbit.plates` (ENABLE ALWAYS,
+per the 0122 lesson) snapshots the outgoing row as whole-row jsonb into
+`rvbbit.plate_revisions` — every write path, no `upsert_plate` churn.
+Content-diff guard means idempotent seed re-runs capture nothing; last
+20 kept. `restore_plate(id, rev)` re-materializes via
+`jsonb_populate_record` after a DELETE that itself ledgers the replaced
+state: restores are undoable. Validated in a rolled-back txn: update →
+captured, no-op rewrite → skipped, restore → v1 back + v2 ledgered.
+
+**Source menu — the bench→seed round trip in the strip.** A compact
+rail dropdown on every plate window (Ryan's counter-proposal to menu
+sprawl): the whole plate as ONE `upsert_plate` statement (server-built
+dollar-quoting + companion `UPDATE` for module/listens/requires_role),
+each named query, and the revision ledger as built-not-run
+`restore_plate` statements. `/api/plate/source` + `loadPlateSource()`.
+Proved byte-identical: generated SQL re-run against the live row left
+`md5(template||queries||actions)` unchanged and captured zero revisions.
+What I did by hand all trinity day (psql-dump → seed reconstruction) is
+now a click.
+
+**Placement cascade — fixed in `openWindow`, not 93 callsites.** Every
+opener passes fixed coords, so second folder/plate/settings landed at
+100% overlap (bit this session repeatedly). When the requested corner
+is claimed (top-left within 24px of an existing window), step
+down-right 32/28 px inside the visible world rect, wrapping into fresh
+lanes rather than piling bottom-right. One chokepoint, all species.
+
+**Focused window = assistant context hint.** Ryan's no-buttons design:
+chatting doesn't steal window focus, so the focused window rides the
+snapshot as `focused:true` + a context note — prefer it for ambiguous
+targets ("this one", bare restyle asks), everything stays addressable.
+No new UI.
+
+**Chart latitude (0183) — x/y-only was losing 90% of Vega-Lite.**
+Quick attrs `color`/`stack`/`x-format`/`y-format`/`height`, plus full
+passthrough: `spec='{"mark":…,"encoding":…}'` (mark/encoding/transform/
+layer). The island still force-injects data, width, autosize,
+background, theme config — a spec can never detach a chart from its
+query or container; malformed JSON renders an inline error (she gets
+feedback, not a blank). Both paths verified through the sanitizer live.
+Considered chart.js et al; rejected — a second spec dialect for zero
+capability Vega-Lite doesn't already have.
+
+**Config comments (0184).** The isodow guess, generalized: kit config
+tables carry `COMMENT ON COLUMN` for every convention (scheduling seed
+now comments dow/status/skills/buffer), and the assistant is taught to
+read `col_description()` before assuming — and to comment config tables
+it creates. The catalog is the only channel a later session sees.
+
+Banked for later rounds: LISTEN/NOTIFY cross-client reactivity (the
+multiplayer dispatch board), auto-refresh plates (if a real deployment
+wants wall dashboards), fragment re-render, headless capture routes,
+metric_defs/cube_defs manifest sections.

@@ -745,6 +745,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0181_assistant_chart_autosize",
         include_str!("../sql/migrations/0181_assistant_chart_autosize.sql"),
     ),
+    (
+        "0182_plate_revisions",
+        include_str!("../sql/migrations/0182_plate_revisions.sql"),
+    ),
+    (
+        "0183_assistant_chart_spec",
+        include_str!("../sql/migrations/0183_assistant_chart_spec.sql"),
+    ),
+    (
+        "0184_assistant_config_comments",
+        include_str!("../sql/migrations/0184_assistant_config_comments.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

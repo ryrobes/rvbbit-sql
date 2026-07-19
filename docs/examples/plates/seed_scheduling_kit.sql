@@ -46,6 +46,15 @@ CREATE TABLE IF NOT EXISTS scheduling.hours (
     close_at time                                              -- NULL = closed
 );
 
+-- Conventions live in the catalog (0184): the assistant reads column
+-- comments before assuming an encoding, so every non-obvious convention
+-- gets one here.
+COMMENT ON COLUMN scheduling.hours.dow IS 'PostgreSQL extract(dow) numbering: 0=Sunday .. 6=Saturday (NOT isodow)';
+COMMENT ON COLUMN scheduling.hours.close_at IS 'NULL open_at/close_at = closed that day';
+COMMENT ON COLUMN scheduling.appointments.status IS 'booked -> confirmed -> in_progress -> done; cancelled and no_show are terminal';
+COMMENT ON COLUMN scheduling.assignees.skills IS 'empty array = generalist (matches any job_type)';
+COMMENT ON COLUMN scheduling.job_types.buffer_minutes IS 'travel/cleanup padding after default_minutes when proposing slots';
+
 -- Fresh-shop SELF-FIT: the kit's own table IS the canon. Guarded twice
 -- so a customer's accepted fitting over their existing data is never
 -- clobbered by setup re-runs/upgrades.
@@ -107,6 +116,11 @@ CREATE TABLE IF NOT EXISTS scheduling.hours (
     open_at  time,
     close_at time
 );
+COMMENT ON COLUMN scheduling.hours.dow IS 'PostgreSQL extract(dow) numbering: 0=Sunday .. 6=Saturday (NOT isodow)';
+COMMENT ON COLUMN scheduling.hours.close_at IS 'NULL open_at/close_at = closed that day';
+COMMENT ON COLUMN scheduling.appointments.status IS 'booked -> confirmed -> in_progress -> done; cancelled and no_show are terminal';
+COMMENT ON COLUMN scheduling.assignees.skills IS 'empty array = generalist (matches any job_type)';
+COMMENT ON COLUMN scheduling.job_types.buffer_minutes IS 'travel/cleanup padding after default_minutes when proposing slots';
 DO $selffit$
 BEGIN
     IF to_regclass('scheduling.v_appointments') IS NULL THEN
