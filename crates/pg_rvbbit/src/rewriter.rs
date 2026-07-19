@@ -10031,9 +10031,166 @@ unsafe fn render_level_op_arg(
             LevelSource::Relation { oid, rtindex } if *rtindex == 1 => {
                 render_expr_via_deparse(lvl, *oid, inner)
             }
+            // CTEs have no relation OID, so ruleutils can't build a deparse
+            // context — render the honest subset by hand instead. Without
+            // this, `op(left(c.col, 7000), …)` at a CTE level silently
+            // dropped the whole statement to serial per-row calls.
+            LevelSource::Cte { .. } => {
+                if pg_sys::contain_volatile_functions(inner) || pg_sys::contain_agg_clause(inner) {
+                    return None;
+                }
+                render_cte_expr(source, inner, 0)
+            }
             _ => None,
         },
     }
+}
+
+/// Bounded recursive SQL renderer for op-argument expressions over a CTE
+/// source: function calls, binary operators, COALESCE, and NULLIF over
+/// Vars/Consts. Anything else (SubLinks, CASE, window/agg refs, variadic
+/// calls) refuses — the caller degrades to no prewarm, never to wrong SQL.
+/// Volatile functions are rejected by the caller up front: a volatile arg
+/// would hash differently in the prewarm pass than in the real query, which
+/// is pure cache-miss spend.
+unsafe fn render_cte_expr(
+    source: &LevelSource,
+    node: *mut pg_sys::Node,
+    depth: usize,
+) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let inner = peel_casts(node);
+    if inner.is_null() {
+        return None;
+    }
+    match (*inner).type_ {
+        pg_sys::NodeTag::T_Var => {
+            let var = inner as *mut pg_sys::Var;
+            if (*var).varlevelsup != 0 || (*var).varattno < 1 {
+                return None;
+            }
+            match source {
+                LevelSource::Cte { rtindex, colnames, .. } => {
+                    if (*var).varno as i32 != *rtindex {
+                        return None;
+                    }
+                    let name = colnames.get(((*var).varattno - 1) as usize)?;
+                    Some(quote_ident(name))
+                }
+                LevelSource::Relation { .. } => None,
+            }
+        }
+        pg_sys::NodeTag::T_Const => {
+            let c = inner as *mut pg_sys::Const;
+            if (*c).constisnull {
+                return Some("NULL".to_string());
+            }
+            let typ = (*c).consttype;
+            let text = const_output_text((*c).constvalue, typ);
+            let typename = const_type_name(typ)?;
+            Some(format!("{}::{}", sql_literal(&text), typename))
+        }
+        pg_sys::NodeTag::T_FuncExpr => {
+            let fe = inner as *mut pg_sys::FuncExpr;
+            // Never fold another semantic op into an argument fragment.
+            if rvbbit_op_for_funcid((*fe).funcid.to_u32()).is_some() {
+                return None;
+            }
+            // Cast-form FuncExprs: render the payload, drop the cast — op
+            // inputs are textified downstream, matching peel_casts semantics.
+            if (*fe).funcformat == pg_sys::CoercionForm::COERCE_EXPLICIT_CAST
+                || (*fe).funcformat == pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
+            {
+                let arg0 = list_nth_node((*fe).args, 0)?;
+                return render_cte_expr(source, arg0, depth + 1);
+            }
+            // VARIADIC-collapsed calls need array reconstruction — refuse.
+            if (*fe).funcvariadic {
+                return None;
+            }
+            let name = qualified_func_name((*fe).funcid)?;
+            let args = (*fe).args;
+            if args.is_null() || (*args).length == 0 {
+                return Some(format!("{name}()"));
+            }
+            let mut frags: Vec<String> = Vec::with_capacity((*args).length as usize);
+            for i in 0..(*args).length {
+                let arg = pg_sys::list_nth(args, i) as *mut pg_sys::Node;
+                frags.push(render_cte_expr(source, arg, depth + 1)?);
+            }
+            Some(format!("{}({})", name, frags.join(", ")))
+        }
+        pg_sys::NodeTag::T_OpExpr => {
+            let oe = inner as *mut pg_sys::OpExpr;
+            let args = (*oe).args;
+            if args.is_null() || (*args).length != 2 {
+                return None;
+            }
+            let name_c = pg_sys::get_opname((*oe).opno);
+            if name_c.is_null() {
+                return None;
+            }
+            let opname = std::ffi::CStr::from_ptr(name_c).to_string_lossy().into_owned();
+            let l = render_cte_expr(source, list_nth_node(args, 0)?, depth + 1)?;
+            let r = render_cte_expr(source, list_nth_node(args, 1)?, depth + 1)?;
+            // OPERATOR(pg_catalog.x) form would be safest, but the prewarm
+            // SELECT runs in the same session/search_path as the statement it
+            // mirrors, so the bare spelling resolves identically.
+            Some(format!("({l} {opname} {r})"))
+        }
+        pg_sys::NodeTag::T_NullIfExpr => {
+            // NullIfExpr shares OpExpr's layout.
+            let oe = inner as *mut pg_sys::OpExpr;
+            let args = (*oe).args;
+            if args.is_null() || (*args).length != 2 {
+                return None;
+            }
+            let l = render_cte_expr(source, list_nth_node(args, 0)?, depth + 1)?;
+            let r = render_cte_expr(source, list_nth_node(args, 1)?, depth + 1)?;
+            Some(format!("NULLIF({l}, {r})"))
+        }
+        pg_sys::NodeTag::T_CoalesceExpr => {
+            let ce = inner as *mut pg_sys::CoalesceExpr;
+            let args = (*ce).args;
+            if args.is_null() || (*args).length == 0 {
+                return None;
+            }
+            let mut frags: Vec<String> = Vec::with_capacity((*args).length as usize);
+            for i in 0..(*args).length {
+                let arg = pg_sys::list_nth(args, i) as *mut pg_sys::Node;
+                frags.push(render_cte_expr(source, arg, depth + 1)?);
+            }
+            Some(format!("COALESCE({})", frags.join(", ")))
+        }
+        _ => None,
+    }
+}
+
+unsafe fn list_nth_node(list: *mut pg_sys::List, i: i32) -> Option<*mut pg_sys::Node> {
+    if list.is_null() || i < 0 || i >= (*list).length {
+        return None;
+    }
+    let p = pg_sys::list_nth(list, i) as *mut pg_sys::Node;
+    if p.is_null() { None } else { Some(p) }
+}
+
+/// `schema.func` spelled callably, quoting each part as needed. lsyscache
+/// has the name; the namespace comes from the proc's catalog row.
+unsafe fn qualified_func_name(funcid: pg_sys::Oid) -> Option<String> {
+    let name_c = pg_sys::get_func_name(funcid);
+    if name_c.is_null() {
+        return None;
+    }
+    let name = std::ffi::CStr::from_ptr(name_c).to_string_lossy().into_owned();
+    let nsp_oid = pg_sys::get_func_namespace(funcid);
+    let nsp_c = pg_sys::get_namespace_name(nsp_oid);
+    if nsp_c.is_null() {
+        return None;
+    }
+    let nsp = std::ffi::CStr::from_ptr(nsp_c).to_string_lossy().into_owned();
+    Some(format!("{}.{}", quote_ident(&nsp), quote_ident(&name)))
 }
 
 /// Does this query level (target list, WHERE, HAVING) contain any rvbbit

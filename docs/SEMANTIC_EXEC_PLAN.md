@@ -221,3 +221,30 @@ missing parse locations, non-UTF8 source. The hook's INSERT branch
 runs ONLY the prewarm rule (no scan rewrites for DML) under
 IN_REWRITER + extern-param guards; INSERT..VALUES costs one empty
 level enumeration.
+
+### Phase 5.1 — expression args over CTE sources (2026-07-19)
+
+Found in the wild the same week Phase 5 shipped: a reputation-signals
+INSERT..CTE query stayed serial while its siblings fanned out to 25
+lanes. Culprit: the op's first arg was `left(c.review_bundle, 7000)` —
+a FuncExpr over a CTE Var. Over a real relation, arbitrary expressions
+deparse via `deparse_context_for` (needs a relation OID); CTEs have no
+OID, so the CTE arm accepted only bare Vars and Consts and bailed.
+
+Fix: `render_cte_expr` — a bounded recursive renderer (depth 8) for the
+honest expression subset over CTE sources: non-variadic FuncExprs
+(cast-form wrappers peeled, semantic ops refused), binary OpExprs (bare
+operator spelling — the prewarm SELECT runs in the same session/search
+path), COALESCE, NULLIF, over Vars/Consts. Volatile functions and
+aggregates rejected up front (a volatile arg hashes differently in the
+prewarm pass than in the real query — pure cache-miss spend). Function
+names render schema-qualified via lsyscache
+(get_func_name/get_func_namespace). Unknown node tags refuse, and the
+prewarm Spi::run is already error-swallowed, so the failure mode stays
+"no prewarm," never "wrong SQL breaks the query."
+
+A/B on the bench (24 rows, cheap encoder, INSERT..CTE shape):
+`left(input, 500)` arg went 1264ms → 72ms; composite arg
+`coalesce(label,'anon') || ': ' || left(thread, 300)` fans out at
+137ms. Interim guidance for pre-4.0.14 boxes: build the semantic input
+in the upstream CTE and pass the bare column (the lead-intent pattern).
