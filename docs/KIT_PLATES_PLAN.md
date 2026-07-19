@@ -1137,3 +1137,21 @@ request) visible synthetic follow-up carrying a real diagnosis —
 context snippet, so she SEES the literal-newline mistake instead of
 guessing — plus the recovery protocol. Mirrors the visual self-check
 continuation machinery.
+
+## 33. The compose layer — canon drafted (2026-07-19)
+
+Ryan's layout idea grew into docs/PLATE_COMPOSE_PLAN.md ("the Pass",
+working name). Load-bearing decisions from the design conversation:
+layouts own arrangement NEVER behavior (the HyperCard wall — header
+bars with buttons are toolbar PLATES); free-floating rects + z on a
+declared design size, NOT grid splits — because a floating pane is a
+desktop window rect minus chrome, making stamp mode trivial and the
+DESKTOP itself the WYSIWYG editor (arrange windows → save as layout);
+fraction-translation without content scaling (text 1:1, charts
+re-measure via §31); responsive = SIBLING LAYOUTS (crm/home-phone is
+its own row, maybe fewer panes) + min_width auto-pick; transient
+plates are never dead panes (modals = windows over the dimmed wall,
+master-detail = slot panes running zero queries until rv-open
+@pane-targeted); orchestration = the existing param bus. Kit icon →
+kits.default_layout answers "what does CRM open with"; many layouts
+per kit is the point. Not yet built — plan is the artifact.
