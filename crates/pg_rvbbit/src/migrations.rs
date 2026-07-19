@@ -741,6 +741,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0180_assistant_utility_palette",
         include_str!("../sql/migrations/0180_assistant_utility_palette.sql"),
     ),
+    (
+        "0181_assistant_chart_autosize",
+        include_str!("../sql/migrations/0181_assistant_chart_autosize.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
