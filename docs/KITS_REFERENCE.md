@@ -213,9 +213,21 @@ need the sequences). Existing objects only — rerun after kit upgrades.
 ## 3. Template vocabulary (the whole language)
 
 Values are always HTML-escaped; the sanitizer allowlists tags/attributes
-twice (install + render, before AND after expansion); `style` attributes
-and URLs are stripped. There is NO expression language — anything
-computed is a column.
+twice (install + render, before AND after expansion); URLs are stripped.
+There is NO expression language — anything computed is a column.
+
+**Inline styles (0192): allowed, property-allowlisted.** The guardrail is
+containment, not "no styles": `style` may use any VISUAL property — colors
+(oklch/hex/`var()`/`color-mix()`), `background-image: linear-gradient(...)`,
+borders/radius/shadows, typography, spacing, display/flex/grid including
+exact `grid-template-columns`, opacity/filter/blend — and the render pass
+strips the escape hatches: position/inset/z-index, transform family,
+pointer-events, transitions/animations, and `url()` at the VALUE level.
+The scrub runs on the final post-interpolation document and drops
+offending declarations individually, so `url()` smuggled through DATA
+dies while the row's other styles survive. Styles are data-drivable:
+`style="width: {{ row.pct }}%"`, `background: {{ row.heat }}`. Prefer
+theme vars so custom designs retheme.
 
 | Verb | Form | Semantics |
 |---|---|---|

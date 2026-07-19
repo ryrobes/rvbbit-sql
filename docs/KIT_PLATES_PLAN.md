@@ -1186,3 +1186,36 @@ stacking-tree impossibility, so transient plates open wall-LOCAL
 modals — same conclusion the markup editor forced. rv-open-sql from a
 wall pane opens a desktop window BEHIND the wall (chromeless hides the
 affordances that would invoke it; acceptable, noted).
+
+## 35. Inline styles — latitude within the guardrails (2026-07-19)
+
+Ryan's diagnosis after real use: "everything made looks the same" —
+the primitives were the ceiling. The unlock: the style attribute was
+never the danger; CONTAINMENT is the guardrail, and containment is a
+property-level concern. The lens now allows style with a generous
+visual-property allowlist (STYLE_PROPS in plates.ts: colors, gradients,
+borders/radius/shadows, typography, spacing, display/flex/grid incl.
+exact grid-template-columns, opacity/filter/blend) and strips the
+escape hatches by omission (position/inset/z-index, transform family,
+pointer-events, transitions) plus a value-level deny
+(url()/expression()/javascript:/@import/-moz-binding).
+
+Mechanics that mattered:
+- sanitize-html postcss-parses style attrs BY DEFAULT and silently
+  drops any containing template tokens ({{ row.pct }} breaks the
+  parse). parseStyleAttributes: false — the sanitizer passes style
+  through verbatim; the render's own scrub is the sole enforcer.
+- The scrub runs on the FINAL post-interpolation document, per
+  DECLARATION: url() smuggled through DATA (a hue column returning
+  url(https://evil...)) kills that declaration only — the row's width
+  bar survives, the exfil dies. Verified with an adversarial plate:
+  10/10 checks (gradients/grid/SQL-driven widths+colors kept;
+  position/z/transform/pointer-events/template-url/data-url stripped).
+- Styles are DATA-DRIVABLE — width: {{ row.pct }}% replaces the w0-w100
+  5%-step palette with exact SQL bars; background: {{ row.heat }} =
+  real heatmaps; the logic-lives-in-SQL doctrine now covers looks.
+
+0192 rewrites the STYLING teaching: CUSTOM LOOKS bullet (what's
+allowed, what's stripped, prefer theme vars, "make surfaces DISTINCT —
+not every plate should look like the default cards"); native classes
+demoted to "still the fast path."
