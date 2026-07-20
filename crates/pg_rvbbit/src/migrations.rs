@@ -801,6 +801,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0195_managed_provider_models",
         include_str!("../sql/migrations/0195_managed_provider_models.sql"),
     ),
+    (
+        "0196_gdrive_connector_backend",
+        include_str!("../sql/migrations/0196_gdrive_connector_backend.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

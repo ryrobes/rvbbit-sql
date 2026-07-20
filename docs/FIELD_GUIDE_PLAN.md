@@ -192,3 +192,43 @@ deployable things.**
   the OS bar as a progress chip during first-run only.
 - Providers window naming: "AI Providers" vs "Intelligence" vs
   "Models" (lean: AI Providers — boring and unmistakable).
+
+## 10. The company-brain frame (2026-07-20)
+
+Market signal (a VC-backed SaaS pitch thread describing "how to become an
+AI-native company") maps 1:1 onto what already ships — the gap is
+packaging and first-touch, which is THIS plan's whole job:
+
+| Their step | rvbbit today |
+|---|---|
+| 1. Single MCP/API gateway | warehouse-mcp (rvbbit-as-server) + mcp-gateway (outbound) |
+| 2. Company brain (static + hot context) | Document Brain: brain_* corpus, remote sources, ACL sync, ask_brain |
+| 3. Company harness | the desktop assistant + operator/agent steps + capability KG |
+| 4. Onboard the team, self-improving loop | Field Guide (this plan) + Hindsight/system learning |
+| 5. Model-routing layer, remove vendor risk | AI Providers panel + backends + default_provider + Clover/BYOK/local ladder |
+| 6. Autonomous agents on top | flows, alerts, agent steps, warren |
+
+The weakest first-touch link was the brain eating real documents — fixed
+2026-07-20 by promoting the document sidecars to core:
+
+- **doc-extract** (universal file→markdown) and **gdrive-connector**
+  (Drive → brain remote sources) were product code in `sidecars/` that
+  only existed as hand-built images on one box. Now: versioned release
+  images (`rvbbit-doc-extract`, `rvbbit-gdrive-connector`), compose
+  services in release/uber/dev (doc-extract ON BY DEFAULT + shared
+  `/staging` volume; gdrive behind the `gdrive` profile since it is
+  credential-gated), and 0196 registers the connector backend so "add a
+  Drive source" never dead-ends on a missing row.
+- **Brain readiness strip** (sources panel): a live probe through the
+  real `extract_doc` path — "Document extraction ready" / "sidecar not
+  reachable at <endpoint>, it ships in the compose" — plus the Drive
+  connector's registration + setup line. Verified end-to-end on the
+  bench: staged binary DOCX → SQL `extract_doc` → docling → clean text.
+- Deferred, honestly: capability-catalog PACK entries for both (the
+  runtime_sidecar pack machinery registers gateways/runtimes, not
+  specialist backends — needs a small design pass). Images + compose +
+  migrations make them core TODAY; packs add warren-managed deploys
+  later.
+
+Field Guide chapter to add when P1 lands: **"Feed the brain"** — drop a
+folder of PDFs (or connect Drive), watch ask_brain answer from them.

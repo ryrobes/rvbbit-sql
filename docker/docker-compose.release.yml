@@ -20,6 +20,7 @@ services:
       - "${RVBBIT_POSTGRES_PORT:-55433}:5432"
     volumes:
       - rvbbit_pgdata:/var/lib/postgresql
+      - rvbbit_staging:/staging
     command:
       - postgres
       - -c
@@ -111,6 +112,30 @@ services:
       - rvbbit_warren:/var/lib/rvbbit/warren
     restart: unless-stopped
 
+  # Document-brain extraction — ON BY DEFAULT: the brain must read
+  # pdf/docx/xlsx/pptx/images out of the box. 0047 pre-registered the
+  # extract_doc backend at this service name; nothing else to configure.
+  doc-extract:
+    image: ${RVBBIT_DOC_EXTRACT_IMAGE:-ghcr.io/ryrobes/rvbbit-doc-extract:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-doc-extract
+    volumes:
+      - rvbbit_staging:/staging
+    restart: unless-stopped
+
+  # Google Drive connector for brain remote sources — credential-gated, so it
+  # rides the "gdrive" profile: set GDRIVE_SA_KEY and start with
+  #   docker compose --profile gdrive -f docker/docker-compose.release.yml up -d
+  gdrive-connector:
+    profiles: ["gdrive"]
+    image: ${RVBBIT_GDRIVE_CONNECTOR_IMAGE:-ghcr.io/ryrobes/rvbbit-gdrive-connector:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-gdrive-connector
+    environment:
+      GDRIVE_SA_KEY: ${GDRIVE_SA_KEY:-}
+      CONNECTOR_TOKEN: ${GDRIVE_CONNECTOR_TOKEN:-}
+    volumes:
+      - rvbbit_staging:/staging
+    restart: unless-stopped
+
 networks:
   default:
     name: ${RVBBIT_DOCKER_NETWORK:-rvbbit_release}
@@ -119,3 +144,4 @@ volumes:
   rvbbit_pgdata:
   rvbbit_lens:
   rvbbit_warren:
+  rvbbit_staging:

@@ -34,6 +34,7 @@ services:
       - "${RVBBIT_POSTGRES_PORT:-55433}:5432"
     volumes:
       - rvbbit_pgdata:/var/lib/postgresql
+      - rvbbit_staging:/staging
       - rvbbit_duck_run:/run/rvbbit
       - rvbbit_duck_arrow_ipc:/tmp/rvbbit-arrow-ipc
     command:
@@ -223,11 +224,35 @@ services:
     command: tunnel --no-autoupdate --url http://warehouse-mcp:8765
     restart: unless-stopped
 
+  # Document-brain extraction — ON BY DEFAULT (0047 pre-registered the
+  # extract_doc backend at this service name).
+  doc-extract:
+    image: ${RVBBIT_DOC_EXTRACT_IMAGE:-ghcr.io/ryrobes/rvbbit-doc-extract:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-doc-extract
+    volumes:
+      - rvbbit_staging:/staging
+    restart: unless-stopped
+
+  # Google Drive connector for brain remote sources — set GDRIVE_SA_KEY and
+  # start with --profile gdrive.
+  gdrive-connector:
+    profiles: ["gdrive"]
+    image: ${RVBBIT_GDRIVE_CONNECTOR_IMAGE:-ghcr.io/ryrobes/rvbbit-gdrive-connector:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-gdrive-connector
+    environment:
+      GDRIVE_SA_KEY: ${GDRIVE_SA_KEY:-}
+      CONNECTOR_TOKEN: ${GDRIVE_CONNECTOR_TOKEN:-}
+    volumes:
+      - rvbbit_staging:/staging
+    restart: unless-stopped
+
 networks:
   default:
     name: ${RVBBIT_DOCKER_NETWORK:-rvbbit_uber}
 
 volumes:
+  rvbbit_staging:
+    name: ${RVBBIT_STAGING_VOLUME:-rvbbit_uber_staging}
   rvbbit_pgdata:
     name: ${RVBBIT_PGDATA_VOLUME:-rvbbit_uber_pgdata}
   rvbbit_duck_run:

@@ -149,6 +149,7 @@ services:
     volumes:
       - rvbbit_data:/var/lib/postgresql
       - ../bench/clickbench/direct_accel:/rvbbit_import:ro
+      - rvbbit_staging:/staging
     # All knobs come from /etc/rvbbit/tuning.conf (see
     # docker/config/rvbbit-tuning.conf). Override individual settings by
     # adding `-c key=value` after the config_file line — last value wins.
@@ -238,7 +239,18 @@ services:
     # Idle by default so you can `docker compose exec bench python run.py …`.
     command: ["sleep", "infinity"]
 
+  # Document-brain extraction sidecar (dev build from sidecars/doc-extract).
+  # 0047 registered the extract_doc backend at this container name.
+  doc-extract:
+    build:
+      context: ../sidecars/doc-extract
+    container_name: rvbbit-doc-extract
+    volumes:
+      - rvbbit_staging:/staging
+    restart: unless-stopped
+
 volumes:
   heap_data:
   rvbbit_data:
   mcp_gateway_data:
+  rvbbit_staging:
