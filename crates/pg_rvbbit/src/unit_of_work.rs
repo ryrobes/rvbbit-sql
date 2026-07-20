@@ -2063,7 +2063,14 @@ fn run_step_mcp(step: &Value, step_name: &str, scope: &Scope) -> (SubCall, Value
         .get("inputs")
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
-    let rendered = render_value_templates(&inputs_raw, scope);
+    let mut rendered = render_value_templates(&inputs_raw, scope);
+    // An unset optional arg is OMITTED, never sent as null — the same
+    // doctrine as the per-server schema wrappers. Without this, MCP-tool
+    // operators called with NULL optional args (now CALLED ON NULL INPUT,
+    // not STRICT) would forward literal nulls that many servers reject.
+    if let Value::Object(map) = &mut rendered {
+        map.retain(|_, v| !v.is_null());
+    }
 
     let t0 = Instant::now();
     let res = crate::mcp::call(&server, &tool, &rendered);

@@ -809,6 +809,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0197_brain_ingest_folder",
         include_str!("../sql/migrations/0197_brain_ingest_folder.sql"),
     ),
+    (
+        "0198_mcp_capability_freshness",
+        include_str!("../sql/migrations/0198_mcp_capability_freshness.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

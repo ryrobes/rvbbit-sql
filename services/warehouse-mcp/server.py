@@ -195,12 +195,30 @@ def tool_capability_search(query: str, limit: int = 8, kinds=None) -> dict:
     if kinds:
         ks = [str(k).strip() for k in (kinds if isinstance(kinds, list) else str(kinds).split(",")) if str(k).strip()]
         ks = ks or None
+    rebuilt = False
     with _conn() as c:
+        # Self-heal FIRST: the capabilities graph only updates when
+        # capability_crawl() runs (e.g. after installing an MCP server), and
+        # a stale-but-populated index returns confident results that simply
+        # omit new tools — invisible to a zero-match check. The staleness
+        # probe is one cheap query and a full re-crawl measures ~2s, so when
+        # stale we just rebuild before searching.
+        try:
+            probe = c.execute(
+                "SELECT to_regprocedure('rvbbit.capability_search_stale()') IS NOT NULL AS ok"
+            ).fetchone()
+            if probe and probe["ok"] and bool(
+                c.execute("SELECT rvbbit.capability_search_stale() AS s").fetchone()["s"]
+            ):
+                c.execute("SELECT rvbbit.capability_crawl()")
+                rebuilt = True
+        except Exception:  # noqa: BLE001
+            pass  # search whatever index exists; never fail discovery on upkeep
         rows = c.execute(
             "SELECT kind, name, score, doc FROM rvbbit.capability_search(%s, %s, %s)",
             (query, limit, ks),
         ).fetchall()
-    return {
+    out = {
         "query": query,
         "matches": [
             {"kind": r["kind"], "name": r["name"], "score": round(float(r["score"] or 0), 3), "doc": r["doc"]}
@@ -208,6 +226,9 @@ def tool_capability_search(query: str, limit: int = 8, kinds=None) -> dict:
         ],
         "hint": "cap_operator results are SQL functions (use via run_sql); cap_pack results are installable capabilities; cap_mcp_tool results are tools on MCP servers already installed in the warehouse.",
     }
+    if rebuilt:
+        out["index_rebuilt"] = "capability index was stale — rebuilt automatically before this search"
+    return out
 
 
 def tool_search_data(query: str, limit: int = 8, schema=None) -> dict:
