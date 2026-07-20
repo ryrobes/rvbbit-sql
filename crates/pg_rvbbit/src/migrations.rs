@@ -805,6 +805,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0196_gdrive_connector_backend",
         include_str!("../sql/migrations/0196_gdrive_connector_backend.sql"),
     ),
+    (
+        "0197_brain_ingest_folder",
+        include_str!("../sql/migrations/0197_brain_ingest_folder.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
