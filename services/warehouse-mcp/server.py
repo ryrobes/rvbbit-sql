@@ -180,6 +180,36 @@ def _freshness(cur, schema: str, rel: str):
 
 # ── tools ───────────────────────────────────────────────────────────────────
 
+def tool_capability_search(query: str, limit: int = 8, kinds=None) -> dict:
+    """Search WHAT THIS WAREHOUSE CAN DO — the same just-in-time discovery the
+    built-in assistant uses: semantic SQL operators (means()/about()/extract/
+    classify/forecast/...), installed MCP servers and their tools, installable
+    capability packs, SQL syntax patterns, models and providers. Ask in plain
+    language ("extract entities from text", "search the web", "forecast this
+    series") and get callable names + signatures back — operators are directly
+    usable inside run_sql. Complements search_data (which finds DATA: tables,
+    metrics, cubes); this finds ABILITIES. kinds filter (optional):
+    cap_operator | cap_mcp_tool | cap_pack | cap_syntax | model | provider."""
+    limit = max(1, min(int(limit or 8), 25))
+    ks = None
+    if kinds:
+        ks = [str(k).strip() for k in (kinds if isinstance(kinds, list) else str(kinds).split(",")) if str(k).strip()]
+        ks = ks or None
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT kind, name, score, doc FROM rvbbit.capability_search(%s, %s, %s)",
+            (query, limit, ks),
+        ).fetchall()
+    return {
+        "query": query,
+        "matches": [
+            {"kind": r["kind"], "name": r["name"], "score": round(float(r["score"] or 0), 3), "doc": r["doc"]}
+            for r in rows
+        ],
+        "hint": "cap_operator results are SQL functions (use via run_sql); cap_pack results are installable capabilities; cap_mcp_tool results are tools on MCP servers already installed in the warehouse.",
+    }
+
+
 def tool_search_data(query: str, limit: int = 8, schema=None) -> dict:
     """Semantic search over the catalog KG + data-KG, each table hit grounded with live
     samples, cheap per-column stats, and freshness/drift. Internal (rvbbit/pg_*)
@@ -3792,6 +3822,9 @@ def _register(mcp):
     mcp.tool(name="search_data")(lambda query, limit=8, schema=None: _logged(
         "search_data", {"query": query, "limit": limit, "schema": schema},
         lambda: tool_search_data(query, limit, schema)))
+    mcp.tool(name="capability_search")(lambda query, limit=8, kinds=None: _logged(
+        "capability_search", {"query": query, "limit": limit, "kinds": kinds},
+        lambda: tool_capability_search(query, limit, kinds)))
     mcp.tool(name="describe_table")(lambda table, lean=False: _logged(
         "describe_table", {"table": table, "lean": lean}, lambda: tool_describe_table(table, lean)))
     mcp.tool(name="profile_schema")(lambda schema=None: _logged(
