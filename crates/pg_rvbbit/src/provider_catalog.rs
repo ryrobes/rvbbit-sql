@@ -448,6 +448,38 @@ struct RefreshStats {
     raw: Value,
 }
 
+/// Where would a named credential resolve from, if a backend asked right
+/// now? Mirrors the REAL auth precedence (env var first — deploy-time
+/// wins — then rvbbit.secrets). Presence only, never the value. Lets the
+/// AI Providers panel say "via env" / "stored secret" / "missing"
+/// honestly instead of guessing — the lens cannot see this process's
+/// environment.
+#[pg_extern(volatile)]
+fn credential_state(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return "none".to_string();
+    }
+    if std::env::var(name)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_some()
+    {
+        return "env".to_string();
+    }
+    let esc = name.replace('\'', "''");
+    let has_secret = Spi::get_one::<String>(&format!("SELECT rvbbit.get_secret('{esc}')"))
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
+        .is_some();
+    if has_secret {
+        "secret".to_string()
+    } else {
+        "missing".to_string()
+    }
+}
+
 /// One real completion through the exact production path (backend spec →
 /// transport → auth env-or-secret). The AI Providers panel's Test button:
 /// proves endpoint + credentials + model in one call and returns the

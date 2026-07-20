@@ -793,6 +793,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0193_provider_test",
         include_str!("../sql/migrations/0193_provider_test.sql"),
     ),
+    (
+        "0194_credential_state",
+        include_str!("../sql/migrations/0194_credential_state.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
