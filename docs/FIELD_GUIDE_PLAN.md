@@ -133,7 +133,7 @@ rvbbit:
 - First-run furnished room: on a fresh homebase, auto-open the Field
   Guide + Finder + a welcome note window instead of the void.
 
-## 7. Companion decision — AI providers become first-class
+## 7. Companion decision — AI providers become first-class (BUILT 2026-07-20)
 
 The guide's biggest fork is "is intelligence configured?" — which today
 is buried in capability installs. Decision (2026-07-20): **provider
@@ -159,6 +159,17 @@ deployable things.**
   4. Local — detect Ollama/vLLM/warren on localhost, zero keys.
 - Field Guide chapter 7 IS this ladder; `needs: "intelligence"` gates
   resolve against "any configured provider passing a test call."
+- **AS BUILT** (engine 9904db0c, lens a041bd0): "AI Providers" panel in
+  the Semantic group — provider list (default badge, key-source state,
+  make-default, remove), preset-ladder add form (OpenRouter/OpenAI/
+  Anthropic/Gemini/Clover/Ollama/custom; canonical key names shared with
+  the catalog fetchers), keys via rvbbit.set_secret (presence-only
+  display), Test via new rvbbit.provider_test() (one real completion
+  through the production path, 0193), model catalogs via
+  refresh_provider_catalogs + a provider_models browser. Engine fix:
+  catalog auth now falls back to the secrets table like the specialists
+  path, so one pasted key powers both completions and refresh. OAuth
+  (OpenRouter PKCE) and the managed-Clover one-click signup remain open.
 - Scope guard: no backends.rs rewrite. Warren/HF deploys stay
   capabilities — they deploy things. This is credentials + model lists +
   defaults + a test button.
