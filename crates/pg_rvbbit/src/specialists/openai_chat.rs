@@ -38,10 +38,28 @@ impl OpenAiChatTransport {
         spec: &SpecialistSpec,
         input: &Value,
     ) -> Result<(String, Usage), ProviderError> {
+        // Managed/capability backends (Clover) serve a fixed alias stamped in
+        // transport_opts.model — callers may omit the model entirely and get
+        // the backend's default, which is what lets the rest of the system
+        // use a managed provider "freely" without knowing its alias.
         let model = input
             .get("model")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ProviderError::Config("chat request missing 'model'".into()))?;
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                spec.transport_opts
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| {
+                ProviderError::Config(
+                    "chat request missing 'model' (and the backend has no default in transport_opts.model)".into(),
+                )
+            })?;
+        let model = model.as_str();
         let user = input.get("user").and_then(|v| v.as_str()).unwrap_or("");
         let system = input
             .get("system")
