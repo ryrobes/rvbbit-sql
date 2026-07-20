@@ -448,6 +448,48 @@ struct RefreshStats {
     raw: Value,
 }
 
+/// One real completion through the exact production path (backend spec →
+/// transport → auth env-or-secret). The AI Providers panel's Test button:
+/// proves endpoint + credentials + model in one call and returns the
+/// receipt. Providers with a public catalog can use
+/// refresh_provider_catalogs for auth_state; THIS works for any backend,
+/// including custom/local OpenAI-compatible endpoints.
+#[pg_extern(volatile)]
+fn provider_test(
+    provider: &str,
+    model: &str,
+    prompt: default!(&str, "'Reply with exactly: OK'"),
+) -> JsonB {
+    let started = Instant::now();
+    match crate::providers::chat(crate::providers::ChatRequest {
+        model: model.to_string(),
+        system: None,
+        user: prompt.to_string(),
+        temperature: Some(0.0),
+        max_tokens: Some(16),
+        provider: Some(provider.to_string()),
+    }) {
+        Ok(resp) => JsonB(serde_json::json!({
+            "ok": true,
+            "provider": resp.provider,
+            "model": resp.model,
+            "transport": resp.transport,
+            "content": resp.content,
+            "latency_ms": resp.latency_ms,
+            "tokens_in": resp.prompt_tokens,
+            "tokens_out": resp.completion_tokens,
+            "cost_usd": resp.cost_usd,
+        })),
+        Err(e) => JsonB(serde_json::json!({
+            "ok": false,
+            "provider": provider,
+            "model": model,
+            "error": crate::providers::redact_body(&e.to_string()),
+            "latency_ms": started.elapsed().as_millis() as i64,
+        })),
+    }
+}
+
 #[pg_extern(volatile)]
 fn refresh_provider_catalogs(
     providers: default!(&str, "'auto'"),
@@ -762,7 +804,7 @@ fn provider_list(raw: &str) -> Vec<String> {
 fn refresh_openrouter() -> Result<RefreshStats, String> {
     let client = http_client()?;
     let mut req = client.get("https://openrouter.ai/api/v1/models");
-    let auth_state = if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+    let auth_state = if let Some(key) = env_token("OPENROUTER_API_KEY") {
         if !key.trim().is_empty() {
             req = req.bearer_auth(key);
             "configured"
@@ -1053,9 +1095,24 @@ fn auth_state_for_env(env_name: &str) -> String {
     .to_string()
 }
 
+/// Provider credential: env var FIRST (deploy-time wins), then the
+/// SQL-settable rvbbit.secrets table via the SECURITY DEFINER resolver —
+/// the SAME precedence the specialists auth path uses. Catalog refresh
+/// runs on the leader (pg_extern), so SPI is legal here. Without the
+/// secrets fallback, a key pasted through the AI Providers panel powered
+/// completions but the model-catalog refresh claimed the key was missing.
 fn env_token(env_name: &str) -> Option<String> {
-    std::env::var(env_name)
+    if let Some(v) = std::env::var(env_name)
         .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(v);
+    }
+    let esc = env_name.replace('\'', "''");
+    pgrx::Spi::get_one::<String>(&format!("SELECT rvbbit.get_secret('{esc}')"))
+        .ok()
+        .flatten()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
