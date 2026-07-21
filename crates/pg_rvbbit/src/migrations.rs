@@ -841,6 +841,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0205_kit_public_surface",
         include_str!("../sql/migrations/0205_kit_public_surface.sql"),
     ),
+    (
+        "0206_kit_brief",
+        include_str!("../sql/migrations/0206_kit_brief.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

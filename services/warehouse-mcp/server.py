@@ -3474,6 +3474,58 @@ def tool_render_pdf(name, html=None, slug=None, source_artifact_id=None,
             "bridge": telemetry}
 
 
+def _llm_chat(messages, model=None, max_tokens=1600):
+    """One openai-compatible chat call using the box's vision/chat envs
+    (WAREHOUSE_VISION_BASE/KEY/MODEL; OpenRouter/OpenAI keys as fallback).
+    Returns (text, model) or raises."""
+    import httpx
+    base = os.environ.get("WAREHOUSE_VISION_BASE", "https://openrouter.ai/api/v1").rstrip("/")
+    key = (os.environ.get("WAREHOUSE_VISION_KEY") or os.environ.get("OPENROUTER_API_KEY")
+           or os.environ.get("OPENAI_API_KEY") or "")
+    mdl = model or os.environ.get("WAREHOUSE_VISION_MODEL", "google/gemini-2.5-flash")
+    if not key:
+        raise RuntimeError("set WAREHOUSE_VISION_KEY (or OPENROUTER_API_KEY / OPENAI_API_KEY)")
+    r = httpx.post(f"{base}/chat/completions",
+                   headers={"Authorization": f"Bearer {key}"},
+                   json={"model": mdl, "max_tokens": max_tokens, "messages": messages},
+                   timeout=90.0)
+    r.raise_for_status()
+    return (r.json()["choices"][0]["message"]["content"] or ""), mdl
+
+
+def tool_kit_rehearsal(kit, scenario=None, model=None):
+    """The rehearsal (a LINT, never the source): compile the kit's
+    deterministic briefing (rvbbit.kit_brief), hand it to a model with a
+    scenario, and get back (a) the step-by-step runstream it would follow
+    and (b) every AMBIGUITY or MISSING VERB it had to guess around. The
+    gap list is the payload — each finding is either an edit to a logic
+    plate's explanation or an action the kit still needs."""
+    with _conn(read_only=True) as c:
+        row = c.execute("SELECT rvbbit.kit_brief(%s) AS b", (kit,)).fetchone()
+    brief = (row or {}).get("b") or ""
+    if not brief or "(no such kit)" in brief:
+        return {"error": {"code": "NOT_FOUND", "message": f"no kit named {kit}"}}
+    scen = scenario or "A typical new item of work arrives via chat for this kit."
+    ask = (
+        "You are an autonomous agent that has just been directed at the following kit. "
+        "The briefing below is your ONLY context (it is exactly what you would receive "
+        "in production).\n\n--- BRIEFING ---\n" + brief + "\n--- END BRIEFING ---\n\n"
+        "Scenario: " + scen + "\n\n"
+        "Reply in two markdown sections:\n"
+        "## Runstream — numbered, concrete steps you would take (name the exact actions/"
+        "functions from the briefing at each step; include what you would SAY to the human "
+        "when a check is red).\n"
+        "## Gaps & ambiguities — every point where the briefing forced you to guess: "
+        "unclear rules, missing actions/verbs, undefined vocabulary, identity ambiguity. "
+        "Be specific and adversarial; an empty list is a failure of imagination.")
+    try:
+        text, mdl = _llm_chat([{"role": "user", "content": ask}], model=model)
+    except Exception as e:  # noqa: BLE001
+        return {"error": {"code": "REHEARSAL_CALL_FAILED", "message": str(e)[:300]}}
+    return {"kit": kit, "scenario": scen, "model": mdl, "rehearsal": text,
+            "note": "The briefing is ground truth; this narration is one model's traversal — a lint, not a spec."}
+
+
 def tool_extract_image(path, fields, model=None, prompt=None):
     """Vision extraction for intake workflows: read an image (staging or
     capture volume — texted photos land there via the agent) and pull the
@@ -3494,30 +3546,18 @@ def tool_extract_image(path, fields, model=None, prompt=None):
         return {"error": {"code": "BAD_TYPE", "message": f"unsupported image type .{ext}"}}
     b64 = base64.b64encode(rp.read_bytes()).decode()
 
-    base = os.environ.get("WAREHOUSE_VISION_BASE", "https://openrouter.ai/api/v1").rstrip("/")
-    key = (os.environ.get("WAREHOUSE_VISION_KEY") or os.environ.get("OPENROUTER_API_KEY")
-           or os.environ.get("OPENAI_API_KEY") or "")
-    mdl = model or os.environ.get("WAREHOUSE_VISION_MODEL", "google/gemini-2.5-flash")
-    if not key:
-        return {"error": {"code": "NO_PROVIDER",
-                          "message": "set WAREHOUSE_VISION_KEY (or OPENROUTER_API_KEY / OPENAI_API_KEY)"}}
     want = [f.strip() for f in str(fields).split(",") if f.strip()]
     ask = prompt or (
         "Extract these fields from the image: " + ", ".join(want) + ". "
         "Reply with ONLY a JSON object: one key per field (string value, or null if absent/unreadable) "
         "plus a _confidence object mapping each field to 0..1. No prose.")
-    import httpx
     try:
-        r = httpx.post(f"{base}/chat/completions",
-                       headers={"Authorization": f"Bearer {key}"},
-                       json={"model": mdl, "max_tokens": 800, "messages": [{
-                           "role": "user",
-                           "content": [{"type": "text", "text": ask},
-                                       {"type": "image_url",
-                                        "image_url": {"url": f"data:{mime};base64,{b64}"}}]}]},
-                       timeout=60.0)
-        r.raise_for_status()
-        text = r.json()["choices"][0]["message"]["content"] or ""
+        text, mdl = _llm_chat([{
+            "role": "user",
+            "content": [{"type": "text", "text": ask},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:{mime};base64,{b64}"}}]}],
+            model=model, max_tokens=800)
     except Exception as e:  # noqa: BLE001
         return {"error": {"code": "VISION_CALL_FAILED", "message": str(e)[:300]}}
     mjson = re.search(r"\{.*\}", text, re.DOTALL)
@@ -4151,6 +4191,9 @@ def _register(mcp):
     mcp.tool(name="extract_image")(lambda path, fields, model=None, prompt=None: _logged(
         "extract_image", {"path": path, "fields": fields, "model": model},
         lambda: tool_extract_image(path, fields, model, prompt)))
+    mcp.tool(name="kit_rehearsal")(lambda kit, scenario=None, model=None: _logged(
+        "kit_rehearsal", {"kit": kit, "scenario": scenario},
+        lambda: tool_kit_rehearsal(kit, scenario, model)))
     mcp.tool(name="describe_table")(lambda table, lean=False: _logged(
         "describe_table", {"table": table, "lean": lean}, lambda: tool_describe_table(table, lean)))
     mcp.tool(name="profile_schema")(lambda schema=None: _logged(
