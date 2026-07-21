@@ -817,6 +817,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0199_capability_crawl_on_catalog_crawl",
         include_str!("../sql/migrations/0199_capability_crawl_on_catalog_crawl.sql"),
     ),
+    (
+        "0200_hub_front_door",
+        include_str!("../sql/migrations/0200_hub_front_door.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -83,6 +83,12 @@ services:
       RVBBIT_CAPABILITY_CLI: ${RVBBIT_CAPABILITY_CLI:-/usr/share/rvbbit/capabilities/tools/rvbbit-capability}
       DOCKER_HOST: ${RVBBIT_DOCKER_HOST:-unix:///var/run/docker.sock}
       RVBBIT_DOCKER_NETWORK: ${RVBBIT_DOCKER_NETWORK:-rvbbit_release}
+      # The Hub (docs/HUB_PLAN.md): point these at a warehouse-mcp host to
+      # light up live-app embeds + thumbnails in the /?hub gallery. This
+      # stack doesn't run warehouse-mcp itself, so both pass straight through.
+      RVBBIT_APP_BASE: ${WAREHOUSE_PUBLIC_URL:-}
+      RVBBIT_APP_BASE_INTERNAL: ${RVBBIT_APP_BASE_INTERNAL:-}
+      WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:-}
     ports:
       - "${RVBBIT_LENS_PORT:-3000}:3000"
     volumes:

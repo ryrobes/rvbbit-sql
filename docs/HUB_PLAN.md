@@ -3,6 +3,21 @@
 > "A bridge for those who only use the MCP on external devices and only
 > consume dashboards via the external MCP URL."
 
+**STATUS: BUILT (P0–P2), browser-verified end to end 2026-07-21.** Ships as
+migration 0200 (view + hub_pins + hub kit/plates/layout), lens `/?hub`
+wall entry + `rv-shot`/`rv-frame` artifact islands + `/api/rvbbit/thumb`
+proxy, and warehouse-mcp auto-thumbnails + `/thumbs` + `hub_url` in tool
+responses. As-built deltas from the plan below: favorites shipped as
+box-wide **pins** (rvbbit.hub_pins + an audited `toggle_pin` action —
+per-user favorites arrive with per-user keys); search is ILIKE (the KNN
+upgrade stays banked); the peek is a dedicated slot pane, not a modal;
+deep links are `/?hub&sel=<kind>:<slug>` and every publish/update tool
+returns one as `hub_url`. Env contract: warehouse-mcp takes
+`LENS_PUBLIC_URL` (+ `WAREHOUSE_LIVE_APP_CAPTURE_DIR`, compose-defaulted
+to the durable volume); lens takes `RVBBIT_APP_BASE` (browser-reachable
+warehouse origin), optional `RVBBIT_APP_BASE_INTERNAL` (compose-network
+fetch target for thumbs), and `WAREHOUSE_MCP_KEY` (thumb-proxy bearer).
+
 Working name: **the Hub**. ("Bridge" is already a term of art in
 ARCHIPELAGO — the param bus between app islands — so we don't reuse it.
 Rabbit-verse alternatives welcome; the noun matters less than the URL.)

@@ -32,7 +32,7 @@ from __future__ import annotations
 # (DictRow vs TupleRow covariance); the code is correct at runtime (see --selftest).
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
-import asyncio, hashlib, hmac, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, time
+import asyncio, hashlib, hmac, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time
 from decimal import Decimal
 from pathlib import Path
 
@@ -2231,6 +2231,58 @@ def _live_app_url(slug):
     return f"{public}/apps/{slug}" if public else None
 
 
+# ── The Hub (docs/HUB_PLAN.md) ───────────────────────────────────────────
+# The DataRabbit front door for chat-first users: /?hub on the LENS host is
+# a browsable index of everything made through this server. Tools return
+# hub_url alongside url so agents hand users the gallery link, not just the
+# bare artifact — distribution through the transcript.
+
+def _artifact_kind(app_kind):
+    return "dashboard" if (app_kind or "") == "dashboard" else "app"
+
+
+def _hub_url(app_kind, slug):
+    lens = os.environ.get("LENS_PUBLIC_URL", "").rstrip("/")
+    return f"{lens}/?hub&sel={_artifact_kind(app_kind)}:{slug}" if lens else None
+
+
+def _thumb_path(kind, slug):
+    return _live_app_capture_root() / "thumbs" / kind / f"{slug}.png"
+
+
+_THUMBS_IN_FLIGHT = set()
+
+
+def _auto_thumb(app_kind, slug):
+    """Best-effort background thumbnail for the Hub gallery: render the stored
+    HTML through the same bridge-injected capture the capture tool uses, into
+    a stable path (<capture_root>/thumbs/<kind>/<slug>.png) that /thumbs
+    serves and the lens gallery proxies. Never blocks or fails a publish."""
+    kind = _artifact_kind(app_kind)
+    key = f"{kind}:{slug}"
+    if key in _THUMBS_IN_FLIGHT:
+        return
+
+    def _work():
+        try:
+            app, row = _load_live_app_version(slug)
+            if not app or (app.get("runtime_kind") or "html") != "html":
+                return
+            path = _thumb_path(kind, slug)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp.png")
+            _capture_html_with_playwright((row or {}).get("html") or "", tmp,
+                                          width=1200, height=750, full_page=False, wait_ms=1200)
+            tmp.replace(path)
+        except Exception as e:  # noqa: BLE001
+            print(f"auto-thumb {key}: {e}", file=sys.stderr)
+        finally:
+            _THUMBS_IN_FLIGHT.discard(key)
+
+    _THUMBS_IN_FLIGHT.add(key)
+    threading.Thread(target=_work, name=f"thumb-{slug}", daemon=True).start()
+
+
 def _coerce_json_object(value, field):
     if value is None:
         return {}
@@ -2686,7 +2738,9 @@ def tool_publish_dashboard(name, html=None, team=None, description=None, kind="l
         c.execute("INSERT INTO rvbbit.dashboard_versions (dashboard_id,version,html,kind,created_by) "
                   "VALUES (%s,1,%s,%s,%s)", (d["id"], html, kind, caller))
     crawl = _crawl_safe(slug, use_llm=False)   # fast deterministic deps at publish
-    return {"slug": slug, "version": 1, "url": _dash_url(slug), "owner": caller, "kind": kind, "deps": crawl}
+    _auto_thumb("dashboard", slug)
+    return {"slug": slug, "version": 1, "url": _dash_url(slug), "hub_url": _hub_url("dashboard", slug),
+            "owner": caller, "kind": kind, "deps": crawl}
 
 
 def tool_update_dashboard(slug, html=None, notes=None, source_artifact_id=None):
@@ -2706,7 +2760,9 @@ def tool_update_dashboard(slug, html=None, notes=None, source_artifact_id=None):
                   "VALUES (%s,%s,%s,%s,%s)", (d["id"], nv, html, caller, notes))
         c.execute("UPDATE rvbbit.dashboards SET latest_version=%s, updated_at=now() WHERE id=%s", (nv, d["id"]))
     crawl = _crawl_safe(slug, use_llm=False)
-    return {"slug": slug, "version": nv, "url": _dash_url(slug), "deps": crawl}
+    _auto_thumb("dashboard", slug)
+    return {"slug": slug, "version": nv, "url": _dash_url(slug), "hub_url": _hub_url("dashboard", slug),
+            "deps": crawl}
 
 
 def tool_list_dashboards(team=None, search=None):
@@ -2781,7 +2837,9 @@ def tool_live_app_template(runtime_kind="html", app_kind="dashboard"):
 def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboard",
                          team=None, description=None, manifest=None, source_files=None,
                          source_artifact_id=None):
-    """Create a versioned live app. HTML apps are served immediately at /apps/<slug>."""
+    """Create a versioned live app. HTML apps are served immediately at /apps/<slug>.
+    Share BOTH links with the user: url (the bare app) and hub_url (the DataRabbit
+    Hub — the browsable gallery of everything they've made, with this app focused)."""
     html, aerr = _resolve_source(html, source_artifact_id)
     if aerr:
         return aerr
@@ -2818,10 +2876,13 @@ def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
             "VALUES (%s,1,%s,%s,%s,%s::jsonb,%s::jsonb)",
             (d["id"], html, runtime_kind, caller, _json_default(manifest_doc), _json_default(source_files)))
     crawl = _crawl_safe(slug, use_llm=False)
+    if runtime_kind == "html":
+        _auto_thumb(app_kind, slug)
     return {
         "slug": slug,
         "version": 1,
         "url": _live_app_url(slug),
+        "hub_url": _hub_url(app_kind, slug),
         "owner": caller,
         "runtime_kind": runtime_kind,
         "app_kind": app_kind,
@@ -2833,7 +2894,8 @@ def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
 
 def tool_update_live_app(slug, html=None, notes=None, manifest=None, source_files=None,
                          runtime_kind=None, app_kind=None, source_artifact_id=None):
-    """Publish a new version of a live app, preserving omitted source fields."""
+    """Publish a new version of a live app, preserving omitted source fields.
+    Share hub_url with the user alongside url — the Hub gallery link."""
     html, aerr = _resolve_source(html, source_artifact_id)
     if aerr:
         return aerr
@@ -2876,10 +2938,13 @@ def tool_update_live_app(slug, html=None, notes=None, manifest=None, source_file
     except ValueError as e:
         return {"error": {"code": "INVALID_ARGUMENT", "message": str(e)}}
     crawl = _crawl_safe(slug, use_llm=False)
+    if next_runtime == "html":
+        _auto_thumb(next_app_kind, slug)
     return {
         "slug": slug,
         "version": nv,
         "url": _live_app_url(slug),
+        "hub_url": _hub_url(next_app_kind, slug),
         "runtime_kind": next_runtime,
         "app_kind": next_app_kind,
         "manifest": next_manifest,
@@ -2911,8 +2976,10 @@ def tool_list_live_apps(team=None, search=None, runtime_kind=None, app_kind=None
     for row in rows:
         item = dict(row)
         item["url"] = _live_app_url(item["slug"])
+        item["hub_url"] = _hub_url(item.get("app_kind"), item["slug"])
         apps.append(item)
-    return {"live_apps": apps}
+    return {"live_apps": apps, "hub_url": (os.environ.get("LENS_PUBLIC_URL", "").rstrip("/") + "/?hub")
+            if os.environ.get("LENS_PUBLIC_URL") else None}
 
 
 def tool_get_live_app(slug, version=None, include_source=True):
@@ -2948,6 +3015,7 @@ def tool_get_live_app(slug, version=None, include_source=True):
             f"FROM {ACTIVITY_TABLE} WHERE tool='dashboard_query' AND args->>'dashboard'=%s "
             "ORDER BY ts DESC LIMIT 20", (slug,)).fetchall()
     app["url"] = _live_app_url(slug)
+    app["hub_url"] = _hub_url(app.get("app_kind"), slug)
     app["path"] = f"/apps/{slug}"
     app["runner"] = _live_app_runner_status(slug, probe=False)
     return app
@@ -3787,6 +3855,27 @@ def register_dashboard_routes(m):
         }
         return Response(proxied.content, status_code=proxied.status_code, headers=out_headers)
 
+    @m.custom_route("/thumbs/{kind}/{slug}.png", methods=["GET"])
+    async def _thumb(request):
+        # Hub gallery thumbnails (docs/HUB_PLAN.md). Viewer auth: a browser
+        # session OR the static bearer key — the LENS thumb proxy fetches
+        # server-side with WAREHOUSE_MCP_KEY, browsers ride their session.
+        authed = bool(auth.read_session(request))
+        if not authed and auth.STATIC_KEY:
+            hdr = request.headers.get("authorization", "")
+            authed = hdr.startswith("Bearer ") and hmac.compare_digest(hdr[7:], auth.STATIC_KEY)
+        if not authed and auth.STATIC_KEY:
+            return _json({"error": "unauthorized"}, 401)
+        kind = request.path_params["kind"]
+        slug = request.path_params["slug"]
+        if kind not in ("app", "dashboard") or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", slug, re.I):
+            return _json({"error": "bad artifact handle"}, 400)
+        path = _thumb_path(kind, slug)
+        if not path.is_file():
+            return _json({"error": "no thumbnail"}, 404)
+        return Response(path.read_bytes(), media_type="image/png",
+                        headers={"cache-control": "public, max-age=60"})
+
     @m.custom_route("/d/{slug}", methods=["GET"])
     async def _view(request):
         if not auth.read_session(request):
@@ -4158,7 +4247,10 @@ _INSTRUCTIONS = (
     "source_artifact_id to publish/update tools (no local file reads, no re-transmission). To "
     "VALIDATE a query set, run_sql_multi(queries, result_mode='summary') returns row counts + "
     "tiny previews instead of full rowsets. capture_live_app(return_image=true) returns the PNG "
-    "as viewable image content plus bridge health (queries run/failed, console + page errors)."
+    "as viewable image content plus bridge health (queries run/failed, console + page errors). "
+    "THE HUB: publish/update tools return hub_url — the DataRabbit gallery of everything made "
+    "through this server (search, previews, lineage). When you hand the user their app link, "
+    "hand them hub_url too; it is the front door to all their artifacts."
 )
 
 

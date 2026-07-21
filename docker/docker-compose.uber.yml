@@ -114,6 +114,12 @@ services:
       RVBBIT_CAPABILITY_CLI: ${RVBBIT_CAPABILITY_CLI:-/usr/share/rvbbit/capabilities/tools/rvbbit-capability}
       DOCKER_HOST: ${RVBBIT_DOCKER_HOST:-unix:///var/run/docker.sock}
       RVBBIT_DOCKER_NETWORK: ${RVBBIT_DOCKER_NETWORK:-rvbbit_uber}
+      # The Hub (docs/HUB_PLAN.md): rv-frame islands embed live apps from the
+      # warehouse origin (browser-reachable URL); the thumb proxy fetches
+      # captures server-side over the compose network with the static key.
+      RVBBIT_APP_BASE: ${WAREHOUSE_PUBLIC_URL:-}
+      RVBBIT_APP_BASE_INTERNAL: http://warehouse-mcp:8765
+      WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:-}
     ports:
       - "${RVBBIT_LENS_PORT:-3000}:3000"
     volumes:
@@ -209,6 +215,11 @@ services:
       WAREHOUSE_STATE_FILE: /app/data/oauth_state.json   # survives restarts (no re-add of connectors)
       # Shared-key fallback (Claude Code / optional):
       WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:-}
+      # The Hub (docs/HUB_PLAN.md): hub_url in tool responses points at the
+      # lens host; auto-thumbnails persist under the shared capture volume
+      # and serve at /thumbs (lens proxies them at /api/rvbbit/thumb).
+      LENS_PUBLIC_URL: ${LENS_PUBLIC_URL:-}
+      WAREHOUSE_LIVE_APP_CAPTURE_DIR: /app/data/captures
     restart: unless-stopped
 
   # OPTIONAL Cloudflare QUICK tunnel — only if you have NO proxy of your own. Separate
