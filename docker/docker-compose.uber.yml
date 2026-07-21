@@ -209,6 +209,9 @@ services:
     volumes:
       - rvbbit_warehouse_mcp:/app/data   # durable OAuth state (clients + refresh tokens)
     environment:
+      # provider keys ride along for the vision tool (extract_image) —
+      # WAREHOUSE_VISION_KEY overrides; OPENROUTER/OPENAI keys are fallback.
+      <<: *rvbbit-secret-env
       WAREHOUSE_DSN: ${WAREHOUSE_DSN:-postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}}
       WAREHOUSE_MCP_PORT: "8765"
       # OAuth mode (set these for the native connector):
