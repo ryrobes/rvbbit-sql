@@ -1,0 +1,76 @@
+<!doctype html><html><head><style>
+body{background:#14100d;color:#e8ddcc;font-family:ui-monospace,monospace;margin:0;padding:18px}
+h1{font-size:16px;margin:0 12px 0 0;display:inline-block;color:#f5b446}
+select{background:#241d16;color:#e8ddcc;border:1px solid #4a3d2c;border-radius:7px;padding:5px 9px;font-family:inherit}
+#legend{float:right;font-size:10px;opacity:.7}#legend span{margin-left:12px}
+svg{width:100%;margin-top:14px}
+.node rect{rx:7px}.node text{font-size:11px;fill:#e8ddcc}
+.edgelbl{font-size:8.5px;fill:#9a8b74}
+</style></head><body>
+<h1>Kit Flow</h1>
+<select id="kit"></select>
+<div id="legend"></div>
+<svg id="g" height="10"></svg>
+<script>
+const KIND_ORDER = ["layout","contract","module","plate","param","table"];
+const KIND_COLOR = {layout:"#7f9fd4", contract:"#d47f7f", module:"#c9a2d8",
+                    plate:"#f5b446", param:"#8fcf9a", table:"#8faec4"};
+const q = s => rvbbitQuery(s).then(r => r.rows || []);
+async function boot(){
+  const kits = await q("SELECT kit FROM public.kit_catalog ORDER BY 1");
+  const sel = document.getElementById("kit");
+  sel.innerHTML = kits.map(k => `<option>${k.kit}</option>`).join("");
+  sel.onchange = () => draw(sel.value);
+  document.getElementById("legend").innerHTML = KIND_ORDER.map(k =>
+    `<span style="color:${KIND_COLOR[k]}">■ ${k}</span>`).join("");
+  const start = kits.find(k => k.kit === "certify") ? "certify" : (kits[0]||{}).kit;
+  if (start){ sel.value = start; draw(start); }
+}
+async function draw(kit){
+  const edges = await q("SELECT src_kind, src, edge, dst_kind, dst FROM public.kit_flow('" +
+                        kit.replace(/'/g, "''") + "')");
+  const nodes = new Map();
+  for (const e of edges){
+    nodes.set(e.src_kind + ":" + e.src, {kind: e.src_kind, label: e.src});
+    nodes.set(e.dst_kind + ":" + e.dst, {kind: e.dst_kind, label: e.dst});
+  }
+  const cols = KIND_ORDER.filter(k => [...nodes.values()].some(n => n.kind === k));
+  const W = document.body.clientWidth - 40, colW = W / Math.max(cols.length, 1);
+  const perCol = {}; let maxRows = 1;
+  for (const [id, n] of nodes){
+    const c = cols.indexOf(n.kind);
+    perCol[c] = perCol[c] || [];
+    n.x = c * colW + colW / 2;
+    n.row = perCol[c].length; perCol[c].push(id);
+    maxRows = Math.max(maxRows, perCol[c].length);
+  }
+  const rowH = 46, H = maxRows * rowH + 60;
+  for (const n of nodes.values()){
+    const colCount = perCol[cols.indexOf(n.kind)].length;
+    const pad = (maxRows - colCount) * rowH / 2;
+    n.y = 40 + pad + n.row * rowH;
+  }
+  const svg = document.getElementById("g");
+  svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  let out = "";
+  for (const e of edges){
+    const a = nodes.get(e.src_kind + ":" + e.src), b = nodes.get(e.dst_kind + ":" + e.dst);
+    if (!a || !b) continue;
+    const mx = (a.x + b.x) / 2;
+    out += `<path d="M ${a.x} ${a.y} C ${mx} ${a.y}, ${mx} ${b.y}, ${b.x} ${b.y}"
+            fill="none" stroke="${KIND_COLOR[a.kind]}55" stroke-width="1.3"/>`;
+    out += `<text class="edgelbl" x="${mx}" y="${(a.y + b.y) / 2 - 4}" text-anchor="middle">${e.edge}</text>`;
+  }
+  for (const n of nodes.values()){
+    const w = Math.min(Math.max(n.label.length * 6.4 + 18, 60), colW - 16);
+    out += `<g class="node"><rect x="${n.x - w/2}" y="${n.y - 13}" width="${w}" height="26"
+            fill="#1e1813" stroke="${KIND_COLOR[n.kind]}" stroke-width="1.2"/>
+            <text x="${n.x}" y="${n.y + 4}" text-anchor="middle">${
+              n.label.length > Math.floor(w/6.4) ? n.label.slice(0, Math.floor(w/6.4) - 1) + "…" : n.label
+            }</text></g>`;
+  }
+  svg.innerHTML = out;
+}
+boot();
+</script></body></html>

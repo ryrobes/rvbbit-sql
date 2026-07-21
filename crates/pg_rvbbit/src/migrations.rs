@@ -837,6 +837,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0204_headless_plates_kit_pulse",
         include_str!("../sql/migrations/0204_headless_plates_kit_pulse.sql"),
     ),
+    (
+        "0205_kit_public_surface",
+        include_str!("../sql/migrations/0205_kit_public_surface.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
