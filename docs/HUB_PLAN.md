@@ -10,7 +10,16 @@ any open-in-DataRabbit gesture, SQL windows included); peek grows an
 explicit Open-in-DataRabbit button, a Queries section with LIVE first-row
 samples (`rvbbit._hub_query_preview`) and built-not-run open buttons, and
 clickable table lineage chips; rv-frame gains a hover "open ↗" pill (the
-artifact's external URL). Ships as
+artifact's external URL).
+**0202:** metric peeks show the CURRENT VALUE as a callout
+(`rvbbit._hub_metric_callout` via the metrics layer; unresolvable = no
+callout), cube peeks show real rows in a data grid (the new
+`rv-grid sql-from=` capability — SQL held in another query's first row,
+read-only, capped), and thumbnails became fully self-healing: /thumbs
+enqueues a throttled capture on miss or staleness, so pre-Hub artifacts
+get shots just by being looked at (no backfill step). Deep-link emits
+are idempotent (`force` set-semantics — re-opening the same ?sel link no
+longer toggles the selection off). Ships as
 migration 0200 (view + hub_pins + hub kit/plates/layout), lens `/?hub`
 wall entry + `rv-shot`/`rv-frame` artifact islands + `/api/rvbbit/thumb`
 proxy, and warehouse-mcp auto-thumbnails + `/thumbs` + `hub_url` in tool

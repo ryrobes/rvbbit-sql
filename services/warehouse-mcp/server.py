@@ -2251,13 +2251,18 @@ def _thumb_path(kind, slug):
 
 
 _THUMBS_IN_FLIGHT = set()
+# Captures are playwright renders — cheap enough singly, a stampede when a
+# gallery of 40 uncaptured artifacts loads. Two at a time, rest queue.
+_THUMBS_GATE = threading.Semaphore(2)
 
 
 def _auto_thumb(app_kind, slug):
     """Best-effort background thumbnail for the Hub gallery: render the stored
     HTML through the same bridge-injected capture the capture tool uses, into
     a stable path (<capture_root>/thumbs/<kind>/<slug>.png) that /thumbs
-    serves and the lens gallery proxies. Never blocks or fails a publish."""
+    serves and the lens gallery proxies. Never blocks or fails a publish;
+    also fired lazily by /thumbs on miss/stale, so thumbnails need no
+    manual step anywhere."""
     kind = _artifact_kind(app_kind)
     key = f"{kind}:{slug}"
     if key in _THUMBS_IN_FLIGHT:
@@ -2265,15 +2270,16 @@ def _auto_thumb(app_kind, slug):
 
     def _work():
         try:
-            app, row = _load_live_app_version(slug)
-            if not app or (app.get("runtime_kind") or "html") != "html":
-                return
-            path = _thumb_path(kind, slug)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp.png")
-            _capture_html_with_playwright((row or {}).get("html") or "", tmp,
-                                          width=1200, height=750, full_page=False, wait_ms=1200)
-            tmp.replace(path)
+            with _THUMBS_GATE:
+                app, row = _load_live_app_version(slug)
+                if not app or (app.get("runtime_kind") or "html") != "html":
+                    return
+                path = _thumb_path(kind, slug)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp.png")
+                _capture_html_with_playwright((row or {}).get("html") or "", tmp,
+                                              width=1200, height=750, full_page=False, wait_ms=1200)
+                tmp.replace(path)
         except Exception as e:  # noqa: BLE001
             print(f"auto-thumb {key}: {e}", file=sys.stderr)
         finally:
@@ -3871,6 +3877,22 @@ def register_dashboard_routes(m):
         if kind not in ("app", "dashboard") or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", slug, re.I):
             return _json({"error": "bad artifact handle"}, 400)
         path = _thumb_path(kind, slug)
+        # Lazy self-heal: a missing or out-of-date capture enqueues itself
+        # (throttled, deduped) — pre-Hub artifacts and republished versions
+        # get thumbnails just by being LOOKED AT. Stale files still serve
+        # (better a last-version shot than a monogram) while the refresh
+        # renders in the background.
+        try:
+            with _conn() as c:
+                d = c.execute("SELECT app_kind, runtime_kind, updated_at FROM rvbbit.dashboards "
+                              "WHERE slug=%s", (slug,)).fetchone()
+            if d and (d.get("runtime_kind") or "html") == "html":
+                stale = (not path.is_file()
+                         or path.stat().st_mtime < d["updated_at"].timestamp())
+                if stale:
+                    _auto_thumb(d.get("app_kind"), slug)
+        except Exception as e:  # noqa: BLE001
+            print(f"thumbs route ({kind}:{slug}): {e}", file=sys.stderr)
         if not path.is_file():
             return _json({"error": "no thumbnail"}, 404)
         return Response(path.read_bytes(), media_type="image/png",

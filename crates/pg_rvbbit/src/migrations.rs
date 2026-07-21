@@ -825,6 +825,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0201_hub_open_ergonomics",
         include_str!("../sql/migrations/0201_hub_open_ergonomics.sql"),
     ),
+    (
+        "0202_hub_peek_data",
+        include_str!("../sql/migrations/0202_hub_peek_data.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
