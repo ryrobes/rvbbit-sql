@@ -833,6 +833,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0203_burrow_enroll",
         include_str!("../sql/migrations/0203_burrow_enroll.sql"),
     ),
+    (
+        "0204_headless_plates_kit_pulse",
+        include_str!("../sql/migrations/0204_headless_plates_kit_pulse.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

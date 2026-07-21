@@ -3394,6 +3394,143 @@ def _capture_url_with_playwright(url, path, width, height, full_page, wait_ms):
         browser.close()
 
 
+def _workflow_file_root():
+    """Where workflow artifacts live: the capture root (durable volume in
+    compose) — PDFs under pdfs/, and inbound images are expected under the
+    shared /staging volume or this root. Path reads are JAILED to these."""
+    return _live_app_capture_root()
+
+
+def _jailed_path(p):
+    """Resolve a user-supplied path inside the allowed roots (staging +
+    capture root) or raise — workflow tools must never read arbitrary disk."""
+    import pathlib
+    roots = [pathlib.Path("/staging"), _workflow_file_root()]
+    extra = os.environ.get("WAREHOUSE_FILE_ROOTS", "")
+    roots += [pathlib.Path(x) for x in extra.split(":") if x.strip()]
+    rp = pathlib.Path(p).resolve()
+    for root in roots:
+        try:
+            rp.relative_to(root.resolve())
+            return rp
+        except ValueError:
+            continue
+    raise ValueError(f"path {p} is outside the allowed file roots")
+
+
+def tool_render_pdf(name, html=None, slug=None, source_artifact_id=None,
+                    width=816, height=1056, landscape=False, wait_ms=900):
+    """Render HTML (or a stored live app by slug) to a PDF — the official-
+    document leg of intake->extract->validate->document workflows (certs,
+    permits, invoices). Rides the same bridge-injected playwright renderer
+    as captures, so rvbbitQuery works inside the template: the PDF can pull
+    LIVE rows at render time. Returns the served path (/pdfs/<name>.pdf)."""
+    html, aerr = _resolve_source(html, source_artifact_id)
+    if aerr:
+        return aerr
+    if slug and not html:
+        app, row = _load_live_app_version(slug)
+        if not app:
+            return {"error": {"code": "NOT_FOUND", "message": slug}}
+        html = (row or {}).get("html") or ""
+    if not html:
+        return {"error": {"code": "EMPTY_HTML", "message": "pass html, slug, or source_artifact_id"}}
+    safe = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(name or "document")).strip("-")[:80] or "document"
+    out_dir = _workflow_file_root() / "pdfs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{safe}.pdf"
+
+    from playwright.sync_api import sync_playwright
+    telemetry = {"queries": [], "console_errors": [], "page_errors": []}
+
+    def _query(sql, opts=None):
+        opts = opts or {}
+        res = tool_run_sql(str(sql), opts.get("as_of"))
+        entry = {"sql": str(sql)[:200]}
+        if isinstance(res, dict) and res.get("error"):
+            entry["error"] = res["error"]
+        else:
+            entry["rows"] = res.get("row_count")
+        telemetry["queries"].append(entry)
+        return json.loads(json.dumps(res, default=str))
+
+    init = ("<script>window.rvbbitQuery = async function(sql, opts) "
+            "{ return await window.__rvbbitQuery(sql, opts || {}); };</script>")
+    doc = html
+    mhead = re.search(r"<head[^>]*>", doc, re.IGNORECASE)
+    doc = doc[:mhead.end()] + init + doc[mhead.end():] if mhead else init + doc
+    with sync_playwright() as pw:
+        browser = _launch_playwright_chromium(pw)
+        page = browser.new_page(viewport={"width": int(width), "height": int(height)})
+        page.expose_function("__rvbbitQuery", _query)
+        page.on("pageerror", lambda exc: telemetry["page_errors"].append(str(exc)[:400])
+                if len(telemetry["page_errors"]) < 10 else None)
+        page.set_content(doc, wait_until="networkidle", timeout=30_000)
+        if wait_ms:
+            page.wait_for_timeout(int(wait_ms))
+        page.pdf(path=str(path), landscape=bool(landscape), print_background=True)
+        browser.close()
+    return {"name": safe, "path": f"/pdfs/{safe}.pdf", "bytes": path.stat().st_size,
+            "bridge": telemetry}
+
+
+def tool_extract_image(path, fields, model=None, prompt=None):
+    """Vision extraction for intake workflows: read an image (staging or
+    capture volume — texted photos land there via the agent) and pull the
+    named fields with a multimodal model. Returns strict JSON per field plus
+    _confidence 0-1 each; low confidence is the caller's cue to ask for a
+    better photo ("can't read the serial — shoot it closer")."""
+    import base64
+    try:
+        rp = _jailed_path(path)
+    except ValueError as e:
+        return {"error": {"code": "BAD_PATH", "message": str(e)}}
+    if not rp.is_file():
+        return {"error": {"code": "NOT_FOUND", "message": str(path)}}
+    ext = rp.suffix.lower().lstrip(".")
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+            "webp": "image/webp", "gif": "image/gif"}.get(ext)
+    if not mime:
+        return {"error": {"code": "BAD_TYPE", "message": f"unsupported image type .{ext}"}}
+    b64 = base64.b64encode(rp.read_bytes()).decode()
+
+    base = os.environ.get("WAREHOUSE_VISION_BASE", "https://openrouter.ai/api/v1").rstrip("/")
+    key = (os.environ.get("WAREHOUSE_VISION_KEY") or os.environ.get("OPENROUTER_API_KEY")
+           or os.environ.get("OPENAI_API_KEY") or "")
+    mdl = model or os.environ.get("WAREHOUSE_VISION_MODEL", "google/gemini-2.5-flash")
+    if not key:
+        return {"error": {"code": "NO_PROVIDER",
+                          "message": "set WAREHOUSE_VISION_KEY (or OPENROUTER_API_KEY / OPENAI_API_KEY)"}}
+    want = [f.strip() for f in str(fields).split(",") if f.strip()]
+    ask = prompt or (
+        "Extract these fields from the image: " + ", ".join(want) + ". "
+        "Reply with ONLY a JSON object: one key per field (string value, or null if absent/unreadable) "
+        "plus a _confidence object mapping each field to 0..1. No prose.")
+    import httpx
+    try:
+        r = httpx.post(f"{base}/chat/completions",
+                       headers={"Authorization": f"Bearer {key}"},
+                       json={"model": mdl, "max_tokens": 800, "messages": [{
+                           "role": "user",
+                           "content": [{"type": "text", "text": ask},
+                                       {"type": "image_url",
+                                        "image_url": {"url": f"data:{mime};base64,{b64}"}}]}]},
+                       timeout=60.0)
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"] or ""
+    except Exception as e:  # noqa: BLE001
+        return {"error": {"code": "VISION_CALL_FAILED", "message": str(e)[:300]}}
+    mjson = re.search(r"\{.*\}", text, re.DOTALL)
+    if not mjson:
+        return {"error": {"code": "UNPARSEABLE", "message": text[:300]}}
+    try:
+        out = json.loads(mjson.group(0))
+    except Exception:  # noqa: BLE001
+        return {"error": {"code": "UNPARSEABLE", "message": text[:300]}}
+    return {"model": mdl, "fields": {k: v for k, v in out.items() if k != "_confidence"},
+            "confidence": out.get("_confidence", {}), "image": str(rp)}
+
+
 def tool_capture_live_app(slug, path=None, width=1440, height=900, full_page=True, start=True, wait_ms=750):
     """Capture a PNG screenshot. HTML apps get an injected live rvbbitQuery bridge; Python apps
     are captured from their running local endpoint and can be auto-started."""
@@ -3925,6 +4062,24 @@ def register_dashboard_routes(m):
         return Response(path.read_bytes(), media_type="image/png",
                         headers={"cache-control": "public, max-age=60"})
 
+    @m.custom_route("/pdfs/{name}.pdf", methods=["GET"])
+    async def _pdf(request):
+        # Workflow documents (render_pdf output). Same viewer wall as /thumbs.
+        authed = bool(auth.read_session(request))
+        if not authed and auth.STATIC_KEY:
+            hdr = request.headers.get("authorization", "")
+            authed = hdr.startswith("Bearer ") and hmac.compare_digest(hdr[7:], auth.STATIC_KEY)
+        if not authed and auth.STATIC_KEY:
+            return _json({"error": "unauthorized"}, 401)
+        nm = request.path_params["name"]
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", nm):
+            return _json({"error": "bad name"}, 400)
+        fp = _workflow_file_root() / "pdfs" / f"{nm}.pdf"
+        if not fp.is_file():
+            return _json({"error": "no such document"}, 404)
+        return Response(fp.read_bytes(), media_type="application/pdf",
+                        headers={"content-disposition": f'inline; filename="{nm}.pdf"'})
+
     @m.custom_route("/d/{slug}", methods=["GET"])
     async def _view(request):
         if not auth.read_session(request):
@@ -3990,6 +4145,12 @@ def _register(mcp):
     mcp.tool(name="capability_search")(lambda query, limit=8, kinds=None: _logged(
         "capability_search", {"query": query, "limit": limit, "kinds": kinds},
         lambda: tool_capability_search(query, limit, kinds)))
+    mcp.tool(name="render_pdf")(lambda name, html=None, slug=None, source_artifact_id=None, width=816, height=1056, landscape=False, wait_ms=900: _logged(
+        "render_pdf", {"name": name, "slug": slug},
+        lambda: tool_render_pdf(name, html, slug, source_artifact_id, width, height, landscape, wait_ms)))
+    mcp.tool(name="extract_image")(lambda path, fields, model=None, prompt=None: _logged(
+        "extract_image", {"path": path, "fields": fields, "model": model},
+        lambda: tool_extract_image(path, fields, model, prompt)))
     mcp.tool(name="describe_table")(lambda table, lean=False: _logged(
         "describe_table", {"table": table, "lean": lean}, lambda: tool_describe_table(table, lean)))
     mcp.tool(name="profile_schema")(lambda schema=None: _logged(
