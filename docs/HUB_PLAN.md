@@ -3,7 +3,14 @@
 > "A bridge for those who only use the MCP on external devices and only
 > consume dashboards via the external MCP URL."
 
-**STATUS: BUILT (P0–P2), browser-verified end to end 2026-07-21.** Ships as
+**STATUS: BUILT (P0–P2), browser-verified end to end 2026-07-21.**
+**0201 (same day, field feedback):** double-click a card → the artifact's
+native DataRabbit window (`rv-open-dbl` + `app:live` verb; wall closes on
+any open-in-DataRabbit gesture, SQL windows included); peek grows an
+explicit Open-in-DataRabbit button, a Queries section with LIVE first-row
+samples (`rvbbit._hub_query_preview`) and built-not-run open buttons, and
+clickable table lineage chips; rv-frame gains a hover "open ↗" pill (the
+artifact's external URL). Ships as
 migration 0200 (view + hub_pins + hub kit/plates/layout), lens `/?hub`
 wall entry + `rv-shot`/`rv-frame` artifact islands + `/api/rvbbit/thumb`
 proxy, and warehouse-mcp auto-thumbnails + `/thumbs` + `hub_url` in tool
