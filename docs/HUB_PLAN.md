@@ -92,11 +92,15 @@ breadcrumbs into the full product are one click deep, never forced.
 
 ## §4 Architecture
 
-**Entry**: `LENS_URL/?hub=1` (lens is a single-page app; query param is the
-house pattern, handled and stripped like `?scene=`). Opens straight into
-wall mode on the system `hub` layout — no desktop visible first. Auth
-posture per install: on trusted/VPN boxes the plain URL; where exposure
-matters, a capability token param following the scene-share pattern.
+**Entry**: the hand-out paths are `LENS_URL/hub` (+ `?sel=<kind>:<slug>`
+for a focused artifact — what `hub_url` emits) and `LENS_URL/wall/<id>`
+for any layout wall; both redirect into the SPA's `/?hub` / `/?wall=`
+entries. Unlike `?scene=`, wall params are NOT stripped: the address bar
+carries the wall's link for its whole lifetime (refresh restores the
+shared view, sel included; closing cleans the URL), and the wall pill
+has a copy-link button emitting the pretty path. Auth posture per
+install: on trusted/VPN boxes the plain URL; where exposure matters, a
+capability token param following the scene-share pattern.
 
 **Index**: `rvbbit.artifact_index` view — UNION of live_apps, dashboards,
 metric_defs (latest version), cube_defs, alert rules → one row per

@@ -2243,7 +2243,7 @@ def _artifact_kind(app_kind):
 
 def _hub_url(app_kind, slug):
     lens = os.environ.get("LENS_PUBLIC_URL", "").rstrip("/")
-    return f"{lens}/?hub&sel={_artifact_kind(app_kind)}:{slug}" if lens else None
+    return f"{lens}/hub?sel={_artifact_kind(app_kind)}:{slug}" if lens else None
 
 
 def _thumb_path(kind, slug):
@@ -2978,7 +2978,7 @@ def tool_list_live_apps(team=None, search=None, runtime_kind=None, app_kind=None
         item["url"] = _live_app_url(item["slug"])
         item["hub_url"] = _hub_url(item.get("app_kind"), item["slug"])
         apps.append(item)
-    return {"live_apps": apps, "hub_url": (os.environ.get("LENS_PUBLIC_URL", "").rstrip("/") + "/?hub")
+    return {"live_apps": apps, "hub_url": (os.environ.get("LENS_PUBLIC_URL", "").rstrip("/") + "/hub")
             if os.environ.get("LENS_PUBLIC_URL") else None}
 
 
