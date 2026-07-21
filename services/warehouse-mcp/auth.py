@@ -28,6 +28,7 @@ import hmac
 import html
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -93,7 +94,9 @@ def validate_config() -> list[str]:
         errs.append("WAREHOUSE_JWT_SECRET is required and must be independent of WAREHOUSE_MCP_KEY.")
     elif STATIC_KEY and hmac.compare_digest(JWT_SECRET, STATIC_KEY):
         errs.append("WAREHOUSE_JWT_SECRET must differ from WAREHOUSE_MCP_KEY (no credential reuse).")
-    if not LOGIN_PASSWORD:
+    if AUTH_MODE == "pg":
+        pass   # Burrow: credentials are Postgres accounts; no shared password.
+    elif not LOGIN_PASSWORD:
         errs.append("WAREHOUSE_LOGIN_PASSWORD is required (else no one can log in).")
     return errs
 
@@ -330,9 +333,50 @@ def _email_allowed(email: str) -> bool:
     return any(e == a or (a.startswith("@") and e.endswith(a)) for a in ALLOWED_EMAILS)
 
 
-def _creds_ok(email: str, password: str) -> bool:
+def _creds_ok_shared(email: str, password: str) -> bool:
     good_pw = bool(LOGIN_PASSWORD) and hmac.compare_digest(password, LOGIN_PASSWORD)
     return bool(good_pw and _email_allowed(email) and email and "@" in email)
+
+
+# ── Postgres-as-IdP (Burrow mode, docs/BURROW_PLAN.md) ──────────────────────
+# WAREHOUSE_AUTH=pg: credentials ARE a Postgres role + password. We verify by
+# attempting a real connection as that role (scram), then exchange it for our
+# own JWTs on the spot — the PG password is never stored or re-sent. The
+# subject becomes the ROLE NAME, and downstream surfaces run SET LOCAL ROLE
+# under it, so the DBA's GRANTs/RLS are the app's permission system.
+# Optional gate: WAREHOUSE_PG_LOGIN_ROLE (default rvbbit_users) — when that
+# role exists, only its members may log in; manage the allowlist with GRANT.
+AUTH_MODE = os.environ.get("WAREHOUSE_AUTH", "shared").strip().lower()
+PG_LOGIN_ROLE = os.environ.get("WAREHOUSE_PG_LOGIN_ROLE", "rvbbit_users")
+# lens = the login PAGE is rendered by lens on the unified origin (POSTs land
+# here; failures PRG back to /login?err=1). Default keeps the built-in form.
+LOGIN_UI = os.environ.get("WAREHOUSE_LOGIN_UI", "builtin").strip().lower()
+_ROLE_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_$]{0,62}$")
+
+
+def _creds_ok_pg(username: str, password: str) -> bool:
+    if not _ROLE_NAME_RE.fullmatch(username or "") or not password:
+        return False
+    import psycopg
+    from psycopg import conninfo
+    base = os.environ.get(
+        "WAREHOUSE_DSN", "host=localhost port=55433 dbname=bench user=postgres password=rvbbit")
+    try:
+        dsn = conninfo.make_conninfo(base, user=username, password=password)
+        with psycopg.connect(dsn, connect_timeout=5) as c:
+            row = c.execute(
+                "SELECT NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) "
+                "OR pg_has_role(current_user, %s, 'member')",
+                (PG_LOGIN_ROLE, PG_LOGIN_ROLE)).fetchone()
+            return bool(row and row[0])
+    except Exception:   # noqa: BLE001 — bad creds and unreachable DB read the same: no.
+        return False
+
+
+def _creds_ok(email: str, password: str) -> bool:
+    if AUTH_MODE == "pg":
+        return _creds_ok_pg(email, password)
+    return _creds_ok_shared(email, password)
 
 
 # ── browser view session (cookie, for /d/<slug> dashboards) ──────────────────
@@ -387,12 +431,17 @@ def _login_form(hidden: dict, error: str | None = None,
     err = f'<div class=err>{html.escape(error)}</div>' if error else ""
     fields = "".join(f'<input type=hidden name="{html.escape(k)}" value="{html.escape(str(v))}">'
                      for k, v in hidden.items() if v)
+    # Burrow (pg) mode: credentials are a Postgres role, not an email.
+    ident = ('<label>Username</label><input name=email autocomplete=username autofocus required>'
+             if AUTH_MODE == "pg" else
+             '<label>Email</label><input name=email type=email autocomplete=username autofocus required>')
+    pw_label = "Password" if AUTH_MODE == "pg" else "Access password"
     return _page(
         f"""<h1>Data Warehouse</h1><p class=sub>{html.escape(sub)}</p>
 <form method=post action=/login>
  {fields}
- <label>Email</label><input name=email type=email autocomplete=username autofocus required>
- <label>Access password</label><input name=password type=password autocomplete=current-password required>
+ {ident}
+ <label>{pw_label}</label><input name=password type=password autocomplete=current-password required>
  <button type=submit>{html.escape(cta)}</button>{err}
 </form>""", status=401 if error else 200)
 
@@ -430,6 +479,12 @@ def register_login_route(mcp, provider: WarehouseAuthProvider):
             if not _creds_ok(email, password):
                 _LIMITER.record_fail(ip)
                 await asyncio.sleep(1.0)
+                # Lens-rendered login (BURROW_PLAN §5 P4): fail via PRG back to
+                # the pretty page — the ingress routes GET /login to lens, so an
+                # inline form here would break out of the branded flow.
+                if LOGIN_UI == "lens":
+                    q = f"err=1&txn={txn}" if txn else f"err=1&next={nxt}"
+                    return RedirectResponse(f"/login?{q}", status_code=303)
                 hidden = {"txn": txn} if txn else {"next": nxt}
                 return _login_form(hidden, error="Invalid email or password.",
                                    cta="Authorize Claude" if txn else "Sign in")
@@ -441,6 +496,28 @@ def register_login_route(mcp, provider: WarehouseAuthProvider):
         # browser session: set the cookie, go where they were headed
         resp = RedirectResponse(nxt, status_code=302)
         set_session(resp, email, secure=request.url.scheme == "https")
+        return resp
+
+    # Session introspection for sibling services (lens gates on this in
+    # Burrow mode — no JWT-secret sharing, just a cookie round-trip on the
+    # unified origin).
+    @mcp.custom_route("/auth/whoami", methods=["GET"])
+    async def whoami(request: Request):
+        sub = read_session(request)
+        # pg mode: the subject must BE a role name. A session minted under a
+        # previous auth mode (an email sub) is stale here — treat it as
+        # signed out so every surface converges on re-login.
+        if sub and AUTH_MODE == "pg" and not _ROLE_NAME_RE.fullmatch(sub):
+            sub = None
+        if not sub:
+            return HTMLResponse('{"ok":false}', status_code=401, media_type="application/json")
+        return HTMLResponse(json.dumps({"ok": True, "sub": sub, "mode": AUTH_MODE}),
+                            media_type="application/json")
+
+    @mcp.custom_route("/auth/logout", methods=["GET", "POST"])
+    async def logout(request: Request):   # noqa: ARG001
+        resp = RedirectResponse("/login", status_code=303)
+        resp.delete_cookie(SESSION_COOKIE)
         return resp
 
     return login

@@ -829,6 +829,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0202_hub_peek_data",
         include_str!("../sql/migrations/0202_hub_peek_data.sql"),
     ),
+    (
+        "0203_burrow_enroll",
+        include_str!("../sql/migrations/0203_burrow_enroll.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

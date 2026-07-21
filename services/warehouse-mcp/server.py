@@ -70,14 +70,41 @@ _TYPE = {16: "bool", 20: "int8", 21: "int2", 23: "int4", 25: "text", 700: "float
          1184: "timestamptz", 1700: "numeric", 114: "json", 3802: "jsonb"}
 
 
-def _conn(read_only: bool = False):
+def _conn(read_only: bool = False, role: str | None = None):
     c = psycopg.connect(DSN, row_factory=dict_row, autocommit=not read_only)
+    if role:
+        # Burrow mode (docs/BURROW_PLAN.md): execute as the caller's PG role —
+        # their GRANTs/RLS govern the query. Connection is per-call, so plain
+        # SET ROLE is safe (no pool to leak into).
+        c.execute('SET ROLE "%s"' % role.replace('"', '""'))
     if read_only:
         # belt: txn read-only blocks any write/DDL even for a superuser DSN.
         # suspenders (prod): the mapped role simply lacks write grants.
         c.execute("SET default_transaction_read_only = on")
         c.execute(f"SET statement_timeout = {STMT_TIMEOUT_MS}")
     return c
+
+
+_BURROW_ROLE_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_$]{0,62}$")
+# Session-cookie surfaces (the app data bridge) carry identity out-of-band of
+# the OAuth token context — they park the subject here around tool calls so
+# an extra role arg never leaks into the MCP tool schemas.
+import contextvars
+_SESSION_SUB = contextvars.ContextVar("rvbbit_session_sub", default=None)
+
+
+def _session_pg_role(sub=None):
+    """In pg auth mode (Burrow) the authenticated subject IS a Postgres role —
+    return it for SET ROLE execution; None means service identity (shared/
+    stdio modes, or a malformed subject)."""
+    try:
+        import auth
+        if getattr(auth, "AUTH_MODE", "shared") != "pg":
+            return None
+    except Exception:  # noqa: BLE001 — auth module absent in some harnesses
+        return None
+    s = sub if sub is not None else (_SESSION_SUB.get() or _caller()[0])
+    return s if s and _BURROW_ROLE_RE.fullmatch(str(s)) else None
 
 
 def _ro():
@@ -1869,7 +1896,7 @@ def tool_run_sql(sql: str, as_of=None, limit=None) -> dict:
         return {"error": {"code": "NOT_SELECT",
                           "message": "only a read-only SELECT/CTE is allowed", "reason": v.get("reason")}}
     t0 = time.time()
-    with _conn(read_only=True) as c, c.cursor() as cur:
+    with _conn(read_only=True, role=_session_pg_role()) as c, c.cursor() as cur:
         cur.execute(_with_as_of(sql, as_of))
         cols = ([{"name": d.name, "type": _TYPE.get(d.type_code, str(d.type_code))}
                  for d in cur.description] if cur.description else [])
@@ -3926,7 +3953,13 @@ def register_dashboard_routes(m):
             return _json({"error": {"code": "MISSING_SQL"}}, 400)
         as_of = (body or {}).get("as_of")
         t0 = time.time()
-        res = tool_run_sql(sql, as_of)
+        # Burrow: the viewer's session identity IS a PG role — app queries run
+        # under it (parked in a contextvar; tool schemas stay clean).
+        tok = _SESSION_SUB.set(email)
+        try:
+            res = tool_run_sql(sql, as_of)
+        finally:
+            _SESSION_SUB.reset(tok)
         _record("dashboard_query", {"dashboard": slug, "sql": sql, "as_of": as_of},
                 res, res.get("error"), int((time.time() - t0) * 1000), caller_override=email)
         return _json(res, 400 if res.get("error") else 200)

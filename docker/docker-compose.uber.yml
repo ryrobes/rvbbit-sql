@@ -120,6 +120,10 @@ services:
       RVBBIT_APP_BASE: ${WAREHOUSE_PUBLIC_URL:-}
       RVBBIT_APP_BASE_INTERNAL: http://warehouse-mcp:8765
       WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:-}
+      # Burrow mode (docs/BURROW_PLAN.md): one database, one door — lens
+      # gates on the warehouse session and executes SQL as the viewer's role.
+      RVBBIT_MODE: ${RVBBIT_MODE:-}
+      RVBBIT_AUTH_INTERNAL: http://warehouse-mcp:8765
     ports:
       - "${RVBBIT_LENS_PORT:-3000}:3000"
     volumes:
@@ -220,6 +224,36 @@ services:
       # and serve at /thumbs (lens proxies them at /api/rvbbit/thumb).
       LENS_PUBLIC_URL: ${LENS_PUBLIC_URL:-}
       WAREHOUSE_LIVE_APP_CAPTURE_DIR: /app/data/captures
+      # Burrow mode (docs/BURROW_PLAN.md): WAREHOUSE_AUTH=pg makes Postgres
+      # the IdP — logins are PG accounts (members of WAREHOUSE_PG_LOGIN_ROLE),
+      # sessions run SET ROLE. WAREHOUSE_LOGIN_UI=lens hands the login PAGE
+      # to DataRabbit on the unified origin (run the `origin` profile).
+      WAREHOUSE_AUTH: ${WAREHOUSE_AUTH:-shared}
+      WAREHOUSE_PG_LOGIN_ROLE: ${WAREHOUSE_PG_LOGIN_ROLE:-rvbbit_users}
+      WAREHOUSE_LOGIN_UI: ${WAREHOUSE_LOGIN_UI:-builtin}
+    restart: unless-stopped
+
+  # The DataRabbit ORIGIN (BURROW_PLAN §5 P0): one hostname fronting lens +
+  # warehouse-mcp — first-party cookies everywhere, one login, one URL. Opt-in
+  # profile because existing deployments already have their own proxies:
+  #   docker compose -f docker/docker-compose.uber.yml --profile origin --profile warehouse up -d
+  # Point your TLS terminator at :${RVBBIT_ORIGIN_PORT:-8080}, and set
+  # WAREHOUSE_PUBLIC_URL and LENS_PUBLIC_URL BOTH to the public origin URL.
+  origin:
+    profiles: ["origin"]
+    image: caddy:2-alpine
+    container_name: rvbbit-origin
+    depends_on:
+      - lens
+      - warehouse-mcp
+    volumes:
+      - ./origin/Caddyfile:/etc/caddy/Caddyfile:ro
+    environment:
+      ORIGIN_LISTEN: ":80"
+      LENS_UPSTREAM: lens:3000
+      WAREHOUSE_UPSTREAM: warehouse-mcp:8765
+    ports:
+      - "${RVBBIT_ORIGIN_PORT:-8080}:80"
     restart: unless-stopped
 
   # OPTIONAL Cloudflare QUICK tunnel — only if you have NO proxy of your own. Separate

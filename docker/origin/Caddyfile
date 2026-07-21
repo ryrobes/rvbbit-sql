@@ -1,0 +1,36 @@
+# The DataRabbit origin (BURROW_PLAN §5 P0): ONE hostname fronting lens +
+# warehouse-mcp. Everything auth/artifact/MCP-shaped goes to the warehouse;
+# the rest is DataRabbit. One origin = first-party cookies everywhere, one
+# login page, one URL to hand out, and the OAuth issuer == the site.
+#
+# Env: LENS_UPSTREAM (default lens:3000), WAREHOUSE_UPSTREAM (default
+# warehouse-mcp:8765), ORIGIN_LISTEN (default :80 — front with your TLS
+# terminator, or replace the site address with your domain to let caddy
+# manage certs itself).
+
+{$ORIGIN_LISTEN::80} {
+	# The login PAGE is DataRabbit's (lens renders it); the login POST is the
+	# warehouse's (it owns sessions and the OAuth txn continuation).
+	@login_get {
+		method GET
+		path /login
+	}
+	handle @login_get {
+		reverse_proxy {$LENS_UPSTREAM:lens:3000}
+	}
+
+	@warehouse {
+		path /mcp /mcp/* /login /auth/* /authorize /authorize/* /token /register \
+		     /.well-known/* /apps /apps/* /d/* /api/d/* /api/apps/* /thumbs/* /health
+	}
+	handle @warehouse {
+		# flush immediately: /mcp is streamable HTTP — buffering kills it.
+		reverse_proxy {$WAREHOUSE_UPSTREAM:warehouse-mcp:8765} {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy {$LENS_UPSTREAM:lens:3000}
+	}
+}
