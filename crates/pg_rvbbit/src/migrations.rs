@@ -813,6 +813,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0198_mcp_capability_freshness",
         include_str!("../sql/migrations/0198_mcp_capability_freshness.sql"),
     ),
+    (
+        "0199_capability_crawl_on_catalog_crawl",
+        include_str!("../sql/migrations/0199_capability_crawl_on_catalog_crawl.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
