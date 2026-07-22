@@ -845,6 +845,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0206_kit_brief",
         include_str!("../sql/migrations/0206_kit_brief.sql"),
     ),
+    (
+        "0207_data_crawl_run",
+        include_str!("../sql/migrations/0207_data_crawl_run.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
