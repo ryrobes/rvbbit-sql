@@ -20,6 +20,75 @@
 -- warehouse-mcp side: auto-thumbnails on publish, /thumbs serving, and
 -- hub_url in tool responses — distribution through the transcript.
 
+-- FRESH-INSTALL GUARD (added 4.1.1): everything below assumes the
+-- dashboards registry, which warehouse-mcp creates lazily at ITS first
+-- startup (_DASHBOARDS_DDL in services/warehouse-mcp/server.py). On a
+-- virgin database the extension migrates FIRST — before warehouse-mcp
+-- has ever connected — and this migration died on the missing tables,
+-- killing container init (broke every fresh install 4.0.17→4.1.0; only
+-- upgrades of long-lived DBs worked). Create the same tables here,
+-- shape-identical and idempotent, so boot order is irrelevant. If you
+-- change one side, change the other.
+CREATE TABLE IF NOT EXISTS rvbbit.dashboards (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug        text UNIQUE NOT NULL,
+  name        text NOT NULL,
+  description text,
+  owner_email text,
+  team        text,
+  status      text DEFAULT 'live',
+  latest_version int DEFAULT 1,
+  created_at  timestamptz DEFAULT now(),
+  updated_at  timestamptz DEFAULT now()
+);
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS runtime_kind text NOT NULL DEFAULT 'html';
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS app_kind text NOT NULL DEFAULT 'dashboard';
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS manifest jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS last_health jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS last_debug_at timestamptz;
+
+CREATE TABLE IF NOT EXISTS rvbbit.dashboard_versions (
+  dashboard_id bigint NOT NULL REFERENCES rvbbit.dashboards(id) ON DELETE CASCADE,
+  version      int NOT NULL,
+  html         text NOT NULL,
+  kind         text DEFAULT 'live',
+  created_by   text, created_at timestamptz DEFAULT now(), notes text,
+  PRIMARY KEY (dashboard_id, version)
+);
+ALTER TABLE rvbbit.dashboard_versions ADD COLUMN IF NOT EXISTS manifest jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE rvbbit.dashboard_versions ADD COLUMN IF NOT EXISTS source_files jsonb NOT NULL DEFAULT '{}'::jsonb;
+CREATE INDEX IF NOT EXISTS dashboards_team_idx ON rvbbit.dashboards (team, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS rvbbit.dashboard_deps (
+  dashboard_id bigint NOT NULL REFERENCES rvbbit.dashboards(id) ON DELETE CASCADE,
+  version      int NOT NULL,
+  kind         text NOT NULL,
+  object_ref   text,
+  base_sql     text,
+  source       text,
+  confidence   real DEFAULT 1.0,
+  created_at   timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS dashboard_deps_did_idx ON rvbbit.dashboard_deps (dashboard_id);
+CREATE INDEX IF NOT EXISTS dashboard_deps_obj_idx ON rvbbit.dashboard_deps (object_ref);
+
+CREATE OR REPLACE VIEW rvbbit.live_apps AS
+  SELECT d.id, d.slug, d.name, d.description, d.owner_email, d.team, d.status,
+         d.runtime_kind, d.app_kind, d.latest_version, d.manifest, d.last_health,
+         d.last_debug_at, d.created_at, d.updated_at,
+         coalesce(dep.queries, 0)::int AS queries,
+         coalesce(dep.tables, 0)::int AS tables,
+         coalesce(dep.metrics, 0)::int AS metrics
+  FROM rvbbit.dashboards d
+  LEFT JOIN (
+    SELECT dashboard_id,
+           count(*) FILTER (WHERE kind = 'query') AS queries,
+           count(*) FILTER (WHERE kind = 'table') AS tables,
+           count(*) FILTER (WHERE kind = 'metric') AS metrics
+    FROM rvbbit.dashboard_deps
+    GROUP BY dashboard_id
+  ) dep ON dep.dashboard_id = d.id;
+
 -- artifact_index draft (freezes into 0200)
 CREATE OR REPLACE VIEW rvbbit.artifact_index AS
 WITH latest_dash_ver AS (

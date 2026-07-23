@@ -2151,6 +2151,10 @@ def _logged(tool, args, thunk):
 # `rvbbitQuery(sql)` client → /api/d/<slug>/q, which runs read-only on the MIRROR
 # (safe_select-gated) and logs to mcp_activity. The dashboard outlives the chat.
 
+# NOTE: extension migration 0200_hub_front_door.sql carries a shape-identical
+# copy of the dashboards/dashboard_versions/dashboard_deps/live_apps DDL —
+# fresh installs migrate before this service ever connects, and 0200's
+# artifact_index view needs the tables to exist. Change one, change both.
 _DASHBOARDS_DDL = """
 CREATE TABLE IF NOT EXISTS rvbbit.dashboards (
   id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

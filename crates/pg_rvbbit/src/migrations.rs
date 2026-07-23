@@ -849,6 +849,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0207_data_crawl_run",
         include_str!("../sql/migrations/0207_data_crawl_run.sql"),
     ),
+    (
+        "0208_backends_generation",
+        include_str!("../sql/migrations/0208_backends_generation.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

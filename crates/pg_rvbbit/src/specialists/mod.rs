@@ -21,6 +21,7 @@
 //! rvbbit.reload_backends()). Workers MUST NOT trigger an SPI load.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -228,9 +229,43 @@ pub fn get_cached_spec(name: &str) -> Option<Arc<SpecialistSpec>> {
     cache().read().ok()?.get(name).cloned()
 }
 
+/// Generation the cache was loaded at (rvbbit.backends_gen). -1 = never
+/// checked. Stale caches (a backend row edited under a warm connection)
+/// were invisible before 0208: pooled connections kept the old
+/// endpoint_url until they reconnected.
+static SPEC_CACHE_GEN: AtomicI64 = AtomicI64::new(-1);
+
+/// Read rvbbit.backends_gen. LEADER CONTEXT ONLY (SPI). None when the
+/// sequence doesn't exist yet (databases that haven't run migration 0208)
+/// — callers skip the staleness check, preserving pre-0208 behavior.
+fn current_backends_gen() -> Option<i64> {
+    use pgrx::Spi;
+    Spi::get_one::<i64>(
+        "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM rvbbit.backends_gen",
+    )
+    .ok()
+    .flatten()
+}
+
+/// Drop every cached spec if rvbbit.backends changed since the cache was
+/// loaded. One int read off a single sequence page per leader-side spec
+/// load — noise next to the network call that follows.
+fn drop_cache_if_stale() {
+    let Some(gen) = current_backends_gen() else {
+        return;
+    };
+    if SPEC_CACHE_GEN.swap(gen, Ordering::AcqRel) != gen {
+        if let Ok(mut w) = cache().write() {
+            w.clear();
+        }
+    }
+}
+
 /// Load a spec via SPI and cache it. LEADER CONTEXT ONLY (pgrx Spi).
-/// Idempotent — returns the cached spec if already present.
+/// Idempotent — returns the cached spec if already present AND
+/// rvbbit.backends hasn't changed since it was cached.
 pub fn load_spec(name: &str) -> Result<Arc<SpecialistSpec>, ProviderError> {
+    drop_cache_if_stale();
     if let Some(s) = get_cached_spec(name) {
         return Ok(s);
     }
@@ -296,6 +331,9 @@ fn collect_provider_names(nodes: Option<&Value>, out: &mut Vec<String>) {
 /// prewarm before it dispatches work.
 pub fn reload_all() -> Result<usize, ProviderError> {
     let _ = crate::providers::reload_default_provider_from_spi();
+    if let Some(gen) = current_backends_gen() {
+        SPEC_CACHE_GEN.store(gen, Ordering::Release);
+    }
     let names = load_all_names()?;
     let n = names.len();
     if let Ok(mut w) = cache().write() {
