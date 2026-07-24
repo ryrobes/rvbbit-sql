@@ -16,9 +16,19 @@ conflict on the cross-origin runtime. As-built deltas: shipped the P1
 shared-asset shape immediately (inline-bundle P0 was skipped — smaller
 publishes won); spec gained `data.column` (pluck the measure for
 points/cell — first-numeric-column guessing picks the year, found in
-test); ChartSlide wraps bare charts in centered titled slides. Remaining
-from the phases below: validation + deck MCP tools + Hub chip (P1),
-assistant desktop→deck flow (P2), live-mode surfacing/PDF/roles (P3).
+test); ChartSlide wraps bare charts in centered titled slides. **P2 BUILT + verified 2026-07-24** (rvbbit-sql 534e6290 + lens 3731520):
+migration 0209 teaches `publish_deck` (spec-not-code, taste rules,
+binding contracts); the lens applier pins every slide's `data.sql`
+server-side (the assistant never types numbers), publishes into
+`rvbbit.dashboards`, and opens the deck in the existing dashboard-app
+window — whose srcdoc iframe carries the lens rvbbitQuery bridge, so
+LIVE mode works locally with zero warehouse-mcp. Runtime 0.1.1 ships a
+history-write shim (sandboxed iframes reject the engine's hash-sync
+replaceState; the mount died — found live, fixed in our layer). Proven
+with a real turn: "make a deck from this desktop" against the bigfoot
+workspace → 8-slide spec, 6 pinned queries, opened rendering in-window.
+Remaining: spec validation + deck MCP tools + Hub chip (P1), live-mode
+polish/PDF/roles (P3).
 
 Upstream: [stackblitz/bolt-slides](https://github.com/stackblitz/bolt-slides)
 (MIT, ~64 files, pushed 2026-07-16). Assessed in full before this plan:
