@@ -3,7 +3,22 @@
 > "Have the assistant make a Deck out of a desktop full of queries —
 > external URL, iframe, lean on this for all the nice design."
 
-**STATUS: PLANNED 2026-07-24. Nothing built.**
+**STATUS: P0 BUILT + published end-to-end 2026-07-24.** The runtime lives
+at `services/warehouse-mcp/deck-runtime/` (vendored upstream @ 9ad90e6a,
+spec renderer, `window.RvbbitDeck.render`); built assets are versioned on
+the shared CDN at `rvbbit.ai/dist/deck-runtime/0.1.0/` (306KB js / 46KB
+css — so published deck HTML is ~4KB: refs + inline spec). First deck
+("Sasquatch, by the numbers", 8 slides, pinned bigfoot data) authored as
+pure JSON and published through the EXISTING `create_live_app` tool with
+`app_kind='deck'` — accepted as-is, live at `/apps/<slug>` with a
+`hub_url`, capture-verified rendering with a healthy bridge and no CSP
+conflict on the cross-origin runtime. As-built deltas: shipped the P1
+shared-asset shape immediately (inline-bundle P0 was skipped — smaller
+publishes won); spec gained `data.column` (pluck the measure for
+points/cell — first-numeric-column guessing picks the year, found in
+test); ChartSlide wraps bare charts in centered titled slides. Remaining
+from the phases below: validation + deck MCP tools + Hub chip (P1),
+assistant desktop→deck flow (P2), live-mode surfacing/PDF/roles (P3).
 
 Upstream: [stackblitz/bolt-slides](https://github.com/stackblitz/bolt-slides)
 (MIT, ~64 files, pushed 2026-07-16). Assessed in full before this plan:

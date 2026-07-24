@@ -1,0 +1,125 @@
+/* window.RvbbitDeck — render an rvbbit deck spec with the vendored
+ * bolt-slides engine. See docs/DECKS_PLAN.md §3.
+ *
+ * Spec shape:
+ *   { deck: { title, theme?: {tokens}, slides: [
+ *       { component, props?, notes?, nav?,
+ *         data?: { sql, bind, shape?: "rows"|"points"|"cell", mode?: "pinned"|"live", rows? } }
+ *   ] } }
+ *
+ * Data binding:
+ *   pinned → data.rows was embedded at publish time; bound synchronously.
+ *   live   → window.rvbbitQuery(sql) (injected by the /d/ host) is called at
+ *            mount; the slide renders with pinned rows (if any) until it lands.
+ *   shape "rows"  → props[bind] = rows as-is (SQL aliases ARE the prop keys)
+ *   shape "points"→ props[bind] = first numeric column as number[]
+ *   shape "cell"  → props[bind] = first cell of first row
+ */
+import React, { useEffect, useState } from "react";
+import { createRoot } from "react-dom/client";
+import Deck from "./vendor/deck/Deck";
+import { ErrorSlide, REGISTRY } from "./registry";
+import "./vendor/styles/tokens.css";
+import "./vendor/styles/base.css";
+
+type Row = Record<string, unknown>;
+
+interface SlideSpec {
+  component: string;
+  props?: Record<string, unknown>;
+  notes?: string;
+  nav?: string;
+  data?: {
+    sql?: string;
+    bind: string;
+    shape?: "rows" | "points" | "cell";
+    /** Column to pluck for points/cell shapes; default = first numeric
+     *  (points) / first column (cell). Aliases in the SQL are the API. */
+    column?: string;
+    mode?: "pinned" | "live";
+    rows?: Row[];
+  };
+}
+
+interface DeckSpec {
+  deck: {
+    title?: string;
+    theme?: Record<string, string>;
+    slides: SlideSpec[];
+  };
+}
+
+declare global {
+  interface Window {
+    rvbbitQuery?: (sql: string) => Promise<{ rows?: Row[] } | Row[]>;
+    RvbbitDeck?: { render: (el: HTMLElement, spec: DeckSpec) => void; version: string };
+  }
+}
+
+function shapeRows(rows: Row[], shape: string, column?: string): unknown {
+  if (shape === "cell") {
+    const first = rows[0] ?? {};
+    const k = column && column in first ? column : Object.keys(first)[0];
+    return k ? first[k] : null;
+  }
+  if (shape === "points") {
+    return rows.map((r) => {
+      if (column && column in r) {
+        const n = Number(r[column]);
+        return Number.isFinite(n) ? n : 0;
+      }
+      for (const v of Object.values(r)) {
+        const n = typeof v === "number" ? v : Number(v);
+        if (Number.isFinite(n)) return n;
+      }
+      return 0;
+    });
+  }
+  return rows;
+}
+
+function DataBound({ spec, children }: { spec: SlideSpec; children: (extra: Record<string, unknown>) => React.ReactNode }) {
+  const d = spec.data;
+  const pinned = d?.rows ? { [d.bind]: shapeRows(d.rows, d.shape ?? "rows", d.column) } : {};
+  const [extra, setExtra] = useState<Record<string, unknown>>(pinned);
+  useEffect(() => {
+    if (!d || d.mode !== "live" || !d.sql || !window.rvbbitQuery) return;
+    let dead = false;
+    window
+      .rvbbitQuery(d.sql)
+      .then((res) => {
+        const rows: Row[] = Array.isArray(res) ? res : (res?.rows ?? []);
+        if (!dead && rows.length) setExtra({ [d.bind]: shapeRows(rows, d.shape ?? "rows", d.column) });
+      })
+      .catch(() => { /* keep pinned rows — live is best-effort */ });
+    return () => { dead = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return <>{children(extra)}</>;
+}
+
+function SlideFromSpec({ s, i }: { s: SlideSpec; i: number }) {
+  const C = REGISTRY[s.component];
+  if (!C) return <>{ErrorSlide({ name: s.component, error: `unknown component (slide ${i + 1})` })}</>;
+  const base = { ...(s.props ?? {}), nav: s.nav ?? (s.props?.nav as string | undefined), notes: s.notes };
+  if (!s.data) return <C {...base} />;
+  return <DataBound spec={s}>{(extra) => <C {...base} {...extra} />}</DataBound>;
+}
+
+function applyTheme(theme?: Record<string, string>) {
+  if (!theme) return;
+  const root = document.documentElement;
+  for (const [k, v] of Object.entries(theme)) {
+    root.style.setProperty(k.startsWith("--") ? k : `--${k}`, v);
+  }
+}
+
+function render(el: HTMLElement, spec: DeckSpec) {
+  applyTheme(spec.deck.theme);
+  if (spec.deck.title) document.title = spec.deck.title;
+  const slides = (spec.deck.slides ?? []).map((s, i) => <SlideFromSpec key={i} s={s} i={i} />);
+  createRoot(el).render(<Deck>{slides}</Deck>);
+}
+
+window.RvbbitDeck = { render, version: "0.1.0" };
+export { render };

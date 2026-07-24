@@ -1,0 +1,1 @@
+Vendored from https://github.com/stackblitz/bolt-slides @ 9ad90e6abf93818ea552ae49bb731556f7eb2b0a (MIT). src/vendor/* is upstream src/* unmodified — per the plan, never patch the engine; add new components beside it.
