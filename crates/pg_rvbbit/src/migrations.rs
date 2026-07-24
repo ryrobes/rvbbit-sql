@@ -853,6 +853,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0208_backends_generation",
         include_str!("../sql/migrations/0208_backends_generation.sql"),
     ),
+    (
+        "0209_assistant_decks",
+        include_str!("../sql/migrations/0209_assistant_decks.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

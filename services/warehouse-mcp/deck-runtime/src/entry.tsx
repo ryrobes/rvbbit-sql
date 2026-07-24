@@ -114,12 +114,35 @@ function applyTheme(theme?: Record<string, string>) {
   }
 }
 
+/* Sandboxed hosts (the lens renders decks in a srcdoc iframe, origin null)
+ * reject history.replaceState/pushState with absolute URLs — the engine's
+ * hash-sync would throw and kill the mount. Make history writes
+ * best-effort everywhere; hash reads and in-deck navigation still work.
+ * This lives in OUR layer — the vendored engine stays untouched. */
+function shimHistoryForSandbox() {
+  const wrap = <T extends typeof history.replaceState>(fn: T): T =>
+    function (this: History, ...args: Parameters<T>) {
+      try {
+        return fn.apply(history, args)
+      } catch {
+        /* sandboxed frame — navigation state is in-memory only */
+      }
+    } as T
+  try {
+    history.replaceState = wrap(history.replaceState.bind(history))
+    history.pushState = wrap(history.pushState.bind(history))
+  } catch {
+    /* history not writable — nothing to shim */
+  }
+}
+
 function render(el: HTMLElement, spec: DeckSpec) {
+  shimHistoryForSandbox()
   applyTheme(spec.deck.theme);
   if (spec.deck.title) document.title = spec.deck.title;
   const slides = (spec.deck.slides ?? []).map((s, i) => <SlideFromSpec key={i} s={s} i={i} />);
   createRoot(el).render(<Deck>{slides}</Deck>);
 }
 
-window.RvbbitDeck = { render, version: "0.1.0" };
+window.RvbbitDeck = { render, version: "0.1.1" };
 export { render };
