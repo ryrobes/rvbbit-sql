@@ -136,13 +136,57 @@ function shimHistoryForSandbox() {
   }
 }
 
+/* Accent-follows-desktop: the lens materializes its live theme into deck
+ * iframes as --main/--background/… (themeStyleTag). When --main is present,
+ * derive the deck's accent family from it so any deck opened on the
+ * desktop matches the CURRENT theme — including decks published before a
+ * retheme. Precedence: spec theme applies first, derived tokens LAST —
+ * on the desktop, the desktop wins (that's the point); on /apps and the
+ * hub --main is absent, so the spec's authored accent governs. Authors
+ * can pin their accent everywhere with theme {"follow-desktop":"off"}.
+ * Conservative by design: only the accent family follows — the deck
+ * keeps its own dark canvas, because mapping a light desktop background
+ * onto slides built for dark would shred contrast. */
+function deriveThemeFromDesktop(): Record<string, string> | null {
+  const main = getComputedStyle(document.documentElement).getPropertyValue("--main").trim();
+  if (!main) return null;
+  // Resolve to rgb via the engine (handles oklch/hex/named) for luminance.
+  let ink = "#04140e";
+  try {
+    const probe = document.createElement("div");
+    probe.style.color = main;
+    probe.style.display = "none";
+    document.body.appendChild(probe);
+    const rgb = getComputedStyle(probe).color.match(/\d+(\.\d+)?/g)?.map(Number) ?? [];
+    probe.remove();
+    if (rgb.length >= 3) {
+      const [r, g, b] = rgb;
+      const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+      ink = lum > 0.6 ? "#04140e" : "#f4f7fa";
+    }
+  } catch {
+    /* keep default ink */
+  }
+  return {
+    "--primary": main,
+    "--accent": main,
+    "--accent-ink": ink,
+    "--bg-grad-1": `color-mix(in oklab, ${main} 14%, transparent)`,
+    "--bg-grad-2": `color-mix(in oklab, ${main} 7%, transparent)`,
+  };
+}
+
 function render(el: HTMLElement, spec: DeckSpec) {
   shimHistoryForSandbox()
   applyTheme(spec.deck.theme);
+  if (spec.deck.theme?.["follow-desktop"] !== "off") {
+    const derived = deriveThemeFromDesktop();
+    if (derived) applyTheme(derived);
+  }
   if (spec.deck.title) document.title = spec.deck.title;
   const slides = (spec.deck.slides ?? []).map((s, i) => <SlideFromSpec key={i} s={s} i={i} />);
   createRoot(el).render(<Deck>{slides}</Deck>);
 }
 
-window.RvbbitDeck = { render, version: "0.1.1" };
+window.RvbbitDeck = { render, version: "0.1.2" };
 export { render };
