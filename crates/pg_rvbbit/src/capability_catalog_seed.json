@@ -25021,6 +25021,1572 @@
         ],
         "title": "Time / Timezone"
       }
+    },
+    {
+      "capability_manifest": {
+        "connection": {
+          "auth_header_env": "X_BEARER_TOKEN",
+          "timeout_ms": 45000,
+          "transport": "http",
+          "url": "https://api.x.com/mcp"
+        },
+        "description": "Official X (Twitter) MCP \u2014 full-archive post search, users, timelines, trends, and news as live SQL rows via rvbbit.mcp_rows() or the generated x_* operators. Hosted by X at api.x.com/mcp; needs X_BEARER_TOKEN (app-only bearer from developer.x.com, read-only). Pipe results straight into clover_* classifiers: sentiment/classify/extract over the live firehose in one statement.",
+        "kind": "mcp",
+        "name": "x",
+        "operators": [
+          {
+            "arg_names": [
+              "folder_id",
+              "id",
+              "tweet_id"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Create Users Bookmark",
+            "name": "x_create_users_bookmark",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "id",
+              "name"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Create Bookmark Folder",
+            "name": "x_create_users_bookmark_folder",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "id",
+              "tweet_id"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Delete Bookmark",
+            "name": "x_delete_users_bookmark",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "id",
+              "news.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text"
+            ],
+            "description": "Get news stories by ID Each returned story includes a `url` deeplinking to its x.com page.",
+            "name": "x_get_news",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "expansions",
+              "id",
+              "media.fields",
+              "place.fields",
+              "poll.fields",
+              "post.fields",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Posts by ID Each returned post includes a `url` deeplinking to it on x.com.",
+            "name": "x_get_posts_by_id",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "expansions",
+              "ids",
+              "media.fields",
+              "place.fields",
+              "poll.fields",
+              "post.fields",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Posts by IDs Each returned post includes a `url` deeplinking to it on x.com.",
+            "name": "x_get_posts_by_ids",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "end_time",
+              "granularity",
+              "next_token",
+              "pagination_token",
+              "query",
+              "search_count.fields",
+              "since_id",
+              "start_time",
+              "until_id"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Posts Counts Recent",
+            "name": "x_get_posts_counts_recent",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "expansions",
+              "id",
+              "max_results",
+              "pagination_token",
+              "post.fields",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Posts Liking Users",
+            "name": "x_get_posts_liking_users",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "exclude",
+              "expansions",
+              "id",
+              "max_results",
+              "media.fields",
+              "pagination_token",
+              "place.fields",
+              "poll.fields",
+              "post.fields",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Posts Quoted Posts Each returned post includes a `url` deeplinking to it on x.com.",
+            "name": "x_get_posts_quoted_posts",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "expansions",
+              "id",
+              "max_results",
+              "pagination_token",
+              "post.fields",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Posts Reposted by",
+            "name": "x_get_posts_reposted_by",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "max_trends",
+              "trend.fields",
+              "woeid"
+            ],
+            "arg_types": [
+              "bigint",
+              "text",
+              "bigint"
+            ],
+            "description": "Get Trends by Woeid Each returned trend includes a `url` deeplinking to its x.com search.",
+            "name": "x_get_trends_by_woeid",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "id",
+              "max_results",
+              "pagination_token"
+            ],
+            "arg_types": [
+              "text",
+              "bigint",
+              "text"
+            ],
+            "description": "Get Users Bookmark Folders",
+            "name": "x_get_users_bookmark_folders",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "expansions",
+              "id",
+              "max_results",
+              "media.fields",
+              "pagination_token",
+              "place.fields",
+              "poll.fields",
+              "post.fields",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Users Bookmarks Each returned post includes a `url` deeplinking to it on x.com.",
+            "name": "x_get_users_bookmarks",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "folder_id",
+              "id",
+              "max_results",
+              "pagination_token"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "bigint",
+              "text"
+            ],
+            "description": "Get Users Bookmarks by Folder ID Each returned post includes a `url` deeplinking to it on x.com.",
+            "name": "x_get_users_bookmarks_by_folder_id",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "expansions",
+              "id",
+              "post.fields",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Users by ID",
+            "name": "x_get_users_by_id",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "expansions",
+              "post.fields",
+              "user.fields",
+              "username"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Users by Username",
+            "name": "x_get_users_by_username",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "expansions",
+              "post.fields",
+              "user.fields",
+              "usernames"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Users by Usernames",
+            "name": "x_get_users_by_usernames",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "expansions",
+              "post.fields",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Users Me",
+            "name": "x_get_users_me",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "end_time",
+              "expansions",
+              "id",
+              "max_results",
+              "media.fields",
+              "pagination_token",
+              "place.fields",
+              "poll.fields",
+              "post.fields",
+              "since_id",
+              "start_time",
+              "until_id",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Users Mentions Each returned post includes a `url` deeplinking to it on x.com.",
+            "name": "x_get_users_mentions",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "end_time",
+              "exclude",
+              "expansions",
+              "id",
+              "max_results",
+              "media.fields",
+              "pagination_token",
+              "place.fields",
+              "poll.fields",
+              "post.fields",
+              "since_id",
+              "start_time",
+              "until_id",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Users Posts Each returned post includes a `url` deeplinking to it on x.com.",
+            "name": "x_get_users_posts",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "end_time",
+              "exclude",
+              "expansions",
+              "id",
+              "max_results",
+              "media.fields",
+              "pagination_token",
+              "place.fields",
+              "poll.fields",
+              "post.fields",
+              "since_id",
+              "start_time",
+              "until_id",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Get Users Timeline Each returned post includes a `url` deeplinking to it on x.com.",
+            "name": "x_get_users_timeline",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "max_age_hours",
+              "max_results",
+              "news.fields",
+              "query"
+            ],
+            "arg_types": [
+              "bigint",
+              "bigint",
+              "text",
+              "text"
+            ],
+            "description": "Search News Each returned story includes a `url` deeplinking to its x.com page.",
+            "name": "x_search_news",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "end_time",
+              "expansions",
+              "max_results",
+              "media.fields",
+              "next_token",
+              "pagination_token",
+              "place.fields",
+              "poll.fields",
+              "post.fields",
+              "query",
+              "since_id",
+              "sort_order",
+              "start_time",
+              "until_id",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Search Posts All Each returned post includes a `url` deeplinking to it on x.com.",
+            "name": "x_search_posts_all",
+            "return_type": "text",
+            "shape": "scalar"
+          },
+          {
+            "arg_names": [
+              "expansions",
+              "max_results",
+              "next_token",
+              "post.fields",
+              "query",
+              "user.fields"
+            ],
+            "arg_types": [
+              "text",
+              "bigint",
+              "text",
+              "text",
+              "text",
+              "text"
+            ],
+            "description": "Search Users",
+            "name": "x_search_users",
+            "return_type": "text",
+            "shape": "scalar"
+          }
+        ],
+        "resources": [
+          {
+            "description": "Renders AI-curated news stories X Explore-style: a bold two-line headline over a muted meta line (relative time \u00b7 category). The headline deep-links to the story's x.com page when the payload carries a `url` field.",
+            "mime_type": "text/html;profile=mcp-app",
+            "name": "X News List",
+            "uri": "ui://x/news-list"
+          },
+          {
+            "description": "Renders a single X post with author, text, timestamp and metrics.",
+            "mime_type": "text/html;profile=mcp-app",
+            "name": "X Post Card",
+            "uri": "ui://x/post-card"
+          },
+          {
+            "description": "Renders a list of X posts (search results or a user's timeline).",
+            "mime_type": "text/html;profile=mcp-app",
+            "name": "X Posts List",
+            "uri": "ui://x/posts-list"
+          },
+          {
+            "description": "Renders trending topics X Explore-style: a bold trend name (deep-linking to x.com search) over a muted post-volume line when available.",
+            "mime_type": "text/html;profile=mcp-app",
+            "name": "X Trends List",
+            "uri": "ui://x/trends-list"
+          },
+          {
+            "description": "Renders an X user profile card with name, handle, bio and follower metrics.",
+            "mime_type": "text/html;profile=mcp-app",
+            "name": "X User Card",
+            "uri": "ui://x/user-card"
+          }
+        ],
+        "scanned_at": "2026-07-25T19:06:57.013852+00:00",
+        "secrets": [
+          {
+            "env_var": "X_BEARER_TOKEN",
+            "help": "",
+            "label": "X_BEARER_TOKEN",
+            "link": "",
+            "name": "X_BEARER_TOKEN",
+            "required": true,
+            "secret": true
+          }
+        ],
+        "surface": {
+          "n_resources": 5,
+          "n_tools": 24
+        },
+        "tools": [
+          {
+            "cacheable": false,
+            "description": "Create Users Bookmark",
+            "input_schema": {
+              "properties": {
+                "folder_id": {
+                  "description": "Optional ID of the Bookmark folder to add the Post to. When omitted, the Post is added to the use...",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "tweet_id": {
+                  "description": "The ID of the Post to add to the user's Bookmarks.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "tweet_id"
+              ],
+              "type": "object"
+            },
+            "name": "create_users_bookmark",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Create Bookmark Folder",
+            "input_schema": {
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "description": "Name of the Bookmark folder (1-25 characters).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "name"
+              ],
+              "type": "object"
+            },
+            "name": "create_users_bookmark_folder",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Delete Bookmark",
+            "input_schema": {
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "tweet_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "tweet_id"
+              ],
+              "type": "object"
+            },
+            "name": "delete_users_bookmark",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get news stories by ID Each returned story includes a `url` deeplinking to its x.com page.",
+            "input_schema": {
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "news.fields": {
+                  "description": "A comma separated list of News fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_news",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Posts by ID Each returned post includes a `url` deeplinking to it on x.com.",
+            "input_schema": {
+              "properties": {
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "media.fields": {
+                  "description": "A comma separated list of Media fields to display.",
+                  "type": "string"
+                },
+                "place.fields": {
+                  "description": "A comma separated list of Place fields to display.",
+                  "type": "string"
+                },
+                "poll.fields": {
+                  "description": "A comma separated list of Poll fields to display.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_posts_by_id",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Posts by IDs Each returned post includes a `url` deeplinking to it on x.com.",
+            "input_schema": {
+              "properties": {
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "ids": {
+                  "description": "(comma-separated)",
+                  "type": "string"
+                },
+                "media.fields": {
+                  "description": "A comma separated list of Media fields to display.",
+                  "type": "string"
+                },
+                "place.fields": {
+                  "description": "A comma separated list of Place fields to display.",
+                  "type": "string"
+                },
+                "poll.fields": {
+                  "description": "A comma separated list of Poll fields to display.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ids"
+              ],
+              "type": "object"
+            },
+            "name": "get_posts_by_ids",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Posts Counts Recent",
+            "input_schema": {
+              "properties": {
+                "end_time": {
+                  "type": "string"
+                },
+                "granularity": {
+                  "enum": [
+                    "minute",
+                    "hour",
+                    "day"
+                  ],
+                  "type": "string"
+                },
+                "next_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "search_count.fields": {
+                  "type": "string"
+                },
+                "since_id": {
+                  "type": "string"
+                },
+                "start_time": {
+                  "description": "Must be within the last 7 days.",
+                  "type": "string"
+                },
+                "until_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ],
+              "type": "object"
+            },
+            "name": "get_posts_counts_recent",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Posts Liking Users",
+            "input_schema": {
+              "properties": {
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_posts_liking_users",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Posts Quoted Posts Each returned post includes a `url` deeplinking to it on x.com.",
+            "input_schema": {
+              "properties": {
+                "exclude": {
+                  "description": "(comma-separated)",
+                  "type": "string"
+                },
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "media.fields": {
+                  "description": "A comma separated list of Media fields to display.",
+                  "type": "string"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "place.fields": {
+                  "description": "A comma separated list of Place fields to display.",
+                  "type": "string"
+                },
+                "poll.fields": {
+                  "description": "A comma separated list of Poll fields to display.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_posts_quoted_posts",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Posts Reposted by",
+            "input_schema": {
+              "properties": {
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_posts_reposted_by",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Trends by Woeid Each returned trend includes a `url` deeplinking to its x.com search.",
+            "input_schema": {
+              "properties": {
+                "max_trends": {
+                  "type": "integer"
+                },
+                "trend.fields": {
+                  "description": "A comma separated list of Trend fields to display.",
+                  "type": "string"
+                },
+                "woeid": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "woeid"
+              ],
+              "type": "object"
+            },
+            "name": "get_trends_by_woeid",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Users Bookmark Folders",
+            "input_schema": {
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_users_bookmark_folders",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Users Bookmarks Each returned post includes a `url` deeplinking to it on x.com.",
+            "input_schema": {
+              "properties": {
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "media.fields": {
+                  "description": "A comma separated list of Media fields to display.",
+                  "type": "string"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "place.fields": {
+                  "description": "A comma separated list of Place fields to display.",
+                  "type": "string"
+                },
+                "poll.fields": {
+                  "description": "A comma separated list of Poll fields to display.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_users_bookmarks",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Users Bookmarks by Folder ID Each returned post includes a `url` deeplinking to it on x.com.",
+            "input_schema": {
+              "properties": {
+                "folder_id": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "folder_id"
+              ],
+              "type": "object"
+            },
+            "name": "get_users_bookmarks_by_folder_id",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Users by ID",
+            "input_schema": {
+              "properties": {
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_users_by_id",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Users by Username",
+            "input_schema": {
+              "properties": {
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                },
+                "username": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "username"
+              ],
+              "type": "object"
+            },
+            "name": "get_users_by_username",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Users by Usernames",
+            "input_schema": {
+              "properties": {
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                },
+                "usernames": {
+                  "description": "(comma-separated)",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "usernames"
+              ],
+              "type": "object"
+            },
+            "name": "get_users_by_usernames",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Users Me",
+            "input_schema": {
+              "properties": {
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "name": "get_users_me",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Users Mentions Each returned post includes a `url` deeplinking to it on x.com.",
+            "input_schema": {
+              "properties": {
+                "end_time": {
+                  "description": "Must be on or after 2010-11-06.",
+                  "type": "string"
+                },
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "media.fields": {
+                  "description": "A comma separated list of Media fields to display.",
+                  "type": "string"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "place.fields": {
+                  "description": "A comma separated list of Place fields to display.",
+                  "type": "string"
+                },
+                "poll.fields": {
+                  "description": "A comma separated list of Poll fields to display.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "since_id": {
+                  "type": "string"
+                },
+                "start_time": {
+                  "description": "Must be on or after 2010-11-06.",
+                  "type": "string"
+                },
+                "until_id": {
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_users_mentions",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Users Posts Each returned post includes a `url` deeplinking to it on x.com.",
+            "input_schema": {
+              "properties": {
+                "end_time": {
+                  "description": "Must be on or after 2010-11-06.",
+                  "type": "string"
+                },
+                "exclude": {
+                  "description": "(comma-separated)",
+                  "type": "string"
+                },
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "media.fields": {
+                  "description": "A comma separated list of Media fields to display.",
+                  "type": "string"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "place.fields": {
+                  "description": "A comma separated list of Place fields to display.",
+                  "type": "string"
+                },
+                "poll.fields": {
+                  "description": "A comma separated list of Poll fields to display.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "since_id": {
+                  "type": "string"
+                },
+                "start_time": {
+                  "description": "Must be on or after 2010-11-06.",
+                  "type": "string"
+                },
+                "until_id": {
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_users_posts",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Get Users Timeline Each returned post includes a `url` deeplinking to it on x.com.",
+            "input_schema": {
+              "properties": {
+                "end_time": {
+                  "description": "Must be on or after 2010-11-06.",
+                  "type": "string"
+                },
+                "exclude": {
+                  "description": "(comma-separated)",
+                  "type": "string"
+                },
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "media.fields": {
+                  "description": "A comma separated list of Media fields to display.",
+                  "type": "string"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "place.fields": {
+                  "description": "A comma separated list of Place fields to display.",
+                  "type": "string"
+                },
+                "poll.fields": {
+                  "description": "A comma separated list of Poll fields to display.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "since_id": {
+                  "type": "string"
+                },
+                "start_time": {
+                  "description": "Must be on or after 2010-11-06.",
+                  "type": "string"
+                },
+                "until_id": {
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "get_users_timeline",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Search News Each returned story includes a `url` deeplinking to its x.com page.",
+            "input_schema": {
+              "properties": {
+                "max_age_hours": {
+                  "type": "integer"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "news.fields": {
+                  "description": "A comma separated list of News fields to display.",
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ],
+              "type": "object"
+            },
+            "name": "search_news",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Search Posts All Each returned post includes a `url` deeplinking to it on x.com.",
+            "input_schema": {
+              "properties": {
+                "end_time": {
+                  "type": "string"
+                },
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "media.fields": {
+                  "description": "A comma separated list of Media fields to display.",
+                  "type": "string"
+                },
+                "next_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "pagination_token": {
+                  "description": "A base32hex-encoded pagination token.",
+                  "type": "string"
+                },
+                "place.fields": {
+                  "description": "A comma separated list of Place fields to display.",
+                  "type": "string"
+                },
+                "poll.fields": {
+                  "description": "A comma separated list of Poll fields to display.",
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "since_id": {
+                  "type": "string"
+                },
+                "sort_order": {
+                  "enum": [
+                    "recency",
+                    "relevancy"
+                  ],
+                  "type": "string"
+                },
+                "start_time": {
+                  "type": "string"
+                },
+                "until_id": {
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ],
+              "type": "object"
+            },
+            "name": "search_posts_all",
+            "ttl_seconds": null
+          },
+          {
+            "cacheable": false,
+            "description": "Search Users",
+            "input_schema": {
+              "properties": {
+                "expansions": {
+                  "description": "A comma separated list of fields to expand.",
+                  "type": "string"
+                },
+                "max_results": {
+                  "type": "integer"
+                },
+                "next_token": {
+                  "type": "string"
+                },
+                "post.fields": {
+                  "description": "A comma separated list of Post fields to display.",
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "user.fields": {
+                  "description": "A comma separated list of User fields to display.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ],
+              "type": "object"
+            },
+            "name": "search_users",
+            "ttl_seconds": null
+          }
+        ]
+      },
+      "catalog_entry": {
+        "catalog_visibility": "public",
+        "description": "Official X (Twitter) MCP \u2014 full-archive post search, users, timelines, trends, and news as live SQL rows via rvbbit.mcp_rows() or the generated x_* operators. Hosted by X at api.x.com/mcp; needs X_BEARER_TOKEN (app-only bearer from developer.x.com, read-only). Pipe results straight into clover_* classifiers: sentiment/classify/extract over the live firehose in one statement.",
+        "id": "mcp/x",
+        "kind": "mcp",
+        "manifest_path": "mcp/x",
+        "name": "x",
+        "operators": [
+          "x_create_users_bookmark",
+          "x_create_users_bookmark_folder",
+          "x_delete_users_bookmark",
+          "x_get_news",
+          "x_get_posts_by_id",
+          "x_get_posts_by_ids",
+          "x_get_posts_counts_recent",
+          "x_get_posts_liking_users",
+          "x_get_posts_quoted_posts",
+          "x_get_posts_reposted_by",
+          "x_get_trends_by_woeid",
+          "x_get_users_bookmark_folders",
+          "x_get_users_bookmarks",
+          "x_get_users_bookmarks_by_folder_id",
+          "x_get_users_by_id",
+          "x_get_users_by_username",
+          "x_get_users_by_usernames",
+          "x_get_users_me",
+          "x_get_users_mentions",
+          "x_get_users_posts",
+          "x_get_users_timeline",
+          "x_search_news",
+          "x_search_posts_all",
+          "x_search_users"
+        ],
+        "tags": [
+          "mcp",
+          "news",
+          "search",
+          "social",
+          "trends",
+          "twitter",
+          "verified",
+          "x"
+        ],
+        "title": "X (Twitter) \u2014 Official XMCP"
+      }
     }
   ],
   "catalog_layout": "rvbbit.pack/v1",
