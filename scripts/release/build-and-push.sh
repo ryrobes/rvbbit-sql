@@ -215,6 +215,7 @@ if [[ "$SKIP_DB" -eq 0 || "$SKIP_WARREN" -eq 0 ]]; then
         --exclude node_modules \
         --exclude results \
         --exclude target \
+        --exclude 'target-*' \
         --exclude test_runs \
         --exclude __pycache__ \
         --exclude '*.log' \
