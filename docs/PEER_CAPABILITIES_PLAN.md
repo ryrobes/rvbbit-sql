@@ -13,22 +13,32 @@ locally-run MCP server. Engineering nouns (tables, functions, the
 `peer_queue` transport) stay plain; "Colony" is the product-facing name
 for the feature and its UI.
 
-**STATUS: P0/P1 built, proven end to end, and committed in both repos
-(2026-07-26).** Schema (migrations 0212-0214), the `peer_queue` Rust
+**STATUS: P0-P4 built, browser-verified, and committed in both repos
+(2026-07-26).** Schema (migrations 0212-0215), the `peer_queue` Rust
 Transport, and burrow-role scoping are live and verified through the real
 dispatch path (`rvbbit.call_specialist`, and via a `specialist`/`llm` flow
-step), not just raw SQL: a scoped caller reaches a real local Ollama
-(`llama3.1:latest`, ollama_native shape) and a real Gradio-hosted
-specialist (a lexicon sentiment app, matching Warren's own
-BGE-reranker-via-Gradio pattern), while an out-of-scope caller is correctly
-rejected. P1's client runner is real now, not a prototype: `colony-runner.ts`
-in rvbbit-lens is a server-lifetime claim-loop (the `openai_chat` shape —
-covers Ollama; Gradio isn't ported yet), paired with a `colony-window.tsx`
-desktop window combining P2's "Share a Capability" and P3's "My Shared
-Capabilities" (manual-URL register form + live roster + pause/resume/
-detach), browser-verified against a real Ollama end to end.
+step), not just raw SQL. `colony-runner.ts` in rvbbit-lens is a real
+server-lifetime claim-loop supporting all three shapes: `openai_chat`
+(Ollama's own OpenAI-compatible endpoint), `gradio` (the official
+`@gradio/client`), and `mcp` (the official `@modelcontextprotocol/sdk`,
+spawning a local stdio MCP server — the first such code in this repo; the
+existing `rvbbit-mcp-gateway` is a separate server-side Python service,
+the wrong shape for "share what's on my own machine"). `colony-scan.ts`
+does explicit, on-demand detection (Ollama's default port, a bounded
+Gradio port range) with real installed-model discovery. Migration 0215
+wires peer backends into `capability_search()` via the same numbered-block
+convention every other capability kind uses. The `colony-window.tsx`
+desktop window combines Share/Scan, live roster, a "Try it" click-through,
+and pause/resume/detach.
 
-Caught and fixed three real bugs along the way: (1) the Rust transport's
+Browser-verified end to end against real local services: Ollama
+(`llama3.1:latest`), a Gradio sentiment specialist, and
+`@modelcontextprotocol/server-everything` (a real MCP tool call, echo,
+round-tripped through the actual Rust transport) — plus scope rejection,
+pause, and detach (confirmed a detached MCP backend's spawned subprocess
+is actually killed, not just its DB row).
+
+Caught and fixed four real bugs along the way: (1) the Rust transport's
 side connection lands as superuser via unix-socket peer auth, and
 Postgres's `pg_has_role()` unconditionally bypasses for superusers — so
 every call through the transport silently ignored scoping until fixed via
@@ -39,12 +49,15 @@ parameter cast straight to a non-text type (`$2::jsonb`) makes
 double-cast; (3) detaching any backend that had ever completed a real call
 hit a foreign-key violation — fixed by dropping the FK on
 `peer_capability_requests.backend_name`, matching the existing
-`rvbbit.ml_models.backend_name` convention (audit survives deletion).
+`rvbbit.ml_models.backend_name` convention (audit survives deletion);
+(4) the "Try it" click-through assumed a chat-shaped payload for every
+kind — now branches on `kind==='mcp'` to a correctly-shaped placeholder.
 
-Still open: the Gradio shape in the real (TypeScript) runner, the
-system-wide roster reusing Finder's live-vitals rendering, detection/
-auto-scan (the other half of P2), and P4 (MCP extension) / P5 (clustering
-polish).
+Still open: only the system-wide roster's literal Finder-vitals-*component*
+reuse — the Colony window's own live roster already covers that function
+end to end, just via its own rendering rather than Finder's specific one —
+and P5 (clustering UX polish; the fan-out mechanics themselves already work
+as of P0).
 
 ## §1 The idea
 
