@@ -27,7 +27,7 @@ are not lifetime model counters. A request can contain multiple input rows.
 
 | Resident model | Managed backend / route | SQL coverage | Successful use |
 |---|---|---|---:|
-| Snowflake Arctic Embed L v2.0 | `embed` / `/v1/embeddings`; `cluster` / `/cluster` | built-in embedding composites, `clover_similar`, `clover_cluster` | 1,892 embed; 8 cluster |
+| Snowflake Arctic Embed L v2.0 | `embed` / `/v1/embeddings`; `cluster` / `/cluster` | built-in embedding composites, `clover_embed`, `clover_similar`, `clover_cluster` | 1,892 embed; 8 cluster |
 | BGE Reranker v2 M3 | `rerank` / `/rerank` | `clover_means`, `clover_relevance` | 818 |
 | Twitter XLM-R sentiment | `sentiment` / `/sentiment` | `clover_sentiment`, `clover_sentiment_score` | 21,841 |
 | DeBERTa v3 large zero-shot | `nli`, `classify` | `clover_entails`, `clover_classify`, `clover_classify_scores` | 356 NLI; 415 classify |
@@ -57,6 +57,7 @@ available directly:
 - `clover_classify_scores(text, labels)` -- winner plus all candidate scores
 - `clover_nli(premise, hypothesis)` -- full entailment/neutral/contradiction scores
 - `clover_language_info(text)` -- language plus confidence
+- `clover_embed(t)` -- reusable Arctic text vector (1024-dim)
 - `clover_image_embed(item)` -- reusable SigLIP2 vector
 - `clover_cluster(values, num_clusters)` -- K-means or HDBSCAN over Arctic embeddings
 - `clover_explain(model_blob_b64, model_sha256, features, feature_names)` -- SHAP attributions for TabPFN or anomaly models
