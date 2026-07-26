@@ -452,6 +452,16 @@ CREATE TABLE rvbbit.acceleration_state (
     last_refresh_rows         bigint NOT NULL DEFAULT 0,
     last_refresh_row_groups   bigint NOT NULL DEFAULT 0,
     last_refresh_at           timestamptz,
+    -- The heap's relfilenode as of the last successful refresh/rebuild. A
+    -- heap rewrite (ALTER TABLE .. TYPE, VACUUM FULL, CLUSTER) reinserts
+    -- every row with a fresh xmin into a NEW relfilenode without firing the
+    -- dirty triggers refresh_acceleration relies on to detect non-append
+    -- changes — its xid-watermark scan would otherwise see the whole
+    -- rewritten heap as "new rows" and duplicate every row into a second,
+    -- never-retired generation of row groups. NULL = never baselined yet
+    -- (fresh table, or an install from before this column existed) — the
+    -- guard is a no-op until the first successful refresh/rebuild stamps it.
+    refresh_relfilenode       oid,
     updated_at                timestamptz NOT NULL DEFAULT now(),
     CHECK (last_refresh_xid >= 0),
     CHECK (last_refresh_generation >= 0),
@@ -1849,6 +1859,7 @@ BEGIN
         last_refresh_generation,
         last_refresh_rows,
         last_refresh_row_groups,
+        refresh_relfilenode,
         last_refresh_at,
         updated_at
     ) VALUES (
@@ -1857,6 +1868,7 @@ BEGIN
         generation_after,
         coalesce(rebuilt_rows, 0) + coalesce(catchup_rows, 0),
         coalesce(row_groups_written, 0),
+        pg_relation_filenode(reloid),
         clock_timestamp(),
         clock_timestamp()
     )
@@ -1865,6 +1877,7 @@ BEGIN
            last_refresh_generation = EXCLUDED.last_refresh_generation,
            last_refresh_rows = EXCLUDED.last_refresh_rows,
            last_refresh_row_groups = EXCLUDED.last_refresh_row_groups,
+           refresh_relfilenode = EXCLUDED.refresh_relfilenode,
            last_refresh_at = EXCLUDED.last_refresh_at,
            updated_at = EXCLUDED.updated_at;
 
@@ -6978,6 +6991,8 @@ DECLARE
     op_id bigint;
     table_name_text text := reloid::text;
     last_xid numeric;
+    current_relfilenode oid;
+    stored_relfilenode oid;
     safe_upper_xid numeric;
     frontier_fxid numeric := 0;
     has_pending_above boolean := false;
@@ -7011,11 +7026,13 @@ BEGIN
     VALUES (reloid)
     ON CONFLICT (table_oid) DO NOTHING;
 
-    SELECT s.last_refresh_xid
-      INTO last_xid
+    SELECT s.last_refresh_xid, s.refresh_relfilenode
+      INTO last_xid, stored_relfilenode
       FROM rvbbit.acceleration_state s
      WHERE s.table_oid = reloid
      FOR UPDATE;
+
+    current_relfilenode := pg_relation_filenode(reloid);
 
     -- pg_snapshot_xmin is the oldest still-active xid in this snapshot.
     -- XIDs below it are complete, so rows in that range are safe to mark
@@ -7087,6 +7104,32 @@ BEGIN
             reloid, quote_literal(reloid::text);
     END IF;
 
+    -- Heap-rewrite guard: a rewrite (ALTER TABLE .. TYPE, VACUUM FULL,
+    -- CLUSTER) does not fire the dirty triggers above, so it can reach this
+    -- point looking "clean" — but every row was just reinserted with a fresh
+    -- xmin, which the watermark scan below cannot distinguish from genuinely
+    -- new rows. Refuse loudly rather than silently duplicating every row
+    -- into a second, never-retired generation of row groups (found live:
+    -- ALTER COLUMN TYPE between two refreshes left both generations valid
+    -- simultaneously, real duplicate primary keys on plain SELECT).
+    IF existing_rgs > 0
+       AND stored_relfilenode IS NOT NULL
+       AND stored_relfilenode <> current_relfilenode THEN
+        UPDATE rvbbit.acceleration_operations
+           SET status = 'failed',
+               finished_at = clock_timestamp(),
+               error = 'heap relfilenode changed since the last refresh (a rewrite occurred); incremental refresh cannot safely tell rewritten rows from new ones',
+               settings = settings || jsonb_build_object(
+                   'stored_relfilenode', stored_relfilenode,
+                   'current_relfilenode', current_relfilenode,
+                   'recommended_action', 'rebuild_acceleration'
+               )
+         WHERE id = op_id;
+        RAISE EXCEPTION
+            'rvbbit.refresh_acceleration: % heap was rewritten (relfilenode changed) since the last refresh; run rvbbit.rebuild_acceleration(%) — incremental refresh cannot be used across a heap rewrite',
+            reloid, quote_literal(reloid::text);
+    END IF;
+
     IF last_xid = 0 AND existing_rgs > 0 AND heap_bytes > 0 THEN
         IF shadow_retained AND NOT shadow_dirty THEN
             UPDATE rvbbit.tables
@@ -7102,6 +7145,7 @@ BEGIN
             UPDATE rvbbit.acceleration_state
                SET last_refresh_xid = safe_upper_xid,
                    last_refresh_generation = generation_after,
+                   refresh_relfilenode = current_relfilenode,
                    last_refresh_at = clock_timestamp(),
                    updated_at = clock_timestamp()
              WHERE table_oid = reloid;
@@ -7266,6 +7310,7 @@ BEGIN
            last_refresh_generation = generation_after,
            last_refresh_rows = coalesce(last_refresh_rows, 0) + coalesce(rows_written, 0),
            last_refresh_row_groups = coalesce(last_refresh_row_groups, 0) + coalesce(row_groups_written, 0),
+           refresh_relfilenode = current_relfilenode,
            last_refresh_at = clock_timestamp(),
            updated_at = clock_timestamp()
      WHERE table_oid = reloid;

@@ -21,7 +21,33 @@ ALTER SYSTEM SET shared_preload_libraries = 'pg_rvbbit';   -- (+ pg_cron if want
 
 # 3.
 CREATE EXTENSION pg_rvbbit;
+SELECT rvbbit.migrate();   -- REQUIRED — see note below, this is not optional
 ```
+
+**`rvbbit.migrate()` is a separate, mandatory step — `CREATE EXTENSION` alone
+does not run it.** The extension's own SQL install script lays down whatever
+was `default_version` at build time; everything shipped since as a numbered
+migration (0001, 0002, … — most ongoing feature work) only lands after
+`rvbbit.migrate()` runs. It's idempotent (a no-op, reporting "up to date",
+once nothing is pending) so it's always safe to (re-)run.
+
+**This bites hardest on a SECOND database on a box that already runs
+rvbbit.** The docker-compose bootstrap and release images pair the two
+calls automatically — but only for the ONE database that exists at
+container-first-boot (`docker-entrypoint-initdb.d` scripts never re-run).
+Any database created afterward — a new project database, a test DB, a
+`CREATE DATABASE` on a long-running box — needs BOTH steps run by hand:
+
+```sql
+CREATE EXTENSION pg_rvbbit;
+SELECT rvbbit.migrate();
+```
+
+Symptom of skipping it: schema-qualified internal calls the rewriter emits
+(e.g. `rvbbit._engine_rows(...)`) fail with "does not exist" — the extension
+is present, but a specific migration-gated function never got created.
+Diagnose fast: `SELECT to_regclass('rvbbit.schema_migrations')` — if that's
+NULL, migrate() has never been run on this database, full stop.
 
 VERIFIED facts (not aspirations):
 - **`pg_rvbbit.so` is self-contained** — `ldd` shows zero missing libs on a
