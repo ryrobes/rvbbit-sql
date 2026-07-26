@@ -13,24 +13,38 @@ locally-run MCP server. Engineering nouns (tables, functions, the
 `peer_queue` transport) stay plain; "Colony" is the product-facing name
 for the feature and its UI.
 
-**STATUS: P0/P1 proven end to end locally against real installed models
-(2026-07-26).** Schema (migration 0212), the `peer_queue` Rust Transport,
-and burrow-role scoping are all live and verified through the real dispatch
-path (`rvbbit.call_specialist`, and via a `specialist`/`llm` flow step),
-not just raw SQL: a scoped caller reaches a real local Ollama
+**STATUS: P0/P1 built, proven end to end, and committed in both repos
+(2026-07-26).** Schema (migrations 0212-0214), the `peer_queue` Rust
+Transport, and burrow-role scoping are live and verified through the real
+dispatch path (`rvbbit.call_specialist`, and via a `specialist`/`llm` flow
+step), not just raw SQL: a scoped caller reaches a real local Ollama
 (`llama3.1:latest`, ollama_native shape) and a real Gradio-hosted
 specialist (a lexicon sentiment app, matching Warren's own
 BGE-reranker-via-Gradio pattern), while an out-of-scope caller is correctly
-rejected. Caught and fixed a real bug along the way: the Rust transport's
+rejected. P1's client runner is real now, not a prototype: `colony-runner.ts`
+in rvbbit-lens is a server-lifetime claim-loop (the `openai_chat` shape —
+covers Ollama; Gradio isn't ported yet), paired with a `colony-window.tsx`
+desktop window combining P2's "Share a Capability" and P3's "My Shared
+Capabilities" (manual-URL register form + live roster + pause/resume/
+detach), browser-verified against a real Ollama end to end.
+
+Caught and fixed three real bugs along the way: (1) the Rust transport's
 side connection lands as superuser via unix-socket peer auth, and
 Postgres's `pg_has_role()` unconditionally bypasses for superusers — so
 every call through the transport silently ignored scoping until fixed via
 `SET SESSION AUTHORIZATION` to the real caller (captured through the same
-non-SPI FFI read `route_log.rs` already uses). P1's client runner exists as
-a standalone Python prototype (`colony_runner.py`, not yet committed —
-scratchpad) proving the claim-loop shape; porting it into DataRabbit's
-Next.js server, and P2-P5 (detection/scan UI, monitoring UI, MCP extension,
-clustering polish), remain.
+non-SPI FFI read `route_log.rs` already uses); (2) a `postgres::Client`
+parameter cast straight to a non-text type (`$2::jsonb`) makes
+`ToSql::accepts()` reject a bound `String`/`&str` — fixed via a `::text`
+double-cast; (3) detaching any backend that had ever completed a real call
+hit a foreign-key violation — fixed by dropping the FK on
+`peer_capability_requests.backend_name`, matching the existing
+`rvbbit.ml_models.backend_name` convention (audit survives deletion).
+
+Still open: the Gradio shape in the real (TypeScript) runner, the
+system-wide roster reusing Finder's live-vitals rendering, detection/
+auto-scan (the other half of P2), and P4 (MCP extension) / P5 (clustering
+polish).
 
 ## §1 The idea
 
