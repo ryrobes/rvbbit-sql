@@ -881,6 +881,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0215_colony_capability_search",
         include_str!("../sql/migrations/0215_colony_capability_search.sql"),
     ),
+    (
+        "0216_capability_alert_enabled",
+        include_str!("../sql/migrations/0216_capability_alert_enabled.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
