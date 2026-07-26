@@ -141,10 +141,33 @@ fn dispatch_one(
 
     let response_text: Option<String> = row.get(0);
     match response_text {
-        Some(text) => serde_json::from_str(&text).map_err(|e| {
-            ProviderError::BadResponse(format!("peer_queue: bad response json: {e}"))
-        }),
+        Some(text) => {
+            let parsed: Value = serde_json::from_str(&text).map_err(|e| {
+                ProviderError::BadResponse(format!("peer_queue: bad response json: {e}"))
+            })?;
+            Ok(extract_content(parsed))
+        }
         None => Ok(Value::Null),
+    }
+}
+
+/// The DataRabbit runner's chat/specialist reply is its own envelope —
+/// `{"content": "...", "model": "..."}` — but every other transport's
+/// `predict()` already hands back a bare scalar (openai_chat.rs extracts
+/// `content` before returning; gradio.rs picks a single `output_index`), and
+/// that bare-scalar contract is what `providers::chat()` builds
+/// `ChatResponse.content` from. Left unextracted, the whole envelope leaked
+/// into operator output as a stringified JSON blob instead of the answer
+/// text. Only unwrap when `content` is actually a string: an MCP tool reply
+/// shapes `content` as an array of content blocks per the MCP spec, so this
+/// guard leaves those (and anything else non-chat-shaped) untouched.
+fn extract_content(value: Value) -> Value {
+    match &value {
+        Value::Object(map) => match map.get("content") {
+            Some(Value::String(s)) => Value::String(s.clone()),
+            _ => value,
+        },
+        _ => value,
     }
 }
 
