@@ -865,6 +865,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0211_refresh_relfilenode_guard",
         include_str!("../sql/migrations/0211_refresh_relfilenode_guard.sql"),
     ),
+    (
+        "0212_colony_peer_capabilities",
+        include_str!("../sql/migrations/0212_colony_peer_capabilities.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

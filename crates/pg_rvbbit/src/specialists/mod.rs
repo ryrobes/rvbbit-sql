@@ -38,6 +38,7 @@ pub mod local_embed;
 pub mod native;
 pub mod openai;
 pub mod openai_chat;
+pub mod peer_queue;
 pub mod stub;
 
 /// Catalog metadata for one registered specialist. Resolved from
@@ -164,6 +165,7 @@ fn build_transports() -> HashMap<&'static str, Box<dyn Transport>> {
         Box::new(openai_chat::OpenAiChatTransport::new()),
     );
     m.insert("stub", Box::new(stub::StubTransport::new()));
+    m.insert("peer_queue", Box::new(peer_queue::PeerQueueTransport::new()));
     m
 }
 
@@ -459,6 +461,22 @@ pub fn predict_batch(
         )));
     }
     Ok(resp)
+}
+
+/// Ad-hoc single-call test of any registered backend, whatever its
+/// transport — bypasses operators/flows entirely. Useful for verifying a
+/// newly registered backend actually answers before wiring it into an
+/// operator.
+#[pgrx::pg_extern(volatile)]
+fn call_specialist(specialist_name: &str, input: pgrx::JsonB) -> pgrx::JsonB {
+    let spec = match load_spec(specialist_name) {
+        Ok(s) => s,
+        Err(e) => pgrx::error!("call_specialist: {e}"),
+    };
+    match predict_one(&spec, &input.0) {
+        Ok(v) => pgrx::JsonB(v),
+        Err(e) => pgrx::error!("call_specialist: {e}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
