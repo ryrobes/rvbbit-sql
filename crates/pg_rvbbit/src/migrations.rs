@@ -885,6 +885,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0216_capability_alert_enabled",
         include_str!("../sql/migrations/0216_capability_alert_enabled.sql"),
     ),
+    (
+        "0217_colony_deregister_backends_row",
+        include_str!("../sql/migrations/0217_colony_deregister_backends_row.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
