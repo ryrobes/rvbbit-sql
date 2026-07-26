@@ -869,6 +869,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0212_colony_peer_capabilities",
         include_str!("../sql/migrations/0212_colony_peer_capabilities.sql"),
     ),
+    (
+        "0213_colony_lifecycle",
+        include_str!("../sql/migrations/0213_colony_lifecycle.sql"),
+    ),
+    (
+        "0214_colony_detach_fk_fix",
+        include_str!("../sql/migrations/0214_colony_detach_fk_fix.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
