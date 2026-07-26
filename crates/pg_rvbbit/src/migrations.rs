@@ -877,6 +877,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0214_colony_detach_fk_fix",
         include_str!("../sql/migrations/0214_colony_detach_fk_fix.sql"),
     ),
+    (
+        "0215_colony_capability_search",
+        include_str!("../sql/migrations/0215_colony_capability_search.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
