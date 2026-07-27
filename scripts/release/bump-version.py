@@ -127,10 +127,16 @@ def main() -> None:
     if lens_dir.exists():
         package_json = lens_dir / "package.json"
         package_lock = lens_dir / "package-lock.json"
+        # electron-builder reads its version from electron/package.json (its
+        # projectDir), NOT the repo root — missing it ships binaries labeled
+        # with the previous version (bit us on 4.1.6).
+        electron_package = lens_dir / "electron" / "package.json"
         if package_json.exists():
             update_json_version(package_json, version)
         if package_lock.exists():
             update_json_version(package_lock, version)
+        if electron_package.exists():
+            update_json_version(electron_package, version)
     else:
         print(f"skipped Lens version bump; not found: {lens_dir}")
 
