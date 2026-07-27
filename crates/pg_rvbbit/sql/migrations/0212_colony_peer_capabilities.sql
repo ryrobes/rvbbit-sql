@@ -150,7 +150,12 @@ $$;
 -- Presence view: a backend is "live" iff at least one instance has
 -- heartbeat within the last 15s — a timestamp check, not raw socket
 -- liveness (sleep/wake and flaky wifi lie about TCP state; this doesn't).
-CREATE OR REPLACE VIEW rvbbit.peer_backends_live AS
+-- DROP+CREATE, never OR REPLACE (0135 doctrine): this view is b.*-shaped,
+-- and on a database where later migrations already widened peer_backends
+-- (drift, partial application), OR REPLACE dies on the column-position
+-- shift ("cannot change name of view column ...").
+DROP VIEW IF EXISTS rvbbit.peer_backends_live;
+CREATE VIEW rvbbit.peer_backends_live AS
 SELECT b.*,
        p.instance_count,
        p.min_queue_depth

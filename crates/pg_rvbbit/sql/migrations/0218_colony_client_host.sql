@@ -16,9 +16,25 @@
 
 ALTER TABLE rvbbit.peer_backends ADD COLUMN IF NOT EXISTS client_host text;
 
+-- Rebuild the presence view so b.* picks up client_host. DROP+CREATE,
+-- never OR REPLACE — the new column shifts every position after it
+-- (0135 doctrine).
+DROP VIEW IF EXISTS rvbbit.peer_backends_live;
+CREATE VIEW rvbbit.peer_backends_live AS
+SELECT b.*,
+       p.instance_count,
+       p.min_queue_depth
+FROM rvbbit.peer_backends b
+JOIN LATERAL (
+    SELECT count(*) AS instance_count, min(queue_depth) AS min_queue_depth
+    FROM rvbbit.peer_backend_presence pp
+    WHERE pp.backend_name = b.backend_name
+      AND pp.last_heartbeat_at > clock_timestamp() - interval '15 seconds'
+) p ON p.instance_count > 0;
+
 DROP FUNCTION IF EXISTS rvbbit.register_peer_backend(text, text, text, text, text, text);
 
-CREATE FUNCTION rvbbit.register_peer_backend(p_backend_name text, p_kind text, p_scope_role text, p_template text DEFAULT NULL::text, p_description text DEFAULT NULL::text, p_model_digest text DEFAULT NULL::text, p_client_host text DEFAULT NULL::text)
+CREATE OR REPLACE FUNCTION rvbbit.register_peer_backend(p_backend_name text, p_kind text, p_scope_role text, p_template text DEFAULT NULL::text, p_description text DEFAULT NULL::text, p_model_digest text DEFAULT NULL::text, p_client_host text DEFAULT NULL::text)
  RETURNS void
  LANGUAGE plpgsql
  SECURITY DEFINER
