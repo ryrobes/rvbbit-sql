@@ -80,8 +80,36 @@ fan-out for free), `complete_peer_request(id, response, error)`,
 
 ## Scope enforcement
 
-`enqueue_peer_request` gates on `pg_has_role(session_user, scope_role,
-'MEMBER')`. Two hard-won facts:
+Two sides, two different checks (0219 added the second — the original
+design only had the first, which was a critical hole; see below).
+
+**Call side** — `enqueue_peer_request` gates on
+`pg_has_role(session_user, scope_role, 'MEMBER')`.
+
+**Serve side** — `claim_peer_request`, `complete_peer_request` and
+`peer_heartbeat` gate on `rvbbit._peer_may_serve(backend)`: session_user
+must equal `peer_backends.shared_by` (the identity recorded at
+registration), be a member of it, or hold `rvbbit_admin`. Without this,
+ANY role on the warehouse could claim pending requests for ANY backend
+(reading every prompt sent to it), complete them with forged content
+(the caller receives attacker output believing it came from the shared
+model), and starve the real runner. Verified end to end as a
+non-member before the fix, and re-verified blocked after.
+
+`poll_peer_response` additionally requires `requested_by = session_user`
+(or rvbbit_admin): a request id alone no longer discloses an answer.
+
+**Consequence for same-name pooling:** every runner sharing one backend
+name must connect as the same database role (shared_by is set by the
+FIRST registrant and is not overwritten on re-register).
+
+**NEVER compare against `current_user` in these functions.** Inside a
+SECURITY DEFINER function `current_user` is the function OWNER
+(postgres) while `session_user` remains the real caller — the first cut
+of 0219 included `current_user` in the comparison and every check passed
+for everybody. The attack replay caught it; a code read had not.
+
+Two more hard-won facts:
 
 1. **Superuser bypasses pg_has_role() unconditionally** (documented
    Postgres semantics). The Rust transport's side connection lands via
