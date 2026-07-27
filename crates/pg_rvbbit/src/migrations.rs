@@ -897,6 +897,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0219_colony_serve_side_authz",
         include_str!("../sql/migrations/0219_colony_serve_side_authz.sql"),
     ),
+    (
+        "0220_colony_authz_followups",
+        include_str!("../sql/migrations/0220_colony_authz_followups.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

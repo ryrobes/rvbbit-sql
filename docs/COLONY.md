@@ -165,7 +165,13 @@ GOTCHAS:
 
 - No live instance → `enqueue_peer_request` raises immediately
   ("has no live instance right now") — fast failure, not a hang.
-- `poll_peer_response` timeout → request marked failed.
+- `poll_peer_response` timeout → the caller gets an exception. The row is
+  NOT retired by that branch: RAISE EXCEPTION aborts the function's own
+  subtransaction, so a status UPDATE there would be rolled back by the
+  very raise that follows it (verified empirically). Abandoned rows are
+  retired by `rvbbit.reap_stale_peer_requests(interval)` instead, called
+  opportunistically from `enqueue_peer_request` (a path that commits) and
+  available standalone for pg_cron.
 - Detach → in-flight requests failed with an explicit error.
 - Requests/responses are retained rows: auditable by anyone who can
   read the tables. Share with groups you'd be comfortable seeing the
