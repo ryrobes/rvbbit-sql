@@ -14,7 +14,8 @@ locally-run MCP server. Engineering nouns (tables, functions, the
 for the feature and its UI.
 
 **STATUS: P0-P4 built, browser-verified, and committed in both repos
-(2026-07-26).** Schema (migrations 0212-0215), the `peer_queue` Rust
+(2026-07-26).** Engineering reference: `docs/COLONY.md`. User docs:
+rvbbit.ai/docs/colony (rvbbit-docs `content/docs/colony.md`). Schema (migrations 0212-0215), the `peer_queue` Rust
 Transport, and burrow-role scoping are live and verified through the real
 dispatch path (`rvbbit.call_specialist`, and via a `specialist`/`llm` flow
 step), not just raw SQL. `colony-runner.ts` in rvbbit-lens is a real
