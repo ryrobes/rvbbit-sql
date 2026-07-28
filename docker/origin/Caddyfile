@@ -19,9 +19,13 @@
 		reverse_proxy {$LENS_UPSTREAM:lens:3000}
 	}
 
+	# /gallery is the warehouse's own artifact index. It serves at / too, which
+	# is what a warehouse-only box (no lens) gets; here DataRabbit owns /, so
+	# the index is reachable by name instead.
 	@warehouse {
 		path /mcp /mcp/* /login /auth/* /authorize /authorize/* /token /register \
-		     /.well-known/* /apps /apps/* /d/* /api/d/* /api/apps/* /thumbs/* /health
+		     /.well-known/* /apps /apps/* /d/* /api/d/* /api/apps/* /thumbs/* /health \
+		     /gallery
 	}
 	handle @warehouse {
 		# flush immediately: /mcp is streamable HTTP — buffering kills it.

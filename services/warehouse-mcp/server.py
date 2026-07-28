@@ -4033,6 +4033,257 @@ def _dash_shim(slug):
     return _DASH_SHIM.replace("__SLUG__", json.dumps(slug))
 
 
+# ── the landing page: this server's own front door ───────────────────────────
+# For the install shape where nobody opens DataRabbit at all — people talk to
+# the warehouse through Claude, artifacts get published here, and the links go
+# out in chat. Without an index, "find last week's dashboard" means scrolling a
+# transcript. The Hub (docs/HUB_PLAN.md) answers the same need but is a
+# DataRabbit plate wall and needs lens running; this is the lens-free version,
+# served by the same process that serves the artifacts, behind the same session
+# cookie that already gates /d/<slug>. A cold link lands on /login and comes
+# back here.
+#
+# Deliberately one server-rendered page: no build step, no framework, no new
+# dependency, and no new table — the whole index is one SELECT over
+# rvbbit.live_apps plus <img> tags pointed at the self-healing /thumbs route.
+
+_LANDING_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --void:#100d0b; --panel:#171310; --panel-2:#1c1712;
+  --bone:#e8ddcc; --fog:rgba(232,221,204,.55); --dim:rgba(232,221,204,.32);
+  --line:rgba(232,221,204,.13); --line-hot:rgba(245,180,70,.42);
+  --amber:#f5b446;
+  --mono:ui-monospace,"JetBrains Mono",SFMono-Regular,Menlo,monospace;
+  --sans:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --serif:"Iowan Old Style",Baskerville,"Times New Roman",serif;
+}
+html{background:var(--void)}
+body{
+  min-height:100vh; background:
+    radial-gradient(1200px 800px at 30% -10%, #241c14 0%, rgba(23,19,16,0) 60%),
+    var(--void);
+  color:var(--bone); font-family:var(--sans); -webkit-font-smoothing:antialiased;
+}
+a{color:inherit;text-decoration:none}
+::selection{background:var(--amber);color:#1a1206}
+
+/* the faint grid wash, faded out down the page */
+.wash{position:fixed;inset:56px 0 0;z-index:0;opacity:.5;pointer-events:none;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:72px 72px;
+  -webkit-mask-image:linear-gradient(to bottom,#000 0%,transparent 70%);
+          mask-image:linear-gradient(to bottom,#000 0%,transparent 70%)}
+
+nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
+  height:56px;padding:0 max(20px,4vw);border-bottom:1px solid var(--line);
+  background:rgba(16,13,11,.82);backdrop-filter:blur(18px)}
+.mark{color:var(--amber);font-size:17px;line-height:1}
+.wordmark{font:700 12px/1 var(--mono);letter-spacing:.14em}
+.wordmark small{margin-left:10px;padding-left:10px;border-left:1px solid var(--line);
+  font-weight:400;font-size:9px;letter-spacing:.16em;color:var(--dim)}
+.who{margin-left:auto;display:flex;align-items:center;gap:14px;
+  font:10px/1 var(--mono);letter-spacing:.1em;color:var(--fog)}
+.who a{color:var(--dim)}
+.who a:hover{color:var(--amber)}
+
+main{position:relative;z-index:1;padding:0 max(20px,4vw) 90px}
+header.hero{padding:66px 0 30px;border-bottom:1px solid var(--line)}
+.kicker{color:var(--amber);font:10px/1.3 var(--mono);letter-spacing:.19em;text-transform:uppercase}
+h1{margin-top:16px;font-size:clamp(38px,5.4vw,68px);line-height:.92;
+  letter-spacing:-.045em;font-weight:600}
+h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:italic;letter-spacing:-.02em}
+.tally{margin-top:18px;color:var(--fog);font:10px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase}
+
+.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:16px 0;border-bottom:1px solid var(--line)}
+#q{flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--line);
+  background:rgba(232,221,204,.04);color:var(--bone);
+  font:12px/1 var(--mono);letter-spacing:.04em;outline:none}
+#q:focus{border-color:var(--line-hot)}
+#q::placeholder{color:var(--dim)}
+.chip{padding:8px 13px;border:1px solid var(--line);background:transparent;color:var(--fog);
+  font:9px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;cursor:pointer}
+.chip:hover{color:var(--bone);border-color:var(--line-hot)}
+.chip[aria-pressed=true]{color:#1a1206;background:var(--amber);border-color:var(--amber);font-weight:700}
+
+/* hairline grid: 1px gaps over a line-colored bed, so rules stay perfect at any wrap */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));
+  gap:1px;margin-top:1px;background:var(--line);border:1px solid var(--line)}
+.card{display:flex;flex-direction:column;background:var(--panel);transition:background .25s}
+.card:hover{background:var(--panel-2)}
+.shot{position:relative;aspect-ratio:16/10;overflow:hidden;background:#0d0b09;
+  border-bottom:1px solid var(--line)}
+.shot img{width:100%;height:100%;object-fit:cover;object-position:top center;display:block;
+  opacity:.84;transition:transform .7s,opacity .45s}
+.card:hover .shot img{transform:scale(1.035);opacity:1}
+.shot::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(to top,var(--panel) 2%,transparent 46%)}
+.glyph{position:absolute;inset:0;display:grid;place-items:center;
+  font-size:38px;color:var(--amber);opacity:.16}
+/* the stand-in only when there is no shot — onerror drops the <img>, which
+   drops this rule with it, so a 404 thumbnail falls back on its own */
+.shot img+.glyph{display:none}
+.body{display:flex;flex-direction:column;gap:8px;flex:1;padding:16px 18px 18px}
+.meta{display:flex;align-items:center;gap:9px;flex-wrap:wrap;
+  font:9px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase}
+.pill{padding:3px 8px;border:1px solid var(--line-hot);color:var(--amber)}
+.pill.dim{border-color:var(--line);color:var(--dim)}
+.when{color:var(--dim)}
+.card h2{font:italic 400 21px/1.2 var(--serif);letter-spacing:-.01em}
+.desc{color:var(--fog);font-size:12.5px;line-height:1.55;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.foot{margin-top:auto;padding-top:12px;display:flex;gap:14px;
+  color:var(--dim);font:9px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
+.foot b{color:var(--fog);font-weight:400}
+
+.empty{padding:80px 0;text-align:center;color:var(--fog);font:12px/1.7 var(--mono);letter-spacing:.06em}
+.empty code{color:var(--amber)}
+#none{display:none;padding:60px 0;text-align:center;color:var(--dim);
+  font:10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase}
+@media (max-width:640px){header.hero{padding:44px 0 24px}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+"""
+
+_LANDING_JS = """
+(function(){
+ var q=document.getElementById('q'),
+     chips=[].slice.call(document.querySelectorAll('.chip')),
+     cards=[].slice.call(document.querySelectorAll('.card')),
+     none=document.getElementById('none'), kind='';
+ function apply(){
+   var t=(q.value||'').trim().toLowerCase(), shown=0;
+   cards.forEach(function(c){
+     var ok=(!kind||c.dataset.kind===kind)&&(!t||c.dataset.search.indexOf(t)>=0);
+     c.style.display=ok?'':'none'; if(ok)shown++;
+   });
+   none.style.display=shown?'none':'block';
+ }
+ q.addEventListener('input',apply);
+ chips.forEach(function(ch){ch.addEventListener('click',function(){
+   kind=ch.dataset.kind||'';
+   chips.forEach(function(o){o.setAttribute('aria-pressed',String(o===ch))});
+   apply();
+ })});
+ // "/" focuses search, the way every browse page should behave
+ document.addEventListener('keydown',function(e){
+   if(e.key==='/'&&document.activeElement!==q){e.preventDefault();q.focus();}
+   if(e.key==='Escape'&&document.activeElement===q){q.value='';apply();q.blur();}
+ });
+})();
+"""
+
+# Species → how it's labelled and what stands in when there's no screenshot.
+# app_kind is free-form (agents may invent one), so this is a display hint with
+# a sane default, never a gate.
+_KIND_GLYPH = {"dashboard": "▦", "app": "◈", "deck": "▷", "report": "▤", "tool": "⌘"}
+
+
+def _rel_time(dt):
+    """'3d ago' — a browse page reads better in elapsed time than in dates."""
+    if not dt:
+        return ""
+    try:
+        secs = time.time() - dt.timestamp()
+    except Exception:  # noqa: BLE001
+        return ""
+    if secs < 90:
+        return "just now"
+    for span, unit in ((3600, "m"), (86400, "h"), (604800, "d"), (2629800, "w"), (31557600, "mo")):
+        if secs < span:
+            prev = {3600: 60, 86400: 3600, 604800: 86400, 2629800: 604800, 31557600: 2629800}[span]
+            return f"{int(secs // prev)}{unit} ago"
+    return f"{int(secs // 31557600)}y ago"
+
+
+def _landing_rows():
+    """Every published, web-addressable artifact. rvbbit.live_apps is the view
+    over rvbbit.dashboards (which is ONLY external artifacts — DataRabbit plates
+    live in rvbbit.plates and never appear here), so no filtering is needed and
+    none is wanted: decks and custom app_kinds have public URLs too."""
+    with _conn() as c:
+        return c.execute(
+            "SELECT slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
+            "latest_version, queries, tables, metrics, updated_at "
+            "FROM rvbbit.live_apps ORDER BY updated_at DESC").fetchall()
+
+
+def _landing_html(rows, viewer):
+    from html import escape as e
+
+    kinds, cards = {}, []
+    for r in rows:
+        app_kind = (r.get("app_kind") or "dashboard").lower()
+        kinds[app_kind] = kinds.get(app_kind, 0) + 1
+        slug = r["slug"]
+        # Link where the publish tools already told the user to look, so the
+        # cards match the URLs sitting in their chat history.
+        href = f"/d/{slug}" if app_kind == "dashboard" else f"/apps/{slug}"
+        name = r.get("name") or slug
+        desc = r.get("description") or ""
+        # /thumbs self-heals: a miss or a stale shot enqueues a capture and the
+        # next load has it. onerror drops the <img> so the glyph shows through.
+        thumb = ""
+        if (r.get("runtime_kind") or "html") == "html":
+            thumb = (f'<img src="/thumbs/{e(_artifact_kind(app_kind))}/{e(slug)}.png" alt="" '
+                     f'loading="lazy" onerror="this.remove()">')
+        deps = []
+        for label, key in (("queries", "queries"), ("tables", "tables"), ("metrics", "metrics")):
+            if r.get(key):
+                deps.append(f"<span><b>{r[key]}</b> {label}</span>")
+        if r.get("latest_version"):
+            deps.append(f"<span>v<b>{r['latest_version']}</b></span>")
+        owner = r.get("owner_email") or r.get("team") or ""
+        haystack = " ".join(str(x) for x in (name, desc, slug, app_kind, owner) if x).lower()
+        cards.append(
+            f'<a class="card" href="{e(href)}" data-kind="{e(app_kind)}" data-search="{e(haystack)}">'
+            f'<div class="shot">{thumb}<div class="glyph">{_KIND_GLYPH.get(app_kind, "◇")}</div></div>'
+            f'<div class="body">'
+            f'<div class="meta"><span class="pill">{e(app_kind)}</span>'
+            + (f'<span class="pill dim">{e(owner)}</span>' if owner else "")
+            + f'<span class="when">{e(_rel_time(r.get("updated_at")))}</span></div>'
+            f'<h2>{e(name)}</h2>'
+            + (f'<p class="desc">{e(desc)}</p>' if desc else "")
+            + (f'<div class="foot">{"".join(deps)}</div>' if deps else "")
+            + '</div></a>')
+
+    total = len(rows)
+    tally = " · ".join([f"{total} artifact{'' if total == 1 else 's'}"]
+                       + [f"{n} {k}{'' if n == 1 else 's'}" for k, n in
+                          sorted(kinds.items(), key=lambda kv: -kv[1])])
+    chips = ('<button class="chip" data-kind="" aria-pressed="true">All</button>'
+             + "".join(f'<button class="chip" data-kind="{e(k)}" aria-pressed="false">{e(k)}s</button>'
+                       for k, _ in sorted(kinds.items(), key=lambda kv: -kv[1])))
+
+    body = (f'<div class="toolbar"><input id="q" type="search" placeholder="Search artifacts…  (press /)" '
+            f'autocomplete="off" spellcheck="false">{chips}</div>'
+            f'<div class="grid">{"".join(cards)}</div>'
+            f'<div id="none">Nothing matches</div>') if rows else (
+        '<div class="empty">No artifacts published yet.<br><br>'
+        'Ask Claude to build one — it starts with <code>live_app_template</code><br>'
+        'and publishes with <code>create_live_app</code>.</div>')
+
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Warehouse — published artifacts</title>
+<style>{_LANDING_CSS}</style></head><body>
+<div class="wash"></div>
+<nav><span class="mark" aria-hidden="true">&#10022;</span>
+ <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
+ <span class="who">{f'<span>{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
+<main>
+ <header class="hero">
+  <div class="kicker">Published artifacts</div>
+  <h1>Your data, <em>live</em>.</h1>
+  <div class="tally">{e(tally)}</div>
+ </header>
+ {body}
+</main>
+<script>{_LANDING_JS}</script></body></html>"""
+
+
 def register_dashboard_routes(m):
     import auth
     from urllib.parse import quote
@@ -4068,6 +4319,27 @@ def register_dashboard_routes(m):
             if k.lower() in {"content-type", "cache-control", "etag", "last-modified"}
         }
         return Response(proxied.content, status_code=proxied.status_code, headers=out_headers)
+
+    @m.custom_route("/", methods=["GET"])
+    async def _landing(request):
+        # Same wall as /d/<slug>: no session → login → back here. On a
+        # warehouse-only box this is the root of the site; on a unified origin
+        # (docker/origin/Caddyfile) DataRabbit owns / and this is reached at
+        # /gallery, which the ingress routes here.
+        viewer = auth.read_session(request)
+        if not viewer:
+            return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
+        try:
+            rows = _landing_rows()
+        except Exception as ex:   # noqa: BLE001 — an index that can't query is still a page
+            print(f"landing page: {ex}", file=sys.stderr)
+            rows = []
+        return HTMLResponse(_landing_html(rows, viewer),
+                            headers={"cache-control": "no-store"})
+
+    @m.custom_route("/gallery", methods=["GET"])
+    async def _landing_alias(request):
+        return await _landing(request)
 
     @m.custom_route("/thumbs/{kind}/{slug}.png", methods=["GET"])
     async def _thumb(request):
@@ -4177,7 +4449,7 @@ def register_dashboard_routes(m):
     async def _data_app(request):
         return await _data(request)
 
-    return _view, _data, _view_app, _proxy_app_path, _data_app
+    return _view, _data, _view_app, _proxy_app_path, _data_app, _landing, _landing_alias
 
 
 # ── MCP server ───────────────────────────────────────────────────────────────

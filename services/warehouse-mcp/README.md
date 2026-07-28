@@ -129,6 +129,24 @@ it's hidden from `search_data`. Logging is best-effort; with a read-only data ro
   password → **Allow**. No header.
 - **Claude Code (either mode):** `claude mcp add --transport http rvbbit-warehouse <url>/mcp --header "Authorization: Bearer $WAREHOUSE_MCP_KEY"`
 
+## The landing page (`/`)
+`GET /` is this server's own index of every published artifact — thumbnail, kind,
+description, dependency counts, search and kind filters — behind the same session
+cookie that already gates `/d/<slug>`, so a cold link bounces through `/login` and
+comes back. It's for the install shape where nobody opens DataRabbit at all: people
+talk to the warehouse through Claude, artifacts get published here, and without an
+index "find last week's dashboard" means scrolling a transcript.
+
+Also served at **`/gallery`** — on a warehouse-only box `/` is free and you get it at
+the root; behind the unified origin (`docker/origin/Caddyfile`) DataRabbit owns `/`,
+so the ingress routes `/gallery` here instead. Same page either way.
+
+It lists `rvbbit.live_apps` unfiltered — every row there is externally addressable
+(DataRabbit *plates* live in `rvbbit.plates` and never appear). Thumbnails come from
+the existing self-healing `/thumbs` route, so they populate themselves: a miss or a
+stale shot enqueues a capture and the next load has it. No new table, no build step,
+no extra config. Routes only exist in OAuth mode (same as `/d/<slug>`).
+
 ## Dashboards (artifacts that live + work outside Claude)
 **Start from `dashboard_template`** — the proven boilerplate (see [`DASHBOARD_TEMPLATE.md`](DASHBOARD_TEMPLATE.md)).
 Its dual-mode data bridge means the *same* artifact runs live in **two places, no login**:
