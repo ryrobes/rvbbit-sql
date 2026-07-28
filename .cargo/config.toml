@@ -1,0 +1,11 @@
+# macOS link flags for the Postgres extension.
+#
+# A PG extension library deliberately leaves the server's own symbols
+# (standard_planner, table_open, work_mem, shmem_startup_hook, ...) undefined
+# — postgres resolves them when it dlopen()s the module. GNU ld allows that by
+# default; Apple's linker rejects it ("symbol(s) not found for architecture
+# arm64") unless told to defer resolution to load time.
+#
+# Target-gated, so this is inert on the Linux release build.
+[target.'cfg(target_os="macos")']
+rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
