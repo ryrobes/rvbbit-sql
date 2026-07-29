@@ -219,6 +219,16 @@ services:
       WAREHOUSE_LOGIN_PASSWORD: ${WAREHOUSE_LOGIN_PASSWORD:-}
       WAREHOUSE_ALLOWED_EMAILS: ${WAREHOUSE_ALLOWED_EMAILS:-}
       WAREHOUSE_JWT_SECRET: ${WAREHOUSE_JWT_SECRET:-}
+      # Google Sign-In (optional). Cloud console -> OAuth client ID -> Web
+      # application, redirect URI EXACTLY <WAREHOUSE_PUBLIC_URL>/auth/google/callback.
+      # _HD restricts to one Workspace domain and is verified against the SIGNED
+      # hd claim (the hd request param is only a chooser hint). The server refuses
+      # to start with Google on and neither _HD nor ALLOWED_EMAILS set.
+      # _ONLY=1 retires the shared password once everyone has moved.
+      WAREHOUSE_GOOGLE_CLIENT_ID: ${WAREHOUSE_GOOGLE_CLIENT_ID:-}
+      WAREHOUSE_GOOGLE_CLIENT_SECRET: ${WAREHOUSE_GOOGLE_CLIENT_SECRET:-}
+      WAREHOUSE_GOOGLE_HD: ${WAREHOUSE_GOOGLE_HD:-}
+      WAREHOUSE_GOOGLE_ONLY: ${WAREHOUSE_GOOGLE_ONLY:-}
       WAREHOUSE_STATE_FILE: /app/data/oauth_state.json   # survives restarts (no re-add of connectors)
       # Shared-key fallback (Claude Code / optional):
       WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:-}

@@ -32,6 +32,7 @@ import re
 import secrets
 import sys
 import time
+from urllib.parse import urlencode
 
 import jwt
 from pydantic import AnyHttpUrl
@@ -96,16 +97,38 @@ def validate_config() -> list[str]:
         errs.append("WAREHOUSE_JWT_SECRET must differ from WAREHOUSE_MCP_KEY (no credential reuse).")
     if AUTH_MODE == "pg":
         pass   # Burrow: credentials are Postgres accounts; no shared password.
-    elif not LOGIN_PASSWORD:
+    elif not LOGIN_PASSWORD and not google_enabled():
         errs.append("WAREHOUSE_LOGIN_PASSWORD is required (else no one can log in).")
+    # FAIL CLOSED on the one configuration that silently opens the door to the
+    # whole internet. With a shared password, an empty allowlist still leaves
+    # the password as a gate. With Google and no domain/allowlist there is NO
+    # gate at all: any Google account on earth satisfies "signed in with
+    # Google". Demand an explicit audience.
+    if google_enabled() and not GOOGLE_HD and not ALLOWED_EMAILS:
+        errs.append(
+            "Google sign-in is configured with no audience restriction — set "
+            "WAREHOUSE_GOOGLE_HD (a Workspace domain, verified against the signed "
+            "hd claim) and/or WAREHOUSE_ALLOWED_EMAILS. Without one, ANY Google "
+            "account can log in.")
+    if GOOGLE_ONLY and not google_enabled():
+        errs.append("WAREHOUSE_GOOGLE_ONLY is set but Google sign-in is not configured "
+                    "(needs WAREHOUSE_GOOGLE_CLIENT_ID + WAREHOUSE_GOOGLE_CLIENT_SECRET"
+                    + (", and is unavailable in Burrow/pg mode)." if AUTH_MODE == "pg" else ")."))
     return errs
 
 
 def config_warnings() -> list[str]:
     w = []
-    if LOGIN_PASSWORD and len(LOGIN_PASSWORD) < MIN_PASSWORD_LEN:
+    if LOGIN_PASSWORD and len(LOGIN_PASSWORD) < MIN_PASSWORD_LEN and not GOOGLE_ONLY:
         w.append(f"WAREHOUSE_LOGIN_PASSWORD is short (<{MIN_PASSWORD_LEN} chars) — it's a shared, "
                  "internet-facing password; use a long random one.")
+    if google_enabled() and LOGIN_PASSWORD and not GOOGLE_ONLY:
+        w.append("Google sign-in is on but the shared password still works. Once users "
+                 "have moved, set WAREHOUSE_GOOGLE_ONLY=1 — a permanent fallback keeps "
+                 "the weakest credential permanently.")
+    if GOOGLE_CLIENT_ID and AUTH_MODE == "pg":
+        w.append("Google sign-in is IGNORED in Burrow (WAREHOUSE_AUTH=pg) mode: the session "
+                 "subject must be a Postgres role name, not an email.")
     return w
 
 
@@ -376,7 +399,126 @@ def _creds_ok_pg(username: str, password: str) -> bool:
 def _creds_ok(email: str, password: str) -> bool:
     if AUTH_MODE == "pg":
         return _creds_ok_pg(email, password)
+    # GOOGLE_ONLY has to be enforced HERE, not just by hiding the form: the
+    # login page is a courtesy, POST /login is the door. Anyone can still post
+    # to it directly, so a retired password must actually stop working.
+    if GOOGLE_ONLY and google_enabled():
+        return False
     return _creds_ok_shared(email, password)
+
+
+# ── Google Sign-In (federated IdP) ───────────────────────────────────────────
+# We are already an OAuth *server* (to Claude); this additionally makes us an
+# OAuth *client* to Google. The two never meet in _creds_ok() — that's a
+# form-post credential check and Google is a redirect round-trip. They meet at
+# _finish_login(), so a Google-verified email reaches the access token's `sub`
+# (and therefore mcp_activity.caller) by exactly the same path a typed one does.
+#
+# This is a REAL identity upgrade, not just convenience: in shared mode the
+# email is self-asserted and the password is the only gate, so any key-holder
+# can own any name in the audit log. Google's email_verified claim ends that.
+#
+# Deliberately NOT wired into AUTH_MODE=pg (Burrow): there the session subject
+# IS a Postgres role name (surfaces run SET LOCAL ROLE under it, and
+# _ROLE_NAME_RE rejects '@' and '.'), so an email cannot be the subject.
+# Federating Burrow needs an email->role mapping — its own design pass.
+GOOGLE_CLIENT_ID = os.environ.get("WAREHOUSE_GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.environ.get("WAREHOUSE_GOOGLE_CLIENT_SECRET", "").strip()
+# Workspace domain gate, e.g. "acme.com". Google treats `hd` on the AUTHORIZATION
+# REQUEST as an account-chooser hint only — the user can edit it out of the URL —
+# so it is NEVER a security boundary there. We send it for the UX and verify the
+# signed `hd` CLAIM on the returned id_token, which is the actual gate.
+GOOGLE_HD = os.environ.get("WAREHOUSE_GOOGLE_HD", "").strip().lower()
+# Retire the shared password once everyone has moved over. A fallback that lives
+# forever means the weakest credential lives forever.
+GOOGLE_ONLY = os.environ.get("WAREHOUSE_GOOGLE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+_GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+_GOOGLE_JWKS_URI = "https://www.googleapis.com/oauth2/v3/certs"
+_GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
+
+
+def google_enabled() -> bool:
+    """Google is a shared-mode feature; pg mode keeps Postgres as the IdP."""
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and AUTH_MODE != "pg")
+
+
+def google_redirect_uri(public: str) -> str:
+    """Must match a registered redirect URI in the Google Cloud console EXACTLY."""
+    return f"{public.rstrip('/')}/auth/google/callback"
+
+
+class _GoogleFlows:
+    """Pending Google round-trips: state -> what to resume when the user returns.
+
+    Same discipline as the OAuth `_pending` map (TTL'd, capped, swept on write)
+    because these entries are created by UNAUTHENTICATED requests. `state` is
+    generated and stored server-side and consumed single-use — the txn is never
+    round-tripped through the browser as something we'd trust on the way back.
+    """
+
+    def __init__(self):
+        self._m: dict[str, tuple[str, str, str, float]] = {}   # state -> (txn, next, nonce, created)
+
+    def begin(self, txn: str, nxt: str) -> tuple[str, str]:
+        self._sweep()
+        while len(self._m) >= MAX_PENDING:
+            self._m.pop(next(iter(self._m)))       # evict oldest
+        state, nonce = secrets.token_urlsafe(24), secrets.token_urlsafe(16)
+        self._m[state] = (txn, nxt, nonce, time.time())
+        return state, nonce
+
+    def take(self, state: str) -> tuple[str, str, str] | None:
+        entry = self._m.pop(state, None)           # single-use: a replay finds nothing
+        if not entry or time.time() - entry[3] > CODE_TTL:
+            return None
+        return entry[0], entry[1], entry[2]
+
+    def _sweep(self) -> None:
+        now = time.time()
+        self._m = {k: v for k, v in self._m.items() if now - v[3] < CODE_TTL}
+
+
+_GFLOWS = _GoogleFlows()
+_JWKS_CLIENT = None
+
+
+def _google_jwks():
+    global _JWKS_CLIENT
+    if _JWKS_CLIENT is None:
+        from jwt import PyJWKClient
+        _JWKS_CLIENT = PyJWKClient(_GOOGLE_JWKS_URI)   # caches keys across logins
+    return _JWKS_CLIENT
+
+
+def verify_google_id_token(id_token: str, nonce: str) -> dict:
+    """VERIFY the token, never merely decode it: RS256 signature against Google's
+    published JWKS, audience == our client id, issuer, expiry, and the nonce we
+    planted. Raises on anything less. Blocking (may fetch JWKS) — call it off
+    the event loop."""
+    key = _google_jwks().get_signing_key_from_jwt(id_token).key
+    claims = jwt.decode(
+        id_token, key, algorithms=["RS256"], audience=GOOGLE_CLIENT_ID,
+        options={"require": ["exp", "iat", "aud", "iss", "sub"]})
+    if claims.get("iss") not in _GOOGLE_ISSUERS:
+        raise ValueError("unexpected issuer")
+    if not hmac.compare_digest(str(claims.get("nonce") or ""), nonce):
+        raise ValueError("nonce mismatch")          # replayed or injected callback
+    if not claims.get("email"):
+        raise ValueError("no email claim")
+    if claims.get("email_verified") not in (True, "true"):
+        raise ValueError("Google has not verified this address")
+    return claims
+
+
+def google_domain_ok(claims: dict) -> bool:
+    """The real domain gate: the SIGNED hd claim, not the request parameter.
+    A consumer Google account cannot present an `hd`, so this is strictly
+    stronger than matching the email's suffix."""
+    if not GOOGLE_HD:
+        return True
+    return (claims.get("hd") or "").strip().lower() == GOOGLE_HD
 
 
 # ── browser view session (cookie, for /d/<slug> dashboards) ──────────────────
@@ -407,6 +549,23 @@ def _safe_next(nxt: str) -> str:
     return nxt if (nxt.startswith("/") and not nxt.startswith("//")) else "/"
 
 
+def _finish_login(request: Request, provider, email: str, txn: str, nxt: str):
+    """THE one place a verified identity becomes a session.
+
+    Every authentication path — typed password, Postgres role, Google — lands
+    here, which is why `email` reaches the OAuth token's `sub` (and so
+    mcp_activity.caller) identically no matter how it was proven. Two exits:
+    an OAuth txn continues back to Claude with a fresh code; anything else
+    gets the browser session cookie and goes where it was headed.
+    """
+    if txn:
+        target = provider.complete_login(txn, email)
+        return RedirectResponse(target, status_code=302) if target else _page(_EXPIRED, 400)
+    resp = RedirectResponse(nxt, status_code=302)
+    set_session(resp, email, secure=request.url.scheme == "https")
+    return resp
+
+
 # ── login page ───────────────────────────────────────────────────────────────
 
 def _page(body: str, status: int = 200) -> HTMLResponse:
@@ -422,8 +581,35 @@ def _page(body: str, status: int = 200) -> HTMLResponse:
  input:focus{{outline:none;border-color:#e8b572}}
  button{{width:100%;margin-top:20px;background:#e8b572;color:#1a1206;border:0;border-radius:7px;padding:10px;font:inherit;font-weight:600;cursor:pointer}}
  .err{{background:#3a1f1c;border:1px solid #6a3530;color:#f0b8b0;border-radius:7px;padding:8px 11px;font-size:13px;margin-top:14px}}
+ .goog{{display:flex;align-items:center;justify-content:center;gap:9px;width:100%;margin-top:14px;
+   background:#f0e6d8;color:#1a1206;border-radius:7px;padding:10px;font:inherit;font-weight:600;
+   text-decoration:none;box-sizing:border-box}}
+ .goog:hover{{background:#fff}}
+ .goog svg{{width:17px;height:17px;display:block}}
+ .or{{display:flex;align-items:center;gap:10px;margin:18px 0 4px;color:#8a8078;font-size:11px}}
+ .or::before,.or::after{{content:"";flex:1;height:1px;background:#3a2f24}}
 </style>
 <div class=card>{body}</div>""", status_code=status)
+
+
+# Google's mark, inlined — the login page must render before any external host
+# is reachable (and a CDN <img> here would leak every login to a third party).
+_G_SVG = ('<svg viewBox="0 0 48 48" aria-hidden="true">'
+          '<path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-2.8-.4-4H24v7.3h12.1c-.2 2-1.6 5-4.5 7l-.1.3 6.6 5 .4.1c4.2-3.9 6.6-9.6 6.6-15.7"/>'
+          '<path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.4l-7-5.4c-1.8 1.3-4.3 2.2-7.6 2.2-5.8 0-10.7-3.8-12.5-9.1l-.3.1-6.8 5.3-.1.3C8 41.1 15.4 46 24 46"/>'
+          '<path fill="#FBBC05" d="M11.5 28.3c-.5-1.4-.8-2.9-.8-4.3s.3-3 .7-4.3v-.4l-6.9-5.4-.2.1C2.8 16.8 2 20.3 2 24s.8 7.2 2.3 10.3z"/>'
+          '<path fill="#EB4335" d="M24 9.9c4.1 0 6.9 1.8 8.5 3.3l6.2-6C34.9 3.7 30 1.5 24 1.5 15.4 1.5 8 6.4 4.3 13.6l7.1 5.5C13.3 13.8 18.2 9.9 24 9.9"/>'
+          '</svg>')
+
+
+def _google_button(hidden: dict) -> str:
+    """A link, not a form post: /auth/google/start owns the redirect. Carrying
+    txn/next through means a Google login resumes whatever flow sent us here."""
+    if not google_enabled():
+        return ""
+    q = urlencode({k: str(v) for k, v in hidden.items() if v})
+    href = f"/auth/google/start?{q}" if q else "/auth/google/start"
+    return f'<a class=goog href="{html.escape(href)}">{_G_SVG}Sign in with Google</a>'
 
 
 def _login_form(hidden: dict, error: str | None = None,
@@ -431,13 +617,19 @@ def _login_form(hidden: dict, error: str | None = None,
     err = f'<div class=err>{html.escape(error)}</div>' if error else ""
     fields = "".join(f'<input type=hidden name="{html.escape(k)}" value="{html.escape(str(v))}">'
                      for k, v in hidden.items() if v)
+    goog = _google_button(hidden)
+    head = f'<h1>Data Warehouse</h1><p class=sub>{html.escape(sub)}</p>'
+    # Password retired on this box: Google is the only door, so don't render a
+    # form that cannot succeed.
+    if GOOGLE_ONLY and google_enabled():
+        return _page(f"{head}{goog}{err}", status=401 if error else 200)
     # Burrow (pg) mode: credentials are a Postgres role, not an email.
     ident = ('<label>Username</label><input name=email autocomplete=username autofocus required>'
              if AUTH_MODE == "pg" else
              '<label>Email</label><input name=email type=email autocomplete=username autofocus required>')
     pw_label = "Password" if AUTH_MODE == "pg" else "Access password"
     return _page(
-        f"""<h1>Data Warehouse</h1><p class=sub>{html.escape(sub)}</p>
+        f"""{head}{goog}{'<div class=or>or</div>' if goog else ''}
 <form method=post action=/login>
  {fields}
  {ident}
@@ -490,13 +682,89 @@ def register_login_route(mcp, provider: WarehouseAuthProvider):
                                    cta="Authorize Claude" if txn else "Sign in")
             _LIMITER.record_success(ip)
 
-        if txn:   # OAuth: mint the code, redirect back to Claude
-            target = provider.complete_login(txn, email)
-            return RedirectResponse(target, status_code=302) if target else _page(_EXPIRED, 400)
-        # browser session: set the cookie, go where they were headed
-        resp = RedirectResponse(nxt, status_code=302)
-        set_session(resp, email, secure=request.url.scheme == "https")
-        return resp
+        return _finish_login(request, provider, email, txn, nxt)
+
+    def _bounce(txn: str, nxt: str, msg: str):
+        """Send a failed Google attempt back to the login page. PRG when lens
+        renders it (an inline form here would break out of the branded flow)."""
+        if LOGIN_UI == "lens":
+            q = f"err=1&txn={txn}" if txn else f"err=1&next={nxt}"
+            return RedirectResponse(f"/login?{q}", status_code=303)
+        return _login_form({"txn": txn} if txn else {"next": nxt}, error=msg,
+                           cta="Authorize Claude" if txn else "Sign in")
+
+    @mcp.custom_route("/auth/google/start", methods=["GET"])
+    async def google_start(request: Request):
+        if not google_enabled():
+            return _page("<h1>Google sign-in is not configured</h1>", 404)
+        txn = request.query_params.get("txn", "")
+        nxt = _safe_next(request.query_params.get("next", "/"))
+        if txn and not provider.has_pending(txn):
+            return _page(_EXPIRED, 400)
+        state, nonce = _GFLOWS.begin(txn, nxt)
+        params = {
+            "client_id": GOOGLE_CLIENT_ID,
+            "redirect_uri": google_redirect_uri(provider.public),
+            "response_type": "code",
+            "scope": "openid email",
+            "state": state,
+            "nonce": nonce,
+            "prompt": "select_account",
+        }
+        if GOOGLE_HD:
+            params["hd"] = GOOGLE_HD     # chooser hint ONLY — the claim check below is the gate
+        return RedirectResponse(f"{_GOOGLE_AUTH_URI}?{urlencode(params)}", status_code=302)
+
+    @mcp.custom_route("/auth/google/callback", methods=["GET"])
+    async def google_callback(request: Request):
+        if not google_enabled():
+            return _page("<h1>Google sign-in is not configured</h1>", 404)
+        entry = _GFLOWS.take(request.query_params.get("state", ""))
+        if not entry:
+            # Unknown/expired/replayed state. We have no trustworthy txn or
+            # next to resume, so stop here rather than guess.
+            return _page("<h1>Sign-in expired</h1>"
+                         "<p class=sub>Start again from the login page.</p>", 400)
+        txn, nxt, nonce = entry
+        if txn and not provider.has_pending(txn):
+            return _page(_EXPIRED, 400)
+        if request.query_params.get("error"):
+            return _bounce(txn, nxt, "Google sign-in was cancelled.")
+        code = request.query_params.get("code", "")
+        if not code:
+            return _bounce(txn, nxt, "Google sign-in returned no authorization code.")
+
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as cli:
+                r = await cli.post(_GOOGLE_TOKEN_URI, data={
+                    "code": code,
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": google_redirect_uri(provider.public),
+                    "grant_type": "authorization_code",
+                })
+            r.raise_for_status()
+            id_token = (r.json() or {}).get("id_token")
+            if not id_token:
+                raise ValueError("no id_token in Google's token response")
+            # Verification fetches/caches JWKS and does RSA work — keep it off
+            # the event loop.
+            claims = await asyncio.to_thread(verify_google_id_token, id_token, nonce)
+        except Exception as e:   # noqa: BLE001 — any failure is a failed login, never a partial one
+            print(f"google callback: {type(e).__name__}: {e}", file=sys.stderr)
+            return _bounce(txn, nxt, "Could not verify your Google sign-in.")
+
+        email = str(claims.get("email", "")).strip().lower()
+        ip = _client_ip(request)
+        if not google_domain_ok(claims):
+            _LIMITER.record_fail(ip)
+            return _bounce(txn, nxt, f"That account is not in the {GOOGLE_HD} organization.")
+        if not _email_allowed(email):
+            _LIMITER.record_fail(ip)
+            return _bounce(txn, nxt, "That account is not allowed to sign in here.")
+        _LIMITER.record_success(ip)
+        return _finish_login(request, provider, email, txn, nxt)
 
     # Session introspection for sibling services (lens gates on this in
     # Burrow mode — no JWT-secret sharing, just a cookie round-trip on the
@@ -513,6 +781,19 @@ def register_login_route(mcp, provider: WarehouseAuthProvider):
             return HTMLResponse('{"ok":false}', status_code=401, media_type="application/json")
         return HTMLResponse(json.dumps({"ok": True, "sub": sub, "mode": AUTH_MODE}),
                             media_type="application/json")
+
+    @mcp.custom_route("/auth/config", methods=["GET"])
+    async def auth_config(request: Request):   # noqa: ARG001
+        """What the login page should render. Unauthenticated by necessity (it
+        IS the pre-login state) and deliberately says nothing secret — which
+        buttons to draw, never the client id or secret. Lets a sibling-rendered
+        login page (WAREHOUSE_LOGIN_UI=lens) stay in sync with this server's
+        config instead of duplicating env vars across two repos."""
+        return HTMLResponse(json.dumps({
+            "mode": AUTH_MODE,
+            "google": google_enabled(),
+            "password": not (GOOGLE_ONLY and google_enabled()),
+        }), media_type="application/json", headers={"cache-control": "no-store"})
 
     @mcp.custom_route("/auth/logout", methods=["GET", "POST"])
     async def logout(request: Request):   # noqa: ARG001

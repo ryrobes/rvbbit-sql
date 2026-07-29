@@ -90,6 +90,52 @@ python server.py --http     # serves :8765; behind your proxy at WAREHOUSE_PUBLI
 **Shared key (Claude Code / scripts).** No `WAREHOUSE_PUBLIC_URL`; gate on a static
 bearer. Still accepted in OAuth mode too, so Code keeps working alongside the UI flow.
 
+### Google Sign-In (optional, recommended)
+Adds a **Sign in with Google** button to the login page. We stay the OAuth *server*
+for Claude and additionally become an OAuth *client* to Google; both paths converge on
+one place (`_finish_login`), so a Google-verified address reaches the access token's
+`sub` — and therefore `mcp_activity.caller` — exactly like a typed one. It gates the
+MCP endpoint **and** everything served behind the same session (`/`, `/d/<slug>`,
+`/apps/<slug>`).
+
+This is an identity upgrade, not just convenience: with a shared password the email is
+*self-asserted*, so any password-holder can claim any name in your audit log. Google's
+`email_verified` claim ends that.
+
+```bash
+export WAREHOUSE_GOOGLE_CLIENT_ID="....apps.googleusercontent.com"
+export WAREHOUSE_GOOGLE_CLIENT_SECRET="..."
+export WAREHOUSE_GOOGLE_HD="acme.com"    # restrict to one Workspace domain
+# export WAREHOUSE_GOOGLE_ONLY=1         # later: retire the shared password
+```
+In the Google Cloud console create an **OAuth client ID → Web application** and register
+the redirect URI **exactly**: `<WAREHOUSE_PUBLIC_URL>/auth/google/callback`. (That's a
+*web* client — not a service-account JSON, which is a different credential with no human
+sign-in. It needs a stable origin, so the ephemeral `warehouse-tunnel-up` quick-tunnel
+URL can't be used with Google.)
+
+> **Restricting to one domain — read this.** Passing `hd=` on the authorization request
+> is only an account-chooser *hint*; a user can edit it out of the URL, so it is **not**
+> a security boundary. The gate is the signed **`hd` claim** on the returned ID token,
+> which `WAREHOUSE_GOOGLE_HD` verifies server-side. It's strictly stronger than matching
+> the email's suffix — a consumer Google account cannot present an `hd` at all.
+> `WAREHOUSE_ALLOWED_EMAILS` still applies on top (exact addresses or `@domain`).
+> The server **refuses to start** with Google enabled and *neither* `WAREHOUSE_GOOGLE_HD`
+> nor `WAREHOUSE_ALLOWED_EMAILS` set — that combination would let any Google account on
+> earth sign in.
+
+The shared password keeps working alongside it (existing users are unaffected) until you
+set `WAREHOUSE_GOOGLE_ONLY=1`, which stops `POST /login` from accepting a password at all
+— not merely hiding the form. ID tokens are verified, never just decoded: RS256 against
+Google's JWKS, audience, issuer, expiry, and a server-planted single-use `nonce`.
+
+**Not available in Burrow (`WAREHOUSE_AUTH=pg`) mode**, where the session subject must be
+a Postgres role name rather than an email; federating that needs an email→role mapping
+and is a separate design. Configuring both logs a warning and Google is ignored.
+
+`GET /auth/config` reports `{mode, google, password}` so a sibling-rendered login page
+(`WAREHOUSE_LOGIN_UI=lens`) draws the right buttons without duplicating this config.
+
 ### nginx (terminate TLS, forward all paths to `127.0.0.1:8765`)
 ```nginx
 server {
