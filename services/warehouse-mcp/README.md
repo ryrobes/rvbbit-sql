@@ -188,10 +188,27 @@ the root; behind the unified origin (`docker/origin/Caddyfile`) DataRabbit owns 
 so the ingress routes `/gallery` here instead. Same page either way.
 
 It lists `rvbbit.live_apps` unfiltered — every row there is externally addressable
-(DataRabbit *plates* live in `rvbbit.plates` and never appear). Thumbnails come from
-the existing self-healing `/thumbs` route, so they populate themselves: a miss or a
-stale shot enqueues a capture and the next load has it. No new table, no build step,
-no extra config. Routes only exist in OAuth mode (same as `/d/<slug>`).
+(DataRabbit *plates* live in `rvbbit.plates` and never appear). Cards open in a new
+tab: the index is somewhere you come back to. No new table, no build step, no extra
+config. Routes only exist in OAuth mode (same as `/d/<slug>`).
+
+**Thumbnails.** Captures are stored on disk under
+`$WAREHOUSE_LIVE_APP_CAPTURE_DIR/thumbs/<kind>/<slug>.jpg` (compose points that at the
+durable volume) and are **never regenerated per visit** — a warm request is a ~7ms
+file read. Three things keep a cold gallery from looking broken:
+- **Warming happens at page render**, not at image request. The browser only fetches
+  thumbnails for cards it decides to load, so leaving generation to `/thumbs` meant an
+  artifact below the fold never started rendering until somebody scrolled to it.
+- **The page retries** a missing shot with backoff (5 tries), so a cold gallery fills
+  in while you watch instead of after a manual refresh.
+- **`ETag` + `304`**, so a reload revalidates for ~0 bytes instead of re-transferring
+  every image.
+
+Captures are JPEG at 800×500/q72 (~28KB each, down from ~190KB PNGs). The URL keeps its
+`.png` spelling because lens's `rv-shot` proxy hardcodes it — the `content-type` header
+is what the browser reads, and the proxy forwards ours. Pre-existing `.png` captures are
+still served until the artifact is republished. The `capture_live_app` MCP tool is
+unaffected and still produces full-resolution lossless PNGs.
 
 ## Dashboards (artifacts that live + work outside Claude)
 **Start from `dashboard_template`** — the proven boilerplate (see [`DASHBOARD_TEMPLATE.md`](DASHBOARD_TEMPLATE.md)).

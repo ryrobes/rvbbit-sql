@@ -2277,8 +2277,40 @@ def _hub_url(app_kind, slug):
     return f"{lens}/hub?sel={_artifact_kind(app_kind)}:{slug}" if lens else None
 
 
-def _thumb_path(kind, slug):
-    return _live_app_capture_root() / "thumbs" / kind / f"{slug}.png"
+# Captures are JPEG as of 4.1.9 — a gallery card renders ~290px wide, and the
+# old 1200x750 PNGs averaged ~190KB (worst case 414KB), so a 40-artifact wall
+# was multiple megabytes of first load. The URL keeps its .png spelling for
+# compatibility (lens's rv-shot proxy hardcodes it); the response's
+# content-type is what actually tells the browser, and the proxy forwards ours.
+# PNG is still READ so pre-4.1.9 captures keep serving until they're refreshed.
+_THUMB_EXTS = (("jpg", "image/jpeg"), ("png", "image/png"))
+_THUMB_W, _THUMB_H, _THUMB_Q = 800, 500, 72
+
+
+def _thumb_path(kind, slug, ext="jpg"):
+    return _live_app_capture_root() / "thumbs" / kind / f"{slug}.{ext}"
+
+
+def _thumb_existing(kind, slug):
+    """(path, media_type) of the capture to serve, preferring the current
+    format; (None, None) when nothing has been rendered yet."""
+    for ext, mime in _THUMB_EXTS:
+        p = _thumb_path(kind, slug, ext)
+        if p.is_file():
+            return p, mime
+    return None, None
+
+
+def _thumb_stale(kind, slug, updated_at) -> bool:
+    """Missing, or older than the artifact's last publish. Republishing an
+    artifact is exactly when its picture stops being true."""
+    p, _ = _thumb_existing(kind, slug)
+    if p is None:
+        return True
+    try:
+        return p.stat().st_mtime < updated_at.timestamp()
+    except Exception:   # noqa: BLE001 — unreadable stat: leave what we have
+        return False
 
 
 _THUMBS_IN_FLIGHT = set()
@@ -2307,10 +2339,16 @@ def _auto_thumb(app_kind, slug):
                     return
                 path = _thumb_path(kind, slug)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_suffix(".tmp.png")
+                tmp = path.with_suffix(".tmp.jpg")
                 _capture_html_with_playwright((row or {}).get("html") or "", tmp,
-                                              width=1200, height=750, full_page=False, wait_ms=1200)
+                                              width=_THUMB_W, height=_THUMB_H, full_page=False,
+                                              wait_ms=1200, quality=_THUMB_Q)
                 tmp.replace(path)
+                # Retire the pre-4.1.9 PNG so _thumb_existing stops having to
+                # choose and the volume doesn't keep both forever.
+                legacy = _thumb_path(kind, slug, "png")
+                if legacy.is_file():
+                    legacy.unlink(missing_ok=True)
         except Exception as e:  # noqa: BLE001
             print(f"auto-thumb {key}: {e}", file=sys.stderr)
         finally:
@@ -3328,7 +3366,7 @@ def _launch_playwright_chromium(playwright):
         return playwright.chromium.launch()
 
 
-def _capture_html_with_playwright(html, path, width, height, full_page, wait_ms):
+def _capture_html_with_playwright(html, path, width, height, full_page, wait_ms, quality=None):
     """Render + screenshot the stored HTML with the LIVE rvbbitQuery bridge injected.
     Returns a telemetry dict — every bridge query that ran (ok/rows/ms) plus console
     and page errors — so a capture doubles as a health check of the data bridge,
@@ -3381,7 +3419,12 @@ window.cowork.callMcpTool = async function(tool, args) {
         page.set_content(doc, wait_until="networkidle", timeout=30_000)
         if wait_ms:
             page.wait_for_timeout(wait_ms)
-        page.screenshot(path=str(path), full_page=bool(full_page))
+        # quality only applies to JPEG; playwright infers the codec from the
+        # path suffix, so callers passing .png keep lossless output untouched.
+        shot = {"path": str(path), "full_page": bool(full_page)}
+        if quality is not None and str(path).lower().endswith((".jpg", ".jpeg")):
+            shot["quality"] = int(quality)
+        page.screenshot(**shot)
         browser.close()
     return telemetry
 
@@ -4079,7 +4122,7 @@ a{color:inherit;text-decoration:none}
 nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
   height:56px;padding:0 max(20px,4vw);border-bottom:1px solid var(--line);
   background:rgba(16,13,11,.82);backdrop-filter:blur(18px)}
-.mark{color:var(--amber);font-size:17px;line-height:1}
+.mark{display:block;height:15px;width:auto;color:var(--amber);flex:none}
 .wordmark{font:700 12px/1 var(--mono);letter-spacing:.14em}
 .wordmark small{margin-left:10px;padding-left:10px;border-left:1px solid var(--line);
   font-weight:400;font-size:9px;letter-spacing:.16em;color:var(--dim)}
@@ -4115,16 +4158,25 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .card:hover{background:var(--panel-2)}
 .shot{position:relative;aspect-ratio:16/10;overflow:hidden;background:#0d0b09;
   border-bottom:1px solid var(--line)}
-.shot img{width:100%;height:100%;object-fit:cover;object-position:top center;display:block;
-  opacity:.84;transition:transform .7s,opacity .45s}
-.card:hover .shot img{transform:scale(1.035);opacity:1}
-.shot::after{content:"";position:absolute;inset:0;pointer-events:none;
+/* The glyph sits underneath permanently; the shot fades in ON TOP once it
+   actually loads. That way a thumbnail still being rendered shows the
+   stand-in rather than a broken image, and a retry can swap it in later
+   without the page having thrown the <img> away. */
+.shot img{position:absolute;inset:0;z-index:1;width:100%;height:100%;
+  object-fit:cover;object-position:top center;display:block;
+  opacity:0;transition:transform .7s,opacity .45s}
+.shot img.ok{opacity:.84}
+.card:hover .shot img.ok{transform:scale(1.035);opacity:1}
+.shot::after{content:"";position:absolute;inset:0;z-index:2;pointer-events:none;
   background:linear-gradient(to top,var(--panel) 2%,transparent 46%)}
-.glyph{position:absolute;inset:0;display:grid;place-items:center;
+.glyph{position:absolute;inset:0;z-index:0;display:grid;place-items:center;
   font-size:38px;color:var(--amber);opacity:.16}
-/* the stand-in only when there is no shot — onerror drops the <img>, which
-   drops this rule with it, so a 404 thumbnail falls back on its own */
-.shot img+.glyph{display:none}
+/* Once the shot is up it sits at 84% opacity, so an untouched stand-in would
+   ghost through the dark areas of the image. Retire it on load — but only on
+   load, so the pending state still has something to show. */
+.shot img.ok+.glyph{display:none}
+.shot.pending .glyph{animation:breathe 1.9s ease-in-out infinite}
+@keyframes breathe{0%,100%{opacity:.16}50%{opacity:.34}}
 .body{display:flex;flex-direction:column;gap:8px;flex:1;padding:16px 18px 18px}
 .meta{display:flex;align-items:center;gap:9px;flex-wrap:wrap;
   font:9px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase}
@@ -4148,6 +4200,25 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 
 _LANDING_JS = """
 (function(){
+ // Thumbnails render on the server the first time an index is viewed, so a
+ // cold gallery has cards whose shot does not exist YET. Retry with backoff
+ // instead of settling for the monogram until someone thinks to refresh.
+ // Cache-buster only on retries: the first hit must stay cacheable.
+ [].forEach.call(document.querySelectorAll('.shot img'), function(img){
+   var shot=img.parentNode, tries=0, base=img.getAttribute('src');
+   shot.classList.add('pending');
+   img.addEventListener('load', function(){
+     img.classList.add('ok'); shot.classList.remove('pending');
+   });
+   img.addEventListener('error', function(){
+     if(++tries>5){ shot.classList.remove('pending'); return; }
+     setTimeout(function(){ img.src = base + '?r=' + tries; }, tries*2500);
+   });
+   if(img.complete && img.naturalWidth>0){
+     img.classList.add('ok'); shot.classList.remove('pending');
+   }
+ });
+
  var q=document.getElementById('q'),
      chips=[].slice.call(document.querySelectorAll('.chip')),
      cards=[].slice.call(document.querySelectorAll('.card')),
@@ -4179,6 +4250,31 @@ _LANDING_JS = """
 # a sane default, never a gate.
 _KIND_GLYPH = {"dashboard": "▦", "app": "◈", "deck": "▷", "report": "▤", "tool": "⌘"}
 
+# The rvbbit rabbit, same traced mark rvbbit-lens uses in its menu bar
+# (src/components/desktop/rvbbit-logo.tsx). Paths fill with currentColor, so
+# the nav's amber carries straight through — same colour the sparkle had.
+_RABBIT_SVG = (
+    '<svg class=mark viewBox="0 0 1383 709" fill="none" aria-hidden="true">'
+    '<path d="M 0 458 L 0 708 L 36 708 L 36 458 Z" fill="currentColor" fill-rule="evenodd"/>'
+    '<path d="M 81 458 L 81 708 L 144 708 L 193 702 L 233 692 L 271 678 L 314 656 L 378 608 L 406 579'
+    ' L 435 541 L 623 541 L 654 536 L 681 528 L 717 511 L 746 491 L 773 465 L 789 486 L 814 509 L 849 529'
+    ' L 873 537 L 896 541 L 1175 541 L 1271 589 L 1382 365 L 1274 310 L 1288 270 L 1289 232 L 1282 188'
+    ' L 1262 135 L 1237 96 L 1204 61 L 1163 32 L 1124 14 L 1097 6 L 1057 0 L 672 0 L 672 50 L 678 96'
+    ' L 641 86 L 589 83 L 552 88 L 516 99 L 500 59 L 483 37 L 468 24 L 444 10 L 427 4 L 406 0 L 380 0'
+    ' L 359 4 L 332 15 L 313 28 L 296 45 L 277 77 L 268 115 L 272 158 L 285 189 L 298 207 L 331 234'
+    ' L 360 246 L 381 250 L 373 291 L 247 292 L 247 345 L 242 370 L 232 393 L 212 420 L 182 443 L 155 454'
+    ' L 134 458 Z M 831 364 L 843 331 L 863 309 L 889 295 L 926 292 L 953 301 L 975 318 L 990 340'
+    ' L 1002 375 L 1216 375 L 1270 403 L 1233 476 L 1197 458 L 905 458 L 874 448 L 849 427 L 834 399 Z'
+    ' M 722 230 L 735 253 L 744 280 L 747 298 L 745 340 L 737 367 L 725 390 L 707 413 L 685 432 L 653 449'
+    ' L 614 458 L 387 458 L 345 521 L 295 568 L 264 588 L 231 604 L 191 617 L 164 621 L 164 538 L 205 525'
+    ' L 235 509 L 259 491 L 285 464 L 303 438 L 318 406 L 327 375 L 462 375 L 456 327 L 456 297 L 461 272'
+    ' L 481 230 L 492 216 L 519 192 L 544 178 L 573 169 L 625 168 L 654 176 L 678 188 L 698 203 Z'
+    ' M 763 84 L 1048 83 L 1076 87 L 1104 96 L 1146 122 L 1167 143 L 1185 169 L 1195 190 L 1204 223'
+    ' L 1206 254 L 1203 265 L 1188 284 L 1172 291 L 1111 292 L 1073 285 L 1044 268 L 1020 240 L 1008 210'
+    ' L 1002 167 L 882 167 L 840 160 L 815 148 L 800 137 L 776 110 Z M 389 83 L 406 85 L 421 94 L 428 102'
+    ' L 435 121 L 434 134 L 427 149 L 414 161 L 401 166 L 385 166 L 368 158 L 356 144 L 352 133 L 352 116'
+    ' L 359 101 L 372 89 Z" fill="currentColor" fill-rule="evenodd"/></svg>')
+
 
 def _rel_time(dt):
     """'3d ago' — a browse page reads better in elapsed time than in dates."""
@@ -4209,6 +4305,27 @@ def _landing_rows():
             "FROM rvbbit.live_apps ORDER BY updated_at DESC").fetchall()
 
 
+def _warm_thumbs(rows):
+    """Start captures for everything missing or stale when the INDEX renders,
+    not when an <img> happens to be requested.
+
+    The browser only fetches thumbnails it decides to load — lazily, and only
+    for cards near the viewport — so leaving generation to /thumbs meant an
+    artifact below the fold never began rendering until somebody scrolled to
+    it, and a first visit showed monograms that only filled in on a later
+    manual refresh. Deduped and semaphore-gated inside _auto_thumb, so calling
+    it for every row on every page view is cheap once the volume is warm."""
+    for r in rows:
+        if (r.get("runtime_kind") or "html") != "html":
+            continue
+        app_kind = (r.get("app_kind") or "dashboard").lower()
+        try:
+            if _thumb_stale(_artifact_kind(app_kind), r["slug"], r["updated_at"]):
+                _auto_thumb(app_kind, r["slug"])
+        except Exception as e:   # noqa: BLE001 — warming is best-effort, never fails a page
+            print(f"warm thumb {r.get('slug')}: {e}", file=sys.stderr)
+
+
 def _landing_html(rows, viewer):
     from html import escape as e
 
@@ -4222,12 +4339,13 @@ def _landing_html(rows, viewer):
         href = f"/d/{slug}" if app_kind == "dashboard" else f"/apps/{slug}"
         name = r.get("name") or slug
         desc = r.get("description") or ""
-        # /thumbs self-heals: a miss or a stale shot enqueues a capture and the
-        # next load has it. onerror drops the <img> so the glyph shows through.
+        # No onerror-remove and no lazy: the page warms every capture on render
+        # (_warm_thumbs), and the script retries a miss with backoff, so a cold
+        # gallery fills itself in while you watch instead of after a refresh.
         thumb = ""
         if (r.get("runtime_kind") or "html") == "html":
             thumb = (f'<img src="/thumbs/{e(_artifact_kind(app_kind))}/{e(slug)}.png" alt="" '
-                     f'loading="lazy" onerror="this.remove()">')
+                     f'decoding="async">')
         deps = []
         for label, key in (("queries", "queries"), ("tables", "tables"), ("metrics", "metrics")):
             if r.get(key):
@@ -4237,7 +4355,11 @@ def _landing_html(rows, viewer):
         owner = r.get("owner_email") or r.get("team") or ""
         haystack = " ".join(str(x) for x in (name, desc, slug, app_kind, owner) if x).lower()
         cards.append(
-            f'<a class="card" href="{e(href)}" data-kind="{e(app_kind)}" data-search="{e(haystack)}">'
+            # New tab: the index is a place you come back to, not a page you
+            # navigate away from. noopener because these are arbitrary
+            # LLM-authored artifacts — no window.opener handle back to here.
+            f'<a class="card" href="{e(href)}" target="_blank" rel="noopener" '
+            f'data-kind="{e(app_kind)}" data-search="{e(haystack)}">'
             f'<div class="shot">{thumb}<div class="glyph">{_KIND_GLYPH.get(app_kind, "◇")}</div></div>'
             f'<div class="body">'
             f'<div class="meta"><span class="pill">{e(app_kind)}</span>'
@@ -4270,7 +4392,7 @@ def _landing_html(rows, viewer):
 <title>Warehouse — published artifacts</title>
 <style>{_LANDING_CSS}</style></head><body>
 <div class="wash"></div>
-<nav><span class="mark" aria-hidden="true">&#10022;</span>
+<nav>{_RABBIT_SVG}
  <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
  <span class="who">{f'<span>{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
 <main>
@@ -4334,6 +4456,7 @@ def register_dashboard_routes(m):
         except Exception as ex:   # noqa: BLE001 — an index that can't query is still a page
             print(f"landing page: {ex}", file=sys.stderr)
             rows = []
+        _warm_thumbs(rows)        # background; the page renders immediately
         return HTMLResponse(_landing_html(rows, viewer),
                             headers={"cache-control": "no-store"})
 
@@ -4356,27 +4479,34 @@ def register_dashboard_routes(m):
         slug = request.path_params["slug"]
         if kind not in ("app", "dashboard") or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", slug, re.I):
             return _json({"error": "bad artifact handle"}, 400)
-        path = _thumb_path(kind, slug)
         # Lazy self-heal: a missing or out-of-date capture enqueues itself
         # (throttled, deduped) — pre-Hub artifacts and republished versions
         # get thumbnails just by being LOOKED AT. Stale files still serve
         # (better a last-version shot than a monogram) while the refresh
-        # renders in the background.
+        # renders in the background. The landing page ALSO warms on render, so
+        # this path is the backstop rather than the only trigger.
         try:
             with _conn() as c:
                 d = c.execute("SELECT app_kind, runtime_kind, updated_at FROM rvbbit.dashboards "
                               "WHERE slug=%s", (slug,)).fetchone()
-            if d and (d.get("runtime_kind") or "html") == "html":
-                stale = (not path.is_file()
-                         or path.stat().st_mtime < d["updated_at"].timestamp())
-                if stale:
-                    _auto_thumb(d.get("app_kind"), slug)
+            if d and (d.get("runtime_kind") or "html") == "html" \
+                    and _thumb_stale(kind, slug, d["updated_at"]):
+                _auto_thumb(d.get("app_kind"), slug)
         except Exception as e:  # noqa: BLE001
             print(f"thumbs route ({kind}:{slug}): {e}", file=sys.stderr)
-        if not path.is_file():
+        path, mime = _thumb_existing(kind, slug)
+        if path is None:
             return _json({"error": "no thumbnail"}, 404)
-        return Response(path.read_bytes(), media_type="image/png",
-                        headers={"cache-control": "public, max-age=60"})
+        # Conditional requests. Without an ETag every reload re-transferred the
+        # whole gallery (a refresh looked like the server was regenerating);
+        # now an unchanged capture costs a 304 instead of its full body.
+        st = path.stat()
+        etag = f'W/"{int(st.st_mtime)}-{st.st_size}"'
+        cache = "public, max-age=60"
+        if request.headers.get("if-none-match", "") == etag:
+            return Response(status_code=304, headers={"etag": etag, "cache-control": cache})
+        return Response(path.read_bytes(), media_type=mime,
+                        headers={"cache-control": cache, "etag": etag})
 
     @m.custom_route("/pdfs/{name}.pdf", methods=["GET"])
     async def _pdf(request):
