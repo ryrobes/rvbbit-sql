@@ -37,7 +37,7 @@ from urllib.parse import urlencode
 import jwt
 from pydantic import AnyHttpUrl
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -566,6 +566,43 @@ def _finish_login(request: Request, provider, email: str, txn: str, nxt: str):
     return resp
 
 
+# ── backgrounds ──────────────────────────────────────────────────────────────
+# Scenes lifted from the DataRabbit wallpaper set (rvbbit-lens
+# public/wallpapers/4k), downscaled for the web. They're chosen to already sit
+# in the warm near-black palette, so they blend rather than fight the chrome.
+# One is picked per request — the room is the same, the light isn't.
+#
+# Lives here rather than in server.py because the LOGIN page needs it before
+# any session exists, and auth.py is the module server.py imports (not the
+# other way round). The serving route is deliberately unauthenticated: it's the
+# backdrop of the sign-in page, so gating it would be circular.
+BACKGROUNDS = ("the_flooded_core", "dead_zone", "the_black_site",
+               "fallout_bunker", "deep_sea_vessel")
+_BG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backgrounds")
+
+
+def pick_background() -> str:
+    """A different scene each visit. secrets over random: no reason to hold a
+    seeded PRNG's state for this, and it costs nothing."""
+    return secrets.choice(BACKGROUNDS)
+
+
+def background_layer(image_opacity: float, veil: str) -> str:
+    """The two-element backdrop: the photo, then a scrim that pushes it back
+    under the palette. Callers set how loud it is — the login page can afford
+    atmosphere, an index full of content cannot."""
+    bg = pick_background()
+    return (f'<div class=bg style="background-image:url(/bg/{bg}.jpg);opacity:{image_opacity}"></div>'
+            f'<div class=veil style="background:{veil}"></div>')
+
+
+_BG_CSS = """
+ .bg{position:fixed;inset:0;z-index:-2;background-position:center;background-size:cover;
+   background-repeat:no-repeat;filter:saturate(.75) contrast(1.04);pointer-events:none}
+ .veil{position:fixed;inset:0;z-index:-1;pointer-events:none}
+"""
+
+
 # ── login page ───────────────────────────────────────────────────────────────
 
 def _page(body: str, status: int = 200) -> HTMLResponse:
@@ -573,8 +610,14 @@ def _page(body: str, status: int = 200) -> HTMLResponse:
         f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>rvbbit warehouse</title>
 <style>
- body{{background:#15110d;color:#f0e6d8;font:15px/1.5 ui-monospace,Menlo,monospace;display:grid;place-items:center;min-height:100vh;margin:0}}
- .card{{background:#1e1813;border:1px solid #3a2f24;border-radius:12px;padding:28px 30px;max-width:360px;width:90%;box-shadow:0 10px 40px #0008}}
+ /* Base colour on <html>, body transparent — a negative-z-index layer paints
+    BEFORE in-flow backgrounds, so an opaque body would hide .bg entirely.
+    (This page only ever worked because it had no html background and body's
+    propagated to the canvas; don't leave that to luck.) */
+ html{{background:#15110d}}
+ body{{background:transparent;color:#f0e6d8;font:15px/1.5 ui-monospace,Menlo,monospace;display:grid;place-items:center;min-height:100vh;margin:0}}
+{_BG_CSS}
+ .card{{background:rgba(30,24,19,.86);backdrop-filter:blur(3px);border:1px solid #3a2f24;border-radius:12px;padding:28px 30px;max-width:360px;width:90%;box-shadow:0 10px 40px #000a}}
  h1{{font-size:16px;margin:0 0 4px;color:#e8b572}} p.sub{{margin:0 0 18px;color:#a99}}
  label{{display:block;font-size:12px;color:#bba;margin:12px 0 4px}}
  input{{width:100%;box-sizing:border-box;background:#15110d;border:1px solid #4a3d2e;border-radius:7px;color:#f0e6d8;padding:9px 11px;font:inherit}}
@@ -589,6 +632,7 @@ def _page(body: str, status: int = 200) -> HTMLResponse:
  .or{{display:flex;align-items:center;gap:10px;margin:18px 0 4px;color:#8a8078;font-size:11px}}
  .or::before,.or::after{{content:"";flex:1;height:1px;background:#3a2f24}}
 </style>
+{background_layer(0.62, "radial-gradient(1000px 700px at 50% 45%, rgba(21,17,13,.34) 0%, rgba(21,17,13,.70) 55%, rgba(21,17,13,.93) 100%)")}
 <div class=card>{body}</div>""", status_code=status)
 
 
@@ -781,6 +825,22 @@ def register_login_route(mcp, provider: WarehouseAuthProvider):
             return HTMLResponse('{"ok":false}', status_code=401, media_type="application/json")
         return HTMLResponse(json.dumps({"ok": True, "sub": sub, "mode": AUTH_MODE}),
                             media_type="application/json")
+
+    @mcp.custom_route("/bg/{name}.jpg", methods=["GET"])
+    async def background(request: Request):
+        """Backdrop art. Unauthenticated on purpose — it's the wallpaper behind
+        the SIGN-IN page, so gating it on a session would be circular. The name
+        is matched against a fixed tuple rather than sanitised into a path, so
+        this can never be coaxed into reading anything else off the disk."""
+        name = request.path_params["name"]
+        if name not in BACKGROUNDS:
+            return HTMLResponse("not found", status_code=404)
+        try:
+            data = open(os.path.join(_BG_DIR, f"{name}.jpg"), "rb").read()
+        except OSError:
+            return HTMLResponse("not found", status_code=404)
+        return Response(data, media_type="image/jpeg",
+                        headers={"cache-control": "public, max-age=604800, immutable"})
 
     @mcp.custom_route("/auth/config", methods=["GET"])
     async def auth_config(request: Request):   # noqa: ARG001

@@ -4101,15 +4101,24 @@ _LANDING_CSS = """
   --sans:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   --serif:"Iowan Old Style",Baskerville,"Times New Roman",serif;
 }
+/* The base colour lives on <html> and NOWHERE else. body must stay
+   transparent: a negative-z-index layer paints BEFORE in-flow backgrounds, so
+   an opaque body background hides .bg completely (it did — measured at zero
+   contributed pixels). The warm gradient that used to live here moved into
+   .veil, which sits ABOVE the photo. */
 html{background:var(--void)}
 body{
-  min-height:100vh; background:
-    radial-gradient(1200px 800px at 30% -10%, #241c14 0%, rgba(23,19,16,0) 60%),
-    var(--void);
+  min-height:100vh; background:transparent;
   color:var(--bone); font-family:var(--sans); -webkit-font-smoothing:antialiased;
 }
 a{color:inherit;text-decoration:none}
 ::selection{background:var(--amber);color:#1a1206}
+
+/* Backdrop, pushed much further back than the login page's — this page is full
+   of content and the scene is atmosphere, not subject. */
+.bg{position:fixed;inset:0;z-index:-2;background-position:center;background-size:cover;
+  background-repeat:no-repeat;filter:saturate(.7) contrast(1.03);pointer-events:none}
+.veil{position:fixed;inset:0;z-index:-1;pointer-events:none}
 
 /* the faint grid wash, faded out down the page */
 .wash{position:fixed;inset:56px 0 0;z-index:0;opacity:.5;pointer-events:none;
@@ -4327,7 +4336,20 @@ def _warm_thumbs(rows):
 
 
 def _landing_html(rows, viewer):
+    import auth
     from html import escape as e
+
+    # Far dimmer than the login page's 0.42: a wall of cards has to stay the
+    # subject. Cards are opaque, so the scene only ever reads in the hero band
+    # and the outer gutters — the veil is lightest there and closes down over
+    # the grid, which is where legibility actually matters.
+    # The veil also carries the warm top-left glow the body background used to
+    # provide, so the palette survives while the scene shows through.
+    _bg_layer = auth.background_layer(
+        0.40,
+        "radial-gradient(1200px 800px at 30% -10%, rgba(36,28,20,.50) 0%, rgba(36,28,20,0) 62%),"
+        "linear-gradient(to bottom, rgba(16,13,11,.26) 0%, rgba(16,13,11,.50) 30%,"
+        " rgba(16,13,11,.84) 62%, rgba(16,13,11,.93) 100%)")
 
     kinds, cards = {}, []
     for r in rows:
@@ -4391,6 +4413,7 @@ def _landing_html(rows, viewer):
 <meta name="robots" content="noindex,nofollow">
 <title>Warehouse — published artifacts</title>
 <style>{_LANDING_CSS}</style></head><body>
+{_bg_layer}
 <div class="wash"></div>
 <nav>{_RABBIT_SVG}
  <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
