@@ -289,6 +289,15 @@ before finishing. Any image surface can also be opened in the pen/arrow/box mark
 editor; the flattened annotation is sent with the next message while its separately
 stored overlay becomes a toggleable, lineage-linked stage surface.
 
+The header's **Design Profiles** library turns uploaded reference images, a frozen
+URL viewport/extraction, an existing selected capture, and optional written direction
+into a reusable dashboard style contract. Profiles are company-visible and creator-
+editable. Markdown remains directly editable; every save creates an immutable version.
+A profile may be pinned to the notebook or only the next turn, and selecting an older
+artifact carries its exact pinned profile forward. Calliope injects that version into
+the Hermes authoring and screenshot-review prompts; the reference assets and compiled
+profile never become runtime CSS for unrelated custom artifacts.
+
 Cube schema surfaces are also direct interactive analysis tables. Add one or more
 dimensions to Rows and one or more numeric aggregations to Values; this produces a
 normal grouped table with named columns. Columns is optional—adding dimensions there
@@ -303,6 +312,8 @@ export WAREHOUSE_HERMES_API_KEY="..."       # Hermes API_SERVER_KEY
 # Optional: one shared company memory scope, never an email-derived scope
 export WAREHOUSE_HERMES_MEMORY_KEY="company"
 export WAREHOUSE_CALLIOPE_DIR="/var/lib/warehouse/calliope"
+# Optional, trusted networks only: permit URL references on private/local hosts
+export WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS="false"
 # Optional but required for browser downloads created by external Hermes:
 export WAREHOUSE_CALLIOPE_EXPORT_ROOTS="/var/lib/hermes/exports"
 export WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES="134217728" # 128 MiB; ceiling 512 MiB
@@ -383,6 +394,8 @@ put it on a volume, else a restart strands connectors with "client_id not found"
 `WAREHOUSE_HERMES_MEMORY_KEY` (optional shared company scope) ·
 `WAREHOUSE_CALLIOPE_DIR` (attachment storage) ·
 `WAREHOUSE_CALLIOPE_MAX_IMAGE_BYTES` (8 MiB default) ·
+`WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS` (false by default; trusted-network
+opt-in for private/local Design Profile URL references) ·
 `WAREHOUSE_CALLIOPE_EXPORT_ROOTS` (OS-path-separated allowed Hermes output roots) ·
 `WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES` (128 MiB default, 512 MiB ceiling; in uber
 Compose set the single shared host path with `WAREHOUSE_CALLIOPE_EXPORT_DIR`).

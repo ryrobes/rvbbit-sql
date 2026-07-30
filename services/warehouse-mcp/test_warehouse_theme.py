@@ -39,6 +39,8 @@ def test_lens_wallpaper_library_is_shipped_as_web_sized_pairs():
 
 def test_theme_assets_are_shared_by_every_first_party_warehouse_shell():
     assets = warehouse_theme.head_assets()
+    assert '/theme/datarabbit.svg' in assets
+    assert 'rel="icon"' in assets
     assert "/theme/warehouse-theme.css" in assets
     assert "/theme/warehouse-theme.js" in assets
 
@@ -48,10 +50,15 @@ def test_theme_assets_are_shared_by_every_first_party_warehouse_shell():
     assert "warehouse_theme.head_assets()" in auth
     assert server.count("warehouse_theme.head_assets()") >= 2
     assert "/theme/warehouse-theme.js" in calliope
+    assert "/theme/datarabbit.svg" in calliope
     assert all("data-warehouse-theme-anchor" in page for page in (auth, server, calliope))
     assert "auth.register_login_route(m, provider, _RABBIT_SVG)" in server
     assert "{_LOGIN_RABBIT_SVG}DATA RABBIT" in auth
     assert "var(--amber,#e8b572)" in auth
+    favicon = warehouse_theme._FAVICON
+    assert favicon.is_file()
+    assert 'viewBox="0 0 32 32"' in favicon.read_text(encoding="utf-8")
+    assert "/theme/datarabbit.svg" in server
 
 
 def test_theme_pipeline_uses_vibrant_tokens_and_browser_storage():

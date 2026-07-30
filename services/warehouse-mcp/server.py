@@ -2935,6 +2935,7 @@ def _python_placeholder_html(name, slug=None):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title}</title>
+  <link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">
   <style>
     body {{ margin: 0; font-family: Inter, system-ui, sans-serif; background: #111827; color: #e5e7eb; }}
     main {{ max-width: 840px; margin: 10vh auto; padding: 32px; }}
@@ -2984,6 +2985,7 @@ async def index(request: Request):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RVBBIT Live App</title>
+  <link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">
 </head>
 <body>
   <main>
@@ -4580,6 +4582,7 @@ def _mcp_dashboard_template():
 # Cowork-built artifact (callMcpTool) and a hosted-built one (rvbbitQuery) both run here
 # unchanged — no codemod of the artifact needed.
 _DASH_SHIM = (
+    '<link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">\n'
     "<script>\n"
     "window.RVBBIT_DASHBOARD={slug:__SLUG__};\n"
     "window.rvbbitQuery=async function(sql,opts){opts=opts||{};"

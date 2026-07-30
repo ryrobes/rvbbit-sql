@@ -252,6 +252,9 @@ services:
       WAREHOUSE_HERMES_API_KEY: ${WAREHOUSE_HERMES_API_KEY:-}
       WAREHOUSE_HERMES_MEMORY_KEY: ${WAREHOUSE_HERMES_MEMORY_KEY:-}
       WAREHOUSE_CALLIOPE_DIR: /app/data/calliope
+      # URL-backed Design Profile references reject private/local targets by
+      # default. Enable only when Warehouse runs on a trusted client network.
+      WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS: ${WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS:-false}
       WAREHOUSE_CALLIOPE_EXPORT_ROOTS: ${WAREHOUSE_CALLIOPE_EXPORT_DIR:-/tmp/rvbbit-hermes-exports}
       WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES: ${WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES:-134217728}
       # Burrow mode (docs/BURROW_PLAN.md): WAREHOUSE_AUTH=pg makes Postgres

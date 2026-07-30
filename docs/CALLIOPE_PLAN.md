@@ -34,7 +34,7 @@ Calliope uses the current/default Hermes profile and its shared memory. The Hub
 never creates a Hermes profile. An optional `WAREHOUSE_HERMES_MEMORY_KEY` is a
 single company-wide key, never derived from the user.
 
-## Three records, three jobs
+## Warehouse records
 
 Hermes remains authoritative for agent conversation and company memory.
 Postgres stores the Hub-owned index and visual ledger:
@@ -49,6 +49,15 @@ Postgres stores the Hub-owned index and visual ledger:
   it never mutates history.
 * `rvbbit.calliope_attachments` records owner-gated image files stored under
   `WAREHOUSE_CALLIOPE_DIR`.
+* `rvbbit.calliope_design_profiles` holds company-visible names, ownership, and
+  the current version pointer. Only the creator may revise or archive the
+  original; any authenticated user may use or fork it.
+* `rvbbit.calliope_design_profile_versions` holds immutable human-editable
+  Markdown, compact structured design tokens, and the exact compiled prompt.
+* `rvbbit.calliope_design_profile_assets` records frozen uploaded images, URL
+  viewport captures/extractions, and selected scratchpad captures. Binary data
+  remains under `WAREHOUSE_CALLIOPE_DIR`; Postgres stores authenticated,
+  company-visible references alongside the profile version.
 
 Published apps, dashboards, and decks still live in
 `rvbbit.dashboards`/`rvbbit.dashboard_versions`. A surface holds only their
@@ -78,6 +87,41 @@ selected surface to the warehouse server. The server:
 Hermes decides and executes through its configured RVBBIT MCP. The browser
 materializes. No `rvbbit.desktop_commands` contract or internal
 `desktop_assistant_turn` operator participates.
+
+## Design Profiles
+
+The Design Profiles modal is deliberately separate from the Warehouse appearance
+theme. A user can combine reference images, an HTTP(S) URL, a selected Calliope
+capture/artifact, and written direction. Warehouse freezes URL evidence with a
+bounded Playwright viewport plus computed-style/text extraction (or a bounded HTML
+fallback), then asks a short-lived Hermes session to synthesize:
+
+* an actionable Markdown guide for creative direction, palette, typography,
+  layout, components, data visualization, interaction, responsiveness,
+  accessibility, and avoid rules; and
+* compact JSON tokens used by the in-app preview and available to native
+  system renderers.
+
+The generated document is stored as version one. Editing Markdown always appends
+a version rather than rewriting history. A notebook can pin one exact version,
+or the composer can override only the next turn. Turn resolution is:
+
+1. explicit next-turn override;
+2. the selected artifact's pinned version;
+3. the notebook default; then
+4. no Design Profile.
+
+The resolved version is written to the turn and every projected surface, including
+a small name/version snapshot in surface presentation metadata. Its compiled prompt
+is supplied on every Hermes hop, including private screenshot feedback. Old turns
+therefore retain their original creative contract even after a profile is revised.
+
+URL ingestion rejects credentials and private, loopback, link-local, or otherwise
+non-global destinations by default, including redirects and browser subresources.
+Authentication-like query parameters are redacted from saved, company-visible
+provenance after the capture is made.
+Trusted installations may explicitly opt into private URL references with
+`WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS=true`.
 
 ## Surface projection
 
@@ -131,6 +175,7 @@ WAREHOUSE_HERMES_URL=http://hermes-host:8642
 WAREHOUSE_HERMES_API_KEY=...
 WAREHOUSE_HERMES_MEMORY_KEY=...       # optional, one company scope
 WAREHOUSE_CALLIOPE_DIR=/app/data/calliope
+WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS=false
 ```
 
 Hermes default/current profile:
@@ -149,7 +194,7 @@ platforms:
       host: 127.0.0.1
       port: 8642
       key: ...                         # same value as WAREHOUSE_HERMES_API_KEY
-      model_name: anthropic/claude-sonnet-4.6
+      model_name: openai/gpt-5.6-sol
 ```
 
 `model_name` should be the actual provider-routable model configured on that

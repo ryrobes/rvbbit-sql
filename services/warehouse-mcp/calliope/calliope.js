@@ -28,6 +28,7 @@
     composer: $("#composer"),
     input: $("#message-input"),
     send: $("#send-message"),
+    designProfileChip: $("#design-profile-chip"),
     imageInput: $("#image-input"),
     attachmentTray: $("#attachment-tray"),
     selectedReference: $("#selected-reference"),
@@ -45,6 +46,34 @@
     mobileSessions: $("#mobile-sessions-toggle"),
     mobileChat: $("#mobile-chat-toggle"),
     mobileShade: $("#mobile-shade"),
+    styleOpen: $("#style-library-open"),
+    styleDialog: $("#style-library-dialog"),
+    styleClose: $("#style-library-close"),
+    styleNew: $("#style-new"),
+    styleList: $("#style-list"),
+    styleCreatePane: $("#style-create-pane"),
+    styleEditorPane: $("#style-editor-pane"),
+    styleName: $("#style-name"),
+    styleUrl: $("#style-url"),
+    styleGuidance: $("#style-guidance"),
+    styleImages: $("#style-images"),
+    styleUseSelected: $("#style-use-selected"),
+    styleSourceStrip: $("#style-source-strip"),
+    styleGenerate: $("#style-generate"),
+    styleGenerateStatus: $("#style-generate-status"),
+    styleEditorName: $("#style-editor-name"),
+    styleEditorDescription: $("#style-editor-description"),
+    styleOwner: $("#style-owner"),
+    styleVersion: $("#style-version"),
+    styleReferenceStrip: $("#style-reference-strip"),
+    stylePreview: $("#style-preview"),
+    styleSourceSummary: $("#style-source-summary"),
+    styleMarkdown: $("#style-markdown"),
+    styleArchive: $("#style-archive"),
+    styleFork: $("#style-fork"),
+    styleSaveVersion: $("#style-save-version"),
+    styleUseOnce: $("#style-use-once"),
+    styleUseSession: $("#style-use-session"),
     toast: $("#toast"),
   };
 
@@ -65,6 +94,12 @@
     avatarTimer: null,
     chatWidth: null,
     cubeBuilders: new Map(),
+    designProfiles: [],
+    designProfileId: null,
+    designProfileVersionId: null,
+    nextTurnDesignProfileVersionId: null,
+    designSourceImages: [],
+    useSelectedAsDesignSource: false,
     markup: {
       surface: null,
       image: null,
@@ -256,6 +291,448 @@
     }
   }
 
+  function designVersions(profile) {
+    if (Array.isArray(profile?.versions) && profile.versions.length) return profile.versions;
+    return profile?.version ? [profile.version] : [];
+  }
+
+  function designVersionById(versionId) {
+    if (!versionId) return null;
+    for (const profile of state.designProfiles) {
+      const version = designVersions(profile).find((item) => item.id === versionId);
+      if (version) return { profile, version };
+    }
+    return null;
+  }
+
+  function selectedSurfaceDesignVersionId() {
+    const surface = state.surfaces.find((item) => item.id === state.selectedSurfaceId);
+    return surface?.presentation?.design_profile?.version_id
+      || surface?.design_profile_version_id
+      || null;
+  }
+
+  function effectiveComposerDesignProfile() {
+    const choices = [
+      [state.nextTurnDesignProfileVersionId, "next turn"],
+      [selectedSurfaceDesignVersionId(), "selected artifact"],
+      [state.current?.design_profile_version_id, "session"],
+    ];
+    for (const [versionId, mode] of choices) {
+      if (!versionId) continue;
+      const found = designVersionById(versionId);
+      if (found) return { ...found, mode };
+      const surface = state.surfaces.find((item) =>
+        item.presentation?.design_profile?.version_id === versionId
+      );
+      const snapshot = surface?.presentation?.design_profile;
+      if (snapshot) {
+        return {
+          mode,
+          profile: { id: snapshot.profile_id, name: snapshot.name },
+          version: { id: snapshot.version_id, version: snapshot.version },
+        };
+      }
+    }
+    return null;
+  }
+
+  function renderDesignProfileChip() {
+    const active = effectiveComposerDesignProfile();
+    els.designProfileChip.hidden = !active;
+    if (!active) {
+      els.designProfileChip.innerHTML = "";
+      return;
+    }
+    const clearMode = active.mode === "selected artifact"
+      ? "surface"
+      : active.mode === "next turn" ? "once" : "session";
+    els.designProfileChip.innerHTML = `<i aria-hidden="true"></i>
+      <span>Design · ${escapeHtml(active.mode)}</span>
+      <strong data-open-design-profile="${escapeHtml(active.profile.id || "")}">${
+        escapeHtml(active.profile.name || "Pinned profile")
+      } · v${escapeHtml(active.version.version || "?")}</strong>
+      <button type="button" data-clear-design-profile="${clearMode}" aria-label="Clear Design Profile">×</button>`;
+  }
+
+  function mergeDesignProfile(profile) {
+    const index = state.designProfiles.findIndex((item) => item.id === profile.id);
+    if (index >= 0) state.designProfiles[index] = profile;
+    else state.designProfiles.unshift(profile);
+  }
+
+  async function loadDesignProfiles() {
+    const data = await api("/api/calliope/styles");
+    state.designProfiles = data.profiles || [];
+    renderDesignProfileList();
+    renderDesignProfileChip();
+  }
+
+  function renderDesignProfileList() {
+    const visibleProfiles = state.designProfiles.filter((profile) => !profile.archived);
+    if (!visibleProfiles.length) {
+      els.styleList.innerHTML = '<div class="style-list-empty">No Design Profiles yet.<br>Create the company’s first reusable visual language.</div>';
+      return;
+    }
+    els.styleList.innerHTML = visibleProfiles.map((profile) => `
+      <button class="style-list-card ${state.designProfileId === profile.id ? "active" : ""}"
+              type="button" data-design-profile="${escapeHtml(profile.id)}">
+        <i aria-hidden="true"></i>
+        <strong>${escapeHtml(profile.name)}</strong>
+        <span>v${escapeHtml(profile.current_version)} · ${escapeHtml(profile.can_edit ? "yours" : profile.owner_email)}</span>
+      </button>`).join("");
+  }
+
+  function resetDesignSourceForm() {
+    state.designSourceImages = [];
+    state.useSelectedAsDesignSource = false;
+    els.styleName.value = "";
+    els.styleUrl.value = "";
+    els.styleGuidance.value = "";
+    els.styleImages.value = "";
+    els.styleGenerateStatus.textContent = "";
+    renderDesignSourceStrip();
+  }
+
+  function eligibleSelectedDesignSource() {
+    return state.surfaces.find((item) =>
+      item.id === state.selectedSurfaceId && ["image", "artifact"].includes(item.kind)
+    ) || null;
+  }
+
+  function syncSelectedDesignSourceButton() {
+    const surface = eligibleSelectedDesignSource();
+    els.styleUseSelected.disabled = !surface;
+    els.styleUseSelected.classList.toggle("active", Boolean(surface && state.useSelectedAsDesignSource));
+    els.styleUseSelected.innerHTML = surface
+      ? `<span>⌖</span> ${state.useSelectedAsDesignSource ? "Using" : "Use"} ${escapeHtml(surface.title)}`
+      : "<span>⌖</span> Select a capture or artifact first";
+  }
+
+  function renderDesignSourceStrip() {
+    const sourceCards = state.designSourceImages.map((item, index) => `
+      <div class="style-source-thumb">
+        <img src="${escapeHtml(item.data_url)}" alt="${escapeHtml(item.name)}">
+        <span>${escapeHtml(item.name)}</span>
+        <button type="button" data-remove-design-source="${index}" aria-label="Remove ${escapeHtml(item.name)}">×</button>
+      </div>`).join("");
+    const selected = state.useSelectedAsDesignSource ? eligibleSelectedDesignSource() : null;
+    const selectedCard = selected
+      ? `<div class="style-source-thumb"><span>Selected · ${escapeHtml(selected.title)}</span></div>`
+      : "";
+    els.styleSourceStrip.innerHTML = sourceCards + selectedCard;
+    els.styleSourceStrip.hidden = !sourceCards && !selectedCard;
+    syncSelectedDesignSourceButton();
+  }
+
+  function showNewDesignProfile() {
+    state.designProfileId = null;
+    state.designProfileVersionId = null;
+    els.styleCreatePane.hidden = false;
+    els.styleEditorPane.hidden = true;
+    resetDesignSourceForm();
+    renderDesignProfileList();
+    requestAnimationFrame(() => els.styleName.focus());
+  }
+
+  async function openDesignProfiles(profileId = null) {
+    const opening = !els.styleDialog.open;
+    if (opening) {
+      els.styleDialog.showModal();
+      await loadDesignProfiles();
+    }
+    syncSelectedDesignSourceButton();
+    const target = profileId || state.designProfileId || state.designProfiles[0]?.id;
+    if (target) await selectDesignProfile(target);
+    else showNewDesignProfile();
+  }
+
+  function selectedDesignVersion() {
+    const profile = state.designProfiles.find((item) => item.id === state.designProfileId);
+    if (!profile) return null;
+    const versions = designVersions(profile);
+    const version = versions.find((item) => item.id === state.designProfileVersionId)
+      || versions.find((item) => Number(item.version) === Number(profile.current_version))
+      || versions[0];
+    return version ? { profile, version } : null;
+  }
+
+  function safeStyleColor(value, fallback) {
+    const candidate = String(value || "").trim();
+    return candidate && globalThis.CSS?.supports?.("color", candidate) ? candidate : fallback;
+  }
+
+  function safeStyleLength(property, value, fallback) {
+    const candidate = String(value || "").trim();
+    return candidate && globalThis.CSS?.supports?.(property, candidate) ? candidate : fallback;
+  }
+
+  function safeStyleFont(value, fallback) {
+    const candidate = String(value || "").trim();
+    return candidate && !/[;{}<>]|url\s*\(/i.test(candidate) ? candidate : fallback;
+  }
+
+  function renderDesignPreview(profile, version) {
+    const tokens = version.tokens || {};
+    const palette = tokens.palette || {};
+    const typography = tokens.typography || {};
+    const shape = tokens.shape || {};
+    const effects = tokens.effects || {};
+    const chart = tokens.charts || {};
+    const colors = {
+      bg: safeStyleColor(palette.background, "#10151a"),
+      surface: safeStyleColor(palette.surface, "#172027"),
+      surfaceAlt: safeStyleColor(palette.surface_alt, "#121b21"),
+      text: safeStyleColor(palette.text, "#f3f5f6"),
+      muted: safeStyleColor(palette.muted, "#87929a"),
+      accent: safeStyleColor(palette.accent, "#68c7b2"),
+      accentAlt: safeStyleColor(palette.accent_alt, "#f5b446"),
+      border: safeStyleColor(palette.border, "rgba(255,255,255,.12)"),
+    };
+    const series = Array.isArray(chart.series)
+      ? chart.series.map((color) => safeStyleColor(color, colors.accent)).slice(0, 6)
+      : [];
+    const bars = [38, 66, 49, 84, 58, 96, 73].map((height, index) =>
+      `<i style="--bar:${height}%;--bar-color:${escapeHtml(series[index % Math.max(1, series.length)] || (index % 3 === 1 ? colors.accentAlt : colors.accent))}"></i>`
+    ).join("");
+    els.stylePreview.innerHTML = `
+      <div class="style-preview-top"><i></i><strong>${escapeHtml(profile.name)}</strong><span>Operations overview</span></div>
+      <div class="style-preview-body">
+        <div class="style-preview-kicker">Live signal · current period</div>
+        <div class="style-preview-title">Clarity at decision speed.</div>
+        <div class="style-preview-metrics">
+          <div class="style-preview-metric"><span>Pipeline</span><b>$2.4m</b></div>
+          <div class="style-preview-metric"><span>Conversion</span><b>18.7%</b></div>
+          <div class="style-preview-metric"><span>At risk</span><b>14</b></div>
+        </div>
+        <div class="style-preview-chart">${bars}</div>
+      </div>`;
+    const variables = {
+      "--sp-bg": colors.bg,
+      "--sp-surface": colors.surface,
+      "--sp-surface-alt": colors.surfaceAlt,
+      "--sp-text": colors.text,
+      "--sp-muted": colors.muted,
+      "--sp-accent": colors.accent,
+      "--sp-border": colors.border,
+      "--sp-display": safeStyleFont(typography.display, "ui-sans-serif, sans-serif"),
+      "--sp-body": safeStyleFont(typography.body, "ui-sans-serif, sans-serif"),
+      "--sp-mono": safeStyleFont(typography.mono, "ui-monospace, monospace"),
+      "--sp-radius": safeStyleLength("border-radius", shape.radius, "0px"),
+      "--sp-shadow": safeStyleLength("box-shadow", effects.shadow, "0 18px 45px rgba(0,0,0,.3)"),
+    };
+    Object.entries(variables).forEach(([name, value]) => els.stylePreview.style.setProperty(name, value));
+  }
+
+  function renderDesignReferences(version) {
+    const assets = version.assets || [];
+    els.styleReferenceStrip.innerHTML = assets.map((asset) => {
+      if (asset.url) {
+        return `<div class="style-reference-card">
+          <img src="${escapeHtml(asset.url)}" alt="${escapeHtml(asset.original_name || "Design reference")}">
+          <span>${escapeHtml(asset.source_kind)} · ${escapeHtml(asset.original_name || "reference")}</span>
+        </div>`;
+      }
+      return `<div class="style-reference-card url-only">
+        <b title="${escapeHtml(asset.source_url || "Frozen source")}">${escapeHtml(asset.source_url || asset.source_kind)}</b>
+      </div>`;
+    }).join("");
+  }
+
+  function renderDesignEditor() {
+    const selected = selectedDesignVersion();
+    if (!selected) {
+      showNewDesignProfile();
+      return;
+    }
+    const { profile, version } = selected;
+    state.designProfileVersionId = version.id;
+    els.styleCreatePane.hidden = true;
+    els.styleEditorPane.hidden = false;
+    els.styleEditorName.textContent = profile.name;
+    els.styleEditorDescription.textContent = profile.description || "No description supplied.";
+    els.styleOwner.textContent = profile.can_edit
+      ? `Created by you · company visible`
+      : `Created by ${profile.owner_email} · duplicate to revise`;
+    els.styleVersion.innerHTML = designVersions(profile).map((item) =>
+      `<option value="${escapeHtml(item.id)}" ${item.id === version.id ? "selected" : ""}>v${escapeHtml(item.version)}${
+        Number(item.version) === Number(profile.current_version) ? " · current" : ""
+      }</option>`
+    ).join("");
+    els.styleMarkdown.value = version.markdown || "";
+    els.styleMarkdown.readOnly = !profile.can_edit;
+    els.styleSaveVersion.disabled = !profile.can_edit;
+    els.styleArchive.disabled = !profile.can_edit;
+    els.styleUseOnce.disabled = !state.current || profile.archived;
+    els.styleUseSession.disabled = !state.current || profile.archived;
+    els.styleUseSession.textContent = state.current?.design_profile_version_id === version.id
+      ? "Using in this session"
+      : "Use in this session";
+    els.styleUseOnce.textContent = state.nextTurnDesignProfileVersionId === version.id
+      ? "Using next turn"
+      : "Use next turn";
+    els.styleSourceSummary.textContent = version.source_summary || "";
+    renderDesignReferences(version);
+    renderDesignPreview(profile, version);
+    renderDesignProfileList();
+  }
+
+  async function selectDesignProfile(profileId) {
+    const data = await api(`/api/calliope/styles/${encodeURIComponent(profileId)}`);
+    mergeDesignProfile(data.profile);
+    state.designProfileId = data.profile.id;
+    state.designProfileVersionId = data.profile.version?.id || designVersions(data.profile)[0]?.id || null;
+    renderDesignEditor();
+    renderDesignProfileChip();
+  }
+
+  async function readDesignSourceImages(files) {
+    const accepted = [...files].slice(0, Math.max(0, 4 - state.designSourceImages.length));
+    for (const file of accepted) {
+      if (!/^image\/(png|jpeg|webp|gif)$/.test(file.type)) {
+        toast(`${file.name} is not a supported image`, true);
+        continue;
+      }
+      if (state.config?.max_image_bytes && file.size > state.config.max_image_bytes) {
+        toast(`${file.name} is too large`, true);
+        continue;
+      }
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+      state.designSourceImages.push({ name: file.name, data_url: dataUrl });
+    }
+    renderDesignSourceStrip();
+  }
+
+  async function generateDesignProfile() {
+    const name = els.styleName.value.trim();
+    if (!name) {
+      toast("Give the Design Profile a name", true);
+      els.styleName.focus();
+      return;
+    }
+    const selected = state.useSelectedAsDesignSource ? eligibleSelectedDesignSource() : null;
+    els.styleGenerate.disabled = true;
+    els.styleGenerateStatus.textContent = "Calliope is reading the references and building the profile…";
+    try {
+      const data = await api("/api/calliope/styles", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          source_url: els.styleUrl.value.trim(),
+          guidance: els.styleGuidance.value.trim(),
+          attachments: state.designSourceImages,
+          selected_surface_id: selected?.id || null,
+        }),
+      });
+      mergeDesignProfile(data.profile);
+      state.designProfileId = data.profile.id;
+      state.designProfileVersionId = data.profile.version.id;
+      resetDesignSourceForm();
+      renderDesignEditor();
+      toast(`Design Profile created · ${data.profile.name}`);
+    } finally {
+      els.styleGenerate.disabled = false;
+      els.styleGenerateStatus.textContent = "";
+    }
+  }
+
+  async function saveDesignProfileVersion() {
+    const selected = selectedDesignVersion();
+    if (!selected?.profile.can_edit) return;
+    const markdown = els.styleMarkdown.value.trim();
+    const data = await api(
+      `/api/calliope/styles/${encodeURIComponent(selected.profile.id)}/versions`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          markdown,
+          tokens: selected.version.tokens || {},
+          source_summary: selected.version.source_summary || "",
+        }),
+      },
+    );
+    mergeDesignProfile(data.profile);
+    state.designProfileId = data.profile.id;
+    state.designProfileVersionId = data.profile.version.id;
+    renderDesignEditor();
+    renderDesignProfileChip();
+    toast(`Saved ${data.profile.name} · v${data.profile.current_version}`);
+  }
+
+  async function applyDesignProfileToSession(versionId) {
+    if (!state.current) return;
+    const data = await api(`/api/calliope/sessions/${encodeURIComponent(state.current.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ design_profile_version_id: versionId }),
+    });
+    state.current = data.session;
+    const summary = state.sessions.find((item) => item.id === state.current.id);
+    if (summary) summary.design_profile_version_id = versionId;
+    renderDesignEditor();
+    renderDesignProfileChip();
+  }
+
+  async function clearComposerDesignProfile(mode) {
+    if (mode === "once") {
+      state.nextTurnDesignProfileVersionId = null;
+    } else if (mode === "surface") {
+      clearSurfaceSelection();
+    } else if (mode === "session" && state.current) {
+      await applyDesignProfileToSession(null);
+    }
+    renderDesignProfileChip();
+  }
+
+  async function archiveDesignProfile() {
+    const selected = selectedDesignVersion();
+    if (!selected?.profile.can_edit) return;
+    if (!window.confirm(`Archive “${selected.profile.name}”? Existing artifacts retain their pinned version.`)) return;
+    await api(`/api/calliope/styles/${encodeURIComponent(selected.profile.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ archived: true }),
+    });
+    const ids = new Set(designVersions(selected.profile).map((item) => item.id));
+    if (ids.has(state.current?.design_profile_version_id)) {
+      await applyDesignProfileToSession(null);
+    }
+    if (ids.has(state.nextTurnDesignProfileVersionId)) {
+      state.nextTurnDesignProfileVersionId = null;
+    }
+    state.designProfileId = null;
+    state.designProfileVersionId = null;
+    await loadDesignProfiles();
+    if (state.designProfiles[0]) await selectDesignProfile(state.designProfiles[0].id);
+    else showNewDesignProfile();
+    toast("Design Profile archived");
+  }
+
+  async function forkDesignProfile() {
+    const selected = selectedDesignVersion();
+    if (!selected) return;
+    const name = window.prompt("Name the duplicated Design Profile", `${selected.profile.name} copy`);
+    if (!name?.trim()) return;
+    const data = await api(
+      `/api/calliope/styles/${encodeURIComponent(selected.profile.id)}/fork`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          name: name.trim(),
+          version_id: selected.version.id,
+        }),
+      },
+    );
+    mergeDesignProfile(data.profile);
+    state.designProfileId = data.profile.id;
+    state.designProfileVersionId = data.profile.version.id;
+    renderDesignEditor();
+    toast(`Duplicated as ${data.profile.name}`);
+  }
+
   async function loadSessions(selectId = null) {
     const data = await api("/api/calliope/sessions");
     state.sessions = data.sessions || [];
@@ -298,12 +775,14 @@
     state.turns = [];
     state.surfaces = [];
     state.selectedSurfaceId = null;
+    state.nextTurnDesignProfileVersionId = null;
     state.cubeBuilders.clear();
     els.sessionTitle.textContent = "Choose or start a session";
     els.archiveSession.disabled = true;
     els.input.disabled = true;
     els.send.disabled = true;
     renderSelected();
+    renderDesignProfileChip();
     renderSpatialSelectionTray();
     renderChat();
     renderStage();
@@ -317,6 +796,7 @@
     state.turns = data.turns || [];
     state.surfaces = data.surfaces || [];
     state.selectedSurfaceId = null;
+    state.nextTurnDesignProfileVersionId = null;
     state.cubeBuilders.clear();
     state.newSurfaceCount = 0;
     els.sessionTitle.textContent = state.current.title;
@@ -325,6 +805,7 @@
     els.send.disabled = false;
     renderSessions();
     renderSelected();
+    renderDesignProfileChip();
     renderSpatialSelectionTray();
     renderChat(true);
     renderStage(true);
@@ -1355,11 +1836,26 @@
     }
   }
 
+  function artifactEmbedUrl(value) {
+    try {
+      const url = new URL(value, window.location.href);
+      if (
+        url.origin === window.location.origin
+        && url.pathname.startsWith("/calliope/artifacts/")
+      ) {
+        url.searchParams.set("embed", "1");
+        return `${url.pathname}${url.search}${url.hash}`;
+      }
+    } catch { /* retain the original artifact URL */ }
+    return value;
+  }
+
   function renderArtifact(surface) {
     const url = surface.payload?.display_url || surface.payload?.url;
     if (!url) return `<div class="chart-empty">Artifact URL unavailable</div>`;
+    const embedUrl = artifactEmbedUrl(url);
     return `<div class="artifact-frame">
-      <iframe src="${escapeHtml(url)}" title="${escapeHtml(surface.title)}"
+      <iframe src="${escapeHtml(embedUrl)}" title="${escapeHtml(surface.title)}"
         data-artifact-slug="${escapeHtml(surface.artifact_slug || "")}"
         sandbox="allow-scripts allow-forms allow-popups allow-downloads"
         loading="lazy" scrolling="no" referrerpolicy="same-origin"></iframe>
@@ -1381,6 +1877,7 @@
     const url = surface.payload?.image_url;
     const baseUrl = surface.payload?.base_image_url;
     const overlayUrl = surface.payload?.overlay_image_url;
+    const imageStatus = surface.payload?.image_status;
     const width = Number(surface.payload?.width);
     const height = Number(surface.payload?.height);
     if (url && baseUrl && overlayUrl) {
@@ -1397,7 +1894,11 @@
     return `<div class="image-body">${
       url
         ? `<img src="${escapeHtml(url)}" alt="${escapeHtml(surface.title)}">`
-        : `<div class="chart-empty">Capture saved at ${escapeHtml(surface.payload?.path || "the warehouse")}</div>`
+        : `<div class="chart-empty">${
+          imageStatus === "expired"
+            ? "Capture expired · the artifact version remains available"
+            : "Capture unavailable"
+        }</div>`
     }</div>`;
   }
 
@@ -1433,6 +1934,7 @@
   }
 
   function surfaceCard(surface) {
+    const designProfile = surface.presentation?.design_profile;
     const meta = [
       surface.artifact_version ? `v${surface.artifact_version}` : null,
       relativeTime(surface.created_at),
@@ -1470,7 +1972,11 @@
     }">
       <header class="surface-head">
         <span class="surface-kind">${surfaceGlyph(surface.kind)} ${metadata ? "metadata" : escapeHtml(surface.kind)}</span>
-        <div class="surface-titles"><h3>${escapeHtml(surface.title)}</h3><p>${escapeHtml(meta)}</p></div>
+        <div class="surface-titles"><h3>${escapeHtml(surface.title)}</h3><p>${escapeHtml(meta)}${
+          designProfile
+            ? `<span class="style-profile-badge" title="Pinned Design Profile version">${escapeHtml(designProfile.name)} · v${escapeHtml(designProfile.version)}</span>`
+            : ""
+        }</p></div>
         <div class="surface-tools">
           ${surface.kind === "image" && surface.payload?.overlay_image_url
             ? `<button type="button" data-toggle-markup="${escapeHtml(surface.id)}" aria-pressed="true" title="Hide or show markup">Marks</button>`
@@ -1524,6 +2030,7 @@
     state.selectedSurfaceId = id;
     setMobilePanel();
     renderSelected();
+    renderDesignProfileChip();
     $$(".surface.selected").forEach((element) => {
       element.classList.remove("selected");
       element.setAttribute("aria-current", "false");
@@ -1543,6 +2050,7 @@
   function clearSurfaceSelection() {
     state.selectedSurfaceId = null;
     renderSelected();
+    renderDesignProfileChip();
     $$(".surface.selected").forEach((element) => {
       element.classList.remove("selected");
       element.setAttribute("aria-current", "false");
@@ -1706,6 +2214,7 @@
     state.spatialSelections.push(selection);
     state.selectedSurfaceId = surface.id;
     renderSelected();
+    renderDesignProfileChip();
     renderSpatialSelectionTray();
     $$(".surface.selected").forEach((element) => {
       element.classList.remove("selected");
@@ -2018,6 +2527,7 @@
   }
 
   async function readFiles(files) {
+    const before = state.attachments.length;
     const accepted = [...files].slice(0, Math.max(0, 4 - state.attachments.length));
     for (const file of accepted) {
       if (!/^image\/(png|jpeg|webp|gif)$/.test(file.type)) {
@@ -2034,9 +2544,43 @@
         reader.onerror = reject;
         reader.readAsDataURL(file);
       });
-      state.attachments.push({ name: file.name, data_url: dataUrl });
+      const extension = {
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/webp": "webp",
+        "image/gif": "gif",
+      }[file.type] || "png";
+      const name = file.name || `Pasted image ${state.attachments.length + 1}.${extension}`;
+      state.attachments.push({ name, data_url: dataUrl });
     }
     renderAttachmentTray();
+    return state.attachments.length - before;
+  }
+
+  function pastedImageFiles(event) {
+    const clipboard = event.clipboardData;
+    if (!clipboard) return [];
+    const direct = [...(clipboard.files || [])].filter((file) => file.type.startsWith("image/"));
+    if (direct.length) return direct;
+    return [...(clipboard.items || [])]
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+  }
+
+  function pasteImages(event) {
+    const images = pastedImageFiles(event);
+    if (!images.length) return;
+    event.preventDefault();
+    readFiles(images)
+      .then((added) => {
+        if (!added) {
+          toast("A message can include at most four supported images", true);
+        } else {
+          toast(added === 1 ? "Pasted image attached" : `${added} pasted images attached`);
+        }
+      })
+      .catch((error) => toast(error.message, true));
   }
 
   function renderAttachmentTray() {
@@ -2114,11 +2658,14 @@
     if (!message && !state.attachments.length && !state.spatialSelections.length) return;
     const outgoingAttachments = [...state.attachments];
     const outgoingSpatialSelections = state.spatialSelections.map((selection) => ({ ...selection }));
+    const outgoingDesignProfileVersionId = state.nextTurnDesignProfileVersionId;
     const pending = optimisticTurn(message, Boolean(outgoingSpatialSelections.length));
     els.input.value = "";
     state.attachments = [];
     clearSpatialSelections();
+    state.nextTurnDesignProfileVersionId = null;
     renderAttachmentTray();
+    renderDesignProfileChip();
     resizeComposer();
     state.busy = true;
     els.send.disabled = true;
@@ -2136,6 +2683,9 @@
           attachments: outgoingAttachments,
           spatial_selections: outgoingSpatialSelections,
           selected_surface_id: state.selectedSurfaceId,
+          ...(outgoingDesignProfileVersionId
+            ? { design_profile_version_id: outgoingDesignProfileVersionId }
+            : {}),
         }),
       });
       await parseEventStream(response, async (event, data) => {
@@ -2193,6 +2743,10 @@
     } catch (error) {
       pending.status = "failed";
       pending.error = error.message;
+      if (outgoingDesignProfileVersionId && !state.nextTurnDesignProfileVersionId) {
+        state.nextTurnDesignProfileVersionId = outgoingDesignProfileVersionId;
+        renderDesignProfileChip();
+      }
       renderChat();
       toast(error.message, true);
     } finally {
@@ -2214,6 +2768,81 @@
   }
 
   function setupEvents() {
+    els.styleOpen.addEventListener("click", () => {
+      openDesignProfiles().catch((error) => toast(error.message, true));
+    });
+    els.styleClose.addEventListener("click", () => els.styleDialog.close());
+    els.styleNew.addEventListener("click", showNewDesignProfile);
+    els.styleList.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-design-profile]");
+      if (!button) return;
+      selectDesignProfile(button.dataset.designProfile).catch((error) => toast(error.message, true));
+    });
+    els.styleImages.addEventListener("change", () => {
+      readDesignSourceImages(els.styleImages.files).catch((error) => toast(error.message, true));
+      els.styleImages.value = "";
+    });
+    els.styleSourceStrip.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-remove-design-source]");
+      if (!button) return;
+      state.designSourceImages.splice(Number(button.dataset.removeDesignSource), 1);
+      renderDesignSourceStrip();
+    });
+    els.styleUseSelected.addEventListener("click", () => {
+      if (!eligibleSelectedDesignSource()) return;
+      state.useSelectedAsDesignSource = !state.useSelectedAsDesignSource;
+      renderDesignSourceStrip();
+    });
+    els.styleGenerate.addEventListener("click", () => {
+      generateDesignProfile().catch((error) => toast(error.message, true));
+    });
+    els.styleVersion.addEventListener("change", () => {
+      state.designProfileVersionId = els.styleVersion.value;
+      renderDesignEditor();
+    });
+    els.styleSaveVersion.addEventListener("click", () => {
+      saveDesignProfileVersion().catch((error) => toast(error.message, true));
+    });
+    els.styleFork.addEventListener("click", () => {
+      forkDesignProfile().catch((error) => toast(error.message, true));
+    });
+    els.styleArchive.addEventListener("click", () => {
+      archiveDesignProfile().catch((error) => toast(error.message, true));
+    });
+    els.styleUseOnce.addEventListener("click", () => {
+      const selected = selectedDesignVersion();
+      if (!selected || !state.current) return;
+      state.nextTurnDesignProfileVersionId = selected.version.id;
+      renderDesignEditor();
+      renderDesignProfileChip();
+      els.styleDialog.close();
+      els.input.focus();
+      toast(`${selected.profile.name} will guide the next turn`);
+    });
+    els.styleUseSession.addEventListener("click", () => {
+      const selected = selectedDesignVersion();
+      if (!selected || !state.current) return;
+      applyDesignProfileToSession(selected.version.id)
+        .then(() => {
+          els.styleDialog.close();
+          els.input.focus();
+          toast(`${selected.profile.name} is now the session Design Profile`);
+        })
+        .catch((error) => toast(error.message, true));
+    });
+    els.designProfileChip.addEventListener("click", (event) => {
+      const clear = event.target.closest("[data-clear-design-profile]");
+      if (clear) {
+        clearComposerDesignProfile(clear.dataset.clearDesignProfile)
+          .catch((error) => toast(error.message, true));
+        return;
+      }
+      const target = event.target.closest("[data-open-design-profile]");
+      if (target) {
+        openDesignProfiles(target.dataset.openDesignProfile)
+          .catch((error) => toast(error.message, true));
+      }
+    });
     els.chatResizer.addEventListener("pointerdown", beginChatResize);
     els.chatResizer.addEventListener("pointermove", moveChatResize);
     els.chatResizer.addEventListener("pointerup", endChatResize);
@@ -2264,6 +2893,7 @@
       sendTurn();
     });
     els.input.addEventListener("input", resizeComposer);
+    els.input.addEventListener("paste", pasteImages);
     els.input.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
         event.preventDefault();
@@ -2519,6 +3149,7 @@
     setupEvents();
     try {
       await loadConfig();
+      await loadDesignProfiles();
       await loadSessions();
       if (!state.sessions.length) {
         els.dialog.showModal();

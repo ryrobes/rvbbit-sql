@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -48,6 +50,15 @@ def test_calliope_header_requests_homemade_apple_and_local_time_avatars():
     assert "now.getHours()" in script
 
 
+def test_chat_composer_accepts_clipboard_images_through_the_upload_pipeline():
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    assert "function pastedImageFiles(event)" in script
+    assert "event.clipboardData" in script
+    assert 'els.input.addEventListener("paste", pasteImages)' in script
+    assert "readFiles(images)" in script
+    assert "Pasted image attached" in script
+
+
 def test_calliope_selection_toggles_and_chat_column_is_resizable():
     page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
     script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
@@ -84,6 +95,75 @@ def test_owner_is_signed_human_identity_not_execution_subject(monkeypatch):
     assert session["sub"] == "analyst_execution_role"
 
 
+def test_new_artifact_versions_are_attributed_to_the_signed_turn_owner():
+    queries = []
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            queries.append((query, params))
+            if query.startswith("UPDATE rvbbit.dashboard_versions"):
+                assert params == (
+                    "business.user@example.com",
+                    "09fe1c22-5802-4bb0-9e14-2f26ab0223af",
+                    "business.user@example.com",
+                    "growth-brief",
+                    4,
+                )
+                assert "v.created_at >= t.created_at" in query
+                return Result({"dashboard_id": "dashboard-1"})
+            return Result()
+
+    projected = [{
+        "kind": "artifact",
+        "artifact_slug": "growth-brief",
+        "artifact_version": 4,
+        "payload": {"slug": "growth-brief", "version": 4, "owner": "static-key"},
+    }]
+    attributed = calliope._attribute_turn_artifacts(
+        Connection,
+        "business.user@example.com",
+        "09fe1c22-5802-4bb0-9e14-2f26ab0223af",
+        projected,
+    )
+    assert attributed[0]["payload"]["owner"] == "business.user@example.com"
+    assert attributed[0]["payload"]["created_by"] == "business.user@example.com"
+    assert any(
+        query.startswith("UPDATE rvbbit.dashboards")
+        and params == ("business.user@example.com", "dashboard-1")
+        for query, params in queries
+    )
+
+
+def test_startup_attribution_backfill_only_replaces_service_identities():
+    queries = []
+
+    class Connection:
+        def execute(self, query):
+            queries.append(query)
+
+    calliope._backfill_artifact_attribution(Connection())
+    assert len(queries) == 2
+    assert all("calliope_surfaces" in query for query in queries)
+    assert "dashboard_versions" in queries[0]
+    assert "created_by=a.owner_email" in queries[0]
+    assert "dashboards" in queries[1]
+    assert "owner_email=o.owner_email" in queries[1]
+    assert all("'static-key'" in query for query in queries)
+
+
 def test_shared_memory_header_is_company_scope_only():
     config = calliope.CalliopeConfig(
         hermes_url="http://hermes:8642",
@@ -97,6 +177,188 @@ def test_shared_memory_header_is_company_scope_only():
         "Content-Type": "application/json",
         "X-Hermes-Session-Key": "company-brain",
     }
+
+
+def test_design_profiles_are_versioned_in_schema_and_extension_migrations():
+    root = _HERE.parent.parent
+    migration = (
+        root
+        / "crates"
+        / "pg_rvbbit"
+        / "sql"
+        / "migrations"
+        / "0223_calliope_design_profiles.sql"
+    ).read_text(encoding="utf-8")
+    registry = (
+        root / "crates" / "pg_rvbbit" / "src" / "migrations.rs"
+    ).read_text(encoding="utf-8")
+    assert "calliope_design_profiles" in migration
+    assert "calliope_design_profile_versions" in migration
+    assert "calliope_design_profile_assets" in migration
+    assert migration.count("ADD COLUMN IF NOT EXISTS design_profile_version_id") == 3
+    assert "0223_calliope_design_profiles" in registry
+    assert "calliope_design_profile_versions" in calliope._STYLE_DDL
+
+
+def test_design_profile_prompt_is_exact_versioned_and_separate_from_ui_theme():
+    profile_id = "09fe1c22-5802-4bb0-9e14-2f26ab0223af"
+    compiled = calliope._compile_design_profile(
+        "Clinical clarity",
+        "# Direction\nUse calm, high-contrast operational layouts.",
+        {"palette": {"accent": "#2eb5a3"}},
+        profile_id,
+        3,
+    )
+    instructions = calliope._instructions(
+        [],
+        None,
+        design_profile={"compiled_prompt": compiled},
+    )
+    assert f"Exact profile: {profile_id} version 3" in instructions
+    assert "CALLIOPE_DESIGN_PROFILE_BEGIN" in instructions
+    assert "visual self-check must explicitly assess" in instructions
+    assert "Do not restyle Calliope itself" in instructions
+    assert '"accent":"#2eb5a3"' in instructions
+
+
+def test_design_profile_generation_parser_accepts_fenced_json_and_bounds_tokens():
+    result = calliope._parse_design_profile_generation(
+        {
+            "message": {
+                "content": """```json
+{
+  "description": "High-trust operations",
+  "source_summary": "Muted healthcare reference with crisp tables.",
+  "markdown": "# Design Profile\\n\\n## Direction\\nUse a calm, legible system for operational decisions.\\n\\n## Palette\\nUse deep navy and teal.\\n\\n## Avoid\\nNo ornamental gradients.",
+  "tokens": {"palette": {"background": "#07151d", "accent": "#2eb5a3"}}
+}
+```"""
+            }
+        },
+        "Clinical clarity",
+    )
+    assert result["name"] == "Clinical clarity"
+    assert result["tokens"]["palette"]["accent"] == "#2eb5a3"
+    assert result["markdown"].startswith("# Design Profile")
+
+
+def test_design_profile_url_validation_rejects_credentials_and_private_hosts():
+    assert calliope._style_url("https://example.com/reference") == (
+        "https://example.com/reference"
+    )
+    assert calliope._style_host_is_public("127.0.0.1") is False
+    assert calliope._style_host_is_public("8.8.8.8") is True
+    with pytest.raises(ValueError, match="credentials"):
+        calliope._style_url("https://user:secret@example.com")
+    with pytest.raises(ValueError, match="http or https"):
+        calliope._style_url("file:///etc/passwd")
+    assert calliope._redact_style_url(
+        "https://example.com/reference?token=secret&view=compact#private"
+    ) == "https://example.com/reference?token=%5Bredacted%5D&view=compact"
+
+
+def test_design_profile_library_ui_supports_sources_preview_versions_and_scope():
+    page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    css = (calliope._ASSET_DIR / "calliope.css").read_text(encoding="utf-8")
+    source = (_HERE / "calliope.py").read_text(encoding="utf-8")
+    assert 'id="style-library-dialog"' in page
+    assert 'id="style-url"' in page
+    assert 'id="style-markdown"' in page
+    assert 'id="style-use-selected"' in page
+    assert 'id="style-use-once"' in page
+    assert "/api/calliope/styles" in script
+    assert "design_profile_version_id" in script
+    assert "selected artifact" in script
+    assert "Live token preview" in page
+    assert ".style-preview" in css
+    # The library chrome follows the browser-selected Warehouse theme while
+    # the miniature dashboard remains an honest preview of the profile itself.
+    assert "--style-accent:var(--main,var(--amber))" in css
+    assert "--style-control:color-mix(in oklch,var(--block-bg,var(--panel))" in css
+    assert "background:var(--style-bg)" in css
+    assert ".style-library-dialog .primary-action" in css
+    assert "background:var(--sp-bg,#10151a)" in css
+    assert '"/api/calliope/styles/{profile_id}/versions"' in source
+    assert '"/api/calliope/style-assets/{asset_id}"' in source
+
+
+def test_design_profile_generator_sends_reference_images_to_hidden_hermes_session(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    async def fake_hermes(config, method, path, body=None, timeout_seconds=45.0):
+        calls.append((method, path, body, timeout_seconds))
+        if path.endswith("/chat"):
+            return {
+                "message": {
+                    "content": (
+                        '{"description":"Editorial operations",'
+                        '"source_summary":"One image and human guidance.",'
+                        '"markdown":"# Design Profile\\n\\n## Direction\\nUse a precise editorial '
+                        'system for operational dashboards.\\n\\n## Palette\\nUse ink and '
+                        'vermilion.\\n\\n## Avoid\\nAvoid gradients and ornamental cards.",'
+                        '"tokens":{"palette":{"accent":"#c43d2f"}}}'
+                    )
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(calliope, "_hermes_json", fake_hermes)
+    config = calliope.CalliopeConfig(
+        hermes_url="http://hermes:8642",
+        hermes_api_key="key",
+        memory_key="company",
+        file_root=tmp_path,
+        max_image_bytes=256 * 1024,
+    )
+    result = asyncio.run(calliope._generate_design_profile(
+        config,
+        "Editorial operations",
+        "Dense, legible, warm paper surfaces.",
+        [{
+            "source_kind": "image",
+            "original_name": "reference.png",
+            "data_url": "data:image/png;base64,aW1hZ2U=",
+            "metadata": {},
+        }],
+    ))
+    chat = next(call for call in calls if call[1].endswith("/chat"))
+    parts = chat[2]["message"]
+    assert any(part.get("type") == "image_url" for part in parts)
+    assert chat[3] == 240.0
+    assert result["tokens"]["palette"]["accent"] == "#c43d2f"
+    assert any(method == "DELETE" for method, *_ in calls)
+
+
+def test_session_patch_owns_profile_pinning_not_profile_metadata_patch():
+    source = (_HERE / "calliope.py").read_text(encoding="utf-8")
+    profile_patch = source.split("async def patch_design_profile", 1)[1].split(
+        "async def create_design_profile_version", 1
+    )[0]
+    session_patch = source.split("async def patch_session", 1)[1].split(
+        "async def get_attachment", 1
+    )[0]
+    assert '"design_profile_version_id" in body' not in profile_patch
+    assert '"design_profile_version_id" in body' in session_patch
+    assert "active_only=True" in session_patch
+
+
+def test_design_profile_asset_json_never_exposes_server_storage_path():
+    asset = calliope._design_profile_asset_json({
+        "id": "09fe1c22-5802-4bb0-9e14-2f26ab0223af",
+        "profile_version_id": "6c381d88-f8dd-44f5-82a7-3985657fbe52",
+        "source_kind": "image",
+        "original_name": "reference.png",
+        "mime_type": "image/png",
+        "storage_path": "/private/calliope/styles/reference.png",
+        "bytes": 42,
+        "metadata": {},
+    })
+    assert "storage_path" not in asset
+    assert asset["url"].endswith("/09fe1c22-5802-4bb0-9e14-2f26ab0223af")
 
 
 def test_projects_wrapped_query_and_batch_results_into_separate_surfaces():
@@ -240,6 +502,131 @@ def test_projects_exact_artifact_version_for_immutable_history():
     assert surfaces[0]["payload"]["display_url"] == (
         "/calliope/artifacts/growth-brief/versions/4"
     )
+
+
+def test_terminal_wrapped_artifact_and_capture_are_recovered_then_verified(
+    tmp_path,
+    monkeypatch,
+):
+    capture_root = tmp_path / "renderer"
+    capture_root.mkdir()
+    capture = capture_root / "growth-brief-v4.png"
+    capture.write_bytes(b"\x89PNG\r\n\x1a\nverified capture")
+    monkeypatch.setenv("WAREHOUSE_LIVE_APP_CAPTURE_DIR", str(capture_root))
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "terminal-update", "function": {"name": "terminal", "arguments": "{}"}},
+                {"id": "terminal-capture", "function": {"name": "terminal", "arguments": "{}"}},
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_name": "terminal",
+            "tool_call_id": "terminal-update",
+            "content": {
+                "exit_code": 0,
+                "output": json.dumps({
+                    "slug": "growth-brief",
+                    "version": 4,
+                    "runtime_kind": "html",
+                    "app_kind": "dashboard",
+                    "manifest": {"schema_version": "live_app.v0"},
+                }),
+            },
+        },
+        {
+            "role": "tool",
+            "tool_name": "terminal",
+            "tool_call_id": "terminal-capture",
+            "content": {
+                "exit_code": 0,
+                "output": json.dumps({
+                    "slug": "growth-brief",
+                    "version": 4,
+                    "runtime_kind": "html",
+                    "path": str(capture),
+                    "bytes": capture.stat().st_size,
+                    "width": 1200,
+                    "height": 800,
+                    "bridge": {"healthy": True, "queries_failed": 0},
+                }),
+            },
+        },
+    ]
+    projected = calliope.project_messages(messages)
+    assert [item["kind"] for item in projected] == ["artifact", "image"]
+    assert [item["_requires_artifact_verification"] for item in projected] == [
+        "artifact_write",
+        "capture",
+    ]
+
+    config = calliope.CalliopeConfig(
+        hermes_url="http://hermes:8642",
+        hermes_api_key="key",
+        memory_key="",
+        file_root=tmp_path / "calliope",
+        max_image_bytes=1024 * 1024,
+    )
+    frozen = calliope._publish_local_files(
+        projected,
+        messages,
+        "",
+        config,
+        "session-1",
+        "turn-1",
+    )
+    managed = Path(frozen[1]["payload"]["storage_path"])
+    assert managed.is_file()
+    assert managed.is_relative_to(config.file_root / "captures")
+
+    class Result:
+        def fetchone(self):
+            return {
+                "name": "Growth Brief",
+                "runtime_kind": "html",
+                "app_kind": "dashboard",
+            }
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _query, params):
+            assert params[1:3] == ("growth-brief", 4)
+            return Result()
+
+    verified = calliope._verify_recovered_surfaces(
+        Connection,
+        config,
+        "94da7082-b64c-4f3b-8bc4-63e59fcb7d57",
+        frozen,
+    )
+    assert [item["kind"] for item in verified] == ["artifact", "image"]
+    assert all("_requires_artifact_verification" not in item for item in verified)
+    assert all(item["source"]["verification"] == "warehouse_database" for item in verified)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"exit_code": 1, "output": '{"slug":"growth-brief","version":4}'},
+        {"exit_code": 0, "output": '{"slug":"growth-brief","version":4}'},
+        {"exit_code": 0, "output": "ordinary terminal prose"},
+    ],
+)
+def test_terminal_projection_rejects_unverified_or_ambiguous_output(content):
+    messages = [{
+        "role": "tool",
+        "tool_name": "terminal",
+        "tool_call_id": "terminal-noise",
+        "content": content,
+    }]
+    assert calliope.project_messages(messages) == []
 
 
 def test_metric_history_enriches_metric_and_pivot_projects_as_live_cube():
@@ -449,6 +836,38 @@ def test_sandbox_bridge_supports_single_and_batched_queries_without_same_origin(
     assert "document.cookie" not in script
 
 
+def test_historical_artifact_uses_parent_bridge_only_when_embedded():
+    def direct_shim(slug):
+        return f"<script>window.rvbbitQuery=()=>fetch('/api/d/{slug}/q');</script>"
+
+    full = calliope._artifact_version_document(
+        "artifact-one",
+        7,
+        "<main>historical</main>",
+        direct_shim,
+        embedded=False,
+    )
+    embedded = calliope._artifact_version_document(
+        "artifact-one",
+        7,
+        "<main>historical</main>",
+        direct_shim,
+        embedded=True,
+    )
+    assert "/api/d/artifact-one/q" in full
+    assert "Calliope data bridge timed out" not in full
+    assert "parent.postMessage" in embedded
+    assert "/api/d/artifact-one/q" not in embedded
+    assert "historical:true,version:7" in full
+    assert "historical:true,version:7" in embedded
+    assert not calliope._artifact_version_csp(False).startswith("sandbox")
+    assert calliope._artifact_version_csp(True).startswith("sandbox")
+
+    browser = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    assert "function artifactEmbedUrl(value)" in browser
+    assert 'url.searchParams.set("embed", "1")' in browser
+
+
 def test_calliope_spatial_prompt_ui_supports_objects_regions_and_drawing():
     page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
     script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
@@ -655,9 +1074,13 @@ def test_capture_feedback_is_real_image_input_and_bounded_to_new_surface(tmp_pat
     assert "visual self-check 1/2" in feedback[0]["text"]
     assert feedback[1]["image_url"]["url"].startswith("data:image/png;base64,")
     assert "capture_live_app(width=1200" in calliope._instructions([], None)
+    assert "Never import Warehouse server.py" in calliope._instructions([], None)
+    assert "do not build a local fallback wrapper" in calliope._instructions([], None)
 
 
-def test_capture_surface_hides_server_path_behind_owner_gated_url():
+def test_capture_surface_hides_server_path_behind_owner_gated_url(tmp_path):
+    capture = tmp_path / "private.png"
+    capture.write_bytes(b"\x89PNG\r\n\x1a\ncapture")
     surface = calliope._surface_json({
         "id": "09fe1c22-5802-4bb0-9e14-2f26ab0223af",
         "session_id": "6c381d88-f8dd-44f5-82a7-3985657fbe52",
@@ -665,7 +1088,7 @@ def test_capture_surface_hides_server_path_behind_owner_gated_url():
         "parent_surface_id": None,
         "kind": "image",
         "payload": {
-            "path": "/var/lib/warehouse/captures/private.png",
+            "path": str(capture),
             "slug": "quarterly-plan",
         },
     })
@@ -673,6 +1096,24 @@ def test_capture_surface_hides_server_path_behind_owner_gated_url():
     assert surface["payload"]["image_url"] == (
         "/api/calliope/surfaces/09fe1c22-5802-4bb0-9e14-2f26ab0223af/image"
     )
+
+
+def test_missing_legacy_capture_is_marked_expired_without_a_broken_image_request():
+    surface = calliope._surface_json({
+        "id": "09fe1c22-5802-4bb0-9e14-2f26ab0223af",
+        "session_id": "6c381d88-f8dd-44f5-82a7-3985657fbe52",
+        "turn_id": "94da7082-b64c-4f3b-8bc4-63e59fcb7d57",
+        "parent_surface_id": None,
+        "kind": "image",
+        "payload": {
+            "path": "/working/tmp/rvbbit-live-app-captures/deleted.png",
+            "slug": "quarterly-plan",
+        },
+    })
+    assert surface["payload"]["image_status"] == "expired"
+    assert "image_url" not in surface["payload"]
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    assert "Capture expired · the artifact version remains available" in script
 
 
 def test_local_agent_file_is_copied_and_exposed_only_by_surface_url(tmp_path):

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Calliope · Data Rabbit</title>
+  <link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Homemade+Apple&display=swap">
   <link rel="stylesheet" href="/calliope/calliope.css">
   <link rel="stylesheet" href="/theme/warehouse-theme.css">
@@ -30,6 +31,7 @@ __CALLIOPE_BACKGROUND__
   <div class="top-context">
     <span class="company-memory"><i></i> shared company memory</span>
     <a class="artifacts-link" href="/gallery">Artifacts</a>
+    <button id="style-library-open" class="style-library-open" type="button">Design Profiles</button>
     <span data-warehouse-theme-anchor></span>
     <span class="viewer">__CALLIOPE_VIEWER__</span>
     <a href="/auth/logout">Sign out</a>
@@ -104,6 +106,7 @@ __CALLIOPE_BACKGROUND__
     <div id="tool-activity" class="tool-activity" hidden></div>
 
     <form id="composer" class="composer">
+      <div id="design-profile-chip" class="design-profile-chip" hidden></div>
       <div id="selected-reference" class="selected-reference" hidden></div>
       <div id="spatial-selection-tray" class="spatial-selection-tray" hidden></div>
       <div id="attachment-tray" class="attachment-tray" hidden></div>
@@ -184,6 +187,96 @@ __CALLIOPE_BACKGROUND__
         <button id="markup-attach" type="button" class="primary-action" disabled>Add to message</button>
       </div>
     </footer>
+  </div>
+</dialog>
+
+<dialog id="style-library-dialog" class="style-library-dialog" aria-labelledby="style-library-title">
+  <div class="style-library-shell">
+    <header class="style-library-head">
+      <div>
+        <p class="eyebrow">Reusable creative direction</p>
+        <h2 id="style-library-title">Design Profiles</h2>
+      </div>
+      <p>Turn references and intent into a versioned authoring contract for dashboards, apps, charts, and decks.</p>
+      <button id="style-library-close" class="markup-close" type="button" aria-label="Close Design Profiles">×</button>
+    </header>
+    <div class="style-library-workspace">
+      <aside class="style-library-rail">
+        <div class="style-library-rail-head">
+          <span>Company library</span>
+          <button id="style-new" type="button">+ New</button>
+        </div>
+        <div id="style-list" class="style-list"></div>
+        <p>Everyone can use and fork profiles. Only the creator can revise the original.</p>
+      </aside>
+
+      <section id="style-create-pane" class="style-create-pane">
+        <div class="style-pane-intro">
+          <p class="eyebrow">Create from evidence</p>
+          <h3>Seed a visual language.</h3>
+          <p>Use any combination of screenshots, a URL, a selected Calliope capture, and plain-language direction. The source is frozen with version one.</p>
+        </div>
+        <label class="style-field">
+          <span>Profile name</span>
+          <input id="style-name" maxlength="120" placeholder="e.g. Clinical clarity">
+        </label>
+        <label class="style-field">
+          <span>Reference URL <i>optional</i></span>
+          <input id="style-url" type="url" placeholder="https://example.com">
+        </label>
+        <label class="style-field">
+          <span>Direction and constraints <i>optional</i></span>
+          <textarea id="style-guidance" rows="7" maxlength="12000" placeholder="Calm, high-trust, dense enough for operations. Avoid generic gradient cards…"></textarea>
+        </label>
+        <div class="style-source-actions">
+          <label class="style-source-button">
+            <input id="style-images" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+            <span>＋</span> Add reference images
+          </label>
+          <button id="style-use-selected" class="style-source-button" type="button" disabled><span>⌖</span> Use selected capture</button>
+        </div>
+        <div id="style-source-strip" class="style-source-strip" hidden></div>
+        <div class="style-create-actions">
+          <span id="style-generate-status"></span>
+          <button id="style-generate" class="primary-action" type="button">Generate &amp; save profile</button>
+        </div>
+      </section>
+
+      <section id="style-editor-pane" class="style-editor-pane" hidden>
+        <header class="style-editor-head">
+          <div>
+            <p id="style-owner" class="eyebrow"></p>
+            <h3 id="style-editor-name"></h3>
+            <p id="style-editor-description"></p>
+          </div>
+          <label class="style-version-picker">
+            <span>Version</span>
+            <select id="style-version"></select>
+          </label>
+        </header>
+        <div id="style-reference-strip" class="style-reference-strip"></div>
+        <div class="style-editor-grid">
+          <div class="style-preview-column">
+            <p class="style-section-label">Live token preview</p>
+            <div id="style-preview" class="style-preview"></div>
+            <p class="style-preview-note">The preview follows generated tokens. Edited Markdown is authoritative for Calliope.</p>
+            <div id="style-source-summary" class="style-source-summary"></div>
+          </div>
+          <label class="style-markdown-column">
+            <span class="style-section-label">Editable profile Markdown</span>
+            <textarea id="style-markdown" spellcheck="false" maxlength="32000"></textarea>
+          </label>
+        </div>
+        <footer class="style-editor-actions">
+          <button id="style-archive" class="quiet-action" type="button">Archive</button>
+          <button id="style-fork" class="quiet-action" type="button">Duplicate</button>
+          <span></span>
+          <button id="style-save-version" class="quiet-action" type="button">Save as new version</button>
+          <button id="style-use-once" class="quiet-action" type="button">Use next turn</button>
+          <button id="style-use-session" class="primary-action" type="button">Use in this session</button>
+        </footer>
+      </section>
+    </div>
   </div>
 </dialog>
 

@@ -18,12 +18,14 @@ from starlette.responses import FileResponse, Response
 
 _ASSET_DIR = Path(__file__).resolve().parent / "theme"
 _IMAGE_DIR = _ASSET_DIR / "images"
+_FAVICON = _ASSET_DIR / "datarabbit.svg"
 _THEME_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,160}$")
 
 
 def head_assets() -> str:
     """The shared, public include used in each first-party Warehouse page."""
     return (
+        '<link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">'
         '<link rel="stylesheet" href="/theme/warehouse-theme.css">'
         '<script src="/theme/warehouse-theme.js"></script>'
     )
@@ -72,6 +74,17 @@ def register_theme_routes(mcp: Any) -> None:
     non-user data and the path parameters are strictly jailed.
     """
 
+    @mcp.custom_route("/theme/datarabbit.svg", methods=["GET"])
+    async def datarabbit_favicon(_request):
+        return FileResponse(
+            _FAVICON,
+            media_type="image/svg+xml",
+            headers={
+                "cache-control": "public, max-age=31536000, immutable",
+                "x-content-type-options": "nosniff",
+            },
+        )
+
     @mcp.custom_route("/theme/warehouse-theme.css", methods=["GET"])
     async def warehouse_theme_css(_request):
         return FileResponse(
@@ -113,4 +126,3 @@ def register_theme_routes(mcp: Any) -> None:
                 "x-content-type-options": "nosniff",
             },
         )
-
