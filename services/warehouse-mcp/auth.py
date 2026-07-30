@@ -683,8 +683,11 @@ _BG_CSS = """
 # ── login page ───────────────────────────────────────────────────────────────
 
 def _page(body: str, status: int = 200) -> HTMLResponse:
+    import warehouse_theme
     return HTMLResponse(
-        f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+        f"""<!doctype html><html lang="en"><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<meta name=color-scheme content=dark>
 <title>rvbbit warehouse</title>
 <style>
  /* Base colour on <html>, body transparent — a negative-z-index layer paints
@@ -692,9 +695,17 @@ def _page(body: str, status: int = 200) -> HTMLResponse:
     (This page only ever worked because it had no html background and body's
     propagated to the canvas; don't leave that to luck.) */
  html{{background:#15110d}}
- body{{background:transparent;color:#f0e6d8;font:15px/1.5 ui-monospace,Menlo,monospace;display:grid;place-items:center;min-height:100vh;margin:0}}
+ body{{background:transparent;color:#f0e6d8;font:15px/1.5 ui-monospace,Menlo,monospace;display:grid;place-items:center;min-height:100vh;margin:0;padding-top:56px;box-sizing:border-box}}
 {_BG_CSS}
- .card{{background:rgba(30,24,19,.86);backdrop-filter:blur(3px);border:1px solid #3a2f24;border-radius:12px;padding:28px 30px;max-width:360px;width:90%;box-shadow:0 10px 40px #000a}}
+ .loginbar{{position:fixed;z-index:20;inset:0 0 auto;height:56px;display:flex;align-items:center;
+   padding:0 max(20px,4vw);border-bottom:1px solid #3a2f24;background:rgba(21,17,13,.82);
+   backdrop-filter:blur(18px);box-sizing:border-box}}
+ .loginbrand{{display:flex;align-items:center;color:#f0e6d8;font:700 12px/1 ui-monospace,Menlo,monospace;
+   letter-spacing:.14em;text-decoration:none}}
+ .loginbrand small{{margin-left:10px;padding-left:10px;border-left:1px solid #3a2f24;
+   color:#8a8078;font-size:9px;font-weight:400;letter-spacing:.16em}}
+ .loginbar [data-warehouse-theme-anchor]{{margin-left:auto}}
+ .card{{box-sizing:border-box;background:rgba(30,24,19,.86);backdrop-filter:blur(3px);border:1px solid #3a2f24;border-radius:12px;padding:28px 30px;max-width:360px;width:90%;box-shadow:0 10px 40px #000a}}
  h1{{font-size:16px;margin:0 0 4px;color:#e8b572}} p.sub{{margin:0 0 18px;color:#a99}}
  label{{display:block;font-size:12px;color:#bba;margin:12px 0 4px}}
  input{{width:100%;box-sizing:border-box;background:#15110d;border:1px solid #4a3d2e;border-radius:7px;color:#f0e6d8;padding:9px 11px;font:inherit}}
@@ -709,8 +720,15 @@ def _page(body: str, status: int = 200) -> HTMLResponse:
  .or{{display:flex;align-items:center;gap:10px;margin:18px 0 4px;color:#8a8078;font-size:11px}}
  .or::before,.or::after{{content:"";flex:1;height:1px;background:#3a2f24}}
 </style>
+{warehouse_theme.head_assets()}
+</head><body>
 {background_layer(0.62, "radial-gradient(1000px 700px at 50% 45%, rgba(21,17,13,.34) 0%, rgba(21,17,13,.70) 55%, rgba(21,17,13,.93) 100%)")}
-<div class=card>{body}</div>""", status_code=status)
+<nav class=loginbar data-warehouse-header>
+ <span class=loginbrand>DATA RABBIT<small>WAREHOUSE</small></span>
+ <span data-warehouse-theme-anchor></span>
+</nav>
+<div class=card>{body}</div>
+</body></html>""", status_code=status)
 
 
 # Google's mark, inlined — the login page must render before any external host

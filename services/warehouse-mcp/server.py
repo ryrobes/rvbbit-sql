@@ -4142,6 +4142,8 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
 .applink{padding:6px 11px;border:1px solid var(--line-hot);color:var(--amber)!important;
   letter-spacing:.12em}
 .applink:hover{background:var(--amber);color:#1a1206!important}
+.applink.calliope{border-color:rgba(104,199,178,.46);color:#68c7b2!important}
+.applink.calliope:hover{background:#68c7b2;border-color:#68c7b2;color:#10211e!important}
 
 main{position:relative;z-index:1;padding:0 max(20px,4vw) 90px}
 header.hero{padding:66px 0 30px;border-bottom:1px solid var(--line)}
@@ -4206,7 +4208,17 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .empty code{color:var(--amber)}
 #none{display:none;padding:60px 0;text-align:center;color:var(--dim);
   font:10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase}
-@media (max-width:640px){header.hero{padding:44px 0 24px}}
+@media (max-width:760px){
+  header.hero{padding:44px 0 24px}
+  .who{gap:8px}
+  .who .viewer{display:none}
+  .applink{padding:6px 8px}
+}
+@media (max-width:520px){
+  nav{padding-inline:14px}
+  .wordmark small{display:none}
+  .applink:not(.calliope){display:none}
+}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
@@ -4354,6 +4366,7 @@ def _unmapped_html(identity):
     access) is one a DBA can actually act on.
     """
     import auth
+    import warehouse_theme
     from html import escape as e
     bg = auth.background_layer(
         0.34, "radial-gradient(1000px 700px at 50% 42%, rgba(16,13,11,.52) 0%, "
@@ -4373,12 +4386,14 @@ def _unmapped_html(identity):
 .gate-foot{{margin-top:26px;padding-top:18px;border-top:1px solid var(--line);
   color:var(--dim);font:9px/1.6 var(--mono);letter-spacing:.1em;text-transform:uppercase}}
 .gate-foot a{{color:var(--fog)}}
-</style></head><body>
+</style>
+{warehouse_theme.head_assets()}
+</head><body>
 {bg}
 <div class="wash"></div>
-<nav>{_RABBIT_SVG}
+<nav data-warehouse-header>{_RABBIT_SVG}
  <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
- <span class="who"><span>{e(identity)}</span><a href="/auth/logout">Sign out</a></span></nav>
+ <span class="who"><span data-warehouse-theme-anchor></span><span class="viewer">{e(identity)}</span><a href="/auth/logout">Sign out</a></span></nav>
 <div class="gate"><div class="gate-card">
   <div class="kicker">Access pending</div>
   <h1>You&rsquo;re signed in.</h1>
@@ -4395,6 +4410,7 @@ def _unmapped_html(identity):
 
 def _landing_html(rows, viewer):
     import auth
+    import warehouse_theme
     from html import escape as e
 
     # Far dimmer than the login page's 0.42: a wall of cards has to stay the
@@ -4458,6 +4474,14 @@ def _landing_html(rows, viewer):
     lens = _lens_url()
     _app_link = (f'<a class=applink href="{e(lens)}/" title="Open the full DataRabbit desktop">'
                  f'Open DataRabbit &rarr;</a>') if lens else ""
+    # Calliope is a true opt-in surface: when Hermes is not configured there is
+    # no nav affordance and its routes are not registered.
+    import calliope
+    _calliope_link = (
+        '<a class="applink calliope" href="/calliope" '
+        'title="Create and iterate with Calliope">Calliope &rarr;</a>'
+        if calliope.is_enabled() else ""
+    )
 
     total = len(rows)
     tally = " · ".join([f"{total} artifact{'' if total == 1 else 's'}"]
@@ -4479,12 +4503,14 @@ def _landing_html(rows, viewer):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
 <title>Warehouse — published artifacts</title>
-<style>{_LANDING_CSS}</style></head><body>
+<style>{_LANDING_CSS}</style>
+{warehouse_theme.head_assets()}
+</head><body>
 {_bg_layer}
 <div class="wash"></div>
-<nav>{_RABBIT_SVG}
+<nav data-warehouse-header>{_RABBIT_SVG}
  <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
- <span class="who">{_app_link}{f'<span>{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
+ <span class="who"><span data-warehouse-theme-anchor></span>{_calliope_link}{_app_link}{f'<span class="viewer">{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
 <main>
  <header class="hero">
   <div class="kicker">Published artifacts</div>
@@ -5049,7 +5075,12 @@ def _build_mcp_oauth(public: str):
     _ensure_activity_table()
     _ensure_dashboard_tables()
     auth.register_login_route(m, provider)
+    import warehouse_theme
+    warehouse_theme.register_theme_routes(m)
     register_dashboard_routes(m)
+    import calliope
+    if calliope.register_calliope_routes(m, _conn, _RABBIT_SVG, _dash_shim):
+        print("Calliope enabled (Hermes-backed living artifact notebook)", file=sys.stderr)
 
     @m.custom_route("/health", methods=["GET"])
     async def _health(_req):

@@ -1,0 +1,549 @@
+/*
+ * Shared Warehouse appearance chrome.  This stylesheet is loaded only by
+ * first-party Warehouse pages; authored dashboard/app documents and their
+ * iframes intentionally do not receive it.
+ */
+[data-warehouse-theme-anchor] {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+.warehouse-theme-button {
+  position: relative;
+  width: 31px;
+  height: 31px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line, rgba(232, 221, 204, .16));
+  border-radius: 50%;
+  background: color-mix(in oklch, var(--panel-raised, #1d1813) 88%, transparent);
+  color: var(--amber, #f5b446);
+  cursor: pointer;
+  box-shadow: 0 5px 16px rgba(0, 0, 0, .22);
+  transition: border-color .18s, color .18s, transform .18s;
+}
+
+.warehouse-theme-button:hover,
+.warehouse-theme-button[aria-expanded="true"] {
+  border-color: var(--line-hot, rgba(245, 180, 70, .55));
+  color: var(--bone, #e8ddcc);
+  transform: translateY(-1px);
+}
+
+.warehouse-theme-button svg {
+  position: relative;
+  z-index: 2;
+  width: 15px;
+  height: 15px;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, .65));
+}
+
+.warehouse-theme-button .warehouse-theme-button-thumb {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background-image: var(--warehouse-wallpaper);
+  background-position: center;
+  background-size: cover;
+  opacity: .42;
+}
+
+.warehouse-theme-button:not([data-has-theme="true"]) .warehouse-theme-button-thumb {
+  display: none;
+}
+
+.warehouse-theme-fallback {
+  position: fixed;
+  z-index: 80;
+  top: 12px;
+  right: 18px;
+}
+
+.warehouse-theme-dialog {
+  width: min(960px, calc(100vw - 30px));
+  height: min(700px, calc(100dvh - 30px));
+  max-width: none;
+  max-height: none;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-hot, rgba(245, 180, 70, .45));
+  border-radius: 2px;
+  background: var(--void, #100d0b);
+  color: var(--bone, #e8ddcc);
+  box-shadow: 0 34px 120px rgba(0, 0, 0, .78);
+}
+
+.warehouse-theme-dialog::backdrop {
+  background: rgba(5, 4, 3, .76);
+  backdrop-filter: blur(7px);
+}
+
+.warehouse-theme-dialog [hidden] {
+  display: none !important;
+}
+
+.warehouse-theme-shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background:
+    linear-gradient(135deg, color-mix(in oklch, var(--amber, #f5b446) 5%, transparent), transparent 32%),
+    color-mix(in oklch, var(--void, #100d0b) 96%, black);
+}
+
+.warehouse-theme-head {
+  min-height: 64px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: none;
+  padding: 0 18px 0 21px;
+  border-bottom: 1px solid var(--line, rgba(232, 221, 204, .13));
+  background: color-mix(in oklch, var(--panel, #171310) 90%, transparent);
+}
+
+.warehouse-theme-head > div {
+  min-width: 0;
+}
+
+.warehouse-theme-kicker {
+  margin: 0 0 5px;
+  color: var(--amber, #f5b446);
+  font: 8px/1 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+}
+
+.warehouse-theme-head h2 {
+  margin: 0;
+  color: var(--bone, #e8ddcc);
+  font: italic 400 25px/1 "Iowan Old Style", Baskerville, "Times New Roman", serif;
+  letter-spacing: -.02em;
+}
+
+.warehouse-theme-close {
+  width: 34px;
+  height: 34px;
+  margin-left: auto;
+  padding: 0;
+  border: 1px solid var(--line, rgba(232, 221, 204, .13));
+  background: transparent;
+  color: var(--dim, rgba(232, 221, 204, .4));
+  font: 22px/1 Inter, sans-serif;
+  cursor: pointer;
+}
+
+.warehouse-theme-close:hover {
+  border-color: var(--line-hot, rgba(245, 180, 70, .45));
+  color: var(--amber, #f5b446);
+}
+
+.warehouse-theme-content {
+  min-height: 0;
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+}
+
+.warehouse-theme-library {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px;
+  border-right: 1px solid var(--line, rgba(232, 221, 204, .13));
+}
+
+.warehouse-theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(145px, 1fr));
+  gap: 10px;
+}
+
+.warehouse-theme-tile {
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line, rgba(232, 221, 204, .13));
+  background: var(--panel, #171310);
+  color: var(--fog, rgba(232, 221, 204, .62));
+  text-align: left;
+  cursor: pointer;
+  transition: border-color .18s, transform .18s, background .18s;
+}
+
+.warehouse-theme-tile:hover {
+  border-color: var(--line-hot, rgba(245, 180, 70, .45));
+  transform: translateY(-2px);
+}
+
+.warehouse-theme-tile[aria-pressed="true"] {
+  border-color: var(--amber, #f5b446);
+  background: var(--panel-raised, #1d1813);
+  box-shadow: 0 0 0 1px color-mix(in oklch, var(--amber, #f5b446) 25%, transparent);
+}
+
+.warehouse-theme-tile img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+  background: #0b0a09;
+}
+
+.warehouse-theme-tile span {
+  display: block;
+  padding: 8px 9px 9px;
+  overflow: hidden;
+  color: inherit;
+  font: 8px/1.2 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: .07em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.warehouse-theme-empty {
+  min-height: 230px;
+  display: grid;
+  place-items: center;
+  color: var(--dim, rgba(232, 221, 204, .38));
+  font: 9px/1.6 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: .1em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.warehouse-theme-preview {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+  background: color-mix(in oklch, var(--panel, #171310) 74%, transparent);
+}
+
+.warehouse-theme-preview-image {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  border: 1px solid var(--line, rgba(232, 221, 204, .13));
+  background: var(--panel-raised, #1d1813);
+  background-position: center;
+  background-size: cover;
+}
+
+.warehouse-theme-preview-image::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(to top, color-mix(in oklch, var(--void, #100d0b) 45%, transparent), transparent 55%);
+}
+
+.warehouse-theme-preview h3 {
+  margin: 14px 0 5px;
+  overflow: hidden;
+  color: var(--bone, #e8ddcc);
+  font: 500 14px/1.3 Inter, ui-sans-serif, sans-serif;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.warehouse-theme-preview > p {
+  margin: 0;
+  color: var(--dim, rgba(232, 221, 204, .38));
+  font: 9px/1.55 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+}
+
+.warehouse-theme-swatches {
+  display: flex;
+  gap: 5px;
+  min-height: 28px;
+  margin-top: 14px;
+}
+
+.warehouse-theme-swatch {
+  min-width: 0;
+  flex: 1;
+  height: 24px;
+  border: 1px solid color-mix(in srgb, white 14%, transparent);
+  background: var(--swatch);
+}
+
+.warehouse-theme-error {
+  margin-top: 12px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in oklch, var(--danger, #df765f) 48%, transparent);
+  background: color-mix(in oklch, var(--danger, #df765f) 9%, transparent);
+  color: color-mix(in oklch, var(--danger, #df765f) 72%, white);
+  font: 9px/1.45 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+}
+
+.warehouse-theme-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: auto;
+  padding-top: 18px;
+}
+
+.warehouse-theme-action,
+.warehouse-theme-upload {
+  min-height: 33px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 11px;
+  border: 1px solid var(--line, rgba(232, 221, 204, .13));
+  background: transparent;
+  color: var(--fog, rgba(232, 221, 204, .62));
+  font: 8px/1 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.warehouse-theme-action:hover:not(:disabled),
+.warehouse-theme-upload:hover {
+  border-color: var(--line-hot, rgba(245, 180, 70, .45));
+  color: var(--amber, #f5b446);
+}
+
+.warehouse-theme-action.primary {
+  border-color: var(--amber, #f5b446);
+  background: var(--amber, #f5b446);
+  color: var(--main-foreground, #1a1206);
+  font-weight: 800;
+}
+
+.warehouse-theme-action:disabled,
+.warehouse-theme-upload[aria-disabled="true"] {
+  opacity: .36;
+  cursor: wait;
+}
+
+.warehouse-theme-upload input {
+  display: none;
+}
+
+.warehouse-theme-footnote {
+  margin-top: 12px !important;
+  color: var(--dim, rgba(232, 221, 204, .38)) !important;
+  font-size: 8px !important;
+}
+
+/* Once a saved image theme is active, re-tint first-party Warehouse chrome.
+   Artifact iframe documents remain a separate CSS tree and are untouched. */
+html[data-warehouse-wallpaper] .bg {
+  background-image: var(--warehouse-wallpaper) !important;
+  filter: saturate(.72) contrast(1.04) !important;
+}
+
+html[data-warehouse-theme] .veil {
+  background:
+    radial-gradient(1100px 760px at 28% -8%, color-mix(in oklch, var(--main) 16%, transparent), transparent 63%),
+    linear-gradient(to bottom, color-mix(in oklch, var(--background) 32%, transparent) 0%, color-mix(in oklch, var(--background) 72%, transparent) 52%, color-mix(in oklch, var(--background) 94%, transparent) 100%) !important;
+}
+
+html[data-warehouse-theme] .wash,
+html[data-warehouse-theme] .grid-wash {
+  background-image:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px) !important;
+}
+
+html[data-warehouse-theme] nav,
+html[data-warehouse-theme] .topbar,
+html[data-warehouse-theme] .loginbar {
+  border-color: var(--line) !important;
+  background: color-mix(in oklch, var(--void) 85%, transparent) !important;
+}
+
+html[data-warehouse-theme] .card,
+html[data-warehouse-theme] .gate-card,
+html[data-warehouse-theme] .session-dialog,
+html[data-warehouse-theme] .surface:not(.kind-artifact),
+html[data-warehouse-theme] .rail-note {
+  border-color: var(--line);
+  background: color-mix(in oklch, var(--panel) 95%, transparent);
+}
+
+html[data-warehouse-theme] .card:hover,
+html[data-warehouse-theme] .surface:not(.kind-artifact):hover {
+  background: var(--panel-raised);
+}
+
+html[data-warehouse-theme] .sessions-column,
+html[data-warehouse-theme] .stage-column,
+html[data-warehouse-theme] .chat-column,
+html[data-warehouse-theme] .column-head,
+html[data-warehouse-theme] .composer,
+html[data-warehouse-theme] .markup-head,
+html[data-warehouse-theme] .markup-toolbar,
+html[data-warehouse-theme] .markup-foot {
+  border-color: var(--line);
+  background: color-mix(in oklch, var(--panel) 78%, transparent);
+}
+
+html[data-warehouse-theme] .stage-column {
+  background: color-mix(in oklch, var(--void) 55%, transparent);
+}
+
+html[data-warehouse-theme] .chat-column {
+  background: color-mix(in oklch, var(--panel) 90%, transparent);
+}
+
+/* Calliope deliberately keeps more of the selected scene visible than the
+   gallery/login shells. Its three panes and native surfaces act as layered
+   glass, while authored artifact iframe documents retain their own styling. */
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .veil {
+  background:
+    radial-gradient(1100px 760px at 28% -8%, color-mix(in oklch, var(--main) 8%, transparent), transparent 64%),
+    linear-gradient(to bottom, color-mix(in oklch, var(--background) 8%, transparent) 0%, color-mix(in oklch, var(--background) 24%, transparent) 54%, color-mix(in oklch, var(--background) 44%, transparent) 100%) !important;
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .topbar {
+  background: color-mix(in oklch, var(--void) 56%, transparent) !important;
+  -webkit-backdrop-filter: blur(16px) saturate(1.16);
+  backdrop-filter: blur(16px) saturate(1.16);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .sessions-column {
+  background: color-mix(in oklch, var(--panel) 40%, transparent);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .stage-column {
+  background: color-mix(in oklch, var(--void) 16%, transparent);
+  -webkit-backdrop-filter: blur(10px) saturate(1.08);
+  backdrop-filter: blur(10px) saturate(1.08);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .chat-column {
+  background: color-mix(in oklch, var(--panel) 52%, transparent);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .column-head {
+  background: color-mix(in oklch, var(--panel) 36%, transparent);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .composer {
+  background: color-mix(in oklch, var(--panel) 40%, transparent);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .stage-head {
+  background: color-mix(in oklch, var(--void) 32%, transparent);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .surface {
+  border-color: var(--line);
+  background: color-mix(in oklch, var(--panel) 64%, transparent);
+  -webkit-backdrop-filter: blur(12px) saturate(1.10);
+  backdrop-filter: blur(12px) saturate(1.10);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .surface.metadata-surface {
+  background: color-mix(in oklch, var(--panel) 56%, transparent);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .surface:not(.kind-artifact):hover {
+  background: color-mix(in oklch, var(--panel-raised) 74%, transparent);
+}
+
+html[data-warehouse-theme] input,
+html[data-warehouse-theme] textarea,
+html[data-warehouse-theme] .compose-box,
+html[data-warehouse-theme] .session-search {
+  border-color: var(--line);
+  background: color-mix(in oklch, var(--panel-raised) 78%, transparent);
+  color: var(--bone);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .compose-box,
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .session-search {
+  background: color-mix(in oklch, var(--panel-raised) 48%, transparent);
+}
+
+html[data-warehouse-theme] .data-table th {
+  background: var(--panel-raised);
+}
+
+html[data-warehouse-theme] .data-table td {
+  border-color: var(--line);
+}
+
+html[data-warehouse-theme] .chart-wrap {
+  border-color: var(--line);
+  background: color-mix(in oklch, var(--void) 66%, transparent);
+}
+
+html[data-warehouse-theme] .chart-axis {
+  stroke: color-mix(in oklch, var(--bone) 22%, transparent);
+}
+
+html[data-warehouse-theme] .chart-grid {
+  stroke: color-mix(in oklch, var(--bone) 8%, transparent);
+}
+
+html[data-warehouse-theme] .chart-label {
+  fill: color-mix(in oklch, var(--bone) 48%, transparent);
+}
+
+html[data-warehouse-theme] .chart-bar {
+  fill: var(--chart-2, var(--jade));
+}
+
+html[data-warehouse-theme] .chart-bar:hover {
+  fill: var(--chart-1, var(--amber));
+}
+
+html[data-warehouse-theme] .chart-line {
+  stroke: var(--chart-1, var(--amber));
+}
+
+html[data-warehouse-theme] .chart-area {
+  fill: color-mix(in oklch, var(--chart-1, var(--amber)) 13%, transparent);
+}
+
+html[data-warehouse-theme] .chart-point {
+  fill: var(--chart-1, var(--amber));
+  stroke: var(--panel);
+}
+
+@media (max-width: 760px) {
+  .warehouse-theme-dialog {
+    width: 100vw;
+    height: 100dvh;
+    border: 0;
+  }
+
+  .warehouse-theme-content {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+
+  .warehouse-theme-library {
+    min-height: 330px;
+    overflow: visible;
+    border-right: 0;
+    border-bottom: 1px solid var(--line, rgba(232, 221, 204, .13));
+  }
+
+  .warehouse-theme-preview {
+    min-height: 340px;
+  }
+
+  .warehouse-theme-grid {
+    grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .warehouse-theme-button,
+  .warehouse-theme-tile {
+    transition: none;
+  }
+}

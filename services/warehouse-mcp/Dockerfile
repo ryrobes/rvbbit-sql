@@ -3,8 +3,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m playwright install --with-deps chromium
-COPY server.py auth.py dashboard_template.html ./
+COPY server.py auth.py calliope.py warehouse_theme.py dashboard_template.html ./
 COPY backgrounds ./backgrounds
+COPY calliope ./calliope
+COPY theme ./theme
 EXPOSE 8765
 # Remote streamable-HTTP MCP + shared-key auth (set WAREHOUSE_MCP_KEY + WAREHOUSE_DSN).
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \

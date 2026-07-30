@@ -183,6 +183,9 @@ engineering references are in [`docs/`](./docs/):
   registerable backends
 - **[MCP.md](./docs/MCP.md)** — MCP tools as first-class steps inside
   operators
+- **[CALLIOPE_PLAN.md](./docs/CALLIOPE_PLAN.md)** — the optional
+  Hermes-backed business-user notebook: private session rail, shared company
+  memory, and a versioned visual artifact record
 - **[KNOWLEDGE_GRAPH.md](./docs/KNOWLEDGE_GRAPH.md)** — entity
   extraction + traversal in SQL
 - **[RVBBIT_ROUTING_PRODUCTION_GOAL.md](./docs/RVBBIT_ROUTING_PRODUCTION_GOAL.md)**

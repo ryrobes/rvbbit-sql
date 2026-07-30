@@ -206,6 +206,10 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:8765:8765"   # localhost-only — your host nginx/proxy reaches it here
+    extra_hosts:
+      # Lets an external/default-profile Hermes running on the Docker host be
+      # addressed as http://host.docker.internal:8642 on Linux too.
+      - "host.docker.internal:host-gateway"
     volumes:
       - rvbbit_warehouse_mcp:/app/data   # durable OAuth state (clients + refresh tokens)
     environment:
@@ -237,6 +241,13 @@ services:
       # and serve at /thumbs (lens proxies them at /api/rvbbit/thumb).
       LENS_PUBLIC_URL: ${LENS_PUBLIC_URL:-}
       WAREHOUSE_LIVE_APP_CAPTURE_DIR: /app/data/captures
+      # Calliope living-artifact notebook (optional). Both Hermes values are
+      # required; with either blank, the feature and all its routes disappear.
+      # Hermes uses its current/default profile and shared company memory.
+      WAREHOUSE_HERMES_URL: ${WAREHOUSE_HERMES_URL:-}
+      WAREHOUSE_HERMES_API_KEY: ${WAREHOUSE_HERMES_API_KEY:-}
+      WAREHOUSE_HERMES_MEMORY_KEY: ${WAREHOUSE_HERMES_MEMORY_KEY:-}
+      WAREHOUSE_CALLIOPE_DIR: /app/data/calliope
       # Burrow mode (docs/BURROW_PLAN.md): WAREHOUSE_AUTH=pg makes Postgres
       # the IdP — logins are PG accounts (members of WAREHOUSE_PG_LOGIN_ROLE),
       # sessions run SET ROLE. WAREHOUSE_LOGIN_UI=lens hands the login PAGE

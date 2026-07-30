@@ -242,6 +242,76 @@ is what the browser reads, and the proxy forwards ours. Pre-existing `.png` capt
 still served until the artifact is republished. The `capture_live_app` MCP tool is
 unaffected and still produces full-resolution lossless PNGs.
 
+## Warehouse appearance
+The palette icon in every first-party Warehouse header opens the shared image-theme
+picker. It is available before authentication too, so a saved room follows the browser
+across the login page, artifact hub, access-pending page, and Calliope. The bundled
+library is a self-contained, web-sized copy of DataRabbit's Lens wallpaper set: 74
+thumbnail/full WebP pairs rather than a runtime dependency on the Lens checkout.
+
+Color selection uses the same pipeline as DataRabbit: `node-vibrant` role swatches are
+normalized into an image palette, then the dark-theme derivation generates interface,
+accent, semantic, and chart tokens around the image's dominant hue. Library selections
+store their stable source reference, palette, and generated tokens in `localStorage`.
+Uploaded images store the actual Blob in IndexedDB and the compact palette/tokens in
+`localStorage`, so colors can restore during `<head>` and the image follows immediately
+after browser storage opens. **Use default** deletes both records and exposes the page's
+existing hand-tuned colors and randomized background again.
+
+The boundary is deliberate: first-party chrome and native system objects (including
+Calliope query charts) inherit the generated tokens. Published HTML/JavaScript apps,
+dashboards, and decks do not load the appearance bundle, and Calliope artifact iframes
+remain separate CSS trees, so authored artifacts keep their own visual identity. The
+uber-origin Caddy route proxies `/theme/*` to the Warehouse service.
+
+## Calliope (optional Hermes-backed notebook)
+Set both `WAREHOUSE_HERMES_URL` and `WAREHOUSE_HERMES_API_KEY` to add **Calliope** to
+the gallery nav. If either is blank, no Calliope link or route is registered.
+
+Calliope is a three-column business-user surface: the signed-in user's private session
+rail, a newest-first living artifact record, and chat. Hermes owns the agent run and uses
+its current/default profile and shared company memory; the warehouse stores only the
+email-owned UI index, mirrored turn prose, image attachments, and immutable projections
+of MCP results. Queries, metrics, dashboards, apps, captures, and PDFs appear as stage
+surfaces linked back to their source message. Updating a published artifact creates a
+new exact-version surface linked to the older one. Visual builds get a bounded
+capture-and-review continuation: Calliope receives the real screenshot as vision input
+before finishing. Any image surface can also be opened in the pen/arrow/box markup
+editor; the flattened annotation is sent with the next message while its separately
+stored overlay becomes a toggleable, lineage-linked stage surface.
+
+```bash
+export WAREHOUSE_HERMES_URL="http://127.0.0.1:8642"
+export WAREHOUSE_HERMES_API_KEY="..."       # Hermes API_SERVER_KEY
+# Optional: one shared company memory scope, never an email-derived scope
+export WAREHOUSE_HERMES_MEMORY_KEY="company"
+export WAREHOUSE_CALLIOPE_DIR="/var/lib/warehouse/calliope"
+```
+
+For the uber Compose stack with Hermes running directly on the Docker host,
+use `WAREHOUSE_HERMES_URL=http://host.docker.internal:8642`; the service
+includes the Linux `host-gateway` mapping. A Hermes container on the same
+Compose network can use its service name instead.
+
+Configure the Hermes default profile's `mcp_servers` entry to use this warehouse's
+`/mcp` URL and a server-side `WAREHOUSE_MCP_KEY`. Calliope does not create or select a
+Hermes profile. Enable that same profile's API server and pin its advertised model to
+the real provider-routable model ID:
+
+```bash
+hermes config set platforms.api_server.enabled true
+hermes config set platforms.api_server.extra.host 127.0.0.1
+hermes config set platforms.api_server.extra.port 8642
+hermes config set platforms.api_server.extra.model_name anthropic/claude-sonnet-4.6
+hermes config set platforms.api_server.extra.key "$WAREHOUSE_HERMES_API_KEY"
+hermes gateway run --accept-hooks
+```
+
+The explicit model avoids the default API alias (`hermes-agent`) being sent to a
+provider that does not recognize it. Browser users never receive either secret.
+Full contracts and the temporal interaction model are in
+[`docs/CALLIOPE_PLAN.md`](../../docs/CALLIOPE_PLAN.md).
+
 ## Dashboards (artifacts that live + work outside Claude)
 **Start from `dashboard_template`** — the proven boilerplate (see [`DASHBOARD_TEMPLATE.md`](DASHBOARD_TEMPLATE.md)).
 Its dual-mode data bridge means the *same* artifact runs live in **two places, no login**:
@@ -281,6 +351,10 @@ No `rvbbitQuery`/metric found ⇒ flagged `materialized` (a "dead tree" — nudg
 `WAREHOUSE_ACCESS_TTL` (3600) · `WAREHOUSE_REFRESH_TTL` (30d) ·
 `WAREHOUSE_STATE_FILE` (persist registered clients + refresh tokens across restarts —
 put it on a volume, else a restart strands connectors with "client_id not found").
+**Calliope:** `WAREHOUSE_HERMES_URL` + `WAREHOUSE_HERMES_API_KEY` (both required) ·
+`WAREHOUSE_HERMES_MEMORY_KEY` (optional shared company scope) ·
+`WAREHOUSE_CALLIOPE_DIR` (attachment storage) ·
+`WAREHOUSE_CALLIOPE_MAX_IMAGE_BYTES` (8 MiB default).
 **Shared-key mode:** `WAREHOUSE_MCP_KEY` (bearer; unset = auth OFF, dev only).
 
 ## Deferred to Phase 1+
