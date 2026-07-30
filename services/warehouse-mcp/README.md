@@ -129,9 +129,41 @@ set `WAREHOUSE_GOOGLE_ONLY=1`, which stops `POST /login` from accepting a passwo
 — not merely hiding the form. ID tokens are verified, never just decoded: RS256 against
 Google's JWKS, audience, issuer, expiry, and a server-planted single-use `nonce`.
 
-**Not available in Burrow (`WAREHOUSE_AUTH=pg`) mode**, where the session subject must be
-a Postgres role name rather than an email; federating that needs an email→role mapping
-and is a separate design. Configuring both logs a warning and Google is ignored.
+### Burrow + Google: one door, Postgres still decides
+With `WAREHOUSE_AUTH=pg`, Google proves **who** you are and Postgres still decides **what**
+you may touch. A verified identity is resolved to a role by `rvbbit.resolve_identity()`
+(migration 0221), in this order:
+
+1. an enabled `rvbbit.identity_map` row (`identity` → `role_name`) — the DBA's escape hatch;
+2. **the email IS a role** — Azure Entra and Cloud SQL IAM both name database roles after the
+   principal, so `CREATE ROLE "ryan@acme.com" LOGIN` needs no mapping at all;
+3. nothing matches → **`rvbbit_guest`**.
+
+That third case is a state neither system expresses alone: *OAuth says yes, the database says
+it can't place this user.* It isn't an error — it's someone who needs provisioning. They get
+the artifact index's **access-pending** page (no artifacts, no titles, no DataRabbit link — an
+unmapped session would fail every query it made), and they're recorded in
+**`rvbbit.identity_pending`** so there's a queue to work from:
+
+```sql
+SELECT * FROM rvbbit.identity_pending;                 -- who's waiting (role_now_exists = ready)
+SELECT rvbbit.burrow_enroll('ryan@acme.com');          -- once their role exists
+INSERT INTO rvbbit.identity_map(identity, role_name)   -- or map to a differently-named role
+     VALUES ('ryan@acme.com', 'analyst_ryan');
+```
+
+`rvbbit_guest` is created `NOLOGIN` **with no grants at all** — it cannot be connected as, and
+it can read nothing. (`NOLOGIN` costs nothing: `SET ROLE` into a NOLOGIN role works, and guest
+is only ever reached that way.) To give it a real read-only tier, that's a deliberate act:
+`SELECT rvbbit.burrow_grant_guest('analytics');`
+
+> Identities longer than **63 bytes** can't be role names — Postgres truncates identifiers at
+> that length with only a `NOTICE`, so two long addresses sharing a prefix would silently
+> collide into one account. Resolution refuses them; they need an explicit `identity_map` row.
+
+**Non-Burrow installs are untouched by all of this.** `session_subject()` returns before any
+resolution when `WAREHOUSE_AUTH` isn't `pg`, and 0221's only footprint on such a box is one
+inert row in `pg_authid`.
 
 `GET /auth/config` reports `{mode, google, password}` so a sibling-rendered login page
 (`WAREHOUSE_LOGIN_UI=lens`) draws the right buttons without duplicating this config.

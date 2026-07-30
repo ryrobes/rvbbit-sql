@@ -182,3 +182,55 @@ identity; chicken-egg, keep it a plain lens route.
 - **Superuser hygiene**: the service role should NOT be superuser in
   burrow mode (SET ROLE from superuser reaches anything). Document a
   least-privilege service role as part of install.
+
+---
+
+## §9 Federated identity (0221) — one door for MCP and DataRabbit
+
+**BUILT 2026-07-29.** The warehouse was already the IdP for both surfaces — one
+`wh_session` cookie, lens holding no auth of its own and gating on
+`/auth/whoami`, `_session_pg_role()` falling back to the OAuth token so MCP tool
+calls already `SET ROLE`. The only missing piece was that an external IdP
+couldn't produce a role-shaped subject. It can now.
+
+**Resolution** (`rvbbit.resolve_identity`): explicit `identity_map` row → the
+email IS a role → `rvbbit_guest`. The middle rung is not a hack: Azure Entra and
+Cloud SQL IAM both name database roles after the principal, so on managed
+Postgres the mapping table is usually empty. Verified that PG accepts
+`"ryan@acme.com"` as a role and `SET ROLE` into it works; `_ROLE_NAME_RE` was
+widened to match, and both `SET ROLE` call sites already doubled embedded
+quotes.
+
+**The third state is the feature.** "OAuth says yes, the database can't place
+this user" is a real condition neither system expresses alone. It resolves to
+`rvbbit_guest` — NOLOGIN, **zero grants** — and the viewer gets an
+access-pending page rather than a gallery of dead links. Their arrival lands in
+`rvbbit.identity_pending`, which turns a support ticket into a work queue.
+
+**The ladder.** A mapped viewer sees the artifact index *and* an "Open
+DataRabbit" rung; an unmapped one sees neither. Withholding the app from someone
+with no grants isn't a lesser experience — the desktop would fail every query
+they made. This is HUB_PLAN §2.3's "breadcrumbs are a ladder, not a wall,"
+enforced by GRANTs instead of by UI, and it gives viewers a surface that isn't
+cluttered by an interface they can't use.
+
+**Blast radius on non-Burrow installs: one inert row in `pg_authid`.**
+`session_subject()` returns before resolution unless `WAREHOUSE_AUTH=pg`, and
+0221 keeps the rule the rest of these migrations already keep — top-level GRANTs
+touch only rvbbit-owned objects; anything reaching a customer schema lives in a
+function a DBA calls (`burrow_grant_guest`).
+
+**Gotchas.**
+- `NOLOGIN` does **not** block `SET ROLE`; guest never needs LOGIN, and keeping
+  it NOLOGIN means it can't become a real account and `burrow_enroll()` (which
+  requires `rolcanlogin`) refuses to enroll it as a person.
+- Postgres truncates identifiers at 63 bytes with a `NOTICE`, not an error, so
+  two long addresses sharing a prefix would collide into one role. Resolution
+  refuses over-long identities; they need an `identity_map` row.
+- `via` distinguishes how identity was proven. A password login in pg mode
+  proved possession of the role itself and skips resolution; a federated login
+  must resolve. Conflating them hands every federated user a role named after
+  their email whether or not it exists — caught in testing exactly that way.
+
+Tests: `services/warehouse-mcp/test_burrow_federated.py` (14 checks, real
+routes, stand-in IdP).

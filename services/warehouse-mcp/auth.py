@@ -112,8 +112,7 @@ def validate_config() -> list[str]:
             "account can log in.")
     if GOOGLE_ONLY and not google_enabled():
         errs.append("WAREHOUSE_GOOGLE_ONLY is set but Google sign-in is not configured "
-                    "(needs WAREHOUSE_GOOGLE_CLIENT_ID + WAREHOUSE_GOOGLE_CLIENT_SECRET"
-                    + (", and is unavailable in Burrow/pg mode)." if AUTH_MODE == "pg" else ")."))
+                    "(needs WAREHOUSE_GOOGLE_CLIENT_ID + WAREHOUSE_GOOGLE_CLIENT_SECRET).")
     return errs
 
 
@@ -127,8 +126,10 @@ def config_warnings() -> list[str]:
                  "have moved, set WAREHOUSE_GOOGLE_ONLY=1 — a permanent fallback keeps "
                  "the weakest credential permanently.")
     if GOOGLE_CLIENT_ID and AUTH_MODE == "pg":
-        w.append("Google sign-in is IGNORED in Burrow (WAREHOUSE_AUTH=pg) mode: the session "
-                 "subject must be a Postgres role name, not an email.")
+        w.append("Burrow + Google: verified identities resolve to a PG role via "
+                 "rvbbit.resolve_identity (an identity_map row, or a role named after the "
+                 "email). Anyone unresolved lands on rvbbit_guest — which holds NO grants "
+                 "by default — and is queued in rvbbit.identity_pending for provisioning.")
     return w
 
 
@@ -374,7 +375,20 @@ PG_LOGIN_ROLE = os.environ.get("WAREHOUSE_PG_LOGIN_ROLE", "rvbbit_users")
 # lens = the login PAGE is rendered by lens on the unified origin (POSTs land
 # here; failures PRG back to /login?err=1). Default keeps the built-in form.
 LOGIN_UI = os.environ.get("WAREHOUSE_LOGIN_UI", "builtin").strip().lower()
-_ROLE_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_$]{0,62}$")
+# Role names may be EMAIL-SHAPED: Azure Entra and Cloud SQL IAM both name the
+# database role after the principal, so "ryan@acme.com" is a legitimate role
+# and federated login maps to it with no mapping table at all. Both SET ROLE
+# call sites quote and double embedded quotes; excluding '"' here is the belt
+# to that's suspenders. 63 bytes is Postgres's identifier limit — anything
+# longer gets silently TRUNCATED by the server, so it must never get this far.
+_ROLE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_$@.\-]{0,62}$")
+# Authenticated by the IdP, unknown to the database. Holds no grants by design
+# (migration 0221) — surfaces show a request-access state, not a broken one.
+GUEST_ROLE = "rvbbit_guest"
+# Where a viewer the database can't place gets sent. /gallery is the artifact
+# index — it exists on every install and, unlike DataRabbit, degrades honestly
+# when the session has no grants.
+UNMAPPED_LANDING = "/gallery"
 
 
 def _creds_ok_pg(username: str, password: str) -> bool:
@@ -440,8 +454,43 @@ _GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
 
 
 def google_enabled() -> bool:
-    """Google is a shared-mode feature; pg mode keeps Postgres as the IdP."""
-    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and AUTH_MODE != "pg")
+    """Available in BOTH modes. In shared mode the verified email is the whole
+    identity; in Burrow it is resolved to a Postgres role (rvbbit.resolve_identity,
+    migration 0221) so the IdP proves WHO you are and Postgres still decides WHAT
+    you may touch."""
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+
+
+def resolve_identity(identity: str, via: str) -> str | None:
+    """Burrow: verified email -> PG role, or None when the database has no
+    account for them (they land on rvbbit_guest and get queued for
+    provisioning). Failing closed on any error is deliberate: an unreachable
+    database must not silently promote someone to a role."""
+    import psycopg
+    dsn = os.environ.get(
+        "WAREHOUSE_DSN", "host=localhost port=55433 dbname=bench user=postgres password=rvbbit")
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as c:
+            row = c.execute("SELECT rvbbit.resolve_identity(%s, %s)", (identity, via)).fetchone()
+            return row[0] if row and row[0] else None
+    except Exception as e:   # noqa: BLE001
+        print(f"resolve_identity({identity}): {e}", file=sys.stderr)
+        return None
+
+
+def session_subject(identity: str, via: str) -> tuple[str, bool]:
+    """(what we execute as, whether the database knows them).
+
+    Shared mode has no roles, so the identity IS the subject and 'mapped' is
+    vacuously true. Burrow resolves: a password login already proved
+    possession of the role itself; a federated login has to be looked up.
+    """
+    if AUTH_MODE != "pg":
+        return identity, True
+    if via == "pg":
+        return identity, True          # they authenticated AS the role
+    role = resolve_identity(identity, via)
+    return (role, True) if role else (GUEST_ROLE, False)
 
 
 def google_redirect_uri(public: str) -> str:
@@ -523,25 +572,43 @@ def google_domain_ok(claims: dict) -> bool:
 
 # ── browser view session (cookie, for /d/<slug> dashboards) ──────────────────
 
-def set_session(resp, email: str, secure: bool) -> None:
-    """Sign an email into the wh_session cookie (same JWT secret as the OAuth tokens)."""
+def set_session(resp, sub: str, secure: bool, identity: str | None = None,
+                mapped: bool = True, via: str = "password") -> None:
+    """Sign the session into wh_session (same JWT secret as the OAuth tokens).
+
+    `sub` keeps its established meaning — what surfaces SET ROLE as — so every
+    existing reader is unchanged. `idt` carries the HUMAN behind it, which in
+    Burrow is no longer the same string: ryan@acme.com may execute as role
+    `ryan`, or as rvbbit_guest when the database doesn't know them yet.
+    """
     now = int(time.time())
-    tok = jwt.encode({"sub": email, "typ": "session", "iat": now, "exp": now + SESSION_TTL},
+    tok = jwt.encode({"sub": sub, "idt": identity or sub, "mpd": bool(mapped), "via": via,
+                      "typ": "session", "iat": now, "exp": now + SESSION_TTL},
                      JWT_SECRET, algorithm=JWT_ALG)
     resp.set_cookie(SESSION_COOKIE, tok, max_age=SESSION_TTL, httponly=True,
                     secure=secure, samesite="lax", path="/")
 
 
-def read_session(request: Request) -> str | None:
-    """The authenticated viewer email from the wh_session cookie, or None."""
+def read_session_full(request: Request) -> dict | None:
+    """{sub, identity, mapped, via} or None. Sessions minted before 4.2.1 carry
+    only `sub`; they read back as mapped, which is what they were."""
     tok = request.cookies.get(SESSION_COOKIE)
     if not tok:
         return None
     try:
         c = jwt.decode(tok, JWT_SECRET, algorithms=[JWT_ALG])
-        return c.get("sub") if c.get("typ") == "session" else None
     except Exception:   # noqa: BLE001
         return None
+    if c.get("typ") != "session" or not c.get("sub"):
+        return None
+    return {"sub": c["sub"], "identity": c.get("idt") or c["sub"],
+            "mapped": c.get("mpd", True), "via": c.get("via", "password")}
+
+
+def read_session(request: Request) -> str | None:
+    """The subject surfaces execute as (a PG role in Burrow), or None."""
+    s = read_session_full(request)
+    return s["sub"] if s else None
 
 
 def _safe_next(nxt: str) -> str:
@@ -549,20 +616,30 @@ def _safe_next(nxt: str) -> str:
     return nxt if (nxt.startswith("/") and not nxt.startswith("//")) else "/"
 
 
-def _finish_login(request: Request, provider, email: str, txn: str, nxt: str):
+def _finish_login(request: Request, provider, identity: str, txn: str, nxt: str,
+                  via: str = "password"):
     """THE one place a verified identity becomes a session.
 
     Every authentication path — typed password, Postgres role, Google — lands
-    here, which is why `email` reaches the OAuth token's `sub` (and so
-    mcp_activity.caller) identically no matter how it was proven. Two exits:
-    an OAuth txn continues back to Claude with a fresh code; anything else
-    gets the browser session cookie and goes where it was headed.
+    here, so the identity reaches the OAuth token and the browser cookie
+    identically no matter how it was proven. This is also where federation
+    resolves: in Burrow the IdP has told us WHO, and Postgres now decides what
+    role that person executes as (or rvbbit_guest, if it has never heard of
+    them). Two exits: an OAuth txn continues back to Claude with a fresh code;
+    anything else gets the session cookie and goes where it was headed.
     """
+    sub, mapped = session_subject(identity, via)
     if txn:
-        target = provider.complete_login(txn, email)
+        target = provider.complete_login(txn, sub)
         return RedirectResponse(target, status_code=302) if target else _page(_EXPIRED, 400)
+    # An unmapped viewer has nothing to do inside DataRabbit — every query
+    # there would fail — so send them to the artifact index regardless of
+    # where they were headed. The index shows them how to ask for access.
+    if not mapped:
+        nxt = UNMAPPED_LANDING
     resp = RedirectResponse(nxt, status_code=302)
-    set_session(resp, email, secure=request.url.scheme == "https")
+    set_session(resp, sub, secure=request.url.scheme == "https",
+                identity=identity, mapped=mapped, via=via)
     return resp
 
 
@@ -726,7 +803,8 @@ def register_login_route(mcp, provider: WarehouseAuthProvider):
                                    cta="Authorize Claude" if txn else "Sign in")
             _LIMITER.record_success(ip)
 
-        return _finish_login(request, provider, email, txn, nxt)
+        return _finish_login(request, provider, email, txn, nxt,
+                             via="pg" if AUTH_MODE == "pg" else "password")
 
     def _bounce(txn: str, nxt: str, msg: str):
         """Send a failed Google attempt back to the login page. PRG when lens
@@ -808,22 +886,33 @@ def register_login_route(mcp, provider: WarehouseAuthProvider):
             _LIMITER.record_fail(ip)
             return _bounce(txn, nxt, "That account is not allowed to sign in here.")
         _LIMITER.record_success(ip)
-        return _finish_login(request, provider, email, txn, nxt)
+        # via="google" matters: it is what tells _finish_login this identity was
+        # proven by the IdP and still needs resolving to a Postgres role. A
+        # password login in pg mode proved possession of the role itself and
+        # skips resolution — conflating the two would hand every federated user
+        # a role named after their email whether or not it exists.
+        return _finish_login(request, provider, email, txn, nxt, via="google")
 
     # Session introspection for sibling services (lens gates on this in
     # Burrow mode — no JWT-secret sharing, just a cookie round-trip on the
     # unified origin).
     @mcp.custom_route("/auth/whoami", methods=["GET"])
     async def whoami(request: Request):
-        sub = read_session(request)
+        s = read_session_full(request)
+        sub = s["sub"] if s else None
         # pg mode: the subject must BE a role name. A session minted under a
         # previous auth mode (an email sub) is stale here — treat it as
         # signed out so every surface converges on re-login.
         if sub and AUTH_MODE == "pg" and not _ROLE_NAME_RE.fullmatch(sub):
             sub = None
-        if not sub:
+        if not sub or not s:
             return HTMLResponse('{"ok":false}', status_code=401, media_type="application/json")
-        return HTMLResponse(json.dumps({"ok": True, "sub": sub, "mode": AUTH_MODE}),
+        # `sub` keeps its meaning (what to SET ROLE as) so existing readers are
+        # untouched; `identity` is the human, and `mapped` says whether the
+        # database actually knows them or they are riding the guest role.
+        return HTMLResponse(json.dumps({"ok": True, "sub": sub, "mode": AUTH_MODE,
+                                        "identity": s["identity"], "mapped": s["mapped"],
+                                        "via": s["via"]}),
                             media_type="application/json")
 
     @mcp.custom_route("/bg/{name}.jpg", methods=["GET"])

@@ -4139,6 +4139,9 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
   font:10px/1 var(--mono);letter-spacing:.1em;color:var(--fog)}
 .who a{color:var(--dim)}
 .who a:hover{color:var(--amber)}
+.applink{padding:6px 11px;border:1px solid var(--line-hot);color:var(--amber)!important;
+  letter-spacing:.12em}
+.applink:hover{background:var(--amber);color:#1a1206!important}
 
 main{position:relative;z-index:1;padding:0 max(20px,4vw) 90px}
 header.hero{padding:66px 0 30px;border-bottom:1px solid var(--line)}
@@ -4335,6 +4338,61 @@ def _warm_thumbs(rows):
             print(f"warm thumb {r.get('slug')}: {e}", file=sys.stderr)
 
 
+def _lens_url():
+    """The DataRabbit origin, when there is one. Absent = warehouse-only
+    install, so there is no app to offer."""
+    return os.environ.get("LENS_PUBLIC_URL", "").rstrip("/")
+
+
+def _unmapped_html(identity):
+    """Signed in, unknown to the database.
+
+    Deliberately a dead end with a next step rather than a 403: the person is
+    who they say they are — a verified account in an allowed domain — they
+    just have no Postgres role yet. Their arrival is already recorded in
+    rvbbit.identity_pending, so this page's promise (someone will grant you
+    access) is one a DBA can actually act on.
+    """
+    import auth
+    from html import escape as e
+    bg = auth.background_layer(
+        0.34, "radial-gradient(1000px 700px at 50% 42%, rgba(16,13,11,.52) 0%, "
+              "rgba(16,13,11,.84) 58%, rgba(16,13,11,.95) 100%)")
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Access pending — Warehouse</title>
+<style>{_LANDING_CSS}
+.gate{{min-height:100vh;display:grid;place-items:center;padding:24px}}
+.gate-card{{max-width:520px;width:100%;border:1px solid var(--line);background:var(--panel);
+  padding:38px 40px;backdrop-filter:blur(3px)}}
+.gate-card h1{{font-size:clamp(28px,3.4vw,40px);margin-bottom:14px}}
+.gate-card p{{color:var(--fog);font-size:13.5px;line-height:1.65;margin-bottom:14px}}
+.gate-who{{display:inline-block;margin:2px 0 18px;padding:5px 11px;border:1px solid var(--line-hot);
+  color:var(--amber);font:10px/1 var(--mono);letter-spacing:.1em}}
+.gate-foot{{margin-top:26px;padding-top:18px;border-top:1px solid var(--line);
+  color:var(--dim);font:9px/1.6 var(--mono);letter-spacing:.1em;text-transform:uppercase}}
+.gate-foot a{{color:var(--fog)}}
+</style></head><body>
+{bg}
+<div class="wash"></div>
+<nav>{_RABBIT_SVG}
+ <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
+ <span class="who"><span>{e(identity)}</span><a href="/auth/logout">Sign out</a></span></nav>
+<div class="gate"><div class="gate-card">
+  <div class="kicker">Access pending</div>
+  <h1>You&rsquo;re signed in.</h1>
+  <div class="gate-who">{e(identity)}</div>
+  <p>Your sign-in was verified, but this warehouse doesn&rsquo;t have an account
+     for you yet — so there&rsquo;s nothing here you can read.</p>
+  <p>Someone with database access needs to map you to a role. Your request has
+     already been recorded, so ask whoever administers this warehouse to grant
+     you access; nothing else is needed from you.</p>
+  <div class="gate-foot">Once granted, sign in again &mdash; <a href="/auth/logout">sign out</a></div>
+</div></div>
+</body></html>"""
+
+
 def _landing_html(rows, viewer):
     import auth
     from html import escape as e
@@ -4392,6 +4450,15 @@ def _landing_html(rows, viewer):
             + (f'<div class="foot">{"".join(deps)}</div>' if deps else "")
             + '</div></a>')
 
+    # The rung up the ladder. Only offered when there IS an app (LENS_PUBLIC_URL)
+    # and only to viewers the database can place — an unmapped session reaching
+    # DataRabbit lands in a desktop where every query fails, so withholding the
+    # affordance is the honest move, not a lesser one. Everyone else gets a
+    # browsable index that works, uncluttered by a surface they can't use.
+    lens = _lens_url()
+    _app_link = (f'<a class=applink href="{e(lens)}/" title="Open the full DataRabbit desktop">'
+                 f'Open DataRabbit &rarr;</a>') if lens else ""
+
     total = len(rows)
     tally = " · ".join([f"{total} artifact{'' if total == 1 else 's'}"]
                        + [f"{n} {k}{'' if n == 1 else 's'}" for k, n in
@@ -4417,7 +4484,7 @@ def _landing_html(rows, viewer):
 <div class="wash"></div>
 <nav>{_RABBIT_SVG}
  <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
- <span class="who">{f'<span>{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
+ <span class="who">{_app_link}{f'<span>{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
 <main>
  <header class="hero">
   <div class="kicker">Published artifacts</div>
@@ -4471,16 +4538,23 @@ def register_dashboard_routes(m):
         # warehouse-only box this is the root of the site; on a unified origin
         # (docker/origin/Caddyfile) DataRabbit owns / and this is reached at
         # /gallery, which the ingress routes here.
-        viewer = auth.read_session(request)
-        if not viewer:
+        s = auth.read_session_full(request)
+        if not s:
             return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
+        # Authenticated, but the database has no account for them. Show the
+        # request-access state and query NOTHING: they have no grants, so every
+        # card would be a dead link, and artifact titles are themselves a
+        # disclosure. A closed door beats a broken gallery.
+        if not s["mapped"]:
+            return HTMLResponse(_unmapped_html(s["identity"]),
+                                headers={"cache-control": "no-store"})
         try:
             rows = _landing_rows()
         except Exception as ex:   # noqa: BLE001 — an index that can't query is still a page
             print(f"landing page: {ex}", file=sys.stderr)
             rows = []
         _warm_thumbs(rows)        # background; the page renders immediately
-        return HTMLResponse(_landing_html(rows, viewer),
+        return HTMLResponse(_landing_html(rows, s["identity"]),
                             headers={"cache-control": "no-store"})
 
     @m.custom_route("/gallery", methods=["GET"])
