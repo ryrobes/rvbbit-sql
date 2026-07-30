@@ -1,0 +1,7 @@
+-- Upgrade pg_rvbbit 4.2.1 -> 4.2.2
+--
+-- Postgres needs this edge for ALTER EXTENSION UPDATE. The SQL additions in
+-- this release are the idempotent, run-once 0223_calliope_design_profiles
+-- migration; packaged deployments apply it through rvbbit.migrate(),
+-- independently of the extension version graph. Do not duplicate that DDL
+-- here or it would bypass schema_migrations bookkeeping.
