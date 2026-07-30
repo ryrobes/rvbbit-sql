@@ -25,6 +25,13 @@
     status: $("#calliope-status"),
     avatar: $("#calliope-avatar"),
     toolActivity: $("#tool-activity"),
+    toolActivityToggle: $("#tool-activity-toggle"),
+    toolActivityMeta: $("#tool-activity-meta"),
+    toolActivitySummary: $("#tool-activity-summary"),
+    toolActivityBody: $("#tool-activity-body"),
+    toolActivityLog: $("#tool-activity-log"),
+    toolActivityDraft: $("#tool-activity-draft"),
+    toolActivityDraftCopy: $("#tool-activity-draft-copy"),
     composer: $("#composer"),
     input: $("#message-input"),
     send: $("#send-message"),
@@ -88,6 +95,7 @@
     attachments: [],
     busy: false,
     stageAtLiveEdge: true,
+    chatAtLiveEdge: true,
     newSurfaceCount: 0,
     config: null,
     artifactResizeTimer: null,
@@ -100,6 +108,18 @@
     nextTurnDesignProfileVersionId: null,
     designSourceImages: [],
     useSelectedAsDesignSource: false,
+    liveActivity: {
+      phase: "idle",
+      expanded: true,
+      summary: "",
+      entries: [],
+      omitted: 0,
+      draft: "",
+      draftTrimmed: false,
+      stepCount: 0,
+      startedAt: 0,
+      finishedAt: 0,
+    },
     markup: {
       surface: null,
       image: null,
@@ -117,6 +137,10 @@
   const CHAT_WIDTH_KEY = "rvbbit-calliope-chat-width-v1";
   const CHAT_MIN_WIDTH = 320;
   const CHAT_DEFAULT_WIDTH = 390;
+  const LIVE_ACTIVITY_ENTRY_LIMIT = 10;
+  const LIVE_ACTIVITY_DRAFT_LIMIT = 6000;
+  let liveActivityFrame = null;
+  let liveActivityClock = null;
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -771,10 +795,12 @@
 
   function clearSession() {
     clearSpatialSelections();
+    clearLiveActivity();
     state.current = null;
     state.turns = [];
     state.surfaces = [];
     state.selectedSurfaceId = null;
+    state.chatAtLiveEdge = true;
     state.nextTurnDesignProfileVersionId = null;
     state.cubeBuilders.clear();
     els.sessionTitle.textContent = "Choose or start a session";
@@ -791,6 +817,7 @@
   async function selectSession(id) {
     if (state.busy) return;
     clearSpatialSelections();
+    clearLiveActivity();
     const data = await api(`/api/calliope/sessions/${encodeURIComponent(id)}`);
     state.current = data.session;
     state.turns = data.turns || [];
@@ -883,6 +910,21 @@
     );
   }
 
+  function isChatAtLiveEdge() {
+    return (
+      els.messages.scrollHeight
+      - els.messages.clientHeight
+      - els.messages.scrollTop
+    ) < 72;
+  }
+
+  function scrollChatToLiveEdge() {
+    window.requestAnimationFrame(() => {
+      els.messages.scrollTop = els.messages.scrollHeight;
+      state.chatAtLiveEdge = true;
+    });
+  }
+
   function renderChat(initial = false) {
     els.chatEmpty.hidden = Boolean(state.turns.length);
     els.messages.innerHTML = state.turns.map((turn) => {
@@ -912,7 +954,273 @@
         </article>`;
     }).join("");
     window.CalliopeThinkingOrbs?.mountAll(els.messages);
-    if (initial) requestAnimationFrame(() => { els.messages.scrollTop = els.messages.scrollHeight; });
+    if (initial) {
+      state.chatAtLiveEdge = true;
+      scrollChatToLiveEdge();
+    }
+  }
+
+  // Display-only turn telemetry. Nothing here is copied into state.turns or
+  // posted back to the server, so session reload is also the persistence test.
+  function blankLiveActivity() {
+    return {
+      phase: "idle",
+      expanded: true,
+      summary: "",
+      entries: [],
+      omitted: 0,
+      draft: "",
+      draftTrimmed: false,
+      stepCount: 0,
+      startedAt: 0,
+      finishedAt: 0,
+    };
+  }
+
+  function stopLiveActivityClock() {
+    if (liveActivityClock !== null) {
+      window.clearInterval(liveActivityClock);
+      liveActivityClock = null;
+    }
+  }
+
+  function clearLiveActivity() {
+    stopLiveActivityClock();
+    if (liveActivityFrame !== null) {
+      window.cancelAnimationFrame(liveActivityFrame);
+      liveActivityFrame = null;
+    }
+    state.liveActivity = blankLiveActivity();
+    els.toolActivity.hidden = true;
+  }
+
+  function liveActivityElapsed() {
+    const activity = state.liveActivity;
+    if (!activity.startedAt) return "0s";
+    const endedAt = activity.finishedAt || Date.now();
+    const total = Math.max(0, Math.round((endedAt - activity.startedAt) / 1000));
+    if (total < 60) return `${total}s`;
+    const minutes = Math.floor(total / 60);
+    const seconds = String(total % 60).padStart(2, "0");
+    return `${minutes}m ${seconds}s`;
+  }
+
+  function scheduleLiveActivityRender() {
+    if (liveActivityFrame !== null) return;
+    liveActivityFrame = window.requestAnimationFrame(() => {
+      liveActivityFrame = null;
+      renderLiveActivity();
+    });
+  }
+
+  function renderLiveActivity() {
+    const activity = state.liveActivity;
+    const followChat = state.chatAtLiveEdge;
+    if (activity.phase === "idle") {
+      els.toolActivity.hidden = true;
+      return;
+    }
+    els.toolActivity.hidden = false;
+    els.toolActivity.classList.toggle("is-working", activity.phase === "working");
+    els.toolActivity.classList.toggle("is-complete", activity.phase === "complete");
+    els.toolActivity.classList.toggle("is-failed", activity.phase === "failed");
+    els.toolActivity.classList.toggle("is-collapsed", !activity.expanded);
+    els.toolActivityToggle.setAttribute("aria-expanded", String(activity.expanded));
+    els.toolActivityBody.hidden = !activity.expanded;
+    els.toolActivityMeta.textContent = `${
+      activity.phase === "working" ? "Ephemeral" : "Not saved"
+    } · ${liveActivityElapsed()}`;
+    els.toolActivitySummary.textContent = activity.summary || "Working…";
+    els.toolActivityLog.innerHTML = `${
+      activity.omitted
+        ? `<div class="activity-earlier">+${activity.omitted} earlier step${activity.omitted === 1 ? "" : "s"}</div>`
+        : ""
+    }${activity.entries.map((entry) => `
+      <div class="activity-entry is-${escapeHtml(entry.status)}">
+        <i aria-hidden="true"></i>
+        <span class="activity-entry-copy">
+          <strong>${escapeHtml(entry.label)}</strong>
+          ${entry.detail ? `<small title="${escapeHtml(entry.detail)}">${escapeHtml(entry.detail)}</small>` : ""}
+        </span>
+      </div>`).join("")}`;
+    els.toolActivityDraft.hidden = !activity.draft;
+    els.toolActivityDraftCopy.textContent = activity.draft
+      ? `${activity.draftTrimmed ? "…\n" : ""}${activity.draft}`
+      : "";
+    if (activity.expanded) {
+      window.requestAnimationFrame(() => {
+        els.toolActivityLog.scrollTop = els.toolActivityLog.scrollHeight;
+        els.toolActivityDraftCopy.scrollTop = els.toolActivityDraftCopy.scrollHeight;
+      });
+    }
+    if (activity.phase === "working" && followChat) scrollChatToLiveEdge();
+  }
+
+  function beginLiveActivity() {
+    clearLiveActivity();
+    state.liveActivity = {
+      ...blankLiveActivity(),
+      phase: "working",
+      expanded: true,
+      summary: "Reading notebook context",
+      startedAt: Date.now(),
+      entries: [{
+        kind: "context",
+        key: "context",
+        label: "Notebook context",
+        detail: "Reading the session, selected surfaces, and attachments",
+        status: "active",
+      }],
+    };
+    renderLiveActivity();
+    liveActivityClock = window.setInterval(renderLiveActivity, 1000);
+  }
+
+  function completeLiveContext() {
+    const context = state.liveActivity.entries.find((entry) => entry.key === "context");
+    if (context) context.status = "complete";
+    state.liveActivity.summary = "Planning the next move";
+    renderLiveActivity();
+  }
+
+  function pushLiveActivityEntry(entry, countStep = true) {
+    const activity = state.liveActivity;
+    if (activity.phase !== "working") return;
+    activity.entries.push(entry);
+    if (countStep) activity.stepCount += 1;
+    if (activity.entries.length > LIVE_ACTIVITY_ENTRY_LIMIT) {
+      activity.entries.shift();
+      activity.omitted += 1;
+    }
+    activity.summary = entry.label;
+    renderLiveActivity();
+  }
+
+  function startLiveTool(rawName, preview) {
+    const key = String(rawName || "warehouse tool");
+    const label = friendlyTool(key);
+    pushLiveActivityEntry({
+      kind: "tool",
+      key,
+      label,
+      detail: String(preview || "Running warehouse tool"),
+      status: "active",
+    });
+  }
+
+  function completeLiveTool(rawName, failed = false, detail = "") {
+    const key = String(rawName || "warehouse tool");
+    const label = friendlyTool(key);
+    const entries = state.liveActivity.entries;
+    let active = null;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      if (entries[index].kind === "tool" && entries[index].key === key && entries[index].status === "active") {
+        active = entries[index];
+        break;
+      }
+    }
+    if (active) {
+      active.status = failed ? "failed" : "complete";
+      active.detail = detail || (failed ? "Tool call failed" : "Tool call finished");
+      state.liveActivity.summary = failed ? `${label} failed` : `${label} finished`;
+      renderLiveActivity();
+      return;
+    }
+    pushLiveActivityEntry({
+      kind: "tool",
+      key,
+      label,
+      detail: detail || (failed ? "Tool call failed" : "Tool call finished"),
+      status: failed ? "failed" : "complete",
+    });
+  }
+
+  function appendLiveDraft(value, replace = false) {
+    const text = String(value || "");
+    if (!text || state.liveActivity.phase !== "working") return;
+    let next = replace ? text : state.liveActivity.draft + text;
+    if (next.length > LIVE_ACTIVITY_DRAFT_LIMIT) {
+      next = next.slice(-LIVE_ACTIVITY_DRAFT_LIMIT);
+      state.liveActivity.draftTrimmed = true;
+    } else if (replace) {
+      state.liveActivity.draftTrimmed = false;
+    }
+    state.liveActivity.draft = next;
+    state.liveActivity.summary = replace ? "Draft ready · finishing the turn" : "Drafting a response";
+    scheduleLiveActivityRender();
+  }
+
+  function mergeLiveWorkingNote(value) {
+    const note = String(value || "").trim();
+    if (!note || state.liveActivity.phase !== "working") return;
+    const current = state.liveActivity.draft.trim();
+    if (current.includes(note)) return;
+    if (note.includes(current) && current) appendLiveDraft(note, true);
+    else appendLiveDraft(`${current ? "\n\n" : ""}${note}`);
+  }
+
+  function noteLiveVisualCheck(number, budget) {
+    state.liveActivity.draft = "";
+    state.liveActivity.draftTrimmed = false;
+    pushLiveActivityEntry({
+      kind: "visual",
+      key: `visual-${number}`,
+      label: `Visual check ${number}/${budget}`,
+      detail: "Reviewing the rendered artifact before returning it",
+      status: "active",
+    });
+  }
+
+  function noteLiveSurfaces(surfaces) {
+    if (!surfaces.length || state.liveActivity.phase !== "working") return;
+    const names = surfaces.slice(0, 2).map((surface) => surface.title).filter(Boolean);
+    const extra = surfaces.length - names.length;
+    pushLiveActivityEntry({
+      kind: "surface",
+      key: `surfaces-${Date.now()}`,
+      label: `Placed ${surfaces.length} surface${surfaces.length === 1 ? "" : "s"}`,
+      detail: `${names.join(" · ")}${extra > 0 ? ` · +${extra} more` : ""}`,
+      status: "complete",
+    }, false);
+  }
+
+  function finishLiveActivity(success, surfaceCount = 0, error = "") {
+    const activity = state.liveActivity;
+    if (activity.phase === "idle") return;
+    stopLiveActivityClock();
+    activity.finishedAt = Date.now();
+    activity.phase = success ? "complete" : "failed";
+    activity.expanded = !success;
+    activity.entries.forEach((entry) => {
+      if (entry.status === "active") entry.status = success ? "complete" : "failed";
+    });
+    if (success) {
+      activity.entries.push({
+        kind: "answer",
+        key: "answer",
+        label: "Final answer delivered",
+        detail: "Working notes remain temporary and are not part of the notebook transcript",
+        status: "complete",
+      });
+      if (activity.entries.length > LIVE_ACTIVITY_ENTRY_LIMIT) {
+        activity.entries.shift();
+        activity.omitted += 1;
+      }
+      const surfaces = Number(surfaceCount || 0);
+      activity.summary = `${activity.stepCount} step${activity.stepCount === 1 ? "" : "s"}${
+        surfaces ? ` · ${surfaces} surface${surfaces === 1 ? "" : "s"}` : ""
+      } · complete`;
+    } else {
+      activity.entries.push({
+        kind: "error",
+        key: "error",
+        label: "Turn stopped",
+        detail: String(error || "Calliope could not complete the turn"),
+        status: "failed",
+      });
+      activity.summary = "Turn stopped";
+    }
+    renderLiveActivity();
   }
 
   function surfaceGlyph(kind) {
@@ -2615,8 +2923,9 @@
       created_at: new Date().toISOString(),
     };
     state.turns.push(turn);
+    state.chatAtLiveEdge = true;
     renderChat();
-    requestAnimationFrame(() => { els.messages.scrollTop = els.messages.scrollHeight; });
+    scrollChatToLiveEdge();
     return turn;
   }
 
@@ -2671,8 +2980,7 @@
     els.send.disabled = true;
     els.input.disabled = true;
     setStatus("working", "working");
-    els.toolActivity.hidden = false;
-    els.toolActivity.innerHTML = "<strong>Calliope is reading the notebook…</strong>";
+    beginLiveActivity();
 
     try {
       const response = await fetch(`/api/calliope/sessions/${state.current.id}/turn`, {
@@ -2694,30 +3002,25 @@
           pending.ordinal = data.ordinal;
           pending.attachments = data.attachments || pending.attachments;
           renderChat();
-          els.messages.scrollTop = els.messages.scrollHeight;
+          completeLiveContext();
+          scrollChatToLiveEdge();
         } else if (event === "assistant.delta") {
-          pending.assistant_message += data.delta || "";
-          const body = $(`[data-assistant-turn-id="${CSS.escape(pending.id)}"] .message-body`);
-          if (body) body.innerHTML = safeMarkdown(pending.assistant_message);
-          els.messages.scrollTop = els.messages.scrollHeight;
+          appendLiveDraft(data.delta || "");
         } else if (event === "assistant.completed") {
-          pending.assistant_message = data.content || pending.assistant_message;
-          renderChat();
-          els.messages.scrollTop = els.messages.scrollHeight;
+          appendLiveDraft(data.content || state.liveActivity.draft, true);
+        } else if (event === "calliope.progress") {
+          mergeLiveWorkingNote(data.text || "");
         } else if (event === "calliope.visual_check") {
-          pending.assistant_message = "";
           pending.status = "running";
           renderChat();
-          els.toolActivity.hidden = false;
-          els.toolActivity.innerHTML = `<strong>Calliope is reviewing the rendered image</strong> · visual check ${
-            escapeHtml(data.number || 1)
-          }/${escapeHtml(data.budget || 2)}`;
-          els.messages.scrollTop = els.messages.scrollHeight;
+          noteLiveVisualCheck(data.number || 1, data.budget || 2);
+          scrollChatToLiveEdge();
         } else if (event === "tool.started") {
-          const name = friendlyTool(data.tool_name);
-          els.toolActivity.innerHTML = `<strong>${escapeHtml(name)}</strong> · ${escapeHtml(data.preview || "working…")}`;
+          startLiveTool(data.tool_name, data.preview);
         } else if (event === "tool.completed") {
-          els.toolActivity.innerHTML = `<strong>${escapeHtml(friendlyTool(data.tool_name))}</strong> · placed result`;
+          completeLiveTool(data.tool_name);
+        } else if (event === "tool.failed") {
+          completeLiveTool(data.tool_name, true, data.message);
         } else if (event === "calliope.surfaces") {
           const incoming = data.surfaces || [];
           state.surfaces = [...incoming, ...state.surfaces.filter((surface) =>
@@ -2728,13 +3031,15 @@
             els.newSurfaces.hidden = false;
             els.newSurfaces.textContent = `${state.newSurfaceCount} new surface${state.newSurfaceCount === 1 ? "" : "s"} ↑`;
           }
+          noteLiveSurfaces(incoming);
           renderStage(state.stageAtLiveEdge);
           renderChat();
         } else if (event === "calliope.turn.completed") {
           pending.status = "complete";
           pending.assistant_message = data.assistant_message || pending.assistant_message;
           renderChat();
-          els.messages.scrollTop = els.messages.scrollHeight;
+          finishLiveActivity(true, data.surface_count);
+          scrollChatToLiveEdge();
         } else if (event === "calliope.error" || event === "error") {
           throw new Error(data.message || "Calliope could not complete the turn");
         }
@@ -2748,12 +3053,12 @@
         renderDesignProfileChip();
       }
       renderChat();
+      finishLiveActivity(false, 0, error.message);
       toast(error.message, true);
     } finally {
       state.busy = false;
       els.input.disabled = false;
       els.send.disabled = false;
-      els.toolActivity.hidden = true;
       setStatus(state.config?.healthy ? "ready" : "unavailable", state.config?.healthy ? "" : "offline");
       els.input.focus();
     }
@@ -2768,6 +3073,11 @@
   }
 
   function setupEvents() {
+    els.toolActivityToggle.addEventListener("click", () => {
+      if (state.liveActivity.phase === "idle") return;
+      state.liveActivity.expanded = !state.liveActivity.expanded;
+      renderLiveActivity();
+    });
     els.styleOpen.addEventListener("click", () => {
       openDesignProfiles().catch((error) => toast(error.message, true));
     });
@@ -2974,6 +3284,9 @@
       const button = event.target.closest("[data-focus-surface]");
       if (button) focusSurface(button.dataset.focusSurface);
     });
+    els.messages.addEventListener("scroll", () => {
+      state.chatAtLiveEdge = isChatAtLiveEdge();
+    }, { passive: true });
     els.stage.addEventListener("click", (event) => {
       const inspect = event.target.closest("[data-inspect-artifact]");
       if (inspect) {

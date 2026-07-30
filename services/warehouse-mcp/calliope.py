@@ -53,7 +53,12 @@ _INLINE_DATA_IMAGE_RE = re.compile(
     r"data:image/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=\r\n]+",
     re.I,
 )
+_WORKING_NOTE_TAG_RE = re.compile(
+    r"</?(?:REASONING_SCRATCHPAD|think|thinking|reasoning|thought)(?:\s[^>]*)?>",
+    re.I,
+)
 _MAX_ASSISTANT_CHARS = 40_000
+_MAX_WORKING_NOTE_CHARS = 800
 _DEFAULT_MAX_EXPORT_BYTES = 128 * 1024 * 1024
 _MAX_EXPORT_BYTES_CEILING = 512 * 1024 * 1024
 _EXPORT_EXTENSIONS = {
@@ -1880,6 +1885,12 @@ def _sanitize_assistant_text(value: Any) -> str:
     if len(text) > _MAX_ASSISTANT_CHARS:
         text = text[:_MAX_ASSISTANT_CHARS].rstrip() + "\n\n[Response shortened for the notebook.]"
     return text
+
+
+def _sanitize_working_note(value: Any) -> str:
+    """Bound Hermes' display-oriented progress text for the ephemeral browser UI."""
+    text = _WORKING_NOTE_TAG_RE.sub("", str(value or ""))
+    return _sanitize_assistant_text(text).strip()[:_MAX_WORKING_NOTE_CHARS]
 
 
 def _extract_json(value: Any) -> Any:
@@ -4872,6 +4883,22 @@ def register_calliope_routes(
                                         # is server-side projection input, never a
                                         # browser/chat event.
                                         skip_forward = True
+                                    elif event == "tool.progress":
+                                        # Hermes derives this _thinking event from
+                                        # user-visible assistant content, not from
+                                        # provider-native hidden reasoning.
+                                        note = (
+                                            _sanitize_working_note(
+                                                data.get("delta") or data.get("preview")
+                                            )
+                                            if str(data.get("tool_name") or "") == "_thinking"
+                                            else ""
+                                        )
+                                        if note:
+                                            event = "calliope.progress"
+                                            data = {"text": note}
+                                        else:
+                                            skip_forward = True
                                     elif event == "tool.started":
                                         data = {
                                             "tool_name": str(
@@ -4885,6 +4912,15 @@ def register_calliope_routes(
                                                 data.get("tool_name") or "warehouse tool"
                                             ),
                                             "call_id": str(data.get("call_id") or ""),
+                                        }
+                                    elif event == "tool.failed":
+                                        data = {
+                                            "tool_name": str(
+                                                data.get("tool_name") or "warehouse tool"
+                                            ),
+                                            "message": _sanitize_working_note(
+                                                data.get("preview") or "Tool call failed"
+                                            ),
                                         }
                                     elif event == "error":
                                         upstream_error = str(

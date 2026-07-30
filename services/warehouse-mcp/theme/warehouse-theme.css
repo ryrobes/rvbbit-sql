@@ -557,7 +557,14 @@ html[data-warehouse-theme] body[data-warehouse-page="calliope"] .stage-column {
 }
 
 html[data-warehouse-theme] body[data-warehouse-page="calliope"] .chat-column {
-  background: color-mix(in oklch, var(--panel) 32%, transparent);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in oklch, var(--void) 72%, transparent),
+      color-mix(in oklch, var(--panel) 68%, transparent)
+    );
+  -webkit-backdrop-filter: blur(24px) saturate(1.10);
+  backdrop-filter: blur(24px) saturate(1.10);
 }
 
 html[data-warehouse-theme] body[data-warehouse-page="calliope"] .column-head {
@@ -566,6 +573,14 @@ html[data-warehouse-theme] body[data-warehouse-page="calliope"] .column-head {
 
 html[data-warehouse-theme] body[data-warehouse-page="calliope"] .composer {
   background: color-mix(in oklch, var(--panel) 24%, transparent);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .chat-column .calliope-head {
+  background: color-mix(in oklch, var(--void) 54%, transparent);
+}
+
+html[data-warehouse-theme] body[data-warehouse-page="calliope"] .chat-column .composer {
+  background: color-mix(in oklch, var(--void) 62%, transparent);
 }
 
 html[data-warehouse-theme] body[data-warehouse-page="calliope"] .stage-head {

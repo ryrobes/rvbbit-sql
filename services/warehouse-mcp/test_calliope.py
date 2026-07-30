@@ -81,6 +81,45 @@ def test_calliope_ships_the_same_three_thinking_orb_states_as_data_rabbit():
     assert (calliope._ASSET_DIR / "THINKING-ORBS-LICENSE").is_file()
 
 
+def test_calliope_live_activity_is_temporary_distinct_and_collapses_after_final():
+    page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    css = (calliope._ASSET_DIR / "calliope.css").read_text(encoding="utf-8")
+    theme_css = (_HERE / "theme" / "warehouse-theme.css").read_text(encoding="utf-8")
+    source = (_HERE / "calliope.py").read_text(encoding="utf-8")
+
+    assert 'aria-label="Temporary turn activity"' in page
+    assert "Calliope / live" in page
+    assert "Ephemeral · not saved" in page
+    assert "Transient output · may change" in page
+    assert "beginLiveActivity()" in script
+    assert 'event === "calliope.progress"' in script
+    assert "appendLiveDraft(data.delta" in script
+    assert "finishLiveActivity(true, data.surface_count)" in script
+    assert "activity.expanded = !success" in script
+    assert "pending.assistant_message += data.delta" not in script
+    assert ".tool-activity.is-collapsed" in css
+    assert ".tool-activity:not(.is-collapsed){height:clamp(" in css
+    assert "background:repeating-linear-gradient" in css
+    assert ".tool-activity-draft-copy" in css
+    assert "chatAtLiveEdge" in script
+    assert "scrollChatToLiveEdge" in script
+    assert 'els.messages.addEventListener("scroll"' in script
+    assert "var(--void) 72%" in theme_css
+    assert 'elif event == "tool.progress":' in source
+    assert 'event = "calliope.progress"' in source
+
+
+def test_calliope_working_notes_are_bounded_and_strip_reasoning_markup():
+    note = calliope._sanitize_working_note(
+        "<think>Checking the dashboard layout.</think>"
+        + "x" * (calliope._MAX_WORKING_NOTE_CHARS + 100)
+    )
+    assert note.startswith("Checking the dashboard layout.")
+    assert "<think>" not in note
+    assert len(note) == calliope._MAX_WORKING_NOTE_CHARS
+
+
 def test_owner_is_signed_human_identity_not_execution_subject(monkeypatch):
     fake_auth = types.SimpleNamespace(
         read_session_full=lambda _request: {

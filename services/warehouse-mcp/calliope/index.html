@@ -103,7 +103,24 @@ __CALLIOPE_BACKGROUND__
       <p>Calliope works through the same governed RVBBIT tools used from GChat and MCP clients. Her prose stays here; what she makes appears on the stage.</p>
     </div>
     <div id="messages" class="messages" aria-live="polite"></div>
-    <div id="tool-activity" class="tool-activity" hidden></div>
+    <section id="tool-activity" class="tool-activity" aria-label="Temporary turn activity" hidden>
+      <button id="tool-activity-toggle" class="tool-activity-toggle" type="button" aria-expanded="true">
+        <i class="activity-signal" aria-hidden="true"></i>
+        <span class="activity-heading">
+          <strong>Calliope / live</strong>
+          <small id="tool-activity-meta">Ephemeral · not saved</small>
+        </span>
+        <span id="tool-activity-summary" class="tool-activity-summary">Starting…</span>
+        <span class="activity-chevron" aria-hidden="true">⌃</span>
+      </button>
+      <div id="tool-activity-body" class="tool-activity-body">
+        <div id="tool-activity-log" class="tool-activity-log" role="log" aria-live="polite"></div>
+        <div id="tool-activity-draft" class="tool-activity-draft" hidden>
+          <span>Transient output · may change</span>
+          <div id="tool-activity-draft-copy" class="tool-activity-draft-copy"></div>
+        </div>
+      </div>
+    </section>
 
     <form id="composer" class="composer">
       <div id="design-profile-chip" class="design-profile-chip" hidden></div>
