@@ -1,0 +1,5 @@
+-- Upgrade pg_rvbbit 4.2.2 -> 4.2.4
+--
+-- Postgres needs this edge for ALTER EXTENSION UPDATE. Version 4.2.3 was a
+-- Warehouse-only image release, so the extension advances directly from
+-- 4.2.2 to 4.2.4. This release changes no extension SQL surface.

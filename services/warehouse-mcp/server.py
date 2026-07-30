@@ -33,6 +33,7 @@ from __future__ import annotations
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
 import asyncio, hashlib, hmac, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -117,9 +118,37 @@ def _ro():
     return c
 
 
+def _normalize_as_of(as_of):
+    """Return one safe, UTC timestamp for the statement directive.
+
+    The value ultimately appears in a leading SQL comment, so accepting arbitrary
+    text here would let a newline escape the directive.  Keep the public contract
+    deliberately narrow: ISO-8601 timestamps (a date alone means midnight UTC).
+    """
+    if as_of is None:
+        return None
+    if isinstance(as_of, datetime):
+        parsed = as_of
+    else:
+        raw = str(as_of).strip()
+        if not raw:
+            return None
+        if len(raw) > 80 or "\n" in raw or "\r" in raw or "\x00" in raw:
+            raise ValueError("as_of must be one ISO-8601 timestamp")
+        candidate = raw[:-1] + "+00:00" if raw.lower().endswith("z") else raw
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError as exc:
+            raise ValueError("as_of must be one ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _with_as_of(sql: str, as_of):
     """Time-travel: the engine reads a leading `-- rvbbit: as_of <ts>` directive."""
-    return f"-- rvbbit: as_of {as_of}\n{sql}" if as_of else sql
+    normalized = _normalize_as_of(as_of)
+    return f"-- rvbbit: as_of {normalized}\n{sql}" if normalized else sql
 
 
 def _split(table: str):
@@ -2390,9 +2419,15 @@ def tool_brain_crawl_folder(path, source=None, roles=None, base_folder=None,
 def tool_validate_sql(sql: str, as_of=None) -> dict:
     """Plan, don't execute — route_explain dry-run so Claude can self-correct cheaply."""
     try:
+        normalized_as_of = _normalize_as_of(as_of)
         with _conn() as c:
-            ex = c.execute("SELECT rvbbit.route_explain(%s) AS e",
-                           (_with_as_of(sql, as_of),)).fetchone()["e"]
+            # route_explain's read-only gate expects SELECT/WITH at byte zero and
+            # does not currently strip the documented leading AS-OF directive.
+            # Validate the underlying statement; the execution below receives
+            # the directive after the same statement has passed this gate.
+            ex = c.execute("SELECT rvbbit.route_explain(%s) AS e", (sql,)).fetchone()["e"]
+    except ValueError as e:
+        return {"valid": False, "safe_select": False, "error": str(e)}
     except Exception as e:  # noqa: BLE001
         return {"valid": False, "safe_select": False, "error": str(e)}
     return {
@@ -2403,13 +2438,18 @@ def tool_validate_sql(sql: str, as_of=None) -> dict:
         "rvbbit_tables": ex.get("rvbbit_tables"),
         "reason": ex.get("reason"),
         "candidates": [c.get("name") for c in (ex.get("candidates") or [])],
+        "as_of_applied": normalized_as_of,
     }
 
 
 def tool_run_sql(sql: str, as_of=None, limit=None) -> dict:
     """Governed read-only execute: validate -> safe_select gate -> read-only run + LIMIT."""
     limit = max(1, min(int(limit or ROW_CAP), ROW_CAP))
-    v = tool_validate_sql(sql, as_of)
+    try:
+        normalized_as_of = _normalize_as_of(as_of)
+    except ValueError as exc:
+        return {"error": {"code": "BAD_AS_OF", "message": str(exc)}}
+    v = tool_validate_sql(sql, normalized_as_of)
     if not v.get("valid"):
         return {"error": {"code": "INVALID_SQL", "message": v.get("error")}}
     if not v.get("safe_select"):
@@ -2417,14 +2457,14 @@ def tool_run_sql(sql: str, as_of=None, limit=None) -> dict:
                           "message": "only a read-only SELECT/CTE is allowed", "reason": v.get("reason")}}
     t0 = time.time()
     with _conn(read_only=True, role=_session_pg_role()) as c, c.cursor() as cur:
-        cur.execute(_with_as_of(sql, as_of))
+        cur.execute(_with_as_of(sql, normalized_as_of))
         cols = ([{"name": d.name, "type": _TYPE.get(d.type_code, str(d.type_code))}
                  for d in cur.description] if cur.description else [])
         rows = cur.fetchmany(limit)
         truncated = cur.fetchone() is not None
     return {"columns": cols, "rows": rows, "row_count": len(rows), "truncated": truncated,
             "engine": v.get("engine"), "elapsed_ms": int((time.time() - t0) * 1000),
-            "as_of_applied": as_of}
+            "as_of_applied": normalized_as_of}
 
 
 def tool_run_sql_multi(queries, as_of=None, limit=None, result_mode="full", preview_rows=3) -> dict:
@@ -2448,11 +2488,18 @@ def tool_run_sql_multi(queries, as_of=None, limit=None, result_mode="full", prev
     if result_mode not in ("full", "summary"):
         return {"error": {"code": "BAD_RESULT_MODE", "message": "result_mode must be 'full' or 'summary'"}}
     try:
+        normalized_as_of = _normalize_as_of(as_of)
+    except ValueError as exc:
+        return {"error": {"code": "BAD_AS_OF", "message": str(exc)}}
+    try:
         preview_rows = max(0, min(int(preview_rows), 25))
     except (TypeError, ValueError):
         preview_rows = 3
     t0 = time.time()
-    results = {str(name): tool_run_sql(sql, as_of, limit) for name, sql in queries.items()}
+    results = {
+        str(name): tool_run_sql(sql, normalized_as_of, limit)
+        for name, sql in queries.items()
+    }
     if result_mode == "summary":
         compact = {}
         for name, r in results.items():
@@ -2470,7 +2517,7 @@ def tool_run_sql_multi(queries, as_of=None, limit=None, result_mode="full", prev
         results = compact
     return {"results": results, "result_mode": result_mode,
             "elapsed_ms": int((time.time() - t0) * 1000),
-            "as_of_applied": as_of}
+            "as_of_applied": normalized_as_of}
 
 
 # ── activity log (audit + a substrate for usage-learning) ────────────────────
@@ -3102,6 +3149,7 @@ def _runner_helper_source():
 
 import os
 import re
+from datetime import datetime, timezone
 
 import psycopg
 from psycopg.rows import dict_row
@@ -3121,8 +3169,24 @@ def _safe_select(sql: str) -> bool:
     return bool(_SAFE_HEAD.search(text)) and not _BLOCKED.search(text)
 
 
+def _normalize_as_of(as_of: str | None = None) -> str | None:
+    if as_of is None:
+        return None
+    raw = str(as_of).strip()
+    if not raw:
+        return None
+    if len(raw) > 80 or "\n" in raw or "\r" in raw or "\x00" in raw:
+        raise ValueError("as_of must be one ISO-8601 timestamp")
+    candidate = raw[:-1] + "+00:00" if raw.lower().endswith("z") else raw
+    parsed = datetime.fromisoformat(candidate)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _with_as_of(sql: str, as_of: str | None = None) -> str:
-    return f"-- rvbbit: as_of {as_of}\n{sql}" if as_of else sql
+    normalized = _normalize_as_of(as_of)
+    return f"-- rvbbit: as_of {normalized}\n{sql}" if normalized else sql
 
 
 async def rvbbit_query(sql: str, as_of: str | None = None, limit: int | None = None) -> dict:
@@ -4584,19 +4648,191 @@ def _mcp_dashboard_template():
 _DASH_SHIM = (
     '<link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">\n'
     "<script>\n"
-    "window.RVBBIT_DASHBOARD={slug:__SLUG__};\n"
+    "window.RVBBIT_DASHBOARD={slug:__SLUG__};"
+    "(()=>{const v=new URLSearchParams(location.search).get('rvbbit_as_of');"
+    "if(v)window.RVBBIT_DASHBOARD.as_of=v;})();\n"
     "window.rvbbitQuery=async function(sql,opts){opts=opts||{};"
+    "const asOf=opts.as_of||window.RVBBIT_DASHBOARD.as_of||null;"
     "const r=await fetch('/api/d/'+__SLUG__+'/q',{method:'POST',headers:{'content-type':'application/json'},"
-    "body:JSON.stringify({sql:sql,as_of:opts.as_of||null})});const d=await r.json();"
+    "body:JSON.stringify({sql:sql,as_of:asOf})});const d=await r.json();"
     "if(!r.ok||d.error){throw new Error((d.error&&d.error.message)||('query failed '+r.status));}return d;};\n"
     "window.cowork=window.cowork||{};"
     "if(!window.cowork.callMcpTool){window.cowork.callMcpTool=async function(tool,args){"
-    "const d=await window.rvbbitQuery((args&&args.sql)||'');return{structuredContent:{rows:(d&&d.rows)||[]}};};}\n"
-    "</script>\n")
+    "args=args||{};const d=await window.rvbbitQuery(args.sql||'',{as_of:args.as_of||null});"
+    "return{structuredContent:{rows:(d&&d.rows)||[]}};};}\n"
+    "</script>\n"
+    '<script src="/theme/artifact-lens.js" defer></script>\n')
 
 
 def _dash_shim(slug):
     return _DASH_SHIM.replace("__SLUG__", json.dumps(slug))
+
+
+def _iso_utc(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return _normalize_as_of(value)
+
+
+def _summarize_dashboard_time_travel(rows, point_rows, version):
+    """Turn dependency/generation metadata into the small public lens contract."""
+    base = {
+        "eligible": False,
+        "version": int(version),
+        "table_count": len(rows),
+        "points": [],
+    }
+    if not rows:
+        return base | {
+            "code": "NO_QUERY_SOURCES",
+            "message": "No live SQL sources have been discovered for this artifact yet.",
+        }
+    unmanaged = [row for row in rows if not row.get("rvbbit_managed")]
+    if unmanaged:
+        return base | {
+            "code": "PARTIAL_COVERAGE",
+            "message": (
+                "Data time is available only when every dashboard source is "
+                "an RVBBIT-managed table or cube."
+            ),
+            "unsupported_count": len(unmanaged),
+        }
+    without_history = [row for row in rows if int(row.get("generations") or 0) < 1]
+    if without_history:
+        return base | {
+            "code": "NO_RETAINED_HISTORY",
+            "message": "One or more dashboard sources have no retained generations yet.",
+            "unsupported_count": len(without_history),
+        }
+
+    common_earliest = max(row["earliest"] for row in rows if row.get("earliest"))
+    latest_refresh = max(row["latest"] for row in rows if row.get("latest"))
+    raw_points = [
+        row.get("committed_at") if isinstance(row, dict) else row
+        for row in point_rows
+    ]
+    points = sorted({
+        point for point in raw_points
+        if point is not None and point >= common_earliest
+    })
+    if len(points) < 2:
+        return base | {
+            "code": "ONE_RETAINED_POINT",
+            "message": "This dashboard does not have two common retained data points yet.",
+            "earliest": _iso_utc(common_earliest),
+            "latest_refresh": _iso_utc(latest_refresh),
+        }
+    return base | {
+        "eligible": True,
+        "code": "READY",
+        "message": "Every discovered source supports RVBBIT data-time travel.",
+        "earliest": _iso_utc(common_earliest),
+        "latest_refresh": _iso_utc(latest_refresh),
+        "points": [_iso_utc(point) for point in points],
+        "point_count": len(points),
+    }
+
+
+def _dashboard_time_travel(slug, version=None):
+    """Discover one published artifact's common RVBBIT generation timeline.
+
+    Dependency rows are the fast path.  For dynamically-authored SQL that was
+    not visible during publication, recent dashboard-query telemetry supplies
+    a read-only fallback after the page has run once.
+    """
+    _ensure_dashboard_tables()
+    _ensure_activity_table()
+    with _conn() as c:
+        dashboard = c.execute(
+            "SELECT id, latest_version, runtime_kind FROM rvbbit.dashboards WHERE slug=%s",
+            (slug,),
+        ).fetchone()
+        if not dashboard:
+            return {
+                "eligible": False,
+                "code": "NOT_FOUND",
+                "message": "No such published artifact.",
+                "points": [],
+            }
+        selected_version = int(version or dashboard["latest_version"])
+        if selected_version < 1:
+            raise ValueError("version must be a positive integer")
+        refs = [
+            row["object_ref"]
+            for row in c.execute(
+                "SELECT DISTINCT object_ref FROM rvbbit.dashboard_deps "
+                "WHERE dashboard_id=%s AND version=%s AND kind='table' "
+                "AND object_ref IS NOT NULL ORDER BY object_ref",
+                (dashboard["id"], selected_version),
+            ).fetchall()
+        ]
+        runtime_sql = []
+        if not refs and selected_version == int(dashboard["latest_version"]):
+            runtime_sql = [
+                row["sql"]
+                for row in c.execute(
+                    f"SELECT DISTINCT args->>'sql' AS sql FROM {ACTIVITY_TABLE} "
+                    "WHERE tool='dashboard_query' AND args->>'dashboard'=%s "
+                    "AND args->>'sql' IS NOT NULL ORDER BY sql LIMIT 24",
+                    (slug,),
+                ).fetchall()
+            ]
+
+    if not refs:
+        refs = sorted({
+            relation
+            for query in runtime_sql
+            for relation in _referenced_tables(query)
+        })
+    if not refs:
+        return _summarize_dashboard_time_travel([], [], selected_version)
+
+    coverage_sql = """
+        WITH requested AS (
+          SELECT ref, to_regclass(ref)::oid AS table_oid
+          FROM unnest(%s::text[]) AS requested_refs(ref)
+        )
+        SELECT requested.ref,
+               requested.table_oid,
+               (managed.table_oid IS NOT NULL) AS rvbbit_managed,
+               count(generation.generation)::int AS generations,
+               min(generation.committed_at) AS earliest,
+               max(generation.committed_at) AS latest
+        FROM requested
+        LEFT JOIN rvbbit.tables managed ON managed.table_oid=requested.table_oid
+        LEFT JOIN rvbbit.generations generation ON generation.table_oid=managed.table_oid
+        GROUP BY requested.ref, requested.table_oid, managed.table_oid
+        ORDER BY requested.ref
+    """
+    with _conn() as c:
+        coverage = c.execute(coverage_sql, (refs,)).fetchall()
+    if (
+        not coverage
+        or any(not row.get("rvbbit_managed") for row in coverage)
+        or any(int(row.get("generations") or 0) < 1 for row in coverage)
+    ):
+        return _summarize_dashboard_time_travel(coverage, [], selected_version)
+
+    common_earliest = max(row["earliest"] for row in coverage)
+    points_sql = """
+        WITH requested AS (
+          SELECT to_regclass(ref)::oid AS table_oid
+          FROM unnest(%s::text[]) AS requested_refs(ref)
+        )
+        SELECT DISTINCT generation.committed_at
+        FROM requested
+        JOIN rvbbit.generations generation ON generation.table_oid=requested.table_oid
+        WHERE generation.committed_at >= %s
+        ORDER BY generation.committed_at DESC
+        LIMIT 240
+    """
+    with _conn() as c:
+        points = c.execute(points_sql, (refs, common_earliest)).fetchall()
+    return _summarize_dashboard_time_travel(coverage, points, selected_version)
 
 
 # ── the landing page: this server's own front door ───────────────────────────
@@ -5239,6 +5475,32 @@ def register_dashboard_routes(m):
             v = c.execute("SELECT html FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
                           (d["id"], d["latest_version"])).fetchone()
         return HTMLResponse(_dash_shim(slug) + (v["html"] or ""))
+
+    @m.custom_route("/api/d/{slug}/time-travel", methods=["GET"])
+    async def _time_travel(request):
+        if not auth.read_session(request):
+            return _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        slug = request.path_params["slug"]
+        version = request.query_params.get("version")
+        try:
+            selected_version = int(version) if version else None
+            if selected_version is not None and selected_version < 1:
+                raise ValueError("version must be a positive integer")
+            result = _dashboard_time_travel(slug, selected_version)
+        except (TypeError, ValueError) as exc:
+            return _json({"error": {"code": "BAD_VERSION", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001 — keep the dashboard itself usable
+            print(f"artifact time travel ({slug}): {exc}", file=sys.stderr)
+            return _json(
+                {
+                    "eligible": False,
+                    "code": "TIMELINE_UNAVAILABLE",
+                    "message": "The retained data timeline could not be loaded.",
+                    "points": [],
+                },
+                200,
+            )
+        return _json(result, 404 if result.get("code") == "NOT_FOUND" else 200)
 
     @m.custom_route("/api/d/{slug}/q", methods=["POST"])
     async def _data(request):

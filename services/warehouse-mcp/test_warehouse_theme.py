@@ -104,6 +104,8 @@ def test_container_and_unified_origin_ship_theme_assets():
     assert "COPY theme ./theme" in dockerfile
     assert "/theme/*" in caddy
     assert "warehouse_theme.register_theme_routes(m)" in server
+    assert warehouse_theme._ARTIFACT_LENS_JS.is_file()
+    assert warehouse_theme._ARTIFACT_LENS_CSS.is_file()
 
 
 def test_gallery_calliope_entry_is_a_floating_time_aware_avatar():

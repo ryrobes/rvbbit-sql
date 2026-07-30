@@ -3,8 +3,9 @@
 The login page, artifact hub, and optional Calliope notebook are intentionally
 framework-free, but they should still feel like one application.  This module
 owns the public theme asset routes and the small HTML include all three shells
-use.  Published HTML/JS artifacts never include these assets, so their authored
-styles remain isolated.
+use. Published HTML/JS artifacts never inherit the Warehouse theme; the
+system-owned Artifact Lens mounts its own isolated Shadow DOM when requested by
+the serving shim, so authored styles remain untouched.
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ from starlette.responses import FileResponse, Response
 _ASSET_DIR = Path(__file__).resolve().parent / "theme"
 _IMAGE_DIR = _ASSET_DIR / "images"
 _FAVICON = _ASSET_DIR / "datarabbit.svg"
+_ARTIFACT_LENS_JS = _ASSET_DIR / "artifact-lens.js"
+_ARTIFACT_LENS_CSS = _ASSET_DIR / "artifact-lens.css"
 _THEME_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,160}$")
 
 
@@ -98,6 +101,22 @@ def register_theme_routes(mcp: Any) -> None:
         return FileResponse(
             _ASSET_DIR / "warehouse-theme.js",
             media_type="text/javascript",
+            headers={"cache-control": "no-cache", "x-content-type-options": "nosniff"},
+        )
+
+    @mcp.custom_route("/theme/artifact-lens.js", methods=["GET"])
+    async def artifact_lens_js(_request):
+        return FileResponse(
+            _ARTIFACT_LENS_JS,
+            media_type="text/javascript",
+            headers={"cache-control": "no-cache", "x-content-type-options": "nosniff"},
+        )
+
+    @mcp.custom_route("/theme/artifact-lens.css", methods=["GET"])
+    async def artifact_lens_css(_request):
+        return FileResponse(
+            _ARTIFACT_LENS_CSS,
+            media_type="text/css",
             headers={"cache-control": "no-cache", "x-content-type-options": "nosniff"},
         )
 
