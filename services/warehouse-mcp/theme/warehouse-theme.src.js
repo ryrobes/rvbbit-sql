@@ -18,6 +18,7 @@ const DB_STORE = "appearance";
 const DB_KEY = "theme:default";
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const LIBRARY_URL = /^\/theme\/images\/full\/[A-Za-z0-9][A-Za-z0-9_-]{0,160}\.webp$/;
+const SOLID_COLOR = /^#[0-9a-f]{6}$/i;
 const ROOT = document.documentElement;
 
 const THEME_KEYS = [
@@ -71,9 +72,14 @@ const THEME_KEYS = [
   "--jade",
   "--jade-soft",
   "--warehouse-wallpaper",
+  "--warehouse-solid-background",
 ];
 
 let current = readStoredState();
+let selectedBackgroundMode = themeBackground(current).mode;
+let selectedSolidColor = themeBackground(current).solidColor;
+let solidColorTouched = Boolean(current?.background?.solidColor);
+let previewWallpaperUrl = null;
 let activeObjectUrl = null;
 let button = null;
 let dialog = null;
@@ -121,16 +127,7 @@ function installButton() {
   button.setAttribute("aria-label", "Choose warehouse appearance");
   button.setAttribute("aria-haspopup", "dialog");
   button.setAttribute("aria-expanded", "false");
-  button.innerHTML = `
-    <span class="warehouse-theme-button-thumb" aria-hidden="true"></span>
-    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M12 3a9 9 0 1 0 0 18h1.25a2.15 2.15 0 0 0 0-4.3h-.65a1.45 1.45 0 0 1 0-2.9H15a6 6 0 0 0 0-12h-3Z"
-            stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>
-      <circle cx="7.3" cy="10.3" r="1.05" fill="currentColor"/>
-      <circle cx="9.7" cy="6.9" r="1.05" fill="currentColor"/>
-      <circle cx="14" cy="6.5" r="1.05" fill="currentColor"/>
-      <circle cx="17.2" cy="9.1" r="1.05" fill="currentColor"/>
-    </svg>`;
+  button.innerHTML = '<span class="warehouse-theme-button-thumb" aria-hidden="true"></span>';
   button.addEventListener("click", openDialog);
   host.append(button);
 }
@@ -158,6 +155,21 @@ function installDialog() {
           <h3 data-theme-preview-title>Current warehouse background</h3>
           <p data-theme-preview-copy>Choose an image. Data Rabbit will derive the interface and chart colors automatically.</p>
           <div class="warehouse-theme-swatches" data-theme-swatches aria-label="Derived color palette"></div>
+          <div class="warehouse-theme-background">
+            <div class="warehouse-theme-background-head">
+              <b>Page background</b>
+              <span>The theme palette stays active</span>
+            </div>
+            <div class="warehouse-theme-background-modes" aria-label="Page background style">
+              <button type="button" data-theme-background-mode="image" aria-pressed="true">Wallpaper</button>
+              <button type="button" data-theme-background-mode="solid" aria-pressed="false">Solid color</button>
+            </div>
+            <label class="warehouse-theme-color" data-theme-solid-picker hidden>
+              <span>Background color</span>
+              <input type="color" data-theme-solid-color value="#100d0b">
+              <output data-theme-solid-value>#100d0b</output>
+            </label>
+          </div>
           <div class="warehouse-theme-error" data-theme-error hidden></div>
           <div class="warehouse-theme-actions">
             <label class="warehouse-theme-upload">
@@ -175,8 +187,12 @@ function installDialog() {
 
   dialog.querySelector(".warehouse-theme-close").addEventListener("click", closeDialog);
   dialog.querySelector("[data-theme-reset]").addEventListener("click", () => void resetTheme());
-  dialog.querySelector("[data-theme-apply]").addEventListener("click", () => void applySelectedLibrary());
+  dialog.querySelector("[data-theme-apply]").addEventListener("click", () => void applySelectedTheme());
   dialog.querySelector('input[type="file"]').addEventListener("change", onUpload);
+  dialog.querySelectorAll("[data-theme-background-mode]").forEach((control) => {
+    control.addEventListener("click", () => setBackgroundMode(control.dataset.themeBackgroundMode));
+  });
+  dialog.querySelector("[data-theme-solid-color]").addEventListener("input", onSolidColor);
   dialog.addEventListener("cancel", (event) => {
     event.preventDefault();
     closeDialog();
@@ -255,8 +271,12 @@ function selectLibraryItem(id) {
   selectedPalette = current?.source?.kind === "library" && current.source.id === item.id
     ? current.palette
     : null;
+  if (!solidColorTouched && selectedPalette) {
+    selectedSolidColor = derivedSolidColor(selectedPalette);
+  }
   renderLibrary();
   renderPreview(item.url, item.label, selectedPalette);
+  syncBackgroundControls();
   const apply = dialog.querySelector("[data-theme-apply]");
   apply.disabled = false;
   apply.textContent = selectedPalette ? "Apply" : "Deriving…";
@@ -267,7 +287,9 @@ function selectLibraryItem(id) {
   selectedPalettePromise.then((palette) => {
     if (sequence !== previewSequence || selectedItem?.id !== item.id) return;
     selectedPalette = palette;
+    if (!solidColorTouched) selectedSolidColor = derivedSolidColor(palette);
     renderSwatches(palette);
+    syncBackgroundControls();
     apply.textContent = "Apply";
   }).catch((error) => {
     if (sequence !== previewSequence) return;
@@ -277,29 +299,53 @@ function selectLibraryItem(id) {
   });
 }
 
-async function applySelectedLibrary() {
-  if (!selectedItem) return;
+async function applySelectedTheme() {
+  if (!selectedItem && !current) return;
   const apply = dialog.querySelector("[data-theme-apply]");
   setBusy(true);
   setError("");
   try {
-    const palette = selectedPalette || await (
-      selectedPalettePromise || extractPalette(selectedItem.url)
-    );
-    const next = {
-      version: 1,
-      source: {
-        kind: "library",
-        id: selectedItem.id,
-        label: selectedItem.label,
-        url: selectedItem.url,
-      },
-      palette: { ...palette, source: selectedItem.label },
-      tokens: deriveWarehouseTokens(palette),
-      updatedAt: new Date().toISOString(),
-    };
-    await clearUploadBlob().catch(() => {});
-    persistAndApply(next);
+    let next;
+    let uploadUrl = activeObjectUrl;
+    if (selectedItem) {
+      const palette = selectedPalette || await (
+        selectedPalettePromise || extractPalette(selectedItem.url)
+      );
+      next = {
+        version: 1,
+        source: {
+          kind: "library",
+          id: selectedItem.id,
+          label: selectedItem.label,
+          url: selectedItem.url,
+        },
+        palette: { ...palette, source: selectedItem.label },
+        tokens: deriveWarehouseTokens(palette),
+        background: backgroundChoice(),
+        updatedAt: new Date().toISOString(),
+      };
+      await clearUploadBlob().catch(() => {});
+      uploadUrl = null;
+    } else {
+      next = {
+        ...current,
+        background: backgroundChoice(),
+        updatedAt: new Date().toISOString(),
+      };
+      if (
+        next.source.kind === "upload"
+        && selectedBackgroundMode === "image"
+        && !uploadUrl
+      ) {
+        const blob = await loadUploadBlob();
+        if (blob) {
+          releaseObjectUrl();
+          activeObjectUrl = URL.createObjectURL(blob);
+          uploadUrl = activeObjectUrl;
+        }
+      }
+    }
+    persistAndApply(next, uploadUrl);
     closeDialog();
   } catch (error) {
     setError(error instanceof Error ? error.message : "Could not apply that image.");
@@ -334,6 +380,7 @@ async function onUpload(event) {
       source: { kind: "upload", name: file.name },
       palette: { ...palette, source: file.name },
       tokens: deriveWarehouseTokens(palette),
+      background: backgroundChoice(),
       updatedAt: new Date().toISOString(),
     };
     releaseObjectUrl();
@@ -363,6 +410,9 @@ async function resetTheme() {
   selectedItem = null;
   selectedPalette = null;
   selectedPalettePromise = null;
+  selectedBackgroundMode = "image";
+  selectedSolidColor = derivedSolidColor(null);
+  solidColorTouched = false;
   showCurrentPreview();
   renderLibrary();
   notifyThemeChange();
@@ -399,14 +449,17 @@ function validStoredSource(source) {
 function applyStoredState(state, uploadUrl = null) {
   if (!state) return;
   for (const key of THEME_KEYS) {
-    if (key === "--warehouse-wallpaper") continue;
+    if (key === "--warehouse-wallpaper" || key === "--warehouse-solid-background") continue;
     const value = state.tokens?.[key];
     if (typeof value === "string" && value.length <= 180) {
       ROOT.style.setProperty(key, value);
     }
   }
+  const background = themeBackground(state);
+  ROOT.style.setProperty("--warehouse-solid-background", background.solidColor);
+  ROOT.dataset.warehouseBackground = background.mode;
   const wallpaper = state.source.kind === "library" ? state.source.url : uploadUrl;
-  if (wallpaper) setWallpaper(wallpaper);
+  if (background.mode === "image" && wallpaper) setWallpaper(wallpaper);
   ROOT.dataset.warehouseTheme = state.source.kind;
 }
 
@@ -414,6 +467,7 @@ function clearAppliedTheme() {
   for (const key of THEME_KEYS) ROOT.style.removeProperty(key);
   delete ROOT.dataset.warehouseTheme;
   delete ROOT.dataset.warehouseWallpaper;
+  delete ROOT.dataset.warehouseBackground;
 }
 
 function setWallpaper(url) {
@@ -428,7 +482,7 @@ async function restoreUploadImage(state) {
     if (!blob || current !== state) return;
     releaseObjectUrl();
     activeObjectUrl = URL.createObjectURL(blob);
-    setWallpaper(activeObjectUrl);
+    if (themeBackground(state).mode === "image") setWallpaper(activeObjectUrl);
     refreshButton();
   } catch {
     // Keep the derived colors. The reset action can clear a stale record.
@@ -444,8 +498,22 @@ function releaseObjectUrl() {
 function refreshButton() {
   if (!button) return;
   button.dataset.hasTheme = String(Boolean(current));
+  button.dataset.backgroundMode = current ? themeBackground(current).mode : "default";
+  const thumb = button.querySelector(".warehouse-theme-button-thumb");
+  if (thumb) {
+    thumb.style.backgroundImage = "";
+    if (!current) {
+      const fallback = document.querySelector(".bg");
+      const fallbackImage = fallback ? getComputedStyle(fallback).backgroundImage : "";
+      if (fallbackImage && fallbackImage !== "none") {
+        thumb.style.backgroundImage = fallbackImage;
+      }
+    }
+  }
   button.title = current
-    ? `Appearance · ${current.source.label || current.source.name || "custom image"}`
+    ? `Appearance · ${current.source.label || current.source.name || "custom image"} · ${
+      themeBackground(current).mode === "solid" ? "solid background" : "wallpaper"
+    }`
     : "Warehouse appearance";
 }
 
@@ -456,10 +524,14 @@ function showCurrentPreview() {
     : null;
   selectedPalette = current?.palette || null;
   selectedPalettePromise = selectedPalette ? Promise.resolve(selectedPalette) : null;
+  const background = themeBackground(current);
+  selectedBackgroundMode = background.mode;
+  selectedSolidColor = background.solidColor;
+  solidColorTouched = Boolean(current?.background?.solidColor);
   const url = current?.source?.kind === "library" ? current.source.url : activeObjectUrl;
   const label = current?.source?.label || current?.source?.name || "Current warehouse background";
   renderPreview(url, label, current?.palette || null);
-  if (!url) {
+  if (!url && selectedBackgroundMode === "image") {
     const fallback = document.querySelector(".bg");
     const fallbackImage = fallback ? getComputedStyle(fallback).backgroundImage : "";
     if (fallbackImage && fallbackImage !== "none") {
@@ -467,14 +539,16 @@ function showCurrentPreview() {
     }
   }
   dialog.querySelector("[data-theme-reset]").disabled = !current;
-  dialog.querySelector("[data-theme-apply]").disabled = !selectedItem;
+  dialog.querySelector("[data-theme-apply]").disabled = !selectedItem && !current;
+  syncBackgroundControls();
 }
 
 function renderPreview(url, label, palette) {
+  previewWallpaperUrl = url || null;
   const image = dialog.querySelector("[data-theme-preview-image]");
-  image.style.backgroundImage = url ? `url("${String(url).replaceAll('"', '\\"')}")` : "";
   dialog.querySelector("[data-theme-preview-title]").textContent = label;
   renderSwatches(palette);
+  syncBackgroundControls();
 }
 
 function renderSwatches(palette) {
@@ -495,11 +569,106 @@ function renderSwatches(palette) {
   )).join("");
 }
 
+function setBackgroundMode(mode) {
+  if (!selectedItem && !current) return;
+  if (mode !== "image" && mode !== "solid") return;
+  selectedBackgroundMode = mode;
+  if (mode === "solid" && !solidColorTouched) {
+    selectedSolidColor = derivedSolidColor(selectedPalette || current?.palette);
+  }
+  syncBackgroundControls();
+}
+
+function onSolidColor(event) {
+  const value = String(event.currentTarget.value || "").toLowerCase();
+  if (!SOLID_COLOR.test(value)) return;
+  selectedSolidColor = value;
+  solidColorTouched = true;
+  syncBackgroundControls();
+}
+
+function syncBackgroundControls() {
+  if (!dialog) return;
+  const available = Boolean(selectedItem || current);
+  dialog.querySelectorAll("[data-theme-background-mode]").forEach((control) => {
+    const active = control.dataset.themeBackgroundMode === selectedBackgroundMode;
+    control.setAttribute("aria-pressed", String(active));
+    control.disabled = !available;
+  });
+  const picker = dialog.querySelector("[data-theme-solid-picker]");
+  picker.hidden = selectedBackgroundMode !== "solid";
+  const input = dialog.querySelector("[data-theme-solid-color]");
+  input.value = selectedSolidColor;
+  input.disabled = !available;
+  dialog.querySelector("[data-theme-solid-value]").textContent = selectedSolidColor;
+
+  const preview = dialog.querySelector("[data-theme-preview-image]");
+  preview.dataset.backgroundMode = selectedBackgroundMode;
+  if (selectedBackgroundMode === "solid") {
+    preview.style.backgroundImage = "none";
+    preview.style.backgroundColor = selectedSolidColor;
+  } else {
+    preview.style.backgroundColor = "";
+    preview.style.backgroundImage = previewWallpaperUrl
+      ? `url("${String(previewWallpaperUrl).replaceAll('"', '\\"')}")`
+      : "";
+  }
+}
+
+function backgroundChoice() {
+  return {
+    mode: selectedBackgroundMode === "solid" ? "solid" : "image",
+    solidColor: SOLID_COLOR.test(selectedSolidColor)
+      ? selectedSolidColor.toLowerCase()
+      : derivedSolidColor(selectedPalette || current?.palette),
+  };
+}
+
+function themeBackground(state) {
+  const solidColor = String(state?.background?.solidColor || "").toLowerCase();
+  return {
+    mode: state?.background?.mode === "solid" ? "solid" : "image",
+    solidColor: SOLID_COLOR.test(solidColor)
+      ? solidColor
+      : derivedSolidColor(state?.palette),
+  };
+}
+
+function derivedSolidColor(palette) {
+  const hue = Number.isFinite(Number(palette?.baseHue))
+    ? Number(palette.baseHue)
+    : 28;
+  return hslToHex(hue, 22, 7);
+}
+
+function hslToHex(hue, saturation, lightness) {
+  const h = ((Number(hue) % 360) + 360) % 360;
+  const s = Math.max(0, Math.min(100, Number(saturation))) / 100;
+  const l = Math.max(0, Math.min(100, Number(lightness))) / 100;
+  const chroma = (1 - Math.abs(2 * l - 1)) * s;
+  const segment = h / 60;
+  const x = chroma * (1 - Math.abs((segment % 2) - 1));
+  const [r1, g1, b1] = segment < 1 ? [chroma, x, 0]
+    : segment < 2 ? [x, chroma, 0]
+      : segment < 3 ? [0, chroma, x]
+        : segment < 4 ? [0, x, chroma]
+          : segment < 5 ? [x, 0, chroma]
+            : [chroma, 0, x];
+  const m = l - chroma / 2;
+  return `#${[r1, g1, b1].map((part) => (
+    Math.round((part + m) * 255).toString(16).padStart(2, "0")
+  )).join("")}`;
+}
+
 function setBusy(busy) {
   dialog.querySelector(".warehouse-theme-upload").setAttribute("aria-disabled", String(busy));
   dialog.querySelector("[data-theme-reset]").disabled = busy || !current;
-  dialog.querySelector("[data-theme-apply]").disabled = busy || !selectedItem;
+  dialog.querySelector("[data-theme-apply]").disabled = busy || (!selectedItem && !current);
   dialog.querySelector('input[type="file"]').disabled = busy;
+  dialog.querySelectorAll("[data-theme-background-mode]").forEach((control) => {
+    control.disabled = busy || (!selectedItem && !current);
+  });
+  dialog.querySelector("[data-theme-solid-color]").disabled = busy || (!selectedItem && !current);
 }
 
 function setError(message) {
@@ -524,7 +693,11 @@ function onStorage(event) {
 
 function notifyThemeChange() {
   window.dispatchEvent(new CustomEvent("warehouse-theme-change", {
-    detail: { source: current?.source || null, tokens: current?.tokens || null },
+    detail: {
+      source: current?.source || null,
+      tokens: current?.tokens || null,
+      background: current ? themeBackground(current) : null,
+    },
   }));
 }
 

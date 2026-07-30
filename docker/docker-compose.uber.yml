@@ -212,6 +212,10 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - rvbbit_warehouse_mcp:/app/data   # durable OAuth state (clients + refresh tokens)
+      # Shared, same-path handoff for files created by an external Hermes.
+      # Hermes writes here; Warehouse validates and copies downloads into its
+      # owner-gated durable store. Override this host path when needed.
+      - ${WAREHOUSE_CALLIOPE_EXPORT_DIR:-/tmp/rvbbit-hermes-exports}:${WAREHOUSE_CALLIOPE_EXPORT_DIR:-/tmp/rvbbit-hermes-exports}:ro
     environment:
       # provider keys ride along for the vision tool (extract_image) —
       # WAREHOUSE_VISION_KEY overrides; OPENROUTER/OPENAI keys are fallback.
@@ -248,6 +252,8 @@ services:
       WAREHOUSE_HERMES_API_KEY: ${WAREHOUSE_HERMES_API_KEY:-}
       WAREHOUSE_HERMES_MEMORY_KEY: ${WAREHOUSE_HERMES_MEMORY_KEY:-}
       WAREHOUSE_CALLIOPE_DIR: /app/data/calliope
+      WAREHOUSE_CALLIOPE_EXPORT_ROOTS: ${WAREHOUSE_CALLIOPE_EXPORT_DIR:-/tmp/rvbbit-hermes-exports}
+      WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES: ${WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES:-134217728}
       # Burrow mode (docs/BURROW_PLAN.md): WAREHOUSE_AUTH=pg makes Postgres
       # the IdP — logins are PG accounts (members of WAREHOUSE_PG_LOGIN_ROLE),
       # sessions run SET ROLE. WAREHOUSE_LOGIN_UI=lens hands the login PAGE

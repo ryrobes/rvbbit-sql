@@ -57,6 +57,7 @@ def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = No
 
 ROW_CAP = _env_int("WAREHOUSE_ROW_CAP", 1000, maximum=100_000)
 STMT_TIMEOUT_MS = _env_int("WAREHOUSE_STMT_TIMEOUT_MS", 30_000, maximum=600_000)
+CUBE_PIVOT_CELL_CAP = _env_int("WAREHOUSE_CUBE_PIVOT_CELL_CAP", 2500, maximum=25_000)
 
 # Schema scoping — the warehouse and rvbbit's own internals share one database, so we
 # expose the data schemas and hide the engine's catalog. _DENY is always hidden;
@@ -85,7 +86,7 @@ def _conn(read_only: bool = False, role: str | None = None):
     return c
 
 
-_BURROW_ROLE_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_$]{0,62}$")
+_BURROW_ROLE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_$@.\-]{0,62}$")
 # Session-cookie surfaces (the app data bridge) carry identity out-of-band of
 # the OAuth token context — they park the subject here around tool calls so
 # an extra role arg never leaks into the MCP tool schemas.
@@ -421,9 +422,41 @@ def tool_set_category(kind, name, category=None, subcategory=None) -> dict:
 
 def tool_describe_cube(name: str) -> dict:
     """A cube's grain, columns, freshness + definition SQL (the agent's grounding to query it)."""
-    with _conn() as c:
+    with _conn(read_only=True, role=_session_pg_role()) as c:
         d = c.execute("SELECT rvbbit.describe_cube(%s) AS d", (name,)).fetchone()
-    return d["d"] if (d and d["d"] is not None) else {"error": {"code": "CUBE_NOT_FOUND", "message": name}}
+        value = d["d"] if (d and d["d"] is not None) else None
+        if value:
+            dimensions = c.execute(
+                "SELECT column_name,data_type,kind,groupable,distinct_est,semantics "
+                "FROM rvbbit.cube_dimensions(%s)",
+                (name,),
+            ).fetchall()
+            by_name = {str(row["column_name"]): dict(row) for row in dimensions}
+            columns = value.get("columns")
+            if isinstance(columns, list):
+                enriched = []
+                for column in columns:
+                    if not isinstance(column, dict):
+                        enriched.append(column)
+                        continue
+                    column_name = str(column.get("name") or "")
+                    data_type = str(
+                        column.get("type") or column.get("data_type") or ""
+                    ).lower()
+                    detail = by_name.get(column_name, {})
+                    numeric = data_type in _CUBE_NUMERIC_TYPES
+                    fallback_kind = _cube_fallback_kind(column_name, data_type)
+                    enriched.append({
+                        **column,
+                        **detail,
+                        "kind": detail.get("kind") or fallback_kind,
+                        "groupable": detail.get("groupable")
+                        if detail.get("groupable") is not None
+                        else fallback_kind != "measure",
+                        "numeric": numeric,
+                    })
+                value["columns"] = enriched
+    return value if value is not None else {"error": {"code": "CUBE_NOT_FOUND", "message": name}}
 
 
 def tool_propose_cube(subject: str, seed_tables=None, schema=None) -> dict:
@@ -1137,6 +1170,493 @@ def tool_pivot(metric, rows, cols, measure=None, params=None, as_of=None) -> dic
                                f"{measure}. Right-align numbers; add the per-row 'total' column and the col_totals "
                                f"row (with grand_total in the corner); bold totals. Other measures available: "
                                f"{[a for a in available if a != measure]} (re-call pivot with measure= to switch)."}}
+
+
+_CUBE_NUMERIC_TYPES = {
+    "bigint",
+    "decimal",
+    "double precision",
+    "integer",
+    "money",
+    "numeric",
+    "real",
+    "smallint",
+}
+_CUBE_PIVOT_AGGREGATES = ("sum", "avg", "min", "max", "count", "count_distinct")
+
+
+def _cube_fallback_kind(name: str, data_type: str) -> str:
+    lowered = str(name or "").lower()
+    if lowered == "id" or lowered.endswith("_id"):
+        return "key"
+    if data_type in {
+        "date",
+        "time without time zone",
+        "timestamp with time zone",
+        "timestamp without time zone",
+    }:
+        return "time"
+    return "measure" if data_type in _CUBE_NUMERIC_TYPES else "dimension"
+
+
+def _cube_pivot_aggregate(aggregate: str, measure: str | None):
+    """Build an aggregate expression from a fixed verb allowlist + validated identifier."""
+    if aggregate == "count" and measure is None:
+        return pgsql.SQL("count(*)")
+    if measure is None:
+        raise ValueError(f"{aggregate} requires a numeric measure")
+    ident = pgsql.Identifier(measure)
+    if aggregate == "count_distinct":
+        return pgsql.SQL("count(DISTINCT {})").format(ident)
+    return pgsql.SQL("{}({})").format(pgsql.SQL(aggregate), ident)
+
+
+def _cube_pivot_label(value) -> str:
+    return "(blank)" if value is None else str(value)
+
+
+def _cube_field_list(value, maximum: int = 8) -> list[str]:
+    raw = value if isinstance(value, (list, tuple)) else [value]
+    out = []
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in out:
+            out.append(name)
+        if len(out) >= maximum:
+            break
+    return out
+
+
+def _cube_measure_list(measures, measure, aggregate) -> tuple[list[dict], dict | None]:
+    if measures is None:
+        raw = [{"field": measure, "aggregate": aggregate}]
+    elif isinstance(measures, (list, tuple)):
+        raw = list(measures)
+    else:
+        raw = [measures]
+    out = []
+    for item in raw[:8]:
+        if isinstance(item, dict):
+            field = item.get("field", item.get("measure", item.get("name")))
+            agg = item.get("aggregate", item.get("agg", "sum"))
+        else:
+            field, agg = item, "sum"
+        field = str(field or "").strip() or None
+        if field in {"*", "__rows__"}:
+            field = None
+        agg = str(agg or "sum").strip().lower()
+        if agg not in _CUBE_PIVOT_AGGREGATES:
+            return [], {
+                "code": "BAD_AGGREGATE",
+                "message": (
+                    f"'{agg}' is not supported; available: "
+                    f"{list(_CUBE_PIVOT_AGGREGATES)}"
+                ),
+            }
+        if field is None and agg != "count":
+            return [], {
+                "code": "BAD_MEASURE",
+                "message": f"{agg} requires a numeric cube field",
+            }
+        key = f"{agg}:{field or '__rows__'}"
+        if any(spec["key"] == key for spec in out):
+            continue
+        out.append({
+            "key": key,
+            "field": field,
+            "aggregate": agg,
+            "label": f"{agg.replace('_', ' ').upper()} {field or 'rows'}",
+            "alias": f"__m{len(out)}",
+        })
+    if not out:
+        return [], {
+            "code": "BAD_MEASURE",
+            "message": "choose at least one numeric value or row count",
+        }
+    return out, None
+
+
+def _cube_group_query(relation, dimensions: list[str], measures: list[dict], limit: bool):
+    select_parts = [pgsql.Identifier(name) for name in dimensions]
+    select_parts.extend(
+        pgsql.SQL("{} AS {}").format(
+            _cube_pivot_aggregate(spec["aggregate"], spec["field"]),
+            pgsql.Identifier(spec["alias"]),
+        )
+        for spec in measures
+    )
+    query = pgsql.SQL("SELECT {} FROM {}").format(
+        pgsql.SQL(",").join(select_parts),
+        relation,
+    )
+    if dimensions:
+        ordinals = [pgsql.SQL(str(index + 1)) for index in range(len(dimensions))]
+        ordered = [
+            pgsql.SQL("{} NULLS LAST").format(ordinal)
+            for ordinal in ordinals
+        ]
+        query += pgsql.SQL(" GROUP BY {} ORDER BY {}").format(
+            pgsql.SQL(",").join(ordinals),
+            pgsql.SQL(",").join(ordered),
+        )
+    if limit:
+        query += pgsql.SQL(" LIMIT %s")
+    return query
+
+
+def _cube_dimension_values(row, dimensions: list[str]) -> dict[str, str]:
+    return {name: _cube_pivot_label(row.get(name)) for name in dimensions}
+
+
+def _cube_dimension_key(row, dimensions: list[str]) -> str:
+    return json.dumps(
+        [_cube_pivot_label(row.get(name)) for name in dimensions],
+        separators=(",", ":"),
+    )
+
+
+def tool_cube_pivot(
+    cube,
+    rows,
+    cols=None,
+    measure=None,
+    aggregate="sum",
+    measures=None,
+) -> dict:
+    """Explore a cube directly as a grouped table or crosstab, without requiring a metric.
+
+    ``rows`` and optional ``cols`` accept one field or a list of fields.
+    ``measures`` accepts ``[{field, aggregate}, ...]`` and supersedes the legacy
+    singular ``measure``/``aggregate`` pair. With no column dimensions the
+    result is an ordinary grouped table. Adding column dimensions produces a
+    crosstab. Every relation and field is validated and quoted.
+    """
+    cube = str(cube or "").strip()
+    row_dimensions = _cube_field_list(rows)
+    column_dimensions = _cube_field_list(cols)
+    measure_specs, measure_error = _cube_measure_list(
+        measures,
+        measure,
+        aggregate,
+    )
+    if not cube:
+        return {
+            "error": {
+                "code": "BAD_AXES",
+                "message": "cube is required",
+            }
+        }
+    if measure_error:
+        return {"error": measure_error}
+    overlap = sorted(set(row_dimensions) & set(column_dimensions))
+    if overlap:
+        return {
+            "error": {
+                "code": "BAD_AXES",
+                "message": f"fields cannot be on both Rows and Columns: {overlap}",
+            }
+        }
+
+    try:
+        with _conn(read_only=True, role=_session_pg_role()) as c:
+            found = c.execute(
+                "SELECT name FROM rvbbit.cube_catalog WHERE name=%s",
+                (cube,),
+            ).fetchone()
+            if not found:
+                return {"error": {"code": "CUBE_NOT_FOUND", "message": cube}}
+
+            column_rows = c.execute(
+                "SELECT column_name,data_type FROM information_schema.columns "
+                "WHERE table_schema='cubes' AND table_name=%s ORDER BY ordinal_position",
+                (cube,),
+            ).fetchall()
+            if not column_rows:
+                return {
+                    "error": {
+                        "code": "CUBE_UNAVAILABLE",
+                        "message": f"cubes.{cube} is not materialized or is not visible",
+                    }
+                }
+            dimension_rows = c.execute(
+                "SELECT column_name,data_type,kind,groupable,distinct_est,semantics "
+                "FROM rvbbit.cube_dimensions(%s)",
+                (cube,),
+            ).fetchall()
+            dimensions = {str(row["column_name"]): dict(row) for row in dimension_rows}
+            fields = []
+            for column in column_rows:
+                name = str(column["column_name"])
+                data_type = str(column["data_type"] or "").lower()
+                detail = dimensions.get(name, {})
+                fallback_kind = _cube_fallback_kind(name, data_type)
+                fields.append({
+                    "name": name,
+                    "type": data_type,
+                    "kind": detail.get("kind") or fallback_kind,
+                    "groupable": bool(detail.get(
+                        "groupable",
+                        fallback_kind != "measure",
+                    )),
+                    "numeric": data_type in _CUBE_NUMERIC_TYPES,
+                    "distinct_est": detail.get("distinct_est"),
+                    "semantics": detail.get("semantics"),
+                })
+            by_name = {field["name"]: field for field in fields}
+            available_dimensions = [
+                field["name"] for field in fields if field["groupable"]
+            ]
+            available_measures = [
+                field["name"] for field in fields if field["numeric"]
+            ]
+            bad_axes = [
+                axis for axis in row_dimensions + column_dimensions
+                if axis not in available_dimensions
+            ]
+            if bad_axes:
+                return {
+                    "error": {
+                        "code": "BAD_AXES",
+                        "message": (
+                            f"not groupable: {bad_axes}; available: "
+                            f"{available_dimensions}"
+                        ),
+                    }
+                }
+            bad_measures = sorted({
+                spec["field"]
+                for spec in measure_specs
+                if spec["field"] is not None
+                and (
+                    spec["field"] not in by_name
+                    or not by_name[spec["field"]]["numeric"]
+                )
+            })
+            if bad_measures:
+                return {
+                    "error": {
+                        "code": "BAD_MEASURE",
+                        "message": (
+                            f"not numeric: {bad_measures}; available: "
+                            f"{available_measures}"
+                        ),
+                    }
+                }
+
+            relation = pgsql.SQL("{}.{}").format(
+                pgsql.Identifier("cubes"),
+                pgsql.Identifier(cube),
+            )
+            cell_dimensions = row_dimensions + column_dimensions
+            grouped_row_cap = max(
+                1,
+                CUBE_PIVOT_CELL_CAP // max(1, len(measure_specs)),
+            )
+            cell_query = _cube_group_query(
+                relation,
+                cell_dimensions,
+                measure_specs,
+                limit=bool(cell_dimensions),
+            )
+            cell_rows = c.execute(
+                cell_query,
+                (grouped_row_cap + 1,) if cell_dimensions else None,
+            ).fetchall()
+            if len(cell_rows) > grouped_row_cap:
+                return {
+                    "error": {
+                        "code": "PIVOT_TOO_LARGE",
+                        "message": (
+                            f"this pivot exceeds {CUBE_PIVOT_CELL_CAP:,} cells; "
+                            "choose lower-cardinality axes"
+                        ),
+                    }
+                }
+            if column_dimensions:
+                row_total_rows = c.execute(
+                    _cube_group_query(
+                        relation,
+                        row_dimensions,
+                        measure_specs,
+                        limit=False,
+                    )
+                ).fetchall()
+                col_total_rows = c.execute(
+                    _cube_group_query(
+                        relation,
+                        column_dimensions,
+                        measure_specs,
+                        limit=False,
+                    )
+                ).fetchall()
+            else:
+                row_total_rows = []
+                col_total_rows = []
+            grand_row = c.execute(
+                _cube_group_query(
+                    relation,
+                    [],
+                    measure_specs,
+                    limit=False,
+                )
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "error": {
+                "code": "CUBE_PIVOT_FAILED",
+                "message": str(exc),
+            }
+        }
+
+    public_measures = [
+        {key: spec[key] for key in ("key", "field", "aggregate", "label")}
+        for spec in measure_specs
+    ]
+    grand_totals = {
+        spec["key"]: grand_row.get(spec["alias"]) if grand_row else None
+        for spec in measure_specs
+    }
+    common = {
+        "cube": cube,
+        "rows_dim": row_dimensions[0] if len(row_dimensions) == 1 else " › ".join(row_dimensions),
+        "cols_dim": (
+            column_dimensions[0]
+            if len(column_dimensions) == 1
+            else " › ".join(column_dimensions)
+        ) or None,
+        "row_dimensions": row_dimensions,
+        "column_dimensions": column_dimensions,
+        "measure": measure_specs[0]["field"],
+        "value_label": measure_specs[0]["field"] or "rows",
+        "aggregate": measure_specs[0]["aggregate"],
+        "measures": public_measures,
+        "available_dimensions": available_dimensions,
+        "available_measures": available_measures,
+        "available_aggregates": list(_CUBE_PIVOT_AGGREGATES),
+        "fields": fields,
+        "grand_totals": grand_totals,
+        "grand_total": grand_totals.get(measure_specs[0]["key"]),
+        "cell_count": len(cell_rows) * len(measure_specs),
+    }
+
+    if not column_dimensions:
+        table_columns = [
+            {"key": name, "label": name, "kind": "dimension"}
+            for name in row_dimensions
+        ] + [
+            {
+                "key": spec["key"],
+                "label": spec["label"],
+                "kind": "measure",
+                "measure_key": spec["key"],
+            }
+            for spec in measure_specs
+        ]
+        table_rows = [
+            {
+                "dimensions": _cube_dimension_values(row, row_dimensions),
+                "values": {
+                    spec["key"]: row.get(spec["alias"])
+                    for spec in measure_specs
+                },
+            }
+            for row in cell_rows
+        ]
+        return {
+            **common,
+            "display_mode": "table",
+            "table_columns": table_columns,
+            "table_rows": table_rows,
+            "row_count": len(table_rows),
+            "render": {
+                "as": "grouped_table",
+                "note": (
+                    f"Render {row_dimensions or ['overall']} as ordinary columns "
+                    f"with values {[spec['label'] for spec in measure_specs]}."
+                ),
+            },
+        }
+
+    column_groups = []
+    column_group_keys = {}
+    row_items = {}
+    for record in cell_rows:
+        row_key = _cube_dimension_key(record, row_dimensions)
+        col_key = _cube_dimension_key(record, column_dimensions)
+        if col_key not in column_group_keys:
+            short_key = f"c{len(column_groups)}"
+            column_group_keys[col_key] = short_key
+            column_groups.append({
+                "key": short_key,
+                "values": _cube_dimension_values(record, column_dimensions),
+            })
+        short_key = column_group_keys[col_key]
+        if row_key not in row_items:
+            row_items[row_key] = {
+                "row": " › ".join(_cube_dimension_values(record, row_dimensions).values()) or "Overall",
+                "dimensions": _cube_dimension_values(record, row_dimensions),
+                "cells": {},
+                "totals": {},
+            }
+        for spec in measure_specs:
+            row_items[row_key]["cells"][f"{short_key}::{spec['key']}"] = record.get(
+                spec["alias"]
+            )
+
+    row_totals = {
+        _cube_dimension_key(record, row_dimensions): {
+            spec["key"]: record.get(spec["alias"])
+            for spec in measure_specs
+        }
+        for record in row_total_rows
+    }
+    for row_key, item in row_items.items():
+        item["totals"] = row_totals.get(row_key, {})
+        item["total"] = item["totals"].get(measure_specs[0]["key"])
+
+    col_total_groups = {
+        _cube_dimension_key(record, column_dimensions): record
+        for record in col_total_rows
+    }
+    value_columns = []
+    col_totals = {}
+    for group in column_groups:
+        raw_key = json.dumps(list(group["values"].values()), separators=(",", ":"))
+        total_record = col_total_groups.get(raw_key, {})
+        group_label = " › ".join(group["values"].values()) or "Overall"
+        for spec in measure_specs:
+            key = f"{group['key']}::{spec['key']}"
+            value_columns.append({
+                "key": key,
+                "label": (
+                    f"{group_label} · {spec['label']}"
+                    if len(measure_specs) > 1
+                    else group_label
+                ),
+                "column_values": group["values"],
+                "measure_key": spec["key"],
+            })
+            col_totals[key] = total_record.get(spec["alias"])
+
+    matrix = list(row_items.values())
+    return {
+        **common,
+        "display_mode": "crosstab",
+        "column_groups": column_groups,
+        "value_columns": value_columns,
+        "columns": [column["key"] for column in value_columns],
+        "matrix": matrix,
+        "col_totals": col_totals,
+        "row_count": len(matrix),
+        "render": {
+            "as": "pivot",
+            "note": (
+                f"Render {row_dimensions or ['overall']} down the left, "
+                f"{column_dimensions} across the top, with "
+                f"{[spec['label'] for spec in measure_specs]} as values."
+            ),
+        },
+    }
 
 
 def tool_compare(metric, period_a, period_b, by=None, params=None) -> dict:
@@ -4142,8 +4662,35 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
 .applink{padding:6px 11px;border:1px solid var(--line-hot);color:var(--amber)!important;
   letter-spacing:.12em}
 .applink:hover{background:var(--amber);color:#1a1206!important}
-.applink.calliope{border-color:rgba(104,199,178,.46);color:#68c7b2!important}
-.applink.calliope:hover{background:#68c7b2;border-color:#68c7b2;color:#10211e!important}
+
+.calliope-float{
+  --calliope-edge:clamp(18px,2vw,28px);
+  position:fixed;right:var(--calliope-edge);bottom:var(--calliope-edge);z-index:19;
+  display:inline-flex;align-items:center;gap:13px;min-height:64px;
+  padding:6px 20px 6px 6px;border:1px solid var(--line-hot);border-radius:999px;
+  background:color-mix(in oklch,var(--panel) 58%,transparent);
+  -webkit-backdrop-filter:blur(20px) saturate(1.24);
+  backdrop-filter:blur(20px) saturate(1.24);
+  box-shadow:0 14px 42px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.045);
+  color:var(--bone-bright);transition:transform .2s,border-color .2s,background .2s,box-shadow .2s}
+.calliope-float:hover{
+  transform:translateY(-2px);border-color:var(--amber);
+  background:color-mix(in oklch,var(--panel-raised) 72%,transparent);
+  box-shadow:0 18px 52px rgba(0,0,0,.52),0 0 0 1px var(--amber-soft)}
+.calliope-float:focus-visible{outline:2px solid var(--amber);outline-offset:3px}
+.calliope-float-avatar{
+  width:50px;height:50px;flex:none;overflow:hidden;border:1px solid var(--line-hot);
+  border-radius:50%;background:var(--panel-raised);
+  box-shadow:0 0 0 3px var(--amber-soft),0 7px 20px rgba(0,0,0,.38)}
+.calliope-float-avatar[data-period=night]{
+  border-color:color-mix(in oklch,var(--jade) 58%,transparent);
+  box-shadow:0 0 0 3px var(--jade-soft),0 7px 20px rgba(0,0,0,.42)}
+.calliope-float-avatar img{
+  display:block;width:100%;height:100%;object-fit:cover;
+  transform:scale(1.22);transform-origin:57% 39%}
+.calliope-float-name{
+  color:var(--bone-bright);font-family:"Homemade Apple",cursive;
+  font-size:22px;font-weight:400;line-height:1.35;white-space:nowrap}
 
 main{position:relative;z-index:1;padding:0 max(20px,4vw) 90px}
 header.hero{padding:66px 0 30px;border-bottom:1px solid var(--line)}
@@ -4217,7 +4764,10 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 @media (max-width:520px){
   nav{padding-inline:14px}
   .wordmark small{display:none}
-  .applink:not(.calliope){display:none}
+  .applink{display:none}
+  .calliope-float{gap:11px;min-height:60px;padding:5px 17px 5px 5px}
+  .calliope-float-avatar{width:48px;height:48px}
+  .calliope-float-name{font-size:20px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
@@ -4242,6 +4792,24 @@ _LANDING_JS = """
      img.classList.add('ok'); shot.classList.remove('pending');
    }
  });
+
+ var calliopeFrame=document.querySelector('.calliope-float-avatar'),
+     calliopeTimer=null;
+ function updateCalliopeAvatar(){
+   if(!calliopeFrame)return;
+   var hour=new Date().getHours(),
+       period=hour>=7&&hour<19?'day':'night',
+       image=calliopeFrame.querySelector('img'),
+       src=period==='day'?calliopeFrame.dataset.daySrc:calliopeFrame.dataset.nightSrc;
+   if(src&&image.getAttribute('src')!==src)image.src=src;
+   calliopeFrame.dataset.period=period;
+ }
+ function scheduleCalliopeAvatar(){
+   updateCalliopeAvatar();
+   clearTimeout(calliopeTimer);
+   calliopeTimer=setTimeout(scheduleCalliopeAvatar,60050-(Date.now()%60000));
+ }
+ if(calliopeFrame)scheduleCalliopeAvatar();
 
  var q=document.getElementById('q'),
      chips=[].slice.call(document.querySelectorAll('.chip')),
@@ -4475,11 +5043,16 @@ def _landing_html(rows, viewer):
     _app_link = (f'<a class=applink href="{e(lens)}/" title="Open the full DataRabbit desktop">'
                  f'Open DataRabbit &rarr;</a>') if lens else ""
     # Calliope is a true opt-in surface: when Hermes is not configured there is
-    # no nav affordance and its routes are not registered.
+    # no gallery launcher and its routes are not registered.
     import calliope
     _calliope_link = (
-        '<a class="applink calliope" href="/calliope" '
-        'title="Create and iterate with Calliope">Calliope &rarr;</a>'
+        '<a class="calliope-float" href="/calliope" '
+        'title="Create and iterate with Calliope">'
+        '<span class="calliope-float-avatar" aria-hidden="true" '
+        'data-day-src="/calliope/callie-avatar-day.jpg" '
+        'data-night-src="/calliope/callie-avatar-night.jpg">'
+        '<img alt="" width="50" height="50" decoding="async"></span>'
+        '<span class="calliope-float-name">Calliope</span></a>'
         if calliope.is_enabled() else ""
     )
 
@@ -4503,6 +5076,7 @@ def _landing_html(rows, viewer):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
 <title>Warehouse — published artifacts</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Homemade+Apple&display=swap">
 <style>{_LANDING_CSS}</style>
 {warehouse_theme.head_assets()}
 </head><body>
@@ -4510,7 +5084,7 @@ def _landing_html(rows, viewer):
 <div class="wash"></div>
 <nav data-warehouse-header>{_RABBIT_SVG}
  <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
- <span class="who"><span data-warehouse-theme-anchor></span>{_calliope_link}{_app_link}{f'<span class="viewer">{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
+ <span class="who"><span data-warehouse-theme-anchor></span>{_app_link}{f'<span class="viewer">{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
 <main>
  <header class="hero">
   <div class="kicker">Published artifacts</div>
@@ -4519,6 +5093,7 @@ def _landing_html(rows, viewer):
  </header>
  {body}
 </main>
+{_calliope_link}
 <script>{_LANDING_JS}</script></body></html>"""
 
 
@@ -4811,6 +5386,17 @@ def _register(mcp):
     mcp.tool(name="pivot")(lambda metric, rows, cols, measure=None, params=None, as_of=None: _logged(
         "pivot", {"metric": metric, "rows": rows, "cols": cols, "measure": measure, "as_of": as_of},
         lambda: tool_pivot(metric, rows, cols, measure, params, as_of)))
+    mcp.tool(name="cube_pivot")(lambda cube, rows=None, cols=None, measure=None, aggregate="sum", measures=None: _logged(
+        "cube_pivot",
+        {
+            "cube": cube,
+            "rows": rows,
+            "cols": cols,
+            "measure": measure,
+            "aggregate": aggregate,
+            "measures": measures,
+        },
+        lambda: tool_cube_pivot(cube, rows, cols, measure, aggregate, measures)))
     mcp.tool(name="compare")(lambda metric, period_a, period_b, by=None, params=None: _logged(
         "compare", {"metric": metric, "period_a": period_a, "period_b": period_b, "by": by},
         lambda: tool_compare(metric, period_a, period_b, by, params)))
@@ -5051,6 +5637,49 @@ def _build_mcp():
     return m
 
 
+def _calliope_cube_pivot(
+    cube,
+    rows,
+    cols,
+    measure,
+    aggregate,
+    measures,
+    execution_subject,
+    owner,
+):
+    """Run a browser pivot under its database subject and log the human owner."""
+    args = {
+        "cube": cube,
+        "rows": rows,
+        "cols": cols,
+        "measure": measure,
+        "aggregate": aggregate,
+        "measures": measures,
+    }
+    t0 = time.time()
+    token = _SESSION_SUB.set(execution_subject)
+    try:
+        result = tool_cube_pivot(cube, rows, cols, measure, aggregate, measures)
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "error": {
+                "code": "EXCEPTION",
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+        }
+    finally:
+        _SESSION_SUB.reset(token)
+    _record(
+        "cube_pivot",
+        args,
+        result,
+        result.get("error") if isinstance(result, dict) else None,
+        int((time.time() - t0) * 1000),
+        caller_override=owner,
+    )
+    return result
+
+
 def _build_mcp_oauth(public: str):
     """FastMCP with our self-contained OAuth AS (auth.py). The SDK mounts /authorize,
     /token, /register + the .well-known metadata and verifies PKCE; auth.py supplies
@@ -5074,12 +5703,18 @@ def _build_mcp_oauth(public: str):
     _register(m)
     _ensure_activity_table()
     _ensure_dashboard_tables()
-    auth.register_login_route(m, provider)
+    auth.register_login_route(m, provider, _RABBIT_SVG)
     import warehouse_theme
     warehouse_theme.register_theme_routes(m)
     register_dashboard_routes(m)
     import calliope
-    if calliope.register_calliope_routes(m, _conn, _RABBIT_SVG, _dash_shim):
+    if calliope.register_calliope_routes(
+        m,
+        _conn,
+        _RABBIT_SVG,
+        _dash_shim,
+        cube_pivot=_calliope_cube_pivot,
+    ):
         print("Calliope enabled (Hermes-backed living artifact notebook)", file=sys.stderr)
 
     @m.custom_route("/health", methods=["GET"])

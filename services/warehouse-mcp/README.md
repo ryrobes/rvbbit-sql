@@ -14,6 +14,7 @@ read-only connection** — per-user role scoping is Phase 1.
 | `describe_table(table)` | columns + samples + per-column stats + freshness | information_schema + `pg_stats` + `accel_freshness` |
 | `list_metrics(category?, search?)` / `get_metric(name)` | the blessed metric catalog | `metric_defs` |
 | `metric(name, params?, as_of?, def_as_of?)` | a governed scalar number (bitemporal) | `rvbbit.metric_scalar()` |
+| `cube_pivot(cube, rows?, cols?, measures?)` | direct grouped table or crosstab; accepts multiple dimensions and aggregated numeric values without requiring a metric definition | validated, read-only `cubes.<name>` aggregation |
 | `validate_sql(sql, as_of?)` | plan, **don't execute** (self-correct loop) | `route_explain` |
 | `run_sql(sql, as_of?, limit?)` | **read-only** execute (validate → safe_select gate → run) | engine |
 
@@ -255,8 +256,12 @@ accent, semantic, and chart tokens around the image's dominant hue. Library sele
 store their stable source reference, palette, and generated tokens in `localStorage`.
 Uploaded images store the actual Blob in IndexedDB and the compact palette/tokens in
 `localStorage`, so colors can restore during `<head>` and the image follows immediately
-after browser storage opens. **Use default** deletes both records and exposes the page's
-existing hand-tuned colors and randomized background again.
+after browser storage opens. A selected theme can use either its wallpaper or a
+user-selected solid background color; switching to solid keeps the derived interface
+and chart palette intact. Calliope applies a darker image blend than the other Warehouse
+pages so its translucent notebook panes remain legible without losing the scene.
+**Use default** deletes both records and exposes the page's existing hand-tuned colors
+and randomized background again.
 
 The boundary is deliberate: first-party chrome and native system objects (including
 Calliope query charts) inherit the generated tokens. Published HTML/JavaScript apps,
@@ -266,19 +271,31 @@ uber-origin Caddy route proxies `/theme/*` to the Warehouse service.
 
 ## Calliope (optional Hermes-backed notebook)
 Set both `WAREHOUSE_HERMES_URL` and `WAREHOUSE_HERMES_API_KEY` to add **Calliope** to
-the gallery nav. If either is blank, no Calliope link or route is registered.
+the gallery as a floating avatar launcher. If either is blank, no Calliope launcher
+or route is registered.
 
 Calliope is a three-column business-user surface: the signed-in user's private session
 rail, a newest-first living artifact record, and chat. Hermes owns the agent run and uses
 its current/default profile and shared company memory; the warehouse stores only the
 email-owned UI index, mirrored turn prose, image attachments, and immutable projections
-of MCP results. Queries, metrics, dashboards, apps, captures, and PDFs appear as stage
-surfaces linked back to their source message. Updating a published artifact creates a
-new exact-version surface linked to the older one. Visual builds get a bounded
+of MCP results. Queries, KPI timelines, dashboards, apps,
+captures, and downloadable documents appear as stage surfaces linked back to their
+source message. Selecting a surface adds it to chat context; selecting it again clears
+that context. The chat edge is draggable (and keyboard adjustable) within
+viewport-derived bounds. Updating a published artifact creates a new exact-version
+surface linked to the older one. Visual builds get a bounded
 capture-and-review continuation: Calliope receives the real screenshot as vision input
 before finishing. Any image surface can also be opened in the pen/arrow/box markup
 editor; the flattened annotation is sent with the next message while its separately
 stored overlay becomes a toggleable, lineage-linked stage surface.
+
+Cube schema surfaces are also direct interactive analysis tables. Add one or more
+dimensions to Rows and one or more numeric aggregations to Values; this produces a
+normal grouped table with named columns. Columns is optional—adding dimensions there
+turns the same view into a cross-tab. Every shelf change recalculates automatically,
+without asking Hermes or requiring a governed metric. The backend validates every
+field against the materialized cube, quotes identifiers, and rejects results above
+the configured cell cap.
 
 ```bash
 export WAREHOUSE_HERMES_URL="http://127.0.0.1:8642"
@@ -286,12 +303,22 @@ export WAREHOUSE_HERMES_API_KEY="..."       # Hermes API_SERVER_KEY
 # Optional: one shared company memory scope, never an email-derived scope
 export WAREHOUSE_HERMES_MEMORY_KEY="company"
 export WAREHOUSE_CALLIOPE_DIR="/var/lib/warehouse/calliope"
+# Optional but required for browser downloads created by external Hermes:
+export WAREHOUSE_CALLIOPE_EXPORT_ROOTS="/var/lib/hermes/exports"
+export WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES="134217728" # 128 MiB; ceiling 512 MiB
 ```
 
 For the uber Compose stack with Hermes running directly on the Docker host,
 use `WAREHOUSE_HERMES_URL=http://host.docker.internal:8642`; the service
 includes the Linux `host-gateway` mapping. A Hermes container on the same
-Compose network can use its service name instead.
+Compose network can use its service name instead. Compose also mounts
+`WAREHOUSE_CALLIOPE_EXPORT_DIR` (default `/tmp/rvbbit-hermes-exports`) read-only
+at the same absolute path inside Warehouse and advertises it to Calliope's agent
+instructions. Hermes must be able to write that directory; a containerized Hermes
+needs the same bind mount. Warehouse accepts only a bounded document/data extension
+allowlist beneath configured roots, rejects sensitive config/credential paths, hashes
+and copies valid files into `WAREHOUSE_CALLIOPE_DIR`, and serves them through
+email-owner-gated download URLs. The originating host path is never sent to the browser.
 
 Configure the Hermes default profile's `mcp_servers` entry to use this warehouse's
 `/mcp` URL and a server-side `WAREHOUSE_MCP_KEY`. Calliope does not create or select a
@@ -302,7 +329,7 @@ the real provider-routable model ID:
 hermes config set platforms.api_server.enabled true
 hermes config set platforms.api_server.extra.host 127.0.0.1
 hermes config set platforms.api_server.extra.port 8642
-hermes config set platforms.api_server.extra.model_name anthropic/claude-sonnet-4.6
+hermes config set platforms.api_server.extra.model_name openai/gpt-5.6-sol
 hermes config set platforms.api_server.extra.key "$WAREHOUSE_HERMES_API_KEY"
 hermes gateway run --accept-hooks
 ```
@@ -345,6 +372,7 @@ No `rvbbitQuery`/metric found ⇒ flagged `materialized` (a "dead tree" — nudg
 `WAREHOUSE_DSN` · `RVBBIT_CATALOG_GRAPH` (default `db_catalog`) ·
 `WAREHOUSE_SCHEMAS` (CSV allowlist; default = all but rvbbit/pg_*) ·
 `WAREHOUSE_ROW_CAP` (1000) · `WAREHOUSE_STMT_TIMEOUT_MS` (30000) ·
+`WAREHOUSE_CUBE_PIVOT_CELL_CAP` (2500) ·
 `WAREHOUSE_MCP_HOST` (0.0.0.0) · `WAREHOUSE_MCP_PORT` (8765)
 **OAuth mode:** `WAREHOUSE_PUBLIC_URL` (enables it) · `WAREHOUSE_LOGIN_PASSWORD` (req) ·
 `WAREHOUSE_JWT_SECRET` (req, ≠ MCP_KEY) · `WAREHOUSE_ALLOWED_EMAILS` (opt) ·
@@ -354,7 +382,10 @@ put it on a volume, else a restart strands connectors with "client_id not found"
 **Calliope:** `WAREHOUSE_HERMES_URL` + `WAREHOUSE_HERMES_API_KEY` (both required) ·
 `WAREHOUSE_HERMES_MEMORY_KEY` (optional shared company scope) ·
 `WAREHOUSE_CALLIOPE_DIR` (attachment storage) ·
-`WAREHOUSE_CALLIOPE_MAX_IMAGE_BYTES` (8 MiB default).
+`WAREHOUSE_CALLIOPE_MAX_IMAGE_BYTES` (8 MiB default) ·
+`WAREHOUSE_CALLIOPE_EXPORT_ROOTS` (OS-path-separated allowed Hermes output roots) ·
+`WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES` (128 MiB default, 512 MiB ceiling; in uber
+Compose set the single shared host path with `WAREHOUSE_CALLIOPE_EXPORT_DIR`).
 **Shared-key mode:** `WAREHOUSE_MCP_KEY` (bearer; unset = auth OFF, dev only).
 
 ## Deferred to Phase 1+

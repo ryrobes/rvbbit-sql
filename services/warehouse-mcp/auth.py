@@ -682,6 +682,9 @@ _BG_CSS = """
 
 # ── login page ───────────────────────────────────────────────────────────────
 
+_LOGIN_RABBIT_SVG = ""
+
+
 def _page(body: str, status: int = 200) -> HTMLResponse:
     import warehouse_theme
     return HTMLResponse(
@@ -702,6 +705,8 @@ def _page(body: str, status: int = 200) -> HTMLResponse:
    backdrop-filter:blur(18px);box-sizing:border-box}}
  .loginbrand{{display:flex;align-items:center;color:#f0e6d8;font:700 12px/1 ui-monospace,Menlo,monospace;
    letter-spacing:.14em;text-decoration:none}}
+ .loginbrand .mark{{display:block;width:auto;height:15px;margin-right:12px;flex:none;
+   color:var(--amber,#e8b572)}}
  .loginbrand small{{margin-left:10px;padding-left:10px;border-left:1px solid #3a2f24;
    color:#8a8078;font-size:9px;font-weight:400;letter-spacing:.16em}}
  .loginbar [data-warehouse-theme-anchor]{{margin-left:auto}}
@@ -724,7 +729,7 @@ def _page(body: str, status: int = 200) -> HTMLResponse:
 </head><body>
 {background_layer(0.62, "radial-gradient(1000px 700px at 50% 45%, rgba(21,17,13,.34) 0%, rgba(21,17,13,.70) 55%, rgba(21,17,13,.93) 100%)")}
 <nav class=loginbar data-warehouse-header>
- <span class=loginbrand>DATA RABBIT<small>WAREHOUSE</small></span>
+ <span class=loginbrand>{_LOGIN_RABBIT_SVG}DATA RABBIT<small>WAREHOUSE</small></span>
  <span data-warehouse-theme-anchor></span>
 </nav>
 <div class=card>{body}</div>
@@ -780,7 +785,10 @@ def _login_form(hidden: dict, error: str | None = None,
 _EXPIRED = "<h1>Session expired</h1><p class=sub>Re-launch the connector from Claude to try again.</p>"
 
 
-def register_login_route(mcp, provider: WarehouseAuthProvider):
+def register_login_route(mcp, provider: WarehouseAuthProvider, rabbit_svg: str = ""):
+    global _LOGIN_RABBIT_SVG
+    _LOGIN_RABBIT_SVG = str(rabbit_svg or "")
+
     @mcp.custom_route("/login", methods=["GET", "POST"])
     async def login(request: Request):
         if request.method == "GET":

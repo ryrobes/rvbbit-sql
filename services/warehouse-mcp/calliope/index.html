@@ -80,6 +80,10 @@ __CALLIOPE_BACKGROUND__
   </section>
 
   <aside id="calliope-chat" class="chat-column" aria-label="Calliope conversation">
+    <div id="chat-resizer" class="chat-resizer" role="separator"
+         aria-label="Resize conversation panel" aria-orientation="vertical"
+         aria-valuemin="320" aria-valuemax="720" aria-valuenow="390"
+         tabindex="0"></div>
     <header class="column-head calliope-head">
       <div class="muse-avatar" aria-hidden="true"
            data-day-src="/calliope/callie-avatar-day.jpg"
@@ -101,6 +105,7 @@ __CALLIOPE_BACKGROUND__
 
     <form id="composer" class="composer">
       <div id="selected-reference" class="selected-reference" hidden></div>
+      <div id="spatial-selection-tray" class="spatial-selection-tray" hidden></div>
       <div id="attachment-tray" class="attachment-tray" hidden></div>
       <label class="compose-box">
         <span class="sr-only">Message Calliope</span>
@@ -136,14 +141,15 @@ __CALLIOPE_BACKGROUND__
   <div class="markup-shell">
     <header class="markup-head">
       <div>
-        <p class="eyebrow">Visual note</p>
-        <h2 id="markup-title">Mark up image</h2>
+        <p class="eyebrow">Spatial prompt</p>
+        <h2 id="markup-title">Select or mark up image</h2>
       </div>
       <button id="markup-close" class="markup-close" type="button" aria-label="Close markup editor">×</button>
     </header>
     <div id="markup-toolbar" class="markup-toolbar" aria-label="Markup tools">
       <div class="markup-tool-group">
-        <button type="button" class="active" data-markup-tool="pen">Pen</button>
+        <button type="button" class="active" data-markup-tool="select">Select</button>
+        <button type="button" data-markup-tool="pen">Pen</button>
         <button type="button" data-markup-tool="arrow">Arrow</button>
         <button type="button" data-markup-tool="rect">Box</button>
       </div>
@@ -172,7 +178,7 @@ __CALLIOPE_BACKGROUND__
       <canvas id="markup-canvas" aria-label="Image markup canvas"></canvas>
     </div>
     <footer class="markup-foot">
-      <span>Draw at full image resolution · Ctrl/⌘ Z to undo</span>
+      <span>Select an area or draw at full image resolution · Ctrl/⌘ Z to undo</span>
       <div>
         <button id="markup-cancel" type="button" class="quiet-action">Cancel</button>
         <button id="markup-attach" type="button" class="primary-action" disabled>Add to message</button>
