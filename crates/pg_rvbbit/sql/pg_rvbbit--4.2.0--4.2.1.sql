@@ -1,0 +1,7 @@
+-- Upgrade pg_rvbbit 4.2.0 -> 4.2.1
+--
+-- Postgres needs this edge for ALTER EXTENSION UPDATE. The SQL additions in
+-- this release are the idempotent, run-once 0221_burrow_guest_identity and
+-- 0222_calliope_notebook migrations; packaged deployments apply them through
+-- rvbbit.migrate(), independently of the extension version graph. Do not
+-- duplicate that DDL here or it would bypass schema_migrations bookkeeping.
