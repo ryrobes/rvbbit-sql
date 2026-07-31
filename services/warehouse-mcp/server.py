@@ -4402,7 +4402,13 @@ def dashboard_crawl(slug, use_llm=True):
     status = "live" if (sql_src or metric_names) else "materialized"
 
     with _conn() as c:
-        c.execute("DELETE FROM rvbbit.dashboard_deps WHERE dashboard_id=%s", (did,))
+        # Dependency rows are versioned evidence. Re-crawling one published
+        # version should replace only that version, not erase the lineage that
+        # immutable Calliope surfaces and Artifact Lens investigations rely on.
+        c.execute(
+            "DELETE FROM rvbbit.dashboard_deps WHERE dashboard_id=%s AND version=%s",
+            (did, ver),
+        )
         for kind, obj, bsql, src in rows:
             c.execute("INSERT INTO rvbbit.dashboard_deps (dashboard_id,version,kind,object_ref,base_sql,source) "
                       "VALUES (%s,%s,%s,%s,%s,%s)", (did, ver, kind, obj, bsql, src))
@@ -4648,24 +4654,50 @@ def _mcp_dashboard_template():
 _DASH_SHIM = (
     '<link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">\n'
     "<script>\n"
-    "window.RVBBIT_DASHBOARD={slug:__SLUG__};"
+    "window.RVBBIT_DASHBOARD={slug:__SLUG__,version:__VERSION__};"
     "(()=>{const v=new URLSearchParams(location.search).get('rvbbit_as_of');"
-    "if(v)window.RVBBIT_DASHBOARD.as_of=v;})();\n"
+    "if(v)window.RVBBIT_DASHBOARD.as_of=v;"
+    "const trace=[];let sequence=0;"
+    "const hash=(value)=>{let h=2166136261;for(let i=0;i<value.length;i++){"
+    "h^=value.charCodeAt(i);h=Math.imul(h,16777619);}return(h>>>0).toString(16).padStart(8,'0');};"
+    "window.RVBBIT_DASHBOARD.queryTrace=()=>trace.map((entry)=>({...entry,"
+    "columns:[...(entry.columns||[])],rows:[...(entry.rows||[])]}));"
+    "window.RVBBIT_DASHBOARD.clearQueryTrace=()=>{trace.length=0;};"
+    "window.RVBBIT_DASHBOARD._recordQueryTrace=(sql,asOf,result,error)=>{"
+    "const text=String(sql||'');const entry={id:'q-'+Date.now().toString(36)+'-'+(++sequence).toString(36),"
+    "query_hash:hash(text.replace(/\\s+/g,' ').trim().toLowerCase()),sql:text,as_of:asOf||null,"
+    "columns:Array.isArray(result&&result.columns)?result.columns.slice(0,160):[],"
+    "rows:Array.isArray(result&&result.rows)?result.rows.slice(0,200):[],"
+    "row_count:Number(result&&result.row_count)||0,truncated:Boolean(result&&result.truncated),"
+    "engine:(result&&result.engine)||null,elapsed_ms:Number(result&&result.elapsed_ms)||null,"
+    "error:error?String(error.message||error).slice(0,500):null,at:new Date().toISOString()};"
+    "trace.unshift(entry);if(trace.length>24)trace.length=24;"
+    "window.dispatchEvent(new CustomEvent('rvbbit:query-trace',{detail:entry}));return entry;};})();\n"
     "window.rvbbitQuery=async function(sql,opts){opts=opts||{};"
     "const asOf=opts.as_of||window.RVBBIT_DASHBOARD.as_of||null;"
-    "const r=await fetch('/api/d/'+__SLUG__+'/q',{method:'POST',headers:{'content-type':'application/json'},"
+    "try{const r=await fetch('/api/d/'+__SLUG__+'/q',{method:'POST',headers:{'content-type':'application/json'},"
     "body:JSON.stringify({sql:sql,as_of:asOf})});const d=await r.json();"
-    "if(!r.ok||d.error){throw new Error((d.error&&d.error.message)||('query failed '+r.status));}return d;};\n"
+    "if(!r.ok||d.error){throw new Error((d.error&&d.error.message)||('query failed '+r.status));}"
+    "window.RVBBIT_DASHBOARD._recordQueryTrace(sql,asOf,d,null);return d;"
+    "}catch(error){window.RVBBIT_DASHBOARD._recordQueryTrace(sql,asOf,null,error);throw error;}};\n"
     "window.cowork=window.cowork||{};"
     "if(!window.cowork.callMcpTool){window.cowork.callMcpTool=async function(tool,args){"
-    "args=args||{};const d=await window.rvbbitQuery(args.sql||'',{as_of:args.as_of||null});"
-    "return{structuredContent:{rows:(d&&d.rows)||[]}};};}\n"
+    "args=args||{};if(String(tool||'').endsWith('run_sql_multi')){"
+    "const pairs=Object.entries(args.queries||{});const results={};"
+    "for(const [name,sql] of pairs){results[name]=await window.rvbbitQuery(sql,{as_of:args.as_of||null});}"
+    "return{structuredContent:{results:results}};}"
+    "const d=await window.rvbbitQuery(args.sql||'',{as_of:args.as_of||null});"
+    "return{structuredContent:{...d,rows:(d&&d.rows)||[]}};};}\n"
     "</script>\n"
     '<script src="/theme/artifact-lens.js" defer></script>\n')
 
 
-def _dash_shim(slug):
-    return _DASH_SHIM.replace("__SLUG__", json.dumps(slug))
+def _dash_shim(slug, version=None):
+    return (
+        _DASH_SHIM
+        .replace("__SLUG__", json.dumps(slug))
+        .replace("__VERSION__", json.dumps(int(version)) if version is not None else "null")
+    )
 
 
 def _iso_utc(value):
@@ -4835,6 +4867,384 @@ def _dashboard_time_travel(slug, version=None):
     return _summarize_dashboard_time_travel(coverage, points, selected_version)
 
 
+_INSPECTION_SENSITIVE_RE = re.compile(
+    r"(?:secret|token|password|passwd|auth|cookie|session|api[-_]?key)",
+    re.I,
+)
+
+
+def _inspection_text(value, limit):
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]+", " ", str(value or "")).strip()[:limit]
+
+
+def _inspection_number(value, minimum=-1_000_000, maximum=1_000_000):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (minimum <= number <= maximum):
+        return None
+    return round(number, 3)
+
+
+def _sanitize_inspection_target(value):
+    """Bound browser DOM evidence before it can become durable investigation context."""
+    if not isinstance(value, dict):
+        raise ValueError("target must be an object")
+    bounds = value.get("bounds")
+    viewport = value.get("viewport")
+    if not isinstance(bounds, dict) or not isinstance(viewport, dict):
+        raise ValueError("target needs bounds and viewport")
+    clean_bounds = {
+        key: _inspection_number(bounds.get(key), 0, 100_000)
+        for key in ("x", "y", "width", "height")
+    }
+    clean_viewport = {
+        key: _inspection_number(viewport.get(key), 0, 100_000)
+        for key in ("width", "height", "scroll_x", "scroll_y", "document_width", "document_height")
+        if viewport.get(key) is not None
+    }
+    if (
+        clean_bounds["width"] is None
+        or clean_bounds["height"] is None
+        or clean_bounds["width"] < 1
+        or clean_bounds["height"] < 1
+        or clean_viewport.get("width") is None
+        or clean_viewport.get("height") is None
+    ):
+        raise ValueError("target must describe one visible dashboard object")
+    target = {
+        "label": _inspection_text(value.get("label") or "Selected target", 400),
+        "selector": _inspection_text(value.get("selector"), 800),
+        "tag": _inspection_text(value.get("tag"), 80),
+        "role": _inspection_text(value.get("role"), 80),
+        "text": _inspection_text(value.get("text"), 600),
+        "bounds": clean_bounds,
+        "viewport": clean_viewport,
+    }
+    raw_data = value.get("data")
+    if isinstance(raw_data, dict):
+        safe_data = {}
+        for raw_key, raw_value in list(raw_data.items())[:20]:
+            key = re.sub(r"[^a-zA-Z0-9_.:-]", "", str(raw_key))[:64]
+            if key and not _INSPECTION_SENSITIVE_RE.search(key):
+                safe_data[key] = _inspection_text(raw_value, 240)
+        if safe_data:
+            target["data"] = safe_data
+    for nested, limits in (
+        ("table", {"row_index": 100_000, "column_index": 10_000}),
+        ("chart", {"dataset_index": 10_000, "data_index": 100_000}),
+    ):
+        raw = value.get(nested)
+        if not isinstance(raw, dict):
+            continue
+        cleaned = {
+            key: int(number)
+            for key, maximum in limits.items()
+            if raw.get(key) is not None
+            if (number := _inspection_number(raw.get(key), 0, maximum)) is not None
+        }
+        for key in (
+            "column_header",
+            "cell_text",
+            "dataset_label",
+            "data_label",
+            "value",
+        ):
+            if raw.get(key) is not None:
+                cleaned[key] = _inspection_text(raw.get(key), 400)
+        target[nested] = cleaned
+    raw_visual = value.get("visual")
+    if isinstance(raw_visual, dict):
+        visual = {}
+        for key, maximum in (("row_index", 100_000), ("indexed_mark_count", 100_000)):
+            if raw_visual.get(key) is not None:
+                number = _inspection_number(raw_visual.get(key), 0, maximum)
+                if number is not None:
+                    visual[key] = int(number)
+        for key in ("mark_tag", "mark_text", "container_label"):
+            if raw_visual.get(key) is not None:
+                visual[key] = _inspection_text(raw_visual.get(key), 240)
+        values = raw_visual.get("text_values")
+        if isinstance(values, list):
+            visual["text_values"] = [
+                _inspection_text(item, 120)
+                for item in values[:160]
+                if _inspection_text(item, 120)
+            ]
+        raw_visual_data = raw_visual.get("data")
+        if isinstance(raw_visual_data, dict):
+            visual["data"] = {
+                key: _inspection_text(item, 240)
+                for raw_key, item in list(raw_visual_data.items())[:20]
+                if (key := re.sub(r"[^a-zA-Z0-9_.:-]", "", str(raw_key))[:64])
+                and not _INSPECTION_SENSITIVE_RE.search(key)
+            }
+        target["visual"] = visual
+    return target
+
+
+def _sanitize_inspection_binding(value):
+    if not isinstance(value, dict):
+        return {"kind": "element", "confidence": "visual"}
+    kind = str(value.get("kind") or "element").lower()
+    if kind not in {"chart", "table", "value", "element"}:
+        kind = "element"
+    confidence = str(value.get("confidence") or "visual").lower()
+    if confidence not in {"exact", "likely", "visual"}:
+        confidence = "visual"
+    binding = {
+        "kind": kind,
+        "confidence": confidence,
+        "field": _inspection_text(value.get("field"), 160),
+        "label": _inspection_text(value.get("label"), 300),
+        "value": _inspection_text(value.get("value"), 400),
+    }
+    for key in ("trace_row_index", "row_index", "column_index", "dataset_index", "data_index"):
+        if value.get(key) is not None:
+            number = _inspection_number(value.get(key), 0, 100_000)
+            if number is not None:
+                binding[key] = int(number)
+    raw_row = value.get("row")
+    if isinstance(raw_row, dict):
+        binding["row"] = {
+            _inspection_text(key, 160): _inspection_text(raw_value, 500)
+            for key, raw_value in list(raw_row.items())[:80]
+            if _inspection_text(key, 160)
+        }
+    return binding
+
+
+def _bound_inspection_trace(binding, trace):
+    """Only keep query provenance when the selected object actually matched it."""
+    if not isinstance(trace, dict):
+        return {}
+    if binding.get("confidence") not in {"exact", "likely"}:
+        return {}
+    return trace
+
+
+def _normalized_field(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _row_value(row, field_hint=None, value_hint=None):
+    if not isinstance(row, dict) or not row:
+        return None, None
+    if field_hint:
+        wanted = _normalized_field(field_hint)
+        for key, value in row.items():
+            if _normalized_field(key) == wanted:
+                return str(key), value
+    if value_hint not in (None, ""):
+        wanted_value = _inspection_text(value_hint, 400).replace(",", "").replace("$", "")
+        for key, value in row.items():
+            if _inspection_text(value, 400).replace(",", "").replace("$", "") == wanted_value:
+                return str(key), value
+    numeric = [
+        (str(key), value)
+        for key, value in row.items()
+        if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
+    ]
+    return numeric[0] if len(numeric) == 1 else (None, None)
+
+
+def _matching_latest_row(current_row, latest_rows, row_index):
+    if not isinstance(current_row, dict):
+        return None
+    dimensions = [
+        (key, value)
+        for key, value in current_row.items()
+        if value not in (None, "")
+        and not isinstance(value, (int, float, Decimal, bool))
+    ][:4]
+    if dimensions:
+        matches = [
+            row for row in latest_rows
+            if isinstance(row, dict)
+            and all(str(row.get(key)) == str(value) for key, value in dimensions)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    if isinstance(row_index, (int, float)):
+        index = int(row_index)
+        if 0 <= index < len(latest_rows) and isinstance(latest_rows[index], dict):
+            return latest_rows[index]
+    return latest_rows[0] if len(latest_rows) == 1 and isinstance(latest_rows[0], dict) else None
+
+
+def _numeric_delta(current, latest):
+    def parse(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float, Decimal)):
+            return float(value)
+        raw = str(value or "").strip()
+        negative = raw.startswith("(") and raw.endswith(")")
+        raw = re.sub(r"[^0-9.eE+-]", "", raw)
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return -parsed if negative else parsed
+
+    left, right = parse(current), parse(latest)
+    if left is None or right is None:
+        return None
+    delta = right - left
+    return {
+        "absolute": delta,
+        "percent": (delta / abs(left) * 100) if left else None,
+    }
+
+
+def _dashboard_inspection(slug, version, target, binding, trace):
+    """Build deterministic breadcrumbs for one exact rendered dashboard target."""
+    selected_target = _sanitize_inspection_target(target)
+    selected_binding = _sanitize_inspection_binding(binding)
+    # Defense in depth for stale or hand-written clients: artifact-level source
+    # edges remain available, but an unbound visual object cannot claim a query.
+    trace = _bound_inspection_trace(selected_binding, trace)
+    query_sql = str(trace.get("sql") or "").strip()
+    if len(query_sql) > 50_000:
+        raise ValueError("query trace is too large")
+    normalized_as_of = _normalize_as_of(trace.get("as_of")) if trace.get("as_of") else None
+
+    with _conn() as c:
+        dashboard = c.execute(
+            "SELECT id,slug,name,description,latest_version,runtime_kind,app_kind "
+            "FROM rvbbit.dashboards WHERE slug=%s",
+            (slug,),
+        ).fetchone()
+        if not dashboard:
+            return {"error": {"code": "NOT_FOUND", "message": "No such published artifact."}}
+        selected_version = int(version or dashboard["latest_version"])
+        if selected_version < 1:
+            raise ValueError("version must be a positive integer")
+        exists = c.execute(
+            "SELECT 1 FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
+            (dashboard["id"], selected_version),
+        ).fetchone()
+        if not exists:
+            return {"error": {"code": "VERSION_NOT_FOUND", "message": "No such artifact version."}}
+        deps = c.execute(
+            "SELECT kind,object_ref,base_sql,source,confidence "
+            "FROM rvbbit.dashboard_deps WHERE dashboard_id=%s AND version=%s "
+            "ORDER BY kind,object_ref NULLS LAST,base_sql NULLS LAST",
+            (dashboard["id"], selected_version),
+        ).fetchall()
+
+    validation = None
+    if query_sql:
+        validation = tool_validate_sql(query_sql, normalized_as_of)
+        if not validation.get("valid") or not validation.get("safe_select"):
+            raise ValueError("selected query trace is not a safe read-only query")
+    tables = _referenced_tables(query_sql) if query_sql else []
+    if not tables:
+        tables = sorted({
+            str(row["object_ref"])
+            for row in deps
+            if row.get("kind") == "table" and row.get("object_ref")
+        })
+
+    source_cards = []
+    with _ro() as rc, rc.cursor() as cur:
+        for table in tables[:16]:
+            schema, rel = _split(table)
+            if not _schema_allowed(schema):
+                continue
+            freshness = _freshness(cur, schema, rel)
+            doc = None
+            try:
+                row = cur.execute(
+                    "SELECT doc FROM rvbbit.catalog_docs "
+                    "WHERE graph_id=%s AND kind='db_table' "
+                    "AND schema_name=%s AND rel_name=%s "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (GRAPH, schema, rel),
+                ).fetchone()
+                doc = _inspection_text((row or {}).get("doc"), 900) or None
+            except Exception:  # noqa: BLE001 — catalog prose is optional evidence
+                pass
+            source_cards.append({
+                "table": f"{schema}.{rel}",
+                "doc": doc,
+                "freshness": freshness,
+            })
+
+    related = []
+    if tables:
+        with _conn() as c:
+            related = c.execute(
+                "SELECT DISTINCT d.slug,d.name,d.app_kind,d.latest_version "
+                "FROM rvbbit.dashboard_deps dd "
+                "JOIN rvbbit.dashboards d ON d.id=dd.dashboard_id "
+                "AND d.latest_version=dd.version "
+                "WHERE dd.kind='table' AND dd.object_ref=ANY(%s::text[]) "
+                "AND d.slug<>%s ORDER BY d.name LIMIT 8",
+                (tables, slug),
+            ).fetchall()
+
+    comparison = None
+    if query_sql and normalized_as_of:
+        historical = tool_run_sql(query_sql, normalized_as_of, 200)
+        latest = tool_run_sql(query_sql, None, 200)
+        if not historical.get("error") and not latest.get("error"):
+            row_index = selected_binding.get("trace_row_index")
+            if row_index is None:
+                row_index = selected_binding.get("row_index")
+            index = int(row_index) if isinstance(row_index, (int, float)) else 0
+            historical_rows = historical.get("rows") or []
+            current_row = (
+                historical_rows[index]
+                if 0 <= index < len(historical_rows) and isinstance(historical_rows[index], dict)
+                else (historical_rows[0] if len(historical_rows) == 1 else None)
+            )
+            latest_row = _matching_latest_row(current_row, latest.get("rows") or [], row_index)
+            field, current_value = _row_value(
+                current_row,
+                selected_binding.get("field"),
+                selected_binding.get("value"),
+            )
+            latest_value = latest_row.get(field) if field and latest_row else None
+            if current_row is not None:
+                comparison = {
+                    "as_of": normalized_as_of,
+                    "field": field,
+                    "current": current_value,
+                    "latest": latest_value,
+                    "delta": _numeric_delta(current_value, latest_value),
+                    "matched_latest_row": latest_row is not None,
+                }
+
+    return {
+        "artifact": {
+            "slug": dashboard["slug"],
+            "name": dashboard["name"],
+            "description": dashboard.get("description"),
+            "version": selected_version,
+            "latest_version": int(dashboard["latest_version"]),
+            "runtime_kind": dashboard.get("runtime_kind"),
+            "app_kind": dashboard.get("app_kind"),
+        },
+        "selection": selected_target,
+        "binding": selected_binding,
+        "provenance": {
+            "query_id": _inspection_text(trace.get("id"), 120) or None,
+            "query_hash": _inspection_text(trace.get("query_hash"), 80) or None,
+            "sql": query_sql or None,
+            "as_of": normalized_as_of,
+            "engine": (validation or {}).get("engine") or _inspection_text(trace.get("engine"), 120) or None,
+            "tables": tables,
+            "confidence": selected_binding["confidence"],
+        },
+        "sources": source_cards,
+        "related_artifacts": [dict(row) for row in related],
+        "comparison": comparison,
+        "dependency_count": len(deps),
+    }
+
+
 # ── the landing page: this server's own front door ───────────────────────────
 # For the install shape where nobody opens DataRabbit at all — people talk to
 # the warehouse through Claude, artifacts get published here, and the links go
@@ -4856,6 +5266,7 @@ _LANDING_CSS = """
   --bone:#e8ddcc; --fog:rgba(232,221,204,.55); --dim:rgba(232,221,204,.32);
   --line:rgba(232,221,204,.13); --line-hot:rgba(245,180,70,.42);
   --amber:#f5b446;
+  --gallery-rail-bg:color-mix(in oklch,var(--void) 85%,transparent);
   --mono:ui-monospace,"JetBrains Mono",SFMono-Regular,Menlo,monospace;
   --sans:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   --serif:"Iowan Old Style",Baskerville,"Times New Roman",serif;
@@ -4889,7 +5300,7 @@ a{color:inherit;text-decoration:none}
 
 nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
   height:56px;padding:0 max(20px,4vw);border-bottom:1px solid var(--line);
-  background:rgba(16,13,11,.82);backdrop-filter:blur(18px)}
+  background:var(--gallery-rail-bg);backdrop-filter:blur(18px)}
 .mark{display:block;height:15px;width:auto;color:var(--amber);flex:none}
 .wordmark{font:700 12px/1 var(--mono);letter-spacing:.14em}
 .wordmark small{margin-left:10px;padding-left:10px;border-left:1px solid var(--line);
@@ -4907,18 +5318,18 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
   position:fixed;right:var(--calliope-edge);bottom:var(--calliope-edge);z-index:19;
   display:inline-flex;align-items:center;gap:13px;min-height:64px;
   padding:6px 20px 6px 6px;border:1px solid var(--line-hot);border-radius:999px;
-  background:color-mix(in oklch,var(--panel) 58%,transparent);
+  background:var(--gallery-rail-bg);
   -webkit-backdrop-filter:blur(20px) saturate(1.24);
   backdrop-filter:blur(20px) saturate(1.24);
   box-shadow:0 14px 42px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.045);
   color:var(--bone-bright);transition:transform .2s,border-color .2s,background .2s,box-shadow .2s}
 .calliope-float:hover{
   transform:translateY(-2px);border-color:var(--amber);
-  background:color-mix(in oklch,var(--panel-raised) 72%,transparent);
+  background:var(--gallery-rail-bg);
   box-shadow:0 18px 52px rgba(0,0,0,.52),0 0 0 1px var(--amber-soft)}
 .calliope-float:focus-visible{outline:2px solid var(--amber);outline-offset:3px}
 .calliope-float-avatar{
-  width:50px;height:50px;flex:none;overflow:hidden;border:1px solid var(--line-hot);
+  width:44px;height:44px;flex:none;overflow:hidden;border:1px solid var(--line-hot);
   border-radius:50%;background:var(--panel-raised);
   box-shadow:0 0 0 3px var(--amber-soft),0 7px 20px rgba(0,0,0,.38)}
 .calliope-float-avatar[data-period=night]{
@@ -4928,8 +5339,9 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
   display:block;width:100%;height:100%;object-fit:cover;
   transform:scale(1.22);transform-origin:57% 39%}
 .calliope-float-name{
+  align-self:stretch;display:flex;align-items:center;
   color:var(--bone-bright);font-family:"Homemade Apple",cursive;
-  font-size:22px;font-weight:400;line-height:1.35;white-space:nowrap}
+  font-size:22px;font-weight:400;line-height:1;white-space:nowrap}
 
 main{position:relative;z-index:1;padding:0 max(20px,4vw) 90px}
 header.hero{padding:66px 0 30px;border-bottom:1px solid var(--line)}
@@ -4956,8 +5368,7 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   gap:1px;margin-top:1px;background:var(--line);border:1px solid var(--line)}
 .card{display:flex;flex-direction:column;background:var(--panel);transition:background .25s}
 .card:hover{background:var(--panel-2)}
-.shot{position:relative;aspect-ratio:16/10;overflow:hidden;background:#0d0b09;
-  border-bottom:1px solid var(--line)}
+.shot{position:relative;aspect-ratio:16/10;overflow:hidden;background:#0d0b09}
 /* The glyph sits underneath permanently; the shot fades in ON TOP once it
    actually loads. That way a thumbnail still being rendered shows the
    stand-in rather than a broken image, and a retry can swap it in later
@@ -5005,7 +5416,7 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .wordmark small{display:none}
   .applink{display:none}
   .calliope-float{gap:11px;min-height:60px;padding:5px 17px 5px 5px}
-  .calliope-float-avatar{width:48px;height:48px}
+  .calliope-float-avatar{width:42px;height:42px}
   .calliope-float-name{font-size:20px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
@@ -5290,7 +5701,7 @@ def _landing_html(rows, viewer):
         '<span class="calliope-float-avatar" aria-hidden="true" '
         'data-day-src="/calliope/callie-avatar-day.jpg" '
         'data-night-src="/calliope/callie-avatar-night.jpg">'
-        '<img alt="" width="50" height="50" decoding="async"></span>'
+        '<img alt="" width="44" height="44" decoding="async"></span>'
         '<span class="calliope-float-name">Calliope</span></a>'
         if calliope.is_enabled() else ""
     )
@@ -5474,7 +5885,7 @@ def register_dashboard_routes(m):
                 return HTMLResponse("<h1>404 — no such dashboard</h1>", status_code=404)
             v = c.execute("SELECT html FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
                           (d["id"], d["latest_version"])).fetchone()
-        return HTMLResponse(_dash_shim(slug) + (v["html"] or ""))
+        return HTMLResponse(_dash_shim(slug, d["latest_version"]) + (v["html"] or ""))
 
     @m.custom_route("/api/d/{slug}/time-travel", methods=["GET"])
     async def _time_travel(request):
@@ -5501,6 +5912,61 @@ def register_dashboard_routes(m):
                 200,
             )
         return _json(result, 404 if result.get("code") == "NOT_FOUND" else 200)
+
+    @m.custom_route("/api/d/{slug}/inspect", methods=["POST"])
+    async def _inspect(request):
+        email = auth.read_session(request)
+        if not email:
+            return _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            version = body.get("version")
+            selected_version = int(version) if version is not None else None
+            if selected_version is not None and selected_version < 1:
+                raise ValueError("version must be a positive integer")
+            tok = _SESSION_SUB.set(email)
+            try:
+                result = _dashboard_inspection(
+                    request.path_params["slug"],
+                    selected_version,
+                    body.get("target"),
+                    body.get("binding"),
+                    body.get("trace"),
+                )
+            finally:
+                _SESSION_SUB.reset(tok)
+        except (TypeError, ValueError) as exc:
+            return _json(
+                {"error": {"code": "BAD_INSPECTION", "message": str(exc)}},
+                400,
+            )
+        except Exception as exc:  # noqa: BLE001 — the dashboard remains usable
+            print(
+                f"artifact inspection ({request.path_params['slug']}): {exc}",
+                file=sys.stderr,
+            )
+            return _json(
+                {
+                    "error": {
+                        "code": "INSPECTION_UNAVAILABLE",
+                        "message": "The evidence graph could not be assembled.",
+                    }
+                },
+                500,
+            )
+        if result.get("error"):
+            code = result["error"].get("code")
+            return _json(result, 404 if code in {"NOT_FOUND", "VERSION_NOT_FOUND"} else 400)
+        try:
+            import calliope
+            result["calliope_enabled"] = calliope.is_enabled()
+        except Exception:  # noqa: BLE001
+            result["calliope_enabled"] = False
+        return _json(result)
 
     @m.custom_route("/api/d/{slug}/q", methods=["POST"])
     async def _data(request):

@@ -1,0 +1,4 @@
+-- Upgrade pg_rvbbit 4.2.4 -> 4.2.5
+--
+-- Postgres needs this edge for ALTER EXTENSION UPDATE. This release changes
+-- the Warehouse MCP and Lens packaging only; there is no extension SQL delta.

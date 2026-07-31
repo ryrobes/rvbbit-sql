@@ -1797,6 +1797,11 @@ def _compact_surface_context(
             ),
             "sql": str(source.get("sql") or "")[:900] or None,
             "target": payload.get("selection") if row.get("kind") == "selection" else None,
+            "evidence": (
+                _bounded_investigation_packet(payload.get("inspection"))
+                if row.get("kind") == "selection" and payload.get("inspection")
+                else None
+            ),
             "created_at": _now_iso(row.get("created_at")),
         }
         compact.append({k: v for k, v in item.items() if v is not None})
@@ -3672,6 +3677,174 @@ def _complete_turn(
         )
 
 
+async def _create_session_record(
+    config: CalliopeConfig,
+    conn_factory: Callable[..., Any],
+    owner: str,
+    title: str,
+) -> dict[str, Any]:
+    """Create the paired Hermes and user-owned Calliope session."""
+    title = re.sub(r"\s+", " ", str(title or "New inquiry")).strip()[:120] or "New inquiry"
+    local_id = str(uuid.uuid4())
+    hermes_id = f"calliope_{int(time.time())}_{uuid.uuid4().hex[:10]}"
+    await _hermes_json(
+        config,
+        "POST",
+        "/api/sessions",
+        {"id": hermes_id, "source": "api_server"},
+    )
+    try:
+        with conn_factory() as conn:
+            row = conn.execute(
+                "INSERT INTO rvbbit.calliope_sessions "
+                "(id,owner_email,hermes_session_id,title) "
+                "VALUES (%s::uuid,%s,%s,%s) RETURNING *",
+                (local_id, owner, hermes_id, title),
+            ).fetchone()
+    except Exception:
+        try:
+            await _hermes_json(
+                config,
+                "DELETE",
+                f"/api/sessions/{quote(hermes_id, safe='')}",
+            )
+        except Exception:
+            pass
+        raise
+    return dict(row)
+
+
+def _bounded_investigation_packet(value: Any) -> dict[str, Any]:
+    """Keep imported Lens evidence useful, inert, and reasonably small."""
+    if not isinstance(value, dict):
+        return {}
+    sensitive = re.compile(
+        r"(?:secret|token|password|passwd|auth|cookie|session|api[-_]?key)",
+        re.I,
+    )
+
+    def clean(item: Any, depth=0) -> Any:
+        if depth > 6:
+            return None
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        if isinstance(item, str):
+            return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]+", " ", item)[:16_000]
+        if isinstance(item, dict):
+            out = {}
+            for raw_key, raw_value in list(item.items())[:80]:
+                key = re.sub(r"[^a-zA-Z0-9_.:-]", "", str(raw_key))[:80]
+                if not key or sensitive.search(key):
+                    continue
+                out[key] = clean(raw_value, depth + 1)
+            return out
+        if isinstance(item, (list, tuple)):
+            return [clean(child, depth + 1) for child in list(item)[:40]]
+        return str(item)[:1000]
+
+    def clean_query_result(item: Any) -> dict[str, Any] | None:
+        """Keep enough executed rows to orient Hermes without cloning a result set."""
+        if not isinstance(item, dict):
+            return None
+        result = {
+            key: clean(item.get(key))
+            for key in (
+                "query_hash",
+                "row_count",
+                "returned_rows",
+                "truncated",
+                "engine",
+                "elapsed_ms",
+                "as_of_applied",
+            )
+            if item.get(key) is not None
+        }
+        columns = []
+        for raw_column in list(item.get("columns") or [])[:40]:
+            if isinstance(raw_column, dict):
+                name = str(raw_column.get("name") or "")[:160]
+                if not name or sensitive.search(name):
+                    continue
+                columns.append({
+                    "name": name,
+                    "type": str(raw_column.get("type") or "")[:80],
+                })
+            else:
+                name = str(raw_column or "")[:160]
+                if name and not sensitive.search(name):
+                    columns.append({"name": name, "type": ""})
+        result["columns"] = columns
+
+        preview_rows = []
+        remaining = 24_000
+        for raw_row in list(item.get("rows") or [])[:12]:
+            if remaining <= 0:
+                break
+            if isinstance(raw_row, dict):
+                row = {}
+                for raw_key, raw_value in list(raw_row.items())[:40]:
+                    key = re.sub(r"[^a-zA-Z0-9_.:-]", "", str(raw_key))[:160]
+                    if not key or sensitive.search(key):
+                        continue
+                    if raw_value is None or isinstance(raw_value, (bool, int, float)):
+                        value = raw_value
+                    elif isinstance(raw_value, str):
+                        value = re.sub(
+                            r"[\x00-\x08\x0b\x0c\x0e-\x1f]+",
+                            " ",
+                            raw_value,
+                        )[:800]
+                    else:
+                        value = json.dumps(
+                            clean(raw_value),
+                            default=str,
+                            separators=(",", ":"),
+                        )[:800]
+                    size = len(json.dumps(value, default=str).encode("utf-8"))
+                    if size > remaining:
+                        break
+                    row[key] = value
+                    remaining -= size
+                if row:
+                    preview_rows.append(row)
+            elif isinstance(raw_row, (list, tuple)):
+                row = [clean(value) for value in list(raw_row)[:40]]
+                encoded = json.dumps(row, default=str).encode("utf-8")
+                if len(encoded) > remaining:
+                    break
+                preview_rows.append(row)
+                remaining -= len(encoded)
+        result["rows"] = preview_rows
+        result["preview_rows"] = len(preview_rows)
+        return result
+
+    packet = {
+        key: clean(value.get(key))
+        for key in (
+            "artifact",
+            "binding",
+            "provenance",
+            "sources",
+            "related_artifacts",
+            "comparison",
+            "dependency_count",
+        )
+        if value.get(key) is not None
+    }
+    query_result = clean_query_result(value.get("query_result"))
+    if query_result is not None:
+        packet["query_result"] = query_result
+    encoded = json.dumps(packet, default=str, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > 64_000:
+        provenance = dict(packet.get("provenance") or {})
+        if provenance.get("sql"):
+            provenance["sql"] = str(provenance["sql"])[:12_000]
+        packet["provenance"] = provenance
+        packet["sources"] = list(packet.get("sources") or [])[:8]
+        packet["related_artifacts"] = list(packet.get("related_artifacts") or [])[:6]
+    return packet
+
+
 def register_calliope_routes(
     mcp: Any,
     conn_factory: Callable[..., Any],
@@ -4242,35 +4415,235 @@ def register_calliope_routes(
         title = re.sub(r"\s+", " ", str((body or {}).get("title") or "New inquiry")).strip()[:120]
         if not title:
             title = "New inquiry"
-        local_id = str(uuid.uuid4())
-        hermes_id = f"calliope_{int(time.time())}_{uuid.uuid4().hex[:10]}"
         try:
-            await _hermes_json(
-                config,
-                "POST",
-                "/api/sessions",
-                {"id": hermes_id, "source": "api_server"},
-            )
+            row = await _create_session_record(config, conn_factory, owner, title)
         except Exception as exc:
             return json_response(
                 {"error": {"code": "HERMES_UNAVAILABLE", "message": str(exc)[:600]}},
                 502,
             )
-        try:
-            with conn_factory() as conn:
-                row = conn.execute(
-                    "INSERT INTO rvbbit.calliope_sessions "
-                    "(id,owner_email,hermes_session_id,title) "
-                    "VALUES (%s::uuid,%s,%s,%s) RETURNING *",
-                    (local_id, owner, hermes_id, title),
-                ).fetchone()
-        except Exception:
-            try:
-                await _hermes_json(config, "DELETE", f"/api/sessions/{quote(hermes_id, safe='')}")
-            except Exception:
-                pass
-            raise
         return json_response({"session": _session_json(row)}, 201)
+
+    @mcp.custom_route("/api/calliope/investigations", methods=["POST"])
+    async def create_investigation(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        slug = str(body.get("slug") or "")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", slug, re.I):
+            return json_response(
+                {"error": {"code": "BAD_ARTIFACT", "message": "Invalid artifact handle."}},
+                400,
+            )
+        try:
+            version = int(body.get("version"))
+            if version < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            return json_response(
+                {"error": {"code": "BAD_VERSION", "message": "Version must be positive."}},
+                400,
+            )
+        packet = _bounded_investigation_packet(body.get("inspection"))
+        query_result = packet.get("query_result")
+        analyze_result = isinstance(query_result, dict)
+        target = body.get("target")
+        if not isinstance(target, dict):
+            target = (body.get("inspection") or {}).get("selection")
+        if not isinstance(target, dict):
+            return json_response(
+                {"error": {"code": "BAD_TARGET", "message": "A selected target is required."}},
+                400,
+            )
+
+        with conn_factory() as conn:
+            artifact = conn.execute(
+                "SELECT d.name,d.app_kind,d.runtime_kind "
+                "FROM rvbbit.dashboards d "
+                "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
+                "WHERE d.slug=%s AND v.version=%s",
+                (slug, version),
+            ).fetchone()
+        if not artifact:
+            return json_response(
+                {"error": {"code": "NOT_FOUND", "message": "No such artifact version."}},
+                404,
+            )
+
+        label = re.sub(
+            r"\s+",
+            " ",
+            str(target.get("label") or target.get("text") or "Selected target"),
+        ).strip()[:180] or "Selected target"
+        session_row = None
+        try:
+            # An Artifact Lens question is a branch, never an append. Deliberately
+            # ignore any browser/session context and create a fresh paired Hermes
+            # + Calliope session for every invocation.
+            session_row = await _create_session_record(
+                config,
+                conn_factory,
+                owner,
+                (
+                    f"Analyze · {artifact['name']} · {label}"
+                    if analyze_result
+                    else f"Why · {artifact['name']} · {label}"
+                ),
+            )
+            session_id = str(session_row["id"])
+            turn_id = str(uuid.uuid4())
+            with conn_factory() as conn:
+                conn.execute(
+                    "INSERT INTO rvbbit.calliope_turns "
+                    "(id,session_id,ordinal,user_message,assistant_message,status,completed_at) "
+                    "VALUES (%s::uuid,%s::uuid,1,%s,%s,'complete',now())",
+                    (
+                        turn_id,
+                        session_id,
+                        (
+                            f"[Artifact Lens result] Analyze the executed query behind "
+                            f"“{label}” in {artifact['name']}."
+                            if analyze_result
+                            else f"[Artifact Lens] Investigate “{label}” in {artifact['name']}."
+                        ),
+                        (
+                            "The exact SQL, execution metadata, and a bounded result preview "
+                            "are pinned with the artifact. I can profile the rows, explain "
+                            "patterns, or rerun the governed query through RVBBIT for deeper work."
+                            if analyze_result
+                            else "The exact artifact version, rendered target, query provenance, "
+                            "and available source evidence are pinned in the scratchpad. Ask me "
+                            "what you want to explain, compare, or change."
+                        ),
+                    ),
+                )
+            artifact_surfaces = _insert_surfaces(
+                conn_factory,
+                session_id,
+                turn_id,
+                [{
+                    "kind": "artifact",
+                    "title": str(artifact["name"])[:240],
+                    "tool_name": "artifact_lens_import",
+                    "tool_call_id": f"artifact-lens:{slug}:v{version}",
+                    "lineage_key": f"artifact:{slug}",
+                    "artifact_slug": slug,
+                    "artifact_version": version,
+                    "payload": {
+                        "slug": slug,
+                        "version": version,
+                        "app_kind": artifact.get("app_kind"),
+                        "runtime_kind": artifact.get("runtime_kind"),
+                        "display_url": (
+                            f"/calliope/artifacts/{quote(slug, safe='')}/versions/{version}"
+                        ),
+                    },
+                    "source": {"origin": "artifact_lens"},
+                }],
+            )
+            if not artifact_surfaces:
+                raise RuntimeError("could not pin the artifact surface")
+            artifact_surface = artifact_surfaces[0]
+            decoded = _decode_spatial_selections([{
+                **target,
+                "selection_id": str(uuid.uuid4()),
+                "source_surface_id": artifact_surface["id"],
+                "type": "artifact_element",
+            }])
+            projections = _spatial_selection_projections(
+                decoded,
+                {
+                    artifact_surface["id"]: {
+                        "kind": "artifact",
+                        "title": artifact_surface["title"],
+                        "lineage_key": artifact_surface["lineage_key"],
+                        "artifact_slug": slug,
+                        "artifact_version": version,
+                    }
+                },
+            )
+            projections[0]["payload"]["inspection"] = packet
+            selection_surfaces = _insert_surfaces(
+                conn_factory,
+                session_id,
+                turn_id,
+                projections,
+            )
+            if not selection_surfaces:
+                raise RuntimeError("could not pin the selected target")
+            selection_surface = selection_surfaces[0]
+            with conn_factory() as conn:
+                conn.execute(
+                    "UPDATE rvbbit.calliope_turns SET selected_surface_id=%s::uuid "
+                    "WHERE id=%s::uuid",
+                    (selection_surface["id"], turn_id),
+                )
+                conn.execute(
+                    "UPDATE rvbbit.calliope_sessions SET updated_at=now() WHERE id=%s::uuid",
+                    (session_id,),
+                )
+        except Exception as exc:
+            if session_row:
+                with conn_factory() as conn:
+                    conn.execute(
+                        "DELETE FROM rvbbit.calliope_sessions WHERE id=%s::uuid",
+                        (str(session_row["id"]),),
+                    )
+                try:
+                    await _hermes_json(
+                        config,
+                        "DELETE",
+                        f"/api/sessions/{quote(str(session_row['hermes_session_id']), safe='')}",
+                    )
+                except Exception:
+                    pass
+            return json_response(
+                {
+                    "error": {
+                        "code": "INVESTIGATION_FAILED",
+                        "message": str(exc)[:600],
+                    }
+                },
+                500,
+            )
+
+        if analyze_result:
+            returned_rows = query_result.get("returned_rows") or query_result.get("row_count")
+            row_copy = f" ({returned_rows} returned rows)" if returned_rows is not None else ""
+            prompt = (
+                f"Analyze the pinned result set for “{label}”{row_copy}. Start with its SQL, "
+                "execution metadata, columns, and row preview. Identify useful patterns, "
+                "outliers, and follow-up questions; rerun the governed SQL through RVBBIT "
+                "when the preview is not enough."
+            )
+        else:
+            prompt = (
+                f"Explain why “{label}” has this value. Start with the pinned deterministic "
+                "evidence, then use the RVBBIT MCP tools only where more proof is needed."
+            )
+        url = (
+            "/calliope?"
+            + urlencode({
+                "session": str(session_row["id"]),
+                "surface": selection_surface["id"],
+                "prompt": prompt,
+            })
+        )
+        return json_response(
+            {
+                "new_session": True,
+                "mode": "query_result" if analyze_result else "selection",
+                "session": _session_json(session_row),
+                "surface": selection_surface,
+                "url": url,
+            },
+            201,
+        )
 
     @mcp.custom_route("/api/calliope/sessions/{session_id}", methods=["GET"])
     async def get_session(request):

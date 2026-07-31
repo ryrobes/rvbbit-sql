@@ -977,6 +977,120 @@ def test_spatial_targets_are_bounded_sanitized_and_projected_as_lineage():
         }])
 
 
+def test_artifact_lens_investigation_packet_is_bounded_and_launches_exact_context():
+    preview_rows = [
+        {
+            "region": f"Region {index}",
+            "revenue": index * 100,
+            "notes": "x" * 1000,
+            "api_token": "do-not-store",
+        }
+        for index in range(15)
+    ]
+    packet = calliope._bounded_investigation_packet({
+        "artifact": {"slug": "regional-revenue", "version": 7},
+        "binding": {"field": "revenue", "confidence": "exact"},
+        "provenance": {
+            "sql": "select region, revenue from marts.sales",
+            "api_token": "do-not-store",
+        },
+        "sources": [{"table": "marts.sales"}],
+        "query_result": {
+            "query_hash": "abc123",
+            "row_count": 1500,
+            "returned_rows": 500,
+            "truncated": True,
+            "engine": "postgres",
+            "columns": [
+                {"name": "region", "type": "text"},
+                {"name": "revenue", "type": "numeric"},
+                {"name": "api_token", "type": "text"},
+            ],
+            "rows": preview_rows,
+        },
+        "selection": {"text": "not duplicated in the evidence packet"},
+        "ignored": "also omitted",
+    })
+    assert packet["artifact"]["version"] == 7
+    assert packet["binding"]["confidence"] == "exact"
+    assert packet["provenance"]["sql"].startswith("select region")
+    assert "api_token" not in packet["provenance"]
+    assert "selection" not in packet
+    assert "ignored" not in packet
+    result = packet["query_result"]
+    assert result["preview_rows"] == 12
+    assert result["row_count"] == 1500
+    assert result["returned_rows"] == 500
+    assert result["truncated"] is True
+    assert [column["name"] for column in result["columns"]] == ["region", "revenue"]
+    assert all("api_token" not in row for row in result["rows"])
+    assert len(result["rows"][0]["notes"]) == 800
+
+    script = (_HERE / "calliope" / "calliope.js").read_text(encoding="utf-8")
+    source = (_HERE / "calliope.py").read_text(encoding="utf-8")
+    assert 'launch.get("session")' in script
+    assert 'launch.get("surface")' in script
+    assert 'launch.get("prompt")' in script
+    assert "/api/calliope/investigations" in source
+    assert "artifact_lens_import" in source
+    assert "selected_surface_id=%s::uuid" in source
+    assert '"new_session": True' in source
+    assert "An Artifact Lens question is a branch, never an append" in source
+    assert '"mode": "query_result" if analyze_result else "selection"' in source
+    assert "[Artifact Lens result]" in source
+    assert "Analyze the pinned result set" in source
+
+
+def test_selected_investigation_surface_sends_deterministic_evidence_to_hermes():
+    surface_id = "bac8e23c-ccb7-41de-891b-ac3cd6ee955d"
+
+    class Result:
+        @staticmethod
+        def fetchall():
+            return [{
+                "id": surface_id,
+                "kind": "selection",
+                "title": "Target · Revenue",
+                "artifact_slug": "regional-revenue",
+                "artifact_version": 7,
+                "lineage_key": "selection:regional-revenue:abc",
+                "payload": {
+                    "selection": {"label": "Revenue", "selector": "#revenue"},
+                    "inspection": {
+                        "binding": {"field": "revenue", "confidence": "exact"},
+                        "provenance": {
+                            "sql": "select revenue from marts.sales",
+                            "tables": ["marts.sales"],
+                        },
+                    },
+                },
+                "source": {},
+                "created_at": "2026-07-30T20:00:00Z",
+            }]
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(_statement, _params):
+            return Result()
+
+    compact, selected = calliope._compact_surface_context(
+        lambda: Connection(),
+        "45f8a9da-5ff7-488f-b377-211c6e94aff0",
+        surface_id,
+    )
+    assert compact[0]["evidence"]["binding"]["confidence"] == "exact"
+    assert selected["evidence"]["provenance"]["tables"] == ["marts.sales"]
+    instructions = calliope._instructions(compact, selected)
+    assert "select revenue from marts.sales" in instructions
+    assert '"confidence":"exact"' in instructions
+
+
 def test_assistant_prose_strips_inline_image_payloads():
     content = (
         "Capture ready.\n\n![image](data:image/png;base64,"

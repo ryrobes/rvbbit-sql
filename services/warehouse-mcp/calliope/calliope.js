@@ -3461,9 +3461,24 @@
     restoreChatWidth();
     setupEvents();
     try {
+      const launch = new URLSearchParams(window.location.search);
+      const launchSession = launch.get("session");
+      const launchSurface = launch.get("surface");
+      const launchPrompt = launch.get("prompt");
       await loadConfig();
       await loadDesignProfiles();
-      await loadSessions();
+      await loadSessions(launchSession);
+      if (launchSurface && state.surfaces.some((surface) => surface.id === launchSurface)) {
+        requestAnimationFrame(() => focusSurface(launchSurface));
+      }
+      if (launchPrompt && state.current) {
+        els.input.value = launchPrompt.slice(0, 6000);
+        resizeComposer();
+        requestAnimationFrame(() => els.input.focus());
+        launch.delete("prompt");
+        const query = launch.toString();
+        window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+      }
       if (!state.sessions.length) {
         els.dialog.showModal();
         requestAnimationFrame(() => els.newSessionTitle.focus());
