@@ -913,6 +913,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0223_calliope_design_profiles",
         include_str!("../sql/migrations/0223_calliope_design_profiles.sql"),
     ),
+    (
+        "0224_artifact_semantic_enrichment",
+        include_str!("../sql/migrations/0224_artifact_semantic_enrichment.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -1,0 +1,191 @@
+{
+  "semantic_map": {
+    "schema_version": "rvbbit.semantic-map.v1",
+    "description": "Business meanings and exact SQL recreations for the semantic-map local proof.",
+    "objects": [
+      {
+        "id": "selected_drop_rate",
+        "kind": "scalar",
+        "meaning": {
+          "label": "Selected region drop rate",
+          "description": "The share of the selected region currently classified as dropped.",
+          "unit": "percent",
+          "formula": "drop_pct multiplied by 100 for the current region"
+        },
+        "parameters": {
+          "region": {
+            "type": "text",
+            "default": "US",
+            "label": "Region",
+            "source": "#region-filter"
+          }
+        },
+        "bindings": [
+          {
+            "selector": "#selected-drop-rate"
+          }
+        ],
+        "evaluator": {
+          "sql": "select drop_pct * 100 as value from public._demo_revenue where region = {{region}}",
+          "shape": "scalar",
+          "value_column": "value"
+        },
+        "display": {
+          "suffix": "%",
+          "decimals": 1
+        },
+        "source_queries": [
+          "regional_rows"
+        ]
+      },
+      {
+        "id": "retained_share",
+        "kind": "scalar",
+        "meaning": {
+          "label": "Selected region retained share",
+          "description": "The complement of the selected region drop rate.",
+          "unit": "percent",
+          "formula": "100 minus the selected region drop rate"
+        },
+        "parameters": {
+          "region": {
+            "type": "text",
+            "default": "US",
+            "label": "Region",
+            "source": "#region-filter"
+          }
+        },
+        "bindings": [
+          {
+            "selector": "#retained-share"
+          }
+        ],
+        "evaluator": {
+          "sql": "select (1 - drop_pct) * 100 as value from public._demo_revenue where region = {{region}}",
+          "shape": "scalar",
+          "value_column": "value"
+        },
+        "display": {
+          "suffix": "%",
+          "decimals": 1
+        },
+        "source_queries": [
+          "regional_rows"
+        ]
+      },
+      {
+        "id": "portfolio_average",
+        "kind": "scalar",
+        "meaning": {
+          "label": "Portfolio average drop rate",
+          "description": "The unweighted mean drop rate across every returned region.",
+          "unit": "percent",
+          "formula": "Average of every regional drop_pct multiplied by 100"
+        },
+        "bindings": [
+          {
+            "selector": "#portfolio-average"
+          }
+        ],
+        "evaluator": {
+          "sql": "select avg(drop_pct) * 100 as value from public._demo_revenue",
+          "shape": "scalar",
+          "value_column": "value"
+        },
+        "display": {
+          "suffix": "%",
+          "decimals": 1
+        },
+        "source_queries": [
+          "regional_rows"
+        ]
+      },
+      {
+        "id": "above_average_count",
+        "kind": "scalar",
+        "meaning": {
+          "label": "Regions above portfolio average",
+          "description": "How many regions have a drop rate greater than the current portfolio mean.",
+          "unit": "regions",
+          "formula": "Count of regions where drop_pct exceeds the mean drop_pct"
+        },
+        "bindings": [
+          {
+            "selector": "#above-average-count"
+          }
+        ],
+        "evaluator": {
+          "sql": "select count(*) as value from public._demo_revenue where drop_pct > (select avg(drop_pct) from public._demo_revenue)",
+          "shape": "scalar",
+          "value_column": "value"
+        },
+        "display": {
+          "decimals": 0
+        },
+        "source_queries": [
+          "regional_rows"
+        ]
+      },
+      {
+        "id": "region_count",
+        "kind": "scalar",
+        "meaning": {
+          "label": "Regions represented",
+          "description": "The number of regional source rows represented on this dashboard.",
+          "unit": "regions",
+          "formula": "Count of rows in the regional source"
+        },
+        "bindings": [
+          {
+            "selector": "#region-count"
+          }
+        ],
+        "evaluator": {
+          "sql": "select count(*) as value from public._demo_revenue",
+          "shape": "scalar",
+          "value_column": "value"
+        },
+        "display": {
+          "decimals": 0
+        },
+        "source_queries": [
+          "regional_rows"
+        ]
+      },
+      {
+        "id": "regional_drop_rate",
+        "kind": "scalar",
+        "meaning": {
+          "label": "Regional drop rate",
+          "description": "The drop rate represented by one regional bar in the comparison.",
+          "unit": "percent",
+          "formula": "drop_pct multiplied by 100 for the bar's region"
+        },
+        "parameters": {
+          "region": {
+            "type": "text",
+            "default": "US",
+            "label": "Region"
+          }
+        },
+        "bindings": [
+          {
+            "selector": ".bar-rate"
+          }
+        ],
+        "evaluator": {
+          "sql": "select drop_pct * 100 as value from public._demo_revenue where region = {{region}}",
+          "shape": "scalar",
+          "value_column": "value"
+        },
+        "display": {
+          "suffix": "%",
+          "decimals": 1
+        },
+        "source_queries": [
+          "regional_rows"
+        ]
+      }
+    ]
+  }
+}

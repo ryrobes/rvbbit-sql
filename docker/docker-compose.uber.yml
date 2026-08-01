@@ -245,6 +245,14 @@ services:
       # and serve at /thumbs (lens proxies them at /api/rvbbit/thumb).
       LENS_PUBLIC_URL: ${LENS_PUBLIC_URL:-}
       WAREHOUSE_LIVE_APP_CAPTURE_DIR: /app/data/captures
+      # Post-publication semantic compiler. Publication remains non-blocking;
+      # the worker renders each immutable HTML version and the database-side
+      # RVBBIT agent operator proposes replayable value definitions.
+      WAREHOUSE_SEMANTIC_ENRICHMENT: ${WAREHOUSE_SEMANTIC_ENRICHMENT:-1}
+      WAREHOUSE_SEMANTIC_ENRICH_MODEL: ${WAREHOUSE_SEMANTIC_ENRICH_MODEL:-openai/gpt-5.6-sol}
+      WAREHOUSE_SEMANTIC_ENRICH_MAX_ATTEMPTS: ${WAREHOUSE_SEMANTIC_ENRICH_MAX_ATTEMPTS:-3}
+      WAREHOUSE_SEMANTIC_ENRICH_RENDER_WAIT_MS: ${WAREHOUSE_SEMANTIC_ENRICH_RENDER_WAIT_MS:-3000}
+      WAREHOUSE_SEMANTIC_ENRICH_SOURCE_CHARS: ${WAREHOUSE_SEMANTIC_ENRICH_SOURCE_CHARS:-180000}
       # Calliope living-artifact notebook (optional). Both Hermes values are
       # required; with either blank, the feature and all its routes disappear.
       # Hermes uses its current/default profile and shared company memory.

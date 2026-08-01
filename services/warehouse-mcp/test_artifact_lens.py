@@ -17,6 +17,103 @@ def _at(hour: int) -> datetime:
     return datetime(2026, 7, 30, hour, 0, tzinfo=timezone.utc)
 
 
+def _semantic_manifest():
+    return {
+        "semantic_map": {
+            "description": "Business values visible on the dashboard.",
+            "objects": [{
+                "id": "regional_revenue",
+                "kind": "scalar",
+                "meaning": {
+                    "label": "Regional revenue",
+                    "description": "Recognized revenue in the selected region.",
+                    "unit": "USD",
+                    "formula": "Sum of recognized order revenue for the current region.",
+                },
+                "parameters": {
+                    "region": {
+                        "type": "text",
+                        "default": "North",
+                        "source": "#region-filter",
+                    },
+                    "minimum_orders": {"type": "integer", "default": 2},
+                },
+                "bindings": [{"selector": "#regional-revenue"}],
+                "evaluator": {
+                    "sql": (
+                        "select sum(revenue) as value from public.orders "
+                        "where region={{region}} and orders >= {{minimum_orders}}"
+                    ),
+                    "shape": "scalar",
+                    "value_column": "value",
+                },
+                "display": {"prefix": "$", "decimals": 0},
+                "source_queries": ["orders_by_region"],
+            }],
+        },
+    }
+
+
+def test_semantic_map_normalizes_binds_and_safely_renders_context():
+    manifest = server._normalize_semantic_manifest(_semantic_manifest())
+    semantic_map = manifest["semantic_map"]
+    semantic_object = semantic_map["objects"][0]
+
+    assert semantic_map["schema_version"] == "rvbbit.semantic-map.v1"
+    assert semantic_object["id"] == "regional_revenue"
+    assert semantic_object["bindings"] == [{"selector": "#regional-revenue"}]
+    assert len(semantic_object["definition_hash"]) == 20
+    sql, context = server._render_semantic_sql(
+        semantic_object,
+        {"region": "O'Reilly", "minimum_orders": 7},
+    )
+    assert "region='O''Reilly'" in sql
+    assert "orders >= 7" in sql
+    assert context == {"region": "O'Reilly", "minimum_orders": 7}
+
+
+def test_semantic_map_requires_declared_replay_parameters_and_executes_at_publish(monkeypatch):
+    wrong_schema = _semantic_manifest()
+    wrong_schema["semantic_map"]["schema_version"] = "rvbbit.semantic-map.v99"
+    with pytest.raises(ValueError, match="unsupported semantic map schema"):
+        server._normalize_semantic_manifest(wrong_schema)
+
+    invalid = _semantic_manifest()
+    invalid["semantic_map"]["objects"][0]["evaluator"]["sql"] += " and team={{team}}"
+    with pytest.raises(ValueError, match="undeclared SQL parameters: team"):
+        server._normalize_semantic_manifest(invalid)
+
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "tool_validate_sql",
+        lambda sql, as_of=None: {
+            "valid": True,
+            "safe_select": True,
+            "engine": "rvbbit_native",
+        },
+    )
+
+    def run(sql, as_of=None, limit=None):
+        calls.append((sql, as_of, limit))
+        return {
+            "columns": [{"name": "value", "type": "numeric"}],
+            "rows": [{"value": 42000}],
+            "row_count": 1,
+            "elapsed_ms": 3,
+        }
+
+    monkeypatch.setattr(server, "tool_run_sql", run)
+    manifest, report = server._prepare_artifact_manifest(
+        _semantic_manifest(), execute=True,
+    )
+    assert manifest["semantic_map"]["objects"][0]["meaning"]["label"] == "Regional revenue"
+    assert report["object_count"] == 1
+    assert report["objects"][0]["verified"] is True
+    assert report["objects"][0]["value"] == 42000
+    assert calls[0][2] == 2
+
+
 def test_as_of_accepts_only_one_normalized_iso_timestamp():
     assert server._normalize_as_of("2026-07-30") == "2026-07-30T00:00:00Z"
     assert (
@@ -78,9 +175,42 @@ def test_validate_sql_keeps_as_of_directive_out_of_read_only_gate(monkeypatch):
     ]
 
 
+def test_publish_quarantines_bad_optional_semantics_instead_of_rejecting_artifact():
+    invalid = {
+        "app_kind": "dashboard",
+        "semantic_map": {
+            "schema_version": "rvbbit.semantic-map.v99",
+            "objects": [{"id": "broken"}],
+        },
+    }
+
+    manifest, report = server._prepare_artifact_manifest_for_publish(invalid)
+
+    assert manifest["app_kind"] == "dashboard"
+    assert "semantic_map" not in manifest
+    assert manifest["semantic_map_warning"]["code"] == "SEMANTIC_MAP_QUARANTINED"
+    assert len(manifest["semantic_map_warning"]["source_hash"]) == 20
+    assert report["object_count"] == 0
+    assert report["warning"] == manifest["semantic_map_warning"]
+
+
 def test_native_dashboard_shim_inherits_url_data_time_without_artifact_changes():
-    shim = server._dash_shim("revenue-map", 7)
-    assert 'window.RVBBIT_DASHBOARD={slug:"revenue-map",version:7}' in shim
+    manifest = _semantic_manifest()
+    manifest["note"] = "</script><script>window.pwned=true</script>"
+    shim = server._dash_shim("revenue-map", 7, manifest)
+    assert 'window.RVBBIT_DASHBOARD={slug:"revenue-map",version:7,calliope_enabled:' in shim
+    assert "__CALLIOPE_ENABLED__" not in shim
+    assert "window.RVBBIT_DASHBOARD.manifest=" in shim
+    assert "root.semanticObjects" in shim
+    assert "root.semanticObject" in shim
+    assert "root.bindSemanticObject" in shim
+    assert "elementRuntime=new WeakMap()" in shim
+    assert "elementRuntime.set(node,snapshot)" in shim
+    assert "root.semanticObject=(id,target)" in shim
+    assert "data-rvbbit-object" in shim
+    assert "rvbbit:semantic-map-ready" in shim
+    assert "\\u003c/script\\u003e" in shim
+    assert "<script>window.pwned" not in shim
     assert "rvbbit_as_of" in shim
     assert "window.RVBBIT_DASHBOARD.as_of" in shim
     assert "body:JSON.stringify({sql:sql,as_of:asOf})" in shim
@@ -88,9 +218,136 @@ def test_native_dashboard_shim_inherits_url_data_time_without_artifact_changes()
     assert "rvbbit:query-trace" in shim
     assert "trace.length>24" in shim
     assert "rows.slice(0,200)" in shim
+    assert '<link rel="preload" href="/theme/artifact-lens.css" as="style">' in shim
     assert "/theme/artifact-lens.js" in shim
     assert "args.as_of||null" in shim
     assert "<iframe" not in shim
+
+
+def test_dashboard_templates_teach_the_same_semantic_publish_contract():
+    dashboard = server.tool_dashboard_template()
+    live_app = server.tool_live_app_template("html", "dashboard")
+    example = dashboard["semantic_map_example"]
+
+    assert example["semantic_map"]["schema_version"] == "rvbbit.semantic-map.v1"
+    assert example["semantic_map"]["objects"][0]["bindings"][0]["selector"] == "#kpi-revenue"
+    assert " as value " in example["semantic_map"]["objects"][0]["evaluator"]["sql"]
+    assert live_app["semantic_map_example"] == example
+    assert any("bindBusinessObject" in instruction for instruction in dashboard["how_to_use"])
+    assert any("semantic_map_example" in instruction for instruction in live_app["how_to_use"])
+
+
+def test_verified_semantic_overlay_uses_captured_binding_and_replays_sql(monkeypatch):
+    evidence = {
+        "authored_semantic_map": {},
+        "dom": {
+            "candidate_elements": 1,
+            "candidates": [{
+                "candidate_id": "candidate_001",
+                "selector": "main > section#summary > strong.kpi-value",
+                "value": "$42K",
+                "represented_elements": 1,
+            }],
+        },
+    }
+    candidate = {
+        "candidate_id": "candidate_001",
+        "id": "recognized_revenue",
+        "kind": "scalar",
+        "meaning": {
+            "label": "Recognized revenue",
+            "description": "Recognized revenue represented by the summary callout.",
+            "unit": "USD",
+            "formula": "Sum of recognized revenue for the current scope.",
+        },
+        # A model-supplied selector is never trusted; captured evidence owns it.
+        "bindings": [{"selector": "#invented-by-model"}],
+        "parameters": {},
+        "evaluator": {
+            "sql": "select 42000::numeric as value",
+            "shape": "scalar",
+            "value_column": "value",
+        },
+        "display": {"prefix": "$", "compact": True},
+    }
+    monkeypatch.setattr(
+        server,
+        "tool_validate_sql",
+        lambda sql, as_of=None: {"valid": True, "safe_select": True, "engine": "postgres"},
+    )
+    monkeypatch.setattr(
+        server,
+        "tool_run_sql",
+        lambda sql, as_of=None, limit=None: {
+            "columns": [{"name": "value", "type": "numeric"}],
+            "rows": [{"value": 42000}],
+            "row_count": 1,
+            "elapsed_ms": 3,
+        },
+    )
+
+    semantic_map, report = server._verified_semantic_overlay(
+        {"objects": [candidate]}, evidence, "analyst@example.com"
+    )
+
+    assert report["verified_count"] == 1
+    assert report["rejected_count"] == 0
+    assert report["coverage"] == 1.0
+    semantic_object = semantic_map["objects"][0]
+    assert semantic_object["id"] == "recognized_revenue"
+    assert semantic_object["bindings"] == [{
+        "selector": "main > section#summary > strong.kpi-value"
+    }]
+    assert semantic_object["evaluator"]["sql"] == "select 42000::numeric as value"
+
+
+def test_semantic_operator_payload_unwraps_sql_and_agent_result_envelopes():
+    payload, run_id = server._semantic_operator_payload({
+        "result": {
+            "agent_run_id": "run-123",
+            "status": "done",
+            "result": {
+                "description": "Compiled values",
+                "objects": [{"candidate_id": "candidate_001"}],
+            },
+        },
+    })
+
+    assert run_id == "run-123"
+    assert payload["description"] == "Compiled values"
+    assert payload["objects"] == [{"candidate_id": "candidate_001"}]
+
+
+def test_semantic_overlay_is_additive_and_authored_definitions_win():
+    authored = server._normalize_semantic_manifest(_semantic_manifest())
+
+    def generated(object_id, selector):
+        raw = dict(_semantic_manifest()["semantic_map"]["objects"][0])
+        raw["id"] = object_id
+        raw["bindings"] = [{"selector": selector}]
+        return server._normalize_semantic_object(raw)
+
+    enrichment = {
+        "status": "ready",
+        "semantic_map": {
+            "schema_version": "rvbbit.semantic-map.v1",
+            "objects": [
+                generated("regional_revenue", "#model-duplicate-id"),
+                generated("overlapping_revenue", "#regional-revenue"),
+                generated("order_count", "#order-count"),
+            ],
+        },
+        "verification": {"verified_count": 3, "rejected_count": 0, "coverage": 1.0},
+        "prompt_version": "artifact-semantic-enricher.v1",
+        "model": "openai/gpt-5.6-sol",
+    }
+
+    effective = server._merge_semantic_overlay(authored, enrichment)
+
+    objects = effective["semantic_map"]["objects"]
+    assert [item["id"] for item in objects] == ["regional_revenue", "order_count"]
+    assert objects[0]["bindings"] == [{"selector": "#regional-revenue"}]
+    assert effective["semantic_enrichment"]["status"] == "ready"
 
 
 def test_time_travel_summary_requires_complete_rvbbit_history():
@@ -151,6 +408,12 @@ def test_artifact_lens_is_shadow_isolated_trace_capable_and_heavily_debounced():
     dockerfile = (_HERE / "Dockerfile").read_text(encoding="utf-8")
 
     assert "attachShadow({ mode: \"open\" })" in script
+    assert 'host.style.setProperty("visibility", "hidden", "important")' in script
+    assert 'stylesheet.addEventListener("load"' in script
+    assert 'stylesheet.addEventListener("error"' in script
+    assert 'host.style.removeProperty("visibility")' in script
+    assert script.index('stylesheet.addEventListener("load"') < script.index("root.appendChild(stylesheet)")
+    assert "window.requestAnimationFrame(() => window.requestAnimationFrame(initializePosition))" not in script
     assert "window.self !== window.top" in script
     assert "dashboard.historical" in script
     assert "SCRUB_DEBOUNCE_MS = 1100" in script
@@ -163,7 +426,16 @@ def test_artifact_lens_is_shadow_isolated_trace_capable_and_heavily_debounced():
     assert "positionKey" in script
     assert "setPointerCapture" in script
     assert "persistLensPosition" in script
-    assert "Pick from dashboard" in script
+    assert "[panelHeader, trigger].forEach" in script
+    assert "suppressTriggerClickUntil" in script
+    assert "Pick from dashboard" not in script
+    assert "Selection active" in script
+    assert 'shell.dataset.open === "true" && !pickerActive' in script
+    assert "Browse dashboard query data" in script
+    assert "dashboardQueryEntries" in script
+    assert "openDashboardQuery" in script
+    assert "captured rows" in script
+    assert "query-source" in script
     assert "Ask Calliope" in script
     assert "Continue in Calliope" not in script
     assert "Pick another" not in script
@@ -174,6 +446,18 @@ def test_artifact_lens_is_shadow_isolated_trace_capable_and_heavily_debounced():
     assert "indexedCoverage >= 0.8" in script
     assert "indexed_mark_count" in script
     assert "resolveBinding" in script
+    assert "semanticEntries" in script
+    assert "semanticObjectForElement" in script
+    assert "semanticSelectionForElement" in script
+    assert "semanticSourceValue" in script
+    assert "$element.data." in script
+    assert "pollSemanticEnrichment" in script
+    assert "/semantic-enrichment" in script
+    assert "Named business object" in script
+    assert "Reproducible warehouse definition" in script
+    assert "Open recreated result" in script
+    assert 'semantic_object: semanticSelection' in script
+    assert '"semantic-lens"' in script
     assert "renderCandidateHighlights" in script
     assert "candidateConfidence" in script
     assert "isValueLikeText" in script
@@ -184,8 +468,20 @@ def test_artifact_lens_is_shadow_isolated_trace_capable_and_heavily_debounced():
     assert "runInspectionQuery" in script
     assert "query-drawer" in script
     assert "RESULT_BATCH_SIZE = 100" in script
-    assert "Analyze with Calliope" in script
+    assert "Analyze with Calliope" not in script
+    assert "Ask Calliope" in script
     assert "queryResultPreview" in script
+    assert "highlightSql" in script
+    assert "formatSql" in script
+    assert "SQL_FORMAT_PHRASES" in script
+    assert "SQL_KEYWORDS" in script
+    assert "query-sql-toggle" in script
+    assert "query-sql-view" in script
+    assert "query-sql-copy" in script
+    assert 'setQuerySqlVisible(false)' in script
+    assert 'aria-pressed="false"' in script
+    assert "dashboardQueryInspection" in script
+    assert 'source: "dashboard runtime query trace"' in script
     assert 'mode: analyzeResult ? "query_result" : "selection"' in script
     assert ".slice(0, 12)" in script
     assert "/q" in script
@@ -196,6 +492,8 @@ def test_artifact_lens_is_shadow_isolated_trace_capable_and_heavily_debounced():
     assert "/theme/artifact-lens.css" in script
     assert ":host {" in css
     assert "position: fixed;" in css
+    assert "width: max-content;" in css
+    assert "height: max-content;" in css
     assert "right: max(18px" in css
     assert "bottom: max(18px" in css
     assert ".lens[data-open=\"true\"] .panel" in css
@@ -203,9 +501,20 @@ def test_artifact_lens_is_shadow_isolated_trace_capable_and_heavily_debounced():
     assert ".query-analyze" in css
     assert ".target-outline" in css
     assert ".candidate-box" in css
+    assert ".candidate-box.semantic" in css
+    assert ".semantic-replay" in css
+    assert ".semantic-context" in css
     assert ".lens[data-dragging=\"true\"]" in css
+    assert "grid-template-rows: auto auto minmax(0, 1fr) auto;" in css
+    assert "height: min(720px, calc(100dvh - 96px));" in css
+    assert "overscroll-behavior: contain;" in css
+    assert ".view::-webkit-scrollbar" in css
     assert ".lens[data-drawer-open=\"true\"] .query-drawer" in css
     assert ".query-table" in css
+    assert ".query-sql-toggle[aria-pressed=\"true\"]" in css
+    assert ".query-sql-code .sql-keyword" in css
+    assert ".query-sql-code .sql-comment" in css
+    assert ".query-sql-view pre::-webkit-scrollbar-thumb" in css
     assert "cursor: grab;" in css
     assert ".panel {" in css and "z-index: 20;" in css
     assert ".target-outline {" in css and "z-index: 4;" in css
@@ -286,6 +595,189 @@ def test_visual_inspection_cannot_claim_an_ambient_query_trace():
         {"kind": "chart", "confidence": "exact"},
         trace,
     ) == trace
+
+
+def test_semantic_inspection_uses_versioned_definition_not_browser_sql(monkeypatch):
+    manifest = server._normalize_semantic_manifest(_semantic_manifest())
+    semantic_object = manifest["semantic_map"]["objects"][0]
+
+    class Result:
+        def __init__(self, row=None, rows=None):
+            self.row = row
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(statement, _params=None):
+            if "FROM rvbbit.dashboards WHERE slug" in statement:
+                return Result({
+                    "id": 9,
+                    "slug": "semantic-demo",
+                    "name": "Semantic demo",
+                    "description": "A demo",
+                    "latest_version": 3,
+                    "runtime_kind": "html",
+                    "app_kind": "dashboard",
+                })
+            if "SELECT manifest FROM rvbbit.dashboard_versions" in statement:
+                return Result({"manifest": manifest})
+            if "FROM rvbbit.dashboard_deps" in statement:
+                return Result(rows=[])
+            raise AssertionError(statement)
+
+    class ReadOnly:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return self
+
+    calls = []
+
+    def run(sql, as_of=None, limit=None):
+        calls.append((sql, as_of, limit))
+        return {
+            "columns": [{"name": "value", "type": "numeric"}],
+            "rows": [{"value": 42000}],
+            "row_count": 1,
+            "engine": "rvbbit_native",
+            "elapsed_ms": 2,
+        }
+
+    monkeypatch.setattr(server, "_conn", lambda *_args, **_kwargs: Connection())
+    monkeypatch.setattr(server, "_ro", lambda *_args, **_kwargs: ReadOnly())
+    monkeypatch.setattr(server, "_referenced_tables", lambda _sql: [])
+    monkeypatch.setattr(
+        server,
+        "tool_validate_sql",
+        lambda _sql, _as_of=None: {
+            "valid": True,
+            "safe_select": True,
+            "engine": "rvbbit_native",
+        },
+    )
+    monkeypatch.setattr(server, "tool_run_sql", run)
+
+    result = server._dashboard_inspection(
+        "semantic-demo",
+        3,
+        {
+            "label": "$42K",
+            "selector": "#regional-revenue",
+            "tag": "strong",
+            "text": "$42K",
+            "bounds": {"x": 20, "y": 30, "width": 100, "height": 40},
+            "viewport": {"width": 1440, "height": 900},
+        },
+        {"kind": "value", "confidence": "visual"},
+        {
+            "id": "browser-forged",
+            "sql": "select secret_value from private.credentials",
+        },
+        {
+            "id": "regional_revenue",
+            "definition_hash": semantic_object["definition_hash"],
+            "context": {"region": "North", "minimum_orders": 2},
+            "rendered_value": "$42K",
+        },
+    )
+
+    assert result["semantic_object"]["meaning"]["label"] == "Regional revenue"
+    assert result["semantic_object"]["context"]["region"] == "North"
+    assert result["binding"]["confidence"] == "semantic"
+    assert result["provenance"]["source"] == "semantic_map"
+    assert "private.credentials" not in result["provenance"]["sql"]
+    assert "region='North'" in result["provenance"]["sql"]
+    assert result["replay"]["status"] == "verified"
+    assert result["replay"]["value"] == 42000
+    assert calls == [(result["provenance"]["sql"], None, 2)]
+
+
+def test_dependency_crawl_indexes_semantic_evaluators_as_versioned_sources(monkeypatch):
+    manifest = server._normalize_semantic_manifest(_semantic_manifest())
+    writes = []
+
+    class Result:
+        def __init__(self, row=None, rows=None):
+            self.row = row
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(statement, params=None):
+            if "SELECT id, latest_version FROM rvbbit.dashboards" in statement:
+                return Result({"id": 14, "latest_version": 4})
+            if "SELECT html, source_files, manifest" in statement:
+                return Result({
+                    "html": "<html><body>Runtime-built dashboard</body></html>",
+                    "source_files": {},
+                    "manifest": manifest,
+                })
+            if "SELECT DISTINCT args->>'sql'" in statement:
+                return Result(rows=[])
+            if "SELECT DISTINCT name FROM rvbbit.metric_defs" in statement:
+                return Result(rows=[])
+            writes.append((statement, params))
+            return Result()
+
+    monkeypatch.setattr(server, "_ensure_dashboard_tables", lambda: None)
+    monkeypatch.setattr(server, "_ensure_activity_table", lambda: None)
+    monkeypatch.setattr(server, "_conn", lambda *_args, **_kwargs: Connection())
+    monkeypatch.setattr(
+        server,
+        "_referenced_tables",
+        lambda sql: ["public.orders"] if "public.orders" in sql else [],
+    )
+
+    result = server.dashboard_crawl("semantic-demo", use_llm=False)
+    assert result["status"] == "live"
+    assert result["queries"] == 0
+    assert result["semantic_objects"] == 1
+    assert result["tables"] == ["public.orders"]
+    dependency_rows = [
+        params
+        for statement, params in writes
+        if "INSERT INTO rvbbit.dashboard_deps" in statement
+    ]
+    assert any(
+        params[2] == "semantic"
+        and params[3] == "regional_revenue"
+        and params[5] == "semantic-map:regional_revenue"
+        for params in dependency_rows
+    )
+    assert any(
+        params[2] == "table"
+        and params[3] == "public.orders"
+        and params[5] == "semantic-map:regional_revenue"
+        for params in dependency_rows
+    )
 
 
 def test_inspection_comparison_matches_dimensions_and_calculates_delta():

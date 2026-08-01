@@ -32,7 +32,7 @@ from __future__ import annotations
 # (DictRow vs TupleRow covariance); the code is correct at runtime (see --selftest).
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
-import asyncio, hashlib, hmac, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time
+import asyncio, hashlib, hmac, json, math, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -2751,6 +2751,35 @@ CREATE TABLE IF NOT EXISTS rvbbit.dashboard_versions (
 ALTER TABLE rvbbit.dashboard_versions ADD COLUMN IF NOT EXISTS manifest jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE rvbbit.dashboard_versions ADD COLUMN IF NOT EXISTS source_files jsonb NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS dashboards_team_idx ON rvbbit.dashboards (team, updated_at DESC);
+-- Agent-generated semantic metadata is a derived, regenerable overlay keyed to
+-- one immutable artifact version.  Publication never waits for or depends on
+-- this row; the effective manifest merges it at read time.
+CREATE TABLE IF NOT EXISTS rvbbit.artifact_semantic_enrichments (
+  dashboard_id bigint NOT NULL,
+  version int NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  input_hash text NOT NULL,
+  semantic_map jsonb NOT NULL DEFAULT '{"schema_version":"rvbbit.semantic-map.v1","objects":[]}'::jsonb,
+  verification jsonb NOT NULL DEFAULT '{}'::jsonb,
+  agent_run_id text,
+  model text,
+  prompt_version text NOT NULL,
+  attempts int NOT NULL DEFAULT 0,
+  last_error text,
+  not_before timestamptz NOT NULL DEFAULT now(),
+  enqueued_at timestamptz NOT NULL DEFAULT now(),
+  started_at timestamptz,
+  completed_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (dashboard_id, version),
+  FOREIGN KEY (dashboard_id, version)
+    REFERENCES rvbbit.dashboard_versions(dashboard_id, version) ON DELETE CASCADE,
+  CONSTRAINT artifact_semantic_enrichments_status_check CHECK (
+    status IN ('pending','running','ready','partial','failed','disabled')
+  )
+);
+CREATE INDEX IF NOT EXISTS artifact_semantic_enrichments_queue_idx
+  ON rvbbit.artifact_semantic_enrichments (status, not_before, enqueued_at);
 -- staged artifact uploads: lets an agent ship a large HTML/source payload once
 -- (optionally in chunks) and then publish by handle, instead of re-transmitting
 -- the whole document through every publish/update call. Short-lived by design.
@@ -2767,9 +2796,9 @@ CREATE TABLE IF NOT EXISTS rvbbit.mcp_artifacts (
 CREATE TABLE IF NOT EXISTS rvbbit.dashboard_deps (
   dashboard_id bigint NOT NULL REFERENCES rvbbit.dashboards(id) ON DELETE CASCADE,
   version      int NOT NULL,
-  kind         text NOT NULL,        -- 'query' | 'table' | 'metric'
-  object_ref   text,                 -- schema.table | metric name
-  base_sql     text,                 -- the panel query (kind='query')
+  kind         text NOT NULL,        -- 'query' | 'semantic' | 'table' | 'metric'
+  object_ref   text,                 -- schema.table | metric name | semantic object id
+  base_sql     text,                 -- the panel/evaluator SQL
   source       text,                 -- 'parse' | 'runtime' | 'llm'
   confidence   real DEFAULT 1.0,
   created_at   timestamptz DEFAULT now()
@@ -2793,16 +2822,18 @@ CREATE OR REPLACE VIEW rvbbit.live_apps AS
          d.last_debug_at, d.created_at, d.updated_at,
          coalesce(dep.queries, 0)::int AS queries,
          coalesce(dep.tables, 0)::int AS tables,
-         coalesce(dep.metrics, 0)::int AS metrics
+         coalesce(dep.metrics, 0)::int AS metrics,
+         coalesce(dep.semantic_objects, 0)::int AS semantic_objects
   FROM rvbbit.dashboards d
-  LEFT JOIN (
-    SELECT dashboard_id,
+  LEFT JOIN LATERAL (
+    SELECT
            count(*) FILTER (WHERE kind = 'query') AS queries,
            count(*) FILTER (WHERE kind = 'table') AS tables,
-           count(*) FILTER (WHERE kind = 'metric') AS metrics
+           count(*) FILTER (WHERE kind = 'metric') AS metrics,
+           count(*) FILTER (WHERE kind = 'semantic') AS semantic_objects
     FROM rvbbit.dashboard_deps
-    GROUP BY dashboard_id
-  ) dep ON dep.dashboard_id = d.id;
+    WHERE dashboard_id = d.id AND version = d.latest_version
+  ) dep ON true;
 """
 
 
@@ -2944,6 +2975,672 @@ def _json_default(obj):
     return json.dumps(obj or {}, default=str)
 
 
+_SEMANTIC_MAP_SCHEMA = "rvbbit.semantic-map.v1"
+_SEMANTIC_OBJECT_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_.:-]{0,127}$")
+_SEMANTIC_PARAM_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,63}$")
+_SEMANTIC_PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z][a-zA-Z0-9_]*)\s*\}\}")
+_SEMANTIC_PARAM_TYPES = {
+    "text", "number", "integer", "boolean", "date", "timestamp", "text_array", "number_array",
+}
+_SEMANTIC_KINDS = {"scalar", "cell", "status"}
+_SEMANTIC_SHAPES = {"scalar"}
+_SEMANTIC_SENSITIVE_RE = re.compile(
+    r"(?:secret|token|password|passwd|auth|cookie|session|api[-_]?key)",
+    re.I,
+)
+
+
+def _semantic_text(value, limit, *, required=False):
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]+", " ", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()[:limit]
+    if required and not text:
+        raise ValueError("semantic object text is required")
+    return text
+
+
+def _semantic_json_value(value, depth=0):
+    """Bound inert manifest/context JSON without preserving credential-shaped keys."""
+    if depth > 5:
+        return None
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, str):
+        # Context values are query inputs, not prose: preserve meaningful
+        # whitespace exactly while removing control characters and bounding size.
+        return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]+", " ", value)[:1000]
+    if isinstance(value, (list, tuple)):
+        return [_semantic_json_value(item, depth + 1) for item in list(value)[:80]]
+    if isinstance(value, dict):
+        clean = {}
+        for raw_key, raw_value in list(value.items())[:80]:
+            key = re.sub(r"[^a-zA-Z0-9_.:-]", "", str(raw_key))[:80]
+            if not key or _SEMANTIC_SENSITIVE_RE.search(key):
+                continue
+            clean[key] = _semantic_json_value(raw_value, depth + 1)
+        return clean
+    return _semantic_text(value, 1000)
+
+
+def _normalize_semantic_parameter(name, value):
+    if not _SEMANTIC_PARAM_RE.fullmatch(str(name or "")):
+        raise ValueError(f"invalid semantic parameter name: {name}")
+    if _SEMANTIC_SENSITIVE_RE.search(str(name)):
+        raise ValueError(f"semantic parameter cannot contain credentials: {name}")
+    raw = value if isinstance(value, dict) else {"default": value}
+    kind = str(raw.get("type") or "").strip().lower()
+    default = _semantic_json_value(raw.get("default"))
+    if not kind:
+        if isinstance(default, bool):
+            kind = "boolean"
+        elif isinstance(default, int):
+            kind = "integer"
+        elif isinstance(default, float):
+            kind = "number"
+        elif isinstance(default, list):
+            kind = "number_array" if all(isinstance(item, (int, float)) for item in default) else "text_array"
+        else:
+            kind = "text"
+    if kind not in _SEMANTIC_PARAM_TYPES:
+        raise ValueError(
+            f"semantic parameter {name} type must be one of: "
+            + ", ".join(sorted(_SEMANTIC_PARAM_TYPES))
+        )
+    out = {
+        "type": kind,
+        "default": default,
+        "label": _semantic_text(raw.get("label") or str(name).replace("_", " ").title(), 160),
+    }
+    source = _semantic_text(raw.get("source"), 240)
+    if source:
+        out["source"] = source
+    if raw.get("rolling") is not None:
+        out["rolling"] = bool(raw.get("rolling"))
+    return out
+
+
+def _normalize_semantic_binding(value):
+    raw = {"selector": value} if isinstance(value, str) else value
+    if not isinstance(raw, dict):
+        raise ValueError("semantic object bindings must be selectors or JSON objects")
+    out = {}
+    for key, limit in (
+        ("selector", 800),
+        ("element_id", 240),
+        ("name", 240),
+        ("role", 120),
+        ("chart_dataset", 240),
+        ("table_column", 240),
+        ("value_source", 320),
+    ):
+        text = _semantic_text(raw.get(key), limit)
+        if text:
+            out[key] = text
+    if raw.get("dataset_index") is not None:
+        try:
+            out["dataset_index"] = max(0, min(int(raw["dataset_index"]), 100_000))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("semantic binding dataset_index must be an integer") from exc
+    context = _semantic_json_value(raw.get("context"))
+    if isinstance(context, dict) and context:
+        out["context"] = context
+    if not any(out.get(key) for key in ("selector", "element_id", "name")):
+        raise ValueError("semantic object binding requires selector, element_id, or name")
+    return out
+
+
+def _normalize_semantic_object(value):
+    if not isinstance(value, dict):
+        raise ValueError("semantic map objects must be JSON objects")
+    object_id = str(value.get("id") or "").strip()
+    if not _SEMANTIC_OBJECT_ID_RE.fullmatch(object_id):
+        raise ValueError(
+            "semantic object id must start with a letter and contain only letters, "
+            f"numbers, `_`, `.`, `:`, or `-`: {object_id or '(missing)'}"
+        )
+    if _SEMANTIC_SENSITIVE_RE.search(object_id):
+        raise ValueError(f"semantic object id cannot contain credentials: {object_id}")
+    kind = str(value.get("kind") or "scalar").strip().lower()
+    kind = {"value": "scalar", "number": "scalar", "kpi": "scalar"}.get(kind, kind)
+    if kind not in _SEMANTIC_KINDS:
+        raise ValueError(f"semantic object {object_id} has unsupported kind: {kind}")
+
+    raw_meaning = value.get("meaning") if isinstance(value.get("meaning"), dict) else {}
+    label = _semantic_text(
+        raw_meaning.get("label") or value.get("label") or object_id.replace("_", " ").replace("-", " ").title(),
+        240,
+        required=True,
+    )
+    meaning = {
+        "label": label,
+        "description": _semantic_text(
+            raw_meaning.get("description") or value.get("description"), 1400
+        ),
+        "unit": _semantic_text(raw_meaning.get("unit") or value.get("unit"), 120),
+        "formula": _semantic_text(raw_meaning.get("formula") or value.get("formula"), 1000),
+    }
+    meaning = {key: item for key, item in meaning.items() if item}
+
+    raw_bindings = value.get("bindings")
+    if raw_bindings is None and value.get("binding") is not None:
+        raw_bindings = [value.get("binding")]
+    if raw_bindings is None:
+        raw_bindings = []
+    if not isinstance(raw_bindings, list):
+        raw_bindings = [raw_bindings]
+    bindings = [_normalize_semantic_binding(binding) for binding in raw_bindings[:16]]
+
+    raw_parameters = value.get("parameters") or {}
+    if not isinstance(raw_parameters, dict):
+        raise ValueError(f"semantic object {object_id} parameters must be a JSON object")
+    parameters = {
+        str(name): _normalize_semantic_parameter(name, spec)
+        for name, spec in list(raw_parameters.items())[:32]
+    }
+
+    raw_evaluator = value.get("evaluator") or value.get("replay")
+    if not isinstance(raw_evaluator, dict):
+        raise ValueError(f"semantic object {object_id} requires an evaluator")
+    evaluator_sql = str(raw_evaluator.get("sql") or "").strip()
+    if not evaluator_sql:
+        raise ValueError(f"semantic object {object_id} evaluator.sql is required")
+    if len(evaluator_sql) > 50_000:
+        raise ValueError(f"semantic object {object_id} evaluator.sql exceeds 50000 characters")
+    shape = str(raw_evaluator.get("shape") or "scalar").lower()
+    if shape not in _SEMANTIC_SHAPES:
+        raise ValueError(f"semantic object {object_id} evaluator shape is unsupported: {shape}")
+    evaluator = {
+        "sql": evaluator_sql,
+        "shape": shape,
+        "value_column": _semantic_text(raw_evaluator.get("value_column") or "value", 160),
+    }
+    if raw_evaluator.get("row_index") is not None:
+        try:
+            evaluator["row_index"] = max(0, min(int(raw_evaluator["row_index"]), 100_000))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"semantic object {object_id} row_index must be an integer") from exc
+
+    placeholders = set(_SEMANTIC_PLACEHOLDER_RE.findall(evaluator_sql))
+    undeclared = sorted(placeholders - set(parameters))
+    if undeclared:
+        raise ValueError(
+            f"semantic object {object_id} has undeclared SQL parameters: {', '.join(undeclared)}"
+        )
+    missing_defaults = sorted(
+        name for name in placeholders if parameters[name].get("default") is None
+    )
+    if missing_defaults:
+        raise ValueError(
+            f"semantic object {object_id} parameters need defaults for publication: "
+            + ", ".join(missing_defaults)
+        )
+
+    display = _semantic_json_value(value.get("display") or {})
+    source_queries = [
+        _semantic_text(item, 160)
+        for item in list(value.get("source_queries") or [])[:24]
+        if _semantic_text(item, 160)
+    ]
+    definition_payload = {
+        "kind": kind,
+        "meaning": meaning,
+        "parameters": parameters,
+        "evaluator": evaluator,
+    }
+    definition_hash = hashlib.sha256(
+        json.dumps(definition_payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()[:20]
+    out = {
+        "id": object_id,
+        "kind": kind,
+        "meaning": meaning,
+        "parameters": parameters,
+        "bindings": bindings,
+        "evaluator": evaluator,
+        "definition_hash": definition_hash,
+    }
+    if isinstance(display, dict) and display:
+        out["display"] = display
+    if source_queries:
+        out["source_queries"] = source_queries
+    return out
+
+
+def _normalize_semantic_manifest(manifest):
+    """Canonicalize the optional versioned semantic source map in an artifact manifest."""
+    doc = _coerce_json_object(manifest, "manifest") if manifest is not None else {}
+    doc = dict(doc)
+    raw_map = doc.get("semantic_map")
+    if raw_map is None:
+        return doc
+    if isinstance(raw_map, list):
+        raw_map = {"objects": raw_map}
+    if not isinstance(raw_map, dict):
+        raise ValueError("manifest.semantic_map must be a JSON object")
+    requested_schema = str(raw_map.get("schema_version") or _SEMANTIC_MAP_SCHEMA)
+    if requested_schema != _SEMANTIC_MAP_SCHEMA:
+        raise ValueError(
+            f"unsupported semantic map schema {requested_schema!r}; "
+            f"expected {_SEMANTIC_MAP_SCHEMA!r}"
+        )
+    raw_objects = raw_map.get("objects") or []
+    if not isinstance(raw_objects, list):
+        raise ValueError("manifest.semantic_map.objects must be a list")
+    if len(raw_objects) > 160:
+        raise ValueError("manifest.semantic_map supports at most 160 objects")
+    objects = [_normalize_semantic_object(item) for item in raw_objects]
+    ids = [item["id"] for item in objects]
+    duplicates = sorted({item for item in ids if ids.count(item) > 1})
+    if duplicates:
+        raise ValueError("duplicate semantic object ids: " + ", ".join(duplicates))
+    doc["semantic_map"] = {
+        "schema_version": _SEMANTIC_MAP_SCHEMA,
+        "objects": objects,
+        "description": _semantic_text(raw_map.get("description"), 1000),
+    }
+    if not doc["semantic_map"]["description"]:
+        doc["semantic_map"].pop("description")
+    return doc
+
+
+def _semantic_sql_literal(value, kind):
+    if value is None:
+        return "NULL"
+    if kind == "boolean":
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered not in {"true", "false", "1", "0", "yes", "no"}:
+                raise ValueError(f"cannot coerce {value!r} to boolean")
+            value = lowered in {"true", "1", "yes"}
+        return "TRUE" if bool(value) else "FALSE"
+    if kind in {"number", "integer"}:
+        try:
+            number = int(value) if kind == "integer" else float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"cannot coerce {value!r} to {kind}") from exc
+        if isinstance(number, float) and not math.isfinite(number):
+            raise ValueError(f"cannot coerce {value!r} to finite number")
+        return str(number)
+    if kind in {"date", "timestamp"}:
+        raw = str(value).strip()
+        try:
+            if kind == "date":
+                datetime.fromisoformat(raw).date()
+            else:
+                _normalize_as_of(raw)
+        except ValueError as exc:
+            raise ValueError(f"cannot coerce {value!r} to {kind}") from exc
+        return "'" + raw.replace("'", "''") + "'"
+    if kind in {"text_array", "number_array"}:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"cannot coerce {value!r} to {kind}")
+        child_kind = "text" if kind == "text_array" else "number"
+        items = [_semantic_sql_literal(item, child_kind) for item in list(value)[:500]]
+        if items:
+            return "ARRAY[" + ",".join(items) + "]"
+        target = "text[]" if kind == "text_array" else "numeric[]"
+        return f"cast(ARRAY[] as {target})"
+    bounded = str(value).replace("\x00", "")[:4000]
+    return "'" + bounded.replace("'", "''") + "'"
+
+
+def _render_semantic_sql(semantic_object, context=None):
+    parameters = semantic_object.get("parameters") or {}
+    supplied = context if isinstance(context, dict) else {}
+    resolved = {}
+    for name, spec in parameters.items():
+        raw = supplied.get(name, spec.get("default"))
+        resolved[name] = _semantic_json_value(raw)
+    sql_text = str((semantic_object.get("evaluator") or {}).get("sql") or "")
+
+    def replace(match):
+        name = match.group(1)
+        spec = parameters.get(name)
+        if not spec:
+            raise ValueError(f"undeclared semantic SQL parameter: {name}")
+        return _semantic_sql_literal(resolved.get(name), spec.get("type") or "text")
+
+    return _SEMANTIC_PLACEHOLDER_RE.sub(replace, sql_text), resolved
+
+
+def _semantic_result_value(semantic_object, result):
+    if not isinstance(result, dict) or result.get("error"):
+        return None, None
+    rows = result.get("rows") or []
+    evaluator = semantic_object.get("evaluator") or {}
+    row_index = int(evaluator.get("row_index") or 0)
+    if not (0 <= row_index < len(rows)):
+        return None, None
+    row = rows[row_index]
+    columns = [
+        column if isinstance(column, str) else column.get("name")
+        for column in (result.get("columns") or [])
+    ]
+    if isinstance(row, (list, tuple)):
+        row = {
+            name: row[index]
+            for index, name in enumerate(columns)
+            if name and index < len(row)
+        }
+    if not isinstance(row, dict):
+        return None, None
+    value_column = str(evaluator.get("value_column") or "value")
+    if value_column in row:
+        return row[value_column], value_column
+    if len(row) == 1:
+        key = next(iter(row))
+        return row[key], str(key)
+    return None, None
+
+
+def _validate_semantic_manifest(manifest, *, execute=True):
+    semantic_map = (manifest or {}).get("semantic_map") or {}
+    objects = semantic_map.get("objects") or []
+    report = {
+        "schema_version": semantic_map.get("schema_version") or _SEMANTIC_MAP_SCHEMA,
+        "object_count": len(objects),
+        "objects": [],
+    }
+    for semantic_object in objects:
+        sql_text, context = _render_semantic_sql(semantic_object)
+        validation = tool_validate_sql(sql_text)
+        if not validation.get("valid") or not validation.get("safe_select"):
+            raise ValueError(
+                f"semantic object {semantic_object['id']} replay SQL is not a safe read-only query: "
+                + str(validation.get("error") or validation.get("reason") or "validation failed")
+            )
+        item = {
+            "id": semantic_object["id"],
+            "definition_hash": semantic_object["definition_hash"],
+            "engine": validation.get("engine"),
+            "context": context,
+            "verified": not execute,
+        }
+        if execute:
+            result = tool_run_sql(sql_text, limit=2)
+            if result.get("error"):
+                raise ValueError(
+                    f"semantic object {semantic_object['id']} replay failed: "
+                    + str((result.get("error") or {}).get("message") or result["error"])
+                )
+            shape = (semantic_object.get("evaluator") or {}).get("shape")
+            value, value_column = _semantic_result_value(semantic_object, result)
+            if shape == "scalar":
+                if int(result.get("row_count") or 0) != 1:
+                    raise ValueError(
+                        f"semantic object {semantic_object['id']} scalar replay must return exactly one row"
+                    )
+                if value_column is None:
+                    raise ValueError(
+                        f"semantic object {semantic_object['id']} replay did not return "
+                        f"value column {(semantic_object.get('evaluator') or {}).get('value_column')!r}"
+                    )
+            item.update({
+                "verified": True,
+                "value": value,
+                "value_column": value_column,
+                "row_count": result.get("row_count"),
+                "elapsed_ms": result.get("elapsed_ms"),
+            })
+        report["objects"].append(item)
+    return report
+
+
+def _prepare_artifact_manifest(manifest, *, execute=True):
+    doc = _normalize_semantic_manifest(manifest)
+    return doc, _validate_semantic_manifest(doc, execute=execute)
+
+
+def _prepare_artifact_manifest_for_publish(
+    manifest,
+    *,
+    fallback_semantic_map=None,
+    execute=True,
+):
+    """Keep semantic metadata advisory: quarantine it instead of blocking HTML.
+
+    The strict helper above remains useful for validation tools and tests. Publish
+    paths use this wrapper because an optional debug-symbol layer must never make
+    an otherwise valid artifact fail to version. On update, a previously verified
+    authored map may be retained when the replacement is malformed.
+    """
+    raw = dict(_coerce_json_object(manifest, "manifest"))
+    raw.pop("semantic_map_warning", None)
+    try:
+        return _prepare_artifact_manifest(raw, execute=execute)
+    except ValueError as exc:
+        if "semantic_map" not in raw:
+            raise
+        rejected_map = raw.pop("semantic_map")
+        if fallback_semantic_map is not None:
+            raw["semantic_map"] = fallback_semantic_map
+        try:
+            doc, report = _prepare_artifact_manifest(raw, execute=execute)
+        except ValueError:
+            raw.pop("semantic_map", None)
+            doc, report = _prepare_artifact_manifest(raw, execute=execute)
+        warning = {
+            "code": "SEMANTIC_MAP_QUARANTINED",
+            "message": _semantic_text(exc, 1200),
+            "source_hash": hashlib.sha256(
+                json.dumps(rejected_map, sort_keys=True, default=str).encode()
+            ).hexdigest()[:20],
+        }
+        doc["semantic_map_warning"] = warning
+        report["warning"] = warning
+        return doc, report
+
+
+_SEMANTIC_ENRICH_PROMPT_VERSION = "artifact-semantic-enricher.v2"
+_SEMANTIC_ENRICH_MODEL = os.environ.get(
+    "WAREHOUSE_SEMANTIC_ENRICH_MODEL", "openai/gpt-5.6-sol"
+).strip() or "openai/gpt-5.6-sol"
+_SEMANTIC_ENRICH_WAKE = threading.Event()
+_SEMANTIC_ENRICH_THREAD = None
+_SEMANTIC_ENRICH_THREAD_LOCK = threading.Lock()
+
+
+def _semantic_enrichment_enabled():
+    return os.environ.get("WAREHOUSE_SEMANTIC_ENRICHMENT", "1").strip().lower() not in {
+        "0", "false", "no", "off", "",
+    }
+
+
+def _semantic_binding_keys(semantic_object):
+    keys = set()
+    for binding in (semantic_object or {}).get("bindings") or []:
+        if not isinstance(binding, dict):
+            continue
+        for name in ("selector", "element_id", "name"):
+            value = str(binding.get(name) or "").strip()
+            if value:
+                keys.add((name, value))
+    return keys
+
+
+def _merge_semantic_overlay(manifest, enrichment):
+    """Merge verified derived objects without rewriting the authored manifest.
+
+    Authored ids and DOM bindings win.  That lets a human or builder provide a
+    precise definition while the publication-side compiler fills only the gaps.
+    """
+    doc = dict(manifest or {})
+    authored_map = doc.get("semantic_map") if isinstance(doc.get("semantic_map"), dict) else {}
+    authored_objects = [
+        item for item in (authored_map.get("objects") or []) if isinstance(item, dict)
+    ]
+    status = str((enrichment or {}).get("status") or "none")
+    overlay_map = (
+        (enrichment or {}).get("semantic_map")
+        if status in {"ready", "partial"}
+        and isinstance((enrichment or {}).get("semantic_map"), dict)
+        else {}
+    )
+    authored_ids = {str(item.get("id") or "") for item in authored_objects}
+    authored_bindings = set().union(*(
+        _semantic_binding_keys(item) for item in authored_objects
+    )) if authored_objects else set()
+    generated = []
+    for item in overlay_map.get("objects") or []:
+        if not isinstance(item, dict) or str(item.get("id") or "") in authored_ids:
+            continue
+        item_bindings = _semantic_binding_keys(item)
+        if item_bindings and item_bindings & authored_bindings:
+            continue
+        generated.append(item)
+    objects = authored_objects + generated
+    if objects or authored_map or overlay_map:
+        merged_map = {
+            "schema_version": _SEMANTIC_MAP_SCHEMA,
+            "objects": objects,
+        }
+        description = _semantic_text(
+            authored_map.get("description")
+            or overlay_map.get("description")
+            or "Business meanings and replayable SQL attached by the RVBBIT artifact compiler.",
+            1000,
+        )
+        if description:
+            merged_map["description"] = description
+        doc["semantic_map"] = merged_map
+    verification = (enrichment or {}).get("verification") or {}
+    doc["semantic_enrichment"] = {
+        "status": status,
+        "source": "rvbbit-agent-overlay",
+        "prompt_version": (enrichment or {}).get("prompt_version"),
+        "model": (enrichment or {}).get("model"),
+        "verified_objects": int(verification.get("verified_count") or len(generated)),
+        "rejected_objects": int(verification.get("rejected_count") or 0),
+        "coverage": verification.get("coverage"),
+        "updated_at": _iso_utc((enrichment or {}).get("updated_at")),
+    }
+    return doc
+
+
+def _semantic_enrichment_row(dashboard_id, version):
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT * FROM rvbbit.artifact_semantic_enrichments "
+                "WHERE dashboard_id=%s AND version=%s",
+                (dashboard_id, version),
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception:  # noqa: BLE001 — old installs simply have no overlay yet
+        return None
+
+
+def _effective_artifact_manifest(dashboard_id, version, manifest, enrichment=None):
+    row = enrichment if enrichment is not None else _semantic_enrichment_row(dashboard_id, version)
+    return _merge_semantic_overlay(manifest or {}, row)
+
+
+def _semantic_enrichment_public(row):
+    if not row:
+        return {"status": "none", "eligible": False}
+    verification = row.get("verification") or {}
+    return {
+        "status": row.get("status"),
+        "eligible": row.get("status") != "disabled",
+        "version": int(row.get("version") or 0),
+        "attempts": int(row.get("attempts") or 0),
+        "verified_objects": int(verification.get("verified_count") or 0),
+        "rejected_objects": int(verification.get("rejected_count") or 0),
+        "coverage": verification.get("coverage"),
+        "model": row.get("model"),
+        "prompt_version": row.get("prompt_version"),
+        "last_error": _semantic_text(row.get("last_error"), 600) or None,
+        "enqueued_at": _iso_utc(row.get("enqueued_at")),
+        "started_at": _iso_utc(row.get("started_at")),
+        "completed_at": _iso_utc(row.get("completed_at")),
+        "updated_at": _iso_utc(row.get("updated_at")),
+    }
+
+
+def _semantic_enrichment_input_hash(html, manifest, source_files):
+    payload = json.dumps(
+        {
+            "html": html or "",
+            "manifest": manifest or {},
+            "source_files": source_files or {},
+            "prompt_version": _SEMANTIC_ENRICH_PROMPT_VERSION,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _enqueue_semantic_enrichment(dashboard_id, version, *, force=False):
+    """Durably schedule a post-commit compiler pass; never fail publication."""
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT d.runtime_kind,d.app_kind,v.html,v.manifest,v.source_files "
+                "FROM rvbbit.dashboards d JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
+                "WHERE d.id=%s AND v.version=%s",
+                (dashboard_id, version),
+            ).fetchone()
+            if not row:
+                return {"status": "none", "eligible": False}
+            if str(row.get("runtime_kind") or "html") != "html":
+                return {"status": "disabled", "eligible": False, "reason": "non-html runtime"}
+            input_hash = _semantic_enrichment_input_hash(
+                row.get("html"), row.get("manifest"), row.get("source_files")
+            )
+            existing = c.execute(
+                "SELECT * FROM rvbbit.artifact_semantic_enrichments "
+                "WHERE dashboard_id=%s AND version=%s",
+                (dashboard_id, version),
+            ).fetchone()
+            enabled = _semantic_enrichment_enabled()
+            if (
+                existing
+                and not force
+                and existing.get("input_hash") == input_hash
+                and existing.get("status") in {"pending", "running", "ready", "partial"}
+            ):
+                return _semantic_enrichment_public(dict(existing))
+            status = "pending" if enabled else "disabled"
+            c.execute(
+                "INSERT INTO rvbbit.artifact_semantic_enrichments "
+                "(dashboard_id,version,status,input_hash,prompt_version,model,not_before,enqueued_at,updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,now(),now(),now()) "
+                "ON CONFLICT (dashboard_id,version) DO UPDATE SET "
+                "status=EXCLUDED.status,input_hash=EXCLUDED.input_hash,prompt_version=EXCLUDED.prompt_version,"
+                "model=EXCLUDED.model,semantic_map='{\"schema_version\":\"rvbbit.semantic-map.v1\",\"objects\":[]}'::jsonb,"
+                "verification='{}'::jsonb,agent_run_id=NULL,attempts=0,last_error=NULL,"
+                "not_before=now(),enqueued_at=now(),started_at=NULL,completed_at=NULL,updated_at=now()",
+                (
+                    dashboard_id,
+                    version,
+                    status,
+                    input_hash,
+                    _SEMANTIC_ENRICH_PROMPT_VERSION,
+                    _SEMANTIC_ENRICH_MODEL,
+                ),
+            )
+            saved = c.execute(
+                "SELECT * FROM rvbbit.artifact_semantic_enrichments "
+                "WHERE dashboard_id=%s AND version=%s",
+                (dashboard_id, version),
+            ).fetchone()
+        if status == "pending":
+            _SEMANTIC_ENRICH_WAKE.set()
+        return _semantic_enrichment_public(dict(saved))
+    except Exception as exc:  # noqa: BLE001 — semantic compilation is never a publish gate
+        print(f"WARNING: could not enqueue semantic enrichment: {exc}", file=sys.stderr)
+        return {
+            "status": "unavailable",
+            "eligible": False,
+            "last_error": _semantic_text(exc, 600),
+        }
+
+
 def _normalize_runtime_kind(runtime_kind):
     kind = (runtime_kind or "html").strip().lower().replace("_", "-")
     aliases = {
@@ -3059,7 +3756,7 @@ def _html_from_live_app(runtime_kind, name, slug, html, source_files):
 
 
 def _live_app_manifest(runtime_kind="html", app_kind="dashboard", manifest=None,
-                       source_files=None, description=None):
+                       source_files=None, description=None, *, normalize=True):
     runtime_kind = _normalize_runtime_kind(runtime_kind)
     app_kind = _normalize_app_kind(app_kind)
     user = _coerce_json_object(manifest, "manifest") if manifest is not None else {}
@@ -3087,7 +3784,7 @@ def _live_app_manifest(runtime_kind="html", app_kind="dashboard", manifest=None,
     base.update(user)
     base["runtime_kind"] = runtime_kind
     base["app_kind"] = app_kind
-    return base
+    return _normalize_semantic_manifest(base) if normalize else base
 
 
 def _live_app_runtime_health(runtime_kind, status="unknown", issues=None):
@@ -3379,13 +4076,19 @@ def _resolve_source(html, source_artifact_id):
 
 
 def tool_publish_dashboard(name, html=None, team=None, description=None, kind="live",
-                           source_artifact_id=None):
+                           source_artifact_id=None, manifest=None):
     html, aerr = _resolve_source(html, source_artifact_id)
     if aerr:
         return aerr
     if not html:
         return {"error": {"code": "EMPTY_HTML",
                           "message": "pass html, or upload_artifact + source_artifact_id"}}
+    try:
+        manifest_doc, semantic_validation = _prepare_artifact_manifest_for_publish(
+            manifest, execute=True
+        )
+    except ValueError as e:
+        return {"error": {"code": "INVALID_SEMANTIC_MAP", "message": str(e)}}
     caller, _ = _caller()
     base = _slugify(name)
     with _conn() as c:
@@ -3394,17 +4097,27 @@ def tool_publish_dashboard(name, html=None, team=None, description=None, kind="l
             n += 1
             slug = f"{base}-{n}"
         d = c.execute(
-            "INSERT INTO rvbbit.dashboards (slug,name,description,owner_email,team,status,latest_version) "
-            "VALUES (%s,%s,%s,%s,%s,%s,1) RETURNING id", (slug, name, description, caller, team, kind)).fetchone()
-        c.execute("INSERT INTO rvbbit.dashboard_versions (dashboard_id,version,html,kind,created_by) "
-                  "VALUES (%s,1,%s,%s,%s)", (d["id"], html, kind, caller))
+            "INSERT INTO rvbbit.dashboards "
+            "(slug,name,description,owner_email,team,status,latest_version,manifest) "
+            "VALUES (%s,%s,%s,%s,%s,%s,1,%s::jsonb) RETURNING id",
+            (slug, name, description, caller, team, kind, _json_default(manifest_doc)),
+        ).fetchone()
+        c.execute(
+            "INSERT INTO rvbbit.dashboard_versions "
+            "(dashboard_id,version,html,kind,created_by,manifest) "
+            "VALUES (%s,1,%s,%s,%s,%s::jsonb)",
+            (d["id"], html, kind, caller, _json_default(manifest_doc)),
+        )
     crawl = _crawl_safe(slug, use_llm=False)   # fast deterministic deps at publish
+    enrichment = _enqueue_semantic_enrichment(d["id"], 1)
     _auto_thumb("dashboard", slug)
     return {"slug": slug, "version": 1, "url": _dash_url(slug), "hub_url": _hub_url("dashboard", slug),
-            "owner": caller, "kind": kind, "deps": crawl}
+            "owner": caller, "kind": kind, "manifest": manifest_doc,
+            "semantic_validation": semantic_validation, "semantic_enrichment": enrichment,
+            "deps": crawl}
 
 
-def tool_update_dashboard(slug, html=None, notes=None, source_artifact_id=None):
+def tool_update_dashboard(slug, html=None, notes=None, source_artifact_id=None, manifest=None):
     html, aerr = _resolve_source(html, source_artifact_id)
     if aerr:
         return aerr
@@ -3412,18 +4125,59 @@ def tool_update_dashboard(slug, html=None, notes=None, source_artifact_id=None):
         return {"error": {"code": "EMPTY_HTML",
                           "message": "pass html, or upload_artifact + source_artifact_id"}}
     caller, _ = _caller()
+    try:
+        manifest_patch = (
+            _coerce_json_object(manifest, "manifest") if manifest is not None else None
+        )
+    except ValueError as e:
+        return {"error": {"code": "INVALID_SEMANTIC_MAP", "message": str(e)}}
     with _conn() as c:
-        d = c.execute("SELECT id, latest_version FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
+        d = c.execute(
+            "SELECT id, latest_version, manifest FROM rvbbit.dashboards WHERE slug=%s",
+            (slug,),
+        ).fetchone()
         if not d:
             return {"error": {"code": "NOT_FOUND", "message": slug}}
+        current = c.execute(
+            "SELECT manifest FROM rvbbit.dashboard_versions "
+            "WHERE dashboard_id=%s AND version=%s",
+            (d["id"], d["latest_version"]),
+        ).fetchone()
+        next_manifest = dict(d.get("manifest") or {})
+        next_manifest.update((current or {}).get("manifest") or {})
+        previous_semantic_map = next_manifest.get("semantic_map")
+        if manifest_patch is not None:
+            next_manifest.update(manifest_patch)
+        try:
+            next_manifest, semantic_validation = _prepare_artifact_manifest_for_publish(
+                next_manifest,
+                fallback_semantic_map=(
+                    previous_semantic_map
+                    if manifest_patch is not None and "semantic_map" in manifest_patch
+                    else None
+                ),
+                execute=True,
+            )
+        except ValueError as e:
+            return {"error": {"code": "INVALID_SEMANTIC_MAP", "message": str(e)}}
         nv = d["latest_version"] + 1
-        c.execute("INSERT INTO rvbbit.dashboard_versions (dashboard_id,version,html,created_by,notes) "
-                  "VALUES (%s,%s,%s,%s,%s)", (d["id"], nv, html, caller, notes))
-        c.execute("UPDATE rvbbit.dashboards SET latest_version=%s, updated_at=now() WHERE id=%s", (nv, d["id"]))
+        c.execute(
+            "INSERT INTO rvbbit.dashboard_versions "
+            "(dashboard_id,version,html,created_by,notes,manifest) "
+            "VALUES (%s,%s,%s,%s,%s,%s::jsonb)",
+            (d["id"], nv, html, caller, notes, _json_default(next_manifest)),
+        )
+        c.execute(
+            "UPDATE rvbbit.dashboards SET latest_version=%s, updated_at=now(), manifest=%s::jsonb "
+            "WHERE id=%s",
+            (nv, _json_default(next_manifest), d["id"]),
+        )
     crawl = _crawl_safe(slug, use_llm=False)
+    enrichment = _enqueue_semantic_enrichment(d["id"], nv)
     _auto_thumb("dashboard", slug)
     return {"slug": slug, "version": nv, "url": _dash_url(slug), "hub_url": _hub_url("dashboard", slug),
-            "deps": crawl}
+            "manifest": next_manifest, "semantic_validation": semantic_validation,
+            "semantic_enrichment": enrichment, "deps": crawl}
 
 
 def tool_list_dashboards(team=None, search=None):
@@ -3439,17 +4193,30 @@ def tool_list_dashboards(team=None, search=None):
 
 def tool_get_dashboard(slug, version=None):
     with _conn() as c:
-        d = c.execute("SELECT id, slug, name, description, owner_email, team, status, latest_version, created_at "
+        d = c.execute("SELECT id, slug, name, description, owner_email, team, status, "
+                      "latest_version, manifest, created_at "
                       "FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
         if not d:
             return {"error": {"code": "NOT_FOUND", "message": slug}}
         v = int(version or d["latest_version"])
-        d["version"] = c.execute(
-            "SELECT version, html, kind, created_by, created_at, notes "
+        version_row = c.execute(
+            "SELECT version, html, kind, created_by, created_at, notes, manifest "
             "FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s", (d["id"], v)).fetchone()
+        if version_row:
+            version_row = dict(version_row)
+            version_row["authored_manifest"] = version_row.get("manifest") or {}
+            version_row["manifest"] = _effective_artifact_manifest(
+                d["id"], v, version_row.get("manifest")
+            )
+        d["version"] = version_row
         d["sources"] = c.execute(
             "SELECT kind, object_ref, base_sql, source FROM rvbbit.dashboard_deps "
-            "WHERE dashboard_id=%s ORDER BY kind, object_ref NULLS LAST", (d["id"],)).fetchall()
+            "WHERE dashboard_id=%s AND version=%s ORDER BY kind, object_ref NULLS LAST",
+            (d["id"], v),
+        ).fetchall()
+    d["semantic_enrichment"] = _semantic_enrichment_public(
+        _semantic_enrichment_row(d["id"], v)
+    )
     d["url"] = _dash_url(slug)
     return d
 
@@ -3472,9 +4239,13 @@ def tool_live_app_template(runtime_kind="html", app_kind="dashboard"):
             "app_kind": app_kind,
             "manifest": manifest,
             "template_html": dashboard["template_html"],
+            "semantic_map_example": dashboard["semantic_map_example"],
             "how_to_use": [
                 "Build the UI in one HTML artifact and call rvbbitQuery(sql) for live read-only data.",
-                "Use create_live_app(name, html, manifest=manifest) to publish and version it.",
+                "Publish normally with create_live_app; RVBBIT automatically compiles a verified "
+                "semantic overlay after publication without changing the artifact.",
+                "semantic_map_example is an optional precision hint when you already have an exact "
+                "business definition; authored objects override generated ones.",
                 "Use debug_live_app(slug) after it runs to reconcile parsed and runtime dependencies.",
             ] + dashboard.get("how_to_use", []),
         }
@@ -3511,9 +4282,22 @@ def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
         if runtime_kind == "python-fastapi" and not source_files:
             source_files = _python_fastapi_files()
         html = _html_from_live_app(runtime_kind, name, None, html, source_files)
-        manifest_doc = _live_app_manifest(runtime_kind, app_kind, manifest, source_files, description)
     except ValueError as e:
         return {"error": {"code": "INVALID_ARGUMENT", "message": str(e)}}
+    try:
+        manifest_doc = _live_app_manifest(
+            runtime_kind,
+            app_kind,
+            manifest,
+            source_files,
+            description,
+            normalize=False,
+        )
+        manifest_doc, semantic_validation = _prepare_artifact_manifest_for_publish(
+            manifest_doc, execute=True
+        )
+    except ValueError as e:
+        return {"error": {"code": "INVALID_SEMANTIC_MAP", "message": str(e)}}
 
     _ensure_dashboard_tables()
     caller, _ = _caller()
@@ -3537,6 +4321,7 @@ def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
             "VALUES (%s,1,%s,%s,%s,%s::jsonb,%s::jsonb)",
             (d["id"], html, runtime_kind, caller, _json_default(manifest_doc), _json_default(source_files)))
     crawl = _crawl_safe(slug, use_llm=False)
+    enrichment = _enqueue_semantic_enrichment(d["id"], 1)
     if runtime_kind == "html":
         _auto_thumb(app_kind, slug)
     return {
@@ -3548,6 +4333,8 @@ def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
         "runtime_kind": runtime_kind,
         "app_kind": app_kind,
         "manifest": manifest_doc,
+        "semantic_validation": semantic_validation,
+        "semantic_enrichment": enrichment,
         "health": health,
         "deps": crawl,
     }
@@ -3581,9 +4368,26 @@ def tool_update_live_app(slug, html=None, notes=None, manifest=None, source_file
             next_html = _html_from_live_app(next_runtime, d["name"], slug, next_html, next_sources)
             next_manifest = dict(d["manifest"] or {})
             next_manifest.update(cur["manifest"] or {})
+            previous_semantic_map = next_manifest.get("semantic_map")
             next_manifest.update(manifest_patch)
-            next_manifest = _live_app_manifest(
-                next_runtime, next_app_kind, next_manifest, next_sources, d["description"])
+            try:
+                next_manifest = _live_app_manifest(
+                    next_runtime,
+                    next_app_kind,
+                    next_manifest,
+                    next_sources,
+                    d["description"],
+                    normalize=False,
+                )
+                next_manifest, semantic_validation = _prepare_artifact_manifest_for_publish(
+                    next_manifest,
+                    fallback_semantic_map=(
+                        previous_semantic_map if "semantic_map" in manifest_patch else None
+                    ),
+                    execute=True,
+                )
+            except ValueError as e:
+                return {"error": {"code": "INVALID_SEMANTIC_MAP", "message": str(e)}}
             nv = d["latest_version"] + 1
             health = _live_app_runtime_health(next_runtime, "updated")
             c.execute(
@@ -3599,6 +4403,7 @@ def tool_update_live_app(slug, html=None, notes=None, manifest=None, source_file
     except ValueError as e:
         return {"error": {"code": "INVALID_ARGUMENT", "message": str(e)}}
     crawl = _crawl_safe(slug, use_llm=False)
+    enrichment = _enqueue_semantic_enrichment(d["id"], nv)
     if next_runtime == "html":
         _auto_thumb(next_app_kind, slug)
     return {
@@ -3609,6 +4414,8 @@ def tool_update_live_app(slug, html=None, notes=None, manifest=None, source_file
         "runtime_kind": next_runtime,
         "app_kind": next_app_kind,
         "manifest": next_manifest,
+        "semantic_validation": semantic_validation,
+        "semantic_enrichment": enrichment,
         "health": health,
         "deps": crawl,
     }
@@ -3624,7 +4431,8 @@ def tool_list_live_apps(team=None, search=None, runtime_kind=None, app_kind=None
     with _conn() as c:
         rows = c.execute(
             "SELECT slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
-            "latest_version, manifest, last_health, last_debug_at, queries, tables, metrics, updated_at "
+            "latest_version, manifest, last_health, last_debug_at, queries, tables, metrics, "
+            "semantic_objects, updated_at "
             "FROM rvbbit.live_apps "
             "WHERE (%s::text IS NULL OR team=%s::text) "
             "AND (%s::text IS NULL OR runtime_kind=%s::text) "
@@ -3662,6 +4470,10 @@ def tool_get_live_app(slug, version=None, include_source=True):
         if not version_row:
             return {"error": {"code": "NOT_FOUND", "message": f"{slug}@v{v}"}}
         version_doc = dict(version_row)
+        version_doc["authored_manifest"] = version_doc.get("manifest") or {}
+        version_doc["manifest"] = _effective_artifact_manifest(
+            app["id"], v, version_doc.get("manifest")
+        )
         if not include_source:
             html = version_doc.pop("html", "") or ""
             source_files = version_doc.pop("source_files", {}) or {}
@@ -3670,7 +4482,9 @@ def tool_get_live_app(slug, version=None, include_source=True):
         app["version"] = version_doc
         app["sources"] = c.execute(
             "SELECT kind, object_ref, base_sql, source FROM rvbbit.dashboard_deps "
-            "WHERE dashboard_id=%s ORDER BY kind, object_ref NULLS LAST", (app["id"],)).fetchall()
+            "WHERE dashboard_id=%s AND version=%s ORDER BY kind, object_ref NULLS LAST",
+            (app["id"], v),
+        ).fetchall()
         app["recent_queries"] = c.execute(
             "SELECT ts, ok, error, rows, engine, elapsed_ms, args->>'sql' AS sql "
             f"FROM {ACTIVITY_TABLE} WHERE tool='dashboard_query' AND args->>'dashboard'=%s "
@@ -3678,6 +4492,9 @@ def tool_get_live_app(slug, version=None, include_source=True):
     app["url"] = _live_app_url(slug)
     app["hub_url"] = _hub_url(app.get("app_kind"), slug)
     app["path"] = f"/apps/{slug}"
+    app["semantic_enrichment"] = _semantic_enrichment_public(
+        _semantic_enrichment_row(app["id"], v)
+    )
     app["runner"] = _live_app_runner_status(slug, probe=False)
     return app
 
@@ -4272,6 +5089,711 @@ def tool_capture_live_app(slug, path=None, width=1440, height=900, full_page=Tru
     return res
 
 
+# ── post-publication semantic compiler ───────────────────────────────────────
+
+_SEMANTIC_EVIDENCE_JS = r"""
+() => {
+  const SENSITIVE = /(?:secret|token|password|passwd|auth|cookie|session|api[-_]?key)/i;
+  const bounded = (value, limit=500) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, limit);
+  const quoteAttr = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+  const css = (value) => window.CSS?.escape ? window.CSS.escape(String(value)) : String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+  const visible = (node) => {
+    if (!(node instanceof Element)) return false;
+    const style = getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0
+      && rect.width >= 2 && rect.height >= 2 && rect.bottom > 0 && rect.right > 0;
+  };
+  const safeAttributes = (node) => {
+    const out = {};
+    [...(node?.attributes || [])].slice(0, 32).forEach((attr) => {
+      if (!SENSITIVE.test(attr.name) && (attr.name.startsWith('data-') || ['aria-label','title','name'].includes(attr.name))) {
+        out[attr.name] = bounded(attr.value, 240);
+      }
+    });
+    return out;
+  };
+  const contextData = (node) => {
+    const out = {};
+    let current = node;
+    for (let depth=0; current && current !== document.body && depth<4; depth++, current=current.parentElement) {
+      Object.entries(safeAttributes(current)).forEach(([key,value]) => {
+        if (key.startsWith('data-') && key !== 'data-value' && !SENSITIVE.test(key)) {
+          const short = key.slice(5).replace(/[^a-zA-Z0-9_]/g, '_');
+          if (!(short in out)) out[short] = value;
+        }
+        if (key === 'aria-label' && !('aria_label' in out)) out.aria_label = value;
+      });
+    }
+    return out;
+  };
+  const uniqueDataPart = (node) => {
+    const attrs = Object.entries(safeAttributes(node)).filter(([key,value]) => key.startsWith('data-') && value);
+    for (let count=1; count<=Math.min(3, attrs.length); count++) {
+      const part = (node.localName || '*') + attrs.slice(0,count)
+        .map(([key,value]) => `[${key}="${quoteAttr(value)}"]`).join('');
+      try { if (document.querySelectorAll(part).length === 1) return part; } catch {}
+    }
+    return '';
+  };
+  const selectorFor = (node) => {
+    if (!(node instanceof Element)) return '';
+    const parts = [];
+    let current = node;
+    while (current && current !== document.body && parts.length < 8) {
+      let part = current.localName || 'div';
+      if (current.id && !SENSITIVE.test(current.id)) {
+        parts.unshift(`${part}#${css(current.id)}`);
+        break;
+      }
+      const dataPart = uniqueDataPart(current);
+      if (dataPart) {
+        parts.unshift(dataPart);
+        break;
+      }
+      const testId = current.getAttribute('data-testid');
+      if (testId && !SENSITIVE.test(testId)) part += `[data-testid="${quoteAttr(testId)}"]`;
+      else if (current.parentElement) {
+        const siblings = [...current.parentElement.children].filter((item) => item.localName === current.localName);
+        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(current)+1})`;
+      }
+      parts.unshift(part);
+      current = current.parentElement;
+    }
+    return parts.join(' > ').slice(0,800);
+  };
+  const valueFrom = (node) => {
+    for (const attr of ['data-value','data-v']) {
+      const value = node.getAttribute?.(attr);
+      if (value !== null && value !== '') return {
+        value: bounded(value,120), value_attribute: attr,
+        value_source:`$element.data.${attr.slice(5).replace(/[^a-zA-Z0-9_]/g,'_')}`,
+      };
+    }
+    const text = bounded(node.textContent,160);
+    if (!text) return {value:'', value_attribute:null, value_source:null};
+    const matches = text.match(/[~≈<>≤≥]?\s*[+-]?\s*(?:[$€£¥]\s*)?\(?\d[\d,]*(?:\.\d+)?\)?(?:\s*%)?(?:\s*[kmbt])?/ig) || [];
+    const comparable = (value) => bounded(value,120).toLowerCase().replace(/[^0-9.eE+-]/g,'');
+    const contextual = new Set(Object.values(contextData(node)).map(comparable).filter(Boolean));
+    let valueIndex = matches.findIndex((item) => bounded(item,120) && !contextual.has(comparable(item)));
+    if (valueIndex < 0) valueIndex = matches.findIndex((item) => bounded(item,120));
+    const value = valueIndex >= 0 ? bounded(matches[valueIndex],120) : '';
+    return {
+      value, value_attribute:null,
+      value_source:valueIndex >= 0 ? `$element.text_number.${valueIndex}` : null,
+    };
+  };
+  const containerFor = (node) => node.closest('section,article,.card,[role="figure"],[role="group"]') || node.parentElement;
+  const labelFor = (node) => {
+    const container = containerFor(node);
+    const local = node.parentElement?.querySelector?.('.lab,.label,[data-label]');
+    const heading = container?.querySelector?.('h1,h2,h3,h4,h5,h6,.lab,.label,[aria-label]');
+    return bounded(local?.textContent || local?.getAttribute?.('data-label') || heading?.textContent
+      || node.getAttribute?.('aria-label') || node.getAttribute?.('title'), 300);
+  };
+  const raw = [];
+  [...document.body.querySelectorAll('*')].slice(0,6000).forEach((node) => {
+    if (!visible(node) || ['script','style','option','path','line','polyline','circle'].includes(node.localName)) return;
+    const {value,value_attribute,value_source} = valueFrom(node);
+    const hinted = node.matches('.val,.value,.metric,.kpi-value,.rowval,.detailbox b,[data-value],[data-v],[data-metric]');
+    const svgMark = node.matches('rect[data-year],rect[data-value],[data-row-index],[data-index]');
+    if (!value || (!hinted && !svgMark && node.childElementCount > 0)) return;
+    const rect = node.getBoundingClientRect();
+    raw.push({
+      node,
+      selector: selectorFor(node),
+      tag: node.localName,
+      classes: bounded(node.className?.baseVal || node.className,180),
+      label: labelFor(node),
+      rendered_text: bounded(node.textContent || node.getAttribute('title'),240),
+      value, value_source,
+      value_attribute,
+      attributes: safeAttributes(node),
+      element_context: contextData(node),
+      bounds: {x:Math.round(rect.left),y:Math.round(rect.top),width:Math.round(rect.width),height:Math.round(rect.height)},
+    });
+  });
+  const groupSelectorFor = (item) => {
+    if (!item.classes) return '';
+    const className = item.classes.split(/\s+/).filter(Boolean)[0];
+    if (!className) return '';
+    const container = item.node.closest('[id]');
+    if (!container?.id || SENSITIVE.test(container.id)) return '';
+    const selector = `#${css(container.id)} .${css(className)}`;
+    try {
+      const nodes = [...document.querySelectorAll(selector)].filter(visible);
+      if (nodes.length >= 3 && nodes.length <= 250 && nodes.every((node) => Object.keys(contextData(node)).length)) return selector;
+    } catch {}
+    return '';
+  };
+  const groups = new Map();
+  raw.forEach((item) => {
+    const selector = groupSelectorFor(item);
+    if (!selector) return;
+    if (!groups.has(selector)) groups.set(selector,[]);
+    groups.get(selector).push(item);
+  });
+  const groupedNodes = new Set();
+  const candidates = [];
+  [...groups.entries()].forEach(([selector,items]) => {
+    if (items.length < 3) return;
+    items.forEach((item) => groupedNodes.add(item.node));
+    candidates.push({
+      kind:'repeated', selector, label:items[0].label, tag:items[0].tag,
+      rendered_text:items[0].rendered_text, value:items[0].value,
+      value_attribute:items[0].value_attribute, value_source:items[0].value_source,
+      element_context:items[0].element_context,
+      represented_elements:items.length,
+      samples:items.slice(0,16).map((item) => ({selector:item.selector,label:item.label,
+        rendered_text:item.rendered_text,value:item.value,value_attribute:item.value_attribute,
+        element_context:item.element_context,attributes:item.attributes})),
+    });
+  });
+  raw.filter((item) => !groupedNodes.has(item.node)).forEach((item) => candidates.push({
+    kind:'value', selector:item.selector, label:item.label, tag:item.tag, classes:item.classes,
+    rendered_text:item.rendered_text, value:item.value, value_attribute:item.value_attribute,
+    value_source:item.value_source, attributes:item.attributes,
+    element_context:item.element_context, bounds:item.bounds,
+    represented_elements:1,
+  }));
+  candidates.sort((left,right) => {
+    const rank = (item) => item.kind === 'value' && /(?:val|value|metric|kpi)/i.test(item.classes || '') ? 0 : item.kind === 'repeated' ? 1 : 2;
+    return rank(left)-rank(right) || (left.bounds?.y || 0)-(right.bounds?.y || 0) || (left.bounds?.x || 0)-(right.bounds?.x || 0);
+  });
+  const finalCandidates = candidates.slice(0,140).map((item,index) => ({...item,candidate_id:`candidate_${String(index+1).padStart(3,'0')}`}));
+  const controls = [...document.querySelectorAll('input,select,textarea,[role="slider"],[role="switch"]')]
+    .filter(visible).slice(0,80).map((node) => ({
+      selector:selectorFor(node), tag:node.localName, type:node.type || node.getAttribute('role') || '',
+      name:bounded(node.name || node.id,120), label:labelFor(node),
+      value:node.type === 'checkbox' ? Boolean(node.checked) : bounded(node.value ?? node.textContent,500),
+      options:node.matches('select') ? [...node.options].slice(0,80).map((option) => ({value:bounded(option.value,160),label:bounded(option.textContent,160)})) : [],
+    }));
+  const tables = [...document.querySelectorAll('table')].filter(visible).slice(0,24).map((table) => ({
+    selector:selectorFor(table), label:labelFor(table),
+    columns:[...table.querySelectorAll('thead tr:last-child th')].slice(0,40).map((node) => bounded(node.textContent,160)),
+    sample_rows:[...table.querySelectorAll('tbody tr')].slice(0,8).map((row) => [...row.querySelectorAll('td,th')].slice(0,40).map((node) => bounded(node.textContent,240))),
+  }));
+  const charts = [...document.querySelectorAll('canvas')].filter(visible).slice(0,24).map((canvas) => {
+    const chart = window.Chart?.getChart?.(canvas);
+    return {selector:selectorFor(canvas),label:labelFor(canvas),
+      labels:(chart?.data?.labels || []).slice(0,40),datasets:(chart?.data?.datasets || []).slice(0,12).map((dataset,index) => ({
+        dataset_index:index,label:bounded(dataset.label,160),values:(dataset.data || []).slice(0,40),
+      }))};
+  });
+  const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')].filter(visible).slice(0,80).map((node) => bounded(node.textContent,240));
+  return {title:document.title || headings[0] || '',headings,controls,tables,charts,candidates:finalCandidates,
+    candidate_elements:finalCandidates.reduce((total,item) => total + Number(item.represented_elements || 1),0),
+    viewport:{width:innerWidth,height:innerHeight,document_width:document.documentElement.scrollWidth,document_height:document.documentElement.scrollHeight}};
+}
+"""
+
+
+def _semantic_capture_document(html):
+    bridge = """<script>
+window.rvbbitQuery=async function(sql,opts){return await window.__rvbbitSemanticQuery(sql,opts||{});};
+window.cowork=window.cowork||{};
+window.cowork.callMcpTool=async function(tool,args){
+  args=args||{};
+  if(String(tool||'').endsWith('run_sql_multi')){
+    const results={};
+    for(const [name,sql] of Object.entries(args.queries||{})){
+      results[name]=await window.rvbbitQuery(sql,{as_of:args.as_of||null});
+    }
+    return {structuredContent:{results}};
+  }
+  const data=await window.rvbbitQuery(args.sql||'',{as_of:args.as_of||null});
+  return {structuredContent:{...data,rows:(data&&data.rows)||[]}};
+};
+</script>"""
+    doc = html or ""
+    match = re.search(r"<head[^>]*>", doc, re.IGNORECASE)
+    return doc[:match.end()] + bridge + doc[match.end():] if match else bridge + doc
+
+
+def _semantic_packet_query(sql_text, result, ordinal):
+    result = result if isinstance(result, dict) else {}
+    return {
+        "query_id": f"runtime_{ordinal}",
+        "sql": str(sql_text or "")[:50_000],
+        "columns": list(result.get("columns") or [])[:160],
+        "sample_rows": list(result.get("rows") or [])[:12],
+        "row_count": int(result.get("row_count") or 0),
+        "truncated": bool(result.get("truncated")),
+        "engine": result.get("engine"),
+        "elapsed_ms": result.get("elapsed_ms"),
+        "error": result.get("error"),
+    }
+
+
+def _capture_semantic_evidence(job):
+    """Render one immutable version and return bounded code + runtime evidence."""
+    from playwright.sync_api import sync_playwright
+
+    app, row = _load_live_app_version(job["slug"], int(job["version"]))
+    if not app or not row:
+        raise ValueError(f"artifact version disappeared: {job['slug']}@v{job['version']}")
+    html = row.get("html") or ""
+    queries = []
+    console_errors = []
+    page_errors = []
+    owner = job.get("owner_email")
+
+    def run_query(sql_text, opts=None):
+        token = _SESSION_SUB.set(owner)
+        try:
+            result = tool_run_sql(str(sql_text or ""), (opts or {}).get("as_of"))
+        finally:
+            _SESSION_SUB.reset(token)
+        queries.append(_semantic_packet_query(sql_text, result, len(queries) + 1))
+        return json.loads(json.dumps(result, default=str))
+
+    capture_root = _live_app_capture_root() / "semantic"
+    capture_root.mkdir(parents=True, exist_ok=True)
+    screenshot = capture_root / f"{job['slug']}-v{int(job['version'])}.jpg"
+    width = _env_int("WAREHOUSE_SEMANTIC_ENRICH_WIDTH", 1200, minimum=640, maximum=1920)
+    height = _env_int("WAREHOUSE_SEMANTIC_ENRICH_HEIGHT", 800, minimum=480, maximum=1440)
+    wait_ms = _env_int("WAREHOUSE_SEMANTIC_ENRICH_RENDER_WAIT_MS", 3000, minimum=250, maximum=15_000)
+    with sync_playwright() as playwright:
+        browser = _launch_playwright_chromium(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.expose_function("__rvbbitSemanticQuery", run_query)
+        page.on(
+            "console",
+            lambda message: console_errors.append(message.text[:500])
+            if message.type in {"error", "warning"} and len(console_errors) < 20 else None,
+        )
+        page.on(
+            "pageerror",
+            lambda error: page_errors.append(str(error)[:500]) if len(page_errors) < 20 else None,
+        )
+        page.set_content(_semantic_capture_document(html), wait_until="networkidle", timeout=30_000)
+        page.wait_for_timeout(wait_ms)
+        dom = page.evaluate(_SEMANTIC_EVIDENCE_JS)
+        page.screenshot(path=str(screenshot), full_page=False, type="jpeg", quality=68)
+        browser.close()
+
+    source_limit = _env_int(
+        "WAREHOUSE_SEMANTIC_ENRICH_SOURCE_CHARS", 180_000, minimum=20_000, maximum=800_000
+    )
+    source = (html + _source_files_text(row.get("source_files")))[:source_limit]
+    packet = {
+        "schema_version": "rvbbit.artifact-evidence.v1",
+        "artifact": {
+            "slug": app["slug"],
+            "name": app["name"],
+            "description": app.get("description"),
+            "version": int(row["version"]),
+            "app_kind": app.get("app_kind"),
+            "runtime_kind": app.get("runtime_kind"),
+        },
+        "authored_semantic_map": ((row.get("manifest") or {}).get("semantic_map") or {}),
+        "dom": dom,
+        "runtime_queries": queries[:24],
+        "source": source,
+        "render_health": {
+            "queries_ran": len(queries),
+            "queries_failed": sum(1 for item in queries if item.get("error")),
+            "console_errors": console_errors,
+            "page_errors": page_errors,
+        },
+        "screenshot": {"path": str(screenshot), "width": width, "height": height},
+    }
+    vision = []
+    if screenshot.is_file() and screenshot.stat().st_size <= 3 * 1024 * 1024:
+        import base64
+        vision.append({
+            "dataUrl": "data:image/jpeg;base64," + base64.b64encode(screenshot.read_bytes()).decode(),
+        })
+    return packet, vision
+
+
+def _semantic_operator_available():
+    try:
+        with _conn() as c:
+            c.execute(
+                "UPDATE rvbbit.operators SET model=%s,"
+                "steps=jsonb_set(steps,'{0,model}',to_jsonb(%s::text),true),updated_at=now() "
+                "WHERE name='artifact_semantic_enrich' AND "
+                "(model IS DISTINCT FROM %s OR steps#>>'{0,model}' IS DISTINCT FROM %s)",
+                (
+                    _SEMANTIC_ENRICH_MODEL,
+                    _SEMANTIC_ENRICH_MODEL,
+                    _SEMANTIC_ENRICH_MODEL,
+                    _SEMANTIC_ENRICH_MODEL,
+                ),
+            )
+            row = c.execute(
+                "SELECT to_regprocedure('rvbbit.artifact_semantic_enrich(jsonb,jsonb,jsonb)') IS NOT NULL AS ok"
+            ).fetchone()
+        return bool((row or {}).get("ok"))
+    except Exception:
+        return False
+
+
+def _semantic_operator_payload(envelope):
+    if isinstance(envelope, str):
+        envelope = json.loads(envelope)
+    if not isinstance(envelope, dict):
+        raise ValueError("semantic enrichment operator returned no JSON object")
+    result = envelope
+    agent_run_id = None
+    # SQL operators return their selected `result` column inside the scalar
+    # function envelope. Agent workflows then intentionally add a second
+    # result envelope with the run receipt. Tolerate both that shape and a
+    # direct object so the publication worker is not coupled to transport
+    # serialization details.
+    for _depth in range(4):
+        if isinstance(result, str):
+            result = json.loads(result)
+        if not isinstance(result, dict):
+            break
+        agent_run_id = result.get("agent_run_id") or agent_run_id
+        if isinstance(result.get("semantic_map"), dict) or isinstance(result.get("objects"), list):
+            return result, agent_run_id
+        if "result" not in result:
+            break
+        result = result["result"]
+    raise ValueError("semantic enrichment operator result did not contain semantic objects")
+
+
+def _run_semantic_operator(packet, vision):
+    if not _semantic_operator_available():
+        raise ValueError("rvbbit.artifact_semantic_enrich is not installed")
+    with _conn() as c:
+        c.execute("SET statement_timeout = 600000")
+        row = c.execute(
+            "SELECT rvbbit.artifact_semantic_enrich(%s::jsonb,%s::jsonb) AS result",
+            (_json_default(packet), _json_default(vision)),
+        ).fetchone()
+    return _semantic_operator_payload((row or {}).get("result"))
+
+
+def _semantic_candidate_id(raw):
+    if not isinstance(raw, dict):
+        return ""
+    evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
+    return str(raw.get("candidate_id") or evidence.get("candidate_id") or "").strip()
+
+
+def _semantic_source_key(source):
+    raw = str(source or "")
+    match = re.fullmatch(r"\$(?:element|selection)\.data\.([a-zA-Z][a-zA-Z0-9_]*)", raw)
+    if not match:
+        match = re.fullmatch(
+            r"\$element\.attr\.data-([a-zA-Z][a-zA-Z0-9_-]*)", raw
+        )
+    return match.group(1).replace("-", "_") if match else None
+
+
+def _candidate_sample_for_defaults(candidate, raw_object):
+    samples = candidate.get("samples") or [candidate]
+    parameters = raw_object.get("parameters") if isinstance(raw_object.get("parameters"), dict) else {}
+    for sample in samples:
+        context = sample.get("element_context") or {}
+        matched = True
+        for spec in parameters.values():
+            if not isinstance(spec, dict):
+                continue
+            key = _semantic_source_key(spec.get("source"))
+            if key and str(context.get(key)) != str(spec.get("default")):
+                matched = False
+                break
+        if matched:
+            return sample
+    return samples[0] if samples else candidate
+
+
+def _verified_semantic_overlay(agent_result, evidence, owner=None):
+    """Accept agent candidates one at a time; bad guesses cannot poison good objects."""
+    raw_map = agent_result.get("semantic_map") if isinstance(agent_result.get("semantic_map"), dict) else {}
+    raw_objects = agent_result.get("objects") or raw_map.get("objects") or []
+    if not isinstance(raw_objects, list):
+        raise ValueError("semantic enrichment objects must be a list")
+    candidates = {
+        item.get("candidate_id"): item
+        for item in ((evidence.get("dom") or {}).get("candidates") or [])
+        if isinstance(item, dict) and item.get("candidate_id")
+    }
+    authored_objects = (
+        (evidence.get("authored_semantic_map") or {}).get("objects") or []
+    )
+    authored_ids = {str(item.get("id") or "") for item in authored_objects if isinstance(item, dict)}
+    authored_bindings = set().union(*(
+        _semantic_binding_keys(item) for item in authored_objects if isinstance(item, dict)
+    )) if authored_objects else set()
+    verified = []
+    rejected = []
+    seen_ids = set(authored_ids)
+    represented = 0
+    token = _SESSION_SUB.set(owner)
+    try:
+        for raw in raw_objects[:160]:
+            object_id = str(raw.get("id") or "") if isinstance(raw, dict) else ""
+            candidate_id = _semantic_candidate_id(raw)
+            candidate = candidates.get(candidate_id)
+            try:
+                if not isinstance(raw, dict):
+                    raise ValueError("candidate is not an object")
+                if not candidate:
+                    raise ValueError(f"unknown or missing candidate_id {candidate_id or '(missing)'}")
+                if object_id in seen_ids:
+                    raise ValueError(f"duplicate or authored object id {object_id}")
+                prepared = dict(raw)
+                raw_bindings = raw.get("bindings") or raw.get("binding") or [{}]
+                if not isinstance(raw_bindings, list):
+                    raw_bindings = [raw_bindings]
+                supplied = raw_bindings[0] if raw_bindings and isinstance(raw_bindings[0], dict) else {}
+                binding = {
+                    key: supplied[key]
+                    for key in ("role", "chart_dataset", "table_column", "dataset_index", "context", "value_source")
+                    if key in supplied
+                }
+                binding["selector"] = candidate["selector"]
+                if candidate.get("value_source"):
+                    binding["value_source"] = candidate["value_source"]
+                elif not binding.get("value_source") and candidate.get("value_attribute", "").startswith("data-"):
+                    binding["value_source"] = "$element.data." + candidate["value_attribute"][5:].replace("-", "_")
+                prepared["bindings"] = [binding]
+                prepared.pop("binding", None)
+                normalized = _normalize_semantic_object(prepared)
+                if _semantic_binding_keys(normalized) & authored_bindings:
+                    raise ValueError("candidate overlaps an authored DOM binding")
+                validation = _validate_semantic_manifest({
+                    "semantic_map": {"schema_version": _SEMANTIC_MAP_SCHEMA, "objects": [normalized]}
+                }, execute=True)
+                validation_item = validation["objects"][0]
+                sample = _candidate_sample_for_defaults(candidate, raw)
+                rendered_value = sample.get("value")
+                if rendered_value in (None, ""):
+                    raise ValueError("candidate has no captured rendered value")
+                matches = _semantic_values_match(
+                    rendered_value, validation_item.get("value"), normalized.get("display")
+                )
+                if matches is not True:
+                    raise ValueError(
+                        f"replay value {validation_item.get('value')!r} did not match rendered value {rendered_value!r}"
+                    )
+                verified.append(normalized)
+                seen_ids.add(normalized["id"])
+                represented += int(candidate.get("represented_elements") or 1)
+            except Exception as exc:  # noqa: BLE001 — retain other independently verified objects
+                rejected.append({
+                    "id": object_id or None,
+                    "candidate_id": candidate_id or None,
+                    "error": _semantic_text(exc, 700),
+                })
+    finally:
+        _SESSION_SUB.reset(token)
+    total_elements = int((evidence.get("dom") or {}).get("candidate_elements") or 0)
+    coverage = (represented / total_elements) if total_elements else 1.0
+    semantic_map = {
+        "schema_version": _SEMANTIC_MAP_SCHEMA,
+        "description": _semantic_text(
+            raw_map.get("description") or agent_result.get("description")
+            or "Automatically compiled business meanings and independently replayable SQL.",
+            1000,
+        ),
+        "objects": verified,
+    }
+    report = {
+        "verified_count": len(verified),
+        "rejected_count": len(rejected),
+        "candidate_count": len(candidates),
+        "candidate_elements": total_elements,
+        "covered_elements": represented,
+        "coverage": round(coverage, 4),
+        "rejected": rejected[:80],
+        "unmapped": list(agent_result.get("unmapped") or [])[:80],
+    }
+    return semantic_map, report
+
+
+def _claim_semantic_enrichment_job():
+    max_attempts = _env_int("WAREHOUSE_SEMANTIC_ENRICH_MAX_ATTEMPTS", 3, minimum=1, maximum=8)
+    with psycopg.connect(DSN, row_factory=dict_row, autocommit=False) as c:
+        c.execute(
+            "UPDATE rvbbit.artifact_semantic_enrichments SET status='pending',not_before=now(),"
+            "last_error=coalesce(last_error,'') || CASE WHEN coalesce(last_error,'')='' THEN '' ELSE E'\\n' END || "
+            "'Recovered stale worker claim',updated_at=now() "
+            "WHERE status='running' AND started_at < now() - interval '20 minutes' AND attempts < %s",
+            (max_attempts,),
+        )
+        c.execute(
+            "UPDATE rvbbit.artifact_semantic_enrichments SET status='failed',completed_at=now(),"
+            "last_error=coalesce(last_error,'Semantic enrichment exhausted its retry budget'),updated_at=now() "
+            "WHERE status='running' AND started_at < now() - interval '20 minutes' AND attempts >= %s",
+            (max_attempts,),
+        )
+        row = c.execute(
+            "SELECT e.*,d.slug,d.name,d.owner_email,d.runtime_kind,d.app_kind "
+            "FROM rvbbit.artifact_semantic_enrichments e "
+            "JOIN rvbbit.dashboards d ON d.id=e.dashboard_id "
+            "WHERE e.status='pending' AND e.not_before<=now() "
+            "ORDER BY e.enqueued_at FOR UPDATE OF e SKIP LOCKED LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        c.execute(
+            "UPDATE rvbbit.artifact_semantic_enrichments SET status='running',attempts=attempts+1,"
+            "started_at=now(),last_error=NULL,updated_at=now() WHERE dashboard_id=%s AND version=%s",
+            (row["dashboard_id"], row["version"]),
+        )
+        job = dict(row)
+        job["attempts"] = int(row.get("attempts") or 0) + 1
+    return job
+
+
+def _complete_semantic_enrichment(job, semantic_map, verification, agent_run_id):
+    status = "partial" if verification.get("rejected_count") else "ready"
+    with _conn() as c:
+        c.execute(
+            "UPDATE rvbbit.artifact_semantic_enrichments SET status=%s,semantic_map=%s::jsonb,"
+            "verification=%s::jsonb,agent_run_id=%s,model=%s,completed_at=now(),last_error=NULL,updated_at=now() "
+            "WHERE dashboard_id=%s AND version=%s",
+            (
+                status,
+                _json_default(semantic_map),
+                _json_default(verification),
+                agent_run_id,
+                _SEMANTIC_ENRICH_MODEL,
+                job["dashboard_id"],
+                job["version"],
+            ),
+        )
+    _crawl_safe(job["slug"], use_llm=False)
+
+
+def _fail_semantic_enrichment(job, exc):
+    max_attempts = _env_int("WAREHOUSE_SEMANTIC_ENRICH_MAX_ATTEMPTS", 3, minimum=1, maximum=8)
+    attempts = int(job.get("attempts") or 1)
+    retry = attempts < max_attempts
+    delay = min(300, 15 * (2 ** max(0, attempts - 1)))
+    with _conn() as c:
+        c.execute(
+            "UPDATE rvbbit.artifact_semantic_enrichments SET status=%s,last_error=%s,"
+            "not_before=now()+(%s * interval '1 second'),completed_at=%s,updated_at=now() "
+            "WHERE dashboard_id=%s AND version=%s",
+            (
+                "pending" if retry else "failed",
+                _semantic_text(f"{type(exc).__name__}: {exc}", 2000),
+                delay if retry else 0,
+                None if retry else datetime.now(timezone.utc),
+                job["dashboard_id"],
+                job["version"],
+            ),
+        )
+    if retry:
+        _SEMANTIC_ENRICH_WAKE.set()
+
+
+def _process_semantic_enrichment_job(job):
+    packet, vision = _capture_semantic_evidence(job)
+    candidate_count = len((packet.get("dom") or {}).get("candidates") or [])
+    if not candidate_count:
+        _complete_semantic_enrichment(
+            job,
+            {"schema_version": _SEMANTIC_MAP_SCHEMA, "objects": []},
+            {"verified_count": 0, "rejected_count": 0, "candidate_count": 0, "coverage": 1.0},
+            None,
+        )
+        return
+    agent_result, agent_run_id = _run_semantic_operator(packet, vision)
+    semantic_map, verification = _verified_semantic_overlay(
+        agent_result, packet, job.get("owner_email")
+    )
+    if not semantic_map.get("objects"):
+        errors = "; ".join(item.get("error") or "" for item in verification.get("rejected") or [])
+        raise ValueError("agent produced no verified semantic objects" + (f": {errors[:1000]}" if errors else ""))
+    _complete_semantic_enrichment(job, semantic_map, verification, agent_run_id)
+
+
+def _semantic_enrichment_worker():
+    unavailable_logged = False
+    while True:
+        if not _semantic_enrichment_enabled():
+            _SEMANTIC_ENRICH_WAKE.wait(30)
+            _SEMANTIC_ENRICH_WAKE.clear()
+            continue
+        if not _semantic_operator_available():
+            if not unavailable_logged:
+                print(
+                    "Semantic enrichment queued but rvbbit.artifact_semantic_enrich is not installed yet",
+                    file=sys.stderr,
+                )
+                unavailable_logged = True
+            _SEMANTIC_ENRICH_WAKE.wait(30)
+            _SEMANTIC_ENRICH_WAKE.clear()
+            continue
+        unavailable_logged = False
+        try:
+            job = _claim_semantic_enrichment_job()
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: semantic enrichment queue unavailable: {exc}", file=sys.stderr)
+            _SEMANTIC_ENRICH_WAKE.wait(15)
+            _SEMANTIC_ENRICH_WAKE.clear()
+            continue
+        if not job:
+            _SEMANTIC_ENRICH_WAKE.wait(10)
+            _SEMANTIC_ENRICH_WAKE.clear()
+            continue
+        try:
+            _process_semantic_enrichment_job(job)
+            print(
+                f"Semantic enrichment complete: {job['slug']}@v{job['version']}",
+                file=sys.stderr,
+            )
+        except Exception as exc:  # noqa: BLE001 — publication stays live; queue owns retries
+            _fail_semantic_enrichment(job, exc)
+            print(
+                f"WARNING: semantic enrichment failed for {job['slug']}@v{job['version']}: {exc}",
+                file=sys.stderr,
+            )
+
+
+def _start_semantic_enrichment_worker():
+    global _SEMANTIC_ENRICH_THREAD
+    if not _semantic_enrichment_enabled():
+        return False
+    with _SEMANTIC_ENRICH_THREAD_LOCK:
+        if _SEMANTIC_ENRICH_THREAD and _SEMANTIC_ENRICH_THREAD.is_alive():
+            return True
+        _SEMANTIC_ENRICH_THREAD = threading.Thread(
+            target=_semantic_enrichment_worker,
+            name="artifact-semantic-enricher",
+            daemon=True,
+        )
+        _SEMANTIC_ENRICH_THREAD.start()
+    return True
+
+
+def tool_semantic_enrichment_status(slug, version=None):
+    _ensure_dashboard_tables()
+    with _conn() as c:
+        dashboard = c.execute(
+            "SELECT id,latest_version FROM rvbbit.dashboards WHERE slug=%s", (slug,)
+        ).fetchone()
+    if not dashboard:
+        return {"error": {"code": "NOT_FOUND", "message": slug}}
+    selected = int(version or dashboard["latest_version"])
+    row = _semantic_enrichment_row(dashboard["id"], selected)
+    return {"slug": slug, **_semantic_enrichment_public(row)}
+
+
+def tool_enrich_live_app(slug, version=None, force=False):
+    """Queue a missing/failed historical version; normal publish paths call this automatically."""
+    _ensure_dashboard_tables()
+    with _conn() as c:
+        dashboard = c.execute(
+            "SELECT id,latest_version FROM rvbbit.dashboards WHERE slug=%s", (slug,)
+        ).fetchone()
+    if not dashboard:
+        return {"error": {"code": "NOT_FOUND", "message": slug}}
+    selected = int(version or dashboard["latest_version"])
+    queued = _enqueue_semantic_enrichment(dashboard["id"], selected, force=bool(force))
+    _start_semantic_enrichment_worker()
+    return {"slug": slug, **queued}
+
+
 # ── dependency extraction (Phase 1: queries → tables/metrics, the derived index) ──
 
 _RVBBIT_QUERY_RE = re.compile(r"rvbbitQuery\(\s*([`'\"])(.*?)\1", re.DOTALL)
@@ -4362,12 +5884,26 @@ def dashboard_crawl(slug, use_llm=True):
         if not d:
             return {"error": {"code": "NOT_FOUND", "message": slug}}
         did, ver = d["id"], d["latest_version"]
-        hrow = c.execute("SELECT html, source_files FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
-                         (did, ver)).fetchone()
+        hrow = c.execute(
+            "SELECT html, source_files, manifest FROM rvbbit.dashboard_versions "
+            "WHERE dashboard_id=%s AND version=%s",
+            (did, ver),
+        ).fetchone()
         html = ((hrow["html"] if hrow else "") or "") + _source_files_text((hrow or {}).get("source_files"))
+        effective_manifest = _effective_artifact_manifest(
+            did, ver, (hrow or {}).get("manifest") or {}
+        )
+        semantic_objects = (
+            (effective_manifest.get("semantic_map") or {}).get("objects")
+            or []
+        )
         runtime = [r["sql"] for r in c.execute(
             "SELECT DISTINCT args->>'sql' AS sql FROM rvbbit.mcp_activity "
-            "WHERE tool='dashboard_query' AND args->>'dashboard'=%s AND args->>'sql' IS NOT NULL", (slug,)).fetchall()]
+            "WHERE tool='dashboard_query' AND args->>'dashboard'=%s "
+            "AND coalesce(args->>'origin','dashboard')='dashboard' "
+            "AND args->>'sql' IS NOT NULL",
+            (slug,),
+        ).fetchall()]
         known_metrics = {r["name"] for r in c.execute("SELECT DISTINCT name FROM rvbbit.metric_defs").fetchall()}
 
     sql_src = {}                                  # sql -> where we found it (trusted)
@@ -4375,17 +5911,44 @@ def dashboard_crawl(slug, use_llm=True):
         sql_src.setdefault(q, "rvbbitQuery")
     for q in runtime:
         sql_src.setdefault(q, "runtime")
+    semantic_sql = []
+    for semantic_object in semantic_objects:
+        try:
+            q, _context = _render_semantic_sql(semantic_object)
+        except ValueError:
+            continue
+        if q:
+            semantic_sql.append((q, str(semantic_object.get("id") or "")))
+    for evaluator_sql, _object_id in semantic_sql:
+        # Older Lens executions predate the explicit activity origin tag. If a
+        # runtime-only activity row is byte-for-byte an evaluator, represent it
+        # as the semantic edge instead of inflating the dashboard query count.
+        if sql_src.get(evaluator_sql) == "runtime":
+            sql_src.pop(evaluator_sql, None)
     # SQL-shaped literals are candidates — only kept if EXPLAIN resolves real tables
-    candidates = [q for q in _extract_sql_literals(html) if q not in sql_src]
+    known_sql = set(sql_src) | {sql for sql, _source in semantic_sql}
+    candidates = [q for q in _extract_sql_literals(html) if q not in known_sql]
     llm_metrics = []
-    if use_llm and not sql_src and not candidates:   # only pay for the LLM when nothing else found
+    if use_llm and not sql_src and not semantic_sql and not candidates:
+        # Only pay for the LLM when deterministic source + manifest extraction found nothing.
         lq, llm_metrics = _llm_extract(html)
         for q in lq:
             sql_src.setdefault(q, "llm")
 
-    sql_tables = {sql: _referenced_tables(sql) for sql in sql_src}   # resolve trusted queries
+    table_cache = {}
+
+    def resolved_tables(sql):
+        if sql not in table_cache:
+            table_cache[sql] = _referenced_tables(sql)
+        return table_cache[sql]
+
+    sql_tables = {sql: resolved_tables(sql) for sql in sql_src}
+    semantic_tables = [
+        (sql, object_id, resolved_tables(sql))
+        for sql, object_id in semantic_sql
+    ]
     for sql in candidates:                        # promote candidates that validate
-        t = _referenced_tables(sql)
+        t = resolved_tables(sql)
         if t:
             sql_src.setdefault(sql, "sql-literal")
             sql_tables[sql] = t
@@ -4397,9 +5960,17 @@ def dashboard_crawl(slug, use_llm=True):
         rows.append(("query", None, sql, src))
         for t in sql_tables.get(sql, []):
             tables.setdefault(t, src)
+    for sql, object_id, resolved in semantic_tables:
+        # Keep one query edge per named object even when two objects happen to
+        # share identical evaluator SQL. The manifest is a semantic map, not
+        # merely a deduplicated list of query strings.
+        source = f"semantic-map:{object_id}"
+        rows.append(("semantic", object_id, sql, source))
+        for table in resolved:
+            tables.setdefault(table, source)
     rows += [("table", t, None, src) for t, src in tables.items()]
     rows += [("metric", m, None, "parse") for m in metric_names]
-    status = "live" if (sql_src or metric_names) else "materialized"
+    status = "live" if (sql_src or semantic_sql or metric_names) else "materialized"
 
     with _conn() as c:
         # Dependency rows are versioned evidence. Re-crawling one published
@@ -4413,8 +5984,14 @@ def dashboard_crawl(slug, use_llm=True):
             c.execute("INSERT INTO rvbbit.dashboard_deps (dashboard_id,version,kind,object_ref,base_sql,source) "
                       "VALUES (%s,%s,%s,%s,%s,%s)", (did, ver, kind, obj, bsql, src))
         c.execute("UPDATE rvbbit.dashboards SET status=%s WHERE id=%s", (status, did))
-    return {"slug": slug, "status": status, "queries": len(sql_src),
-            "tables": sorted(tables), "metrics": sorted(metric_names)}
+    return {
+        "slug": slug,
+        "status": status,
+        "queries": len(sql_src),
+        "semantic_objects": len(semantic_sql),
+        "tables": sorted(tables),
+        "metrics": sorted(metric_names),
+    }
 
 
 def _crawl_safe(slug, use_llm=False):
@@ -4448,7 +6025,7 @@ def _mcp_upload_artifact(content, name=None, artifact_id=None, append=False):
 
 
 def _mcp_publish_dashboard(name, html=None, team=None, description=None, kind="live",
-                           source_artifact_id=None):
+                           source_artifact_id=None, manifest=None):
     """Persist a dashboard so it lives + works OUTSIDE Cowork (a shareable URL + the lens app).
     Build `html` from the `dashboard_template` boilerplate (call that tool FIRST): it gets LIVE
     data through Cowork's callMcpTool→run_sql bridge in-app, and the host's injected rvbbitQuery
@@ -4457,19 +6034,30 @@ def _mcp_publish_dashboard(name, html=None, team=None, description=None, kind="l
     concern its OWN FLAT query in the composePayload parts map — the framework batches them into
     ONE run_sql_multi round trip. NEVER hand-write a json_build_object payload query (it hides the
     SQL from the catalog and the accelerated engines), and NEVER bake query results into the
-    HTML — that's a 'dead tree' with no live data or inspectability."""
+    HTML — that's a 'dead tree' with no live data or inspectability. Publication automatically
+    queues RVBBIT's semantic compiler, which derives and verifies business-object bindings without
+    changing the HTML. An authored manifest.semantic_map is optional and takes precedence when the
+    builder already knows an especially precise meaning or evaluator."""
     return _logged("publish_dashboard", {"name": name, "team": team, "kind": kind,
                                          "html_bytes": len(html or ""),
+                                         "semantic_objects": len(
+                                             ((manifest or {}).get("semantic_map") or {}).get("objects") or []
+                                         ) if isinstance(manifest, dict) else None,
                                          "source_artifact_id": source_artifact_id},
-                   lambda: tool_publish_dashboard(name, html, team, description, kind, source_artifact_id))
+                   lambda: tool_publish_dashboard(
+                       name, html, team, description, kind, source_artifact_id, manifest
+                   ))
 
 
-def _mcp_update_dashboard(slug, html=None, notes=None, source_artifact_id=None):
+def _mcp_update_dashboard(slug, html=None, notes=None, source_artifact_id=None, manifest=None):
     """Publish a new version of an existing dashboard (by slug). Accepts inline html or an
-    upload_artifact handle via source_artifact_id."""
+    upload_artifact handle via source_artifact_id. Omit manifest to retain the current semantic
+    map; pass a manifest patch to revise its versioned business-object definitions."""
     return _logged("update_dashboard", {"slug": slug, "html_bytes": len(html or ""), "notes": notes,
                                         "source_artifact_id": source_artifact_id},
-                   lambda: tool_update_dashboard(slug, html, notes, source_artifact_id))
+                   lambda: tool_update_dashboard(
+                       slug, html, notes, source_artifact_id, manifest
+                   ))
 
 
 def _mcp_list_dashboards(team=None, search=None):
@@ -4507,8 +6095,9 @@ def _mcp_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
                          team=None, description=None, manifest=None, source_files=None,
                          source_artifact_id=None):
     """Create a versioned RVBBIT live app. HTML apps are hosted immediately at /d/<slug> and
-    call rvbbitQuery(sql) for live, read-only data from raw tables, metrics, or cubes. Accepts
-    inline html or an upload_artifact handle via source_artifact_id."""
+    call rvbbitQuery(sql) for live, read-only data. Publication automatically queues a separate
+    semantic compiler pass; an authored manifest.semantic_map remains an optional precise hint.
+    Accepts inline html or an upload_artifact handle via source_artifact_id."""
     return _logged("create_live_app", {
         "name": name,
         "runtime_kind": runtime_kind,
@@ -4523,7 +6112,9 @@ def _mcp_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
 def _mcp_update_live_app(slug, html=None, notes=None, manifest=None, source_files=None,
                          runtime_kind=None, app_kind=None, source_artifact_id=None):
     """Publish a new version of a live app. Omitted source fields are preserved. Accepts inline
-    html or an upload_artifact handle via source_artifact_id."""
+    html or an upload_artifact handle via source_artifact_id. Omit manifest to retain the current
+    semantic map; pass a manifest patch whenever visible meanings, bindings, filters, or replay
+    SQL change."""
     return _logged("update_live_app", {
         "slug": slug,
         "html_bytes": len(html or ""),
@@ -4531,6 +6122,25 @@ def _mcp_update_live_app(slug, html=None, notes=None, manifest=None, source_file
         "source_artifact_id": source_artifact_id,
     }, lambda: tool_update_live_app(slug, html, notes, manifest, source_files, runtime_kind,
                                     app_kind, source_artifact_id))
+
+
+def _mcp_semantic_enrichment_status(slug, version=None):
+    """Inspect the non-blocking semantic compiler state for one immutable artifact version."""
+    return _logged(
+        "semantic_enrichment_status",
+        {"slug": slug, "version": version},
+        lambda: tool_semantic_enrichment_status(slug, version),
+    )
+
+
+def _mcp_enrich_live_app(slug, version=None, force=False):
+    """Queue semantic enrichment for an older or failed artifact version. New HTML versions are
+    queued automatically; this tool is for backfills and explicit retries, not normal publishing."""
+    return _logged(
+        "enrich_live_app",
+        {"slug": slug, "version": version, "force": force},
+        lambda: tool_enrich_live_app(slug, version, force),
+    )
 
 
 def _mcp_list_live_apps(team=None, search=None, runtime_kind=None, app_kind=None):
@@ -4613,6 +6223,46 @@ async def _mcp_capture_live_app(slug, path=None, width=1440, height=900, full_pa
 _TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_template.html")
 
 
+def _dashboard_semantic_map_example():
+    """Agent-facing example; callers adapt it to the values they actually render."""
+    return {
+        "semantic_map": {
+            "schema_version": _SEMANTIC_MAP_SCHEMA,
+            "description": "Exact meanings and independent SQL recreations for visible values.",
+            "objects": [{
+                "id": "revenue",
+                "kind": "scalar",
+                "meaning": {
+                    "label": "Booked revenue",
+                    "description": "Revenue booked across the currently selected channel.",
+                    "unit": "USD",
+                    "formula": "Sum of revenue_booked after applying the dashboard channel filter.",
+                },
+                "parameters": {
+                    "channel": {
+                        "type": "text",
+                        "default": "All",
+                        "label": "Channel",
+                        "source": "#channel-filter",
+                    },
+                },
+                "bindings": [{"selector": "#kpi-revenue"}],
+                "evaluator": {
+                    "sql": (
+                        "select sum(revenue_booked) as value "
+                        "from marts.mart_blended_cac_by_channel "
+                        "where ({{channel}} = 'All' or channel = {{channel}})"
+                    ),
+                    "shape": "scalar",
+                    "value_column": "value",
+                },
+                "display": {"prefix": "$", "decimals": 0},
+                "source_queries": ["kpi"],
+            }],
+        },
+    }
+
+
 def tool_dashboard_template():
     try:
         with open(_TEMPLATE_PATH) as f:
@@ -4621,6 +6271,7 @@ def tool_dashboard_template():
         return {"error": str(e)}
     return {
         "template_html": html,
+        "semantic_map_example": _dashboard_semantic_map_example(),
         "how_to_use": [
             "Set SERVER_ID to the <id> in your `mcp__<id>__run_sql` tool name.",
             "Give composePayload() one FLAT sub-SELECT per data concern — it batches them into ONE "
@@ -4629,6 +6280,11 @@ def tool_dashboard_template():
             "payload query).",
             "Edit only the two `>>> EDIT` blocks (CONFIG: title + composePayload map; RENDER: KPIs / "
             "chart() / table()). Leave everything between the FRAMEWORK markers as-is.",
+            "Publish normally: RVBBIT renders the immutable version and compiles a verified semantic "
+            "overlay from its DOM, filters, query traces, source, and screenshot.",
+            "Optional: use stable DOM ids plus bindBusinessObject and adapt semantic_map_example when "
+            "you already know a particularly precise business definition. Authored objects win; the "
+            "compiler fills remaining gaps.",
             "Live data is the Cowork callMcpTool→run_sql bridge (authed by the connector you already "
             "granted — no fetch, no login); it falls back to the host's rvbbitQuery when published.",
             "SQL gotchas (rvbbit read-only guard): no `::type` casts (use `cast(x as t)` or bare "
@@ -4642,8 +6298,9 @@ def tool_dashboard_template():
 def _mcp_dashboard_template():
     """Return the proven drop-in boilerplate for a LIVE dashboard (Cowork artifact + hosted).
     ALWAYS start a dashboard from this — it has the data bridge, single-round-trip query
-    pattern (composePayload), formatters, and chart/table wrappers already solved. Adapt only
-    its two `>>> EDIT` blocks. Then optionally publish_dashboard to persist/share it."""
+    pattern (composePayload), semantic-object binding helper, formatters, and chart/table
+    wrappers already solved. Adapt its two `>>> EDIT` blocks and publish normally; the semantic
+    compiler runs after publication. semantic_map_example remains an optional precision hint."""
     return _logged("dashboard_template", {}, tool_dashboard_template)
 
 
@@ -4653,8 +6310,47 @@ def _mcp_dashboard_template():
 # unchanged — no codemod of the artifact needed.
 _DASH_SHIM = (
     '<link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">\n'
+    '<link rel="preload" href="/theme/artifact-lens.css" as="style">\n'
     "<script>\n"
-    "window.RVBBIT_DASHBOARD={slug:__SLUG__,version:__VERSION__};"
+    "window.RVBBIT_DASHBOARD={slug:__SLUG__,version:__VERSION__,calliope_enabled:__CALLIOPE_ENABLED__};"
+    "window.RVBBIT_DASHBOARD.manifest=__MANIFEST__;"
+    "(()=>{const root=window.RVBBIT_DASHBOARD;"
+    "let semantic=(root.manifest&&root.manifest.semantic_map)||{};"
+    "let defs=Array.isArray(semantic.objects)?semantic.objects:[];const runtime=new Map();"
+    "const elementRuntime=new WeakMap();"
+    "const find=(id)=>defs.find((item)=>item&&item.id===String(id||''))||null;"
+    "const nodes=(binding)=>{const found=[];try{"
+    "if(binding&&binding.selector)found.push(...document.querySelectorAll(binding.selector));"
+    "if(binding&&binding.element_id){const node=document.getElementById(binding.element_id);if(node)found.push(node);}"
+    "if(binding&&binding.name)found.push(...document.getElementsByName(binding.name));"
+    "}catch(_error){}return[...new Set(found)];};"
+    "const attach=()=>{defs.forEach((item)=>(item.bindings||[]).forEach((binding)=>"
+    "nodes(binding).forEach((node)=>node.setAttribute('data-rvbbit-object',item.id))));"
+    "window.dispatchEvent(new CustomEvent('rvbbit:semantic-map-ready',{detail:{count:defs.length}}));};"
+    "root.semanticMap=()=>semantic;"
+    "root.replaceSemanticManifest=(manifest)=>{root.manifest=manifest||{};"
+    "semantic=(root.manifest&&root.manifest.semantic_map)||{};"
+    "defs=Array.isArray(semantic.objects)?semantic.objects:[];runtime.clear();attach();return defs.length;};"
+    "root.semanticObjects=()=>defs.map((item)=>({...item,runtime:runtime.get(item.id)||null}));"
+    "root.semanticObject=(id,target)=>{const item=find(id);"
+    "const node=target&&target.nodeType===1?target:null;"
+    "return item?({...item,runtime:(node&&elementRuntime.get(node))||runtime.get(item.id)||null}):null;};"
+    "root.bindSemanticObject=(id,target,state)=>{const item=find(id);if(!item)return null;"
+    "const next=(state&&typeof state==='object'&&!Array.isArray(state))?state:{value:state};"
+    "let selected=[];if(target&&target.nodeType===1)selected=[target];"
+    "else if(typeof target==='string'){try{selected=[...document.querySelectorAll(target)];}catch(_error){selected=[];}}"
+    "if(!selected.length)(item.bindings||[]).forEach((binding)=>selected.push(...nodes(binding)));"
+    "selected=[...new Set(selected)];"
+    "const snapshot={value:next.value,"
+    "context:(next.context&&typeof next.context==='object')?next.context:{},"
+    "rendered_at:new Date().toISOString(),selector:typeof target==='string'?target:null};"
+    "runtime.set(item.id,snapshot);"
+    "selected.forEach((node)=>{node.setAttribute('data-rvbbit-object',item.id);"
+    "elementRuntime.set(node,snapshot);});"
+    "window.dispatchEvent(new CustomEvent('rvbbit:semantic-object',{detail:{id:item.id}}));"
+    "return root.semanticObject(item.id,selected[0]);};"
+    "if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',attach,{once:true});"
+    "else queueMicrotask(attach);})();"
     "(()=>{const v=new URLSearchParams(location.search).get('rvbbit_as_of');"
     "if(v)window.RVBBIT_DASHBOARD.as_of=v;"
     "const trace=[];let sequence=0;"
@@ -4692,11 +6388,44 @@ _DASH_SHIM = (
     '<script src="/theme/artifact-lens.js" defer></script>\n')
 
 
-def _dash_shim(slug, version=None):
+def _script_json(value):
+    return (
+        json.dumps(value or {}, default=str, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _dash_shim(slug, version=None, manifest=None):
+    try:
+        import calliope
+        calliope_enabled = calliope.is_enabled()
+    except Exception:  # noqa: BLE001 — the Lens simply omits its optional handoff
+        calliope_enabled = False
+    if version is not None:
+        try:
+            with _conn() as c:
+                row = c.execute(
+                    "SELECT d.id,v.manifest FROM rvbbit.dashboards d "
+                    "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
+                    "WHERE d.slug=%s AND v.version=%s",
+                    (slug, int(version)),
+                ).fetchone()
+            if row:
+                manifest = _effective_artifact_manifest(
+                    row["id"], int(version), manifest if manifest is not None else row["manifest"]
+                )
+        except Exception as exc:  # noqa: BLE001 — serving the artifact always wins
+            print(f"WARNING: semantic overlay unavailable for {slug}@v{version}: {exc}", file=sys.stderr)
     return (
         _DASH_SHIM
         .replace("__SLUG__", json.dumps(slug))
         .replace("__VERSION__", json.dumps(int(version)) if version is not None else "null")
+        .replace("__MANIFEST__", _script_json(manifest))
+        .replace("__CALLIOPE_ENABLED__", "true" if calliope_enabled else "false")
     )
 
 
@@ -4991,7 +6720,7 @@ def _sanitize_inspection_binding(value):
     if kind not in {"chart", "table", "value", "element"}:
         kind = "element"
     confidence = str(value.get("confidence") or "visual").lower()
-    if confidence not in {"exact", "likely", "visual"}:
+    if confidence not in {"semantic", "exact", "likely", "visual"}:
         confidence = "visual"
     binding = {
         "kind": kind,
@@ -5015,13 +6744,84 @@ def _sanitize_inspection_binding(value):
     return binding
 
 
+def _sanitize_semantic_selection(value):
+    if not isinstance(value, dict):
+        return {}
+    object_id = str(value.get("id") or "").strip()
+    if not object_id:
+        return {}
+    if not _SEMANTIC_OBJECT_ID_RE.fullmatch(object_id):
+        raise ValueError("semantic selection has an invalid object id")
+    context = _semantic_json_value(value.get("context") or {})
+    if not isinstance(context, dict):
+        context = {}
+    rendered_value = _semantic_json_value(value.get("rendered_value"))
+    return {
+        "id": object_id,
+        "definition_hash": _inspection_text(value.get("definition_hash"), 80),
+        "context": context,
+        "rendered_value": rendered_value,
+    }
+
+
 def _bound_inspection_trace(binding, trace):
     """Only keep query provenance when the selected object actually matched it."""
     if not isinstance(trace, dict):
         return {}
-    if binding.get("confidence") not in {"exact", "likely"}:
+    if binding.get("confidence") not in {"semantic", "exact", "likely"}:
         return {}
     return trace
+
+
+def _semantic_object_from_manifest(manifest, selection):
+    semantic_map = (manifest or {}).get("semantic_map") or {}
+    for semantic_object in semantic_map.get("objects") or []:
+        if semantic_object.get("id") != selection.get("id"):
+            continue
+        selected_hash = selection.get("definition_hash")
+        if selected_hash and selected_hash != semantic_object.get("definition_hash"):
+            raise ValueError(
+                f"semantic object {selection['id']} changed; reload the artifact before inspecting it"
+            )
+        return semantic_object
+    return None
+
+
+def _semantic_number(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    raw = str(value).strip().lower()
+    negative = raw.startswith("(") and raw.endswith(")")
+    multiplier = 1.0
+    if re.search(r"[kmbt]\s*(?:%|x|×)?$", raw):
+        suffix = re.search(r"([kmbt])\s*(?:%|x|×)?$", raw).group(1)
+        multiplier = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[suffix]
+    cleaned = re.sub(r"[^0-9.eE+-]", "", raw)
+    try:
+        number = float(cleaned) * multiplier
+    except (TypeError, ValueError):
+        return None
+    return -number if negative else number
+
+
+def _semantic_values_match(rendered, replayed, display=None):
+    if rendered is None:
+        return None
+    left = _semantic_number(rendered)
+    right = _semantic_number(replayed)
+    if left is not None and right is not None:
+        display = display if isinstance(display, dict) else {}
+        try:
+            tolerance = max(0.0, float(display.get("tolerance") or 0.000001))
+        except (TypeError, ValueError):
+            tolerance = 0.000001
+        return abs(left - right) <= max(tolerance, abs(right) * tolerance)
+    return re.sub(r"\s+", " ", str(rendered)).strip().lower() == re.sub(
+        r"\s+", " ", str(replayed)
+    ).strip().lower()
 
 
 def _normalized_field(value):
@@ -5098,17 +6898,31 @@ def _numeric_delta(current, latest):
     }
 
 
-def _dashboard_inspection(slug, version, target, binding, trace):
-    """Build deterministic breadcrumbs for one exact rendered dashboard target."""
+def _dashboard_inspection(
+    slug,
+    version,
+    target,
+    binding,
+    trace,
+    semantic_selection=None,
+    as_of=None,
+):
+    """Build deterministic breadcrumbs for one rendered business object.
+
+    A versioned semantic-map object is authoritative when present. Query/DOM
+    matching remains the compatibility path for older artifacts.
+    """
     selected_target = _sanitize_inspection_target(target)
     selected_binding = _sanitize_inspection_binding(binding)
+    selected_semantic = _sanitize_semantic_selection(semantic_selection)
     # Defense in depth for stale or hand-written clients: artifact-level source
     # edges remain available, but an unbound visual object cannot claim a query.
     trace = _bound_inspection_trace(selected_binding, trace)
     query_sql = str(trace.get("sql") or "").strip()
     if len(query_sql) > 50_000:
         raise ValueError("query trace is too large")
-    normalized_as_of = _normalize_as_of(trace.get("as_of")) if trace.get("as_of") else None
+    requested_as_of = as_of if as_of is not None else trace.get("as_of")
+    normalized_as_of = _normalize_as_of(requested_as_of) if requested_as_of else None
 
     with _conn() as c:
         dashboard = c.execute(
@@ -5121,11 +6935,12 @@ def _dashboard_inspection(slug, version, target, binding, trace):
         selected_version = int(version or dashboard["latest_version"])
         if selected_version < 1:
             raise ValueError("version must be a positive integer")
-        exists = c.execute(
-            "SELECT 1 FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
+        version_row = c.execute(
+            "SELECT manifest FROM rvbbit.dashboard_versions "
+            "WHERE dashboard_id=%s AND version=%s",
             (dashboard["id"], selected_version),
         ).fetchone()
-        if not exists:
+        if not version_row:
             return {"error": {"code": "VERSION_NOT_FOUND", "message": "No such artifact version."}}
         deps = c.execute(
             "SELECT kind,object_ref,base_sql,source,confidence "
@@ -5134,11 +6949,39 @@ def _dashboard_inspection(slug, version, target, binding, trace):
             (dashboard["id"], selected_version),
         ).fetchall()
 
+    effective_manifest = _effective_artifact_manifest(
+        dashboard["id"], selected_version, version_row.get("manifest") or {}
+    )
+    semantic_object = None
+    semantic_context = {}
+    if selected_semantic:
+        semantic_object = _semantic_object_from_manifest(
+            effective_manifest, selected_semantic
+        )
+        if not semantic_object:
+            raise ValueError(
+                f"semantic object {selected_semantic['id']} is not defined in artifact version "
+                f"{selected_version}"
+            )
+        query_sql, semantic_context = _render_semantic_sql(
+            semantic_object, selected_semantic.get("context")
+        )
+        meaning = semantic_object.get("meaning") or {}
+        evaluator = semantic_object.get("evaluator") or {}
+        selected_binding = {
+            "kind": "value",
+            "confidence": "semantic",
+            "field": _inspection_text(evaluator.get("value_column"), 160),
+            "label": _inspection_text(meaning.get("label"), 300),
+            "value": _inspection_text(selected_semantic.get("rendered_value"), 400),
+            "semantic_id": semantic_object["id"],
+        }
+
     validation = None
     if query_sql:
         validation = tool_validate_sql(query_sql, normalized_as_of)
         if not validation.get("valid") or not validation.get("safe_select"):
-            raise ValueError("selected query trace is not a safe read-only query")
+            raise ValueError("selected evaluator is not a safe read-only query")
     tables = _referenced_tables(query_sql) if query_sql else []
     if not tables:
         tables = sorted({
@@ -5185,8 +7028,75 @@ def _dashboard_inspection(slug, version, target, binding, trace):
                 (tables, slug),
             ).fetchall()
 
+    replay = None
+    semantic_public = None
+    replay_result = None
+    if semantic_object and query_sql:
+        evaluator = semantic_object.get("evaluator") or {}
+        limit = 2 if evaluator.get("shape") == "scalar" else 200
+        replay_result = tool_run_sql(query_sql, normalized_as_of, limit)
+        rendered_value = selected_semantic.get("rendered_value")
+        if replay_result.get("error"):
+            replay = {
+                "status": "error",
+                "rendered_value": rendered_value,
+                "error": _inspection_text(
+                    (replay_result.get("error") or {}).get("message")
+                    or replay_result.get("error"),
+                    800,
+                ),
+            }
+        else:
+            replay_value, value_column = _semantic_result_value(
+                semantic_object, replay_result
+            )
+            matches = _semantic_values_match(
+                rendered_value, replay_value, semantic_object.get("display")
+            )
+            replay = {
+                "status": (
+                    "verified" if matches is True
+                    else "mismatch" if matches is False
+                    else "recreated"
+                ),
+                "value": replay_value,
+                "rendered_value": rendered_value,
+                "matches_rendered": matches,
+                "value_column": value_column,
+                "row_count": replay_result.get("row_count"),
+                "engine": replay_result.get("engine"),
+                "elapsed_ms": replay_result.get("elapsed_ms"),
+                "as_of": normalized_as_of,
+            }
+        semantic_public = {
+            "id": semantic_object["id"],
+            "kind": semantic_object["kind"],
+            "meaning": semantic_object.get("meaning") or {},
+            "context": semantic_context,
+            "display": semantic_object.get("display") or {},
+            "definition_hash": semantic_object.get("definition_hash"),
+            "evaluator": {
+                "shape": evaluator.get("shape"),
+                "value_column": evaluator.get("value_column"),
+            },
+            "source_queries": semantic_object.get("source_queries") or [],
+        }
+
     comparison = None
-    if query_sql and normalized_as_of:
+    if semantic_object and query_sql and normalized_as_of and replay_result and not replay_result.get("error"):
+        latest = tool_run_sql(query_sql, None, 2 if (semantic_object.get("evaluator") or {}).get("shape") == "scalar" else 200)
+        if not latest.get("error"):
+            current_value, field = _semantic_result_value(semantic_object, replay_result)
+            latest_value, _ = _semantic_result_value(semantic_object, latest)
+            comparison = {
+                "as_of": normalized_as_of,
+                "field": field,
+                "current": current_value,
+                "latest": latest_value,
+                "delta": _numeric_delta(current_value, latest_value),
+                "matched_latest_row": latest_value is not None,
+            }
+    elif query_sql and normalized_as_of:
         historical = tool_run_sql(query_sql, normalized_as_of, 200)
         latest = tool_run_sql(query_sql, None, 200)
         if not historical.get("error") and not latest.get("error"):
@@ -5217,7 +7127,14 @@ def _dashboard_inspection(slug, version, target, binding, trace):
                     "matched_latest_row": latest_row is not None,
                 }
 
-    return {
+    query_hash = _inspection_text(trace.get("query_hash"), 80) or None
+    query_id = _inspection_text(trace.get("id"), 120) or None
+    if semantic_object:
+        query_hash = hashlib.sha256(
+            re.sub(r"\s+", " ", query_sql).strip().lower().encode()
+        ).hexdigest()[:16]
+        query_id = f"semantic:{semantic_object['id']}"
+    result = {
         "artifact": {
             "slug": dashboard["slug"],
             "name": dashboard["name"],
@@ -5230,19 +7147,25 @@ def _dashboard_inspection(slug, version, target, binding, trace):
         "selection": selected_target,
         "binding": selected_binding,
         "provenance": {
-            "query_id": _inspection_text(trace.get("id"), 120) or None,
-            "query_hash": _inspection_text(trace.get("query_hash"), 80) or None,
+            "query_id": query_id,
+            "query_hash": query_hash,
             "sql": query_sql or None,
             "as_of": normalized_as_of,
             "engine": (validation or {}).get("engine") or _inspection_text(trace.get("engine"), 120) or None,
             "tables": tables,
             "confidence": selected_binding["confidence"],
+            "source": "semantic_map" if semantic_object else "query_trace",
         },
         "sources": source_cards,
         "related_artifacts": [dict(row) for row in related],
         "comparison": comparison,
         "dependency_count": len(deps),
     }
+    if semantic_public:
+        result["semantic_object"] = semantic_public
+    if replay:
+        result["replay"] = replay
+    return result
 
 
 # ── the landing page: this server's own front door ───────────────────────────
@@ -5543,7 +7466,7 @@ def _landing_rows():
     with _conn() as c:
         return c.execute(
             "SELECT slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
-            "latest_version, queries, tables, metrics, updated_at "
+            "latest_version, queries, tables, metrics, semantic_objects, updated_at "
             "FROM rvbbit.live_apps ORDER BY updated_at DESC").fetchall()
 
 
@@ -5661,7 +7584,12 @@ def _landing_html(rows, viewer):
             thumb = (f'<img src="/thumbs/{e(_artifact_kind(app_kind))}/{e(slug)}.png" alt="" '
                      f'decoding="async">')
         deps = []
-        for label, key in (("queries", "queries"), ("tables", "tables"), ("metrics", "metrics")):
+        for label, key in (
+            ("queries", "queries"),
+            ("tables", "tables"),
+            ("objects", "semantic_objects"),
+            ("metrics", "metrics"),
+        ):
             if r.get(key):
                 deps.append(f"<span><b>{r[key]}</b> {label}</span>")
         if r.get("latest_version"):
@@ -5883,9 +7811,15 @@ def register_dashboard_routes(m):
             d = c.execute("SELECT id, latest_version FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
             if not d:
                 return HTMLResponse("<h1>404 — no such dashboard</h1>", status_code=404)
-            v = c.execute("SELECT html FROM rvbbit.dashboard_versions WHERE dashboard_id=%s AND version=%s",
-                          (d["id"], d["latest_version"])).fetchone()
-        return HTMLResponse(_dash_shim(slug, d["latest_version"]) + (v["html"] or ""))
+            v = c.execute(
+                "SELECT html, manifest FROM rvbbit.dashboard_versions "
+                "WHERE dashboard_id=%s AND version=%s",
+                (d["id"], d["latest_version"]),
+            ).fetchone()
+        return HTMLResponse(
+            _dash_shim(slug, d["latest_version"], (v or {}).get("manifest"))
+            + ((v or {}).get("html") or "")
+        )
 
     @m.custom_route("/api/d/{slug}/time-travel", methods=["GET"])
     async def _time_travel(request):
@@ -5913,6 +7847,47 @@ def register_dashboard_routes(m):
             )
         return _json(result, 404 if result.get("code") == "NOT_FOUND" else 200)
 
+    @m.custom_route("/api/d/{slug}/semantic-enrichment", methods=["GET"])
+    async def _semantic_enrichment(request):
+        if not auth.read_session(request):
+            return _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        slug = request.path_params["slug"]
+        try:
+            requested = request.query_params.get("version")
+            with _conn() as c:
+                dashboard = c.execute(
+                    "SELECT id,latest_version FROM rvbbit.dashboards WHERE slug=%s", (slug,)
+                ).fetchone()
+                if not dashboard:
+                    return _json({"error": {"code": "NOT_FOUND"}}, 404)
+                version = int(requested or dashboard["latest_version"])
+                version_row = c.execute(
+                    "SELECT manifest FROM rvbbit.dashboard_versions "
+                    "WHERE dashboard_id=%s AND version=%s",
+                    (dashboard["id"], version),
+                ).fetchone()
+            if not version_row:
+                return _json({"error": {"code": "VERSION_NOT_FOUND"}}, 404)
+            enrichment = _semantic_enrichment_row(dashboard["id"], version)
+            effective = _effective_artifact_manifest(
+                dashboard["id"], version, version_row.get("manifest") or {}, enrichment
+            )
+            return _json({
+                "slug": slug,
+                "version": version,
+                **_semantic_enrichment_public(enrichment),
+                "semantic_map": effective.get("semantic_map") or {
+                    "schema_version": _SEMANTIC_MAP_SCHEMA,
+                    "objects": [],
+                },
+                "manifest": effective,
+            })
+        except (TypeError, ValueError) as exc:
+            return _json({"error": {"code": "BAD_VERSION", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001 — artifact rendering remains independent
+            print(f"semantic enrichment status ({slug}): {exc}", file=sys.stderr)
+            return _json({"error": {"code": "SEMANTIC_STATUS_UNAVAILABLE"}}, 500)
+
     @m.custom_route("/api/d/{slug}/inspect", methods=["POST"])
     async def _inspect(request):
         email = auth.read_session(request)
@@ -5936,6 +7911,8 @@ def register_dashboard_routes(m):
                     body.get("target"),
                     body.get("binding"),
                     body.get("trace"),
+                    body.get("semantic_object"),
+                    body.get("as_of"),
                 )
             finally:
                 _SESSION_SUB.reset(tok)
@@ -5982,6 +7959,9 @@ def register_dashboard_routes(m):
         if not sql:
             return _json({"error": {"code": "MISSING_SQL"}}, 400)
         as_of = (body or {}).get("as_of")
+        origin = str((body or {}).get("origin") or "dashboard")
+        if origin not in {"dashboard", "artifact-lens", "semantic-lens"}:
+            origin = "dashboard"
         t0 = time.time()
         # Burrow: the viewer's session identity IS a PG role — app queries run
         # under it (parked in a contextvar; tool schemas stay clean).
@@ -5990,7 +7970,12 @@ def register_dashboard_routes(m):
             res = tool_run_sql(sql, as_of)
         finally:
             _SESSION_SUB.reset(tok)
-        _record("dashboard_query", {"dashboard": slug, "sql": sql, "as_of": as_of},
+        _record("dashboard_query", {
+            "dashboard": slug,
+            "sql": sql,
+            "as_of": as_of,
+            "origin": origin,
+        },
                 res, res.get("error"), int((time.time() - t0) * 1000), caller_override=email)
         return _json(res, 400 if res.get("error") else 200)
 
@@ -6270,6 +8255,8 @@ def _register(mcp):
     mcp.tool(name="live_app_template")(_mcp_live_app_template)
     mcp.tool(name="create_live_app")(_mcp_create_live_app)
     mcp.tool(name="update_live_app")(_mcp_update_live_app)
+    mcp.tool(name="semantic_enrichment_status")(_mcp_semantic_enrichment_status)
+    mcp.tool(name="enrich_live_app")(_mcp_enrich_live_app)
     mcp.tool(name="list_live_apps")(_mcp_list_live_apps)
     mcp.tool(name="get_live_app")(_mcp_get_live_app)
     mcp.tool(name="debug_live_app")(_mcp_debug_live_app)
@@ -6343,6 +8330,11 @@ _INSTRUCTIONS = (
     "and call create_live_app. Hosted HTML apps live at /d/<slug>, are versioned, and call "
     "rvbbitQuery(sql) for live read-only data — one FLAT query per data concern (batch them with "
     "run_sql_multi in-Cowork; never assemble app JSON inside SQL with json_build_object). "
+    "After every HTML publication RVBBIT automatically compiles a version-keyed semantic overlay "
+    "from rendered DOM, filter controls, query traces, source, and screenshot evidence. The build "
+    "must not wait for that pass. An authored manifest.semantic_map or bindBusinessObject call is "
+    "optional precision metadata and overrides the generated overlay; do not sacrifice artifact "
+    "quality to manufacture it. "
     "Use list_live_apps, get_live_app, update_live_app, live_app_logs, and debug_live_app to "
     "maintain them. For Python FastAPI apps, call start_live_app to run the current version under "
     "local uvicorn, stop_live_app to stop it, live_app_status to inspect runner state, and "
@@ -6365,6 +8357,7 @@ def _build_mcp():
     _register(m)
     _ensure_activity_table()
     _ensure_dashboard_tables()
+    _start_semantic_enrichment_worker()
     return m
 
 
@@ -6434,6 +8427,7 @@ def _build_mcp_oauth(public: str):
     _register(m)
     _ensure_activity_table()
     _ensure_dashboard_tables()
+    _start_semantic_enrichment_worker()
     auth.register_login_route(m, provider, _RABBIT_SVG)
     import warehouse_theme
     warehouse_theme.register_theme_routes(m)

@@ -199,6 +199,15 @@ function table(mountId, columns, rows){
     pagination: rows.length>15 ? {limit:15} : false,
     style:{ table:{fontSize:'13px'} } }).render($(mountId));
 }
+/* Bind a visible business value to its versioned manifest definition. This is
+   inert in the Cowork preview and becomes inspectable when the same artifact is
+   published with manifest.semantic_map. Always pass the raw value and the exact
+   filter/context values used for this render. */
+function bindBusinessObject(id, target, value, context={}){
+  return window.RVBBIT_DASHBOARD?.bindSemanticObject?.(
+    id, target, { value, context }
+  ) || null;
+}
 /* ===================== /FRAMEWORK ===================== */
 
 
@@ -239,10 +248,10 @@ function render(p){
   const root = $('root');
   root.innerHTML = `
     <div class="grid cols-4">
-      <div class="card kpi"><div class="lab">Revenue</div><div class="val">${fmt.usdK(p.kpi.revenue)}</div><div class="note">all channels</div></div>
-      <div class="card kpi"><div class="lab">Ad spend</div><div class="val">${fmt.usdK(p.kpi.spend)}</div><div class="note">paid media</div></div>
-      <div class="card kpi"><div class="lab">Students</div><div class="val">${fmt.num(p.kpi.students)}</div><div class="note">${fmt.num(p.kpi.leads)} leads</div></div>
-      <div class="card kpi"><div class="lab">Misattributed</div><div class="val" style="color:var(--danger)">${fmt.usdK(p.kpi.gap_rev)}</div><div class="note">${Math.round(100*p.kpi.gap_rev/p.kpi.revenue)}% → Unknown/Direct</div></div>
+      <div class="card kpi"><div class="lab">Revenue</div><div class="val" id="kpi-revenue">${fmt.usdK(p.kpi.revenue)}</div><div class="note">all channels</div></div>
+      <div class="card kpi"><div class="lab">Ad spend</div><div class="val" id="kpi-spend">${fmt.usdK(p.kpi.spend)}</div><div class="note">paid media</div></div>
+      <div class="card kpi"><div class="lab">Students</div><div class="val" id="kpi-students">${fmt.num(p.kpi.students)}</div><div class="note"><span id="kpi-leads">${fmt.num(p.kpi.leads)} leads</span></div></div>
+      <div class="card kpi"><div class="lab">Misattributed</div><div class="val" id="kpi-gap-revenue" style="color:var(--danger)">${fmt.usdK(p.kpi.gap_rev)}</div><div class="note"><span id="kpi-gap-share">${Math.round(100*p.kpi.gap_rev/p.kpi.revenue)}%</span> → Unknown/Direct</div></div>
     </div>
 
     <div class="grid cols-2 mt">
@@ -252,6 +261,16 @@ function render(p){
 
     <div class="card mt"><h2>Channel performance</h2><p class="cap">Sortable. ROAS distorted by the Direct leakage.</p><div id="t_channel"></div></div>
   `;
+  bindBusinessObject('revenue', '#kpi-revenue', p.kpi.revenue);
+  bindBusinessObject('ad_spend', '#kpi-spend', p.kpi.spend);
+  bindBusinessObject('students', '#kpi-students', p.kpi.students);
+  bindBusinessObject('leads', '#kpi-leads', p.kpi.leads);
+  bindBusinessObject('misattributed_revenue', '#kpi-gap-revenue', p.kpi.gap_rev);
+  bindBusinessObject(
+    'misattributed_share',
+    '#kpi-gap-share',
+    100*p.kpi.gap_rev/p.kpi.revenue
+  );
 
   chart('c_tier', { type:'doughnut',
     data:{ labels:p.tier.map(r=>`${r.method} (${fmt.pct(r.pct)})`),

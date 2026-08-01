@@ -364,6 +364,76 @@ batches them into **one** `run_sql_multi` round trip (each bridge call has ~1.5s
 each query stays flat on the wire: routable by the accelerated engines, visible to the catalog,
 and individually promotable. Never hand-write a `json_build_object` payload query, and never
 bake data in — that's a 'dead tree'.
+
+### Versioned semantic maps
+
+Every published HTML dashboard is queued for a **non-blocking semantic compiler pass**.
+Publication succeeds immediately; a background worker renders that immutable version,
+captures its live read-only queries and visible value-bearing DOM, and calls
+`rvbbit.artifact_semantic_enrich(...)`. The agent proposes meanings and replay SQL, but its
+output is only a candidate: Warehouse replaces model-supplied selectors with selectors from
+the captured DOM, validates each query as a safe `SELECT`, executes it, and accepts an object
+only when its replayed value matches the rendered value. A bad candidate is rejected on its
+own without rejecting the artifact or other good candidates.
+
+The verified result is stored in `rvbbit.artifact_semantic_enrichments`, keyed to the exact
+artifact id + version. It is merged into the manifest when that version is served; the
+original authored manifest is never rewritten. The Artifact Lens polls while compilation is
+pending, so newly verified objects appear without republishing or reloading the dashboard.
+
+This map is deliberately lighter than a governed metric layer: each business-significant
+number says what it means, where it appears in the DOM, which dashboard filter values
+produced it, and the exact read-only SQL that independently recreates it. The evaluator may
+use arbitrary SQL and may repeat a client-side aggregation in SQL; it does not require a cube
+or metric object.
+
+Builders normally do not need to create this map. They can optionally add a precise authored
+`manifest.semantic_map` and runtime bindings for important or unusual values; authored ids
+and DOM bindings always win, while the compiler fills uncovered values. For a manual binding,
+use a stable selector and bind the raw value plus live context after every render:
+
+Use a stable selector and bind the raw value plus live context after every render:
+
+```js
+bindBusinessObject(
+  'regional_revenue',
+  '#regional-revenue',
+  payload.kpi.revenue,
+  { region: selectedRegion }
+);
+```
+
+The matching authored manifest object declares `meaning`, `parameters`, `bindings`, and an
+`evaluator` whose scalar result is exposed as `value`. Authored evaluators are normalized,
+validated, and executed before committing the version. If optional authored semantic
+metadata is malformed or cannot replay, Warehouse quarantines that map, returns a
+`SEMANTIC_MAP_QUARANTINED` warning, and still publishes the artifact; on update it retains a
+previous valid authored map when possible. Generated evaluators use the same contract, but
+are attached asynchronously after deterministic replay verification. The hosted runtime
+resolves the DOM binding from that effective version; the Artifact Lens presents meaning and
+filter context first, recreates the value from warehouse data, and keeps SQL collapsed as
+technical evidence. Older or not-yet-enriched artifacts still use best-effort query-trace
+inference.
+
+The v1 contract is intentionally value-shaped (`scalar`, `cell`, or `status`, with one
+result row). Whole charts and tables stay normal dashboard UI; their individual visible
+values use repeated parameterized bindings. This keeps recreation deterministic instead
+of smuggling a second analytics framework into the manifest.
+
+One definition may bind many rendered elements. Call `bindBusinessObject` once per
+table cell, SVG mark, or chart label with that element's raw value and dimension context;
+the runtime keeps context per DOM element. This maps every visible member of a repeated
+series without manufacturing a separate manifest object for every region, customer, or date.
+
+The dependency crawler indexes verified definitions as `semantic` edges (separate from the
+dashboard's data-fetch `query` edges), resolves their source tables, and reports the current
+version's semantic-object count in the gallery. Lens replays are tagged separately from
+dashboard runtime queries so inspecting a value does not rewrite the artifact's dependency map.
+
+`semantic_enrichment_status(slug, version?)` reports queue, coverage, and verification
+status. `enrich_live_app(slug, version?, force?)` queues or requeues an existing HTML
+artifact, which is useful for backfilling versions published before the compiler existed.
+
 Tools: `dashboard_template` / `publish_dashboard` / `update_dashboard` / `list_dashboards` /
 `get_dashboard`. Tables auto-create on startup (no migration). Design: [`docs/DASHBOARDS_PLAN.md`](../../docs/DASHBOARDS_PLAN.md).
 
@@ -399,6 +469,13 @@ opt-in for private/local Design Profile URL references) ·
 `WAREHOUSE_CALLIOPE_EXPORT_ROOTS` (OS-path-separated allowed Hermes output roots) ·
 `WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES` (128 MiB default, 512 MiB ceiling; in uber
 Compose set the single shared host path with `WAREHOUSE_CALLIOPE_EXPORT_DIR`).
+**Artifact semantic compiler:** `WAREHOUSE_SEMANTIC_ENRICHMENT` (default `1`; set `0` to
+disable queueing and the worker) · `WAREHOUSE_SEMANTIC_ENRICH_MODEL` (default
+`openai/gpt-5.6-sol`) · `WAREHOUSE_SEMANTIC_ENRICH_MAX_ATTEMPTS` (default `3`) ·
+`WAREHOUSE_SEMANTIC_ENRICH_RENDER_WAIT_MS` (default `3000`) ·
+`WAREHOUSE_SEMANTIC_ENRICH_SOURCE_CHARS` (default `180000`). The database process—not
+Warehouse MCP—executes the agent operator, so its configured backend must have the matching
+provider key (for the default model, `OPENROUTER_API_KEY`).
 **Shared-key mode:** `WAREHOUSE_MCP_KEY` (bearer; unset = auth OFF, dev only).
 
 ## Deferred to Phase 1+

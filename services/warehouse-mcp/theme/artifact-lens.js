@@ -11,10 +11,49 @@
   const scrollKey = `rvbbit-artifact-lens-scroll:${dashboard.slug}`;
   const positionKey = `rvbbit-artifact-lens-position:${dashboard.slug}`;
   const SENSITIVE = /(?:secret|token|password|passwd|auth|cookie|session|api[-_]?key)/i;
+  const SQL_KEYWORDS = new Set(`
+    all alter analyze and any array as asc asof at between both by case cast check
+    collate column constraint create cross current_date current_time current_timestamp
+    database default delete desc distinct do else end except exists false fetch filter
+    first following for foreign from full function generated group grouping having if
+    ilike in index inner insert intersect interval into is join lateral leading left
+    like limit materialized natural not null nulls offset on only or order outer over
+    partition preceding primary qualify range recursive references returning right row
+    rows schema select set table tablesample then ties to trailing true truncate union
+    unique unbounded update using values view when where window with within
+    bigint bigserial bit boolean bytea char date decimal double enum float int integer
+    json jsonb numeric real serial smallint text time timestamp uuid varchar
+  `.trim().split(/\s+/));
+  const SQL_TOKEN = /(?:--[^\r\n]*|\/\*[\s\S]*?\*\/|'(?:''|\\[\s\S]|[^'\\])*'|"(?:""|\\[\s\S]|[^"\\])*"|`(?:``|\\[\s\S]|[^`\\])*`|\{\{[\s\S]*?\}\}|\$\d+|:[a-zA-Z_][a-zA-Z0-9_]*|\b(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?\b|\b[a-zA-Z_][a-zA-Z0-9_$]*\b|#>>|->>|::|#>|->|<>|!=|<=|>=|=>|:=|\|\||&&|[-+*/%=<>&|^~])/gi;
+  const SQL_FORMAT_TOKEN = new RegExp(`${SQL_TOKEN.source}|[(),.;]|\\s+|.`, "gis");
+  const SQL_FORMAT_PHRASES = [
+    [["left", "outer", "join"], "join"],
+    [["right", "outer", "join"], "join"],
+    [["full", "outer", "join"], "join"],
+    [["left", "join"], "join"],
+    [["right", "join"], "join"],
+    [["full", "join"], "join"],
+    [["inner", "join"], "join"],
+    [["cross", "join"], "join"],
+    [["natural", "join"], "join"],
+    [["group", "by"], "group"],
+    [["order", "by"], "order"],
+    [["partition", "by"], "partition"],
+    [["union", "all"], "setop"],
+  ];
+  const SQL_MAJOR_CLAUSES = new Map([
+    ["with", "with"], ["select", "select"], ["from", "from"],
+    ["where", "where"], ["having", "having"], ["qualify", "qualify"],
+    ["window", "window"], ["limit", "limit"], ["offset", "offset"],
+    ["fetch", "fetch"], ["returning", "returning"], ["values", "values"],
+    ["set", "set"], ["union", "setop"], ["intersect", "setop"],
+    ["except", "setop"], ["join", "join"],
+  ]);
   const MEANINGFUL = [
     "a", "button", "input", "select", "textarea", "[role]", "[aria-label]", "[title]",
     "canvas", "svg", "table", "th", "td", "h1", "h2", "h3", "h4", "h5", "h6",
-    "[data-field]", "[data-series]", "[data-metric]", "[data-dimension]", "[data-testid]",
+    "[data-rvbbit-object]", "[data-field]", "[data-series]", "[data-metric]",
+    "[data-dimension]", "[data-testid]",
   ].join(",");
   let activeAsOf = new URL(window.location.href).searchParams.get(AS_OF_PARAM);
   let timeline = null;
@@ -26,6 +65,7 @@
   let currentInspection = null;
   let hoverFrame = null;
   let candidateTimer = null;
+  let semanticPollTimer = null;
   let viewExplicitlyChosen = false;
 
   function sessionGet(key) {
@@ -69,6 +109,188 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
+  }
+
+  function highlightSql(value) {
+    const sql = String(value ?? "");
+    let cursor = 0;
+    let highlighted = "";
+    SQL_TOKEN.lastIndex = 0;
+    for (const match of sql.matchAll(SQL_TOKEN)) {
+      const token = match[0];
+      const index = match.index ?? cursor;
+      highlighted += escapeHtml(sql.slice(cursor, index));
+      const lower = token.toLowerCase();
+      let kind = "";
+      if (token.startsWith("--") || token.startsWith("/*")) kind = "comment";
+      else if (token.startsWith("'")) kind = "string";
+      else if (token.startsWith('"') || token.startsWith("`")) kind = "identifier";
+      else if (token.startsWith("{{") || /^\$\d+$/.test(token) || /^:[a-z_]/i.test(token)) kind = "parameter";
+      else if (/^(?:\d|\.\d)/.test(token)) kind = "number";
+      else if (SQL_KEYWORDS.has(lower)) kind = "keyword";
+      else if (/^[a-z_]/i.test(token) && /^\s*\(/.test(sql.slice(index + token.length))) kind = "function";
+      else if (/^[#:\-+*/%=<>&|^~]/.test(token)) kind = "operator";
+      highlighted += kind
+        ? `<span class="sql-${kind}">${escapeHtml(token)}</span>`
+        : escapeHtml(token);
+      cursor = index + token.length;
+    }
+    return highlighted + escapeHtml(sql.slice(cursor));
+  }
+
+  function formatSql(value) {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "";
+    try {
+      SQL_FORMAT_TOKEN.lastIndex = 0;
+      const tokens = [...raw.matchAll(SQL_FORMAT_TOKEN)]
+        .map((match) => match[0])
+        .filter((token) => !/^\s+$/.test(token));
+      const lines = [];
+      const parens = [];
+      const listClauses = new Set(["with", "select", "from", "group", "order", "returning", "values", "set"]);
+      let line = "";
+      let lineIndent = 0;
+      let pendingIndent = null;
+      let indent = 0;
+      let clause = "";
+      let clauseDepth = 0;
+      let previous = "";
+
+      const flush = () => {
+        const text = line.trim();
+        if (text) lines.push(`${"  ".repeat(Math.max(0, lineIndent))}${text}`);
+        line = "";
+      };
+      const append = (text, spaced = true, level = null) => {
+        if (!line) {
+          lineIndent = level ?? pendingIndent ?? indent;
+          pendingIndent = null;
+        }
+        if (spaced && line && !line.endsWith(" ")) line += " ";
+        line += text;
+      };
+      const phraseAt = (index) => SQL_FORMAT_PHRASES.find(([words]) => (
+        words.every((word, offset) => tokens[index + offset]?.toLowerCase() === word)
+      ));
+
+      for (let index = 0; index < tokens.length; index += 1) {
+        const token = tokens[index];
+        const lower = token.toLowerCase();
+        const phrase = /^[a-z_]/i.test(token) ? phraseAt(index) : null;
+        const phraseWords = phrase?.[0] || [lower];
+        const phraseKind = phrase?.[1] || SQL_MAJOR_CLAUSES.get(lower);
+        if (phraseKind) {
+          flush();
+          const text = phraseWords.map((word) => word.toUpperCase()).join(" ");
+          append(text, false, indent);
+          clause = phraseKind;
+          clauseDepth = parens.length;
+          index += phraseWords.length - 1;
+          previous = phraseWords.at(-1);
+          continue;
+        }
+
+        if (lower === "on" && parens.length === clauseDepth) {
+          flush();
+          append("ON", false, indent + 1);
+          clause = "on";
+          previous = lower;
+          continue;
+        }
+        if (["and", "or"].includes(lower) && ["where", "having", "qualify", "on"].includes(clause)) {
+          flush();
+          append(lower.toUpperCase(), false, indent + 1);
+          previous = lower;
+          continue;
+        }
+        if (["when", "else"].includes(lower)) {
+          flush();
+          append(lower.toUpperCase(), false, indent + 1);
+          previous = lower;
+          continue;
+        }
+        if (lower === "end") {
+          flush();
+          append("END", false, indent);
+          previous = lower;
+          continue;
+        }
+
+        if (token === "(") {
+          const next = tokens[index + 1]?.toLowerCase();
+          const block = ["select", "with", "where"].includes(next);
+          const functionLike = /^[a-z_][a-z0-9_$]*$/i.test(previous)
+            && (!SQL_KEYWORDS.has(previous) || ["cast", "extract", "overlay", "position", "substring", "trim"].includes(previous));
+          if (!line) append("(", false);
+          else line = `${line.trimEnd()}${functionLike ? "" : " "}(`;
+          const closeIndent = lineIndent;
+          parens.push({ block, indent, closeIndent, clause, clauseDepth });
+          if (block) {
+            flush();
+            indent = closeIndent + 1;
+            clause = "";
+            clauseDepth = parens.length;
+          }
+          previous = "(";
+          continue;
+        }
+        if (token === ")") {
+          const frame = parens.pop();
+          if (frame?.block) {
+            flush();
+            indent = frame.indent;
+            clause = frame.clause;
+            clauseDepth = frame.clauseDepth;
+            append(")", false, frame.closeIndent);
+          } else if (!line) append(")", false, indent);
+          else line = `${line.trimEnd()})`;
+          previous = ")";
+          continue;
+        }
+        if (token === ",") {
+          line = `${line.trimEnd()},`;
+          if (listClauses.has(clause) && parens.length === clauseDepth) {
+            flush();
+            pendingIndent = indent + 1;
+          }
+          previous = token;
+          continue;
+        }
+        if (token === ".") {
+          line = `${line.trimEnd()}.`;
+          previous = token;
+          continue;
+        }
+        if (token === ";") {
+          line = `${line.trimEnd()};`;
+          flush();
+          previous = token;
+          continue;
+        }
+        if (token === "::") {
+          line = `${line.trimEnd()}::`;
+          previous = token;
+          continue;
+        }
+        if (/^(?:--|\/\*)/.test(token)) {
+          if (line) append(token);
+          else append(token, false, indent);
+          flush();
+          previous = "comment";
+          continue;
+        }
+
+        const rendered = SQL_KEYWORDS.has(lower) ? lower.toUpperCase() : token;
+        const noSpace = !line || previous === "(" || previous === "." || previous === "::";
+        append(rendered, !noSpace);
+        previous = lower;
+      }
+      flush();
+      return lines.join("\n") || raw;
+    } catch {
+      return raw;
+    }
   }
 
   function boundedText(value, limit = 400) {
@@ -210,11 +432,16 @@
     const cells = [...row.children].filter((child) => child.matches("td,th"));
     const columnIndex = cells.indexOf(cell);
     const headers = [...table.querySelectorAll("thead tr:last-child th")];
+    const rowValues = Object.fromEntries(cells.map((rowCell, index) => [
+      boundedText(headers[index]?.textContent, 160) || `column_${index + 1}`,
+      boundedText(rowCell.textContent, 400),
+    ]));
     return {
       row_index: Math.max(0, rows.indexOf(row)),
       column_index: Math.max(0, columnIndex),
       column_header: boundedText(headers[columnIndex]?.textContent, 160),
       cell_text: boundedText(cell.textContent, 400),
+      row: rowValues,
     };
   }
 
@@ -313,6 +540,12 @@
       return null;
     }
     if (source.closest("rvbbit-artifact-lens")) return null;
+    const semanticObject = source.closest("[data-rvbbit-object]");
+    if (
+      semanticObject
+      && semanticObject !== document.body
+      && semanticObject !== document.documentElement
+    ) return semanticObject;
     const semantic = source.closest(MEANINGFUL);
     if (semantic && semantic !== document.body && semantic !== document.documentElement) return semantic;
     let node = source;
@@ -469,6 +702,212 @@
     } catch {
       return [];
     }
+  }
+
+  function semanticEntries() {
+    try {
+      const entries = dashboard.semanticObjects?.();
+      return Array.isArray(entries) ? entries.filter((entry) => entry?.id) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function semanticBoundElements() {
+    const found = new Set();
+    semanticEntries().forEach((semanticObject) => {
+      (semanticObject.bindings || []).forEach((binding) => {
+        try {
+          if (binding.selector) {
+            document.querySelectorAll(binding.selector).forEach((node) => found.add(node));
+          }
+          if (binding.element_id) {
+            const node = document.getElementById(binding.element_id);
+            if (node) found.add(node);
+          }
+          if (binding.name) {
+            [...document.getElementsByName(binding.name)].forEach((node) => found.add(node));
+          }
+        } catch {
+          // A stale selector should not disable the rest of the semantic map.
+        }
+      });
+      found.forEach((node) => {
+        if (
+          (semanticObject.bindings || []).some((binding) => {
+            try {
+              if (binding.selector && node.matches(binding.selector)) return true;
+              if (binding.element_id && node.id === binding.element_id) return true;
+              if (binding.name && node.getAttribute("name") === binding.name) return true;
+            } catch {
+              return false;
+            }
+            return false;
+          })
+        ) node.setAttribute("data-rvbbit-object", semanticObject.id);
+      });
+    });
+    return found;
+  }
+
+  function semanticObjectForElement(element) {
+    if (!(element instanceof Element)) return null;
+    const bound = element.closest("[data-rvbbit-object]");
+    const objectId = bound?.getAttribute("data-rvbbit-object");
+    if (objectId) {
+      try {
+        return dashboard.semanticObject?.(objectId, bound)
+          || semanticEntries().find((entry) => entry.id === objectId)
+          || null;
+      } catch {
+        return null;
+      }
+    }
+    const matched = semanticEntries().find(
+      (semanticObject) => semanticBindingForElement(semanticObject, element),
+    );
+    return matched
+      ? (dashboard.semanticObject?.(matched.id, element) || matched)
+      : null;
+  }
+
+  function semanticBindingForElement(semanticObject, element) {
+    const bindings = semanticObject?.bindings || [];
+    return bindings.find((binding) => {
+      try {
+        if (binding.selector && [...document.querySelectorAll(binding.selector)].some(
+          (node) => node === element || node.contains(element),
+        )) return true;
+        if (binding.element_id) {
+          const node = document.getElementById(binding.element_id);
+          if (node && (node === element || node.contains(element))) return true;
+        }
+        if (binding.name) {
+          return [...document.getElementsByName(binding.name)].some(
+            (node) => node === element || node.contains(element),
+          );
+        }
+      } catch {
+        return false;
+      }
+      return false;
+    }) || null;
+  }
+
+  function semanticSourceValue(source, element, target) {
+    const raw = String(source || "").trim();
+    if (!raw) return undefined;
+    if (raw.startsWith("$element.data.")) {
+      const key = raw.slice("$element.data.".length).replaceAll("_", "-");
+      const owner = element.closest?.(`[data-${safeCss(key)}]`);
+      return owner?.getAttribute?.(`data-${key}`) ?? undefined;
+    }
+    if (raw.startsWith("$element.attr.")) {
+      const key = raw.slice("$element.attr.".length);
+      if (!key || SENSITIVE.test(key)) return undefined;
+      const owner = element.closest?.(`[${safeCss(key)}]`);
+      return owner?.getAttribute?.(key) ?? undefined;
+    }
+    if (raw.startsWith("$element.text_number.")) {
+      const index = Number(raw.slice("$element.text_number.".length));
+      if (!Number.isInteger(index) || index < 0) return undefined;
+      const text = boundedText(
+        element.textContent || element.getAttribute?.("title"),
+        1000,
+      );
+      const values = text.match(
+        /[~≈<>≤≥]?\s*[+-]?\s*(?:[$€£¥]\s*)?\(?\d[\d,]*(?:\.\d+)?\)?(?:\s*%)?(?:\s*[kmbt])?/ig,
+      ) || [];
+      return values[index]?.trim();
+    }
+    if (raw.startsWith("$selection.data.")) {
+      const key = `data-${raw.slice("$selection.data.".length).replaceAll("_", "-")}`;
+      return target.data?.[key];
+    }
+    if (raw === "$selection.chart.data_label") return target.chart?.data_label;
+    if (raw === "$selection.chart.dataset_label") return target.chart?.dataset_label;
+    if (raw === "$selection.chart.value") return target._chart?.raw ?? target.chart?.value;
+    if (raw === "$selection.table.cell_text") return target.table?.cell_text;
+    if (raw.startsWith("$selection.table.row.")) {
+      const key = raw.slice("$selection.table.row.".length);
+      return target.table?.row?.[key];
+    }
+    if (raw.startsWith("$")) return undefined;
+    try {
+      const node = document.querySelector(raw);
+      if (!node) return undefined;
+      if (node.matches("input[type='checkbox'],input[type='radio']")) return Boolean(node.checked);
+      if (node.matches("input,select,textarea")) return node.value;
+      return boundedText(node.textContent, 1000);
+    } catch {
+      return undefined;
+    }
+  }
+
+  function semanticSelectionForElement(semanticObject, element, target) {
+    if (!semanticObject) return null;
+    const runtime = (
+      semanticObject.runtime
+      && typeof semanticObject.runtime === "object"
+      && !Array.isArray(semanticObject.runtime)
+    ) ? semanticObject.runtime : {};
+    const manifestBinding = semanticBindingForElement(semanticObject, element) || {};
+    const context = {
+      ...(
+        manifestBinding.context
+        && typeof manifestBinding.context === "object"
+        && !Array.isArray(manifestBinding.context)
+          ? manifestBinding.context
+          : {}
+      ),
+      ...(
+        runtime.context
+        && typeof runtime.context === "object"
+        && !Array.isArray(runtime.context)
+          ? runtime.context
+          : {}
+      ),
+    };
+    Object.entries(semanticObject.parameters || {}).forEach(([name, spec]) => {
+      const sourced = semanticSourceValue(spec?.source, element, target);
+      if (sourced !== undefined) context[name] = sourced;
+      else if (!(name in context) && spec && Object.hasOwn(spec, "default")) context[name] = spec.default;
+    });
+    const sourcedValue = semanticSourceValue(manifestBinding.value_source, element, target);
+    const fallbackValue = (
+      target._chart?.raw
+      ?? target.table?.cell_text
+      ?? target.data?.["data-value"]
+      ?? target.text
+      ?? ""
+    );
+    return {
+      id: semanticObject.id,
+      definition_hash: semanticObject.definition_hash || null,
+      context,
+      rendered_value: runtime.value ?? sourcedValue ?? fallbackValue,
+    };
+  }
+
+  async function pollSemanticEnrichment() {
+    window.clearTimeout(semanticPollTimer);
+    const status = dashboard.manifest?.semantic_enrichment?.status;
+    if (!["pending", "running"].includes(status)) return;
+    try {
+      const version = dashboard.version ? `?version=${encodeURIComponent(dashboard.version)}` : "";
+      const result = await fetchJson(
+        `/api/d/${encodeURIComponent(dashboard.slug)}/semantic-enrichment${version}`,
+      );
+      if (["ready", "partial"].includes(result.status) && result.manifest) {
+        dashboard.replaceSemanticManifest?.(result.manifest);
+        scheduleCandidateHighlights();
+        return;
+      }
+      if (result.status === "failed" || result.status === "disabled") return;
+    } catch {
+      // Compilation is optional metadata; a transient poll failure never affects the dashboard.
+    }
+    semanticPollTimer = window.setTimeout(pollSemanticEnrichment, 3000);
   }
 
   function visualBindingEvidence(trace, visual) {
@@ -692,19 +1131,38 @@
     const host = document.createElement("rvbbit-artifact-lens");
     host.style.cssText = [
       "all:initial",
+      "display:block",
       "position:fixed",
       "z-index:2147483000",
       "right:max(18px,env(safe-area-inset-right))",
       "bottom:max(18px,env(safe-area-inset-bottom))",
-      "width:auto",
-      "height:auto",
+      "width:max-content",
+      "height:max-content",
       "pointer-events:none",
       "color-scheme:dark",
     ].join(";");
+    // Dashboard styles can be arbitrarily slow (or contain broad custom-element
+    // rules), so keep the host completely out of the paint tree until its own
+    // shadow stylesheet is ready. The priority prevents an authored dashboard
+    // rule from accidentally revealing the raw Lens controls during startup.
+    host.style.setProperty("visibility", "hidden", "important");
+    host.setAttribute("aria-hidden", "true");
     const root = host.attachShadow({ mode: "open" });
     const stylesheet = document.createElement("link");
     stylesheet.rel = "stylesheet";
     stylesheet.href = "/theme/artifact-lens.css";
+    let stylesheetReady = false;
+    let stylesheetFailed = false;
+    let lensReady = false;
+    let revealLensWhenReady = () => {};
+    stylesheet.addEventListener("load", () => {
+      stylesheetReady = true;
+      revealLensWhenReady();
+    }, { once: true });
+    stylesheet.addEventListener("error", () => {
+      stylesheetFailed = true;
+      host.remove();
+    }, { once: true });
     root.appendChild(stylesheet);
 
     const shell = document.createElement("div");
@@ -722,11 +1180,15 @@
           <span class="drag-grip" aria-hidden="true">⠿</span>
           <button class="close" type="button" aria-label="Minimize artifact lens">×</button>
           <strong>Ask the artifact why.</strong>
-          <small>Explore retained data time or trace a rendered object back to its evidence.</small>
+          <small>Explore retained data time or understand the business objects on this surface.</small>
         </header>
         <nav class="tabs" aria-label="Artifact lens modes">
           <button type="button" class="tab active" data-view="time">Data time</button>
-          <button type="button" class="tab" data-view="trace">Trace</button>
+          <button type="button" class="tab" data-view="trace">Objects</button>
+          <button type="button" class="query-browser" aria-label="Browse dashboard query data"
+            title="Browse dashboard query data" disabled>
+            <span>Query data</span><small class="query-count">0</small>
+          </button>
         </nav>
         <div class="view time-view">
           <div class="loading timeline-loading" role="status">
@@ -759,9 +1221,9 @@
         <div class="view trace-view" hidden>
           <div class="trace-intro">
             <span class="trace-glyph" aria-hidden="true">⌖</span>
-            <strong>Select something you want to understand.</strong>
-            <p>Lens binds tables, SVG and Chart.js marks, and contracted values to query evidence when it can. Other objects retain artifact-level source context.</p>
-            <button class="pick" type="button">Pick from dashboard</button>
+            <strong>Select a value you want to understand.</strong>
+            <p>Named values explain what they mean, preserve the dashboard context, and can recreate themselves from warehouse data.</p>
+            <span class="pick-status"><i aria-hidden="true"></i>Selection active</span>
           </div>
           <div class="trace-loading loading" hidden role="status">
             <i aria-hidden="true"></i>
@@ -769,40 +1231,56 @@
           </div>
           <div class="trace-result" hidden></div>
         </div>
-        <footer>RVBBIT evidence sidecar · dashboard code stays unchanged</footer>
+        <footer>Versioned semantic map · dashboard code stays independent</footer>
       </section>
       <aside class="query-drawer" data-side="left" aria-label="Query result" aria-hidden="true">
         <header class="query-drawer-head">
           <div>
             <span class="eyebrow">Live result set</span>
-            <strong class="query-drawer-title">Traced query</strong>
-            <small class="query-drawer-meta">Authenticated · governed read-only execution</small>
+            <strong class="query-drawer-title">Recreated value</strong>
+            <small class="query-drawer-meta">Authenticated · read-only warehouse evidence</small>
           </div>
           <div class="query-drawer-actions">
+            <button class="query-sql-toggle" type="button" aria-pressed="false"
+              aria-label="View query SQL" title="View query SQL" hidden>SQL</button>
             <button class="query-refresh" type="button" aria-label="Run query again" title="Run query again">↻</button>
             <button class="query-drawer-close" type="button" aria-label="Close query result">×</button>
           </div>
         </header>
+        <label class="query-source-picker" hidden>
+          <span>Dashboard result set</span>
+          <select class="query-source" aria-label="Choose dashboard query result"></select>
+        </label>
         <div class="query-drawer-content">
-          <div class="query-drawer-loading" hidden role="status">
-            <i aria-hidden="true"></i>
-            <span>Running the traced query…</span>
+          <div class="query-result-view">
+            <div class="query-drawer-loading" hidden role="status">
+              <i aria-hidden="true"></i>
+              <span>Recreating from warehouse data…</span>
+            </div>
+            <div class="query-drawer-error" hidden></div>
+            <div class="query-table-wrap" hidden>
+              <table class="query-table"></table>
+            </div>
+            <div class="query-empty" hidden>No rows returned.</div>
           </div>
-          <div class="query-drawer-error" hidden></div>
-          <div class="query-table-wrap" hidden>
-            <table class="query-table"></table>
-          </div>
-          <div class="query-empty" hidden>No rows returned.</div>
+          <section class="query-sql-view" aria-label="Executed SQL" hidden>
+            <div class="query-sql-toolbar">
+              <span>Executed SQL</span>
+              <button class="query-sql-copy" type="button">Copy SQL</button>
+            </div>
+            <pre tabindex="0"><code class="query-sql-code"></code></pre>
+          </section>
         </div>
         <footer class="query-drawer-foot">
           <span class="query-row-status">Ready to run</span>
           <div class="query-drawer-foot-actions">
             <button class="query-more" type="button" hidden>Show 100 more</button>
-            <button class="query-analyze" type="button" hidden>Analyze with Calliope</button>
+            <button class="query-analyze" type="button" hidden>Ask Calliope</button>
           </div>
         </footer>
       </aside>
-      <button class="trigger" type="button" aria-expanded="false" aria-label="Open artifact lens">
+      <button class="trigger" type="button" aria-expanded="false" aria-label="Open artifact lens"
+        title="Click to open · drag to move">
         <span class="clock" aria-hidden="true">
           <svg viewBox="0 0 24 24">
             <path d="M12 7v5l3 2M5.6 5.7A8.5 8.5 0 1 1 3.5 12"/>
@@ -811,18 +1289,24 @@
         </span>
         <span class="trigger-copy">
           <b>Artifact lens</b>
-          <small>${activeAsOf ? formatPoint(activeAsOf, false) : "Live · trace"}</small>
+          <small>${activeAsOf ? formatPoint(activeAsOf, false) : "Live · objects"}</small>
         </span>
         <i aria-hidden="true"></i>
       </button>`;
     root.appendChild(shell);
     document.body.appendChild(host);
+    if (stylesheetFailed) {
+      host.remove();
+      return;
+    }
 
     const panel = root.querySelector(".panel");
     const panelHeader = panel.querySelector("header");
     const trigger = root.querySelector(".trigger");
     const close = root.querySelector(".close");
     const tabs = [...root.querySelectorAll(".tab")];
+    const queryBrowser = root.querySelector(".query-browser");
+    const queryCount = root.querySelector(".query-count");
     const timeView = root.querySelector(".time-view");
     const traceView = root.querySelector(".trace-view");
     const loadingNode = root.querySelector(".timeline-loading");
@@ -837,7 +1321,7 @@
     const latest = root.querySelector(".latest");
     const coverage = root.querySelector(".coverage");
     const triggerStatus = root.querySelector(".trigger-copy small");
-    const pick = root.querySelector(".pick");
+    const pickStatus = root.querySelector(".pick-status");
     const traceIntro = root.querySelector(".trace-intro");
     const traceLoading = root.querySelector(".trace-loading");
     const traceResult = root.querySelector(".trace-result");
@@ -849,18 +1333,27 @@
     const queryDrawerMeta = root.querySelector(".query-drawer-meta");
     const queryDrawerLoading = root.querySelector(".query-drawer-loading");
     const queryDrawerError = root.querySelector(".query-drawer-error");
+    const queryResultView = root.querySelector(".query-result-view");
     const queryTableWrap = root.querySelector(".query-table-wrap");
     const queryTable = root.querySelector(".query-table");
     const queryEmpty = root.querySelector(".query-empty");
+    const querySqlToggle = root.querySelector(".query-sql-toggle");
+    const querySqlView = root.querySelector(".query-sql-view");
+    const querySqlCode = root.querySelector(".query-sql-code");
+    const querySqlCopy = root.querySelector(".query-sql-copy");
     const queryRowStatus = root.querySelector(".query-row-status");
     const queryMore = root.querySelector(".query-more");
     const queryAnalyze = root.querySelector(".query-analyze");
     const queryRefresh = root.querySelector(".query-refresh");
     const queryDrawerClose = root.querySelector(".query-drawer-close");
+    const querySourcePicker = root.querySelector(".query-source-picker");
+    const querySource = root.querySelector(".query-source");
     let queryResult = null;
+    let queryContext = null;
     let queryVisibleRows = RESULT_BATCH_SIZE;
     let queryRunning = false;
     let dragState = null;
+    let suppressTriggerClickUntil = 0;
 
     function setHostPosition(left, top) {
       host.style.left = `${Math.round(left)}px`;
@@ -870,7 +1363,7 @@
     }
 
     function lensBounds() {
-      const rects = [trigger.getBoundingClientRect()];
+      const rects = [shell.getBoundingClientRect()];
       if (shell.dataset.open === "true") rects.push(panel.getBoundingClientRect());
       return {
         left: Math.min(...rects.map((rect) => rect.left)),
@@ -972,13 +1465,15 @@
     }
 
     function beginLensDrag(event) {
+      const handle = event.currentTarget;
+      const draggingTrigger = handle === trigger;
       if (
         event.button !== 0
-        || event.target.closest("button,a,input,select,textarea")
+        || (!draggingTrigger && event.target.closest("button,a,input,select,textarea"))
       ) return;
-      const triggerRect = trigger.getBoundingClientRect();
+      const anchorRect = shell.getBoundingClientRect();
       if (!Number.isFinite(Number.parseFloat(host.style.left))) {
-        setHostPosition(triggerRect.left, triggerRect.top);
+        setHostPosition(anchorRect.left, anchorRect.top);
       }
       dragState = {
         pointerId: event.pointerId,
@@ -987,8 +1482,11 @@
         startLeft: Number.parseFloat(host.style.left),
         startTop: Number.parseFloat(host.style.top),
         bounds: lensBounds(),
+        handle,
+        draggingTrigger,
+        moved: false,
       };
-      panelHeader.setPointerCapture?.(event.pointerId);
+      handle.setPointerCapture?.(event.pointerId);
       shell.dataset.dragging = "true";
       event.preventDefault();
     }
@@ -998,6 +1496,8 @@
       const margin = window.innerWidth <= 540 ? 8 : 12;
       let dx = event.clientX - dragState.startX;
       let dy = event.clientY - dragState.startY;
+      if (!dragState.moved && Math.hypot(dx, dy) < 4) return;
+      dragState.moved = true;
       dx = Math.max(
         margin - dragState.bounds.left,
         Math.min(dx, window.innerWidth - margin - dragState.bounds.right),
@@ -1014,10 +1514,16 @@
 
     function endLensDrag(event) {
       if (!dragState || event.pointerId !== dragState.pointerId) return;
-      panelHeader.releasePointerCapture?.(event.pointerId);
+      const completedDrag = dragState;
+      completedDrag.handle.releasePointerCapture?.(event.pointerId);
       dragState = null;
       shell.dataset.dragging = "false";
-      persistLensPosition();
+      if (completedDrag.moved) {
+        persistLensPosition();
+        if (completedDrag.draggingTrigger) {
+          suppressTriggerClickUntil = performance.now() + 350;
+        }
+      }
       constrainLens();
     }
 
@@ -1049,6 +1555,7 @@
     }
 
     function candidateConfidence(element, index) {
+      if (element.matches("[data-rvbbit-object]")) return "semantic";
       if (!index.values.size && !index.rowCounts.size) return null;
       if (element.matches("td,th")) return "exact";
       if (element.matches("canvas") && window.Chart?.getChart?.(element)) return "exact";
@@ -1094,12 +1601,13 @@
     function renderCandidateHighlights() {
       candidateLayer.replaceChildren();
       if (shell.dataset.open !== "true" || shell.dataset.view !== "trace") return;
+      semanticBoundElements();
       const index = traceValueIndex();
-      if (!index.values.size && !index.rowCounts.size) return;
       const candidates = new Set(document.querySelectorAll([
-        "td", "th", "canvas", "svg",
+        "[data-rvbbit-object]", "td", "th", "canvas", "svg",
         "[data-field]", "[data-metric]", "[data-series]", "[data-dimension]",
       ].join(",")));
+      if (!semanticEntries().length && !index.values.size && !index.rowCounts.size) return;
       [...document.body.querySelectorAll("*")].slice(0, 3500).forEach((element) => {
         if (
           element.localName === "rvbbit-artifact-lens"
@@ -1139,7 +1647,17 @@
       )));
       leaves
         .sort((left, right) => (
-          (left.confidence === right.confidence ? 0 : left.confidence === "exact" ? -1 : 1)
+          (
+            left.confidence === right.confidence
+              ? 0
+              : left.confidence === "semantic"
+                ? -1
+                : right.confidence === "semantic"
+                  ? 1
+                  : left.confidence === "exact"
+                    ? -1
+                    : 1
+          )
           || (left.rect.width * left.rect.height) - (right.rect.width * right.rect.height)
         ))
         .slice(0, 96)
@@ -1181,7 +1699,7 @@
         loadTimeline();
       } else {
         scheduleCandidateHighlights();
-        if (currentInspection && !pickerActive) startPicker();
+        if (shell.dataset.open === "true" && !pickerActive) startPicker();
       }
     }
 
@@ -1197,7 +1715,7 @@
       if (open && shell.dataset.view === "time") loadTimeline();
       if (open && shell.dataset.view === "trace") {
         scheduleCandidateHighlights();
-        if (currentInspection && !pickerActive) startPicker();
+        if (!pickerActive) startPicker();
       }
       if (!open && pickerActive) stopPicker();
       if (!open) {
@@ -1339,10 +1857,25 @@
       inspectionBusy = true;
       closeQueryDrawer();
       queryResult = null;
+      queryContext = null;
       pickedElement = element;
       positionOutline(element, true);
       const target = describeElement(element, event);
-      const binding = resolveBinding(target);
+      const semanticObject = semanticObjectForElement(element);
+      const semanticSelection = semanticSelectionForElement(
+        semanticObject, element, target,
+      );
+      const meaning = semanticObject?.meaning || {};
+      const semanticEvaluator = semanticObject?.evaluator || {};
+      const binding = semanticObject
+        ? {
+            kind: "value",
+            confidence: "semantic",
+            field: semanticEvaluator.value_column || "",
+            label: meaning.label || target.label,
+            value: formatValue(semanticSelection?.rendered_value),
+          }
+        : resolveBinding(target);
       const cleanTarget = publicTarget(target);
       const cleanBinding = publicBinding(binding);
       setOpen(true);
@@ -1350,7 +1883,7 @@
       traceIntro.hidden = true;
       traceResult.hidden = true;
       traceLoading.hidden = false;
-      pickerHint.textContent = "Click another highlighted object to replace this trace · Esc to close";
+      pickerHint.textContent = "Click another highlighted object to inspect it · Esc to close";
       try {
         currentInspection = await fetchJson(
           `/api/d/${encodeURIComponent(dashboard.slug)}/inspect`,
@@ -1361,7 +1894,9 @@
               version: dashboard.version,
               target: cleanTarget,
               binding: cleanBinding,
-              trace: tracePayload(binding),
+              trace: semanticObject ? {} : tracePayload(binding),
+              semantic_object: semanticSelection,
+              as_of: activeAsOf || null,
             }),
           },
         );
@@ -1372,7 +1907,7 @@
           <div class="trace-error">
             <b>Evidence unavailable</b>
             <span>${escapeHtml(error instanceof Error ? error.message : error)}</span>
-            <small>Click another highlighted object to try a different trace.</small>
+            <small>Click another highlighted object to inspect it.</small>
           </div>`;
         traceResult.hidden = false;
       } finally {
@@ -1405,14 +1940,14 @@
 
     function startPicker() {
       if (pickerActive) return;
+      semanticBoundElements();
       pickerActive = true;
       shell.dataset.picking = "true";
-      pickerHint.hidden = false;
+      pickStatus.dataset.active = "true";
+      pickerHint.hidden = shell.dataset.drawerOpen === "true";
       pickerHint.textContent = currentInspection
-        ? "Click another highlighted object to replace this trace · Esc to close"
-        : "Pick a highlighted value, chart point, table cell, or visual object · Esc to close";
-      pick.textContent = "Picking…";
-      pick.setAttribute("aria-pressed", "true");
+        ? "Click another highlighted object to inspect it · Esc to close"
+        : "Pick a highlighted business value, chart point, table cell, or visual object · Esc to close";
       document.documentElement.classList.add("rvbbit-artifact-lens-picking");
       document.addEventListener("pointermove", onPickerMove, true);
       document.addEventListener("click", onPickerClick, true);
@@ -1422,9 +1957,8 @@
     function stopPicker(keepOutline = false) {
       pickerActive = false;
       shell.dataset.picking = "false";
+      pickStatus.dataset.active = "false";
       pickerHint.hidden = true;
-      pick.textContent = "Pick from dashboard";
-      pick.setAttribute("aria-pressed", "false");
       document.documentElement.classList.remove("rvbbit-artifact-lens-picking");
       document.removeEventListener("pointermove", onPickerMove, true);
       document.removeEventListener("click", onPickerClick, true);
@@ -1436,15 +1970,131 @@
     function openQueryDrawer() {
       shell.dataset.drawerOpen = "true";
       queryDrawer.setAttribute("aria-hidden", "false");
+      pickerHint.hidden = true;
       positionQueryDrawer();
       window.requestAnimationFrame(positionQueryDrawer);
       scheduleCandidateHighlights();
     }
 
     function closeQueryDrawer() {
+      setQuerySqlVisible(false);
       shell.dataset.drawerOpen = "false";
       queryDrawer.setAttribute("aria-hidden", "true");
+      if (
+        pickerActive
+        && shell.dataset.open === "true"
+        && shell.dataset.view === "trace"
+      ) pickerHint.hidden = false;
       scheduleCandidateHighlights();
+    }
+
+    function setQuerySqlVisible(visible) {
+      const sql = String(queryContext?.sql || "").trim();
+      const formatted = formatSql(sql);
+      const show = Boolean(visible && sql);
+      shell.dataset.sqlView = String(show);
+      querySqlToggle.hidden = !sql;
+      querySqlToggle.disabled = !sql;
+      querySqlToggle.setAttribute("aria-pressed", String(show));
+      querySqlToggle.setAttribute("aria-label", show ? "Show query result" : "View query SQL");
+      querySqlToggle.title = show ? "Show query result" : "View query SQL";
+      queryResultView.hidden = show;
+      querySqlView.hidden = !show;
+      querySqlCopy.textContent = "Copy SQL";
+      if (formatted && querySqlCode.textContent !== formatted) {
+        querySqlCode.innerHTML = highlightSql(formatted);
+      }
+      if (!sql) querySqlCode.replaceChildren();
+      positionQueryDrawer();
+    }
+
+    async function copyQuerySql() {
+      const sql = String(queryContext?.sql || "").trim();
+      if (!sql) return;
+      try {
+        await navigator.clipboard.writeText(formatSql(sql));
+        querySqlCopy.textContent = "Copied";
+      } catch {
+        querySqlCopy.textContent = "Copy failed";
+      }
+      window.setTimeout(() => {
+        if (querySqlCopy.isConnected) querySqlCopy.textContent = "Copy SQL";
+      }, 1400);
+    }
+
+    function dashboardQueryEntries() {
+      const seen = new Set();
+      return traceEntries().flatMap((trace, traceIndex) => {
+        const dedupeKey = `${trace.query_hash || trace.id || traceIndex}:${trace.as_of || "latest"}`;
+        if (!trace.sql || seen.has(dedupeKey)) return [];
+        seen.add(dedupeKey);
+        return [{
+          key: String(trace.id || dedupeKey),
+          trace,
+          traceIndex,
+        }];
+      });
+    }
+
+    function dashboardQueryLabel(entry, index) {
+      const columns = resultColumns(entry.trace).map((column) => column.name);
+      const fieldLabel = columns.length
+        ? `${columns.slice(0, 3).join(", ")}${columns.length > 3 ? "…" : ""}`
+        : `Query ${index + 1}`;
+      const rows = Array.isArray(entry.trace.rows) ? entry.trace.rows.length : 0;
+      const returned = Math.max(rows, Number(entry.trace.row_count) || 0);
+      return `${index + 1}. ${fieldLabel} · ${returned}${entry.trace.truncated ? "+" : ""} row${returned === 1 ? "" : "s"}`;
+    }
+
+    function populateQuerySource(entries, selectedKey = "") {
+      querySource.replaceChildren(...entries.map((entry, index) => {
+        const option = document.createElement("option");
+        option.value = entry.key;
+        option.textContent = dashboardQueryLabel(entry, index);
+        return option;
+      }));
+      if (selectedKey && entries.some((entry) => entry.key === selectedKey)) {
+        querySource.value = selectedKey;
+      }
+    }
+
+    function syncQueryBrowser() {
+      const entries = dashboardQueryEntries();
+      queryCount.textContent = String(entries.length);
+      queryBrowser.disabled = entries.length === 0;
+      queryBrowser.title = entries.length
+        ? `Browse ${entries.length} dashboard query result${entries.length === 1 ? "" : "s"}`
+        : "Dashboard query results are still loading";
+      if (queryContext?.kind === "dashboard") {
+        populateQuerySource(entries, queryContext.key);
+      }
+    }
+
+    function openDashboardQuery(key = "") {
+      const entries = dashboardQueryEntries();
+      if (!entries.length) return;
+      const index = Math.max(0, entries.findIndex((entry) => entry.key === key));
+      const entry = entries[index] || entries[0];
+      const trace = entry.trace;
+      const columns = resultColumns(trace).map((column) => column.name);
+      queryContext = {
+        kind: "dashboard",
+        key: entry.key,
+        sql: String(trace.sql || "").trim(),
+        as_of: trace.as_of || activeAsOf || null,
+        origin: "artifact-lens",
+        query_hash: trace.query_hash || null,
+        engine: trace.engine || null,
+        title: columns.length
+          ? columns.slice(0, 3).join(" · ")
+          : `Dashboard query ${index + 1}`,
+      };
+      setQuerySqlVisible(false);
+      populateQuerySource(entries, entry.key);
+      querySourcePicker.hidden = false;
+      queryRefresh.disabled = !queryContext.sql;
+      renderQueryResult({ ...trace, captured: true });
+      openQueryDrawer();
     }
 
     function resultColumns(result) {
@@ -1504,10 +2154,13 @@
       queryTableWrap.hidden = !rows.length;
       queryEmpty.hidden = Boolean(rows.length);
       const returned = rows.length;
+      const reported = Math.max(returned, Number(queryResult.row_count) || 0);
       const shown = visible.length;
       const capped = queryResult.truncated ? "+" : "";
       queryRowStatus.textContent = rows.length
-        ? `Showing ${shown} of ${returned}${capped} returned rows`
+        ? queryResult.captured && reported > returned
+          ? `Showing ${shown} of ${returned} captured rows · query returned ${reported}${capped}`
+          : `Showing ${shown} of ${returned}${capped} returned rows`
         : "Query completed · 0 rows";
       queryMore.hidden = shown >= returned;
       queryMore.textContent = `Show ${Math.min(RESULT_BATCH_SIZE, returned - shown)} more`;
@@ -1521,13 +2174,20 @@
       queryVisibleRows = RESULT_BATCH_SIZE;
       const columns = resultColumns(result);
       const rows = Array.isArray(result.rows) ? result.rows : [];
+      const context = queryContext || {};
       const provenance = currentInspection?.provenance || {};
-      const rowLabel = `${rows.length}${result.truncated ? "+" : ""} row${rows.length === 1 ? "" : "s"}`;
-      queryDrawerTitle.textContent = currentInspection?.selection?.label
+      const semanticLabel = currentInspection?.semantic_object?.meaning?.label;
+      const reported = Math.max(rows.length, Number(result.row_count) || 0);
+      const rowLabel = result.captured && reported > rows.length
+        ? `${rows.length} captured of ${reported}${result.truncated ? "+" : ""} rows`
+        : `${rows.length}${result.truncated ? "+" : ""} row${rows.length === 1 ? "" : "s"}`;
+      queryDrawerTitle.textContent = context.title
+        || semanticLabel
+        || currentInspection?.selection?.label
         || provenance.query_hash
-        || "Traced query";
+        || "Warehouse evidence";
       queryDrawerMeta.textContent = [
-        result.engine || provenance.engine || "read-only",
+        result.engine || context.engine || provenance.engine || "read-only",
         rowLabel,
         `${columns.length} column${columns.length === 1 ? "" : "s"}`,
         Number.isFinite(Number(result.elapsed_ms)) ? `${Number(result.elapsed_ms)} ms` : "",
@@ -1535,15 +2195,36 @@
       ].filter(Boolean).join(" · ");
       queryDrawerLoading.hidden = true;
       queryDrawerError.hidden = true;
-      queryAnalyze.hidden = !currentInspection?.calliope_enabled;
+      queryAnalyze.hidden = !(
+        context.sql
+        && (dashboard.calliope_enabled || currentInspection?.calliope_enabled)
+      );
       queryAnalyze.disabled = false;
-      queryAnalyze.textContent = "Analyze with Calliope";
+      queryAnalyze.textContent = "Ask Calliope";
       renderQueryRows();
     }
 
-    async function runInspectionQuery(button = null) {
+    function activateInspectionQuery() {
       const provenance = currentInspection?.provenance || {};
-      const sql = String(provenance.sql || "").trim();
+      queryContext = {
+        kind: "inspection",
+        sql: String(provenance.sql || "").trim(),
+        as_of: provenance.as_of || activeAsOf || null,
+        origin: currentInspection?.semantic_object ? "semantic-lens" : "artifact-lens",
+        query_hash: provenance.query_hash || null,
+        engine: provenance.engine || null,
+        title: currentInspection?.semantic_object?.meaning?.label
+          || currentInspection?.selection?.label
+          || "Warehouse evidence",
+      };
+      setQuerySqlVisible(false);
+      querySourcePicker.hidden = true;
+      return queryContext;
+    }
+
+    async function runInspectionQuery(button = null) {
+      const context = button || !queryContext ? activateInspectionQuery() : queryContext;
+      const sql = String(context?.sql || "").trim();
       if (!sql || queryRunning) return;
       queryRunning = true;
       root.querySelectorAll(".query-run").forEach((node) => {
@@ -1551,9 +2232,9 @@
         node.textContent = "Running…";
       });
       queryRefresh.disabled = true;
-      queryDrawerTitle.textContent = currentInspection?.selection?.label || "Traced query";
-      queryDrawerMeta.textContent = provenance.as_of
-        ? `Preparing retained snapshot · ${formatPoint(provenance.as_of)}`
+      queryDrawerTitle.textContent = context.title || "Warehouse evidence";
+      queryDrawerMeta.textContent = context.as_of
+        ? `Preparing retained snapshot · ${formatPoint(context.as_of)}`
         : "Preparing latest governed result";
       queryDrawerLoading.hidden = false;
       queryDrawerError.hidden = true;
@@ -1571,7 +2252,8 @@
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
               sql,
-              as_of: provenance.as_of || activeAsOf || null,
+              as_of: context.as_of || null,
+              origin: context.origin || "artifact-lens",
             }),
           },
         );
@@ -1591,7 +2273,9 @@
         queryRefresh.disabled = false;
         root.querySelectorAll(".query-run").forEach((node) => {
           node.disabled = false;
-          node.textContent = "Run query";
+          node.textContent = currentInspection?.semantic_object
+            ? "Open recreated result"
+            : "Run query";
         });
         if (button?.isConnected) button.focus();
         positionQueryDrawer();
@@ -1613,7 +2297,156 @@
         </div>`;
     }
 
+    function formatSemanticValue(value, display = {}, unit = "") {
+      if (value === null || value === undefined || value === "") return "—";
+      let rendered = value;
+      if (typeof value === "number") {
+        const decimals = Number(display.decimals);
+        rendered = new Intl.NumberFormat(undefined, {
+          maximumFractionDigits: Number.isInteger(decimals)
+            ? Math.max(0, Math.min(decimals, 12))
+            : 2,
+          minimumFractionDigits: Number.isInteger(decimals)
+            ? Math.max(0, Math.min(decimals, 12))
+            : 0,
+        }).format(value);
+      } else {
+        rendered = boundedText(value, 240);
+      }
+      const prefix = boundedText(display.prefix, 16);
+      const suffix = boundedText(display.suffix, 24);
+      const unitSuffix = unit && !prefix && !suffix ? ` ${boundedText(unit, 40)}` : "";
+      return `${prefix}${rendered}${suffix}${unitSuffix}`;
+    }
+
+    function renderSemanticInspection(data) {
+      const semanticObject = data.semantic_object || {};
+      const meaning = semanticObject.meaning || {};
+      const display = semanticObject.display || {};
+      const replay = data.replay || {};
+      const provenance = data.provenance || {};
+      const comparison = data.comparison;
+      const renderedValue = (
+        replay.rendered_value
+        ?? data.binding?.value
+        ?? data.selection?.text
+      );
+      const replayStatuses = {
+        verified: {
+          label: "Verified",
+          title: "Matches the dashboard",
+          copy: "The warehouse independently recreated the value shown on this surface.",
+        },
+        recreated: {
+          label: "Recreated",
+          title: "Reproduced from warehouse data",
+          copy: "The evaluator ran successfully; the dashboard did not expose a comparable raw value.",
+        },
+        mismatch: {
+          label: "Changed",
+          title: "The values do not currently agree",
+          copy: "The rendered value and a fresh warehouse recreation differ. Filters, timing, or client-side logic may have changed.",
+        },
+        error: {
+          label: "Unavailable",
+          title: "Could not recreate this value",
+          copy: replay.error || "The saved evaluator could not be run.",
+        },
+      };
+      const replayState = replayStatuses[replay.status] || replayStatuses.recreated;
+      const contextEntries = Object.entries(semanticObject.context || {});
+      const context = contextEntries.length
+        ? `<div class="semantic-context">
+            <span>Dashboard context</span>
+            <div>${contextEntries.map(([key, value]) => (
+              `<i><b>${escapeHtml(String(key).replaceAll("_", " "))}</b>${escapeHtml(formatValue(value))}</i>`
+            )).join("")}</div>
+          </div>`
+        : "";
+      const formula = meaning.formula
+        ? `<div class="semantic-definition">
+            <span>How to read it</span>
+            <p>${escapeHtml(meaning.formula)}</p>
+          </div>`
+        : "";
+      const replayCard = `
+        <div class="semantic-replay ${escapeHtml(replay.status || "recreated")}">
+          <span>${escapeHtml(replayState.label)}</span>
+          <strong>${escapeHtml(replayState.title)}</strong>
+          <div>
+            <i>
+              <small>On dashboard</small>
+              <b>${escapeHtml(formatSemanticValue(renderedValue, display, meaning.unit))}</b>
+            </i>
+            <em>↔</em>
+            <i>
+              <small>From warehouse</small>
+              <b>${escapeHtml(formatSemanticValue(replay.value, display, meaning.unit))}</b>
+            </i>
+          </div>
+          <p>${escapeHtml(replayState.copy)}</p>
+        </div>`;
+      const comparisonCard = comparison
+        ? `<div class="evidence-card comparison-card">
+            <span>Then → now</span>
+            <div class="compare-values">
+              <strong>${escapeHtml(formatSemanticValue(comparison.current, display, meaning.unit))}</strong>
+              <i>→</i>
+              <strong>${escapeHtml(formatSemanticValue(comparison.latest, display, meaning.unit))}</strong>
+            </div>
+            <small>${escapeHtml(formatPoint(comparison.as_of))}${comparison.delta ? ` · ${escapeHtml(formatDelta(comparison.delta))}` : ""}</small>
+          </div>`
+        : "";
+      const sources = (data.sources || []).length
+        ? data.sources.map(sourceCard).join("")
+        : "";
+      const technical = provenance.sql
+        ? `<details class="evidence-card query-card technical-card">
+            <summary>
+              <span>Technical evidence</span>
+              <strong>Reproducible warehouse definition</strong>
+              <small>${escapeHtml(provenance.engine || "read-only")} · ${(provenance.tables || []).length} source${(provenance.tables || []).length === 1 ? "" : "s"} · definition ${escapeHtml(semanticObject.definition_hash || "")}</small>
+            </summary>
+            <pre>${escapeHtml(provenance.sql)}</pre>
+          </details>`
+        : "";
+      const related = (data.related_artifacts || []).length
+        ? `<div class="related">
+            <span>Also built from this evidence</span>
+            <div>${data.related_artifacts.map((artifact) => (
+              `<a href="/d/${encodeURIComponent(artifact.slug)}" target="_blank" rel="noopener">${escapeHtml(artifact.name)}</a>`
+            )).join("")}</div>
+          </div>`
+        : "";
+      traceResult.innerHTML = `
+        <div class="semantic-heading">
+          <span class="confidence semantic">Named business object</span>
+          <strong>${escapeHtml(meaning.label || semanticObject.id || "Business value")}</strong>
+          ${meaning.description ? `<p>${escapeHtml(meaning.description)}</p>` : ""}
+        </div>
+        ${context}
+        ${formula}
+        <div class="evidence-stack">
+          ${replayCard}
+          ${comparisonCard}
+          ${sources}
+          ${technical}
+        </div>
+        ${related}
+        <div class="trace-actions">
+          ${provenance.sql ? '<button type="button" class="query-run">Open recreated result</button>' : ""}
+          ${data.calliope_enabled ? '<button type="button" class="calliope-investigate">Ask Calliope</button>' : ""}
+        </div>`;
+      traceResult.hidden = false;
+      window.requestAnimationFrame(constrainLens);
+      scheduleCandidateHighlights();
+    }
+
     function renderInspection(data) {
+      if (data.semantic_object) {
+        renderSemanticInspection(data);
+        return;
+      }
       const provenance = data.provenance || {};
       const binding = data.binding || {};
       const selection = data.selection || {};
@@ -1679,7 +2512,6 @@
         </div>
         ${related}
         <div class="trace-actions">
-          <span class="trace-reselect">Click another highlighted object to replace this trace.</span>
           ${provenance.sql ? '<button type="button" class="query-run">Run query</button>' : ""}
           ${data.calliope_enabled ? '<button type="button" class="calliope-investigate">Ask Calliope</button>' : ""}
         </div>`;
@@ -1707,7 +2539,7 @@
         }));
       });
       return {
-        query_hash: currentInspection?.provenance?.query_hash || null,
+        query_hash: queryContext?.query_hash || currentInspection?.provenance?.query_hash || null,
         columns,
         rows,
         preview_rows: rows.length,
@@ -1720,25 +2552,76 @@
       };
     }
 
+    function dashboardQueryInspection() {
+      const title = queryContext?.title || "Dashboard query result";
+      const width = Math.max(1, window.innerWidth);
+      const height = Math.max(1, window.innerHeight);
+      return {
+        artifact: {
+          slug: dashboard.slug,
+          version: dashboard.version,
+          name: document.title || dashboard.slug,
+        },
+        selection: {
+          type: "artifact_element",
+          label: title,
+          selector: "body",
+          tag: "body",
+          text: "Dashboard query result",
+          bounds: { x: 0, y: 0, width, height },
+          viewport: {
+            width,
+            height,
+            scroll_x: window.scrollX,
+            scroll_y: window.scrollY,
+            document_width: Math.max(width, document.documentElement.scrollWidth),
+            document_height: Math.max(height, document.documentElement.scrollHeight),
+          },
+        },
+        binding: {
+          kind: "query",
+          confidence: "exact",
+          label: title,
+          context: {
+            query_hash: queryContext?.query_hash || null,
+            as_of: queryContext?.as_of || activeAsOf || null,
+            location_search: window.location.search,
+          },
+        },
+        provenance: {
+          confidence: "exact",
+          sql: String(queryContext?.sql || "").trim(),
+          query_hash: queryContext?.query_hash || null,
+          engine: queryContext?.engine || queryResult?.engine || null,
+          as_of: queryContext?.as_of || activeAsOf || null,
+          source: "dashboard runtime query trace",
+        },
+        sources: [],
+      };
+    }
+
     async function launchCalliope(button, analyzeResult = false) {
-      if (!currentInspection) return;
       const preview = analyzeResult ? queryResultPreview() : null;
       if (analyzeResult && !preview) return;
-      const idleLabel = analyzeResult ? "Analyze with Calliope" : "Ask Calliope";
+      const baseInspection = analyzeResult && queryContext?.kind === "dashboard"
+        ? dashboardQueryInspection()
+        : currentInspection;
+      if (!baseInspection) return;
+      const idleLabel = "Ask Calliope";
       button.disabled = true;
       button.textContent = "Opening new session…";
       const pending = window.open("about:blank", "_blank");
       try {
         const inspection = analyzeResult
-          ? { ...currentInspection, query_result: preview }
-          : currentInspection;
+          ? { ...baseInspection, query_result: preview }
+          : baseInspection;
         const data = await fetchJson("/api/calliope/investigations", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             slug: dashboard.slug,
-            version: currentInspection.artifact?.version || dashboard.version,
-            target: currentInspection.selection,
+            version: baseInspection.artifact?.version || dashboard.version,
+            target: baseInspection.selection,
             inspection,
             mode: analyzeResult ? "query_result" : "selection",
           }),
@@ -1769,13 +2652,22 @@
       return launchCalliope(button, true);
     }
 
-    trigger.addEventListener("click", () => setOpen(shell.dataset.open !== "true"));
+    trigger.addEventListener("click", (event) => {
+      if (performance.now() < suppressTriggerClickUntil) {
+        event.preventDefault();
+        return;
+      }
+      setOpen(shell.dataset.open !== "true");
+    });
     close.addEventListener("click", () => {
       setOpen(false);
       trigger.focus();
     });
     tabs.forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view, true)));
-    pick.addEventListener("click", startPicker);
+    queryBrowser.addEventListener("click", () => {
+      openDashboardQuery(queryContext?.kind === "dashboard" ? queryContext.key : "");
+    });
+    querySource.addEventListener("change", () => openDashboardQuery(querySource.value));
     scrubber.addEventListener("input", () => {
       if (!timeline) return;
       const point = timeline.points[Number(scrubber.value)];
@@ -1799,6 +2691,14 @@
       if (handoff) askCalliope(handoff);
     });
     queryDrawer.addEventListener("click", (event) => {
+      if (event.target.closest(".query-sql-toggle")) {
+        setQuerySqlVisible(querySqlToggle.getAttribute("aria-pressed") !== "true");
+        return;
+      }
+      if (event.target.closest(".query-sql-copy")) {
+        copyQuerySql();
+        return;
+      }
       const analyze = event.target.closest(".query-analyze");
       if (analyze) {
         analyzeQueryWithCalliope(analyze);
@@ -1826,10 +2726,12 @@
       event.preventDefault();
       cell.classList.toggle("expanded");
     });
-    panelHeader.addEventListener("pointerdown", beginLensDrag);
-    panelHeader.addEventListener("pointermove", moveLens);
-    panelHeader.addEventListener("pointerup", endLensDrag);
-    panelHeader.addEventListener("pointercancel", endLensDrag);
+    [panelHeader, trigger].forEach((handle) => {
+      handle.addEventListener("pointerdown", beginLensDrag);
+      handle.addEventListener("pointermove", moveLens);
+      handle.addEventListener("pointerup", endLensDrag);
+      handle.addEventListener("pointercancel", endLensDrag);
+    });
     panelHeader.addEventListener("dblclick", (event) => {
       if (event.target.closest("button,a,input,select,textarea")) return;
       event.preventDefault();
@@ -1852,15 +2754,25 @@
     window.addEventListener("resize", () => {
       if (pickedElement) positionOutline(pickedElement, true);
       constrainLens();
+      window.requestAnimationFrame(constrainLens);
       scheduleCandidateHighlights();
     });
     window.addEventListener("rvbbit:query-trace", () => {
+      syncQueryBrowser();
       if (shell.dataset.view === "trace") {
         const count = traceEntries().length;
-        pick.title = count ? `${count} dashboard quer${count === 1 ? "y" : "ies"} traced` : "";
+        pickStatus.title = count ? `${count} dashboard quer${count === 1 ? "y" : "ies"} traced` : "";
         scheduleCandidateHighlights();
       }
     });
+    window.addEventListener("rvbbit:semantic-map-ready", () => {
+      const count = semanticEntries().length;
+      pickStatus.title = count
+        ? `${count} named business object${count === 1 ? "" : "s"}`
+        : pickStatus.title;
+      scheduleCandidateHighlights();
+    });
+    window.addEventListener("rvbbit:semantic-object", scheduleCandidateHighlights);
     const candidateObserver = new MutationObserver(() => scheduleCandidateHighlights());
     candidateObserver.observe(document.body, {
       childList: true,
@@ -1872,10 +2784,19 @@
       restoreLensPosition();
       constrainLens();
     };
-    stylesheet.addEventListener("load", initializePosition, { once: true });
-    window.requestAnimationFrame(() => window.requestAnimationFrame(initializePosition));
+    revealLensWhenReady = () => {
+      if (!stylesheetReady || stylesheetFailed || !lensReady || !host.isConnected) return;
+      host.style.removeProperty("visibility");
+      host.removeAttribute("aria-hidden");
+      initializePosition();
+      window.requestAnimationFrame(initializePosition);
+    };
     if (sessionGet(openKey) === "1") setOpen(true);
+    syncQueryBrowser();
+    pollSemanticEnrichment();
     restoreScroll();
+    lensReady = true;
+    revealLensWhenReady();
   }
 
   if (document.readyState === "loading") {

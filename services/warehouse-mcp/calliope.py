@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import ipaddress
 import json
 import math
@@ -1174,14 +1175,42 @@ def _artifact_version_document(
     slug: str,
     version: int,
     html: str,
-    artifact_shim: Callable[[str], str],
+    artifact_shim: Callable[..., str],
     embedded: bool,
+    manifest: dict[str, Any] | None = None,
 ) -> str:
     """Build one immutable version for either the stage or a full-size tab."""
+    if not embedded:
+        try:
+            shim_signature = inspect.signature(artifact_shim)
+            shim_positional = [
+                parameter
+                for parameter in shim_signature.parameters.values()
+                if parameter.kind
+                in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            shim_has_varargs = any(
+                parameter.kind == inspect.Parameter.VAR_POSITIONAL
+                for parameter in shim_signature.parameters.values()
+            )
+        except (TypeError, ValueError):
+            shim_positional = [None, None, None]
+            shim_has_varargs = False
+
+        if shim_has_varargs or len(shim_positional) >= 3:
+            direct_bridge = artifact_shim(slug, version, manifest)
+        elif len(shim_positional) == 2:
+            direct_bridge = artifact_shim(slug, version)
+        else:
+            # Preserve compatibility with embedders that supplied the original
+            # one-argument shim callback before version-aware manifests existed.
+            direct_bridge = artifact_shim(slug)
+    else:
+        direct_bridge = ""
     bridge = (
         _FAVICON_LINK + _sandbox_bridge_shim(slug)
         if embedded
-        else artifact_shim(slug)
+        else direct_bridge
     )
     version_context = (
         "<script>window.RVBBIT_DASHBOARD=Object.assign({},"
@@ -1799,7 +1828,7 @@ def _compact_surface_context(
             "target": payload.get("selection") if row.get("kind") == "selection" else None,
             "evidence": (
                 _bounded_investigation_packet(payload.get("inspection"))
-                if row.get("kind") == "selection" and payload.get("inspection")
+                if payload.get("inspection")
                 else None
             ),
             "created_at": _now_iso(row.get("created_at")),
@@ -3828,6 +3857,8 @@ def _bounded_investigation_packet(value: Any) -> dict[str, Any]:
             "related_artifacts",
             "comparison",
             "dependency_count",
+            "semantic_object",
+            "replay",
         )
         if value.get(key) is not None
     }
@@ -3843,6 +3874,59 @@ def _bounded_investigation_packet(value: Any) -> dict[str, Any]:
         packet["sources"] = list(packet.get("sources") or [])[:8]
         packet["related_artifacts"] = list(packet.get("related_artifacts") or [])[:6]
     return packet
+
+
+def _investigation_query_surface(
+    packet: dict[str, Any],
+    slug: str,
+    version: int,
+    label: str,
+    parent_surface_id: str,
+) -> dict[str, Any] | None:
+    """Project a Lens handoff as the same query surface Hermes tool calls create."""
+    query_result = packet.get("query_result")
+    provenance = packet.get("provenance")
+    if not isinstance(query_result, dict) or not isinstance(provenance, dict):
+        return None
+    sql = str(provenance.get("sql") or "").strip()
+    if not sql:
+        return None
+    query_hash = str(
+        query_result.get("query_hash")
+        or provenance.get("query_hash")
+        or hashlib.sha256(sql.encode("utf-8")).hexdigest()[:20]
+    )[:120]
+    tool_identity = re.sub(r"[^a-zA-Z0-9_.:-]", "", query_hash)[:80]
+    if not tool_identity:
+        tool_identity = hashlib.sha256(sql.encode("utf-8")).hexdigest()[:20]
+    args = {
+        "sql": sql,
+        "as_of": provenance.get("as_of") or query_result.get("as_of_applied"),
+        "origin": "artifact_lens",
+        "query_hash": query_hash,
+    }
+    surface = _query_surface(
+        query_result,
+        args,
+        f"artifact-lens-query:{slug}:v{version}:{tool_identity}",
+        title_hint=label,
+    )
+    if not surface:
+        return None
+    surface.update({
+        "tool_name": "artifact_lens_query_result",
+        "tool_call_id": f"artifact-lens-query:{slug}:v{version}:{tool_identity}",
+        "parent_surface_id": parent_surface_id,
+        "artifact_slug": slug,
+        "artifact_version": version,
+    })
+    surface["payload"]["query_hash"] = query_hash
+    surface["payload"]["inspection"] = packet
+    surface["source"].update({
+        "origin": "artifact_lens",
+        "query_hash": query_hash,
+    })
+    return surface
 
 
 def register_calliope_routes(
@@ -4475,10 +4559,20 @@ def register_calliope_routes(
                 404,
             )
 
+        semantic_meaning = (
+            (packet.get("semantic_object") or {}).get("meaning") or {}
+            if isinstance(packet.get("semantic_object"), dict)
+            else {}
+        )
         label = re.sub(
             r"\s+",
             " ",
-            str(target.get("label") or target.get("text") or "Selected target"),
+            str(
+                semantic_meaning.get("label")
+                or target.get("label")
+                or target.get("text")
+                or "Selected target"
+            ),
         ).strip()[:180] or "Selected target"
         session_row = None
         try:
@@ -4509,16 +4603,17 @@ def register_calliope_routes(
                             f"[Artifact Lens result] Analyze the executed query behind "
                             f"“{label}” in {artifact['name']}."
                             if analyze_result
-                            else f"[Artifact Lens] Investigate “{label}” in {artifact['name']}."
+                            else f"[Artifact Lens] Investigate the business object "
+                            f"“{label}” in {artifact['name']}."
                         ),
                         (
                             "The exact SQL, execution metadata, and a bounded result preview "
                             "are pinned with the artifact. I can profile the rows, explain "
                             "patterns, or rerun the governed query through RVBBIT for deeper work."
                             if analyze_result
-                            else "The exact artifact version, rendered target, query provenance, "
-                            "and available source evidence are pinned in the scratchpad. Ask me "
-                            "what you want to explain, compare, or change."
+                            else "The exact artifact version, business meaning, dashboard context, "
+                            "recreated value, and supporting technical evidence are pinned in the "
+                            "scratchpad. Ask me what you want to explain, compare, monitor, or change."
                         ),
                     ),
                 )
@@ -4577,11 +4672,31 @@ def register_calliope_routes(
             if not selection_surfaces:
                 raise RuntimeError("could not pin the selected target")
             selection_surface = selection_surfaces[0]
+            selected_surface = selection_surface
+            if analyze_result:
+                query_projection = _investigation_query_surface(
+                    packet,
+                    slug,
+                    version,
+                    label,
+                    selection_surface["id"],
+                )
+                if not query_projection:
+                    raise RuntimeError("could not project the query result")
+                query_surfaces = _insert_surfaces(
+                    conn_factory,
+                    session_id,
+                    turn_id,
+                    [query_projection],
+                )
+                if not query_surfaces:
+                    raise RuntimeError("could not pin the query result")
+                selected_surface = query_surfaces[0]
             with conn_factory() as conn:
                 conn.execute(
                     "UPDATE rvbbit.calliope_turns SET selected_surface_id=%s::uuid "
                     "WHERE id=%s::uuid",
-                    (selection_surface["id"], turn_id),
+                    (selected_surface["id"], turn_id),
                 )
                 conn.execute(
                     "UPDATE rvbbit.calliope_sessions SET updated_at=now() WHERE id=%s::uuid",
@@ -4623,14 +4738,16 @@ def register_calliope_routes(
             )
         else:
             prompt = (
-                f"Explain why “{label}” has this value. Start with the pinned deterministic "
-                "evidence, then use the RVBBIT MCP tools only where more proof is needed."
+                f"Explain why “{label}” has this value. Start with its pinned business meaning, "
+                "dashboard filter context, and independent warehouse recreation. Treat SQL as "
+                "supporting technical evidence, then use RVBBIT MCP tools only where more proof "
+                "is needed."
             )
         url = (
             "/calliope?"
             + urlencode({
                 "session": str(session_row["id"]),
-                "surface": selection_surface["id"],
+                "surface": selected_surface["id"],
                 "prompt": prompt,
             })
         )
@@ -4639,7 +4756,7 @@ def register_calliope_routes(
                 "new_session": True,
                 "mode": "query_result" if analyze_result else "selection",
                 "session": _session_json(session_row),
-                "surface": selection_surface,
+                "surface": selected_surface,
                 "url": url,
             },
             201,
@@ -4928,7 +5045,7 @@ def register_calliope_routes(
             return HTMLResponse("<h1>404</h1>", status_code=404)
         with conn_factory() as conn:
             row = conn.execute(
-                "SELECT v.html FROM rvbbit.dashboards d "
+                "SELECT v.html,v.manifest FROM rvbbit.dashboards d "
                 "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
                 "WHERE d.slug=%s AND v.version=%s",
                 (slug, version),
@@ -4943,6 +5060,7 @@ def register_calliope_routes(
                 row["html"] or "",
                 artifact_shim,
                 embedded,
+                row.get("manifest") or {},
             ),
             headers={
                 "cache-control": "no-store",

@@ -995,6 +995,21 @@ def test_artifact_lens_investigation_packet_is_bounded_and_launches_exact_contex
             "api_token": "do-not-store",
         },
         "sources": [{"table": "marts.sales"}],
+        "semantic_object": {
+            "id": "regional_revenue",
+            "meaning": {
+                "label": "Regional revenue",
+                "description": "Recognized revenue for the selected region.",
+            },
+            "context": {"region": "Northeast"},
+            "definition_hash": "definition-123",
+        },
+        "replay": {
+            "status": "verified",
+            "value": 125000,
+            "rendered_value": "$125,000",
+            "matches_rendered": True,
+        },
         "query_result": {
             "query_hash": "abc123",
             "row_count": 1500,
@@ -1014,6 +1029,10 @@ def test_artifact_lens_investigation_packet_is_bounded_and_launches_exact_contex
     assert packet["artifact"]["version"] == 7
     assert packet["binding"]["confidence"] == "exact"
     assert packet["provenance"]["sql"].startswith("select region")
+    assert packet["semantic_object"]["meaning"]["label"] == "Regional revenue"
+    assert packet["semantic_object"]["context"] == {"region": "Northeast"}
+    assert packet["replay"]["status"] == "verified"
+    assert packet["replay"]["value"] == 125000
     assert "api_token" not in packet["provenance"]
     assert "selection" not in packet
     assert "ignored" not in packet
@@ -1026,6 +1045,20 @@ def test_artifact_lens_investigation_packet_is_bounded_and_launches_exact_contex
     assert all("api_token" not in row for row in result["rows"])
     assert len(result["rows"][0]["notes"]) == 800
 
+    surface = calliope._investigation_query_surface(
+        packet,
+        "regional-revenue",
+        7,
+        "Regional revenue query",
+        "bac8e23c-ccb7-41de-891b-ac3cd6ee955d",
+    )
+    assert surface["kind"] == "query"
+    assert surface["tool_name"] == "artifact_lens_query_result"
+    assert surface["parent_surface_id"] == "bac8e23c-ccb7-41de-891b-ac3cd6ee955d"
+    assert surface["source"]["sql"] == "select region, revenue from marts.sales"
+    assert surface["payload"]["row_count"] == 1500
+    assert surface["payload"]["inspection"]["query_result"]["preview_rows"] == 12
+
     script = (_HERE / "calliope" / "calliope.js").read_text(encoding="utf-8")
     source = (_HERE / "calliope.py").read_text(encoding="utf-8")
     assert 'launch.get("session")' in script
@@ -1037,6 +1070,7 @@ def test_artifact_lens_investigation_packet_is_bounded_and_launches_exact_contex
     assert '"new_session": True' in source
     assert "An Artifact Lens question is a branch, never an append" in source
     assert '"mode": "query_result" if analyze_result else "selection"' in source
+    assert "artifact_lens_query_result" in source
     assert "[Artifact Lens result]" in source
     assert "Analyze the pinned result set" in source
 
@@ -1089,6 +1123,61 @@ def test_selected_investigation_surface_sends_deterministic_evidence_to_hermes()
     instructions = calliope._instructions(compact, selected)
     assert "select revenue from marts.sales" in instructions
     assert '"confidence":"exact"' in instructions
+
+
+def test_selected_query_surface_sends_result_preview_to_hermes():
+    surface_id = "f8db6009-66e0-4471-85b9-06e704334431"
+
+    class Result:
+        @staticmethod
+        def fetchall():
+            return [{
+                "id": surface_id,
+                "kind": "query",
+                "title": "Regional revenue query",
+                "artifact_slug": "regional-revenue",
+                "artifact_version": 7,
+                "lineage_key": "query:regional-revenue:abc",
+                "payload": {
+                    "columns": [{"name": "region", "type": "text"}],
+                    "rows": [{"region": "North"}],
+                    "inspection": {
+                        "provenance": {
+                            "sql": "select region from marts.sales",
+                            "query_hash": "abc123",
+                        },
+                        "query_result": {
+                            "query_hash": "abc123",
+                            "columns": [{"name": "region", "type": "text"}],
+                            "rows": [{"region": "North"}],
+                            "row_count": 1,
+                        },
+                    },
+                },
+                "source": {"sql": "select region from marts.sales"},
+                "created_at": "2026-07-30T20:00:00Z",
+            }]
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(_statement, _params):
+            return Result()
+
+    compact, selected = calliope._compact_surface_context(
+        lambda: Connection(),
+        "45f8a9da-5ff7-488f-b377-211c6e94aff0",
+        surface_id,
+    )
+    assert selected["kind"] == "query"
+    assert selected["sql"] == "select region from marts.sales"
+    assert selected["evidence"]["query_result"]["rows"] == [{"region": "North"}]
+    assert "abc123" in calliope._instructions(compact, selected)
 
 
 def test_assistant_prose_strips_inline_image_payloads():
