@@ -17,6 +17,9 @@ class _Result:
     def fetchall(self):
         return self.rows
 
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
 
 class _Connection:
     def __init__(self, rows):
@@ -149,3 +152,162 @@ def test_federated_search_keeps_working_when_one_corpus_is_unavailable(monkeypat
     assert [item["id"] for item in result["items"]] == ["artifact:one:v1", "data:one"]
     assert result["searched"][0]["status"] == "unavailable"
     assert "Company memory is temporarily unavailable" in result["warnings"][0]
+
+
+def test_open_document_rechecks_brain_acl_with_the_signed_owner(monkeypatch):
+    calls = []
+
+    def get_doc(doc_id, owner):
+        calls.append((doc_id, owner))
+        return {
+            "doc_id": doc_id,
+            "title": "Pipeline review",
+            "source": "Fireflies",
+            "folder_path": "/meetings",
+            "mime": "text/markdown",
+            "body": "# Pipeline\nCoverage improved.",
+        }
+
+    monkeypatch.setattr(server, "tool_brain_get_doc", get_doc)
+    result = server._calliope_evidence_open(
+        {
+            "kind": "document",
+            "title": "Search excerpt",
+            "provenance": {"resolver": "brain_search", "doc_id": "77"},
+        },
+        "pilot_pg_role",
+        "pilot@example.com",
+    )
+
+    assert calls == [(77, "pilot@example.com")]
+    assert result["mode"] == "document"
+    assert result["document"]["body"].startswith("# Pipeline")
+
+
+def test_open_column_generates_quoted_sql_and_uses_the_execution_subject(monkeypatch):
+    calls = []
+    records = []
+
+    def run_sql(sql, as_of=None, limit=None):
+        calls.append((sql, as_of, limit, server._SESSION_SUB.get()))
+        return {
+            "columns": [{"name": 'Net "Value', "type": "numeric"}],
+            "rows": [[42]],
+            "row_count": 1,
+            "truncated": False,
+            "engine": "postgres",
+            "elapsed_ms": 2,
+        }
+
+    monkeypatch.setattr(server, "tool_run_sql", run_sql)
+    monkeypatch.setattr(server, "_record", lambda *args, **kwargs: records.append((args, kwargs)))
+    result = server._calliope_evidence_open(
+        {
+            "kind": "db_column",
+            "title": 'public.Order Facts.Net "Value',
+            "provenance": {
+                "resolver": "search_data_weighted",
+                "schema": "public",
+                "relation": "Order Facts",
+                "column": 'Net "Value',
+            },
+        },
+        "pilot_pg_role",
+        "pilot@example.com",
+    )
+
+    expected = 'SELECT "Net ""Value" FROM "public"."Order Facts" LIMIT 500'
+    assert calls == [(expected, None, 500, "pilot_pg_role")]
+    assert result["mode"] == "query"
+    assert result["query"]["sql"] == expected
+    assert result["query"]["default_view"] == "table"
+    assert records[0][1]["caller_override"] == "pilot@example.com"
+
+
+def test_open_cube_uses_its_materialized_relation_as_a_table(monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        server,
+        "_calliope_evidence_query",
+        lambda sql, subject, owner, **kwargs: opened.append((sql, subject, owner, kwargs)) or {
+            "columns": [{"name": "map_name"}, {"name": "brushes"}],
+            "rows": [["e1m1", 486]],
+            "row_count": 1,
+        },
+    )
+    result = server._calliope_evidence_open(
+        {
+            "kind": "cube",
+            "title": "cubes.engine_perf",
+            "provenance": {
+                "resolver": "search_data_weighted",
+                "schema": "untrusted_override",
+                "relation": "engine_perf",
+            },
+        },
+        "pilot_pg_role",
+        "pilot@example.com",
+    )
+
+    expected = 'SELECT * FROM "cubes"."engine_perf" LIMIT 500'
+    assert opened[0][:3] == (expected, "pilot_pg_role", "pilot@example.com")
+    assert result["mode"] == "query"
+    assert result["kind"] == "cube"
+    assert result["query"]["sql"] == expected
+    assert result["query"]["default_view"] == "table"
+
+
+def test_open_dashboard_object_reloads_exact_enriched_manifest(monkeypatch):
+    rows = [{
+        "id": 7,
+        "name": "Pipeline Health",
+        "app_kind": "dashboard",
+        "manifest": {"semantic_map": {"objects": []}},
+        "semantic_status": "ready",
+        "semantic_map": {
+            "objects": [{
+                "id": "weighted_pipeline",
+                "kind": "chart",
+                "meaning": {"label": "Weighted pipeline", "description": "Pipeline by stage."},
+                "evaluator": {"sql": "select stage, amount from sales.pipeline"},
+            }],
+        },
+        "verification": {"verified_count": 1},
+        "prompt_version": "test",
+        "model": "test",
+        "semantic_updated_at": "2026-08-01T12:00:00Z",
+    }]
+    opened = []
+    monkeypatch.setattr(server, "_conn", lambda: _Connection(rows))
+    monkeypatch.setattr(
+        server,
+        "_calliope_evidence_query",
+        lambda sql, subject, owner, **kwargs: opened.append((sql, subject, owner, kwargs)) or {
+            "columns": [{"name": "stage"}, {"name": "amount"}],
+            "rows": [["Won", 10]],
+            "row_count": 1,
+        },
+    )
+    result = server._calliope_evidence_open(
+        {
+            "kind": "dashboard-object",
+            "title": "Weighted pipeline · Pipeline Health",
+            "provenance": {
+                "resolver": "artifact_semantic_map",
+                "slug": "pipeline-health",
+                "version": 3,
+                "object_id": "weighted_pipeline",
+            },
+        },
+        "pilot_pg_role",
+        "pilot@example.com",
+    )
+
+    assert opened[0][:3] == (
+        "select stage, amount from sales.pipeline",
+        "pilot_pg_role",
+        "pilot@example.com",
+    )
+    assert result["mode"] == "query"
+    assert result["query"]["default_view"] == "chart"
+    assert result["external_url"] == "/d/pipeline-health/versions/3"

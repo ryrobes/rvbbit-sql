@@ -55,6 +55,12 @@
     markupAttach: $("#markup-attach"),
     markupUndo: $("#markup-undo"),
     markupClear: $("#markup-clear"),
+    viewerDialog: $("#surface-viewer-dialog"),
+    viewerTitle: $("#surface-viewer-title"),
+    viewerMeta: $("#surface-viewer-meta"),
+    viewerExternal: $("#surface-viewer-external"),
+    viewerContent: $("#surface-viewer-content"),
+    viewerClose: $("#surface-viewer-close"),
     mobileSessions: $("#mobile-sessions-toggle"),
     mobileChat: $("#mobile-chat-toggle"),
     mobileShade: $("#mobile-shade"),
@@ -89,6 +95,44 @@
     toast: $("#toast"),
   };
   const EVIDENCE_SET_HANDLE = "@search-set";
+  const SQL_KEYWORDS = new Set(`
+    all alter analyze and any array as asc asof at between both by case cast check
+    collate column constraint create cross current_date current_time current_timestamp
+    database default delete desc distinct do else end except exists false fetch filter
+    first following for foreign from full function generated group grouping having if
+    ilike in index inner insert intersect interval into is join lateral leading left
+    like limit materialized natural not null nulls offset on only or order outer over
+    partition preceding primary qualify range recursive references returning right row
+    rows schema select set table tablesample then ties to trailing true truncate union
+    unique unbounded update using values view when where window with within
+    bigint bigserial bit boolean bytea char date decimal double enum float int integer
+    json jsonb numeric real serial smallint text time timestamp uuid varchar
+  `.trim().split(/\s+/));
+  const SQL_TOKEN = /(?:--[^\r\n]*|\/\*[\s\S]*?\*\/|'(?:''|\\[\s\S]|[^'\\])*'|"(?:""|\\[\s\S]|[^"\\])*"|`(?:``|\\[\s\S]|[^`\\])*`|\{\{[\s\S]*?\}\}|\$\d+|:[a-zA-Z_][a-zA-Z0-9_]*|\b(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?\b|\b[a-zA-Z_][a-zA-Z0-9_$]*\b|#>>|->>|::|#>|->|<>|!=|<=|>=|=>|:=|\|\||&&|[-+*/%=<>&|^~])/gi;
+  const SQL_FORMAT_TOKEN = new RegExp(`${SQL_TOKEN.source}|[(),.;]|\\s+|.`, "gis");
+  const SQL_FORMAT_PHRASES = [
+    [["left", "outer", "join"], "join"],
+    [["right", "outer", "join"], "join"],
+    [["full", "outer", "join"], "join"],
+    [["left", "join"], "join"],
+    [["right", "join"], "join"],
+    [["full", "join"], "join"],
+    [["inner", "join"], "join"],
+    [["cross", "join"], "join"],
+    [["natural", "join"], "join"],
+    [["group", "by"], "group"],
+    [["order", "by"], "order"],
+    [["partition", "by"], "partition"],
+    [["union", "all"], "setop"],
+  ];
+  const SQL_MAJOR_CLAUSES = new Map([
+    ["with", "with"], ["select", "select"], ["from", "from"],
+    ["where", "where"], ["having", "having"], ["qualify", "qualify"],
+    ["window", "window"], ["limit", "limit"], ["offset", "offset"],
+    ["fetch", "fetch"], ["returning", "returning"], ["values", "values"],
+    ["set", "set"], ["union", "setop"], ["intersect", "setop"],
+    ["except", "setop"], ["join", "join"],
+  ]);
 
   const state = {
     sessions: [],
@@ -101,6 +145,9 @@
     attachments: [],
     evidenceSelections: [],
     evidenceSearching: false,
+    viewerRequestId: 0,
+    viewerSurface: null,
+    viewerGrid: { filter: "", sortIndex: null, direction: 1 },
     busy: false,
     stageAtLiveEdge: true,
     chatAtLiveEdge: true,
@@ -159,6 +206,184 @@
       .replaceAll("'", "&#039;");
   }
 
+  function highlightSql(value) {
+    const sql = String(value ?? "");
+    let cursor = 0;
+    let highlighted = "";
+    SQL_TOKEN.lastIndex = 0;
+    for (const match of sql.matchAll(SQL_TOKEN)) {
+      const token = match[0];
+      const index = match.index ?? cursor;
+      highlighted += escapeHtml(sql.slice(cursor, index));
+      const lower = token.toLowerCase();
+      let kind = "";
+      if (token.startsWith("--") || token.startsWith("/*")) kind = "comment";
+      else if (token.startsWith("'")) kind = "string";
+      else if (token.startsWith('"') || token.startsWith("`")) kind = "identifier";
+      else if (token.startsWith("{{") || /^\$\d+$/.test(token) || /^:[a-z_]/i.test(token)) kind = "parameter";
+      else if (/^(?:\d|\.\d)/.test(token)) kind = "number";
+      else if (SQL_KEYWORDS.has(lower)) kind = "keyword";
+      else if (/^[a-z_]/i.test(token) && /^\s*\(/.test(sql.slice(index + token.length))) kind = "function";
+      else if (/^[#:\-+*/%=<>&|^~]/.test(token)) kind = "operator";
+      highlighted += kind
+        ? `<span class="sql-${kind}">${escapeHtml(token)}</span>`
+        : escapeHtml(token);
+      cursor = index + token.length;
+    }
+    return highlighted + escapeHtml(sql.slice(cursor));
+  }
+
+  function formatSql(value) {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "";
+    try {
+      SQL_FORMAT_TOKEN.lastIndex = 0;
+      const tokens = [...raw.matchAll(SQL_FORMAT_TOKEN)]
+        .map((match) => match[0])
+        .filter((token) => !/^\s+$/.test(token));
+      const lines = [];
+      const parens = [];
+      const listClauses = new Set(["with", "select", "from", "group", "order", "returning", "values", "set"]);
+      let line = "";
+      let lineIndent = 0;
+      let pendingIndent = null;
+      let indent = 0;
+      let clause = "";
+      let clauseDepth = 0;
+      let previous = "";
+
+      const flush = () => {
+        const text = line.trim();
+        if (text) lines.push(`${"  ".repeat(Math.max(0, lineIndent))}${text}`);
+        line = "";
+      };
+      const append = (text, spaced = true, level = null) => {
+        if (!line) {
+          lineIndent = level ?? pendingIndent ?? indent;
+          pendingIndent = null;
+        }
+        if (spaced && line && !line.endsWith(" ")) line += " ";
+        line += text;
+      };
+      const phraseAt = (index) => SQL_FORMAT_PHRASES.find(([words]) => (
+        words.every((word, offset) => tokens[index + offset]?.toLowerCase() === word)
+      ));
+
+      for (let index = 0; index < tokens.length; index += 1) {
+        const token = tokens[index];
+        const lower = token.toLowerCase();
+        const phrase = /^[a-z_]/i.test(token) ? phraseAt(index) : null;
+        const phraseWords = phrase?.[0] || [lower];
+        const phraseKind = phrase?.[1] || SQL_MAJOR_CLAUSES.get(lower);
+        if (phraseKind) {
+          flush();
+          append(phraseWords.map((word) => word.toUpperCase()).join(" "), false, indent);
+          clause = phraseKind;
+          clauseDepth = parens.length;
+          index += phraseWords.length - 1;
+          previous = phraseWords.at(-1);
+          continue;
+        }
+        if (lower === "on" && parens.length === clauseDepth) {
+          flush();
+          append("ON", false, indent + 1);
+          clause = "on";
+          previous = lower;
+          continue;
+        }
+        if (["and", "or"].includes(lower) && ["where", "having", "qualify", "on"].includes(clause)) {
+          flush();
+          append(lower.toUpperCase(), false, indent + 1);
+          previous = lower;
+          continue;
+        }
+        if (["when", "else"].includes(lower)) {
+          flush();
+          append(lower.toUpperCase(), false, indent + 1);
+          previous = lower;
+          continue;
+        }
+        if (lower === "end") {
+          flush();
+          append("END", false, indent);
+          previous = lower;
+          continue;
+        }
+        if (token === "(") {
+          const next = tokens[index + 1]?.toLowerCase();
+          const block = ["select", "with", "where"].includes(next);
+          const functionLike = /^[a-z_][a-z0-9_$]*$/i.test(previous)
+            && (!SQL_KEYWORDS.has(previous) || ["cast", "extract", "overlay", "position", "substring", "trim"].includes(previous));
+          if (!line) append("(", false);
+          else line = `${line.trimEnd()}${functionLike ? "" : " "}(`;
+          const closeIndent = lineIndent;
+          parens.push({ block, indent, closeIndent, clause, clauseDepth });
+          if (block) {
+            flush();
+            indent = closeIndent + 1;
+            clause = "";
+            clauseDepth = parens.length;
+          }
+          previous = "(";
+          continue;
+        }
+        if (token === ")") {
+          const frame = parens.pop();
+          if (frame?.block) {
+            flush();
+            indent = frame.indent;
+            clause = frame.clause;
+            clauseDepth = frame.clauseDepth;
+            append(")", false, frame.closeIndent);
+          } else if (!line) append(")", false, indent);
+          else line = `${line.trimEnd()})`;
+          previous = ")";
+          continue;
+        }
+        if (token === ",") {
+          line = `${line.trimEnd()},`;
+          if (listClauses.has(clause) && parens.length === clauseDepth) {
+            flush();
+            pendingIndent = indent + 1;
+          }
+          previous = token;
+          continue;
+        }
+        if (token === ".") {
+          line = `${line.trimEnd()}.`;
+          previous = token;
+          continue;
+        }
+        if (token === ";") {
+          line = `${line.trimEnd()};`;
+          flush();
+          previous = token;
+          continue;
+        }
+        if (token === "::") {
+          line = `${line.trimEnd()}::`;
+          previous = token;
+          continue;
+        }
+        if (/^(?:--|\/\*)/.test(token)) {
+          if (line) append(token);
+          else append(token, false, indent);
+          flush();
+          previous = "comment";
+          continue;
+        }
+        const rendered = SQL_KEYWORDS.has(lower) ? lower.toUpperCase() : token;
+        const noSpace = !line || previous === "(" || previous === "." || previous === "::";
+        append(rendered, !noSpace);
+        previous = lower;
+      }
+      flush();
+      return lines.join("\n") || raw;
+    } catch {
+      return raw;
+    }
+  }
+
   function safeMarkdown(value) {
     let text = escapeHtml(value || "");
     const blocks = [];
@@ -183,6 +408,131 @@
       text = text.replace(`@@BLOCK${index}@@`, block);
     });
     return text || "<p></p>";
+  }
+
+  function richInline(value) {
+    return escapeHtml(value || "")
+      .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+      .replace(/\[([^\]]+)\]\(((?:https?:\/\/)[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  }
+
+  function documentText(value, mime) {
+    const body = String(value || "").replaceAll("\r\n", "\n");
+    if (!/html/i.test(mime || "")) return body;
+    try {
+      const doc = new DOMParser().parseFromString(body, "text/html");
+      doc.querySelectorAll("script,style,noscript,template").forEach((node) => node.remove());
+      return doc.body?.innerText || doc.body?.textContent || body;
+    } catch {
+      return body;
+    }
+  }
+
+  function markdownCells(line) {
+    const value = String(line || "").trim().replace(/^\|/, "").replace(/\|$/, "");
+    return value.split(/(?<!\\)\|/).map((cell) => cell.trim().replaceAll("\\|", "|"));
+  }
+
+  function richDocumentHtml(value, mime = "text/plain") {
+    const text = documentText(value, mime).trim();
+    if (!text) return '<div class="viewer-empty">This document has no readable body.</div>';
+    if (/json/i.test(mime) || /^[\[{]/.test(text)) {
+      try {
+        return `<pre class="document-code"><code>${escapeHtml(JSON.stringify(JSON.parse(text), null, 2))}</code></pre>`;
+      } catch {
+        // It looked like JSON but is still more useful as formatted text.
+      }
+    }
+    const lines = text.split("\n");
+    const html = [];
+    const blockStart = (index) => {
+      const line = lines[index] || "";
+      const next = lines[index + 1] || "";
+      return !line.trim()
+        || /^\s*```/.test(line)
+        || /^\s{0,3}#{1,6}\s+/.test(line)
+        || /^\s*>/.test(line)
+        || /^\s*(?:[-+*]|\d+[.)])\s+/.test(line)
+        || /^\s*(?:---+|___+|\*\*\*+)\s*$/.test(line)
+        || (line.includes("|") && /^\s*\|?\s*:?-{3,}/.test(next));
+    };
+    for (let index = 0; index < lines.length;) {
+      const line = lines[index];
+      if (!line.trim()) {
+        index += 1;
+        continue;
+      }
+      const fence = line.match(/^\s*```\s*([^\s`]*)/);
+      if (fence) {
+        const code = [];
+        index += 1;
+        while (index < lines.length && !/^\s*```/.test(lines[index])) {
+          code.push(lines[index]);
+          index += 1;
+        }
+        if (index < lines.length) index += 1;
+        html.push(`<pre class="document-code"><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+        continue;
+      }
+      const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+      if (heading) {
+        const level = Math.min(6, heading[1].length + 1);
+        html.push(`<h${level}>${richInline(heading[2])}</h${level}>`);
+        index += 1;
+        continue;
+      }
+      if (/^\s*(?:---+|___+|\*\*\*+)\s*$/.test(line)) {
+        html.push("<hr>");
+        index += 1;
+        continue;
+      }
+      if (line.includes("|") && /^\s*\|?\s*:?-{3,}/.test(lines[index + 1] || "")) {
+        const headers = markdownCells(line);
+        const rows = [];
+        index += 2;
+        while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+          rows.push(markdownCells(lines[index]));
+          index += 1;
+        }
+        html.push(`<div class="document-table-wrap"><table><thead><tr>${headers.map((cell) => `<th>${richInline(cell)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${headers.map((_header, cellIndex) => `<td>${richInline(row[cellIndex] || "")}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`);
+        continue;
+      }
+      if (/^\s*>/.test(line)) {
+        const quote = [];
+        while (index < lines.length && /^\s*>/.test(lines[index])) {
+          quote.push(lines[index].replace(/^\s*>\s?/, ""));
+          index += 1;
+        }
+        html.push(`<blockquote>${quote.map(richInline).join("<br>")}</blockquote>`);
+        continue;
+      }
+      const list = line.match(/^\s*((?:[-+*])|(?:\d+[.)]))\s+(.+)/);
+      if (list) {
+        const ordered = /^\d/.test(list[1]);
+        const tag = ordered ? "ol" : "ul";
+        const items = [];
+        const pattern = ordered ? /^\s*\d+[.)]\s+(.+)/ : /^\s*[-+*]\s+(.+)/;
+        while (index < lines.length) {
+          const match = lines[index].match(pattern);
+          if (!match) break;
+          items.push(`<li>${richInline(match[1])}</li>`);
+          index += 1;
+        }
+        html.push(`<${tag}>${items.join("")}</${tag}>`);
+        continue;
+      }
+      const paragraph = [line.trim()];
+      index += 1;
+      while (index < lines.length && !blockStart(index)) {
+        paragraph.push(lines[index].trim());
+        index += 1;
+      }
+      html.push(`<p>${paragraph.map(richInline).join("<br>")}</p>`);
+    }
+    return html.join("");
   }
 
   function relativeTime(value) {
@@ -1501,20 +1851,74 @@
     </svg></div>`;
   }
 
-  function renderQuery(surface) {
+  function queryRowHtml(row, columns) {
+    return `<tr>${columns.map((column, index) => {
+      const value = formatValue(rowValue(row, column, index));
+      return `<td title="${escapeHtml(value)}">${escapeHtml(value)}</td>`;
+    }).join("")}</tr>`;
+  }
+
+  function compareQueryValues(left, right) {
+    const leftNumber = usableChartNumber(left) ? Number(left) : null;
+    const rightNumber = usableChartNumber(right) ? Number(right) : null;
+    if (leftNumber != null && rightNumber != null) return leftNumber - rightNumber;
+    return formatValue(left).localeCompare(formatValue(right), undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
+  }
+
+  function viewerQueryRows(surface) {
     const columns = queryColumns(surface);
+    const filter = state.viewerGrid.filter.trim().toLocaleLowerCase();
+    let rows = queryRows(surface).filter((row) => !filter || columns.some((column, index) =>
+      formatValue(rowValue(row, column, index)).toLocaleLowerCase().includes(filter)
+    ));
+    const sortIndex = state.viewerGrid.sortIndex;
+    if (Number.isInteger(sortIndex) && columns[sortIndex]) {
+      rows = [...rows].sort((left, right) => state.viewerGrid.direction * compareQueryValues(
+        rowValue(left, columns[sortIndex], sortIndex),
+        rowValue(right, columns[sortIndex], sortIndex),
+      ));
+    }
+    return rows;
+  }
+
+  function renderQueryTable(surface, expanded = false) {
+    const columns = queryColumns(surface);
+    const rows = expanded ? viewerQueryRows(surface) : queryRows(surface);
+    const toolbar = expanded ? `<div class="query-grid-toolbar">
+      <label><span>Filter rows</span><input type="search" data-query-filter value="${escapeHtml(state.viewerGrid.filter)}" placeholder="Search this result set…"></label>
+      <span data-query-grid-count>Showing ${rows.length.toLocaleString()} of ${queryRows(surface).length.toLocaleString()}</span>
+    </div>` : "";
+    const headers = columns.map((column, index) => {
+      if (!expanded) return `<th>${escapeHtml(column)}</th>`;
+      const active = state.viewerGrid.sortIndex === index;
+      const direction = active ? (state.viewerGrid.direction > 0 ? "ascending" : "descending") : "none";
+      const glyph = active ? (state.viewerGrid.direction > 0 ? "↑" : "↓") : "↕";
+      return `<th aria-sort="${direction}"><button type="button" data-query-sort="${index}">${escapeHtml(column)} <i>${glyph}</i></button></th>`;
+    }).join("");
+    return `${toolbar}<div class="table-wrap"><table class="data-table"><thead><tr>${headers}</tr></thead><tbody>${
+      rows.length
+        ? rows.map((row) => queryRowHtml(row, columns)).join("")
+        : `<tr><td class="query-grid-empty" colspan="${Math.max(1, columns.length)}">No rows match this filter.</td></tr>`
+    }</tbody></table></div>`;
+  }
+
+  function renderQuery(surface, options = {}) {
     const rows = queryRows(surface);
     const chart = classifyChart(surface);
-    const defaultView = chart && !isMetadataQuery(surface) ? "chart" : "table";
-    const table = `<div class="table-wrap"><table class="data-table"><thead><tr>${
-      columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")
-    }</tr></thead><tbody>${
-      rows.map((row) => `<tr>${columns.map((column, index) => {
-        const value = formatValue(rowValue(row, column, index));
-        return `<td title="${escapeHtml(value)}">${escapeHtml(value)}</td>`;
-      }).join("")}</tr>`).join("")
-    }</tbody></table></div>`;
+    const sql = String(surface.source?.sql || "").trim();
+    const renderedSql = sql ? highlightSql(formatSql(sql)) : "SQL unavailable";
+    const requestedView = options.defaultView || surface.payload?.default_view;
+    const defaultView = requestedView === "chart" && chart
+      ? "chart"
+      : requestedView === "table"
+        ? "table"
+        : chart && !isMetadataQuery(surface) ? "chart" : "table";
+    const table = renderQueryTable(surface, Boolean(options.expanded));
     return `
+      <div class="query-root ${options.expanded ? "expanded" : ""}" data-query-root>
       <div class="surface-tabs">
         ${chart ? `<button type="button" class="${defaultView === "chart" ? "active" : ""}" data-view="chart">Chart</button>` : ""}
         <button type="button" class="${defaultView === "table" ? "active" : ""}" data-view="table">Table</button>
@@ -1528,7 +1932,8 @@
       </div>
       ${chart ? `<div class="query-view" data-query-view="chart" ${defaultView === "chart" ? "" : "hidden"}>${renderChart(surface, chart)}</div>` : ""}
       <div class="query-view" data-query-view="table" ${defaultView === "table" ? "" : "hidden"}>${table}</div>
-      <div class="query-view" data-query-view="sql" hidden><pre class="sql-view">${escapeHtml(surface.source?.sql || "SQL unavailable")}</pre></div>`;
+      <div class="query-view" data-query-view="sql" hidden><pre class="sql-view sql-code"><code>${renderedSql}</code></pre></div>
+      </div>`;
   }
 
   function renderMetric(surface) {
@@ -2299,6 +2704,17 @@
     })[group] || "Evidence";
   }
 
+  function evidenceCanOpen(item) {
+    if (!state.config?.evidence_open) return false;
+    if (item.kind === "document") return item.provenance?.resolver === "brain_search";
+    if (["cube", "db_table", "db_column"].includes(item.kind)) {
+      return item.provenance?.resolver === "search_data_weighted";
+    }
+    return item.kind === "dashboard-object"
+      && item.provenance?.resolver === "artifact_semantic_map"
+      && Boolean(item.provenance?.replayable);
+  }
+
   function renderEvidenceCard(surface, item) {
     const selected = Boolean(selectedEvidence(surface.id, item.id));
     const entities = (item.entities || []).slice(0, 3).map((entity) =>
@@ -2309,7 +2725,7 @@
       item.occurred_at ? relativeTime(item.occurred_at) : null,
     ].filter(Boolean).join(" · ");
     return `<article class="evidence-card ${selected ? "selected" : ""}"
-      data-evidence-id="${escapeHtml(item.id)}" role="button" tabindex="0"
+      data-evidence-id="${escapeHtml(item.id)}" data-evidence-kind="${escapeHtml(item.kind)}" role="button" tabindex="0"
       aria-pressed="${selected ? "true" : "false"}">
       <header>
         <span class="evidence-type">${escapeHtml(meta || "evidence")}</span>
@@ -2322,7 +2738,10 @@
       ${entities ? `<div class="evidence-entities">${entities}</div>` : ""}
       <footer>
         <span title="${escapeHtml(item.source || "")}">${escapeHtml(item.source || evidenceGroupLabel(item.group))}</span>
-        ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener">Open ↗</a>` : ""}
+        <div class="evidence-actions">
+          ${evidenceCanOpen(item) ? `<button type="button" data-open-evidence="${escapeHtml(item.id)}" aria-label="Open ${escapeHtml(item.title)}">Open</button>` : ""}
+          ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener">${item.kind === "dashboard-object" ? "Dashboard" : "Open"} ↗</a>` : ""}
+        </div>
       </footer>
     </article>`;
   }
@@ -2366,6 +2785,157 @@
       ${warnings}
       ${groups || `<div class="evidence-empty"><strong>No useful evidence surfaced.</strong><span>Try a business term, project name, ticket, metric, or dashboard value.</span></div>`}
     </div>`;
+  }
+
+  function setViewerHeader(title, meta, externalUrl = null) {
+    els.viewerTitle.textContent = title || "Open surface";
+    els.viewerMeta.textContent = meta || "Expanded surface";
+    if (externalUrl) {
+      els.viewerExternal.href = externalUrl;
+      els.viewerExternal.hidden = false;
+    } else {
+      els.viewerExternal.removeAttribute("href");
+      els.viewerExternal.hidden = true;
+    }
+  }
+
+  function showSurfaceViewer(title, meta, externalUrl = null) {
+    setViewerHeader(title, meta, externalUrl);
+    if (!els.viewerDialog.open) els.viewerDialog.showModal();
+  }
+
+  function closeSurfaceViewer() {
+    state.viewerRequestId += 1;
+    state.viewerSurface = null;
+    state.viewerGrid = { filter: "", sortIndex: null, direction: 1 };
+    if (els.viewerDialog.open) els.viewerDialog.close();
+  }
+
+  function renderViewerQuery(data) {
+    const query = data.query || {};
+    const surface = {
+      id: `viewer:${state.viewerRequestId}`,
+      kind: "query",
+      title: data.title || "Query result",
+      payload: query,
+      source: { sql: query.sql || "" },
+    };
+    state.viewerSurface = surface;
+    state.viewerGrid = { filter: "", sortIndex: null, direction: 1 };
+    const meaning = data.detail?.meaning;
+    const meaningBlock = meaning && (meaning.description || meaning.formula)
+      ? `<aside class="viewer-meaning">
+          ${meaning.description ? `<p>${escapeHtml(meaning.description)}</p>` : ""}
+          ${meaning.formula ? `<code>${escapeHtml(meaning.formula)}</code>` : ""}
+        </aside>`
+      : "";
+    els.viewerContent.innerHTML = `<div class="viewer-query">${meaningBlock}${renderQuery(surface, {
+      expanded: true,
+      defaultView: query.default_view,
+    })}</div>`;
+  }
+
+  function renderViewerDocument(data) {
+    state.viewerSurface = null;
+    const document = data.document || {};
+    const details = [
+      document.author ? `<span><b>Author</b>${escapeHtml(document.author)}</span>` : "",
+      document.folder ? `<span><b>Folder</b>${escapeHtml(document.folder)}</span>` : "",
+      document.occurred_at ? `<span><b>Occurred</b>${escapeHtml(document.occurred_at)}</span>` : "",
+      document.ingested_at ? `<span><b>Indexed</b>${escapeHtml(document.ingested_at)}</span>` : "",
+      document.mime ? `<span><b>Format</b>${escapeHtml(document.mime)}</span>` : "",
+    ].filter(Boolean).join("");
+    const rawMeta = document.raw_meta && Object.keys(document.raw_meta).length
+      ? `<details class="viewer-document-meta"><summary>Source metadata</summary><pre>${escapeHtml(JSON.stringify(document.raw_meta, null, 2))}</pre></details>`
+      : "";
+    els.viewerContent.innerHTML = `<article class="viewer-document">
+      ${details ? `<div class="viewer-document-facts">${details}</div>` : ""}
+      ${document.truncated ? '<div class="viewer-notice">This very large document is truncated in the reader.</div>' : ""}
+      <div class="viewer-document-body">${richDocumentHtml(document.body, document.mime)}</div>
+      ${rawMeta}
+    </article>`;
+  }
+
+  function renderViewerDetail(data) {
+    state.viewerSurface = null;
+    const meaning = data.detail?.meaning || data.detail || {};
+    els.viewerContent.innerHTML = `<article class="viewer-document viewer-detail">
+      ${meaning.description ? `<p>${escapeHtml(meaning.description)}</p>` : ""}
+      ${meaning.formula ? `<h3>Definition</h3><pre class="document-code"><code>${escapeHtml(meaning.formula)}</code></pre>` : ""}
+      ${!meaning.description && !meaning.formula ? '<div class="viewer-empty">This item has no inline preview. Open its source to continue.</div>' : ""}
+    </article>`;
+  }
+
+  async function openEvidenceViewer(surfaceId, evidenceId) {
+    const surface = state.surfaces.find((candidate) => candidate.id === surfaceId);
+    const item = (surface?.payload?.items || []).find((candidate) => candidate.id === evidenceId);
+    if (!surface || !item || !state.current) return;
+    const requestId = ++state.viewerRequestId;
+    showSurfaceViewer(item.title, `${item.subtype || item.kind} · ${item.source || evidenceGroupLabel(item.group)}`);
+    els.viewerContent.innerHTML = '<div class="viewer-loading"><i></i><strong>Opening saved evidence…</strong><span>Rechecking access and resolving the live source</span></div>';
+    try {
+      const data = await api(`/api/calliope/sessions/${state.current.id}/evidence-open`, {
+        method: "POST",
+        body: JSON.stringify({ surface_id: surfaceId, evidence_id: evidenceId }),
+      });
+      if (requestId !== state.viewerRequestId || !els.viewerDialog.open) return;
+      setViewerHeader(data.title || item.title, `${data.kind || item.kind} · ${data.source || item.source || "Company evidence"}`, data.external_url);
+      if (data.mode === "document") renderViewerDocument(data);
+      else if (data.mode === "query") renderViewerQuery(data);
+      else renderViewerDetail(data);
+    } catch (error) {
+      if (requestId !== state.viewerRequestId || !els.viewerDialog.open) return;
+      els.viewerContent.innerHTML = `<div class="viewer-error"><strong>Could not open this evidence</strong><span>${escapeHtml(error.message)}</span></div>`;
+    }
+  }
+
+  function openQuerySurface(surfaceId) {
+    const source = state.surfaces.find((surface) => surface.id === surfaceId && surface.kind === "query");
+    if (!source) return;
+    state.viewerRequestId += 1;
+    showSurfaceViewer(source.title, `Query result · ${source.payload?.row_count ?? queryRows(source).length} rows`);
+    renderViewerQuery({
+      title: source.title,
+      kind: "query",
+      source: source.tool_name || "Calliope scratchpad",
+      query: {
+        ...(source.payload || {}),
+        sql: source.source?.sql || "",
+        default_view: classifyChart(source) && !isMetadataQuery(source) ? "chart" : "table",
+      },
+    });
+  }
+
+  function activateQueryView(button) {
+    const root = button.closest("[data-query-root]");
+    if (!root) return;
+    $$(".surface-tabs button", root).forEach((candidate) => candidate.classList.toggle("active", candidate === button));
+    $$('[data-query-view]', root).forEach((view) => {
+      view.hidden = view.dataset.queryView !== button.dataset.view;
+    });
+  }
+
+  function updateViewerGrid() {
+    const surface = state.viewerSurface;
+    const root = $("[data-query-root]", els.viewerContent);
+    if (!surface || !root) return;
+    const columns = queryColumns(surface);
+    const rows = viewerQueryRows(surface);
+    const body = $(".data-table tbody", root);
+    if (body) {
+      body.innerHTML = rows.length
+        ? rows.map((row) => queryRowHtml(row, columns)).join("")
+        : `<tr><td class="query-grid-empty" colspan="${Math.max(1, columns.length)}">No rows match this filter.</td></tr>`;
+    }
+    const count = $("[data-query-grid-count]", root);
+    if (count) count.textContent = `Showing ${rows.length.toLocaleString()} of ${queryRows(surface).length.toLocaleString()}`;
+    $$('[data-query-sort]', root).forEach((button) => {
+      const index = Number(button.dataset.querySort);
+      const active = state.viewerGrid.sortIndex === index;
+      button.closest("th")?.setAttribute("aria-sort", active ? (state.viewerGrid.direction > 0 ? "ascending" : "descending") : "none");
+      const glyph = $("i", button);
+      if (glyph) glyph.textContent = active ? (state.viewerGrid.direction > 0 ? "↑" : "↓") : "↕";
+    });
   }
 
   function surfaceCard(surface) {
@@ -2416,6 +2986,9 @@
             : ""
         }</p></div>
         <div class="surface-tools">
+          ${surface.kind === "query" && !metadata
+            ? `<button type="button" data-open-query-surface="${escapeHtml(surface.id)}" title="Open in the large viewer">Open</button>`
+            : ""}
           ${surface.kind === "image" && surface.payload?.overlay_image_url
             ? `<button type="button" data-toggle-markup="${escapeHtml(surface.id)}" aria-pressed="true" title="Hide or show markup">Marks</button>`
             : ""}
@@ -3597,6 +4170,36 @@
       event.preventDefault();
       closeMarkup();
     });
+    els.viewerClose.addEventListener("click", closeSurfaceViewer);
+    els.viewerDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeSurfaceViewer();
+    });
+    els.viewerDialog.addEventListener("click", (event) => {
+      if (event.target === els.viewerDialog) {
+        closeSurfaceViewer();
+        return;
+      }
+      const tab = event.target.closest("[data-view]");
+      if (tab) {
+        activateQueryView(tab);
+        return;
+      }
+      const sort = event.target.closest("[data-query-sort]");
+      if (!sort || !state.viewerSurface) return;
+      const index = Number(sort.dataset.querySort);
+      if (state.viewerGrid.sortIndex === index) state.viewerGrid.direction *= -1;
+      else {
+        state.viewerGrid.sortIndex = index;
+        state.viewerGrid.direction = 1;
+      }
+      updateViewerGrid();
+    });
+    els.viewerContent.addEventListener("input", (event) => {
+      if (!event.target.matches("[data-query-filter]") || !state.viewerSurface) return;
+      state.viewerGrid.filter = event.target.value;
+      updateViewerGrid();
+    });
     window.addEventListener("keydown", (event) => {
       if (!els.markupDialog.open || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "z") return;
       event.preventDefault();
@@ -3622,8 +4225,21 @@
       state.chatAtLiveEdge = isChatAtLiveEdge();
     }, { passive: true });
     els.stage.addEventListener("click", (event) => {
+      const openEvidence = event.target.closest("[data-open-evidence]");
+      if (openEvidence) {
+        const surfaceId = openEvidence.closest("[data-surface-id]")?.dataset.surfaceId;
+        openEvidenceViewer(surfaceId, openEvidence.dataset.openEvidence);
+        return;
+      }
+      const evidenceSelect = event.target.closest("[data-evidence-select]");
+      if (evidenceSelect) {
+        const card = evidenceSelect.closest(".evidence-card");
+        const surfaceId = card?.closest("[data-surface-id]")?.dataset.surfaceId;
+        toggleEvidenceSelection(surfaceId, card?.dataset.evidenceId);
+        return;
+      }
       const evidenceCard = event.target.closest(".evidence-card");
-      if (evidenceCard && !event.target.closest("a")) {
+      if (evidenceCard && !event.target.closest("a,button")) {
         const surfaceId = evidenceCard.closest("[data-surface-id]")?.dataset.surfaceId;
         toggleEvidenceSelection(surfaceId, evidenceCard.dataset.evidenceId);
         return;
@@ -3649,6 +4265,11 @@
         runEvidenceSearch(surface?.payload?.query).catch((error) => toast(error.message, true));
         return;
       }
+      const openQuery = event.target.closest("[data-open-query-surface]");
+      if (openQuery) {
+        openQuerySurface(openQuery.dataset.openQuerySurface);
+        return;
+      }
       const inspect = event.target.closest("[data-inspect-artifact]");
       if (inspect) {
         startArtifactInspection(inspect.dataset.inspectArtifact);
@@ -3672,9 +4293,7 @@
       }
       const tab = event.target.closest("[data-view]");
       if (tab) {
-        const surface = tab.closest(".surface");
-        $$(".surface-tabs button", surface).forEach((button) => button.classList.toggle("active", button === tab));
-        $$("[data-query-view]", surface).forEach((view) => { view.hidden = view.dataset.queryView !== tab.dataset.view; });
+        activateQueryView(tab);
         return;
       }
       const removeCubeDimension = event.target.closest("[data-cube-remove-field]");
@@ -3723,7 +4342,7 @@
     });
     els.stage.addEventListener("keydown", (event) => {
       const card = event.target.closest(".evidence-card");
-      if (!card || !["Enter", " "].includes(event.key)) return;
+      if (!card || event.target !== card || !["Enter", " "].includes(event.key)) return;
       event.preventDefault();
       const surfaceId = card.closest("[data-surface-id]")?.dataset.surfaceId;
       toggleEvidenceSelection(surfaceId, card.dataset.evidenceId);

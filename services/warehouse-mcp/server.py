@@ -8924,6 +8924,184 @@ def _calliope_evidence_search(query, owner, limit=24):
     }
 
 
+def _calliope_evidence_query(sql, execution_subject, owner, *, origin):
+    """Execute one evidence preview through the same governed SQL path as MCP."""
+    args = {"sql": sql, "limit": 500, "origin": origin}
+    started = time.time()
+    token = _SESSION_SUB.set(execution_subject)
+    try:
+        result = tool_run_sql(sql, limit=500)
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "error": {
+                "code": "EXCEPTION",
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+        }
+    finally:
+        _SESSION_SUB.reset(token)
+    _record(
+        "run_sql",
+        args,
+        result,
+        result.get("error") if isinstance(result, dict) else None,
+        int((time.time() - started) * 1000),
+        caller_override=owner,
+    )
+    return result
+
+
+def _calliope_evidence_open(item, execution_subject, owner):
+    """Rehydrate a persisted evidence handle for the authenticated viewer."""
+    item = item if isinstance(item, dict) else {}
+    kind = str(item.get("kind") or "")
+    provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
+
+    if kind == "document" and provenance.get("resolver") == "brain_search":
+        try:
+            doc_id = int(provenance.get("doc_id"))
+        except (TypeError, ValueError):
+            return {"error": {"code": "INVALID_EVIDENCE", "message": "The document locator is invalid."}}
+        document = tool_brain_get_doc(doc_id, owner)
+        if not isinstance(document, dict) or document.get("error"):
+            return document if isinstance(document, dict) else {
+                "error": {"code": "BRAIN_UNAVAILABLE", "message": "The document could not be loaded."}
+            }
+        return {
+            "mode": "document",
+            "kind": kind,
+            "title": document.get("title") or item.get("title"),
+            "source": document.get("source") or item.get("source"),
+            "document": {
+                "body": document.get("body") or "",
+                "mime": document.get("mime") or "text/plain",
+                "author": document.get("author"),
+                "folder": document.get("folder_path"),
+                "occurred_at": document.get("occurred_at"),
+                "ingested_at": document.get("ingested_at"),
+                "raw_meta": document.get("raw_meta") or {},
+            },
+        }
+
+    if kind in {"cube", "db_table", "db_column"} and provenance.get("resolver") == "search_data_weighted":
+        schema = str(provenance.get("schema") or "").strip()
+        relation = str(provenance.get("relation") or "").strip()
+        column = str(provenance.get("column") or "").strip()
+        if kind == "cube":
+            # Cubes are ordinary materialized relations in the canonical cubes
+            # schema. Do not accept a search-index schema override here.
+            schema = "cubes"
+        if not schema or not relation or not _schema_allowed(schema):
+            return {"error": {"code": "INVALID_EVIDENCE", "message": "The data object is not previewable."}}
+        if kind == "db_column":
+            if not column:
+                return {"error": {"code": "INVALID_EVIDENCE", "message": "The column locator is invalid."}}
+            sql = pgsql.SQL("SELECT {} FROM {} LIMIT 500").format(
+                pgsql.Identifier(column),
+                pgsql.Identifier(schema, relation),
+            ).as_string()
+        else:
+            sql = pgsql.SQL("SELECT * FROM {} LIMIT 500").format(
+                pgsql.Identifier(schema, relation),
+            ).as_string()
+        query = _calliope_evidence_query(
+            sql,
+            execution_subject,
+            owner,
+            origin=f"calliope_evidence_open:{kind}",
+        )
+        if isinstance(query, dict) and query.get("error"):
+            return query
+        query = dict(query or {})
+        query.update({"sql": sql, "default_view": "table"})
+        return {
+            "mode": "query",
+            "kind": kind,
+            "title": item.get("title") or f"{schema}.{relation}",
+            "source": item.get("source") or "Warehouse semantic catalog",
+            "query": query,
+        }
+
+    if kind == "dashboard-object" and provenance.get("resolver") == "artifact_semantic_map":
+        slug = str(provenance.get("slug") or "").strip()
+        object_id = str(provenance.get("object_id") or "").strip()
+        try:
+            version = int(provenance.get("version") or 0)
+        except (TypeError, ValueError):
+            version = 0
+        if not slug or not object_id or version < 1:
+            return {"error": {"code": "INVALID_EVIDENCE", "message": "The dashboard object locator is invalid."}}
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT d.id,d.name,d.app_kind,v.manifest,e.status AS semantic_status,"
+                "e.semantic_map,e.verification,e.prompt_version,e.model,e.updated_at AS semantic_updated_at "
+                "FROM rvbbit.dashboards d "
+                "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id AND v.version=%s "
+                "LEFT JOIN rvbbit.artifact_semantic_enrichments e "
+                "ON e.dashboard_id=d.id AND e.version=v.version "
+                "WHERE d.slug=%s",
+                (version, slug),
+            ).fetchone()
+        if not row:
+            return {"error": {"code": "VERSION_NOT_FOUND", "message": "That artifact version is no longer available."}}
+        manifest = _merge_semantic_overlay(
+            row.get("manifest") or {},
+            {
+                "status": row.get("semantic_status"),
+                "semantic_map": row.get("semantic_map") or {},
+                "verification": row.get("verification") or {},
+                "prompt_version": row.get("prompt_version"),
+                "model": row.get("model"),
+                "updated_at": row.get("semantic_updated_at"),
+            },
+        )
+        semantic_object = _semantic_object_from_manifest(manifest, {"id": object_id})
+        if not semantic_object:
+            return {"error": {"code": "NOT_FOUND", "message": "That semantic object is no longer mapped."}}
+        meaning = semantic_object.get("meaning") or {}
+        sql, resolved_context = _render_semantic_sql(semantic_object, {})
+        external_url = f"/d/{slug}/versions/{version}" if row.get("app_kind") == "dashboard" else f"/apps/{slug}/versions/{version}"
+        if not sql.strip():
+            return {
+                "mode": "detail",
+                "kind": kind,
+                "title": meaning.get("label") or item.get("title"),
+                "source": item.get("source"),
+                "external_url": external_url,
+                "detail": {"meaning": meaning, "replayable": False},
+            }
+        query = _calliope_evidence_query(
+            sql,
+            execution_subject,
+            owner,
+            origin="calliope_evidence_open:dashboard_object",
+        )
+        if isinstance(query, dict) and query.get("error"):
+            return query
+        object_kind = str(semantic_object.get("kind") or item.get("subtype") or "")
+        query = dict(query or {})
+        query.update({
+            "sql": sql,
+            "default_view": "chart" if object_kind in {"chart", "plot", "visualization"} else "table",
+        })
+        return {
+            "mode": "query",
+            "kind": object_kind or kind,
+            "title": meaning.get("label") or item.get("title"),
+            "source": f"{row.get('name') or slug} · semantic map",
+            "external_url": external_url,
+            "query": query,
+            "detail": {"meaning": meaning, "context": resolved_context},
+        }
+
+    return {
+        "error": {
+            "code": "NOT_PREVIEWABLE",
+            "message": "This evidence opens in its native surface instead.",
+        }
+    }
+
+
 def _build_mcp_oauth(public: str):
     """FastMCP with our self-contained OAuth AS (auth.py). The SDK mounts /authorize,
     /token, /register + the .well-known metadata and verifies PKCE; auth.py supplies
@@ -8960,6 +9138,7 @@ def _build_mcp_oauth(public: str):
         _dash_shim,
         cube_pivot=_calliope_cube_pivot,
         evidence_search=_calliope_evidence_search,
+        evidence_open=_calliope_evidence_open,
     ):
         print("Calliope enabled (Hermes-backed living artifact notebook)", file=sys.stderr)
 

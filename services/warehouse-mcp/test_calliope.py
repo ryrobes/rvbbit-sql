@@ -1478,6 +1478,65 @@ def test_evidence_resolver_is_a_native_scratchpad_and_composer_contract():
     assert "CALLIOPE_SELECTED_EVIDENCE_BEGIN" in source
 
 
+def test_evidence_and_query_surfaces_share_a_large_themed_reader():
+    page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    css = (calliope._ASSET_DIR / "calliope.css").read_text(encoding="utf-8")
+    source = (_HERE / "calliope.py").read_text(encoding="utf-8")
+
+    assert 'id="surface-viewer-dialog"' in page
+    assert 'id="surface-viewer-content"' in page
+    assert "data-open-evidence" in script
+    assert "data-open-query-surface" in script
+    assert "/evidence-open`" in script
+    assert "richDocumentHtml" in script
+    assert "data-query-sort" in script
+    assert "data-query-filter" in script
+    assert "function formatSql" in script
+    assert "function highlightSql" in script
+    assert 'class="sql-view sql-code"' in script
+    assert '["cube", "db_table", "db_column"]' in script
+    assert ".surface-viewer-dialog" in css
+    assert ".viewer-document-body" in css
+    assert ".query-root.expanded" in css
+    assert ".sql-code .sql-keyword" in css
+    assert 'kind=\'evidence\'' in source
+    assert "evidence_open is not None" in source
+
+
+def test_opened_evidence_keeps_full_documents_but_bounds_grids():
+    document = calliope._normalize_evidence_open_result(
+        {
+            "mode": "document",
+            "title": "Long operating plan",
+            "document": {
+                "body": "x" * (calliope._MAX_EVIDENCE_DOCUMENT_CHARS + 17),
+                "mime": "text/markdown",
+            },
+        },
+        {"kind": "document", "title": "Plan"},
+    )
+    assert len(document["document"]["body"]) == calliope._MAX_EVIDENCE_DOCUMENT_CHARS
+    assert document["document"]["truncated"] is True
+
+    query = calliope._normalize_evidence_open_result(
+        {
+            "mode": "query",
+            "query": {
+                "columns": [{"name": "id", "type": "int8"}],
+                "rows": [[index] for index in range(calliope._MAX_EVIDENCE_PREVIEW_ROWS + 20)],
+                "row_count": calliope._MAX_EVIDENCE_PREVIEW_ROWS + 20,
+                "sql": "select id from public.events",
+            },
+        },
+        {"kind": "db_table", "title": "public.events"},
+    )
+    assert len(query["query"]["rows"]) == calliope._MAX_EVIDENCE_PREVIEW_ROWS
+    assert query["query"]["truncated"] is True
+    assert query["query"]["columns"] == [{"name": "id", "type": "int8"}]
+    assert query["query"]["sql"] == "select id from public.events"
+
+
 def test_evidence_search_result_is_bounded_deduped_and_url_safe():
     normalized = calliope._normalize_evidence_search_result(
         {

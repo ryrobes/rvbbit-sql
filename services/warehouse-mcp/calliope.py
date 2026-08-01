@@ -141,6 +141,10 @@ _MAX_STYLE_SOURCES = 6
 _MAX_EVIDENCE_REFS = 12
 _MAX_EVIDENCE_RESULTS = 36
 _MAX_EVIDENCE_QUERY_CHARS = 600
+_MAX_EVIDENCE_DOCUMENT_CHARS = 2_000_000
+_MAX_EVIDENCE_PREVIEW_ROWS = 500
+_MAX_EVIDENCE_PREVIEW_COLUMNS = 120
+_MAX_EVIDENCE_CELL_CHARS = 20_000
 _EVIDENCE_SET_HANDLE = "@search-set"
 
 
@@ -1835,6 +1839,98 @@ def _bounded_evidence_json(value: Any, depth: int = 0) -> Any:
                 bounded[name] = normalized
         return bounded
     return str(value)[:600]
+
+
+def _bounded_preview_value(value: Any, depth: int = 0) -> Any:
+    """Keep an opened result useful without allowing one cell to own the response."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return value[:_MAX_EVIDENCE_CELL_CHARS]
+    if depth >= 4:
+        return str(value)[:_MAX_EVIDENCE_CELL_CHARS]
+    if isinstance(value, (list, tuple)):
+        return [_bounded_preview_value(item, depth + 1) for item in value[:200]]
+    if isinstance(value, dict):
+        return {
+            str(key)[:240]: _bounded_preview_value(item, depth + 1)
+            for key, item in list(value.items())[:200]
+        }
+    return str(value)[:_MAX_EVIDENCE_CELL_CHARS]
+
+
+def _normalize_evidence_open_result(raw: Any, item: dict[str, Any]) -> dict[str, Any]:
+    """Bound a resolver rehydration while preserving full documents and useful grids."""
+    if not isinstance(raw, dict):
+        raise ValueError("the evidence opener returned an invalid response")
+    if isinstance(raw.get("error"), dict):
+        error = raw["error"]
+        return {
+            "error": {
+                "code": re.sub(r"[^A-Z0-9_-]", "_", str(error.get("code") or "OPEN_FAILED").upper())[:80],
+                "message": str(error.get("message") or "This evidence could not be opened.")[:1_200],
+            }
+        }
+    mode = str(raw.get("mode") or "detail").lower()
+    if mode not in {"document", "query", "detail"}:
+        mode = "detail"
+    result = {
+        "mode": mode,
+        "kind": str(raw.get("kind") or item.get("kind") or "evidence")[:80],
+        "title": str(raw.get("title") or item.get("title") or "Evidence")[:400],
+        "source": str(raw.get("source") or item.get("source") or "")[:400],
+    }
+    external_url = _evidence_url(raw.get("external_url") or item.get("url"))
+    if external_url:
+        result["external_url"] = external_url
+    if mode == "document":
+        document = raw.get("document") if isinstance(raw.get("document"), dict) else {}
+        body = str(document.get("body") or "")
+        result["document"] = {
+            "body": body[:_MAX_EVIDENCE_DOCUMENT_CHARS],
+            "truncated": bool(document.get("truncated")) or len(body) > _MAX_EVIDENCE_DOCUMENT_CHARS,
+            "mime": str(document.get("mime") or "text/plain")[:200],
+            "author": str(document.get("author") or "")[:400],
+            "folder": str(document.get("folder") or document.get("folder_path") or "")[:1_000],
+            "occurred_at": str(document.get("occurred_at") or "")[:100],
+            "ingested_at": str(document.get("ingested_at") or "")[:100],
+            "raw_meta": _bounded_preview_value(document.get("raw_meta") or {}),
+        }
+    elif mode == "query":
+        query = raw.get("query") if isinstance(raw.get("query"), dict) else {}
+        columns = []
+        for column in (query.get("columns") or [])[:_MAX_EVIDENCE_PREVIEW_COLUMNS]:
+            if isinstance(column, dict):
+                name = str(column.get("name") or "")[:240]
+                if name:
+                    columns.append({
+                        "name": name,
+                        "type": str(column.get("type") or "")[:120],
+                    })
+            elif str(column).strip():
+                columns.append(str(column)[:240])
+        rows = [
+            _bounded_preview_value(row)
+            for row in (query.get("rows") or [])[:_MAX_EVIDENCE_PREVIEW_ROWS]
+        ]
+        result["query"] = {
+            "columns": columns,
+            "rows": rows,
+            "row_count": max(0, int(query.get("row_count") or len(rows))),
+            "truncated": bool(query.get("truncated")) or len(query.get("rows") or []) > len(rows),
+            "engine": str(query.get("engine") or "")[:120],
+            "elapsed_ms": max(0, int(query.get("elapsed_ms") or 0)),
+            "as_of_applied": str(query.get("as_of_applied") or "")[:100] or None,
+            "sql": str(query.get("sql") or raw.get("sql") or "")[:100_000],
+            "default_view": "chart" if query.get("default_view") == "chart" else "table",
+        }
+        if raw.get("detail"):
+            result["detail"] = _bounded_preview_value(raw.get("detail"))
+    else:
+        result["detail"] = _bounded_preview_value(raw.get("detail") or {})
+    return result
 
 
 def _evidence_url(value: Any) -> str | None:
@@ -4206,6 +4302,7 @@ def register_calliope_routes(
     artifact_shim: Callable[[str], str],
     cube_pivot: Callable[..., Any] | None = None,
     evidence_search: Callable[..., Any] | None = None,
+    evidence_open: Callable[..., Any] | None = None,
 ) -> bool:
     """Register the optional Calliope routes. Returns whether it was enabled."""
     config = CalliopeConfig.from_env()
@@ -4332,6 +4429,7 @@ def register_calliope_routes(
             "hermes": detail,
             "shared_memory": True,
             "evidence_search": evidence_search is not None,
+            "evidence_open": evidence_open is not None,
             "max_image_bytes": config.max_image_bytes,
         })
 
@@ -4873,6 +4971,91 @@ def register_calliope_routes(
             },
             201,
         )
+
+    @mcp.custom_route(
+        "/api/calliope/sessions/{session_id}/evidence-open",
+        methods=["POST"],
+    )
+    async def open_session_evidence(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        session = _session_for_owner(
+            conn_factory,
+            request.path_params["session_id"],
+            owner,
+        )
+        if not session:
+            return json_response({"error": {"code": "NOT_FOUND"}}, 404)
+        if evidence_open is None:
+            return json_response(
+                {
+                    "error": {
+                        "code": "EVIDENCE_OPEN_UNAVAILABLE",
+                        "message": "Evidence previews are not configured on this server.",
+                    }
+                },
+                503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        surface_id = _uuid(body.get("surface_id"))
+        evidence_id = str(body.get("evidence_id") or "").strip()[:240]
+        if not surface_id or not evidence_id or evidence_id == _EVIDENCE_SET_HANDLE:
+            return json_response({"error": {"code": "INVALID_EVIDENCE_HANDLE"}}, 400)
+        with conn_factory() as conn:
+            row = conn.execute(
+                "SELECT payload FROM rvbbit.calliope_surfaces "
+                "WHERE id=%s::uuid AND session_id=%s::uuid AND kind='evidence'",
+                (surface_id, str(session["id"])),
+            ).fetchone()
+        item = next(
+            (
+                candidate
+                for candidate in ((row or {}).get("payload") or {}).get("items") or []
+                if isinstance(candidate, dict) and str(candidate.get("id") or "") == evidence_id
+            ),
+            None,
+        )
+        if not item:
+            return json_response({"error": {"code": "NOT_FOUND"}}, 404)
+        auth_session = auth.read_session_full(request) or {}
+        try:
+            raw_result = await asyncio.to_thread(
+                evidence_open,
+                item,
+                auth_session.get("sub"),
+                owner,
+            )
+            if inspect.isawaitable(raw_result):
+                raw_result = await raw_result
+            result = _normalize_evidence_open_result(raw_result, item)
+        except (TypeError, ValueError) as exc:
+            return json_response(
+                {"error": {"code": "EVIDENCE_OPEN_FAILED", "message": str(exc)[:600]}},
+                400,
+            )
+        except Exception as exc:
+            return json_response(
+                {
+                    "error": {
+                        "code": "EVIDENCE_OPEN_FAILED",
+                        "message": f"{type(exc).__name__}: {exc}"[:600],
+                    }
+                },
+                500,
+            )
+        error = result.get("error")
+        if not error:
+            return json_response(result)
+        code = str(error.get("code") or "")
+        status = 404 if code in {"NOT_FOUND", "NOT_VISIBLE", "VERSION_NOT_FOUND"} else 400
+        if code in {"EVIDENCE_OPEN_UNAVAILABLE", "BRAIN_UNAVAILABLE"}:
+            status = 503
+        return json_response(result, status)
 
     @mcp.custom_route("/api/calliope/sessions", methods=["GET"])
     async def list_sessions(request):
