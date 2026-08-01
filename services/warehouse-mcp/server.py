@@ -7391,15 +7391,19 @@ def _dashboard_inspection(
 _LANDING_CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --void:#100d0b; --panel:#171310; --panel-2:#1c1712;
-  --bone:#e8ddcc; --fog:rgba(232,221,204,.55); --dim:rgba(232,221,204,.32);
+  --void:#100d0b; --panel:#171310; --panel-2:#1c1712; --panel-raised:#1d1813;
+  --bone:#e8ddcc; --bone-bright:#fff7e9; --fog:rgba(232,221,204,.55); --dim:rgba(232,221,204,.32);
   --line:rgba(232,221,204,.13); --line-hot:rgba(245,180,70,.42);
-  --amber:#f5b446;
+  --amber:#f5b446; --amber-soft:rgba(245,180,70,.12);
+  --jade:#68c7b2; --jade-soft:rgba(104,199,178,.10);
   --gallery-rail-bg:color-mix(in oklch,var(--void) 85%,transparent);
   --mono:ui-monospace,"JetBrains Mono",SFMono-Regular,Menlo,monospace;
   --sans:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   --serif:"Iowan Old Style",Baskerville,"Times New Roman",serif;
 }
+@view-transition{navigation:auto}
+::view-transition-group(calliope-avatar){
+  animation-duration:.38s;animation-timing-function:cubic-bezier(.2,.8,.2,1)}
 /* The base colour lives on <html> and NOWHERE else. body must stay
    transparent: a negative-z-index layer paints BEFORE in-flow backgrounds, so
    an opaque body background hides .bg completely (it did — measured at zero
@@ -7460,7 +7464,8 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
 .calliope-float-avatar{
   width:44px;height:44px;flex:none;overflow:hidden;border:1px solid var(--line-hot);
   border-radius:50%;background:var(--panel-raised);
-  box-shadow:0 0 0 3px var(--amber-soft),0 7px 20px rgba(0,0,0,.38)}
+  box-shadow:0 0 0 3px var(--amber-soft),0 7px 20px rgba(0,0,0,.38);
+  view-transition-name:calliope-avatar}
 .calliope-float-avatar[data-period=night]{
   border-color:color-mix(in oklch,var(--jade) 58%,transparent);
   box-shadow:0 0 0 3px var(--jade-soft),0 7px 20px rgba(0,0,0,.42)}
@@ -7468,9 +7473,11 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
   display:block;width:100%;height:100%;object-fit:cover;
   transform:scale(1.22);transform-origin:57% 39%}
 .calliope-float-name{
-  align-self:stretch;display:flex;align-items:center;
   color:var(--bone-bright);font-family:"Homemade Apple",cursive;
   font-size:22px;font-weight:400;line-height:1;white-space:nowrap}
+.calliope-float-copy{display:flex;flex-direction:column;align-items:flex-start;gap:5px;padding-top:3px}
+.calliope-float-action{color:var(--fog);font:7px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;white-space:nowrap}
+.calliope-float-action b{margin-left:4px;color:var(--amber);font-size:10px;font-weight:400}
 
 main{position:relative;z-index:1;padding:0 max(20px,4vw) 90px}
 header.hero{padding:66px 0 30px;border-bottom:1px solid var(--line)}
@@ -7491,6 +7498,34 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   font:9px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;cursor:pointer}
 .chip:hover{color:var(--bone);border-color:var(--line-hot)}
 .chip[aria-pressed=true]{color:#1a1206;background:var(--amber);border-color:var(--amber);font-weight:700}
+
+.semantic-launch{padding:10px 0 12px;border-bottom:1px solid var(--line)}
+.semantic-launch[hidden]{display:none}
+.semantic-launch-button{width:100%;min-height:68px;display:grid;grid-template-columns:42px minmax(0,1fr) auto;
+  align-items:center;gap:14px;padding:10px 13px;border:1px solid color-mix(in oklch,var(--jade) 30%,var(--line));
+  background:color-mix(in oklch,var(--void) 72%,transparent);color:var(--bone);text-align:left;cursor:pointer;
+  box-shadow:inset 0 1px 0 color-mix(in oklch,var(--bone) 3%,transparent);
+  transition:border-color .18s,background .18s,transform .18s,box-shadow .18s}
+.semantic-launch-button:hover,.semantic-launch-button:focus-visible{border-color:color-mix(in oklch,var(--jade) 72%,var(--amber));
+  outline:0;background:color-mix(in oklch,var(--jade) 8%,var(--void));transform:translateY(-1px);
+  box-shadow:0 11px 30px rgba(0,0,0,.24),inset 0 1px 0 color-mix(in oklch,var(--bone) 5%,transparent)}
+.semantic-launch-mark{width:42px;height:42px;display:grid;place-items:center;border:1px solid color-mix(in oklch,var(--jade) 48%,transparent);
+  border-radius:50%;background:color-mix(in oklch,var(--jade) 8%,transparent);color:var(--jade);
+  font:italic 400 22px/1 var(--serif);box-shadow:0 0 0 4px color-mix(in oklch,var(--jade) 4%,transparent)}
+.semantic-launch-copy{min-width:0;display:flex;flex-direction:column;gap:6px}
+.semantic-launch-copy strong{overflow:hidden;color:var(--bone-bright);font:italic 400 18px/1.15 var(--serif);text-overflow:ellipsis;white-space:nowrap}
+.semantic-launch-copy small{color:var(--dim);font:8px/1.4 var(--mono);letter-spacing:.08em;text-transform:uppercase}
+.semantic-launch-copy small b{color:var(--fog);font-weight:500}
+.semantic-launch-cta{display:flex;align-items:center;gap:10px;color:var(--jade);font:7px/1.25 var(--mono);letter-spacing:.1em;text-align:right;text-transform:uppercase}
+.semantic-launch-cta b{width:25px;height:25px;display:grid;place-items:center;border:1px solid color-mix(in oklch,var(--jade) 42%,transparent);font-size:11px;font-weight:400}
+.semantic-launch-error{display:block;min-height:0;padding:0;color:#f2a28f;font:8px/1.4 var(--mono)}
+.semantic-launch.has-error .semantic-launch-error{padding:8px 4px 0}
+.semantic-launch.launching .semantic-launch-button{pointer-events:none;border-color:var(--jade);background:color-mix(in oklch,var(--jade) 10%,var(--void))}
+.semantic-launch.launching .semantic-launch-mark{animation:semantic-pulse 1.15s ease-in-out infinite}
+.semantic-launch.launching .semantic-launch-cta b{font-size:0}
+.semantic-launch.launching .semantic-launch-cta b::after{content:"";width:10px;height:10px;border:1px solid var(--jade);border-right-color:transparent;border-radius:50%;animation:semantic-spin .75s linear infinite}
+@keyframes semantic-pulse{50%{box-shadow:0 0 0 8px color-mix(in oklch,var(--jade) 8%,transparent)}}
+@keyframes semantic-spin{to{transform:rotate(360deg)}}
 
 /* hairline grid: 1px gaps over a line-colored bed, so rules stay perfect at any wrap */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));
@@ -7539,6 +7574,9 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .who{gap:8px}
   .who .viewer{display:none}
   .applink{padding:6px 8px}
+  .semantic-launch-button{grid-template-columns:38px minmax(0,1fr)}
+  .semantic-launch-mark{width:38px;height:38px}
+  .semantic-launch-cta{grid-column:2;justify-content:flex-start;text-align:left}
 }
 @media (max-width:520px){
   nav{padding-inline:14px}
@@ -7547,6 +7585,8 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .calliope-float{gap:11px;min-height:60px;padding:5px 17px 5px 5px}
   .calliope-float-avatar{width:42px;height:42px}
   .calliope-float-name{font-size:20px}
+  .calliope-float-copy{padding-top:1px}
+  .calliope-float-action{display:none}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
@@ -7593,16 +7633,74 @@ _LANDING_JS = """
  var q=document.getElementById('q'),
      chips=[].slice.call(document.querySelectorAll('.chip')),
      cards=[].slice.call(document.querySelectorAll('.card')),
-     none=document.getElementById('none'), kind='';
+     none=document.getElementById('none'),
+     semantic=document.getElementById('semantic-launch'),
+     semanticButton=document.getElementById('semantic-launch-button'),
+     semanticQuery=document.getElementById('semantic-launch-query'),
+     semanticLocal=document.getElementById('semantic-launch-local'),
+     semanticScope=document.getElementById('semantic-launch-scope'),
+     semanticError=document.getElementById('semantic-launch-error'),
+     kind='',semanticBusy=false;
+ function queryText(){return q?(q.value||'').trim().replace(/\\s+/g,' '):'';}
+ function syncSemantic(shown){
+   if(!semantic)return;
+   var text=queryText(),ready=text.length>=2;
+   semantic.hidden=!ready;
+   if(!ready)return;
+   semanticQuery.textContent='“'+text+'”';
+   semanticLocal.textContent=shown+' published match'+(shown===1?'':'es')+' here';
+   if(!semanticBusy){
+     semantic.classList.remove('has-error');
+     semanticError.textContent='';
+     semanticScope.textContent='docs · artifacts · warehouse semantics';
+   }
+ }
  function apply(){
-   var t=(q.value||'').trim().toLowerCase(), shown=0;
+   var t=queryText().toLowerCase(),shown=0;
    cards.forEach(function(c){
      var ok=(!kind||c.dataset.kind===kind)&&(!t||c.dataset.search.indexOf(t)>=0);
      c.style.display=ok?'':'none'; if(ok)shown++;
    });
-   none.style.display=shown?'none':'block';
+   if(none)none.style.display=shown?'none':'block';
+   syncSemantic(shown);
  }
- q.addEventListener('input',apply);
+ async function launchSemantic(){
+   var text=queryText();
+   if(!semantic||!semanticButton||semanticBusy||text.length<2)return;
+   semanticBusy=true;
+   semantic.classList.remove('has-error');
+   semantic.classList.add('launching');
+   semanticButton.disabled=true;
+   semanticError.textContent='';
+   semanticScope.textContent='resolving a new evidence workspace…';
+   document.body.classList.add('calliope-launching');
+   try{
+     var response=await fetch('/api/calliope/evidence-explorations',{
+       method:'POST',headers:{'content-type':'application/json','accept':'application/json'},
+       body:JSON.stringify({query:text,limit:24})
+     });
+     var data={};
+     try{data=await response.json();}catch(ignore){}
+     if(!response.ok)throw new Error((data.error&&data.error.message)||'Could not open the evidence workspace');
+     if(!data.url)throw new Error('Calliope did not return a workspace');
+     window.location.assign(data.url);
+   }catch(error){
+     semanticBusy=false;
+     semantic.classList.remove('launching');
+     semantic.classList.add('has-error');
+     semanticButton.disabled=false;
+     semanticScope.textContent='docs · artifacts · warehouse semantics';
+     semanticError.textContent=error&&error.message?error.message:'Could not open Calliope';
+     document.body.classList.remove('calliope-launching');
+   }
+ }
+ if(q){
+   q.addEventListener('input',apply);
+   q.addEventListener('keydown',function(e){
+     if(e.key==='Enter'&&!e.isComposing&&queryText().length>=2){e.preventDefault();launchSemantic();}
+   });
+ }
+ if(semanticButton)semanticButton.addEventListener('click',launchSemantic);
  chips.forEach(function(ch){ch.addEventListener('click',function(){
    kind=ch.dataset.kind||'';
    chips.forEach(function(o){o.setAttribute('aria-pressed',String(o===ch))});
@@ -7610,9 +7708,10 @@ _LANDING_JS = """
  })});
  // "/" focuses search, the way every browse page should behave
  document.addEventListener('keydown',function(e){
-   if(e.key==='/'&&document.activeElement!==q){e.preventDefault();q.focus();}
-   if(e.key==='Escape'&&document.activeElement===q){q.value='';apply();q.blur();}
+   if(q&&e.key==='/'&&document.activeElement!==q){e.preventDefault();q.focus();}
+   if(q&&e.key==='Escape'&&document.activeElement===q){q.value='';apply();q.blur();}
  });
+ apply();
 })();
 """
 
@@ -7829,15 +7928,29 @@ def _landing_html(rows, viewer):
     # Calliope is a true opt-in surface: when Hermes is not configured there is
     # no gallery launcher and its routes are not registered.
     import calliope
+    calliope_enabled = calliope.is_enabled()
     _calliope_link = (
         '<a class="calliope-float" href="/calliope" '
-        'title="Create and iterate with Calliope">'
+        'title="Open the full Calliope workspace" aria-label="Open the full Calliope workspace">'
         '<span class="calliope-float-avatar" aria-hidden="true" '
         'data-day-src="/calliope/callie-avatar-day.jpg" '
         'data-night-src="/calliope/callie-avatar-night.jpg">'
         '<img alt="" width="44" height="44" decoding="async"></span>'
-        '<span class="calliope-float-name">Calliope</span></a>'
-        if calliope.is_enabled() else ""
+        '<span class="calliope-float-copy"><span class="calliope-float-name">Calliope</span>'
+        '<span class="calliope-float-action">Open workspace <b>&rarr;</b></span></span></a>'
+        if calliope_enabled else ""
+    )
+    _calliope_search = (
+        '<div id="semantic-launch" class="semantic-launch" hidden>'
+        '<button id="semantic-launch-button" class="semantic-launch-button" type="button">'
+        '<span class="semantic-launch-mark" aria-hidden="true">⌕</span>'
+        '<span class="semantic-launch-copy">'
+        '<strong>Explore <span id="semantic-launch-query"></span> across company knowledge</strong>'
+        '<small><b id="semantic-launch-local">0 published matches here</b> · '
+        '<span id="semantic-launch-scope">docs · artifacts · warehouse semantics</span></small></span>'
+        '<span class="semantic-launch-cta">Open fresh Calliope session <b aria-hidden="true">↵</b></span>'
+        '</button><span id="semantic-launch-error" class="semantic-launch-error" role="status"></span></div>'
+        if calliope_enabled else ""
     )
 
     total = len(rows)
@@ -7848,13 +7961,33 @@ def _landing_html(rows, viewer):
              + "".join(f'<button class="chip" data-kind="{e(k)}" aria-pressed="false">{e(k)}s</button>'
                        for k, _ in sorted(kinds.items(), key=lambda kv: -kv[1])))
 
-    body = (f'<div class="toolbar"><input id="q" type="search" placeholder="Search artifacts…  (press /)" '
-            f'autocomplete="off" spellcheck="false">{chips}</div>'
-            f'<div class="grid">{"".join(cards)}</div>'
-            f'<div id="none">Nothing matches</div>') if rows else (
-        '<div class="empty">No artifacts published yet.<br><br>'
-        'Ask Claude to build one — it starts with <code>live_app_template</code><br>'
-        'and publishes with <code>create_live_app</code>.</div>')
+    toolbar = (
+        f'<div class="toolbar"><input id="q" type="search" maxlength="600" '
+        f'placeholder="Search artifacts…  (press /)" autocomplete="off" spellcheck="false">'
+        f'{chips if rows else ""}</div>'
+        if rows or calliope_enabled else ""
+    )
+    if rows:
+        body = (
+            toolbar
+            + _calliope_search
+            + f'<div class="grid">{"".join(cards)}</div>'
+            + '<div id="none">No published artifacts match. Explore the company evidence above.</div>'
+        )
+    elif calliope_enabled:
+        body = (
+            toolbar
+            + _calliope_search
+            + '<div class="empty">No artifacts published yet.<br><br>'
+            'Search company knowledge above, or open Calliope to make the first one.</div>'
+        )
+    else:
+        body = (
+            '<div class="empty">No artifacts published yet.<br><br>'
+            'Ask an RVBBIT-enabled agent to build one — it starts with '
+            '<code>live_app_template</code><br>and publishes with '
+            '<code>create_live_app</code>.</div>'
+        )
 
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -8721,21 +8854,256 @@ def _calliope_brain_evidence(query, owner, limit):
     return items
 
 
+def _calliope_compact_count(value):
+    """Format catalog counts for a small semantic-result card."""
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    magnitude = abs(number)
+    for threshold, divisor, suffix in (
+        (1_000_000_000, 1_000_000_000, "B"),
+        (1_000_000, 1_000_000, "M"),
+        (10_000, 1_000, "K"),
+    ):
+        if magnitude >= threshold:
+            scaled = number / divisor
+            precision = 0 if abs(scaled) >= 100 else 1
+            rendered = f"{scaled:.{precision}f}"
+            if "." in rendered:
+                rendered = rendered.rstrip("0").rstrip(".")
+            return rendered + suffix
+    return f"{number:,}"
+
+
+def _calliope_semantic_text(value, limit=520):
+    return _calliope_evidence_text(value, limit) or None
+
+
+def _calliope_data_supplements(conn, rows):
+    """Best-effort typed metadata for data-search hits.
+
+    Search documents deliberately remain useful on older extension installs,
+    but current catalogs retain the same information as structured KG/cube
+    fields. Pull those fields in bounded batches so the browser does not have
+    to reverse-parse one long prose document.
+    """
+    relation_keys = list(dict.fromkeys(
+        (str(row.get("schema_name") or ""), str(row.get("rel_name") or ""))
+        for row in rows
+        if row.get("schema_name") and row.get("rel_name")
+        and row.get("kind") in {"db_table", "cube"}
+    ))
+    fields = {key: [] for key in relation_keys}
+    field_counts = {key: 0 for key in relation_keys}
+    if relation_keys:
+        try:
+            column_rows = conn.execute(
+                "WITH wanted(schema_name,rel_name) AS ("
+                " SELECT * FROM unnest(%s::text[],%s::text[])"
+                "), ranked AS ("
+                " SELECT c.table_schema,c.table_name,c.column_name,c.data_type,c.is_nullable,"
+                "c.ordinal_position,count(*) OVER (PARTITION BY c.table_schema,c.table_name) AS field_count,"
+                "row_number() OVER (PARTITION BY c.table_schema,c.table_name ORDER BY c.ordinal_position) AS field_rank "
+                "FROM information_schema.columns c JOIN wanted w "
+                "ON w.schema_name=c.table_schema AND w.rel_name=c.table_name"
+                ") SELECT * FROM ranked WHERE field_rank<=8 "
+                "ORDER BY table_schema,table_name,ordinal_position",
+                ([key[0] for key in relation_keys], [key[1] for key in relation_keys]),
+            ).fetchall()
+            for column in column_rows:
+                key = (str(column.get("table_schema") or ""), str(column.get("table_name") or ""))
+                if key not in fields:
+                    continue
+                try:
+                    field_counts[key] = max(field_counts[key], int(column.get("field_count")))
+                except (TypeError, ValueError):
+                    field_counts[key] += 1
+                if len(fields[key]) >= 8:
+                    continue
+                fields[key].append({
+                    "name": _calliope_semantic_text(column.get("column_name"), 160),
+                    "type": _calliope_semantic_text(column.get("data_type"), 120),
+                    "nullable": str(column.get("is_nullable") or "").upper() == "YES",
+                })
+        except Exception:  # noqa: BLE001 — metadata is an optional presentation upgrade
+            pass
+
+    cube_names = list(dict.fromkeys(
+        str(row.get("rel_name")) for row in rows
+        if row.get("kind") == "cube" and row.get("rel_name")
+    ))
+    cubes = {}
+    if cube_names:
+        try:
+            cube_rows = conn.execute(
+                "SELECT c.name,c.version,c.grain,c.description,c.category,"
+                "ctl.last_rows,ctl.refreshed_at::text AS refreshed_at "
+                "FROM rvbbit.cube_catalog c LEFT JOIN rvbbit.cube_control ctl "
+                "ON ctl.cube_name=c.name WHERE c.name=ANY(%s::text[])",
+                (cube_names,),
+            ).fetchall()
+            cubes = {str(row.get("name")): row for row in cube_rows if row.get("name")}
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            enriched_rows = conn.execute(
+                "SELECT cube_name,column_name,data_type,doc,semantics,source_ref FROM ("
+                " SELECT cc.*,row_number() OVER (PARTITION BY cube_name ORDER BY column_name) AS rn"
+                " FROM rvbbit.cube_columns cc WHERE cube_name=ANY(%s::text[])"
+                ") ranked WHERE rn<=8 ORDER BY cube_name,column_name",
+                (cube_names,),
+            ).fetchall()
+            for column in enriched_rows:
+                key = ("cubes", str(column.get("cube_name") or ""))
+                if key not in fields:
+                    fields[key] = []
+                field = next(
+                    (item for item in fields[key] if item.get("name") == column.get("column_name")),
+                    None,
+                )
+                if field is None and len(fields[key]) < 8:
+                    field = {
+                        "name": _calliope_semantic_text(column.get("column_name"), 160),
+                        "type": _calliope_semantic_text(column.get("data_type"), 120),
+                    }
+                    fields[key].append(field)
+                    field_counts[key] = max(field_counts.get(key, 0), len(fields[key]))
+                if field is not None:
+                    field["definition"] = _calliope_semantic_text(column.get("doc"), 360)
+                    field["semantics"] = _calliope_semantic_text(column.get("semantics"), 360)
+                    field["source_ref"] = _calliope_semantic_text(column.get("source_ref"), 240)
+        except Exception:  # noqa: BLE001 — V1 cubes predate cube_columns
+            pass
+
+    metric_names = list(dict.fromkeys(
+        str(row.get("rel_name") or row.get("col_name")) for row in rows
+        if row.get("kind") == "metric" and (row.get("rel_name") or row.get("col_name"))
+    ))
+    metrics = {}
+    if metric_names:
+        try:
+            metric_rows = conn.execute(
+                "SELECT name,version,grain,description,params,labels "
+                "FROM rvbbit.metric_catalog WHERE name=ANY(%s::text[])",
+                (metric_names,),
+            ).fetchall()
+            metrics = {str(row.get("name")): row for row in metric_rows if row.get("name")}
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "fields": fields,
+        "field_counts": field_counts,
+        "cubes": cubes,
+        "metrics": metrics,
+    }
+
+
+def _calliope_data_presentation(row, supplements):
+    kind = str(row.get("kind") or "data-object")
+    schema = _calliope_semantic_text(row.get("schema_name"), 160)
+    relation = _calliope_semantic_text(row.get("rel_name"), 160)
+    column = _calliope_semantic_text(row.get("col_name"), 160)
+    props = row.get("properties") if isinstance(row.get("properties"), dict) else {}
+    fields = list(supplements.get("fields", {}).get((schema or "", relation or ""), []))[:8]
+    field_count = supplements.get("field_counts", {}).get((schema or "", relation or ""), 0) or len(fields)
+    if kind not in {"db_table", "cube"}:
+        fields = []
+        field_count = 0
+    facts = []
+
+    def fact(label, value):
+        text = _calliope_semantic_text(value, 120)
+        if text and len(facts) < 4:
+            facts.append({"label": label, "value": text})
+
+    definition = next((
+        _calliope_semantic_text(props.get(key), 520)
+        for key in ("description", "business_definition", "semantic_description", "doc", "comment", "semantics")
+        if _calliope_semantic_text(props.get(key), 520)
+    ), None)
+
+    if kind == "db_column":
+        fact("Type", props.get("data_type"))
+        if props.get("is_pk"):
+            fact("Key", "Primary key")
+        elif props.get("is_fk"):
+            fact("Key", "Foreign key")
+        fact("Distinct", _calliope_compact_count(props.get("ndv")))
+        if props.get("null_frac") is not None:
+            try:
+                fact("Missing", f"{float(props['null_frac']) * 100:.1f}%".replace(".0%", "%"))
+            except (TypeError, ValueError):
+                pass
+        semantic_role = props.get("semantic_role") or props.get("role")
+        if semantic_role:
+            fact("Role", semantic_role)
+    elif kind == "db_table":
+        fact("Rows", _calliope_compact_count(props.get("n_rows")))
+        fact("Fields", _calliope_compact_count(props.get("n_columns") or field_count))
+        relation_kind = {
+            "r": "Table", "p": "Partitioned table", "v": "View", "m": "Materialized view",
+            "f": "Foreign table",
+        }.get(str(props.get("relkind") or ""))
+        fact("Kind", relation_kind)
+    elif kind == "cube":
+        cube = supplements.get("cubes", {}).get(relation or "", {})
+        definition = definition or _calliope_semantic_text(cube.get("description"), 520)
+        fact("Grain", props.get("grain") or cube.get("grain"))
+        fact("Rows", _calliope_compact_count(cube.get("last_rows")))
+        fact("Fields", _calliope_compact_count(field_count) if field_count else None)
+        fact("Category", cube.get("category"))
+    elif kind == "metric":
+        metric = supplements.get("metrics", {}).get(relation or column or "", {})
+        definition = definition or _calliope_semantic_text(metric.get("description"), 520)
+        fact("Grain", props.get("grain") or metric.get("grain"))
+        fact("Version", metric.get("version"))
+        params = metric.get("params")
+        if isinstance(params, dict):
+            fact("Parameters", _calliope_compact_count(len(params)))
+
+    return {
+        "identity": {
+            key: value for key, value in {
+                "schema": schema,
+                "relation": relation,
+                "column": column,
+            }.items() if value
+        },
+        "definition": definition,
+        "facts": facts,
+        "field_count": field_count or None,
+        "fields": [
+            {key: value for key, value in field.items() if value not in (None, "")}
+            for field in fields
+            if field.get("name")
+        ],
+    }
+
+
 def _calliope_data_evidence(query, limit):
+    tier = {"metric": 0, "cube": 1, "db_table": 2, "db_column": 3}
     with _conn() as c:
         rows = c.execute(
-            "SELECT node_id,kind,schema_name,rel_name,col_name,score,boosted_score,doc,usage_touches "
-            "FROM rvbbit.search_data_weighted(%s,%s,%s,%s,0.5)",
-            (query, min(limit * 4, 100), None, GRAPH),
+            "SELECT s.node_id,s.kind,s.schema_name,s.rel_name,s.col_name,s.score,"
+            "s.boosted_score,s.doc,s.usage_touches,n.properties "
+            "FROM rvbbit.search_data_weighted(%s,%s,%s,%s,0.5) s "
+            "LEFT JOIN rvbbit.kg_nodes n ON n.node_id=s.node_id AND n.graph_id=%s",
+            (query, min(limit * 4, 100), None, GRAPH, GRAPH),
         ).fetchall()
-    tier = {"metric": 0, "cube": 1, "db_table": 2, "db_column": 3}
-    rows = sorted(
-        rows,
-        key=lambda row: (
-            tier.get(row.get("kind"), 4),
-            -float(row.get("boosted_score") or row.get("score") or 0),
-        ),
-    )
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                tier.get(row.get("kind"), 4),
+                -float(row.get("boosted_score") or row.get("score") or 0),
+            ),
+        )
+        rows = [
+            row for row in rows
+            if row.get("kind") in {"metric", "cube"}
+            or _schema_allowed(row.get("schema_name") or "")
+        ][:limit]
+        supplements = _calliope_data_supplements(c, rows)
     items = []
     for row in rows:
         if len(items) >= limit:
@@ -8750,7 +9118,8 @@ def _calliope_data_evidence(query, limit):
         except (TypeError, ValueError):
             score = 0.0
         usage = int(row.get("usage_touches") or 0)
-        items.append({
+        presentation = _calliope_data_presentation(row, supplements)
+        item = {
             "id": f"data:{row.get('node_id')}",
             "group": "data",
             "kind": row.get("kind") or "data-object",
@@ -8768,7 +9137,9 @@ def _calliope_data_evidence(query, limit):
                 "column": row.get("col_name"),
                 "usage_touches": usage,
             },
-        })
+        }
+        item.update({key: value for key, value in presentation.items() if value not in (None, "", [], {})})
+        items.append(item)
     return items
 
 
@@ -8817,6 +9188,11 @@ def _calliope_artifact_evidence(query, limit):
         )
         score = _calliope_lexical_score(query, row.get("name"), artifact_body)
         url = f"/d/{row['slug']}" if row.get("app_kind") == "dashboard" else f"/apps/{row['slug']}"
+        thumbnail_url = (
+            f"/thumbs/{_artifact_kind(row.get('app_kind'))}/{row['slug']}.png"
+            if (row.get("runtime_kind") or "html") == "html"
+            else None
+        )
         if score >= 0.16:
             candidates.append({
                 "id": f"artifact:{row['slug']}:v{row['latest_version']}",
@@ -8827,6 +9203,7 @@ def _calliope_artifact_evidence(query, limit):
                 "summary": row.get("description") or semantic_map.get("description") or "Published RVBBIT artifact",
                 "source": "Published artifacts",
                 "url": url,
+                "thumbnail_url": thumbnail_url,
                 "score": score,
                 "occurred_at": row.get("updated_at"),
                 "entities": lineage_refs[:8],
@@ -8864,6 +9241,7 @@ def _calliope_artifact_evidence(query, limit):
                 "summary": summary,
                 "source": f"{row.get('name') or row.get('slug')} · semantic map",
                 "url": url,
+                "thumbnail_url": thumbnail_url,
                 "score": object_score,
                 "occurred_at": row.get("updated_at"),
                 "entities": lineage_refs[:8],

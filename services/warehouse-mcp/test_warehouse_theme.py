@@ -146,7 +146,14 @@ def test_gallery_calliope_entry_is_a_floating_time_aware_avatar():
     assert server.count("background:var(--gallery-rail-bg)") == 3
     assert "width:44px;height:44px" in server
     assert '<img alt="" width="44" height="44" decoding="async">' in server
-    assert "align-self:stretch;display:flex;align-items:center;" in server
+    assert 'class="calliope-float-copy"' in server
+    assert 'class="calliope-float-action">Open workspace' in server
+    assert 'aria-label="Open the full Calliope workspace"' in server
+    assert "view-transition-name:calliope-avatar" in server
+    assert 'id="semantic-launch"' in server
+    assert 'id="semantic-launch-button"' in server
+    assert "/api/calliope/evidence-explorations" in server
+    assert "e.key==='Enter'" in server
     shot_rule = server.split(".shot{", 1)[1].split("}", 1)[0]
     assert "border-bottom" not in shot_rule
     assert (

@@ -1976,6 +1976,7 @@ def _normalize_evidence_search_result(value: Any, query: str) -> dict[str, Any]:
             "summary": re.sub(r"\s+", " ", str(candidate.get("summary") or "")).strip()[:2_000],
             "source": re.sub(r"\s+", " ", str(candidate.get("source") or "")).strip()[:240],
             "url": _evidence_url(candidate.get("url")),
+            "thumbnail_url": _evidence_url(candidate.get("thumbnail_url")),
             "score": score,
             "occurred_at": str(candidate.get("occurred_at") or "")[:80] or None,
             "entities": [
@@ -1985,6 +1986,53 @@ def _normalize_evidence_search_result(value: Any, query: str) -> dict[str, Any]:
             ],
             "provenance": _bounded_evidence_json(candidate.get("provenance") or {}),
         }
+        if group == "data":
+            raw_identity = candidate.get("identity") if isinstance(candidate.get("identity"), dict) else {}
+            identity = {
+                key: re.sub(r"\s+", " ", str(raw_identity.get(key) or "")).strip()[:160]
+                for key in ("schema", "relation", "column")
+                if str(raw_identity.get(key) or "").strip()
+            }
+            definition = re.sub(
+                r"\s+", " ", str(candidate.get("definition") or "")
+            ).strip()[:520]
+            facts = []
+            for raw_fact in (candidate.get("facts") or [])[:4]:
+                if not isinstance(raw_fact, dict):
+                    continue
+                label = re.sub(r"\s+", " ", str(raw_fact.get("label") or "")).strip()[:60]
+                fact_value = re.sub(r"\s+", " ", str(raw_fact.get("value") or "")).strip()[:120]
+                if label and fact_value:
+                    facts.append({"label": label, "value": fact_value})
+            fields = []
+            for raw_field in (candidate.get("fields") or [])[:8]:
+                if not isinstance(raw_field, dict):
+                    continue
+                name = re.sub(r"\s+", " ", str(raw_field.get("name") or "")).strip()[:160]
+                if not name:
+                    continue
+                field = {
+                    "name": name,
+                    "type": re.sub(r"\s+", " ", str(raw_field.get("type") or "")).strip()[:120],
+                    "definition": re.sub(r"\s+", " ", str(raw_field.get("definition") or "")).strip()[:360],
+                    "semantics": re.sub(r"\s+", " ", str(raw_field.get("semantics") or "")).strip()[:360],
+                    "source_ref": re.sub(r"\s+", " ", str(raw_field.get("source_ref") or "")).strip()[:240],
+                    "nullable": bool(raw_field.get("nullable")),
+                }
+                fields.append({key: val for key, val in field.items() if val not in (None, "")})
+            try:
+                field_count = max(0, min(10_000, int(candidate.get("field_count") or len(fields))))
+            except (TypeError, ValueError):
+                field_count = len(fields)
+            item.update({
+                key: val for key, val in {
+                    "identity": identity,
+                    "definition": definition,
+                    "facts": facts,
+                    "field_count": field_count,
+                    "fields": fields,
+                }.items() if val not in (None, "", [], {})
+            })
         items.append({key: val for key, val in item.items() if val not in (None, "", [])})
         if len(items) >= _MAX_EVIDENCE_RESULTS:
             break
@@ -2082,7 +2130,7 @@ def _hydrate_evidence_refs(
                     "kind": str(candidate.get("kind") or "evidence")[:60],
                     "title": str(candidate.get("title") or "Evidence")[:240],
                     "gist": re.sub(
-                        r"\s+", " ", str(candidate.get("summary") or "")
+                        r"\s+", " ", str(candidate.get("definition") or candidate.get("summary") or "")
                     ).strip()[:280],
                     "source": str(candidate.get("source") or "")[:160],
                     "score": candidate.get("score"),
@@ -2127,7 +2175,8 @@ def _hydrate_evidence_refs(
                 key: item.get(key)
                 for key in (
                     "group", "kind", "subtype", "title", "summary", "source", "url",
-                    "score", "occurred_at", "entities", "provenance",
+                    "score", "occurred_at", "entities", "identity", "definition", "facts",
+                    "field_count", "fields", "provenance",
                 )
                 if item.get(key) not in (None, "", [])
             },
@@ -4838,6 +4887,117 @@ def register_calliope_routes(
             status = 500
         return json_response(result, status)
 
+    def decode_evidence_request(value: Any) -> tuple[str, int, Response | None]:
+        body = value if isinstance(value, dict) else {}
+        query = re.sub(r"\s+", " ", str(body.get("query") or "")).strip()
+        if len(query) < 2:
+            return "", 24, json_response(
+                {
+                    "error": {
+                        "code": "QUERY_TOO_SHORT",
+                        "message": "Describe what you want to find in at least two characters.",
+                    }
+                },
+                400,
+            )
+        if len(query) > _MAX_EVIDENCE_QUERY_CHARS:
+            return "", 24, json_response({"error": {"code": "QUERY_TOO_LONG"}}, 400)
+        try:
+            limit = max(6, min(int(body.get("limit") or 24), _MAX_EVIDENCE_RESULTS))
+        except (TypeError, ValueError):
+            limit = 24
+        return query, limit, None
+
+    async def resolve_evidence_bundle(query: str, owner: str, limit: int) -> dict[str, Any]:
+        if evidence_search is None:
+            raise RuntimeError("The company evidence resolver is not configured.")
+        raw_result = await asyncio.to_thread(evidence_search, query, owner, limit)
+        if inspect.isawaitable(raw_result):
+            raw_result = await raw_result
+        return _normalize_evidence_search_result(raw_result, query)
+
+    def persist_evidence_bundle(
+        session: dict[str, Any],
+        owner: str,
+        query: str,
+        result: dict[str, Any],
+        *,
+        origin: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        turn_id = str(uuid.uuid4())
+        with conn_factory() as conn:
+            with conn.transaction():
+                locked = conn.execute(
+                    "SELECT * FROM rvbbit.calliope_sessions "
+                    "WHERE id=%s::uuid AND owner_email=%s FOR UPDATE",
+                    (str(session["id"]), owner),
+                ).fetchone()
+                if not locked:
+                    raise LookupError("Calliope session not found")
+                next_ordinal = conn.execute(
+                    "SELECT coalesce(max(ordinal),0)+1 AS n FROM rvbbit.calliope_turns "
+                    "WHERE session_id=%s::uuid",
+                    (str(session["id"]),),
+                ).fetchone()["n"]
+                turn = conn.execute(
+                    "INSERT INTO rvbbit.calliope_turns "
+                    "(id,session_id,ordinal,user_message,assistant_message,status,completed_at,turn_kind) "
+                    "VALUES (%s::uuid,%s::uuid,%s,%s,NULL,'complete',now(),'evidence_search') "
+                    "RETURNING *",
+                    (turn_id, str(session["id"]), next_ordinal, query),
+                ).fetchone()
+                session = conn.execute(
+                    "UPDATE rvbbit.calliope_sessions SET updated_at=now() "
+                    "WHERE id=%s::uuid RETURNING *",
+                    (str(session["id"]),),
+                ).fetchone()
+
+        search_key = hashlib.sha256(query.lower().encode("utf-8")).hexdigest()[:24]
+        try:
+            surfaces = _insert_surfaces(
+                conn_factory,
+                str(session["id"]),
+                turn_id,
+                [{
+                    "kind": "evidence",
+                    "title": f"Evidence · {query}"[:240],
+                    "tool_name": "evidence_search",
+                    "tool_call_id": f"evidence-search:{uuid.uuid4()}",
+                    "lineage_key": f"evidence-search:{search_key}",
+                    "payload": result,
+                    "source": {
+                        "origin": origin,
+                        "query": query,
+                        "searched": result.get("searched") or [],
+                    },
+                }],
+            )
+            if not surfaces:
+                raise RuntimeError("The evidence was resolved but could not be saved.")
+        except Exception:
+            with conn_factory() as conn:
+                conn.execute(
+                    "DELETE FROM rvbbit.calliope_turns WHERE id=%s::uuid",
+                    (turn_id,),
+                )
+            raise
+        return dict(session), dict(turn), surfaces[0]
+
+    async def discard_created_session(session: dict[str, Any]) -> None:
+        with conn_factory() as conn:
+            conn.execute(
+                "DELETE FROM rvbbit.calliope_sessions WHERE id=%s::uuid",
+                (str(session["id"]),),
+            )
+        try:
+            await _hermes_json(
+                config,
+                "DELETE",
+                f"/api/sessions/{quote(str(session['hermes_session_id']), safe='')}",
+            )
+        except Exception:
+            pass
+
     @mcp.custom_route(
         "/api/calliope/sessions/{session_id}/evidence-search",
         methods=["POST"],
@@ -4867,29 +5027,75 @@ def register_calliope_routes(
             body = await request.json()
         except Exception:
             body = {}
-        body = body if isinstance(body, dict) else {}
-        query = re.sub(r"\s+", " ", str(body.get("query") or "")).strip()
-        if len(query) < 2:
+        query, limit, request_error = decode_evidence_request(body)
+        if request_error:
+            return request_error
+        try:
+            result = await resolve_evidence_bundle(query, owner, limit)
+        except Exception as exc:
             return json_response(
                 {
                     "error": {
-                        "code": "QUERY_TOO_SHORT",
-                        "message": "Describe what you want to find in at least two characters.",
+                        "code": "EVIDENCE_SEARCH_FAILED",
+                        "message": str(exc)[:600],
                     }
                 },
-                400,
+                500,
             )
-        if len(query) > _MAX_EVIDENCE_QUERY_CHARS:
-            return json_response({"error": {"code": "QUERY_TOO_LONG"}}, 400)
         try:
-            limit = max(6, min(int(body.get("limit") or 24), _MAX_EVIDENCE_RESULTS))
-        except (TypeError, ValueError):
-            limit = 24
+            session, turn, surface = persist_evidence_bundle(
+                session,
+                owner,
+                query,
+                result,
+                origin="calliope_evidence_resolver",
+            )
+        except LookupError:
+            return json_response({"error": {"code": "NOT_FOUND"}}, 404)
+        except Exception as exc:
+            return json_response(
+                {
+                    "error": {
+                        "code": "EVIDENCE_STORE_FAILED",
+                        "message": str(exc)[:600],
+                    }
+                },
+                500,
+            )
+        return json_response(
+            {
+                "session": _session_json(session),
+                "turn": _turn_json(turn),
+                "surface": surface,
+            },
+            201,
+        )
+
+    @mcp.custom_route("/api/calliope/evidence-explorations", methods=["POST"])
+    async def create_evidence_exploration(request):
+        """Turn a gallery search into a fresh, evidence-first Calliope session."""
+        owner, err = api_owner(request)
+        if err:
+            return err
+        if evidence_search is None:
+            return json_response(
+                {
+                    "error": {
+                        "code": "EVIDENCE_SEARCH_UNAVAILABLE",
+                        "message": "The company evidence resolver is not configured.",
+                    }
+                },
+                503,
+            )
         try:
-            raw_result = await asyncio.to_thread(evidence_search, query, owner, limit)
-            if inspect.isawaitable(raw_result):
-                raw_result = await raw_result
-            result = _normalize_evidence_search_result(raw_result, query)
+            body = await request.json()
+        except Exception:
+            body = {}
+        query, limit, request_error = decode_evidence_request(body)
+        if request_error:
+            return request_error
+        try:
+            result = await resolve_evidence_bundle(query, owner, limit)
         except Exception as exc:
             return json_response(
                 {
@@ -4901,73 +5107,44 @@ def register_calliope_routes(
                 500,
             )
 
-        turn_id = str(uuid.uuid4())
-        with conn_factory() as conn:
-            with conn.transaction():
-                locked = conn.execute(
-                    "SELECT * FROM rvbbit.calliope_sessions "
-                    "WHERE id=%s::uuid AND owner_email=%s FOR UPDATE",
-                    (str(session["id"]), owner),
-                ).fetchone()
-                if not locked:
-                    return json_response({"error": {"code": "NOT_FOUND"}}, 404)
-                next_ordinal = conn.execute(
-                    "SELECT coalesce(max(ordinal),0)+1 AS n FROM rvbbit.calliope_turns "
-                    "WHERE session_id=%s::uuid",
-                    (str(session["id"]),),
-                ).fetchone()["n"]
-                turn = conn.execute(
-                    "INSERT INTO rvbbit.calliope_turns "
-                    "(id,session_id,ordinal,user_message,assistant_message,status,completed_at,turn_kind) "
-                    "VALUES (%s::uuid,%s::uuid,%s,%s,NULL,'complete',now(),'evidence_search') "
-                    "RETURNING *",
-                    (turn_id, str(session["id"]), next_ordinal, query),
-                ).fetchone()
-                session = conn.execute(
-                    "UPDATE rvbbit.calliope_sessions SET updated_at=now() "
-                    "WHERE id=%s::uuid RETURNING *",
-                    (str(session["id"]),),
-                ).fetchone()
-
-        search_key = hashlib.sha256(query.lower().encode("utf-8")).hexdigest()[:24]
-        surfaces = _insert_surfaces(
-            conn_factory,
-            str(session["id"]),
-            turn_id,
-            [{
-                "kind": "evidence",
-                "title": f"Evidence · {query}"[:240],
-                "tool_name": "evidence_search",
-                "tool_call_id": f"evidence-search:{uuid.uuid4()}",
-                "lineage_key": f"evidence-search:{search_key}",
-                "payload": result,
-                "source": {
-                    "origin": "calliope_evidence_resolver",
-                    "query": query,
-                    "searched": result.get("searched") or [],
-                },
-            }],
-        )
-        if not surfaces:
-            with conn_factory() as conn:
-                conn.execute(
-                    "DELETE FROM rvbbit.calliope_turns WHERE id=%s::uuid",
-                    (turn_id,),
-                )
-            return json_response(
-                {
-                    "error": {
-                        "code": "EVIDENCE_STORE_FAILED",
-                        "message": "The evidence was resolved but could not be saved.",
-                    }
-                },
-                500,
+        session = None
+        try:
+            compact_query = query if len(query) <= 102 else query[:99].rstrip() + "…"
+            session = await _create_session_record(
+                config,
+                conn_factory,
+                owner,
+                f"Explore · {compact_query}",
             )
+            session, turn, surface = persist_evidence_bundle(
+                session,
+                owner,
+                query,
+                result,
+                origin="gallery_semantic_launch",
+            )
+        except Exception as exc:
+            if session:
+                await discard_created_session(session)
+            code = "HERMES_UNAVAILABLE" if session is None else "EVIDENCE_STORE_FAILED"
+            status = 502 if session is None else 500
+            return json_response(
+                {"error": {"code": code, "message": str(exc)[:600]}},
+                status,
+            )
+
+        url = "/calliope?" + urlencode({
+            "session": str(session["id"]),
+            "surface": str(surface["id"]),
+        })
         return json_response(
             {
+                "new_session": True,
+                "mode": "evidence_bundle",
                 "session": _session_json(session),
                 "turn": _turn_json(turn),
-                "surface": surfaces[0],
+                "surface": surface,
+                "url": url,
             },
             201,
         )

@@ -271,8 +271,15 @@ uber-origin Caddy route proxies `/theme/*` to the Warehouse service.
 
 ## Calliope (optional Hermes-backed notebook)
 Set both `WAREHOUSE_HERMES_URL` and `WAREHOUSE_HERMES_API_KEY` to add **Calliope** to
-the gallery as a floating avatar launcher. If either is blank, no Calliope launcher
+the gallery as a floating workspace portal. If either is blank, no Calliope launcher
 or route is registered.
+
+The gallery keeps its instant, browser-local artifact filter. Once a query has at least
+two characters it also offers an explicit semantic escalation: clicking it (or pressing
+Enter in the filter) resolves company evidence, creates a fresh email-owned Hermes and
+Calliope session, saves the result as the first evidence bundle, and then opens that
+bundle in the full Calliope workspace. The search is sent in the authenticated POST body,
+not placed in the URL, and never becomes a synthetic agent chat turn.
 
 Calliope is a three-column business-user surface: the signed-in user's private session
 rail, a newest-first living artifact record, and chat. Hermes owns the agent run and uses
@@ -291,8 +298,9 @@ stored overlay becomes a toggleable, lineage-linked stage surface.
 
 The stage header also contains a company evidence resolver. One query federates the
 caller's ACL-filtered Document Brain, published artifact metadata and enriched semantic
-objects, and the warehouse semantic catalog. Results are saved as a newest-first working
-set in the notebook rather than pasted into chat. Users explicitly select any combination
+objects, and the warehouse semantic catalog. Results are saved as a newest-first evidence
+bundle in the notebook rather than pasted into chat. Published artifact matches reuse compact
+gallery thumbnails. Users explicitly select any combination
 of documents, dashboards, dashboard values, tables, columns, cubes, or metrics and then
 ask Calliope with that context. With no individual selection, **Ask Calliope** attaches the
 whole search as one compact index containing its query, corpus counts, and bounded result

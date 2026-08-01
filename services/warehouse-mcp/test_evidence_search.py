@@ -77,7 +77,9 @@ def test_artifact_ranker_searches_semantic_objects_and_keeps_parent_artifact(mon
     assert items[0]["kind"] == "dashboard-object"
     assert items[0]["title"].startswith("Weighted pipeline")
     assert items[0]["provenance"]["replayable"] is True
+    assert items[0]["thumbnail_url"] == "/thumbs/dashboard/pipeline-health.png"
     assert any(item["kind"] == "artifact" and item["url"] == "/d/pipeline-health" for item in items)
+    assert all(item["thumbnail_url"] == "/thumbs/dashboard/pipeline-health.png" for item in items)
 
 
 def test_business_search_suppresses_system_learning_noise(monkeypatch):
@@ -117,6 +119,141 @@ def test_business_search_suppresses_system_learning_noise(monkeypatch):
         "Route shape native_cap=0",
         "Pipeline review",
     }
+
+
+def test_data_search_projects_catalog_enrichment_as_compact_typed_fields(monkeypatch):
+    search_rows = [
+        {
+            "node_id": 1,
+            "kind": "db_table",
+            "schema_name": "sales",
+            "rel_name": "orders",
+            "col_name": None,
+            "score": 0.7,
+            "boosted_score": 0.8,
+            "usage_touches": 9,
+            "doc": "Table sales.orders — 150000 rows. Columns: order_id, net_value.",
+            "properties": {
+                "n_rows": "150000",
+                "n_columns": "2",
+                "relkind": "r",
+                "comment": "One row per booked order.",
+            },
+        },
+        {
+            "node_id": 2,
+            "kind": "db_column",
+            "schema_name": "sales",
+            "rel_name": "orders",
+            "col_name": "net_value",
+            "score": 0.9,
+            "boosted_score": 0.9,
+            "usage_touches": 4,
+            "doc": "Column sales.orders.net_value (numeric).",
+            "properties": {
+                "data_type": "numeric",
+                "ndv": 42,
+                "null_frac": 0.125,
+                "is_fk": True,
+                "comment": "Booked value after discounts, in USD.",
+            },
+        },
+        {
+            "node_id": 3,
+            "kind": "cube",
+            "schema_name": "cubes",
+            "rel_name": "sales_health",
+            "col_name": None,
+            "score": 0.6,
+            "boosted_score": 0.6,
+            "usage_touches": 0,
+            "doc": "Cube cubes.sales_health — Sales health by region.",
+            "properties": {
+                "description": "A curated view of sales health and coverage.",
+                "grain": "one row per region and week",
+            },
+        },
+    ]
+    catalog_columns = [
+        {"table_schema": "sales", "table_name": "orders", "column_name": "order_id", "data_type": "bigint", "is_nullable": "NO", "ordinal_position": 1},
+        {"table_schema": "sales", "table_name": "orders", "column_name": "net_value", "data_type": "numeric", "is_nullable": "YES", "ordinal_position": 2},
+        {"table_schema": "cubes", "table_name": "sales_health", "column_name": "region", "data_type": "text", "is_nullable": "YES", "ordinal_position": 1},
+        {"table_schema": "cubes", "table_name": "sales_health", "column_name": "coverage", "data_type": "numeric", "is_nullable": "YES", "ordinal_position": 2},
+    ]
+
+    class SemanticConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            if "search_data_weighted" in statement:
+                assert "n.properties" in statement
+                return _Result(search_rows)
+            if "information_schema.columns" in statement:
+                return _Result(catalog_columns)
+            if "cube_catalog" in statement:
+                return _Result([{
+                    "name": "sales_health",
+                    "version": 2,
+                    "grain": "one row per region and week",
+                    "description": "A curated view of sales health and coverage.",
+                    "category": "Revenue",
+                    "last_rows": 150000,
+                    "refreshed_at": "2026-08-01T12:00:00Z",
+                }])
+            if "cube_columns" in statement:
+                return _Result([{
+                    "cube_name": "sales_health",
+                    "column_name": "coverage",
+                    "data_type": "numeric",
+                    "doc": "Share of quota already covered.",
+                    "semantics": "A ratio from zero to one.",
+                    "source_ref": "derived: booked / quota",
+                }])
+            raise AssertionError(statement)
+
+    monkeypatch.setattr(server, "_conn", lambda: SemanticConnection())
+    items = server._calliope_data_evidence("sales health", 8)
+    by_kind = {item["kind"]: item for item in items}
+
+    table = by_kind["db_table"]
+    assert table["identity"] == {"schema": "sales", "relation": "orders"}
+    assert table["definition"] == "One row per booked order."
+    assert table["facts"] == [
+        {"label": "Rows", "value": "150K"},
+        {"label": "Fields", "value": "2"},
+        {"label": "Kind", "value": "Table"},
+    ]
+    assert table["field_count"] == 2
+    assert table["fields"][0] == {"name": "order_id", "type": "bigint", "nullable": False}
+
+    column = by_kind["db_column"]
+    assert column["identity"]["column"] == "net_value"
+    assert column["definition"] == "Booked value after discounts, in USD."
+    assert "fields" not in column
+    assert "field_count" not in column
+    assert {fact["label"]: fact["value"] for fact in column["facts"]} == {
+        "Type": "numeric",
+        "Key": "Foreign key",
+        "Distinct": "42",
+        "Missing": "12.5%",
+    }
+
+    cube = by_kind["cube"]
+    assert cube["definition"] == "A curated view of sales health and coverage."
+    assert {fact["label"]: fact["value"] for fact in cube["facts"]} == {
+        "Grain": "one row per region and week",
+        "Rows": "150K",
+        "Fields": "2",
+        "Category": "Revenue",
+    }
+    assert cube["field_count"] == 2
+    coverage = next(field for field in cube["fields"] if field["name"] == "coverage")
+    assert coverage["definition"] == "Share of quota already covered."
+    assert coverage["semantics"] == "A ratio from zero to one."
 
 
 def test_federated_search_keeps_working_when_one_corpus_is_unavailable(monkeypatch):

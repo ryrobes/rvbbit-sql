@@ -2715,8 +2715,80 @@
       && Boolean(item.provenance?.replayable);
   }
 
+  function evidenceArtifactGlyph(item) {
+    const kind = String(item.provenance?.app_kind || item.subtype || item.kind || "").toLowerCase();
+    if (kind.includes("dashboard")) return "▦";
+    if (kind.includes("deck") || kind.includes("slide")) return "▷";
+    if (kind.includes("report")) return "▤";
+    return "◈";
+  }
+
+  function renderEvidenceThumbnail(item) {
+    if (!item.thumbnail_url || item.group !== "artifacts") return "";
+    const objectClass = item.kind === "dashboard-object" ? " object-thumb" : "";
+    return `<div class="evidence-artifact-thumb${objectClass}" data-evidence-thumbnail>
+      <span aria-hidden="true">${evidenceArtifactGlyph(item)}</span>
+      <img src="${escapeHtml(item.thumbnail_url)}" alt="" loading="lazy" decoding="async">
+    </div>`;
+  }
+
+  function hydrateEvidenceThumbnails(root = els.stage) {
+    $$('[data-evidence-thumbnail]', root).forEach((frame) => {
+      if (frame.dataset.hydrated === "true") return;
+      frame.dataset.hydrated = "true";
+      const image = $("img", frame);
+      if (!image) return;
+      const base = image.getAttribute("src");
+      let tries = 0;
+      image.addEventListener("load", () => frame.classList.add("ready"));
+      image.addEventListener("error", () => {
+        frame.classList.remove("ready");
+        if (++tries > 5) return;
+        window.setTimeout(() => {
+          if (!frame.isConnected) return;
+          image.src = `${base}${base.includes("?") ? "&" : "?"}r=${tries}`;
+        }, tries * 2200);
+      });
+      if (image.complete && image.naturalWidth > 0) frame.classList.add("ready");
+    });
+  }
+
+  function renderDataEvidenceDetails(item) {
+    const identity = item.identity || {};
+    const objectName = identity.column || identity.relation || item.title;
+    const parentParts = identity.column
+      ? [identity.schema, identity.relation]
+      : [identity.schema];
+    const parent = parentParts.filter(Boolean).join(" / ");
+    const facts = (item.facts || []).slice(0, 4).map((fact) =>
+      `<span><b>${escapeHtml(fact.label)}</b><em title="${escapeHtml(fact.value)}">${escapeHtml(fact.value)}</em></span>`
+    ).join("");
+    const fields = (item.fields || []).slice(0, 3);
+    const fieldChips = fields.map((field) => {
+      const notes = [field.type, field.definition, field.semantics].filter(Boolean).join(" · ");
+      return `<span title="${escapeHtml(notes || field.name)}"><b>${escapeHtml(field.name)}</b>${
+        field.type ? `<em>${escapeHtml(field.type)}</em>` : ""
+      }</span>`;
+    }).join("");
+    const fieldCount = Number(item.field_count || (item.fields || []).length);
+    const remaining = Math.max(0, fieldCount - fields.length);
+    const definition = item.definition
+      || (!(item.facts || []).length && !(item.fields || []).length ? item.summary : "");
+    return `<div class="data-evidence-identity">
+        ${parent ? `<span>${escapeHtml(parent)}</span>` : ""}
+        <h4 title="${escapeHtml(item.title)}">${escapeHtml(objectName)}</h4>
+      </div>
+      ${definition ? `<p class="data-evidence-definition">${escapeHtml(definition)}</p>` : ""}
+      ${facts ? `<div class="data-evidence-facts">${facts}</div>` : ""}
+      ${fieldChips ? `<div class="data-evidence-fields"><label>Fields</label>${fieldChips}${
+        remaining ? `<i>+${remaining}</i>` : ""
+      }</div>` : ""}`;
+  }
+
   function renderEvidenceCard(surface, item) {
     const selected = Boolean(selectedEvidence(surface.id, item.id));
+    const thumbnail = renderEvidenceThumbnail(item);
+    const isDataAtom = item.group === "data";
     const entities = (item.entities || []).slice(0, 3).map((entity) =>
       `<span>${escapeHtml(entity)}</span>`
     ).join("");
@@ -2724,17 +2796,18 @@
       item.subtype || item.kind,
       item.occurred_at ? relativeTime(item.occurred_at) : null,
     ].filter(Boolean).join(" · ");
-    return `<article class="evidence-card ${selected ? "selected" : ""}"
+    return `<article class="evidence-card ${isDataAtom ? "data-atom" : ""} ${thumbnail ? "has-thumbnail" : ""} ${item.kind === "dashboard-object" && thumbnail ? "object-thumbnail" : ""} ${selected ? "selected" : ""}"
       data-evidence-id="${escapeHtml(item.id)}" data-evidence-kind="${escapeHtml(item.kind)}" role="button" tabindex="0"
       aria-pressed="${selected ? "true" : "false"}">
+      ${thumbnail}
       <header>
         <span class="evidence-type">${escapeHtml(meta || "evidence")}</span>
         <button type="button" data-evidence-select aria-label="${selected ? "Remove" : "Add"} ${escapeHtml(item.title)} ${selected ? "from" : "to"} Calliope context">
           ${selected ? "Added ✓" : "+ Add"}
         </button>
       </header>
-      <h4>${escapeHtml(item.title)}</h4>
-      <p>${escapeHtml(item.summary || "Matching company evidence")}</p>
+      ${isDataAtom ? renderDataEvidenceDetails(item) : `<h4>${escapeHtml(item.title)}</h4>
+      <p>${escapeHtml(item.summary || "Matching company evidence")}</p>`}
       ${entities ? `<div class="evidence-entities">${entities}</div>` : ""}
       <footer>
         <span title="${escapeHtml(item.source || "")}">${escapeHtml(item.source || evidenceGroupLabel(item.group))}</span>
@@ -2773,7 +2846,7 @@
     return `<div class="evidence-set">
       <div class="evidence-set-intro">
         <div>
-          <span class="eyebrow">Saved working set</span>
+          <span class="eyebrow">Evidence bundle</span>
           <h3>“${escapeHtml(payload.query || surface.title)}”</h3>
           <p>${items.length} evidence item${items.length === 1 ? "" : "s"} resolved in ${escapeHtml(payload.elapsed_ms || 0)}ms. Select specific results, or use the whole search as a compact index.</p>
         </div>
@@ -2960,7 +3033,7 @@
       : surface.kind === "document" ? surface.payload?.download_url : null;
     const lineage = `<div class="surface-lineage"><i></i><span>${
       surface.kind === "evidence"
-        ? (surface.parent_surface_id ? "Refined from an earlier search in this session" : "Search set saved in this session")
+        ? (surface.parent_surface_id ? "Refined from an earlier evidence bundle" : "Evidence bundle saved in this session")
         : (surface.parent_surface_id ? "Revision linked to an earlier surface" : "First surface in this lineage")
     }</span></div>`;
     const content = metadata
@@ -3028,6 +3101,7 @@
         <div class="surface-grid">${surfacesForTurn(turn.id).map(surfaceCard).join("")}</div>
       </section>
     `).join("");
+    hydrateEvidenceThumbnails();
     syncEvidenceSelectionCards();
     requestAnimationFrame(initializeCubeBuilders);
     if (initial) {

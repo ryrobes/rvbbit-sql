@@ -1472,7 +1472,15 @@ def test_evidence_resolver_is_a_native_scratchpad_and_composer_contract():
     assert "data-evidence-select" in script
     assert 'const EVIDENCE_SET_HANDLE = "@search-set"' in script
     assert "attachEvidenceSet" in script
+    assert "Evidence bundle" in script
+    assert "data-evidence-thumbnail" in script
+    assert "renderDataEvidenceDetails" in script
+    assert "/api/calliope/evidence-explorations" in source
+    assert 'origin="gallery_semantic_launch"' in source
     assert ".surface.kind-evidence" in css
+    assert ".evidence-artifact-thumb" in css
+    assert ".data-evidence-facts" in css
+    assert ".data-evidence-fields" in css
     assert ".evidence-context-tray" in css
     assert 'kind=\'evidence\'' in source
     assert "CALLIOPE_SELECTED_EVIDENCE_BEGIN" in source
@@ -1558,6 +1566,7 @@ def test_evidence_search_result_is_bounded_deduped_and_url_safe():
                     "kind": "artifact",
                     "title": "Growth dashboard",
                     "url": "/d/growth",
+                    "thumbnail_url": "/thumbs/dashboard/growth.png",
                     "score": -3,
                 },
             ],
@@ -1572,7 +1581,59 @@ def test_evidence_search_result_is_bounded_deduped_and_url_safe():
     assert len(normalized["items"][0]["summary"]) == 2_000
     assert "url" not in normalized["items"][0]
     assert normalized["items"][1]["url"] == "/d/growth"
+    assert normalized["items"][1]["thumbnail_url"] == "/thumbs/dashboard/growth.png"
     assert normalized["items"][1]["score"] == 0.0
+
+
+def test_data_evidence_structure_is_bounded_without_flattening_its_fields():
+    normalized = calliope._normalize_evidence_search_result(
+        {
+            "items": [{
+                "id": "data:42",
+                "group": "data",
+                "kind": "db_column",
+                "title": " sales.orders.net_value ",
+                "summary": "The legacy flattened catalog document.",
+                "identity": {
+                    "schema": " sales ",
+                    "relation": "orders",
+                    "column": "net_value",
+                    "ignored": "nope",
+                },
+                "definition": "x" * 800,
+                "facts": [
+                    {"label": f" Fact {index} ", "value": "v" * 150}
+                    for index in range(6)
+                ],
+                "field_count": 10,
+                "fields": [
+                    {
+                        "name": f"field_{index}",
+                        "type": "numeric",
+                        "definition": "d" * 500,
+                        "semantics": "ratio",
+                        "source_ref": "raw.amount",
+                        "nullable": False,
+                    }
+                    for index in range(10)
+                ],
+            }],
+        },
+        "net value",
+    )
+    item = normalized["items"][0]
+    assert item["identity"] == {
+        "schema": "sales",
+        "relation": "orders",
+        "column": "net_value",
+    }
+    assert len(item["definition"]) == 520
+    assert len(item["facts"]) == 4
+    assert len(item["facts"][0]["value"]) == 120
+    assert len(item["fields"]) == 8
+    assert item["field_count"] == 10
+    assert len(item["fields"][0]["definition"]) == 360
+    assert item["fields"][0]["nullable"] is False
 
 
 def test_selected_evidence_is_hydrated_from_the_owned_surface_not_browser_text():
