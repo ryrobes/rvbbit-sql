@@ -917,6 +917,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0224_artifact_semantic_enrichment",
         include_str!("../sql/migrations/0224_artifact_semantic_enrichment.sql"),
     ),
+    (
+        "0225_calliope_evidence_sets",
+        include_str!("../sql/migrations/0225_calliope_evidence_sets.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

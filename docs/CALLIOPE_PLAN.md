@@ -43,10 +43,13 @@ Postgres stores the Hub-owned index and visual ledger:
   session ID. Friendly titles are local, so different users may use the same
   title even though Hermes titles are globally constrained.
 * `rvbbit.calliope_turns` mirrors the human/Calliope prose needed to resume the
-  UI and gives every visible causal step a stable local ID.
+  UI and gives every visible causal step a stable local ID. `turn_kind`
+  distinguishes actual Hermes chat from evidence searches, and `evidence_refs`
+  freezes the bounded evidence used by a chat turn.
 * `rvbbit.calliope_surfaces` is an append-only projection of tool results. An
   update creates a new surface and points to the prior surface in its lineage;
-  it never mutates history.
+  it never mutates history. Federated evidence sets use the same ledger and can
+  therefore be resumed, rerun, and linked back to later chat turns.
 * `rvbbit.calliope_attachments` records owner-gated image files stored under
   `WAREHOUSE_CALLIOPE_DIR`.
 * `rvbbit.calliope_design_profiles` holds company-visible names, ownership, and
@@ -62,6 +65,33 @@ Postgres stores the Hub-owned index and visual ledger:
 Published apps, dashboards, and decks still live in
 `rvbbit.dashboards`/`rvbbit.dashboard_versions`. A surface holds only their
 slug/version reference and the rendering metadata needed by the notebook.
+
+## Company evidence resolver
+
+Search is a scratchpad operation, not a second conversational product. The slim
+resolver above the stage fans a query across three existing company substrates:
+
+* ACL-filtered `rvbbit.brain_search` document chunks, including synchronized
+  ticket, document, and meeting-note sources;
+* shared published artifacts plus their enriched semantic-map objects; and
+* `rvbbit.search_data_weighted` warehouse semantics.
+
+The federator normalizes these into typed evidence cards and tolerates a partial
+resolver failure. An evidence-search turn and evidence surface persist the exact
+working set under the signed-in user's session, but neither is sent to Hermes nor
+rendered as chat. Multi-selection is explicit. The browser may submit only
+`surface_id`/`evidence_id` handles; the server verifies ownership and rehydrates
+the authoritative records before compiling bounded, clearly delimited agent
+context. The completed chat turn stores a compact evidence snapshot so a resumed
+notebook still explains what grounded the answer. If no individual card is selected,
+**Ask Calliope** attaches one server-hydrated search-set handle instead: the query,
+corpus/count summary, and bounded result gists and locators. This preserves the useful
+shape of the whole search without copying full document chunks into the prompt.
+
+Artifact semantic maps and sanitized organizational question/answer memory are
+not yet projected into the company knowledge graph by this first pass. The
+resolver creates the product seam for that later attention-graph work without
+requiring a separate search browser or changing Hermes' shared-memory boundary.
 
 ## Turn protocol
 

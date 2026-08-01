@@ -69,13 +69,21 @@ __CALLIOPE_BACKGROUND__
         <button id="archive-session" class="quiet-action" type="button" disabled>Archive</button>
       </div>
     </header>
+    <form id="evidence-search" class="evidence-search" role="search">
+      <span class="evidence-search-glyph" aria-hidden="true">⌕</span>
+      <label for="evidence-query" class="sr-only">Find evidence across company memory, artifacts, and warehouse semantics</label>
+      <input id="evidence-query" type="search" maxlength="600"
+             placeholder="Find evidence across company memory…" autocomplete="off" disabled>
+      <span id="evidence-search-scope" class="evidence-search-scope">docs · artifacts · data</span>
+      <button id="evidence-search-submit" type="submit" disabled>Find</button>
+    </form>
     <div id="stage-scroll" class="stage-scroll">
       <button id="new-surfaces" class="new-surfaces" type="button" hidden>New surfaces ↑</button>
       <div id="stage-empty" class="stage-empty">
         <div class="orbit" aria-hidden="true"><i></i><i></i><i></i></div>
         <p class="eyebrow">Nothing placed yet</p>
         <h2>Ideas become things here.</h2>
-        <p>Ask Calliope a business question. Queries, charts, dashboards, decks, images, and documents collect above their history—not inside the conversation.</p>
+        <p>Find existing evidence or ask Calliope a business question. Search sets, queries, charts, dashboards, decks, images, and documents collect above their history—not inside the conversation.</p>
       </div>
       <div id="stage" class="stage"></div>
     </div>
@@ -125,6 +133,7 @@ __CALLIOPE_BACKGROUND__
     <form id="composer" class="composer">
       <div id="design-profile-chip" class="design-profile-chip" hidden></div>
       <div id="selected-reference" class="selected-reference" hidden></div>
+      <div id="evidence-context-tray" class="evidence-context-tray" hidden></div>
       <div id="spatial-selection-tray" class="spatial-selection-tray" hidden></div>
       <div id="attachment-tray" class="attachment-tray" hidden></div>
       <label class="compose-box">

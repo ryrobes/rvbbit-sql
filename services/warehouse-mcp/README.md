@@ -289,6 +289,20 @@ before finishing. Any image surface can also be opened in the pen/arrow/box mark
 editor; the flattened annotation is sent with the next message while its separately
 stored overlay becomes a toggleable, lineage-linked stage surface.
 
+The stage header also contains a company evidence resolver. One query federates the
+caller's ACL-filtered Document Brain, published artifact metadata and enriched semantic
+objects, and the warehouse semantic catalog. Results are saved as a newest-first working
+set in the notebook rather than pasted into chat. Users explicitly select any combination
+of documents, dashboards, dashboard values, tables, columns, cubes, or metrics and then
+ask Calliope with that context. With no individual selection, **Ask Calliope** attaches the
+whole search as one compact index containing its query, corpus counts, and bounded result
+gists/provenance handles—not the full documents. The browser sends only opaque handles;
+Warehouse rehydrates the selected records or search set from the authenticated session
+before giving bounded evidence to Hermes. Evidence searches are durable scratchpad history
+but are not Hermes chat turns, while the selected evidence is recorded on the eventual chat turn for later
+resumption. A failed corpus is shown as unavailable without discarding results from the
+other resolvers. No additional environment variables are required.
+
 The header's **Design Profiles** library turns uploaded reference images, a frozen
 URL viewport/extraction, an existing selected capture, and optional written direction
 into a reusable dashboard style contract. Profiles are company-visible and creator-

@@ -20,6 +20,10 @@
     stageEmpty: $("#stage-empty"),
     surfaceCount: $("#surface-count"),
     newSurfaces: $("#new-surfaces"),
+    evidenceSearch: $("#evidence-search"),
+    evidenceQuery: $("#evidence-query"),
+    evidenceSearchScope: $("#evidence-search-scope"),
+    evidenceSearchSubmit: $("#evidence-search-submit"),
     messages: $("#messages"),
     chatEmpty: $("#chat-empty"),
     status: $("#calliope-status"),
@@ -39,6 +43,7 @@
     imageInput: $("#image-input"),
     attachmentTray: $("#attachment-tray"),
     selectedReference: $("#selected-reference"),
+    evidenceContextTray: $("#evidence-context-tray"),
     spatialSelectionTray: $("#spatial-selection-tray"),
     markupDialog: $("#markup-dialog"),
     markupTitle: $("#markup-title"),
@@ -83,6 +88,7 @@
     styleUseSession: $("#style-use-session"),
     toast: $("#toast"),
   };
+  const EVIDENCE_SET_HANDLE = "@search-set";
 
   const state = {
     sessions: [],
@@ -93,6 +99,8 @@
     spatialSelections: [],
     inspectingSurfaceId: null,
     attachments: [],
+    evidenceSelections: [],
+    evidenceSearching: false,
     busy: false,
     stageAtLiveEdge: true,
     chatAtLiveEdge: true,
@@ -309,10 +317,24 @@
     try {
       state.config = await api("/api/calliope/config");
       setStatus(state.config.healthy ? "ready" : "unavailable", state.config.healthy ? "" : "offline");
+      syncEvidenceSearchControls();
     } catch (error) {
       setStatus("unavailable", "offline");
+      syncEvidenceSearchControls();
       throw error;
     }
+  }
+
+  function syncEvidenceSearchControls() {
+    const available = Boolean(state.config?.evidence_search);
+    const enabled = available && Boolean(state.current) && !state.evidenceSearching;
+    els.evidenceQuery.disabled = !enabled;
+    els.evidenceSearchSubmit.disabled = !enabled;
+    els.evidenceSearch.classList.toggle("searching", state.evidenceSearching);
+    els.evidenceSearch.setAttribute("aria-busy", String(state.evidenceSearching));
+    els.evidenceSearchScope.textContent = state.evidenceSearching
+      ? "resolving company evidence…"
+      : available ? "docs · artifacts · data" : "resolver unavailable";
   }
 
   function designVersions(profile) {
@@ -800,6 +822,7 @@
     state.turns = [];
     state.surfaces = [];
     state.selectedSurfaceId = null;
+    state.evidenceSelections = [];
     state.chatAtLiveEdge = true;
     state.nextTurnDesignProfileVersionId = null;
     state.cubeBuilders.clear();
@@ -808,14 +831,16 @@
     els.input.disabled = true;
     els.send.disabled = true;
     renderSelected();
+    renderEvidenceContextTray();
     renderDesignProfileChip();
     renderSpatialSelectionTray();
     renderChat();
     renderStage();
+    syncEvidenceSearchControls();
   }
 
   async function selectSession(id) {
-    if (state.busy) return;
+    if (state.busy || state.evidenceSearching) return;
     clearSpatialSelections();
     clearLiveActivity();
     const data = await api(`/api/calliope/sessions/${encodeURIComponent(id)}`);
@@ -823,6 +848,7 @@
     state.turns = data.turns || [];
     state.surfaces = data.surfaces || [];
     state.selectedSurfaceId = null;
+    state.evidenceSelections = [];
     state.nextTurnDesignProfileVersionId = null;
     state.cubeBuilders.clear();
     state.newSurfaceCount = 0;
@@ -832,10 +858,12 @@
     els.send.disabled = false;
     renderSessions();
     renderSelected();
+    renderEvidenceContextTray();
     renderDesignProfileChip();
     renderSpatialSelectionTray();
     renderChat(true);
     renderStage(true);
+    syncEvidenceSearchControls();
     setMobilePanel();
     requestAnimationFrame(() => els.input.focus());
   }
@@ -925,9 +953,21 @@
     });
   }
 
+  function renderTurnEvidenceRefs(turn) {
+    const refs = Array.isArray(turn.evidence_refs) ? turn.evidence_refs : [];
+    if (!refs.length) return "";
+    return `<div class="message-evidence" aria-label="Evidence used in this turn">
+      <span>Evidence used</span>
+      ${refs.map((item) => `<button type="button" data-focus-evidence-surface="${escapeHtml(item.surface_id || "")}" title="${escapeHtml(item.source || item.title || "Selected evidence")}">
+        ${surfaceGlyph("evidence")} ${escapeHtml(item.title || "Evidence")}
+      </button>`).join("")}
+    </div>`;
+  }
+
   function renderChat(initial = false) {
-    els.chatEmpty.hidden = Boolean(state.turns.length);
-    els.messages.innerHTML = state.turns.map((turn) => {
+    const chatTurns = state.turns.filter((turn) => (turn.turn_kind || "chat") === "chat");
+    els.chatEmpty.hidden = Boolean(chatTurns.length);
+    els.messages.innerHTML = chatTurns.map((turn) => {
       const attachments = (turn.attachments || []).map((attachment) =>
         `<a href="${escapeHtml(attachment.url)}" target="_blank" rel="noopener">
           <img src="${escapeHtml(attachment.url)}" alt="${escapeHtml(attachment.name || "Attached image")}">
@@ -945,6 +985,7 @@
           <div class="message-label"><span>You · ${escapeHtml(relativeTime(turn.created_at))}</span></div>
           <div class="message-body">${safeMarkdown(turn.user_message)}</div>
           ${attachments ? `<div class="message-attachments">${attachments}</div>` : ""}
+          ${renderTurnEvidenceRefs(turn)}
         </article>
         <article class="message assistant ${turn.status === "running" ? "streaming" : ""} ${failed ? "error" : ""}"
                  data-assistant-turn-id="${escapeHtml(turn.id)}">
@@ -1224,7 +1265,7 @@
   }
 
   function surfaceGlyph(kind) {
-    return ({ query: "▤", metric: "◆", cube: "▦", artifact: "▦", image: "▧", document: "▱", selection: "⌖" })[kind] || "◇";
+    return ({ query: "▤", metric: "◆", cube: "▦", artifact: "▦", image: "▧", document: "▱", selection: "⌖", evidence: "⌕" })[kind] || "◇";
   }
 
   function formatValue(value) {
@@ -2241,6 +2282,92 @@
     </div>`;
   }
 
+  function evidenceSelectionKey(surfaceId, evidenceId) {
+    return `${surfaceId}:${evidenceId}`;
+  }
+
+  function selectedEvidence(surfaceId, evidenceId) {
+    const key = evidenceSelectionKey(surfaceId, evidenceId);
+    return state.evidenceSelections.find((item) => item.key === key) || null;
+  }
+
+  function evidenceGroupLabel(group) {
+    return ({
+      knowledge: "Company memory",
+      artifacts: "Artifacts & dashboard objects",
+      data: "Warehouse semantics",
+    })[group] || "Evidence";
+  }
+
+  function renderEvidenceCard(surface, item) {
+    const selected = Boolean(selectedEvidence(surface.id, item.id));
+    const entities = (item.entities || []).slice(0, 3).map((entity) =>
+      `<span>${escapeHtml(entity)}</span>`
+    ).join("");
+    const meta = [
+      item.subtype || item.kind,
+      item.occurred_at ? relativeTime(item.occurred_at) : null,
+    ].filter(Boolean).join(" · ");
+    return `<article class="evidence-card ${selected ? "selected" : ""}"
+      data-evidence-id="${escapeHtml(item.id)}" role="button" tabindex="0"
+      aria-pressed="${selected ? "true" : "false"}">
+      <header>
+        <span class="evidence-type">${escapeHtml(meta || "evidence")}</span>
+        <button type="button" data-evidence-select aria-label="${selected ? "Remove" : "Add"} ${escapeHtml(item.title)} ${selected ? "from" : "to"} Calliope context">
+          ${selected ? "Added ✓" : "+ Add"}
+        </button>
+      </header>
+      <h4>${escapeHtml(item.title)}</h4>
+      <p>${escapeHtml(item.summary || "Matching company evidence")}</p>
+      ${entities ? `<div class="evidence-entities">${entities}</div>` : ""}
+      <footer>
+        <span title="${escapeHtml(item.source || "")}">${escapeHtml(item.source || evidenceGroupLabel(item.group))}</span>
+        ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener">Open ↗</a>` : ""}
+      </footer>
+    </article>`;
+  }
+
+  function renderEvidenceSet(surface) {
+    const payload = surface.payload || {};
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    const selectedCount = state.evidenceSelections.filter(
+      (item) => item.surface_id === surface.id && item.evidence_id !== EVIDENCE_SET_HANDLE,
+    ).length;
+    const wholeSetAttached = Boolean(selectedEvidence(surface.id, EVIDENCE_SET_HANDLE));
+    const askMeta = selectedCount
+      ? `· ${selectedCount}`
+      : wholeSetAttached ? "· set attached" : `· all ${items.length}`;
+    const sourceStatus = (payload.searched || []).map((source) =>
+      `<span class="${source.status === "unavailable" ? "unavailable" : ""}"><i></i>${escapeHtml(source.label)} · ${escapeHtml(source.count || 0)}</span>`
+    ).join("");
+    const warnings = (payload.warnings || []).length
+      ? `<details class="evidence-warnings"><summary>Some sources could not be searched</summary><p>${escapeHtml(payload.warnings.join(" · "))}</p></details>`
+      : "";
+    const groups = ["knowledge", "artifacts", "data"].map((group) => {
+      const matches = items.filter((item) => item.group === group);
+      if (!matches.length) return "";
+      return `<section class="evidence-group" data-evidence-group="${group}">
+        <header><h4>${escapeHtml(evidenceGroupLabel(group))}</h4><span>${matches.length} match${matches.length === 1 ? "" : "es"}</span></header>
+        <div class="evidence-grid">${matches.map((item) => renderEvidenceCard(surface, item)).join("")}</div>
+      </section>`;
+    }).join("");
+    return `<div class="evidence-set">
+      <div class="evidence-set-intro">
+        <div>
+          <span class="eyebrow">Saved working set</span>
+          <h3>“${escapeHtml(payload.query || surface.title)}”</h3>
+          <p>${items.length} evidence item${items.length === 1 ? "" : "s"} resolved in ${escapeHtml(payload.elapsed_ms || 0)}ms. Select specific results, or use the whole search as a compact index.</p>
+        </div>
+        <button type="button" data-ask-evidence="${escapeHtml(surface.id)}" aria-pressed="${wholeSetAttached}">
+          Ask Calliope <span>${askMeta}</span> →
+        </button>
+      </div>
+      ${sourceStatus ? `<div class="evidence-source-status">${sourceStatus}</div>` : ""}
+      ${warnings}
+      ${groups || `<div class="evidence-empty"><strong>No useful evidence surfaced.</strong><span>Try a business term, project name, ticket, metric, or dashboard value.</span></div>`}
+    </div>`;
+  }
+
   function surfaceCard(surface) {
     const designProfile = surface.presentation?.design_profile;
     const meta = [
@@ -2256,12 +2383,15 @@
       image: renderImage,
       document: renderDocument,
       selection: renderSelection,
+      evidence: renderEvidenceSet,
     })[surface.kind]?.(surface) || `<div class="chart-empty">Surface unavailable</div>`;
     const openUrl = surface.kind === "artifact"
       ? surface.payload?.display_url || surface.payload?.url
       : surface.kind === "document" ? surface.payload?.download_url : null;
     const lineage = `<div class="surface-lineage"><i></i><span>${
-      surface.parent_surface_id ? "Revision linked to an earlier surface" : "First surface in this lineage"
+      surface.kind === "evidence"
+        ? (surface.parent_surface_id ? "Refined from an earlier search in this session" : "Search set saved in this session")
+        : (surface.parent_surface_id ? "Revision linked to an earlier surface" : "First surface in this lineage")
     }</span></div>`;
     const content = metadata
       ? `<details class="metadata-details">
@@ -2299,7 +2429,9 @@
               state.inspectingSurfaceId === surface.id ? "Picking…" : "Select"
             }</button>`
             : ""}
-          <button type="button" data-source-turn="${escapeHtml(surface.turn_id)}" title="Jump to source message">↗</button>
+          ${surface.kind === "evidence"
+            ? `<button type="button" data-repeat-evidence="${escapeHtml(surface.id)}" title="Run this evidence search again">Again</button>`
+            : `<button type="button" data-source-turn="${escapeHtml(surface.turn_id)}" title="Jump to source message">↗</button>`}
           ${openUrl ? `<a href="${escapeHtml(openUrl)}" target="_blank" rel="noopener" title="Open full size">↥</a>` : ""}
         </div>
       </header>
@@ -2313,19 +2445,185 @@
     const turns = [...state.turns].reverse().filter((turn) => surfacesForTurn(turn.id).length);
     els.stage.innerHTML = turns.map((turn) => `
       <section class="stratum" data-stratum-turn="${escapeHtml(turn.id)}">
-        <header class="stratum-head">
-          <span>Turn ${escapeHtml(turn.ordinal)}</span>
-          <button type="button" data-source-turn="${escapeHtml(turn.id)}">“${escapeHtml(turn.user_message)}”</button>
+        <header class="stratum-head ${turn.turn_kind === "evidence_search" ? "search-stratum" : ""}">
+          <span>${turn.turn_kind === "evidence_search" ? "Search" : `Turn ${escapeHtml(turn.ordinal)}`}</span>
+          ${turn.turn_kind === "evidence_search"
+            ? `<em>“${escapeHtml(turn.user_message)}”</em>`
+            : `<button type="button" data-source-turn="${escapeHtml(turn.id)}">“${escapeHtml(turn.user_message)}”</button>`}
           <span>${escapeHtml(relativeTime(turn.created_at))}</span>
         </header>
         <div class="surface-grid">${surfacesForTurn(turn.id).map(surfaceCard).join("")}</div>
       </section>
     `).join("");
+    syncEvidenceSelectionCards();
     requestAnimationFrame(initializeCubeBuilders);
     if (initial) {
       els.stageScroll.scrollTop = 0;
       state.stageAtLiveEdge = true;
     }
+  }
+
+  function evidenceItem(surfaceId, evidenceId) {
+    const surface = state.surfaces.find((item) => item.id === surfaceId && item.kind === "evidence");
+    const item = (surface?.payload?.items || []).find((candidate) => candidate.id === evidenceId);
+    return surface && item ? { surface, item } : null;
+  }
+
+  function syncEvidenceSelectionCards() {
+    $$(".evidence-card", els.stage).forEach((card) => {
+      const surfaceId = card.closest("[data-surface-id]")?.dataset.surfaceId;
+      const active = Boolean(selectedEvidence(surfaceId, card.dataset.evidenceId));
+      card.classList.toggle("selected", active);
+      card.setAttribute("aria-pressed", String(active));
+      const button = $("[data-evidence-select]", card);
+      if (button) {
+        button.textContent = active ? "Added ✓" : "+ Add";
+        button.setAttribute("aria-label", `${active ? "Remove" : "Add"} evidence ${active ? "from" : "to"} Calliope context`);
+      }
+    });
+    $$('[data-ask-evidence]', els.stage).forEach((button) => {
+      const count = state.evidenceSelections.filter(
+        (item) => item.surface_id === button.dataset.askEvidence
+          && item.evidence_id !== EVIDENCE_SET_HANDLE,
+      ).length;
+      const wholeSetAttached = Boolean(selectedEvidence(
+        button.dataset.askEvidence,
+        EVIDENCE_SET_HANDLE,
+      ));
+      const surface = state.surfaces.find((item) => item.id === button.dataset.askEvidence);
+      const resultCount = Number(surface?.payload?.count ?? surface?.payload?.items?.length ?? 0);
+      const meta = count ? `· ${count}` : wholeSetAttached ? "· set attached" : `· all ${resultCount}`;
+      button.disabled = false;
+      button.setAttribute("aria-pressed", String(wholeSetAttached));
+      button.innerHTML = `Ask Calliope <span>${meta}</span> →`;
+    });
+  }
+
+  function renderEvidenceContextTray() {
+    const selections = state.evidenceSelections;
+    els.evidenceContextTray.hidden = !selections.length;
+    els.evidenceContextTray.innerHTML = selections.length ? `
+      <div class="evidence-context-head">
+        <span>${surfaceGlyph("evidence")} ${selections.length} evidence context item${selections.length === 1 ? "" : "s"} attached</span>
+        <button type="button" data-clear-evidence>Clear all</button>
+      </div>
+      <div class="evidence-context-items">${selections.map((selection) => `
+        <div class="evidence-context-chip">
+          <span title="${escapeHtml(selection.source || selection.title)}">${escapeHtml(selection.title)}</span>
+          <button type="button" data-remove-evidence="${escapeHtml(selection.key)}" aria-label="Remove ${escapeHtml(selection.title)}">×</button>
+        </div>`).join("")}
+      </div>` : "";
+    els.input.placeholder = selections.length
+      ? `Ask Calliope about ${selections.length} attached evidence context item${selections.length === 1 ? "" : "s"}…`
+      : "Ask Calliope to explore, compare, or make something…";
+    syncEvidenceSelectionCards();
+  }
+
+  function toggleEvidenceSelection(surfaceId, evidenceId) {
+    const found = evidenceItem(surfaceId, evidenceId);
+    if (!found) return;
+    const key = evidenceSelectionKey(surfaceId, evidenceId);
+    const existing = state.evidenceSelections.findIndex((item) => item.key === key);
+    if (existing >= 0) {
+      state.evidenceSelections.splice(existing, 1);
+    } else {
+      state.evidenceSelections = state.evidenceSelections.filter(
+        (item) => !(item.surface_id === surfaceId && item.evidence_id === EVIDENCE_SET_HANDLE),
+      );
+      if (state.evidenceSelections.length >= 12) {
+        toast("A turn can use at most twelve evidence items", true);
+        return;
+      }
+      state.evidenceSelections.push({
+        key,
+        surface_id: surfaceId,
+        evidence_id: evidenceId,
+        title: found.item.title || "Evidence",
+        source: found.item.source || evidenceGroupLabel(found.item.group),
+        kind: found.item.kind || "evidence",
+      });
+    }
+    renderEvidenceContextTray();
+  }
+
+  function attachEvidenceSet(surfaceId) {
+    const surface = state.surfaces.find((item) => item.id === surfaceId && item.kind === "evidence");
+    if (!surface) return false;
+    if (selectedEvidence(surfaceId, EVIDENCE_SET_HANDLE)) return true;
+    if (state.evidenceSelections.length >= 12) {
+      toast("A turn can use at most twelve evidence context items", true);
+      return false;
+    }
+    const query = String(surface.payload?.query || surface.title || "Evidence search");
+    const count = Number(surface.payload?.count ?? surface.payload?.items?.length ?? 0);
+    state.evidenceSelections.push({
+      key: evidenceSelectionKey(surfaceId, EVIDENCE_SET_HANDLE),
+      surface_id: surfaceId,
+      evidence_id: EVIDENCE_SET_HANDLE,
+      title: `Search · ${query}`,
+      source: `${count} result${count === 1 ? "" : "s"} · compact index`,
+      kind: "evidence-set",
+    });
+    renderEvidenceContextTray();
+    return true;
+  }
+
+  function clearEvidenceSelections() {
+    state.evidenceSelections = [];
+    renderEvidenceContextTray();
+  }
+
+  async function runEvidenceSearch(requestedQuery = null) {
+    if (!state.current || state.evidenceSearching || !state.config?.evidence_search) return;
+    const query = String(requestedQuery ?? els.evidenceQuery.value).trim().replace(/\s+/g, " ");
+    if (query.length < 2) {
+      toast("Describe what you want to find", true);
+      els.evidenceQuery.focus();
+      return;
+    }
+    state.evidenceSearching = true;
+    syncEvidenceSearchControls();
+    const sessionId = state.current.id;
+    try {
+      const data = await api(`/api/calliope/sessions/${encodeURIComponent(sessionId)}/evidence-search`, {
+        method: "POST",
+        body: JSON.stringify({ query, limit: 24 }),
+      });
+      if (state.current?.id !== sessionId) return;
+      state.current = data.session || state.current;
+      state.turns = [...state.turns.filter((turn) => turn.id !== data.turn.id), data.turn]
+        .sort((left, right) => Number(left.ordinal || 0) - Number(right.ordinal || 0));
+      state.surfaces = [data.surface, ...state.surfaces.filter((surface) => surface.id !== data.surface.id)];
+      const summary = state.sessions.find((item) => item.id === sessionId);
+      if (summary) {
+        Object.assign(summary, state.current, {
+          turn_count: Number(summary.turn_count || 0) + 1,
+          surface_count: Number(summary.surface_count || 0) + 1,
+        });
+      }
+      els.evidenceQuery.value = "";
+      state.newSurfaceCount = 0;
+      els.newSurfaces.hidden = true;
+      renderSessions();
+      renderStage(true);
+      renderChat();
+      setMobilePanel();
+      const count = Number(data.surface?.payload?.count || 0);
+      toast(count ? `${count} evidence item${count === 1 ? "" : "s"} added to the scratchpad` : "Search saved · no useful evidence surfaced");
+    } finally {
+      state.evidenceSearching = false;
+      syncEvidenceSearchControls();
+    }
+  }
+
+  function revealEvidenceSurface(id) {
+    const element = $(`.surface[data-surface-id="${CSS.escape(id)}"]`);
+    if (!element) return;
+    element.scrollIntoView({ behavior: "smooth", block: "center" });
+    element.animate?.([
+      { boxShadow: "0 0 0 6px rgba(104,199,178,.22),0 0 58px rgba(104,199,178,.32)" },
+      { boxShadow: "0 15px 34px rgba(0,0,0,.20)" },
+    ], { duration: 1000 });
   }
 
   function focusSurface(id) {
@@ -2908,18 +3206,19 @@
     els.input.style.height = `${Math.min(180, els.input.scrollHeight)}px`;
   }
 
-  function optimisticTurn(message, hasSpatialSelection = false) {
+  function optimisticTurn(message, hasSpatialSelection = false, evidenceRefs = []) {
     const maxOrdinal = Math.max(0, ...state.turns.map((turn) => Number(turn.ordinal || 0)));
     const turn = {
       id: `pending-${Date.now()}`,
       ordinal: maxOrdinal + 1,
-      user_message: message || (hasSpatialSelection ? "[Object selection]" : "[Image]"),
+      user_message: message || (hasSpatialSelection ? "[Object selection]" : evidenceRefs.length ? "[Selected evidence]" : "[Image]"),
       assistant_message: "",
       attachments: state.attachments.map((attachment) => ({
         name: attachment.name,
         url: attachment.data_url,
       })),
       status: "running",
+      evidence_refs: evidenceRefs,
       created_at: new Date().toISOString(),
     };
     state.turns.push(turn);
@@ -2964,14 +3263,20 @@
   async function sendTurn() {
     if (!state.current || state.busy) return;
     const message = els.input.value.trim();
-    if (!message && !state.attachments.length && !state.spatialSelections.length) return;
+    if (!message && !state.attachments.length && !state.spatialSelections.length && !state.evidenceSelections.length) return;
     const outgoingAttachments = [...state.attachments];
     const outgoingSpatialSelections = state.spatialSelections.map((selection) => ({ ...selection }));
+    const outgoingEvidenceSelections = state.evidenceSelections.map((selection) => ({ ...selection }));
+    const outgoingEvidenceHandles = outgoingEvidenceSelections.map((selection) => ({
+      surface_id: selection.surface_id,
+      evidence_id: selection.evidence_id,
+    }));
     const outgoingDesignProfileVersionId = state.nextTurnDesignProfileVersionId;
-    const pending = optimisticTurn(message, Boolean(outgoingSpatialSelections.length));
+    const pending = optimisticTurn(message, Boolean(outgoingSpatialSelections.length), outgoingEvidenceSelections);
     els.input.value = "";
     state.attachments = [];
     clearSpatialSelections();
+    clearEvidenceSelections();
     state.nextTurnDesignProfileVersionId = null;
     renderAttachmentTray();
     renderDesignProfileChip();
@@ -2990,6 +3295,7 @@
           message,
           attachments: outgoingAttachments,
           spatial_selections: outgoingSpatialSelections,
+          evidence_refs: outgoingEvidenceHandles,
           selected_surface_id: state.selectedSurfaceId,
           ...(outgoingDesignProfileVersionId
             ? { design_profile_version_id: outgoingDesignProfileVersionId }
@@ -3001,6 +3307,7 @@
           pending.id = data.turn_id;
           pending.ordinal = data.ordinal;
           pending.attachments = data.attachments || pending.attachments;
+          pending.evidence_refs = data.evidence_refs || pending.evidence_refs;
           renderChat();
           completeLiveContext();
           scrollChatToLiveEdge();
@@ -3052,6 +3359,11 @@
         state.nextTurnDesignProfileVersionId = outgoingDesignProfileVersionId;
         renderDesignProfileChip();
       }
+      const existingEvidence = new Set(state.evidenceSelections.map((item) => item.key));
+      state.evidenceSelections.push(...outgoingEvidenceSelections.filter(
+        (item) => !existingEvidence.has(item.key),
+      ));
+      renderEvidenceContextTray();
       renderChat();
       finishLiveActivity(false, 0, error.message);
       toast(error.message, true);
@@ -3198,6 +3510,10 @@
     });
     els.sessionTitle.addEventListener("click", () => renameSession().catch((error) => toast(error.message, true)));
     els.archiveSession.addEventListener("click", () => archiveSession().catch((error) => toast(error.message, true)));
+    els.evidenceSearch.addEventListener("submit", (event) => {
+      event.preventDefault();
+      runEvidenceSearch().catch((error) => toast(error.message, true));
+    });
     els.composer.addEventListener("submit", (event) => {
       event.preventDefault();
       sendTurn();
@@ -3219,6 +3535,18 @@
       if (!button) return;
       state.attachments.splice(Number(button.dataset.removeAttachment), 1);
       renderAttachmentTray();
+    });
+    els.evidenceContextTray.addEventListener("click", (event) => {
+      if (event.target.closest("[data-clear-evidence]")) {
+        clearEvidenceSelections();
+        return;
+      }
+      const remove = event.target.closest("[data-remove-evidence]");
+      if (!remove) return;
+      state.evidenceSelections = state.evidenceSelections.filter(
+        (item) => item.key !== remove.dataset.removeEvidence,
+      );
+      renderEvidenceContextTray();
     });
     els.spatialSelectionTray.addEventListener("click", (event) => {
       const remove = event.target.closest("[data-remove-spatial-selection]");
@@ -3281,6 +3609,12 @@
       clearSurfaceSelection();
     });
     els.messages.addEventListener("click", (event) => {
+      const evidence = event.target.closest("[data-focus-evidence-surface]");
+      if (evidence) {
+        setMobilePanel();
+        revealEvidenceSurface(evidence.dataset.focusEvidenceSurface);
+        return;
+      }
       const button = event.target.closest("[data-focus-surface]");
       if (button) focusSurface(button.dataset.focusSurface);
     });
@@ -3288,6 +3622,33 @@
       state.chatAtLiveEdge = isChatAtLiveEdge();
     }, { passive: true });
     els.stage.addEventListener("click", (event) => {
+      const evidenceCard = event.target.closest(".evidence-card");
+      if (evidenceCard && !event.target.closest("a")) {
+        const surfaceId = evidenceCard.closest("[data-surface-id]")?.dataset.surfaceId;
+        toggleEvidenceSelection(surfaceId, evidenceCard.dataset.evidenceId);
+        return;
+      }
+      const askEvidence = event.target.closest("[data-ask-evidence]");
+      if (askEvidence) {
+        const surfaceId = askEvidence.dataset.askEvidence;
+        const selectedCount = state.evidenceSelections.filter(
+          (item) => item.surface_id === surfaceId && item.evidence_id !== EVIDENCE_SET_HANDLE,
+        ).length;
+        const wholeSetAttached = Boolean(selectedEvidence(surfaceId, EVIDENCE_SET_HANDLE));
+        if (!selectedCount && !wholeSetAttached && !attachEvidenceSet(surfaceId)) return;
+        setMobilePanel("chat");
+        els.input.focus();
+        toast(selectedCount
+          ? `${selectedCount} selected evidence item${selectedCount === 1 ? " is" : "s are"} ready for Calliope`
+          : "The whole search is attached as a compact evidence index");
+        return;
+      }
+      const repeatEvidence = event.target.closest("[data-repeat-evidence]");
+      if (repeatEvidence) {
+        const surface = state.surfaces.find((item) => item.id === repeatEvidence.dataset.repeatEvidence);
+        runEvidenceSearch(surface?.payload?.query).catch((error) => toast(error.message, true));
+        return;
+      }
       const inspect = event.target.closest("[data-inspect-artifact]");
       if (inspect) {
         startArtifactInspection(inspect.dataset.inspectArtifact);
@@ -3358,7 +3719,14 @@
         return;
       }
       const card = event.target.closest("[data-surface-id]");
-      if (card && !event.target.closest("a,button,summary,input,select,label")) focusSurface(card.dataset.surfaceId);
+      if (card && !card.classList.contains("kind-evidence") && !event.target.closest("a,button,summary,input,select,label")) focusSurface(card.dataset.surfaceId);
+    });
+    els.stage.addEventListener("keydown", (event) => {
+      const card = event.target.closest(".evidence-card");
+      if (!card || !["Enter", " "].includes(event.key)) return;
+      event.preventDefault();
+      const surfaceId = card.closest("[data-surface-id]")?.dataset.surfaceId;
+      toggleEvidenceSelection(surfaceId, card.dataset.evidenceId);
     });
     els.stage.addEventListener("input", (event) => {
       if (!event.target.matches("[data-cube-search]")) return;

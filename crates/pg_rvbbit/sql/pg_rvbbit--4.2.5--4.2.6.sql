@@ -1,0 +1,7 @@
+-- Upgrade pg_rvbbit 4.2.5 -> 4.2.6
+--
+-- Postgres needs this edge for ALTER EXTENSION UPDATE. The SQL additions in
+-- this release are the idempotent, run-once 0224 artifact semantic enrichment
+-- and 0225 Calliope evidence-set migrations. Packaged deployments apply them
+-- through rvbbit.migrate(), independently of the extension version graph. Do
+-- not duplicate their DDL here or it would bypass schema_migrations bookkeeping.

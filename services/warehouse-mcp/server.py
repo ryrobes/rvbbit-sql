@@ -8614,6 +8614,316 @@ def _calliope_cube_pivot(
     return result
 
 
+_CALLIOPE_EVIDENCE_STOP_WORDS = {
+    "about", "all", "and", "are", "can", "company", "data", "did", "does",
+    "find", "for", "from", "have", "into", "its", "me", "our", "show", "that",
+    "the", "their", "this", "was", "what", "when", "where", "which", "with",
+}
+
+
+def _calliope_evidence_text(value, limit=2_000):
+    if isinstance(value, str):
+        raw = value
+    elif value in (None, ""):
+        raw = ""
+    else:
+        raw = json.dumps(value, ensure_ascii=False, default=str)
+    return re.sub(r"\s+", " ", raw).strip()[:limit]
+
+
+def _calliope_evidence_terms(query):
+    terms = []
+    for token in re.findall(r"[a-z0-9][a-z0-9_.-]*", str(query or "").lower()):
+        if (len(token) >= 3 or any(ch.isdigit() for ch in token)) \
+                and token not in _CALLIOPE_EVIDENCE_STOP_WORDS \
+                and token not in terms:
+            terms.append(token)
+    return terms[:16]
+
+
+def _calliope_lexical_score(query, title, body=""):
+    """Small deterministic ranker for artifacts not yet projected into Brain."""
+    needle = _calliope_evidence_text(query, 600).lower()
+    heading = _calliope_evidence_text(title, 500).lower()
+    haystack = f"{heading} {_calliope_evidence_text(body, 24_000).lower()}"
+    terms = _calliope_evidence_terms(needle)
+    if not needle or not haystack:
+        return 0.0
+    score = 0.0
+    if needle == heading:
+        score += 0.72
+    elif needle in heading:
+        score += 0.48
+    elif needle in haystack:
+        score += 0.28
+    if terms:
+        title_hits = sum(term in heading for term in terms)
+        body_hits = sum(term in haystack for term in terms)
+        score += 0.34 * (body_hits / len(terms))
+        score += 0.18 * (title_hits / len(terms))
+    return round(min(score, 1.0), 4)
+
+
+def _calliope_brain_evidence(query, owner, limit):
+    # Brain can contain a large volume of internal system-learning notes. Fetch
+    # beyond the requested presentation limit so filtering that operational
+    # noise does not crowd ordinary company documents out of the resolver.
+    search_limit = min(max(limit * 4, limit), 50)
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT doc_id,chunk_idx,title,folder_path AS folder,source,doc_type,"
+            "occurred_at::text AS occurred_at,chunk,score,entities "
+            "FROM rvbbit.brain_search(%s,%s,%s,'{}'::jsonb)",
+            (owner, query, search_limit),
+        ).fetchall()
+    items = []
+    system_terms = {
+        "acceleration", "accelerator", "engine", "layout", "operator", "performance",
+        "route", "routing", "rvbbit", "slow", "vortex", "workload",
+    }
+    include_system_learning = bool(set(_calliope_evidence_terms(query)) & system_terms)
+    for row in rows:
+        if row.get("doc_type") == "system_learning" and not include_system_learning:
+            continue
+        if len(items) >= limit:
+            break
+        entities = row.get("entities") or []
+        if isinstance(entities, dict):
+            entities = list(entities.values())
+        labels = []
+        for entity in entities:
+            label = entity.get("label") if isinstance(entity, dict) else entity
+            if label and str(label) not in labels:
+                labels.append(str(label))
+        try:
+            score = max(0.0, min(1.0, float(row.get("score") or 0)))
+        except (TypeError, ValueError):
+            score = 0.0
+        items.append({
+            "id": f"brain:{row['doc_id']}:{row['chunk_idx']}",
+            "group": "knowledge",
+            "kind": "document",
+            "subtype": row.get("doc_type") or "document",
+            "title": row.get("title") or "Company knowledge",
+            "summary": _calliope_evidence_text(row.get("chunk"), 1_800),
+            "source": row.get("source") or row.get("folder") or "Document Brain",
+            "score": score,
+            "occurred_at": row.get("occurred_at"),
+            "entities": labels[:8],
+            "provenance": {
+                "resolver": "brain_search",
+                "doc_id": str(row["doc_id"]),
+                "chunk_idx": int(row["chunk_idx"]),
+                "folder": row.get("folder"),
+                "doc_type": row.get("doc_type"),
+            },
+        })
+    return items
+
+
+def _calliope_data_evidence(query, limit):
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT node_id,kind,schema_name,rel_name,col_name,score,boosted_score,doc,usage_touches "
+            "FROM rvbbit.search_data_weighted(%s,%s,%s,%s,0.5)",
+            (query, min(limit * 4, 100), None, GRAPH),
+        ).fetchall()
+    tier = {"metric": 0, "cube": 1, "db_table": 2, "db_column": 3}
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            tier.get(row.get("kind"), 4),
+            -float(row.get("boosted_score") or row.get("score") or 0),
+        ),
+    )
+    items = []
+    for row in rows:
+        if len(items) >= limit:
+            break
+        if row.get("kind") not in {"metric", "cube"} and not _schema_allowed(row.get("schema_name") or ""):
+            continue
+        object_name = f"{row.get('schema_name')}.{row.get('rel_name')}"
+        if row.get("col_name"):
+            object_name += f".{row['col_name']}"
+        try:
+            score = max(0.0, min(1.0, float(row.get("boosted_score") or row.get("score") or 0)))
+        except (TypeError, ValueError):
+            score = 0.0
+        usage = int(row.get("usage_touches") or 0)
+        items.append({
+            "id": f"data:{row.get('node_id')}",
+            "group": "data",
+            "kind": row.get("kind") or "data-object",
+            "subtype": str(row.get("kind") or "data object").replace("db_", "").replace("_", " "),
+            "title": object_name,
+            "summary": _calliope_evidence_text(row.get("doc"), 1_500),
+            "source": "Warehouse semantic catalog",
+            "score": score,
+            "provenance": {
+                "resolver": "search_data_weighted",
+                "node_id": str(row.get("node_id") or ""),
+                "kind": row.get("kind"),
+                "schema": row.get("schema_name"),
+                "relation": row.get("rel_name"),
+                "column": row.get("col_name"),
+                "usage_touches": usage,
+            },
+        })
+    return items
+
+
+def _calliope_artifact_evidence(query, limit):
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT d.id,d.slug,d.name,d.description,d.owner_email,d.team,d.status,"
+            "d.latest_version,d.updated_at,d.runtime_kind,d.app_kind,v.manifest,"
+            "e.status AS semantic_status,e.semantic_map,e.verification,e.prompt_version,e.model,"
+            "e.updated_at AS semantic_updated_at,coalesce(dep.lineage,'[]'::jsonb) AS lineage "
+            "FROM rvbbit.dashboards d "
+            "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id AND v.version=d.latest_version "
+            "LEFT JOIN rvbbit.artifact_semantic_enrichments e "
+            "ON e.dashboard_id=d.id AND e.version=d.latest_version "
+            "LEFT JOIN LATERAL ("
+            " SELECT jsonb_agg(DISTINCT jsonb_build_object('kind',x.kind,'ref',x.object_ref)) "
+            " FILTER (WHERE x.object_ref IS NOT NULL) AS lineage "
+            " FROM rvbbit.dashboard_deps x "
+            " WHERE x.dashboard_id=d.id AND x.version=d.latest_version"
+            ") dep ON true ORDER BY d.updated_at DESC LIMIT 300"
+        ).fetchall()
+    candidates = []
+    for row in rows:
+        enrichment = {
+            "status": row.get("semantic_status"),
+            "semantic_map": row.get("semantic_map") or {},
+            "verification": row.get("verification") or {},
+            "prompt_version": row.get("prompt_version"),
+            "model": row.get("model"),
+            "updated_at": row.get("semantic_updated_at"),
+        }
+        manifest = _merge_semantic_overlay(row.get("manifest") or {}, enrichment)
+        semantic_map = manifest.get("semantic_map") or {}
+        objects = [item for item in semantic_map.get("objects") or [] if isinstance(item, dict)]
+        lineage = row.get("lineage") or []
+        lineage_refs = [
+            str(item.get("ref")) for item in lineage
+            if isinstance(item, dict) and item.get("ref")
+        ]
+        artifact_body = " ".join(
+            text for value in (
+                row.get("description"), row.get("slug"), row.get("team"), row.get("app_kind"),
+                semantic_map.get("description"), " ".join(lineage_refs), objects,
+            )
+            if (text := _calliope_evidence_text(value, 20_000))
+        )
+        score = _calliope_lexical_score(query, row.get("name"), artifact_body)
+        url = f"/d/{row['slug']}" if row.get("app_kind") == "dashboard" else f"/apps/{row['slug']}"
+        if score >= 0.16:
+            candidates.append({
+                "id": f"artifact:{row['slug']}:v{row['latest_version']}",
+                "group": "artifacts",
+                "kind": "artifact",
+                "subtype": row.get("app_kind") or "dashboard",
+                "title": row.get("name") or row.get("slug"),
+                "summary": row.get("description") or semantic_map.get("description") or "Published RVBBIT artifact",
+                "source": "Published artifacts",
+                "url": url,
+                "score": score,
+                "occurred_at": row.get("updated_at"),
+                "entities": lineage_refs[:8],
+                "provenance": {
+                    "resolver": "artifact_index",
+                    "slug": row.get("slug"),
+                    "version": int(row.get("latest_version") or 1),
+                    "app_kind": row.get("app_kind"),
+                    "semantic_status": row.get("semantic_status") or "none",
+                    "lineage": lineage[:16],
+                },
+            })
+        for semantic_object in objects:
+            meaning = semantic_object.get("meaning") or {}
+            label = meaning.get("label") or semantic_object.get("id") or "Dashboard object"
+            object_body = " ".join(
+                text for value in (
+                    meaning.get("description"), meaning.get("formula"), meaning.get("unit"),
+                    semantic_object.get("id"), row.get("name"),
+                )
+                if (text := _calliope_evidence_text(value, 2_000))
+            )
+            object_score = _calliope_lexical_score(query, label, object_body)
+            if object_score < 0.18:
+                continue
+            summary = meaning.get("description") or meaning.get("formula") or (
+                f"A mapped business value in {row.get('name') or row.get('slug')}."
+            )
+            candidates.append({
+                "id": f"artifact-object:{row['slug']}:v{row['latest_version']}:{semantic_object.get('id') or 'object'}",
+                "group": "artifacts",
+                "kind": "dashboard-object",
+                "subtype": semantic_object.get("kind") or "visible value",
+                "title": f"{label} · {row.get('name') or row.get('slug')}",
+                "summary": summary,
+                "source": f"{row.get('name') or row.get('slug')} · semantic map",
+                "url": url,
+                "score": object_score,
+                "occurred_at": row.get("updated_at"),
+                "entities": lineage_refs[:8],
+                "provenance": {
+                    "resolver": "artifact_semantic_map",
+                    "slug": row.get("slug"),
+                    "version": int(row.get("latest_version") or 1),
+                    "object_id": semantic_object.get("id"),
+                    "meaning": meaning,
+                    "replayable": bool((semantic_object.get("evaluator") or {}).get("sql")),
+                },
+            })
+    candidates.sort(key=lambda item: (
+        -float(item.get("score") or 0),
+        0 if item.get("kind") == "artifact" else 1,
+        str(item.get("title") or ""),
+    ))
+    return candidates[:limit]
+
+
+def _calliope_evidence_search(query, owner, limit=24):
+    """Resolve one user question across ACL'd Brain, artifacts, and the data KG."""
+    started = time.time()
+    limit = max(6, min(int(limit or 24), 36))
+    quota = max(4, math.ceil(limit / 3))
+    sources = [
+        ("knowledge", "Company memory", lambda: _calliope_brain_evidence(query, owner, quota)),
+        ("artifacts", "Artifacts & dashboard objects", lambda: _calliope_artifact_evidence(query, quota)),
+        ("data", "Warehouse semantics", lambda: _calliope_data_evidence(query, quota)),
+    ]
+    groups = {}
+    searched = []
+    warnings = []
+    for key, label, resolver in sources:
+        try:
+            groups[key] = resolver()
+            searched.append({"key": key, "label": label, "count": len(groups[key]), "status": "ready"})
+        except Exception as exc:  # noqa: BLE001 — one corpus must never blank the other two
+            groups[key] = []
+            searched.append({"key": key, "label": label, "count": 0, "status": "unavailable"})
+            warnings.append(f"{label} is temporarily unavailable: {type(exc).__name__}: {exc}")
+    items = []
+    for key, _label, _resolver in sources:
+        items.extend(groups[key][:quota])
+    if len(items) < limit:
+        included = {item.get("id") for item in items}
+        remainder = [
+            item for key, _label, _resolver in sources for item in groups[key]
+            if item.get("id") not in included
+        ]
+        remainder.sort(key=lambda item: -float(item.get("score") or 0))
+        items.extend(remainder[:limit - len(items)])
+    return {
+        "items": items[:limit],
+        "searched": searched,
+        "warnings": warnings,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
 def _build_mcp_oauth(public: str):
     """FastMCP with our self-contained OAuth AS (auth.py). The SDK mounts /authorize,
     /token, /register + the .well-known metadata and verifies PKCE; auth.py supplies
@@ -8649,6 +8959,7 @@ def _build_mcp_oauth(public: str):
         _RABBIT_SVG,
         _dash_shim,
         cube_pivot=_calliope_cube_pivot,
+        evidence_search=_calliope_evidence_search,
     ):
         print("Calliope enabled (Hermes-backed living artifact notebook)", file=sys.stderr)
 
