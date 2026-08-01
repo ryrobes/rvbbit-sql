@@ -352,6 +352,13 @@ Full contracts and the temporal interaction model are in
 
 ## Dashboards (artifacts that live + work outside Claude)
 **Start from `dashboard_template`** — the proven boilerplate (see [`DASHBOARD_TEMPLATE.md`](DASHBOARD_TEMPLATE.md)).
+
+For an explicit, non-default visualization experiment, `tanstack_chart_template` returns a
+complete framework-free dashboard using the pinned TanStack Charts 0.3.1 SVG runtime. Its
+`mountRvbbitChart()` adapter adds exact mark/query/row metadata and semantic bindings while
+leaving the surrounding artifact as unconstrained HTML/CSS/JS. Existing Chart.js artifacts and
+the ordinary template are unchanged. Publish the returned HTML and manifest with
+`create_live_app`, then run `capture_live_app` to validate it.
 Its dual-mode data bridge means the *same* artifact runs live in **two places, no login**:
 - **In a Cowork artifact** — `window.cowork.callMcpTool('mcp__<id>__run_sql', {sql})`, authed by
   the connector OAuth the user already granted (the sandbox blocks `fetch`, so this is the path).

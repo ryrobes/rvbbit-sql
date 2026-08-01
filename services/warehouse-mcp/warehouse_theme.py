@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,46 @@ _IMAGE_DIR = _ASSET_DIR / "images"
 _FAVICON = _ASSET_DIR / "datarabbit.svg"
 _ARTIFACT_LENS_JS = _ASSET_DIR / "artifact-lens.js"
 _ARTIFACT_LENS_CSS = _ASSET_DIR / "artifact-lens.css"
+_CHARTS_DIR = Path(__file__).resolve().parent / "charts"
+TANSTACK_CHARTS_VERSION = "0.3.1"
+TANSTACK_CHARTS_SRC = f"/charts/rvbbit-tanstack-charts-{TANSTACK_CHARTS_VERSION}.js"
+_TANSTACK_CHARTS_JS = _CHARTS_DIR / f"rvbbit-tanstack-charts-{TANSTACK_CHARTS_VERSION}.js"
 _THEME_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,160}$")
+_TANSTACK_SCRIPT_TAG = re.compile(
+    r"<script\b[^>]*\bsrc\s*=\s*(['\"])"
+    + re.escape(TANSTACK_CHARTS_SRC)
+    + r"\1[^>]*>\s*</script\s*>",
+    re.IGNORECASE,
+)
+
+
+@lru_cache(maxsize=1)
+def _tanstack_runtime_source() -> str:
+    return _TANSTACK_CHARTS_JS.read_text(encoding="utf-8")
+
+
+def inline_chart_runtime(html: str) -> str:
+    """Inline the opt-in chart runtime for Playwright ``set_content`` renders.
+
+    Live artifact pages load the immutable public asset normally. Screenshot,
+    PDF, thumbnail, and semantic-enrichment renders use ``about:blank`` and
+    therefore cannot resolve root-relative script URLs; replacing only our
+    exact versioned tag keeps those render paths equivalent without rewriting
+    arbitrary authored dependencies.
+    """
+    document = html or ""
+    if TANSTACK_CHARTS_SRC not in document:
+        return document
+    try:
+        source = re.sub(r"</script", r"<\\/script", _tanstack_runtime_source(), flags=re.IGNORECASE)
+    except OSError:
+        return document
+    replacement = (
+        f'<script data-rvbbit-chart-runtime="{TANSTACK_CHARTS_VERSION}">'
+        + source
+        + "</script>"
+    )
+    return _TANSTACK_SCRIPT_TAG.sub(lambda _match: replacement, document)
 
 
 def head_assets() -> str:
@@ -118,6 +158,17 @@ def register_theme_routes(mcp: Any) -> None:
             _ARTIFACT_LENS_CSS,
             media_type="text/css",
             headers={"cache-control": "no-cache", "x-content-type-options": "nosniff"},
+        )
+
+    @mcp.custom_route(TANSTACK_CHARTS_SRC, methods=["GET"])
+    async def tanstack_charts_runtime(_request):
+        return FileResponse(
+            _TANSTACK_CHARTS_JS,
+            media_type="text/javascript",
+            headers={
+                "cache-control": "public, max-age=31536000, immutable",
+                "x-content-type-options": "nosniff",
+            },
         )
 
     @mcp.custom_route("/theme/library", methods=["GET"])

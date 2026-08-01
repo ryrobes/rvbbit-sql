@@ -103,9 +103,34 @@ def test_container_and_unified_origin_ship_theme_assets():
     server = (_HERE / "server.py").read_text(encoding="utf-8")
     assert "COPY theme ./theme" in dockerfile
     assert "/theme/*" in caddy
+    assert "/charts/*" in caddy
     assert "warehouse_theme.register_theme_routes(m)" in server
     assert warehouse_theme._ARTIFACT_LENS_JS.is_file()
     assert warehouse_theme._ARTIFACT_LENS_CSS.is_file()
+
+
+def test_optional_tanstack_runtime_is_versioned_public_and_inlineable_for_captures():
+    runtime = warehouse_theme._TANSTACK_CHARTS_JS
+    assert warehouse_theme.TANSTACK_CHARTS_VERSION == "0.3.1"
+    assert warehouse_theme.TANSTACK_CHARTS_SRC == "/charts/rvbbit-tanstack-charts-0.3.1.js"
+    assert runtime.is_file()
+    assert runtime.stat().st_size > 100_000
+    assert "RVBBIT_CHARTS" in runtime.read_text(encoding="utf-8")
+
+    ordinary = '<script src="https://cdn.example/chart.js"></script>'
+    assert warehouse_theme.inline_chart_runtime(ordinary) == ordinary
+    opted_in = (
+        '<html><head><script defer src="/charts/rvbbit-tanstack-charts-0.3.1.js">'
+        "</script></head><body></body></html>"
+    )
+    inlined = warehouse_theme.inline_chart_runtime(opted_in)
+    assert warehouse_theme.TANSTACK_CHARTS_SRC not in inlined
+    assert 'data-rvbbit-chart-runtime="0.3.1"' in inlined
+    assert "RVBBIT_CHARTS" in inlined
+
+    dockerfile = (_HERE / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY charts ./charts" in dockerfile
+    assert "COPY examples ./examples" in dockerfile
 
 
 def test_gallery_calliope_entry_is_a_floating_time_aware_avatar():

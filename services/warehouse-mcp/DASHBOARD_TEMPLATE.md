@@ -35,6 +35,26 @@ The sandbox CDN allowlist is integrity-pinned. Only these load; anything else is
 
 > shadcn/ui is **not** usable in-sandbox (React + Tailwind build step, plus non-allowlisted CDNs). The template instead ships a small shadcn-inspired design-token CSS block (`:root` variables for `--card`, `--muted`, `--primary`, `--radius`, semantic colors, badges, buttons, KPIs). Restyle once at the top; everything inherits. On your own `publish_dashboard` host you're *not* sandboxed and can use any stack you like.
 
+### Optional TanStack Charts laboratory
+
+The default remains Chart.js. When a user explicitly wants to try the semantic SVG path,
+call `tanstack_chart_template` instead. It returns a complete bespoke HTML example and a
+matching semantic manifest. The example loads the Warehouse-owned, immutable
+`/charts/rvbbit-tanstack-charts-0.3.1.js` asset; no framework, npm install, import map, or
+artifact-side build is required.
+
+`window.RVBBIT_CHARTS` exposes the native TanStack grammar, D3 scale factories/curves, and
+`mountRvbbitChart()`. The wrapper does not replace TanStack's definitions. It only annotates
+the keyed SVG scene with query, mark, row, field, value, and semantic-object metadata, then
+emits `rvbbit:chart-select`. That lets ordinary application DOM react to a selected mark and
+lets Artifact Lens inspect the exact source datum. Chart.js and arbitrary HTML/JS remain
+available in the same artifact.
+
+The runtime is deliberately pinned because TanStack Charts is pre-alpha. Screenshot, PDF,
+thumbnail, and semantic-enrichment capture paths inline the same pinned asset when rendering
+stored HTML through Playwright. The unified-origin Caddy route forwards `/charts/*` to
+Warehouse MCP.
+
 ## Adapting it
 
 Edit only the two marked blocks:

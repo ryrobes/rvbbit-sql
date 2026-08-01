@@ -1600,7 +1600,7 @@
 
     function renderCandidateHighlights() {
       candidateLayer.replaceChildren();
-      if (shell.dataset.open !== "true" || shell.dataset.view !== "trace") return;
+      if (!pickerEnabled()) return;
       semanticBoundElements();
       const index = traceValueIndex();
       const candidates = new Set(document.querySelectorAll([
@@ -1674,7 +1674,7 @@
 
     function scheduleCandidateHighlights() {
       window.clearTimeout(candidateTimer);
-      if (shell.dataset.open !== "true" || shell.dataset.view !== "trace") {
+      if (!pickerEnabled()) {
         candidateLayer.replaceChildren();
         return;
       }
@@ -1694,12 +1694,11 @@
       traceView.hidden = next !== "trace";
       if (next === "time") {
         closeQueryDrawer();
-        if (pickerActive) stopPicker();
-        candidateLayer.replaceChildren();
+        stopPicker();
         loadTimeline();
       } else {
-        scheduleCandidateHighlights();
         if (shell.dataset.open === "true" && !pickerActive) startPicker();
+        scheduleCandidateHighlights();
       }
     }
 
@@ -1714,12 +1713,14 @@
       sessionSet(openKey, open ? "1" : null);
       if (open && shell.dataset.view === "time") loadTimeline();
       if (open && shell.dataset.view === "trace") {
-        scheduleCandidateHighlights();
         if (!pickerActive) startPicker();
+        scheduleCandidateHighlights();
       }
-      if (!open && pickerActive) stopPicker();
       if (!open) {
-        candidateLayer.replaceChildren();
+        // Closing the Lens is a hard interaction boundary. Always tear down
+        // capture listeners and every visual selection affordance, even if a
+        // prior async inspection or state transition left pickerActive stale.
+        stopPicker();
         closeQueryDrawer();
       }
       if (openedFromTrigger) panel.focus({ preventScroll: true });
@@ -1830,7 +1831,7 @@
     }
 
     function positionOutline(element, selected = false) {
-      if (!element?.isConnected) {
+      if (!pickerEnabled() || !element?.isConnected) {
         outline.hidden = true;
         return;
       }
@@ -1844,16 +1845,17 @@
     }
 
     function onPickerMove(event) {
-      if (!pickerActive) return;
+      if (!pickerEnabled()) return;
       window.cancelAnimationFrame(hoverFrame);
       hoverFrame = window.requestAnimationFrame(() => {
+        if (!pickerEnabled()) return;
         const element = meaningfulElement(event);
         if (element) positionOutline(element);
       });
     }
 
     async function inspectElement(element, event) {
-      if (inspectionBusy) return;
+      if (!pickerEnabled() || inspectionBusy) return;
       inspectionBusy = true;
       closeQueryDrawer();
       queryResult = null;
@@ -1918,7 +1920,7 @@
     }
 
     function onPickerClick(event) {
-      if (!pickerActive) return;
+      if (!pickerEnabled()) return;
       const element = meaningfulElement(event);
       if (!element) return;
       event.preventDefault();
@@ -1928,7 +1930,7 @@
     }
 
     function onPickerKey(event) {
-      if (event.key !== "Escape" || !pickerActive) return;
+      if (event.key !== "Escape" || !pickerEnabled()) return;
       event.preventDefault();
       if (shell.dataset.drawerOpen === "true") {
         closeQueryDrawer();
@@ -1938,8 +1940,20 @@
       trigger.focus();
     }
 
+    function pickerEnabled() {
+      return (
+        pickerActive
+        && shell.dataset.open === "true"
+        && shell.dataset.view === "trace"
+      );
+    }
+
     function startPicker() {
-      if (pickerActive) return;
+      if (
+        pickerActive
+        || shell.dataset.open !== "true"
+        || shell.dataset.view !== "trace"
+      ) return;
       semanticBoundElements();
       pickerActive = true;
       shell.dataset.picking = "true";
@@ -1954,7 +1968,7 @@
       document.addEventListener("keydown", onPickerKey, true);
     }
 
-    function stopPicker(keepOutline = false) {
+    function stopPicker() {
       pickerActive = false;
       shell.dataset.picking = "false";
       pickStatus.dataset.active = "false";
@@ -1964,7 +1978,11 @@
       document.removeEventListener("click", onPickerClick, true);
       document.removeEventListener("keydown", onPickerKey, true);
       window.cancelAnimationFrame(hoverFrame);
-      if (!keepOutline) outline.hidden = true;
+      window.clearTimeout(candidateTimer);
+      pickedElement = null;
+      outline.hidden = true;
+      outline.dataset.selected = "false";
+      candidateLayer.replaceChildren();
     }
 
     function openQueryDrawer() {
@@ -2748,11 +2766,13 @@
       }
     });
     window.addEventListener("scroll", () => {
-      if (pickedElement) positionOutline(pickedElement, true);
+      if (pickerEnabled() && pickedElement) positionOutline(pickedElement, true);
+      else outline.hidden = true;
       scheduleCandidateHighlights();
     }, { passive: true });
     window.addEventListener("resize", () => {
-      if (pickedElement) positionOutline(pickedElement, true);
+      if (pickerEnabled() && pickedElement) positionOutline(pickedElement, true);
+      else outline.hidden = true;
       constrainLens();
       window.requestAnimationFrame(constrainLens);
       scheduleCandidateHighlights();

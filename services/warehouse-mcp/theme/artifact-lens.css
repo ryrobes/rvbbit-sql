@@ -1507,6 +1507,17 @@ select {
   pointer-events: none;
 }
 
+/* The minimized capsule must be behaviorally inert. These guards are a
+   paint-level backstop for async inspection/resize races in the script. */
+.lens:not([data-open="true"]) .candidate-layer,
+.lens:not([data-open="true"]) .target-outline,
+.lens:not([data-open="true"]) .picker-hint,
+.lens:not([data-picking="true"]) .candidate-layer,
+.lens:not([data-picking="true"]) .target-outline,
+.lens:not([data-picking="true"]) .picker-hint {
+  display: none !important;
+}
+
 .candidate-box {
   position: fixed;
   display: block;

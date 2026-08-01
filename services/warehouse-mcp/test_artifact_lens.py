@@ -11,6 +11,7 @@ import pytest
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 import server  # noqa: E402
+import warehouse_theme  # noqa: E402
 
 
 def _at(hour: int) -> datetime:
@@ -235,6 +236,140 @@ def test_dashboard_templates_teach_the_same_semantic_publish_contract():
     assert live_app["semantic_map_example"] == example
     assert any("bindBusinessObject" in instruction for instruction in dashboard["how_to_use"])
     assert any("semantic_map_example" in instruction for instruction in live_app["how_to_use"])
+
+
+def test_tanstack_chart_template_is_opt_in_native_and_semantically_bound():
+    ordinary = server.tool_dashboard_template()
+    experiment = server.tool_tanstack_chart_template()
+
+    assert "/charts/rvbbit-tanstack-charts-0.3.1.js" not in ordinary["template_html"]
+    assert "chart.js@4.5.0" in ordinary["template_html"]
+    assert experiment["status"] == "experimental"
+    assert experiment["tanstack_charts_version"] == "0.3.1"
+    assert experiment["runtime_asset"] == "/charts/rvbbit-tanstack-charts-0.3.1.js"
+    assert experiment["runtime_asset"] in experiment["template_html"]
+    assert "mountRvbbitChart" in experiment["template_html"]
+    assert "rvbbit:chart-select" in experiment["template_html"]
+    assert "chart.js@" not in experiment["template_html"]
+
+    objects = experiment["manifest"]["semantic_map"]["objects"]
+    assert {item["id"] for item in objects} == {
+        "revenue_by_channel",
+        "roas_by_channel",
+        "monthly_revenue",
+        "monthly_spend",
+    }
+    assert all(item["definition_hash"] for item in objects)
+    assert all(item["evaluator"]["shape"] == "scalar" for item in objects)
+    assert any("default" in instruction.lower() and "chart.js" in instruction.lower()
+               for instruction in experiment["how_to_use"])
+
+
+def test_tanstack_scene_evidence_keeps_svg_points_and_capture_bridge_batches_queries():
+    evidence_script = server._SEMANTIC_EVIDENCE_JS
+    capture_source = Path(server.__file__).read_text(encoding="utf-8")
+
+    assert "renderer:'tanstack-svg'" in evidence_script
+    assert "[data-rvbbit-key][data-row-index]" in evidence_script
+    assert "data-rvbbit-object-ref" in evidence_script
+    assert "svgGeometry" in evidence_script
+    assert "String(tool || '').endsWith('run_sql_multi')" in capture_source
+
+
+def test_tanstack_runtime_selects_the_exact_svg_datum_at_a_bar_edge():
+    """Large bars must select by their keyed element, not a nearest-point radius."""
+    from playwright.sync_api import sync_playwright
+
+    html = warehouse_theme.inline_chart_runtime("""<!doctype html>
+    <html><head>
+      <script defer src="/charts/rvbbit-tanstack-charts-0.3.1.js"></script>
+      <style>#chart { width: 720px; }</style>
+    </head><body>
+      <div id="chart"></div>
+      <script>
+        window.RVBBIT_DASHBOARD = {
+          bindSemanticObject(id, target) {
+            target.setAttribute('data-rvbbit-object', id);
+          }
+        };
+        const C = window.RVBBIT_CHARTS;
+        const rows = [
+          {channel: 'Search', revenue: 990000},
+          {channel: 'Social', revenue: 670000}
+        ];
+        window.selectedByUser = null;
+        window.selectionEvents = [];
+        window.addEventListener('rvbbit:chart-select', event => {
+          window.selectionEvents.push(event.detail);
+        });
+        C.mountRvbbitChart('#chart', {
+          definition: C.defineChart({
+            marks: [C.barX(rows, {
+              id: 'revenue-bars', x: 'revenue', y: 'channel', key: 'channel',
+              fill: '#d69d2e'
+            })],
+            x: {scale: C.scales.linear},
+            y: {scale: () => C.scales.band().padding(.2)}
+          }),
+          height: 260,
+          initialWidth: 720,
+          ariaLabel: 'Revenue by channel',
+          onSelect(point) { window.selectedByUser = point?.datum || null; }
+        }, {
+          id: 'channel-chart',
+          query: 'channel',
+          marks: {
+            'revenue-bars': {
+              x: 'revenue', y: 'channel', value: 'revenue',
+              context: ['channel'], semanticObject: 'revenue_by_channel'
+            }
+          }
+        });
+      </script>
+    </body></html>""")
+
+    errors = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 900, "height": 500})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.set_content(html, wait_until="load")
+        page.wait_for_selector("#chart [data-rvbbit-key][data-value]", timeout=3_000)
+        facts = page.evaluate("""() => {
+          const point = document.querySelector('#chart [data-rvbbit-key][data-value]');
+          const box = point.getBoundingClientRect();
+          // Deliberately click the far edge of a wide bar. TanStack's native
+          // nearest-point hit radius does not resolve this location by itself.
+          point.dispatchEvent(new MouseEvent('click', {
+            bubbles: true, composed: true, clientX: box.left + 2, clientY: box.top + 2
+          }));
+          return {
+            attributes: {
+              query: point.dataset.rvbbitQuery,
+              row: point.dataset.rowIndex,
+              field: point.dataset.field,
+              object: point.dataset.rvbbitObject,
+              objectRef: point.dataset.rvbbitObjectRef
+            },
+            selection: RVBBIT_CHARTS.selection('channel-chart'),
+            selectedByUser: window.selectedByUser,
+            events: window.selectionEvents
+          };
+        }""")
+        browser.close()
+
+    assert errors == []
+    assert facts["attributes"] == {
+        "query": "channel",
+        "row": "0",
+        "field": "revenue,channel",
+        "object": "revenue_by_channel",
+        "objectRef": "revenue_by_channel",
+    }
+    assert facts["selection"]["datum"] == {"channel": "Search", "revenue": 990000}
+    assert facts["selection"]["value"] == 990000
+    assert facts["selectedByUser"] == facts["selection"]["datum"]
+    assert facts["events"][-1]["semanticObject"] == "revenue_by_channel"
 
 
 def test_verified_semantic_overlay_uses_captured_binding_and_replays_sql(monkeypatch):
@@ -522,6 +657,125 @@ def test_artifact_lens_is_shadow_isolated_trace_capable_and_heavily_debounced():
     assert "/theme/artifact-lens.js" in theme_server
     assert "/theme/artifact-lens.css" in theme_server
     assert "COPY theme ./theme" in dockerfile
+
+
+def test_closing_artifact_lens_disables_all_dashboard_selection_behavior():
+    from base64 import b64encode
+
+    from playwright.sync_api import sync_playwright
+
+    lens_script = (_HERE / "theme" / "artifact-lens.js").read_text(encoding="utf-8")
+    lens_css = b64encode((_HERE / "theme" / "artifact-lens.css").read_bytes()).decode()
+    lens_script = lens_script.replace(
+        'stylesheet.href = "/theme/artifact-lens.css";',
+        f'stylesheet.href = "data:text/css;base64,{lens_css}";',
+    ).replace("</script", "<\\/script")
+    html = """<!doctype html><html><head><style>
+      body { min-height: 1800px; margin: 40px; background: #181818; color: white; }
+      .value { display: inline-block; margin: 20px; padding: 24px; border: 1px solid #333; }
+    </style></head><body>
+      <div id="first" class="value" data-field="amount">$42</div>
+      <div id="second" class="value" data-field="amount">$84</div>
+      <script>
+        window.dashboardClicks = 0;
+        document.addEventListener('click', event => {
+          if (event.target.id === 'second') window.dashboardClicks += 1;
+        });
+        window.RVBBIT_DASHBOARD = {
+          slug: 'lens-close-test', version: 1, historical: false, manifest: {},
+          queryTrace: () => [{
+            sql: 'select amount from sample', columns: [{name: 'amount'}],
+            rows: [{amount: 42}, {amount: 84}], row_count: 2
+          }],
+          semanticObjects: () => []
+        };
+        window.fetch = async url => {
+          const href = String(url);
+          const data = href.includes('/time-travel')
+            ? {eligible: false, code: 'PARTIAL_COVERAGE', message: 'Trace only'}
+            : href.includes('/inspect')
+              ? {
+                  selection: {label: 'Amount', tag: 'div'},
+                  binding: {confidence: 'exact', field: 'amount', value: '42'},
+                  provenance: {}, sources: []
+                }
+              : {status: 'disabled'};
+          return new Response(JSON.stringify(data), {
+            status: 200, headers: {'content-type': 'application/json'}
+          });
+        };
+      </script>
+      <script>__LENS_SCRIPT__</script>
+    </body></html>""".replace("__LENS_SCRIPT__", lens_script)
+
+    errors = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1100, "height": 700})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.set_content(html, wait_until="load")
+        page.wait_for_selector("rvbbit-artifact-lens")
+        page.evaluate("""() => {
+          const root = document.querySelector('rvbbit-artifact-lens').shadowRoot;
+          root.querySelector('.trigger').click();
+          root.querySelector('[data-view="trace"]').click();
+        }""")
+        page.wait_for_timeout(120)
+        page.evaluate("""() => {
+          const element = document.querySelector('#first');
+          const box = element.getBoundingClientRect();
+          const init = {bubbles: true, clientX: box.left + 4, clientY: box.top + 4};
+          element.dispatchEvent(new PointerEvent('pointermove', init));
+          element.dispatchEvent(new MouseEvent('click', init));
+        }""")
+        page.wait_for_function("""() => {
+          const root = document.querySelector('rvbbit-artifact-lens').shadowRoot;
+          return root.querySelector('.target-outline').dataset.selected === 'true';
+        }""")
+        page.evaluate("""() => {
+          document.querySelector('rvbbit-artifact-lens').shadowRoot.querySelector('.close').click();
+          const element = document.querySelector('#second');
+          const box = element.getBoundingClientRect();
+          const init = {bubbles: true, clientX: box.left + 4, clientY: box.top + 4};
+          element.dispatchEvent(new PointerEvent('pointermove', init));
+          element.dispatchEvent(new MouseEvent('click', init));
+          window.dispatchEvent(new Event('scroll'));
+          window.dispatchEvent(new Event('resize'));
+        }""")
+        page.wait_for_timeout(120)
+        state = page.evaluate("""() => {
+          const root = document.querySelector('rvbbit-artifact-lens').shadowRoot;
+          const shell = root.querySelector('.lens');
+          const outline = root.querySelector('.target-outline');
+          return {
+            open: shell.dataset.open,
+            picking: shell.dataset.picking,
+            documentPicking: document.documentElement.classList.contains(
+              'rvbbit-artifact-lens-picking'
+            ),
+            outlineHidden: outline.hidden,
+            outlineSelected: outline.dataset.selected,
+            outlineDisplay: getComputedStyle(outline).display,
+            candidateCount: root.querySelectorAll('.candidate-box').length,
+            hintHidden: root.querySelector('.picker-hint').hidden,
+            dashboardClicks: window.dashboardClicks,
+          };
+        }""")
+        browser.close()
+
+    assert errors == []
+    assert state == {
+        "open": "false",
+        "picking": "false",
+        "documentPicking": False,
+        "outlineHidden": True,
+        "outlineSelected": "false",
+        "outlineDisplay": "none",
+        "candidateCount": 0,
+        "hintHidden": True,
+        # The post-close click reaches the dashboard instead of the Lens.
+        "dashboardClicks": 1,
+    }
 
 
 def test_inspection_target_and_binding_are_bounded_and_drop_credentials():

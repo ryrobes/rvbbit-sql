@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RVBBIT · TanStack Charts laboratory</title>
+<link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">
+
+<!--
+  EXPERIMENTAL, OPT-IN VISUALIZATION LANE
+
+  This artifact deliberately keeps the ordinary RVBBIT HTML/JS contract. It
+  can use any DOM, CSS, controls, tables, or application logic it wants. Only
+  the chart primitive changes: the versioned Warehouse asset below provides
+  TanStack Charts plus mountRvbbitChart(), which annotates its keyed SVG marks
+  for Artifact Lens. The normal dashboard_template remains on Chart.js.
+-->
+<script src="/charts/rvbbit-tanstack-charts-0.3.1.js"></script>
+
+<style>
+  :root {
+    color-scheme: dark;
+    --ink: #f5f0e6;
+    --muted: #9f9a90;
+    --edge: rgba(255,255,255,.105);
+    --card: rgba(15,17,20,.82);
+    --card-strong: rgba(9,11,13,.94);
+    --gold: #f4b942;
+    --cyan: #56d6d0;
+    --violet: #9f87ff;
+    --danger: #ff746c;
+    --ts-chart-1: var(--gold);
+    --ts-chart-2: var(--cyan);
+    --ts-chart-3: var(--violet);
+    --ts-chart-4: #ff8a5b;
+    --ts-chart-5: #90d26d;
+    --ts-chart-6: #e973b2;
+    --ts-chart-focus: var(--gold);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    color: var(--ink);
+    background:
+      radial-gradient(1100px 700px at 8% -12%, rgba(244,185,66,.16), transparent 58%),
+      radial-gradient(900px 650px at 105% 20%, rgba(86,214,208,.11), transparent 52%),
+      #080a0c;
+  }
+  button { font: inherit; }
+  .shell { width: min(1500px, 100%); margin: 0 auto; padding: 26px clamp(16px,3vw,44px) 46px; }
+  .mast { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
+  .eyebrow { color: var(--gold); font: 700 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .2em; text-transform: uppercase; }
+  h1 { margin: 7px 0 3px; font-size: clamp(24px,3vw,42px); font-weight: 530; letter-spacing: -.045em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #777; box-shadow: 0 0 0 4px rgba(255,255,255,.04); }
+  .status.ok::before { background: var(--cyan); box-shadow: 0 0 0 4px rgba(86,214,208,.1); }
+  .status.err::before { background: var(--danger); }
+  .kpis { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 12px; margin-bottom: 12px; }
+  .kpi, .card {
+    border: 1px solid var(--edge);
+    background: linear-gradient(145deg, rgba(255,255,255,.035), transparent 34%), var(--card);
+    box-shadow: 0 18px 55px rgba(0,0,0,.18);
+    backdrop-filter: blur(18px);
+  }
+  .kpi { min-height: 116px; border-radius: 16px; padding: 17px 18px; }
+  .kpi .label { color: var(--muted); font: 650 10px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
+  .kpi .value { margin-top: 11px; font-size: clamp(22px,2.6vw,34px); font-weight: 540; letter-spacing: -.045em; }
+  .kpi .note { color: var(--muted); margin-top: 3px; font-size: 11px; }
+  .layout { display: grid; grid-template-columns: minmax(0,1.45fr) minmax(320px,.55fr); gap: 12px; align-items: stretch; }
+  .card { border-radius: 18px; overflow: hidden; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 18px 10px; }
+  .card-head h2 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: -.015em; }
+  .card-head p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
+  .segmented { display: inline-flex; padding: 3px; border: 1px solid var(--edge); border-radius: 999px; background: rgba(0,0,0,.25); }
+  .segmented button { cursor: pointer; border: 0; color: var(--muted); background: transparent; padding: 6px 10px; border-radius: 999px; font-size: 10px; }
+  .segmented button[aria-pressed="true"] { color: #16120a; background: var(--gold); }
+  .chart { width: 100%; min-width: 0; height: 390px; padding: 0 10px 10px; color: rgba(245,240,230,.78); }
+  .chart .ts-chart__axis, .chart .ts-chart__grid { opacity: .68; }
+  .inspector { display: flex; flex-direction: column; min-height: 100%; background: var(--card-strong); }
+  .inspector-empty { margin: auto; max-width: 260px; padding: 28px; color: var(--muted); text-align: center; font-size: 12px; line-height: 1.7; }
+  .inspector-empty b { display: block; color: var(--ink); font-size: 14px; margin-bottom: 5px; }
+  .selection { display: none; padding: 8px 18px 18px; }
+  .selection.live { display: block; }
+  .selection .big { font-size: 30px; font-weight: 560; letter-spacing: -.04em; margin: 9px 0 2px; }
+  .selection .channel { color: var(--gold); font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; letter-spacing: .1em; }
+  .facts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 18px; }
+  .fact { border: 1px solid var(--edge); border-radius: 11px; padding: 10px; background: rgba(255,255,255,.025); }
+  .fact span { display: block; color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
+  .fact b { display: block; margin-top: 4px; font-size: 12px; font-weight: 560; }
+  .trace { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--edge); color: var(--muted); font: 10px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+  .wide { grid-column: 1 / -1; margin-top: 12px; }
+  .trend-chart { height: 330px; }
+  .table-wrap { overflow: auto; border-top: 1px solid var(--edge); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { color: var(--muted); font: 650 9px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; text-transform: uppercase; text-align: right; padding: 11px 16px; }
+  th:first-child, td:first-child { text-align: left; }
+  td { padding: 11px 16px; border-top: 1px solid rgba(255,255,255,.055); text-align: right; }
+  tr[data-selected="true"] td { background: rgba(244,185,66,.07); color: #fff5d8; }
+  .chart-tooltip { border: 1px solid var(--edge); border-radius: 10px; color: var(--ink); background: rgba(8,10,12,.96); box-shadow: 0 12px 35px rgba(0,0,0,.4); font-size: 11px; }
+  @media (max-width: 920px) {
+    .kpis { grid-template-columns: repeat(2,minmax(0,1fr)); }
+    .layout { grid-template-columns: 1fr; }
+    .inspector { min-height: 260px; }
+  }
+  @media (max-width: 560px) {
+    .mast { align-items: flex-start; flex-direction: column; }
+    .kpis { grid-template-columns: 1fr; }
+    .card-head { align-items: flex-start; flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+<main class="shell">
+  <header class="mast">
+    <div>
+      <div class="eyebrow">Experimental visualization runtime · TanStack Charts 0.3.1</div>
+      <h1>Attribution signal laboratory</h1>
+      <div class="sub">Ordinary bespoke HTML around a keyed, selectable SVG chart grammar.</div>
+    </div>
+    <div class="status" id="status">waiting for the data bridge</div>
+  </header>
+
+  <section class="kpis" aria-label="Key performance indicators">
+    <article class="kpi"><div class="label">Booked revenue</div><div class="value" id="kpi-revenue">—</div><div class="note">all active channels</div></article>
+    <article class="kpi"><div class="label">Media spend</div><div class="value" id="kpi-spend">—</div><div class="note">tracked investment</div></article>
+    <article class="kpi"><div class="label">Students</div><div class="value" id="kpi-students">—</div><div class="note" id="kpi-leads">— leads</div></article>
+    <article class="kpi"><div class="label">Revenue / spend</div><div class="value" id="kpi-roas">—</div><div class="note">blended efficiency</div></article>
+  </section>
+
+  <section class="layout">
+    <article class="card">
+      <div class="card-head">
+        <div><h2>Channel constellation</h2><p>Bars, points, and labels share one semantic scene. Click any mark.</p></div>
+        <div class="segmented" aria-label="Chart measure">
+          <button type="button" data-measure="revenue" aria-pressed="true">Revenue</button>
+          <button type="button" data-measure="roas" aria-pressed="false">ROAS</button>
+        </div>
+      </div>
+      <div id="channel-chart" class="chart" role="figure" aria-label="Channel performance chart"></div>
+    </article>
+
+    <aside class="card inspector" aria-live="polite">
+      <div class="card-head"><div><h2>Selected business object</h2><p>Outside the chart, driven by its semantic selection.</p></div></div>
+      <div class="inspector-empty" id="selection-empty"><b>Choose a visible mark</b>The chart publishes its mark, source row, query part, field mapping, and semantic object—not just a pixel location.</div>
+      <div class="selection" id="selection">
+        <div class="channel" id="selected-channel">—</div>
+        <div class="big" id="selected-value">—</div>
+        <div class="sub" id="selected-label">—</div>
+        <div class="facts">
+          <div class="fact"><span>Spend</span><b id="selected-spend">—</b></div>
+          <div class="fact"><span>Students</span><b id="selected-students">—</b></div>
+          <div class="fact"><span>Leads</span><b id="selected-leads">—</b></div>
+          <div class="fact"><span>Mark</span><b id="selected-mark">—</b></div>
+        </div>
+        <div class="trace" id="selected-trace">—</div>
+      </div>
+    </aside>
+
+    <article class="card wide">
+      <div class="card-head"><div><h2>Revenue and spend over time</h2><p>A layered area, two lines, and point-level source identity.</p></div></div>
+      <div id="trend-chart" class="chart trend-chart" role="figure" aria-label="Monthly revenue and spend trend"></div>
+    </article>
+
+    <article class="card wide">
+      <div class="card-head"><div><h2>The same rows, still ordinary HTML</h2><p>The visualization primitive does not constrain the rest of the application.</p></div></div>
+      <div class="table-wrap"><table><thead><tr><th>Channel</th><th>Spend</th><th>Revenue</th><th>Students</th><th>Leads</th><th>ROAS</th></tr></thead><tbody id="channel-rows"></tbody></table></div>
+    </article>
+  </section>
+</main>
+
+<script>
+const SERVER_ID = 'REPLACE_WITH_YOUR_SERVER_ID';
+const TOOL = 'mcp__' + SERVER_ID + '__run_sql';
+const fmt = {
+  usd: value => '$' + Math.round(Number(value || 0)).toLocaleString(),
+  usdK: value => Number(value || 0) >= 1e6 ? '$' + (Number(value) / 1e6).toFixed(2) + 'M' : '$' + Math.round(Number(value || 0) / 1e3) + 'K',
+  num: value => Math.round(Number(value || 0)).toLocaleString(),
+  ratio: value => Number(value || 0).toFixed(2) + '×',
+};
+const $ = id => document.getElementById(id);
+let channelRows = [];
+let channelHost = null;
+let trendHost = null;
+let activeMeasure = 'revenue';
+
+const PARTS = {
+  kpi: {shape:'row', sql:`
+    select sum(revenue_booked) revenue, sum(spend) spend,
+           sum(students_enrolled) students, sum(leads_submitted) leads
+    from marts.mart_blended_cac_by_channel`},
+  channel: {shape:'list', sql:`
+    select channel, sum(spend) spend, sum(revenue_booked) revenue,
+           sum(students_enrolled) students, sum(leads_submitted) leads,
+           round(sum(revenue_booked) / nullif(sum(spend),0), 2) roas
+    from marts.mart_blended_cac_by_channel
+    group by channel order by revenue desc`},
+  trend: {shape:'list', sql:`
+    select to_char(date_trunc('month',date_day),'YYYY-MM') ym,
+           sum(revenue_booked) revenue, sum(spend) spend
+    from marts.mart_blended_cac_by_channel group by 1 order by 1`},
+};
+
+function waitForBridge(ms=7000) {
+  return new Promise((resolve,reject) => { const started=Date.now(); (function poll(){
+    if (window.rvbbitQuery || window.cowork?.callMcpTool) return resolve();
+    if (Date.now()-started > ms) return reject(new Error('No RVBBIT data bridge was found'));
+    setTimeout(poll,120);
+  })(); });
+}
+function rowsToObjects(result) {
+  if (Array.isArray(result)) return result;
+  if (!result) return [];
+  const columns = (result.columns || result.fields || []).map(column => typeof column === 'string' ? column : (column.name || column.column));
+  const rows = result.rows || result.data || [];
+  if (rows.length && Array.isArray(rows[0]) && columns.length) return rows.map(row => Object.fromEntries(columns.map((column,index) => [column,row[index]])));
+  return rows;
+}
+async function runSql(sql) {
+  if (window.rvbbitQuery && !window.cowork?.callMcpTool) return rowsToObjects(await window.rvbbitQuery(sql));
+  const result = await window.cowork.callMcpTool(TOOL,{sql});
+  if (result?.isError) throw new Error(JSON.stringify(result.content || result));
+  let data = result?.structuredContent;
+  if (!data && result?.content?.[0]?.text) data = JSON.parse(result.content[0].text);
+  return rowsToObjects(data || result);
+}
+async function composePayload(parts) {
+  const names = Object.keys(parts);
+  let values = {};
+  if (window.rvbbitQuery && !window.cowork?.callMcpTool) {
+    const results = await Promise.all(names.map(name => window.rvbbitQuery(parts[name].sql)));
+    names.forEach((name,index) => values[name] = rowsToObjects(results[index]));
+  } else {
+    const queries = Object.fromEntries(names.map(name => [name,parts[name].sql]));
+    const response = await window.cowork.callMcpTool('mcp__'+SERVER_ID+'__run_sql_multi',{queries});
+    const data = response?.structuredContent || (response?.content?.[0]?.text ? JSON.parse(response.content[0].text) : response);
+    if (!data?.results) {
+      for (const name of names) values[name] = await runSql(parts[name].sql);
+    } else {
+      names.forEach(name => values[name] = rowsToObjects(data.results[name]));
+    }
+  }
+  return Object.fromEntries(names.map(name => [name,parts[name].shape === 'row' ? (values[name]?.[0] || {}) : (values[name] || [])]));
+}
+function bindBusinessObject(id,target,value,context={}) {
+  return window.RVBBIT_DASHBOARD?.bindSemanticObject?.(id,target,{value,context}) || null;
+}
+function numericRows(rows,fields) {
+  return rows.map(row => ({...row,...Object.fromEntries(fields.map(field => [field,Number(row[field] || 0)]))}));
+}
+
+function channelDefinition(rows,measure) {
+  const C = window.RVBBIT_CHARTS;
+  const isRevenue = measure === 'revenue';
+  const markId = `channel-${measure}`;
+  return C.defineChart({
+    marks: [
+      C.barX(rows,{id:markId,x:measure,y:'channel',key:'channel',inset:7,radius:7,
+        fill:row => row.channel === 'Unknown' ? 'var(--danger)' : 'var(--ts-chart-1)',fillOpacity:.62}),
+      C.dot(rows,{id:`${markId}-point`,x:measure,y:'channel',key:'channel',r:5,
+        fill:'var(--ink)',stroke:isRevenue?'var(--gold)':'var(--cyan)',strokeWidth:3}),
+      C.text(rows,{id:`${markId}-label`,x:measure,y:'channel',key:'channel',dx:11,anchor:'start',
+        text:row => isRevenue ? fmt.usdK(row.revenue) : fmt.ratio(row.roas),fill:'var(--ink)',fontSize:10,fontWeight:650}),
+    ],
+    x:{scale:C.scales.linear,nice:true,grid:true,axis:{label:isRevenue?'Booked revenue':'Revenue / spend'}},
+    y:{scale:()=>C.scales.band().padding(.28),axis:{label:'Channel'}},
+    tooltip:{use:C.tooltip,className:'chart-tooltip'},
+    animate:{duration:260,respectReducedMotion:true},
+  });
+}
+
+function renderChannelChart() {
+  const measure = activeMeasure;
+  const markId = `channel-${measure}`;
+  const semanticObject = measure === 'revenue' ? 'revenue_by_channel' : 'roas_by_channel';
+  channelHost?.destroy();
+  channelHost = window.RVBBIT_CHARTS.mountRvbbitChart('#channel-chart',{
+    definition:channelDefinition(channelRows,measure),height:390,initialWidth:760,
+    ariaLabel:`Channel performance by ${measure}`,
+    ariaDescription:'Selectable bars, points, and labels retain their original channel row.',
+  },{
+    id:'channel-performance',query:'channel',
+    marks:Object.fromEntries([markId,`${markId}-point`,`${markId}-label`].map(id => [id,{
+      query:'channel',x:measure,y:'channel',value:measure,context:['channel'],semanticObject,
+    }]))
+  });
+}
+
+function renderTrendChart(rows) {
+  const C = window.RVBBIT_CHARTS;
+  const data = numericRows(rows,['revenue','spend']).map(row => ({...row,date:new Date(row.ym+'-01T00:00:00Z')}));
+  const curve = C.d3Curve(C.curves.monotoneX);
+  const definition = C.defineChart({
+    marks:[
+      C.areaY(data,{id:'revenue-spend-gap',x:'date',y1:'spend',y2:'revenue',key:'ym',fill:'var(--ts-chart-1)',fillOpacity:.11,curve}),
+      C.lineY(data,{id:'monthly-revenue',x:'date',y:'revenue',key:'ym',stroke:'var(--gold)',strokeWidth:2.5,points:true,curve}),
+      C.lineY(data,{id:'monthly-spend',x:'date',y:'spend',key:'ym',stroke:'var(--cyan)',strokeWidth:2,strokeDasharray:'5 5',points:true,curve}),
+    ],
+    x:{scale:C.scales.utc,nice:true,axis:{label:'Month'}},
+    y:{scale:C.scales.linear,nice:true,grid:true,axis:{label:'USD'}},
+    tooltip:{use:C.tooltip,className:'chart-tooltip'},
+    animate:{duration:320,respectReducedMotion:true},
+  });
+  trendHost?.destroy();
+  trendHost = C.mountRvbbitChart('#trend-chart',{
+    definition,height:330,initialWidth:1120,ariaLabel:'Monthly booked revenue and media spend',
+  },{
+    id:'monthly-trend',query:'trend',marks:{
+      'monthly-revenue':{query:'trend',x:'ym',y:'revenue',value:'revenue',context:['ym'],semanticObject:'monthly_revenue'},
+      'monthly-spend':{query:'trend',x:'ym',y:'spend',value:'spend',context:['ym'],semanticObject:'monthly_spend'},
+    }
+  });
+}
+
+function renderTable(rows) {
+  $('channel-rows').innerHTML = rows.map(row => `<tr data-channel="${String(row.channel).replace(/"/g,'&quot;')}">
+    <td>${row.channel}</td><td>${fmt.usd(row.spend)}</td><td>${fmt.usd(row.revenue)}</td>
+    <td>${fmt.num(row.students)}</td><td>${fmt.num(row.leads)}</td><td>${fmt.ratio(row.roas)}</td></tr>`).join('');
+}
+function showSelection(selection) {
+  if (!selection?.datum || typeof selection.datum !== 'object') return;
+  const row = selection.datum;
+  const measure = selection.markId.includes('roas') ? 'roas' : selection.markId.includes('spend') ? 'spend' : 'revenue';
+  const value = row[measure] ?? selection.value;
+  $('selection-empty').style.display = 'none';
+  $('selection').classList.add('live');
+  $('selected-channel').textContent = row.channel || row.ym || selection.groupLabel || 'Selected point';
+  $('selected-value').textContent = measure === 'roas' ? fmt.ratio(value) : fmt.usdK(value);
+  $('selected-label').textContent = measure.replace('_',' ') + ' · exact source datum';
+  $('selected-spend').textContent = row.spend == null ? '—' : fmt.usd(row.spend);
+  $('selected-students').textContent = row.students == null ? '—' : fmt.num(row.students);
+  $('selected-leads').textContent = row.leads == null ? '—' : fmt.num(row.leads);
+  $('selected-mark').textContent = selection.markId;
+  $('selected-trace').textContent = `${selection.query || 'query'} → ${selection.markId} → ${selection.key} → ${selection.semanticObject || 'generated semantic object'}`;
+  document.querySelectorAll('#channel-rows tr').forEach(tr => tr.dataset.selected = String(tr.dataset.channel === row.channel));
+}
+
+window.addEventListener('rvbbit:chart-select',event => {
+  if (event.detail?.selection === null) return;
+  showSelection(event.detail);
+});
+document.querySelectorAll('[data-measure]').forEach(button => button.addEventListener('click',() => {
+  activeMeasure = button.dataset.measure;
+  document.querySelectorAll('[data-measure]').forEach(item => item.setAttribute('aria-pressed',String(item === button)));
+  renderChannelChart();
+}));
+
+async function load() {
+  const status = $('status');
+  try {
+    if (!window.RVBBIT_CHARTS) throw new Error('The optional RVBBIT Charts runtime did not load');
+    await waitForBridge();
+    status.textContent = 'running three flat live queries';
+    const started = performance.now();
+    const payload = await composePayload(PARTS);
+    const kpi = payload.kpi || {};
+    channelRows = numericRows(payload.channel || [],['spend','revenue','students','leads','roas']);
+    $('kpi-revenue').textContent = fmt.usdK(kpi.revenue);
+    $('kpi-spend').textContent = fmt.usdK(kpi.spend);
+    $('kpi-students').textContent = fmt.num(kpi.students);
+    $('kpi-leads').textContent = fmt.num(kpi.leads) + ' leads';
+    $('kpi-roas').textContent = fmt.ratio(Number(kpi.revenue || 0)/Math.max(1,Number(kpi.spend || 0)));
+    bindBusinessObject('revenue','#kpi-revenue',kpi.revenue);
+    bindBusinessObject('ad_spend','#kpi-spend',kpi.spend);
+    bindBusinessObject('students','#kpi-students',kpi.students);
+    renderChannelChart();
+    renderTrendChart(payload.trend || []);
+    renderTable(channelRows);
+    status.className = 'status ok';
+    status.textContent = `live · ${Math.round(performance.now()-started)} ms · keyed SVG scene`;
+  } catch (error) {
+    console.error(error);
+    status.className = 'status err';
+    status.textContent = error.message || String(error);
+  }
+}
+load();
+</script>
+</body>
+</html>
+

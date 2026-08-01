@@ -4769,6 +4769,15 @@ def _launch_playwright_chromium(playwright):
         return playwright.chromium.launch()
 
 
+def _inline_artifact_system_assets(html):
+    """Make first-party opt-in assets available to ``about:blank`` renders."""
+    try:
+        import warehouse_theme
+        return warehouse_theme.inline_chart_runtime(html or "")
+    except Exception:  # noqa: BLE001 — an optional renderer must not break ordinary captures
+        return html or ""
+
+
 def _capture_html_with_playwright(html, path, width, height, full_page, wait_ms, quality=None):
     """Render + screenshot the stored HTML with the LIVE rvbbitQuery bridge injected.
     Returns a telemetry dict — every bridge query that ran (ok/rows/ms) plus console
@@ -4794,6 +4803,14 @@ def _capture_html_with_playwright(html, path, width, height, full_page, wait_ms,
 window.rvbbitQuery = async function(sql, opts) { return await window.__rvbbitQuery(sql, opts || {}); };
 window.cowork = window.cowork || {};
 window.cowork.callMcpTool = async function(tool, args) {
+  args = args || {};
+  if (String(tool || '').endsWith('run_sql_multi')) {
+    const results = {};
+    for (const [name, sql] of Object.entries(args.queries || {})) {
+      results[name] = await window.rvbbitQuery(sql, {as_of: args.as_of || null});
+    }
+    return {structuredContent: {results}};
+  }
   const d = await window.rvbbitQuery((args && args.sql) || "");
   return {structuredContent: {rows: (d && d.rows) || []}};
 };
@@ -4805,7 +4822,7 @@ window.cowork.callMcpTool = async function(tool, args) {
     # Exposed bindings (__rvbbitQuery) ARE installed for set_content, so only
     # the wrapper definition needs to ride inside the HTML, ahead of any
     # content script.
-    doc = html or ""
+    doc = _inline_artifact_system_assets(html)
     m = re.search(r"<head[^>]*>", doc, re.IGNORECASE)
     if m:
         doc = doc[:m.end()] + init + doc[m.end():]
@@ -4906,7 +4923,7 @@ def tool_render_pdf(name, html=None, slug=None, source_artifact_id=None,
 
     init = ("<script>window.rvbbitQuery = async function(sql, opts) "
             "{ return await window.__rvbbitQuery(sql, opts || {}); };</script>")
-    doc = html
+    doc = _inline_artifact_system_assets(html)
     mhead = re.search(r"<head[^>]*>", doc, re.IGNORECASE)
     doc = doc[:mhead.end()] + init + doc[mhead.end():] if mhead else init + doc
     with sync_playwright() as pw:
@@ -5193,10 +5210,12 @@ _SEMANTIC_EVIDENCE_JS = r"""
   };
   const raw = [];
   [...document.body.querySelectorAll('*')].slice(0,6000).forEach((node) => {
-    if (!visible(node) || ['script','style','option','path','line','polyline','circle'].includes(node.localName)) return;
+    const svgGeometry = ['path','line','polyline','circle'].includes(node.localName);
+    if (!visible(node) || ['script','style','option'].includes(node.localName)
+        || (svgGeometry && !node.matches('[data-rvbbit-key],[data-row-index],[data-index],[data-i]'))) return;
     const {value,value_attribute,value_source} = valueFrom(node);
     const hinted = node.matches('.val,.value,.metric,.kpi-value,.rowval,.detailbox b,[data-value],[data-v],[data-metric]');
-    const svgMark = node.matches('rect[data-year],rect[data-value],[data-row-index],[data-index]');
+    const svgMark = node.matches('[data-rvbbit-key][data-value],rect[data-year],rect[data-value],[data-row-index],[data-index]');
     if (!value || (!hinted && !svgMark && node.childElementCount > 0)) return;
     const rect = node.getBoundingClientRect();
     raw.push({
@@ -5273,13 +5292,40 @@ _SEMANTIC_EVIDENCE_JS = r"""
     columns:[...table.querySelectorAll('thead tr:last-child th')].slice(0,40).map((node) => bounded(node.textContent,160)),
     sample_rows:[...table.querySelectorAll('tbody tr')].slice(0,8).map((row) => [...row.querySelectorAll('td,th')].slice(0,40).map((node) => bounded(node.textContent,240))),
   }));
-  const charts = [...document.querySelectorAll('canvas')].filter(visible).slice(0,24).map((canvas) => {
+  const canvasCharts = [...document.querySelectorAll('canvas')].filter(visible).slice(0,24).map((canvas) => {
     const chart = window.Chart?.getChart?.(canvas);
-    return {selector:selectorFor(canvas),label:labelFor(canvas),
+    return {renderer:'chartjs-canvas',selector:selectorFor(canvas),label:labelFor(canvas),
       labels:(chart?.data?.labels || []).slice(0,40),datasets:(chart?.data?.datasets || []).slice(0,12).map((dataset,index) => ({
         dataset_index:index,label:bounded(dataset.label,160),values:(dataset.data || []).slice(0,40),
       }))};
   });
+  const tanstackCharts = [...document.querySelectorAll('[data-rvbbit-chart]')]
+    .filter((node,index,all) => visible(node) && all.indexOf(node) === index && node.querySelector('svg.ts-chart'))
+    .slice(0,24).map((container) => {
+      const points = [...container.querySelectorAll('[data-rvbbit-key][data-row-index]')];
+      const byMark = new Map();
+      points.forEach((point) => {
+        const mark = bounded(point.getAttribute('data-rvbbit-mark'),160) || 'unknown';
+        byMark.set(mark,(byMark.get(mark)||0)+1);
+      });
+      return {
+        renderer:'tanstack-svg',selector:selectorFor(container),label:labelFor(container),
+        chart_id:bounded(container.getAttribute('data-rvbbit-chart'),160),
+        query:bounded(container.getAttribute('data-rvbbit-query'),160),
+        point_count:points.length,
+        marks:[...byMark].slice(0,30).map(([id,count]) => ({id,count})),
+        sample_points:points.slice(0,40).map((point) => ({
+          key:bounded(point.getAttribute('data-rvbbit-key'),240),
+          mark:bounded(point.getAttribute('data-rvbbit-mark'),160),
+          row_index:Number(point.getAttribute('data-row-index')),
+          field:bounded(point.getAttribute('data-field'),160),
+          series:bounded(point.getAttribute('data-series'),160),
+          value:bounded(point.getAttribute('data-value'),160),
+          semantic_object:bounded(point.getAttribute('data-rvbbit-object-ref'),160),
+        })),
+      };
+    });
+  const charts = [...canvasCharts,...tanstackCharts].slice(0,36);
   const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')].filter(visible).slice(0,80).map((node) => bounded(node.textContent,240));
   return {title:document.title || headings[0] || '',headings,controls,tables,charts,candidates:finalCandidates,
     candidate_elements:finalCandidates.reduce((total,item) => total + Number(item.represented_elements || 1),0),
@@ -5305,7 +5351,7 @@ window.cowork.callMcpTool=async function(tool,args){
   return {structuredContent:{...data,rows:(data&&data.rows)||[]}};
 };
 </script>"""
-    doc = html or ""
+    doc = _inline_artifact_system_assets(html)
     match = re.search(r"<head[^>]*>", doc, re.IGNORECASE)
     return doc[:match.end()] + bridge + doc[match.end():] if match else bridge + doc
 
@@ -6221,6 +6267,11 @@ async def _mcp_capture_live_app(slug, path=None, width=1440, height=900, full_pa
 
 
 _TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_template.html")
+_TANSTACK_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "examples",
+    "tanstack-charts-dashboard.html",
+)
 
 
 def _dashboard_semantic_map_example():
@@ -6263,6 +6314,120 @@ def _dashboard_semantic_map_example():
     }
 
 
+def _tanstack_chart_semantic_map_example():
+    """Repeated chart objects: one definition, exact runtime state per SVG mark."""
+    return _normalize_semantic_manifest({
+        "schema_version": "live_app.v0",
+        "runtime_kind": "html",
+        "app_kind": "dashboard",
+        "semantic_map": {
+            "schema_version": _SEMANTIC_MAP_SCHEMA,
+            "description": (
+                "Business meanings used by the optional TanStack chart adapter. "
+                "Each keyed SVG point binds its own value and dimension context."
+            ),
+            "objects": [
+                {
+                    "id": "revenue_by_channel",
+                    "kind": "scalar",
+                    "meaning": {
+                        "label": "Booked revenue by channel",
+                        "description": "Revenue booked for the selected attribution channel.",
+                        "unit": "USD",
+                        "formula": "Sum of revenue_booked for one channel.",
+                    },
+                    "parameters": {
+                        "channel": {"type": "text", "default": "Direct", "label": "Channel"},
+                    },
+                    "evaluator": {
+                        "sql": (
+                            "select sum(revenue_booked) as value "
+                            "from marts.mart_blended_cac_by_channel "
+                            "where channel = {{channel}}"
+                        ),
+                        "shape": "scalar",
+                        "value_column": "value",
+                    },
+                    "display": {"prefix": "$", "decimals": 0},
+                    "source_queries": ["channel"],
+                },
+                {
+                    "id": "roas_by_channel",
+                    "kind": "scalar",
+                    "meaning": {
+                        "label": "Revenue-to-spend ratio by channel",
+                        "description": "Booked revenue divided by media spend for one channel.",
+                        "unit": "ratio",
+                        "formula": "Sum of revenue_booked divided by sum of spend for one channel.",
+                    },
+                    "parameters": {
+                        "channel": {"type": "text", "default": "Direct", "label": "Channel"},
+                    },
+                    "evaluator": {
+                        "sql": (
+                            "select round(sum(revenue_booked) / nullif(sum(spend),0), 2) as value "
+                            "from marts.mart_blended_cac_by_channel "
+                            "where channel = {{channel}}"
+                        ),
+                        "shape": "scalar",
+                        "value_column": "value",
+                    },
+                    "display": {"suffix": "x", "decimals": 2},
+                    "source_queries": ["channel"],
+                },
+                {
+                    "id": "monthly_revenue",
+                    "kind": "scalar",
+                    "meaning": {
+                        "label": "Monthly booked revenue",
+                        "description": "Revenue booked in the selected calendar month.",
+                        "unit": "USD",
+                        "formula": "Sum of revenue_booked for one calendar month.",
+                    },
+                    "parameters": {
+                        "ym": {"type": "text", "default": "2026-01", "label": "Month"},
+                    },
+                    "evaluator": {
+                        "sql": (
+                            "select sum(revenue_booked) as value "
+                            "from marts.mart_blended_cac_by_channel "
+                            "where to_char(date_trunc('month',date_day),'YYYY-MM') = {{ym}}"
+                        ),
+                        "shape": "scalar",
+                        "value_column": "value",
+                    },
+                    "display": {"prefix": "$", "decimals": 0},
+                    "source_queries": ["trend"],
+                },
+                {
+                    "id": "monthly_spend",
+                    "kind": "scalar",
+                    "meaning": {
+                        "label": "Monthly media spend",
+                        "description": "Media spend in the selected calendar month.",
+                        "unit": "USD",
+                        "formula": "Sum of spend for one calendar month.",
+                    },
+                    "parameters": {
+                        "ym": {"type": "text", "default": "2026-01", "label": "Month"},
+                    },
+                    "evaluator": {
+                        "sql": (
+                            "select sum(spend) as value "
+                            "from marts.mart_blended_cac_by_channel "
+                            "where to_char(date_trunc('month',date_day),'YYYY-MM') = {{ym}}"
+                        ),
+                        "shape": "scalar",
+                        "value_column": "value",
+                    },
+                    "display": {"prefix": "$", "decimals": 0},
+                    "source_queries": ["trend"],
+                },
+            ],
+        },
+    })
+
+
 def tool_dashboard_template():
     try:
         with open(_TEMPLATE_PATH) as f:
@@ -6295,6 +6460,38 @@ def tool_dashboard_template():
     }
 
 
+def tool_tanstack_chart_template():
+    """Return the optional TanStack Charts experiment without changing the default template."""
+    try:
+        with open(_TANSTACK_TEMPLATE_PATH, encoding="utf-8") as file:
+            html = file.read()
+    except Exception as error:  # noqa: BLE001
+        return {"error": str(error)}
+    manifest = _tanstack_chart_semantic_map_example()
+    return {
+        "status": "experimental",
+        "tanstack_charts_version": "0.3.1",
+        "runtime_asset": "/charts/rvbbit-tanstack-charts-0.3.1.js",
+        "template_html": html,
+        "manifest": manifest,
+        "how_to_use": [
+            "This is opt-in. The default dashboard_template and live_app_template remain on "
+            "Chart.js 4.5.0 and arbitrary HTML/JS; do not migrate an existing artifact unless asked.",
+            "Keep the exact versioned /charts/rvbbit-tanstack-charts-0.3.1.js script tag. The "
+            "Warehouse self-hosts it, and capture/PDF/semantic renders inline that same asset.",
+            "Author native TanStack definitions with window.RVBBIT_CHARTS marks, scales, tooltip, "
+            "transforms, and createMark escape hatches. mountRvbbitChart only owns lifecycle plus "
+            "RVBBIT metadata; it does not replace the TanStack grammar.",
+            "Give every mark a stable id and pass the tiny metadata map (query, x/y fields, value, "
+            "context fields, semanticObject). Keyed SVG marks then become exact Artifact Lens targets.",
+            "Pass the returned manifest to create_live_app so repeated SVG marks bind to replayable "
+            "business definitions. Omit it only when the post-publication compiler should infer them.",
+            "Call capture_live_app after publication and inspect bridge.page_errors plus the image. "
+            "TanStack Charts is pre-alpha, so keep this runtime pinned while evaluating it.",
+        ],
+    }
+
+
 def _mcp_dashboard_template():
     """Return the proven drop-in boilerplate for a LIVE dashboard (Cowork artifact + hosted).
     ALWAYS start a dashboard from this — it has the data bridge, single-round-trip query
@@ -6302,6 +6499,15 @@ def _mcp_dashboard_template():
     wrappers already solved. Adapt its two `>>> EDIT` blocks and publish normally; the semantic
     compiler runs after publication. semantic_map_example remains an optional precision hint."""
     return _logged("dashboard_template", {}, tool_dashboard_template)
+
+
+def _mcp_tanstack_chart_template():
+    """Get RVBBIT's EXPERIMENTAL, opt-in TanStack Charts starter. It preserves the normal
+    standalone HTML/JS dashboard model while replacing only selected visualization surfaces with
+    native, responsive, keyed SVG chart definitions. The default Chart.js template is unchanged.
+    Use this tool only when the user explicitly wants to try TanStack Charts or the semantic SVG
+    primitive; publish with create_live_app and the returned manifest, then capture it."""
+    return _logged("tanstack_chart_template", {}, tool_tanstack_chart_template)
 
 
 # Data clients injected into every served dashboard. We provide BOTH the hosted
@@ -8252,6 +8458,7 @@ def _register(mcp):
     mcp.tool(name="dashboard_crawl")(_mcp_dashboard_crawl)
     mcp.tool(name="dashboard_dependents")(_mcp_dashboard_dependents)
     mcp.tool(name="dashboard_template")(_mcp_dashboard_template)
+    mcp.tool(name="tanstack_chart_template")(_mcp_tanstack_chart_template)
     mcp.tool(name="live_app_template")(_mcp_live_app_template)
     mcp.tool(name="create_live_app")(_mcp_create_live_app)
     mcp.tool(name="update_live_app")(_mcp_update_live_app)
@@ -8340,6 +8547,9 @@ _INSTRUCTIONS = (
     "local uvicorn, stop_live_app to stop it, live_app_status to inspect runner state, and "
     "capture_live_app to create a PNG screenshot. The legacy dashboard_template/publish_dashboard "
     "tools remain for compatibility. "
+    "OPTIONAL TANSTACK CHARTS EXPERIMENT: only when the user explicitly requests TanStack Charts "
+    "or semantic keyed SVG marks, call tanstack_chart_template instead. It leaves the default "
+    "Chart.js/arbitrary-HTML path untouched and returns a pinned starter plus its semantic manifest. "
     "NO LOCAL GLUE NEEDED: to publish a large document, upload_artifact(content) once and pass "
     "source_artifact_id to publish/update tools (no local file reads, no re-transmission). To "
     "VALIDATE a query set, run_sql_multi(queries, result_mode='summary') returns row counts + "

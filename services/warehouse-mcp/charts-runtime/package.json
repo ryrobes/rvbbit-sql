@@ -1,0 +1,22 @@
+{
+  "name": "rvbbit-tanstack-charts-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Optional, browser-ready TanStack Charts runtime for RVBBIT Warehouse artifacts.",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tanstack/charts": "0.3.1",
+    "d3-scale": "4.0.2",
+    "d3-shape": "3.2.0"
+  },
+  "devDependencies": {
+    "@types/d3-scale": "4.0.9",
+    "@types/d3-shape": "3.1.8",
+    "typescript": "5.9.3",
+    "vite": "8.2.0"
+  }
+}
