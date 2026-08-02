@@ -7751,6 +7751,555 @@ def _semantic_home_preview(source, execution_subject=None):
     }
 
 
+# ── Semantic Watches ────────────────────────────────────────────────────────
+#
+# A watch replays the exact semantic-object handle under the authenticated
+# database subject, then hands only the observed scalar to an isolated RVBBIT
+# alert rule. That preserves Burrow/RLS while reusing the alert reconciler's
+# edge detection, consecutive checks, state, queue, and audit trail. Hermes is
+# intentionally not in this polling loop; the Work Inbox consumes the events.
+_WATCH_CADENCE_SECONDS = {"fast": 60, "normal": 15 * 60, "slow": 60 * 60}
+_WATCH_WAKE = threading.Event()
+_WATCH_THREAD = None
+_WATCH_THREAD_LOCK = threading.Lock()
+
+
+def _watch_number(value):
+    if isinstance(value, bool) or value is None:
+        raise ValueError("That dashboard value is not numeric")
+    try:
+        number = Decimal(str(value).replace(",", "").strip())
+    except Exception as exc:  # noqa: BLE001 — Decimal has several parse errors
+        raise ValueError("That dashboard value is not numeric") from exc
+    if not number.is_finite():
+        raise ValueError("That dashboard value is not a finite number")
+    return number
+
+
+def _watch_rule_name(watch_id):
+    return f"calliope_watch_{uuid.UUID(str(watch_id)).hex}"
+
+
+def _watch_rule_tier(watch_id):
+    return f"calliope:{uuid.UUID(str(watch_id)).hex}"
+
+
+def _watch_comparison_copy(comparator):
+    return "rises to or above" if comparator == "above" else "falls to or below"
+
+
+def _watch_public(row):
+    raw = dict(row or {})
+    source = raw.get("source") if isinstance(raw.get("source"), dict) else {}
+    presentation = raw.get("presentation") if isinstance(raw.get("presentation"), dict) else {}
+    threshold = raw.get("threshold")
+    last_value = raw.get("last_value")
+    return {
+        "id": str(raw.get("id")),
+        "name": raw.get("name") or presentation.get("title") or "Semantic watch",
+        "source": source,
+        "presentation": presentation,
+        "condition": {
+            "comparator": raw.get("comparator"),
+            "threshold": float(threshold) if threshold is not None else None,
+            "cadence": raw.get("cadence") or "normal",
+            "consecutive_n": int(raw.get("consecutive_n") or 1),
+            "copy": _watch_comparison_copy(raw.get("comparator")),
+        },
+        "active": bool(raw.get("active")),
+        "current": {
+            "value": float(last_value) if last_value is not None else None,
+            "status": raw.get("last_status"),
+            "evaluated_at": _iso_utc(raw.get("last_evaluated_at")),
+            "triggered_at": _iso_utc(raw.get("last_triggered_at")),
+            "error": raw.get("last_error"),
+        },
+        "unread_count": int(raw.get("unread_count") or 0),
+        "event_count": int(raw.get("event_count") or 0),
+        "created_at": _iso_utc(raw.get("created_at")),
+        "updated_at": _iso_utc(raw.get("updated_at")),
+    }
+
+
+def _watch_snapshot(owner, *, slug=None, version=None, object_id=None, limit=100):
+    clauses = ["w.owner_email=%s"]
+    params = [owner]
+    if slug:
+        clauses.append("w.source->>'slug'=%s")
+        params.append(str(slug))
+    if version not in (None, ""):
+        clauses.append("w.source->>'version'=%s")
+        params.append(str(int(version)))
+    if object_id:
+        clauses.append("w.source->>'object_id'=%s")
+        params.append(str(object_id))
+    params.append(max(1, min(int(limit or 100), 200)))
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT w.*,coalesce(ev.event_count,0) AS event_count,"
+            "coalesce(ev.unread_count,0) AS unread_count "
+            "FROM rvbbit.calliope_watches w LEFT JOIN LATERAL ("
+            " SELECT count(*) AS event_count,count(*) FILTER (WHERE acknowledged_at IS NULL) AS unread_count "
+            " FROM rvbbit.calliope_watch_events e WHERE e.watch_id=w.id"
+            ") ev ON true WHERE " + " AND ".join(clauses)
+            + " ORDER BY w.active DESC,w.updated_at DESC LIMIT %s",
+            tuple(params),
+        ).fetchall()
+    return {"watches": [_watch_public(row) for row in rows]}
+
+
+def _watch_semantic_definition(source, execution_subject, *, preview=True):
+    resolved = _semantic_home_resolve_handle(source, validate_sql=True)
+    if resolved.get("kind") != "artifact_object":
+        raise ValueError("Only named, replayable dashboard values can be watched")
+    dashboard, _, manifest, _ = _semantic_home_artifact_row(
+        resolved["source"]["slug"], resolved["source"]["version"]
+    )
+    semantic_object = _semantic_object_from_manifest(manifest, {
+        "id": resolved["source"]["object_id"],
+        "definition_hash": resolved["source"]["definition_hash"],
+    })
+    evaluator = (semantic_object or {}).get("evaluator") or {}
+    if not semantic_object or evaluator.get("shape") != "scalar":
+        raise ValueError("This dashboard object is not a single watchable value")
+    current = None
+    if preview:
+        result = _semantic_home_preview(resolved["source"], execution_subject)
+        if result.get("status") == "error":
+            raise ValueError(str(result.get("error") or "The current value could not be read"))
+        current = _watch_number(result.get("value"))
+    presentation = {
+        "title": resolved.get("title") or "Dashboard value",
+        "description": resolved.get("description") or "",
+        "formula": resolved.get("formula") or "",
+        "unit": resolved.get("unit") or "",
+        "display": resolved.get("display") or {},
+        "artifact_name": resolved.get("artifact_name") or dashboard.get("name") or resolved["source"]["slug"],
+        "open_url": resolved.get("open_url"),
+        "thumbnail_url": resolved.get("thumbnail_url"),
+    }
+    return resolved["source"], presentation, current
+
+
+def _watch_alert_definition(watch_id, comparator, threshold, consecutive_n):
+    watch_uuid = str(uuid.UUID(str(watch_id)))
+    # The alert reads a single service-owned observation, never authored SQL.
+    # Semantic SQL stays in the versioned artifact and is replayed separately
+    # under the mapped user's database role.
+    query = (
+        "SELECT ''::text AS entity_key,last_value::numeric AS score "
+        "FROM rvbbit.calliope_watches "
+        f"WHERE id='{watch_uuid}'::uuid AND active AND last_value IS NOT NULL"
+    )
+    condition = {
+        "kind": "sql",
+        "query": query,
+        "threshold": str(_watch_number(threshold)),
+        "compare": "gte" if comparator == "above" else "lte",
+    }
+    fire_policy = {"consecutive_n": int(consecutive_n), "cooldown_secs": 0}
+    return condition, fire_policy
+
+
+def _define_watch_alert(conn, row):
+    row = dict(row)
+    condition, fire_policy = _watch_alert_definition(
+        row["id"], row["comparator"], row["threshold"], row["consecutive_n"]
+    )
+    labels = {
+        "surface": "calliope",
+        "kind": "semantic_watch",
+        "watch_id": str(row["id"]),
+        "owner_email": row["owner_email"],
+    }
+    conn.execute(
+        "SELECT rvbbit.define_alert(%s,%s::jsonb,%s::jsonb,%s::jsonb,"
+        "'aggregate',1,%s,%s,%s,%s::jsonb)",
+        (
+            row["rule_name"],
+            json.dumps(condition),
+            json.dumps({"operator": "noop", "watch_id": str(row["id"])}),
+            json.dumps(fire_policy),
+            _watch_rule_tier(row["id"]),
+            f"Calliope watch: {row['name']}",
+            row["owner_email"],
+            json.dumps(labels),
+        ),
+    )
+    conn.execute(
+        "UPDATE rvbbit.alert_control SET enabled=%s,cadence_tier=%s,updated_at=now() "
+        "WHERE name=%s",
+        (bool(row["active"]), _watch_rule_tier(row["id"]), row["rule_name"]),
+    )
+
+
+def _watch_event_message(row, value, event_kind):
+    presentation = row.get("presentation") if isinstance(row.get("presentation"), dict) else {}
+    label = presentation.get("title") or row.get("name") or "Dashboard value"
+    unit = presentation.get("unit") or ""
+    number = _watch_number(value)
+    value_text = f"{number.normalize():f}"
+    threshold = _watch_number(row.get("threshold"))
+    threshold_text = f"{threshold.normalize():f}"
+    if event_kind == "recovered":
+        return f"{label} is back outside the watched range at {value_text}{(' ' + unit) if unit else ''}."
+    return (
+        f"{label} {_watch_comparison_copy(row.get('comparator'))} "
+        f"{threshold_text}{(' ' + unit) if unit else ''}; current value is {value_text}."
+    )
+
+
+def _watch_inputs(body, *, current=None):
+    body = body if isinstance(body, dict) else {}
+    comparator = str(body.get("comparator") or "below").strip().lower()
+    if comparator not in {"above", "below"}:
+        raise ValueError("comparator must be above or below")
+    threshold_raw = body.get("threshold", current)
+    if threshold_raw in (None, ""):
+        raise ValueError("A numeric threshold is required")
+    threshold = _watch_number(threshold_raw)
+    cadence = str(body.get("cadence") or "normal").strip().lower()
+    if cadence not in _WATCH_CADENCE_SECONDS:
+        raise ValueError("cadence must be fast, normal, or slow")
+    try:
+        consecutive_n = int(body.get("consecutive_n") or 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("consecutive_n must be an integer") from exc
+    if not 1 <= consecutive_n <= 12:
+        raise ValueError("consecutive_n must be between 1 and 12")
+    return comparator, threshold, cadence, consecutive_n
+
+
+def _watch_bool(value, *, default):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError("active must be true or false")
+
+
+def _create_calliope_watch(owner, execution_subject, body):
+    body = body if isinstance(body, dict) else {}
+    source, presentation, current = _watch_semantic_definition(
+        body.get("source") or body, execution_subject, preview=True
+    )
+    comparator, threshold, cadence, consecutive_n = _watch_inputs(body, current=current)
+    name = _semantic_text(body.get("name"), 120) or (
+        f"{presentation['title']} {_watch_comparison_copy(comparator)} {threshold.normalize():f}"
+    )
+    watch_id = str(uuid.uuid4())
+    rule_name = _watch_rule_name(watch_id)
+    with _conn() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "INSERT INTO rvbbit.calliope_watches "
+                "(id,owner_email,execution_subject,name,source,presentation,rule_name,"
+                "comparator,threshold,cadence,consecutive_n,last_value) "
+                "VALUES (%s::uuid,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s) RETURNING *",
+                (
+                    watch_id, owner, execution_subject or owner, name,
+                    json.dumps(source, default=str), json.dumps(presentation, default=str),
+                    rule_name, comparator, threshold, cadence, consecutive_n, current,
+                ),
+            ).fetchone()
+            _define_watch_alert(conn, row)
+    result = _calliope_watch_tick(force_watch_id=watch_id)
+    snapshot = _watch_snapshot(owner, slug=source["slug"], version=source["version"], object_id=source["object_id"])
+    watch = next(item for item in snapshot["watches"] if item["id"] == watch_id)
+    return {"watch": watch, "check": result}
+
+
+def _update_calliope_watch(owner, watch_id, body):
+    watch_id = str(uuid.UUID(str(watch_id)))
+    body = body if isinstance(body, dict) else {}
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM rvbbit.calliope_watches WHERE id=%s::uuid AND owner_email=%s",
+            (watch_id, owner),
+        ).fetchone()
+    if not row:
+        raise LookupError("No such watch")
+    row = dict(row)
+    comparator, threshold, cadence, consecutive_n = _watch_inputs({
+        "comparator": body.get("comparator", row["comparator"]),
+        "threshold": body.get("threshold", row["threshold"]),
+        "cadence": body.get("cadence", row["cadence"]),
+        "consecutive_n": body.get("consecutive_n", row["consecutive_n"]),
+    })
+    active = _watch_bool(body.get("active"), default=row["active"])
+    name = _semantic_text(body.get("name"), 120) or row["name"]
+    changed_condition = (
+        comparator != row["comparator"]
+        or threshold != row["threshold"]
+        or consecutive_n != int(row["consecutive_n"])
+    )
+    with _conn() as conn:
+        with conn.transaction():
+            updated = conn.execute(
+                "UPDATE rvbbit.calliope_watches SET name=%s,comparator=%s,threshold=%s,"
+                "cadence=%s,consecutive_n=%s,active=%s,updated_at=now() "
+                "WHERE id=%s::uuid AND owner_email=%s RETURNING *",
+                (
+                    name, comparator, threshold, cadence, consecutive_n, active,
+                    watch_id, owner,
+                ),
+            ).fetchone()
+            if changed_condition:
+                _define_watch_alert(conn, updated)
+            conn.execute(
+                "UPDATE rvbbit.alert_control SET enabled=%s,updated_at=now() WHERE name=%s",
+                (active, row["rule_name"]),
+            )
+    check = _calliope_watch_tick(force_watch_id=watch_id) if active else {"results": []}
+    snapshot = _watch_snapshot(owner)
+    watch = next(item for item in snapshot["watches"] if item["id"] == watch_id)
+    return {"watch": watch, "check": check}
+
+
+def _delete_calliope_watch(owner, watch_id):
+    watch_id = str(uuid.UUID(str(watch_id)))
+    with _conn() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "DELETE FROM rvbbit.calliope_watches WHERE id=%s::uuid AND owner_email=%s "
+                "RETURNING rule_name",
+                (watch_id, owner),
+            ).fetchone()
+            if not row:
+                raise LookupError("No such watch")
+            conn.execute("SELECT rvbbit.delete_alert(%s)", (row["rule_name"],))
+    return {"removed": watch_id}
+
+
+def _calliope_watch_events(owner, *, watch_id=None, unread_only=False, limit=100):
+    clauses = ["w.owner_email=%s"]
+    params = [owner]
+    if watch_id:
+        clauses.append("e.watch_id=%s::uuid")
+        params.append(str(uuid.UUID(str(watch_id))))
+    if unread_only:
+        clauses.append("e.acknowledged_at IS NULL")
+    params.append(max(1, min(int(limit or 100), 300)))
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT e.*,w.name,w.source,w.presentation,w.comparator,w.cadence "
+            "FROM rvbbit.calliope_watch_events e "
+            "JOIN rvbbit.calliope_watches w ON w.id=e.watch_id WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY e.created_at DESC,e.event_id DESC LIMIT %s",
+            tuple(params),
+        ).fetchall()
+    return {
+        "events": [{
+            "id": str(row["event_id"]),
+            "watch_id": str(row["watch_id"]),
+            "watch_name": row.get("name"),
+            "kind": row.get("event_kind"),
+            "message": row.get("message"),
+            "value": float(row["value"]) if row.get("value") is not None else None,
+            "threshold": float(row["threshold"]) if row.get("threshold") is not None else None,
+            "source": row.get("source") or {},
+            "presentation": row.get("presentation") or {},
+            "payload": row.get("payload") or {},
+            "created_at": _iso_utc(row.get("created_at")),
+            "acknowledged_at": _iso_utc(row.get("acknowledged_at")),
+        } for row in rows]
+    }
+
+
+def _reconcile_calliope_watch(watch_id):
+    watch_id = str(uuid.UUID(str(watch_id)))
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM rvbbit.calliope_watches WHERE id=%s::uuid AND active",
+            (watch_id,),
+        ).fetchone()
+    if not row:
+        return {"watch_id": watch_id, "skipped": True, "reason": "inactive_or_missing"}
+    row = dict(row)
+    try:
+        _source, _presentation, current = _watch_semantic_definition(
+            row["source"], row["execution_subject"], preview=True
+        )
+    except Exception as exc:  # noqa: BLE001 — a failed read is a user-visible watch state
+        message = _semantic_text(exc, 800) or "The watched value could not be read"
+        with _conn() as conn:
+            with conn.transaction():
+                locked = conn.execute(
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS ok",
+                    (row["rule_name"],),
+                ).fetchone()["ok"]
+                if not locked:
+                    return {"watch_id": watch_id, "skipped": True, "reason": "busy"}
+                previous = conn.execute(
+                    "SELECT last_error FROM rvbbit.calliope_watches WHERE id=%s::uuid FOR UPDATE",
+                    (watch_id,),
+                ).fetchone()
+                conn.execute(
+                    "UPDATE rvbbit.calliope_watches SET last_error=%s,last_evaluated_at=now(),updated_at=now() "
+                    "WHERE id=%s::uuid",
+                    (message, watch_id),
+                )
+                if not previous or previous.get("last_error") != message:
+                    conn.execute(
+                        "INSERT INTO rvbbit.calliope_watch_events "
+                        "(watch_id,event_kind,message,payload) VALUES (%s::uuid,'error',%s,%s::jsonb)",
+                        (watch_id, message, json.dumps({"code": "WATCH_REPLAY_FAILED"})),
+                    )
+        return {"watch_id": watch_id, "status": "error", "error": message}
+
+    with _conn() as conn:
+        with conn.transaction():
+            locked = conn.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS ok",
+                (row["rule_name"],),
+            ).fetchone()["ok"]
+            if not locked:
+                return {"watch_id": watch_id, "skipped": True, "reason": "busy"}
+            current_row = conn.execute(
+                "SELECT * FROM rvbbit.calliope_watches WHERE id=%s::uuid AND active FOR UPDATE",
+                (watch_id,),
+            ).fetchone()
+            if not current_row:
+                return {"watch_id": watch_id, "skipped": True, "reason": "inactive_or_missing"}
+            current_row = dict(current_row)
+            previous_status = current_row.get("last_status")
+            conn.execute(
+                "UPDATE rvbbit.calliope_watches SET last_value=%s,last_error=NULL,"
+                "last_evaluated_at=now(),updated_at=now() WHERE id=%s::uuid",
+                (current, watch_id),
+            )
+            sweep = conn.execute(
+                "SELECT rvbbit.alert_sweep(%s) AS result",
+                (_watch_rule_tier(watch_id),),
+            ).fetchone()["result"]
+            pending = conn.execute(
+                "SELECT q.queue_id,q.entity_key,q.transition FROM rvbbit.alert_queue q "
+                "WHERE q.rule_name=%s AND q.status='pending' ORDER BY q.enqueued_at "
+                "FOR UPDATE SKIP LOCKED",
+                (current_row["rule_name"],),
+            ).fetchall()
+            newest_alert_event = int(current_row.get("last_alert_event_id") or 0)
+            triggered = 0
+            for queued in pending:
+                output = {
+                    "ok": True,
+                    "operator": "calliope_inbox",
+                    "watch_id": watch_id,
+                }
+                alert_event = conn.execute(
+                    "INSERT INTO rvbbit.alert_events "
+                    "(rule_name,entity_key,transition,action_output,status) "
+                    "VALUES (%s,%s,%s,%s::jsonb,'fired') RETURNING event_id,ts",
+                    (
+                        current_row["rule_name"], queued.get("entity_key") or "",
+                        queued.get("transition") or "enter_fail", json.dumps(output),
+                    ),
+                ).fetchone()
+                conn.execute(
+                    "UPDATE rvbbit.alert_queue SET status='done',attempts=attempts+1 "
+                    "WHERE queue_id=%s",
+                    (queued["queue_id"],),
+                )
+                message = _watch_event_message(current_row, current, "triggered")
+                conn.execute(
+                    "INSERT INTO rvbbit.calliope_watch_events "
+                    "(watch_id,alert_event_id,event_kind,value,threshold,message,payload) "
+                    "VALUES (%s::uuid,%s,'triggered',%s,%s,%s,%s::jsonb) "
+                    "ON CONFLICT (watch_id,alert_event_id) WHERE alert_event_id IS NOT NULL DO NOTHING",
+                    (
+                        watch_id, alert_event["event_id"], current, current_row["threshold"], message,
+                        json.dumps({
+                            "source": current_row["source"],
+                            "comparator": current_row["comparator"],
+                            "consecutive_n": current_row["consecutive_n"],
+                        }, default=str),
+                    ),
+                )
+                newest_alert_event = max(newest_alert_event, int(alert_event["event_id"]))
+                triggered += 1
+            state = conn.execute(
+                "SELECT last_status,score,consecutive,last_changed_at,last_fired_at,updated_at "
+                "FROM rvbbit.alert_state WHERE rule_name=%s AND entity_key=''",
+                (current_row["rule_name"],),
+            ).fetchone()
+            status = (state or {}).get("last_status")
+            if previous_status == "fail" and status == "pass":
+                message = _watch_event_message(current_row, current, "recovered")
+                conn.execute(
+                    "INSERT INTO rvbbit.calliope_watch_events "
+                    "(watch_id,event_kind,value,threshold,message,payload) "
+                    "VALUES (%s::uuid,'recovered',%s,%s,%s,%s::jsonb)",
+                    (
+                        watch_id, current, current_row["threshold"], message,
+                        json.dumps({"source": current_row["source"]}, default=str),
+                    ),
+                )
+            conn.execute(
+                "UPDATE rvbbit.calliope_watches SET last_status=%s,last_alert_event_id=%s,"
+                "last_triggered_at=CASE WHEN %s>0 THEN now() ELSE last_triggered_at END,updated_at=now() "
+                "WHERE id=%s::uuid",
+                (status, newest_alert_event, triggered, watch_id),
+            )
+    return {
+        "watch_id": watch_id,
+        "status": status,
+        "value": float(current),
+        "triggered": triggered,
+        "sweep": sweep,
+    }
+
+
+def _calliope_watch_tick(force_watch_id=None, budget=50):
+    if force_watch_id:
+        return {"results": [_reconcile_calliope_watch(force_watch_id)]}
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id FROM rvbbit.calliope_watches WHERE active AND ("
+            "last_evaluated_at IS NULL OR last_evaluated_at <= now() - "
+            "CASE cadence WHEN 'fast' THEN interval '60 seconds' "
+            "WHEN 'slow' THEN interval '60 minutes' ELSE interval '15 minutes' END"
+            ") ORDER BY last_evaluated_at NULLS FIRST,created_at LIMIT %s",
+            (max(1, min(int(budget or 50), 200)),),
+        ).fetchall()
+    return {"results": [_reconcile_calliope_watch(row["id"]) for row in rows]}
+
+
+def _calliope_watch_worker():
+    interval = _env_int("WAREHOUSE_CALLIOPE_WATCH_TICK_SECONDS", 20, minimum=5, maximum=300)
+    while True:
+        try:
+            _calliope_watch_tick(budget=50)
+        except Exception as exc:  # noqa: BLE001 — a bad watch cannot stop future checks
+            print(f"WARNING: Calliope semantic watch tick failed: {exc}", file=sys.stderr)
+        _WATCH_WAKE.wait(interval)
+        _WATCH_WAKE.clear()
+
+
+def _start_calliope_watch_worker():
+    global _WATCH_THREAD
+    if not _semantic_home_enabled():
+        return False
+    with _WATCH_THREAD_LOCK:
+        if _WATCH_THREAD and _WATCH_THREAD.is_alive():
+            return True
+        _WATCH_THREAD = threading.Thread(
+            target=_calliope_watch_worker,
+            name="calliope-semantic-watches",
+            daemon=True,
+        )
+        _WATCH_THREAD.start()
+    return True
+
+
 # ── the landing page: this server's own front door ───────────────────────────
 # For the install shape where nobody opens DataRabbit at all — people talk to
 # the warehouse through Claude, artifacts get published here, and the links go
@@ -9223,6 +9772,137 @@ def register_dashboard_routes(m):
                 }
             }, 500)
         return _json({"preview": preview})
+
+    @m.custom_route("/api/calliope/watches", methods=["GET", "POST"])
+    async def _calliope_watches(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, session, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            if request.method == "GET":
+                version = request.query_params.get("version")
+                return _json(_watch_snapshot(
+                    owner,
+                    slug=request.query_params.get("slug"),
+                    version=int(version) if version not in (None, "") else None,
+                    object_id=request.query_params.get("object_id"),
+                    limit=request.query_params.get("limit") or 100,
+                ))
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            result = _create_calliope_watch(
+                owner,
+                session.get("sub") or owner,
+                body if isinstance(body, dict) else {},
+            )
+            _WATCH_WAKE.set()
+            return _json(result, 201)
+        except LookupError as exc:
+            return _json({"error": {"code": "NOT_FOUND", "message": str(exc)}}, 404)
+        except (TypeError, ValueError) as exc:
+            return _json({"error": {"code": "BAD_WATCH", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001
+            print(f"semantic watch ({owner}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "WATCH_UNAVAILABLE",
+                    "message": "That value could not be watched right now.",
+                }
+            }, 500)
+
+    @m.custom_route("/api/calliope/watches/{watch_id}", methods=["PATCH", "DELETE"])
+    async def _calliope_watch(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            watch_id = str(uuid.UUID(str(request.path_params["watch_id"])))
+            if request.method == "DELETE":
+                result = _delete_calliope_watch(owner, watch_id)
+            else:
+                try:
+                    body = await request.json()
+                except Exception:  # noqa: BLE001
+                    body = {}
+                result = _update_calliope_watch(
+                    owner, watch_id, body if isinstance(body, dict) else {}
+                )
+            _WATCH_WAKE.set()
+            return _json(result)
+        except LookupError as exc:
+            return _json({"error": {"code": "NOT_FOUND", "message": str(exc)}}, 404)
+        except (TypeError, ValueError) as exc:
+            return _json({"error": {"code": "BAD_WATCH", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001
+            print(f"semantic watch update ({owner}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "WATCH_UNAVAILABLE",
+                    "message": "That watch could not be changed right now.",
+                }
+            }, 500)
+
+    @m.custom_route("/api/calliope/watches/{watch_id}/check", methods=["POST"])
+    async def _check_calliope_watch(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            watch_id = str(uuid.UUID(str(request.path_params["watch_id"])))
+            with _conn() as conn:
+                owned = conn.execute(
+                    "SELECT 1 FROM rvbbit.calliope_watches WHERE id=%s::uuid AND owner_email=%s",
+                    (watch_id, owner),
+                ).fetchone()
+            if not owned:
+                raise LookupError("No such watch")
+            check = _calliope_watch_tick(force_watch_id=watch_id)
+            snapshot = _watch_snapshot(owner)
+            watch = next((item for item in snapshot["watches"] if item["id"] == watch_id), None)
+            return _json({"watch": watch, "check": check})
+        except LookupError as exc:
+            return _json({"error": {"code": "NOT_FOUND", "message": str(exc)}}, 404)
+        except (TypeError, ValueError) as exc:
+            return _json({"error": {"code": "BAD_WATCH", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001
+            print(f"semantic watch check ({owner}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "WATCH_CHECK_FAILED",
+                    "message": "That value could not be checked right now.",
+                }
+            }, 500)
+
+    @m.custom_route("/api/calliope/watch-events", methods=["GET"])
+    async def _calliope_watch_event_feed(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            unread = str(request.query_params.get("unread") or "").lower() in {
+                "1", "true", "yes", "on",
+            }
+            return _json(_calliope_watch_events(
+                owner,
+                watch_id=request.query_params.get("watch_id"),
+                unread_only=unread,
+                limit=request.query_params.get("limit") or 100,
+            ))
+        except (TypeError, ValueError) as exc:
+            return _json({"error": {"code": "BAD_WATCH_EVENT_QUERY", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001
+            print(f"semantic watch events ({owner}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _json({"error": {"code": "WATCH_EVENTS_UNAVAILABLE"}}, 500)
 
     @m.custom_route("/api/d/{slug}/inspect", methods=["POST"])
     async def _inspect(request):
@@ -11081,6 +11761,7 @@ def _build_mcp_oauth(public: str):
         evidence_open=_calliope_evidence_open,
     ):
         print("Calliope enabled (Hermes-backed living artifact notebook)", file=sys.stderr)
+        _start_calliope_watch_worker()
 
     @m.custom_route("/health", methods=["GET"])
     async def _health(_req):

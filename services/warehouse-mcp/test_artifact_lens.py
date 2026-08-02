@@ -591,6 +591,10 @@ def test_artifact_lens_is_shadow_isolated_trace_capable_and_heavily_debounced():
     assert "Named business object" in script
     assert "Reproducible warehouse definition" in script
     assert "Open recreated result" in script
+    assert "Watch this value" in script
+    assert "loadSemanticWatches" in script
+    assert 'handle?.kind === "artifact_object"' in script
+    assert ".watch-panel" in css
     assert 'semantic_object: semanticSelection' in script
     assert '"semantic-lens"' in script
     assert "renderCandidateHighlights" in script

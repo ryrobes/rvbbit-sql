@@ -66,6 +66,10 @@
   let currentTrail = null;
   let trailHistory = [];
   let trailRequest = 0;
+  let watchRequest = 0;
+  let currentWatches = null;
+  let watchPanelOpen = false;
+  let watchError = "";
   let hoverFrame = null;
   let candidateTimer = null;
   let semanticPollTimer = null;
@@ -2352,6 +2356,7 @@
         ?? data.binding?.value
         ?? data.selection?.text
       );
+      const watchable = Boolean(data.calliope_enabled && watchNumericValue(data) !== null);
       const replayStatuses = {
         verified: {
           label: "Verified",
@@ -2457,10 +2462,14 @@
         <div class="trace-actions">
           ${provenance.sql ? '<button type="button" class="query-run">Open recreated result</button>' : ""}
           ${data.calliope_enabled ? '<button type="button" class="home-pin">Pin to Home</button>' : ""}
+          ${watchable ? '<button type="button" class="watch-open">Watch this value</button>' : ""}
           ${data.calliope_enabled ? '<button type="button" class="trail-follow">Follow trail</button>' : ""}
           ${data.calliope_enabled ? '<button type="button" class="calliope-investigate">Ask Calliope</button>' : ""}
-        </div><section class="lens-trail" hidden></section>`;
+        </div>
+        ${watchable ? '<section class="watch-panel" hidden></section>' : ""}
+        <section class="lens-trail" hidden></section>`;
       traceResult.hidden = false;
+      if (watchable) void loadSemanticWatches(false);
       window.requestAnimationFrame(constrainLens);
       scheduleCandidateHighlights();
     }
@@ -2469,6 +2478,10 @@
       currentTrail = null;
       trailHistory = [];
       trailRequest += 1;
+      watchRequest += 1;
+      currentWatches = null;
+      watchPanelOpen = false;
+      watchError = "";
       if (data.semantic_object) {
         renderSemanticInspection(data);
         return;
@@ -2714,6 +2727,232 @@
       }
     }
 
+    function watchNumericValue(data = currentInspection) {
+      const raw = data?.replay?.value;
+      if (raw === null || raw === undefined || typeof raw === "boolean") return null;
+      const number = Number(String(raw).replaceAll(",", "").trim());
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function watchSuggestedThreshold(value) {
+      if (!Number.isFinite(value) || value === 0) return 0;
+      const target = value > 0 ? value * 0.9 : value * 1.1;
+      const magnitude = Math.max(0, Math.floor(Math.log10(Math.abs(target))) - 2);
+      const step = 10 ** magnitude;
+      return Math.round(target / step) * step;
+    }
+
+    function watchNumber(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return "—";
+      return new Intl.NumberFormat(undefined, { maximumFractionDigits: 4 }).format(number);
+    }
+
+    function watchHandle() {
+      const handle = currentTrailHandle();
+      return handle?.kind === "artifact_object" ? handle : null;
+    }
+
+    function watchHandleKey(handle = watchHandle()) {
+      if (!handle) return "";
+      const context = Object.entries(handle.context || {})
+        .sort(([left], [right]) => left.localeCompare(right));
+      return JSON.stringify([
+        handle.slug, handle.version, handle.object_id,
+        handle.definition_hash || "", context,
+      ]);
+    }
+
+    function syncWatchButton() {
+      const button = traceResult.querySelector(".watch-open");
+      if (!button) return;
+      const count = Array.isArray(currentWatches) ? currentWatches.length : 0;
+      button.classList.toggle("watched", count > 0);
+      button.textContent = count
+        ? `${count} watch${count === 1 ? "" : "es"}`
+        : "Watch this value";
+    }
+
+    function watchStatus(watch) {
+      if (!watch.active) return { label: "Paused", tone: "paused" };
+      if (watch.current?.error || watch.current?.status === "error") {
+        return { label: "Read failed", tone: "error" };
+      }
+      if (watch.current?.status === "fail") return { label: "Attention", tone: "fail" };
+      if (watch.current?.status === "pass") return { label: "Quiet", tone: "pass" };
+      return { label: "Waiting", tone: "waiting" };
+    }
+
+    function renderWatchPanel() {
+      const panel = traceResult.querySelector(".watch-panel");
+      if (!panel) return;
+      panel.hidden = !watchPanelOpen;
+      if (!watchPanelOpen) return;
+      const value = watchNumericValue();
+      const semanticObject = currentInspection?.semantic_object || {};
+      const meaning = semanticObject.meaning || {};
+      const display = semanticObject.display || {};
+      const threshold = watchSuggestedThreshold(value);
+      const watches = Array.isArray(currentWatches) ? currentWatches : [];
+      const list = watches.map((watch) => {
+        const state = watchStatus(watch);
+        const condition = watch.condition || {};
+        const cadence = { fast: "every minute", normal: "every 15 minutes", slow: "hourly" }[
+          condition.cadence
+        ] || condition.cadence;
+        const checks = Number(condition.consecutive_n || 1);
+        return `<article class="watch-card ${escapeHtml(state.tone)}">
+          <header>
+            <i aria-hidden="true"></i>
+            <div><strong>${escapeHtml(watch.name || meaning.label || "Semantic watch")}</strong>
+            <small>${escapeHtml(state.label)} · ${escapeHtml(cadence || "scheduled")}</small></div>
+          </header>
+          <p>${escapeHtml(condition.copy || "crosses")} <b>${escapeHtml(watchNumber(condition.threshold))}</b>${
+            meaning.unit ? ` ${escapeHtml(meaning.unit)}` : ""
+          }${checks > 1 ? ` for ${checks} checks` : ""}</p>
+          <div><span>Now <b>${escapeHtml(watchNumber(watch.current?.value))}</b></span>
+            <button type="button" data-watch-check="${escapeHtml(watch.id)}">Check now</button>
+            <button type="button" data-watch-active="${escapeHtml(watch.id)}" data-active="${watch.active}">${watch.active ? "Pause" : "Resume"}</button>
+            <button type="button" class="danger" data-watch-delete="${escapeHtml(watch.id)}">Remove</button>
+          </div>
+          ${watch.current?.error ? `<small class="watch-card-error">${escapeHtml(watch.current.error)}</small>` : ""}
+        </article>`;
+      }).join("");
+      const composer = currentWatches === null ? "" : `<details class="watch-composer"${watches.length ? "" : " open"}>
+        <summary>${watches.length ? "Add another watch" : "Create a watch"}<span>Exact value · permission-aware replay</span></summary>
+        <form class="watch-form">
+          <label class="watch-name"><span>Name <i>optional</i></span><input name="name" maxlength="120" placeholder="${escapeHtml(meaning.label || "My watch")}"></label>
+          <div class="watch-sentence">
+            <span>Tell me when it</span>
+            <select name="comparator" aria-label="Watch direction">
+              <option value="below">falls to or below</option>
+              <option value="above">rises to or above</option>
+            </select>
+            <input name="threshold" type="number" step="any" required value="${escapeHtml(threshold)}" aria-label="Threshold">
+          </div>
+          <div class="watch-options">
+            <label><span>Check</span><select name="cadence">
+              <option value="fast">Every minute</option>
+              <option value="normal" selected>Every 15 minutes</option>
+              <option value="slow">Hourly</option>
+            </select></label>
+            <label><span>Confirm for</span><select name="consecutive_n">
+              <option value="1">1 check</option><option value="2">2 checks</option>
+              <option value="3">3 checks</option><option value="5">5 checks</option>
+            </select></label>
+            <button type="submit">Create watch</button>
+          </div>
+          <p>Checks recreate this exact named value under your warehouse permissions. Calliope only records the observed number and meaningful changes.</p>
+        </form>
+      </details>`;
+      panel.innerHTML = `<header class="watch-panel-head">
+          <div><span>Semantic watch</span><strong>Keep an eye on ${escapeHtml(meaning.label || "this value")}</strong>
+          <small>Current warehouse value · ${escapeHtml(formatSemanticValue(value, display, meaning.unit))}</small></div>
+          <button type="button" class="watch-panel-close" aria-label="Close watch setup">×</button>
+        </header>
+        ${watchError ? `<div class="watch-error">${escapeHtml(watchError)}</div>` : ""}
+        <div class="watch-list">
+          ${currentWatches === null ? '<div class="watch-loading"><i></i><span>Reading your watches…</span></div>' : list}
+        </div>
+        ${composer}`;
+      window.requestAnimationFrame(constrainLens);
+    }
+
+    async function loadSemanticWatches(open = watchPanelOpen) {
+      const handle = watchHandle();
+      if (!handle) return;
+      if (open) watchPanelOpen = true;
+      const key = watchHandleKey(handle);
+      const request = ++watchRequest;
+      if (watchPanelOpen) renderWatchPanel();
+      try {
+        const params = new URLSearchParams({
+          slug: handle.slug,
+          version: String(handle.version),
+          object_id: handle.object_id,
+        });
+        const data = await fetchJson(`/api/calliope/watches?${params}`);
+        if (request !== watchRequest || key !== watchHandleKey()) return;
+        currentWatches = Array.isArray(data.watches) ? data.watches : [];
+        watchError = "";
+      } catch (error) {
+        if (request !== watchRequest || key !== watchHandleKey()) return;
+        currentWatches = [];
+        watchError = error instanceof Error ? error.message : String(error);
+      }
+      syncWatchButton();
+      if (watchPanelOpen) renderWatchPanel();
+    }
+
+    function openWatchPanel() {
+      watchPanelOpen = true;
+      watchError = "";
+      renderWatchPanel();
+      if (currentWatches === null) void loadSemanticWatches(true);
+      traceView.scrollTo({ top: traceView.scrollHeight, behavior: "smooth" });
+    }
+
+    async function createSemanticWatch(form) {
+      const handle = watchHandle();
+      if (!handle) return;
+      const submit = form.querySelector('[type="submit"]');
+      const fields = new FormData(form);
+      submit.disabled = true;
+      submit.textContent = "Creating…";
+      watchError = "";
+      try {
+        await fetchJson("/api/calliope/watches", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            source: handle,
+            name: fields.get("name"),
+            comparator: fields.get("comparator"),
+            threshold: fields.get("threshold"),
+            cadence: fields.get("cadence"),
+            consecutive_n: Number(fields.get("consecutive_n") || 1),
+          }),
+        });
+        currentWatches = null;
+        await loadSemanticWatches(true);
+      } catch (error) {
+        watchError = error instanceof Error ? error.message : String(error);
+        renderWatchPanel();
+      }
+    }
+
+    async function changeSemanticWatch(button, action) {
+      const id = button.dataset.watchCheck
+        || button.dataset.watchActive
+        || button.dataset.watchDelete;
+      if (!id) return;
+      if (action === "delete" && !window.confirm("Remove this semantic watch?")) return;
+      button.disabled = true;
+      const original = button.textContent;
+      button.textContent = action === "check" ? "Checking…" : action === "delete" ? "Removing…" : "Saving…";
+      watchError = "";
+      try {
+        if (action === "check") {
+          await fetchJson(`/api/calliope/watches/${encodeURIComponent(id)}/check`, { method: "POST" });
+        } else if (action === "active") {
+          await fetchJson(`/api/calliope/watches/${encodeURIComponent(id)}`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ active: button.dataset.active !== "true" }),
+          });
+        } else {
+          await fetchJson(`/api/calliope/watches/${encodeURIComponent(id)}`, { method: "DELETE" });
+        }
+        currentWatches = null;
+        await loadSemanticWatches(true);
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = original;
+        watchError = error instanceof Error ? error.message : String(error);
+        renderWatchPanel();
+      }
+    }
+
     function currentTrailHandle() {
       const semanticObject = currentInspection?.semantic_object;
       const artifact = currentInspection?.artifact || dashboard;
@@ -2839,6 +3078,30 @@
         followTrail(currentTrailHandle(), trail, true);
         return;
       }
+      if (event.target.closest(".watch-open")) {
+        openWatchPanel();
+        return;
+      }
+      if (event.target.closest(".watch-panel-close")) {
+        watchPanelOpen = false;
+        renderWatchPanel();
+        return;
+      }
+      const watchCheck = event.target.closest("[data-watch-check]");
+      if (watchCheck) {
+        void changeSemanticWatch(watchCheck, "check");
+        return;
+      }
+      const watchActive = event.target.closest("[data-watch-active]");
+      if (watchActive) {
+        void changeSemanticWatch(watchActive, "active");
+        return;
+      }
+      const watchDelete = event.target.closest("[data-watch-delete]");
+      if (watchDelete) {
+        void changeSemanticWatch(watchDelete, "delete");
+        return;
+      }
       if (event.target.closest(".lens-trail-back")) {
         if (trailHistory.length > 1) {
           trailHistory.pop();
@@ -2854,6 +3117,12 @@
       }
       const homePin = event.target.closest(".home-pin");
       if (homePin) pinSemanticObjectToHome(homePin);
+    });
+    traceResult.addEventListener("submit", (event) => {
+      const form = event.target.closest(".watch-form");
+      if (!form) return;
+      event.preventDefault();
+      void createSemanticWatch(form);
     });
     queryDrawer.addEventListener("click", (event) => {
       if (event.target.closest(".query-sql-toggle")) {

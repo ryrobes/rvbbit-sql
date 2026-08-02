@@ -282,6 +282,7 @@ _STYLE_DDL = """
 CREATE TABLE IF NOT EXISTS rvbbit.calliope_design_profiles (
     id uuid PRIMARY KEY,
     owner_email text NOT NULL,
+    execution_subject text NOT NULL,
     name text NOT NULL,
     description text NOT NULL DEFAULT '',
     current_version integer NOT NULL DEFAULT 1,
@@ -375,12 +376,69 @@ CREATE INDEX IF NOT EXISTS calliope_board_items_board_order_idx
     ON rvbbit.calliope_board_items (board_id, sort_order, created_at);
 """
 
+_WATCH_DDL = """
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_watches (
+    id uuid PRIMARY KEY,
+    owner_email text NOT NULL,
+    execution_subject text NOT NULL,
+    name text NOT NULL,
+    source jsonb NOT NULL,
+    presentation jsonb NOT NULL DEFAULT '{}'::jsonb,
+    rule_name text NOT NULL UNIQUE,
+    comparator text NOT NULL,
+    threshold numeric NOT NULL,
+    cadence text NOT NULL DEFAULT 'normal',
+    consecutive_n integer NOT NULL DEFAULT 1,
+    active boolean NOT NULL DEFAULT true,
+    last_value numeric,
+    last_status text,
+    last_evaluated_at timestamptz,
+    last_triggered_at timestamptz,
+    last_alert_event_id bigint NOT NULL DEFAULT 0,
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_watches_comparator_check CHECK (comparator IN ('above', 'below')),
+    CONSTRAINT calliope_watches_cadence_check CHECK (cadence IN ('fast', 'normal', 'slow')),
+    CONSTRAINT calliope_watches_consecutive_check CHECK (consecutive_n BETWEEN 1 AND 12),
+    CONSTRAINT calliope_watches_source_check CHECK (source->>'kind' = 'artifact_object')
+);
+CREATE INDEX IF NOT EXISTS calliope_watches_owner_updated_idx
+    ON rvbbit.calliope_watches (owner_email, active, updated_at DESC);
+CREATE INDEX IF NOT EXISTS calliope_watches_due_idx
+    ON rvbbit.calliope_watches (cadence, last_evaluated_at) WHERE active;
+CREATE INDEX IF NOT EXISTS calliope_watches_artifact_object_idx
+    ON rvbbit.calliope_watches (
+        owner_email,(source->>'slug'),((source->>'version')::integer),(source->>'object_id')
+    );
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_watch_events (
+    event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    watch_id uuid NOT NULL REFERENCES rvbbit.calliope_watches(id) ON DELETE CASCADE,
+    alert_event_id bigint,
+    event_kind text NOT NULL DEFAULT 'triggered',
+    value numeric,
+    threshold numeric,
+    message text NOT NULL,
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    acknowledged_at timestamptz,
+    CONSTRAINT calliope_watch_events_kind_check CHECK (event_kind IN ('triggered','recovered','error'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS calliope_watch_events_alert_event_idx
+    ON rvbbit.calliope_watch_events (watch_id,alert_event_id) WHERE alert_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS calliope_watch_events_watch_created_idx
+    ON rvbbit.calliope_watch_events (watch_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS calliope_watch_events_unread_idx
+    ON rvbbit.calliope_watch_events (created_at DESC) WHERE acknowledged_at IS NULL;
+"""
+
 
 def ensure_tables(conn_factory: Callable[..., Any]) -> None:
     with conn_factory() as conn:
         conn.execute(_DDL)
         conn.execute(_STYLE_DDL)
         conn.execute(_HOME_DDL)
+        conn.execute(_WATCH_DDL)
         # A server restart cannot preserve an in-flight SSE/agent task. Clear
         # those abandoned leases now so the per-session concurrency guard does
         # not strand a notebook forever after a crash or deploy.
