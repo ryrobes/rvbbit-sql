@@ -32,7 +32,7 @@ from __future__ import annotations
 # (DictRow vs TupleRow covariance); the code is correct at runtime (see --selftest).
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
-import asyncio, hashlib, hmac, json, math, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time
+import asyncio, hashlib, hmac, json, math, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -7374,6 +7374,383 @@ def _dashboard_inspection(
     return result
 
 
+# ── Semantic Home ───────────────────────────────────────────────────────────
+#
+# Home is deliberately a composition of stable warehouse handles, not copied
+# dashboard DOM.  Whole artifacts follow latest. Named business objects pin an
+# exact artifact version + definition hash + resolved dashboard context, which
+# makes them replayable and protects their meaning when an artifact evolves.
+_SEMANTIC_HOME_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$", re.I)
+_SEMANTIC_HOME_ITEM_KINDS = {"artifact", "artifact_object"}
+
+
+def _semantic_home_enabled():
+    try:
+        import calliope
+        return calliope.is_enabled()
+    except Exception:  # noqa: BLE001 — the gallery remains independently useful
+        return False
+
+
+def _semantic_home_artifact_href(slug, app_kind, version=None):
+    prefix = "/d" if (app_kind or "dashboard").lower() == "dashboard" else "/apps"
+    suffix = f"/versions/{int(version)}" if version else ""
+    return f"{prefix}/{slug}{suffix}"
+
+
+def _semantic_home_artifact_row(slug, version=None):
+    if not _SEMANTIC_HOME_SLUG_RE.fullmatch(str(slug or "")):
+        raise ValueError("artifact slug is invalid")
+    with _conn() as conn:
+        dashboard = conn.execute(
+            "SELECT id,slug,name,description,owner_email,team,runtime_kind,app_kind,"
+            "latest_version,updated_at FROM rvbbit.dashboards WHERE slug=%s",
+            (slug,),
+        ).fetchone()
+        if not dashboard:
+            raise LookupError("No such published artifact.")
+        selected_version = int(version or dashboard["latest_version"])
+        if selected_version < 1:
+            raise ValueError("version must be a positive integer")
+        row = conn.execute(
+            "SELECT v.version,v.manifest,v.created_by,v.created_at,"
+            "e.status AS semantic_status,e.semantic_map,e.verification,"
+            "e.prompt_version,e.model,e.updated_at AS semantic_updated_at "
+            "FROM rvbbit.dashboard_versions v "
+            "LEFT JOIN rvbbit.artifact_semantic_enrichments e "
+            "ON e.dashboard_id=v.dashboard_id AND e.version=v.version "
+            "WHERE v.dashboard_id=%s AND v.version=%s",
+            (dashboard["id"], selected_version),
+        ).fetchone()
+        if not row:
+            raise LookupError("No such artifact version.")
+        deps = conn.execute(
+            "SELECT kind,object_ref FROM rvbbit.dashboard_deps "
+            "WHERE dashboard_id=%s AND version=%s ORDER BY kind,object_ref NULLS LAST",
+            (dashboard["id"], selected_version),
+        ).fetchall()
+    enrichment = {
+        "status": row.get("semantic_status"),
+        "semantic_map": row.get("semantic_map") or {},
+        "verification": row.get("verification") or {},
+        "prompt_version": row.get("prompt_version"),
+        "model": row.get("model"),
+        "updated_at": row.get("semantic_updated_at"),
+    }
+    manifest = _effective_artifact_manifest(
+        dashboard["id"], selected_version, row.get("manifest") or {}, enrichment
+    )
+    return dict(dashboard), dict(row), manifest, [dict(dep) for dep in deps]
+
+
+def _semantic_home_source_trail(tables):
+    """Resolve a few friendly catalog breadcrumbs, never expose a graph UI."""
+    normalized = []
+    for table in tables or []:
+        raw = str(table or "").strip()
+        if not raw or raw in normalized:
+            continue
+        schema, relation = _split(raw)
+        if _schema_allowed(schema):
+            normalized.append(f"{schema}.{relation}")
+        if len(normalized) >= 4:
+            break
+    docs = {}
+    try:
+        with _conn() as conn:
+            for table in normalized:
+                schema, relation = _split(table)
+                row = conn.execute(
+                    "SELECT doc FROM rvbbit.catalog_docs "
+                    "WHERE graph_id=%s AND kind='db_table' AND schema_name=%s AND rel_name=%s "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (GRAPH, schema, relation),
+                ).fetchone()
+                docs[table] = _semantic_text((row or {}).get("doc"), 260)
+    except Exception:  # noqa: BLE001 — catalog prose enriches, never gates, a pin
+        docs = {}
+    return [{
+        "kind": "table",
+        "relationship": "recreated from",
+        "label": table,
+        "detail": docs.get(table) or "Warehouse source",
+        "handle": {"kind": "db_table", "table": table},
+    } for table in normalized]
+
+
+def _semantic_home_context_key(context):
+    encoded = json.dumps(
+        context or {}, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _semantic_home_resolve_handle(value, *, validate_sql=False):
+    """Resolve one client or persisted locator into a current, bounded tile."""
+    body = value if isinstance(value, dict) else {}
+    kind = str(body.get("kind") or body.get("item_kind") or "").strip().lower()
+    if kind not in _SEMANTIC_HOME_ITEM_KINDS:
+        raise ValueError("Home items must be artifacts or named artifact objects")
+    slug = str(body.get("slug") or "").strip()
+    requested_version = body.get("version") if kind == "artifact_object" else None
+    try:
+        version = int(requested_version) if requested_version not in (None, "") else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("version must be a positive integer") from exc
+    dashboard, version_row, manifest, deps = _semantic_home_artifact_row(slug, version)
+    selected_version = int(version_row["version"])
+    app_kind = str(dashboard.get("app_kind") or "dashboard").lower()
+    object_count = len(((manifest.get("semantic_map") or {}).get("objects") or []))
+    dependency_tables = sorted({
+        str(dep.get("object_ref"))
+        for dep in deps
+        if dep.get("kind") == "table" and dep.get("object_ref")
+    })
+    artifact_handle = {
+        "kind": "artifact",
+        "slug": slug,
+        "version": selected_version,
+    }
+    artifact_trail = {
+        "kind": "artifact",
+        "relationship": "defined in" if kind == "artifact_object" else "working set",
+        "label": dashboard.get("name") or slug,
+        "detail": f"{app_kind.replace('_', ' ')} · version {selected_version}",
+        "handle": artifact_handle,
+    }
+    if kind == "artifact":
+        source = {
+            "kind": "artifact",
+            "slug": slug,
+            "tracking": "latest",
+            "pinned_version": selected_version,
+        }
+        presentation = {
+            "title": dashboard.get("name") or slug,
+            "description": dashboard.get("description") or "",
+            "app_kind": app_kind,
+            "runtime_kind": dashboard.get("runtime_kind") or "html",
+        }
+        trail = [artifact_trail]
+        if object_count:
+            trail.append({
+                "kind": "semantic_map",
+                "relationship": "contains",
+                "label": f"{object_count} named business object{'' if object_count == 1 else 's'}",
+                "detail": "Values this artifact can explain and recreate",
+                "handle": {"kind": "semantic_map", "slug": slug, "version": selected_version},
+            })
+        trail.extend(_semantic_home_source_trail(dependency_tables)[:2])
+        return {
+            "kind": kind,
+            "canonical_key": f"artifact:{slug}",
+            "source": source,
+            "presentation": presentation,
+            "title": presentation["title"],
+            "description": presentation["description"],
+            "app_kind": app_kind,
+            "version": selected_version,
+            "latest_version": int(dashboard["latest_version"]),
+            "open_url": _semantic_home_artifact_href(slug, app_kind),
+            "thumbnail_url": f"/thumbs/{_artifact_kind(app_kind)}/{slug}.png",
+            "trail": trail,
+            "status": "ready",
+        }
+
+    object_id = str(body.get("object_id") or "").strip()
+    if not _SEMANTIC_OBJECT_ID_RE.fullmatch(object_id):
+        raise ValueError("semantic object id is invalid")
+    requested_hash = _inspection_text(body.get("definition_hash"), 80)
+    semantic_object = _semantic_object_from_manifest(
+        manifest, {"id": object_id, "definition_hash": requested_hash}
+    )
+    if not semantic_object:
+        raise LookupError("That named business object is not defined in this artifact version.")
+    context = _semantic_json_value(body.get("context") or {})
+    if not isinstance(context, dict):
+        context = {}
+    rendered_sql, resolved_context = _render_semantic_sql(semantic_object, context)
+    if validate_sql:
+        validation = tool_validate_sql(rendered_sql)
+        if not validation.get("valid") or not validation.get("safe_select"):
+            raise ValueError("That business object does not have a safe replayable definition")
+    meaning = semantic_object.get("meaning") or {}
+    evaluator = semantic_object.get("evaluator") or {}
+    tables = _referenced_tables(rendered_sql) or dependency_tables
+    definition_hash = str(semantic_object.get("definition_hash") or "")
+    context_key = _semantic_home_context_key(resolved_context)
+    source = {
+        "kind": "artifact_object",
+        "slug": slug,
+        "version": selected_version,
+        "object_id": object_id,
+        "definition_hash": definition_hash,
+        "context": resolved_context,
+    }
+    presentation = {
+        "title": meaning.get("label") or object_id.replace("_", " ").title(),
+        "description": meaning.get("description") or "",
+        "formula": meaning.get("formula") or "",
+        "unit": meaning.get("unit") or "",
+        "display": semantic_object.get("display") or {},
+        "artifact_name": dashboard.get("name") or slug,
+        "last_rendered_value": _semantic_json_value(body.get("rendered_value")),
+    }
+    trail = [{
+        "kind": "artifact_object",
+        "relationship": "named value",
+        "label": presentation["title"],
+        "detail": presentation["formula"] or presentation["description"] or "Replayable business meaning",
+        "handle": source,
+    }, artifact_trail]
+    trail.extend(_semantic_home_source_trail(tables))
+    return {
+        "kind": kind,
+        "canonical_key": f"artifact-object:{slug}:v{selected_version}:{object_id}:{context_key}",
+        "source": source,
+        "presentation": presentation,
+        "title": presentation["title"],
+        "description": presentation["description"],
+        "formula": presentation["formula"],
+        "unit": presentation["unit"],
+        "display": presentation["display"],
+        "context": resolved_context,
+        "artifact_name": presentation["artifact_name"],
+        "app_kind": app_kind,
+        "version": selected_version,
+        "latest_version": int(dashboard["latest_version"]),
+        "newer_version_available": int(dashboard["latest_version"]) > selected_version,
+        "open_url": _semantic_home_artifact_href(slug, app_kind, selected_version),
+        "thumbnail_url": f"/thumbs/{_artifact_kind(app_kind)}/{slug}.png",
+        "trail": trail,
+        "status": "ready",
+        "replayable": bool(rendered_sql.strip()),
+        "evaluator_shape": evaluator.get("shape") or "scalar",
+    }
+
+
+def _semantic_home_board(conn, owner, *, create=False):
+    row = conn.execute(
+        "SELECT * FROM rvbbit.calliope_boards WHERE owner_email=%s AND slug='home'",
+        (owner,),
+    ).fetchone()
+    if row or not create:
+        return dict(row) if row else None
+    return dict(conn.execute(
+        "INSERT INTO rvbbit.calliope_boards (id,owner_email,slug,title,kind) "
+        "VALUES (%s::uuid,%s,'home','My Home','home') "
+        "ON CONFLICT (owner_email,slug) DO UPDATE SET owner_email=excluded.owner_email "
+        "RETURNING *",
+        (str(uuid.uuid4()), owner),
+    ).fetchone())
+
+
+def _semantic_home_public_item(row):
+    raw = dict(row or {})
+    try:
+        resolved = _semantic_home_resolve_handle(raw.get("source") or {})
+        # Keep only the inert, non-authoritative value observed when the user
+        # pinned the object as a graceful fallback while its live replay runs.
+        stored_presentation = raw.get("presentation") or {}
+        if (
+            resolved.get("kind") == "artifact_object"
+            and stored_presentation.get("last_rendered_value") is not None
+        ):
+            resolved["presentation"]["last_rendered_value"] = (
+                stored_presentation["last_rendered_value"]
+            )
+        resolved.update({
+            "id": str(raw.get("id")),
+            "sort_order": int(raw.get("sort_order") or 0),
+            "created_at": _iso_utc(raw.get("created_at")),
+            "updated_at": _iso_utc(raw.get("updated_at")),
+        })
+        return resolved
+    except Exception as exc:  # noqa: BLE001 — a removed source must not break Home
+        presentation = raw.get("presentation") or {}
+        return {
+            "id": str(raw.get("id")),
+            "kind": raw.get("item_kind") or "artifact",
+            "title": presentation.get("title") or "Unavailable Home item",
+            "description": presentation.get("description") or "",
+            "source": raw.get("source") or {},
+            "presentation": presentation,
+            "sort_order": int(raw.get("sort_order") or 0),
+            "status": "unavailable",
+            "message": _semantic_text(exc, 300),
+            "trail": [],
+            "created_at": _iso_utc(raw.get("created_at")),
+            "updated_at": _iso_utc(raw.get("updated_at")),
+        }
+
+
+def _semantic_home_snapshot(owner):
+    with _conn() as conn:
+        board = _semantic_home_board(conn, owner, create=True)
+        rows = conn.execute(
+            "SELECT * FROM rvbbit.calliope_board_items WHERE board_id=%s::uuid "
+            "ORDER BY sort_order,created_at LIMIT 96",
+            (board["id"],),
+        ).fetchall()
+    return {
+        "home": {
+            "id": str(board["id"]),
+            "title": board.get("title") or "My Home",
+            "layout": board.get("layout") or {},
+            "updated_at": _iso_utc(board.get("updated_at")),
+        },
+        "items": [_semantic_home_public_item(row) for row in rows],
+    }
+
+
+def _semantic_home_preview(source, execution_subject=None):
+    resolved = _semantic_home_resolve_handle(source, validate_sql=True)
+    if resolved["kind"] != "artifact_object":
+        raise ValueError("Only named business objects have a live value preview")
+    dashboard, _, manifest, _ = _semantic_home_artifact_row(
+        resolved["source"]["slug"], resolved["source"]["version"]
+    )
+    semantic_object = _semantic_object_from_manifest(manifest, {
+        "id": resolved["source"]["object_id"],
+        "definition_hash": resolved["source"]["definition_hash"],
+    })
+    rendered_sql, context = _render_semantic_sql(
+        semantic_object, resolved["source"].get("context") or {}
+    )
+    token = _SESSION_SUB.set(execution_subject)
+    try:
+        evaluator = semantic_object.get("evaluator") or {}
+        result = tool_run_sql(
+            rendered_sql,
+            None,
+            2 if evaluator.get("shape") == "scalar" else 200,
+        )
+    finally:
+        _SESSION_SUB.reset(token)
+    if result.get("error"):
+        return {
+            "status": "error",
+            "error": (result.get("error") or {}).get("message") or result.get("error"),
+        }
+    value, value_column = _semantic_result_value(semantic_object, result)
+    return {
+        "status": "recreated",
+        "value": value,
+        "value_column": value_column,
+        "context": context,
+        "display": resolved.get("display") or {},
+        "unit": resolved.get("unit") or "",
+        "row_count": result.get("row_count"),
+        "engine": result.get("engine"),
+        "elapsed_ms": result.get("elapsed_ms"),
+        "artifact": {
+            "slug": dashboard["slug"],
+            "version": resolved["version"],
+            "latest_version": resolved["latest_version"],
+        },
+    }
+
+
 # ── the landing page: this server's own front door ───────────────────────────
 # For the install shape where nobody opens DataRabbit at all — people talk to
 # the warehouse through Claude, artifacts get published here, and the links go
@@ -7487,6 +7864,61 @@ h1{margin-top:16px;font-size:clamp(38px,5.4vw,68px);line-height:.92;
 h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:italic;letter-spacing:-.02em}
 .tally{margin-top:18px;color:var(--fog);font:10px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase}
 
+.semantic-home{padding:19px 0 20px;border-bottom:1px solid var(--line)}
+.semantic-home[hidden]{display:none}
+.home-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:12px}
+.home-title{display:flex;align-items:center;gap:11px;min-width:0}
+.home-title-mark{width:31px;height:31px;display:grid;place-items:center;flex:none;border:1px solid color-mix(in oklch,var(--jade) 38%,var(--line));
+  border-radius:50%;background:color-mix(in oklch,var(--jade) 7%,transparent);color:var(--jade);font:16px/1 var(--serif)}
+.home-title-copy{display:flex;flex-direction:column;gap:3px;min-width:0}
+.home-title-copy strong{color:var(--bone-bright);font:italic 400 19px/1 var(--serif)}
+.home-title-copy small{overflow:hidden;color:var(--dim);font:7px/1.35 var(--mono);letter-spacing:.1em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}
+.home-status{min-height:11px;color:var(--dim);font:7px/1.35 var(--mono);letter-spacing:.08em;text-align:right;text-transform:uppercase}
+.home-status.error{color:#f2a28f}
+.home-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:8px}
+.home-empty{display:flex;align-items:center;gap:11px;min-height:62px;padding:11px 13px;border:1px dashed color-mix(in oklch,var(--jade) 25%,var(--line));
+  background:color-mix(in oklch,var(--void) 60%,transparent);color:var(--fog)}
+.home-empty[hidden]{display:none}
+.home-empty b{color:var(--jade);font:italic 400 16px/1.2 var(--serif)}
+.home-empty span{font-size:9px;line-height:1.45}
+.home-tile{position:relative;min-width:0;overflow:hidden;border:1px solid color-mix(in oklch,var(--bone) 11%,transparent);
+  background:linear-gradient(145deg,color-mix(in oklch,var(--panel-raised) 92%,transparent),color-mix(in oklch,var(--void) 88%,transparent));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.025);transition:border-color .18s,transform .18s,background .18s}
+.home-tile:hover{transform:translateY(-1px);border-color:color-mix(in oklch,var(--jade) 34%,var(--line));background:linear-gradient(145deg,color-mix(in oklch,var(--panel-raised) 96%,var(--jade) 4%),var(--void))}
+.home-tile.object::before{content:"";position:absolute;z-index:2;inset:0 auto 0 0;width:2px;background:var(--jade);opacity:.72}
+.home-tile.unavailable{opacity:.66}
+.home-tile-content{display:grid;grid-template-columns:74px minmax(0,1fr);min-height:132px}
+.home-tile.object .home-tile-content{grid-template-columns:1fr}
+.home-thumb{position:relative;display:block;min-height:100%;overflow:hidden;background:#0d0b09;color:var(--amber)}
+.home-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:top center;opacity:.67;transition:opacity .2s,transform .35s}
+.home-tile:hover .home-thumb img{opacity:.88;transform:scale(1.035)}
+.home-thumb::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 45%,var(--panel-raised) 100%);pointer-events:none}
+.home-tile-main{display:flex;flex-direction:column;min-width:0;padding:12px 12px 10px}
+.home-tile.object .home-tile-main{padding-left:14px}
+.home-kicker{display:flex;align-items:center;gap:7px;margin-bottom:6px;color:var(--jade);font:650 6px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
+.home-kicker i{width:5px;height:5px;border-radius:50%;background:currentColor;box-shadow:0 0 9px color-mix(in oklch,currentColor 55%,transparent)}
+.home-tile.artifact .home-kicker{color:var(--amber)}
+.home-tile h3{overflow:hidden;color:var(--bone-bright);font:italic 400 16px/1.17 var(--serif);text-overflow:ellipsis;white-space:nowrap}
+.home-tile-desc{display:-webkit-box;overflow:hidden;margin-top:5px;color:var(--fog);font-size:8px;line-height:1.45;-webkit-box-orient:vertical;-webkit-line-clamp:2}
+.home-value{min-height:25px;margin:4px 0 1px;color:var(--bone-bright);font:600 22px/1.05 var(--sans);letter-spacing:-.025em}
+.home-value.loading{color:var(--dim);font:8px/25px var(--mono);letter-spacing:.08em;text-transform:uppercase}
+.home-value.error{color:#f2a28f;font:8px/1.35 var(--mono);letter-spacing:.04em}
+.home-context{display:flex;gap:4px;overflow:hidden;margin-top:6px}
+.home-context span{overflow:hidden;padding:3px 5px;border:1px solid color-mix(in oklch,var(--jade) 20%,var(--line));border-radius:999px;
+  color:var(--fog);font:6px/1 var(--mono);text-overflow:ellipsis;white-space:nowrap}
+.home-trail{display:flex;align-items:center;gap:4px;overflow:hidden;margin-top:auto;padding-top:8px}
+.home-trail::before{content:"TRAIL";flex:none;margin-right:2px;color:var(--dim);font:600 5px/1 var(--mono);letter-spacing:.12em}
+.home-crumb{display:inline-flex;align-items:center;gap:4px;min-width:0;max-width:128px;padding:3px 5px;border:1px solid var(--line);border-radius:999px;
+  color:var(--fog);font:6px/1 var(--mono);white-space:nowrap}
+.home-crumb:not(:last-child)::after{content:"›";position:relative;right:-9px;color:var(--jade)}
+.home-crumb span{overflow:hidden;text-overflow:ellipsis}
+.home-tile-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:7px 9px;border-top:1px solid var(--line);background:rgba(0,0,0,.12)}
+.home-tile-actions a,.home-tile-actions button{padding:5px 8px;border:1px solid var(--line);background:transparent;color:var(--fog);
+  font:6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;cursor:pointer}
+.home-tile-actions a:hover{border-color:var(--line-hot);color:var(--amber)}
+.home-tile-actions button:hover{border-color:color-mix(in oklch,#ef8178 52%,var(--line));color:#ef9b91}
+.home-version-note{margin-right:auto;color:var(--amber);font:6px/1.2 var(--mono);letter-spacing:.06em;text-transform:uppercase}
+
 .toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
   padding:16px 0;border-bottom:1px solid var(--line)}
 #q{flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--line);
@@ -7530,8 +7962,17 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 /* hairline grid: 1px gaps over a line-colored bed, so rules stay perfect at any wrap */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));
   gap:1px;margin-top:1px;background:var(--line);border:1px solid var(--line)}
-.card{display:flex;flex-direction:column;background:var(--panel);transition:background .25s}
+.card{position:relative;display:flex;flex-direction:column;background:var(--panel);transition:background .25s}
 .card:hover{background:var(--panel-2)}
+.card-link{display:flex;flex:1;flex-direction:column;min-height:100%}
+.card-pin{position:absolute;top:10px;right:10px;z-index:5;display:flex;align-items:center;gap:6px;min-height:27px;padding:6px 8px;
+  border:1px solid color-mix(in oklch,var(--bone) 18%,transparent);border-radius:999px;background:color-mix(in oklch,var(--void) 76%,transparent);
+  -webkit-backdrop-filter:blur(13px);backdrop-filter:blur(13px);color:var(--fog);font:650 6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;
+  box-shadow:0 5px 16px rgba(0,0,0,.28);cursor:pointer;transition:border-color .18s,background .18s,color .18s,transform .18s}
+.card-pin:hover,.card-pin:focus-visible{outline:0;transform:translateY(-1px);border-color:var(--amber);background:color-mix(in oklch,var(--void) 86%,var(--amber) 4%);color:var(--amber)}
+.card-pin[aria-pressed=true]{border-color:color-mix(in oklch,var(--jade) 62%,transparent);background:color-mix(in oklch,var(--jade) 15%,var(--void));color:var(--jade)}
+.card-pin:disabled{cursor:wait;opacity:.62}
+.card-pin b{font-size:10px;font-weight:400;line-height:.6}
 .shot{position:relative;aspect-ratio:16/10;overflow:hidden;background:#0d0b09}
 /* The glyph sits underneath permanently; the shot fades in ON TOP once it
    actually loads. That way a thumbnail still being rendered shows the
@@ -7577,6 +8018,8 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .semantic-launch-button{grid-template-columns:38px minmax(0,1fr)}
   .semantic-launch-mark{width:38px;height:38px}
   .semantic-launch-cta{grid-column:2;justify-content:flex-start;text-align:left}
+  .home-head{align-items:flex-start;flex-direction:column;gap:8px}
+  .home-status{text-align:left}
 }
 @media (max-width:520px){
   nav{padding-inline:14px}
@@ -7629,6 +8072,172 @@ _LANDING_JS = """
    calliopeTimer=setTimeout(scheduleCalliopeAvatar,60050-(Date.now()%60000));
  }
  if(calliopeFrame)scheduleCalliopeAvatar();
+
+ var homeSection=document.getElementById('semantic-home'),
+     homeGrid=document.getElementById('home-grid'),
+     homeEmpty=document.getElementById('home-empty'),
+     homeTitle=document.getElementById('home-title'),
+     homeStatus=document.getElementById('home-status'),
+     homeItems=[];
+ function escapeHome(value){
+   return String(value==null?'':value).replace(/[&<>"']/g,function(char){
+     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char];
+   });
+ }
+ function formatHomeValue(value,display,unit){
+   if(value===null||value===undefined||value==='')return '—';
+   display=display||{};
+   var rendered=value,number=typeof value==='number'?value:null;
+   if(number===null&&typeof value==='string'&&/^[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)$/.test(value.trim())){
+     number=Number(value);
+   }
+   if(number!==null&&Number.isFinite(number)){
+     var decimals=Number(display.decimals);
+     var options=Number.isInteger(decimals)?{
+       maximumFractionDigits:Math.max(0,Math.min(decimals,12)),
+       minimumFractionDigits:Math.max(0,Math.min(decimals,12))
+     }:{maximumFractionDigits:2};
+     rendered=new Intl.NumberFormat(undefined,options).format(number);
+   }else if(typeof value==='object'){
+     try{rendered=JSON.stringify(value);}catch(ignore){rendered=String(value);}
+   }
+   var prefix=String(display.prefix||''),suffix=String(display.suffix||'');
+   return prefix+String(rendered)+suffix+(!prefix&&!suffix&&unit?' '+String(unit):'');
+ }
+ function homeTrailMarkup(trail){
+   var items=(Array.isArray(trail)?trail:[]).slice(0,4);
+   if(!items.length)return '';
+   return '<div class="home-trail" aria-label="Evidence trail">'+items.map(function(crumb){
+     var relationship=crumb.relationship||'',label=crumb.label||crumb.kind||'evidence';
+     return '<span class="home-crumb" title="'+escapeHome(relationship+(relationship?' · ':'')+label)+'">'
+       +'<span>'+escapeHome(label)+'</span></span>';
+   }).join('')+'</div>';
+ }
+ function homeContextMarkup(context){
+   if(!context||typeof context!=='object')return '';
+   var entries=Object.entries(context).slice(0,3);
+   if(!entries.length)return '';
+   return '<div class="home-context">'+entries.map(function(entry){
+     var value=typeof entry[1]==='object'?JSON.stringify(entry[1]):String(entry[1]);
+     return '<span title="'+escapeHome(entry[0]+' · '+value)+'">'
+       +escapeHome(entry[0].replaceAll('_',' '))+': '+escapeHome(value)+'</span>';
+   }).join('')+'</div>';
+ }
+ function homeTileMarkup(item){
+   var object=item.kind==='artifact_object',unavailable=item.status==='unavailable';
+   var presented=item.presentation||{},last=presented.last_rendered_value;
+   var value=object?'<div class="home-value '+(last===null||last===undefined?'loading':'')+'" data-home-value="'
+     +escapeHome(item.id)+'">'+(last===null||last===undefined?'Reading current value…':escapeHome(formatHomeValue(last,item.display,item.unit)))+'</div>':'';
+   var thumbnail=!object&&item.thumbnail_url?'<a class="home-thumb" href="'+escapeHome(item.open_url||'#')
+     +'" target="_blank" rel="noopener"><img src="'+escapeHome(item.thumbnail_url)+'" alt="" decoding="async"></a>':'';
+   var context=object?homeContextMarkup(item.context):'';
+   var versionNote=item.newer_version_available?'<span class="home-version-note">Pinned v'+escapeHome(item.version)
+     +' · v'+escapeHome(item.latest_version)+' exists</span>':'<span class="home-version-note"></span>';
+   var open=item.open_url?'<a href="'+escapeHome(item.open_url)+'" target="_blank" rel="noopener">Open</a>':'';
+   return '<article class="home-tile '+(object?'object':'artifact')+(unavailable?' unavailable':'')+'" data-home-id="'+escapeHome(item.id)+'">'
+     +'<div class="home-tile-content">'+thumbnail+'<div class="home-tile-main">'
+     +'<span class="home-kicker"><i></i>'+(object?'Named business object':escapeHome(item.app_kind||'artifact'))+'</span>'
+     +'<h3 title="'+escapeHome(item.title||'Home item')+'">'+escapeHome(item.title||'Home item')+'</h3>'
+     +value
+     +(item.description?'<p class="home-tile-desc">'+escapeHome(item.description)+'</p>':'')
+     +context+homeTrailMarkup(item.trail)+'</div></div>'
+     +'<div class="home-tile-actions">'+versionNote+open
+     +'<button type="button" data-home-remove="'+escapeHome(item.id)+'">Remove</button></div></article>';
+ }
+ function syncGalleryPins(){
+   var pinned={};
+   homeItems.forEach(function(item){
+     if(item.kind==='artifact'&&item.source&&item.source.slug)pinned[item.source.slug]=item.id;
+   });
+   [].forEach.call(document.querySelectorAll('[data-home-pin]'),function(button){
+     var itemId=pinned[button.dataset.homePin]||'';
+     button.dataset.homeItemId=itemId;
+     button.setAttribute('aria-pressed',String(Boolean(itemId)));
+     button.innerHTML=itemId?'<b aria-hidden="true">✓</b><span>Home</span>':'<b aria-hidden="true">＋</b><span>Pin</span>';
+     button.title=itemId?'Remove this artifact from your private Home':'Pin this artifact to your private Home';
+   });
+ }
+ async function previewHomeItem(item){
+   if(item.kind!=='artifact_object'||item.status!=='ready')return;
+   var node=homeGrid&&homeGrid.querySelector('[data-home-value="'+CSS.escape(item.id)+'"]');
+   if(!node)return;
+   try{
+     var response=await fetch('/api/calliope/home/items/'+encodeURIComponent(item.id)+'/preview',{headers:{accept:'application/json'}});
+     var data={};try{data=await response.json();}catch(ignore){}
+     if(!response.ok||!data.preview)throw new Error(data.error&&data.error.message||'Current value unavailable');
+     if(data.preview.status==='error')throw new Error(data.preview.error||'Current value unavailable');
+     node.className='home-value';
+     node.textContent=formatHomeValue(data.preview.value,data.preview.display,item.unit||data.preview.unit);
+     node.title=[data.preview.engine,data.preview.elapsed_ms!=null?data.preview.elapsed_ms+' ms':''].filter(Boolean).join(' · ');
+   }catch(error){
+     node.className='home-value error';
+     node.textContent=error&&error.message?error.message:'Current value unavailable';
+   }
+ }
+ function renderHome(data){
+   if(!homeSection||!homeGrid)return;
+   homeItems=Array.isArray(data&&data.items)?data.items:[];
+   homeSection.hidden=false;
+   if(homeTitle&&data&&data.home&&data.home.title)homeTitle.textContent=data.home.title;
+   homeGrid.innerHTML=homeItems.map(homeTileMarkup).join('');
+   homeEmpty.hidden=Boolean(homeItems.length);
+   homeStatus.classList.remove('error');
+   homeStatus.textContent=homeItems.length?homeItems.length+' pinned object'+(homeItems.length===1?'':'s'):'Private to your signed-in account';
+   syncGalleryPins();
+   homeItems.forEach(previewHomeItem);
+ }
+ async function loadHome(){
+   if(!homeSection)return;
+   try{
+     var response=await fetch('/api/calliope/home',{headers:{accept:'application/json'}}),data={};
+     try{data=await response.json();}catch(ignore){}
+     if(!response.ok)throw new Error(data.error&&data.error.message||'Could not load your Home');
+     renderHome(data);
+   }catch(error){
+     homeSection.hidden=false;
+     homeStatus.classList.add('error');
+     homeStatus.textContent=error&&error.message?error.message:'Could not load your Home';
+     homeEmpty.hidden=false;
+   }
+ }
+ async function removeHomeItem(itemId,button){
+   if(!itemId||button.disabled)return;
+   button.disabled=true;
+   try{
+     var response=await fetch('/api/calliope/home/items/'+encodeURIComponent(itemId),{method:'DELETE',headers:{accept:'application/json'}}),data={};
+     try{data=await response.json();}catch(ignore){}
+     if(!response.ok)throw new Error(data.error&&data.error.message||'Could not remove the pin');
+     await loadHome();
+   }catch(error){
+     button.disabled=false;
+     homeStatus.classList.add('error');
+     homeStatus.textContent=error&&error.message?error.message:'Could not remove the pin';
+   }
+ }
+ async function toggleArtifactPin(button){
+   if(button.disabled)return;
+   button.disabled=true;
+   var itemId=button.dataset.homeItemId||'',slug=button.dataset.homePin;
+   try{
+     var response=await fetch(itemId?'/api/calliope/home/items/'+encodeURIComponent(itemId):'/api/calliope/home/items',{
+       method:itemId?'DELETE':'POST',headers:{'content-type':'application/json',accept:'application/json'},
+       body:itemId?undefined:JSON.stringify({kind:'artifact',slug:slug})
+     }),data={};
+     try{data=await response.json();}catch(ignore){}
+     if(!response.ok)throw new Error(data.error&&data.error.message||'Could not update your Home');
+     await loadHome();
+   }catch(error){
+     button.disabled=false;
+     if(homeStatus){homeStatus.classList.add('error');homeStatus.textContent=error&&error.message?error.message:'Could not update your Home';}
+   }
+ }
+ if(homeGrid)homeGrid.addEventListener('click',function(event){
+   var button=event.target.closest('[data-home-remove]');
+   if(button)removeHomeItem(button.dataset.homeRemove,button);
+ });
+ [].forEach.call(document.querySelectorAll('[data-home-pin]'),function(button){
+   button.addEventListener('click',function(){toggleArtifactPin(button);});
+ });
 
  var q=document.getElementById('q'),
      chips=[].slice.call(document.querySelectorAll('.chip')),
@@ -7711,6 +8320,7 @@ _LANDING_JS = """
    if(q&&e.key==='/'&&document.activeElement!==q){e.preventDefault();q.focus();}
    if(q&&e.key==='Escape'&&document.activeElement===q){q.value='';apply();q.blur();}
  });
+ if(homeSection)loadHome();
  apply();
 })();
 """
@@ -7871,6 +8481,11 @@ def _landing_html(rows, viewer):
         "linear-gradient(to bottom, rgba(16,13,11,.26) 0%, rgba(16,13,11,.50) 30%,"
         " rgba(16,13,11,.84) 62%, rgba(16,13,11,.93) 100%)")
 
+    # The personal working set exists only with the Hermes-backed Calliope
+    # surface; warehouse-only installs keep the original public gallery.
+    import calliope
+    calliope_enabled = calliope.is_enabled()
+
     kinds, cards = {}, []
     for r in rows:
         app_kind = (r.get("app_kind") or "dashboard").lower()
@@ -7903,10 +8518,11 @@ def _landing_html(rows, viewer):
         haystack = " ".join(str(x) for x in (name, desc, slug, app_kind, owner) if x).lower()
         cards.append(
             # New tab: the index is a place you come back to, not a page you
-            # navigate away from. noopener because these are arbitrary
-            # LLM-authored artifacts — no window.opener handle back to here.
-            f'<a class="card" href="{e(href)}" target="_blank" rel="noopener" '
-            f'data-kind="{e(app_kind)}" data-search="{e(haystack)}">'
+            # navigate away from. The pin is a sibling of the link so both
+            # controls keep valid, predictable browser semantics.
+            f'<article class="card" data-kind="{e(app_kind)}" data-search="{e(haystack)}" '
+            f'data-slug="{e(slug)}">'
+            f'<a class="card-link" href="{e(href)}" target="_blank" rel="noopener">'
             f'<div class="shot">{thumb}<div class="glyph">{_KIND_GLYPH.get(app_kind, "◇")}</div></div>'
             f'<div class="body">'
             f'<div class="meta"><span class="pill">{e(app_kind)}</span>'
@@ -7915,7 +8531,11 @@ def _landing_html(rows, viewer):
             f'<h2>{e(name)}</h2>'
             + (f'<p class="desc">{e(desc)}</p>' if desc else "")
             + (f'<div class="foot">{"".join(deps)}</div>' if deps else "")
-            + '</div></a>')
+            + '</div></a>'
+            + (f'<button class="card-pin" type="button" data-home-pin="{e(slug)}" '
+               f'aria-pressed="false" title="Pin this artifact to your private Home">'
+               f'<b aria-hidden="true">＋</b><span>Pin</span></button>' if calliope_enabled else "")
+            + '</article>')
 
     # The rung up the ladder. Only offered when there IS an app (LENS_PUBLIC_URL)
     # and only to viewers the database can place — an unmapped session reaching
@@ -7927,8 +8547,6 @@ def _landing_html(rows, viewer):
                  f'Open DataRabbit &rarr;</a>') if lens else ""
     # Calliope is a true opt-in surface: when Hermes is not configured there is
     # no gallery launcher and its routes are not registered.
-    import calliope
-    calliope_enabled = calliope.is_enabled()
     _calliope_link = (
         '<a class="calliope-float" href="/calliope" '
         'title="Open the full Calliope workspace" aria-label="Open the full Calliope workspace">'
@@ -7952,6 +8570,19 @@ def _landing_html(rows, viewer):
         '</button><span id="semantic-launch-error" class="semantic-launch-error" role="status"></span></div>'
         if calliope_enabled else ""
     )
+    _semantic_home = (
+        '<section id="semantic-home" class="semantic-home" aria-label="My Semantic Home" hidden>'
+        '<div class="home-head"><div class="home-title">'
+        '<span class="home-title-mark" aria-hidden="true">⌂</span>'
+        '<span class="home-title-copy"><strong id="home-title">My Home</strong>'
+        '<small>Your private working set · live artifacts and named business objects</small></span></div>'
+        '<span id="home-status" class="home-status" role="status">Loading your working set…</span></div>'
+        '<div id="home-grid" class="home-grid"></div>'
+        '<div id="home-empty" class="home-empty" hidden><b>Make this yours.</b>'
+        '<span>Pin an artifact here, or open its Artifact Lens and pin a named value.</span></div>'
+        '</section>'
+        if calliope_enabled else ""
+    )
 
     total = len(rows)
     tally = " · ".join([f"{total} artifact{'' if total == 1 else 's'}"]
@@ -7969,14 +8600,16 @@ def _landing_html(rows, viewer):
     )
     if rows:
         body = (
-            toolbar
+            _semantic_home
+            + toolbar
             + _calliope_search
             + f'<div class="grid">{"".join(cards)}</div>'
             + '<div id="none">No published artifacts match. Explore the company evidence above.</div>'
         )
     elif calliope_enabled:
         body = (
-            toolbar
+            _semantic_home
+            + toolbar
             + _calliope_search
             + '<div class="empty">No artifacts published yet.<br><br>'
             'Search company knowledge above, or open Calliope to make the first one.</div>'
@@ -8226,6 +8859,209 @@ def register_dashboard_routes(m):
         except Exception as exc:  # noqa: BLE001 — artifact rendering remains independent
             print(f"semantic enrichment status ({slug}): {exc}", file=sys.stderr)
             return _json({"error": {"code": "SEMANTIC_STATUS_UNAVAILABLE"}}, 500)
+
+    def _home_owner(request):
+        session = auth.read_session_full(request)
+        if not session:
+            return None, None, _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        if not session.get("mapped", True):
+            return None, session, _json({"error": {"code": "ACCESS_PENDING"}}, 403)
+        owner = str(session.get("identity") or "").strip().lower()
+        if not owner:
+            return None, session, _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        return owner, session, None
+
+    @m.custom_route("/api/calliope/home", methods=["GET", "PATCH"])
+    async def _calliope_home(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            if request.method == "GET":
+                return _json(_semantic_home_snapshot(owner))
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            body = body if isinstance(body, dict) else {}
+            item_ids = body.get("item_ids") or []
+            if not isinstance(item_ids, list) or len(item_ids) > 96:
+                raise ValueError("item_ids must be a bounded ordered list")
+            normalized_ids = []
+            for item_id in item_ids:
+                try:
+                    normalized_ids.append(str(uuid.UUID(str(item_id))))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Home item id is invalid") from exc
+            if len(set(normalized_ids)) != len(normalized_ids):
+                raise ValueError("Home item order contains duplicates")
+            with _conn() as conn:
+                with conn.transaction():
+                    board = _semantic_home_board(conn, owner, create=True)
+                    total = int(conn.execute(
+                        "SELECT count(*) AS n FROM rvbbit.calliope_board_items "
+                        "WHERE board_id=%s::uuid",
+                        (board["id"],),
+                    ).fetchone()["n"])
+                    count = 0
+                    if normalized_ids:
+                        count = int(conn.execute(
+                            "SELECT count(*) AS n FROM rvbbit.calliope_board_items "
+                            "WHERE board_id=%s::uuid AND id=ANY(%s::uuid[])",
+                            (board["id"], normalized_ids),
+                        ).fetchone()["n"])
+                    if count != len(normalized_ids):
+                        raise PermissionError("One or more Home items do not belong to this user")
+                    if total != len(normalized_ids):
+                        raise ValueError("item_ids must include every current Home item")
+                    for index, item_id in enumerate(normalized_ids, 1):
+                        conn.execute(
+                            "UPDATE rvbbit.calliope_board_items SET sort_order=%s,updated_at=now() "
+                            "WHERE board_id=%s::uuid AND id=%s::uuid",
+                            (index * 1000, board["id"], item_id),
+                        )
+                    conn.execute(
+                        "UPDATE rvbbit.calliope_boards SET updated_at=now() WHERE id=%s::uuid",
+                        (board["id"],),
+                    )
+            return _json(_semantic_home_snapshot(owner))
+        except PermissionError as exc:
+            return _json({"error": {"code": "FORBIDDEN", "message": str(exc)}}, 403)
+        except ValueError as exc:
+            return _json({"error": {"code": "BAD_HOME", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001
+            print(f"semantic home ({owner}): {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "HOME_UNAVAILABLE",
+                    "message": "Your Semantic Home could not be loaded.",
+                }
+            }, 500)
+
+    @m.custom_route("/api/calliope/home/items", methods=["POST"])
+    async def _pin_calliope_home_item(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            resolved = _semantic_home_resolve_handle(
+                body if isinstance(body, dict) else {}, validate_sql=True
+            )
+            with _conn() as conn:
+                with conn.transaction():
+                    board = _semantic_home_board(conn, owner, create=True)
+                    next_order = conn.execute(
+                        "SELECT coalesce(max(sort_order),0)+1000 AS n "
+                        "FROM rvbbit.calliope_board_items WHERE board_id=%s::uuid",
+                        (board["id"],),
+                    ).fetchone()["n"]
+                    row = conn.execute(
+                        "INSERT INTO rvbbit.calliope_board_items "
+                        "(id,board_id,item_kind,canonical_key,source,presentation,sort_order) "
+                        "VALUES (%s::uuid,%s::uuid,%s,%s,%s::jsonb,%s::jsonb,%s) "
+                        "ON CONFLICT (board_id,canonical_key) DO UPDATE SET "
+                        "source=excluded.source,presentation=excluded.presentation,updated_at=now() "
+                        "RETURNING *",
+                        (
+                            str(uuid.uuid4()),
+                            board["id"],
+                            resolved["kind"],
+                            resolved["canonical_key"],
+                            json.dumps(resolved["source"], default=str),
+                            json.dumps(resolved["presentation"], default=str),
+                            next_order,
+                        ),
+                    ).fetchone()
+                    conn.execute(
+                        "UPDATE rvbbit.calliope_boards SET updated_at=now() WHERE id=%s::uuid",
+                        (board["id"],),
+                    )
+            return _json({"item": _semantic_home_public_item(row)}, 201)
+        except LookupError as exc:
+            return _json({"error": {"code": "NOT_FOUND", "message": str(exc)}}, 404)
+        except ValueError as exc:
+            return _json({"error": {"code": "BAD_HOME_ITEM", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001
+            print(f"semantic home pin ({owner}): {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "HOME_PIN_FAILED",
+                    "message": "That item could not be pinned to Home.",
+                }
+            }, 500)
+
+    @m.custom_route("/api/calliope/home/items/{item_id}", methods=["DELETE"])
+    async def _remove_calliope_home_item(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            item_id = str(uuid.UUID(str(request.path_params["item_id"])))
+        except (TypeError, ValueError):
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        with _conn() as conn:
+            row = conn.execute(
+                "DELETE FROM rvbbit.calliope_board_items i USING rvbbit.calliope_boards b "
+                "WHERE i.id=%s::uuid AND i.board_id=b.id AND b.owner_email=%s "
+                "RETURNING i.id,i.board_id",
+                (item_id, owner),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE rvbbit.calliope_boards SET updated_at=now() WHERE id=%s::uuid",
+                    (row["board_id"],),
+                )
+        if not row:
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        return _json({"removed": item_id})
+
+    @m.custom_route("/api/calliope/home/items/{item_id}/preview", methods=["GET"])
+    async def _preview_calliope_home_item(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, session, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            item_id = str(uuid.UUID(str(request.path_params["item_id"])))
+        except (TypeError, ValueError):
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT i.source,i.item_kind FROM rvbbit.calliope_board_items i "
+                "JOIN rvbbit.calliope_boards b ON b.id=i.board_id "
+                "WHERE i.id=%s::uuid AND b.owner_email=%s",
+                (item_id, owner),
+            ).fetchone()
+        if not row:
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        if row.get("item_kind") != "artifact_object":
+            return _json({"error": {"code": "NOT_REPLAYABLE"}}, 400)
+        try:
+            preview = _semantic_home_preview(
+                row.get("source") or {}, session.get("sub") or owner
+            )
+        except (LookupError, ValueError) as exc:
+            return _json({"error": {"code": "PREVIEW_UNAVAILABLE", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001
+            print(f"semantic home preview ({owner}:{item_id}): {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "PREVIEW_UNAVAILABLE",
+                    "message": "The current value could not be recreated.",
+                }
+            }, 500)
+        return _json({"preview": preview})
 
     @m.custom_route("/api/d/{slug}/inspect", methods=["POST"])
     async def _inspect(request):

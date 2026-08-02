@@ -921,6 +921,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0225_calliope_evidence_sets",
         include_str!("../sql/migrations/0225_calliope_evidence_sets.sql"),
     ),
+    (
+        "0226_calliope_semantic_home",
+        include_str!("../sql/migrations/0226_calliope_semantic_home.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

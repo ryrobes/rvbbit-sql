@@ -342,11 +342,45 @@ CREATE INDEX IF NOT EXISTS calliope_surfaces_design_profile_idx
     WHERE design_profile_version_id IS NOT NULL;
 """
 
+_HOME_DDL = """
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_boards (
+    id uuid PRIMARY KEY,
+    owner_email text NOT NULL,
+    slug text NOT NULL,
+    title text NOT NULL,
+    kind text NOT NULL DEFAULT 'home',
+    layout jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_boards_owner_slug_key UNIQUE (owner_email, slug),
+    CONSTRAINT calliope_boards_kind_check CHECK (kind IN ('home'))
+);
+CREATE INDEX IF NOT EXISTS calliope_boards_owner_updated_idx
+    ON rvbbit.calliope_boards (owner_email, updated_at DESC);
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_board_items (
+    id uuid PRIMARY KEY,
+    board_id uuid NOT NULL REFERENCES rvbbit.calliope_boards(id) ON DELETE CASCADE,
+    item_kind text NOT NULL,
+    canonical_key text NOT NULL,
+    source jsonb NOT NULL,
+    presentation jsonb NOT NULL DEFAULT '{}'::jsonb,
+    sort_order bigint NOT NULL DEFAULT 1000,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_board_items_board_key UNIQUE (board_id, canonical_key),
+    CONSTRAINT calliope_board_items_kind_check
+        CHECK (item_kind IN ('artifact', 'artifact_object'))
+);
+CREATE INDEX IF NOT EXISTS calliope_board_items_board_order_idx
+    ON rvbbit.calliope_board_items (board_id, sort_order, created_at);
+"""
+
 
 def ensure_tables(conn_factory: Callable[..., Any]) -> None:
     with conn_factory() as conn:
         conn.execute(_DDL)
         conn.execute(_STYLE_DDL)
+        conn.execute(_HOME_DDL)
         # A server restart cannot preserve an in-flight SSE/agent task. Clear
         # those abandoned leases now so the per-session concurrency guard does
         # not strand a notebook forever after a crash or deploy.

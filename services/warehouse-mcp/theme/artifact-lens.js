@@ -2453,6 +2453,7 @@
         ${related}
         <div class="trace-actions">
           ${provenance.sql ? '<button type="button" class="query-run">Open recreated result</button>' : ""}
+          ${data.calliope_enabled ? '<button type="button" class="home-pin">Pin to Home</button>' : ""}
           ${data.calliope_enabled ? '<button type="button" class="calliope-investigate">Ask Calliope</button>' : ""}
         </div>`;
       traceResult.hidden = false;
@@ -2670,6 +2671,41 @@
       return launchCalliope(button, true);
     }
 
+    async function pinSemanticObjectToHome(button) {
+      const semanticObject = currentInspection?.semantic_object;
+      const artifact = currentInspection?.artifact;
+      if (!semanticObject?.id || !artifact?.slug || !artifact?.version) return;
+      const idleLabel = "Pin to Home";
+      button.disabled = true;
+      button.textContent = "Pinning…";
+      try {
+        await fetchJson("/api/calliope/home/items", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            kind: "artifact_object",
+            slug: artifact.slug,
+            version: artifact.version,
+            object_id: semanticObject.id,
+            definition_hash: semanticObject.definition_hash,
+            context: semanticObject.context || {},
+            rendered_value: currentInspection?.replay?.rendered_value
+              ?? currentInspection?.binding?.value
+              ?? null,
+          }),
+        });
+        button.textContent = "Pinned to Home";
+        button.classList.add("pinned");
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = idleLabel;
+        const note = document.createElement("span");
+        note.className = "handoff-error";
+        note.textContent = error instanceof Error ? error.message : String(error);
+        button.parentElement?.appendChild(note);
+      }
+    }
+
     trigger.addEventListener("click", (event) => {
       if (performance.now() < suppressTriggerClickUntil) {
         event.preventDefault();
@@ -2706,7 +2742,12 @@
         return;
       }
       const handoff = event.target.closest(".calliope-investigate");
-      if (handoff) askCalliope(handoff);
+      if (handoff) {
+        askCalliope(handoff);
+        return;
+      }
+      const homePin = event.target.closest(".home-pin");
+      if (homePin) pinSemanticObjectToHome(homePin);
     });
     queryDrawer.addEventListener("click", (event) => {
       if (event.target.closest(".query-sql-toggle")) {
