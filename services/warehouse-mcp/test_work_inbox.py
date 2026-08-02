@@ -173,5 +173,11 @@ def test_inbox_routes_mcp_routing_prompt_and_themed_ui_ship_together():
     assert "include_resolved=true" in script
     assert "investigateInboxItem" in script
     assert "45_000" in script
+    assert 'id="gallery-work-inbox"' in server_source
+    assert 'href="/calliope?inbox=1"' in server_source
+    assert "function loadGalleryInbox()" in server_source
+    assert "counts.open" in server_source
+    assert 'launch.get("inbox")' in script
+    assert "!els.inboxDialog.open" in script
     assert ".work-inbox-dialog" in css
     assert "color-mix(in oklch,var(--jade)" in css

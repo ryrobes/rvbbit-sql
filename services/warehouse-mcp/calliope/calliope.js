@@ -5227,6 +5227,7 @@
       const launchSurface = launch.get("surface");
       const launchPrompt = launch.get("prompt");
       const launchInstrument = launch.get("instrument");
+      const launchInbox = launch.get("inbox");
       await loadConfig();
       await loadInbox({ silent: true });
       clearInterval(state.inbox.timer);
@@ -5251,7 +5252,13 @@
       if (launchInstrument) {
         await openInstruments(launchInstrument);
       }
-      if (!state.sessions.length && !els.instrumentDialog.open) {
+      if (launchInbox && launchInbox !== "0") {
+        openInbox();
+        launch.delete("inbox");
+        const query = launch.toString();
+        window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+      }
+      if (!state.sessions.length && !els.instrumentDialog.open && !els.inboxDialog.open) {
         els.dialog.showModal();
         requestAnimationFrame(() => els.newSessionTitle.focus());
       }

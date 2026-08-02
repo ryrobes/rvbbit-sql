@@ -158,7 +158,7 @@ def test_gallery_calliope_entry_is_a_floating_time_aware_avatar():
     assert "border-bottom" not in shot_rule
     assert (
         '<span class="who"><span data-warehouse-theme-anchor></span>'
-        "{_app_link}"
+        "{_inbox_link}{_app_link}"
     ) in server
     assert (
         '<span class="who"><span data-warehouse-theme-anchor></span>'

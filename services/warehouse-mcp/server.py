@@ -8478,6 +8478,23 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
   font:10px/1 var(--mono);letter-spacing:.1em;color:var(--fog)}
 .who a{color:var(--dim)}
 .who a:hover{color:var(--amber)}
+.inbox-rail-link{
+  position:relative;display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 9px;
+  border:1px solid var(--line);border-radius:999px;color:var(--fog)!important;
+  font:600 7px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+  transition:border-color .18s,background .18s,color .18s}
+.inbox-rail-link::before{
+  content:"";width:6px;height:6px;flex:none;border:1px solid var(--dim);border-radius:50%;
+  background:transparent;transition:border-color .18s,background .18s,box-shadow .18s}
+.inbox-rail-link:hover{border-color:color-mix(in oklch,var(--jade) 42%,var(--line));color:var(--bone-bright)!important}
+.inbox-rail-link.has-open{border-color:color-mix(in oklch,var(--jade) 34%,var(--line));background:color-mix(in oklch,var(--jade) 5%,transparent)}
+.inbox-rail-link.has-open::before{border-color:var(--jade);background:var(--jade);box-shadow:0 0 9px color-mix(in oklch,var(--jade) 56%,transparent)}
+.inbox-rail-link.has-unread{border-color:var(--line-hot);color:var(--bone-bright)!important;background:var(--amber-soft)}
+.inbox-rail-link.has-unread::before{border-color:var(--amber);background:var(--amber);box-shadow:0 0 10px color-mix(in oklch,var(--amber) 62%,transparent)}
+.inbox-rail-count{min-width:17px;padding:3px 5px;border-radius:999px;background:var(--jade);color:var(--void);
+  font:800 7px/1 var(--mono);letter-spacing:0;text-align:center}
+.inbox-rail-link.has-unread .inbox-rail-count{background:var(--amber)}
+.inbox-rail-count[hidden]{display:none}
 .applink{padding:6px 11px;border:1px solid var(--line-hot);color:var(--amber)!important;
   letter-spacing:.12em}
 .applink:hover{background:var(--amber);color:#1a1206!important}
@@ -8720,6 +8737,8 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 @media (max-width:520px){
   nav{padding-inline:14px}
   .wordmark small{display:none}
+  .inbox-rail-label{display:none}
+  .inbox-rail-link{gap:5px;padding-inline:8px}
   .applink{display:none}
   .calliope-float{gap:11px;min-height:60px;padding:5px 17px 5px 5px}
   .calliope-float-avatar{width:42px;height:42px}
@@ -8770,6 +8789,41 @@ _LANDING_JS = """
    calliopeTimer=setTimeout(scheduleCalliopeAvatar,60050-(Date.now()%60000));
  }
  if(calliopeFrame)scheduleCalliopeAvatar();
+
+ var galleryInbox=document.getElementById('gallery-work-inbox'),
+     galleryInboxCount=document.getElementById('gallery-work-inbox-count'),
+     galleryInboxTimer=null;
+ async function loadGalleryInbox(){
+   if(!galleryInbox||!galleryInboxCount)return;
+   try{
+     var response=await fetch('/api/calliope/inbox?limit=1',{headers:{accept:'application/json'}}),data={};
+     try{data=await response.json();}catch(ignore){}
+     if(!response.ok)throw new Error('Inbox unavailable');
+     var counts=data.counts||{},open=Math.max(0,Number(counts.open)||0),
+         unread=Math.max(0,Number(counts.unread)||0);
+     galleryInbox.classList.toggle('has-open',open>0);
+     galleryInbox.classList.toggle('has-unread',unread>0);
+     galleryInboxCount.hidden=open===0;
+     galleryInboxCount.textContent=open>99?'99+':String(open);
+     galleryInbox.title=open
+       ? open+' open work item'+(open===1?'':'s')+(unread?' · '+unread+' unread':'')+' · Open in Calliope'
+       : 'Work Inbox clear · Open in Calliope';
+     galleryInbox.setAttribute('aria-label',open
+       ? 'Open Work Inbox in Calliope · '+open+' open'+(unread?' · '+unread+' unread':'')
+       : 'Open Work Inbox in Calliope · no open items');
+   }catch(ignore){
+     galleryInbox.classList.remove('has-open','has-unread');
+     galleryInboxCount.hidden=true;
+     galleryInbox.title='Open Work Inbox in Calliope';
+   }
+ }
+ if(galleryInbox){
+   loadGalleryInbox();
+   galleryInboxTimer=setInterval(loadGalleryInbox,45000);
+   document.addEventListener('visibilitychange',function(){
+     if(document.visibilityState==='visible')loadGalleryInbox();
+   });
+ }
 
  var homeSection=document.getElementById('semantic-home'),
      homeGrid=document.getElementById('home-grid'),
@@ -9336,6 +9390,13 @@ def _landing_html(rows, viewer):
         '<span class="calliope-float-action">Open workspace <b>&rarr;</b></span></span></a>'
         if calliope_enabled else ""
     )
+    _inbox_link = (
+        '<a id="gallery-work-inbox" class="inbox-rail-link" href="/calliope?inbox=1" '
+        'title="Open Work Inbox in Calliope" aria-label="Open Work Inbox in Calliope">'
+        '<span class="inbox-rail-label">Work Inbox</span>'
+        '<b id="gallery-work-inbox-count" class="inbox-rail-count" hidden>0</b></a>'
+        if calliope_enabled else ""
+    )
     _calliope_search = (
         '<div id="semantic-launch" class="semantic-launch" hidden>'
         '<button id="semantic-launch-button" class="semantic-launch-button" type="button">'
@@ -9422,7 +9483,7 @@ def _landing_html(rows, viewer):
 <div class="wash"></div>
 <nav data-warehouse-header>{_RABBIT_SVG}
  <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
- <span class="who"><span data-warehouse-theme-anchor></span>{_app_link}{f'<span class="viewer">{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
+ <span class="who"><span data-warehouse-theme-anchor></span>{_inbox_link}{_app_link}{f'<span class="viewer">{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
 <main>
  <header class="hero">
   <div class="kicker">Published artifacts</div>
