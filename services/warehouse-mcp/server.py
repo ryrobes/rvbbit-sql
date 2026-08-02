@@ -7916,8 +7916,45 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .home-tile-actions a,.home-tile-actions button{padding:5px 8px;border:1px solid var(--line);background:transparent;color:var(--fog);
   font:6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;cursor:pointer}
 .home-tile-actions a:hover{border-color:var(--line-hot);color:var(--amber)}
+.home-tile-actions button[data-home-trail]:hover{border-color:color-mix(in oklch,var(--jade) 52%,var(--line));color:var(--jade)}
 .home-tile-actions button:hover{border-color:color-mix(in oklch,#ef8178 52%,var(--line));color:#ef9b91}
 .home-version-note{margin-right:auto;color:var(--amber);font:6px/1.2 var(--mono);letter-spacing:.06em;text-transform:uppercase}
+
+.trail-dialog{width:min(860px,calc(100vw - 32px));max-width:none;height:min(760px,calc(100dvh - 32px));max-height:none;margin:auto;padding:0;
+  border:1px solid var(--line-hot);background:color-mix(in oklch,var(--panel) 92%,transparent);color:var(--bone);
+  box-shadow:0 34px 120px color-mix(in oklch,var(--void) 88%,transparent);color-scheme:dark}
+.trail-dialog::backdrop{background:color-mix(in oklch,var(--void) 74%,transparent);backdrop-filter:blur(8px)}
+.trail-shell{height:100%;display:grid;grid-template-rows:auto minmax(0,1fr)}
+.trail-head{display:flex;align-items:center;gap:12px;min-height:64px;padding:10px 13px 10px 17px;border-bottom:1px solid var(--line);
+  background:color-mix(in oklch,var(--gallery-rail-bg) 92%,transparent);backdrop-filter:blur(20px)}
+.trail-back,.trail-close{width:34px;height:34px;display:grid;place-items:center;flex:none;border:1px solid var(--line);background:transparent;color:var(--fog);cursor:pointer}
+.trail-back:hover,.trail-close:hover{border-color:var(--line-hot);color:var(--amber)}
+.trail-back[hidden]{display:none}
+.trail-head-copy{min-width:0;display:flex;flex:1;flex-direction:column;gap:4px}
+.trail-head-copy strong{overflow:hidden;color:var(--bone-bright);font:italic 400 20px/1.1 var(--serif);text-overflow:ellipsis;white-space:nowrap}
+.trail-head-copy small{overflow:hidden;color:var(--dim);font:7px/1.3 var(--mono);letter-spacing:.08em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}
+.trail-content{min-height:0;overflow:auto;padding:18px;scrollbar-color:var(--line-hot) color-mix(in oklch,var(--void) 65%,transparent)}
+.trail-loading,.trail-error,.trail-empty{min-height:220px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:var(--dim);font:9px/1.5 var(--mono);text-align:center}
+.trail-loading i{width:22px;height:22px;border:1px solid var(--jade);border-right-color:transparent;border-radius:50%;animation:semantic-spin .8s linear infinite}
+.trail-subject{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;padding:15px;border:1px solid color-mix(in oklch,var(--jade) 34%,var(--line));background:color-mix(in oklch,var(--jade) 5%,transparent)}
+.trail-subject span,.trail-section>h3{color:var(--jade);font:650 7px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
+.trail-subject h2{margin:7px 0 4px;color:var(--bone-bright);font:italic 400 25px/1.08 var(--serif)}
+.trail-subject p{max-width:680px;color:var(--fog);font-size:11px;line-height:1.5}
+.trail-subject a{align-self:start;padding:7px 9px;border:1px solid var(--line-hot);color:var(--amber);font:7px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase}
+.trail-facts{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.trail-facts span{max-width:100%;padding:5px 7px;border:1px solid var(--line);color:var(--fog);font:7px/1.3 var(--mono);text-transform:none;letter-spacing:0}
+.trail-facts b{margin-right:6px;color:var(--dim);font-weight:500;text-transform:uppercase;letter-spacing:.06em}
+.trail-section{margin-top:19px}
+.trail-section>h3{display:flex;align-items:center;gap:8px;margin-bottom:8px}.trail-section>h3::after{content:"";height:1px;flex:1;background:var(--line)}
+.trail-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:7px}
+.trail-card{min-width:0;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:11px;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 38%,transparent)}
+.trail-card:hover{border-color:color-mix(in oklch,var(--jade) 30%,var(--line))}
+.trail-card-copy{min-width:0}.trail-card-copy>span{display:block;color:var(--jade);font:650 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}
+.trail-card-copy strong{display:block;overflow:hidden;margin:6px 0 3px;color:var(--bone-bright);font:italic 400 16px/1.15 var(--serif);text-overflow:ellipsis;white-space:nowrap}
+.trail-card-copy p{display:-webkit-box;overflow:hidden;color:var(--dim);font-size:8px;line-height:1.4;-webkit-box-orient:vertical;-webkit-line-clamp:2}
+.trail-shared{display:flex;gap:3px;overflow:hidden;margin-top:7px}.trail-shared i{overflow:hidden;padding:3px 5px;border:1px solid var(--line);border-radius:999px;color:var(--fog);font:5px/1 var(--mono);font-style:normal;text-overflow:ellipsis;white-space:nowrap}
+.trail-card-actions{display:flex;align-items:flex-end;flex-direction:column;gap:5px}.trail-card-actions button,.trail-card-actions a{padding:5px 7px;border:1px solid var(--line);background:transparent;color:var(--fog);font:6px/1 var(--mono);cursor:pointer;text-transform:uppercase;white-space:nowrap}
+.trail-card-actions button:hover{border-color:var(--jade);color:var(--jade)}.trail-card-actions a:hover{border-color:var(--amber);color:var(--amber)}
 
 .toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
   padding:16px 0;border-bottom:1px solid var(--line)}
@@ -8030,6 +8067,8 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .calliope-float-name{font-size:20px}
   .calliope-float-copy{padding-top:1px}
   .calliope-float-action{display:none}
+  .trail-dialog{width:100vw;height:100dvh;margin:0;border:0}
+  .trail-content{padding:12px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
@@ -8078,7 +8117,13 @@ _LANDING_JS = """
      homeEmpty=document.getElementById('home-empty'),
      homeTitle=document.getElementById('home-title'),
      homeStatus=document.getElementById('home-status'),
-     homeItems=[];
+     homeItems=[],
+     trailDialog=document.getElementById('trail-dialog'),
+     trailTitle=document.getElementById('trail-title'),
+     trailMeta=document.getElementById('trail-meta'),
+     trailContent=document.getElementById('trail-content'),
+     trailBack=document.getElementById('trail-back'),
+     trailHistory=[],trailData=null,trailRequest=0;
  function escapeHome(value){
    return String(value==null?'':value).replace(/[&<>"']/g,function(char){
      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char];
@@ -8103,6 +8148,62 @@ _LANDING_JS = """
    }
    var prefix=String(display.prefix||''),suffix=String(display.suffix||'');
    return prefix+String(rendered)+suffix+(!prefix&&!suffix&&unit?' '+String(unit):'');
+ }
+ function trailSectionLabel(section){
+   return {meaning:'What it means',artifacts:'Where it lives',knowledge:'What the company knows',data:'What it is built from'}[section]||'Related evidence';
+ }
+ function trailConnectionMarkup(connection,index){
+   var shared=(connection.shared||[]).slice(0,3).map(function(item){return '<i>'+escapeHome(item)+'</i>';}).join('');
+   return '<article class="trail-card"><div class="trail-card-copy">'
+     +'<span>'+escapeHome(connection.relationship||'related to')+'</span>'
+     +'<strong title="'+escapeHome(connection.label||'Related evidence')+'">'+escapeHome(connection.label||'Related evidence')+'</strong>'
+     +(connection.detail?'<p>'+escapeHome(connection.detail)+'</p>':'')
+     +(shared?'<div class="trail-shared">'+shared+'</div>':'')+'</div>'
+     +'<div class="trail-card-actions"><button type="button" data-trail-follow="'+index+'">Follow</button>'
+     +(connection.url?'<a href="'+escapeHome(connection.url)+'" target="_blank" rel="noopener">Open ↗</a>':'')
+     +'</div></article>';
+ }
+ function renderTrail(data){
+   trailData=data||{};
+   var subject=trailData.subject||{},facts=(trailData.facts||[]).slice(0,8);
+   trailTitle.textContent=subject.label||'Follow the trail';
+   trailMeta.textContent=(subject.kind||'evidence').replaceAll('_',' ')+' · '+(trailData.connections||[]).length+' next hop'+((trailData.connections||[]).length===1?'':'s');
+   trailBack.hidden=trailHistory.length<2;
+   var factMarkup=facts.length?'<div class="trail-facts">'+facts.map(function(fact){
+     return '<span><b>'+escapeHome(fact.label)+'</b>'+escapeHome(fact.value)+'</span>';
+   }).join('')+'</div>':'';
+   var groups={};
+   (trailData.connections||[]).forEach(function(connection,index){
+     var section=connection.section||'knowledge';
+     (groups[section]||(groups[section]=[])).push({connection:connection,index:index});
+   });
+   var sections=['meaning','artifacts','knowledge','data'].map(function(section){
+     var items=groups[section]||[];if(!items.length)return '';
+     return '<section class="trail-section"><h3>'+trailSectionLabel(section)+'</h3><div class="trail-list">'
+       +items.map(function(item){return trailConnectionMarkup(item.connection,item.index);}).join('')+'</div></section>';
+   }).join('');
+   trailContent.innerHTML='<section class="trail-subject"><div><span>You are here</span><h2>'+escapeHome(subject.label||'Evidence')+'</h2>'
+     +(subject.detail?'<p>'+escapeHome(subject.detail)+'</p>':'')+factMarkup+'</div>'
+     +(subject.url?'<a href="'+escapeHome(subject.url)+'" target="_blank" rel="noopener">Open source ↗</a>':'')
+     +'</section>'+(sections||'<div class="trail-empty"><b>No further breadcrumbs surfaced.</b><span>This object is still a valid endpoint.</span></div>');
+ }
+ async function openTrail(handle,push){
+   if(!trailDialog||!handle)return;
+   if(!trailDialog.open)trailDialog.showModal();
+   var request=++trailRequest;
+   trailContent.innerHTML='<div class="trail-loading"><i></i><strong>Following the evidence…</strong><span>Resolving only what your account can see</span></div>';
+   try{
+     var response=await fetch('/api/calliope/trails',{method:'POST',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify({handle:handle})}),data={};
+     try{data=await response.json();}catch(ignore){}
+     if(request!==trailRequest)return;
+     if(!response.ok)throw new Error(data.error&&data.error.message||'Could not follow that trail');
+     if(push!==false)trailHistory.push(handle);
+     renderTrail(data);
+   }catch(error){
+     if(request!==trailRequest)return;
+     trailTitle.textContent='Trail unavailable';trailMeta.textContent='Evidence resolver';
+     trailContent.innerHTML='<div class="trail-error"><b>Those breadcrumbs could not be resolved.</b><span>'+escapeHome(error&&error.message||'Try again shortly.')+'</span></div>';
+   }
  }
  function homeTrailMarkup(trail){
    var items=(Array.isArray(trail)?trail:[]).slice(0,4);
@@ -8142,6 +8243,7 @@ _LANDING_JS = """
      +(item.description?'<p class="home-tile-desc">'+escapeHome(item.description)+'</p>':'')
      +context+homeTrailMarkup(item.trail)+'</div></div>'
      +'<div class="home-tile-actions">'+versionNote+open
+     +'<button type="button" data-home-trail="'+escapeHome(item.id)+'">Follow trail</button>'
      +'<button type="button" data-home-remove="'+escapeHome(item.id)+'">Remove</button></div></article>';
  }
  function syncGalleryPins(){
@@ -8232,9 +8334,26 @@ _LANDING_JS = """
    }
  }
  if(homeGrid)homeGrid.addEventListener('click',function(event){
+   var trailButton=event.target.closest('[data-home-trail]');
+   if(trailButton){
+     var item=homeItems.find(function(candidate){return candidate.id===trailButton.dataset.homeTrail;});
+     if(item&&item.source){trailHistory=[];openTrail(item.source,true);}return;
+   }
    var button=event.target.closest('[data-home-remove]');
    if(button)removeHomeItem(button.dataset.homeRemove,button);
  });
+ if(trailDialog){
+   document.getElementById('trail-close').addEventListener('click',function(){trailRequest++;trailDialog.close();});
+   trailBack.addEventListener('click',function(){
+     if(trailHistory.length<2)return;trailHistory.pop();openTrail(trailHistory[trailHistory.length-1],false);
+   });
+   trailContent.addEventListener('click',function(event){
+     var button=event.target.closest('[data-trail-follow]');if(!button||!trailData)return;
+     var connection=(trailData.connections||[])[Number(button.dataset.trailFollow)];
+     if(connection&&connection.handle)openTrail(connection.handle,true);
+   });
+   trailDialog.addEventListener('close',function(){trailRequest++;trailHistory=[];trailData=null;});
+ }
  [].forEach.call(document.querySelectorAll('[data-home-pin]'),function(button){
    button.addEventListener('click',function(){toggleArtifactPin(button);});
  });
@@ -8583,6 +8702,16 @@ def _landing_html(rows, viewer):
         '</section>'
         if calliope_enabled else ""
     )
+    _trail_dialog = (
+        '<dialog id="trail-dialog" class="trail-dialog" aria-labelledby="trail-title">'
+        '<div class="trail-shell"><header class="trail-head">'
+        '<button id="trail-back" class="trail-back" type="button" aria-label="Previous trail" hidden>←</button>'
+        '<div class="trail-head-copy"><strong id="trail-title">Follow the trail</strong>'
+        '<small id="trail-meta">Permission-aware company evidence</small></div>'
+        '<button id="trail-close" class="trail-close" type="button" aria-label="Close">×</button>'
+        '</header><div id="trail-content" class="trail-content"></div></div></dialog>'
+        if calliope_enabled else ""
+    )
 
     total = len(rows)
     tally = " · ".join([f"{total} artifact{'' if total == 1 else 's'}"]
@@ -8644,6 +8773,7 @@ def _landing_html(rows, viewer):
  {body}
 </main>
 {_calliope_link}
+{_trail_dialog}
 <script>{_LANDING_JS}</script></body></html>"""
 
 
@@ -8870,6 +9000,37 @@ def register_dashboard_routes(m):
         if not owner:
             return None, session, _json({"error": {"code": "UNAUTHORIZED"}}, 401)
         return owner, session, None
+
+    @m.custom_route("/api/calliope/trails", methods=["POST"])
+    async def _follow_calliope_trail(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            body = body if isinstance(body, dict) else {}
+            return _json(_calliope_follow_trail(
+                body.get("handle") or body,
+                owner,
+                body.get("limit") or 14,
+            ))
+        except LookupError as exc:
+            return _json({"error": {"code": "NOT_FOUND", "message": str(exc)}}, 404)
+        except (TypeError, ValueError) as exc:
+            return _json({"error": {"code": "BAD_TRAIL", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001 — a missing graph layer must fail closed
+            print(f"follow trail ({owner}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "TRAIL_UNAVAILABLE",
+                    "message": "Those breadcrumbs could not be resolved right now.",
+                }
+            }, 500)
 
     @m.custom_route("/api/calliope/home", methods=["GET", "PATCH"])
     async def _calliope_home(request):
@@ -9672,6 +9833,11 @@ def _calliope_brain_evidence(query, owner, limit):
             "id": f"brain:{row['doc_id']}:{row['chunk_idx']}",
             "group": "knowledge",
             "kind": "document",
+            "handle": {
+                "kind": "document",
+                "doc_id": str(row["doc_id"]),
+                "chunk_idx": int(row["chunk_idx"]),
+            },
             "subtype": row.get("doc_type") or "document",
             "title": row.get("title") or "Company knowledge",
             "summary": _calliope_evidence_text(row.get("chunk"), 1_800),
@@ -9959,6 +10125,13 @@ def _calliope_data_evidence(query, limit):
             "id": f"data:{row.get('node_id')}",
             "group": "data",
             "kind": row.get("kind") or "data-object",
+            "handle": {
+                "kind": row.get("kind") or "data_object",
+                "node_id": str(row.get("node_id") or ""),
+                "schema": row.get("schema_name"),
+                "relation": row.get("rel_name"),
+                "column": row.get("col_name"),
+            },
             "subtype": str(row.get("kind") or "data object").replace("db_", "").replace("_", " "),
             "title": object_name,
             "summary": _calliope_evidence_text(row.get("doc"), 1_500),
@@ -10034,6 +10207,11 @@ def _calliope_artifact_evidence(query, limit):
                 "id": f"artifact:{row['slug']}:v{row['latest_version']}",
                 "group": "artifacts",
                 "kind": "artifact",
+                "handle": {
+                    "kind": "artifact",
+                    "slug": row.get("slug"),
+                    "version": int(row.get("latest_version") or 1),
+                },
                 "subtype": row.get("app_kind") or "dashboard",
                 "title": row.get("name") or row.get("slug"),
                 "summary": row.get("description") or semantic_map.get("description") or "Published RVBBIT artifact",
@@ -10072,6 +10250,14 @@ def _calliope_artifact_evidence(query, limit):
                 "id": f"artifact-object:{row['slug']}:v{row['latest_version']}:{semantic_object.get('id') or 'object'}",
                 "group": "artifacts",
                 "kind": "dashboard-object",
+                "handle": {
+                    "kind": "artifact_object",
+                    "slug": row.get("slug"),
+                    "version": int(row.get("latest_version") or 1),
+                    "object_id": semantic_object.get("id"),
+                    "definition_hash": semantic_object.get("definition_hash"),
+                    "context": {},
+                },
                 "subtype": semantic_object.get("kind") or "visible value",
                 "title": f"{label} · {row.get('name') or row.get('slug')}",
                 "summary": summary,
@@ -10134,6 +10320,546 @@ def _calliope_evidence_search(query, owner, limit=24):
         "items": items[:limit],
         "searched": searched,
         "warnings": warnings,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
+# ── Follow the Trail ────────────────────────────────────────────────────────
+#
+# The warehouse has real graphs, but a graph viewer is the wrong abstraction
+# for most people.  This resolver exposes one bounded, permission-aware step at
+# a time: a subject, a few plain-language facts, and ranked next hops.  Handles
+# are locators, never copied evidence; every hop is rehydrated under the signed
+# in user's Brain ACL and the current catalog/artifact state.
+_TRAIL_KINDS = {
+    "artifact", "artifact_object", "document", "brain_entity",
+    "metric", "cube", "db_table", "db_column",
+}
+_TRAIL_SECTIONS = {"meaning", "artifacts", "knowledge", "data"}
+
+
+def _trail_handle(value):
+    raw = value if isinstance(value, dict) else {}
+    kind = str(raw.get("kind") or "").strip().lower().replace("-", "_")
+    kind = {
+        "dashboard_object": "artifact_object",
+        "table": "db_table",
+        "column": "db_column",
+        "entity": "brain_entity",
+    }.get(kind, kind)
+    if kind not in _TRAIL_KINDS:
+        raise ValueError("That kind of evidence does not have a trail yet")
+
+    if kind in {"artifact", "artifact_object"}:
+        slug = str(raw.get("slug") or "").strip()
+        if not _SEMANTIC_HOME_SLUG_RE.fullmatch(slug):
+            raise ValueError("artifact slug is invalid")
+        handle = {"kind": kind, "slug": slug}
+        version = raw.get("version")
+        if version not in (None, ""):
+            try:
+                version = int(version)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("version must be a positive integer") from exc
+            if version < 1:
+                raise ValueError("version must be a positive integer")
+            handle["version"] = version
+        if kind == "artifact_object":
+            object_id = str(raw.get("object_id") or "").strip()
+            if not _SEMANTIC_OBJECT_ID_RE.fullmatch(object_id):
+                raise ValueError("semantic object id is invalid")
+            handle.update({
+                "object_id": object_id,
+                "definition_hash": _inspection_text(raw.get("definition_hash"), 80) or None,
+                "context": _semantic_json_value(raw.get("context") or {}),
+            })
+            if not isinstance(handle["context"], dict):
+                handle["context"] = {}
+        return {key: val for key, val in handle.items() if val is not None}
+
+    if kind == "document":
+        try:
+            doc_id = int(raw.get("doc_id"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("document locator is invalid") from exc
+        if doc_id < 1:
+            raise ValueError("document locator is invalid")
+        return {"kind": kind, "doc_id": doc_id}
+
+    if kind == "brain_entity":
+        label = _semantic_text(raw.get("label") or raw.get("name"), 240)
+        if not label:
+            raise ValueError("entity name is required")
+        return {"kind": kind, "label": label}
+
+    try:
+        node_id = int(raw.get("node_id")) if raw.get("node_id") not in (None, "") else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("catalog node locator is invalid") from exc
+    schema = _semantic_text(raw.get("schema"), 128)
+    relation = _semantic_text(raw.get("relation"), 128)
+    column = _semantic_text(raw.get("column"), 128)
+    table = _semantic_text(raw.get("table"), 260)
+    if table and not relation:
+        schema, relation = _split(table)
+    if kind == "cube" and not schema:
+        schema = "cubes"
+    if kind in {"db_table", "db_column", "cube"} and schema and not _schema_allowed(schema):
+        raise ValueError("that schema is not available in the public catalog")
+    if node_id is None and not relation:
+        raise ValueError("catalog object locator is incomplete")
+    if kind == "db_column" and node_id is None and not column:
+        raise ValueError("column locator is incomplete")
+    return {
+        key: val for key, val in {
+            "kind": kind,
+            "node_id": node_id,
+            "schema": schema,
+            "relation": relation,
+            "column": column,
+        }.items() if val not in (None, "")
+    }
+
+
+def _trail_node_handle(row):
+    row = dict(row or {})
+    props = row.get("properties") if isinstance(row.get("properties"), dict) else {}
+    label = str(row.get("label") or "")
+    kind = str(row.get("kind") or "")
+    schema = props.get("schema") or props.get("schema_name")
+    relation = props.get("table") or props.get("rel_name") or props.get("relation")
+    column = props.get("column") or props.get("col_name")
+    if kind == "db_table" and (not schema or not relation):
+        schema, relation = _split(label)
+    elif kind == "db_column" and (not schema or not relation or not column):
+        parts = label.split(".")
+        if len(parts) >= 3:
+            schema, relation, column = parts[0], parts[1], ".".join(parts[2:])
+    return {
+        key: value for key, value in {
+            "kind": kind,
+            "node_id": int(row["node_id"]) if row.get("node_id") is not None else None,
+            "schema": schema,
+            "relation": relation,
+            "column": column,
+        }.items() if value not in (None, "")
+    }
+
+
+def _trail_connection(relationship, label, *, kind, handle, section,
+                      detail=None, url=None, thumbnail_url=None, confidence=None,
+                      shared=None):
+    clean_handle = _trail_handle(handle)
+    payload = {
+        "relationship": _semantic_text(relationship, 80) or "related to",
+        "label": _semantic_text(label, 240) or "Related evidence",
+        "detail": _semantic_text(detail, 520) or None,
+        "kind": _semantic_text(kind, 80) or clean_handle["kind"],
+        "section": section if section in _TRAIL_SECTIONS else "knowledge",
+        "handle": clean_handle,
+        "url": url,
+        "thumbnail_url": thumbnail_url,
+        "shared": [
+            _semantic_text(item, 120) for item in (shared or [])[:8]
+            if _semantic_text(item, 120)
+        ],
+    }
+    try:
+        payload["confidence"] = round(max(0.0, min(1.0, float(confidence))), 3)
+    except (TypeError, ValueError):
+        payload["confidence"] = None
+    identity = json.dumps(clean_handle, sort_keys=True, separators=(",", ":"), default=str)
+    payload["id"] = hashlib.sha256(
+        f"{identity}|{payload['relationship']}".encode("utf-8")
+    ).hexdigest()[:20]
+    return {key: value for key, value in payload.items() if value not in (None, "", [])}
+
+
+def _trail_append(connections, seen, connection):
+    identity = json.dumps(
+        connection.get("handle") or {}, sort_keys=True, separators=(",", ":"), default=str
+    )
+    if identity in seen:
+        return
+    seen.add(identity)
+    connections.append(connection)
+
+
+def _trail_artifact_neighbors(table_refs, exclude_slug, limit=5):
+    refs = list(dict.fromkeys(str(ref) for ref in (table_refs or []) if ref))[:16]
+    if not refs:
+        return []
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT d.slug,d.name,d.description,d.app_kind,d.runtime_kind,d.latest_version,"
+            "count(DISTINCT dep.object_ref) AS shared_count,"
+            "array_agg(DISTINCT dep.object_ref ORDER BY dep.object_ref) AS shared_refs "
+            "FROM rvbbit.dashboard_deps dep JOIN rvbbit.dashboards d ON d.id=dep.dashboard_id "
+            "WHERE dep.version=d.latest_version AND dep.object_ref=ANY(%s::text[]) "
+            "AND d.slug<>%s GROUP BY d.id,d.slug,d.name,d.description,d.app_kind,"
+            "d.runtime_kind,d.latest_version ORDER BY shared_count DESC,d.name LIMIT %s",
+            (refs, exclude_slug or "", int(limit)),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _trail_brain_document_connection(doc, relationship="mentioned by", *, shared=None):
+    doc_id = doc.get("doc_id") if isinstance(doc, dict) else None
+    try:
+        raw_score = float((doc or {}).get("score"))
+        confidence = min(1.0, raw_score if raw_score <= 1 else raw_score / 20.0)
+    except (TypeError, ValueError):
+        confidence = None
+    return _trail_connection(
+        relationship,
+        (doc or {}).get("title") or "Company document",
+        kind="document",
+        handle={"kind": "document", "doc_id": doc_id},
+        section="knowledge",
+        detail=(doc or {}).get("source") or (doc or {}).get("folder") or "Company memory",
+        confidence=confidence,
+        shared=shared,
+    )
+
+
+def _trail_artifact(handle, owner, limit):
+    resolved = _semantic_home_resolve_handle(handle)
+    source = resolved.get("source") or handle
+    kind = resolved["kind"]
+    slug = source["slug"]
+    version = int(resolved.get("version") or source.get("version") or 1)
+    dashboard, _row, manifest, deps = _semantic_home_artifact_row(slug, version)
+    app_kind = dashboard.get("app_kind") or "dashboard"
+    subject = {
+        "kind": kind,
+        "label": resolved.get("title") or dashboard.get("name") or slug,
+        "detail": resolved.get("description") or resolved.get("formula") or dashboard.get("description") or "Published artifact",
+        "handle": _trail_handle(source),
+        "url": resolved.get("open_url"),
+        "thumbnail_url": resolved.get("thumbnail_url"),
+    }
+    facts = [
+        {"label": "Artifact", "value": dashboard.get("name") or slug},
+        {"label": "Version", "value": str(version)},
+    ]
+    if kind == "artifact_object":
+        if resolved.get("formula"):
+            facts.append({"label": "Definition", "value": resolved["formula"]})
+        if resolved.get("unit"):
+            facts.append({"label": "Unit", "value": resolved["unit"]})
+        for key, value in list((resolved.get("context") or {}).items())[:4]:
+            facts.append({"label": str(key).replace("_", " ").title(), "value": _semantic_text(value, 160)})
+    else:
+        facts.append({"label": "Type", "value": str(app_kind).replace("_", " ").title()})
+
+    connections, seen = [], set()
+    tables = sorted({
+        str(dep.get("object_ref")) for dep in deps
+        if dep.get("kind") == "table" and dep.get("object_ref")
+    })
+    if kind == "artifact_object":
+        _trail_append(connections, seen, _trail_connection(
+            "defined in", dashboard.get("name") or slug,
+            kind="artifact", handle={"kind": "artifact", "slug": slug, "version": version},
+            section="artifacts", detail=f"{str(app_kind).replace('_', ' ')} · version {version}",
+            url=_semantic_home_artifact_href(slug, app_kind, version),
+            thumbnail_url=resolved.get("thumbnail_url"), confidence=1,
+        ))
+        semantic_object = _semantic_object_from_manifest(manifest, source)
+        if semantic_object:
+            rendered_sql, _context = _render_semantic_sql(semantic_object, source.get("context") or {})
+            tables = _referenced_tables(rendered_sql) or tables
+    else:
+        for semantic_object in (manifest.get("semantic_map") or {}).get("objects") or []:
+            if not isinstance(semantic_object, dict) or not semantic_object.get("id"):
+                continue
+            meaning = semantic_object.get("meaning") or {}
+            _trail_append(connections, seen, _trail_connection(
+                "contains", meaning.get("label") or semantic_object["id"].replace("_", " ").title(),
+                kind="artifact_object",
+                handle={
+                    "kind": "artifact_object", "slug": slug, "version": version,
+                    "object_id": semantic_object["id"],
+                    "definition_hash": semantic_object.get("definition_hash"), "context": {},
+                },
+                section="meaning",
+                detail=meaning.get("description") or meaning.get("formula") or "Named dashboard value",
+                url=_semantic_home_artifact_href(slug, app_kind, version), confidence=1,
+            ))
+            if len(connections) >= min(6, limit):
+                break
+
+    for table in tables[:6]:
+        _trail_append(connections, seen, _trail_connection(
+            "recreated from" if kind == "artifact_object" else "built from",
+            table, kind="db_table", handle={"kind": "db_table", "table": table},
+            section="data", detail="Warehouse source", confidence=.98,
+        ))
+    for neighbor in _trail_artifact_neighbors(tables, slug, 4):
+        target_kind = neighbor.get("app_kind") or "dashboard"
+        _trail_append(connections, seen, _trail_connection(
+            "also uses this evidence", neighbor.get("name") or neighbor.get("slug"),
+            kind="artifact",
+            handle={"kind": "artifact", "slug": neighbor["slug"], "version": neighbor["latest_version"]},
+            section="artifacts",
+            detail=f"Shares {neighbor.get('shared_count') or 1} warehouse source(s)",
+            url=_semantic_home_artifact_href(neighbor["slug"], target_kind),
+            thumbnail_url=f"/thumbs/{_artifact_kind(target_kind)}/{neighbor['slug']}.png",
+            confidence=min(1, .55 + .1 * int(neighbor.get("shared_count") or 1)),
+            shared=neighbor.get("shared_refs") or [],
+        ))
+    query = " ".join(filter(None, [subject["label"], resolved.get("formula"), *tables[:2]]))
+    if query:
+        try:
+            for item in _calliope_brain_evidence(query, owner, 3):
+                _trail_append(connections, seen, _trail_brain_document_connection(item))
+        except Exception:  # noqa: BLE001 — Brain is one optional breadcrumb layer
+            pass
+    return subject, facts[:8], connections[:limit], ["artifact map", "warehouse lineage", "company memory"]
+
+
+def _trail_document(handle, owner, limit):
+    doc_id = int(handle["doc_id"])
+    document = tool_brain_get_doc(doc_id, owner)
+    if not isinstance(document, dict) or document.get("error") or not document.get("doc_id"):
+        raise LookupError("That document is not visible to this user")
+    related = tool_brain_related(doc_id, owner)
+    if not isinstance(related, dict) or not related.get("visible"):
+        raise LookupError("That document is not visible to this user")
+    subject = {
+        "kind": "document",
+        "label": document.get("title") or "Company document",
+        "detail": document.get("source") or document.get("folder_path") or "Company memory",
+        "handle": handle,
+    }
+    facts = []
+    for label, value in (
+        ("Source", document.get("source")),
+        ("Author", document.get("author")),
+        ("Occurred", document.get("occurred_at")),
+        ("Format", document.get("mime")),
+    ):
+        if value:
+            facts.append({"label": label, "value": _semantic_text(value, 240)})
+    connections, seen = [], set()
+    for entity in (related.get("entities") or [])[:8]:
+        if not isinstance(entity, dict) or not entity.get("label"):
+            continue
+        _trail_append(connections, seen, _trail_connection(
+            "mentions", entity["label"], kind=entity.get("kind") or "entity",
+            handle={"kind": "brain_entity", "label": entity["label"]},
+            section="meaning",
+            detail=str(entity.get("kind") or "company concept").replace("_", " "),
+            confidence=.9,
+        ))
+    for item in (related.get("related") or [])[:8]:
+        if not isinstance(item, dict) or not item.get("doc_id"):
+            continue
+        _trail_append(connections, seen, _trail_brain_document_connection(
+            item, "also discusses", shared=item.get("shared_entities") or [],
+        ))
+    doc_marker = f"#{doc_id}"
+    title = str(document.get("title") or "")
+    for relation in related.get("relations") or []:
+        if not isinstance(relation, dict):
+            continue
+        relation_subject = str(relation.get("subject") or "")
+        if doc_marker not in relation_subject and title not in relation_subject:
+            continue
+        facts.append({
+            "label": str(relation.get("predicate") or "related to").replace("_", " ").title(),
+            "value": _semantic_text(relation.get("object"), 240),
+        })
+    return subject, facts[:8], connections[:limit], ["document brain", "shared entities"]
+
+
+def _trail_brain_entity(handle, owner, limit):
+    label = handle["label"]
+    result = tool_brain_entity(label, owner)
+    if not isinstance(result, dict) or not result.get("found"):
+        raise LookupError("That company concept is not available to this user")
+    subject = {
+        "kind": "brain_entity",
+        "label": result.get("entity") or label,
+        "detail": str(result.get("kind") or "company concept").replace("_", " ").title(),
+        "handle": handle,
+    }
+    facts, connections, seen = [], [], set()
+    for relation in (result.get("relations") or [])[:8]:
+        if not isinstance(relation, dict):
+            continue
+        facts.append({
+            "label": str(relation.get("predicate") or "related to").replace("_", " ").title(),
+            "value": _semantic_text(
+                relation.get("subject") if relation.get("object") == result.get("entity")
+                else relation.get("object"), 240
+            ),
+        })
+    for doc in (result.get("docs") or [])[:limit]:
+        if isinstance(doc, dict) and doc.get("doc_id"):
+            _trail_append(connections, seen, _trail_brain_document_connection(doc, "appears in"))
+    # A data-shaped Brain entity can continue seamlessly into the live catalog.
+    if result.get("kind") in {"db_table", "db_column", "cube", "metric"}:
+        raw_kind = result["kind"]
+        raw = {"kind": raw_kind}
+        if raw_kind == "db_column":
+            parts = str(result.get("entity") or label).split(".")
+            if len(parts) >= 3:
+                raw.update({"schema": parts[0], "relation": parts[1], "column": ".".join(parts[2:])})
+        elif raw_kind in {"db_table", "cube"}:
+            raw["table"] = result.get("entity") or label
+        else:
+            raw["relation"] = result.get("entity") or label
+        try:
+            _trail_append(connections, seen, _trail_connection(
+                "resolved as", result.get("entity") or label,
+                kind=raw_kind, handle=raw, section="data",
+                detail="Live warehouse catalog object", confidence=1,
+            ))
+        except ValueError:
+            pass
+    return subject, facts[:8], connections[:limit], ["document brain", "entity index"]
+
+
+def _trail_catalog_node(handle, owner, limit):
+    kind = handle["kind"]
+    with _conn() as conn:
+        if handle.get("node_id"):
+            row = conn.execute(
+                "SELECT node_id,kind,label,properties,confidence FROM rvbbit.kg_nodes "
+                "WHERE graph_id=%s AND node_id=%s",
+                (GRAPH, int(handle["node_id"])),
+            ).fetchone()
+        else:
+            schema, relation, column = (
+                handle.get("schema"), handle.get("relation"), handle.get("column")
+            )
+            label = ".".join(part for part in (schema, relation, column) if part)
+            row = conn.execute(
+                "SELECT node_id,kind,label,properties,confidence FROM rvbbit.kg_nodes "
+                "WHERE graph_id=%s AND kind=%s AND (label=%s OR label_norm=lower(%s)) "
+                "ORDER BY confidence DESC,node_id LIMIT 1",
+                (GRAPH, kind, label, label),
+            ).fetchone()
+        if not row or row.get("kind") not in {"metric", "cube", "db_table", "db_column"}:
+            raise LookupError("That catalog object is no longer available")
+        row = dict(row)
+        clean_handle = _trail_node_handle(row)
+        if row["kind"] in {"db_table", "db_column", "cube"}:
+            schema = clean_handle.get("schema") or ""
+            if not _schema_allowed(schema):
+                raise LookupError("That catalog object is not available")
+        neighbors = conn.execute(
+            "SELECT direction,predicate,node_id,kind,label,properties,confidence FROM ("
+            " SELECT 'out'::text AS direction,e.predicate,n.node_id,n.kind,n.label,n.properties,e.confidence "
+            " FROM rvbbit.kg_edges e JOIN rvbbit.kg_nodes n "
+            " ON n.graph_id=e.graph_id AND n.node_id=e.object_node_id "
+            " WHERE e.graph_id=%s AND e.subject_node_id=%s "
+            " UNION ALL "
+            " SELECT 'in'::text,e.predicate,n.node_id,n.kind,n.label,n.properties,e.confidence "
+            " FROM rvbbit.kg_edges e JOIN rvbbit.kg_nodes n "
+            " ON n.graph_id=e.graph_id AND n.node_id=e.subject_node_id "
+            " WHERE e.graph_id=%s AND e.object_node_id=%s"
+            ") edge ORDER BY CASE kind WHEN 'db_table' THEN 0 WHEN 'db_column' THEN 1 ELSE 2 END,"
+            "confidence DESC,label LIMIT 24",
+            (GRAPH, row["node_id"], GRAPH, row["node_id"]),
+        ).fetchall()
+    props = row.get("properties") if isinstance(row.get("properties"), dict) else {}
+    subject = {
+        "kind": row["kind"],
+        "label": row.get("label") or handle.get("relation") or "Catalog object",
+        "detail": _semantic_text(
+            props.get("comment") or props.get("description") or props.get("search_doc"), 520
+        ) or str(row["kind"]).replace("db_", "").replace("_", " ").title(),
+        "handle": clean_handle,
+    }
+    facts = []
+    fact_values = (
+        ("Rows", props.get("n_rows")),
+        ("Fields", props.get("n_columns")),
+        ("Type", props.get("data_type")),
+        ("Distinct", props.get("ndv")),
+        ("Grain", props.get("grain")),
+    )
+    for label, value in fact_values:
+        if value not in (None, ""):
+            facts.append({"label": label, "value": _semantic_text(value, 200)})
+    connections, seen = [], set()
+    predicate_labels = {
+        "has_column": ("has field", "data"),
+        "has_table": ("belongs to schema", "data"),
+        "references": ("references", "data"),
+    }
+    for neighbor in neighbors:
+        neighbor = dict(neighbor)
+        if neighbor.get("kind") not in {"metric", "cube", "db_table", "db_column"}:
+            continue
+        neighbor_handle = _trail_node_handle(neighbor)
+        if neighbor.get("kind") in {"db_table", "db_column", "cube"} and not _schema_allowed(neighbor_handle.get("schema") or ""):
+            continue
+        predicate = str(neighbor.get("predicate") or "related_to")
+        relationship, section = predicate_labels.get(
+            predicate, (predicate.replace("_", " "), "data")
+        )
+        if neighbor.get("direction") == "in" and predicate == "has_column":
+            relationship = "belongs to"
+        elif neighbor.get("direction") == "in" and predicate == "references":
+            relationship = "referenced by"
+        neighbor_props = neighbor.get("properties") if isinstance(neighbor.get("properties"), dict) else {}
+        _trail_append(connections, seen, _trail_connection(
+            relationship, neighbor.get("label") or "Catalog object",
+            kind=neighbor.get("kind"), handle=neighbor_handle, section=section,
+            detail=neighbor_props.get("comment") or neighbor_props.get("description")
+            or str(neighbor.get("kind")).replace("db_", "").replace("_", " ").title(),
+            confidence=neighbor.get("confidence"),
+        ))
+        if len(connections) >= min(8, limit):
+            break
+    table_refs = []
+    if row["kind"] == "db_table":
+        table_refs = [row.get("label")]
+    elif row["kind"] == "db_column":
+        table_refs = [".".join(filter(None, [clean_handle.get("schema"), clean_handle.get("relation")]))]
+    elif row["kind"] == "cube":
+        table_refs = [row.get("label")]
+    for artifact in _trail_artifact_neighbors(table_refs, "", 4):
+        artifact_kind = artifact.get("app_kind") or "dashboard"
+        _trail_append(connections, seen, _trail_connection(
+            "used by", artifact.get("name") or artifact.get("slug"),
+            kind="artifact",
+            handle={"kind": "artifact", "slug": artifact["slug"], "version": artifact["latest_version"]},
+            section="artifacts", detail=artifact.get("description") or "Published artifact",
+            url=_semantic_home_artifact_href(artifact["slug"], artifact_kind),
+            thumbnail_url=f"/thumbs/{_artifact_kind(artifact_kind)}/{artifact['slug']}.png",
+            confidence=.85,
+        ))
+    try:
+        entity = tool_brain_entity(row.get("label"), owner)
+        for doc in (entity.get("docs") or [])[:4] if isinstance(entity, dict) else []:
+            if isinstance(doc, dict) and doc.get("doc_id"):
+                _trail_append(connections, seen, _trail_brain_document_connection(doc, "discussed in"))
+    except Exception:  # noqa: BLE001
+        pass
+    return subject, facts[:8], connections[:limit], ["warehouse catalog", "artifact lineage", "company memory"]
+
+
+def _calliope_follow_trail(value, owner, limit=14):
+    started = time.time()
+    handle = _trail_handle(value)
+    limit = max(4, min(int(limit or 14), 24))
+    if handle["kind"] in {"artifact", "artifact_object"}:
+        subject, facts, connections, searched = _trail_artifact(handle, owner, limit)
+    elif handle["kind"] == "document":
+        subject, facts, connections, searched = _trail_document(handle, owner, limit)
+    elif handle["kind"] == "brain_entity":
+        subject, facts, connections, searched = _trail_brain_entity(handle, owner, limit)
+    else:
+        subject, facts, connections, searched = _trail_catalog_node(handle, owner, limit)
+    return {
+        "subject": subject,
+        "facts": [fact for fact in facts if fact.get("label") and fact.get("value")],
+        "connections": connections[:limit],
+        "searched": searched,
         "elapsed_ms": int((time.time() - started) * 1000),
     }
 

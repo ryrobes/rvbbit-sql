@@ -1975,6 +1975,38 @@ def _evidence_url(value: Any) -> str | None:
     return raw if parts.scheme in {"http", "https"} and parts.netloc else None
 
 
+def _normalize_evidence_handle(value: Any) -> dict[str, Any]:
+    """Keep persisted evidence locators small and inert."""
+    raw = value if isinstance(value, dict) else {}
+    kind = re.sub(r"[^a-z0-9_-]", "", str(raw.get("kind") or "").lower())[:60]
+    allowed = {
+        "document": ("doc_id", "chunk_idx"),
+        "artifact": ("slug", "version"),
+        "artifact_object": ("slug", "version", "object_id", "definition_hash", "context"),
+        "brain_entity": ("label",),
+        "metric": ("node_id", "schema", "relation", "column"),
+        "cube": ("node_id", "schema", "relation", "column"),
+        "db_table": ("node_id", "schema", "relation", "column"),
+        "db_column": ("node_id", "schema", "relation", "column"),
+    }
+    if kind not in allowed:
+        return {}
+    handle = {"kind": kind}
+    for key in allowed[kind]:
+        if key not in raw or raw[key] in (None, ""):
+            continue
+        if key == "context":
+            handle[key] = _bounded_evidence_json(raw[key])
+        elif key in {"version", "chunk_idx"}:
+            try:
+                handle[key] = max(0, int(raw[key]))
+            except (TypeError, ValueError):
+                continue
+        else:
+            handle[key] = re.sub(r"\s+", " ", str(raw[key])).strip()[:240]
+    return handle
+
+
 def _normalize_evidence_search_result(value: Any, query: str) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
     items = []
@@ -2005,6 +2037,7 @@ def _normalize_evidence_search_result(value: Any, query: str) -> dict[str, Any]:
             "id": evidence_id,
             "group": group,
             "kind": re.sub(r"[^a-z0-9_-]", "-", str(candidate.get("kind") or "evidence").lower())[:60],
+            "handle": _normalize_evidence_handle(candidate.get("handle") or {}),
             "subtype": re.sub(r"\s+", " ", str(candidate.get("subtype") or "")).strip()[:100] or None,
             "title": title,
             "summary": re.sub(r"\s+", " ", str(candidate.get("summary") or "")).strip()[:2_000],

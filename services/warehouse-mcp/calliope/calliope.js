@@ -148,6 +148,9 @@
     viewerRequestId: 0,
     viewerSurface: null,
     viewerGrid: { filter: "", sortIndex: null, direction: 1 },
+    viewerHandle: null,
+    viewerTrailHistory: [],
+    viewerTrailData: null,
     busy: false,
     stageAtLiveEdge: true,
     chatAtLiveEdge: true,
@@ -2715,6 +2718,10 @@
       && Boolean(item.provenance?.replayable);
   }
 
+  function evidenceCanTrail(item) {
+    return Boolean(item?.handle && Object.keys(item.handle).length);
+  }
+
   function evidenceArtifactGlyph(item) {
     const kind = String(item.provenance?.app_kind || item.subtype || item.kind || "").toLowerCase();
     if (kind.includes("dashboard")) return "▦";
@@ -2812,6 +2819,7 @@
       <footer>
         <span title="${escapeHtml(item.source || "")}">${escapeHtml(item.source || evidenceGroupLabel(item.group))}</span>
         <div class="evidence-actions">
+          ${evidenceCanTrail(item) ? `<button type="button" data-follow-evidence="${escapeHtml(item.id)}" aria-label="Follow the evidence trail from ${escapeHtml(item.title)}">Follow trail</button>` : ""}
           ${evidenceCanOpen(item) ? `<button type="button" data-open-evidence="${escapeHtml(item.id)}" aria-label="Open ${escapeHtml(item.title)}">Open</button>` : ""}
           ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener">${item.kind === "dashboard-object" ? "Dashboard" : "Open"} ↗</a>` : ""}
         </div>
@@ -2880,6 +2888,9 @@
   function closeSurfaceViewer() {
     state.viewerRequestId += 1;
     state.viewerSurface = null;
+    state.viewerHandle = null;
+    state.viewerTrailHistory = [];
+    state.viewerTrailData = null;
     state.viewerGrid = { filter: "", sortIndex: null, direction: 1 };
     if (els.viewerDialog.open) els.viewerDialog.close();
   }
@@ -2922,11 +2933,94 @@
       ? `<details class="viewer-document-meta"><summary>Source metadata</summary><pre>${escapeHtml(JSON.stringify(document.raw_meta, null, 2))}</pre></details>`
       : "";
     els.viewerContent.innerHTML = `<article class="viewer-document">
+      ${state.viewerHandle ? '<div class="viewer-trail-launch"><button type="button" data-viewer-document-trail>Follow this document’s trail <span>→</span></button><small>See the concepts, data, artifacts, and related work around this source.</small></div>' : ""}
       ${details ? `<div class="viewer-document-facts">${details}</div>` : ""}
       ${document.truncated ? '<div class="viewer-notice">This very large document is truncated in the reader.</div>' : ""}
       <div class="viewer-document-body">${richDocumentHtml(document.body, document.mime)}</div>
       ${rawMeta}
     </article>`;
+  }
+
+  function trailSectionLabel(section) {
+    return ({
+      meaning: "What it means",
+      artifacts: "Where it lives",
+      knowledge: "What the company knows",
+      data: "What it is built from",
+    })[section] || "Related evidence";
+  }
+
+  function renderViewerTrail(data) {
+    state.viewerSurface = null;
+    state.viewerTrailData = data;
+    const subject = data.subject || {};
+    const facts = (data.facts || []).slice(0, 8).map((fact) =>
+      `<span><b>${escapeHtml(fact.label)}</b>${escapeHtml(fact.value)}</span>`
+    ).join("");
+    const groups = new Map();
+    (data.connections || []).forEach((connection, index) => {
+      const section = connection.section || "knowledge";
+      if (!groups.has(section)) groups.set(section, []);
+      groups.get(section).push({ connection, index });
+    });
+    const sections = ["meaning", "artifacts", "knowledge", "data"].map((section) => {
+      const items = groups.get(section) || [];
+      if (!items.length) return "";
+      return `<section class="viewer-trail-section"><h3>${trailSectionLabel(section)}</h3><div class="viewer-trail-grid">${items.map(({ connection, index }) => {
+        const shared = (connection.shared || []).slice(0, 3).map((item) => `<i>${escapeHtml(item)}</i>`).join("");
+        return `<article class="viewer-trail-card"><div>
+          <span>${escapeHtml(connection.relationship || "related to")}</span>
+          <strong>${escapeHtml(connection.label || "Related evidence")}</strong>
+          ${connection.detail ? `<p>${escapeHtml(connection.detail)}</p>` : ""}
+          ${shared ? `<aside>${shared}</aside>` : ""}
+        </div><footer>
+          <button type="button" data-viewer-follow-trail="${index}">Follow</button>
+          ${connection.url ? `<a href="${escapeHtml(connection.url)}" target="_blank" rel="noopener">Open ↗</a>` : ""}
+        </footer></article>`;
+      }).join("")}</div></section>`;
+    }).join("");
+    setViewerHeader(
+      subject.label || "Follow the trail",
+      `${String(subject.kind || "evidence").replaceAll("_", " ")} · ${(data.connections || []).length} next hop${(data.connections || []).length === 1 ? "" : "s"}`,
+      subject.url,
+    );
+    els.viewerContent.innerHTML = `<div class="viewer-trail">
+      ${state.viewerTrailHistory.length > 1 ? '<button type="button" class="viewer-trail-back" data-viewer-trail-back>← Previous breadcrumb</button>' : ""}
+      <section class="viewer-trail-subject"><span>You are here</span><h2>${escapeHtml(subject.label || "Evidence")}</h2>
+        ${subject.detail ? `<p>${escapeHtml(subject.detail)}</p>` : ""}
+        ${facts ? `<div>${facts}</div>` : ""}
+      </section>
+      ${sections || '<div class="viewer-empty">No further breadcrumbs surfaced. This object is still a valid endpoint.</div>'}
+    </div>`;
+  }
+
+  async function openTrailViewer(handle, { push = true } = {}) {
+    if (!handle || !Object.keys(handle).length) return;
+    const requestId = ++state.viewerRequestId;
+    showSurfaceViewer("Follow the trail", "Resolving permission-aware company evidence");
+    els.viewerContent.innerHTML = '<div class="viewer-loading"><i></i><strong>Following the evidence…</strong><span>Connecting meaning, work, knowledge, and data</span></div>';
+    try {
+      const data = await api("/api/calliope/trails", {
+        method: "POST",
+        body: JSON.stringify({ handle }),
+      });
+      if (requestId !== state.viewerRequestId || !els.viewerDialog.open) return;
+      if (push) state.viewerTrailHistory.push(handle);
+      renderViewerTrail(data);
+    } catch (error) {
+      if (requestId !== state.viewerRequestId || !els.viewerDialog.open) return;
+      els.viewerContent.innerHTML = `<div class="viewer-error"><strong>Could not follow this trail</strong><span>${escapeHtml(error.message)}</span></div>`;
+    }
+  }
+
+  function openEvidenceTrail(surfaceId, evidenceId) {
+    const surface = state.surfaces.find((candidate) => candidate.id === surfaceId);
+    const item = (surface?.payload?.items || []).find((candidate) => candidate.id === evidenceId);
+    if (!item?.handle) return;
+    state.viewerHandle = item.handle;
+    state.viewerTrailHistory = [];
+    state.viewerTrailData = null;
+    openTrailViewer(item.handle);
   }
 
   function renderViewerDetail(data) {
@@ -2943,6 +3037,9 @@
     const surface = state.surfaces.find((candidate) => candidate.id === surfaceId);
     const item = (surface?.payload?.items || []).find((candidate) => candidate.id === evidenceId);
     if (!surface || !item || !state.current) return;
+    state.viewerHandle = item.handle || null;
+    state.viewerTrailHistory = [];
+    state.viewerTrailData = null;
     const requestId = ++state.viewerRequestId;
     showSurfaceViewer(item.title, `${item.subtype || item.kind} · ${item.source || evidenceGroupLabel(item.group)}`);
     els.viewerContent.innerHTML = '<div class="viewer-loading"><i></i><strong>Opening saved evidence…</strong><span>Rechecking access and resolving the live source</span></div>';
@@ -4254,6 +4351,24 @@
         closeSurfaceViewer();
         return;
       }
+      if (event.target.closest("[data-viewer-document-trail]") && state.viewerHandle) {
+        state.viewerTrailHistory = [];
+        openTrailViewer(state.viewerHandle);
+        return;
+      }
+      if (event.target.closest("[data-viewer-trail-back]")) {
+        if (state.viewerTrailHistory.length > 1) {
+          state.viewerTrailHistory.pop();
+          openTrailViewer(state.viewerTrailHistory.at(-1), { push: false });
+        }
+        return;
+      }
+      const trailHop = event.target.closest("[data-viewer-follow-trail]");
+      if (trailHop && state.viewerTrailData) {
+        const connection = (state.viewerTrailData.connections || [])[Number(trailHop.dataset.viewerFollowTrail)];
+        if (connection?.handle) openTrailViewer(connection.handle);
+        return;
+      }
       const tab = event.target.closest("[data-view]");
       if (tab) {
         activateQueryView(tab);
@@ -4299,6 +4414,12 @@
       state.chatAtLiveEdge = isChatAtLiveEdge();
     }, { passive: true });
     els.stage.addEventListener("click", (event) => {
+      const followEvidence = event.target.closest("[data-follow-evidence]");
+      if (followEvidence) {
+        const surfaceId = followEvidence.closest("[data-surface-id]")?.dataset.surfaceId;
+        openEvidenceTrail(surfaceId, followEvidence.dataset.followEvidence);
+        return;
+      }
       const openEvidence = event.target.closest("[data-open-evidence]");
       if (openEvidence) {
         const surfaceId = openEvidence.closest("[data-surface-id]")?.dataset.surfaceId;

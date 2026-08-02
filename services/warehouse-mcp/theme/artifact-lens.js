@@ -63,6 +63,9 @@
   let inspectionBusy = false;
   let pickedElement = null;
   let currentInspection = null;
+  let currentTrail = null;
+  let trailHistory = [];
+  let trailRequest = 0;
   let hoverFrame = null;
   let candidateTimer = null;
   let semanticPollTimer = null;
@@ -2454,14 +2457,18 @@
         <div class="trace-actions">
           ${provenance.sql ? '<button type="button" class="query-run">Open recreated result</button>' : ""}
           ${data.calliope_enabled ? '<button type="button" class="home-pin">Pin to Home</button>' : ""}
+          ${data.calliope_enabled ? '<button type="button" class="trail-follow">Follow trail</button>' : ""}
           ${data.calliope_enabled ? '<button type="button" class="calliope-investigate">Ask Calliope</button>' : ""}
-        </div>`;
+        </div><section class="lens-trail" hidden></section>`;
       traceResult.hidden = false;
       window.requestAnimationFrame(constrainLens);
       scheduleCandidateHighlights();
     }
 
     function renderInspection(data) {
+      currentTrail = null;
+      trailHistory = [];
+      trailRequest += 1;
       if (data.semantic_object) {
         renderSemanticInspection(data);
         return;
@@ -2532,8 +2539,9 @@
         ${related}
         <div class="trace-actions">
           ${provenance.sql ? '<button type="button" class="query-run">Run query</button>' : ""}
+          ${data.calliope_enabled ? '<button type="button" class="trail-follow">Follow trail</button>' : ""}
           ${data.calliope_enabled ? '<button type="button" class="calliope-investigate">Ask Calliope</button>' : ""}
-        </div>`;
+        </div><section class="lens-trail" hidden></section>`;
       traceResult.hidden = false;
       window.requestAnimationFrame(constrainLens);
       scheduleCandidateHighlights();
@@ -2706,6 +2714,85 @@
       }
     }
 
+    function currentTrailHandle() {
+      const semanticObject = currentInspection?.semantic_object;
+      const artifact = currentInspection?.artifact || dashboard;
+      if (semanticObject?.id && artifact?.slug) {
+        return {
+          kind: "artifact_object",
+          slug: artifact.slug,
+          version: artifact.version || dashboard.version,
+          object_id: semanticObject.id,
+          definition_hash: semanticObject.definition_hash,
+          context: semanticObject.context || {},
+        };
+      }
+      if (!artifact?.slug) return null;
+      return {
+        kind: "artifact",
+        slug: artifact.slug,
+        version: artifact.version || dashboard.version,
+      };
+    }
+
+    function renderLensTrail(data) {
+      const root = traceResult.querySelector(".lens-trail");
+      if (!root) return;
+      currentTrail = data;
+      const subject = data.subject || {};
+      const facts = (data.facts || []).slice(0, 4).map((fact) => (
+        `<span><b>${escapeHtml(fact.label)}</b>${escapeHtml(fact.value)}</span>`
+      )).join("");
+      const connections = (data.connections || []).slice(0, 9).map((connection, index) => (
+        `<article><div><span>${escapeHtml(connection.relationship || "related to")}</span>`
+        + `<strong>${escapeHtml(connection.label || "Related evidence")}</strong>`
+        + `${connection.detail ? `<small>${escapeHtml(connection.detail)}</small>` : ""}</div>`
+        + `<footer><button type="button" data-lens-trail-hop="${index}">Follow</button>`
+        + `${connection.url ? `<a href="${escapeHtml(connection.url)}" target="_blank" rel="noopener">Open ↗</a>` : ""}</footer></article>`
+      )).join("");
+      root.hidden = false;
+      root.innerHTML = `${trailHistory.length > 1 ? '<button type="button" class="lens-trail-back">← Back</button>' : ""}`
+        + `<header><span>Evidence trail</span><strong>${escapeHtml(subject.label || "Selected evidence")}</strong>`
+        + `${subject.detail ? `<p>${escapeHtml(subject.detail)}</p>` : ""}${facts ? `<div>${facts}</div>` : ""}</header>`
+        + (connections ? `<section>${connections}</section>` : '<p class="lens-trail-empty">No further breadcrumbs surfaced.</p>');
+      window.requestAnimationFrame(() => {
+        traceView.scrollTop = traceView.scrollHeight;
+      });
+      window.requestAnimationFrame(constrainLens);
+    }
+
+    async function followTrail(handle, button = null, push = true) {
+      if (!handle) return;
+      const root = traceResult.querySelector(".lens-trail");
+      const request = ++trailRequest;
+      if (button) {
+        button.disabled = true;
+        button.textContent = "Following…";
+      }
+      if (root) {
+        root.hidden = false;
+        root.innerHTML = '<div class="lens-trail-loading"><i></i><span>Connecting the breadcrumbs…</span></div>';
+      }
+      try {
+        const data = await fetchJson("/api/calliope/trails", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ handle, limit: 12 }),
+        });
+        if (request !== trailRequest) return;
+        if (push) trailHistory.push(handle);
+        renderLensTrail(data);
+        if (button) button.textContent = "Trail open";
+      } catch (error) {
+        if (request !== trailRequest) return;
+        if (button) {
+          button.disabled = false;
+          button.textContent = "Follow trail";
+        }
+        if (root) root.innerHTML = `<p class="lens-trail-error">${escapeHtml(error instanceof Error ? error.message : String(error))}</p>`;
+      }
+    }
+
     trigger.addEventListener("click", (event) => {
       if (performance.now() < suppressTriggerClickUntil) {
         event.preventDefault();
@@ -2744,6 +2831,25 @@
       const handoff = event.target.closest(".calliope-investigate");
       if (handoff) {
         askCalliope(handoff);
+        return;
+      }
+      const trail = event.target.closest(".trail-follow");
+      if (trail) {
+        trailHistory = [];
+        followTrail(currentTrailHandle(), trail, true);
+        return;
+      }
+      if (event.target.closest(".lens-trail-back")) {
+        if (trailHistory.length > 1) {
+          trailHistory.pop();
+          followTrail(trailHistory.at(-1), null, false);
+        }
+        return;
+      }
+      const hop = event.target.closest("[data-lens-trail-hop]");
+      if (hop && currentTrail) {
+        const connection = (currentTrail.connections || [])[Number(hop.dataset.lensTrailHop)];
+        if (connection?.handle) followTrail(connection.handle, hop, true);
         return;
       }
       const homePin = event.target.closest(".home-pin");
