@@ -74,6 +74,31 @@
     mobileSessions: $("#mobile-sessions-toggle"),
     mobileChat: $("#mobile-chat-toggle"),
     mobileShade: $("#mobile-shade"),
+    instrumentOpen: $("#instrument-library-open"),
+    instrumentDialog: $("#instrument-library-dialog"),
+    instrumentClose: $("#instrument-library-close"),
+    instrumentNew: $("#instrument-library-new"),
+    instrumentRefresh: $("#instrument-library-refresh"),
+    instrumentList: $("#instrument-list"),
+    instrumentEmpty: $("#instrument-empty"),
+    instrumentDetail: $("#instrument-detail"),
+    instrumentCreate: $("#instrument-create-with-calliope"),
+    instrumentStatus: $("#instrument-status"),
+    instrumentName: $("#instrument-name"),
+    instrumentDescription: $("#instrument-description"),
+    instrumentVersion: $("#instrument-version"),
+    instrumentRunForm: $("#instrument-run-form"),
+    instrumentFields: $("#instrument-fields"),
+    instrumentRun: $("#instrument-run"),
+    instrumentOwnerControls: $("#instrument-owner-controls"),
+    instrumentOwnerCopy: $("#instrument-owner-copy"),
+    instrumentPublishPrivate: $("#instrument-publish-private"),
+    instrumentPublishCompany: $("#instrument-publish-company"),
+    instrumentRevise: $("#instrument-revise"),
+    instrumentUnpublish: $("#instrument-unpublish"),
+    instrumentArchive: $("#instrument-archive"),
+    instrumentPrompt: $("#instrument-prompt-template"),
+    instrumentHistory: $("#instrument-history"),
     styleOpen: $("#style-library-open"),
     styleDialog: $("#style-library-dialog"),
     styleClose: $("#style-library-close"),
@@ -177,6 +202,10 @@
     avatarTimer: null,
     chatWidth: null,
     cubeBuilders: new Map(),
+    instruments: [],
+    instrumentId: null,
+    instrument: null,
+    instrumentLoading: false,
     designProfiles: [],
     designProfileId: null,
     designProfileVersionId: null,
@@ -880,6 +909,264 @@
     els.evidenceSearchScope.textContent = state.evidenceSearching
       ? "resolving company evidence…"
       : available ? "docs · artifacts · data" : "resolver unavailable";
+  }
+
+  function instrumentStatusLabel(instrument) {
+    if (!instrument) return "Instrument";
+    if (!instrument.can_edit) return "Company Instrument";
+    if (instrument.status === "update_ready") return "Private update ready";
+    if (instrument.status === "draft") return "Private draft";
+    return instrument.visibility === "company" ? "Shared with company" : "Published privately";
+  }
+
+  function instrumentListLabel(instrument) {
+    if (!instrument.can_edit) return "company";
+    if (instrument.status === "update_ready") return "draft update";
+    if (instrument.status === "draft") return "draft";
+    return instrument.visibility === "company" ? "company" : "private";
+  }
+
+  function renderInstrumentList() {
+    if (state.instrumentLoading && !state.instruments.length) {
+      els.instrumentList.innerHTML = '<div class="instrument-list-empty">Loading your Instruments…</div>';
+      return;
+    }
+    if (!state.instruments.length) {
+      els.instrumentList.innerHTML = '<div class="instrument-list-empty">No Instruments yet.<br>Design a small reusable workflow with Calliope.</div>';
+      return;
+    }
+    els.instrumentList.innerHTML = state.instruments.map((instrument) => `
+      <button class="instrument-list-card ${state.instrumentId === instrument.id ? "active" : ""}"
+              type="button" data-instrument-id="${escapeHtml(instrument.id)}">
+        <header><span>${escapeHtml(instrumentListLabel(instrument))}</span><i>v${escapeHtml(instrument.version)}</i></header>
+        <strong>${escapeHtml(instrument.name)}</strong>
+        <p>${escapeHtml(instrument.description || "Reusable Calliope workflow")}</p>
+      </button>`).join("");
+  }
+
+  function renderInstrumentField(field) {
+    const key = escapeHtml(field.key);
+    const label = escapeHtml(field.label || field.key);
+    const required = Boolean(field.required);
+    const help = field.help ? `<small>${escapeHtml(field.help)}</small>` : "";
+    const marker = required ? "<b>required</b>" : "";
+    const defaultValue = field.default ?? "";
+    if (field.type === "boolean") {
+      return `<div class="instrument-field">
+        <span>${label}${marker}</span>
+        <label class="instrument-boolean">
+          <input type="checkbox" name="${key}" ${defaultValue === true ? "checked" : ""}>
+          <span>${escapeHtml(field.placeholder || `Include ${field.label || field.key}`)}</span>
+        </label>${help}
+      </div>`;
+    }
+    if (field.type === "select") {
+      const options = (field.options || []).map((option) => `
+        <option value="${escapeHtml(option.value)}" ${String(defaultValue) === String(option.value) ? "selected" : ""}>${escapeHtml(option.label || option.value)}</option>`
+      ).join("");
+      return `<label class="instrument-field">
+        <span>${label}${marker}</span>
+        <select name="${key}" ${required ? "required" : ""}>
+          ${!required && defaultValue === "" ? '<option value="">Not specified</option>' : ""}${options}
+        </select>${help}
+      </label>`;
+    }
+    if (field.type === "textarea") {
+      return `<label class="instrument-field wide">
+        <span>${label}${marker}</span>
+        <textarea name="${key}" ${required ? "required" : ""} placeholder="${escapeHtml(field.placeholder || "")}">${escapeHtml(defaultValue)}</textarea>${help}
+      </label>`;
+    }
+    const type = ["number", "date"].includes(field.type) ? field.type : "text";
+    const numeric = type === "number"
+      ? `${field.min !== undefined ? ` min="${escapeHtml(field.min)}"` : ""}${field.max !== undefined ? ` max="${escapeHtml(field.max)}"` : ""}${field.step !== undefined ? ` step="${escapeHtml(field.step)}"` : ""}`
+      : "";
+    return `<label class="instrument-field">
+      <span>${label}${marker}</span>
+      <input type="${type}" name="${key}" value="${escapeHtml(defaultValue)}" ${required ? "required" : ""}${numeric} placeholder="${escapeHtml(field.placeholder || "")}">${help}
+    </label>`;
+  }
+
+  function showInstrumentEmpty() {
+    state.instrument = null;
+    state.instrumentId = null;
+    els.instrumentDetail.hidden = true;
+    els.instrumentEmpty.hidden = false;
+    renderInstrumentList();
+  }
+
+  function renderInstrumentDetail() {
+    const instrument = state.instrument;
+    if (!instrument) {
+      showInstrumentEmpty();
+      return;
+    }
+    els.instrumentEmpty.hidden = true;
+    els.instrumentDetail.hidden = false;
+    els.instrumentDetail.setAttribute("aria-busy", "false");
+    els.instrumentStatus.textContent = instrumentStatusLabel(instrument);
+    els.instrumentName.textContent = instrument.name || "Calliope Instrument";
+    els.instrumentDescription.textContent = instrument.description || "A reusable Calliope workflow.";
+    const published = Number.isFinite(Number(instrument.published_version))
+      ? Number(instrument.published_version)
+      : null;
+    els.instrumentVersion.innerHTML = `v${escapeHtml(instrument.version)}${
+      published && published !== Number(instrument.version)
+        ? `<br><span>v${escapeHtml(published)} live</span>`
+        : published ? "<br><span>published</span>" : "<br><span>draft</span>"
+    }`;
+    els.instrumentFields.innerHTML = (instrument.fields || []).map(renderInstrumentField).join("");
+    els.instrumentPrompt.textContent = instrument.prompt_template || "";
+    const history = instrument.can_edit ? (instrument.versions || []) : [];
+    els.instrumentHistory.hidden = !history.length;
+    els.instrumentHistory.innerHTML = history.map((version) => {
+      const notes = version.revision_notes || "Saved revision";
+      return `<span title="${escapeHtml(notes)}">v${escapeHtml(version.version)} · ${escapeHtml(relativeTime(version.created_at))}</span>`;
+    }).join("");
+    els.instrumentOwnerControls.hidden = !instrument.can_edit;
+    if (instrument.can_edit) {
+      els.instrumentOwnerCopy.textContent = instrument.status === "update_ready"
+        ? `Version ${instrument.version} is private. Publishing moves the approved pointer forward from v${published}.`
+        : instrument.status === "draft"
+          ? "This agent-created draft is private until you explicitly publish it."
+          : instrument.visibility === "company"
+            ? "The company can run this approved revision; new drafts remain private."
+            : "Only you can run this approved revision; new drafts remain private.";
+      els.instrumentPublishPrivate.hidden = published === Number(instrument.version) && instrument.visibility === "private";
+      els.instrumentPublishCompany.hidden = published === Number(instrument.version) && instrument.visibility === "company";
+      els.instrumentUnpublish.hidden = !published;
+    }
+    els.instrumentRun.disabled = false;
+    els.instrumentRun.textContent = "Open with Calliope →";
+    renderInstrumentList();
+  }
+
+  async function selectInstrument(instrumentId) {
+    if (!instrumentId) {
+      showInstrumentEmpty();
+      return;
+    }
+    state.instrumentId = instrumentId;
+    state.instrumentLoading = true;
+    els.instrumentDetail.setAttribute("aria-busy", "true");
+    renderInstrumentList();
+    try {
+      const data = await api(`/api/calliope/instruments/${encodeURIComponent(instrumentId)}`);
+      state.instrument = data.instrument;
+      state.instrumentId = data.instrument.id;
+      renderInstrumentDetail();
+    } catch (error) {
+      showInstrumentEmpty();
+      throw error;
+    } finally {
+      state.instrumentLoading = false;
+      els.instrumentDetail.setAttribute("aria-busy", "false");
+    }
+  }
+
+  async function loadInstruments(selectId = null) {
+    state.instrumentLoading = true;
+    renderInstrumentList();
+    try {
+      const data = await api("/api/calliope/instruments");
+      state.instruments = data.instruments || [];
+      const currentStillVisible = state.instruments.some((item) => item.id === state.instrumentId);
+      const target = selectId
+        || (currentStillVisible ? state.instrumentId : null)
+        || (els.instrumentDialog.open ? state.instruments[0]?.id : null);
+      if (target) await selectInstrument(target);
+      else if (els.instrumentDialog.open) showInstrumentEmpty();
+      else renderInstrumentList();
+    } finally {
+      state.instrumentLoading = false;
+      renderInstrumentList();
+    }
+  }
+
+  async function openInstruments(instrumentId = null) {
+    if (!els.instrumentDialog.open) els.instrumentDialog.showModal();
+    await loadInstruments(instrumentId);
+  }
+
+  function instrumentInputs() {
+    const inputs = {};
+    for (const field of state.instrument?.fields || []) {
+      const control = els.instrumentRunForm.elements.namedItem(field.key);
+      if (!control) continue;
+      inputs[field.key] = field.type === "boolean" ? Boolean(control.checked) : control.value;
+    }
+    return inputs;
+  }
+
+  async function runInstrument() {
+    if (!state.instrument || state.instrumentLoading) return;
+    els.instrumentRun.disabled = true;
+    els.instrumentRun.textContent = "Opening notebook…";
+    try {
+      const data = await api(`/api/calliope/instruments/${encodeURIComponent(state.instrument.id)}/run`, {
+        method: "POST",
+        body: JSON.stringify({ inputs: instrumentInputs() }),
+      });
+      window.location.assign(data.url);
+    } finally {
+      els.instrumentRun.disabled = false;
+      els.instrumentRun.textContent = "Open with Calliope →";
+    }
+  }
+
+  async function mutateInstrument(action, visibility = null) {
+    if (!state.instrument?.can_edit || state.instrumentLoading) return;
+    state.instrumentLoading = true;
+    try {
+      const data = await api(`/api/calliope/instruments/${encodeURIComponent(state.instrument.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ action, visibility }),
+      });
+      if (action === "archive") {
+        toast("Instrument archived");
+        state.instrument = null;
+        state.instrumentId = null;
+        await loadInstruments();
+        return;
+      }
+      state.instrument = data.instrument;
+      state.instrumentId = data.instrument.id;
+      await loadInstruments(state.instrumentId);
+      toast(action === "unpublish"
+        ? "Instrument returned to a private draft"
+        : visibility === "company" ? "Approved revision shared with the company" : "Approved revision published privately");
+    } finally {
+      state.instrumentLoading = false;
+    }
+  }
+
+  async function reviseInstrument() {
+    if (!state.instrument?.can_edit || state.instrumentLoading) return;
+    els.instrumentRevise.disabled = true;
+    try {
+      const data = await api(`/api/calliope/instruments/${encodeURIComponent(state.instrument.id)}/revise`, {
+        method: "POST",
+        body: "{}",
+      });
+      window.location.assign(data.url);
+    } finally {
+      els.instrumentRevise.disabled = false;
+    }
+  }
+
+  async function designInstrument() {
+    els.instrumentCreate.disabled = true;
+    els.instrumentNew.disabled = true;
+    try {
+      const data = await api("/api/calliope/instruments/design", {
+        method: "POST",
+        body: "{}",
+      });
+      window.location.assign(data.url);
+    } finally {
+      els.instrumentCreate.disabled = false;
+      els.instrumentNew.disabled = false;
+    }
   }
 
   function designVersions(profile) {
@@ -1810,7 +2097,7 @@
   }
 
   function surfaceGlyph(kind) {
-    return ({ query: "▤", metric: "◆", cube: "▦", artifact: "▦", image: "▧", document: "▱", selection: "⌖", evidence: "⌕" })[kind] || "◇";
+    return ({ query: "▤", metric: "◆", cube: "▦", artifact: "▦", image: "▧", document: "▱", selection: "⌖", evidence: "⌕", instrument: "⌁" })[kind] || "◇";
   }
 
   function formatValue(value) {
@@ -2799,6 +3086,23 @@
     return value;
   }
 
+  function renderInstrument(surface) {
+    const instrument = surface.payload || {};
+    const fields = Array.isArray(instrument.fields) ? instrument.fields : [];
+    const status = instrumentStatusLabel(instrument);
+    return `<div class="instrument-surface">
+      <div class="instrument-surface-mark" aria-hidden="true">⌁</div>
+      <div class="instrument-surface-copy">
+        <span>${escapeHtml(status)} · v${escapeHtml(instrument.version || 1)}</span>
+        <p>${escapeHtml(instrument.description || "A reusable workflow drafted with Calliope.")}</p>
+        <div>${fields.slice(0, 6).map((field) => `<i>${escapeHtml(field.label || field.key)}</i>`).join("")}${
+          fields.length > 6 ? `<i>+${fields.length - 6} more</i>` : ""
+        }</div>
+      </div>
+      <button type="button" data-open-instrument="${escapeHtml(instrument.id || "")}">Review &amp; run →</button>
+    </div>`;
+  }
+
   function renderArtifact(surface) {
     const url = surface.payload?.display_url || surface.payload?.url;
     if (!url) return `<div class="chart-empty">Artifact URL unavailable</div>`;
@@ -3316,6 +3620,7 @@
       document: renderDocument,
       selection: renderSelection,
       evidence: renderEvidenceSet,
+      instrument: renderInstrument,
     })[surface.kind]?.(surface) || `<div class="chart-empty">Surface unavailable</div>`;
     const openUrl = surface.kind === "artifact"
       ? surface.payload?.display_url || surface.payload?.url
@@ -4314,7 +4619,7 @@
 
   function friendlyTool(name) {
     const raw = String(name || "warehouse tool").split("_");
-    const known = ["run_sql_multi", "run_sql", "create_live_app", "update_live_app", "publish_dashboard", "update_dashboard", "capture_live_app", "render_pdf", "metric_history", "describe_cube", "pivot", "metric"];
+    const known = ["draft_calliope_instrument", "run_sql_multi", "run_sql", "create_live_app", "update_live_app", "publish_dashboard", "update_dashboard", "capture_live_app", "render_pdf", "metric_history", "describe_cube", "pivot", "metric"];
     const value = String(name || "");
     const found = known.find((tool) => value === tool || value.endsWith(`__${tool}`));
     return (found || raw.slice(-2).join("_")).replaceAll("_", " ");
@@ -4325,6 +4630,51 @@
       if (state.liveActivity.phase === "idle") return;
       state.liveActivity.expanded = !state.liveActivity.expanded;
       renderLiveActivity();
+    });
+    els.instrumentOpen.addEventListener("click", () => {
+      openInstruments().catch((error) => toast(error.message, true));
+    });
+    els.instrumentClose.addEventListener("click", () => els.instrumentDialog.close());
+    els.instrumentDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      els.instrumentDialog.close();
+    });
+    els.instrumentDialog.addEventListener("click", (event) => {
+      if (event.target === els.instrumentDialog) els.instrumentDialog.close();
+    });
+    els.instrumentRefresh.addEventListener("click", () => {
+      loadInstruments(state.instrumentId).catch((error) => toast(error.message, true));
+    });
+    els.instrumentNew.addEventListener("click", () => {
+      designInstrument().catch((error) => toast(error.message, true));
+    });
+    els.instrumentList.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-instrument-id]");
+      if (!button) return;
+      selectInstrument(button.dataset.instrumentId).catch((error) => toast(error.message, true));
+    });
+    els.instrumentCreate.addEventListener("click", () => {
+      designInstrument().catch((error) => toast(error.message, true));
+    });
+    els.instrumentRunForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!els.instrumentRunForm.reportValidity()) return;
+      runInstrument().catch((error) => toast(error.message, true));
+    });
+    els.instrumentPublishPrivate.addEventListener("click", () => {
+      mutateInstrument("publish", "private").catch((error) => toast(error.message, true));
+    });
+    els.instrumentPublishCompany.addEventListener("click", () => {
+      mutateInstrument("publish", "company").catch((error) => toast(error.message, true));
+    });
+    els.instrumentUnpublish.addEventListener("click", () => {
+      mutateInstrument("unpublish").catch((error) => toast(error.message, true));
+    });
+    els.instrumentArchive.addEventListener("click", () => {
+      mutateInstrument("archive").catch((error) => toast(error.message, true));
+    });
+    els.instrumentRevise.addEventListener("click", () => {
+      reviseInstrument().catch((error) => toast(error.message, true));
     });
     els.styleOpen.addEventListener("click", () => {
       openDesignProfiles().catch((error) => toast(error.message, true));
@@ -4685,6 +5035,12 @@
         openQuerySurface(openQuery.dataset.openQuerySurface);
         return;
       }
+      const openInstrument = event.target.closest("[data-open-instrument]");
+      if (openInstrument) {
+        openInstruments(openInstrument.dataset.openInstrument)
+          .catch((error) => toast(error.message, true));
+        return;
+      }
       const inspect = event.target.closest("[data-inspect-artifact]");
       if (inspect) {
         startArtifactInspection(inspect.dataset.inspectArtifact);
@@ -4870,6 +5226,7 @@
       const launchSession = launch.get("session");
       const launchSurface = launch.get("surface");
       const launchPrompt = launch.get("prompt");
+      const launchInstrument = launch.get("instrument");
       await loadConfig();
       await loadInbox({ silent: true });
       clearInterval(state.inbox.timer);
@@ -4878,6 +5235,7 @@
         45_000,
       );
       await loadDesignProfiles();
+      await loadInstruments();
       await loadSessions(launchSession);
       if (launchSurface && state.surfaces.some((surface) => surface.id === launchSurface)) {
         requestAnimationFrame(() => focusSurface(launchSurface));
@@ -4890,7 +5248,10 @@
         const query = launch.toString();
         window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
       }
-      if (!state.sessions.length) {
+      if (launchInstrument) {
+        await openInstruments(launchInstrument);
+      }
+      if (!state.sessions.length && !els.instrumentDialog.open) {
         els.dialog.showModal();
         requestAnimationFrame(() => els.newSessionTitle.focus());
       }

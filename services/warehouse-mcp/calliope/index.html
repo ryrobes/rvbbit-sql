@@ -31,6 +31,7 @@ __CALLIOPE_BACKGROUND__
   <div class="top-context">
     <span class="company-memory"><i></i> shared company memory</span>
     <a class="artifacts-link" href="/gallery">Artifacts</a>
+    <button id="instrument-library-open" class="instrument-library-open" type="button">Instruments</button>
     <button id="style-library-open" class="style-library-open" type="button">Design Profiles</button>
     <span data-warehouse-theme-anchor></span>
     <span class="viewer">__CALLIOPE_VIEWER__</span>
@@ -266,6 +267,76 @@ __CALLIOPE_BACKGROUND__
     </nav>
     <div id="work-inbox-list" class="work-inbox-list" aria-live="polite">
       <div class="work-inbox-loading"><i></i><span>Resolving your work surface…</span></div>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="instrument-library-dialog" class="instrument-library-dialog" aria-labelledby="instrument-library-title">
+  <div class="instrument-library-shell">
+    <header class="instrument-library-head">
+      <div>
+        <p class="eyebrow">Reusable humane workflows</p>
+        <h2 id="instrument-library-title">Calliope Instruments</h2>
+      </div>
+      <p>Small interfaces co-designed with Calliope. Every run starts a governed notebook; every agent revision waits for human publication.</p>
+      <button id="instrument-library-close" class="markup-close" type="button" aria-label="Close Instruments">×</button>
+    </header>
+    <div class="instrument-library-workspace">
+      <aside class="instrument-library-rail">
+        <div class="instrument-library-rail-head">
+          <span>Instrument library</span>
+          <div class="instrument-library-rail-actions">
+            <button id="instrument-library-new" type="button">+ New</button>
+            <button id="instrument-library-refresh" type="button" aria-label="Refresh Instruments">↻</button>
+          </div>
+        </div>
+        <div id="instrument-list" class="instrument-list"></div>
+        <p>Private drafts are visible only to their creator. Company Instruments expose only a human-approved published revision.</p>
+      </aside>
+      <section class="instrument-workspace">
+        <div id="instrument-empty" class="instrument-empty">
+          <i aria-hidden="true">⌁</i>
+          <p class="eyebrow">A skill you can see</p>
+          <h3>Turn repeated work into an Instrument.</h3>
+          <p>Ask Calliope to make a workflow reusable. She drafts the fields and prompt contract here; you decide when it is ready and who can use it.</p>
+          <button id="instrument-create-with-calliope" type="button">Design one with Calliope →</button>
+        </div>
+        <div id="instrument-detail" class="instrument-detail" hidden>
+          <header class="instrument-detail-head">
+            <div>
+              <span id="instrument-status" class="instrument-status">Private draft</span>
+              <h3 id="instrument-name">Instrument</h3>
+              <p id="instrument-description"></p>
+            </div>
+            <div id="instrument-version" class="instrument-version"></div>
+          </header>
+          <form id="instrument-run-form" class="instrument-run-form">
+            <div id="instrument-fields" class="instrument-fields"></div>
+            <div class="instrument-run-foot">
+              <p><b>Governed handoff</b> Inputs become evidence in a fresh private notebook. Calliope runs with your normal warehouse permissions.</p>
+              <button id="instrument-run" type="submit">Open with Calliope →</button>
+            </div>
+          </form>
+          <section id="instrument-owner-controls" class="instrument-owner-controls" hidden>
+            <div>
+              <span>Creator controls</span>
+              <p id="instrument-owner-copy">Review this draft before publishing it.</p>
+            </div>
+            <div class="instrument-owner-actions">
+              <button id="instrument-publish-private" type="button">Publish privately</button>
+              <button id="instrument-publish-company" type="button">Share with company</button>
+              <button id="instrument-revise" type="button">Revise with Calliope</button>
+              <button id="instrument-unpublish" type="button" hidden>Unpublish</button>
+              <button id="instrument-archive" type="button">Archive</button>
+            </div>
+          </section>
+          <details class="instrument-contract">
+            <summary>View the workflow contract <span>transparent by design</span></summary>
+            <pre id="instrument-prompt-template"></pre>
+            <div id="instrument-history" class="instrument-history"></div>
+          </details>
+        </div>
+      </section>
     </div>
   </div>
 </dialog>

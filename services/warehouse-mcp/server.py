@@ -6569,6 +6569,57 @@ def _mcp_calliope_work_item(
     return _logged("calliope_work_item", args, publish)
 
 
+def _mcp_draft_calliope_instrument(
+    session_id,
+    name,
+    description,
+    prompt_template,
+    fields,
+    slug=None,
+    revision_notes=None,
+):
+    """Draft or revise a safe declarative UI skill in the user's Instrument library.
+
+    Use this only after a user asks to make a repeatable workflow reusable, or a
+    proactive task has strong evidence that a small form would remove repeated
+    work. `session_id` must be the exact originating Calliope session UUID from
+    the internal work-routing context; it resolves ownership and this tool
+    accepts no recipient. Fields are declarative objects using text, textarea,
+    number, select, boolean, or date. `prompt_template` may reference them as
+    `{{field_key}}`. No HTML, JavaScript, SQL execution, or auto-publication is
+    accepted here. The result is a private draft revision: its human owner must
+    explicitly publish it privately or share it with the company in Calliope.
+    Reuse `slug` to create the next immutable revision of an existing Instrument.
+    """
+    args = {
+        "session_id": session_id,
+        "name": name,
+        "description": description,
+        "prompt_template": prompt_template,
+        "fields": fields,
+        "slug": slug,
+        "revision_notes": revision_notes,
+    }
+
+    def draft():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return {"instrument": calliope.draft_instrument(
+            _conn,
+            session_id,
+            name,
+            description,
+            prompt_template,
+            fields,
+            slug,
+            revision_notes,
+        )}
+
+    return _logged("draft_calliope_instrument", args, draft)
+
+
 # Data clients injected into every served dashboard. We provide BOTH the hosted
 # rvbbitQuery AND a cowork.callMcpTool shim (routing to the same read-only endpoint), so a
 # Cowork-built artifact (callMcpTool) and a hosted-built one (rvbbitQuery) both run here
@@ -10329,6 +10380,7 @@ def _register(mcp):
     mcp.tool(name="dashboard_template")(_mcp_dashboard_template)
     mcp.tool(name="tanstack_chart_template")(_mcp_tanstack_chart_template)
     mcp.tool(name="calliope_work_item")(_mcp_calliope_work_item)
+    mcp.tool(name="draft_calliope_instrument")(_mcp_draft_calliope_instrument)
     mcp.tool(name="live_app_template")(_mcp_live_app_template)
     mcp.tool(name="create_live_app")(_mcp_create_live_app)
     mcp.tool(name="update_live_app")(_mcp_update_live_app)

@@ -320,6 +320,19 @@ artifact carries its exact pinned profile forward. Calliope injects that version
 the Hermes authoring and screenshot-review prompts; the reference assets and compiled
 profile never become runtime CSS for unrelated custom artifacts.
 
+The adjacent **Instruments** library turns a repeated workflow into a small interface
+that people can reuse without learning prompts. Calliope co-designs a bounded form
+(`text`, `textarea`, `number`, `select`, `boolean`, and `date`) plus a transparent prompt
+contract, then saves it through `draft_calliope_instrument`. Agent-created revisions are
+immutable private drafts: only the human creator can publish one privately or advance
+the company-visible publication pointer. A newer private draft is not exposed to company
+readers until that explicit approval. Running an Instrument validates its inputs and
+opens a fresh email-owned notebook with the exact Instrument version, choices, and form
+values frozen as evidence; revising one starts a separate evidence-backed conversation.
+The interface never executes Instrument-authored HTML, JavaScript, or SQL directly, and
+the resulting Calliope run still uses the signed-in person's normal governed tools and
+warehouse permissions. No additional environment variables are required.
+
 Cube schema surfaces are also direct interactive analysis tables. Add one or more
 dimensions to Rows and one or more numeric aggregations to Values; this produces a
 normal grouped table with named columns. Columns is optional—adding dimensions there
