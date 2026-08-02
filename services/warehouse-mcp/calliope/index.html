@@ -51,6 +51,15 @@ __CALLIOPE_BACKGROUND__
       <span aria-hidden="true">⌕</span>
       <input id="session-search" type="search" placeholder="Find a session…" autocomplete="off">
     </label>
+    <button id="work-inbox-open" class="work-inbox-open" type="button" aria-haspopup="dialog" aria-controls="work-inbox-dialog">
+      <span class="work-inbox-mark" aria-hidden="true">↳</span>
+      <span class="work-inbox-open-copy">
+        <strong>Work Inbox</strong>
+        <small>Changes · results · things to resolve</small>
+      </span>
+      <b id="work-inbox-count" class="work-inbox-count" hidden>0</b>
+      <i aria-hidden="true">›</i>
+    </button>
     <div id="session-list" class="session-list" role="list"></div>
     <div class="rail-note">
       <span>Private rail</span>
@@ -227,6 +236,37 @@ __CALLIOPE_BACKGROUND__
       <button id="surface-viewer-close" class="markup-close" type="button" aria-label="Close expanded surface">×</button>
     </header>
     <div id="surface-viewer-content" class="surface-viewer-content" aria-live="polite"></div>
+  </div>
+</dialog>
+
+<dialog id="work-inbox-dialog" class="work-inbox-dialog" aria-labelledby="work-inbox-title">
+  <div class="work-inbox-shell">
+    <header class="work-inbox-head">
+      <div class="work-inbox-heading">
+        <p class="eyebrow">Private action surface</p>
+        <h2 id="work-inbox-title">Work Inbox</h2>
+        <p>What changed, why it matters, and the next useful move—without another feed to babysit.</p>
+      </div>
+      <div class="work-inbox-head-actions">
+        <button id="work-inbox-schedule" class="work-inbox-primary" type="button">＋ Schedule something</button>
+        <button id="work-inbox-ack" type="button">Mark all seen</button>
+        <button id="work-inbox-refresh" type="button" aria-label="Refresh Work Inbox">↻</button>
+        <button id="work-inbox-close" class="markup-close" type="button" aria-label="Close Work Inbox">×</button>
+      </div>
+    </header>
+    <nav id="work-inbox-filters" class="work-inbox-filters" aria-label="Filter Work Inbox">
+      <button type="button" data-inbox-filter="open" aria-pressed="true">Open</button>
+      <button type="button" data-inbox-filter="attention" aria-pressed="false">Needs attention</button>
+      <button type="button" data-inbox-filter="watch" aria-pressed="false">Watches</button>
+      <button type="button" data-inbox-filter="scheduled" aria-pressed="false">Scheduled</button>
+      <button type="button" data-inbox-filter="goal" aria-pressed="false">Goals</button>
+      <button type="button" data-inbox-filter="suggestion" aria-pressed="false">Suggestions</button>
+      <button type="button" data-inbox-filter="resolved" aria-pressed="false">Resolved</button>
+      <span id="work-inbox-summary">Checking for work…</span>
+    </nav>
+    <div id="work-inbox-list" class="work-inbox-list" aria-live="polite">
+      <div class="work-inbox-loading"><i></i><span>Resolving your work surface…</span></div>
+    </div>
   </div>
 </dialog>
 

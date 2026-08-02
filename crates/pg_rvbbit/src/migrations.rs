@@ -929,6 +929,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0227_calliope_semantic_watches",
         include_str!("../sql/migrations/0227_calliope_semantic_watches.sql"),
     ),
+    (
+        "0228_calliope_work_inbox",
+        include_str!("../sql/migrations/0228_calliope_work_inbox.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

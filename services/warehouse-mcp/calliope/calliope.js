@@ -6,6 +6,16 @@
   const els = {
     sessionList: $("#session-list"),
     sessionSearch: $("#session-search"),
+    inboxOpen: $("#work-inbox-open"),
+    inboxCount: $("#work-inbox-count"),
+    inboxDialog: $("#work-inbox-dialog"),
+    inboxClose: $("#work-inbox-close"),
+    inboxRefresh: $("#work-inbox-refresh"),
+    inboxAck: $("#work-inbox-ack"),
+    inboxSchedule: $("#work-inbox-schedule"),
+    inboxFilters: $("#work-inbox-filters"),
+    inboxSummary: $("#work-inbox-summary"),
+    inboxList: $("#work-inbox-list"),
     newSession: $("#new-session"),
     dialog: $("#new-session-dialog"),
     newSessionForm: $("#new-session-form"),
@@ -145,6 +155,13 @@
     attachments: [],
     evidenceSelections: [],
     evidenceSearching: false,
+    inbox: {
+      items: [],
+      counts: { unread: 0, open: 0, shown: 0, by_kind: {} },
+      filter: "open",
+      loading: false,
+      timer: null,
+    },
     viewerRequestId: 0,
     viewerSurface: null,
     viewerGrid: { filter: "", sortIndex: null, direction: 1 },
@@ -557,6 +574,181 @@
     els.toast.classList.add("show");
     clearTimeout(toast.timer);
     toast.timer = setTimeout(() => els.toast.classList.remove("show"), 2800);
+  }
+
+  function inboxKindLabel(item) {
+    if (item.source === "watch") {
+      return item.event_kind === "recovered" ? "Watch recovered" : "Semantic watch";
+    }
+    return ({
+      suggestion: "Suggestion",
+      scheduled: "Scheduled work",
+      goal: "Persistent goal",
+      blocked: "Blocked work",
+      result: "Result ready",
+    })[item.kind] || "Calliope work";
+  }
+
+  function inboxContextMarkup(item) {
+    const context = item.context || {};
+    const presentation = context.presentation || {};
+    const values = [
+      ["Value", context.value],
+      ["Threshold", context.threshold],
+      ["Due", item.due_at ? new Date(item.due_at).toLocaleString() : null],
+      ["From", presentation.artifact_name || context.session_title || item.origin],
+    ].filter((entry) => entry[1] !== null && entry[1] !== undefined && entry[1] !== "").slice(0, 3);
+    if (!values.length) return "";
+    return `<div class="work-inbox-context">${values.map(([label, value]) =>
+      `<span title="${escapeHtml(String(value))}"><b>${escapeHtml(label)}</b>${escapeHtml(String(value))}</span>`
+    ).join("")}</div>`;
+  }
+
+  function filteredInboxItems() {
+    const filter = state.inbox.filter;
+    return state.inbox.items.filter((item) => {
+      const open = item.state === "unread" || item.state === "seen";
+      if (filter === "open") return open;
+      if (filter === "resolved") return !open;
+      if (filter === "attention") {
+        return open && (
+          ["high", "critical"].includes(item.urgency)
+          || item.kind === "blocked"
+          || ["triggered", "error"].includes(item.event_kind)
+        );
+      }
+      if (filter === "watch") return open && item.source === "watch";
+      return open && item.kind === filter;
+    });
+  }
+
+  function renderInbox() {
+    const counts = state.inbox.counts || {};
+    const unread = Number(counts.unread || 0);
+    els.inboxCount.hidden = !unread;
+    els.inboxCount.textContent = unread > 99 ? "99+" : String(unread);
+    els.inboxOpen.setAttribute(
+      "aria-label",
+      unread ? `Work Inbox · ${unread} unread` : "Work Inbox",
+    );
+    $$("[data-inbox-filter]", els.inboxFilters).forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.inboxFilter === state.inbox.filter));
+    });
+    const items = filteredInboxItems();
+    els.inboxSummary.textContent = `${Number(counts.open || 0)} open · ${unread} unread`;
+    if (!items.length) {
+      const resolved = state.inbox.filter === "resolved";
+      els.inboxList.innerHTML = `<div class="work-inbox-empty">
+        <strong>${resolved ? "Nothing resolved yet." : "Nothing needs your attention."}</strong>
+        <span>${resolved
+          ? "Completed and dismissed work will collect here."
+          : "Watch changes, scheduled results, goals, and useful Calliope handoffs appear here."}</span>
+      </div>`;
+      return;
+    }
+    els.inboxList.innerHTML = `<div class="work-inbox-grid">${items.map((item) => {
+      const open = item.state === "unread" || item.state === "seen";
+      const time = item.updated_at || item.created_at;
+      return `<article class="work-inbox-card kind-${escapeHtml(item.kind || "work")} urgency-${escapeHtml(item.urgency || "normal")} state-${escapeHtml(item.state || "unread")}" data-inbox-source="${escapeHtml(item.source)}" data-inbox-id="${escapeHtml(item.id)}">
+        <i class="work-inbox-rail" aria-hidden="true"></i>
+        <div class="work-inbox-card-main">
+          <header class="work-inbox-card-head">
+            ${item.state === "unread" ? '<i aria-label="Unread"></i>' : ""}
+            <span>${escapeHtml(inboxKindLabel(item))}</span>
+            <time datetime="${escapeHtml(time || "")}">${escapeHtml(relativeTime(time))}</time>
+          </header>
+          <div class="work-inbox-card-body">
+            <h3>${escapeHtml(item.title || "Calliope work")}</h3>
+            <p>${escapeHtml(item.summary || "A saved work handoff is ready to inspect.")}</p>
+            ${inboxContextMarkup(item)}
+          </div>
+          <footer class="work-inbox-card-actions">
+            <button class="ask-calliope" type="button" data-inbox-investigate>Ask Calliope</button>
+            ${item.open_url ? `<a href="${escapeHtml(item.open_url)}" target="_blank" rel="noopener">Open source ↗</a>` : ""}
+            ${open ? '<button type="button" data-inbox-action="done">Done</button><button class="inbox-dismiss" type="button" data-inbox-action="dismissed">Dismiss</button>'
+              : '<button type="button" data-inbox-action="unread">Reopen</button>'}
+          </footer>
+        </div>
+      </article>`;
+    }).join("")}</div>`;
+  }
+
+  async function loadInbox({ silent = false } = {}) {
+    if (state.inbox.loading) return;
+    state.inbox.loading = true;
+    if (!silent && els.inboxDialog.open) {
+      els.inboxList.innerHTML = '<div class="work-inbox-loading"><i></i><span>Resolving your work surface…</span></div>';
+    }
+    try {
+      const data = await api("/api/calliope/inbox?include_resolved=true&limit=100");
+      state.inbox.items = data.items || [];
+      state.inbox.counts = data.counts || { unread: 0, open: 0, shown: 0, by_kind: {} };
+      renderInbox();
+    } catch (error) {
+      if (els.inboxDialog.open) {
+        els.inboxList.innerHTML = `<div class="work-inbox-error"><strong>Inbox unavailable.</strong><span>${escapeHtml(error.message)}</span></div>`;
+      }
+    } finally {
+      state.inbox.loading = false;
+    }
+  }
+
+  async function mutateInboxItem(card, action, button) {
+    if (!card || !action) return;
+    button.disabled = true;
+    try {
+      await api(`/api/calliope/inbox/items/${encodeURIComponent(card.dataset.inboxSource)}/${encodeURIComponent(card.dataset.inboxId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ action }),
+      });
+      await loadInbox({ silent: true });
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message, true);
+    }
+  }
+
+  async function investigateInboxItem(card, button) {
+    if (!card) return;
+    button.disabled = true;
+    try {
+      const data = await api(`/api/calliope/inbox/items/${encodeURIComponent(card.dataset.inboxSource)}/${encodeURIComponent(card.dataset.inboxId)}/investigate`, {
+        method: "POST",
+        body: "{}",
+      });
+      window.location.assign(data.url);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message, true);
+    }
+  }
+
+  async function scheduleInboxWork() {
+    els.inboxSchedule.disabled = true;
+    try {
+      const data = await api("/api/calliope/inbox/schedule", { method: "POST", body: "{}" });
+      window.location.assign(data.url);
+    } catch (error) {
+      els.inboxSchedule.disabled = false;
+      toast(error.message, true);
+    }
+  }
+
+  async function acknowledgeInbox() {
+    els.inboxAck.disabled = true;
+    try {
+      await api("/api/calliope/inbox/acknowledge-all", { method: "POST", body: "{}" });
+      await loadInbox({ silent: true });
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      els.inboxAck.disabled = false;
+    }
+  }
+
+  function openInbox() {
+    if (!els.inboxDialog.open) els.inboxDialog.showModal();
+    loadInbox().catch(() => {});
   }
 
   function chatWidthBounds() {
@@ -4242,6 +4434,34 @@
       els.dialog.showModal();
       requestAnimationFrame(() => els.newSessionTitle.focus());
     });
+    els.inboxOpen.addEventListener("click", openInbox);
+    els.inboxClose.addEventListener("click", () => els.inboxDialog.close());
+    els.inboxDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      els.inboxDialog.close();
+    });
+    els.inboxDialog.addEventListener("click", (event) => {
+      if (event.target === els.inboxDialog) els.inboxDialog.close();
+    });
+    els.inboxRefresh.addEventListener("click", () => loadInbox().catch(() => {}));
+    els.inboxAck.addEventListener("click", () => acknowledgeInbox());
+    els.inboxSchedule.addEventListener("click", () => scheduleInboxWork());
+    els.inboxFilters.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-inbox-filter]");
+      if (!button) return;
+      state.inbox.filter = button.dataset.inboxFilter;
+      renderInbox();
+    });
+    els.inboxList.addEventListener("click", (event) => {
+      const card = event.target.closest("[data-inbox-source][data-inbox-id]");
+      const investigate = event.target.closest("[data-inbox-investigate]");
+      const action = event.target.closest("[data-inbox-action]");
+      if (investigate) {
+        investigateInboxItem(card, investigate);
+      } else if (action) {
+        mutateInboxItem(card, action.dataset.inboxAction, action);
+      }
+    });
     els.newSessionForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       const title = els.newSessionTitle.value.trim() || "New inquiry";
@@ -4629,7 +4849,10 @@
       if ([...event.dataTransfer.types].includes("Files")) event.preventDefault();
     });
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) updateCalliopeAvatar();
+      if (!document.hidden) {
+        updateCalliopeAvatar();
+        loadInbox({ silent: true }).catch(() => {});
+      }
     });
     document.addEventListener("drop", (event) => {
       if (!event.dataTransfer.files.length) return;
@@ -4648,6 +4871,12 @@
       const launchSurface = launch.get("surface");
       const launchPrompt = launch.get("prompt");
       await loadConfig();
+      await loadInbox({ silent: true });
+      clearInterval(state.inbox.timer);
+      state.inbox.timer = setInterval(
+        () => loadInbox({ silent: true }).catch(() => {}),
+        45_000,
+      );
       await loadDesignProfiles();
       await loadSessions(launchSession);
       if (launchSurface && state.surfaces.some((surface) => surface.id === launchSurface)) {

@@ -27,6 +27,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from html import escape
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
@@ -146,6 +147,10 @@ _MAX_EVIDENCE_PREVIEW_ROWS = 500
 _MAX_EVIDENCE_PREVIEW_COLUMNS = 120
 _MAX_EVIDENCE_CELL_CHARS = 20_000
 _EVIDENCE_SET_HANDLE = "@search-set"
+_WORK_KINDS = {"suggestion", "scheduled", "goal", "blocked", "result"}
+_WORK_URGENCIES = {"low", "normal", "high", "critical"}
+_WORK_STATES = {"unread", "seen", "done", "dismissed"}
+_WORK_CONTEXT_BYTES = 32_000
 
 
 @dataclass(frozen=True)
@@ -432,6 +437,44 @@ CREATE INDEX IF NOT EXISTS calliope_watch_events_unread_idx
     ON rvbbit.calliope_watch_events (created_at DESC) WHERE acknowledged_at IS NULL;
 """
 
+_INBOX_DDL = """
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_work_items (
+    id uuid PRIMARY KEY,
+    owner_email text NOT NULL,
+    session_id uuid REFERENCES rvbbit.calliope_sessions(id) ON DELETE SET NULL,
+    kind text NOT NULL,
+    source text NOT NULL DEFAULT 'hermes',
+    source_ref text,
+    dedupe_key text,
+    title text NOT NULL,
+    summary text NOT NULL DEFAULT '',
+    urgency text NOT NULL DEFAULT 'normal',
+    state text NOT NULL DEFAULT 'unread',
+    context jsonb NOT NULL DEFAULT '{}'::jsonb,
+    action_prompt text NOT NULL DEFAULT '',
+    due_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    seen_at timestamptz,
+    resolved_at timestamptz,
+    CONSTRAINT calliope_work_items_kind_check
+        CHECK (kind IN ('suggestion','scheduled','goal','blocked','result')),
+    CONSTRAINT calliope_work_items_urgency_check
+        CHECK (urgency IN ('low','normal','high','critical')),
+    CONSTRAINT calliope_work_items_state_check
+        CHECK (state IN ('unread','seen','done','dismissed')),
+    CONSTRAINT calliope_work_items_owner_source_dedupe_key
+        UNIQUE (owner_email,source,dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS calliope_work_items_owner_state_idx
+    ON rvbbit.calliope_work_items (owner_email,state,updated_at DESC);
+CREATE INDEX IF NOT EXISTS calliope_work_items_session_idx
+    ON rvbbit.calliope_work_items (session_id,updated_at DESC) WHERE session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS calliope_work_items_due_idx
+    ON rvbbit.calliope_work_items (due_at)
+    WHERE state IN ('unread','seen') AND due_at IS NOT NULL;
+"""
+
 
 def ensure_tables(conn_factory: Callable[..., Any]) -> None:
     with conn_factory() as conn:
@@ -439,6 +482,7 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
         conn.execute(_STYLE_DDL)
         conn.execute(_HOME_DDL)
         conn.execute(_WATCH_DDL)
+        conn.execute(_INBOX_DDL)
         # A server restart cannot preserve an in-flight SSE/agent task. Clear
         # those abandoned leases now so the per-session concurrency guard does
         # not strand a notebook forever after a crash or deploy.
@@ -446,6 +490,20 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
             "UPDATE rvbbit.calliope_turns "
             "SET status='interrupted',error='warehouse service restarted',"
             "completed_at=coalesce(completed_at,now()) WHERE status='running'"
+        )
+        conn.execute(
+            "INSERT INTO rvbbit.calliope_work_items "
+            "(id,owner_email,session_id,kind,source,source_ref,dedupe_key,title,summary,urgency,context,action_prompt) "
+            "SELECT gen_random_uuid(),s.owner_email,s.id,'blocked','calliope_turn',t.id::text,t.id::text,"
+            "'Calliope work was interrupted',coalesce(nullif(t.error,''),'This turn stopped before Calliope could finish.'),"
+            "'high',jsonb_build_object('turn_id',t.id,'session_id',s.id,'user_message',left(t.user_message,1200)),"
+            "'Resume this interrupted work. Start from the saved notebook context and determine what remains.' "
+            "FROM rvbbit.calliope_turns t JOIN rvbbit.calliope_sessions s ON s.id=t.session_id "
+            "WHERE t.status IN ('failed','interrupted') AND NOT EXISTS ("
+            " SELECT 1 FROM rvbbit.calliope_turns later WHERE later.session_id=t.session_id "
+            " AND later.ordinal>t.ordinal AND later.status='complete'"
+            ") "
+            "ON CONFLICT (owner_email,source,dedupe_key) DO NOTHING"
         )
         _backfill_artifact_attribution(conn)
 
@@ -1931,6 +1989,342 @@ def _bounded_evidence_json(value: Any, depth: int = 0) -> Any:
                 bounded[name] = normalized
         return bounded
     return str(value)[:600]
+
+
+def _bounded_work_context(value: Any) -> dict[str, Any]:
+    """Keep Inbox handoffs inert, compact, and useful as future evidence."""
+    bounded = _bounded_evidence_json(value if value is not None else {})
+    if not isinstance(bounded, dict):
+        bounded = {"value": bounded}
+    serialized = json.dumps(bounded, default=str, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) <= _WORK_CONTEXT_BYTES:
+        return bounded
+    return {
+        "summary": serialized[: _WORK_CONTEXT_BYTES // 2],
+        "truncated": True,
+    }
+
+
+def _work_due_at(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+        except ValueError as exc:
+            raise ValueError("due_at must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("due_at must include a timezone")
+    return parsed
+
+
+def _work_item_json(row: Any) -> dict[str, Any]:
+    raw = _row_json(row)
+    context = raw.get("context") if isinstance(raw.get("context"), dict) else {}
+    open_url = _evidence_url(
+        context.get("open_url") or context.get("url") or context.get("external_url")
+    )
+    thumbnail_url = _evidence_url(context.get("thumbnail_url"))
+    item = {
+        "source": "work",
+        "id": str(raw.get("id")),
+        "kind": str(raw.get("kind") or "suggestion"),
+        "origin": str(raw.get("source") or "hermes"),
+        "source_ref": raw.get("source_ref"),
+        "session_id": str(raw["session_id"]) if raw.get("session_id") else None,
+        "title": str(raw.get("title") or "Calliope work"),
+        "summary": str(raw.get("summary") or ""),
+        "urgency": str(raw.get("urgency") or "normal"),
+        "state": str(raw.get("state") or "unread"),
+        "context": context,
+        "action_prompt": str(raw.get("action_prompt") or ""),
+        "due_at": raw.get("due_at"),
+        "created_at": raw.get("created_at"),
+        "updated_at": raw.get("updated_at"),
+        "seen_at": raw.get("seen_at"),
+        "resolved_at": raw.get("resolved_at"),
+    }
+    if open_url:
+        item["open_url"] = open_url
+    if thumbnail_url:
+        item["thumbnail_url"] = thumbnail_url
+    handle = context.get("handle") or context.get("source_handle")
+    if isinstance(handle, dict):
+        item["handle"] = _bounded_work_context(handle)
+    return item
+
+
+def _watch_event_work_item(row: Any) -> dict[str, Any]:
+    raw = _row_json(row)
+    source = raw.get("source") if isinstance(raw.get("source"), dict) else {}
+    presentation = (
+        raw.get("presentation") if isinstance(raw.get("presentation"), dict) else {}
+    )
+    payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
+    event_kind = str(raw.get("event_kind") or "triggered")
+    title = str(
+        presentation.get("title") or raw.get("name") or "Dashboard value changed"
+    )
+    action_prompt = (
+        f"Investigate this dashboard value and explain why it {event_kind}. "
+        "Use the attached exact semantic-object evidence before proposing any action."
+    )
+    context = {
+        "watch_id": str(raw.get("watch_id")),
+        "event_kind": event_kind,
+        "watch_name": raw.get("name"),
+        "value": float(raw["value"]) if raw.get("value") is not None else None,
+        "threshold": (
+            float(raw["threshold"]) if raw.get("threshold") is not None else None
+        ),
+        "comparator": raw.get("comparator"),
+        "cadence": raw.get("cadence"),
+        "handle": source,
+        "presentation": presentation,
+        "payload": payload,
+    }
+    open_url = _evidence_url(presentation.get("open_url"))
+    thumbnail_url = _evidence_url(presentation.get("thumbnail_url"))
+    if open_url:
+        context["open_url"] = open_url
+    if thumbnail_url:
+        context["thumbnail_url"] = thumbnail_url
+    return {
+        "source": "watch",
+        "id": str(raw.get("event_id")),
+        "kind": "watch",
+        "event_kind": event_kind,
+        "origin": "semantic_watch",
+        "source_ref": str(raw.get("watch_id")),
+        "title": title,
+        "summary": str(raw.get("message") or "A watched dashboard value changed."),
+        "urgency": (
+            "high" if event_kind in {"triggered", "error"} else "low"
+        ),
+        "state": "unread" if raw.get("acknowledged_at") is None else "done",
+        "context": context,
+        "handle": source,
+        "action_prompt": action_prompt,
+        "open_url": open_url,
+        "thumbnail_url": thumbnail_url,
+        "due_at": None,
+        "created_at": raw.get("created_at"),
+        "updated_at": raw.get("created_at"),
+        "seen_at": raw.get("acknowledged_at"),
+        "resolved_at": raw.get("acknowledged_at"),
+    }
+
+
+def publish_work_item(
+    conn_factory: Callable[..., Any],
+    session_id: Any,
+    kind: Any,
+    title: Any,
+    summary: Any = "",
+    urgency: Any = "normal",
+    action_prompt: Any = "",
+    context: Any = None,
+    dedupe_key: Any = None,
+    due_at: Any = None,
+    *,
+    source: str = "hermes",
+    source_ref: Any = None,
+) -> dict[str, Any]:
+    """Publish a private handoff, resolving the recipient from a session capability."""
+    sid = _uuid(session_id)
+    if not sid:
+        raise ValueError("session_id must be a Calliope session UUID")
+    normalized_kind = str(kind or "suggestion").strip().lower()
+    if normalized_kind not in _WORK_KINDS:
+        raise ValueError("kind must be suggestion, scheduled, goal, blocked, or result")
+    normalized_urgency = str(urgency or "normal").strip().lower()
+    if normalized_urgency not in _WORK_URGENCIES:
+        raise ValueError("urgency must be low, normal, high, or critical")
+    clean_title = re.sub(r"\s+", " ", str(title or "")).strip()[:240]
+    if not clean_title:
+        raise ValueError("title is required")
+    clean_summary = str(summary or "").strip()[:4_000]
+    clean_prompt = str(action_prompt or "").strip()[:4_000]
+    clean_source = re.sub(r"[^a-zA-Z0-9_.:-]", "_", str(source or "hermes"))[:80]
+    clean_ref = str(source_ref or "").strip()[:500] or None
+    clean_dedupe = str(dedupe_key or "").strip()[:500] or None
+    bounded_context = _bounded_work_context(context)
+    parsed_due = _work_due_at(due_at)
+    item_id = str(uuid.uuid4())
+    with conn_factory() as conn:
+        session = conn.execute(
+            "SELECT id,owner_email FROM rvbbit.calliope_sessions WHERE id=%s::uuid",
+            (sid,),
+        ).fetchone()
+        if not session:
+            raise LookupError("Calliope session not found")
+        row = conn.execute(
+            "INSERT INTO rvbbit.calliope_work_items "
+            "(id,owner_email,session_id,kind,source,source_ref,dedupe_key,title,summary,"
+            "urgency,state,context,action_prompt,due_at) "
+            "VALUES (%s::uuid,%s,%s::uuid,%s,%s,%s,%s,%s,%s,%s,'unread',%s::jsonb,%s,%s) "
+            "ON CONFLICT (owner_email,source,dedupe_key) DO UPDATE SET "
+            "session_id=EXCLUDED.session_id,kind=EXCLUDED.kind,source_ref=EXCLUDED.source_ref,"
+            "title=EXCLUDED.title,summary=EXCLUDED.summary,urgency=EXCLUDED.urgency,"
+            "state='unread',context=EXCLUDED.context,action_prompt=EXCLUDED.action_prompt,"
+            "due_at=EXCLUDED.due_at,updated_at=now(),seen_at=NULL,resolved_at=NULL "
+            "RETURNING *",
+            (
+                item_id,
+                str(session["owner_email"]),
+                sid,
+                normalized_kind,
+                clean_source,
+                clean_ref,
+                clean_dedupe,
+                clean_title,
+                clean_summary,
+                normalized_urgency,
+                json.dumps(bounded_context, default=str),
+                clean_prompt,
+                parsed_due,
+            ),
+        ).fetchone()
+    return _work_item_json(row)
+
+
+def _inbox_snapshot(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    *,
+    include_resolved: bool = False,
+    limit: Any = 100,
+) -> dict[str, Any]:
+    try:
+        bounded_limit = max(1, min(int(limit or 100), 300))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    work_clause = "" if include_resolved else "AND state IN ('unread','seen')"
+    watch_clause = "" if include_resolved else "AND e.acknowledged_at IS NULL"
+    with conn_factory() as conn:
+        work_rows = conn.execute(
+            "SELECT * FROM rvbbit.calliope_work_items WHERE owner_email=%s "
+            + work_clause
+            + " ORDER BY updated_at DESC LIMIT %s",
+            (owner, bounded_limit),
+        ).fetchall()
+        watch_rows = conn.execute(
+            "SELECT e.*,w.name,w.source,w.presentation,w.comparator,w.cadence "
+            "FROM rvbbit.calliope_watch_events e "
+            "JOIN rvbbit.calliope_watches w ON w.id=e.watch_id "
+            "WHERE w.owner_email=%s "
+            + watch_clause
+            + " ORDER BY e.created_at DESC,e.event_id DESC LIMIT %s",
+            (owner, bounded_limit),
+        ).fetchall()
+        counts = conn.execute(
+            "SELECT "
+            "(SELECT count(*) FROM rvbbit.calliope_work_items WHERE owner_email=%s AND state='unread') "
+            "+ (SELECT count(*) FROM rvbbit.calliope_watch_events e JOIN rvbbit.calliope_watches w "
+            "ON w.id=e.watch_id WHERE w.owner_email=%s AND e.acknowledged_at IS NULL) AS unread,"
+            "(SELECT count(*) FROM rvbbit.calliope_work_items WHERE owner_email=%s "
+            "AND state IN ('unread','seen')) "
+            "+ (SELECT count(*) FROM rvbbit.calliope_watch_events e JOIN rvbbit.calliope_watches w "
+            "ON w.id=e.watch_id WHERE w.owner_email=%s AND e.acknowledged_at IS NULL) AS open",
+            (owner, owner, owner, owner),
+        ).fetchone()
+    items = [*(_work_item_json(row) for row in work_rows), *(
+        _watch_event_work_item(row) for row in watch_rows
+    )]
+    urgency_rank = {"low": 0, "normal": 1, "high": 2, "critical": 3}
+    items.sort(
+        key=lambda item: (
+            item.get("state") == "unread",
+            urgency_rank.get(str(item.get("urgency")), 1),
+            str(item.get("updated_at") or item.get("created_at") or ""),
+        ),
+        reverse=True,
+    )
+    items = items[:bounded_limit]
+    by_kind: dict[str, int] = {}
+    for item in items:
+        key = str(item.get("kind") or "other")
+        by_kind[key] = by_kind.get(key, 0) + 1
+    return {
+        "items": items,
+        "counts": {
+            "unread": int((counts or {}).get("unread") or 0),
+            "open": int((counts or {}).get("open") or 0),
+            "shown": len(items),
+            "by_kind": by_kind,
+        },
+    }
+
+
+def _inbox_item(
+    conn_factory: Callable[..., Any], owner: str, source: Any, item_id: Any
+) -> dict[str, Any] | None:
+    source = str(source or "").strip().lower()
+    if source == "work":
+        iid = _uuid(item_id)
+        if not iid:
+            return None
+        with conn_factory() as conn:
+            row = conn.execute(
+                "SELECT * FROM rvbbit.calliope_work_items WHERE id=%s::uuid AND owner_email=%s",
+                (iid, owner),
+            ).fetchone()
+        return _work_item_json(row) if row else None
+    if source == "watch":
+        try:
+            eid = int(item_id)
+        except (TypeError, ValueError):
+            return None
+        with conn_factory() as conn:
+            row = conn.execute(
+                "SELECT e.*,w.name,w.source,w.presentation,w.comparator,w.cadence "
+                "FROM rvbbit.calliope_watch_events e JOIN rvbbit.calliope_watches w "
+                "ON w.id=e.watch_id WHERE e.event_id=%s AND w.owner_email=%s",
+                (eid, owner),
+            ).fetchone()
+        return _watch_event_work_item(row) if row else None
+    return None
+
+
+def _mutate_inbox_item(
+    conn_factory: Callable[..., Any], owner: str, source: Any, item_id: Any, action: Any
+) -> dict[str, Any] | None:
+    action = str(action or "").strip().lower()
+    if action not in _WORK_STATES:
+        raise ValueError("action must be unread, seen, done, or dismissed")
+    source = str(source or "").strip().lower()
+    if source == "work":
+        iid = _uuid(item_id)
+        if not iid:
+            return None
+        with conn_factory() as conn:
+            row = conn.execute(
+                "UPDATE rvbbit.calliope_work_items SET state=%s,updated_at=now(),"
+                "seen_at=CASE WHEN %s='unread' THEN NULL ELSE coalesce(seen_at,now()) END,"
+                "resolved_at=CASE WHEN %s IN ('done','dismissed') THEN now() ELSE NULL END "
+                "WHERE id=%s::uuid AND owner_email=%s RETURNING *",
+                (action, action, action, iid, owner),
+            ).fetchone()
+        return _work_item_json(row) if row else None
+    if source == "watch":
+        try:
+            eid = int(item_id)
+        except (TypeError, ValueError):
+            return None
+        acknowledged = action != "unread"
+        with conn_factory() as conn:
+            row = conn.execute(
+                "UPDATE rvbbit.calliope_watch_events e SET acknowledged_at="
+                + ("coalesce(e.acknowledged_at,now()) " if acknowledged else "NULL ")
+                + "FROM rvbbit.calliope_watches w WHERE e.watch_id=w.id "
+                "AND e.event_id=%s AND w.owner_email=%s RETURNING e.event_id",
+                (eid, owner),
+            ).fetchone()
+        return _inbox_item(conn_factory, owner, "watch", eid) if row else None
+    return None
 
 
 def _bounded_preview_value(value: Any, depth: int = 0) -> Any:
@@ -4233,6 +4627,7 @@ def _complete_turn(
     status: str = "complete",
     error: str | None = None,
 ) -> None:
+    blocked_context = None
     with conn_factory() as conn:
         conn.execute(
             "UPDATE rvbbit.calliope_turns SET assistant_message=%s,hermes_message_id=%s,"
@@ -4244,6 +4639,38 @@ def _complete_turn(
             "WHERE id=(SELECT session_id FROM rvbbit.calliope_turns WHERE id=%s::uuid)",
             (turn_id,),
         )
+        if status in {"failed", "interrupted"}:
+            blocked_context = conn.execute(
+                "SELECT t.id,t.session_id,t.user_message,t.error,s.title AS session_title "
+                "FROM rvbbit.calliope_turns t JOIN rvbbit.calliope_sessions s "
+                "ON s.id=t.session_id WHERE t.id=%s::uuid",
+                (turn_id,),
+            ).fetchone()
+    if blocked_context:
+        row = dict(blocked_context)
+        try:
+            publish_work_item(
+                conn_factory,
+                row["session_id"],
+                "blocked",
+                "Calliope work needs attention",
+                str(row.get("error") or "This turn stopped before Calliope could finish."),
+                "high",
+                "Resume this interrupted work from the saved notebook context. Determine what completed, what remains, and continue safely.",
+                {
+                    "turn_id": str(row["id"]),
+                    "session_id": str(row["session_id"]),
+                    "session_title": row.get("session_title"),
+                    "user_message": str(row.get("user_message") or "")[:1_200],
+                },
+                str(row["id"]),
+                source="calliope_turn",
+                source_ref=str(row["id"]),
+            )
+        except Exception:
+            # Completing the turn is the durable contract. A transient Inbox
+            # write is backfilled by ensure_tables on the next service start.
+            pass
 
 
 async def _create_session_record(
@@ -5274,6 +5701,237 @@ def register_calliope_routes(
             201,
         )
 
+    @mcp.custom_route("/api/calliope/inbox", methods=["GET"])
+    async def calliope_inbox(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        include_resolved = str(
+            request.query_params.get("include_resolved") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            snapshot = _inbox_snapshot(
+                conn_factory,
+                owner,
+                include_resolved=include_resolved,
+                limit=request.query_params.get("limit") or 100,
+            )
+        except ValueError as exc:
+            return json_response(
+                {"error": {"code": "BAD_INBOX_QUERY", "message": str(exc)}}, 400
+            )
+        return json_response(snapshot)
+
+    @mcp.custom_route(
+        "/api/calliope/inbox/items/{source}/{item_id}", methods=["PATCH"]
+    )
+    async def mutate_calliope_inbox_item(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            item = _mutate_inbox_item(
+                conn_factory,
+                owner,
+                request.path_params["source"],
+                request.path_params["item_id"],
+                (body if isinstance(body, dict) else {}).get("action"),
+            )
+        except ValueError as exc:
+            return json_response(
+                {"error": {"code": "BAD_INBOX_ACTION", "message": str(exc)}}, 400
+            )
+        if not item:
+            return json_response({"error": {"code": "NOT_FOUND"}}, 404)
+        return json_response({"item": item})
+
+    @mcp.custom_route("/api/calliope/inbox/acknowledge-all", methods=["POST"])
+    async def acknowledge_calliope_inbox(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        with conn_factory() as conn:
+            with conn.transaction():
+                work = conn.execute(
+                    "UPDATE rvbbit.calliope_work_items SET state='seen',"
+                    "seen_at=coalesce(seen_at,now()),updated_at=now() "
+                    "WHERE owner_email=%s AND state='unread' RETURNING id",
+                    (owner,),
+                ).fetchall()
+                watches = conn.execute(
+                    "UPDATE rvbbit.calliope_watch_events e "
+                    "SET acknowledged_at=coalesce(e.acknowledged_at,now()) "
+                    "FROM rvbbit.calliope_watches w WHERE e.watch_id=w.id "
+                    "AND w.owner_email=%s AND e.acknowledged_at IS NULL RETURNING e.event_id",
+                    (owner,),
+                ).fetchall()
+        return json_response({"acknowledged": len(work) + len(watches)})
+
+    def inbox_evidence_result(item: dict[str, Any], query: str) -> dict[str, Any]:
+        context = item.get("context") if isinstance(item.get("context"), dict) else {}
+        handle = item.get("handle") if isinstance(item.get("handle"), dict) else {}
+        presentation = (
+            context.get("presentation")
+            if isinstance(context.get("presentation"), dict)
+            else {}
+        )
+        facts = []
+        for label, value in (
+            ("Event", item.get("event_kind") or item.get("kind")),
+            ("Current value", context.get("value")),
+            ("Threshold", context.get("threshold")),
+            ("Due", item.get("due_at")),
+        ):
+            if value not in (None, ""):
+                facts.append({"label": label, "value": str(value)})
+        is_object = handle.get("kind") == "artifact_object"
+        candidate = {
+            "id": f"inbox:{item.get('source')}:{item.get('id')}",
+            "group": "artifacts" if is_object else "knowledge",
+            "kind": "dashboard-object" if is_object else "work-item",
+            "subtype": item.get("event_kind") or item.get("kind"),
+            "title": item.get("title") or "Calliope work",
+            "summary": item.get("summary") or "A saved Calliope work handoff.",
+            "source": (
+                presentation.get("artifact_name")
+                or item.get("origin")
+                or "Calliope Work Inbox"
+            ),
+            "handle": handle,
+            "url": item.get("open_url"),
+            "thumbnail_url": item.get("thumbnail_url"),
+            "occurred_at": item.get("created_at"),
+            "facts": facts,
+            "provenance": {
+                "inbox_source": item.get("source"),
+                "inbox_item_id": item.get("id"),
+                "urgency": item.get("urgency"),
+                "state": item.get("state"),
+                "context": context,
+            },
+        }
+        return _normalize_evidence_search_result(
+            {
+                "items": [candidate],
+                "searched": [
+                    {"key": "work-inbox", "label": "Work Inbox", "count": 1}
+                ],
+            },
+            query,
+        )
+
+    @mcp.custom_route(
+        "/api/calliope/inbox/items/{source}/{item_id}/investigate",
+        methods=["POST"],
+    )
+    async def investigate_calliope_inbox_item(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        item = _inbox_item(
+            conn_factory,
+            owner,
+            request.path_params["source"],
+            request.path_params["item_id"],
+        )
+        if not item:
+            return json_response({"error": {"code": "NOT_FOUND"}}, 404)
+        title = re.sub(r"\s+", " ", str(item.get("title") or "Work item")).strip()
+        query = f"Work Inbox · {title}"[:_MAX_EVIDENCE_QUERY_CHARS]
+        result = inbox_evidence_result(item, query)
+        session = None
+        try:
+            session = await _create_session_record(
+                config,
+                conn_factory,
+                owner,
+                f"Investigate · {title}"[:120],
+            )
+            session, turn, surface = persist_evidence_bundle(
+                session,
+                owner,
+                query,
+                result,
+                origin="calliope_work_inbox",
+            )
+            _mutate_inbox_item(
+                conn_factory, owner, item["source"], item["id"], "seen"
+            )
+        except Exception as exc:
+            if session:
+                await discard_created_session(session)
+            code = "HERMES_UNAVAILABLE" if session is None else "INBOX_HANDOFF_FAILED"
+            return json_response(
+                {"error": {"code": code, "message": str(exc)[:600]}},
+                502 if session is None else 500,
+            )
+        prompt = str(item.get("action_prompt") or "").strip() or (
+            "Help me understand what changed, why it matters, and what I should do next."
+        )
+        url = "/calliope?" + urlencode(
+            {
+                "session": str(session["id"]),
+                "surface": str(surface["id"]),
+                "prompt": prompt,
+            }
+        )
+        return json_response(
+            {
+                "new_session": True,
+                "mode": "inbox_evidence",
+                "session": _session_json(session),
+                "turn": _turn_json(turn),
+                "surface": surface,
+                "url": url,
+            },
+            201,
+        )
+
+    @mcp.custom_route("/api/calliope/inbox/schedule", methods=["POST"])
+    async def schedule_from_calliope_inbox(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        hint = re.sub(
+            r"\s+", " ", str((body if isinstance(body, dict) else {}).get("hint") or "")
+        ).strip()[:600]
+        try:
+            session = await _create_session_record(
+                config, conn_factory, owner, "Schedule · New automation"
+            )
+        except Exception as exc:
+            return json_response(
+                {
+                    "error": {
+                        "code": "HERMES_UNAVAILABLE",
+                        "message": str(exc)[:600],
+                    }
+                },
+                502,
+            )
+        prompt = (
+            "Help me schedule a recurring or one-time task with Hermes. Ask only for "
+            "missing cadence, outcome, or delivery details; use Hermes's native scheduler; "
+            "and arrange for meaningful future results to return to my Calliope Work Inbox."
+        )
+        if hint:
+            prompt += f"\n\nWhat I want to schedule: {hint}"
+        url = "/calliope?" + urlencode(
+            {"session": str(session["id"]), "prompt": prompt}
+        )
+        return json_response(
+            {"new_session": True, "session": _session_json(session), "url": url},
+            201,
+        )
+
     @mcp.custom_route(
         "/api/calliope/sessions/{session_id}/evidence-open",
         methods=["POST"],
@@ -6161,8 +6819,26 @@ def register_calliope_routes(
         )
         spatial_context = _spatial_context_text(spatial_selections, spatial_sources)
         evidence_context = _evidence_context_text(evidence_refs)
+        work_routing_context = (
+            "[CALLIOPE WORK ROUTING — internal]\n"
+            f"Originating Calliope session_id: {session['id']}\n"
+            "Use the RVBBIT MCP tool calliope_work_item with this exact session_id when "
+            "you create scheduled work or a persistent goal, reach a meaningful async "
+            "result, become blocked, or identify a genuinely useful proactive suggestion. "
+            "Do not publish routine tool progress. If you create a Hermes cron job or goal, "
+            "include this session_id and an instruction to call calliope_work_item in the "
+            "future job/goal prompt so its results return to the owning user's Work Inbox.\n"
+            "[/CALLIOPE WORK ROUTING]"
+        )
         prompt_text = "\n\n".join(
-            part for part in (message, spatial_context, evidence_context) if part
+            part
+            for part in (
+                message,
+                spatial_context,
+                evidence_context,
+                work_routing_context,
+            )
+            if part
         )
         if decoded:
             hermes_message: Any = []

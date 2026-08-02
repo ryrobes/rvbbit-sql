@@ -6510,6 +6510,65 @@ def _mcp_tanstack_chart_template():
     return _logged("tanstack_chart_template", {}, tool_tanstack_chart_template)
 
 
+def _mcp_calliope_work_item(
+    session_id,
+    kind,
+    title,
+    summary="",
+    urgency="normal",
+    action_prompt=None,
+    context=None,
+    dedupe_key=None,
+    due_at=None,
+    source_ref=None,
+):
+    """Publish a meaningful handoff to the originating user's Calliope Work Inbox.
+
+    `session_id` must be the exact Calliope session UUID supplied in the current
+    turn's internal work-routing context; it resolves the owner, so this tool
+    intentionally accepts no email or recipient. Use `kind` suggestion,
+    scheduled, goal, blocked, or result after creating scheduled/persistent
+    work, reaching a useful async result, becoming blocked, or finding a truly
+    useful proactive suggestion. Do not publish routine tool progress. For a
+    Hermes cron job or persistent goal, copy the same session UUID and a future
+    call to this tool into the saved job prompt. Reuse `dedupe_key` when later
+    updates should reopen or replace the same logical item.
+    """
+    args = {
+        "session_id": session_id,
+        "kind": kind,
+        "title": title,
+        "summary": summary,
+        "urgency": urgency,
+        "action_prompt": action_prompt,
+        "context": context,
+        "dedupe_key": dedupe_key,
+        "due_at": due_at,
+        "source_ref": source_ref,
+    }
+
+    def publish():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return {"item": calliope.publish_work_item(
+            _conn,
+            session_id,
+            kind,
+            title,
+            summary,
+            urgency,
+            action_prompt,
+            context,
+            dedupe_key,
+            due_at,
+            source_ref=source_ref,
+        )}
+
+    return _logged("calliope_work_item", args, publish)
+
+
 # Data clients injected into every served dashboard. We provide BOTH the hosted
 # rvbbitQuery AND a cowork.callMcpTool shim (routing to the same read-only endpoint), so a
 # Cowork-built artifact (callMcpTool) and a hosted-built one (rvbbitQuery) both run here
@@ -10269,6 +10328,7 @@ def _register(mcp):
     mcp.tool(name="dashboard_dependents")(_mcp_dashboard_dependents)
     mcp.tool(name="dashboard_template")(_mcp_dashboard_template)
     mcp.tool(name="tanstack_chart_template")(_mcp_tanstack_chart_template)
+    mcp.tool(name="calliope_work_item")(_mcp_calliope_work_item)
     mcp.tool(name="live_app_template")(_mcp_live_app_template)
     mcp.tool(name="create_live_app")(_mcp_create_live_app)
     mcp.tool(name="update_live_app")(_mcp_update_live_app)
