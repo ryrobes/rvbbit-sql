@@ -65,6 +65,38 @@ def test_theme_assets_are_shared_by_every_first_party_warehouse_shell():
     assert "/theme/datarabbit.svg" in server
 
 
+def test_navigation_prepaints_the_desktop_and_never_uses_cross_document_snapshots():
+    auth = (_HERE / "auth.py").read_text(encoding="utf-8")
+    server = (_HERE / "server.py").read_text(encoding="utf-8")
+    calliope_css = (_HERE / "calliope" / "calliope.css").read_text(encoding="utf-8")
+    shared_css = (_HERE / "theme" / "warehouse-theme.css").read_text(encoding="utf-8")
+
+    assert 'class="warehouse-desktop-background" aria-hidden="true"' in auth
+    assert 'data-warehouse-background-url="/bg/{bg}.jpg"' in auth
+    assert 'data-warehouse-background-opacity="{image_opacity}"' in auth
+    assert "pick_background(scene_key" in auth
+    assert "scene_key=viewer" in server
+    assert "scene_key=owner" in (_HERE / "calliope.py").read_text(encoding="utf-8")
+    assert "@view-transition" not in shared_css
+    assert "::view-transition" not in shared_css
+    assert "background: var(--void, #100d0b)" in shared_css
+    assert "body > main" in shared_css
+    assert "animation: warehouse-page-in" in shared_css
+    assert "cubic-bezier(.16, 1, .3, 1) backwards" in shared_css
+    assert "@keyframes warehouse-page-in" in shared_css
+    assert "prefers-reduced-motion: reduce" in shared_css
+    assert 'html[data-warehouse-background-bridge]::before' in shared_css
+    assert 'html[data-warehouse-background-bridge="settling"]::before' in shared_css
+    assert 'body[data-warehouse-page="calliope"] > main {' in shared_css
+    assert 'body[data-warehouse-page="calliope"] > main > .stage-column > *' in shared_css
+    assert '<style>html{background:#100d0b}body{background:transparent}</style>' in (
+        _HERE / "calliope" / "index.html"
+    ).read_text(encoding="utf-8")
+    # No shell may re-enable compositor snapshots locally.
+    assert "@view-transition" not in server
+    assert "@view-transition" not in calliope_css
+
+
 def test_theme_pipeline_uses_vibrant_tokens_and_browser_storage():
     source = (_HERE / "theme" / "warehouse-theme.src.js").read_text(encoding="utf-8")
     bundle = (_HERE / "theme" / "warehouse-theme.js").read_text(encoding="utf-8")
@@ -80,6 +112,9 @@ def test_theme_pipeline_uses_vibrant_tokens_and_browser_storage():
     assert "backgroundChoice" in source
     assert "warehouseBackground" in source
     assert "rvbbit-warehouse-color-mode" in source
+    assert "rvbbit-warehouse-background-bridge-v1" in source
+    assert "sessionStorage.setItem(BACKGROUND_BRIDGE_KEY" in source
+    assert "settleBackgroundBridge" in source
     assert "deriveLightWarehouseTokens" in source
     assert "warehouseColorMode" in source
     assert "warehouse-theme-mode-button" in source
@@ -87,6 +122,7 @@ def test_theme_pipeline_uses_vibrant_tokens_and_browser_storage():
     assert "Switch to dark mode" in source
     assert "rvbbit-warehouse-theme-v1" in bundle
     assert "rvbbit-warehouse-color-mode" in bundle
+    assert "rvbbit-warehouse-background-bridge-v1" in bundle
     assert "/theme/library" in bundle
     assert "data-theme-background-mode" in bundle
     assert "warehouseBackground" in bundle
@@ -168,7 +204,12 @@ def test_gallery_calliope_entry_is_a_floating_time_aware_avatar():
     assert 'class="calliope-float-copy"' in server
     assert 'class="calliope-float-action">Open workspace' in server
     assert 'aria-label="Open the full Calliope workspace"' in server
-    assert "view-transition-name:calliope-avatar" in server
+    assert "view-transition" not in server
+    assert "sparkGradientSequence" in server
+    assert "metric-card-area-gradient-" in server
+    assert 'class="metric-card-area-clear" offset="82%"' in server
+    assert 'class="metric-card-area-floor" offset="100%"' in server
+    assert "--metric-card-floor:var(--panel)" in server
     assert 'id="semantic-launch"' in server
     assert 'id="semantic-launch-button"' in server
     assert "/api/calliope/evidence-explorations" in server
@@ -183,3 +224,16 @@ def test_gallery_calliope_entry_is_a_floating_time_aware_avatar():
         '<span class="who"><span data-warehouse-theme-anchor></span>'
         "{_calliope_link}"
     ) not in server
+
+
+def test_gallery_and_pinned_metric_charts_fade_beneath_legible_text():
+    server = (_HERE / "server.py").read_text(encoding="utf-8")
+
+    assert "homeSparkGradientSequence" in server
+    assert "home-metric-area-gradient-" in server
+    assert 'class="home-metric-area-clear" offset="82%"' in server
+    assert 'class="home-metric-area-floor" offset="100%"' in server
+    assert "--home-metric-floor:var(--void)" in server
+    assert ".home-tile.metric .home-tile-main{text-shadow:0 1px 1px" in server
+    assert ".metric-card-content{" in server
+    assert "0 8px 22px color-mix(in oklch,var(--void) 84%,transparent)" in server

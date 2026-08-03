@@ -13,12 +13,14 @@ import { Vibrant } from "node-vibrant/browser";
 
 const STORAGE_KEY = "rvbbit-warehouse-theme-v1";
 const MODE_STORAGE_KEY = "rvbbit-warehouse-color-mode";
+const BACKGROUND_BRIDGE_KEY = "rvbbit-warehouse-background-bridge-v1";
 const DB_NAME = "rvbbit-warehouse-browser";
 const DB_VERSION = 1;
 const DB_STORE = "appearance";
 const DB_KEY = "theme:default";
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const LIBRARY_URL = /^\/theme\/images\/full\/[A-Za-z0-9][A-Za-z0-9_-]{0,160}\.webp$/;
+const BACKGROUND_BRIDGE_URL = /^(?:\/bg\/[A-Za-z0-9_-]{1,80}\.jpg|\/theme\/images\/full\/[A-Za-z0-9][A-Za-z0-9_-]{0,160}\.webp)$/;
 const SOLID_COLOR = /^#[0-9a-f]{6}$/i;
 const ROOT = document.documentElement;
 const SUN_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42"></path></svg>';
@@ -96,6 +98,7 @@ let selectedPalettePromise = null;
 let previewSequence = 0;
 
 applyColorModeRoot();
+applyBackgroundBridgeRoot(preferredBackgroundBridge(current, readBackgroundBridge()));
 applyStoredState(current);
 
 if (document.readyState === "loading") {
@@ -105,6 +108,8 @@ if (document.readyState === "loading") {
 }
 
 function init() {
+  captureBackgroundBridge();
+  settleBackgroundBridge();
   installButton();
   installDialog();
   refreshButton();
@@ -112,6 +117,7 @@ function init() {
     void restoreUploadImage(current);
   }
   window.addEventListener("storage", onStorage);
+  window.addEventListener("pagehide", captureBackgroundBridge);
   window.addEventListener("pagehide", releaseObjectUrl);
   window.WarehouseTheme = Object.freeze({
     open: openDialog,
@@ -120,6 +126,98 @@ function init() {
     getMode: () => colorMode,
     setMode: (mode) => setColorMode(mode),
   });
+}
+
+function normalizedBackgroundBridge(value) {
+  const url = String(value?.url || "");
+  if (!BACKGROUND_BRIDGE_URL.test(url)) return null;
+  const rawOpacity = Number(value?.opacity);
+  return {
+    url,
+    opacity: Number.isFinite(rawOpacity) ? clamp(rawOpacity, .18, 1) : .58,
+  };
+}
+
+function readBackgroundBridge() {
+  try {
+    return normalizedBackgroundBridge(JSON.parse(sessionStorage.getItem(BACKGROUND_BRIDGE_KEY) || "null"));
+  } catch {
+    return null;
+  }
+}
+
+function preferredBackgroundBridge(state, previous) {
+  if (state && themeBackground(state).mode === "solid") return null;
+  if (state?.source?.kind === "library") {
+    return normalizedBackgroundBridge({
+      url: state.source.url,
+      opacity: previous?.url === state.source.url ? previous.opacity : .64,
+    });
+  }
+  return previous;
+}
+
+function applyBackgroundBridgeRoot(value) {
+  const bridge = normalizedBackgroundBridge(value);
+  if (!bridge) return;
+  ROOT.style.setProperty("--warehouse-bridge-wallpaper", cssUrl(bridge.url));
+  ROOT.style.setProperty("--warehouse-bridge-opacity", String(bridge.opacity));
+  ROOT.dataset.warehouseBackgroundBridge = "active";
+}
+
+function captureBackgroundBridge() {
+  if (current && themeBackground(current).mode === "solid") {
+    try {
+      sessionStorage.removeItem(BACKGROUND_BRIDGE_KEY);
+    } catch {
+      // A solid theme already supplies its own synchronous first paint.
+    }
+    return;
+  }
+  const backdrop = document.querySelector(".warehouse-desktop-background");
+  const fallback = {
+    url: backdrop?.dataset.warehouseBackgroundUrl,
+    opacity: backdrop?.dataset.warehouseBackgroundOpacity,
+  };
+  const bridge = preferredBackgroundBridge(current, normalizedBackgroundBridge(fallback));
+  if (!bridge) return;
+  try {
+    sessionStorage.setItem(BACKGROUND_BRIDGE_KEY, JSON.stringify(bridge));
+  } catch {
+    // Navigation still works normally when browser storage is unavailable.
+  }
+}
+
+function settleBackgroundBridge() {
+  if (!ROOT.dataset.warehouseBackgroundBridge) return;
+  const backdrop = document.querySelector(".warehouse-desktop-background");
+  const currentUrl = current?.source?.kind === "library" && themeBackground(current).mode === "image"
+    ? current.source.url
+    : backdrop?.dataset.warehouseBackgroundUrl;
+  if (!BACKGROUND_BRIDGE_URL.test(String(currentUrl || ""))) {
+    clearBackgroundBridgeRoot();
+    return;
+  }
+  const image = new Image();
+  let settled = false;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      ROOT.dataset.warehouseBackgroundBridge = "settling";
+      window.setTimeout(clearBackgroundBridgeRoot, 240);
+    }));
+  };
+  image.addEventListener("load", settle, { once: true });
+  image.addEventListener("error", settle, { once: true });
+  image.src = currentUrl;
+  if (image.complete) settle();
+}
+
+function clearBackgroundBridgeRoot() {
+  delete ROOT.dataset.warehouseBackgroundBridge;
+  ROOT.style.removeProperty("--warehouse-bridge-wallpaper");
+  ROOT.style.removeProperty("--warehouse-bridge-opacity");
 }
 
 function installButton() {
@@ -555,9 +653,13 @@ function clearAppliedTheme() {
 }
 
 function setWallpaper(url) {
-  const escaped = String(url).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-  ROOT.style.setProperty("--warehouse-wallpaper", `url("${escaped}")`);
+  ROOT.style.setProperty("--warehouse-wallpaper", cssUrl(url));
   ROOT.dataset.warehouseWallpaper = "true";
+}
+
+function cssUrl(url) {
+  const escaped = String(url).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+  return `url("${escaped}")`;
 }
 
 async function restoreUploadImage(state) {

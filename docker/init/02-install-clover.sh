@@ -2,9 +2,9 @@
 # First-boot Clover auto-install: when the container starts with
 # RVBBIT_CLOVER_KEY set, fetch the current managed-operator install from the
 # docs site and apply it — one `docker run -e RVBBIT_CLOVER_KEY=...` yields a
-# Postgres where semantic SQL just works. Best-effort by design: offline or
-# airgapped boots log a note and continue (re-run the curl|psql line later).
-set -u
+# Postgres where semantic SQL just works. The extension also ships a known-good
+# catalog snapshot, so offline/airgapped boots can install that cached version.
+set -uo pipefail
 
 if [ -z "${RVBBIT_CLOVER_KEY:-}" ]; then
   echo "rvbbit: RVBBIT_CLOVER_KEY not set — skipping Clover operator install"
@@ -16,8 +16,38 @@ echo "rvbbit: RVBBIT_CLOVER_KEY present — installing Clover operators from ${C
 
 if curl -fsSL --max-time 30 "$CLOVER_INSTALL_URL" \
   | psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"; then
-  echo "rvbbit: Clover operators installed"
+  echo "rvbbit: Clover operators installed from live catalog"
 else
-  echo "rvbbit: Clover install skipped (fetch or apply failed) — run manually:"
-  echo "  curl -fsSL ${CLOVER_INSTALL_URL} | psql \$DSN"
+  echo "rvbbit: live Clover install unavailable — applying shipped catalog snapshot"
+  if psql -X -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+DO $cached_clover$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM rvbbit.capability_catalog
+    WHERE id = 'managed/clover'
+      AND active
+      AND jsonb_typeof(manifest #> '{managed,install,sql}') = 'array'
+      AND jsonb_array_length(manifest #> '{managed,install,sql}') > 0
+  ) THEN
+    RAISE EXCEPTION 'managed/clover shipped snapshot is unavailable';
+  END IF;
+END
+$cached_clover$;
+
+SELECT step
+FROM rvbbit.capability_catalog c
+CROSS JOIN LATERAL jsonb_array_elements_text(c.manifest #> '{managed,install,sql}')
+  WITH ORDINALITY AS s(step, ordinal)
+WHERE c.id = 'managed/clover'
+  AND c.active
+ORDER BY ordinal
+\gexec
+SQL
+  then
+    echo "rvbbit: Clover operators installed from shipped snapshot"
+  else
+    echo "rvbbit: Clover install failed from both live and shipped catalogs — run manually:"
+    echo "  curl -fsSL ${CLOVER_INSTALL_URL} | psql \$DSN"
+  fi
 fi

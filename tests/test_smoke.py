@@ -64,7 +64,16 @@ def test_capability_catalog_seeded(rvbbit):
             WHERE active
               AND kind = 'sql_test_pack'
               AND id IN ('sql/core-workflows', 'sql/workflow-visuals')
-          ) AS sql_test_entries
+          ) AS sql_test_entries,
+          count(*) FILTER (
+            WHERE active
+              AND id = 'managed/clover'
+              AND catalog_source = 'url:rvbbit.ai/catalog.json'
+              AND catalog_entry->>'catalog_url' = 'https://rvbbit.ai/catalog.json'
+              AND coalesce((catalog_entry->>'catalog_seed_snapshot')::boolean, false)
+              AND operators @> ARRAY['clover_embed']::text[]
+              AND jsonb_array_length(manifest #> '{managed,install,sql}') >= 127
+          ) AS managed_snapshot_entries
         FROM rvbbit.capability_catalog
         """
     ).fetchone()
@@ -74,6 +83,32 @@ def test_capability_catalog_seeded(rvbbit):
     assert row[3] == 1
     assert row[4] == 1
     assert row[5] == 2
+    assert row[6] == 1
+
+
+def test_capability_catalog_reseed_preserves_refreshed_managed_row(rvbbit):
+    """The bundled URL snapshot must never replace a newer live import."""
+    rvbbit.execute("BEGIN")
+    try:
+        rvbbit.execute(
+            """
+            UPDATE rvbbit.capability_catalog
+            SET catalog_entry = catalog_entry || '{"live_refresh_marker":true}'::jsonb,
+                catalog_source = 'url:rvbbit.ai/catalog.json'
+            WHERE id = 'managed/clover'
+            """
+        )
+        rvbbit.execute("SELECT rvbbit.seed_capability_catalog()")
+        row = rvbbit.execute(
+            """
+            SELECT catalog_entry->>'live_refresh_marker'
+            FROM rvbbit.capability_catalog
+            WHERE id = 'managed/clover'
+            """
+        ).fetchone()
+        assert row == ("true",)
+    finally:
+        rvbbit.execute("ROLLBACK")
 
 
 def test_sql_test_catalog_acceptance_packs_execute(rvbbit):

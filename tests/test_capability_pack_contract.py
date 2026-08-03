@@ -345,6 +345,67 @@ def test_catalog_json_flattens_gpu_weight_estimates():
     assert not bad, "catalog JSON must expose flattened GPU weight estimates: " + "; ".join(bad)
 
 
+def test_managed_clover_pack_ships_refreshable_offline_snapshot():
+    proc = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "catalog",
+            "seed-json",
+            "--root",
+            str(PACKS),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    doc = json.loads(proc.stdout)
+    item = next(
+        entry
+        for entry in doc["capabilities"]
+        if entry["catalog_entry"]["id"] == "managed/clover"
+    )
+    catalog = item["catalog_entry"]
+    manifest = item["capability_manifest"]
+
+    assert catalog["catalog_url"] == "https://rvbbit.ai/catalog.json"
+    assert catalog["catalog_refresh_seconds"] == 21600
+    assert catalog["catalog_seed_snapshot"] is True
+    assert "clover_embed" in catalog["operators"]
+    assert any(
+        "clover_embed" in statement
+        for statement in manifest["managed"]["install"]["sql"]
+    )
+
+    pack = PACKS / "managed" / "clover"
+    register = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "register",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    compose = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "compose",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    assert "create_operator('clover_embed'" in register
+    assert "services:" not in compose
+    assert "no Docker sidecar" in compose
+
+
 def test_release_catalog_can_emit_image_mode_runtimes():
     proc = subprocess.run(
         [

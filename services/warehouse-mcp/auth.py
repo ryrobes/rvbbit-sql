@@ -24,6 +24,7 @@ from __future__ import annotations
 # pydantic model generics + list invariance trip Pyright's strict checks; correct at runtime.
 # pyright: reportArgumentType=false
 import asyncio
+import hashlib
 import hmac
 import html
 import json
@@ -54,6 +55,12 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 LOGIN_PASSWORD = os.environ.get("WAREHOUSE_LOGIN_PASSWORD", "")
 ALLOWED_EMAILS = {e.strip().lower() for e in os.environ.get("WAREHOUSE_ALLOWED_EMAILS", "").split(",") if e.strip()}
 STATIC_KEY = os.environ.get("WAREHOUSE_MCP_KEY", "")        # legacy shared-key (Claude Code)
+# A shared bearer has no person-shaped identity of its own.  Keep its auth
+# mechanism visible as client_id="static-key", but let an installation name
+# the long-lived service principal used by legacy Hermes/Calliope traffic.
+# OAuth access tokens never use this fallback: their verified `sub` remains the
+# caller.  The default preserves existing installations byte-for-byte.
+STATIC_CALLER = os.environ.get("WAREHOUSE_MCP_STATIC_CALLER", "").strip().lower() or "static-key"
 # The JWT signing secret MUST be independent of STATIC_KEY: that key is *handed to
 # users* (it rides in their Authorization header, so it's in client configs, shell
 # history, proxy logs). Reusing it to sign HS256 would let any key-holder forge a
@@ -279,7 +286,8 @@ class WarehouseAuthProvider:
     # — access-token validation, called on every /mcp request —
     async def load_access_token(self, token: str):
         if STATIC_KEY and hmac.compare_digest(token, STATIC_KEY):
-            return _AccessToken(token=token, client_id="static-key", scopes=[SCOPE], expires_at=None, email="static-key")
+            return _AccessToken(token=token, client_id="static-key", scopes=[SCOPE],
+                                expires_at=None, email=STATIC_CALLER)
         try:
             claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG], audience=self.audience, issuer=self.public)
         except Exception:   # noqa: BLE001 — any decode/signature/expiry failure → unauthenticated
@@ -647,7 +655,9 @@ def _finish_login(request: Request, provider, identity: str, txn: str, nxt: str,
 # Scenes lifted from the DataRabbit wallpaper set (rvbbit-lens
 # public/wallpapers/4k), downscaled for the web. They're chosen to already sit
 # in the warm near-black palette, so they blend rather than fight the chrome.
-# One is picked per request — the room is the same, the light isn't.
+# Authenticated shells pass the viewer identity as a stable scene key so a
+# Gallery -> Calliope navigation never swaps the room under their feet.  The
+# unauthenticated login page still gets a fresh scene on each visit.
 #
 # Lives here rather than in server.py because the LOGIN page needs it before
 # any session exists, and auth.py is the module server.py imports (not the
@@ -658,19 +668,29 @@ BACKGROUNDS = ("the_flooded_core", "dead_zone", "the_black_site",
 _BG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backgrounds")
 
 
-def pick_background() -> str:
-    """A different scene each visit. secrets over random: no reason to hold a
-    seeded PRNG's state for this, and it costs nothing."""
+def pick_background(scene_key: str | None = None) -> str:
+    """Choose a stable per-viewer scene, or a fresh one when no viewer exists."""
+    if scene_key:
+        digest = hashlib.sha256(scene_key.strip().casefold().encode("utf-8")).digest()
+        return BACKGROUNDS[int.from_bytes(digest[:8], "big") % len(BACKGROUNDS)]
     return secrets.choice(BACKGROUNDS)
 
 
-def background_layer(image_opacity: float, veil: str) -> str:
-    """The two-element backdrop: the photo, then a scrim that pushes it back
-    under the palette. Callers set how loud it is — the login page can afford
-    atmosphere, an index full of content cannot."""
-    bg = pick_background()
-    return (f'<div class=bg style="background-image:url(/bg/{bg}.jpg);opacity:{image_opacity}"></div>'
-            f'<div class=veil style="background:{veil}"></div>')
+def background_layer(image_opacity: float, veil: str, scene_key: str | None = None) -> str:
+    """The shared desktop backdrop: photo plus the scrim that pushes it back.
+
+    The named wrapper lets cross-document view transitions keep this layer in
+    place while page chrome/content enters independently.  Callers still set
+    how loud it is — the login page can afford atmosphere, an index full of
+    content cannot.
+    """
+    bg = pick_background(scene_key)
+    return ('<div class="warehouse-desktop-background" aria-hidden="true" '
+            f'data-warehouse-background-url="/bg/{bg}.jpg" '
+            f'data-warehouse-background-opacity="{image_opacity}">'
+            f'<div class=bg style="background-image:url(/bg/{bg}.jpg);opacity:{image_opacity}"></div>'
+            f'<div class=veil style="background:{veil}"></div>'
+            '</div>')
 
 
 _BG_CSS = """

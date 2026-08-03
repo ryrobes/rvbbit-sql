@@ -3,6 +3,90 @@
  * first-party Warehouse pages; authored dashboard/app documents and their
  * iframes intentionally do not receive it.
  */
+/* Do not opt first-party pages into cross-document View Transitions. Browser
+   compositor snapshots can expose their default canvas between documents,
+   which is especially glaring in dark mode. Each destination paints its own
+   desktop first, then animates only these foreground shells on entry. */
+html {
+  background: var(--void, #100d0b);
+}
+
+.warehouse-desktop-background {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* A tiny same-origin navigation bridge. The outgoing page records its actual
+   wallpaper URL; the incoming head restores it on this root pseudo before its
+   body exists, then fades it once the real backdrop has decoded. */
+html[data-warehouse-background-bridge]::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -3;
+  pointer-events: none;
+  background-color: var(--void, #100d0b);
+  background-image: var(--warehouse-bridge-wallpaper);
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+  opacity: var(--warehouse-bridge-opacity, .58);
+  filter: saturate(.72) contrast(1.04);
+  transition: opacity .22s ease-out;
+}
+
+html[data-warehouse-background-bridge="settling"]::before {
+  opacity: 0;
+}
+
+.warehouse-desktop-background > .bg,
+.warehouse-desktop-background > .veil {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.warehouse-desktop-background > .bg {
+  z-index: 0;
+}
+
+.warehouse-desktop-background > .veil {
+  z-index: 1;
+}
+
+body > nav,
+body > main,
+body > .card,
+body > .gate,
+body > .calliope-float {
+  animation: warehouse-page-in .24s cubic-bezier(.16, 1, .3, 1) backwards;
+}
+
+/* Keep Calliope's glass surfaces outside animated stacking contexts. A
+   transformed notebook/topbar becomes a backdrop root and prevents the panes'
+   backdrop-filter from sampling the wallpaper. Animate their contents only. */
+body[data-warehouse-page="calliope"] > nav,
+body[data-warehouse-page="calliope"] > main {
+  animation: none;
+}
+
+body[data-warehouse-page="calliope"] > nav > *,
+body[data-warehouse-page="calliope"] > main > .sessions-column > *,
+body[data-warehouse-page="calliope"] > main > .stage-column > *,
+body[data-warehouse-page="calliope"] > main > .chat-column > * {
+  animation: warehouse-page-in .24s cubic-bezier(.16, 1, .3, 1) backwards;
+}
+
+@keyframes warehouse-page-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px) scale(.996);
+  }
+}
+
 :root[data-warehouse-color-mode="light"] {
   color-scheme: light;
   --background: oklch(97% 0.008 85);
@@ -981,6 +1065,16 @@ html[data-warehouse-color-mode="light"] ::-webkit-scrollbar-thumb {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  body > nav,
+  body > main,
+  body > .card,
+  body > .gate,
+  body > .calliope-float,
+  body[data-warehouse-page="calliope"] > nav > *,
+  body[data-warehouse-page="calliope"] > main > .sessions-column > *,
+  body[data-warehouse-page="calliope"] > main > .stage-column > *,
+  body[data-warehouse-page="calliope"] > main > .chat-column > *,
+
   .warehouse-theme-button,
   .warehouse-theme-mode-button,
   .warehouse-theme-tile {

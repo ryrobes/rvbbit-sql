@@ -319,6 +319,21 @@ also stamps the queued `rvbbit.warren_jobs` row with the catalog's
 `backend_name`, `runtime_name`, and first `operator_name` when those values are
 known, so the UI can show install intent before a Warren claims the job.
 
+### Managed URL catalogs and offline snapshots
+
+Managed capabilities may declare `catalog_url`, `catalog_refresh_seconds`, and
+`catalog_seed_snapshot` in their pack metadata. A release embeds that manifest
+in the extension seed as a known-good offline snapshot. `seed_capability_catalog()`
+inserts snapshot rows only when they are absent; later migrations therefore
+cannot overwrite a newer row already imported from the live URL.
+
+Lens refreshes due URL-backed managed catalogs while the capability browser is
+open and always attempts a refresh immediately before install. Imports do not
+prune cached rows. If the URL is unreachable or malformed, the existing
+database manifest remains available and the install UI explicitly falls back
+to it. The first-boot Clover installer follows the same contract: live installer
+first, then the shipped `managed/clover` SQL when offline.
+
 GPU-capable model packs may publish `resources.gpu`. The catalog flattens the
 most important values into `gpu_required`, `model_size_bytes`, and
 `vram_required_bytes` for UI cards and Warren admission checks. V1 treats this

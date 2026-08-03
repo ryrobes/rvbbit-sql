@@ -244,6 +244,9 @@ services:
       WAREHOUSE_STATE_FILE: /app/data/oauth_state.json   # survives restarts (no re-add of connectors)
       # Shared-key fallback (Claude Code / optional):
       WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:-}
+      # Optional audit principal for that shared bearer. The auth mechanism
+      # remains client_id=static-key; verified OAuth email callers always win.
+      WAREHOUSE_MCP_STATIC_CALLER: ${WAREHOUSE_MCP_STATIC_CALLER:-}
       # The Hub (docs/HUB_PLAN.md): hub_url in tool responses points at the
       # lens host; auto-thumbnails persist under the shared capture volume
       # and serve at /thumbs (lens proxies them at /api/rvbbit/thumb).

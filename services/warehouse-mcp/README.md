@@ -90,6 +90,10 @@ python server.py --http     # serves :8765; behind your proxy at WAREHOUSE_PUBLI
 
 **Shared key (Claude Code / scripts).** No `WAREHOUSE_PUBLIC_URL`; gate on a static
 bearer. Still accepted in OAuth mode too, so Code keeps working alongside the UI flow.
+Because a shared bearer contains no user identity, its activity caller defaults to
+`static-key`. Set `WAREHOUSE_MCP_STATIC_CALLER` to the legacy service email/name when
+one shared integration should retain its old attribution. The audit `client_id` remains
+`static-key`, and a verified OAuth token's email always takes precedence over this fallback.
 
 ### Google Sign-In (optional, recommended)
 Adds a **Sign in with Google** button to the login page. We stay the OAuth *server*
@@ -733,7 +737,9 @@ disable queueing and the worker) · `WAREHOUSE_SEMANTIC_ENRICH_MODEL` (default
 `WAREHOUSE_SEMANTIC_ENRICH_SOURCE_CHARS` (default `180000`). The database process—not
 Warehouse MCP—executes the agent operator, so its configured backend must have the matching
 provider key (for the default model, `OPENROUTER_API_KEY`).
-**Shared-key mode:** `WAREHOUSE_MCP_KEY` (bearer; unset = auth OFF, dev only).
+**Shared-key mode:** `WAREHOUSE_MCP_KEY` (bearer; unset = auth OFF, dev only) ·
+`WAREHOUSE_MCP_STATIC_CALLER` (optional legacy caller label/email; auth `client_id`
+stays `static-key`, default caller is `static-key`).
 
 ## Deferred to Phase 1+
 Per-user identity → scoped role (tools run as the *caller's* scope), PII masking in

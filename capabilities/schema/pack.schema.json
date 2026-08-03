@@ -39,6 +39,18 @@
       "enum": ["public", "example", "internal"],
       "default": "public"
     },
+    "catalog_url": {
+      "type": "string",
+      "format": "uri"
+    },
+    "catalog_refresh_seconds": {
+      "type": "integer",
+      "minimum": 60
+    },
+    "catalog_seed_snapshot": {
+      "type": "boolean",
+      "default": false
+    },
     "system_runtime": {
       "type": "boolean",
       "default": false

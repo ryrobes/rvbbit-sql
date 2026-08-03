@@ -10,6 +10,7 @@ forged or wrong-audience token through unnoticed.
 """
 from __future__ import annotations
 # pyright: reportMissingImports=false
+import asyncio
 import importlib
 import os
 import sys
@@ -133,6 +134,59 @@ for label, ok in (("state resolves to (txn, next, nonce)", first == ("txn-1", "/
                   ("replayed state is consumed", second is None)):
     results.append(ok)
     print(f"  {'PASS' if ok else '*** FAIL ***':12} {label:40}")
+
+print("\nshared-key caller attribution")
+os.environ.update({
+    **BASE_ENV,
+    "WAREHOUSE_MCP_KEY": "unit-test-static-key",
+    "WAREHOUSE_MCP_STATIC_CALLER": " Calliope@Acme.com ",
+})
+importlib.reload(auth)
+provider = auth.WarehouseAuthProvider("https://warehouse.example")
+static_access = asyncio.run(provider.load_access_token("unit-test-static-key"))
+configured = bool(
+    static_access
+    and static_access.email == "calliope@acme.com"
+    and static_access.client_id == "static-key"
+)
+results.append(configured)
+print(f"  {'PASS' if configured else '*** FAIL ***':12} "
+      f"{'legacy caller named, auth method retained':40}")
+
+now = int(time.time())
+oauth_jwt = jwt.encode(
+    {
+        "iss": provider.public,
+        "sub": "ryan@acme.com",
+        "aud": provider.audience,
+        "client_id": "oauth-client",
+        "scope": auth.SCOPE,
+        "iat": now,
+        "exp": now + 3600,
+    },
+    auth.JWT_SECRET,
+    algorithm=auth.JWT_ALG,
+)
+oauth_access = asyncio.run(provider.load_access_token(oauth_jwt))
+oauth_wins = bool(
+    oauth_access
+    and oauth_access.email == "ryan@acme.com"
+    and oauth_access.client_id == "oauth-client"
+)
+results.append(oauth_wins)
+print(f"  {'PASS' if oauth_wins else '*** FAIL ***':12} "
+      f"{'verified OAuth email wins over fallback':40}")
+
+os.environ.update({**BASE_ENV, "WAREHOUSE_MCP_KEY": "unit-test-static-key",
+                   "WAREHOUSE_MCP_STATIC_CALLER": ""})
+importlib.reload(auth)
+default_access = asyncio.run(
+    auth.WarehouseAuthProvider("https://warehouse.example").load_access_token("unit-test-static-key")
+)
+default_preserved = bool(default_access and default_access.email == "static-key")
+results.append(default_preserved)
+print(f"  {'PASS' if default_preserved else '*** FAIL ***':12} "
+      f"{'unset fallback preserves old default':40}")
 
 print(f"\n{sum(results)}/{len(results)} checks passed")
 sys.exit(0 if all(results) else 1)

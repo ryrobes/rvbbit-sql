@@ -12,7 +12,7 @@
     },
     "kind": {
       "type": "string",
-      "enum": ["hf_backend", "runtime_sidecar", "llm_provider", "sql_test_pack"]
+      "enum": ["hf_backend", "runtime_sidecar", "llm_provider", "sql_test_pack", "managed"]
     },
     "name": {
       "type": "string",
@@ -209,7 +209,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["name", "arg_names", "return_type"],
+        "required": ["name"],
         "additionalProperties": false,
         "properties": {
           "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
@@ -258,6 +258,28 @@
         }
       }
     },
+    "managed": {
+      "type": "object",
+      "required": ["vendor", "entitlement", "key_env", "install"],
+      "additionalProperties": true,
+      "properties": {
+        "vendor": { "type": "string" },
+        "status": { "type": "string" },
+        "entitlement": { "type": "string" },
+        "key_env": { "type": "string" },
+        "install": {
+          "type": "object",
+          "required": ["sql"],
+          "additionalProperties": true,
+          "properties": {
+            "sql": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
     "smoke": {
       "type": "object",
       "additionalProperties": false,
@@ -292,6 +314,18 @@
     {
       "if": { "properties": { "kind": { "const": "runtime_sidecar" } } },
       "then": { "required": ["runtime", "runtime_registration"] }
+    },
+    {
+      "if": { "properties": { "kind": { "not": { "const": "managed" } } } },
+      "then": {
+        "properties": {
+          "operators": {
+            "items": {
+              "required": ["name", "arg_names", "return_type"]
+            }
+          }
+        }
+      }
     }
   ]
 }

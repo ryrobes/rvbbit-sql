@@ -125,6 +125,11 @@ zero-shot classifiers, language detection, sentiment, emotion, toxicity, the
 managed Python runtime, and row-oriented JSONB operators for classifying,
 reranking, and predicting over tabular records.
 
+`managed/clover` is also shipped as a seed-only snapshot. Its pack metadata
+points at `https://rvbbit.ai/catalog.json`; connected Lens installs refresh that
+authority before applying SQL, while offline installs retain and can execute
+the packaged manifest.
+
 ## Install Pattern
 
 1. Build/run the generated sidecar.

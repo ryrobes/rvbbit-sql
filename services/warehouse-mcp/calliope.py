@@ -13077,6 +13077,7 @@ def register_calliope_routes(
             0.74,
             "radial-gradient(1000px 700px at 58% -15%, rgba(32,67,64,.10), transparent 67%),"
             "linear-gradient(to bottom,rgba(16,13,11,.10),rgba(16,13,11,.40) 86%)",
+            scene_key=owner,
         )
         html = (
             template.replace("__CALLIOPE_BACKGROUND__", background)

@@ -26,6 +26,8 @@ OAuth mode (for Claude Desktop/Cowork's native connector) — set a public URL:
                              with '@' (e.g. "@acme.com" allows anyone @acme.com). Empty = any email + pw.
   WAREHOUSE_JWT_SECRET       REQUIRED in OAuth mode; token-signing secret — MUST be
                              independent of WAREHOUSE_MCP_KEY (users hold that one)
+  WAREHOUSE_MCP_STATIC_CALLER optional caller label/email for the legacy shared bearer;
+                             client_id remains "static-key" (default caller: "static-key")
 """
 from __future__ import annotations
 # psycopg's dict_row factory + sql.SQL composition trip Pyright's strict overloads
@@ -9254,9 +9256,6 @@ _LANDING_CSS = """
   --sans:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   --serif:"Iowan Old Style",Baskerville,"Times New Roman",serif;
 }
-@view-transition{navigation:auto}
-::view-transition-group(calliope-avatar){
-  animation-duration:.38s;animation-timing-function:cubic-bezier(.2,.8,.2,1)}
 /* The base colour lives on <html> and NOWHERE else. body must stay
    transparent: a negative-z-index layer paints BEFORE in-flow backgrounds, so
    an opaque body background hides .bg completely (it did — measured at zero
@@ -9347,8 +9346,7 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
 .calliope-float-avatar{
   width:44px;height:44px;flex:none;overflow:hidden;border:1px solid var(--line-hot);
   border-radius:50%;background:var(--panel-raised);
-  box-shadow:0 0 0 3px var(--amber-soft),0 7px 20px rgba(0,0,0,.38);
-  view-transition-name:calliope-avatar}
+  box-shadow:0 0 0 3px var(--amber-soft),0 7px 20px rgba(0,0,0,.38)}
 .calliope-float-avatar[data-period=night]{
   border-color:color-mix(in oklch,var(--jade) 58%,transparent);
   box-shadow:0 0 0 3px var(--jade-soft),0 7px 20px rgba(0,0,0,.42)}
@@ -9393,6 +9391,7 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   box-shadow:inset 0 1px 0 rgba(255,255,255,.025);transition:border-color .18s,transform .18s,background .18s}
 .home-tile:hover{transform:translateY(-1px);border-color:color-mix(in oklch,var(--jade) 34%,var(--line));background:linear-gradient(145deg,color-mix(in oklch,var(--panel-raised) 96%,var(--jade) 4%),var(--void))}
 .home-tile.object::before{content:"";position:absolute;z-index:2;inset:0 auto 0 0;width:2px;background:var(--jade);opacity:.72}
+.home-tile.metric{--home-metric-trend:var(--jade);--home-metric-floor:var(--void)}
 .home-tile.metric::before{content:"";position:absolute;z-index:2;inset:0 auto 0 0;width:2px;background:var(--amber);opacity:.78}
 .home-tile.unavailable{opacity:.66}
 .home-tile-content{display:grid;grid-template-columns:74px minmax(0,1fr);min-height:132px}
@@ -9414,7 +9413,7 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .home-kicker i{width:5px;height:5px;border-radius:50%;background:currentColor;box-shadow:0 0 9px color-mix(in oklch,currentColor 55%,transparent)}
 .home-tile.artifact .home-kicker{color:var(--amber)}
 .home-tile.metric .home-kicker{color:var(--amber)}
-.home-metric-spark{position:absolute;z-index:0;inset:28px 0 26px;opacity:.52;pointer-events:none}.home-metric-spark svg{display:block;width:100%;height:100%}.home-metric-spark path:first-child{fill:color-mix(in oklch,var(--jade) 9%,transparent)}.home-metric-spark path:last-child{fill:none;stroke:var(--jade);stroke-width:2;vector-effect:non-scaling-stroke}.home-tile.metric .home-value{font-size:28px;text-shadow:0 2px 10px var(--void)}
+.home-metric-spark{position:absolute;z-index:0;inset:28px 0 26px;opacity:.52;pointer-events:none}.home-metric-spark svg{display:block;width:100%;height:100%}.home-metric-area-top{stop-color:var(--home-metric-trend);stop-opacity:.24}.home-metric-area-mid{stop-color:var(--home-metric-trend);stop-opacity:.07}.home-metric-area-clear{stop-color:var(--home-metric-floor);stop-opacity:0}.home-metric-area-floor{stop-color:var(--home-metric-floor);stop-opacity:.96}.home-metric-line{fill:none;stroke:var(--home-metric-trend);stroke-width:2;vector-effect:non-scaling-stroke;filter:drop-shadow(0 0 6px color-mix(in oklch,var(--home-metric-trend) 38%,transparent))}.home-tile.metric .home-tile-main{text-shadow:0 1px 1px color-mix(in oklch,var(--void) 98%,transparent),0 2px 6px color-mix(in oklch,var(--void) 94%,transparent),0 7px 18px color-mix(in oklch,var(--void) 80%,transparent)}.home-tile.metric .home-value{font-size:28px}
 .home-tile h3{overflow:hidden;color:var(--bone-bright);font:italic 400 16px/1.17 var(--serif);text-overflow:ellipsis;white-space:nowrap}
 .home-tile-desc{display:-webkit-box;overflow:hidden;margin-top:5px;color:var(--fog);font-size:8px;line-height:1.45;-webkit-box-orient:vertical;-webkit-line-clamp:2}
 .home-value{min-height:25px;margin:4px 0 1px;color:var(--bone-bright);font:600 22px/1.05 var(--sans);letter-spacing:-.025em}
@@ -9617,12 +9616,12 @@ _GALLERY_METRICS_CSS = """
 .metric-relation-filter{display:inline-flex;border:1px solid var(--line)}.metric-relation-filter button{height:28px;padding:0 9px;border:0;border-right:1px solid var(--line);background:transparent;color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;cursor:pointer}.metric-relation-filter button:last-child{border:0}.metric-relation-filter button:hover{color:var(--jade)}.metric-relation-filter button[aria-pressed=true]{background:var(--jade-soft);color:var(--jade)}
 .metric-browser-status,.metric-gallery-empty{min-height:190px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:var(--dim);font:8px/1.5 var(--mono);letter-spacing:.08em;text-align:center;text-transform:uppercase}.metric-browser-status[hidden],.metric-gallery-empty[hidden]{display:none}.metric-browser-status i{width:21px;height:21px;border:1px solid var(--jade);border-right-color:transparent;border-radius:50%;animation:semantic-spin .75s linear infinite}.metric-browser-status.error{color:#f2a28f}.metric-browser-status.error i{display:none}.metric-gallery-empty strong{color:var(--fog);font:italic 400 18px/1.2 var(--serif);letter-spacing:0;text-transform:none}.metric-gallery-empty span{font-size:7px}
 .metric-gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:1px;margin-top:1px;border:1px solid var(--line);background:var(--line)}.metric-gallery-grid:empty{display:none}
-.metric-gallery-card{position:relative;min-height:280px;overflow:hidden;background:linear-gradient(145deg,color-mix(in oklch,var(--panel) 95%,var(--jade) 5%),var(--panel));cursor:pointer;isolation:isolate;transition:background .22s,transform .2s}.metric-gallery-card:hover{z-index:2;background:linear-gradient(145deg,color-mix(in oklch,var(--panel-2) 90%,var(--jade) 10%),var(--panel-2))}.metric-gallery-card:focus-within{z-index:3;outline:1px solid var(--jade);outline-offset:-1px}
+.metric-gallery-card{--metric-card-trend:var(--jade);--metric-card-floor:var(--panel);position:relative;min-height:280px;overflow:hidden;background:linear-gradient(145deg,color-mix(in oklch,var(--panel) 95%,var(--jade) 5%),var(--panel));cursor:pointer;isolation:isolate;transition:background .22s,transform .2s}.metric-gallery-card:hover{--metric-card-floor:var(--panel-2);z-index:2;background:linear-gradient(145deg,color-mix(in oklch,var(--panel-2) 90%,var(--jade) 10%),var(--panel-2))}.metric-gallery-card:focus-within{z-index:3;outline:1px solid var(--jade);outline-offset:-1px}.metric-gallery-card.bad{--metric-card-trend:#df765f}
 .metric-card-grid{position:absolute;z-index:-1;inset:0;opacity:.62;background-image:linear-gradient(color-mix(in oklch,var(--bone) 4%,transparent) 1px,transparent 1px),linear-gradient(90deg,color-mix(in oklch,var(--bone) 3%,transparent) 1px,transparent 1px);background-size:100% 25%,16.66% 100%;mask-image:linear-gradient(to top,#000,transparent 92%)}
-.metric-card-chart{position:absolute;z-index:-1;inset:50px 0 0;opacity:.72;pointer-events:none}.metric-card-chart svg{width:100%;height:100%;display:block;overflow:visible}.metric-card-area{fill:color-mix(in oklch,var(--jade) 11%,transparent)}.metric-card-line{fill:none;stroke:var(--jade);stroke-width:1.8;vector-effect:non-scaling-stroke;filter:drop-shadow(0 0 7px color-mix(in oklch,var(--jade) 42%,transparent))}.metric-gallery-card.bad .metric-card-line{stroke:#df765f}.metric-gallery-card.bad .metric-card-area{fill:color-mix(in oklch,#df765f 10%,transparent)}
+.metric-card-chart{position:absolute;z-index:-1;inset:50px 0 0;opacity:.72;pointer-events:none}.metric-card-chart svg{width:100%;height:100%;display:block;overflow:visible}.metric-card-area-top{stop-color:var(--metric-card-trend);stop-opacity:.24}.metric-card-area-mid{stop-color:var(--metric-card-trend);stop-opacity:.07}.metric-card-area-clear{stop-color:var(--metric-card-floor);stop-opacity:0}.metric-card-area-floor{stop-color:var(--metric-card-floor);stop-opacity:.96}.metric-card-line{fill:none;stroke:var(--metric-card-trend);stroke-width:1.8;vector-effect:non-scaling-stroke;filter:drop-shadow(0 0 7px color-mix(in oklch,var(--metric-card-trend) 42%,transparent))}
 .metric-card-open{position:absolute;z-index:1;inset:0;width:100%;border:0;background:transparent;color:inherit;cursor:pointer}.metric-card-open:focus-visible{outline:2px solid var(--jade);outline-offset:-3px}
 .metric-card-actions{position:absolute;z-index:3;top:12px;right:12px;display:flex;gap:5px}.metric-card-actions button,.metric-lens-actions button{display:inline-flex;align-items:center;gap:5px;min-height:27px;padding:5px 8px;border:1px solid color-mix(in oklch,var(--bone) 17%,transparent);border-radius:999px;background:color-mix(in oklch,var(--void) 72%,transparent);color:var(--fog);font:700 6px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;cursor:pointer;backdrop-filter:blur(12px);transition:border-color .16s,color .16s,background .16s,transform .16s}.metric-card-actions button:hover,.metric-lens-actions button:hover{transform:translateY(-1px);border-color:var(--jade);color:var(--jade)}.metric-card-actions button.active,.metric-lens-actions button.active{border-color:color-mix(in oklch,var(--jade) 58%,var(--line));background:color-mix(in oklch,var(--jade) 13%,var(--void));color:var(--jade)}.metric-card-actions button.ask,.metric-lens-actions button.ask{border-color:color-mix(in oklch,var(--amber) 46%,var(--line));color:var(--amber)}.metric-card-actions button:disabled,.metric-lens-actions button:disabled{opacity:.55;cursor:wait;transform:none}
-.metric-card-content{position:relative;z-index:2;min-height:280px;display:flex;flex-direction:column;justify-content:flex-end;padding:18px;pointer-events:none;text-shadow:0 2px 12px color-mix(in oklch,var(--void) 90%,transparent)}
+.metric-card-content{position:relative;z-index:2;min-height:280px;display:flex;flex-direction:column;justify-content:flex-end;padding:18px;pointer-events:none;text-shadow:0 1px 1px color-mix(in oklch,var(--void) 98%,transparent),0 2px 7px color-mix(in oklch,var(--void) 96%,transparent),0 8px 22px color-mix(in oklch,var(--void) 84%,transparent)}
 .metric-card-kicker{position:absolute;top:18px;left:18px;right:168px;display:flex;align-items:center;gap:7px;overflow:hidden;color:var(--jade);font:700 6px/1 var(--mono);letter-spacing:.12em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.metric-card-kicker::before{content:"";width:13px;height:1px;flex:none;background:currentColor}.metric-gallery-card.bad .metric-card-kicker{color:#df765f}
 .metric-card-status{align-self:flex-start;margin-bottom:auto;padding:4px 6px;border:1px solid var(--line);color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}.metric-card-status.good{border-color:color-mix(in oklch,var(--jade) 38%,var(--line));color:var(--jade)}.metric-card-status.bad{border-color:color-mix(in oklch,#df765f 48%,var(--line));color:#ef9b91}
 .metric-card-value{display:flex;align-items:baseline;gap:10px;color:var(--bone-bright);font:600 clamp(34px,4vw,57px)/.92 var(--sans);letter-spacing:-.06em}.metric-card-value small{color:var(--jade);font:650 8px/1 var(--mono);letter-spacing:0}.metric-card-value small.bad{color:#ef9b91}.metric-card-value small.neutral{color:var(--fog)}
@@ -9749,7 +9748,7 @@ _LANDING_JS = """
      homeEmpty=document.getElementById('home-empty'),
      homeTitle=document.getElementById('home-title'),
      homeStatus=document.getElementById('home-status'),
-     homeItems=[],
+     homeItems=[],homeSparkGradientSequence=0,
      trailDialog=document.getElementById('trail-dialog'),
      trailTitle=document.getElementById('trail-title'),
      trailMeta=document.getElementById('trail-meta'),
@@ -10009,8 +10008,8 @@ _LANDING_JS = """
    if(points.length<2)return '';
    var w=420,h=115,min=Math.min.apply(null,points),max=Math.max.apply(null,points);if(max===min){var homeFlatPad=Math.abs(max)*.08||1;min-=homeFlatPad;max+=homeFlatPad;}var range=max-min;
    var x=function(index){return index/Math.max(1,points.length-1)*w;},y=function(value){return 8+(max-value)/range*(h-16);};
-   var path=points.map(function(value,index){return (index?'L':'M')+' '+x(index).toFixed(2)+' '+y(value).toFixed(2);}).join(' ');
-   return '<div class="home-metric-spark" aria-hidden="true"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><path d="'+path+' L '+w+' '+h+' L 0 '+h+' Z"></path><path d="'+path+'"></path></svg></div>';
+   var path=points.map(function(value,index){return (index?'L':'M')+' '+x(index).toFixed(2)+' '+y(value).toFixed(2);}).join(' '),gradientId='home-metric-area-gradient-'+(++homeSparkGradientSequence);
+   return '<div class="home-metric-spark" aria-hidden="true"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><defs><linearGradient id="'+gradientId+'" x1="0" y1="0" x2="0" y2="1"><stop class="home-metric-area-top" offset="0%"></stop><stop class="home-metric-area-mid" offset="54%"></stop><stop class="home-metric-area-clear" offset="82%"></stop><stop class="home-metric-area-floor" offset="100%"></stop></linearGradient></defs><path class="home-metric-area" fill="url(#'+gradientId+')" d="'+path+' L '+w+' '+h+' L 0 '+h+' Z"></path><path class="home-metric-line" d="'+path+'"></path></svg></div>';
  }
  function homeMetricTooltip(item){
    var snapshot=item.snapshot||{},source=item.source||{},stamp=snapshot.data_as_of||snapshot.observed_at||'',params=source.params||{};
@@ -10129,6 +10128,7 @@ _LANDING_JS = """
    homeItems=Array.isArray(data&&data.items)?data.items:[];
    homeSection.hidden=false;
    if(homeTitle&&data&&data.home&&data.home.title)homeTitle.textContent=data.home.title;
+   homeSparkGradientSequence=0;
    homeGrid.innerHTML=homeItems.map(homeTileMarkup).join('');
    homeEmpty.hidden=Boolean(homeItems.length);
    homeStatus.classList.remove('error');
@@ -10337,6 +10337,7 @@ _GALLERY_METRICS_JS = """
      calliope=browser.dataset.calliope==='true';
  var state={view:'artifacts',loaded:false,loading:false,metrics:[],categories:[],relation:'all',
    pinIds:{},detail:null,detailDays:90,selected:[],request:0,busy:new Set()};
+ var sparkGradientSequence=0;
  function esc(value){return String(value==null?'':value).replace(/[&<>"']/g,function(char){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char];});}
  function text(value){return String(value==null?'':value).replace(/\\s+/g,' ').trim();}
  function queryText(){return q?text(q.value).toLowerCase():'';}
@@ -10377,8 +10378,8 @@ _GALLERY_METRICS_JS = """
    var values=points(metric);if(values.length<2)return '';
    var w=600,h=210,pad=0,min=Math.min.apply(null,values.map(function(item){return item.value;})),max=Math.max.apply(null,values.map(function(item){return item.value;}));if(max===min){var cardFlatPad=Math.abs(max)*.08||1;min-=cardFlatPad;max+=cardFlatPad;}var range=max-min;
    var x=function(index){return pad+index/Math.max(1,values.length-1)*(w-pad*2);},y=function(value){return 18+(max-value)/range*(h-36);};
-   var path=values.map(function(item,index){return (index?'L':'M')+' '+x(index).toFixed(2)+' '+y(item.value).toFixed(2);}).join(' ');
-   return '<div class="metric-card-chart" aria-hidden="true"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><path class="metric-card-area" d="'+path+' L '+x(values.length-1)+' '+h+' L 0 '+h+' Z"></path><path class="metric-card-line" d="'+path+'"></path></svg></div>';
+   var path=values.map(function(item,index){return (index?'L':'M')+' '+x(index).toFixed(2)+' '+y(item.value).toFixed(2);}).join(' '),gradientId='metric-card-area-gradient-'+(++sparkGradientSequence);
+   return '<div class="metric-card-chart" aria-hidden="true"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><defs><linearGradient id="'+gradientId+'" x1="0" y1="0" x2="0" y2="1"><stop class="metric-card-area-top" offset="0%"></stop><stop class="metric-card-area-mid" offset="54%"></stop><stop class="metric-card-area-clear" offset="82%"></stop><stop class="metric-card-area-floor" offset="100%"></stop></linearGradient></defs><path class="metric-card-area" fill="url(#'+gradientId+')" d="'+path+' L '+x(values.length-1)+' '+h+' L 0 '+h+' Z"></path><path class="metric-card-line" d="'+path+'"></path></svg></div>';
  }
  function statusInfo(metric){
    var snapshot=metric.snapshot||{},raw=String(snapshot.status||'').toLowerCase(),bad=snapshot.ok===false||/(fail|breach|error)/.test(raw),good=snapshot.ok===true||/(pass|healthy|ok)/.test(raw);
@@ -10613,7 +10614,8 @@ def _unmapped_html(identity):
     from html import escape as e
     bg = auth.background_layer(
         0.34, "radial-gradient(1000px 700px at 50% 42%, rgba(16,13,11,.52) 0%, "
-              "rgba(16,13,11,.84) 58%, rgba(16,13,11,.95) 100%)")
+              "rgba(16,13,11,.84) 58%, rgba(16,13,11,.95) 100%)",
+        scene_key=identity)
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
@@ -10666,7 +10668,8 @@ def _landing_html(rows, viewer):
         0.40,
         "radial-gradient(1200px 800px at 30% -10%, rgba(36,28,20,.50) 0%, rgba(36,28,20,0) 62%),"
         "linear-gradient(to bottom, rgba(16,13,11,.26) 0%, rgba(16,13,11,.50) 30%,"
-        " rgba(16,13,11,.84) 62%, rgba(16,13,11,.93) 100%)")
+        " rgba(16,13,11,.84) 62%, rgba(16,13,11,.93) 100%)",
+        scene_key=viewer)
 
     # The personal working set exists only with the Hermes-backed Calliope
     # surface; warehouse-only installs keep the original public gallery.

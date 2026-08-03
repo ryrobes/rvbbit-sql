@@ -10057,21 +10057,58 @@ fn seed_capability_catalog() -> JsonB {
         let Some(id) = catalog_entry.get("id").and_then(Value::as_str) else {
             pgrx::error!("rvbbit.seed_capability_catalog: seed entry missing catalog id");
         };
+        let entry_source = catalog_entry
+            .get("catalog_url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                format!(
+                    "url:{}",
+                    value
+                        .trim()
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                )
+            })
+            .unwrap_or_else(|| source.clone());
+        let seed_snapshot = catalog_entry
+            .get("catalog_seed_snapshot")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         keep_ids.push(id.to_string());
-        prepared_rows.push((catalog_entry, capability_manifest));
+        prepared_rows.push((
+            id,
+            catalog_entry,
+            capability_manifest,
+            entry_source,
+            seed_snapshot,
+        ));
     }
 
     let result = Spi::connect_mut(|client| -> Result<(usize, i32), pgrx::spi::Error> {
-        for (catalog_entry, capability_manifest) in &prepared_rows {
+        for (id, catalog_entry, capability_manifest, entry_source, seed_snapshot) in &prepared_rows
+        {
+            // A packaged URL catalog is an offline safety net, not authority over
+            // a row that has already been refreshed from the network. Insert the
+            // snapshot once, then preserve whatever live version is present.
+            let guard = if *seed_snapshot {
+                format!(
+                    " WHERE NOT EXISTS (SELECT 1 FROM rvbbit.capability_catalog WHERE id = {})",
+                    seed_sql_lit(id)
+                )
+            } else {
+                String::new()
+            };
             let sql = format!(
                 "SELECT rvbbit.upsert_capability_catalog_entry(\
                     catalog_entry => {}, \
                     capability_manifest => {}, \
                     catalog_source => {}, \
-                    entry_active => true)",
+                    entry_active => true){}",
                 seed_jsonb_sql(catalog_entry),
                 seed_jsonb_sql(capability_manifest),
-                seed_sql_lit(&source),
+                seed_sql_lit(entry_source),
+                guard,
             );
             client.update(&sql, None, &[])?;
         }
