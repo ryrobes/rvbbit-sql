@@ -6015,6 +6015,54 @@ class _GoogleCalendarSyncTokenExpired(RuntimeError):
     pass
 
 
+def _google_calendar_http_error(response: httpx.Response) -> RuntimeError:
+    """Turn Google API error payloads into safe, actionable sync errors."""
+    try:
+        payload = response.json() or {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    error = payload.get("error") if isinstance(payload, dict) else {}
+    error = error if isinstance(error, dict) else {}
+    message = _google_calendar_clean_text(error.get("message"), 500)
+    reasons = {
+        _google_calendar_clean_text(item.get("reason"), 100)
+        for item in error.get("errors") or []
+        if isinstance(item, dict)
+    }
+    project = ""
+    service = ""
+    for detail in error.get("details") or []:
+        if not isinstance(detail, dict):
+            continue
+        reasons.add(_google_calendar_clean_text(detail.get("reason"), 100))
+        metadata = detail.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        service = service or _google_calendar_clean_text(metadata.get("service"), 200)
+        consumer = _google_calendar_clean_text(metadata.get("consumer"), 200)
+        if consumer.startswith("projects/"):
+            project = consumer.removeprefix("projects/")
+    if (
+        "SERVICE_DISABLED" in reasons
+        or "accessNotConfigured" in reasons
+        or service == "calendar-json.googleapis.com"
+        and "disabled" in message.lower()
+    ):
+        project_copy = f" for Google Cloud project {project}" if project else ""
+        return RuntimeError(
+            f"Google Calendar API is disabled{project_copy}. A project admin must "
+            "enable the Google Calendar API, wait for activation, then retry sync."
+        )
+    status = int(response.status_code)
+    if status == 403:
+        prefix = "Google Calendar denied the sync request"
+    elif status == 429:
+        prefix = "Google Calendar temporarily rate-limited the sync request"
+    else:
+        prefix = f"Google Calendar sync failed ({status})"
+    return RuntimeError(f"{prefix}: {message}" if message else prefix)
+
+
 async def _fetch_google_calendar_events(
     access_token: str,
     *,
@@ -6046,7 +6094,8 @@ async def _fetch_google_calendar_events(
             )
             if response.status_code == 410:
                 raise _GoogleCalendarSyncTokenExpired("Google Calendar sync token expired")
-            response.raise_for_status()
+            if response.status_code >= 400:
+                raise _google_calendar_http_error(response)
             payload = response.json() or {}
             calendar_timezone = str(payload.get("timeZone") or "UTC")[:100]
             for raw in payload.get("items") or []:

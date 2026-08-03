@@ -213,6 +213,58 @@ def test_expired_incremental_token_falls_back_to_full_sync(monkeypatch):
     }
 
 
+def test_disabled_calendar_api_error_is_actionable(monkeypatch):
+    class Response:
+        status_code = 403
+
+        @staticmethod
+        def json():
+            return {
+                "error": {
+                    "code": 403,
+                    "message": (
+                        "Google Calendar API has not been used in project "
+                        "488166772690 before or it is disabled."
+                    ),
+                    "errors": [{"reason": "accessNotConfigured"}],
+                    "details": [{
+                        "reason": "SERVICE_DISABLED",
+                        "metadata": {
+                            "consumer": "projects/488166772690",
+                            "service": "calendar-json.googleapis.com",
+                        },
+                    }],
+                }
+            }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(calliope.httpx, "AsyncClient", Client)
+
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(calliope._fetch_google_calendar_events(
+            "short-lived-access-token",
+            sync_token=None,
+            now=datetime(2026, 8, 3, tzinfo=timezone.utc),
+        ))
+
+    message = str(caught.value)
+    assert "Google Calendar API is disabled" in message
+    assert "Google Cloud project 488166772690" in message
+    assert "retry sync" in message
+
+
 def test_calendar_oauth_is_incremental_single_use_and_account_bound(monkeypatch):
     routes = {}
 
@@ -332,3 +384,4 @@ def test_calendar_ui_and_routes_are_gated_by_google_auth_configuration():
     assert "if auth.google_enabled() and calliope.CalliopeConfig.from_env().enabled" in server
     assert "els.calendarOpen.hidden = !enabled" in script
     assert "if (!state.config?.google_calendar) return \"\"" in script
+    assert 'syncError ? "Retry sync"' in script

@@ -1039,22 +1039,30 @@
     if (!enabled) return;
     const calendar = state.brief.calendar || {};
     const connected = Boolean(calendar.connected);
-    const needsAttention = Boolean(calendar.needs_reconnect || calendar.status === "error");
+    const needsReconnect = Boolean(calendar.needs_reconnect);
+    const syncError = calendar.status === "error";
+    const needsAttention = needsReconnect || syncError;
     els.calendarOpen.disabled = state.brief.calendarLoading;
     els.calendarOpen.classList.toggle("loading", state.brief.calendarLoading);
     els.calendarOpen.classList.toggle("connected", connected && !needsAttention);
     els.calendarOpen.classList.toggle("needs-attention", needsAttention);
     const count = Math.max(0, Number(calendar.upcoming_count) || 0);
-    els.calendarOpen.setAttribute("aria-label", connected
-      ? `Google Calendar connected · ${count} upcoming event${count === 1 ? "" : "s"}`
-      : needsAttention ? "Reconnect Google Calendar" : "Connect Google Calendar");
+    els.calendarOpen.setAttribute("aria-label", needsReconnect
+      ? "Reconnect Google Calendar"
+      : syncError
+        ? "Google Calendar sync needs attention · click to retry"
+        : connected
+          ? `Google Calendar connected · ${count} upcoming event${count === 1 ? "" : "s"}`
+          : "Connect Google Calendar");
     els.calendarOpen.title = state.brief.calendarLoading
       ? "Syncing your private Calendar context…"
-      : connected
-        ? `${count} upcoming event${count === 1 ? "" : "s"} available to Personal Briefs · click to sync`
-        : needsAttention
-          ? "Google Calendar needs to be reconnected"
-          : "Add your primary Google Calendar to private Personal Brief context";
+      : needsReconnect
+        ? "Google Calendar authorization needs to be reconnected"
+        : syncError
+          ? `${calendar.last_error || "Google Calendar sync needs attention"} · click to retry`
+          : connected
+            ? `${count} upcoming event${count === 1 ? "" : "s"} available to Personal Briefs · click to sync`
+            : "Add your primary Google Calendar to private Personal Brief context";
   }
 
   function connectGoogleCalendar() {
@@ -5947,27 +5955,33 @@
     const calendar = state.brief.calendar || {};
     const loading = state.brief.calendarLoading;
     const connected = Boolean(calendar.connected);
-    const needsAttention = Boolean(calendar.needs_reconnect || calendar.status === "error");
+    const needsReconnect = Boolean(calendar.needs_reconnect);
+    const syncError = calendar.status === "error";
+    const needsAttention = needsReconnect || syncError;
     const synced = calendar.last_synced_at ? new Date(calendar.last_synced_at) : null;
     const syncedLabel = synced && !Number.isNaN(synced.getTime())
       ? `synced ${synced.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`
       : "not synced yet";
     const upcoming = Math.max(0, Number(calendar.upcoming_count) || 0);
-    const copy = connected
-      ? `${upcoming} upcoming event${upcoming === 1 ? "" : "s"} · ${syncedLabel} · read-only and private to you`
-      : needsAttention
-        ? `${calendar.last_error || "Google authorization needs attention"} · reconnect to resume Brief context`
-        : "Optionally add your primary company calendar as read-only, private Brief context.";
+    const copy = needsReconnect
+      ? `${calendar.last_error || "Google authorization needs attention"} · reconnect to resume Brief context`
+      : syncError
+        ? `${calendar.last_error || "Google Calendar sync needs attention"} · retry sync after resolving it`
+        : connected
+          ? `${upcoming} upcoming event${upcoming === 1 ? "" : "s"} · ${syncedLabel} · read-only and private to you`
+          : "Optionally add your primary company calendar as read-only, private Brief context.";
     return `<div class="brief-calendar-connection ${needsAttention ? "needs-attention" : ""}">
       <span class="brief-calendar-glyph" aria-hidden="true">▦</span>
       <div class="brief-calendar-copy">
-        <strong>${connected ? "Google Calendar is part of this private layer" : needsAttention ? "Google Calendar needs attention" : "Bring your schedule into Personal Briefs"}</strong>
+        <strong>${needsReconnect ? "Google Calendar needs to be reconnected" : syncError ? "Google Calendar sync needs attention" : connected ? "Google Calendar is part of this private layer" : "Bring your schedule into Personal Briefs"}</strong>
         <span title="${escapeHtml(copy)}">${escapeHtml(copy)}</span>
       </div>
       <div class="brief-calendar-actions">
-        ${connected && !needsAttention
-          ? `<button type="button" data-calendar-sync ${loading ? "disabled" : ""}>${loading ? "Syncing…" : "Sync + refresh"}</button>`
-          : `<button type="button" data-calendar-connect ${loading ? "disabled" : ""}>${needsAttention ? "Reconnect" : "Connect Calendar"}</button>`}
+        ${needsReconnect
+          ? `<button type="button" data-calendar-connect ${loading ? "disabled" : ""}>Reconnect</button>`
+          : connected
+            ? `<button type="button" data-calendar-sync ${loading ? "disabled" : ""}>${loading ? "Syncing…" : syncError ? "Retry sync" : "Sync + refresh"}</button>`
+            : `<button type="button" data-calendar-connect ${loading ? "disabled" : ""}>Connect Calendar</button>`}
         ${calendar.status && calendar.status !== "disconnected" ? `<button type="button" data-calendar-disconnect ${loading ? "disabled" : ""}>Disconnect</button>` : ""}
       </div>
     </div>`;
