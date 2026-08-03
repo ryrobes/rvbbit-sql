@@ -6225,11 +6225,16 @@
         : defaultDescription;
       const matches = items.filter((item) => item.provenance?.brief_section === key);
       if (!matches.length) return "";
+      const omitted = Math.max(0, Number(brief.section_omitted_counts?.[key]) || 0);
+      const available = Math.max(matches.length, Number(brief.section_available_counts?.[key]) || 0);
+      const sectionDescription = omitted
+        ? `${description} · showing ${matches.length} of ${available} bounded matches`
+        : description;
       const sectionBody = key === "coming_up"
         ? renderBriefComingUp(surface, matches, brief)
         : `<div class="evidence-grid brief-grid">${matches.map((item) => renderBriefCard(surface, item)).join("")}</div>`;
       return `<section class="brief-section section-${key}">
-        <header><div><h4>${escapeHtml(label)}</h4><p>${escapeHtml(description)}</p></div><span>${matches.length}</span></header>
+        <header><div><h4>${escapeHtml(label)}</h4><p>${escapeHtml(sectionDescription)}</p></div><span title="${escapeHtml(omitted ? `${omitted} additional matches omitted by the compact Brief limit` : `${matches.length} items`)}">${matches.length}</span></header>
         ${sectionBody}
       </section>`;
     }).join("");

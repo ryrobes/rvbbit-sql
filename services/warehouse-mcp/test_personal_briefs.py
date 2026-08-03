@@ -229,6 +229,83 @@ def test_time_bounded_snapshot_filters_user_feedback_and_preserves_truth_section
     }
 
 
+def test_calendar_section_keeps_nearest_events_and_uses_dense_view_allowance(monkeypatch):
+    now = datetime(2026, 8, 3, 12, tzinfo=timezone.utc)
+    events = []
+    for index in range(50):
+        starts_at = now + timedelta(hours=index + 1)
+        events.append({
+            "id": f"calendar:primary:event-{index}",
+            "group": "knowledge",
+            "kind": "calendar-event",
+            "subtype": "calendar",
+            "title": f"Calendar event {index}",
+            "summary": "Scheduled on the connected primary calendar.",
+            "source": "Google Calendar",
+            "occurred_at": starts_at.isoformat(),
+            "provenance": {
+                "resolver": "private_google_calendar",
+                "coverage_key": "google-calendar",
+                "brief_section": "coming_up",
+                "observation_key": f"calendar:primary:event-{index}",
+                "starts_at": starts_at.isoformat(),
+                "viewer_relation": {
+                    "kind": "calendar_owner",
+                    "confidence": "exact",
+                    "truth": "observed",
+                },
+            },
+        })
+
+    monkeypatch.setattr(calliope, "_brief_previous_snapshot", lambda *_args: None)
+    monkeypatch.setattr(calliope, "_brief_identity_state", lambda *_args: ({}, {}))
+    monkeypatch.setattr(
+        calliope,
+        "_brief_calendar_observations",
+        lambda *_args: (
+            list(reversed(events)),
+            [{
+                "key": "google-calendar",
+                "label": "Google Calendar",
+                "count": len(events),
+                "available": len(events),
+                "status": "ready",
+                "scope": "personal",
+            }],
+            [],
+        ),
+    )
+    empty_observer = lambda *_args: ([], [], [])
+    monkeypatch.setattr(calliope, "_brief_brain_observations", empty_observer)
+    monkeypatch.setattr(calliope, "_brief_internal_observations", empty_observer)
+    monkeypatch.setattr(calliope, "_brief_note_observations", empty_observer)
+
+    raw = calliope._personal_brief_snapshot(
+        lambda: None,
+        "owner@example.com",
+        {
+            "id": str(uuid.uuid4()),
+            "brief_date": "2026-08-03",
+            "timezone": "UTC",
+            "session_id": str(uuid.uuid4()),
+            "window_start": now - timedelta(days=1),
+            "window_end": now + timedelta(days=14),
+        },
+        now=now,
+        include_google_calendar=True,
+    )
+    normalized = calliope._normalize_personal_brief_result(raw)
+
+    assert len(normalized["items"]) == 42
+    assert normalized["items"][0]["id"] == "calendar:primary:event-0"
+    assert normalized["items"][-1]["id"] == "calendar:primary:event-41"
+    assert normalized["brief"]["section_counts"]["coming_up"] == 42
+    assert normalized["brief"]["section_available_counts"]["coming_up"] == 50
+    assert normalized["brief"]["section_omitted_counts"]["coming_up"] == 8
+    assert normalized["coverage"][0]["count"] == 42
+    assert normalized["coverage"][0]["matched_count"] == 50
+
+
 def test_brain_observer_accepts_source_level_maps_without_provider_specific_code():
     now = datetime(2026, 8, 1, 15, tzinfo=timezone.utc)
     doc_id = 42

@@ -199,10 +199,12 @@ _BRIEF_DEFAULT_FUTURE_DAYS = 14
 _BRIEF_MAX_SOURCES = 24
 _BRIEF_SOURCE_SCAN_LIMIT = 1_000
 _BRIEF_TOTAL_SCAN_LIMIT = 4_000
-# A whole Brief is attachable as one compact evidence index. Keep the visible
-# snapshot and that handoff on the same bounded result contract so an item can
-# never appear selectable in the UI but disappear from the agent context.
-_BRIEF_MAX_OBSERVATIONS = _MAX_EVIDENCE_RESULTS
+# A whole Brief is attachable as one compact evidence index. Calendar tiles are
+# substantially denser than ordinary evidence cards, so Briefs get their own
+# bounded allowance and the compact handoff below uses this same limit.
+_BRIEF_MAX_OBSERVATIONS = 72
+_BRIEF_DEFAULT_SECTION_LIMIT = 14
+_BRIEF_SECTION_LIMITS = {"coming_up": 42}
 _BRIEF_SECTIONS = (
     "focus",
     "needs_now",
@@ -7732,17 +7734,49 @@ def _personal_brief_snapshot(
             matched_counts[coverage_key] = matched_counts.get(coverage_key, 0) + 1
     items, comparison = _brief_apply_deltas(items, previous)
     section_order = {section: index for index, section in enumerate(_BRIEF_SECTIONS)}
-    items.sort(key=lambda item: (
-        section_order.get(str((item.get("provenance") or {}).get("brief_section")), 99),
-        -(_brief_parse_datetime(item.get("occurred_at"), zone) or datetime.min.replace(tzinfo=timezone.utc)).timestamp(),
-        str(item.get("title") or "").casefold(),
-    ))
+    def item_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
+        section = str(provenance.get("brief_section") or "changed")
+        occurred_at = _brief_parse_datetime(item.get("occurred_at"), zone)
+        if section == "coming_up":
+            # A future calendar must retain the next commitment first. The
+            # previous generic newest-first ordering dropped today's events
+            # whenever the section limit was reached.
+            scheduled_at = (
+                _brief_parse_datetime(provenance.get("starts_at"), zone)
+                or _brief_parse_datetime(provenance.get("due_at"), zone, end_of_day=True)
+                or occurred_at
+            )
+            time_key = (
+                scheduled_at.timestamp() if scheduled_at else float("inf")
+            )
+        else:
+            time_key = -(
+                occurred_at or datetime.min.replace(tzinfo=timezone.utc)
+            ).timestamp()
+        return (
+            section_order.get(section, 99),
+            time_key,
+            str(item.get("title") or "").casefold(),
+        )
+
+    items.sort(key=item_sort_key)
+    section_available_counts = {section: 0 for section in _BRIEF_SECTIONS}
+    for item in items:
+        section = str((item.get("provenance") or {}).get("brief_section") or "changed")
+        section_available_counts[section] = section_available_counts.get(section, 0) + 1
     section_counts = {section: 0 for section in _BRIEF_SECTIONS}
     bounded = []
     per_section: dict[str, int] = {}
     for item in items:
         section = str((item.get("provenance") or {}).get("brief_section") or "changed")
-        if per_section.get(section, 0) >= 14 or len(bounded) >= _BRIEF_MAX_OBSERVATIONS:
+        section_limit = _BRIEF_SECTION_LIMITS.get(
+            section, _BRIEF_DEFAULT_SECTION_LIMIT
+        )
+        if (
+            per_section.get(section, 0) >= section_limit
+            or len(bounded) >= _BRIEF_MAX_OBSERVATIONS
+        ):
             continue
         per_section[section] = per_section.get(section, 0) + 1
         section_counts[section] = section_counts.get(section, 0) + 1
@@ -7817,6 +7851,15 @@ def _personal_brief_snapshot(
                 "interpreted": "Reserved for optional Calliope synthesis",
             },
             "section_counts": section_counts,
+            "section_available_counts": section_available_counts,
+            "section_omitted_counts": {
+                section: max(
+                    0,
+                    int(section_available_counts.get(section, 0))
+                    - int(section_counts.get(section, 0)),
+                )
+                for section in _BRIEF_SECTIONS
+            },
             "source_count": contributing_sources,
             "resolver_count": len(coverage),
             "available_resolver_count": available_resolvers,
@@ -10945,8 +10988,14 @@ def _normalize_evidence_handle(value: Any) -> dict[str, Any]:
     return handle
 
 
-def _normalize_evidence_search_result(value: Any, query: str) -> dict[str, Any]:
+def _normalize_evidence_search_result(
+    value: Any,
+    query: str,
+    *,
+    max_results: int = _MAX_EVIDENCE_RESULTS,
+) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
+    result_limit = max(1, min(int(max_results), _BRIEF_MAX_OBSERVATIONS))
     items = []
     seen = set()
     for index, candidate in enumerate(raw.get("items") or []):
@@ -11039,7 +11088,7 @@ def _normalize_evidence_search_result(value: Any, query: str) -> dict[str, Any]:
                 }.items() if val not in (None, "", [], {})
             })
         items.append({key: val for key, val in item.items() if val not in (None, "", [])})
-        if len(items) >= _MAX_EVIDENCE_RESULTS:
+        if len(items) >= result_limit:
             break
     searched = []
     for source in (raw.get("searched") or [])[:8]:
@@ -11072,7 +11121,9 @@ def _normalize_personal_brief_result(value: Any) -> dict[str, Any]:
     query = re.sub(
         r"\s+", " ", str(raw.get("query") or "Personal brief")
     ).strip()
-    normalized = _normalize_evidence_search_result(raw, query)
+    normalized = _normalize_evidence_search_result(
+        raw, query, max_results=_BRIEF_MAX_OBSERVATIONS
+    )
     brief_raw = raw.get("brief") if isinstance(raw.get("brief"), dict) else {}
     section_counts = {section: 0 for section in _BRIEF_SECTIONS}
     for item in normalized["items"]:
@@ -11088,6 +11139,18 @@ def _normalize_personal_brief_result(value: Any) -> dict[str, Any]:
             "resolved": "Confirmed or candidate identity relationship",
             "interpreted": "Reserved for optional Calliope synthesis",
         }
+    def section_count_map(value: Any, fallback: dict[str, int]) -> dict[str, int]:
+        raw_counts = value if isinstance(value, dict) else {}
+        counts = {}
+        for section in _BRIEF_SECTIONS:
+            try:
+                counts[section] = max(
+                    0, int(raw_counts.get(section, fallback.get(section, 0)))
+                )
+            except (TypeError, ValueError):
+                counts[section] = max(0, int(fallback.get(section, 0)))
+        return counts
+
     brief = {
         "id": _uuid(brief_raw.get("id")),
         "date": str(brief_raw.get("date") or "")[:40],
@@ -11098,6 +11161,12 @@ def _normalize_personal_brief_result(value: Any) -> dict[str, Any]:
         "owner": str(brief_raw.get("owner") or "")[:320],
         "truth_levels": _bounded_evidence_json(truth_levels),
         "section_counts": section_counts,
+        "section_available_counts": section_count_map(
+            brief_raw.get("section_available_counts"), section_counts
+        ),
+        "section_omitted_counts": section_count_map(
+            brief_raw.get("section_omitted_counts"), {}
+        ),
         "source_count": max(0, int(brief_raw.get("source_count") or 0)),
         "resolver_count": max(0, int(brief_raw.get("resolver_count") or 0)),
         "available_resolver_count": max(
@@ -11194,7 +11263,10 @@ def _hydrate_evidence_refs(
             is_brief = payload.get("mode") == "personal_brief"
             result_handles = []
             group_counts = {}
-            for candidate in (payload.get("items") or [])[:_MAX_EVIDENCE_RESULTS]:
+            compact_limit = (
+                _BRIEF_MAX_OBSERVATIONS if is_brief else _MAX_EVIDENCE_RESULTS
+            )
+            for candidate in (payload.get("items") or [])[:compact_limit]:
                 if not isinstance(candidate, dict) or not candidate.get("id"):
                     continue
                 group = str(candidate.get("group") or "evidence")[:40]
