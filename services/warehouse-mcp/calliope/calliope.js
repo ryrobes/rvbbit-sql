@@ -5633,7 +5633,7 @@
     return calliopeTooltipSourceMarkup({
       eyebrow: "Daily Brief · linked object",
       status: canonical ? "resolved" : kind,
-      title: object?.canonical_label || object?.label || "Linked object",
+      title: object?.label || object?.canonical_label || "Linked object",
       meaning: canonical
         ? `This explicit ${kind} edge was matched exactly to an ACL-visible company Brain object. The Calendar event remains private while Calliope can follow that canonical object into governed history.`
         : `This ${kind} is preserved as an explicit edge from the Brief observation, so future Calliope work can attempt to resolve the same company object.`,
@@ -5752,7 +5752,10 @@
       ? item.provenance.entity_refs : [])
       .filter((object) => object?.node_id && (object?.canonical_label || object?.label));
     if (!canonical.length) return "";
-    const visible = canonical.slice(0, 2).map((object) => `<span class="kind-${escapeHtml(object.kind || "thing")}" tabindex="0" data-calliope-tooltip data-tooltip-kind="entity" aria-label="${escapeHtml(`${object.canonical_label || object.label}. Explain this Calendar edge.`)}"><b>${escapeHtml(object.kind || "thing")}</b>${escapeHtml(object.canonical_label || object.label)}${briefEntityTooltip(object)}</span>`).join("");
+    const visible = canonical.slice(0, 2).map((object) => {
+      const label = object.label || object.canonical_label;
+      return `<span class="kind-${escapeHtml(object.kind || "thing")}" tabindex="0" data-calliope-tooltip data-tooltip-kind="entity" aria-label="${escapeHtml(`${label}. Explain this Calendar edge.`)}"><b>${escapeHtml(object.kind || "thing")}</b><em>${escapeHtml(label)}</em>${briefEntityTooltip(object)}</span>`;
+    }).join("");
     const remaining = canonical.length - 2;
     return `<div class="brief-calendar-linked" aria-label="${canonical.length} canonical company object${canonical.length === 1 ? "" : "s"} connected">${visible}${remaining > 0 ? `<i>+${remaining}</i>` : ""}</div>`;
   }
