@@ -12709,7 +12709,7 @@ def _calliope_evidence_search(query, owner, limit=24):
 # in user's Brain ACL and the current catalog/artifact state.
 _TRAIL_KINDS = {
     "artifact", "artifact_object", "document", "brain_entity",
-    "metric", "cube", "db_table", "db_column",
+    "metric", "cube", "db_table", "db_column", "calendar_event",
 }
 _TRAIL_SECTIONS = {"meaning", "artifacts", "knowledge", "data"}
 
@@ -12767,6 +12767,17 @@ def _trail_handle(value):
         if not label:
             raise ValueError("entity name is required")
         return {"kind": kind, "label": label}
+
+    if kind == "calendar_event":
+        calendar_id = _semantic_text(raw.get("calendar_id") or "primary", 120)
+        event_id = _semantic_text(raw.get("event_id"), 1_024)
+        if calendar_id != "primary" or not event_id:
+            raise ValueError("calendar event locator is invalid")
+        return {
+            "kind": kind,
+            "calendar_id": calendar_id,
+            "event_id": event_id,
+        }
 
     try:
         node_id = int(raw.get("node_id")) if raw.get("node_id") not in (None, "") else None
@@ -13103,6 +13114,133 @@ def _trail_metric(handle, owner, limit):
     ]
 
 
+def _trail_calendar_event(handle, owner, limit):
+    """Follow one owner-private event into ACL-visible company context."""
+    calendar_id = handle["calendar_id"]
+    event_id = handle["event_id"]
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT summary,description,location,html_link,meeting_link,organizer,"
+            "attendees,starts_at::text AS starts_at,ends_at::text AS ends_at,"
+            "all_day,response_status,event_type,visibility,status "
+            "FROM rvbbit.calliope_google_calendar_events "
+            "WHERE lower(owner_email)=lower(%s) AND calendar_id=%s AND event_id=%s "
+            "AND status<>'cancelled'",
+            (owner, calendar_id, event_id),
+        ).fetchone()
+        if not row:
+            raise LookupError("That private calendar event is no longer available")
+        row = dict(row)
+        edges = conn.execute(
+            "WITH visible_docs AS MATERIALIZED ("
+            " SELECT doc_id FROM rvbbit.brain_visible_docs(%s)),"
+            "visible_nodes AS MATERIALIZED ("
+            " SELECT DISTINCT n.node_id FROM rvbbit.kg_nodes n "
+            " JOIN rvbbit.kg_edges me ON me.graph_id='brain' "
+            "  AND me.object_node_id=n.node_id AND me.predicate_norm='mentions' "
+            " JOIN rvbbit.kg_nodes dn ON dn.node_id=me.subject_node_id "
+            "  AND dn.graph_id='brain' AND dn.kind='document' "
+            " JOIN visible_docs vd ON vd.doc_id=CASE "
+            "  WHEN dn.properties->>'doc_id' ~ '^[0-9]+$' "
+            "  THEN (dn.properties->>'doc_id')::bigint END "
+            " WHERE n.graph_id='brain') "
+            "SELECT e.predicate,e.object_kind,e.label,e.properties,e.kg_node_id,"
+            "e.node_kind,e.canonical_label,e.match_basis,e.match_confidence "
+            "FROM rvbbit.calliope_private_calendar_edges e "
+            "JOIN visible_nodes visible ON visible.node_id=e.kg_node_id "
+            "WHERE lower(e.owner_email)=lower(%s) AND e.calendar_id=%s "
+            "AND e.event_id=%s AND e.kg_node_id IS NOT NULL "
+            "AND NOT (e.object_kind='person' AND ("
+            " lower(e.object_key)=lower(%s) OR coalesce(e.properties->>'self','false')='true')) "
+            "ORDER BY CASE e.predicate WHEN 'organized_by' THEN 0 "
+            "WHEN 'involves' THEN 1 ELSE 2 END,e.canonical_label",
+            (owner, owner, calendar_id, event_id, owner),
+        ).fetchall()
+
+    title = _semantic_text(row.get("summary"), 500) or "Untitled event"
+    description = _semantic_text(row.get("description"), 1_200)
+    subject = {
+        "kind": "calendar_event",
+        "label": title,
+        "detail": description or "Owner-private Google Calendar event",
+        "handle": handle,
+        "url": row.get("html_link") or row.get("meeting_link"),
+    }
+    facts = []
+    for label, value in (
+        ("Starts", row.get("starts_at")),
+        ("Ends", row.get("ends_at")),
+        ("Location", row.get("location")),
+        ("Your response", row.get("response_status")),
+        ("Type", "All day" if row.get("all_day") else row.get("event_type")),
+    ):
+        value = _semantic_text(value, 240)
+        if value:
+            facts.append({"label": label, "value": value})
+    attendee_count = len(row.get("attendees") or []) if isinstance(row.get("attendees"), list) else 0
+    if attendee_count:
+        facts.append({"label": "Attendees", "value": str(attendee_count)})
+
+    connections, seen, canonical_labels = [], set(), []
+    relationship_labels = {
+        "organized_by": "organized by",
+        "involves": "meeting with",
+        "at": "scheduled at",
+    }
+    # Keep room for a few semantically retrieved preparation documents even
+    # when a large meeting has many attendees.
+    entity_limit = max(1, min(8, limit - 3))
+    for edge in edges:
+        edge = dict(edge)
+        canonical_label = _semantic_text(edge.get("canonical_label"), 240)
+        if not canonical_label:
+            continue
+        canonical_labels.append(canonical_label)
+        _trail_append(connections, seen, _trail_connection(
+            relationship_labels.get(
+                str(edge.get("predicate") or ""),
+                str(edge.get("predicate") or "related to").replace("_", " "),
+            ),
+            canonical_label,
+            kind=edge.get("object_kind") or edge.get("node_kind") or "entity",
+            handle={"kind": "brain_entity", "label": canonical_label},
+            section="meaning",
+            detail=(
+                f"{str(edge.get('node_kind') or edge.get('object_kind') or 'entity').replace('_', ' ').title()}"
+                f" · exact Calendar {str(edge.get('match_basis') or 'identity').replace('_', ' ')} match"
+            ),
+            confidence=edge.get("match_confidence"),
+        ))
+        if len(connections) >= entity_limit:
+            break
+
+    if canonical_labels:
+        facts.append({
+            "label": "Company objects",
+            "value": str(len(set(canonical_labels))),
+        })
+    query = " ".join(filter(None, [
+        title,
+        description[:600] if description else None,
+        *list(dict.fromkeys(canonical_labels))[:6],
+    ]))
+    if query and title.lower() != "private event":
+        try:
+            for doc in _calliope_brain_evidence(query, owner, min(4, limit)):
+                _trail_append(
+                    connections,
+                    seen,
+                    _trail_brain_document_connection(doc, "preparation context"),
+                )
+                if len(connections) >= limit:
+                    break
+        except Exception:  # noqa: BLE001 — company memory is an optional trail layer
+            pass
+    return subject, facts[:8], connections[:limit], [
+        "private calendar overlay", "visible company entities", "company memory",
+    ]
+
+
 def _trail_document(handle, owner, limit):
     doc_id = int(handle["doc_id"])
     document = tool_brain_get_doc(doc_id, owner)
@@ -13338,6 +13476,8 @@ def _calliope_follow_trail(value, owner, limit=14):
         subject, facts, connections, searched = _trail_document(handle, owner, limit)
     elif handle["kind"] == "brain_entity":
         subject, facts, connections, searched = _trail_brain_entity(handle, owner, limit)
+    elif handle["kind"] == "calendar_event":
+        subject, facts, connections, searched = _trail_calendar_event(handle, owner, limit)
     elif handle["kind"] == "metric":
         subject, facts, connections, searched = _trail_metric(handle, owner, limit)
     else:

@@ -393,9 +393,16 @@ noted** so user context is never presented as independently observed fact.
 An optionally connected Google Calendar follows the same private-overlay contract.
 Upcoming and recently completed events enter Briefs as directly **observed** Calendar
 facts; normalized attendee, organizer, and location fields produce owner-keyed
-person/place edges for later personal context. They never create organization-wide KG
-edges. Brief refreshes sync Calendar first when the local cache is stale, while a Google
-API outage leaves the last private cache and every other Brief resolver intact.
+person/place edges for later personal context. Exact email, display-name, and location
+matches may point at canonical Brain objects only when those objects are backed by a
+document visible to the signed-in user. The event remains private: no Calendar prose or
+edge is written into the organization graph, fuzzy identity matches are not attempted,
+and every **Trail** hop rechecks both the Calendar owner and Brain ACL. A resolved event
+trail can surface its canonical people/places and semantically relevant company documents,
+which gives **Prepare** grounded history without presenting a private Calendar fact as a
+company assertion. Brief refreshes sync Calendar first when the local cache is stale,
+while a Google API outage leaves the last private cache and every other Brief resolver
+intact.
 
 Brain resolution is sampled fairly per visible source before applying the overall bound,
 so a high-volume fresh corpus cannot starve another source. System-learning records remain

@@ -1539,36 +1539,86 @@ CREATE INDEX IF NOT EXISTS calliope_google_calendar_events_owner_start_idx
 CREATE INDEX IF NOT EXISTS calliope_google_calendar_events_owner_updated_idx
     ON rvbbit.calliope_google_calendar_events (owner_email,google_updated_at DESC NULLS LAST);
 CREATE OR REPLACE VIEW rvbbit.calliope_private_calendar_edges AS
-SELECT e.owner_email,e.calendar_id,e.event_id,
-       'calendar_event'::text AS subject_kind,e.event_id AS subject_key,
-       'involves'::text AS predicate,'person'::text AS object_kind,
-       lower(a.item->>'email') AS object_key,
-       coalesce(nullif(a.item->>'display_name',''),a.item->>'email') AS label,
-       jsonb_strip_nulls(jsonb_build_object(
-           'email',lower(a.item->>'email'),
-           'response_status',a.item->>'response_status',
-           'organizer',(a.item->>'organizer')::boolean,
-           'self',(a.item->>'self')::boolean
-       )) AS properties,e.starts_at,e.ends_at
-  FROM rvbbit.calliope_google_calendar_events e
+WITH raw_edges AS (
+    SELECT e.owner_email,e.calendar_id,e.event_id,
+           'calendar_event'::text AS subject_kind,e.event_id AS subject_key,
+           'involves'::text AS predicate,'person'::text AS object_kind,
+           lower(a.item->>'email') AS object_key,
+           coalesce(nullif(a.item->>'display_name',''),a.item->>'email') AS label,
+           jsonb_strip_nulls(jsonb_build_object(
+               'email',lower(a.item->>'email'),
+               'response_status',a.item->>'response_status',
+               'organizer',(a.item->>'organizer')::boolean,
+               'self',(a.item->>'self')::boolean
+           )) AS properties,e.starts_at,e.ends_at
+      FROM rvbbit.calliope_google_calendar_events e
  CROSS JOIN LATERAL jsonb_array_elements(e.attendees) AS a(item)
- WHERE e.status <> 'cancelled' AND nullif(a.item->>'email','') IS NOT NULL
-UNION ALL
-SELECT e.owner_email,e.calendar_id,e.event_id,
-       'calendar_event'::text,e.event_id,'organized_by'::text,'person'::text,
-       lower(e.organizer->>'email'),
-       coalesce(nullif(e.organizer->>'display_name',''),e.organizer->>'email'),
-       jsonb_strip_nulls(jsonb_build_object('email',lower(e.organizer->>'email'))),
-       e.starts_at,e.ends_at
-  FROM rvbbit.calliope_google_calendar_events e
- WHERE e.status <> 'cancelled' AND nullif(e.organizer->>'email','') IS NOT NULL
-UNION ALL
-SELECT e.owner_email,e.calendar_id,e.event_id,
-       'calendar_event'::text,e.event_id,'at'::text,'place'::text,
-       lower(e.location),e.location,jsonb_build_object('label',e.location),
-       e.starts_at,e.ends_at
-  FROM rvbbit.calliope_google_calendar_events e
- WHERE e.status <> 'cancelled' AND nullif(e.location,'') IS NOT NULL;
+     WHERE e.status <> 'cancelled' AND nullif(a.item->>'email','') IS NOT NULL
+    UNION ALL
+    SELECT e.owner_email,e.calendar_id,e.event_id,
+           'calendar_event'::text,e.event_id,'organized_by'::text,'person'::text,
+           lower(e.organizer->>'email'),
+           coalesce(nullif(e.organizer->>'display_name',''),e.organizer->>'email'),
+           jsonb_strip_nulls(jsonb_build_object('email',lower(e.organizer->>'email'))),
+           e.starts_at,e.ends_at
+      FROM rvbbit.calliope_google_calendar_events e
+     WHERE e.status <> 'cancelled' AND nullif(e.organizer->>'email','') IS NOT NULL
+    UNION ALL
+    SELECT e.owner_email,e.calendar_id,e.event_id,
+           'calendar_event'::text,e.event_id,'at'::text,'place'::text,
+           lower(e.location),e.location,jsonb_build_object('label',e.location),
+           e.starts_at,e.ends_at
+      FROM rvbbit.calliope_google_calendar_events e
+     WHERE e.status <> 'cancelled' AND nullif(e.location,'') IS NOT NULL
+)
+SELECT r.owner_email,r.calendar_id,r.event_id,r.subject_kind,r.subject_key,
+       r.predicate,r.object_kind,r.object_key,r.label,r.properties,
+       r.starts_at,r.ends_at,
+       resolved.node_id AS kg_node_id,
+       resolved.graph_id,
+       resolved.kind AS node_kind,
+       resolved.label AS canonical_label,
+       resolved.match_basis,
+       resolved.match_confidence
+  FROM raw_edges r
+  LEFT JOIN LATERAL (
+        WITH direct_lookup(match_value,match_basis,match_priority,match_confidence) AS (
+            VALUES
+              (rvbbit.kg_normalize_label(r.object_key),'object_key'::text,0,1.0::double precision),
+              (rvbbit.kg_normalize_label(r.label),'display_label'::text,2,0.99::double precision)
+        ),
+        alias_lookup(match_value,match_basis,match_priority,match_confidence) AS (
+            VALUES
+              (rvbbit.kg_normalize_label(r.object_key),'object_key_alias'::text,1,1.0::double precision),
+              (rvbbit.kg_normalize_label(r.label),'display_alias'::text,3,0.98::double precision)
+        ),
+        candidates AS (
+            SELECT n.node_id,n.graph_id,n.kind,n.label,n.confidence,
+                   lookup.match_basis,lookup.match_priority,lookup.match_confidence
+              FROM direct_lookup lookup
+              JOIN rvbbit.kg_nodes n
+                ON n.graph_id='brain' AND n.label_norm=lookup.match_value
+            UNION ALL
+            SELECT n.node_id,n.graph_id,n.kind,n.label,n.confidence,
+                   lookup.match_basis,lookup.match_priority,lookup.match_confidence
+              FROM alias_lookup lookup
+              JOIN rvbbit.kg_aliases a
+                ON a.graph_id='brain' AND a.alias_norm=lookup.match_value
+              JOIN rvbbit.kg_nodes n ON n.node_id=a.node_id AND n.graph_id='brain'
+        )
+        SELECT c.node_id,c.graph_id,c.kind,c.label,c.match_basis,c.match_confidence
+          FROM candidates c
+         WHERE (
+             (r.object_kind='person' AND c.kind IN
+               ('person','people','employee','user','contact','assignee','owner'))
+             OR
+             (r.object_kind='place' AND c.kind IN
+               ('place','location','city','country','state','region','address',
+                'venue','office','site'))
+         )
+         ORDER BY c.match_priority,c.confidence DESC,c.node_id
+         LIMIT 1
+  ) resolved ON true;
 """
 
 _INSTRUMENT_DDL = """
@@ -6278,6 +6328,88 @@ def google_calendar_grant_handler(conn_factory: Callable[..., Any]):
     return handle
 
 
+def _brief_calendar_graph_matches(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    event_ids: list[str],
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """Resolve exact Calendar edge hints to Brain nodes this owner can see.
+
+    The SQL view deliberately exposes only a canonical *candidate*.  This
+    second gate is what makes that candidate usable: the node must be backed by
+    at least one document admitted by ``brain_visible_docs(owner)``.  Calendar
+    prose and event nodes never enter the shared Brain graph.
+    """
+    bounded_ids = list(dict.fromkeys(
+        str(event_id)[:1_024] for event_id in event_ids if str(event_id).strip()
+    ))[:500]
+    if not bounded_ids:
+        return {}
+    with conn_factory() as conn:
+        rows = conn.execute(
+            "WITH visible_docs AS MATERIALIZED ("
+            " SELECT doc_id FROM rvbbit.brain_visible_docs(%s)),"
+            "visible_nodes AS MATERIALIZED ("
+            " SELECT DISTINCT n.node_id FROM rvbbit.kg_nodes n "
+            " JOIN rvbbit.kg_edges me ON me.graph_id='brain' "
+            "  AND me.object_node_id=n.node_id AND me.predicate_norm='mentions' "
+            " JOIN rvbbit.kg_nodes dn ON dn.node_id=me.subject_node_id "
+            "  AND dn.graph_id='brain' AND dn.kind='document' "
+            " JOIN visible_docs vd ON vd.doc_id=CASE "
+            "  WHEN dn.properties->>'doc_id' ~ '^[0-9]+$' "
+            "  THEN (dn.properties->>'doc_id')::bigint END "
+            " WHERE n.graph_id='brain') "
+            "SELECT e.event_id,e.object_kind,e.object_key,e.predicate,e.kg_node_id,"
+            "e.graph_id,e.node_kind,e.canonical_label,e.match_basis,"
+            "e.match_confidence,n.confidence AS node_confidence "
+            "FROM rvbbit.calliope_private_calendar_edges e "
+            "JOIN visible_nodes visible ON visible.node_id=e.kg_node_id "
+            "JOIN rvbbit.kg_nodes n ON n.node_id=e.kg_node_id "
+            "WHERE lower(e.owner_email)=lower(%s) "
+            "AND e.event_id=ANY(%s::text[]) AND e.kg_node_id IS NOT NULL "
+            "ORDER BY e.event_id,CASE e.predicate WHEN 'organized_by' THEN 0 "
+            "WHEN 'involves' THEN 1 ELSE 2 END,e.object_key",
+            (owner, owner, bounded_ids),
+        ).fetchall()
+    matches: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        if not row.get("kg_node_id"):
+            continue
+        key = (
+            str(row.get("event_id") or ""),
+            str(row.get("object_kind") or ""),
+            str(row.get("object_key") or "").strip().lower(),
+        )
+        if not all(key) or key in matches:
+            continue
+        canonical_label = re.sub(
+            r"\s+", " ", str(row.get("canonical_label") or "")
+        ).strip()[:240]
+        if not canonical_label:
+            continue
+        try:
+            confidence = round(
+                max(0.0, min(1.0, float(row.get("match_confidence") or 0))), 3
+            )
+        except (TypeError, ValueError):
+            confidence = 0.98
+        matches[key] = {
+            "node_id": str(row["kg_node_id"]),
+            "graph_id": str(row.get("graph_id") or "brain")[:80],
+            "node_kind": str(row.get("node_kind") or row.get("object_kind") or "entity")[:80],
+            "canonical_label": canonical_label,
+            "handle": {"kind": "brain_entity", "label": canonical_label},
+            "resolution": "canonical_exact",
+            "match_basis": str(row.get("match_basis") or "exact")[:80],
+            "resolution_confidence": confidence,
+            "evidence": (
+                "An exact Calendar identity matched a canonical company object "
+                "backed by knowledge visible to this user."
+            ),
+        }
+    return matches
+
+
 def _brief_calendar_observations(
     conn_factory: Callable[..., Any],
     owner: str,
@@ -6318,6 +6450,21 @@ def _brief_calendar_observations(
             "scope": "personal",
         }], [warning]
 
+    graph_matches: dict[tuple[str, str, str], dict[str, Any]] = {}
+    graph_warning = ""
+    try:
+        graph_matches = _brief_calendar_graph_matches(
+            conn_factory,
+            owner,
+            [str(row.get("event_id") or "") for row in rows],
+        )
+    except Exception as exc:
+        # A missing or rebuilding company graph must never hide the schedule.
+        graph_warning = (
+            "Calendar company-object context is unavailable: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
     observations = []
     for row in rows:
         starts_at = _brief_parse_datetime(row.get("starts_at"), zone)
@@ -6326,8 +6473,27 @@ def _brief_calendar_observations(
             continue
         attendees = row.get("attendees") if isinstance(row.get("attendees"), list) else []
         organizer = row.get("organizer") if isinstance(row.get("organizer"), dict) else {}
+        event_id = str(row.get("event_id") or "")
         entity_refs = []
         seen_entities = set()
+
+        def entity_ref(
+            kind: str,
+            key: str,
+            label: Any,
+            relationship: str,
+        ) -> dict[str, Any]:
+            ref = {
+                "kind": kind,
+                "key": key,
+                "label": label or key,
+                "relationship": relationship,
+                "source": "Google Calendar",
+                "confidence": "exact",
+            }
+            canonical = graph_matches.get((event_id, kind, key.strip().lower()))
+            return {**ref, **canonical} if canonical else ref
+
         for attendee in attendees[:12]:
             if not isinstance(attendee, dict):
                 continue
@@ -6335,35 +6501,22 @@ def _brief_calendar_observations(
             if not email or email == owner or email in seen_entities:
                 continue
             seen_entities.add(email)
-            entity_refs.append({
-                "kind": "person",
-                "key": email,
-                "label": attendee.get("display_name") or email,
-                "relationship": "involves",
-                "source": "Google Calendar",
-                "confidence": "exact",
-            })
+            entity_refs.append(entity_ref(
+                "person", email, attendee.get("display_name") or email, "involves"
+            ))
         organizer_email = str(organizer.get("email") or "").strip().lower()
         if organizer_email and organizer_email != owner and organizer_email not in seen_entities:
-            entity_refs.append({
-                "kind": "person",
-                "key": organizer_email,
-                "label": organizer.get("display_name") or organizer_email,
-                "relationship": "organized_by",
-                "source": "Google Calendar",
-                "confidence": "exact",
-            })
+            entity_refs.append(entity_ref(
+                "person",
+                organizer_email,
+                organizer.get("display_name") or organizer_email,
+                "organized_by",
+            ))
         location = str(row.get("location") or "").strip()
         if location:
-            entity_refs.append({
-                "kind": "place",
-                "key": location.lower(),
-                "label": location,
-                "relationship": "at",
-                "source": "Google Calendar",
-                "confidence": "exact",
-            })
-        event_id = str(row.get("event_id") or "")
+            entity_refs.append(entity_ref(
+                "place", location.lower(), location, "at"
+            ))
         observation_key = f"calendar:primary:{event_id}"
         future = bool((ends_at or starts_at) >= now)
         summary = _google_calendar_clean_text(row.get("description"), 1_600)
@@ -6382,13 +6535,24 @@ def _brief_calendar_observations(
             "title": row.get("summary") or "Untitled event",
             "summary": summary,
             "source": "Google Calendar",
+            "handle": {
+                "kind": "calendar_event",
+                "calendar_id": "primary",
+                "event_id": event_id,
+            },
             "url": row.get("html_link") or row.get("meeting_link"),
             "occurred_at": starts_at.isoformat(),
+            "entities": [
+                str(ref.get("canonical_label") or ref.get("label") or "")[:240]
+                for ref in entity_refs[:8]
+            ],
             "provenance": {
                 "resolver": "private_google_calendar",
                 "coverage_key": coverage_key,
                 "brief_section": "coming_up" if future else "changed",
                 "observation_key": observation_key,
+                "calendar_id": "primary",
+                "event_id": event_id,
                 "viewer_relation": {
                     "kind": "calendar_owner",
                     "confidence": "exact",
@@ -6401,16 +6565,38 @@ def _brief_calendar_observations(
                 "all_day": bool(row.get("all_day")),
                 "event_type": row.get("event_type") or "default",
                 "entity_refs": entity_refs,
+                "graph_context": {
+                    "edge_count": len(entity_refs),
+                    "canonical_count": sum(
+                        1 for ref in entity_refs if ref.get("node_id")
+                    ),
+                },
                 "feedback_allowed": False,
             },
         })
     connection_status = str(connection.get("status") or "connected")
-    warnings = []
+    warnings = [graph_warning] if graph_warning else []
     if connection_status in {"error", "needs_reconnect"} and connection.get("last_error"):
         warnings.append(
             "Google Calendar needs attention: "
             + _google_calendar_clean_text(connection.get("last_error"), 400)
         )
+    canonical_nodes = {
+        str(ref.get("node_id"))
+        for observation in observations
+        for ref in (observation.get("provenance") or {}).get("entity_refs") or []
+        if ref.get("node_id")
+    }
+    graph_edges = sum(
+        len((observation.get("provenance") or {}).get("entity_refs") or [])
+        for observation in observations
+    )
+    canonical_edges = sum(
+        1
+        for observation in observations
+        for ref in (observation.get("provenance") or {}).get("entity_refs") or []
+        if ref.get("node_id")
+    )
     return observations, [{
         "key": coverage_key,
         "label": "Google Calendar",
@@ -6419,6 +6605,9 @@ def _brief_calendar_observations(
         "scope": "personal",
         "available": len(rows),
         "identity_status": "mapped",
+        "graph_edge_count": graph_edges,
+        "canonical_edge_count": canonical_edges,
+        "canonical_entity_count": len(canonical_nodes),
     }], warnings
 
 
@@ -10969,6 +11158,7 @@ def _normalize_evidence_handle(value: Any) -> dict[str, Any]:
         "cube": ("node_id", "schema", "relation", "column"),
         "db_table": ("node_id", "schema", "relation", "column"),
         "db_column": ("node_id", "schema", "relation", "column"),
+        "calendar_event": ("calendar_id", "event_id"),
     }
     if kind not in allowed:
         return {}
@@ -11196,6 +11386,15 @@ def _normalize_personal_brief_result(value: Any) -> dict[str, Any]:
             "unavailable": max(0, int(candidate.get("unavailable") or 0)),
             "scope": "external" if candidate.get("scope") == "external" else "personal",
             "identity_needed": max(0, int(candidate.get("identity_needed") or 0)),
+            "graph_edge_count": max(
+                0, int(candidate.get("graph_edge_count") or 0)
+            ),
+            "canonical_edge_count": max(
+                0, int(candidate.get("canonical_edge_count") or 0)
+            ),
+            "canonical_entity_count": max(
+                0, int(candidate.get("canonical_entity_count") or 0)
+            ),
             "identity_status": (
                 str(candidate.get("identity_status"))
                 if candidate.get("identity_status") in {
@@ -11280,7 +11479,8 @@ def _hydrate_evidence_refs(
                         "brief_section", "observation_key", "viewer_relation", "status",
                         "due_at", "starts_at", "urgency", "session_id", "inbox_source",
                         "inbox_item_id", "home_item_id", "pinned_version", "tracking",
-                        "note_id", "note_date", "entity_refs", "delta",
+                        "note_id", "note_date", "calendar_id", "event_id", "ends_at",
+                        "all_day", "entity_refs", "graph_context", "delta",
                     )
                     if provenance.get(key) not in (None, "", [])
                 }

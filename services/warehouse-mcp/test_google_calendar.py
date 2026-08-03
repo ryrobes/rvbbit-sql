@@ -36,20 +36,29 @@ def test_calendar_schema_is_migrated_self_healing_and_private_by_owner():
         ROOT / "crates" / "pg_rvbbit" / "sql" / "migrations"
         / "0237_calliope_google_calendar.sql"
     ).read_text(encoding="utf-8")
+    graph_migration = (
+        ROOT / "crates" / "pg_rvbbit" / "sql" / "migrations"
+        / "0238_calliope_calendar_graph_context.sql"
+    ).read_text(encoding="utf-8")
     registry = (ROOT / "crates" / "pg_rvbbit" / "src" / "migrations.rs").read_text(
         encoding="utf-8"
     )
     backend = (HERE / "calliope.py").read_text(encoding="utf-8")
 
     assert "0237_calliope_google_calendar" in registry
+    assert "0238_calliope_calendar_graph_context" in registry
     assert "owner_email text PRIMARY KEY" in migration
     assert "refresh_token_ciphertext text NOT NULL" in migration
     assert "calliope_private_calendar_edges" in migration
+    assert "brain_visible_docs(owner_email)" in graph_migration
+    assert "resolved.node_id AS kg_node_id" in graph_migration
+    assert "match_basis" in graph_migration
     assert "shared Brain" in migration
     assert "CREATE TABLE IF NOT EXISTS rvbbit.calliope_google_calendar_connections" in calliope._GOOGLE_CALENDAR_DDL
     assert "conn.execute(_GOOGLE_CALENDAR_DDL)" in backend
     assert "WAREHOUSE_GOOGLE_TOKEN_KEY" in backend
     assert "raw Google event payloads" in migration
+    assert "resolved.node_id AS kg_node_id" in calliope._GOOGLE_CALENDAR_DDL
 
 
 def test_refresh_tokens_are_encrypted_and_private_events_are_redacted(monkeypatch):
@@ -137,6 +146,19 @@ def test_calendar_observations_are_owner_filtered_and_emit_private_graph_refs():
         "event_type": "default",
         "all_day": False,
     }
+    graph_match = {
+        "event_id": "evt-1",
+        "object_kind": "person",
+        "object_key": "ada@example.com",
+        "predicate": "involves",
+        "kg_node_id": 42,
+        "graph_id": "brain",
+        "node_kind": "person",
+        "canonical_label": "Ada Lovelace",
+        "match_basis": "object_key_alias",
+        "match_confidence": 1.0,
+        "node_confidence": 1.0,
+    }
 
     class Connection:
         def __enter__(self):
@@ -149,6 +171,8 @@ def test_calendar_observations_are_owner_filtered_and_emit_private_graph_refs():
             queries.append((query, params))
             if "calendar_connections" in query:
                 return _Result(connection)
+            if "calliope_private_calendar_edges" in query:
+                return _Result([graph_match])
             return _Result([event])
 
     items, coverage, warnings = calliope._brief_calendar_observations(
@@ -166,9 +190,24 @@ def test_calendar_observations_are_owner_filtered_and_emit_private_graph_refs():
     assert items[0]["provenance"]["viewer_relation"]["truth"] == "observed"
     assert items[0]["provenance"]["feedback_allowed"] is False
     assert {edge["kind"] for edge in items[0]["provenance"]["entity_refs"]} == {"person", "place"}
+    person = next(
+        edge for edge in items[0]["provenance"]["entity_refs"]
+        if edge["kind"] == "person"
+    )
+    assert person["node_id"] == "42"
+    assert person["canonical_label"] == "Ada Lovelace"
+    assert person["handle"] == {"kind": "brain_entity", "label": "Ada Lovelace"}
+    assert person["resolution"] == "canonical_exact"
+    assert items[0]["handle"] == {
+        "kind": "calendar_event", "calendar_id": "primary", "event_id": "evt-1",
+    }
     assert all(params[0] == "owner@example.com" for _query, params in queries)
     assert "response_status,'')<>'declined'" in queries[1][0]
+    assert "brain_visible_docs" in queries[2][0]
     assert coverage[0]["scope"] == "personal"
+    assert coverage[0]["graph_edge_count"] == 2
+    assert coverage[0]["canonical_edge_count"] == 1
+    assert coverage[0]["canonical_entity_count"] == 1
 
 
 def test_expired_incremental_token_falls_back_to_full_sync(monkeypatch):

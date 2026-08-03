@@ -45,6 +45,16 @@ def test_trail_handles_are_small_locators_not_copied_evidence():
     }) == {
         "kind": "db_table", "schema": "sales", "relation": "orders",
     }
+    assert server._trail_handle({
+        "kind": "calendar-event",
+        "calendar_id": "primary",
+        "event_id": "evt_private_123",
+        "summary": "must not be copied into a locator",
+    }) == {
+        "kind": "calendar_event",
+        "calendar_id": "primary",
+        "event_id": "evt_private_123",
+    }
 
 
 def test_document_trail_uses_acl_brain_functions_and_explains_shared_context(monkeypatch):
@@ -212,6 +222,82 @@ def test_metric_trail_uses_governed_source_without_requiring_a_kg_node(monkeypat
     assert "governed metric" in result["searched"]
 
 
+def test_calendar_trail_keeps_event_private_and_follows_only_visible_canonical_edges(
+    monkeypatch,
+):
+    event = {
+        "summary": "Atlas renewal review",
+        "description": "Review the open renewal decision.",
+        "location": "Conference room 3",
+        "html_link": "https://calendar.google.com/event?eid=1",
+        "meeting_link": "https://meet.google.com/abc",
+        "organizer": {"email": "ada@example.com"},
+        "attendees": [{"email": "ada@example.com"}, {"email": "owner@example.com"}],
+        "starts_at": "2026-08-04 13:00:00+00",
+        "ends_at": "2026-08-04 14:00:00+00",
+        "all_day": False,
+        "response_status": "accepted",
+        "event_type": "default",
+        "visibility": "default",
+        "status": "confirmed",
+    }
+    edges = [{
+        "predicate": "organized_by",
+        "object_kind": "person",
+        "label": "Ada",
+        "properties": {"email": "ada@example.com"},
+        "kg_node_id": 42,
+        "node_kind": "person",
+        "canonical_label": "Ada Lovelace",
+        "match_basis": "object_key_alias",
+        "match_confidence": 1.0,
+    }]
+    calls = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, params=None):
+            calls.append((statement, params))
+            return _Result(edges if "visible_docs" in statement else [event])
+
+    monkeypatch.setattr(server, "_conn", lambda: Connection())
+    monkeypatch.setattr(server, "_calliope_brain_evidence", lambda query, owner, limit: [{
+        "doc_id": 11,
+        "title": "Atlas decision history",
+        "source": "Company memory",
+        "score": .91,
+    }])
+
+    result = server._calliope_follow_trail({
+        "kind": "calendar_event", "calendar_id": "primary", "event_id": "evt-1",
+    }, "owner@example.com", 12)
+
+    assert result["subject"]["label"] == "Atlas renewal review"
+    assert result["subject"]["handle"] == {
+        "kind": "calendar_event", "calendar_id": "primary", "event_id": "evt-1",
+    }
+    assert {connection["relationship"] for connection in result["connections"]} == {
+        "organized by", "preparation context",
+    }
+    person = next(
+        connection for connection in result["connections"]
+        if connection["relationship"] == "organized by"
+    )
+    assert person["handle"] == {"kind": "brain_entity", "label": "Ada Lovelace"}
+    assert person["confidence"] == 1.0
+    assert calls[0][1] == ("owner@example.com", "primary", "evt-1")
+    assert calls[1][1] == (
+        "owner@example.com", "owner@example.com", "primary", "evt-1",
+        "owner@example.com",
+    )
+    assert "private calendar overlay" in result["searched"]
+
+
 def test_search_normalizer_preserves_rehydratable_trail_handle():
     result = calliope._normalize_evidence_search_result({
         "items": [{
@@ -224,6 +310,22 @@ def test_search_normalizer_preserves_rehydratable_trail_handle():
     }, "launch")
 
     assert result["items"][0]["handle"] == {"kind": "document", "doc_id": "11"}
+
+    calendar = calliope._normalize_evidence_search_result({
+        "items": [{
+            "id": "calendar:primary:evt-1",
+            "group": "knowledge",
+            "kind": "calendar-event",
+            "title": "Atlas renewal review",
+            "handle": {
+                "kind": "calendar_event", "calendar_id": "primary",
+                "event_id": "evt-1", "description": "must not survive",
+            },
+        }],
+    }, "calendar")
+    assert calendar["items"][0]["handle"] == {
+        "kind": "calendar_event", "calendar_id": "primary", "event_id": "evt-1",
+    }
 
 
 def test_trail_affordance_is_shared_by_home_search_documents_and_lens():

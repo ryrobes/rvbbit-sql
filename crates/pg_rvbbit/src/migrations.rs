@@ -969,6 +969,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0237_calliope_google_calendar",
         include_str!("../sql/migrations/0237_calliope_google_calendar.sql"),
     ),
+    (
+        "0238_calliope_calendar_graph_context",
+        include_str!("../sql/migrations/0238_calliope_calendar_graph_context.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

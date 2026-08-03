@@ -5626,20 +5626,23 @@
   function briefEntityTooltip(object) {
     const kind = String(object?.kind || "thing").replaceAll("_", " ");
     const handle = object?.handle && typeof object.handle === "object" ? object.handle : {};
-    const reference = object?.ref || object?.id || object?.key
+    const reference = object?.node_id || object?.ref || object?.id || object?.key
       || handle.object_id || handle.slug || handle.table || "";
     const relationship = object?.relationship || object?.edge || "linked by the Brief resolver";
+    const canonical = object?.resolution === "canonical_exact" || Boolean(object?.node_id);
     return calliopeTooltipSourceMarkup({
       eyebrow: "Daily Brief · linked object",
-      status: kind,
-      title: object?.label || "Linked object",
-      meaning: `This ${kind} is preserved as an explicit edge from the Brief observation, so future Calliope work can resolve the same company object.`,
+      status: canonical ? "resolved" : kind,
+      title: object?.canonical_label || object?.label || "Linked object",
+      meaning: canonical
+        ? `This explicit ${kind} edge was matched exactly to an ACL-visible company Brain object. The Calendar event remains private while Calliope can follow that canonical object into governed history.`
+        : `This ${kind} is preserved as an explicit edge from the Brief observation, so future Calliope work can attempt to resolve the same company object.`,
       evidence: object?.evidence || `Relationship: ${String(relationship).replaceAll("_", " ")}.`,
       evidenceLabel: "How it connects",
       facts: [
         ["Reference", calliopeShortRef(reference)],
         ["Source", object?.source],
-        ["Confidence", object?.confidence],
+        ["Match", object?.match_basis ? String(object.match_basis).replaceAll("_", " ") : object?.confidence],
       ],
     });
   }
@@ -5725,6 +5728,8 @@
     const provenance = item.provenance || {};
     const relation = provenance.viewer_relation || {};
     const linked = Array.isArray(provenance.entity_refs) ? provenance.entity_refs.length : 0;
+    const canonical = Array.isArray(provenance.entity_refs)
+      ? provenance.entity_refs.filter((object) => object?.node_id).length : 0;
     return calliopeTooltipSourceMarkup({
       eyebrow: "Coming Up · calendar",
       status: provenance.status || "scheduled",
@@ -5737,8 +5742,19 @@
         ["Source", item.source || evidenceGroupLabel(item.group)],
         ["Type", item.subtype || item.kind],
         ["Graph edges", linked ? String(linked) : ""],
+        ["Company matches", canonical ? String(canonical) : ""],
       ],
     });
+  }
+
+  function briefCalendarLinkedObjects(item) {
+    const canonical = (Array.isArray(item?.provenance?.entity_refs)
+      ? item.provenance.entity_refs : [])
+      .filter((object) => object?.node_id && (object?.canonical_label || object?.label));
+    if (!canonical.length) return "";
+    const visible = canonical.slice(0, 2).map((object) => `<span class="kind-${escapeHtml(object.kind || "thing")}" tabindex="0" data-calliope-tooltip data-tooltip-kind="entity" aria-label="${escapeHtml(`${object.canonical_label || object.label}. Explain this Calendar edge.`)}"><b>${escapeHtml(object.kind || "thing")}</b>${escapeHtml(object.canonical_label || object.label)}${briefEntityTooltip(object)}</span>`).join("");
+    const remaining = canonical.length - 2;
+    return `<div class="brief-calendar-linked" aria-label="${canonical.length} canonical company object${canonical.length === 1 ? "" : "s"} connected">${visible}${remaining > 0 ? `<i>+${remaining}</i>` : ""}</div>`;
   }
 
   function renderBriefCalendarEvent(surface, item, timeZone, { showDate = false } = {}) {
@@ -5754,6 +5770,7 @@
     const timingClass = provenance.starts_at
       ? "scheduled-event"
       : provenance.due_at ? "due-event" : "observed-event";
+    const linkedObjects = briefCalendarLinkedObjects(item);
     return `<article class="evidence-card brief-calendar-event ${timingClass} ${selected ? "selected" : ""}"
       data-evidence-id="${escapeHtml(item.id)}" data-evidence-kind="${escapeHtml(item.kind)}" role="button" tabindex="0"
       aria-pressed="${selected ? "true" : "false"}" data-calliope-tooltip data-tooltip-kind="provenance"
@@ -5764,6 +5781,7 @@
       </header>
       <h5>${escapeHtml(item.title || "Scheduled item")}</h5>
       <span class="brief-calendar-event-source"><i class="${escapeHtml(truth)}"></i>${escapeHtml(item.source || evidenceGroupLabel(item.group))}</span>
+      ${linkedObjects}
       <footer>
         <button type="button" data-brief-action="prepare">Prepare</button>
         ${evidenceCanTrail(item) ? `<button type="button" data-follow-evidence="${escapeHtml(item.id)}">Trail</button>` : ""}
@@ -6204,7 +6222,11 @@
       const identity = Number(source.identity_needed || 0);
       const included = Number(source.count || 0);
       const matched = Number(source.matched_count || included);
-      const detail = source.status === "unavailable"
+      const canonical = Number(source.canonical_entity_count || 0);
+      const graphSuffix = canonical
+        ? ` · ${canonical} company object${canonical === 1 ? "" : "s"} connected`
+        : "";
+      const baseDetail = source.status === "unavailable"
         ? "unavailable"
         : source.identity_status === "not_person_mapped"
           ? "not person-mapped"
@@ -6213,7 +6235,11 @@
             : matched > included
               ? `${included} shown · ${matched} matched`
               : `${included} in brief`;
-      return `<span class="${source.status === "unavailable" ? "unavailable" : ""}" title="${escapeHtml(`${Number(source.available || matched || included)} source records available to the resolver`)}"><i></i>${escapeHtml(source.label)} · ${escapeHtml(detail)}</span>`;
+      const detail = `${baseDetail}${graphSuffix}`;
+      const graphEdges = Number(source.graph_edge_count || 0);
+      const canonicalEdges = Number(source.canonical_edge_count || 0);
+      const coverageTitle = `${Number(source.available || matched || included)} source records available to the resolver${graphEdges ? ` · ${graphEdges} explicit private edges · ${canonicalEdges} exact ACL-visible company matches` : ""}`;
+      return `<span class="${source.status === "unavailable" ? "unavailable" : ""}" title="${escapeHtml(coverageTitle)}"><i></i>${escapeHtml(source.label)} · ${escapeHtml(detail)}</span>`;
     }).join("");
     const warnings = (payload.warnings || []).length
       ? `<details class="evidence-warnings"><summary>Some observed sources were unavailable</summary><p>${escapeHtml(payload.warnings.join(" · "))}</p></details>`
@@ -6809,7 +6835,7 @@
     const prompts = {
       review: "Review the attached Brief observation in the context of my current priorities. Verify its current state and tell me what deserves attention; keep observed facts separate from interpretation.",
       plan: "Help me plan the next step for the attached Brief observation. Verify the source evidence, identify the smallest useful action, and ask before scheduling work or changing any source system.",
-      prepare: "Help me prepare from the attached Brief observation. Gather the relevant history and open questions from governed evidence, then give me a concise preparation checklist.",
+      prepare: "Help me prepare from the attached Brief observation. Follow its explicit people, place, project, and ticket edges—especially any canonical company objects—into governed history, identify relevant prior decisions and open questions, then give me a concise preparation checklist. Keep the private Calendar fact separate from company-source evidence.",
       investigate: "Investigate the attached Brief observation. Verify what changed, connect only source-backed evidence, explain why it may matter, and keep correlation separate from causal interpretation.",
       resume: "Help me resume the work represented by the attached Brief observation. Reconstruct the last useful state from governed evidence, identify what remains, and propose the next concrete step.",
       connect: "Help me connect the attached private note to my current work. Treat it as context I wrote, not as an independently verified fact; follow its linked company objects, verify anything material against governed evidence, and suggest the useful next connection or action.",
