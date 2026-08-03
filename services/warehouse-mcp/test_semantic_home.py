@@ -197,6 +197,11 @@ def test_home_schema_and_surfaces_preserve_private_composition_contract():
     assert "data-home-value-text" in landing
     assert "setGalleryTooltipSource(node,homeValueTooltip" in landing
     assert ".gallery-tooltip" in landing
+    assert 'class="home-thumb pending" data-home-thumbnail' in landing
+    assert 'class="home-thumb-fallback"' in landing
+    assert "function hydrateHomeThumbnails" in landing
+    assert "hydrateHomeThumbnails(homeGrid)" in landing
+    assert ".home-thumb.ready img" in landing
     assert '<button type="button" class="home-pin">Pin to Home</button>' in lens
     assert "definition_hash: semanticObject.definition_hash" in lens
     assert "context: semanticObject.context || {}" in lens

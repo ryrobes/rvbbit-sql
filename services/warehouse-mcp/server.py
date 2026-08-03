@@ -9397,10 +9397,17 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .home-tile.unavailable{opacity:.66}
 .home-tile-content{display:grid;grid-template-columns:74px minmax(0,1fr);min-height:132px}
 .home-tile.object .home-tile-content,.home-tile.metric .home-tile-content{grid-template-columns:1fr}
-.home-thumb{position:relative;display:block;min-height:100%;overflow:hidden;background:#0d0b09;color:var(--amber)}
-.home-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:top center;opacity:.67;transition:opacity .2s,transform .35s}
-.home-tile:hover .home-thumb img{opacity:.88;transform:scale(1.035)}
-.home-thumb::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 45%,var(--panel-raised) 100%);pointer-events:none}
+.home-thumb{position:relative;display:block;min-height:100%;overflow:hidden;isolation:isolate;background:#0d0b09;color:var(--amber)}
+.home-thumb-fallback{position:absolute;z-index:0;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:7px;
+  background:radial-gradient(circle at 42% 42%,color-mix(in oklch,var(--amber) 7%,transparent),transparent 64%);transition:opacity .25s}
+.home-thumb-fallback b{color:var(--amber);font:italic 400 25px/1 var(--serif);opacity:.28}
+.home-thumb-fallback small{color:var(--dim);font:600 5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase}
+.home-thumb.pending .home-thumb-fallback b{animation:breathe 1.9s ease-in-out infinite}
+.home-thumb img{position:absolute;z-index:1;inset:0;width:100%;height:100%;object-fit:cover;object-position:top center;visibility:hidden;opacity:0;transition:opacity .2s,transform .35s}
+.home-thumb.ready img{visibility:visible;opacity:.67}
+.home-thumb.ready .home-thumb-fallback{opacity:0}
+.home-tile:hover .home-thumb.ready img{opacity:.88;transform:scale(1.035)}
+.home-thumb::after{content:"";position:absolute;z-index:2;inset:0;background:linear-gradient(90deg,transparent 45%,var(--panel-raised) 100%);pointer-events:none}
 .home-tile-main{display:flex;flex-direction:column;min-width:0;padding:12px 12px 10px}
 .home-tile.object .home-tile-main,.home-tile.metric .home-tile-main{position:relative;z-index:1;padding-left:14px}
 .home-kicker{display:flex;align-items:center;gap:7px;margin-bottom:6px;color:var(--jade);font:650 6px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
@@ -10018,6 +10025,13 @@ _LANDING_JS = """
      ]
    });
  }
+ function homeArtifactGlyph(item){
+   var kind=String(item&&item.app_kind||'artifact').toLowerCase();
+   if(kind.indexOf('dashboard')>=0)return '▦';
+   if(kind.indexOf('deck')>=0||kind.indexOf('slide')>=0)return '▷';
+   if(kind.indexOf('report')>=0)return '▤';
+   return '◈';
+ }
  function homeTileMarkup(item){
    var object=item.kind==='artifact_object',metric=item.kind==='metric',unavailable=item.status==='unavailable';
    var presented=item.presentation||{},last=presented.last_rendered_value;
@@ -10027,8 +10041,9 @@ _LANDING_JS = """
      +escapeHome(item.id)+'" tabindex="0" data-gallery-tooltip data-tooltip-kind="value" aria-label="Live value for '
      +escapeHome(item.title||'named business object')+'. Explain this governed value."><span data-home-value-text>'
      +escapeHome(valueText)+'</span>'+homeValueTooltip(item,null,null)+'</div>':metric?'<div class="home-value '+(metricValue===null||metricValue===undefined?'loading':'')+'" tabindex="0" data-gallery-tooltip data-tooltip-kind="value" aria-label="Current observed value for '+escapeHome(item.title||'metric')+'"><span data-home-value-text>'+escapeHome(valueText)+'</span>'+homeMetricTooltip(item)+'</div>':'';
-   var thumbnail=!object&&!metric&&item.thumbnail_url?'<a class="home-thumb" href="'+escapeHome(item.open_url||'#')
-     +'" target="_blank" rel="noopener"><img src="'+escapeHome(item.thumbnail_url)+'" alt="" decoding="async"></a>':'';
+   var thumbnail=!object&&!metric&&item.thumbnail_url?'<a class="home-thumb pending" data-home-thumbnail href="'+escapeHome(item.open_url||'#')
+     +'" target="_blank" rel="noopener"><span class="home-thumb-fallback" aria-hidden="true"><b>'+homeArtifactGlyph(item)+'</b><small>Preview pending</small></span>'
+     +'<img src="'+escapeHome(item.thumbnail_url)+'" alt="" loading="lazy" decoding="async"></a>':'';
    var context=object?homeContextMarkup(item.context):metric?homeContextMarkup(item.params):'';
    var versionNote=metric?'<span class="home-version-note">Definition v'+escapeHome(item.version||'?')+'</span>':item.newer_version_available?'<span class="home-version-note">Pinned v'+escapeHome(item.version)
      +' · v'+escapeHome(item.latest_version)+' exists</span>':'<span class="home-version-note"></span>';
@@ -10044,6 +10059,37 @@ _LANDING_JS = """
      +'<div class="home-tile-actions">'+versionNote+open+ask
      +'<button type="button" data-home-trail="'+escapeHome(item.id)+'">Follow trail</button>'
      +'<button type="button" data-home-remove="'+escapeHome(item.id)+'">Remove</button></div></article>';
+ }
+ function hydrateHomeThumbnails(root){
+   if(!root)return;
+   [].forEach.call(root.querySelectorAll('[data-home-thumbnail]'),function(frame){
+     if(frame.dataset.hydrated==='true')return;
+     frame.dataset.hydrated='true';
+     var image=frame.querySelector('img'),tries=0,retryTimer=null;
+     if(!image)return;
+     var base=image.getAttribute('src');
+     function ready(){
+       if(retryTimer){clearTimeout(retryTimer);retryTimer=null;}
+       frame.classList.add('ready');
+       frame.classList.remove('pending','unavailable');
+     }
+     function retry(){
+       if(retryTimer)return;
+       frame.classList.remove('ready');
+       if(++tries>5){frame.classList.remove('pending');frame.classList.add('unavailable');return;}
+       frame.classList.add('pending');
+       retryTimer=setTimeout(function(){
+         retryTimer=null;
+         if(!frame.isConnected)return;
+         image.src=base+(base.indexOf('?')>=0?'&':'?')+'r='+tries;
+       },tries*2500);
+     }
+     image.addEventListener('load',ready);
+     image.addEventListener('error',retry);
+     if(image.complete){
+       if(image.naturalWidth>0)ready();else setTimeout(retry,0);
+     }
+   });
  }
  function syncGalleryPins(){
    var pinned={};
@@ -10087,6 +10133,7 @@ _LANDING_JS = """
    homeEmpty.hidden=Boolean(homeItems.length);
    homeStatus.classList.remove('error');
    homeStatus.textContent=homeItems.length?homeItems.length+' pinned object'+(homeItems.length===1?'':'s'):'Private to your signed-in account';
+   hydrateHomeThumbnails(homeGrid);
    syncGalleryPins();
    homeItems.forEach(previewHomeItem);
  }
