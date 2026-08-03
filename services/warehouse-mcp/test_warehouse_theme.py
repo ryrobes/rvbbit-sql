@@ -75,11 +75,18 @@ def test_theme_pipeline_uses_vibrant_tokens_and_browser_storage():
     assert "data-theme-solid-color" in source
     assert "backgroundChoice" in source
     assert "warehouseBackground" in source
+    assert "rvbbit-warehouse-color-mode" in source
+    assert "deriveLightWarehouseTokens" in source
+    assert "warehouseColorMode" in source
+    assert "warehouse-theme-mode-button" in source
+    assert "Switch to light mode" in source
+    assert "Switch to dark mode" in source
     assert "rvbbit-warehouse-theme-v1" in bundle
+    assert "rvbbit-warehouse-color-mode" in bundle
     assert "/theme/library" in bundle
     assert "data-theme-background-mode" in bundle
     assert "warehouseBackground" in bundle
-    assert '<svg viewBox="0 0 24 24"' not in source
+    assert source.count('<svg viewBox="0 0 24 24"') == 2
     assert "warehouse-theme-button-thumb" in bundle
     assert (_HERE / "theme" / "VIBRANT-LICENSE").is_file()
 
@@ -91,6 +98,10 @@ def test_theme_pipeline_uses_vibrant_tokens_and_browser_storage():
     assert '[data-warehouse-background="solid"] .bg' in css
     assert "--warehouse-solid-background" in css
     assert 'body[data-warehouse-page="calliope"] .bg' in css
+    assert ':root[data-warehouse-color-mode="light"]' in css
+    assert '.warehouse-theme-mode-button' in css
+    assert 'html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .veil' in css
+    assert 'html[data-warehouse-color-mode="light"] .artifact-frame iframe' not in css
     assert "position: fixed;" in css
     assert "margin: auto;" in css
     assert "scrollbar-color:" in css
@@ -143,7 +154,11 @@ def test_gallery_calliope_entry_is_a_floating_time_aware_avatar():
     assert "family=Homemade+Apple&display=swap" in server
     assert "position:fixed;right:var(--calliope-edge);bottom:var(--calliope-edge)" in server
     assert "--gallery-rail-bg:color-mix(in oklch,var(--void) 85%,transparent)" in server
-    assert server.count("background:var(--gallery-rail-bg)") == 3
+    assert server.count("background:var(--gallery-rail-bg)") == 1
+    assert "--calliope-capsule-bg:color-mix(in oklch,#fffaf1 86%,var(--amber))" in server
+    assert "--calliope-capsule-ink:color-mix(in oklch,#100d0b 91%,var(--amber))" in server
+    assert "background:linear-gradient(135deg,#fff,var(--calliope-capsule-bg))" in server
+    assert "color:var(--calliope-capsule-ink);font-family" in server
     assert "width:44px;height:44px" in server
     assert '<img alt="" width="44" height="44" decoding="async">' in server
     assert 'class="calliope-float-copy"' in server
@@ -158,7 +173,7 @@ def test_gallery_calliope_entry_is_a_floating_time_aware_avatar():
     assert "border-bottom" not in shot_rule
     assert (
         '<span class="who"><span data-warehouse-theme-anchor></span>'
-        "{_inbox_link}{_app_link}"
+        "{_brief_link}{_inbox_link}{_app_link}"
     ) in server
     assert (
         '<span class="who"><span data-warehouse-theme-anchor></span>'

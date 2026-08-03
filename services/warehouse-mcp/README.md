@@ -225,6 +225,14 @@ It lists `rvbbit.live_apps` unfiltered — every row there is externally address
 tab: the index is somewhere you come back to. No new table, no build step, no extra
 config. Routes only exist in OAuth mode (same as `/d/<slug>`).
 
+The adjacent **Metrics** view is explicit opt-in and stays out of artifact search by
+default. It reads governed definitions plus already-materialized
+`rvbbit.metric_observations`; browsing never evaluates every metric. Cards show the
+latest value and bounded trend, while **Metric Lens** exposes the inspectable timeline,
+definition versions, parameters, source freshness, and dependent artifacts. Metric
+handles include canonical JSON parameters, so two slices of the same definition remain
+distinct everywhere they are followed, pinned, or discussed.
+
 **Thumbnails.** Captures are stored on disk under
 `$WAREHOUSE_LIVE_APP_CAPTURE_DIR/thumbs/<kind>/<slug>.jpg` (compose points that at the
 durable volume) and are **never regenerated per visit** — a warm request is a ~7ms
@@ -251,15 +259,18 @@ library is a self-contained, web-sized copy of DataRabbit's Lens wallpaper set: 
 thumbnail/full WebP pairs rather than a runtime dependency on the Lens checkout.
 
 Color selection uses the same pipeline as DataRabbit: `node-vibrant` role swatches are
-normalized into an image palette, then the dark-theme derivation generates interface,
-accent, semantic, and chart tokens around the image's dominant hue. Library selections
+normalized into an image palette, then paired dark/light derivations generate interface,
+accent, semantic, and chart tokens around the image's dominant hue. The sun/moon control
+beside the palette icon switches the active derivation and saves that choice in the browser;
+it applies before first paint and follows the user across every first-party Warehouse page.
+Library selections
 store their stable source reference, palette, and generated tokens in `localStorage`.
 Uploaded images store the actual Blob in IndexedDB and the compact palette/tokens in
 `localStorage`, so colors can restore during `<head>` and the image follows immediately
 after browser storage opens. A selected theme can use either its wallpaper or a
 user-selected solid background color; switching to solid keeps the derived interface
-and chart palette intact. Calliope applies a darker image blend than the other Warehouse
-pages so its translucent notebook panes remain legible without losing the scene.
+and chart palette intact. Calliope uses a darkened scene behind dark mode and a warm paper
+wash behind light mode so its translucent notebook panes remain legible without losing the scene.
 **Use default** deletes both records and exposes the page's existing hand-tuned colors
 and randomized background again.
 
@@ -281,6 +292,18 @@ Calliope session, saves the result as the first evidence bundle, and then opens 
 bundle in the full Calliope workspace. The search is sent in the authenticated POST body,
 not placed in the URL, and never becomes a synthetic agent chat turn.
 
+Each gallery card also has an explicit **Ask** action. It always creates a fresh notebook
+and pins the card's exact published artifact version to the stage; the immutable version
+URL is used for rendering even if the gallery alias advances later. **Pin** remains a
+separate action for adding the artifact to the user's Semantic Home.
+
+Governed metrics use the same three-intent split. **Follow** quietly contributes recent
+durable observations to that user's Personal Brief without creating an alert. **Pin**
+tracks the latest observation on Semantic Home. **Ask Calliope** freezes either the
+current observation or a selected Metric Lens range onto a fresh Stage, preserving the
+observation ids, definition version, parameters, and lineage while the conversation
+continues.
+
 Calliope is a three-column business-user surface: the signed-in user's private session
 rail, a newest-first living artifact record, and chat. Hermes owns the agent run and uses
 its current/default profile and shared company memory; the warehouse stores only the
@@ -296,6 +319,14 @@ before finishing. Any image surface can also be opened in the pen/arrow/box mark
 editor; the flattened annotation is sent with the next message while its separately
 stored overlay becomes a toggleable, lineage-linked stage surface.
 
+A new notebook may be created without a title. After its first substantive completed
+turn, Warehouse calls the receipted `rvbbit.summarize` operator over a bounded transcript
+and replaces only the provisional title; an explicit human rename always wins. Hermes
+terminal usage is mirrored into the RVBBIT receipt and semantic cost ledgers with the
+signed caller. Explicit upstream charges are settled, known model rates are estimated,
+and subscription/OAuth or otherwise unreported runs are honestly recorded as
+`0.00 / uncosted` rather than pretending they were free.
+
 The stage header also contains a company evidence resolver. One query federates the
 caller's ACL-filtered Document Brain, published artifact metadata and enriched semantic
 objects, and the warehouse semantic catalog. Results are saved as a newest-first evidence
@@ -310,6 +341,57 @@ before giving bounded evidence to Hermes. Evidence searches are durable scratchp
 but are not Hermes chat turns, while the selected evidence is recorded on the eventual chat turn for later
 resumption. A failed corpus is shown as unavailable without discarding results from the
 other resolvers. No additional environment variables are required.
+
+**Personal Briefs** are the user/time-scoped front door to that same evidence system.
+The **Brief** control in both the gallery rail and Calliope opens one private notebook per
+OAuth email and local calendar day. Its first surface is resolved deterministically—no
+LLM call—from ACL-visible Brain sources, the user's Work Inbox and semantic watches,
+their private Semantic Home pins, recent private Calliope notebooks, and recently authored
+artifacts. Whole-artifact Home pins follow latest while named business-object pins retain
+their exact versioned handle. Explicit refreshes
+append timestamped snapshots to the same lineage; simply reopening today's Brief reuses
+the latest snapshot. Each refresh compares stable observation state with the immediately
+preceding snapshot: new and materially changed facts are explicit, while unchanged generic
+activity is not mislabeled as “changed.” Sections distinguish the user's pinned focus,
+work that needs attention, upcoming events, exact changes, moved watch values, resumable
+work, and possible identity matches. Source facts are labeled **observed**,
+confirmed/candidate identity joins are
+**resolved**, and agent **interpretation** only begins after the user attaches selected
+items or the compact whole-Brief index and chooses Ask Calliope. Card actions attach the
+exact item and prepare a reviewable investigation/preparation/resumption prompt; they never
+auto-send or mutate a source. “That's me,” “Relevant,” and “Not mine” corrections are
+private and durable; they never rewrite source documents or split the shared
+Hermes/Hindsight company memory.
+
+Each daily Brief also has an optional append-only **Daily notes** thread. The
+CodeMirror editor supports Obsidian-style `[[…]]` completion against ACL-visible
+Brain objects projected as people, places, things, projects, and tickets. Choosing
+an object records an explicit private `mentions` edge to its canonical KG node;
+ordinary prose creates no inferred edge. Note bodies stay out of the shared Brain
+graph and shared Hermes memory. Instead, the owner-keyed graph overlay and recent
+prior notes feed later Personal Briefs under **From your notes**, labeled **You
+noted** so user context is never presented as independently observed fact.
+
+Brain resolution is sampled fairly per visible source before applying the overall bound,
+so a high-volume fresh corpus cannot starve another source. System-learning records remain
+outside the personal resolver rather than pretending to be person-addressed work; they are
+better suited to a separate operator-oriented Brief. Coverage distinguishes resolvers
+checked, contributing sources, available records, person mapping, and records omitted from
+the visible bounded snapshot.
+
+Providers can project arbitrary source JSON into this observed layer with an optional
+`observation_map` on `rvbbit.brain_doc_providers`, or a source-specific override at
+`rvbbit.brain_sources.config.observation_map`. The deliberately small JSON-path subset
+supports fields such as `status`, `due_at`, `starts_at`, `url`, `assignee_emails`,
+`assignee_names`, `participants`, `authors`, and `viewer_scope`. This keeps Linear,
+calendar, meeting, ticket, and future connector names out of Calliope itself. Sources
+already synchronized under the bundled Linear and Fireflies providers receive matching
+defaults, including Fireflies attendee objects, participant-email strings, organizer,
+meeting time, and meeting link fields. Sources
+without a usable person projection remain visible in Brief coverage as **not
+person-mapped**, which gives a future setup wizard a concrete recommendation instead of
+silently pretending the integration is personalized. No additional environment
+variables are required.
 
 The header's **Design Profiles** library turns uploaded reference images, a frozen
 URL viewport/extraction, an existing selected capture, and optional written direction
@@ -332,6 +414,94 @@ values frozen as evidence; revising one starts a separate evidence-backed conver
 The interface never executes Instrument-authored HTML, JavaScript, or SQL directly, and
 the resulting Calliope run still uses the signed-in person's normal governed tools and
 warehouse permissions. No additional environment variables are required.
+
+The adjacent **Workflows** library is the headless counterpart to Instruments. A readable,
+versioned graph has one manual or schedule trigger, up to eight governed context nodes
+(`artifact`, `semantic_object`, `evidence`, `knowledge`, or `instruction`), one agent goal
+with decision rules, and stage, Work Inbox, or artifact outputs. It deliberately does not
+store arbitrary SQL, JavaScript, shell, or low-level tool DAGs: Hermes chooses concrete
+governed tools at run time. Agent-authored revisions remain private until the owner moves
+the publication pointer. Every invocation creates a fresh notebook, freezes the approved
+graph and resolved context, and requires a paired begin/finish lifecycle call; completion
+adds durable result surfaces and a deduplicated Work Inbox result or blocker. These fresh
+execution notebooks join Instrument executions under the **Runs** tab in the session rail.
+The compact **Chats**, **Briefs**, **Runs**, and **Actions** tabs keep generated notebooks
+out of the ordinary conversation list while Work Inbox remains continuously visible. The
+browser remembers the active tab, the last notebook in each tab, and the last notebook
+overall; a valid `?session=` deep link always takes precedence over remembered state.
+
+**New** opens a native starter-based builder and creates a private draft without invoking
+an LLM. **Design one with Calliope** is the separate conversational path for people who
+want the agent to co-design the graph. This distinction remains visible in the builder so
+a missing model provider cannot prevent someone from authoring a Workflow.
+
+**Run now** opens that notebook and auto-submits only the Workflow launch instruction;
+ordinary prepared Calliope handoffs remain review-before-send. If the streamed agent turn
+ends without the required finish call—including provider/authentication failure—the
+warehouse fails the run closed, commits a visible result surface, and publishes an unread
+Work Inbox blocker instead of leaving the Workflow permanently running.
+
+Before Run now or schedule enablement, **Test readiness** resolves the exact frozen
+contexts and checks Hermes model/configuration health plus declared requirements such as
+personal context, project/ticket sources, MCP servers, Brain providers, or installed
+capabilities. The check is side-effect free: it creates no session, run, Inbox item, model
+call, or schedule change. Explicit missing requirements block execution; advisory
+requirements inferred from older graphs remain warnings that require acknowledgement.
+The graph, approval, automation, readiness, and latest-run states stay visible together in
+one lifecycle strip.
+
+The frozen launch contract also exposes an identity-scoped personal-context capability
+when a goal needs the owner's latest Daily Brief, private notes, or Work Inbox. The opaque
+run ID resolves ownership server-side; the agent cannot provide or enumerate an email
+address, and the bounded result remains subject to the same owner checks as the UI.
+
+Each run keeps a bounded, user-visible diagnostic timeline of tool start, completion, and
+failure events, plus any explicitly reported action/outcome steps from a scheduled agent.
+The UI groups those events under four readable phases—prepare, gather governed context,
+analyze and decide, and commit the result—while leaving the exact technical events
+expandable underneath. The timeline redacts credential-shaped text and never stores hidden
+reasoning, raw tool arguments, or raw tool results. **Revise Workflow from this run** opens
+a fresh revision notebook with the exact graph plus a bounded outcome snapshot (status,
+summary, structured details, phase summaries, artifact refs, and source notebook pointer),
+never a transcript, prompt, or raw tool payload. The Workflow rail also includes a
+lightweight Hermes operations summary for visible cron jobs and queue health; prompts,
+delivery targets, and provider credentials are deliberately excluded.
+
+Published schedule graphs require a second explicit **Enable schedule** action. The
+schedule pins that approved version and runs through Hermes cron using the Hermes
+installation's timezone and configured cron/default model provider. Drafting or revising
+never silently advances the live schedule. The Workflow library mirrors Hermes job state,
+including provider failures that occur before a Calliope run can begin, so unattended work
+cannot fail invisibly. Pausing, resuming, running now, disabling, unpublishing, or archiving
+also updates or removes the corresponding Hermes job. No additional environment variables
+are required beyond the normal Calliope/Hermes setup.
+
+The header's **Library** control is an outcome-oriented front door to the SQL-first
+administration and capability catalog. People can search for goals such as “use Linear in
+my Brief” instead of knowing an MCP server, Brain provider, or catalog capability by name.
+Each result exposes what it unlocks, its current requirements, and one of two paths:
+guided actions seed a fresh Calliope notebook with a structured contract, while typed
+actions use a bounded native form. Typed changes always produce an immutable plan first;
+**Apply change** is a separate human approval and records progress through apply, probe,
+verify, and receipt steps. Receipts retain redacted inputs and rollback guidance, and can
+be reopened from both the Library and the Calliope stage. Guided notebooks are collected
+under the **Actions** tab in the session rail. Grouping is derived from their durable
+Library handoff surface, so ordinary conversations that merely use an action remain under
+**Chats**.
+
+Workflow readiness links missing declared requirements directly to matching Library
+actions. A successful repair returns to the blocked Workflow and reruns its side-effect-free
+readiness check. In this first version, authenticated organization members are trusted to
+use the Library; the eventual unified role and policy system is intentionally not modeled
+piecemeal here.
+
+MCP credentials never enter a Calliope prompt or PostgreSQL. Secret fields are password
+controls whose values are sent only with the explicit apply request, immediately cleared
+in the browser, and forwarded to the MCP gateway's encrypted secret route. Existing saved
+secret names may be shown, but values are never returned. Set the same
+`RVBBIT_GATEWAY_TOKEN` on PostgreSQL, Warehouse, Warren, and the MCP gateway in deployed
+environments; `MCP_GATEWAY_URL` can override endpoint discovery when needed. An absent
+required credential or an unavailable gateway fails the action closed before activation.
 
 Cube schema surfaces are also direct interactive analysis tables. Add one or more
 dimensions to Rows and one or more numeric aggregations to Values; this produces a

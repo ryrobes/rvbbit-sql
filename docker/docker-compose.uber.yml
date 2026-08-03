@@ -26,6 +26,9 @@ services:
       RVBBIT_DUCK_BACKEND_SHARED_DIR: ${RVBBIT_DUCK_BACKEND_SHARED_DIR:-/run/rvbbit/duck}
       RVBBIT_DUCK_BACKEND_SHARED_WORKERS: ${RVBBIT_DUCK_BACKEND_SHARED_WORKERS:-4}
       RVBBIT_DUCK_BACKEND_TIMEOUT_S: ${RVBBIT_DUCK_BACKEND_TIMEOUT_S:-300}
+      # Shared by PostgreSQL MCP calls, Warren's gateway runtime template, and
+      # Calliope's secure credential handoff. Empty keeps local dev open.
+      RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}
       RVBBIT_DUCK_THREADS: ${RVBBIT_DUCK_THREADS:-0}
       RVBBIT_PGDATA_PREFIX: ${RVBBIT_PGDATA_PREFIX:-/var/lib/postgresql}
       RVBBIT_VISIBLE_PGDATA_PREFIX: ${RVBBIT_VISIBLE_PGDATA_PREFIX:-/var/lib/postgresql}
@@ -140,6 +143,7 @@ services:
     environment:
       <<: *rvbbit-secret-env
       RVBBIT_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}
+      RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}
       WARREN_NODE: ${WARREN_NODE:-compose-warren}
       WARREN_WORK_DIR: /var/lib/rvbbit/warren
       RVBBIT_DOCKER_NETWORK: ${RVBBIT_DOCKER_NETWORK:-rvbbit_uber}
@@ -259,6 +263,7 @@ services:
       WAREHOUSE_HERMES_URL: ${WAREHOUSE_HERMES_URL:-}
       WAREHOUSE_HERMES_API_KEY: ${WAREHOUSE_HERMES_API_KEY:-}
       WAREHOUSE_HERMES_MEMORY_KEY: ${WAREHOUSE_HERMES_MEMORY_KEY:-}
+      RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}
       WAREHOUSE_CALLIOPE_DIR: /app/data/calliope
       # URL-backed Design Profile references reject private/local targets by
       # default. Enable only when Warehouse runs on a trusted client network.

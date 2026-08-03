@@ -937,6 +937,34 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0229_calliope_instruments",
         include_str!("../sql/migrations/0229_calliope_instruments.sql"),
     ),
+    (
+        "0230_calliope_personal_briefs",
+        include_str!("../sql/migrations/0230_calliope_personal_briefs.sql"),
+    ),
+    (
+        "0231_calliope_daily_notes",
+        include_str!("../sql/migrations/0231_calliope_daily_notes.sql"),
+    ),
+    (
+        "0232_calliope_titles_and_cost_callers",
+        include_str!("../sql/migrations/0232_calliope_titles_and_cost_callers.sql"),
+    ),
+    (
+        "0233_calliope_workflows",
+        include_str!("../sql/migrations/0233_calliope_workflows.sql"),
+    ),
+    (
+        "0234_calliope_workflow_diagnostics",
+        include_str!("../sql/migrations/0234_calliope_workflow_diagnostics.sql"),
+    ),
+    (
+        "0235_calliope_action_library",
+        include_str!("../sql/migrations/0235_calliope_action_library.sql"),
+    ),
+    (
+        "0236_calliope_metrics",
+        include_str!("../sql/migrations/0236_calliope_metrics.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

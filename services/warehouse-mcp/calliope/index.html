@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="dark light">
   <title>Calliope · Data Rabbit</title>
   <link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Homemade+Apple&display=swap">
@@ -31,7 +31,12 @@ __CALLIOPE_BACKGROUND__
   <div class="top-context">
     <span class="company-memory"><i></i> shared company memory</span>
     <a class="artifacts-link" href="/gallery">Artifacts</a>
+    <button id="personal-brief-open" class="personal-brief-open" type="button" title="Open today's private Personal Brief">
+      <span>Brief</span><b id="personal-brief-count" hidden>0</b>
+    </button>
+    <button id="action-library-open" class="action-library-open" type="button" title="Find things Calliope can connect, configure, or help you do">Library</button>
     <button id="instrument-library-open" class="instrument-library-open" type="button">Instruments</button>
+    <button id="workflow-library-open" class="workflow-library-open" type="button">Workflows</button>
     <button id="style-library-open" class="style-library-open" type="button">Design Profiles</button>
     <span data-warehouse-theme-anchor></span>
     <span class="viewer">__CALLIOPE_VIEWER__</span>
@@ -61,7 +66,7 @@ __CALLIOPE_BACKGROUND__
       <b id="work-inbox-count" class="work-inbox-count" hidden>0</b>
       <i aria-hidden="true">›</i>
     </button>
-    <div id="session-list" class="session-list" role="list"></div>
+    <div id="session-list" class="session-list" aria-label="Calliope notebooks"></div>
     <div class="rail-note">
       <span>Private rail</span>
       <p>Only you see these notebooks. Published work joins the shared artifact library.</p>
@@ -167,8 +172,8 @@ __CALLIOPE_BACKGROUND__
   <form id="new-session-form" method="dialog">
     <p class="eyebrow">New notebook</p>
     <h2>What are we working on?</h2>
-    <p>A useful name makes the living record easy to resume later.</p>
-    <input id="new-session-title" maxlength="120" placeholder="e.g. Fall enrollment planning" autocomplete="off">
+    <p>The name is optional. Leave it blank and Calliope will name the notebook after the first exchange.</p>
+    <input id="new-session-title" maxlength="120" placeholder="Optional · e.g. Fall enrollment planning" autocomplete="off">
     <div>
       <button value="cancel" class="quiet-action">Cancel</button>
       <button id="create-session" value="default" class="primary-action">Begin session</button>
@@ -271,6 +276,75 @@ __CALLIOPE_BACKGROUND__
   </div>
 </dialog>
 
+<dialog id="action-library-dialog" class="action-library-dialog" aria-labelledby="action-library-title">
+  <div class="action-library-shell">
+    <header class="action-library-head">
+      <div>
+        <p class="eyebrow">Discover · connect · automate</p>
+        <h2 id="action-library-title">Ways Callie can help</h2>
+        <p>Search for an outcome—even if you do not know which capability, source, or SQL function makes it possible.</p>
+      </div>
+      <span class="action-trust-note"><i></i>Trusted organization mode</span>
+      <button id="action-library-close" class="markup-close" type="button" aria-label="Close Calliope Library">×</button>
+    </header>
+    <div class="action-library-discovery">
+      <label class="action-library-search">
+        <span aria-hidden="true">⌕</span>
+        <input id="action-library-search" type="search" maxlength="600" placeholder="What would you like to connect, change, or make possible?" autocomplete="off">
+      </label>
+      <nav id="action-library-categories" class="action-library-categories" aria-label="Action categories"></nav>
+    </div>
+    <div class="action-library-workspace">
+      <aside class="action-library-results">
+        <header><span id="action-library-summary">Loading possibilities…</span><button id="action-library-refresh" type="button" aria-label="Refresh Calliope Library">↻</button></header>
+        <div id="action-library-list" class="action-library-list" aria-live="polite"></div>
+        <section class="action-history-block">
+          <header><span>Recent changes</span><button id="action-history-refresh" type="button" aria-label="Refresh recent changes">↻</button></header>
+          <div id="action-history-list" class="action-history-list"><p>No changes recorded yet.</p></div>
+        </section>
+      </aside>
+      <section class="action-library-detail">
+        <div id="action-library-empty" class="action-library-empty">
+          <i aria-hidden="true">✦</i>
+          <p class="eyebrow">You do not need to know the command</p>
+          <h3>Start with what you want to accomplish.</h3>
+          <p>Calliope can connect services, add knowledge, install capabilities, design workflows, and test the result using the system's SQL-first contracts.</p>
+          <div class="action-library-examples">
+            <button type="button" data-action-example="track project blockers">Track project blockers</button>
+            <button type="button" data-action-example="add Linear issues to company knowledge">Add Linear to company knowledge</button>
+            <button type="button" data-action-example="watch an important metric">Watch an important metric</button>
+          </div>
+        </div>
+        <article id="action-library-selected" class="action-library-selected" hidden>
+          <header class="action-detail-head">
+            <div>
+              <span id="action-detail-state" class="action-state">Ready</span>
+              <p id="action-detail-category" class="eyebrow">Action</p>
+              <h3 id="action-detail-title">Calliope action</h3>
+              <p id="action-detail-summary"></p>
+            </div>
+            <span id="action-detail-risk" class="action-risk"></span>
+          </header>
+          <p id="action-detail-description" class="action-detail-description"></p>
+          <section id="action-detail-requirements" class="action-detail-requirements" hidden></section>
+          <form id="action-detail-form" class="action-detail-form"></form>
+          <section id="action-plan" class="action-plan" hidden>
+            <header><div><span>Change plan</span><strong id="action-plan-summary"></strong></div><b id="action-plan-status">Awaiting approval</b></header>
+            <div id="action-plan-steps" class="action-plan-steps"></div>
+            <p id="action-plan-rollback" class="action-plan-rollback"></p>
+          </section>
+          <footer class="action-detail-actions">
+            <p id="action-detail-note">Nothing changes until you approve the plan.</p>
+            <button id="action-open-with-calliope" type="button">Open with Calliope</button>
+            <button id="action-create-plan" class="primary-action" type="button">Review change →</button>
+            <button id="action-apply" class="primary-action" type="button" hidden>Approve &amp; apply →</button>
+          </footer>
+        </article>
+      </section>
+    </div>
+  </div>
+</dialog>
+
 <dialog id="instrument-library-dialog" class="instrument-library-dialog" aria-labelledby="instrument-library-title">
   <div class="instrument-library-shell">
     <header class="instrument-library-head">
@@ -334,6 +408,181 @@ __CALLIOPE_BACKGROUND__
             <summary>View the workflow contract <span>transparent by design</span></summary>
             <pre id="instrument-prompt-template"></pre>
             <div id="instrument-history" class="instrument-history"></div>
+          </details>
+        </div>
+      </section>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="workflow-library-dialog" class="instrument-library-dialog workflow-library-dialog" aria-labelledby="workflow-library-title">
+  <div class="instrument-library-shell">
+    <header class="instrument-library-head">
+      <div>
+        <p class="eyebrow">Headless, agent-driven Instruments</p>
+        <h2 id="workflow-library-title">Calliope Workflows</h2>
+      </div>
+      <p>Triggers and governed context flow into an agent goal. Hermes chooses the useful steps; every run returns as a fresh notebook and Work Inbox result.</p>
+      <button id="workflow-library-close" class="markup-close" type="button" aria-label="Close Workflows">×</button>
+    </header>
+    <div class="instrument-library-workspace">
+      <aside class="instrument-library-rail">
+        <div class="instrument-library-rail-head">
+          <span>Workflow library</span>
+          <div class="instrument-library-rail-actions">
+            <button id="workflow-library-new" type="button">+ New</button>
+            <button id="workflow-library-refresh" type="button" aria-label="Refresh Workflows">↻</button>
+          </div>
+        </div>
+        <div id="workflow-list" class="instrument-list"></div>
+        <section class="workflow-operations" aria-labelledby="workflow-operations-title">
+          <header>
+            <span id="workflow-operations-title">Hermes operations</span>
+            <button id="workflow-operations-refresh" type="button" aria-label="Refresh Hermes operations">↻</button>
+          </header>
+          <p id="workflow-operations-summary">Checking gateway and task queue…</p>
+          <div id="workflow-operations-jobs" class="workflow-operations-jobs"></div>
+        </section>
+        <p>Draft graphs stay private. Only a human-published version can be scheduled; revisions never silently move a live schedule.</p>
+      </aside>
+      <section class="instrument-workspace">
+        <form id="workflow-native-form" class="workflow-create-pane" hidden>
+          <header class="workflow-create-head">
+            <div>
+              <p class="eyebrow">Native private draft</p>
+              <h3>Start with a readable contract.</h3>
+              <p>This builder saves a versioned Workflow without asking an LLM. You can publish, run, or refine it with Calliope later.</p>
+            </div>
+            <button id="workflow-native-cancel" type="button" aria-label="Cancel new Workflow">×</button>
+          </header>
+          <div class="instrument-fields workflow-create-fields">
+            <label class="instrument-field">
+              <span>Starter</span>
+              <select id="workflow-native-template">
+                <option value="blank">Blank Workflow</option>
+                <option value="daily_brief">Daily brief follow-up</option>
+                <option value="project_pulse">Project and ticket pulse</option>
+                <option value="data_watch">Data quality watch</option>
+              </select>
+            </label>
+            <label class="instrument-field">
+              <span>Trigger</span>
+              <select id="workflow-native-trigger">
+                <option value="manual">On demand</option>
+                <option value="schedule">Hermes schedule</option>
+              </select>
+            </label>
+            <label class="instrument-field wide">
+              <span>Name</span>
+              <input id="workflow-native-name" maxlength="160" required placeholder="e.g. Morning pipeline pulse">
+            </label>
+            <label class="instrument-field wide">
+              <span>Description <b>optional</b></span>
+              <input id="workflow-native-description" maxlength="2000" placeholder="What this reusable Workflow is for">
+            </label>
+            <label id="workflow-native-schedule-field" class="instrument-field wide" hidden>
+              <span>Hermes schedule</span>
+              <input id="workflow-native-schedule" maxlength="160" placeholder="0 9 * * 1-5 or every 2h">
+              <small>Uses the Hermes installation timezone. Publishing and schedule enablement remain separate human actions.</small>
+            </label>
+            <label class="instrument-field wide">
+              <span>Agent goal</span>
+              <textarea id="workflow-native-goal" maxlength="12000" required placeholder="Describe the outcome, not a fixed sequence of tools."></textarea>
+            </label>
+            <label class="instrument-field wide">
+              <span>Run context <b>optional</b></span>
+              <textarea id="workflow-native-context" maxlength="2000" placeholder="Stable context or boundaries the agent should use. Add exact artifact and semantic-object handles with Calliope when needed."></textarea>
+            </label>
+            <label class="instrument-field wide">
+              <span>Required governed systems <b>optional, comma separated</b></span>
+              <input id="workflow-native-requirements" maxlength="600" placeholder="personal_context, project_ticket, warehouse, mcp:linear">
+              <small>Preflight verifies these before a model call or schedule. Supported forms: personal_context, project_ticket, warehouse, mcp:&lt;server&gt;, brain:&lt;provider&gt;, capability:&lt;id&gt;.</small>
+            </label>
+            <label class="instrument-field wide">
+              <span>Decision rules <b>one per line, optional</b></span>
+              <textarea id="workflow-native-rules" maxlength="6000" placeholder="Escalate only material changes.&#10;Cite the governed objects used."></textarea>
+            </label>
+          </div>
+          <fieldset class="workflow-output-picker">
+            <legend>Durable outputs</legend>
+            <label><input id="workflow-output-stage" type="checkbox" value="stage" checked> Stage result</label>
+            <label><input id="workflow-output-inbox" type="checkbox" value="work_inbox" checked> Work Inbox</label>
+            <label><input id="workflow-output-artifact" type="checkbox" value="artifact"> Versioned artifact</label>
+          </fieldset>
+          <div class="workflow-create-actions">
+            <p id="workflow-native-status">No model call is made. The graph starts as a private v1 draft.</p>
+            <button id="workflow-native-design" type="button">Design with Calliope instead</button>
+            <button id="workflow-native-submit" type="submit">Create private draft →</button>
+          </div>
+        </form>
+        <div id="workflow-empty" class="instrument-empty">
+          <i aria-hidden="true">⌘</i>
+          <p class="eyebrow">An Instrument without a form</p>
+          <h3>Connect intent, context, and time.</h3>
+          <p>Create a private graph directly from a starter, or ask Calliope to co-design one conversationally. Hermes keeps freedom to choose the right governed tools on each run.</p>
+          <div class="workflow-empty-actions">
+            <button id="workflow-create-native" type="button">Create from a starter</button>
+            <button id="workflow-create-with-calliope" type="button">Design one with Calliope →</button>
+          </div>
+        </div>
+        <div id="workflow-detail" class="instrument-detail" hidden>
+          <header class="instrument-detail-head">
+            <div>
+              <span id="workflow-status" class="instrument-status">Private draft</span>
+              <h3 id="workflow-name">Workflow</h3>
+              <p id="workflow-description"></p>
+            </div>
+            <div id="workflow-version" class="instrument-version"></div>
+          </header>
+          <section id="workflow-lifecycle" class="workflow-lifecycle" aria-label="Workflow lifecycle"></section>
+          <section id="workflow-preflight" class="workflow-preflight" aria-live="polite">
+            <header class="workflow-preflight-head">
+              <div><span>Test readiness</span><b id="workflow-preflight-status">Not checked</b></div>
+              <button id="workflow-preflight-refresh" type="button">Test readiness</button>
+            </header>
+            <p id="workflow-preflight-summary">No model call, notebook, Inbox item, or schedule change is made.</p>
+            <div id="workflow-preflight-checks" class="workflow-preflight-checks"></div>
+            <details id="workflow-preflight-contract" class="workflow-preflight-contract" hidden>
+              <summary>Inspect frozen preview <span>side-effect free</span></summary>
+              <pre id="workflow-preflight-json"></pre>
+            </details>
+          </section>
+          <section class="workflow-canvas-block">
+            <div class="workflow-canvas-head"><span>Readable execution graph</span><b id="workflow-trigger-label"></b></div>
+            <div id="workflow-graph" class="workflow-graph"></div>
+            <p id="workflow-goal" class="workflow-goal"></p>
+          </section>
+          <div class="instrument-run-foot workflow-run-foot">
+            <p><b>Fresh run notebook</b> The approved graph and exact governed context are frozen first; the agent then chooses its steps and publishes a durable result.</p>
+            <button id="workflow-run" type="button">Run now →</button>
+          </div>
+          <section id="workflow-owner-controls" class="instrument-owner-controls" hidden>
+            <div>
+              <span>Creator controls</span>
+              <p id="workflow-owner-copy">Review this graph before publishing it.</p>
+            </div>
+            <div class="instrument-owner-actions workflow-owner-actions">
+              <button id="workflow-publish-private" type="button">Publish privately</button>
+              <button id="workflow-publish-company" type="button">Share with company</button>
+              <button id="workflow-revise" type="button">Revise with Calliope</button>
+              <button id="workflow-unpublish" type="button" hidden>Unpublish</button>
+              <button id="workflow-archive" type="button">Archive</button>
+            </div>
+          </section>
+          <section id="workflow-schedule-panel" class="workflow-schedule-panel" hidden>
+            <div><span>Hermes schedule</span><p id="workflow-schedule-copy"></p></div>
+            <div class="workflow-schedule-actions">
+              <button id="workflow-schedule-enable" type="button">Enable schedule</button>
+              <button id="workflow-schedule-pause" type="button" hidden>Pause</button>
+              <button id="workflow-schedule-resume" type="button" hidden>Resume</button>
+              <button id="workflow-schedule-run" type="button" hidden>Run once now</button>
+              <button id="workflow-schedule-disable" type="button" hidden>Remove schedule</button>
+            </div>
+          </section>
+          <details class="instrument-contract workflow-contract">
+            <summary>Inspect immutable contract &amp; run history <span>no hidden low-level DAG</span></summary>
+            <pre id="workflow-contract-json"></pre>
+            <div id="workflow-run-history" class="instrument-history"></div>
           </details>
         </div>
       </section>
@@ -433,6 +682,7 @@ __CALLIOPE_BACKGROUND__
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script src="/calliope/thinking-orbs.js" defer></script>
+<script src="/calliope/daily-notes-editor.js" defer></script>
 <script src="/calliope/calliope.js" defer></script>
 </body>
 </html>

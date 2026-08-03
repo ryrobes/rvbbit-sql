@@ -3,7 +3,7 @@ import { Vibrant } from "node-vibrant/browser";
 /*
  * DataRabbit's image-theme pipeline, adapted to the framework-free Warehouse:
  *
- *   image -> node-vibrant role swatches -> ImagePalette -> dark UI tokens
+ *   image -> node-vibrant role swatches -> ImagePalette -> dark/light UI tokens
  *
  * Library choices keep a stable source URL in localStorage.  Custom uploads
  * keep the actual Blob in IndexedDB, while their compact palette/tokens live in
@@ -12,6 +12,7 @@ import { Vibrant } from "node-vibrant/browser";
  */
 
 const STORAGE_KEY = "rvbbit-warehouse-theme-v1";
+const MODE_STORAGE_KEY = "rvbbit-warehouse-color-mode";
 const DB_NAME = "rvbbit-warehouse-browser";
 const DB_VERSION = 1;
 const DB_STORE = "appearance";
@@ -20,6 +21,8 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const LIBRARY_URL = /^\/theme\/images\/full\/[A-Za-z0-9][A-Za-z0-9_-]{0,160}\.webp$/;
 const SOLID_COLOR = /^#[0-9a-f]{6}$/i;
 const ROOT = document.documentElement;
+const SUN_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42"></path></svg>';
+const MOON_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 15.3A8.5 8.5 0 0 1 8.7 3.8 8.5 8.5 0 1 0 20.2 15.3Z"></path></svg>';
 
 const THEME_KEYS = [
   "--background",
@@ -75,6 +78,8 @@ const THEME_KEYS = [
   "--warehouse-solid-background",
 ];
 
+let colorMode = readColorMode();
+let appliedTokens = null;
 let current = readStoredState();
 let selectedBackgroundMode = themeBackground(current).mode;
 let selectedSolidColor = themeBackground(current).solidColor;
@@ -82,6 +87,7 @@ let solidColorTouched = Boolean(current?.background?.solidColor);
 let previewWallpaperUrl = null;
 let activeObjectUrl = null;
 let button = null;
+let modeButton = null;
 let dialog = null;
 let library = null;
 let selectedItem = null;
@@ -89,6 +95,7 @@ let selectedPalette = null;
 let selectedPalettePromise = null;
 let previewSequence = 0;
 
+applyColorModeRoot();
 applyStoredState(current);
 
 if (document.readyState === "loading") {
@@ -110,6 +117,8 @@ function init() {
     open: openDialog,
     reset: resetTheme,
     getState: () => current,
+    getMode: () => colorMode,
+    setMode: (mode) => setColorMode(mode),
   });
 }
 
@@ -129,7 +138,67 @@ function installButton() {
   button.setAttribute("aria-expanded", "false");
   button.innerHTML = '<span class="warehouse-theme-button-thumb" aria-hidden="true"></span>';
   button.addEventListener("click", openDialog);
-  host.append(button);
+
+  modeButton = document.createElement("button");
+  modeButton.type = "button";
+  modeButton.className = "warehouse-theme-mode-button";
+  modeButton.addEventListener("click", toggleColorMode);
+  refreshModeButton();
+  host.append(button, modeButton);
+}
+
+function readColorMode() {
+  try {
+    return localStorage.getItem(MODE_STORAGE_KEY) === "light" ? "light" : "dark";
+  } catch {
+    return "dark";
+  }
+}
+
+function applyColorModeRoot() {
+  ROOT.dataset.theme = colorMode;
+  ROOT.dataset.warehouseColorMode = colorMode;
+  ROOT.style.colorScheme = colorMode;
+  ROOT.classList.toggle("dark", colorMode === "dark");
+}
+
+function toggleColorMode() {
+  setColorMode(colorMode === "dark" ? "light" : "dark");
+}
+
+function setColorMode(mode, { persist = true } = {}) {
+  const next = mode === "light" ? "light" : "dark";
+  if (next === colorMode) {
+    refreshModeButton();
+    return colorMode;
+  }
+  colorMode = next;
+  if (persist) {
+    try {
+      localStorage.setItem(MODE_STORAGE_KEY, colorMode);
+    } catch {
+      // The mode still applies for this page when persistence is blocked.
+    }
+  }
+  clearAppliedTheme();
+  applyColorModeRoot();
+  applyStoredState(current, activeObjectUrl);
+  refreshButton();
+  refreshModeButton();
+  showCurrentPreview();
+  notifyThemeChange();
+  return colorMode;
+}
+
+function refreshModeButton() {
+  if (!modeButton) return;
+  const toLight = colorMode === "dark";
+  const label = toLight ? "Switch to light mode" : "Switch to dark mode";
+  modeButton.innerHTML = toLight ? SUN_ICON : MOON_ICON;
+  modeButton.title = label;
+  modeButton.setAttribute("aria-label", label);
+  modeButton.setAttribute("aria-pressed", String(colorMode === "light"));
+  modeButton.dataset.mode = colorMode;
 }
 
 function installDialog() {
@@ -446,11 +515,25 @@ function validStoredSource(source) {
     && LIBRARY_URL.test(String(source.url || ""));
 }
 
+function validStoredPalette(palette) {
+  if (!palette || !Number.isFinite(Number(palette.baseHue)) || !Number.isFinite(Number(palette.chroma))) {
+    return false;
+  }
+  return ["vibrant", "darkVibrant", "lightVibrant"].every((key) => (
+    typeof palette[key] === "string" && palette[key].length <= 180
+  ));
+}
+
 function applyStoredState(state, uploadUrl = null) {
+  appliedTokens = null;
   if (!state) return;
+  const tokens = validStoredPalette(state.palette)
+    ? deriveWarehouseTokens(state.palette, colorMode)
+    : state.tokens;
+  appliedTokens = tokens;
   for (const key of THEME_KEYS) {
     if (key === "--warehouse-wallpaper" || key === "--warehouse-solid-background") continue;
-    const value = state.tokens?.[key];
+    const value = tokens?.[key];
     if (typeof value === "string" && value.length <= 180) {
       ROOT.style.setProperty(key, value);
     }
@@ -465,6 +548,7 @@ function applyStoredState(state, uploadUrl = null) {
 
 function clearAppliedTheme() {
   for (const key of THEME_KEYS) ROOT.style.removeProperty(key);
+  appliedTokens = null;
   delete ROOT.dataset.warehouseTheme;
   delete ROOT.dataset.warehouseWallpaper;
   delete ROOT.dataset.warehouseBackground;
@@ -638,7 +722,9 @@ function derivedSolidColor(palette) {
   const hue = Number.isFinite(Number(palette?.baseHue))
     ? Number(palette.baseHue)
     : 28;
-  return hslToHex(hue, 22, 7);
+  return colorMode === "light"
+    ? hslToHex(hue, 18, 94)
+    : hslToHex(hue, 22, 7);
 }
 
 function hslToHex(hue, saturation, lightness) {
@@ -679,6 +765,10 @@ function setError(message) {
 }
 
 function onStorage(event) {
+  if (event.key === MODE_STORAGE_KEY) {
+    setColorMode(readColorMode(), { persist: false });
+    return;
+  }
   if (event.key !== STORAGE_KEY) return;
   releaseObjectUrl();
   clearAppliedTheme();
@@ -695,8 +785,9 @@ function notifyThemeChange() {
   window.dispatchEvent(new CustomEvent("warehouse-theme-change", {
     detail: {
       source: current?.source || null,
-      tokens: current?.tokens || null,
+      tokens: appliedTokens,
       background: current ? themeBackground(current) : null,
+      mode: colorMode,
     },
   }));
 }
@@ -764,9 +855,15 @@ function paletteToImagePalette(palette) {
   };
 }
 
-function deriveWarehouseTokens(palette) {
-  // This is DataRabbit's deriveDark palette logic, narrowed to tokens the
-  // Warehouse shells and native chart surfaces consume.
+function deriveWarehouseTokens(palette, mode = colorMode) {
+  return mode === "light"
+    ? deriveLightWarehouseTokens(palette)
+    : deriveDarkWarehouseTokens(palette);
+}
+
+function deriveDarkWarehouseTokens(palette) {
+  // DataRabbit's dark palette logic, narrowed to the tokens the Warehouse
+  // shells and native chart surfaces consume.
   const main = palette.vibrant;
   const rvbbit = palette.lightVibrant;
   const seriesChroma = clamp(palette.chroma * 6, .12, .20);
@@ -838,6 +935,83 @@ function deriveWarehouseTokens(palette) {
     "--amber-soft": "color-mix(in oklch, var(--main) 12%, transparent)",
     "--jade": rvbbit,
     "--jade-soft": "color-mix(in oklch, var(--rvbbit-accent) 10%, transparent)",
+  };
+}
+
+function deriveLightWarehouseTokens(palette) {
+  // Keep the selected room's identity in accents and visualization colors,
+  // while moving structural surfaces to DataRabbit's warm-paper light branch.
+  const main = palette.darkVibrant;
+  const rvbbit = palette.darkVibrant;
+  const seriesChroma = clamp(palette.chroma * 7, .13, .18);
+  const background = oklch(96, .008, 95);
+  const secondaryBackground = oklch(92, .012, 95);
+  const foreground = oklch(21, .015, 260);
+  const border = oklch(45, .02, 255);
+  const chromeBg = oklch(91, .01, 95);
+  const chromeBorder = oklch(73, .015, 250);
+  const chromeText = oklch(39, .012, 255);
+  const docBg = oklch(98, .003, 95);
+  const blockBg = oklch(99, .004, 95);
+  const blockBgHover = oklch(94, .012, hueOf(main) ?? palette.baseHue);
+  const blockBorder = oklch(76, .016, 250);
+  const chart1 = main;
+  const chart2 = oklch(58, seriesChroma * .92, (palette.baseHue + 90) % 360);
+  const chart3 = oklch(66, seriesChroma * .82, (palette.baseHue + 180) % 360);
+  const chart4 = oklch(60, seriesChroma, (palette.baseHue + 240) % 360);
+  const chart5 = oklch(60, seriesChroma * .92, (palette.baseHue + 320) % 360);
+  const chart6 = oklch(64, seriesChroma * .96, (palette.baseHue + 290) % 360);
+
+  return {
+    "--background": background,
+    "--secondary-background": secondaryBackground,
+    "--foreground": foreground,
+    "--border": border,
+    "--ring": main,
+    "--overlay": oklch(18, .01, 260, .14),
+    "--main": main,
+    "--main-foreground": oklch(99, 0, 0),
+    "--chart-1": chart1,
+    "--chart-2": chart2,
+    "--chart-3": chart3,
+    "--chart-4": chart4,
+    "--chart-5": chart5,
+    "--chart-6": chart6,
+    "--success": "oklch(58% 0.17 145)",
+    "--warning": "oklch(71% 0.16 85)",
+    "--danger": "oklch(58% 0.21 25)",
+    "--info": "oklch(58% 0.14 240)",
+    "--chrome-bg": chromeBg,
+    "--chrome-border": chromeBorder,
+    "--chrome-text": chromeText,
+    "--doc-bg": docBg,
+    "--block-bg": blockBg,
+    "--block-bg-hover": blockBgHover,
+    "--block-border": blockBorder,
+    "--grid-dot": oklch(85, .015, 240),
+    "--grid-outline": oklch(82, .015, 245),
+    "--rvbbit-accent": rvbbit,
+    "--rvbbit-bg": oklch(94, .03, hueOf(rvbbit) ?? palette.baseHue),
+    "--wallpaper-overlay-from": oklch(94, .01, palette.baseHue, .62),
+    "--wallpaper-overlay-to": oklch(86, .03, palette.baseHue, .35),
+    "--ambient-1": oklch(76, .10, palette.baseHue, .18),
+    "--ambient-2": oklch(82, .12, (palette.baseHue + 120) % 360, .14),
+    "--ambient-3": oklch(72, .14, (palette.baseHue + 240) % 360, .10),
+    "--void": background,
+    "--panel": blockBg,
+    "--panel-raised": blockBgHover,
+    "--panel-soft": "color-mix(in oklch, var(--panel) 80%, transparent)",
+    "--bone": foreground,
+    "--bone-bright": oklch(15, .012, 260),
+    "--fog": "color-mix(in oklch, var(--bone) 68%, transparent)",
+    "--dim": "color-mix(in oklch, var(--bone) 46%, transparent)",
+    "--faint": "color-mix(in oklch, var(--bone) 16%, transparent)",
+    "--line": "color-mix(in oklch, var(--bone) 15%, transparent)",
+    "--line-hot": "color-mix(in oklch, var(--main) 52%, transparent)",
+    "--amber": main,
+    "--amber-soft": "color-mix(in oklch, var(--main) 11%, transparent)",
+    "--jade": rvbbit,
+    "--jade-soft": "color-mix(in oklch, var(--rvbbit-accent) 9%, transparent)",
   };
 }
 

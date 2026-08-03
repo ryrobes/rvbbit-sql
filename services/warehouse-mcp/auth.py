@@ -690,7 +690,7 @@ def _page(body: str, status: int = 200) -> HTMLResponse:
     return HTMLResponse(
         f"""<!doctype html><html lang="en"><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<meta name=color-scheme content=dark>
+<meta name=color-scheme content="dark light">
 <title>rvbbit warehouse</title>
 <style>
  /* Base colour on <html>, body transparent — a negative-z-index layer paints

@@ -191,6 +191,12 @@ def test_home_schema_and_surfaces_preserve_private_composition_contract():
     assert 'id="semantic-home"' in landing
     assert "data-home-pin" in landing
     assert "/api/calliope/home/items" in landing
+    assert "function galleryTooltipSourceMarkup" in landing
+    assert "function homeValueTooltip" in landing
+    assert "data-gallery-tooltip" in landing
+    assert "data-home-value-text" in landing
+    assert "setGalleryTooltipSource(node,homeValueTooltip" in landing
+    assert ".gallery-tooltip" in landing
     assert '<button type="button" class="home-pin">Pin to Home</button>' in lens
     assert "definition_hash: semanticObject.definition_hash" in lens
     assert "context: semanticObject.context || {}" in lens

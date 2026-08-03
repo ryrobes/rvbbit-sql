@@ -33,7 +33,7 @@ from __future__ import annotations
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
 import asyncio, hashlib, hmac, json, math, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -6569,6 +6569,110 @@ def _mcp_calliope_work_item(
     return _logged("calliope_work_item", args, publish)
 
 
+def _mcp_search_calliope_actions(
+    session_id: str,
+    query: str,
+    category: str | None = None,
+    limit: int = 12,
+):
+    """Search outcome-oriented actions available to a Calliope user.
+
+    Use the exact `session_id` from Calliope's internal work-routing context;
+    it resolves the owning human and current runtime state. Search in ordinary
+    language such as "connect Linear", "add tickets to company knowledge", or
+    "monitor a metric". Results distinguish ready, connect/install, and blocked
+    actions and include structured question fields. For typed changes, call
+    `plan_calliope_action` next. Never ask the user to put a secret in chat.
+    """
+    args = {
+        "session_id": session_id,
+        "query": query,
+        "category": category,
+        "limit": limit,
+    }
+
+    def search():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return calliope.search_actions_for_session(
+            _conn, session_id, query, category, limit
+        )
+
+    return _logged("search_calliope_actions", args, search)
+
+
+def _mcp_plan_calliope_action(
+    session_id: str,
+    action_id: str,
+    inputs: dict | None = None,
+):
+    """Create a durable, redacted plan for one typed Calliope action.
+
+    Use an exact action id returned by `search_calliope_actions` and the exact
+    originating Calliope session id. The plan records human-readable steps,
+    change scope, verification, and rollback guidance, but does not apply the
+    change. Explain it and wait for explicit user approval before calling
+    `execute_calliope_action`. Secret-required MCP connections are deliberately
+    completed only in the native Library form; never request or pass secrets.
+    """
+    args = {"session_id": session_id, "action_id": action_id, "inputs": inputs}
+
+    def plan():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return calliope.plan_action_for_session(
+            _conn, session_id, action_id, inputs
+        )
+
+    return _logged("plan_calliope_action", args, plan)
+
+
+def _mcp_execute_calliope_action(session_id: str, run_id: str):
+    """Apply one explicitly approved, previously planned Calliope action.
+
+    This accepts only the opaque plan UUID returned by `plan_calliope_action`;
+    the action id and non-secret inputs are frozen in that plan. It runs typed
+    SQL operations, verification, and a durable receipt. If the action needs a
+    credential, the result directs the user to the secure native Library flow
+    instead of accepting a secret through the model.
+    """
+    args = {"session_id": session_id, "run_id": run_id}
+
+    def execute():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return calliope.execute_action_for_session(_conn, session_id, run_id)
+
+    return _logged("execute_calliope_action", args, execute)
+
+
+# Warehouse currently ships a FastMCP release that inspects raw annotations
+# while discovering Context parameters.  This module postpones annotations, so
+# expose concrete runtime types for directly registered typed tools (matching
+# the Workflow helpers below) instead of leaving strings for FastMCP to inspect.
+_mcp_search_calliope_actions.__annotations__ = {
+    "session_id": str,
+    "query": str,
+    "category": str | None,
+    "limit": int,
+}
+_mcp_plan_calliope_action.__annotations__ = {
+    "session_id": str,
+    "action_id": str,
+    "inputs": dict | None,
+}
+_mcp_execute_calliope_action.__annotations__ = {
+    "session_id": str,
+    "run_id": str,
+}
+
+
 def _mcp_draft_calliope_instrument(
     session_id,
     name,
@@ -6618,6 +6722,206 @@ def _mcp_draft_calliope_instrument(
         )}
 
     return _logged("draft_calliope_instrument", args, draft)
+
+
+def _mcp_draft_calliope_workflow(
+    session_id,
+    name,
+    description,
+    goal,
+    trigger=None,
+    contexts=None,
+    outputs=None,
+    slug=None,
+    revision_notes=None,
+    decision_rules=None,
+    requirements=None,
+):
+    """Draft or revise a bounded, agent-driven Calliope Workflow.
+
+    Use this after the user wants repeatable work to run headlessly or on a
+    schedule. `session_id` is the exact originating Calliope session UUID and
+    resolves ownership. A Workflow has one manual/schedule trigger, up to eight
+    governed context nodes (`artifact`, `semantic_object`, `evidence`,
+    `knowledge`, or `instruction`), one agent goal with optional decision rules,
+    and `stage`, `work_inbox`, or `artifact` outputs. Hermes dynamically chooses
+    tools at run time; do not encode SQL, JavaScript, shell commands, or low-level
+    tool nodes. Optional `requirements` name preflightable runtime dependencies:
+    `personal_context`, `project_ticket`, `warehouse`, `mcp:<server>`,
+    `brain:<provider>`, or `capability:<id>`. Scheduled triggers use Hermes syntax (`every 30m`, `every 2h`, a
+    five-field cron expression, or an ISO timestamp) in the Hermes installation
+    timezone; per-Workflow timezone overrides are not supported. The result is
+    always a private immutable draft revision. A human
+    must review and publish it before any schedule can be enabled. Reuse `slug`
+    to create the next revision.
+    """
+    args = {
+        "session_id": session_id,
+        "name": name,
+        "description": description,
+        "goal": goal,
+        "trigger": trigger,
+        "contexts": contexts,
+        "outputs": outputs,
+        "slug": slug,
+        "revision_notes": revision_notes,
+        "decision_rules": decision_rules,
+        "requirements": requirements,
+    }
+
+    def draft():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return {"workflow": calliope.draft_workflow(
+            _conn,
+            session_id,
+            name,
+            description,
+            goal,
+            trigger,
+            contexts,
+            outputs,
+            slug,
+            revision_notes,
+            decision_rules,
+            requirements,
+        )}
+
+    return _logged("draft_calliope_workflow", args, draft)
+
+
+def _mcp_begin_calliope_workflow_run(workflow_id, source_session_id, version):
+    """Begin one approved headless Calliope Workflow run.
+
+    This lifecycle tool is for the Hermes schedule prompt produced by Calliope.
+    Pass the exact workflow UUID, originating Calliope session UUID, and approved
+    version embedded in that prompt. It validates the publication pointer,
+    creates a fresh paired run notebook, freezes the graph and governed context,
+    and returns the sole execution contract. Do not improvise IDs or call it for
+    an unpublished draft. Finish every successful begin with exactly one
+    `finish_calliope_workflow_run` call.
+    """
+    args = {
+        "workflow_id": workflow_id,
+        "source_session_id": source_session_id,
+        "version": version,
+    }
+
+    def begin():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return calliope.begin_workflow_run(
+            _conn,
+            workflow_id,
+            source_session_id,
+            version,
+            trigger_kind="scheduled",
+        )
+
+    return _logged("begin_calliope_workflow_run", args, begin)
+
+
+def _mcp_get_calliope_personal_context(
+    run_id: str,
+    include_resolved: bool = True,
+    limit: int = 30,
+):
+    """Read the Workflow owner's latest private Brief, notes, and Work Inbox.
+
+    The exact Workflow run UUID is an opaque capability: ownership is resolved
+    server-side and there is intentionally no email or user parameter. Use this
+    only when the frozen Workflow goal requires the owner's personal Calliope
+    context. Resolved Inbox items may be included to avoid duplicate follow-up.
+    """
+    args = {
+        "run_id": run_id,
+        "include_resolved": include_resolved,
+        "limit": limit,
+    }
+
+    def resolve():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return calliope.workflow_personal_context(
+            _conn,
+            run_id,
+            include_resolved,
+            limit,
+        )
+
+    return _logged("get_calliope_personal_context", args, resolve)
+
+
+_mcp_get_calliope_personal_context.__annotations__ = {
+    "run_id": str,
+    "include_resolved": bool,
+    "limit": int,
+}
+
+
+def _mcp_finish_calliope_workflow_run(
+    run_id: str,
+    status: str,
+    summary: str,
+    details: dict | list | None = None,
+    artifacts: list[dict | str] | None = None,
+    action_prompt: str | None = None,
+):
+    """Finish one Calliope Workflow run and publish its durable result.
+
+    Call exactly once after a successful `begin_calliope_workflow_run`, or when
+    a manually opened Workflow supplies an exact run UUID. Status is `complete`,
+    `blocked`, or `failed`. Include concise evidence-backed details and exact
+    artifact refs/versions where applicable; unverified artifact claims remain
+    visibly unverified. This closes the run notebook, adds result surfaces,
+    records caller-attributed cost state, and publishes the user's Work Inbox
+    result or blocker. It is idempotent for an already-finished run.
+    """
+    args = {
+        "run_id": run_id,
+        "status": status,
+        "summary": summary,
+        "details": details,
+        "artifacts": artifacts,
+        "action_prompt": action_prompt,
+    }
+
+    def finish():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return calliope.finish_workflow_run(
+            _conn,
+            run_id,
+            status,
+            summary,
+            details,
+            artifacts,
+            action_prompt,
+        )
+
+    return _logged("finish_calliope_workflow_run", args, finish)
+
+
+# This module uses postponed annotations, while the FastMCP version deployed by
+# Warehouse inspects ``__annotations__`` directly instead of resolving them.
+# Give it concrete runtime types so the emitted JSON schema preserves objects
+# and arrays rather than falling back to strings.
+_mcp_finish_calliope_workflow_run.__annotations__ = {
+    "run_id": str,
+    "status": str,
+    "summary": str,
+    "details": dict | list | None,
+    "artifacts": list[dict | str] | None,
+    "action_prompt": str | None,
+}
 
 
 # Data clients injected into every served dashboard. We provide BOTH the hosted
@@ -7484,6 +7788,430 @@ def _dashboard_inspection(
     return result
 
 
+# ── Gallery metrics ─────────────────────────────────────────────────────────
+#
+# The catalog, observation log, Home, Brief, and Calliope stage all project the
+# same parameter-aware metric identity.  Gallery reads materialized
+# observations only: opening the page must never execute every metric.
+_GALLERY_METRIC_LIMIT = 600
+_GALLERY_METRIC_SERIES_LIMIT = 32
+_METRIC_BUCKETS = {"raw", "day", "week", "month", "quarter", "year"}
+
+
+def _metric_name(value):
+    name = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not name or len(name) > 240 or any(ord(char) < 32 for char in name):
+        raise ValueError("metric name is invalid")
+    return name
+
+
+def _metric_params(value=None):
+    if value in (None, ""):
+        return {}
+    if isinstance(value, str):
+        if len(value) > 20_000:
+            raise ValueError("metric parameters are too large")
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("metric parameters must be a JSON object") from exc
+    if not isinstance(value, dict) or len(value) > 48:
+        raise ValueError("metric parameters must be a bounded JSON object")
+    if any(not isinstance(key, str) or not key or len(key) > 160 for key in value):
+        raise ValueError("metric parameter names are invalid")
+    try:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("metric parameters must contain JSON values") from exc
+    if len(encoded.encode("utf-8")) > 20_000:
+        raise ValueError("metric parameters are too large")
+    return json.loads(encoded)
+
+
+def _metric_canonical_key(name, params=None):
+    normalized_name = _metric_name(name)
+    normalized_params = _metric_params(params)
+    encoded = json.dumps(
+        normalized_params, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
+    return f"metric:{normalized_name}:{digest}"
+
+
+def _metric_display(definition):
+    definition = definition if isinstance(definition, dict) else {}
+    labels = definition.get("labels") if isinstance(definition.get("labels"), dict) else {}
+    nested = labels.get("display") if isinstance(labels.get("display"), dict) else {}
+    display = dict(nested)
+    for key in (
+        "unit", "format", "currency", "prefix", "suffix", "decimals",
+        "precision", "preferred_direction", "good_direction", "label", "title",
+    ):
+        if key not in display and labels.get(key) not in (None, ""):
+            display[key] = labels[key]
+    preferred = str(
+        display.get("preferred_direction") or display.get("good_direction") or "neutral"
+    ).strip().lower()
+    display["preferred_direction"] = {
+        "up": "higher", "increase": "higher", "higher": "higher",
+        "down": "lower", "decrease": "lower", "lower": "lower",
+    }.get(preferred, "neutral")
+    try:
+        decimals = display.get("decimals", display.get("precision"))
+        if decimals not in (None, ""):
+            display["decimals"] = max(0, min(int(decimals), 8))
+    except (TypeError, ValueError):
+        display.pop("decimals", None)
+    return {
+        key: value for key, value in display.items()
+        if value not in (None, "") and key != "good_direction"
+    }
+
+
+def _metric_title(definition):
+    display = _metric_display(definition)
+    return str(
+        display.get("title") or display.get("label")
+        or str((definition or {}).get("name") or "Metric").replace("_", " ").title()
+    )[:240]
+
+
+def _metric_observation_public(row):
+    if not row:
+        return None
+    raw = dict(row)
+    value = raw.get("value")
+    numeric = _metric_scalar(value)
+    verdict = raw.get("verdict") if isinstance(raw.get("verdict"), dict) else {}
+    ok = verdict.get("ok") if isinstance(verdict, dict) else None
+    if ok is None:
+        status = str(raw.get("status") or "").lower()
+        ok = True if status in {"pass", "passing", "ok", "healthy"} else (
+            False if status in {"fail", "failing", "breach", "breaching"} else None
+        )
+    return {
+        "observation_id": int(raw["observation_id"]) if raw.get("observation_id") is not None else None,
+        "metric_version": int(raw["metric_version"]) if raw.get("metric_version") is not None else None,
+        "value": numeric if numeric is not None else value,
+        "numeric_value": numeric,
+        "verdict": verdict,
+        "status": raw.get("status"),
+        "ok": ok,
+        "trigger": raw.get("trigger"),
+        "params": raw.get("params") if isinstance(raw.get("params"), dict) else {},
+        "data_as_of": _iso_utc(raw.get("data_as_of")),
+        "observed_at": _iso_utc(raw.get("observed_at")),
+    }
+
+
+def _metric_trend(series, preferred_direction="neutral"):
+    numeric = [
+        point for point in series
+        if isinstance(point, dict) and point.get("numeric_value") is not None
+    ]
+    if len(numeric) < 2:
+        return None
+    first = float(numeric[0]["numeric_value"])
+    last = float(numeric[-1]["numeric_value"])
+    absolute = last - first
+    percent = (absolute / abs(first) * 100) if first else None
+    direction = "up" if absolute > 0 else "down" if absolute < 0 else "flat"
+    preferred = str(preferred_direction or "neutral")
+    meaning = "neutral"
+    if direction != "flat" and preferred in {"higher", "lower"}:
+        meaning = "good" if (
+            (preferred == "higher" and direction == "up")
+            or (preferred == "lower" and direction == "down")
+        ) else "bad"
+    return {
+        "absolute": absolute,
+        "percent": percent,
+        "direction": direction,
+        "meaning": meaning,
+        "from_observation_id": numeric[0].get("observation_id"),
+        "to_observation_id": numeric[-1].get("observation_id"),
+    }
+
+
+def _metric_user_relations(owner):
+    followed, pinned = set(), set()
+    if not owner:
+        return followed, pinned
+    try:
+        with _conn() as conn:
+            followed = {
+                str(row["canonical_key"])
+                for row in conn.execute(
+                    "SELECT canonical_key FROM rvbbit.calliope_metric_follows "
+                    "WHERE lower(owner_email)=lower(%s)", (owner,),
+                ).fetchall()
+            }
+            pinned = {
+                str(row["canonical_key"])
+                for row in conn.execute(
+                    "SELECT i.canonical_key FROM rvbbit.calliope_board_items i "
+                    "JOIN rvbbit.calliope_boards b ON b.id=i.board_id "
+                    "WHERE lower(b.owner_email)=lower(%s) AND b.slug='home' "
+                    "AND i.item_kind='metric'", (owner,),
+                ).fetchall()
+            }
+    except Exception:  # noqa: BLE001 — Gallery metrics still browse without Calliope tables
+        pass
+    return followed, pinned
+
+
+def _metric_catalog_snapshot(owner=None, search=None, category=None, limit=None):
+    limit = max(1, min(int(limit or _GALLERY_METRIC_LIMIT), _GALLERY_METRIC_LIMIT))
+    search = re.sub(r"\s+", " ", str(search or "")).strip()[:300] or None
+    category = re.sub(r"\s+", " ", str(category or "")).strip()[:160] or None
+    with _conn() as conn:
+        definitions = conn.execute(
+            "SELECT name,version,description,params,grain,labels,check_sql IS NOT NULL AS has_check,"
+            "category,subcategory,created_at FROM rvbbit.metric_catalog "
+            "WHERE (%s::text IS NULL OR name ILIKE '%%'||%s||'%%' "
+            "OR description ILIKE '%%'||%s||'%%') "
+            "AND (%s::text IS NULL OR category=%s) "
+            "ORDER BY category NULLS LAST,subcategory NULLS LAST,name LIMIT %s",
+            (search, search, search, category, category, limit),
+        ).fetchall()
+        names = [str(row["name"]) for row in definitions]
+        observations = []
+        if names:
+            observations = conn.execute(
+                "SELECT * FROM (SELECT o.observation_id,o.metric_name,o.metric_version,"
+                "o.value,o.verdict,o.status,o.trigger,o.params,o.data_as_of,o.observed_at,"
+                "row_number() OVER (PARTITION BY o.metric_name ORDER BY "
+                "coalesce(o.data_as_of,o.observed_at) DESC,o.observed_at DESC,o.observation_id DESC) AS rn "
+                "FROM rvbbit.metric_observations o WHERE o.metric_name=ANY(%s::text[]) "
+                "AND o.params='{}'::jsonb "
+                "AND coalesce(o.data_as_of,o.observed_at)<=now()) ranked WHERE rn<=%s "
+                "ORDER BY metric_name,coalesce(data_as_of,observed_at),observed_at,observation_id",
+                (names, _GALLERY_METRIC_SERIES_LIMIT),
+            ).fetchall()
+        category_rows = conn.execute(
+            "SELECT coalesce(category,'Uncategorized') AS category,count(*)::int AS count "
+            "FROM rvbbit.metric_catalog GROUP BY category ORDER BY category NULLS LAST"
+        ).fetchall()
+    by_name = {name: [] for name in names}
+    for raw in observations:
+        point = _metric_observation_public(raw)
+        if point:
+            by_name.setdefault(str(raw["metric_name"]), []).append(point)
+    followed, pinned = _metric_user_relations(owner)
+    metrics = []
+    for raw in definitions:
+        definition = dict(raw)
+        params = {}
+        canonical_key = _metric_canonical_key(definition["name"], params)
+        series = by_name.get(str(definition["name"]), [])
+        display = _metric_display(definition)
+        latest = series[-1] if series else None
+        metrics.append({
+            "name": definition["name"],
+            "title": _metric_title(definition),
+            "description": definition.get("description") or "",
+            "version": int(definition.get("version") or 1),
+            "grain": definition.get("grain"),
+            "category": definition.get("category") or "Uncategorized",
+            "subcategory": definition.get("subcategory") or "",
+            "parameter_defaults": definition.get("params") or {},
+            "parameter_count": len(definition.get("params") or {}),
+            "params": params,
+            "display": display,
+            "has_check": bool(definition.get("has_check")),
+            "defined_at": _iso_utc(definition.get("created_at")),
+            "canonical_key": canonical_key,
+            "snapshot": latest,
+            "series": series,
+            "trend": _metric_trend(series, display.get("preferred_direction")),
+            "followed": canonical_key in followed,
+            "pinned": canonical_key in pinned,
+        })
+    return {
+        "metrics": metrics,
+        "count": len(metrics),
+        "categories": [dict(row) for row in category_rows],
+        "observation_contract": "materialized",
+    }
+
+
+def _metric_detail_snapshot(name, params=None, *, owner=None, days=90, bucket="raw"):
+    name = _metric_name(name)
+    params = _metric_params(params)
+    try:
+        days = max(1, min(int(days or 90), 3650))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("days must be an integer") from exc
+    bucket = str(bucket or "raw").strip().lower()
+    if bucket not in _METRIC_BUCKETS:
+        raise ValueError(f"bucket must be one of {sorted(_METRIC_BUCKETS)}")
+    with _conn() as conn:
+        definition = conn.execute(
+            "SELECT name,version,description,params,grain,labels,sql AS definition_sql,"
+            "check_sql,category,subcategory,owner,created_at "
+            "FROM rvbbit.metric_catalog WHERE name=%s", (name,),
+        ).fetchone()
+        if not definition:
+            raise LookupError("No such governed metric")
+        definition = dict(definition)
+        expression = "coalesce(data_as_of,observed_at)" if bucket == "raw" else (
+            f"date_trunc('{bucket}',coalesce(data_as_of,observed_at))"
+        )
+        series_rows = conn.execute(
+            "SELECT observation_id,metric_version,value,verdict,status,trigger,params,"
+            "data_as_of,observed_at FROM (SELECT * FROM ("
+            "SELECT DISTINCT ON (bucket_value) * FROM ("
+            f"SELECT o.*,{expression} AS bucket_value FROM rvbbit.metric_observations o "
+            "WHERE metric_name=%s AND params=%s::jsonb "
+            "AND coalesce(data_as_of,observed_at)>=now()-(%s * interval '1 day') "
+            "AND coalesce(data_as_of,observed_at)<=now()"
+            ") scoped ORDER BY bucket_value DESC,coalesce(data_as_of,observed_at) DESC,"
+            "observed_at DESC,observation_id DESC) picked LIMIT 500) bounded "
+            "ORDER BY coalesce(data_as_of,observed_at),observed_at,observation_id",
+            (name, json.dumps(params), days),
+        ).fetchall()
+        latest_row = conn.execute(
+            "SELECT observation_id,metric_version,value,verdict,status,trigger,params,"
+            "data_as_of,observed_at FROM rvbbit.metric_observations "
+            "WHERE metric_name=%s AND params=%s::jsonb "
+            "AND coalesce(data_as_of,observed_at)<=now() ORDER BY "
+            "coalesce(data_as_of,observed_at) DESC,observed_at DESC,observation_id DESC LIMIT 1",
+            (name, json.dumps(params)),
+        ).fetchone()
+        versions = conn.execute(
+            "SELECT version,created_at FROM rvbbit.metric_defs WHERE name=%s "
+            "ORDER BY version DESC", (name,),
+        ).fetchall()
+        artifacts = conn.execute(
+            "SELECT DISTINCT d.slug,d.name,d.description,d.app_kind,d.latest_version "
+            "FROM rvbbit.dashboard_deps x JOIN rvbbit.dashboards d ON d.id=x.dashboard_id "
+            "WHERE x.kind='metric' AND x.object_ref=%s AND x.version=d.latest_version "
+            "ORDER BY d.name LIMIT 12", (name,),
+        ).fetchall()
+        try:
+            freshness = conn.execute(
+                "SELECT table_schema||'.'||table_name AS table_name,freshness_column,"
+                "max_freshness,age,stale FROM rvbbit.metric_dependency_freshness("
+                "ARRAY[%s]::text[],interval '2 days') ORDER BY table_schema,table_name",
+                (name,),
+            ).fetchall()
+        except Exception:  # noqa: BLE001 — older installs still have definition lineage
+            freshness = []
+        try:
+            lineage_row = conn.execute(
+                "SELECT rvbbit.metric_lineage(%s) AS source_tables", (name,),
+            ).fetchone()
+            lineage = (lineage_row or {}).get("source_tables") or []
+        except Exception:  # noqa: BLE001
+            lineage = []
+    series = [point for row in series_rows if (point := _metric_observation_public(row))]
+    latest = _metric_observation_public(latest_row)
+    if latest and not any(
+        point.get("observation_id") == latest.get("observation_id") for point in series
+    ):
+        series.append(latest)
+        series.sort(key=lambda point: point.get("data_as_of") or point.get("observed_at") or "")
+    display = _metric_display(definition)
+    canonical_key = _metric_canonical_key(name, params)
+    followed, pinned = _metric_user_relations(owner)
+    dependency_names = list(dict.fromkeys([
+        str(row.get("table_name")) for row in freshness if row.get("table_name")
+    ] + [str(value) for value in lineage if value]))
+    return {
+        "name": name,
+        "title": _metric_title(definition),
+        "description": definition.get("description") or "",
+        "version": int(definition.get("version") or 1),
+        "grain": definition.get("grain"),
+        "category": definition.get("category") or "Uncategorized",
+        "subcategory": definition.get("subcategory") or "",
+        "owner": definition.get("owner"),
+        "parameter_defaults": definition.get("params") or {},
+        "params": params,
+        "display": display,
+        "definition_sql": definition.get("definition_sql") or "",
+        "has_check": bool(definition.get("check_sql")),
+        "defined_at": _iso_utc(definition.get("created_at")),
+        "versions": [{**dict(row), "created_at": _iso_utc(row.get("created_at"))} for row in versions],
+        "canonical_key": canonical_key,
+        "snapshot": latest,
+        "series": series,
+        "trend": _metric_trend(series, display.get("preferred_direction")),
+        "range": {"days": days, "bucket": bucket},
+        "dependencies": [{
+            **dict(row),
+            "max_freshness": _iso_utc(row.get("max_freshness")),
+            "age": str(row.get("age")) if row.get("age") is not None else None,
+        } for row in freshness],
+        "source_tables": dependency_names,
+        "artifacts": [dict(row) for row in artifacts],
+        "followed": canonical_key in followed,
+        "pinned": canonical_key in pinned,
+    }
+
+
+def _metric_follow_snapshot(owner):
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id,metric_name,params,canonical_key,created_at,updated_at "
+            "FROM rvbbit.calliope_metric_follows WHERE lower(owner_email)=lower(%s) "
+            "ORDER BY updated_at DESC", (owner,),
+        ).fetchall()
+    return {"follows": [{
+        **dict(row),
+        "id": str(row["id"]),
+        "created_at": _iso_utc(row.get("created_at")),
+        "updated_at": _iso_utc(row.get("updated_at")),
+    } for row in rows]}
+
+
+def _follow_metric(owner, execution_subject, name, params=None):
+    name = _metric_name(name)
+    params = _metric_params(params)
+    canonical_key = _metric_canonical_key(name, params)
+    with _conn() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM rvbbit.metric_catalog WHERE name=%s", (name,),
+        ).fetchone():
+            raise LookupError("No such governed metric")
+        row = conn.execute(
+            "INSERT INTO rvbbit.calliope_metric_follows "
+            "(id,owner_email,execution_subject,metric_name,params,canonical_key) "
+            "VALUES (%s::uuid,%s,%s,%s,%s::jsonb,%s) "
+            "ON CONFLICT (owner_email,canonical_key) DO UPDATE SET "
+            "execution_subject=excluded.execution_subject,updated_at=now() RETURNING *",
+            (
+                str(uuid.uuid4()), owner, execution_subject or owner, name,
+                json.dumps(params), canonical_key,
+            ),
+        ).fetchone()
+    return {
+        "follow": {
+            "id": str(row["id"]), "metric_name": name, "params": params,
+            "canonical_key": canonical_key, "followed": True,
+        }
+    }
+
+
+def _unfollow_metric(owner, name, params=None):
+    name = _metric_name(name)
+    params = _metric_params(params)
+    canonical_key = _metric_canonical_key(name, params)
+    with _conn() as conn:
+        row = conn.execute(
+            "DELETE FROM rvbbit.calliope_metric_follows "
+            "WHERE lower(owner_email)=lower(%s) AND canonical_key=%s RETURNING id",
+            (owner, canonical_key),
+        ).fetchone()
+    return {
+        "metric_name": name, "params": params, "canonical_key": canonical_key,
+        "followed": False, "removed": bool(row),
+    }
+
+
 # ── Semantic Home ───────────────────────────────────────────────────────────
 #
 # Home is deliberately a composition of stable warehouse handles, not copied
@@ -7491,7 +8219,7 @@ def _dashboard_inspection(
 # exact artifact version + definition hash + resolved dashboard context, which
 # makes them replayable and protects their meaning when an artifact evolves.
 _SEMANTIC_HOME_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$", re.I)
-_SEMANTIC_HOME_ITEM_KINDS = {"artifact", "artifact_object"}
+_SEMANTIC_HOME_ITEM_KINDS = {"artifact", "artifact_object", "metric"}
 
 
 def _semantic_home_enabled():
@@ -7600,7 +8328,68 @@ def _semantic_home_resolve_handle(value, *, validate_sql=False):
     body = value if isinstance(value, dict) else {}
     kind = str(body.get("kind") or body.get("item_kind") or "").strip().lower()
     if kind not in _SEMANTIC_HOME_ITEM_KINDS:
-        raise ValueError("Home items must be artifacts or named artifact objects")
+        raise ValueError("Home items must be artifacts, named artifact objects, or metrics")
+    if kind == "metric":
+        from urllib.parse import quote, urlencode
+
+        name = _metric_name(body.get("name") or body.get("metric") or body.get("relation"))
+        params = _metric_params(body.get("params"))
+        detail = _metric_detail_snapshot(name, params, days=90, bucket="raw")
+        source = {
+            "kind": "metric",
+            "name": name,
+            "params": params,
+            "tracking": "latest",
+            "pinned_version": detail["version"],
+        }
+        presentation = {
+            "title": detail["title"],
+            "description": detail["description"],
+            "grain": detail.get("grain"),
+            "category": detail.get("category"),
+            "subcategory": detail.get("subcategory"),
+            "display": detail.get("display") or {},
+        }
+        query = {"view": "metrics", "metric": name}
+        if params:
+            query["params"] = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
+        trail = [{
+            "kind": "metric",
+            "relationship": "governed measure",
+            "label": detail["title"],
+            "detail": detail.get("description") or detail.get("grain") or "Warehouse metric",
+            "handle": {"kind": "metric", "name": name, "relation": name, "params": params},
+        }]
+        trail.extend({
+            "kind": "table",
+            "relationship": "derived from",
+            "label": table,
+            "detail": "Metric source",
+            "handle": {"kind": "db_table", "table": table},
+        } for table in (detail.get("source_tables") or [])[:3])
+        return {
+            "kind": "metric",
+            "canonical_key": detail["canonical_key"],
+            "source": source,
+            "presentation": presentation,
+            "title": detail["title"],
+            "description": detail["description"],
+            "grain": detail.get("grain"),
+            "category": detail.get("category"),
+            "subcategory": detail.get("subcategory"),
+            "display": detail.get("display") or {},
+            "params": params,
+            "parameter_defaults": detail.get("parameter_defaults") or {},
+            "version": detail["version"],
+            "snapshot": detail.get("snapshot"),
+            "series": (detail.get("series") or [])[-_GALLERY_METRIC_SERIES_LIMIT:],
+            "trend": detail.get("trend"),
+            "open_url": "/gallery?" + urlencode(query, quote_via=quote),
+            "thumbnail_url": None,
+            "trail": trail,
+            "status": "ready" if detail.get("snapshot") else "unobserved",
+            "replayable": False,
+        }
     slug = str(body.get("slug") or "").strip()
     requested_version = body.get("version") if kind == "artifact_object" else None
     try:
@@ -7815,6 +8604,27 @@ def _semantic_home_snapshot(owner):
 
 def _semantic_home_preview(source, execution_subject=None):
     resolved = _semantic_home_resolve_handle(source, validate_sql=True)
+    if resolved["kind"] == "metric":
+        snapshot = resolved.get("snapshot")
+        if not snapshot:
+            return {
+                "status": "unobserved",
+                "value": None,
+                "display": resolved.get("display") or {},
+                "metric": resolved["source"]["name"],
+                "params": resolved["source"].get("params") or {},
+            }
+        return {
+            "status": "observed",
+            "value": snapshot.get("value"),
+            "display": resolved.get("display") or {},
+            "metric": resolved["source"]["name"],
+            "params": resolved["source"].get("params") or {},
+            "observation_id": snapshot.get("observation_id"),
+            "metric_version": snapshot.get("metric_version"),
+            "data_as_of": snapshot.get("data_as_of"),
+            "observed_at": snapshot.get("observed_at"),
+        }
     if resolved["kind"] != "artifact_object":
         raise ValueError("Only named business objects have a live value preview")
     dashboard, _, manifest, _ = _semantic_home_artifact_row(
@@ -8495,24 +9305,37 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
   font:800 7px/1 var(--mono);letter-spacing:0;text-align:center}
 .inbox-rail-link.has-unread .inbox-rail-count{background:var(--amber)}
 .inbox-rail-count[hidden]{display:none}
+.brief-rail-link{
+  position:relative;display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 9px;
+  border:1px solid color-mix(in oklch,var(--amber) 34%,var(--line));border-radius:999px;
+  background:color-mix(in oklch,var(--amber) 5%,transparent);color:var(--fog)!important;
+  font:600 7px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+  transition:border-color .18s,background .18s,color .18s}
+.brief-rail-link::before{content:"◐";color:var(--amber);font:10px/1 var(--serif)}
+.brief-rail-link:hover,.brief-rail-link.has-brief{border-color:var(--amber);color:var(--bone-bright)!important;background:var(--amber-soft)}
+.brief-rail-count{min-width:17px;padding:3px 5px;border-radius:999px;background:var(--amber);color:var(--void);font:800 7px/1 var(--mono);letter-spacing:0;text-align:center}
+.brief-rail-count[hidden]{display:none}
 .applink{padding:6px 11px;border:1px solid var(--line-hot);color:var(--amber)!important;
   letter-spacing:.12em}
 .applink:hover{background:var(--amber);color:#1a1206!important}
 
 .calliope-float{
   --calliope-edge:clamp(18px,2vw,28px);
+  --calliope-capsule-bg:color-mix(in oklch,#fffaf1 86%,var(--amber));
+  --calliope-capsule-ink:color-mix(in oklch,#100d0b 91%,var(--amber));
+  --calliope-capsule-muted:color-mix(in oklch,var(--calliope-capsule-ink) 68%,transparent);
   position:fixed;right:var(--calliope-edge);bottom:var(--calliope-edge);z-index:19;
   display:inline-flex;align-items:center;gap:13px;min-height:64px;
-  padding:6px 20px 6px 6px;border:1px solid var(--line-hot);border-radius:999px;
-  background:var(--gallery-rail-bg);
+  padding:6px 20px 6px 6px;border:1px solid color-mix(in oklch,var(--amber) 68%,#fff);border-radius:999px;
+  background:linear-gradient(135deg,color-mix(in oklch,#fff 62%,var(--calliope-capsule-bg)),var(--calliope-capsule-bg));
   -webkit-backdrop-filter:blur(20px) saturate(1.24);
   backdrop-filter:blur(20px) saturate(1.24);
-  box-shadow:0 14px 42px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.045);
-  color:var(--bone-bright);transition:transform .2s,border-color .2s,background .2s,box-shadow .2s}
+  box-shadow:0 16px 46px rgba(0,0,0,.46),0 0 0 4px color-mix(in oklch,var(--amber) 9%,transparent),inset 0 1px 0 rgba(255,255,255,.72);
+  color:var(--calliope-capsule-ink);transition:transform .2s,border-color .2s,background .2s,box-shadow .2s}
 .calliope-float:hover{
-  transform:translateY(-2px);border-color:var(--amber);
-  background:var(--gallery-rail-bg);
-  box-shadow:0 18px 52px rgba(0,0,0,.52),0 0 0 1px var(--amber-soft)}
+  transform:translateY(-3px);border-color:var(--amber);
+  background:linear-gradient(135deg,#fff,var(--calliope-capsule-bg));
+  box-shadow:0 20px 58px rgba(0,0,0,.52),0 0 0 5px color-mix(in oklch,var(--amber) 14%,transparent),inset 0 1px 0 #fff}
 .calliope-float:focus-visible{outline:2px solid var(--amber);outline-offset:3px}
 .calliope-float-avatar{
   width:44px;height:44px;flex:none;overflow:hidden;border:1px solid var(--line-hot);
@@ -8526,11 +9349,12 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
   display:block;width:100%;height:100%;object-fit:cover;
   transform:scale(1.22);transform-origin:57% 39%}
 .calliope-float-name{
-  color:var(--bone-bright);font-family:"Homemade Apple",cursive;
-  font-size:22px;font-weight:400;line-height:1;white-space:nowrap}
+  color:var(--calliope-capsule-ink);font-family:"Homemade Apple",cursive;
+  font-size:22px;font-weight:650;line-height:1;letter-spacing:-.015em;white-space:nowrap;
+  text-shadow:.35px 0 currentColor,-.2px .2px currentColor}
 .calliope-float-copy{display:flex;flex-direction:column;align-items:flex-start;gap:5px;padding-top:3px}
-.calliope-float-action{color:var(--fog);font:7px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;white-space:nowrap}
-.calliope-float-action b{margin-left:4px;color:var(--amber);font-size:10px;font-weight:400}
+.calliope-float-action{color:var(--calliope-capsule-muted);font:7px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;white-space:nowrap}
+.calliope-float-action b{margin-left:4px;color:color-mix(in oklch,var(--calliope-capsule-ink) 62%,var(--amber));font-size:10px;font-weight:700}
 
 main{position:relative;z-index:1;padding:0 max(20px,4vw) 90px}
 header.hero{padding:66px 0 30px;border-bottom:1px solid var(--line)}
@@ -8562,18 +9386,21 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   box-shadow:inset 0 1px 0 rgba(255,255,255,.025);transition:border-color .18s,transform .18s,background .18s}
 .home-tile:hover{transform:translateY(-1px);border-color:color-mix(in oklch,var(--jade) 34%,var(--line));background:linear-gradient(145deg,color-mix(in oklch,var(--panel-raised) 96%,var(--jade) 4%),var(--void))}
 .home-tile.object::before{content:"";position:absolute;z-index:2;inset:0 auto 0 0;width:2px;background:var(--jade);opacity:.72}
+.home-tile.metric::before{content:"";position:absolute;z-index:2;inset:0 auto 0 0;width:2px;background:var(--amber);opacity:.78}
 .home-tile.unavailable{opacity:.66}
 .home-tile-content{display:grid;grid-template-columns:74px minmax(0,1fr);min-height:132px}
-.home-tile.object .home-tile-content{grid-template-columns:1fr}
+.home-tile.object .home-tile-content,.home-tile.metric .home-tile-content{grid-template-columns:1fr}
 .home-thumb{position:relative;display:block;min-height:100%;overflow:hidden;background:#0d0b09;color:var(--amber)}
 .home-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:top center;opacity:.67;transition:opacity .2s,transform .35s}
 .home-tile:hover .home-thumb img{opacity:.88;transform:scale(1.035)}
 .home-thumb::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 45%,var(--panel-raised) 100%);pointer-events:none}
 .home-tile-main{display:flex;flex-direction:column;min-width:0;padding:12px 12px 10px}
-.home-tile.object .home-tile-main{padding-left:14px}
+.home-tile.object .home-tile-main,.home-tile.metric .home-tile-main{position:relative;z-index:1;padding-left:14px}
 .home-kicker{display:flex;align-items:center;gap:7px;margin-bottom:6px;color:var(--jade);font:650 6px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
 .home-kicker i{width:5px;height:5px;border-radius:50%;background:currentColor;box-shadow:0 0 9px color-mix(in oklch,currentColor 55%,transparent)}
 .home-tile.artifact .home-kicker{color:var(--amber)}
+.home-tile.metric .home-kicker{color:var(--amber)}
+.home-metric-spark{position:absolute;z-index:0;inset:28px 0 26px;opacity:.52;pointer-events:none}.home-metric-spark svg{display:block;width:100%;height:100%}.home-metric-spark path:first-child{fill:color-mix(in oklch,var(--jade) 9%,transparent)}.home-metric-spark path:last-child{fill:none;stroke:var(--jade);stroke-width:2;vector-effect:non-scaling-stroke}.home-tile.metric .home-value{font-size:28px;text-shadow:0 2px 10px var(--void)}
 .home-tile h3{overflow:hidden;color:var(--bone-bright);font:italic 400 16px/1.17 var(--serif);text-overflow:ellipsis;white-space:nowrap}
 .home-tile-desc{display:-webkit-box;overflow:hidden;margin-top:5px;color:var(--fog);font-size:8px;line-height:1.45;-webkit-box-orient:vertical;-webkit-line-clamp:2}
 .home-value{min-height:25px;margin:4px 0 1px;color:var(--bone-bright);font:600 22px/1.05 var(--sans);letter-spacing:-.025em}
@@ -8595,6 +9422,9 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .home-tile-actions button[data-home-trail]:hover{border-color:color-mix(in oklch,var(--jade) 52%,var(--line));color:var(--jade)}
 .home-tile-actions button:hover{border-color:color-mix(in oklch,#ef8178 52%,var(--line));color:#ef9b91}
 .home-version-note{margin-right:auto;color:var(--amber);font:6px/1.2 var(--mono);letter-spacing:.06em;text-transform:uppercase}
+
+[data-gallery-tooltip]{cursor:help}[data-gallery-tooltip]:focus-visible{outline:1px solid color-mix(in oklch,var(--amber) 68%,var(--jade));outline-offset:2px}.home-crumb[data-gallery-tooltip],.home-context span[data-gallery-tooltip],.home-value[data-gallery-tooltip]{transition:border-color .15s,box-shadow .15s,filter .15s}.home-crumb[data-gallery-tooltip]:hover,.home-context span[data-gallery-tooltip]:hover{border-color:color-mix(in oklch,var(--jade) 48%,var(--line));box-shadow:inset 0 -1px 0 color-mix(in oklch,var(--jade) 46%,transparent)}.home-value[data-gallery-tooltip]:hover{filter:brightness(1.08)}
+.gallery-tooltip{--gallery-tooltip-accent:color-mix(in oklch,var(--amber) 55%,var(--jade));--gallery-tooltip-bg:color-mix(in oklch,var(--block-bg,var(--panel)) 96%,var(--background,var(--void)));position:fixed;z-index:100000;width:min(342px,calc(100vw - 24px));padding:13px 14px 14px;border:1px solid color-mix(in oklch,var(--gallery-tooltip-accent) 48%,var(--block-border,var(--line)));background:var(--gallery-tooltip-bg);color:var(--foreground,var(--bone));box-shadow:0 18px 50px color-mix(in oklch,var(--overlay,#000) 42%,transparent),inset 0 0 0 1px color-mix(in oklch,var(--foreground,var(--bone)) 4%,transparent);opacity:0;pointer-events:none;transform:translateY(4px);transition:opacity .13s ease,transform .13s ease}.gallery-tooltip[hidden]{display:none}.gallery-tooltip.visible{opacity:1;transform:translateY(0)}.gallery-tooltip[data-placement="bottom"]{transform:translateY(-4px)}.gallery-tooltip[data-placement="bottom"].visible{transform:translateY(0)}.gallery-tooltip[data-tooltip-kind="trail"],.gallery-tooltip[data-tooltip-kind="value"]{--gallery-tooltip-accent:var(--jade)}.gallery-tooltip[data-tooltip-kind="context"]{--gallery-tooltip-accent:var(--amber)}.gallery-tooltip::after{content:"";position:absolute;left:var(--gallery-tooltip-anchor,calc(50% - 5px));bottom:-5px;width:8px;height:8px;border-right:1px solid color-mix(in oklch,var(--gallery-tooltip-accent) 48%,var(--block-border,var(--line)));border-bottom:1px solid color-mix(in oklch,var(--gallery-tooltip-accent) 48%,var(--block-border,var(--line)));background:var(--gallery-tooltip-bg);transform:rotate(45deg)}.gallery-tooltip[data-placement="bottom"]::after{top:-5px;bottom:auto;border:0;border-top:1px solid color-mix(in oklch,var(--gallery-tooltip-accent) 48%,var(--block-border,var(--line)));border-left:1px solid color-mix(in oklch,var(--gallery-tooltip-accent) 48%,var(--block-border,var(--line)))}.gallery-tooltip-head{display:flex;align-items:center;gap:9px}.gallery-tooltip-head span{overflow:hidden;color:var(--gallery-tooltip-accent);font:750 6px/1 var(--mono);letter-spacing:.11em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.gallery-tooltip-head b{margin-left:auto;padding:4px 6px;border:1px solid color-mix(in oklch,var(--gallery-tooltip-accent) 34%,var(--block-border,var(--line)));color:var(--gallery-tooltip-accent);font:700 6px/1 var(--mono);letter-spacing:.07em;text-transform:uppercase}.gallery-tooltip-head b.error,.gallery-tooltip-head b.unavailable{border-color:color-mix(in oklch,#df765f 44%,var(--block-border,var(--line)));color:#df765f}.gallery-tooltip-title{display:block;margin-top:9px;color:var(--foreground,var(--bone));font:italic 500 19px/1.15 var(--serif)}.gallery-tooltip-section{margin-top:10px}.gallery-tooltip-section>span{display:block;margin-bottom:4px;color:var(--chrome-text,var(--dim));font:700 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}.gallery-tooltip-section>p{margin:0;color:var(--chrome-text,var(--fog));font:9px/1.5 var(--sans)}.gallery-tooltip-section.evidence{margin:11px -14px -14px;padding:10px 14px 12px;border-top:1px solid color-mix(in oklch,var(--gallery-tooltip-accent) 24%,var(--block-border,var(--line)));background:color-mix(in oklch,var(--gallery-tooltip-accent) 5%,transparent)}.gallery-tooltip-section.evidence>span{color:var(--gallery-tooltip-accent)}.gallery-tooltip-facts{display:flex;gap:5px;flex-wrap:wrap;margin:10px 0 0}.gallery-tooltip-facts div{min-width:0;display:flex;align-items:center;gap:5px;padding:5px 6px;border:1px solid var(--block-border,var(--line));background:color-mix(in oklch,var(--doc-bg,var(--void)) 52%,transparent);font:6px/1.2 var(--mono)}.gallery-tooltip-facts dt{color:var(--chrome-text,var(--dim));text-transform:uppercase}.gallery-tooltip-facts dd{overflow:hidden;max-width:220px;margin:0;color:var(--foreground,var(--fog));text-overflow:ellipsis;white-space:nowrap}
 
 .trail-dialog{width:min(860px,calc(100vw - 32px));max-width:none;height:min(760px,calc(100dvh - 32px));max-height:none;margin:auto;padding:0;
   border:1px solid var(--line-hot);background:color-mix(in oklch,var(--panel) 92%,transparent);color:var(--bone);
@@ -8678,11 +9508,15 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .card{position:relative;display:flex;flex-direction:column;background:var(--panel);transition:background .25s}
 .card:hover{background:var(--panel-2)}
 .card-link{display:flex;flex:1;flex-direction:column;min-height:100%}
-.card-pin{position:absolute;top:10px;right:10px;z-index:5;display:flex;align-items:center;gap:6px;min-height:27px;padding:6px 8px;
+.card-actions{position:absolute;top:10px;right:10px;z-index:5;display:flex;align-items:center;gap:5px}
+.card-pin,.card-ask{display:flex;align-items:center;gap:6px;min-height:27px;padding:6px 8px;
   border:1px solid color-mix(in oklch,var(--bone) 18%,transparent);border-radius:999px;background:color-mix(in oklch,var(--void) 76%,transparent);
   -webkit-backdrop-filter:blur(13px);backdrop-filter:blur(13px);color:var(--fog);font:650 6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;
   box-shadow:0 5px 16px rgba(0,0,0,.28);cursor:pointer;transition:border-color .18s,background .18s,color .18s,transform .18s}
 .card-pin:hover,.card-pin:focus-visible{outline:0;transform:translateY(-1px);border-color:var(--amber);background:color-mix(in oklch,var(--void) 86%,var(--amber) 4%);color:var(--amber)}
+.card-ask{border-color:color-mix(in oklch,var(--jade) 36%,var(--line));color:var(--jade)}
+.card-ask:hover,.card-ask:focus-visible{outline:0;transform:translateY(-1px);border-color:var(--jade);background:color-mix(in oklch,var(--jade) 12%,var(--void));color:color-mix(in oklch,var(--jade) 82%,#fff)}
+.card-ask:disabled{cursor:wait;opacity:.72}.card-ask.loading span{font-size:0}.card-ask.loading span::after{content:"…";font-size:6px}
 .card-pin[aria-pressed=true]{border-color:color-mix(in oklch,var(--jade) 62%,transparent);background:color-mix(in oklch,var(--jade) 15%,var(--void));color:var(--jade)}
 .card-pin:disabled{cursor:wait;opacity:.62}
 .card-pin b{font-size:10px;font-weight:400;line-height:.6}
@@ -8737,8 +9571,8 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 @media (max-width:520px){
   nav{padding-inline:14px}
   .wordmark small{display:none}
-  .inbox-rail-label{display:none}
-  .inbox-rail-link{gap:5px;padding-inline:8px}
+  .inbox-rail-label,.brief-rail-label{display:none}
+  .inbox-rail-link,.brief-rail-link{gap:5px;padding-inline:8px}
   .applink{display:none}
   .calliope-float{gap:11px;min-height:60px;padding:5px 17px 5px 5px}
   .calliope-float-avatar{width:42px;height:42px}
@@ -8749,6 +9583,44 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .trail-content{padding:12px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+"""
+
+_GALLERY_METRICS_CSS = """
+.gallery-view-switch{display:inline-flex;align-items:center;flex:none;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 62%,transparent)}
+.gallery-view-switch button{min-height:34px;padding:0 12px;border:0;border-right:1px solid var(--line);background:transparent;color:var(--dim);font:700 8px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;cursor:pointer}
+.gallery-view-switch button:last-child{border-right:0}.gallery-view-switch button:hover{color:var(--bone)}
+.gallery-view-switch button[aria-selected=true]{background:var(--amber);color:#1a1206}
+.gallery-view-switch b{display:inline-grid;min-width:17px;margin-left:6px;padding:3px 4px;border-radius:999px;background:color-mix(in oklch,currentColor 14%,transparent);font-size:6px;place-items:center}.gallery-view-switch b[hidden]{display:none}
+.artifact-kind-chips{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.artifact-kind-chips[hidden]{display:none}
+#artifact-browser[hidden],.metrics-browser[hidden]{display:none}
+.metrics-browser{padding-top:16px}
+.metrics-browser-head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding:0 0 14px;border-bottom:1px solid var(--line)}
+.metrics-browser-head>div:first-child{display:flex;flex-direction:column;gap:6px}.metrics-browser-head>div:first-child>span{color:var(--jade);font:700 7px/1 var(--mono);letter-spacing:.15em;text-transform:uppercase}
+.metrics-browser-head>div:first-child>strong{color:var(--fog);font:italic 400 16px/1.2 var(--serif)}
+.metric-browser-filters{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+#metric-category{height:30px;max-width:210px;padding:0 25px 0 9px;border:1px solid var(--line);border-radius:0;background:var(--panel);color:var(--fog);font:7px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;outline:none}
+#metric-category:focus{border-color:var(--jade)}
+.metric-relation-filter{display:inline-flex;border:1px solid var(--line)}.metric-relation-filter button{height:28px;padding:0 9px;border:0;border-right:1px solid var(--line);background:transparent;color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;cursor:pointer}.metric-relation-filter button:last-child{border:0}.metric-relation-filter button:hover{color:var(--jade)}.metric-relation-filter button[aria-pressed=true]{background:var(--jade-soft);color:var(--jade)}
+.metric-browser-status,.metric-gallery-empty{min-height:190px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:var(--dim);font:8px/1.5 var(--mono);letter-spacing:.08em;text-align:center;text-transform:uppercase}.metric-browser-status[hidden],.metric-gallery-empty[hidden]{display:none}.metric-browser-status i{width:21px;height:21px;border:1px solid var(--jade);border-right-color:transparent;border-radius:50%;animation:semantic-spin .75s linear infinite}.metric-browser-status.error{color:#f2a28f}.metric-browser-status.error i{display:none}.metric-gallery-empty strong{color:var(--fog);font:italic 400 18px/1.2 var(--serif);letter-spacing:0;text-transform:none}.metric-gallery-empty span{font-size:7px}
+.metric-gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:1px;margin-top:1px;border:1px solid var(--line);background:var(--line)}.metric-gallery-grid:empty{display:none}
+.metric-gallery-card{position:relative;min-height:280px;overflow:hidden;background:linear-gradient(145deg,color-mix(in oklch,var(--panel) 95%,var(--jade) 5%),var(--panel));cursor:pointer;isolation:isolate;transition:background .22s,transform .2s}.metric-gallery-card:hover{z-index:2;background:linear-gradient(145deg,color-mix(in oklch,var(--panel-2) 90%,var(--jade) 10%),var(--panel-2))}.metric-gallery-card:focus-within{z-index:3;outline:1px solid var(--jade);outline-offset:-1px}
+.metric-card-grid{position:absolute;z-index:-1;inset:0;opacity:.62;background-image:linear-gradient(color-mix(in oklch,var(--bone) 4%,transparent) 1px,transparent 1px),linear-gradient(90deg,color-mix(in oklch,var(--bone) 3%,transparent) 1px,transparent 1px);background-size:100% 25%,16.66% 100%;mask-image:linear-gradient(to top,#000,transparent 92%)}
+.metric-card-chart{position:absolute;z-index:-1;inset:50px 0 0;opacity:.72;pointer-events:none}.metric-card-chart svg{width:100%;height:100%;display:block;overflow:visible}.metric-card-area{fill:color-mix(in oklch,var(--jade) 11%,transparent)}.metric-card-line{fill:none;stroke:var(--jade);stroke-width:1.8;vector-effect:non-scaling-stroke;filter:drop-shadow(0 0 7px color-mix(in oklch,var(--jade) 42%,transparent))}.metric-gallery-card.bad .metric-card-line{stroke:#df765f}.metric-gallery-card.bad .metric-card-area{fill:color-mix(in oklch,#df765f 10%,transparent)}
+.metric-card-open{position:absolute;z-index:1;inset:0;width:100%;border:0;background:transparent;color:inherit;cursor:pointer}.metric-card-open:focus-visible{outline:2px solid var(--jade);outline-offset:-3px}
+.metric-card-actions{position:absolute;z-index:3;top:12px;right:12px;display:flex;gap:5px}.metric-card-actions button,.metric-lens-actions button{display:inline-flex;align-items:center;gap:5px;min-height:27px;padding:5px 8px;border:1px solid color-mix(in oklch,var(--bone) 17%,transparent);border-radius:999px;background:color-mix(in oklch,var(--void) 72%,transparent);color:var(--fog);font:700 6px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;cursor:pointer;backdrop-filter:blur(12px);transition:border-color .16s,color .16s,background .16s,transform .16s}.metric-card-actions button:hover,.metric-lens-actions button:hover{transform:translateY(-1px);border-color:var(--jade);color:var(--jade)}.metric-card-actions button.active,.metric-lens-actions button.active{border-color:color-mix(in oklch,var(--jade) 58%,var(--line));background:color-mix(in oklch,var(--jade) 13%,var(--void));color:var(--jade)}.metric-card-actions button.ask,.metric-lens-actions button.ask{border-color:color-mix(in oklch,var(--amber) 46%,var(--line));color:var(--amber)}.metric-card-actions button:disabled,.metric-lens-actions button:disabled{opacity:.55;cursor:wait;transform:none}
+.metric-card-content{position:relative;z-index:2;min-height:280px;display:flex;flex-direction:column;justify-content:flex-end;padding:18px;pointer-events:none;text-shadow:0 2px 12px color-mix(in oklch,var(--void) 90%,transparent)}
+.metric-card-kicker{position:absolute;top:18px;left:18px;right:168px;display:flex;align-items:center;gap:7px;overflow:hidden;color:var(--jade);font:700 6px/1 var(--mono);letter-spacing:.12em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.metric-card-kicker::before{content:"";width:13px;height:1px;flex:none;background:currentColor}.metric-gallery-card.bad .metric-card-kicker{color:#df765f}
+.metric-card-status{align-self:flex-start;margin-bottom:auto;padding:4px 6px;border:1px solid var(--line);color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}.metric-card-status.good{border-color:color-mix(in oklch,var(--jade) 38%,var(--line));color:var(--jade)}.metric-card-status.bad{border-color:color-mix(in oklch,#df765f 48%,var(--line));color:#ef9b91}
+.metric-card-value{display:flex;align-items:baseline;gap:10px;color:var(--bone-bright);font:600 clamp(34px,4vw,57px)/.92 var(--sans);letter-spacing:-.06em}.metric-card-value small{color:var(--jade);font:650 8px/1 var(--mono);letter-spacing:0}.metric-card-value small.bad{color:#ef9b91}.metric-card-value small.neutral{color:var(--fog)}
+.metric-card-title{margin-top:9px;color:var(--bone-bright);font:italic 400 20px/1.15 var(--serif)}.metric-card-description{display:-webkit-box;overflow:hidden;margin-top:6px;color:var(--fog);font-size:9px;line-height:1.45;-webkit-box-orient:vertical;-webkit-line-clamp:2}.metric-card-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;padding-top:9px;border-top:1px solid var(--line);color:var(--dim);font:6px/1.3 var(--mono);letter-spacing:.09em;text-transform:uppercase}.metric-card-foot span:last-child{text-align:right}
+.metric-lens{width:min(1120px,calc(100vw - 28px));max-width:none;height:min(850px,calc(100dvh - 28px));max-height:none;margin:auto;padding:0;border:1px solid color-mix(in oklch,var(--jade) 46%,var(--line));background:color-mix(in oklch,var(--panel) 96%,transparent);color:var(--bone);box-shadow:0 38px 140px color-mix(in oklch,var(--void) 90%,transparent)}.metric-lens::backdrop{background:color-mix(in oklch,var(--void) 76%,transparent);backdrop-filter:blur(9px)}.metric-lens-shell{height:100%;display:grid;grid-template-rows:auto minmax(0,1fr)}
+.metric-lens-head{display:flex;align-items:center;gap:16px;min-height:72px;padding:11px 13px 11px 19px;border-bottom:1px solid var(--line);background:color-mix(in oklch,var(--gallery-rail-bg) 92%,transparent);backdrop-filter:blur(18px)}.metric-lens-heading{min-width:0;display:flex;flex:1;flex-direction:column;gap:4px}.metric-lens-heading>span{color:var(--jade);font:750 6px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase}.metric-lens-heading>strong{overflow:hidden;color:var(--bone-bright);font:italic 400 22px/1.05 var(--serif);text-overflow:ellipsis;white-space:nowrap}.metric-lens-heading>small{overflow:hidden;color:var(--dim);font:7px/1.25 var(--mono);letter-spacing:.08em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.metric-lens-actions{display:flex;align-items:center;gap:5px}.metric-lens-close{width:36px;height:36px;display:grid;place-items:center;flex:none;border:1px solid var(--line);background:transparent;color:var(--fog);font:19px/1 var(--sans);cursor:pointer}.metric-lens-close:hover{border-color:var(--amber);color:var(--amber)}
+.metric-lens-content{min-height:0;overflow:auto;padding:18px;scrollbar-color:color-mix(in oklch,var(--jade) 48%,var(--line)) color-mix(in oklch,var(--void) 60%,transparent)}.metric-lens-loading,.metric-lens-error{min-height:300px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:11px;color:var(--dim);font:8px/1.5 var(--mono);text-align:center}.metric-lens-loading i{width:25px;height:25px;border:1px solid var(--jade);border-right-color:transparent;border-radius:50%;animation:semantic-spin .75s linear infinite}.metric-lens-error strong{color:#ef9b91;font:italic 400 20px/1.2 var(--serif)}
+.metric-lens-hero{position:relative;min-height:200px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:20px;overflow:hidden;padding:20px;border:1px solid color-mix(in oklch,var(--jade) 28%,var(--line));background:linear-gradient(145deg,color-mix(in oklch,var(--jade) 7%,var(--panel)),var(--panel))}.metric-lens-hero::before{content:"";position:absolute;inset:0;opacity:.5;background-image:linear-gradient(color-mix(in oklch,var(--bone) 4%,transparent) 1px,transparent 1px),linear-gradient(90deg,color-mix(in oklch,var(--bone) 3%,transparent) 1px,transparent 1px);background-size:100% 25%,12.5% 100%;pointer-events:none}.metric-lens-hero-copy{position:relative;z-index:1;align-self:end}.metric-lens-hero-copy>span{color:var(--jade);font:700 7px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase}.metric-lens-hero-copy>strong{display:block;margin-top:14px;color:var(--bone-bright);font:600 clamp(45px,7vw,80px)/.86 var(--sans);letter-spacing:-.07em}.metric-lens-hero-copy>p{max-width:720px;margin-top:13px;color:var(--fog);font-size:11px;line-height:1.5}.metric-lens-hero-facts{position:relative;z-index:1;display:flex;align-items:flex-end;flex-direction:column;justify-content:flex-end;gap:6px}.metric-lens-hero-facts span{padding:5px 7px;border:1px solid var(--line);color:var(--fog);font:7px/1.25 var(--mono);text-transform:uppercase}.metric-lens-hero-facts b{margin-right:6px;color:var(--dim);font-weight:500}
+.metric-lens-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding:9px 10px;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 35%,transparent)}.metric-range-buttons{display:flex;gap:4px}.metric-range-buttons button{height:27px;padding:0 8px;border:1px solid var(--line);background:transparent;color:var(--dim);font:650 6px/1 var(--mono);text-transform:uppercase;cursor:pointer}.metric-range-buttons button:hover,.metric-range-buttons button.active{border-color:var(--jade);color:var(--jade);background:var(--jade-soft)}.metric-range-selection{color:var(--dim);font:7px/1.35 var(--mono);letter-spacing:.06em;text-align:right}.metric-range-selection.active{color:var(--jade)}
+.metric-lens-chart{position:relative;margin-top:1px;min-height:310px;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 38%,transparent)}.metric-lens-chart svg{display:block;width:100%;height:310px}.metric-lens-chart .grid-line{stroke:color-mix(in oklch,var(--bone) 7%,transparent);stroke-width:1;vector-effect:non-scaling-stroke}.metric-lens-chart .axis-label{fill:var(--dim);font:7px var(--mono)}.metric-lens-chart .area{fill:color-mix(in oklch,var(--jade) 10%,transparent)}.metric-lens-chart .line{fill:none;stroke:var(--jade);stroke-width:2;vector-effect:non-scaling-stroke}.metric-lens-chart .point{fill:var(--panel);stroke:var(--jade);stroke-width:2;vector-effect:non-scaling-stroke;cursor:pointer}.metric-lens-chart .point:hover,.metric-lens-chart .point.selected{fill:var(--amber);stroke:var(--amber);r:5}.metric-lens-chart .version-mark{stroke:color-mix(in oklch,var(--amber) 45%,transparent);stroke-dasharray:3 3;vector-effect:non-scaling-stroke}.metric-chart-tooltip{position:absolute;z-index:3;max-width:240px;padding:8px 9px;border:1px solid color-mix(in oklch,var(--jade) 45%,var(--line));background:color-mix(in oklch,var(--panel) 97%,transparent);box-shadow:0 10px 35px rgba(0,0,0,.35);color:var(--fog);font:7px/1.4 var(--mono);pointer-events:none;transform:translate(-50%,-112%)}.metric-chart-tooltip[hidden]{display:none}.metric-chart-tooltip strong{display:block;margin-bottom:3px;color:var(--bone-bright);font-size:9px}.metric-chart-tooltip b{color:var(--jade);font-weight:500}
+.metric-lens-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(260px,.75fr);gap:12px;margin-top:14px}.metric-lens-panel{min-width:0;padding:15px;border:1px solid var(--line);background:color-mix(in oklch,var(--panel-raised) 72%,transparent)}.metric-lens-panel>h3{display:flex;align-items:center;gap:8px;margin-bottom:11px;color:var(--jade);font:700 7px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}.metric-lens-panel>h3::after{content:"";height:1px;flex:1;background:var(--line)}.metric-lens-panel>p{color:var(--fog);font-size:11px;line-height:1.6}.metric-definition-facts,.metric-source-list,.metric-artifact-list{display:flex;flex-wrap:wrap;gap:6px}.metric-definition-facts span,.metric-source-list span,.metric-artifact-list a{padding:6px 8px;border:1px solid var(--line);color:var(--fog);font:7px/1.3 var(--mono)}.metric-definition-facts b{margin-right:6px;color:var(--dim);font-weight:500;text-transform:uppercase}.metric-source-list span.stale{border-color:color-mix(in oklch,#df765f 45%,var(--line));color:#ef9b91}.metric-artifact-list a:hover{border-color:var(--amber);color:var(--amber)}.metric-sql{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}.metric-sql summary{color:var(--dim);font:7px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;cursor:pointer}.metric-sql pre{max-height:260px;overflow:auto;margin-top:10px;padding:11px;border:1px solid var(--line);background:var(--void);color:var(--fog);font:8px/1.55 var(--mono);white-space:pre-wrap}.metric-param-list{display:flex;flex-direction:column;gap:5px}.metric-param-list div{display:grid;grid-template-columns:minmax(90px,.55fr) minmax(0,1fr);gap:8px;padding:7px 8px;border:1px solid var(--line);font:7px/1.35 var(--mono)}.metric-param-list dt{color:var(--dim)}.metric-param-list dt small{display:block;margin-top:3px;color:var(--jade);font:5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}.metric-param-list dd{overflow-wrap:anywhere;color:var(--fog)}
+@media(max-width:760px){.gallery-view-switch{width:100%}.gallery-view-switch button{flex:1}.artifact-kind-chips{width:100%;overflow:auto;flex-wrap:nowrap}.metrics-browser-head{align-items:flex-start;flex-direction:column}.metric-browser-filters{width:100%;justify-content:flex-start}.metric-lens{width:100vw;height:100dvh;margin:0;border:0}.metric-lens-head{gap:9px}.metric-lens-heading>small{display:none}.metric-lens-actions button span{display:none}.metric-lens-content{padding:11px}.metric-lens-hero{grid-template-columns:1fr}.metric-lens-hero-facts{align-items:flex-start}.metric-lens-toolbar{align-items:flex-start;flex-direction:column}.metric-range-selection{text-align:left}.metric-lens-grid{grid-template-columns:1fr}}
 """
 
 _LANDING_JS = """
@@ -8825,6 +9697,39 @@ _LANDING_JS = """
    });
  }
 
+ var galleryBrief=document.getElementById('gallery-personal-brief'),
+     galleryBriefCount=document.getElementById('gallery-personal-brief-count'),
+     galleryBriefTimer=null;
+ async function loadGalleryBrief(){
+   if(!galleryBrief||!galleryBriefCount)return;
+   try{
+     var timezone='UTC';
+     try{timezone=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';}catch(ignore){}
+     var response=await fetch('/api/calliope/briefs/status?timezone='+encodeURIComponent(timezone),{headers:{accept:'application/json'}}),data={};
+     try{data=await response.json();}catch(ignore){}
+     if(!response.ok)throw new Error('Brief unavailable');
+     var brief=data.brief||{},exists=Boolean(brief.exists),count=Math.max(0,Number(brief.item_count)||0);
+     galleryBrief.classList.toggle('has-brief',exists);
+     galleryBriefCount.hidden=!exists;
+     galleryBriefCount.textContent=count>99?'99+':String(count);
+     galleryBrief.title=exists
+       ? "Open today's Personal Brief · "+count+' grounded item'+(count===1?'':'s')
+       : "Create today's private Personal Brief";
+     galleryBrief.setAttribute('aria-label',galleryBrief.title);
+   }catch(ignore){
+     galleryBrief.classList.remove('has-brief');
+     galleryBriefCount.hidden=true;
+     galleryBrief.title="Open today's private Personal Brief";
+   }
+ }
+ if(galleryBrief){
+   loadGalleryBrief();
+   galleryBriefTimer=setInterval(loadGalleryBrief,60000);
+   document.addEventListener('visibilitychange',function(){
+     if(document.visibilityState==='visible')loadGalleryBrief();
+   });
+ }
+
  var homeSection=document.getElementById('semantic-home'),
      homeGrid=document.getElementById('home-grid'),
      homeEmpty=document.getElementById('home-empty'),
@@ -8842,6 +9747,99 @@ _LANDING_JS = """
      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char];
    });
  }
+ function galleryShortRef(value){
+   var text=String(value||'');
+   return text.length>18?text.slice(0,8)+'…'+text.slice(-4):text;
+ }
+ function galleryTooltipSourceMarkup(options){
+   options=options||{};
+   var facts=(options.facts||[]).filter(function(fact){
+     return fact&&fact[0]&&fact[1]!==null&&fact[1]!==undefined&&fact[1]!=='';
+   });
+   var status=String(options.status||'context'),statusClass=status.toLowerCase().replace(/[^a-z0-9_-]+/g,'-');
+   return '<template class="gallery-tooltip-source">'
+     +'<header class="gallery-tooltip-head"><span>'+escapeHome(options.eyebrow||'Explain this')+'</span><b class="'+escapeHome(statusClass)+'">'+escapeHome(status)+'</b></header>'
+     +'<strong class="gallery-tooltip-title">'+escapeHome(options.title||'Context')+'</strong>'
+     +(options.meaning?'<section class="gallery-tooltip-section"><span>'+escapeHome(options.meaningLabel||'What it means')+'</span><p>'+escapeHome(options.meaning)+'</p></section>':'')
+     +(facts.length?'<dl class="gallery-tooltip-facts">'+facts.map(function(fact){return '<div><dt>'+escapeHome(fact[0])+'</dt><dd>'+escapeHome(fact[1])+'</dd></div>';}).join('')+'</dl>':'')
+     +(options.evidence?'<section class="gallery-tooltip-section evidence"><span>'+escapeHome(options.evidenceLabel||'Why it is here')+'</span><p>'+escapeHome(options.evidence)+'</p></section>':'')
+     +'</template>';
+ }
+ function setGalleryTooltipSource(target,markup){
+   if(!target)return;
+   var source=target.querySelector('.gallery-tooltip-source');
+   if(source)source.remove();
+   target.insertAdjacentHTML('beforeend',markup||'');
+   if(galleryTooltipTarget===target)showGalleryTooltip(target);
+ }
+ var galleryTooltipTarget=null,galleryTooltipFrame=null,galleryTooltipHideTimer=null;
+ function galleryTooltipElement(target){
+   var tooltip=document.getElementById('gallery-explain-tooltip');
+   if(!tooltip){
+     tooltip=document.createElement('div');tooltip.id='gallery-explain-tooltip';tooltip.className='gallery-tooltip';
+     tooltip.setAttribute('role','tooltip');tooltip.hidden=true;
+   }
+   var owner=target&&target.closest('dialog[open]')||document.body;
+   if(tooltip.parentNode!==owner)owner.appendChild(tooltip);
+   return tooltip;
+ }
+ function positionGalleryTooltip(){
+   galleryTooltipFrame=null;
+   var target=galleryTooltipTarget;
+   if(!target||!target.isConnected){hideGalleryTooltip();return;}
+   var tooltip=galleryTooltipElement(target);if(tooltip.hidden)return;
+   var targetRect=target.getBoundingClientRect(),tooltipRect=tooltip.getBoundingClientRect(),dialog=target.closest('dialog[open]');
+   var bounds=dialog?dialog.getBoundingClientRect():{top:0,right:window.innerWidth,bottom:window.innerHeight,left:0};
+   var inset=11,gap=10,minLeft=bounds.left+inset,maxLeft=Math.max(minLeft,bounds.right-tooltipRect.width-inset);
+   var left=Math.min(maxLeft,Math.max(minLeft,targetRect.left+(targetRect.width-tooltipRect.width)/2));
+   var placement='top',top=targetRect.top-tooltipRect.height-gap;
+   if(top<bounds.top+inset){placement='bottom';top=targetRect.bottom+gap;}
+   var maxTop=Math.max(bounds.top+inset,bounds.bottom-tooltipRect.height-inset);
+   top=Math.min(maxTop,Math.max(bounds.top+inset,top));
+   var anchor=Math.min(tooltipRect.width-18,Math.max(10,targetRect.left+targetRect.width/2-left-4));
+   tooltip.dataset.placement=placement;tooltip.style.setProperty('--gallery-tooltip-anchor',Math.round(anchor)+'px');
+   tooltip.style.left=Math.round(left)+'px';tooltip.style.top=Math.round(top)+'px';
+ }
+ function scheduleGalleryTooltipPosition(){
+   if(!galleryTooltipTarget||galleryTooltipFrame!==null)return;
+   galleryTooltipFrame=requestAnimationFrame(positionGalleryTooltip);
+ }
+ function showGalleryTooltip(target){
+   var source=target&&target.querySelector('.gallery-tooltip-source');if(!source)return;
+   clearTimeout(galleryTooltipHideTimer);
+   if(galleryTooltipTarget&&galleryTooltipTarget!==target)galleryTooltipTarget.removeAttribute('aria-describedby');
+   galleryTooltipTarget=target;
+   var tooltip=galleryTooltipElement(target);tooltip.dataset.tooltipKind=target.dataset.tooltipKind||'context';
+   tooltip.innerHTML=source.innerHTML;tooltip.hidden=false;tooltip.classList.remove('visible');
+   target.setAttribute('aria-describedby',tooltip.id);positionGalleryTooltip();
+   requestAnimationFrame(function(){if(galleryTooltipTarget===target)tooltip.classList.add('visible');});
+ }
+ function hideGalleryTooltip(){
+   var target=galleryTooltipTarget;galleryTooltipTarget=null;if(target)target.removeAttribute('aria-describedby');
+   if(galleryTooltipFrame!==null)cancelAnimationFrame(galleryTooltipFrame);galleryTooltipFrame=null;
+   var tooltip=document.getElementById('gallery-explain-tooltip');if(!tooltip)return;
+   tooltip.classList.remove('visible');clearTimeout(galleryTooltipHideTimer);
+   galleryTooltipHideTimer=setTimeout(function(){if(galleryTooltipTarget)return;tooltip.hidden=true;tooltip.innerHTML='';},140);
+ }
+ document.addEventListener('pointerover',function(event){
+   var target=event.target.closest&&event.target.closest('[data-gallery-tooltip]');
+   if(!target||target.contains(event.relatedTarget))return;showGalleryTooltip(target);
+ });
+ document.addEventListener('pointerout',function(event){
+   var target=event.target.closest&&event.target.closest('[data-gallery-tooltip]');
+   if(!target||target!==galleryTooltipTarget||target.contains(event.relatedTarget)||target.contains(document.activeElement))return;
+   hideGalleryTooltip();
+ });
+ document.addEventListener('focusin',function(event){
+   var target=event.target.closest&&event.target.closest('[data-gallery-tooltip]');if(target)showGalleryTooltip(target);
+ });
+ document.addEventListener('focusout',function(event){
+   var target=event.target.closest&&event.target.closest('[data-gallery-tooltip]');if(!target)return;
+   requestAnimationFrame(function(){if(target===galleryTooltipTarget&&!target.matches(':hover')&&!target.contains(document.activeElement))hideGalleryTooltip();});
+ });
+ document.addEventListener('scroll',scheduleGalleryTooltipPosition,true);
+ window.addEventListener('resize',scheduleGalleryTooltipPosition);
+ document.addEventListener('keydown',function(event){if(event.key==='Escape'&&galleryTooltipTarget)hideGalleryTooltip();});
  function formatHomeValue(value,display,unit){
    if(value===null||value===undefined||value==='')return '—';
    display=display||{};
@@ -8918,13 +9916,64 @@ _LANDING_JS = """
      trailContent.innerHTML='<div class="trail-error"><b>Those breadcrumbs could not be resolved.</b><span>'+escapeHome(error&&error.message||'Try again shortly.')+'</span></div>';
    }
  }
+ function galleryTrailReference(crumb){
+   var handle=crumb&&crumb.handle||{};
+   return handle.object_id||handle.slug||handle.table||handle.column||handle.id||'';
+ }
+ function homeTrailTooltip(crumb){
+   crumb=crumb||{};
+   var kind=String(crumb.kind||'evidence').replaceAll('_',' '),relationship=String(crumb.relationship||'related to');
+   var reference=galleryTrailReference(crumb),handle=crumb.handle||{};
+   return galleryTooltipSourceMarkup({
+     eyebrow:'Semantic Home · evidence trail',status:relationship,title:crumb.label||kind,
+     meaning:'This '+kind+' is connected through the “'+relationship+'” edge.',
+     evidence:crumb.detail||'Follow this breadcrumb to inspect the governed evidence behind the connection.',
+     evidenceLabel:'Resolved detail',
+     facts:[['Kind',kind],['Reference',galleryShortRef(reference)],['Version',handle.version||handle.pinned_version]]
+   });
+ }
+ function homeContextTooltip(key,value){
+   return galleryTooltipSourceMarkup({
+     eyebrow:'Semantic Home · context',status:'frozen',title:String(key||'context').replaceAll('_',' '),
+     meaning:'This frozen parameter scopes the named business object; replay uses the same value.',
+     evidence:value,evidenceLabel:'Bound value'
+   });
+ }
+ function homeValueTooltip(item,preview,error){
+   item=item||{};preview=preview||null;
+   var source=item.source||{},presented=item.presentation||{},hasLast=presented.last_rendered_value!==null&&presented.last_rendered_value!==undefined;
+   var status=error?'unavailable':preview&&preview.status||(!hasLast?'recreating':'pinned');
+   var rawValue=preview?preview.value:presented.last_rendered_value;
+   var display=preview&&preview.display||item.display||{},unit=item.unit||preview&&preview.unit||'';
+   var artifactSlug=preview&&preview.artifact&&preview.artifact.slug||source.slug||'';
+   var artifactVersion=preview&&preview.artifact&&preview.artifact.version||item.version||source.pinned_version||'';
+   var context=item.context&&typeof item.context==='object'?JSON.stringify(item.context):item.context||'';
+   var evidence=error?'Live recreation failed: '+String(error&&error.message||error):preview
+     ?'Recreated now under the signed-in warehouse identity'+(artifactSlug?' from '+artifactSlug+(artifactVersion?' v'+artifactVersion:''):'')+'.'
+     :hasLast?'Showing the preserved rendered value while the governed definition is replayed.'
+     :'The governed definition is being replayed under the signed-in warehouse identity.';
+   return galleryTooltipSourceMarkup({
+     eyebrow:'Semantic Home · governed value',status:status,title:item.title||'Named business object',
+     meaning:item.definition||item.description||'Live reconstruction of this named business object from its frozen semantic definition.',
+     evidence:evidence,evidenceLabel:'Current observation',
+     facts:[
+       ['Value',rawValue!==null&&rawValue!==undefined?formatHomeValue(rawValue,display,unit):''],
+       ['Unit',unit],['Engine',preview&&preview.engine],
+       ['Runtime',preview&&preview.elapsed_ms!=null?preview.elapsed_ms+' ms':''],
+       ['Rows',preview&&preview.row_count],
+       ['Artifact',artifactSlug+(artifactVersion?' · v'+artifactVersion:'')],
+       ['Object',galleryShortRef(source.object_id||item.id)],['Context',context]
+     ]
+   });
+ }
  function homeTrailMarkup(trail){
    var items=(Array.isArray(trail)?trail:[]).slice(0,4);
    if(!items.length)return '';
    return '<div class="home-trail" aria-label="Evidence trail">'+items.map(function(crumb){
      var relationship=crumb.relationship||'',label=crumb.label||crumb.kind||'evidence';
-     return '<span class="home-crumb" title="'+escapeHome(relationship+(relationship?' · ':'')+label)+'">'
-       +'<span>'+escapeHome(label)+'</span></span>';
+     return '<span class="home-crumb" tabindex="0" data-gallery-tooltip data-tooltip-kind="trail" aria-label="'
+       +escapeHome(label+'. Explain this Semantic Home relationship.')+'"><span>'+escapeHome(label)+'</span>'
+       +homeTrailTooltip(crumb)+'</span>';
    }).join('')+'</div>';
  }
  function homeContextMarkup(context){
@@ -8933,29 +9982,59 @@ _LANDING_JS = """
    if(!entries.length)return '';
    return '<div class="home-context">'+entries.map(function(entry){
      var value=typeof entry[1]==='object'?JSON.stringify(entry[1]):String(entry[1]);
-     return '<span title="'+escapeHome(entry[0]+' · '+value)+'">'
-       +escapeHome(entry[0].replaceAll('_',' '))+': '+escapeHome(value)+'</span>';
+     return '<span tabindex="0" data-gallery-tooltip data-tooltip-kind="context" aria-label="'
+       +escapeHome(entry[0].replaceAll('_',' ')+'. Explain this frozen context.')+'">'
+       +escapeHome(entry[0].replaceAll('_',' '))+': '+escapeHome(value)+homeContextTooltip(entry[0],value)+'</span>';
    }).join('')+'</div>';
  }
+ function homeMetricSparkline(item){
+   var points=(item.series||[]).map(function(point){
+     var value=point&&point.numeric_value!==null&&point.numeric_value!==undefined?Number(point.numeric_value):Number(point&&point.value);
+     return Number.isFinite(value)?value:null;
+   }).filter(function(value){return value!==null;});
+   if(points.length<2)return '';
+   var w=420,h=115,min=Math.min.apply(null,points),max=Math.max.apply(null,points);if(max===min){var homeFlatPad=Math.abs(max)*.08||1;min-=homeFlatPad;max+=homeFlatPad;}var range=max-min;
+   var x=function(index){return index/Math.max(1,points.length-1)*w;},y=function(value){return 8+(max-value)/range*(h-16);};
+   var path=points.map(function(value,index){return (index?'L':'M')+' '+x(index).toFixed(2)+' '+y(value).toFixed(2);}).join(' ');
+   return '<div class="home-metric-spark" aria-hidden="true"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><path d="'+path+' L '+w+' '+h+' L 0 '+h+' Z"></path><path d="'+path+'"></path></svg></div>';
+ }
+ function homeMetricTooltip(item){
+   var snapshot=item.snapshot||{},source=item.source||{},stamp=snapshot.data_as_of||snapshot.observed_at||'',params=source.params||{};
+   return galleryTooltipSourceMarkup({
+     eyebrow:'Semantic Home · governed metric',status:snapshot.status||item.status||'observed',title:item.title||source.name||'Metric',
+     meaning:item.description||'Latest durable observation of this governed metric instance.',
+     evidence:snapshot.observation_id?'Materialized observation '+snapshot.observation_id+(stamp?' at '+stamp:'')+'.':'No materialized observation exists for this parameter scope yet.',
+     evidenceLabel:'Current observation',facts:[
+       ['Value',snapshot.value!==undefined?formatHomeValue(snapshot.value,item.display):''],
+       ['Metric',source.name],['Params',Object.keys(params).length?JSON.stringify(params):'defaults'],
+       ['Definition','v'+(item.version||source.pinned_version||'?')],['Observed',stamp]
+     ]
+   });
+ }
  function homeTileMarkup(item){
-   var object=item.kind==='artifact_object',unavailable=item.status==='unavailable';
+   var object=item.kind==='artifact_object',metric=item.kind==='metric',unavailable=item.status==='unavailable';
    var presented=item.presentation||{},last=presented.last_rendered_value;
+   var metricSnapshot=item.snapshot||{},metricValue=metricSnapshot.value;
+   var valueText=metric?(metricValue===null||metricValue===undefined?'No observation':formatHomeValue(metricValue,item.display,item.unit)):(last===null||last===undefined?'Reading current value…':formatHomeValue(last,item.display,item.unit));
    var value=object?'<div class="home-value '+(last===null||last===undefined?'loading':'')+'" data-home-value="'
-     +escapeHome(item.id)+'">'+(last===null||last===undefined?'Reading current value…':escapeHome(formatHomeValue(last,item.display,item.unit)))+'</div>':'';
-   var thumbnail=!object&&item.thumbnail_url?'<a class="home-thumb" href="'+escapeHome(item.open_url||'#')
+     +escapeHome(item.id)+'" tabindex="0" data-gallery-tooltip data-tooltip-kind="value" aria-label="Live value for '
+     +escapeHome(item.title||'named business object')+'. Explain this governed value."><span data-home-value-text>'
+     +escapeHome(valueText)+'</span>'+homeValueTooltip(item,null,null)+'</div>':metric?'<div class="home-value '+(metricValue===null||metricValue===undefined?'loading':'')+'" tabindex="0" data-gallery-tooltip data-tooltip-kind="value" aria-label="Current observed value for '+escapeHome(item.title||'metric')+'"><span data-home-value-text>'+escapeHome(valueText)+'</span>'+homeMetricTooltip(item)+'</div>':'';
+   var thumbnail=!object&&!metric&&item.thumbnail_url?'<a class="home-thumb" href="'+escapeHome(item.open_url||'#')
      +'" target="_blank" rel="noopener"><img src="'+escapeHome(item.thumbnail_url)+'" alt="" decoding="async"></a>':'';
-   var context=object?homeContextMarkup(item.context):'';
-   var versionNote=item.newer_version_available?'<span class="home-version-note">Pinned v'+escapeHome(item.version)
+   var context=object?homeContextMarkup(item.context):metric?homeContextMarkup(item.params):'';
+   var versionNote=metric?'<span class="home-version-note">Definition v'+escapeHome(item.version||'?')+'</span>':item.newer_version_available?'<span class="home-version-note">Pinned v'+escapeHome(item.version)
      +' · v'+escapeHome(item.latest_version)+' exists</span>':'<span class="home-version-note"></span>';
-   var open=item.open_url?'<a href="'+escapeHome(item.open_url)+'" target="_blank" rel="noopener">Open</a>':'';
-   return '<article class="home-tile '+(object?'object':'artifact')+(unavailable?' unavailable':'')+'" data-home-id="'+escapeHome(item.id)+'">'
-     +'<div class="home-tile-content">'+thumbnail+'<div class="home-tile-main">'
-     +'<span class="home-kicker"><i></i>'+(object?'Named business object':escapeHome(item.app_kind||'artifact'))+'</span>'
+   var open=item.open_url?'<a href="'+escapeHome(item.open_url)+'"'+(metric?'':' target="_blank" rel="noopener"')+'>Open</a>':'';
+   var ask=metric?'<button type="button" data-home-metric-ask="'+escapeHome((item.source||{}).name||item.title)+'" data-home-metric-params="'+escapeHome(JSON.stringify((item.source||{}).params||{}))+'">✦ Ask Calliope</button>':'';
+   return '<article class="home-tile '+(metric?'metric':object?'object':'artifact')+(unavailable?' unavailable':'')+'" data-home-id="'+escapeHome(item.id)+'">'
+     +(metric?homeMetricSparkline(item):'')+'<div class="home-tile-content">'+thumbnail+'<div class="home-tile-main">'
+     +'<span class="home-kicker"><i></i>'+(metric?'Governed metric':object?'Named business object':escapeHome(item.app_kind||'artifact'))+'</span>'
      +'<h3 title="'+escapeHome(item.title||'Home item')+'">'+escapeHome(item.title||'Home item')+'</h3>'
      +value
      +(item.description?'<p class="home-tile-desc">'+escapeHome(item.description)+'</p>':'')
      +context+homeTrailMarkup(item.trail)+'</div></div>'
-     +'<div class="home-tile-actions">'+versionNote+open
+     +'<div class="home-tile-actions">'+versionNote+open+ask
      +'<button type="button" data-home-trail="'+escapeHome(item.id)+'">Follow trail</button>'
      +'<button type="button" data-home-remove="'+escapeHome(item.id)+'">Remove</button></div></article>';
  }
@@ -8982,11 +10061,14 @@ _LANDING_JS = """
      if(!response.ok||!data.preview)throw new Error(data.error&&data.error.message||'Current value unavailable');
      if(data.preview.status==='error')throw new Error(data.preview.error||'Current value unavailable');
      node.className='home-value';
-     node.textContent=formatHomeValue(data.preview.value,data.preview.display,item.unit||data.preview.unit);
-     node.title=[data.preview.engine,data.preview.elapsed_ms!=null?data.preview.elapsed_ms+' ms':''].filter(Boolean).join(' · ');
+     var valueText=node.querySelector('[data-home-value-text]');
+     if(valueText)valueText.textContent=formatHomeValue(data.preview.value,data.preview.display,item.unit||data.preview.unit);
+     setGalleryTooltipSource(node,homeValueTooltip(item,data.preview,null));
    }catch(error){
      node.className='home-value error';
-     node.textContent=error&&error.message?error.message:'Current value unavailable';
+     var errorText=node.querySelector('[data-home-value-text]');
+     if(errorText)errorText.textContent=error&&error.message?error.message:'Current value unavailable';
+     setGalleryTooltipSource(node,homeValueTooltip(item,null,error));
    }
  }
  function renderHome(data){
@@ -9046,6 +10128,25 @@ _LANDING_JS = """
      if(homeStatus){homeStatus.classList.add('error');homeStatus.textContent=error&&error.message?error.message:'Could not update your Home';}
    }
  }
+ async function askCalliopeAboutArtifact(button){
+   if(!button||button.disabled)return;
+   var slug=button.dataset.galleryAsk;
+   if(!slug)return;
+   button.disabled=true;button.classList.add('loading');
+   try{
+     var response=await fetch('/api/calliope/gallery/artifacts/'+encodeURIComponent(slug)+'/ask',{
+       method:'POST',headers:{'content-type':'application/json',accept:'application/json'},body:'{}'
+     }),data={};
+     try{data=await response.json();}catch(ignore){}
+     if(!response.ok)throw new Error(data.error&&data.error.message||'Could not open this artifact in Calliope');
+     if(!data.new_session||!data.url)throw new Error('Calliope did not create a fresh artifact notebook');
+     window.location.assign(data.url);
+   }catch(error){
+     button.disabled=false;button.classList.remove('loading');
+     if(homeStatus){homeStatus.classList.add('error');homeStatus.textContent=error&&error.message?error.message:'Could not open Calliope';}
+     else window.alert(error&&error.message?error.message:'Could not open Calliope');
+   }
+ }
  if(homeGrid)homeGrid.addEventListener('click',function(event){
    var trailButton=event.target.closest('[data-home-trail]');
    if(trailButton){
@@ -9070,6 +10171,9 @@ _LANDING_JS = """
  [].forEach.call(document.querySelectorAll('[data-home-pin]'),function(button){
    button.addEventListener('click',function(){toggleArtifactPin(button);});
  });
+ [].forEach.call(document.querySelectorAll('[data-gallery-ask]'),function(button){
+   button.addEventListener('click',function(){askCalliopeAboutArtifact(button);});
+ });
 
  var q=document.getElementById('q'),
      chips=[].slice.call(document.querySelectorAll('.chip')),
@@ -9083,8 +10187,10 @@ _LANDING_JS = """
      semanticError=document.getElementById('semantic-launch-error'),
      kind='',semanticBusy=false;
  function queryText(){return q?(q.value||'').trim().replace(/\\s+/g,' '):'';}
+ function metricViewActive(){var metricsBrowser=document.getElementById('metrics-browser');return Boolean(metricsBrowser&&!metricsBrowser.hidden);}
  function syncSemantic(shown){
    if(!semantic)return;
+   if(metricViewActive()){semantic.hidden=true;return;}
    var text=queryText(),ready=text.length>=2;
    semantic.hidden=!ready;
    if(!ready)return;
@@ -9138,7 +10244,7 @@ _LANDING_JS = """
  if(q){
    q.addEventListener('input',apply);
    q.addEventListener('keydown',function(e){
-     if(e.key==='Enter'&&!e.isComposing&&queryText().length>=2){e.preventDefault();launchSemantic();}
+     if(e.key==='Enter'&&!e.isComposing&&!metricViewActive()&&queryText().length>=2){e.preventDefault();launchSemantic();}
    });
  }
  if(semanticButton)semanticButton.addEventListener('click',launchSemantic);
@@ -9152,8 +10258,203 @@ _LANDING_JS = """
    if(q&&e.key==='/'&&document.activeElement!==q){e.preventDefault();q.focus();}
    if(q&&e.key==='Escape'&&document.activeElement===q){q.value='';apply();q.blur();}
  });
- if(homeSection)loadHome();
+ if(homeSection){
+   loadHome();
+   window.addEventListener('gallery-home-changed',loadHome);
+ }
  apply();
+})();
+"""
+
+_GALLERY_METRICS_JS = """
+(function(){
+ var browser=document.getElementById('metrics-browser'),artifactBrowser=document.getElementById('artifact-browser');
+ if(!browser)return;
+ var grid=document.getElementById('metric-gallery-grid'),statusNode=document.getElementById('metric-browser-status'),
+     empty=document.getElementById('metric-gallery-empty'),category=document.getElementById('metric-category'),
+     countNode=document.getElementById('gallery-metric-count'),q=document.getElementById('q'),
+     artifactChips=document.getElementById('artifact-kind-chips'),kicker=document.getElementById('gallery-kicker'),
+     title=document.getElementById('gallery-title'),tally=document.getElementById('gallery-tally'),
+     viewButtons=[].slice.call(document.querySelectorAll('[data-gallery-view]')),
+     relationButtons=[].slice.call(document.querySelectorAll('[data-metric-relation]')),
+     lens=document.getElementById('metric-lens'),lensTitle=document.getElementById('metric-lens-title'),
+     lensMeta=document.getElementById('metric-lens-meta'),lensActions=document.getElementById('metric-lens-actions'),
+     lensContent=document.getElementById('metric-lens-content'),lensClose=document.getElementById('metric-lens-close'),
+     calliope=browser.dataset.calliope==='true';
+ var state={view:'artifacts',loaded:false,loading:false,metrics:[],categories:[],relation:'all',
+   pinIds:{},detail:null,detailDays:90,selected:[],request:0,busy:new Set()};
+ function esc(value){return String(value==null?'':value).replace(/[&<>"']/g,function(char){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char];});}
+ function text(value){return String(value==null?'':value).replace(/\\s+/g,' ').trim();}
+ function queryText(){return q?text(q.value).toLowerCase():'';}
+ function relative(value){
+   if(!value)return 'not observed';var time=Date.parse(value);if(!Number.isFinite(time))return String(value);
+   var seconds=Math.max(0,(Date.now()-time)/1000),steps=[[3600,60,'m'],[86400,3600,'h'],[604800,86400,'d'],[2629800,604800,'w'],[31557600,2629800,'mo']];
+   if(seconds<90)return 'just now';for(var i=0;i<steps.length;i++){if(seconds<steps[i][0])return Math.floor(seconds/steps[i][1])+steps[i][2]+' ago';}
+   return Math.floor(seconds/31557600)+'y ago';
+ }
+ function numeric(value){
+   if(typeof value==='number'&&Number.isFinite(value))return value;
+   if(typeof value==='string'&&value.trim()!==''&&Number.isFinite(Number(value)))return Number(value);
+   if(value&&typeof value==='object'){
+     if(Number.isFinite(Number(value.value)))return Number(value.value);
+     if(value.row&&typeof value.row==='object'){
+       var found=Object.values(value.row).find(function(item){return typeof item==='number'&&Number.isFinite(item);});
+       if(found!==undefined)return Number(found);
+     }
+   }return null;
+ }
+ function formatValue(value,display,name){
+   var number=numeric(value);if(number===null)return value==null?'—':typeof value==='object'?JSON.stringify(value):String(value);
+   display=display||{};var hint=(String(display.format||'')+' '+String(display.unit||'')+' '+String(name||'')).toLowerCase();
+   var decimals=Number.isInteger(Number(display.decimals))?Math.max(0,Math.min(Number(display.decimals),8)):2,rendered='';
+   if(display.currency||/(?:currency|revenue|sales|amount|arr|mrr|dollar|usd)/.test(hint)){
+     try{rendered=new Intl.NumberFormat(undefined,{style:'currency',currency:display.currency||'USD',notation:Math.abs(number)>=10000?'compact':'standard',maximumFractionDigits:decimals}).format(number);}catch(ignore){}
+   }else if(/(?:percent|percentage|pct|rate|%)/.test(hint)){
+     var pct=Math.abs(number)<=1.25?number:number/100;
+     rendered=new Intl.NumberFormat(undefined,{style:'percent',maximumFractionDigits:decimals}).format(pct);
+   }
+   if(!rendered)rendered=new Intl.NumberFormat(undefined,{notation:Math.abs(number)>=100000?'compact':'standard',maximumFractionDigits:decimals}).format(number);
+   if(display.prefix)rendered=String(display.prefix)+rendered;if(display.suffix)rendered+=String(display.suffix);
+   if(display.unit&&!display.prefix&&!display.suffix&&!/(?:%|usd|currency)/i.test(String(display.unit)))rendered+=' '+display.unit;
+   return rendered;
+ }
+ function points(metric){return (metric.series||[]).map(function(point){return {value:numeric(point.numeric_value!=null?point.numeric_value:point.value),point:point};}).filter(function(item){return item.value!==null;});}
+ function sparkline(metric){
+   var values=points(metric);if(values.length<2)return '';
+   var w=600,h=210,pad=0,min=Math.min.apply(null,values.map(function(item){return item.value;})),max=Math.max.apply(null,values.map(function(item){return item.value;}));if(max===min){var cardFlatPad=Math.abs(max)*.08||1;min-=cardFlatPad;max+=cardFlatPad;}var range=max-min;
+   var x=function(index){return pad+index/Math.max(1,values.length-1)*(w-pad*2);},y=function(value){return 18+(max-value)/range*(h-36);};
+   var path=values.map(function(item,index){return (index?'L':'M')+' '+x(index).toFixed(2)+' '+y(item.value).toFixed(2);}).join(' ');
+   return '<div class="metric-card-chart" aria-hidden="true"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><path class="metric-card-area" d="'+path+' L '+x(values.length-1)+' '+h+' L 0 '+h+' Z"></path><path class="metric-card-line" d="'+path+'"></path></svg></div>';
+ }
+ function statusInfo(metric){
+   var snapshot=metric.snapshot||{},raw=String(snapshot.status||'').toLowerCase(),bad=snapshot.ok===false||/(fail|breach|error)/.test(raw),good=snapshot.ok===true||/(pass|healthy|ok)/.test(raw);
+   return {label:snapshot.status||(snapshot.observation_id?'observed':'not observed'),className:bad?'bad':good?'good':'neutral',bad:bad};
+ }
+ function deltaMarkup(metric){
+   var trend=metric.trend;if(!trend)return '';
+   var sign=trend.direction==='up'?'▲':trend.direction==='down'?'▼':'–',value=trend.percent==null?'':Math.abs(Number(trend.percent)).toFixed(1)+'%';
+   return '<small class="'+esc(trend.meaning||'neutral')+'">'+sign+(value?' '+esc(value):'')+'</small>';
+ }
+ function actionMarkup(metric){
+   if(!calliope)return '';
+   return '<div class="metric-card-actions">'
+     +'<button type="button" data-metric-follow="'+esc(metric.name)+'" class="'+(metric.followed?'active':'')+'" aria-pressed="'+String(Boolean(metric.followed))+'" title="'+(metric.followed?'Stop quietly following this metric':'Follow meaningful movement in your Personal Brief')+'">'+(metric.followed?'✓ Follow':'Follow')+'</button>'
+     +'<button type="button" data-metric-pin="'+esc(metric.name)+'" class="'+(metric.pinned?'active':'')+'" aria-pressed="'+String(Boolean(metric.pinned))+'" title="'+(metric.pinned?'Remove from Semantic Home':'Pin to Semantic Home')+'">'+(metric.pinned?'✓ Home':'Pin')+'</button>'
+     +'<button type="button" class="ask" data-metric-ask="'+esc(metric.name)+'" title="Freeze this observation on a new Calliope stage">✦ Ask</button></div>';
+ }
+ function cardMarkup(metric){
+   var snapshot=metric.snapshot||{},status=statusInfo(metric),stamp=snapshot.data_as_of||snapshot.observed_at;
+   return '<article class="metric-gallery-card '+(status.bad?'bad':'')+'" data-metric-card="'+esc(metric.name)+'">'
+     +'<div class="metric-card-grid"></div>'+sparkline(metric)
+     +'<button type="button" class="metric-card-open" data-metric-open="'+esc(metric.name)+'" aria-label="Open Metric Lens for '+esc(metric.title)+'"></button>'
+     +actionMarkup(metric)+'<div class="metric-card-content"><div class="metric-card-kicker">'+esc(metric.category)+(metric.subcategory?' · '+esc(metric.subcategory):'')+'</div>'
+     +'<span class="metric-card-status '+status.className+'">'+esc(status.label)+'</span>'
+     +'<div class="metric-card-value">'+esc(formatValue(snapshot.value,metric.display,metric.name))+deltaMarkup(metric)+'</div>'
+     +'<h2 class="metric-card-title">'+esc(metric.title)+'</h2>'+(metric.description?'<p class="metric-card-description">'+esc(metric.description)+'</p>':'')
+     +'<footer class="metric-card-foot"><span>v'+esc(metric.version)+(metric.grain?' · '+esc(metric.grain):'')+(metric.parameter_count?' · '+metric.parameter_count+' params':'')+'</span><span>'+esc(stamp?'observed '+relative(stamp):'no materialized history')+'</span></footer></div></article>';
+ }
+ function visibleMetrics(){
+   var needle=queryText(),selected=category.value||'';
+   return state.metrics.filter(function(metric){
+     if(selected&&metric.category!==selected)return false;
+     if(state.relation==='followed'&&!metric.followed)return false;if(state.relation==='pinned'&&!metric.pinned)return false;
+     if(!needle)return true;return [metric.name,metric.title,metric.description,metric.category,metric.subcategory].join(' ').toLowerCase().indexOf(needle)>=0;
+   });
+ }
+ function renderMetrics(){
+   if(!state.loaded)return;var visible=visibleMetrics();grid.innerHTML=visible.map(cardMarkup).join('');
+   empty.hidden=Boolean(visible.length);statusNode.hidden=true;
+   tally.textContent=visible.length+' of '+state.metrics.length+' governed metric'+(state.metrics.length===1?'':'s')+(state.relation!=='all'?' · '+state.relation:'');
+ }
+ async function loadPinIds(){
+   if(!calliope)return;try{var response=await fetch('/api/calliope/home',{headers:{accept:'application/json'}}),data=await response.json();if(!response.ok)return;state.pinIds={};(data.items||[]).forEach(function(item){if(item.kind==='metric'&&item.canonical_key)state.pinIds[item.canonical_key]=item.id;});}catch(ignore){}
+ }
+ async function loadMetrics(){
+   if(state.loaded||state.loading)return;state.loading=true;statusNode.hidden=false;statusNode.classList.remove('error');statusNode.innerHTML='<i></i><span>Loading governed metrics…</span>';
+   try{var response=await fetch('/api/gallery/metrics?limit=600',{headers:{accept:'application/json'}}),data=await response.json();if(!response.ok)throw new Error(data.error&&data.error.message||'Metric catalog unavailable');
+     state.metrics=data.metrics||[];state.categories=data.categories||[];state.loaded=true;
+     category.innerHTML='<option value="">Every category</option>'+state.categories.map(function(item){return '<option value="'+esc(item.category)+'">'+esc(item.category)+' · '+esc(item.count)+'</option>';}).join('');
+     countNode.hidden=false;countNode.textContent=state.metrics.length>999?'999+':String(state.metrics.length);await loadPinIds();renderMetrics();
+   }catch(error){statusNode.classList.add('error');statusNode.innerHTML='<span>'+esc(error&&error.message||'Metric catalog unavailable')+'</span>';}
+   finally{state.loading=false;}
+ }
+ function setView(view,updateUrl){
+   state.view=view==='metrics'?'metrics':'artifacts';var metrics=state.view==='metrics';browser.hidden=!metrics;if(artifactBrowser)artifactBrowser.hidden=metrics;if(artifactChips)artifactChips.hidden=metrics;
+   viewButtons.forEach(function(button){button.setAttribute('aria-selected',String(button.dataset.galleryView===state.view));});
+   q.placeholder=metrics?'Search metrics…  (press /)':'Search artifacts…  (press /)';kicker.textContent=metrics?'Governed metric catalog':'Published artifacts';title.innerHTML=metrics?'The numbers that <em>matter</em>.':'Your data, <em>live</em>.';
+   if(q)q.dispatchEvent(new Event('input'));
+   if(metrics){loadMetrics().then(renderMetrics);}else tally.textContent=tally.dataset.artifactTally||'';
+   if(updateUrl!==false){var url=new URL(window.location.href);if(metrics)url.searchParams.set('view','metrics');else{url.searchParams.delete('view');url.searchParams.delete('metric');url.searchParams.delete('params');}history.replaceState({},'',url);}
+ }
+ function metricByName(name){return state.metrics.find(function(metric){return metric.name===name;})||(state.detail&&state.detail.name===name?state.detail:null);}
+ function setBusy(button,busy){if(!button)return;button.disabled=busy;button.classList.toggle('loading',busy);}
+ async function toggleFollow(metric,button){
+   if(!metric||!calliope)return;setBusy(button,true);try{var response=await fetch('/api/calliope/metrics/'+encodeURIComponent(metric.name)+'/follow',{method:metric.followed?'DELETE':'POST',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify({params:metric.params||{}})}),data=await response.json();if(!response.ok)throw new Error(data.error&&data.error.message||'Could not update follow');
+     var followed=!metric.followed;state.metrics.filter(function(item){return item.canonical_key===metric.canonical_key;}).forEach(function(item){item.followed=followed;});if(state.detail&&state.detail.canonical_key===metric.canonical_key)state.detail.followed=followed;renderMetrics();if(state.detail)renderLens();
+   }catch(error){window.alert(error&&error.message||'Could not update follow');}finally{setBusy(button,false);}
+ }
+ async function togglePin(metric,button){
+   if(!metric||!calliope)return;setBusy(button,true);try{var itemId=state.pinIds[metric.canonical_key]||'',response=await fetch(itemId?'/api/calliope/home/items/'+encodeURIComponent(itemId):'/api/calliope/home/items',{method:itemId?'DELETE':'POST',headers:{'content-type':'application/json',accept:'application/json'},body:itemId?undefined:JSON.stringify({kind:'metric',name:metric.name,params:metric.params||{}})}),data=await response.json();if(!response.ok)throw new Error(data.error&&data.error.message||'Could not update Home');
+     if(itemId)delete state.pinIds[metric.canonical_key];else if(data.item)state.pinIds[metric.canonical_key]=data.item.id;
+     var pinned=!metric.pinned;state.metrics.filter(function(item){return item.canonical_key===metric.canonical_key;}).forEach(function(item){item.pinned=pinned;});if(state.detail&&state.detail.canonical_key===metric.canonical_key)state.detail.pinned=pinned;
+     window.dispatchEvent(new CustomEvent('gallery-home-changed'));renderMetrics();if(state.detail)renderLens();
+   }catch(error){window.alert(error&&error.message||'Could not update Home');}finally{setBusy(button,false);}
+ }
+ async function askMetric(metric,button){
+   if(!metric||!calliope)return;setBusy(button,true);try{var body={params:metric.params||{},days:state.detailDays,bucket:'raw'},selected=state.selected;
+     if(state.detail&&selected.length){body.from_observation_id=selected[0];body.to_observation_id=selected[selected.length-1];}
+     var response=await fetch('/api/calliope/gallery/metrics/'+encodeURIComponent(metric.name)+'/ask',{method:'POST',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify(body)}),data=await response.json();if(!response.ok)throw new Error(data.error&&data.error.message||'Could not open metric in Calliope');if(!data.url)throw new Error('Calliope did not return a metric notebook');window.location.assign(data.url);
+   }catch(error){window.alert(error&&error.message||'Could not open Calliope');setBusy(button,false);}
+ }
+ function lensActionsMarkup(metric){if(!calliope)return '';return '<button type="button" data-lens-follow class="'+(metric.followed?'active':'')+'"><span>'+(metric.followed?'✓ Following':'Follow')+'</span></button><button type="button" data-lens-pin class="'+(metric.pinned?'active':'')+'"><span>'+(metric.pinned?'✓ Home':'Pin')+'</span></button><button type="button" class="ask" data-lens-ask>✦ <span>'+(state.selected.length>1?'Ask about range':'Ask Calliope')+'</span></button>';}
+ function chartMarkup(metric){
+   var list=points(metric);if(list.length<2)return '<div class="metric-lens-error"><strong>No timeline yet.</strong><span>This metric has fewer than two materialized numeric observations.</span></div>';
+   var w=980,h=310,left=54,right=18,top=20,bottom=35,values=list.map(function(item){return item.value;}),min=Math.min.apply(null,values),max=Math.max.apply(null,values);if(max===min){var lensFlatPad=Math.abs(max)*.08||1;min-=lensFlatPad;max+=lensFlatPad;}var range=max-min;
+   var x=function(index){return left+index/Math.max(1,list.length-1)*(w-left-right);},y=function(value){return top+(max-value)/range*(h-top-bottom);};
+   var path=list.map(function(item,index){return (index?'L':'M')+' '+x(index).toFixed(2)+' '+y(item.value).toFixed(2);}).join(' '),gridLines=[0,.25,.5,.75,1].map(function(fraction){var value=max-range*fraction,yy=y(value);return '<line class="grid-line" x1="'+left+'" y1="'+yy+'" x2="'+(w-right)+'" y2="'+yy+'"></line><text class="axis-label" x="'+(left-7)+'" y="'+(yy+3)+'" text-anchor="end">'+esc(formatValue(value,metric.display,metric.name))+'</text>';}).join('');
+   var priorVersion=null,marks='',circles='';list.forEach(function(item,index){var point=item.point,selected=state.selected.indexOf(point.observation_id)>=0;
+     if(priorVersion!==null&&point.metric_version!==priorVersion)marks+='<line class="version-mark" x1="'+x(index)+'" y1="'+top+'" x2="'+x(index)+'" y2="'+(h-bottom)+'"></line>';priorVersion=point.metric_version;
+     circles+='<circle tabindex="0" role="button" aria-label="Observation '+esc(point.observation_id)+' · '+esc(formatValue(item.value,metric.display,metric.name))+'" class="point '+(selected?'selected':'')+'" data-metric-point="'+esc(point.observation_id)+'" data-point-index="'+index+'" cx="'+x(index)+'" cy="'+y(item.value)+'" r="3.2"></circle>';
+   });
+   return '<div class="metric-lens-chart"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none" role="img" aria-label="Timeline for '+esc(metric.title)+'">'+gridLines+'<path class="area" d="'+path+' L '+x(list.length-1)+' '+(h-bottom)+' L '+x(0)+' '+(h-bottom)+' Z"></path><path class="line" d="'+path+'"></path>'+marks+circles+'</svg><div class="metric-chart-tooltip" hidden></div></div>';
+ }
+ function parameterMarkup(metric){
+   var defaults=metric.parameter_defaults||{},current=metric.params||{},keys=Array.from(new Set(Object.keys(defaults).concat(Object.keys(current))));
+   if(!keys.length)return '<p>This metric has no parameters.</p>';
+   return '<dl class="metric-param-list">'+keys.map(function(key){var active=Object.prototype.hasOwnProperty.call(current,key),value=active?current[key]:defaults[key];return '<div><dt>'+esc(key)+'<small>'+(active?'Current instance':'Definition default')+'</small></dt><dd>'+esc(typeof value==='object'?JSON.stringify(value):value)+'</dd></div>';}).join('')+'</dl>';
+ }
+ function renderLens(){
+   var metric=state.detail;if(!metric)return;var snapshot=metric.snapshot||{},info=statusInfo(metric),stamp=snapshot.data_as_of||snapshot.observed_at;
+   lensTitle.textContent=metric.title;lensMeta.textContent=[metric.category,metric.subcategory,'definition v'+metric.version].filter(Boolean).join(' · ');lensActions.innerHTML=lensActionsMarkup(metric);
+   var selection='Click one point to anchor a question; click a second to select a range.';if(state.selected.length===1)selection='Observation '+state.selected[0]+' selected · choose an endpoint.';if(state.selected.length>1)selection='Observation range '+state.selected[0]+' → '+state.selected[state.selected.length-1]+' selected for Calliope.';
+   var dependencies=(metric.dependencies||[]).length?(metric.dependencies||[]).map(function(item){return '<span class="'+(item.stale?'stale':'')+'">'+esc(item.table_name)+(item.stale?' · stale':'')+(item.max_freshness?' · '+esc(relative(item.max_freshness)):'')+'</span>';}).join(''):(metric.source_tables||[]).map(function(item){return '<span>'+esc(item)+'</span>';}).join('');
+   var artifacts=(metric.artifacts||[]).map(function(item){var path=(item.app_kind||'dashboard')==='dashboard'?'/d/':'/apps/';return '<a href="'+path+esc(item.slug)+'" target="_blank" rel="noopener">'+esc(item.name||item.slug)+' ↗</a>';}).join('');
+   lensContent.innerHTML='<section class="metric-lens-hero"><div class="metric-lens-hero-copy"><span>'+esc(info.label)+'</span><strong>'+esc(formatValue(snapshot.value,metric.display,metric.name))+'</strong><p>'+esc(metric.description||'Governed warehouse metric.')+'</p></div><div class="metric-lens-hero-facts"><span><b>Observed</b>'+esc(stamp?relative(stamp):'never')+'</span><span><b>Grain</b>'+esc(metric.grain||'unspecified')+'</span><span><b>Definition</b>v'+esc(metric.version)+'</span><span><b>History</b>'+esc((metric.series||[]).length)+' points</span></div></section>'
+     +'<div class="metric-lens-toolbar"><div class="metric-range-buttons">'+[7,30,90,365].map(function(days){return '<button type="button" data-metric-days="'+days+'" class="'+(state.detailDays===days?'active':'')+'">'+(days===365?'1 year':days+' days')+'</button>';}).join('')+'</div><span class="metric-range-selection '+(state.selected.length?'active':'')+'">'+esc(selection)+'</span></div>'
+     +chartMarkup(metric)+'<div class="metric-lens-grid"><section class="metric-lens-panel"><h3>Definition</h3><p>'+esc(metric.description||'No business definition supplied.')+'</p><div class="metric-definition-facts"><span><b>Canonical name</b>'+esc(metric.name)+'</span><span><b>Category</b>'+esc(metric.category)+(metric.subcategory?' · '+esc(metric.subcategory):'')+'</span><span><b>Check</b>'+(metric.has_check?'Governed target':'No target check')+'</span><span><b>Versions</b>'+esc((metric.versions||[]).length)+'</span></div><details class="metric-sql"><summary>Advanced · definition SQL</summary><pre>'+esc(metric.definition_sql||'SQL unavailable')+'</pre></details></section>'
+     +'<section class="metric-lens-panel"><h3>Parameters</h3>'+parameterMarkup(metric)+'</section><section class="metric-lens-panel"><h3>Sources & freshness</h3><div class="metric-source-list">'+(dependencies||'<span>No source lineage resolved</span>')+'</div></section><section class="metric-lens-panel"><h3>Used by artifacts</h3><div class="metric-artifact-list">'+(artifacts||'<span>No published artifact dependency recorded</span>')+'</div></section></div>';
+ }
+ async function openMetric(name,params,days,updateUrl){
+   if(!lens)return;state.detail=null;state.selected=[];state.detailDays=days||90;var request=++state.request;if(!lens.open)lens.showModal();lensTitle.textContent=name;lensMeta.textContent='Resolving definition, lineage, and durable observations';lensActions.innerHTML='';lensContent.innerHTML='<div class="metric-lens-loading"><i></i><strong>Opening Metric Lens…</strong><span>Reading the governed definition and materialized timeline</span></div>';
+   try{var query=new URLSearchParams({days:String(state.detailDays),bucket:'raw'});if(params&&Object.keys(params).length)query.set('params',JSON.stringify(params));var response=await fetch('/api/gallery/metrics/'+encodeURIComponent(name)+'?'+query.toString(),{headers:{accept:'application/json'}}),data=await response.json();if(request!==state.request)return;if(!response.ok)throw new Error(data.error&&data.error.message||'Could not inspect metric');state.detail=data.metric;renderLens();
+     if(updateUrl!==false){var url=new URL(window.location.href);url.searchParams.set('view','metrics');url.searchParams.set('metric',name);if(params&&Object.keys(params).length)url.searchParams.set('params',JSON.stringify(params));else url.searchParams.delete('params');history.replaceState({},'',url);}
+   }catch(error){if(request!==state.request)return;lensContent.innerHTML='<div class="metric-lens-error"><strong>Metric Lens unavailable</strong><span>'+esc(error&&error.message||'Try again shortly.')+'</span></div>';}
+ }
+ function closeLens(updateUrl){state.request++;state.detail=null;state.selected=[];if(lens&&lens.open)lens.close();if(updateUrl!==false){var url=new URL(window.location.href);url.searchParams.delete('metric');url.searchParams.delete('params');history.replaceState({},'',url);}}
+ function choosePoint(id){id=Number(id);if(!Number.isFinite(id))return;if(!state.selected.length)state.selected=[id];else if(state.selected.length===1&&state.selected[0]!==id)state.selected=[state.selected[0],id];else state.selected=[id];renderLens();}
+ viewButtons.forEach(function(button){button.addEventListener('click',function(){setView(button.dataset.galleryView,true);});});
+ relationButtons.forEach(function(button){button.addEventListener('click',function(){state.relation=button.dataset.metricRelation;relationButtons.forEach(function(item){item.setAttribute('aria-pressed',String(item===button));});renderMetrics();});});
+ category.addEventListener('change',renderMetrics);if(q)q.addEventListener('input',function(){if(state.view==='metrics')renderMetrics();});
+ grid.addEventListener('click',function(event){var open=event.target.closest('[data-metric-open]'),follow=event.target.closest('[data-metric-follow]'),pin=event.target.closest('[data-metric-pin]'),ask=event.target.closest('[data-metric-ask]'),target=open||follow||pin||ask;if(!target)return;var name=target.dataset.metricOpen||target.dataset.metricFollow||target.dataset.metricPin||target.dataset.metricAsk,metric=metricByName(name);if(open)openMetric(name,metric&&metric.params,90,true);else if(follow)toggleFollow(metric,follow);else if(pin)togglePin(metric,pin);else askMetric(metric,ask);});
+ lensActions.addEventListener('click',function(event){var metric=state.detail;if(!metric)return;var follow=event.target.closest('[data-lens-follow]'),pin=event.target.closest('[data-lens-pin]'),ask=event.target.closest('[data-lens-ask]');if(follow)toggleFollow(metric,follow);else if(pin)togglePin(metric,pin);else if(ask)askMetric(metric,ask);});
+ lensContent.addEventListener('click',function(event){var days=event.target.closest('[data-metric-days]'),point=event.target.closest('[data-metric-point]');if(days&&state.detail)openMetric(state.detail.name,state.detail.params,Number(days.dataset.metricDays),false);else if(point)choosePoint(point.dataset.metricPoint);});
+ lensContent.addEventListener('keydown',function(event){var point=event.target.closest&&event.target.closest('[data-metric-point]');if(point&&(event.key==='Enter'||event.key===' ')){event.preventDefault();choosePoint(point.dataset.metricPoint);}});
+ lensContent.addEventListener('pointerover',function(event){var point=event.target.closest&&event.target.closest('[data-metric-point]');if(!point||!state.detail)return;var list=points(state.detail),item=list[Number(point.dataset.pointIndex)],tip=lensContent.querySelector('.metric-chart-tooltip');if(!item||!tip)return;var rect=point.getBoundingClientRect(),host=point.closest('.metric-lens-chart').getBoundingClientRect();tip.innerHTML='<strong>'+esc(formatValue(item.value,state.detail.display,state.detail.name))+'</strong><b>'+esc(item.point.data_as_of||item.point.observed_at||'')+'</b><br>Observation '+esc(item.point.observation_id)+' · metric v'+esc(item.point.metric_version||'?');tip.style.left=(rect.left-host.left+rect.width/2)+'px';tip.style.top=(rect.top-host.top)+'px';tip.hidden=false;});
+ lensContent.addEventListener('pointerout',function(event){if(!event.target.closest||!event.target.closest('[data-metric-point]'))return;var tip=lensContent.querySelector('.metric-chart-tooltip');if(tip)tip.hidden=true;});
+ if(lensClose)lensClose.addEventListener('click',function(){closeLens(true);});if(lens)lens.addEventListener('cancel',function(event){event.preventDefault();closeLens(true);});
+ document.addEventListener('click',function(event){var button=event.target.closest&&event.target.closest('[data-home-metric-ask]');if(!button)return;var params={};try{params=JSON.parse(button.dataset.homeMetricParams||'{}');}catch(ignore){}askMetric({name:button.dataset.homeMetricAsk,params:params},button);});
+ window.addEventListener('popstate',function(){var url=new URL(window.location.href),view=url.searchParams.get('view'),params={};setView(view==='metrics'?'metrics':'artifacts',false);try{params=url.searchParams.get('params')?JSON.parse(url.searchParams.get('params')):{};}catch(ignore){}if(url.searchParams.get('metric'))openMetric(url.searchParams.get('metric'),params,90,false);else closeLens(false);});
+ var initial=new URL(window.location.href),initialView=initial.searchParams.get('view')==='metrics'||Boolean(initial.searchParams.get('metric'))?'metrics':'artifacts';setView(initialView,false);if(initial.searchParams.get('metric')){var initialParams={};try{initialParams=initial.searchParams.get('params')?JSON.parse(initial.searchParams.get('params')):{};}catch(ignore){}loadMetrics().then(function(){openMetric(initial.searchParams.get('metric'),initialParams,90,false);});}
 })();
 """
 
@@ -9364,9 +10665,13 @@ def _landing_html(rows, viewer):
             + (f'<p class="desc">{e(desc)}</p>' if desc else "")
             + (f'<div class="foot">{"".join(deps)}</div>' if deps else "")
             + '</div></a>'
-            + (f'<button class="card-pin" type="button" data-home-pin="{e(slug)}" '
+            + (f'<div class="card-actions">'
+               f'<button class="card-ask" type="button" data-gallery-ask="{e(slug)}" '
+               f'title="Ask Calliope about this exact published version">'
+               f'<b aria-hidden="true">✦</b><span>Ask</span></button>'
+               f'<button class="card-pin" type="button" data-home-pin="{e(slug)}" '
                f'aria-pressed="false" title="Pin this artifact to your private Home">'
-               f'<b aria-hidden="true">＋</b><span>Pin</span></button>' if calliope_enabled else "")
+               f'<b aria-hidden="true">＋</b><span>Pin</span></button></div>' if calliope_enabled else "")
             + '</article>')
 
     # The rung up the ladder. Only offered when there IS an app (LENS_PUBLIC_URL)
@@ -9397,6 +10702,13 @@ def _landing_html(rows, viewer):
         '<b id="gallery-work-inbox-count" class="inbox-rail-count" hidden>0</b></a>'
         if calliope_enabled else ""
     )
+    _brief_link = (
+        '<a id="gallery-personal-brief" class="brief-rail-link" href="/calliope?brief=1" '
+        'title="Open today\'s private Personal Brief" aria-label="Open today\'s private Personal Brief">'
+        '<span class="brief-rail-label">Brief</span>'
+        '<b id="gallery-personal-brief-count" class="brief-rail-count" hidden>0</b></a>'
+        if calliope_enabled else ""
+    )
     _calliope_search = (
         '<div id="semantic-launch" class="semantic-launch" hidden>'
         '<button id="semantic-launch-button" class="semantic-launch-button" type="button">'
@@ -9414,11 +10726,11 @@ def _landing_html(rows, viewer):
         '<div class="home-head"><div class="home-title">'
         '<span class="home-title-mark" aria-hidden="true">⌂</span>'
         '<span class="home-title-copy"><strong id="home-title">My Home</strong>'
-        '<small>Your private working set · live artifacts and named business objects</small></span></div>'
+        '<small>Your private working set · metrics, artifacts, and named business objects</small></span></div>'
         '<span id="home-status" class="home-status" role="status">Loading your working set…</span></div>'
         '<div id="home-grid" class="home-grid"></div>'
         '<div id="home-empty" class="home-empty" hidden><b>Make this yours.</b>'
-        '<span>Pin an artifact here, or open its Artifact Lens and pin a named value.</span></div>'
+        '<span>Pin a metric or artifact here, or use Artifact Lens to pin a named value.</span></div>'
         '</section>'
         if calliope_enabled else ""
     )
@@ -9432,6 +10744,36 @@ def _landing_html(rows, viewer):
         '</header><div id="trail-content" class="trail-content"></div></div></dialog>'
         if calliope_enabled else ""
     )
+    _metric_browser = (
+        '<section id="metrics-browser" class="metrics-browser" '
+        f'data-calliope="{str(calliope_enabled).lower()}" hidden>'
+        '<header class="metrics-browser-head"><div><span>Governed measures</span>'
+        '<strong>Current observations, not ad-hoc calculations.</strong></div>'
+        '<div class="metric-browser-filters">'
+        '<select id="metric-category" aria-label="Filter metrics by category">'
+        '<option value="">Every category</option></select>'
+        '<div class="metric-relation-filter" role="group" aria-label="Filter personal metrics">'
+        '<button type="button" data-metric-relation="all" aria-pressed="true">All</button>'
+        '<button type="button" data-metric-relation="followed" aria-pressed="false">Following</button>'
+        '<button type="button" data-metric-relation="pinned" aria-pressed="false">Pinned</button>'
+        '</div></div></header>'
+        '<div id="metric-browser-status" class="metric-browser-status" role="status">'
+        '<i></i><span>Loading governed metrics…</span></div>'
+        '<div id="metric-gallery-grid" class="metric-gallery-grid"></div>'
+        '<div id="metric-gallery-empty" class="metric-gallery-empty" hidden>'
+        '<strong>No metrics match this view.</strong><span>Try another category or clear the search.</span></div>'
+        '</section>'
+    )
+    _metric_dialog = (
+        '<dialog id="metric-lens" class="metric-lens" aria-labelledby="metric-lens-title">'
+        '<div class="metric-lens-shell"><header class="metric-lens-head">'
+        '<div class="metric-lens-heading"><span>Metric Lens</span>'
+        '<strong id="metric-lens-title">Governed metric</strong>'
+        '<small id="metric-lens-meta">Inspect definition and observation history</small></div>'
+        '<div id="metric-lens-actions" class="metric-lens-actions"></div>'
+        '<button id="metric-lens-close" class="metric-lens-close" type="button" aria-label="Close">×</button>'
+        '</header><div id="metric-lens-content" class="metric-lens-content"></div></div></dialog>'
+    )
 
     total = len(rows)
     tally = " · ".join([f"{total} artifact{'' if total == 1 else 's'}"]
@@ -9442,33 +10784,44 @@ def _landing_html(rows, viewer):
                        for k, _ in sorted(kinds.items(), key=lambda kv: -kv[1])))
 
     toolbar = (
-        f'<div class="toolbar"><input id="q" type="search" maxlength="600" '
+        f'<div class="toolbar"><div class="gallery-view-switch" role="tablist" aria-label="Gallery view">'
+        f'<button type="button" role="tab" data-gallery-view="artifacts" aria-selected="true">Artifacts</button>'
+        f'<button type="button" role="tab" data-gallery-view="metrics" aria-selected="false">Metrics'
+        f'<b id="gallery-metric-count" hidden>0</b></button></div>'
+        f'<input id="q" type="search" maxlength="600" '
         f'placeholder="Search artifacts…  (press /)" autocomplete="off" spellcheck="false">'
-        f'{chips if rows else ""}</div>'
-        if rows or calliope_enabled else ""
+        f'<div id="artifact-kind-chips" class="artifact-kind-chips">{chips if rows else ""}</div></div>'
     )
     if rows:
         body = (
             _semantic_home
             + toolbar
+            + _metric_browser
+            + '<section id="artifact-browser">'
             + _calliope_search
             + f'<div class="grid">{"".join(cards)}</div>'
             + '<div id="none">No published artifacts match. Explore the company evidence above.</div>'
+            + '</section>'
         )
     elif calliope_enabled:
         body = (
             _semantic_home
             + toolbar
+            + _metric_browser
+            + '<section id="artifact-browser">'
             + _calliope_search
             + '<div class="empty">No artifacts published yet.<br><br>'
             'Search company knowledge above, or open Calliope to make the first one.</div>'
+            + '</section>'
         )
     else:
         body = (
-            '<div class="empty">No artifacts published yet.<br><br>'
+            toolbar
+            + _metric_browser
+            + '<section id="artifact-browser"><div class="empty">No artifacts published yet.<br><br>'
             'Ask an RVBBIT-enabled agent to build one — it starts with '
             '<code>live_app_template</code><br>and publishes with '
-            '<code>create_live_app</code>.</div>'
+            '<code>create_live_app</code>.</div></section>'
         )
 
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -9476,25 +10829,26 @@ def _landing_html(rows, viewer):
 <meta name="robots" content="noindex,nofollow">
 <title>Warehouse — published artifacts</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Homemade+Apple&display=swap">
-<style>{_LANDING_CSS}</style>
+<style>{_LANDING_CSS}{_GALLERY_METRICS_CSS}</style>
 {warehouse_theme.head_assets()}
 </head><body>
 {_bg_layer}
 <div class="wash"></div>
 <nav data-warehouse-header>{_RABBIT_SVG}
  <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
- <span class="who"><span data-warehouse-theme-anchor></span>{_inbox_link}{_app_link}{f'<span class="viewer">{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
+ <span class="who"><span data-warehouse-theme-anchor></span>{_brief_link}{_inbox_link}{_app_link}{f'<span class="viewer">{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
 <main>
  <header class="hero">
-  <div class="kicker">Published artifacts</div>
-  <h1>Your data, <em>live</em>.</h1>
-  <div class="tally">{e(tally)}</div>
+  <div id="gallery-kicker" class="kicker">Published artifacts</div>
+  <h1 id="gallery-title">Your data, <em>live</em>.</h1>
+  <div id="gallery-tally" class="tally" data-artifact-tally="{e(tally)}">{e(tally)}</div>
  </header>
  {body}
 </main>
 {_calliope_link}
 {_trail_dialog}
-<script>{_LANDING_JS}</script></body></html>"""
+{_metric_dialog}
+<script>{_LANDING_JS}</script><script>{_GALLERY_METRICS_JS}</script></body></html>"""
 
 
 def register_dashboard_routes(m):
@@ -9721,6 +11075,108 @@ def register_dashboard_routes(m):
             return None, session, _json({"error": {"code": "UNAUTHORIZED"}}, 401)
         return owner, session, None
 
+    @m.custom_route("/api/gallery/metrics", methods=["GET"])
+    async def _gallery_metrics(request):
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            return _json(_metric_catalog_snapshot(
+                owner,
+                search=request.query_params.get("search"),
+                category=request.query_params.get("category"),
+                limit=request.query_params.get("limit") or _GALLERY_METRIC_LIMIT,
+            ))
+        except (TypeError, ValueError) as exc:
+            return _json({"error": {"code": "BAD_METRIC_QUERY", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001 — artifact Gallery must remain usable
+            print(f"gallery metrics ({owner}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "METRICS_UNAVAILABLE",
+                    "message": "The governed metric catalog could not be loaded.",
+                }
+            }, 500)
+
+    @m.custom_route("/api/gallery/metrics/{name}", methods=["GET"])
+    async def _gallery_metric_detail(request):
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            return _json({"metric": _metric_detail_snapshot(
+                request.path_params.get("name"),
+                request.query_params.get("params"),
+                owner=owner,
+                days=request.query_params.get("days") or 90,
+                bucket=request.query_params.get("bucket") or "raw",
+            )})
+        except LookupError as exc:
+            return _json({"error": {"code": "NOT_FOUND", "message": str(exc)}}, 404)
+        except (TypeError, ValueError) as exc:
+            return _json({"error": {"code": "BAD_METRIC_QUERY", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001
+            print(f"gallery metric detail ({owner}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "METRIC_UNAVAILABLE",
+                    "message": "That metric could not be inspected right now.",
+                }
+            }, 500)
+
+    @m.custom_route("/api/calliope/metric-follows", methods=["GET"])
+    async def _calliope_metric_follows(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            return _json(_metric_follow_snapshot(owner))
+        except Exception as exc:  # noqa: BLE001
+            print(f"metric follows ({owner}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _json({"error": {"code": "FOLLOWS_UNAVAILABLE"}}, 500)
+
+    @m.custom_route(
+        "/api/calliope/metrics/{name}/follow", methods=["POST", "DELETE"]
+    )
+    async def _calliope_metric_follow(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, session, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            body = body if isinstance(body, dict) else {}
+            if request.method == "DELETE":
+                result = _unfollow_metric(
+                    owner, request.path_params.get("name"), body.get("params")
+                )
+            else:
+                result = _follow_metric(
+                    owner,
+                    session.get("sub") or owner,
+                    request.path_params.get("name"),
+                    body.get("params"),
+                )
+            return _json(result, 201 if request.method == "POST" else 200)
+        except LookupError as exc:
+            return _json({"error": {"code": "NOT_FOUND", "message": str(exc)}}, 404)
+        except (TypeError, ValueError) as exc:
+            return _json({"error": {"code": "BAD_METRIC_FOLLOW", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001
+            print(f"metric follow ({owner}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "METRIC_FOLLOW_FAILED",
+                    "message": "That metric follow could not be changed.",
+                }
+            }, 500)
+
     @m.custom_route("/api/calliope/trails", methods=["POST"])
     async def _follow_calliope_trail(request):
         if not _semantic_home_enabled():
@@ -9926,7 +11382,7 @@ def register_dashboard_routes(m):
             ).fetchone()
         if not row:
             return _json({"error": {"code": "NOT_FOUND"}}, 404)
-        if row.get("item_kind") != "artifact_object":
+        if row.get("item_kind") not in {"artifact_object", "metric"}:
             return _json({"error": {"code": "NOT_REPLAYABLE"}}, 400)
         try:
             preview = _semantic_home_preview(
@@ -10442,6 +11898,13 @@ def _register(mcp):
     mcp.tool(name="tanstack_chart_template")(_mcp_tanstack_chart_template)
     mcp.tool(name="calliope_work_item")(_mcp_calliope_work_item)
     mcp.tool(name="draft_calliope_instrument")(_mcp_draft_calliope_instrument)
+    mcp.tool(name="draft_calliope_workflow")(_mcp_draft_calliope_workflow)
+    mcp.tool(name="search_calliope_actions")(_mcp_search_calliope_actions)
+    mcp.tool(name="plan_calliope_action")(_mcp_plan_calliope_action)
+    mcp.tool(name="execute_calliope_action")(_mcp_execute_calliope_action)
+    mcp.tool(name="begin_calliope_workflow_run")(_mcp_begin_calliope_workflow_run)
+    mcp.tool(name="get_calliope_personal_context")(_mcp_get_calliope_personal_context)
+    mcp.tool(name="finish_calliope_workflow_run")(_mcp_finish_calliope_workflow_run)
     mcp.tool(name="live_app_template")(_mcp_live_app_template)
     mcp.tool(name="create_live_app")(_mcp_create_live_app)
     mcp.tool(name="update_live_app")(_mcp_update_live_app)
@@ -11250,7 +12713,9 @@ def _trail_handle(value):
     except (TypeError, ValueError) as exc:
         raise ValueError("catalog node locator is invalid") from exc
     schema = _semantic_text(raw.get("schema"), 128)
-    relation = _semantic_text(raw.get("relation"), 128)
+    relation = _semantic_text(
+        raw.get("relation") or (raw.get("name") if kind == "metric" else None), 128
+    )
     column = _semantic_text(raw.get("column"), 128)
     table = _semantic_text(raw.get("table"), 260)
     if table and not relation:
@@ -11263,7 +12728,7 @@ def _trail_handle(value):
         raise ValueError("catalog object locator is incomplete")
     if kind == "db_column" and node_id is None and not column:
         raise ValueError("column locator is incomplete")
-    return {
+    handle = {
         key: val for key, val in {
             "kind": kind,
             "node_id": node_id,
@@ -11272,6 +12737,10 @@ def _trail_handle(value):
             "column": column,
         }.items() if val not in (None, "")
     }
+    if kind == "metric":
+        handle["name"] = relation
+        handle["params"] = _metric_params(raw.get("params"))
+    return handle
 
 
 def _trail_node_handle(row):
@@ -11932,6 +13401,7 @@ def _build_mcp_oauth(public: str):
         cube_pivot=_calliope_cube_pivot,
         evidence_search=_calliope_evidence_search,
         evidence_open=_calliope_evidence_open,
+        metric_detail=_metric_detail_snapshot,
     ):
         print("Calliope enabled (Hermes-backed living artifact notebook)", file=sys.stderr)
         _start_calliope_watch_worker()

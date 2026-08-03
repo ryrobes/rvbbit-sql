@@ -3,9 +3,65 @@
  * first-party Warehouse pages; authored dashboard/app documents and their
  * iframes intentionally do not receive it.
  */
+:root[data-warehouse-color-mode="light"] {
+  color-scheme: light;
+  --background: oklch(97% 0.008 85);
+  --secondary-background: oklch(93% 0.010 85);
+  --foreground: oklch(22% 0.012 65);
+  --border: oklch(48% 0.012 70);
+  --ring: oklch(58% 0.13 68);
+  --overlay: oklch(22% 0.01 65 / .14);
+  --main: oklch(58% 0.13 68);
+  --main-foreground: oklch(99% 0.004 85);
+  --chart-1: oklch(54% 0.14 68);
+  --chart-2: oklch(52% 0.14 165);
+  --chart-3: oklch(58% 0.14 238);
+  --chart-4: oklch(55% 0.15 305);
+  --chart-5: oklch(58% 0.15 28);
+  --chart-6: oklch(56% 0.14 345);
+  --success: oklch(52% 0.15 145);
+  --warning: oklch(66% 0.15 82);
+  --danger: oklch(55% 0.19 25);
+  --info: oklch(52% 0.13 240);
+  --chrome-bg: oklch(92% 0.010 85);
+  --chrome-border: oklch(74% 0.012 75);
+  --chrome-text: oklch(40% 0.010 68);
+  --doc-bg: oklch(98% 0.005 88);
+  --block-bg: oklch(99% 0.004 88);
+  --block-bg-hover: oklch(95% 0.012 80);
+  --block-border: oklch(78% 0.012 75);
+  --grid-dot: oklch(85% 0.012 78);
+  --grid-outline: oklch(82% 0.012 78);
+  --rvbbit-accent: oklch(48% 0.11 165);
+  --rvbbit-bg: oklch(94% 0.025 160);
+  --wallpaper-overlay-from: oklch(96% 0.01 85 / .72);
+  --wallpaper-overlay-to: oklch(90% 0.025 85 / .52);
+  --ambient-1: oklch(76% 0.10 68 / .16);
+  --ambient-2: oklch(82% 0.10 165 / .12);
+  --ambient-3: oklch(76% 0.10 305 / .08);
+  --void: var(--background);
+  --panel: var(--block-bg);
+  --panel-2: var(--secondary-background);
+  --panel-raised: var(--block-bg-hover);
+  --panel-soft: color-mix(in oklch, var(--panel) 82%, transparent);
+  --bone: var(--foreground);
+  --bone-bright: oklch(16% 0.012 65);
+  --fog: color-mix(in oklch, var(--bone) 68%, transparent);
+  --dim: color-mix(in oklch, var(--bone) 46%, transparent);
+  --faint: color-mix(in oklch, var(--bone) 16%, transparent);
+  --line: color-mix(in oklch, var(--bone) 15%, transparent);
+  --line-hot: color-mix(in oklch, var(--main) 52%, transparent);
+  --amber: var(--main);
+  --amber-soft: color-mix(in oklch, var(--main) 11%, transparent);
+  --jade: var(--rvbbit-accent);
+  --jade-soft: color-mix(in oklch, var(--rvbbit-accent) 9%, transparent);
+  --gallery-rail-bg: color-mix(in oklch, var(--void) 84%, transparent);
+}
+
 [data-warehouse-theme-anchor] {
   display: inline-flex;
   align-items: center;
+  gap: 7px;
   flex: none;
 }
 
@@ -33,6 +89,42 @@
   border-color: var(--line-hot, rgba(245, 180, 70, .55));
   color: var(--bone, #e8ddcc);
   transform: translateY(-1px);
+}
+
+.warehouse-theme-mode-button {
+  width: 31px;
+  height: 31px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line, rgba(232, 221, 204, .16));
+  border-radius: 50%;
+  background: color-mix(in oklch, var(--panel-raised, #1d1813) 72%, transparent);
+  color: var(--fog, rgba(232, 221, 204, .62));
+  cursor: pointer;
+  transition: border-color .18s, background .18s, color .18s, transform .18s;
+}
+
+.warehouse-theme-mode-button:hover,
+.warehouse-theme-mode-button:focus-visible {
+  outline: 0;
+  border-color: var(--line-hot, rgba(245, 180, 70, .55));
+  background: var(--amber-soft, rgba(245, 180, 70, .12));
+  color: var(--amber, #f5b446);
+  transform: translateY(-1px);
+}
+
+.warehouse-theme-mode-button svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .warehouse-theme-button .warehouse-theme-button-thumb {
@@ -682,6 +774,174 @@ html[data-warehouse-theme] .chart-point {
   stroke: var(--panel);
 }
 
+/* Light mode is a structural re-render of the active room: the same image and
+   accent family, with warm paper glass and dark ink. Authored artifact iframe
+   documents remain isolated and keep their own color scheme. */
+html[data-warehouse-color-mode="light"] {
+  background: var(--void) !important;
+}
+
+html[data-warehouse-color-mode="light"] body {
+  color: var(--bone);
+}
+
+html[data-warehouse-color-mode="light"] .bg {
+  opacity: .32;
+  filter: brightness(1.08) saturate(.55) contrast(.9) !important;
+}
+
+html[data-warehouse-color-mode="light"] .veil {
+  background:
+    radial-gradient(1100px 760px at 28% -8%, color-mix(in oklch, var(--main) 9%, transparent), transparent 62%),
+    linear-gradient(to bottom, color-mix(in oklch, var(--background) 72%, transparent) 0%, color-mix(in oklch, var(--background) 88%, transparent) 54%, color-mix(in oklch, var(--background) 96%, transparent) 100%) !important;
+}
+
+html[data-warehouse-color-mode="light"] .wash,
+html[data-warehouse-color-mode="light"] .grid-wash {
+  opacity: .38;
+  background-image:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px) !important;
+}
+
+html[data-warehouse-color-mode="light"] nav,
+html[data-warehouse-color-mode="light"] .topbar,
+html[data-warehouse-color-mode="light"] .loginbar {
+  border-color: var(--line) !important;
+  background: color-mix(in oklch, var(--background) 88%, transparent) !important;
+  box-shadow: inset 0 -1px 0 color-mix(in oklch, var(--foreground) 4%, transparent);
+}
+
+html[data-warehouse-color-mode="light"] .loginbrand {
+  color: var(--bone) !important;
+}
+
+html[data-warehouse-color-mode="light"] .loginbrand small {
+  border-color: var(--line) !important;
+  color: var(--dim) !important;
+}
+
+html[data-warehouse-color-mode="light"] .card h1 {
+  color: var(--amber);
+}
+
+html[data-warehouse-color-mode="light"] .card p.sub,
+html[data-warehouse-color-mode="light"] .card label {
+  color: var(--fog);
+}
+
+html[data-warehouse-color-mode="light"] .card,
+html[data-warehouse-color-mode="light"] .gate-card,
+html[data-warehouse-color-mode="light"] .session-dialog,
+html[data-warehouse-color-mode="light"] .surface:not(.kind-artifact),
+html[data-warehouse-color-mode="light"] .rail-note {
+  border-color: var(--line);
+  background: color-mix(in oklch, var(--panel) 91%, transparent);
+  box-shadow: 0 14px 38px color-mix(in oklch, var(--foreground) 8%, transparent);
+}
+
+html[data-warehouse-color-mode="light"] .sessions-column,
+html[data-warehouse-color-mode="light"] .stage-column,
+html[data-warehouse-color-mode="light"] .chat-column,
+html[data-warehouse-color-mode="light"] .column-head,
+html[data-warehouse-color-mode="light"] .composer,
+html[data-warehouse-color-mode="light"] .markup-head,
+html[data-warehouse-color-mode="light"] .markup-toolbar,
+html[data-warehouse-color-mode="light"] .markup-foot {
+  border-color: var(--line);
+  background: color-mix(in oklch, var(--panel) 73%, transparent);
+  box-shadow: none;
+}
+
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .veil {
+  background:
+    radial-gradient(1100px 760px at 28% -8%, color-mix(in oklch, var(--main) 7%, transparent), transparent 64%),
+    linear-gradient(to bottom, color-mix(in oklch, var(--background) 64%, transparent) 0%, color-mix(in oklch, var(--background) 78%, transparent) 54%, color-mix(in oklch, var(--background) 91%, transparent) 100%) !important;
+}
+
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .sessions-column {
+  background: color-mix(in oklch, var(--panel) 69%, transparent);
+}
+
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .stage-column {
+  background: color-mix(in oklch, var(--background) 43%, transparent);
+}
+
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .chat-column {
+  background: linear-gradient(180deg, color-mix(in oklch, var(--doc-bg) 83%, transparent), color-mix(in oklch, var(--panel) 76%, transparent));
+  box-shadow: inset 1px 0 0 color-mix(in oklch, var(--foreground) 4%, transparent), -16px 0 42px color-mix(in oklch, var(--foreground) 7%, transparent);
+}
+
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .column-head,
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .composer,
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .chat-column .calliope-head,
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .chat-column .composer,
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .stage-head {
+  background: color-mix(in oklch, var(--panel) 72%, transparent);
+}
+
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .evidence-search {
+  background: linear-gradient(90deg, color-mix(in oklch, var(--jade) 5%, var(--panel)), color-mix(in oklch, var(--panel) 78%, transparent));
+}
+
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .surface:not(.kind-artifact) {
+  border-color: var(--line);
+  background: color-mix(in oklch, var(--panel) 88%, transparent);
+}
+
+html[data-warehouse-color-mode="light"] body[data-warehouse-page="calliope"] .surface:not(.kind-artifact):hover {
+  background: color-mix(in oklch, var(--panel-raised) 82%, white);
+}
+
+html[data-warehouse-color-mode="light"] .session-card:hover,
+html[data-warehouse-color-mode="light"] .surface-tabs button.active,
+html[data-warehouse-color-mode="light"] .compose-box,
+html[data-warehouse-color-mode="light"] .session-search,
+html[data-warehouse-color-mode="light"] input,
+html[data-warehouse-color-mode="light"] textarea {
+  border-color: var(--line);
+  background: color-mix(in oklch, var(--panel-raised) 52%, transparent);
+  color: var(--bone);
+}
+
+html[data-warehouse-color-mode="light"] .session-card.active {
+  background: linear-gradient(90deg, var(--amber-soft), color-mix(in oklch, var(--panel) 54%, transparent));
+}
+
+html[data-warehouse-color-mode="light"] .data-table th {
+  background: var(--secondary-background);
+}
+
+html[data-warehouse-color-mode="light"] .data-table td {
+  border-color: var(--line);
+}
+
+html[data-warehouse-color-mode="light"] .chart-wrap {
+  border-color: var(--line);
+  background: color-mix(in oklch, var(--doc-bg) 88%, transparent);
+}
+
+html[data-warehouse-color-mode="light"] .instrument-library-dialog,
+html[data-warehouse-color-mode="light"] .action-library-dialog,
+html[data-warehouse-color-mode="light"] .style-library-dialog,
+html[data-warehouse-color-mode="light"] .work-inbox-dialog,
+html[data-warehouse-color-mode="light"] .surface-viewer-dialog,
+html[data-warehouse-color-mode="light"] .trail-dialog {
+  color-scheme: inherit;
+}
+
+html[data-warehouse-color-mode="light"] .tool-activity {
+  --bone: #e8f1ed;
+  --bone-bright: #f8fffc;
+  --fog: rgba(232, 241, 237, .62);
+  --dim: rgba(232, 241, 237, .38);
+  --line: rgba(232, 241, 237, .14);
+}
+
+html[data-warehouse-color-mode="light"] ::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--bone) 22%, transparent);
+}
+
 @media (max-width: 760px) {
   .warehouse-theme-dialog {
     width: 100vw;
@@ -708,10 +968,21 @@ html[data-warehouse-theme] .chart-point {
   .warehouse-theme-grid {
     grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
   }
+
+  [data-warehouse-theme-anchor] {
+    gap: 4px;
+  }
+
+  .warehouse-theme-button,
+  .warehouse-theme-mode-button {
+    width: 28px;
+    height: 28px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .warehouse-theme-button,
+  .warehouse-theme-mode-button,
   .warehouse-theme-tile {
     transition: none;
   }

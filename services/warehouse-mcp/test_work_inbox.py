@@ -170,6 +170,9 @@ def test_inbox_routes_mcp_routing_prompt_and_themed_ui_ship_together():
     assert 'id="work-inbox-open"' in page
     assert 'id="work-inbox-dialog"' in page
     assert "function renderInbox()" in script
+    assert "function inboxExplainTooltip" in script
+    assert "Next useful move" in script
+    assert "Calliope Workflow" in script
     assert "include_resolved=true" in script
     assert "investigateInboxItem" in script
     assert "45_000" in script
@@ -180,4 +183,5 @@ def test_inbox_routes_mcp_routing_prompt_and_themed_ui_ship_together():
     assert 'launch.get("inbox")' in script
     assert "!els.inboxDialog.open" in script
     assert ".work-inbox-dialog" in css
+    assert "[data-calliope-tooltip]" in css
     assert "color-mix(in oklch,var(--jade)" in css
