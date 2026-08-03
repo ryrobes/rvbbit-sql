@@ -568,6 +568,22 @@ def test_brief_routes_and_both_native_entry_points_ship_as_one_feature():
     assert "function loadGalleryBrief" in server
 
 
+def test_coming_up_is_a_sunday_first_two_week_calendar_without_losing_overflow():
+    script = (HERE / "calliope" / "calliope.js").read_text(encoding="utf-8")
+    css = (HERE / "calliope" / "calliope.css").read_text(encoding="utf-8")
+
+    assert '"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"' in script
+    assert "function renderBriefComingUp" in script
+    assert "Array.from({ length: 14 }" in script
+    assert 'key === "coming_up"' in script
+    assert "Later in the Brief horizon" in script
+    assert 'data-brief-action="prepare"' in script
+    assert "briefCalendarEventTooltip" in script
+    assert ".brief-calendar-weekdays,.brief-calendar-days" in css
+    assert "grid-template-columns:repeat(7,minmax(0,1fr))" in css
+    assert ".brief-calendar-overflow" in css
+
+
 def test_brief_timezone_rejects_ambiguous_names_and_sections_are_deterministic():
     name, zone = calliope._brief_timezone("America/New_York")
     assert name == "America/New_York"

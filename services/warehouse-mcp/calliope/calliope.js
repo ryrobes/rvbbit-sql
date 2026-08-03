@@ -5551,7 +5551,7 @@
   const BRIEF_SECTIONS = [
     ["focus", "My focus", "Artifacts and named values explicitly pinned to your private Semantic Home"],
     ["needs_now", "Needs you now", "Open work, near-term due dates, and unresolved handoffs"],
-    ["coming_up", "Coming up", "Scheduled events and future commitments in the bounded horizon"],
+    ["coming_up", "Coming up", "Two Sunday-to-Saturday weeks of scheduled events and future commitments"],
     ["from_notes", "From your notes", "Private context you recorded on earlier days, with your explicit object links"],
     ["changed", "Changed since last brief", "Source-backed activity observed since your previous snapshot"],
     ["data_moved", "Data that moved", "Triggered semantic watches and monitored business values"],
@@ -5642,6 +5642,198 @@
         ["Confidence", object?.confidence],
       ],
     });
+  }
+
+  const BRIEF_CALENDAR_WEEKDAYS = [
+    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+  ];
+
+  function briefCalendarGridKey(date) {
+    const year = date.getUTCFullYear();
+    const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(date.getUTCDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  function briefCalendarDateKey(value, timeZone) {
+    const date = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    try {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).formatToParts(date);
+      const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+      return `${values.year}-${values.month}-${values.day}`;
+    } catch (_error) {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const day = String(date.getDate()).padStart(2, "0");
+      return `${year}-${month}-${day}`;
+    }
+  }
+
+  function briefCalendarAnchor(value) {
+    const matched = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value || ""));
+    const now = new Date();
+    const date = matched
+      ? new Date(Date.UTC(Number(matched[1]), Number(matched[2]) - 1, Number(matched[3])))
+      : new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+    date.setUTCDate(date.getUTCDate() - date.getUTCDay());
+    return date;
+  }
+
+  function briefCalendarItemMoment(item) {
+    const provenance = item.provenance || {};
+    return provenance.starts_at || provenance.due_at || item.occurred_at || "";
+  }
+
+  function briefCalendarFormat(value, timeZone, options) {
+    const date = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    try {
+      return date.toLocaleString([], { ...options, timeZone });
+    } catch (_error) {
+      return date.toLocaleString([], options);
+    }
+  }
+
+  function briefCalendarTimeLabel(item, timeZone) {
+    const provenance = item.provenance || {};
+    if (provenance.all_day) return "All day";
+    const raw = briefCalendarItemMoment(item);
+    if (!raw) return "Scheduled";
+    const start = new Date(raw);
+    if (Number.isNaN(start.getTime())) return "Scheduled";
+    const timeOptions = { hour: "numeric", minute: "2-digit" };
+    const startLabel = briefCalendarFormat(start, timeZone, timeOptions);
+    if (provenance.due_at && !provenance.starts_at) return `Due ${startLabel}`;
+    const end = provenance.ends_at ? new Date(provenance.ends_at) : null;
+    if (
+      end
+      && !Number.isNaN(end.getTime())
+      && briefCalendarDateKey(start, timeZone) === briefCalendarDateKey(end, timeZone)
+    ) {
+      return `${startLabel}–${briefCalendarFormat(end, timeZone, timeOptions)}`;
+    }
+    return startLabel || "Scheduled";
+  }
+
+  function briefCalendarEventTooltip(item, dateLabel, timeLabel) {
+    const provenance = item.provenance || {};
+    const relation = provenance.viewer_relation || {};
+    const linked = Array.isArray(provenance.entity_refs) ? provenance.entity_refs.length : 0;
+    return calliopeTooltipSourceMarkup({
+      eyebrow: "Coming Up · calendar",
+      status: provenance.status || "scheduled",
+      title: item.title || "Scheduled item",
+      meaning: item.summary || "A source-backed commitment in your current Brief horizon.",
+      evidence: relation.evidence || "Observed by a governed Brief resolver for the signed-in user.",
+      evidenceLabel: "Why it is here",
+      facts: [
+        ["When", [dateLabel, timeLabel].filter(Boolean).join(" · ")],
+        ["Source", item.source || evidenceGroupLabel(item.group)],
+        ["Type", item.subtype || item.kind],
+        ["Graph edges", linked ? String(linked) : ""],
+      ],
+    });
+  }
+
+  function renderBriefCalendarEvent(surface, item, timeZone, { showDate = false } = {}) {
+    const selected = Boolean(selectedEvidence(surface.id, item.id));
+    const provenance = item.provenance || {};
+    const relation = provenance.viewer_relation || {};
+    const truth = relation.truth || "observed";
+    const moment = briefCalendarItemMoment(item);
+    const dateLabel = briefCalendarFormat(moment, timeZone, {
+      weekday: "short", month: "short", day: "numeric",
+    });
+    const timeLabel = briefCalendarTimeLabel(item, timeZone);
+    const timingClass = provenance.starts_at
+      ? "scheduled-event"
+      : provenance.due_at ? "due-event" : "observed-event";
+    return `<article class="evidence-card brief-calendar-event ${timingClass} ${selected ? "selected" : ""}"
+      data-evidence-id="${escapeHtml(item.id)}" data-evidence-kind="${escapeHtml(item.kind)}" role="button" tabindex="0"
+      aria-pressed="${selected ? "true" : "false"}" data-calliope-tooltip data-tooltip-kind="provenance"
+      aria-label="${escapeHtml(`${item.title || "Scheduled item"}, ${dateLabel}, ${timeLabel}. Click to ${selected ? "remove from" : "add to"} Calliope context.`)}">
+      <header>
+        <time datetime="${escapeHtml(moment)}">${escapeHtml(`${showDate && dateLabel ? `${dateLabel} · ` : ""}${timeLabel}`)}</time>
+        <button type="button" data-evidence-select title="${selected ? "Remove from" : "Add to"} Calliope context" aria-label="${selected ? "Remove" : "Add"} ${escapeHtml(item.title)} ${selected ? "from" : "to"} Calliope context">${selected ? "✓" : "+"}</button>
+      </header>
+      <h5>${escapeHtml(item.title || "Scheduled item")}</h5>
+      <span class="brief-calendar-event-source"><i class="${escapeHtml(truth)}"></i>${escapeHtml(item.source || evidenceGroupLabel(item.group))}</span>
+      <footer>
+        <button type="button" data-brief-action="prepare">Prepare</button>
+        ${evidenceCanTrail(item) ? `<button type="button" data-follow-evidence="${escapeHtml(item.id)}">Trail</button>` : ""}
+        ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener">Open ↗</a>` : ""}
+      </footer>
+      ${briefCalendarEventTooltip(item, dateLabel, timeLabel)}
+    </article>`;
+  }
+
+  function renderBriefComingUp(surface, items, brief) {
+    const timeZone = brief.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    const anchor = briefCalendarAnchor(brief.date || brief.as_of);
+    const days = Array.from({ length: 14 }, (_unused, index) => {
+      const date = new Date(anchor);
+      date.setUTCDate(anchor.getUTCDate() + index);
+      return date;
+    });
+    const grouped = new Map(days.map((date) => [briefCalendarGridKey(date), []]));
+    const outside = [];
+    items.forEach((item) => {
+      const key = briefCalendarDateKey(briefCalendarItemMoment(item), timeZone);
+      if (grouped.has(key)) grouped.get(key).push(item);
+      else outside.push(item);
+    });
+    const byMoment = (left, right) => {
+      const leftAt = new Date(briefCalendarItemMoment(left)).getTime();
+      const rightAt = new Date(briefCalendarItemMoment(right)).getTime();
+      return (Number.isNaN(leftAt) ? Number.MAX_SAFE_INTEGER : leftAt)
+        - (Number.isNaN(rightAt) ? Number.MAX_SAFE_INTEGER : rightAt);
+    };
+    grouped.forEach((entries) => entries.sort(byMoment));
+    outside.sort(byMoment);
+    const todayKey = briefCalendarDateKey(new Date(), timeZone);
+    const briefDay = String(brief.date || "");
+    const lastDay = days[days.length - 1];
+    const rangeLabel = `${briefCalendarFormat(anchor, "UTC", { month: "short", day: "numeric" })}–${briefCalendarFormat(lastDay, "UTC", { month: "short", day: "numeric", year: "numeric" })}`;
+    const zoneLabel = String(timeZone).replaceAll("_", " ");
+    const dayMarkup = days.map((date, index) => {
+      const key = briefCalendarGridKey(date);
+      const entries = grouped.get(key) || [];
+      const isToday = key === todayKey;
+      const isBriefDay = key === briefDay;
+      const isPast = briefDay && key < briefDay;
+      const dateLabel = briefCalendarFormat(date, "UTC", {
+        weekday: "long", month: "long", day: "numeric", year: "numeric",
+      });
+      const marker = isToday ? "Today" : isBriefDay ? "Brief day" : "";
+      return `<section class="brief-calendar-day ${index % 7 === 0 || index % 7 === 6 ? "weekend" : ""} ${isToday ? "today" : ""} ${isBriefDay ? "brief-day" : ""} ${isPast ? "past" : ""}" aria-label="${escapeHtml(dateLabel)}">
+        <header>
+          <time datetime="${escapeHtml(key)}"><span>${escapeHtml(briefCalendarFormat(date, "UTC", { month: "short" }))}</span><b>${date.getUTCDate()}</b></time>
+          ${marker ? `<em>${marker}</em>` : ""}
+          ${entries.length ? `<i>${entries.length}</i>` : ""}
+        </header>
+        <div class="brief-calendar-day-events">${entries.length
+          ? entries.map((item) => renderBriefCalendarEvent(surface, item, timeZone)).join("")
+          : '<span class="brief-calendar-day-empty">—</span>'}</div>
+      </section>`;
+    }).join("");
+    const outsideMarkup = outside.length ? `<div class="brief-calendar-overflow">
+      <header><div><span>Later in the Brief horizon</span><p>Commitments preserved by the resolver beyond these two calendar weeks.</p></div><b>${outside.length}</b></header>
+      <div>${outside.map((item) => renderBriefCalendarEvent(surface, item, timeZone, { showDate: true })).join("")}</div>
+    </div>` : "";
+    return `<div class="brief-calendar-board">
+      <div class="brief-calendar-frame">
+        <div class="brief-calendar-range"><strong>${escapeHtml(rangeLabel)}</strong><span>${escapeHtml(`Sunday–Saturday · ${zoneLabel}`)}</span></div>
+        <div class="brief-calendar-weekdays">${BRIEF_CALENDAR_WEEKDAYS.map((day) => `<span aria-label="${day}">${day.slice(0, 3)}</span>`).join("")}</div>
+        <div class="brief-calendar-days">${dayMarkup}</div>
+      </div>
+      ${outsideMarkup}
+    </div>`;
   }
 
   function renderBriefCard(surface, item) {
@@ -6033,9 +6225,12 @@
         : defaultDescription;
       const matches = items.filter((item) => item.provenance?.brief_section === key);
       if (!matches.length) return "";
+      const sectionBody = key === "coming_up"
+        ? renderBriefComingUp(surface, matches, brief)
+        : `<div class="evidence-grid brief-grid">${matches.map((item) => renderBriefCard(surface, item)).join("")}</div>`;
       return `<section class="brief-section section-${key}">
         <header><div><h4>${escapeHtml(label)}</h4><p>${escapeHtml(description)}</p></div><span>${matches.length}</span></header>
-        <div class="evidence-grid brief-grid">${matches.map((item) => renderBriefCard(surface, item)).join("")}</div>
+        ${sectionBody}
       </section>`;
     }).join("");
     return `<div class="evidence-set personal-brief">
@@ -6497,7 +6692,8 @@
       card.setAttribute("aria-pressed", String(active));
       const button = $("[data-evidence-select]", card);
       if (button) {
-        button.textContent = active ? "Added ✓" : "+ Add";
+        const compactCalendarEvent = card.classList.contains("brief-calendar-event");
+        button.textContent = compactCalendarEvent ? (active ? "✓" : "+") : (active ? "Added ✓" : "+ Add");
         button.setAttribute("aria-label", `${active ? "Remove" : "Add"} evidence ${active ? "from" : "to"} Calliope context`);
       }
     });
