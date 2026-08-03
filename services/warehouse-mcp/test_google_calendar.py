@@ -265,6 +265,48 @@ def test_disabled_calendar_api_error_is_actionable(monkeypatch):
     assert "retry sync" in message
 
 
+def test_full_calendar_sync_uses_token_compatible_bounded_query(monkeypatch):
+    requested = {}
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "items": [],
+                "timeZone": "America/New_York",
+                "nextSyncToken": "fresh-incremental-token",
+            }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **kwargs):
+            requested.update(kwargs.get("params") or {})
+            return Response()
+
+    monkeypatch.setattr(calliope.httpx, "AsyncClient", Client)
+
+    items, token = asyncio.run(calliope._fetch_google_calendar_events(
+        "short-lived-access-token",
+        sync_token=None,
+        now=datetime(2026, 8, 3, tzinfo=timezone.utc),
+    ))
+
+    assert items == []
+    assert token == "fresh-incremental-token"
+    assert "timeMin" in requested and "timeMax" in requested
+    assert "orderBy" not in requested
+
+
 def test_calendar_oauth_is_incremental_single_use_and_account_bound(monkeypatch):
     routes = {}
 

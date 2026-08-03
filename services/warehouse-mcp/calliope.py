@@ -6076,8 +6076,9 @@ async def _fetch_google_calendar_events(
         "maxResults": "2500",
     }
     if full_sync:
+        # Google omits nextSyncToken when orderBy is combined with this bounded
+        # initial query. Brief reads apply their own chronological ordering.
         params.update({
-            "orderBy": "startTime",
             "timeMin": (now - timedelta(days=_GOOGLE_CALENDAR_PAST_DAYS)).isoformat(),
             "timeMax": (now + timedelta(days=_GOOGLE_CALENDAR_FUTURE_DAYS)).isoformat(),
         })
