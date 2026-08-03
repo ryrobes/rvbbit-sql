@@ -220,6 +220,92 @@ _BRIEF_NOTE_MAX_CHARS = 12_000
 _BRIEF_NOTE_MAX_LINKS = 24
 _BRIEF_NOTE_LOOKBACK_DAYS = 30
 _BRIEF_NOTE_ENTITY_KINDS = {"person", "place", "thing", "project", "ticket"}
+_BRIEF_WORK_MAPPING_VERSION = 1
+_BRIEF_WORK_PROFILE_SAMPLE = 40
+_BRIEF_WORK_INDEX_BATCH = 500
+_BRIEF_WORK_INVENTORY_LIMIT = 240
+_BRIEF_WORK_OBSERVATION_LIMIT = 24
+_BRIEF_WORK_STALE_SECONDS = 72 * 60 * 60
+_BRIEF_IDENTITY_DIRECTORY_TTL_SECONDS = 15 * 60
+_BRIEF_IDENTITY_DIRECTORY_MAX_ROWS = 5_000
+_BRIEF_IDENTITY_DIRECTORY_MAX_CACHE_ENTRIES = 32
+_BRIEF_IDENTITY_DIRECTORY_CACHE: dict[
+    str, tuple[float, list[dict[str, Any]]]
+] = {}
+_BRIEF_WORK_ACTIVE_LIFECYCLES = {"open", "in_progress", "blocked", "review"}
+_BRIEF_WORK_FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "status": (
+        "$.state.name", "$.status.name", "$.fields.status.name",
+        "$.state.display_value", "$.status.display_value", "$.state", "$.status",
+    ),
+    "lifecycle": (
+        "$.state.type", "$.fields.status.statusCategory.key",
+        "$.status.statusCategory.key", "$.statusCategory.key", "$.state.category",
+    ),
+    "active": ("$.active", "$.fields.active"),
+    "due_at": (
+        "$.dueDate", "$.due_at", "$.dueAt", "$.deadline", "$.fields.duedate",
+        "$.due_date", "$.sla_due", "$.target_date",
+    ),
+    "url": (
+        "$.url", "$.webUrl", "$.html_url", "$.permalink", "$.self",
+        "$.links.html.href",
+    ),
+    "identifier": (
+        "$.identifier", "$.key", "$.number", "$.issueKey", "$.sys_id", "$.id",
+    ),
+    "updated_at": (
+        "$.updatedAt", "$.updated_at", "$.fields.updated", "$.sys_updated_on",
+        "$.lastUpdated", "$.modified_at",
+    ),
+    "priority": (
+        "$.priorityLabel", "$.priority.name", "$.fields.priority.name",
+        "$.priority.display_value", "$.priority",
+    ),
+    "assignee_emails": (
+        "$.assignee.email", "$.assignee.emailAddress", "$.fields.assignee.emailAddress",
+        "$.assigned_to.email", "$.assignees[*].email",
+    ),
+    "assignee_names": (
+        "$.assignee.name", "$.assignee.displayName", "$.fields.assignee.displayName",
+        "$.assigned_to.display_value", "$.assigned_to.name", "$.assignees[*].name",
+    ),
+    "assignee_ids": (
+        "$.assignee.id", "$.assignee.accountId", "$.fields.assignee.accountId",
+        "$.assigned_to.value", "$.assigned_to.sys_id", "$.assignees[*].login",
+        "$.assignees[*].id", "$.assignee.login",
+    ),
+    "reviewer_emails": (
+        "$.reviewers[*].email", "$.requested_reviewers[*].email",
+    ),
+    "reviewer_names": (
+        "$.reviewers[*].name", "$.requested_reviewers[*].name",
+    ),
+    "reviewer_ids": (
+        "$.reviewers[*].id", "$.reviewers[*].login",
+        "$.requested_reviewers[*].id", "$.requested_reviewers[*].login",
+        "$.fields.customfield_10000[*].accountId",
+    ),
+    "authors": (
+        "$.author.email", "$.author.name", "$.author.login", "$.user.email",
+        "$.user.name", "$.user.login", "$.creator.emailAddress", "$.creator.displayName",
+        "$.fields.creator.emailAddress", "$.fields.creator.displayName",
+    ),
+    "author_ids": (
+        "$.author.id", "$.user.id", "$.creator.accountId", "$.fields.creator.accountId",
+    ),
+    "participants": (
+        "$.participants[*].email", "$.participants[*].name", "$.participants[*]",
+        "$.subscribers[*].email", "$.watchers[*].email",
+    ),
+    "project": (
+        "$.project.name", "$.fields.project.name", "$.project.display_value",
+        "$.project", "$.repository.full_name",
+    ),
+    "team": ("$.team.name", "$.fields.team.name", "$.assignment_group.display_value"),
+    "merged_at": ("$.merged_at", "$.mergedAt"),
+    "viewer_scope": ("$.visibility.scope", "$.viewer_scope"),
+}
 _GOOGLE_CALENDAR_SCOPE = (
     "https://www.googleapis.com/auth/calendar.events.owned.readonly"
 )
@@ -1486,6 +1572,91 @@ SELECT n.owner_email,n.note_date,n.id AS note_id,
   JOIN rvbbit.calliope_daily_note_links l ON l.note_id=n.id;
 """
 
+_BRAIN_WORK_DDL = """
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_brain_work_profiles (
+    source_id bigint NOT NULL REFERENCES rvbbit.brain_sources(source_id) ON DELETE CASCADE,
+    doc_type text NOT NULL DEFAULT 'document',
+    shape_hash text NOT NULL,
+    mapping_version integer NOT NULL DEFAULT 1,
+    profile_source text NOT NULL DEFAULT 'inferred',
+    status text NOT NULL DEFAULT 'possible',
+    work_kind text NOT NULL DEFAULT 'work_item',
+    confidence double precision NOT NULL DEFAULT 0,
+    field_map jsonb NOT NULL DEFAULT '{}'::jsonb,
+    lifecycle_map jsonb NOT NULL DEFAULT '{}'::jsonb,
+    qualification jsonb NOT NULL DEFAULT '{}'::jsonb,
+    sample_count integer NOT NULL DEFAULT 0,
+    document_count bigint NOT NULL DEFAULT 0,
+    last_source_sync_at timestamptz,
+    last_document_ingested_at timestamptz,
+    last_indexed_at timestamptz,
+    profiled_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    last_error text,
+    PRIMARY KEY (source_id,doc_type),
+    CONSTRAINT calliope_brain_work_profiles_status_check
+        CHECK (status IN ('active','possible','ignored','error')),
+    CONSTRAINT calliope_brain_work_profiles_source_check
+        CHECK (profile_source IN ('provider','source','provider+source','inferred')),
+    CONSTRAINT calliope_brain_work_profiles_confidence_check
+        CHECK (confidence BETWEEN 0 AND 1),
+    CONSTRAINT calliope_brain_work_profiles_counts_check
+        CHECK (sample_count >= 0 AND document_count >= 0),
+    CONSTRAINT calliope_brain_work_profiles_map_check
+        CHECK (jsonb_typeof(field_map)='object' AND jsonb_typeof(lifecycle_map)='object'
+           AND jsonb_typeof(qualification)='object')
+);
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_brain_work_items (
+    doc_id bigint PRIMARY KEY REFERENCES rvbbit.brain_documents(doc_id) ON DELETE CASCADE,
+    source_id bigint NOT NULL REFERENCES rvbbit.brain_sources(source_id) ON DELETE CASCADE,
+    profile_doc_type text NOT NULL DEFAULT 'document',
+    profile_shape_hash text NOT NULL,
+    work_kind text NOT NULL DEFAULT 'work_item',
+    identifier text,
+    title text NOT NULL,
+    url text,
+    status_label text,
+    lifecycle text NOT NULL DEFAULT 'unknown',
+    due_at timestamptz,
+    priority_label text,
+    source_updated_at timestamptz,
+    relations jsonb NOT NULL DEFAULT '{}'::jsonb,
+    project jsonb NOT NULL DEFAULT '{}'::jsonb,
+    facts jsonb NOT NULL DEFAULT '{}'::jsonb,
+    index_run_id uuid NOT NULL,
+    indexed_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_brain_work_items_lifecycle_check
+        CHECK (lifecycle IN ('open','in_progress','blocked','review','closed','canceled','unknown')),
+    CONSTRAINT calliope_brain_work_items_json_check
+        CHECK (jsonb_typeof(relations)='object' AND jsonb_typeof(project)='object'
+           AND jsonb_typeof(facts)='object')
+);
+CREATE INDEX IF NOT EXISTS calliope_brain_work_items_source_lifecycle_idx
+    ON rvbbit.calliope_brain_work_items (source_id,lifecycle,source_updated_at DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS calliope_brain_work_items_active_due_idx
+    ON rvbbit.calliope_brain_work_items (due_at,source_id)
+    WHERE lifecycle IN ('open','in_progress','blocked','review');
+CREATE INDEX IF NOT EXISTS calliope_brain_work_items_relations_idx
+    ON rvbbit.calliope_brain_work_items USING gin (relations jsonb_path_ops);
+UPDATE rvbbit.brain_doc_providers
+SET observation_map = jsonb_build_object(
+    'identity_directory', jsonb_build_object(
+        'server', 'linear',
+        'tool', 'linear_getUsers',
+        'args', '{}'::jsonb,
+        'email_paths', jsonb_build_array('$.email'),
+        'aliases', jsonb_build_object(
+            'external_id', jsonb_build_array('$.id'),
+            'name', jsonb_build_array('$.name', '$.displayName')
+        ),
+        'ttl_seconds', 900
+    )
+) || observation_map,
+    updated_at = now()
+WHERE provider = 'linear-issues'
+  AND NOT (observation_map ? 'identity_directory');
+"""
+
 _GOOGLE_CALENDAR_DDL = """
 CREATE TABLE IF NOT EXISTS rvbbit.calliope_google_calendar_connections (
     owner_email text PRIMARY KEY,
@@ -1915,6 +2086,10 @@ def _seed_action_catalog(conn: Any) -> None:
 def ensure_tables(conn_factory: Callable[..., Any]) -> None:
     orphaned_manual_runs: list[dict[str, Any]] = []
     with conn_factory() as conn:
+        # Keep Warehouse startup scoped to the service-owned, idempotent DDL
+        # below. Extension-wide migrations are a deployment concern: invoking
+        # rvbbit.migrate() here can make an unrelated pending extension
+        # migration prevent the HTTP service from starting at all.
         conn.execute(_DDL)
         conn.execute(_STYLE_DDL)
         conn.execute(_HOME_DDL)
@@ -1922,6 +2097,7 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
         conn.execute(_WATCH_DDL)
         conn.execute(_INBOX_DDL)
         conn.execute(_BRIEF_DDL)
+        conn.execute(_BRAIN_WORK_DDL)
         conn.execute(_GOOGLE_CALENDAR_DDL)
         conn.execute(_INSTRUMENT_DDL)
         conn.execute(_COST_CALLER_DDL)
@@ -5603,6 +5779,175 @@ def _brief_text_values(values: list[Any], *, prefer: str | None = None) -> list[
     return found[:40]
 
 
+def _brief_identity_directory_config(value: Any) -> dict[str, Any] | None:
+    """Normalize a provider-declared user directory without provider code."""
+    raw = value if isinstance(value, dict) else {}
+    server = str(raw.get("server") or "").strip()
+    tool = str(raw.get("tool") or "").strip()
+    safe_name = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+    if not safe_name.fullmatch(server) or not safe_name.fullmatch(tool):
+        return None
+
+    def paths(candidate: Any, *, limit: int = 16) -> list[str]:
+        values = [candidate] if isinstance(candidate, str) else candidate
+        if not isinstance(values, list):
+            return []
+        normalized = []
+        for item in values[:limit]:
+            path = str(item or "").strip()
+            if path.startswith("$.") and path not in normalized:
+                normalized.append(path[:300])
+        return normalized
+
+    email_paths = paths(raw.get("email_paths") or raw.get("email_path"), limit=8)
+    raw_aliases = raw.get("aliases") if isinstance(raw.get("aliases"), dict) else {}
+    aliases = {
+        kind: resolved
+        for kind in ("email", "name", "external_id")
+        if (resolved := paths(raw_aliases.get(kind)))
+    }
+    if not email_paths or not aliases:
+        return None
+    args = raw.get("args") if isinstance(raw.get("args"), dict) else {}
+    try:
+        ttl_seconds = int(raw.get("ttl_seconds") or _BRIEF_IDENTITY_DIRECTORY_TTL_SECONDS)
+    except (TypeError, ValueError):
+        ttl_seconds = _BRIEF_IDENTITY_DIRECTORY_TTL_SECONDS
+    return {
+        "server": server,
+        "tool": tool,
+        "args": args,
+        "email_paths": email_paths,
+        "aliases": aliases,
+        "ttl_seconds": max(60, min(ttl_seconds, 3_600)),
+    }
+
+
+def _brief_identity_directory_records(
+    conn_factory: Callable[..., Any], config: dict[str, Any]
+) -> list[dict[str, Any]]:
+    cache_key = json.dumps(
+        [config["server"], config["tool"], config.get("args") or {}],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cached = _BRIEF_IDENTITY_DIRECTORY_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] <= int(config["ttl_seconds"]):
+        return [dict(record) for record in cached[1]]
+    try:
+        with conn_factory() as conn:
+            rows = conn.execute(
+                "SELECT r AS identity_record FROM rvbbit.mcp_rows(%s,%s,%s::jsonb) r "
+                "LIMIT %s",
+                (
+                    config["server"],
+                    config["tool"],
+                    json.dumps(config.get("args") or {}),
+                    _BRIEF_IDENTITY_DIRECTORY_MAX_ROWS,
+                ),
+            ).fetchall()
+        records = [
+            dict(row["identity_record"])
+            for row in rows
+            if isinstance(row.get("identity_record"), dict)
+        ]
+    except Exception:
+        if cached:
+            return [dict(record) for record in cached[1]]
+        raise
+    if (
+        cache_key not in _BRIEF_IDENTITY_DIRECTORY_CACHE
+        and len(_BRIEF_IDENTITY_DIRECTORY_CACHE)
+        >= _BRIEF_IDENTITY_DIRECTORY_MAX_CACHE_ENTRIES
+    ):
+        oldest = min(
+            _BRIEF_IDENTITY_DIRECTORY_CACHE,
+            key=lambda key: _BRIEF_IDENTITY_DIRECTORY_CACHE[key][0],
+        )
+        _BRIEF_IDENTITY_DIRECTORY_CACHE.pop(oldest, None)
+    _BRIEF_IDENTITY_DIRECTORY_CACHE[cache_key] = (now, records)
+    return [dict(record) for record in records]
+
+
+def _brief_directory_identity_aliases(
+    conn_factory: Callable[..., Any], owner: str
+) -> tuple[dict[str, set[str]], list[str]]:
+    """Resolve OAuth email to source IDs/names through declared directories."""
+    try:
+        with conn_factory() as conn:
+            sources = conn.execute(
+                "SELECT DISTINCT s.source_id,s.label,"
+                "coalesce(s.config->'observation_map'->'identity_directory',"
+                " p.observation_map->'identity_directory') AS identity_directory "
+                "FROM rvbbit.calliope_brain_work_profiles wp "
+                "JOIN rvbbit.brain_sources s ON s.source_id=wp.source_id "
+                "LEFT JOIN rvbbit.brain_doc_providers p "
+                " ON p.provider=s.config->>'provider' "
+                "WHERE wp.status='active' AND s.enabled "
+                "AND coalesce(s.config->'observation_map'->'identity_directory',"
+                " p.observation_map->'identity_directory') IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM rvbbit.brain_documents d "
+                " JOIN rvbbit.brain_visible_docs(%s) v ON v.doc_id=d.doc_id "
+                " WHERE d.source_id=s.source_id AND d.deleted_at IS NULL) "
+                "ORDER BY s.source_id",
+                (owner,),
+            ).fetchall()
+    except Exception:
+        # Older schemas and installations without structured work sources keep
+        # the normal exact-email/manual-alias behavior.
+        return {}, []
+
+    owner_key = owner.casefold()
+    resolved: dict[str, set[str]] = {}
+    warnings = []
+    for source in sources:
+        config = _brief_identity_directory_config(source.get("identity_directory"))
+        if not config:
+            continue
+        label = re.sub(r"\s+", " ", str(source.get("label") or "Work source")).strip()
+        try:
+            records = _brief_identity_directory_records(conn_factory, config)
+        except Exception as exc:
+            if len(warnings) < 4:
+                warnings.append(
+                    f"{label} could not resolve its assignment directory: "
+                    f"{type(exc).__name__}: {str(exc)[:400]}"
+                )
+            continue
+        source_aliases = resolved.setdefault(label.casefold(), set())
+        for record in records:
+            emails = _brief_text_values(
+                [
+                    value
+                    for path in config["email_paths"]
+                    for value in _brief_path_values(record, path)
+                ],
+                prefer="email",
+            )
+            if owner_key not in {email.casefold() for email in emails}:
+                continue
+            for alias_kind, alias_paths in config["aliases"].items():
+                prefer = (
+                    "email" if alias_kind == "email"
+                    else "name" if alias_kind == "name"
+                    else "id"
+                )
+                source_aliases.update(
+                    value.casefold()
+                    for value in _brief_text_values(
+                        [
+                            candidate
+                            for path in alias_paths
+                            for candidate in _brief_path_values(record, path)
+                        ],
+                        prefer=prefer,
+                    )
+                    if value
+                )
+    return {key: values for key, values in resolved.items() if values}, warnings
+
+
 def _brief_identity_state(
     conn_factory: Callable[..., Any], owner: str
 ) -> tuple[dict[str, set[str]], dict[str, str]]:
@@ -5644,10 +5989,16 @@ def _brief_viewer_relation(
     source: str,
     *,
     aliases: dict[str, set[str]],
+    directory_aliases: dict[str, set[str]] | None = None,
     assignee_emails: list[str] = (),
     assignee_names: list[str] = (),
+    assignee_ids: list[str] = (),
+    reviewer_emails: list[str] = (),
+    reviewer_names: list[str] = (),
+    reviewer_ids: list[str] = (),
     participants: list[str] = (),
     authors: list[str] = (),
+    author_ids: list[str] = (),
     viewer_scope: Any = None,
 ) -> dict[str, Any] | None:
     if str(viewer_scope or "").strip().lower() in {"owner", "viewer", "personal"}:
@@ -5659,16 +6010,24 @@ def _brief_viewer_relation(
         }
     owner_key = owner.casefold()
     candidates: list[tuple[str, str, str]] = []
-    for role, values in (
-        ("assigned_to", assignee_emails),
-        ("assigned_to", assignee_names),
-        ("participant", participants),
-        ("author", authors),
+    for role, values, alias_kind in (
+        ("assigned_to", assignee_emails, "email"),
+        ("assigned_to", assignee_names, "name"),
+        ("assigned_to", assignee_ids, "external_id"),
+        ("review_requested", reviewer_emails, "email"),
+        ("review_requested", reviewer_names, "name"),
+        ("review_requested", reviewer_ids, "external_id"),
+        ("participant", participants, "email_or_name"),
+        ("author", authors, "email_or_name"),
+        ("author", author_ids, "external_id"),
     ):
         for value in values:
             clean = re.sub(r"\s+", " ", str(value or "")).strip()
             if clean:
-                candidates.append((role, clean, "email" if "@" in clean else "name"))
+                resolved_kind = (
+                    "email" if "@" in clean else "name"
+                ) if alias_kind == "email_or_name" else alias_kind
+                candidates.append((role, clean, resolved_kind))
     for role, candidate, alias_kind in candidates:
         if alias_kind == "email" and candidate.casefold() == owner_key:
             return {
@@ -5678,6 +6037,23 @@ def _brief_viewer_relation(
                 "evidence": f"{role.replace('_', ' ').title()} email matches the OAuth identity.",
                 "candidate": candidate,
                 "alias_kind": alias_kind,
+            }
+    directory_accepted = (
+        (directory_aliases or {}).get("*", set())
+        | (directory_aliases or {}).get(source.casefold(), set())
+    )
+    for role, candidate, alias_kind in candidates:
+        if candidate.casefold() in directory_accepted:
+            return {
+                "kind": role,
+                "confidence": "exact",
+                "truth": "resolved",
+                "evidence": (
+                    "The source directory maps this assignment identity to the OAuth email."
+                ),
+                "candidate": candidate,
+                "alias_kind": alias_kind,
+                "resolver": "identity_directory",
             }
     accepted = aliases.get("*", set()) | aliases.get(source.casefold(), set())
     for role, candidate, alias_kind in candidates:
@@ -5696,7 +6072,7 @@ def _brief_viewer_relation(
     for role, candidate, alias_kind in candidates:
         candidate_name = re.sub(r"[^a-z0-9]", "", candidate.casefold())
         if (
-            alias_kind == "name"
+            alias_kind in {"name", "external_id"}
             and len(local_compact) >= 3
             and candidate_name
             and (candidate_name == local_compact or candidate.casefold() == local_name)
@@ -5705,7 +6081,11 @@ def _brief_viewer_relation(
                 "kind": role,
                 "confidence": "possible",
                 "truth": "resolved",
-                "evidence": "The source name resembles the OAuth email, but has not been confirmed.",
+                "evidence": (
+                    "The source username resembles the OAuth email, but has not been confirmed."
+                    if alias_kind == "external_id"
+                    else "The source name resembles the OAuth email, but has not been confirmed."
+                ),
                 "candidate": candidate,
                 "alias_kind": alias_kind,
             }
@@ -5718,6 +6098,840 @@ def _brief_is_closed(status: Any) -> bool:
         "cancelled", "canceled", "closed", "complete", "completed", "done",
         "duplicate", "resolved", "won t do", "wont do",
     }
+
+
+def _brief_work_shape_paths(
+    value: Any,
+    path: str = "$",
+    *,
+    depth: int = 0,
+    found: dict[str, set[str]] | None = None,
+) -> dict[str, set[str]]:
+    """Describe JSON structure without retaining any source values."""
+    found = found if found is not None else {}
+    if depth > 7:
+        return found
+    if isinstance(value, dict):
+        for key, child in list(value.items())[:160]:
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", str(key)):
+                continue
+            child_path = f"{path}.{key}"
+            kind = (
+                "object" if isinstance(child, dict)
+                else "array" if isinstance(child, list)
+                else "null" if child is None
+                else type(child).__name__
+            )
+            found.setdefault(child_path, set()).add(kind)
+            _brief_work_shape_paths(
+                child, child_path, depth=depth + 1, found=found
+            )
+    elif isinstance(value, list):
+        array_path = f"{path}[*]"
+        for child in value[:8]:
+            kind = (
+                "object" if isinstance(child, dict)
+                else "array" if isinstance(child, list)
+                else "null" if child is None
+                else type(child).__name__
+            )
+            found.setdefault(array_path, set()).add(kind)
+            _brief_work_shape_paths(
+                child, array_path, depth=depth + 1, found=found
+            )
+    return found
+
+
+def _brief_work_mapping(value: Any) -> dict[str, Any]:
+    mapping = value if isinstance(value, dict) else {}
+    normalized: dict[str, Any] = {}
+    for key, raw_paths in mapping.items():
+        field = str(key or "").strip()
+        if field not in _BRIEF_WORK_FIELD_CANDIDATES:
+            continue
+        paths = [raw_paths] if isinstance(raw_paths, str) else raw_paths
+        if not isinstance(paths, list):
+            continue
+        clean = []
+        for raw_path in paths[:16]:
+            path = str(raw_path or "").strip()
+            if not path or path in clean:
+                continue
+            if path.startswith("$.") or field == "viewer_scope":
+                clean.append(path[:300])
+        if clean:
+            normalized[field] = clean
+    return normalized
+
+
+def _brief_work_lifecycle(
+    status: Any,
+    lifecycle: Any = None,
+    active: Any = None,
+    *,
+    merged_at: Any = None,
+) -> str:
+    if merged_at not in (None, "", False):
+        return "closed"
+    tokens = []
+    for value in (lifecycle, status):
+        text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+        if text:
+            tokens.append(text)
+    combined = " ".join(tokens)
+    if any(term in combined for term in ("cancelled", "canceled", "wont do", "won t do")):
+        return "canceled"
+    if any(term in combined for term in (
+        "completed", "complete", "closed", "resolved", "merged", "duplicate", "done",
+    )):
+        return "closed"
+    if any(term in combined for term in ("blocked", "on hold", "onhold", "waiting")):
+        return "blocked"
+    if any(term in combined for term in (
+        "review", "approval", "qa testing", "quality assurance", "verification",
+    )):
+        return "review"
+    if any(term in combined for term in (
+        "started", "in progress", "inprogress", "active", "implementing",
+        "testing", "indeterminate",
+    )):
+        return "in_progress"
+    if any(term in combined for term in (
+        "open", "backlog", "unstarted", "todo", "to do", "new", "prioritized",
+        "selected for development",
+    )):
+        return "open"
+    if isinstance(active, bool):
+        return "open" if active else "closed"
+    active_text = str(active or "").strip().lower()
+    if active_text in {"true", "1", "yes"}:
+        return "open"
+    if active_text in {"false", "0", "no"}:
+        return "closed"
+    return "unknown"
+
+
+def _brief_work_kind(doc_type: Any, shape_paths: set[str]) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(doc_type or "").lower()).strip("_")
+    if normalized in {"pull", "pull_request", "merge_request", "code_review"}:
+        return "pull_request"
+    if normalized in {"change", "change_request"}:
+        return "change_request"
+    if any(path in shape_paths for path in (
+        "$.pull_request", "$.merged_at", "$.mergedAt", "$.requested_reviewers",
+    )):
+        return "pull_request"
+    if normalized in {"ticket", "task", "issue", "incident", "problem"}:
+        return normalized
+    if any(path.startswith("$.fields.status") for path in shape_paths):
+        return "issue"
+    if "$.sys_id" in shape_paths or "$.assigned_to" in shape_paths:
+        return "ticket"
+    return "work_item"
+
+
+def _brief_work_profile(
+    source: dict[str, Any], samples: list[dict[str, Any]]
+) -> dict[str, Any]:
+    sample_props = []
+    shape: dict[str, set[str]] = {}
+    for sample in samples[:_BRIEF_WORK_PROFILE_SAMPLE]:
+        props = sample.get("props") if isinstance(sample.get("props"), dict) else {}
+        if not props and isinstance(sample.get("raw_meta"), dict):
+            props = sample.get("raw_meta") or {}
+        if not props:
+            continue
+        sample_props.append(props)
+        _brief_work_shape_paths(props, found=shape)
+    provider_map = _brief_work_mapping(source.get("provider_observation_map"))
+    source_map = _brief_work_mapping(source.get("source_observation_map"))
+    explicit_map = {**provider_map, **source_map}
+    field_map = dict(explicit_map)
+    shape_paths = set(shape)
+    for field, candidates in _BRIEF_WORK_FIELD_CANDIDATES.items():
+        if field in field_map:
+            continue
+        inferred = [path for path in candidates if path in shape_paths]
+        if inferred:
+            field_map[field] = inferred[:6]
+
+    def observed(field: str) -> bool:
+        paths = field_map.get(field) or []
+        if field == "viewer_scope" and any(
+            isinstance(path, str) and not path.startswith("$.") for path in paths
+        ):
+            return True
+        return any(
+            _brief_mapped_values(props, field_map, field) for props in sample_props
+        )
+
+    lifecycle_evidence = any(observed(field) for field in ("status", "lifecycle", "active"))
+    work_kind = _brief_work_kind(str(source.get("doc_type") or "document"), shape_paths)
+    identity_fields = [
+        "assignee_emails", "assignee_names", "assignee_ids", "reviewer_emails",
+        "reviewer_names", "reviewer_ids", "viewer_scope",
+    ]
+    if work_kind in {"pull_request", "change_request"}:
+        identity_fields.extend(("authors", "author_ids"))
+    identity_evidence = any(observed(field) for field in identity_fields)
+    locator_evidence = any(observed(field) for field in ("identifier", "url"))
+    supporting_evidence = any(observed(field) for field in (
+        "due_at", "updated_at", "priority", "project", "team",
+    ))
+    doc_type = re.sub(
+        r"[^a-z0-9_-]", "-", str(source.get("doc_type") or "document").lower()
+    )[:80]
+    explicit_work_type = doc_type in {
+        "ticket", "task", "issue", "incident", "problem", "pull-request",
+        "pull_request", "merge-request", "change", "change-request",
+    }
+    confidence = min(1.0, round(
+        (0.25 if lifecycle_evidence else 0)
+        + (0.30 if identity_evidence else 0)
+        + (0.20 if locator_evidence else 0)
+        + (0.15 if explicit_work_type else 0)
+        + (0.10 if supporting_evidence else 0),
+        3,
+    ))
+    qualified = bool(
+        lifecycle_evidence
+        and identity_evidence
+        and (explicit_work_type or locator_evidence)
+        and confidence >= 0.70
+    )
+    possible = bool(
+        not qualified and lifecycle_evidence and identity_evidence and confidence >= 0.50
+    )
+    profile_status = "active" if qualified else "possible" if possible else "ignored"
+    raw_lifecycles: dict[str, str] = {}
+    for props in sample_props:
+        status = next(iter(_brief_text_values(
+            _brief_mapped_values(props, field_map, "status")
+        )), None)
+        lifecycle = next(iter(_brief_text_values(
+            _brief_mapped_values(props, field_map, "lifecycle")
+        )), None)
+        active_values = _brief_mapped_values(props, field_map, "active")
+        active = active_values[0] if active_values else None
+        raw = str(lifecycle or status or active or "").strip()
+        if raw and raw not in raw_lifecycles and len(raw_lifecycles) < 80:
+            raw_lifecycles[raw[:160]] = _brief_work_lifecycle(status, lifecycle, active)
+    profile_source = (
+        "provider+source" if provider_map and source_map
+        else "source" if source_map
+        else "provider" if provider_map
+        else "inferred"
+    )
+    shape_signature = {
+        path: sorted(kinds) for path, kinds in sorted(shape.items())
+    }
+    shape_hash = hashlib.sha256(json.dumps({
+        "version": _BRIEF_WORK_MAPPING_VERSION,
+        "shape": shape_signature,
+        "mapping": field_map,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "source_id": int(source.get("source_id") or 0),
+        "doc_type": doc_type or "document",
+        "shape_hash": shape_hash,
+        "mapping_version": _BRIEF_WORK_MAPPING_VERSION,
+        "profile_source": profile_source,
+        "status": profile_status,
+        "work_kind": work_kind,
+        "confidence": confidence,
+        "field_map": field_map,
+        "lifecycle_map": raw_lifecycles,
+        "qualification": {
+            "lifecycle": lifecycle_evidence,
+            "identity": identity_evidence,
+            "locator": locator_evidence,
+            "supporting": supporting_evidence,
+            "explicit_work_type": explicit_work_type,
+            "shape_field_count": len(shape_signature),
+        },
+        "sample_count": len(sample_props),
+        "document_count": max(0, int(source.get("document_count") or 0)),
+        "last_source_sync_at": source.get("last_synced_at"),
+        "last_document_ingested_at": source.get("last_document_ingested_at"),
+    }
+
+
+def _brief_work_first(
+    props: dict[str, Any], mapping: dict[str, Any], field: str
+) -> Any:
+    values = _brief_mapped_values(props, mapping, field)
+    return values[0] if values else None
+
+
+def _brief_work_index_item(
+    row: dict[str, Any], profile: dict[str, Any], zone: ZoneInfo
+) -> dict[str, Any]:
+    props = row.get("props") if isinstance(row.get("props"), dict) else {}
+    if not props and isinstance(row.get("raw_meta"), dict):
+        props = row.get("raw_meta") or {}
+    mapping = profile.get("field_map") or {}
+    status = next(iter(_brief_text_values(
+        _brief_mapped_values(props, mapping, "status")
+    )), None)
+    raw_lifecycle = next(iter(_brief_text_values(
+        _brief_mapped_values(props, mapping, "lifecycle")
+    )), None)
+    active = _brief_work_first(props, mapping, "active")
+    merged_at = _brief_work_first(props, mapping, "merged_at")
+    due_at = _brief_parse_datetime(
+        _brief_work_first(props, mapping, "due_at"), zone, end_of_day=True
+    )
+    updated_at = _brief_parse_datetime(
+        _brief_work_first(props, mapping, "updated_at"), zone
+    ) or _brief_parse_datetime(
+        row.get("occurred_at") or row.get("ingested_at"), zone
+    )
+
+    def texts(field: str, *, prefer: str | None = None) -> list[str]:
+        return _brief_text_values(
+            _brief_mapped_values(props, mapping, field), prefer=prefer
+        )
+
+    assignees = {
+        "emails": texts("assignee_emails", prefer="email"),
+        "names": texts("assignee_names", prefer="name"),
+        "ids": texts("assignee_ids", prefer="id"),
+    }
+    reviewers = {
+        "emails": texts("reviewer_emails", prefer="email"),
+        "names": texts("reviewer_names", prefer="name"),
+        "ids": texts("reviewer_ids", prefer="id"),
+    }
+    author_values = [row.get("author"), *texts("authors")]
+    authors = {
+        "emails": [value for value in _brief_text_values(author_values) if "@" in value],
+        "names": [value for value in _brief_text_values(author_values) if "@" not in value],
+        "ids": texts("author_ids", prefer="id"),
+    }
+    relations = {
+        "assignee": assignees,
+        "reviewer": reviewers,
+        "author": authors,
+        "participant": {"values": texts("participants")},
+    }
+    relations = {
+        role: {kind: values for kind, values in buckets.items() if values}
+        for role, buckets in relations.items()
+        if any(buckets.values())
+    }
+    project = {
+        "name": next(iter(texts("project")), None),
+        "team": next(iter(texts("team")), None),
+    }
+    project = {key: value for key, value in project.items() if value}
+    identifier = next(iter(texts("identifier")), None)
+    priority = next(iter(texts("priority")), None)
+    url_value = next(iter(texts("url")), None)
+    viewer_scope = next(iter(texts("viewer_scope")), None)
+    configured_scope = (mapping.get("viewer_scope") or [None])[0]
+    if viewer_scope is None and configured_scope and not str(configured_scope).startswith("$."):
+        viewer_scope = str(configured_scope)
+    return {
+        "doc_id": int(row["doc_id"]),
+        "source_id": int(row["source_id"]),
+        "profile_doc_type": profile.get("doc_type") or "document",
+        "profile_shape_hash": profile["shape_hash"],
+        "work_kind": profile.get("work_kind") or "work_item",
+        "identifier": identifier,
+        "title": re.sub(r"\s+", " ", str(row.get("title") or identifier or "Work item")).strip()[:500],
+        "url": url_value,
+        "status_label": status or raw_lifecycle,
+        "lifecycle": _brief_work_lifecycle(
+            status, raw_lifecycle, active, merged_at=merged_at
+        ),
+        "due_at": due_at,
+        "priority_label": priority,
+        "source_updated_at": updated_at,
+        "relations": relations,
+        "project": project,
+        "facts": {
+            "raw_lifecycle": raw_lifecycle,
+            "active": active,
+            "viewer_scope": viewer_scope,
+            "profile_source": profile.get("profile_source"),
+            "profile_confidence": profile.get("confidence"),
+        },
+    }
+
+
+def _brief_work_profile_upsert(conn: Any, profile: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO rvbbit.calliope_brain_work_profiles "
+        "(source_id,doc_type,shape_hash,mapping_version,profile_source,status,work_kind,"
+        "confidence,field_map,lifecycle_map,qualification,sample_count,document_count,"
+        "last_source_sync_at,last_document_ingested_at,profiled_at,updated_at,last_error) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,now(),now(),NULL) "
+        "ON CONFLICT (source_id,doc_type) DO UPDATE SET shape_hash=EXCLUDED.shape_hash,"
+        "mapping_version=EXCLUDED.mapping_version,profile_source=EXCLUDED.profile_source,"
+        "status=EXCLUDED.status,work_kind=EXCLUDED.work_kind,confidence=EXCLUDED.confidence,"
+        "field_map=EXCLUDED.field_map,lifecycle_map=EXCLUDED.lifecycle_map,"
+        "qualification=EXCLUDED.qualification,sample_count=EXCLUDED.sample_count,"
+        "document_count=EXCLUDED.document_count,last_source_sync_at=EXCLUDED.last_source_sync_at,"
+        "last_document_ingested_at=EXCLUDED.last_document_ingested_at,profiled_at=now(),"
+        "updated_at=now(),last_error=NULL",
+        (
+            profile["source_id"], profile["doc_type"], profile["shape_hash"],
+            profile["mapping_version"], profile["profile_source"], profile["status"],
+            profile["work_kind"], profile["confidence"],
+            json.dumps(profile["field_map"]), json.dumps(profile["lifecycle_map"]),
+            json.dumps(profile["qualification"]), profile["sample_count"],
+            profile["document_count"], profile.get("last_source_sync_at"),
+            profile.get("last_document_ingested_at"),
+        ),
+    )
+
+
+def _brief_work_refresh_source(conn: Any, source: dict[str, Any]) -> dict[str, Any]:
+    locked = conn.execute(
+        "SELECT pg_try_advisory_xact_lock(hashtext('calliope-brain-work'),%s::integer) AS locked",
+        (int(source["source_id"]) % 2_147_483_647,),
+    ).fetchone()
+    if locked and not locked.get("locked"):
+        return {"status": "busy", "source": source.get("label")}
+    samples = conn.execute(
+        "SELECT props,raw_meta FROM rvbbit.brain_documents "
+        "WHERE source_id=%s AND deleted_at IS NULL "
+        "ORDER BY ingested_at DESC,doc_id DESC LIMIT %s",
+        (source["source_id"], _BRIEF_WORK_PROFILE_SAMPLE),
+    ).fetchall()
+    profile = _brief_work_profile(source, samples)
+    conn.execute(
+        "DELETE FROM rvbbit.calliope_brain_work_profiles "
+        "WHERE source_id=%s AND doc_type<>%s",
+        (profile["source_id"], profile["doc_type"]),
+    )
+    existing = conn.execute(
+        "SELECT * FROM rvbbit.calliope_brain_work_profiles "
+        "WHERE source_id=%s AND doc_type=%s",
+        (profile["source_id"], profile["doc_type"]),
+    ).fetchone()
+    changed = not existing or any((
+        str(existing.get("shape_hash") or "") != profile["shape_hash"],
+        int(existing.get("mapping_version") or 0) != _BRIEF_WORK_MAPPING_VERSION,
+        str(existing.get("status") or "") != profile["status"],
+        int(existing.get("document_count") or 0) != profile["document_count"],
+        existing.get("last_source_sync_at") != profile.get("last_source_sync_at"),
+        existing.get("last_document_ingested_at") != profile.get("last_document_ingested_at"),
+        existing.get("last_indexed_at") is None,
+    ))
+    _brief_work_profile_upsert(conn, profile)
+    if profile["status"] != "active":
+        conn.execute(
+            "DELETE FROM rvbbit.calliope_brain_work_items WHERE source_id=%s",
+            (profile["source_id"],),
+        )
+        return {"status": profile["status"], "source": source.get("label"), "indexed": 0}
+    if not changed:
+        return {"status": "current", "source": source.get("label"), "indexed": 0}
+
+    run_id = str(uuid.uuid4())
+    cursor_doc_id = 0
+    indexed = 0
+    upsert_sql = (
+        "INSERT INTO rvbbit.calliope_brain_work_items "
+        "(doc_id,source_id,profile_doc_type,profile_shape_hash,work_kind,identifier,title,url,"
+        "status_label,lifecycle,due_at,priority_label,source_updated_at,relations,project,facts,"
+        "index_run_id,indexed_at) VALUES "
+        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::uuid,now()) "
+        "ON CONFLICT (doc_id) DO UPDATE SET source_id=EXCLUDED.source_id,"
+        "profile_doc_type=EXCLUDED.profile_doc_type,profile_shape_hash=EXCLUDED.profile_shape_hash,"
+        "work_kind=EXCLUDED.work_kind,identifier=EXCLUDED.identifier,title=EXCLUDED.title,"
+        "url=EXCLUDED.url,status_label=EXCLUDED.status_label,lifecycle=EXCLUDED.lifecycle,"
+        "due_at=EXCLUDED.due_at,priority_label=EXCLUDED.priority_label,"
+        "source_updated_at=EXCLUDED.source_updated_at,relations=EXCLUDED.relations,"
+        "project=EXCLUDED.project,facts=EXCLUDED.facts,index_run_id=EXCLUDED.index_run_id,indexed_at=now()"
+    )
+    while True:
+        rows = conn.execute(
+            "SELECT doc_id,source_id,title,author,occurred_at,ingested_at,raw_meta,props "
+            "FROM rvbbit.brain_documents WHERE source_id=%s AND deleted_at IS NULL AND doc_id>%s "
+            "ORDER BY doc_id LIMIT %s",
+            (profile["source_id"], cursor_doc_id, _BRIEF_WORK_INDEX_BATCH),
+        ).fetchall()
+        if not rows:
+            break
+        values = []
+        for row in rows:
+            item = _brief_work_index_item(row, profile, ZoneInfo("UTC"))
+            values.append((
+                item["doc_id"], item["source_id"], item["profile_doc_type"],
+                item["profile_shape_hash"], item["work_kind"], item.get("identifier"),
+                item["title"], item.get("url"), item.get("status_label"), item["lifecycle"],
+                item.get("due_at"), item.get("priority_label"), item.get("source_updated_at"),
+                json.dumps(item["relations"]), json.dumps(item["project"]),
+                json.dumps(item["facts"], default=str), run_id,
+            ))
+        with conn.cursor() as cursor:
+            cursor.executemany(upsert_sql, values)
+        indexed += len(values)
+        cursor_doc_id = int(rows[-1]["doc_id"])
+        if len(rows) < _BRIEF_WORK_INDEX_BATCH:
+            break
+    conn.execute(
+        "DELETE FROM rvbbit.calliope_brain_work_items "
+        "WHERE source_id=%s AND index_run_id<>%s::uuid",
+        (profile["source_id"], run_id),
+    )
+    conn.execute(
+        "UPDATE rvbbit.calliope_brain_work_profiles SET last_indexed_at=now(),"
+        "last_error=NULL,updated_at=now() WHERE source_id=%s AND doc_type=%s",
+        (profile["source_id"], profile["doc_type"]),
+    )
+    return {"status": "indexed", "source": source.get("label"), "indexed": indexed}
+
+
+def _brief_refresh_brain_work_index(
+    conn_factory: Callable[..., Any], owner: str | None = None,
+) -> list[str]:
+    """Lazily refresh changed source projections; old indexes survive failures."""
+    try:
+        with conn_factory() as conn:
+            sources = conn.execute(
+                "SELECT s.source_id,s.label,s.config,s.last_synced_at,"
+                "rvbbit.brain_doc_type(s.config) AS doc_type,"
+                "coalesce(p.observation_map,'{}'::jsonb) AS provider_observation_map,"
+                "coalesce(s.config->'observation_map','{}'::jsonb) AS source_observation_map,"
+                "count(d.doc_id) AS document_count,max(d.ingested_at) AS last_document_ingested_at "
+                "FROM rvbbit.brain_sources s "
+                "LEFT JOIN rvbbit.brain_doc_providers p ON p.provider=s.config->>'provider' "
+                "LEFT JOIN rvbbit.brain_documents d ON d.source_id=s.source_id AND d.deleted_at IS NULL "
+                "WHERE s.enabled AND rvbbit.brain_doc_type(s.config)<>'system_learning' "
+                "AND (%s::text IS NULL OR EXISTS ("
+                " SELECT 1 FROM rvbbit.brain_documents vd "
+                " JOIN rvbbit.brain_visible_docs(%s) vv ON vv.doc_id=vd.doc_id "
+                " WHERE vd.source_id=s.source_id AND vd.deleted_at IS NULL)) "
+                "GROUP BY s.source_id,s.label,s.config,s.last_synced_at,p.observation_map "
+                "ORDER BY coalesce(s.last_synced_at,s.created_at) DESC,s.source_id LIMIT %s",
+                (owner, owner, _BRIEF_MAX_SOURCES * 4),
+            ).fetchall()
+    except Exception as exc:
+        return [f"Assigned work discovery is unavailable: {type(exc).__name__}: {exc}"]
+    warnings = []
+    for source in sources:
+        try:
+            with conn_factory() as conn:
+                _brief_work_refresh_source(conn, dict(source))
+        except Exception as exc:
+            # A failed refresh intentionally leaves the prior atomic index in
+            # place.  The profile records the error for admin inspection.
+            try:
+                with conn_factory() as conn:
+                    conn.execute(
+                        "UPDATE rvbbit.calliope_brain_work_profiles SET last_error=%s,"
+                        "updated_at=now() WHERE source_id=%s",
+                        (f"{type(exc).__name__}: {exc}"[:1_000], source["source_id"]),
+                    )
+            except Exception:
+                pass
+            if len(warnings) < 4:
+                warnings.append(
+                    f"{source.get('label') or 'A work source'} could not refresh its work index: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+    return warnings
+
+
+def _brief_work_inventory(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    now: datetime,
+    zone: ZoneInfo,
+    aliases: dict[str, set[str]],
+    feedback: dict[str, str],
+) -> tuple[
+    list[dict[str, Any]], dict[str, Any], list[dict[str, Any]], list[str]
+]:
+    warnings = _brief_refresh_brain_work_index(conn_factory, owner)
+    directory_aliases, directory_warnings = _brief_directory_identity_aliases(
+        conn_factory, owner
+    )
+    warnings.extend(directory_warnings)
+    accepted_values = {owner.casefold()}
+    for values in [*aliases.values(), *directory_aliases.values()]:
+        accepted_values.update(str(value).casefold() for value in values if value)
+    local_name = re.sub(r"[._+\-]+", " ", owner.split("@", 1)[0]).strip().casefold()
+    local_compact = re.sub(r"[^a-z0-9]", "", local_name)
+    try:
+        with conn_factory() as conn:
+            profile_counts = conn.execute(
+                "SELECT count(*) FILTER (WHERE status='active') AS active,"
+                "count(*) FILTER (WHERE status='possible') AS possible,"
+                "count(*) FILTER (WHERE status='error' OR last_error IS NOT NULL) AS errors,"
+                "max(last_indexed_at) AS last_indexed_at "
+                "FROM rvbbit.calliope_brain_work_profiles p WHERE EXISTS ("
+                " SELECT 1 FROM rvbbit.brain_documents pd "
+                " JOIN rvbbit.brain_visible_docs(%s) pv ON pv.doc_id=pd.doc_id "
+                " WHERE pd.source_id=p.source_id AND pd.deleted_at IS NULL)",
+                (owner,),
+            ).fetchone() or {}
+            rows = conn.execute(
+                "WITH visible AS MATERIALIZED ("
+                " SELECT doc_id FROM rvbbit.brain_visible_docs(%s)),"
+                "candidate AS MATERIALIZED ("
+                " SELECT wi.*,s.label AS source,s.last_synced_at,"
+                " p.last_document_ingested_at,p.last_error AS profile_error "
+                " FROM rvbbit.calliope_brain_work_items wi "
+                " JOIN visible v ON v.doc_id=wi.doc_id "
+                " JOIN rvbbit.brain_sources s ON s.source_id=wi.source_id "
+                " JOIN rvbbit.calliope_brain_work_profiles p "
+                "   ON p.source_id=wi.source_id AND p.doc_type=wi.profile_doc_type "
+                " WHERE s.enabled AND rvbbit.brain_doc_type(s.config)<>'system_learning' "
+                " AND wi.lifecycle IN ('open','in_progress','blocked','review')"
+                ") SELECT DISTINCT c.* FROM candidate c "
+                "WHERE lower(coalesce(c.facts->>'viewer_scope','')) IN ('owner','viewer','personal') "
+                "OR EXISTS (SELECT 1 FROM jsonb_each(c.relations) role(role_name,buckets) "
+                " CROSS JOIN LATERAL jsonb_each(role.buckets) bucket(value_kind,values_json) "
+                " CROSS JOIN LATERAL jsonb_array_elements_text("
+                "   CASE WHEN jsonb_typeof(bucket.values_json)='array' "
+                "        THEN bucket.values_json ELSE '[]'::jsonb END) candidate_value "
+                " WHERE lower(candidate_value)=ANY(%s::text[]) "
+                "    OR (bucket.value_kind='names' AND %s<>'' AND "
+                "        regexp_replace(lower(candidate_value),'[^a-z0-9]','','g')=%s)) "
+                "ORDER BY c.due_at ASC NULLS LAST,c.source_updated_at DESC NULLS LAST,c.doc_id",
+                (owner, sorted(accepted_values), local_compact, local_compact),
+            ).fetchall()
+    except Exception as exc:
+        if not warnings:
+            warnings.append(
+                f"Assigned work inventory is unavailable: {type(exc).__name__}: {exc}"
+            )
+        return [], {
+            "available": False,
+            "summary": {},
+            "groups": {},
+            "items": [],
+            "sources": [],
+        }, [], warnings
+
+    def relation_values(
+        relations: dict[str, Any], role: str, kind: str
+    ) -> list[str]:
+        role_value = relations.get(role)
+        if not isinstance(role_value, dict):
+            return []
+        values = role_value.get(kind)
+        return _brief_text_values(values if isinstance(values, list) else [])
+
+    resolved = []
+    source_rollup: dict[str, dict[str, Any]] = {}
+    assigned_total = 0
+    possible_total = 0
+    overdue_total = 0
+    due_soon_total = 0
+    blocked_total = 0
+    review_total = 0
+    stale_total = 0
+    bucket_counts = {
+        "overdue": 0,
+        "blocked": 0,
+        "review": 0,
+        "due_soon": 0,
+        "open": 0,
+        "possible": 0,
+    }
+    now_utc = now.astimezone(timezone.utc)
+    for row in rows:
+        observation_key = f"brain:{row['doc_id']}"
+        if feedback.get(observation_key) == "not_mine":
+            continue
+        relations = row.get("relations") if isinstance(row.get("relations"), dict) else {}
+        facts = row.get("facts") if isinstance(row.get("facts"), dict) else {}
+        work_kind = str(row.get("work_kind") or "work_item")
+        source = re.sub(r"\s+", " ", str(row.get("source") or "Company work")).strip()[:240]
+        include_author = work_kind in {"pull_request", "change_request"}
+        author_emails = relation_values(relations, "author", "emails") if include_author else []
+        author_names = relation_values(relations, "author", "names") if include_author else []
+        author_ids = relation_values(relations, "author", "ids") if include_author else []
+        relation = _brief_viewer_relation(
+            owner,
+            source,
+            aliases=aliases,
+            directory_aliases=directory_aliases,
+            assignee_emails=relation_values(relations, "assignee", "emails"),
+            assignee_names=relation_values(relations, "assignee", "names"),
+            assignee_ids=relation_values(relations, "assignee", "ids"),
+            reviewer_emails=relation_values(relations, "reviewer", "emails"),
+            reviewer_names=relation_values(relations, "reviewer", "names"),
+            reviewer_ids=relation_values(relations, "reviewer", "ids"),
+            authors=[*author_emails, *author_names],
+            author_ids=author_ids,
+            viewer_scope=facts.get("viewer_scope"),
+        )
+        if not relation:
+            continue
+        confidence = str(relation.get("confidence") or "possible")
+        lifecycle = str(row.get("lifecycle") or "unknown")
+        due_at = _brief_parse_datetime(row.get("due_at"), zone, end_of_day=True)
+        source_updated_at = _brief_parse_datetime(row.get("source_updated_at"), zone)
+        fresh_at = (
+            _brief_parse_datetime(row.get("last_synced_at"), zone)
+            or _brief_parse_datetime(row.get("last_document_ingested_at"), zone)
+            or source_updated_at
+        )
+        stale = bool(
+            fresh_at
+            and (now_utc - fresh_at).total_seconds() > _BRIEF_WORK_STALE_SECONDS
+        )
+        possible = confidence == "possible"
+        overdue = bool(not possible and due_at and due_at < now_utc)
+        due_soon = bool(
+            not possible and due_at and now_utc <= due_at <= now_utc + timedelta(days=7)
+        )
+        review = bool(
+            not possible
+            and (lifecycle == "review" or relation.get("kind") == "review_requested")
+        )
+        blocked = bool(not possible and lifecycle == "blocked")
+        if possible:
+            bucket = "possible"
+            possible_total += 1
+        else:
+            assigned_total += 1
+            if overdue:
+                overdue_total += 1
+            if due_soon:
+                due_soon_total += 1
+            if blocked:
+                blocked_total += 1
+            if review:
+                review_total += 1
+            if overdue:
+                bucket = "overdue"
+            elif blocked:
+                bucket = "blocked"
+            elif review:
+                bucket = "review"
+            elif due_soon:
+                bucket = "due_soon"
+            else:
+                bucket = "open"
+        if stale:
+            stale_total += 1
+        bucket_counts[bucket] += 1
+        source_entry = source_rollup.setdefault(source, {
+            "label": source, "count": 0, "possible": 0, "stale": stale,
+        })
+        source_entry["count"] += 1
+        source_entry["possible"] += int(possible)
+        source_entry["stale"] = source_entry["stale"] or stale
+        identifier = str(row.get("identifier") or "").strip()[:160]
+        project = row.get("project") if isinstance(row.get("project"), dict) else {}
+        status_label = str(row.get("status_label") or lifecycle.replace("_", " ")).strip()[:160]
+        summary_parts = [f"Status: {status_label}."]
+        if project.get("name"):
+            summary_parts.append(f"Project: {str(project['name'])[:240]}.")
+        if row.get("priority_label"):
+            summary_parts.append(f"Priority: {str(row['priority_label'])[:120]}.")
+        if due_at:
+            summary_parts.append(
+                f"Due {due_at.astimezone(zone).strftime('%b %-d, %Y')}."
+            )
+        if stale:
+            summary_parts.append("This is the last known source state; its source sync is stale.")
+        brief_section = (
+            "possible" if possible
+            else "needs_now" if bucket in {"overdue", "blocked", "review"}
+            else "needs_now" if not due_at or due_at <= now_utc + timedelta(days=2)
+            else "coming_up"
+        )
+        item = {
+            "id": observation_key,
+            "group": "knowledge",
+            "kind": "document",
+            "handle": {"kind": "document", "doc_id": str(row["doc_id"]), "chunk_idx": 0},
+            "subtype": work_kind.replace("_", "-"),
+            "title": row.get("title") or identifier or "Assigned work",
+            "summary": " ".join(summary_parts)[:1_600],
+            "source": source,
+            "url": row.get("url"),
+            "occurred_at": source_updated_at.isoformat() if source_updated_at else None,
+            "provenance": {
+                "resolver": "brain_work_inventory",
+                "coverage_key": "brain-work",
+                "doc_id": str(row["doc_id"]),
+                "brief_section": brief_section,
+                "observation_key": observation_key,
+                "viewer_relation": relation,
+                "status": status_label,
+                "lifecycle": lifecycle,
+                "due_at": due_at.isoformat() if due_at else None,
+                "priority": row.get("priority_label"),
+                "identifier": identifier or None,
+                "project": project,
+                "work_bucket": bucket,
+                "source_stale": stale,
+                "source_fresh_at": fresh_at.isoformat() if fresh_at else None,
+                "profile_shape_hash": str(row.get("profile_shape_hash") or "")[:80],
+                "feedback_allowed": True,
+            },
+        }
+        resolved.append(item)
+
+    bucket_order = {
+        "overdue": 0, "blocked": 1, "review": 2,
+        "due_soon": 3, "open": 4, "possible": 5,
+    }
+    resolved.sort(key=lambda item: (
+        bucket_order.get(str((item.get("provenance") or {}).get("work_bucket")), 9),
+        _brief_parse_datetime((item.get("provenance") or {}).get("due_at"), zone)
+        or datetime.max.replace(tzinfo=timezone.utc),
+        str(item.get("source") or "").casefold(),
+        str(item.get("title") or "").casefold(),
+    ))
+    inventory_items = resolved[:_BRIEF_WORK_INVENTORY_LIMIT]
+    observations = resolved[:_BRIEF_WORK_OBSERVATION_LIMIT]
+    profile_active = max(0, int(profile_counts.get("active") or 0))
+    profile_possible = max(0, int(profile_counts.get("possible") or 0))
+    inventory = {
+        "available": bool(profile_active),
+        "summary": {
+            "open": assigned_total,
+            "overdue": overdue_total,
+            "due_soon": due_soon_total,
+            "blocked": blocked_total,
+            "review": review_total,
+            "possible": possible_total,
+            "stale": stale_total,
+            "shown": len(inventory_items),
+            "total": len(resolved),
+        },
+        "groups": bucket_counts,
+        "items": inventory_items,
+        "sources": sorted(
+            source_rollup.values(), key=lambda entry: (-entry["count"], entry["label"].casefold())
+        ),
+        "profiled_sources": profile_active,
+        "possible_sources": profile_possible,
+        "identity_directory_sources": len(directory_aliases),
+        "last_indexed_at": (
+            profile_counts.get("last_indexed_at").isoformat()
+            if isinstance(profile_counts.get("last_indexed_at"), datetime)
+            else str(profile_counts.get("last_indexed_at") or "") or None
+        ),
+        "truncated": len(resolved) > len(inventory_items),
+    }
+    coverage = []
+    if profile_active or resolved:
+        coverage.append({
+            "key": "brain-work",
+            "label": "Assigned work",
+            "count": len(observations),
+            "available": len(resolved),
+            "status": "ready",
+            "scope": "external",
+            "identity_needed": possible_total,
+            "identity_status": (
+                "mapped" if assigned_total
+                else "unresolved" if possible_total
+                else "not_person_mapped"
+            ),
+        })
+    return observations, inventory, coverage, warnings
 
 
 def _google_calendar_cipher():
@@ -7879,6 +9093,9 @@ def _personal_brief_snapshot(
     window_end = _brief_parse_datetime(brief.get("window_end"), zone) or generated_at + timedelta(days=_BRIEF_DEFAULT_FUTURE_DAYS)
     previous = _brief_previous_snapshot(conn_factory, owner, brief)
     aliases, feedback = _brief_identity_state(conn_factory, owner)
+    work_items, work_inventory, work_coverage, work_warnings = _brief_work_inventory(
+        conn_factory, owner, generated_at, zone, aliases, feedback
+    )
     brain_items, brain_coverage, brain_warnings = _brief_brain_observations(
         conn_factory, owner, window_start, window_end, generated_at, zone, aliases
     )
@@ -7909,7 +9126,9 @@ def _personal_brief_snapshot(
         )
     items = []
     seen = set()
-    for item in [*calendar_items, *brain_items, *internal_items, *note_items]:
+    for item in [
+        *calendar_items, *work_items, *brain_items, *internal_items, *note_items,
+    ]:
         key = str((item.get("provenance") or {}).get("observation_key") or item.get("id") or "")
         if not key or key in seen or feedback.get(key) == "not_mine":
             continue
@@ -7979,6 +9198,7 @@ def _personal_brief_snapshot(
     coverage = []
     for raw_source in [
         *calendar_coverage,
+        *work_coverage,
         *brain_coverage,
         *internal_coverage,
         *note_coverage,
@@ -8019,6 +9239,7 @@ def _personal_brief_snapshot(
         ],
         "warnings": [
             *calendar_warnings,
+            *work_warnings,
             *brain_warnings,
             *internal_warnings,
             *note_warnings,
@@ -8056,6 +9277,7 @@ def _personal_brief_snapshot(
             "person_mapped_source_count": person_mapped_sources,
             "comparison": comparison,
         },
+        "work_inventory": work_inventory,
         "coverage": coverage,
     }
 
@@ -11305,6 +12527,60 @@ def _normalize_evidence_search_result(
     }
 
 
+def _normalize_brief_work_inventory(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    items = []
+    seen = set()
+    for candidate in (raw.get("items") or [])[:_BRIEF_WORK_INVENTORY_LIMIT]:
+        if not isinstance(candidate, dict):
+            continue
+        normalized = _normalize_evidence_search_result(
+            {"items": [candidate]}, "Assigned work", max_results=1
+        ).get("items") or []
+        if not normalized or normalized[0]["id"] in seen:
+            continue
+        seen.add(normalized[0]["id"])
+        items.append(normalized[0])
+
+    def counts(value: Any) -> dict[str, int]:
+        raw_counts = value if isinstance(value, dict) else {}
+        return {
+            key: max(0, int(raw_counts.get(key) or 0))
+            for key in (
+                "open", "overdue", "due_soon", "blocked", "review", "possible",
+                "stale", "shown", "total",
+            )
+        }
+
+    groups_raw = raw.get("groups") if isinstance(raw.get("groups"), dict) else {}
+    groups = {
+        key: max(0, int(groups_raw.get(key) or 0))
+        for key in ("overdue", "blocked", "review", "due_soon", "open", "possible")
+    }
+    sources = []
+    for source in (raw.get("sources") or [])[:48]:
+        if not isinstance(source, dict):
+            continue
+        label = re.sub(r"\s+", " ", str(source.get("label") or "Work source")).strip()[:160]
+        sources.append({
+            "label": label,
+            "count": max(0, int(source.get("count") or 0)),
+            "possible": max(0, int(source.get("possible") or 0)),
+            "stale": bool(source.get("stale")),
+        })
+    return {
+        "available": bool(raw.get("available")),
+        "summary": counts(raw.get("summary")),
+        "groups": groups,
+        "items": items,
+        "sources": sources,
+        "profiled_sources": max(0, int(raw.get("profiled_sources") or 0)),
+        "possible_sources": max(0, int(raw.get("possible_sources") or 0)),
+        "last_indexed_at": str(raw.get("last_indexed_at") or "")[:100] or None,
+        "truncated": bool(raw.get("truncated")),
+    }
+
+
 def _normalize_personal_brief_result(value: Any) -> dict[str, Any]:
     """Freeze a resolver snapshot without turning it into agent-authored prose."""
     raw = value if isinstance(value, dict) else {}
@@ -11407,9 +12683,30 @@ def _normalize_personal_brief_result(value: Any) -> dict[str, Any]:
     normalized.update({
         "mode": "personal_brief",
         "brief": {key: item for key, item in brief.items() if item not in (None, "")},
+        "work_inventory": _normalize_brief_work_inventory(raw.get("work_inventory")),
         "coverage": coverage,
     })
     return normalized
+
+
+def _brief_payload_items(payload: Any) -> list[dict[str, Any]]:
+    """Expose compact and expanded Brief evidence through the same controls."""
+    if not isinstance(payload, dict):
+        return []
+    candidates = list(payload.get("items") or [])
+    work_inventory = payload.get("work_inventory")
+    if isinstance(work_inventory, dict):
+        candidates.extend(work_inventory.get("items") or [])
+    items = []
+    seen = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        evidence_id = str(candidate.get("id") or "")
+        if evidence_id and evidence_id not in seen:
+            seen.add(evidence_id)
+            items.append(candidate)
+    return items
 
 
 def _decode_evidence_handles(value: Any) -> list[dict[str, str]]:
@@ -11477,7 +12774,8 @@ def _hydrate_evidence_refs(
                         "resolver", "doc_id", "chunk_idx", "slug", "version",
                         "object_id", "node_id", "kind", "schema", "relation", "column",
                         "brief_section", "observation_key", "viewer_relation", "status",
-                        "due_at", "starts_at", "urgency", "session_id", "inbox_source",
+                        "lifecycle", "work_bucket", "priority", "identifier", "project",
+                        "source_stale", "due_at", "starts_at", "urgency", "session_id", "inbox_source",
                         "inbox_item_id", "home_item_id", "pinned_version", "tracking",
                         "note_id", "note_date", "calendar_id", "event_id", "ends_at",
                         "all_day", "entity_refs", "graph_context", "delta",
@@ -11535,7 +12833,7 @@ def _hydrate_evidence_refs(
             continue
         items = {
             str(item.get("id")): item
-            for item in (payload.get("items") or [])
+            for item in _brief_payload_items(payload)
             if isinstance(item, dict) and item.get("id")
         }
         item = items.get(handle["evidence_id"])
@@ -15839,7 +17137,7 @@ def register_calliope_routes(
             return json_response({"error": {"code": "BRIEF_ITEM_NOT_FOUND"}}, 404)
         item = next(
             (
-                candidate for candidate in (payload.get("items") or [])
+                candidate for candidate in _brief_payload_items(payload)
                 if isinstance(candidate, dict) and str(candidate.get("id")) == evidence_id
             ),
             None,
@@ -17585,7 +18883,7 @@ def register_calliope_routes(
         item = next(
             (
                 candidate
-                for candidate in ((row or {}).get("payload") or {}).get("items") or []
+                for candidate in _brief_payload_items((row or {}).get("payload") or {})
                 if isinstance(candidate, dict) and str(candidate.get("id") or "") == evidence_id
             ),
             None,

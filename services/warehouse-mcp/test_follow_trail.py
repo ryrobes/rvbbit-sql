@@ -108,6 +108,56 @@ def test_document_trail_uses_acl_brain_functions_and_explains_shared_context(mon
     assert related_doc["handle"] == {"kind": "document", "doc_id": 12}
     assert related_doc["shared"] == ["Atlas", "Q3"]
     assert {fact["label"]: fact["value"] for fact in result["facts"]}["Has Status"] == "at risk"
+    assert result["route_summary"] == {
+        "resolved": 2,
+        "limit": 12,
+        "bounded": False,
+        "sections": {
+            "meaning": 1,
+            "artifacts": 0,
+            "knowledge": 1,
+            "data": 0,
+        },
+    }
+
+
+def test_trail_route_summary_marks_a_full_neighborhood_as_bounded(monkeypatch):
+    connections = [
+        server._trail_connection(
+            "mentions",
+            f"Project {index}",
+            kind="project",
+            handle={"kind": "brain_entity", "label": f"Project {index}"},
+            section="meaning" if index < 3 else "knowledge",
+        )
+        for index in range(4)
+    ]
+    monkeypatch.setattr(server, "_trail_document", lambda *_args: (
+        {
+            "kind": "document",
+            "label": "Portfolio review",
+            "handle": {"kind": "document", "doc_id": 99},
+        },
+        [],
+        connections,
+        ["document brain"],
+    ))
+
+    result = server._calliope_follow_trail(
+        {"kind": "document", "doc_id": 99}, "analyst@example.com", 4,
+    )
+
+    assert result["route_summary"] == {
+        "resolved": 4,
+        "limit": 4,
+        "bounded": True,
+        "sections": {
+            "meaning": 3,
+            "artifacts": 0,
+            "knowledge": 1,
+            "data": 0,
+        },
+    }
 
 
 def test_catalog_trail_turns_edges_into_ranked_plain_language_hops(monkeypatch):
@@ -347,13 +397,31 @@ def test_search_normalizer_preserves_rehydratable_trail_handle():
 def test_trail_affordance_is_shared_by_home_search_documents_and_lens():
     landing = (HERE / "server.py").read_text(encoding="utf-8")
     calliope_js = (HERE / "calliope" / "calliope.js").read_text(encoding="utf-8")
+    calliope_css = (HERE / "calliope" / "calliope.css").read_text(encoding="utf-8")
     lens_js = (HERE / "theme" / "artifact-lens.js").read_text(encoding="utf-8")
+    lens_css = (HERE / "theme" / "artifact-lens.css").read_text(encoding="utf-8")
 
     assert '@m.custom_route("/api/calliope/trails", methods=["POST"])' in landing
     assert 'id="trail-dialog"' in landing
     assert "data-home-trail" in landing
+    assert "trailLoomMarkup()" in landing
+    assert "followTrailConnection(connection)" in landing
+    assert "data-trail-step" in landing
+    assert "{handle:handle,limit:24}" in landing
     assert "data-follow-evidence" in calliope_js
     assert "data-viewer-document-trail" in calliope_js
-    assert "openTrailViewer(connection.handle)" in calliope_js
+    assert "viewerTrailLoomMarkup()" in calliope_js
+    assert "followViewerTrailConnection(connection)" in calliope_js
+    assert "data-viewer-trail-step" in calliope_js
+    assert "JSON.stringify({ handle, limit: 24 })" in calliope_js
+    assert ".viewer-trail-loom" in calliope_css
+    assert ".viewer-trail-route-context" in calliope_css
     assert '<button type="button" class="trail-follow">Follow trail</button>' in lens_js
     assert "data-lens-trail-hop" in lens_js
+    assert "lensTrailLoomMarkup()" in lens_js
+    assert "followLensTrailConnection(connection, hop)" in lens_js
+    assert "data-lens-trail-step" in lens_js
+    assert "JSON.stringify({ handle, limit: 24 })" in lens_js
+    assert ".lens-trail-loom" in lens_css
+    assert ".lens-trail-route-context" in lens_css
+    assert ".slice(0, 9)" not in lens_js

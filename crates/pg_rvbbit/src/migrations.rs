@@ -973,6 +973,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0238_calliope_calendar_graph_context",
         include_str!("../sql/migrations/0238_calliope_calendar_graph_context.sql"),
     ),
+    (
+        "0239_calliope_brain_work_inventory",
+        include_str!("../sql/migrations/0239_calliope_brain_work_inventory.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

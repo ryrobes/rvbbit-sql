@@ -1413,6 +1413,136 @@ select {
   color: var(--lens-fog);
 }
 
+.lens-trail-loom {
+  display: grid;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid rgba(104, 199, 178, .2);
+  border-radius: 11px;
+  background: linear-gradient(145deg, rgba(104, 199, 178, .045), rgba(0, 0, 0, .12));
+}
+
+.lens-trail-loom > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--lens-dim);
+  font: 5.5px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.lens-trail-loom > header span {
+  flex: none;
+  color: var(--lens-jade);
+  font-weight: 700;
+  letter-spacing: .1em;
+}
+
+.lens-trail-loom > header b {
+  font-weight: 500;
+  text-align: right;
+}
+
+.lens-trail-loom-track {
+  display: grid;
+  gap: 4px;
+}
+
+.lens-trail-loom-step {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 8px;
+  padding: 8px;
+  border: 1px solid var(--lens-line);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, .13);
+  color: var(--lens-fog);
+  text-align: left;
+  cursor: pointer;
+}
+
+.lens-trail-loom-step:hover {
+  border-color: rgba(104, 199, 178, .42);
+}
+
+.lens-trail-loom-step.current {
+  border-color: rgba(104, 199, 178, .5);
+  background: rgba(104, 199, 178, .07);
+}
+
+.lens-trail-loom-step small {
+  color: var(--lens-dim);
+  font: 5.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.lens-trail-loom-step strong {
+  grid-column: 1;
+  overflow: hidden;
+  color: var(--lens-bone);
+  font-size: 8.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lens-trail-loom-step > span {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  color: var(--lens-fog);
+  font: 5.5px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: nowrap;
+}
+
+.lens-trail-loom-step em {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  font-style: normal;
+}
+
+.lens-trail-loom-step em i {
+  padding: 3px 4px;
+  border: 1px solid var(--lens-line);
+  border-radius: 999px;
+  color: var(--lens-dim);
+  font: 5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-style: normal;
+}
+
+.lens-trail-loom-step u {
+  grid-column: 1 / -1;
+  color: var(--lens-jade);
+  font: 650 5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: .08em;
+  text-decoration: none;
+  text-transform: uppercase;
+}
+
+.lens-trail-loom-link {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding-left: 8px;
+  color: var(--lens-dim);
+}
+
+.lens-trail-loom-link b {
+  font: 5.5px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 500;
+}
+
+.lens-trail-loom-link i {
+  color: var(--lens-jade);
+  font: 8px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-style: normal;
+}
+
 .lens-trail > header {
   padding: 11px;
   border: 1px solid rgba(104, 199, 178, .27);
@@ -1465,7 +1595,30 @@ select {
   text-transform: uppercase;
 }
 
-.lens-trail > section {
+.lens-trail-group {
+  display: grid;
+  gap: 5px;
+}
+
+.lens-trail-group > h4 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0 0;
+  color: var(--lens-jade);
+  font: 650 5.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+}
+
+.lens-trail-group > h4::after {
+  height: 1px;
+  flex: 1;
+  background: var(--lens-line);
+  content: "";
+}
+
+.lens-trail-group > section {
   display: grid;
   gap: 5px;
 }
@@ -1503,6 +1656,24 @@ select {
   line-height: 1.4;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+.lens-trail-route-context {
+  display: inline-flex;
+  margin-top: 5px;
+  padding: 3px 4px;
+  border: 1px solid rgba(232, 173, 74, .3);
+  border-radius: 999px;
+  background: rgba(232, 173, 74, .07);
+  color: var(--lens-amber);
+  font: 5.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-style: normal;
+}
+
+.lens-trail-route-context.return {
+  border-color: rgba(104, 199, 178, .34);
+  background: rgba(104, 199, 178, .06);
+  color: var(--lens-jade);
 }
 
 .lens-trail article footer {

@@ -52,6 +52,270 @@ def test_personal_brief_schema_and_provider_projection_are_migrated_and_self_hea
     assert "conn.execute(_BRIEF_DDL)" in inspect.getsource(calliope.ensure_tables)
 
 
+def test_brain_work_projection_schema_is_registered_and_runtime_self_healing():
+    migration = (
+        ROOT / "crates" / "pg_rvbbit" / "sql" / "migrations"
+        / "0239_calliope_brain_work_inventory.sql"
+    ).read_text(encoding="utf-8")
+    registry = (ROOT / "crates" / "pg_rvbbit" / "src" / "migrations.rs").read_text(
+        encoding="utf-8"
+    )
+    upgrade = (
+        ROOT / "crates" / "pg_rvbbit" / "sql" / "pg_rvbbit--4.2.8--4.2.9.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "CREATE TABLE IF NOT EXISTS rvbbit.calliope_brain_work_profiles" in migration
+    assert "CREATE TABLE IF NOT EXISTS rvbbit.calliope_brain_work_items" in migration
+    assert "owner_email" not in migration  # ownership is deliberately read-time only
+    assert "assignee_ids" in migration
+    assert "$.state.type" in migration
+    assert "0239_calliope_brain_work_inventory" in registry
+    assert "identity_directory" in migration
+    assert "linear_getUsers" in migration
+    assert "linear_getUsers" in upgrade
+    assert "CREATE TABLE IF NOT EXISTS rvbbit.calliope_brain_work_profiles" in calliope._BRAIN_WORK_DDL
+    assert "linear_getUsers" in calliope._BRAIN_WORK_DDL
+    ensure_source = inspect.getsource(calliope.ensure_tables)
+    assert "conn.execute(_BRAIN_WORK_DDL)" in ensure_source
+    assert "SELECT rvbbit.migrate()" not in ensure_source
+
+
+@pytest.mark.parametrize(
+    ("source", "props", "expected_kind", "expected_lifecycle"),
+    [
+        (
+            {"source_id": 1, "doc_type": "document", "document_count": 12},
+            {
+                "key": "OPS-42",
+                "self": "https://jira.example.test/rest/api/issue/OPS-42",
+                "fields": {
+                    "status": {
+                        "name": "In Progress",
+                        "statusCategory": {"key": "indeterminate"},
+                    },
+                    "assignee": {
+                        "displayName": "Ryan R",
+                        "emailAddress": "ryan@example.com",
+                        "accountId": "jira-user-1",
+                    },
+                    "updated": "2026-08-01T12:00:00Z",
+                    "priority": {"name": "High"},
+                },
+            },
+            "issue",
+            "in_progress",
+        ),
+        (
+            {"source_id": 2, "doc_type": "document", "document_count": 8},
+            {
+                "number": 81,
+                "state": "open",
+                "html_url": "https://github.example.test/acme/repo/pull/81",
+                "updated_at": "2026-08-01T12:00:00Z",
+                "requested_reviewers": [{"login": "ryanr", "id": 77}],
+                "user": {"login": "author", "id": 88},
+                "pull_request": {"url": "https://api.github.example.test/pulls/81"},
+            },
+            "pull_request",
+            "open",
+        ),
+        (
+            {"source_id": 3, "doc_type": "document", "document_count": 25},
+            {
+                "number": "INC0010042",
+                "sys_id": "snow-42",
+                "active": True,
+                "state": {"display_value": "New", "value": "1"},
+                "assigned_to": {"display_value": "Ryan R", "value": "snow-user-1"},
+                "sys_updated_on": "2026-08-01 12:00:00",
+                "priority": {"display_value": "2 - High"},
+            },
+            "ticket",
+            "open",
+        ),
+    ],
+)
+def test_work_shape_profiler_recognizes_common_systems_without_provider_code(
+    source, props, expected_kind, expected_lifecycle
+):
+    profile = calliope._brief_work_profile(source, [{"props": props}])
+    item = calliope._brief_work_index_item(
+        {
+            "doc_id": source["source_id"],
+            "source_id": source["source_id"],
+            "title": "Structured work record",
+            "author": None,
+            "occurred_at": None,
+            "ingested_at": "2026-08-01T12:00:00Z",
+            "props": props,
+            "raw_meta": {},
+        },
+        profile,
+        ZoneInfo("UTC"),
+    )
+
+    assert profile["status"] == "active"
+    assert profile["confidence"] >= 0.7
+    assert profile["work_kind"] == expected_kind
+    assert profile["profile_source"] == "inferred"
+    assert item["lifecycle"] == expected_lifecycle
+    assert item["relations"]
+
+
+def test_work_profiler_does_not_mistake_meetings_for_assigned_work():
+    profile = calliope._brief_work_profile(
+        {"source_id": 4, "doc_type": "meeting", "document_count": 50},
+        [{"props": {
+            "dateString": "2026-08-04T15:00:00Z",
+            "meetingLink": "https://meet.example.test/4",
+            "participants": ["owner@example.com"],
+            "organizerEmail": "owner@example.com",
+        }}],
+    )
+
+    assert profile["status"] == "ignored"
+    assert profile["qualification"]["lifecycle"] is False
+
+
+def test_work_inventory_reapplies_brain_acl_and_keeps_old_open_assignments(monkeypatch):
+    now = datetime(2026, 8, 3, 15, tzinfo=timezone.utc)
+    rows = [
+        {
+            "doc_id": 101,
+            "source_id": 8,
+            "profile_doc_type": "ticket",
+            "profile_shape_hash": "linear-shape",
+            "work_kind": "ticket",
+            "identifier": "ENG-101",
+            "title": "Old but still open",
+            "url": "https://linear.example.test/ENG-101",
+            "status_label": "In Progress",
+            "lifecycle": "in_progress",
+            "due_at": now - timedelta(days=2),
+            "priority_label": "High",
+            "source_updated_at": now - timedelta(days=90),
+            "relations": {
+                "assignee": {
+                    "ids": ["linear-owner-1"],
+                    "names": ["Owner Person"],
+                }
+            },
+            "project": {"name": "Warehouse"},
+            "facts": {},
+            "source": "Linear",
+            "last_synced_at": now - timedelta(hours=1),
+            "last_document_ingested_at": now - timedelta(hours=1),
+            "profile_error": None,
+        },
+        {
+            "doc_id": 102,
+            "source_id": 8,
+            "profile_doc_type": "ticket",
+            "profile_shape_hash": "linear-shape",
+            "work_kind": "ticket",
+            "identifier": "ENG-102",
+            "title": "Possible display-name assignment",
+            "url": "https://linear.example.test/ENG-102",
+            "status_label": "Todo",
+            "lifecycle": "open",
+            "due_at": None,
+            "priority_label": None,
+            "source_updated_at": now - timedelta(days=45),
+            "relations": {"assignee": {"names": ["Owner"]}},
+            "project": {},
+            "facts": {},
+            "source": "Linear",
+            "last_synced_at": now - timedelta(hours=1),
+            "last_document_ingested_at": now - timedelta(hours=1),
+            "profile_error": None,
+        },
+    ]
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            if "FROM rvbbit.calliope_brain_work_profiles" in query and "FILTER" in query:
+                return _Result({
+                    "active": 1, "possible": 0, "errors": 0,
+                    "last_indexed_at": now - timedelta(hours=1),
+                })
+            if "WITH visible AS MATERIALIZED" in query:
+                assert "rvbbit.brain_visible_docs(%s)" in query
+                assert "wi.lifecycle IN ('open','in_progress','blocked','review')" in query
+                assert params[0] == "owner@example.com"
+                assert "linear-owner-1" in params[1]
+                return _Result(rows)
+            raise AssertionError(query)
+
+    monkeypatch.setattr(calliope, "_brief_refresh_brain_work_index", lambda *_args: [])
+    monkeypatch.setattr(
+        calliope,
+        "_brief_directory_identity_aliases",
+        lambda *_args: ({"linear": {"linear-owner-1", "owner person"}}, []),
+    )
+    observations, inventory, coverage, warnings = calliope._brief_work_inventory(
+        Connection,
+        "owner@example.com",
+        now,
+        ZoneInfo("UTC"),
+        {"*": {"owner@example.com"}},
+        {},
+    )
+
+    assert warnings == []
+    assert [item["id"] for item in observations] == ["brain:101", "brain:102"]
+    assert inventory["summary"] == {
+        "open": 1,
+        "overdue": 1,
+        "due_soon": 0,
+        "blocked": 0,
+        "review": 0,
+        "possible": 1,
+        "stale": 0,
+        "shown": 2,
+        "total": 2,
+    }
+    assert inventory["groups"]["overdue"] == 1
+    assert inventory["groups"]["possible"] == 1
+    assert observations[0]["provenance"]["brief_section"] == "needs_now"
+    assert observations[0]["provenance"]["viewer_relation"]["resolver"] == "identity_directory"
+    assert observations[1]["provenance"]["viewer_relation"]["confidence"] == "possible"
+    assert coverage[0]["identity_status"] == "mapped"
+
+
+def test_expanded_work_inventory_survives_normalization_and_is_openable():
+    raw_items = [{
+        "id": f"brain:{index}",
+        "group": "knowledge",
+        "kind": "document",
+        "handle": {"kind": "document", "doc_id": str(index), "chunk_idx": 0},
+        "title": f"Work {index}",
+        "source": "Generic work",
+        "provenance": {"work_bucket": "open", "observation_key": f"brain:{index}"},
+    } for index in range(100)]
+    normalized = calliope._normalize_brief_work_inventory({
+        "available": True,
+        "summary": {"open": 100, "shown": 100, "total": 100},
+        "groups": {"open": 100},
+        "items": raw_items,
+    })
+    payload = {"items": raw_items[:24], "work_inventory": normalized}
+
+    assert len(normalized["items"]) == 100
+    assert len(calliope._brief_payload_items(payload)) == 100
+    script = (HERE / "calliope" / "calliope.js").read_text(encoding="utf-8")
+    css = (HERE / "calliope" / "calliope.css").read_text(encoding="utf-8")
+    assert "function renderBriefWork(surface)" in script
+    assert "function surfaceEvidenceItems(surface)" in script
+    assert 'data-brief-feedback="relevant"' in script
+    assert ".brief-work-inventory" in css
+
+
 def test_brief_sessions_have_stable_summary_metadata_and_a_session_tab():
     session_id = uuid.uuid4()
     brief_id = uuid.uuid4()
@@ -79,6 +343,16 @@ def test_brief_sessions_have_stable_summary_metadata_and_a_session_tab():
     assert ".session-tabs" in css
     assert ".session-tab-panel" in css
     assert ".brief-session-card" in css
+
+
+def test_daily_brief_stage_renders_sections_once_and_hides_superseded_snapshots():
+    script = (HERE / "calliope" / "calliope.js").read_text(encoding="utf-8")
+
+    assert "function visibleStageSurfaces()" in script
+    assert 'surface.payload?.mode !== "personal_brief" || surface.id === latest.id' in script
+    assert "const visibleSurfaces = visibleStageSurfaces();" in script
+    assert "${sections}" in script
+    assert "Work index healthy · identity not mapped" in script
 
 
 def test_observation_map_and_identity_resolution_stay_generic_and_explainable():
@@ -123,6 +397,88 @@ def test_observation_map_and_identity_resolution_stay_generic_and_explainable():
         assignee_names=["Ryan R"],
     )
     assert confirmed["confidence"] == "confirmed"
+
+    external_username = calliope._brief_viewer_relation(
+        "ryan.r@example.com",
+        "GitHub pull requests",
+        aliases={"*": {"ryan.r@example.com"}},
+        reviewer_ids=["ryanr"],
+    )
+    assert external_username["confidence"] == "possible"
+    assert external_username["alias_kind"] == "external_id"
+
+
+def test_provider_directory_resolves_oauth_email_to_external_assignment_identity():
+    owner = "owner@example.com"
+    external_id = "linear-owner-1"
+    directory = {
+        "server": "linear",
+        "tool": "linear_getUsers",
+        "args": {},
+        "email_paths": ["$.email"],
+        "aliases": {
+            "external_id": ["$.id"],
+            "name": ["$.name", "$.displayName"],
+        },
+        "ttl_seconds": 900,
+    }
+    calls = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            if "FROM rvbbit.calliope_brain_work_profiles wp" in query:
+                assert params == (owner,)
+                return _Result({
+                    "source_id": 8,
+                    "label": "Linear · all",
+                    "identity_directory": directory,
+                })
+            if "FROM rvbbit.mcp_rows" in query:
+                calls.append((query, params))
+                assert params[:3] == ("linear", "linear_getUsers", "{}")
+                return _Result([
+                    {"identity_record": {
+                        "id": external_id,
+                        "name": "Owner Person",
+                        "displayName": "owner",
+                        "email": owner,
+                    }},
+                    {"identity_record": {
+                        "id": "linear-other-1",
+                        "name": "Other Person",
+                        "email": "other@example.com",
+                    }},
+                ])
+            raise AssertionError(query)
+
+    calliope._BRIEF_IDENTITY_DIRECTORY_CACHE.clear()
+    aliases, warnings = calliope._brief_directory_identity_aliases(Connection, owner)
+    aliases_again, warnings_again = calliope._brief_directory_identity_aliases(
+        Connection, owner
+    )
+
+    assert warnings == warnings_again == []
+    assert aliases == aliases_again == {
+        "linear · all": {external_id, "owner person", "owner"}
+    }
+    assert len(calls) == 1  # the bounded directory result is cached, not refetched
+    relation = calliope._brief_viewer_relation(
+        owner,
+        "Linear · all",
+        aliases={"*": {owner}},
+        directory_aliases=aliases,
+        assignee_ids=[external_id],
+    )
+    assert relation["confidence"] == "exact"
+    assert relation["truth"] == "resolved"
+    assert relation["resolver"] == "identity_directory"
+    assert "OAuth email" in relation["evidence"]
 
 
 def test_time_bounded_snapshot_filters_user_feedback_and_preserves_truth_sections(monkeypatch):

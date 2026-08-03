@@ -2974,6 +2974,103 @@
       };
     }
 
+    function lensTrailStableValue(value) {
+      if (Array.isArray(value)) return `[${value.map(lensTrailStableValue).join(",")}]`;
+      if (value && typeof value === "object") {
+        return `{${Object.keys(value).sort().map((key) => (
+          `${JSON.stringify(key)}:${lensTrailStableValue(value[key])}`
+        )).join(",")}}`;
+      }
+      return JSON.stringify(value);
+    }
+
+    function lensTrailHandleKey(handle) {
+      return lensTrailStableValue(handle || {});
+    }
+
+    function lensTrailFrameIndex(handle) {
+      const key = lensTrailHandleKey(handle);
+      return trailHistory.findIndex((frame) => lensTrailHandleKey(frame.handle) === key);
+    }
+
+    function lensTrailSectionLabel(section) {
+      return ({
+        meaning: "What it means",
+        artifacts: "Where it lives",
+        knowledge: "What the company knows",
+        data: "What it is built from",
+      })[section] || "Related evidence";
+    }
+
+    function lensTrailRouteSummary(data) {
+      const connections = data?.connections || [];
+      const raw = data?.route_summary || {};
+      const sections = { meaning: 0, artifacts: 0, knowledge: 0, data: 0 };
+      connections.forEach((connection) => {
+        const section = connection.section || "knowledge";
+        sections[section] = (sections[section] || 0) + 1;
+      });
+      if (raw.sections) {
+        Object.keys(sections).forEach((section) => {
+          sections[section] = Number(raw.sections[section] || 0);
+        });
+      }
+      return {
+        resolved: Number(raw.resolved ?? connections.length),
+        bounded: Boolean(raw.bounded),
+        sections,
+      };
+    }
+
+    function lensTrailConnectionContext(handle) {
+      const key = lensTrailHandleKey(handle);
+      const pathStep = lensTrailFrameIndex(handle);
+      if (pathStep >= 0) {
+        return { kind: "return", step: pathStep, label: `Returns to step ${pathStep + 1}` };
+      }
+      for (let step = 0; step < trailHistory.length - 1; step += 1) {
+        const found = (trailHistory[step].data?.connections || []).some(
+          (connection) => lensTrailHandleKey(connection.handle) === key,
+        );
+        if (found) {
+          return { kind: "converges", step, label: `Also reachable from step ${step + 1}` };
+        }
+      }
+      return null;
+    }
+
+    function lensTrailLoomMarkup() {
+      if (!trailHistory.length) return "";
+      const retained = trailHistory.reduce(
+        (total, frame) => total + lensTrailRouteSummary(frame.data).resolved,
+        0,
+      );
+      const steps = trailHistory.map((frame, index) => {
+        const subject = frame.data?.subject || {};
+        const summary = lensTrailRouteSummary(frame.data);
+        const current = index === trailHistory.length - 1;
+        const mixes = [
+          ["meaning", "Meaning"], ["artifacts", "Places"],
+          ["knowledge", "Knowledge"], ["data", "Data"],
+        ].map(([section, label]) => (
+          summary.sections[section] ? `<i>${label} ${summary.sections[section]}</i>` : ""
+        )).join("");
+        const link = index && frame.via
+          ? `<span class="lens-trail-loom-link"><b>${escapeHtml(frame.via.relationship || "related to")}</b><i>↓</i></span>`
+          : "";
+        return `${link}<button type="button" class="lens-trail-loom-step${current ? " current" : ""}" data-lens-trail-step="${index}"${current ? ' aria-current="step"' : ""}>
+          <small>${escapeHtml(String(subject.kind || "evidence").replaceAll("_", " "))}</small>
+          <strong>${escapeHtml(subject.label || "Evidence")}</strong>
+          <span>${summary.resolved}${summary.bounded ? "+" : ""} nearby route${summary.resolved === 1 ? "" : "s"}</span>
+          ${mixes ? `<em>${mixes}</em>` : ""}${current ? "<u>You are here</u>" : ""}
+        </button>`;
+      }).join("");
+      return `<nav class="lens-trail-loom" aria-label="How you got here">
+        <header><span>How you got here</span><b>${trailHistory.length} step${trailHistory.length === 1 ? "" : "s"} · ${retained} route choice${retained === 1 ? "" : "s"} retained</b></header>
+        <div class="lens-trail-loom-track">${steps}</div>
+      </nav>`;
+    }
+
     function renderLensTrail(data) {
       const root = traceResult.querySelector(".lens-trail");
       if (!root) return;
@@ -2982,25 +3079,55 @@
       const facts = (data.facts || []).slice(0, 4).map((fact) => (
         `<span><b>${escapeHtml(fact.label)}</b>${escapeHtml(fact.value)}</span>`
       )).join("");
-      const connections = (data.connections || []).slice(0, 9).map((connection, index) => (
-        `<article><div><span>${escapeHtml(connection.relationship || "related to")}</span>`
-        + `<strong>${escapeHtml(connection.label || "Related evidence")}</strong>`
-        + `${connection.detail ? `<small>${escapeHtml(connection.detail)}</small>` : ""}</div>`
-        + `<footer><button type="button" data-lens-trail-hop="${index}">Follow</button>`
-        + `${connection.url ? `<a href="${escapeHtml(connection.url)}" target="_blank" rel="noopener">Open ↗</a>` : ""}</footer></article>`
-      )).join("");
+      const groups = new Map();
+      (data.connections || []).forEach((connection, index) => {
+        const section = connection.section || "knowledge";
+        if (!groups.has(section)) groups.set(section, []);
+        groups.get(section).push({ connection, index });
+      });
+      const connections = ["meaning", "artifacts", "knowledge", "data"].map((section) => {
+        const items = groups.get(section) || [];
+        if (!items.length) return "";
+        return `<div class="lens-trail-group"><h4>${lensTrailSectionLabel(section)}</h4><section>${items.map(({ connection, index }) => {
+          const context = lensTrailConnectionContext(connection.handle);
+          return `<article><div><span>${escapeHtml(connection.relationship || "related to")}</span>`
+            + `<strong>${escapeHtml(connection.label || "Related evidence")}</strong>`
+            + `${connection.detail ? `<small>${escapeHtml(connection.detail)}</small>` : ""}`
+            + `${context ? `<em class="lens-trail-route-context ${context.kind}">${escapeHtml(context.label)}</em>` : ""}</div>`
+            + `<footer><button type="button" data-lens-trail-hop="${index}">${context?.kind === "return" ? "Return" : "Follow"}</button>`
+            + `${connection.url ? `<a href="${escapeHtml(connection.url)}" target="_blank" rel="noopener">Open ↗</a>` : ""}</footer></article>`;
+        }).join("")}</section></div>`;
+      }).join("");
+      const routeSummary = lensTrailRouteSummary(data);
       root.hidden = false;
-      root.innerHTML = `${trailHistory.length > 1 ? '<button type="button" class="lens-trail-back">← Back</button>' : ""}`
-        + `<header><span>Evidence trail</span><strong>${escapeHtml(subject.label || "Selected evidence")}</strong>`
+      root.innerHTML = `${trailHistory.length > 1 ? '<button type="button" class="lens-trail-back">← Previous breadcrumb</button>' : ""}`
+        + lensTrailLoomMarkup()
+        + `<header><span>Current evidence · ${routeSummary.resolved}${routeSummary.bounded ? "+" : ""} nearby route${routeSummary.resolved === 1 ? "" : "s"}</span><strong>${escapeHtml(subject.label || "Selected evidence")}</strong>`
         + `${subject.detail ? `<p>${escapeHtml(subject.detail)}</p>` : ""}${facts ? `<div>${facts}</div>` : ""}</header>`
-        + (connections ? `<section>${connections}</section>` : '<p class="lens-trail-empty">No further breadcrumbs surfaced.</p>');
+        + (connections || '<p class="lens-trail-empty">No further breadcrumbs surfaced. This object is still a valid endpoint.</p>');
       window.requestAnimationFrame(() => {
         traceView.scrollTop = traceView.scrollHeight;
       });
       window.requestAnimationFrame(constrainLens);
     }
 
-    async function followTrail(handle, button = null, push = true) {
+    function showLensTrailStep(index) {
+      if (index < 0 || index >= trailHistory.length) return;
+      trailHistory = trailHistory.slice(0, index + 1);
+      renderLensTrail(trailHistory[index].data);
+    }
+
+    function followLensTrailConnection(connection, button = null) {
+      if (!connection?.handle) return;
+      const earlier = lensTrailFrameIndex(connection.handle);
+      if (earlier >= 0) {
+        showLensTrailStep(earlier);
+        return;
+      }
+      followTrail(connection.handle, button, { via: connection });
+    }
+
+    async function followTrail(handle, button = null, { push = true, via = null } = {}) {
       if (!handle) return;
       const root = traceResult.querySelector(".lens-trail");
       const request = ++trailRequest;
@@ -3016,10 +3143,25 @@
         const data = await fetchJson("/api/calliope/trails", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ handle, limit: 12 }),
+          body: JSON.stringify({ handle, limit: 24 }),
         });
         if (request !== trailRequest) return;
-        if (push) trailHistory.push(handle);
+        const canonical = data.subject?.handle || handle;
+        if (push) {
+          const earlier = lensTrailFrameIndex(canonical);
+          if (earlier >= 0) {
+            trailHistory = trailHistory.slice(0, earlier + 1);
+            trailHistory[earlier].data = data;
+          } else {
+            trailHistory.push({ handle: canonical, data, via });
+          }
+        } else if (trailHistory.length) {
+          const frame = trailHistory.at(-1);
+          frame.handle = canonical;
+          frame.data = data;
+        } else {
+          trailHistory.push({ handle: canonical, data, via });
+        }
         renderLensTrail(data);
         if (button) button.textContent = "Trail open";
       } catch (error) {
@@ -3075,7 +3217,7 @@
       const trail = event.target.closest(".trail-follow");
       if (trail) {
         trailHistory = [];
-        followTrail(currentTrailHandle(), trail, true);
+        followTrail(currentTrailHandle(), trail);
         return;
       }
       if (event.target.closest(".watch-open")) {
@@ -3104,15 +3246,19 @@
       }
       if (event.target.closest(".lens-trail-back")) {
         if (trailHistory.length > 1) {
-          trailHistory.pop();
-          followTrail(trailHistory.at(-1), null, false);
+          showLensTrailStep(trailHistory.length - 2);
         }
+        return;
+      }
+      const trailStep = event.target.closest("[data-lens-trail-step]");
+      if (trailStep) {
+        showLensTrailStep(Number(trailStep.dataset.lensTrailStep));
         return;
       }
       const hop = event.target.closest("[data-lens-trail-hop]");
       if (hop && currentTrail) {
         const connection = (currentTrail.connections || [])[Number(hop.dataset.lensTrailHop)];
-        if (connection?.handle) followTrail(connection.handle, hop, true);
+        followLensTrailConnection(connection, hop);
         return;
       }
       const homePin = event.target.closest(".home-pin");

@@ -3866,8 +3866,23 @@
     toast("Notebook archived");
   }
 
+  function visibleStageSurfaces() {
+    const briefs = state.surfaces.filter(
+      (surface) => surface.kind === "evidence" && surface.payload?.mode === "personal_brief",
+    );
+    if (briefs.length <= 1) return state.surfaces;
+    const latest = [...briefs].sort((left, right) => {
+      const created = new Date(right.created_at || 0).getTime()
+        - new Date(left.created_at || 0).getTime();
+      return created || String(right.id || "").localeCompare(String(left.id || ""));
+    })[0];
+    return state.surfaces.filter(
+      (surface) => surface.payload?.mode !== "personal_brief" || surface.id === latest.id,
+    );
+  }
+
   function surfacesForTurn(turnId) {
-    return state.surfaces
+    return visibleStageSurfaces()
       .filter((surface) => surface.turn_id === turnId)
       .sort((left, right) => {
         const ordinal = Number(right.ordinal || 0) - Number(left.ordinal || 0);
@@ -6200,6 +6215,94 @@
     </div>`;
   }
 
+  const BRIEF_WORK_GROUPS = [
+    ["overdue", "Overdue", "Past a source-provided due date"],
+    ["blocked", "Blocked", "Waiting or explicitly blocked"],
+    ["review", "Review", "Review or approval requested"],
+    ["due_soon", "Due soon", "Due in the next seven days"],
+    ["open", "Open", "Active, with no nearer signal"],
+    ["possible", "Possible matches", "Confirm before Calliope treats these as yours"],
+  ];
+
+  function briefWorkDueLabel(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    return `Due ${date.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}`;
+  }
+
+  function renderBriefWorkRow(surface, item, { priority = false } = {}) {
+    const provenance = item.provenance || {};
+    const relation = provenance.viewer_relation || {};
+    const bucket = provenance.work_bucket || "open";
+    const selected = Boolean(selectedEvidence(surface.id, item.id));
+    const possible = relation.confidence === "possible";
+    const identifier = provenance.identifier ? String(provenance.identifier) : "";
+    const status = provenance.status || provenance.lifecycle?.replaceAll("_", " ") || "Open";
+    const due = briefWorkDueLabel(provenance.due_at);
+    const project = provenance.project?.name || provenance.project?.team || "";
+    const stale = Boolean(provenance.source_stale);
+    const relationLabel = possible
+      ? `Possible ${String(relation.kind || "identity").replaceAll("_", " ")}`
+      : String(relation.kind || "assigned").replaceAll("_", " ");
+    return `<article class="evidence-card brief-work-row bucket-${escapeHtml(bucket)} ${priority ? "priority" : ""} ${possible ? "confidence-possible" : ""} ${selected ? "selected" : ""}"
+      data-evidence-id="${escapeHtml(item.id)}" data-evidence-kind="${escapeHtml(item.kind || "document")}" role="button" tabindex="0" aria-pressed="${selected ? "true" : "false"}">
+      <i class="brief-work-state" aria-hidden="true"></i>
+      <div class="brief-work-copy">
+        <span>${identifier ? `<b>${escapeHtml(identifier)}</b>` : ""}${escapeHtml(item.source || "Company work")}${stale ? '<em title="The source has not synced in more than 72 hours">Last known</em>' : ""}</span>
+        <strong>${escapeHtml(item.title || "Assigned work")}</strong>
+        <small>${escapeHtml([status, due, project, relationLabel].filter(Boolean).join(" · "))}</small>
+      </div>
+      <div class="brief-work-actions">
+        <button type="button" data-evidence-select aria-label="${selected ? "Remove" : "Add"} ${escapeHtml(item.title || "work item")} ${selected ? "from" : "to"} Calliope context">${selected ? "✓" : "+"}</button>
+        ${evidenceCanTrail(item) ? `<button type="button" data-follow-evidence="${escapeHtml(item.id)}">Trail</button>` : ""}
+        ${evidenceCanOpen(item) ? `<button type="button" data-open-evidence="${escapeHtml(item.id)}">Inspect</button>` : ""}
+        ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener">Source ↗</a>` : ""}
+      </div>
+      ${possible ? `<div class="brief-work-feedback"><span>${escapeHtml(relation.evidence || "This source identity resembles yours.")}</span><button type="button" data-brief-feedback="relevant">That's me</button><button type="button" data-brief-feedback="not_mine">Not mine</button></div>` : ""}
+    </article>`;
+  }
+
+  function renderBriefWork(surface) {
+    const inventory = surface.payload?.work_inventory || {};
+    const items = Array.isArray(inventory.items) ? inventory.items : [];
+    if (!inventory.available && !items.length) return "";
+    const workCoverage = (surface.payload?.coverage || []).find(
+      (source) => source?.key === "brain-work",
+    ) || {};
+    const identityUnmapped = workCoverage.identity_status === "not_person_mapped";
+    const summary = inventory.summary || {};
+    const priorityItems = items.slice(0, 6);
+    const chips = [
+      ["open", "Open"], ["overdue", "Overdue"], ["due_soon", "Due soon"],
+      ["blocked", "Blocked"], ["review", "Review"], ["possible", "Possible"],
+    ].filter(([key]) => key === "open" || Number(summary[key] || 0) > 0)
+      .map(([key, label]) => `<span class="kind-${escapeHtml(key)}"><b>${Number(summary[key] || 0)}</b>${escapeHtml(label)}</span>`)
+      .join("");
+    const groups = BRIEF_WORK_GROUPS.map(([key, label, description]) => {
+      const matches = items.filter((item) => item.provenance?.work_bucket === key);
+      const available = Math.max(matches.length, Number(inventory.groups?.[key] || 0));
+      if (!available) return "";
+      return `<section class="brief-work-group group-${escapeHtml(key)}">
+        <header><div><strong>${escapeHtml(label)}</strong><span>${escapeHtml(description)}</span></div><b>${available}</b></header>
+        ${matches.length ? `<div>${matches.map((item) => renderBriefWorkRow(surface, item)).join("")}</div>` : '<p>No rows fit inside this compact saved inventory.</p>'}
+      </section>`;
+    }).join("");
+    const sourceCount = Array.isArray(inventory.sources) ? inventory.sources.length : 0;
+    const staleCopy = Number(summary.stale || 0)
+      ? ` · ${Number(summary.stale)} last-known item${Number(summary.stale) === 1 ? "" : "s"} from stale sources`
+      : "";
+    return `<section class="brief-work">
+      <header class="brief-work-head">
+        <div><span class="eyebrow">Document brain · normalized across systems</span><h4>Your work</h4><p>Open issues, tickets, and reviews found from structured source records visible to you. Assignment remains source evidence, never agent inference.</p></div>
+        <div class="brief-work-summary">${chips}</div>
+      </header>
+      ${priorityItems.length ? `<div class="brief-work-priority">${priorityItems.map((item) => renderBriefWorkRow(surface, item, { priority: true })).join("")}</div>` : `<div class="brief-work-clear"><strong>${identityUnmapped ? "Work index healthy · identity not mapped" : "No assigned open work matched."}</strong><span>${identityUnmapped ? `Calliope profiled ${Number(inventory.profiled_sources || 0)} structured work source${Number(inventory.profiled_sources || 0) === 1 ? "" : "s"}, but their assignment names or IDs do not yet match your signed-in identity. Nothing is attributed to you by guesswork.` : "The profiler is active; completed work and other people’s assignments stay out of your Brief."}</span></div>`}
+      ${items.length ? `<details class="brief-work-inventory"><summary><span>Browse the full work inventory</span><b>${Number(summary.total || items.length)} item${Number(summary.total || items.length) === 1 ? "" : "s"} across ${sourceCount} source${sourceCount === 1 ? "" : "s"}${escapeHtml(staleCopy)}</b><i>⌄</i></summary><div class="brief-work-groups">${groups}</div></details>` : ""}
+      ${inventory.truncated ? `<p class="brief-work-truncated">Showing ${items.length} of ${Number(summary.total || items.length)} identity-matched records. Ask Calliope to inspect a narrower source or project.</p>` : ""}
+    </section>`;
+  }
+
   function renderPersonalBrief(surface) {
     const payload = surface.payload || {};
     const brief = payload.brief || {};
@@ -6252,7 +6355,8 @@
       const description = key === "changed" && !comparison.available
         ? "Source-backed activity in the initial bounded window; later snapshots show exact deltas"
         : defaultDescription;
-      const matches = items.filter((item) => item.provenance?.brief_section === key);
+      const matches = items.filter((item) => item.provenance?.brief_section === key
+        && item.provenance?.resolver !== "brain_work_inventory");
       if (!matches.length) return "";
       const omitted = Math.max(0, Number(brief.section_omitted_counts?.[key]) || 0);
       const available = Math.max(matches.length, Number(brief.section_available_counts?.[key]) || 0);
@@ -6267,6 +6371,7 @@
         ${sectionBody}
       </section>`;
     }).join("");
+    const showQuietState = !sections && !(payload.work_inventory?.items || []).length;
     return `<div class="evidence-set personal-brief">
       <div class="evidence-set-intro brief-intro">
         <div>
@@ -6285,8 +6390,10 @@
       </div>
       ${coverage ? `<div class="evidence-source-status brief-source-status">${coverage}</div>` : ""}
       ${renderBriefCalendarConnection()}
+      ${renderBriefWork(surface)}
       ${warnings}
-      ${sections || `<div class="evidence-empty"><strong>Your Personal Brief is quiet.</strong><span>${Number(brief.person_mapped_source_count || 0) ? "No matching observations changed in this bounded window." : "Connect or map a person-aware source, pin a focus artifact, or create a Work Inbox handoff."}</span></div>`}
+      ${sections}
+      ${showQuietState ? `<div class="evidence-empty"><strong>Your Personal Brief is quiet.</strong><span>${Number(brief.person_mapped_source_count || 0) ? "No matching observations changed in this bounded window." : "Connect or map a person-aware source, pin a focus artifact, or create a Work Inbox handoff."}</span></div>` : ""}
       ${renderBriefNotes(surface)}
     </div>`;
   }
@@ -6415,6 +6522,100 @@
     })[section] || "Related evidence";
   }
 
+  function viewerTrailStableValue(value) {
+    if (Array.isArray(value)) return `[${value.map(viewerTrailStableValue).join(",")}]`;
+    if (value && typeof value === "object") {
+      return `{${Object.keys(value).sort().map((key) =>
+        `${JSON.stringify(key)}:${viewerTrailStableValue(value[key])}`
+      ).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  function viewerTrailHandleKey(handle) {
+    return viewerTrailStableValue(handle || {});
+  }
+
+  function viewerTrailFrameIndex(handle) {
+    const key = viewerTrailHandleKey(handle);
+    return state.viewerTrailHistory.findIndex(
+      (frame) => viewerTrailHandleKey(frame.handle) === key,
+    );
+  }
+
+  function viewerTrailRouteSummary(data) {
+    const connections = data?.connections || [];
+    const raw = data?.route_summary || {};
+    const sections = { meaning: 0, artifacts: 0, knowledge: 0, data: 0 };
+    connections.forEach((connection) => {
+      const section = connection.section || "knowledge";
+      sections[section] = (sections[section] || 0) + 1;
+    });
+    if (raw.sections) {
+      Object.keys(sections).forEach((section) => {
+        sections[section] = Number(raw.sections[section] || 0);
+      });
+    }
+    return {
+      resolved: Number(raw.resolved ?? connections.length),
+      bounded: Boolean(raw.bounded),
+      sections,
+    };
+  }
+
+  function viewerTrailConnectionContext(handle) {
+    const key = viewerTrailHandleKey(handle);
+    const pathStep = viewerTrailFrameIndex(handle);
+    if (pathStep >= 0) {
+      return { kind: "return", step: pathStep, label: `Returns to step ${pathStep + 1}` };
+    }
+    for (let step = 0; step < state.viewerTrailHistory.length - 1; step += 1) {
+      const found = (state.viewerTrailHistory[step].data?.connections || []).some(
+        (connection) => viewerTrailHandleKey(connection.handle) === key,
+      );
+      if (found) {
+        return {
+          kind: "converges",
+          step,
+          label: `Also reachable from step ${step + 1}`,
+        };
+      }
+    }
+    return null;
+  }
+
+  function viewerTrailLoomMarkup() {
+    if (!state.viewerTrailHistory.length) return "";
+    const retained = state.viewerTrailHistory.reduce(
+      (total, frame) => total + viewerTrailRouteSummary(frame.data).resolved,
+      0,
+    );
+    const steps = state.viewerTrailHistory.map((frame, index) => {
+      const subject = frame.data?.subject || {};
+      const summary = viewerTrailRouteSummary(frame.data);
+      const current = index === state.viewerTrailHistory.length - 1;
+      const mixes = [
+        ["meaning", "Meaning"], ["artifacts", "Places"],
+        ["knowledge", "Knowledge"], ["data", "Data"],
+      ].map(([section, label]) => (
+        summary.sections[section] ? `<i>${label} ${summary.sections[section]}</i>` : ""
+      )).join("");
+      const link = index && frame.via
+        ? `<span class="viewer-trail-loom-link"><b>${escapeHtml(frame.via.relationship || "related to")}</b><i>→</i></span>`
+        : "";
+      return `${link}<button type="button" class="viewer-trail-loom-step${current ? " current" : ""}" data-viewer-trail-step="${index}"${current ? ' aria-current="step"' : ""}>
+        <small>${escapeHtml(String(subject.kind || "evidence").replaceAll("_", " "))}</small>
+        <strong>${escapeHtml(subject.label || "Evidence")}</strong>
+        <span>${summary.resolved}${summary.bounded ? "+" : ""} nearby route${summary.resolved === 1 ? "" : "s"}</span>
+        ${mixes ? `<em>${mixes}</em>` : ""}${current ? "<u>You are here</u>" : ""}
+      </button>`;
+    }).join("");
+    return `<nav class="viewer-trail-loom" aria-label="How you got here">
+      <header><span>How you got here</span><b>${state.viewerTrailHistory.length} step${state.viewerTrailHistory.length === 1 ? "" : "s"} · ${retained} route choice${retained === 1 ? "" : "s"} retained</b></header>
+      <div class="viewer-trail-loom-track">${steps}</div>
+    </nav>`;
+  }
+
   function renderViewerTrail(data) {
     state.viewerSurface = null;
     state.viewerTrailData = data;
@@ -6433,25 +6634,29 @@
       if (!items.length) return "";
       return `<section class="viewer-trail-section"><h3>${trailSectionLabel(section)}</h3><div class="viewer-trail-grid">${items.map(({ connection, index }) => {
         const shared = (connection.shared || []).slice(0, 3).map((item) => `<i>${escapeHtml(item)}</i>`).join("");
+        const context = viewerTrailConnectionContext(connection.handle);
         return `<article class="viewer-trail-card"><div>
           <span>${escapeHtml(connection.relationship || "related to")}</span>
           <strong>${escapeHtml(connection.label || "Related evidence")}</strong>
           ${connection.detail ? `<p>${escapeHtml(connection.detail)}</p>` : ""}
+          ${context ? `<em class="viewer-trail-route-context ${context.kind}">${escapeHtml(context.label)}</em>` : ""}
           ${shared ? `<aside>${shared}</aside>` : ""}
         </div><footer>
-          <button type="button" data-viewer-follow-trail="${index}">Follow</button>
+          <button type="button" data-viewer-follow-trail="${index}">${context?.kind === "return" ? "Return" : "Follow"}</button>
           ${connection.url ? `<a href="${escapeHtml(connection.url)}" target="_blank" rel="noopener">Open ↗</a>` : ""}
         </footer></article>`;
       }).join("")}</div></section>`;
     }).join("");
+    const routeSummary = viewerTrailRouteSummary(data);
     setViewerHeader(
       subject.label || "Follow the trail",
-      `${String(subject.kind || "evidence").replaceAll("_", " ")} · ${(data.connections || []).length} next hop${(data.connections || []).length === 1 ? "" : "s"}`,
+      `${String(subject.kind || "evidence").replaceAll("_", " ")} · ${routeSummary.resolved}${routeSummary.bounded ? "+" : ""} nearby route${routeSummary.resolved === 1 ? "" : "s"}`,
       subject.url,
     );
     els.viewerContent.innerHTML = `<div class="viewer-trail">
       ${state.viewerTrailHistory.length > 1 ? '<button type="button" class="viewer-trail-back" data-viewer-trail-back>← Previous breadcrumb</button>' : ""}
-      <section class="viewer-trail-subject"><span>You are here</span><h2>${escapeHtml(subject.label || "Evidence")}</h2>
+      ${viewerTrailLoomMarkup()}
+      <section class="viewer-trail-subject"><span>Current evidence</span><h2>${escapeHtml(subject.label || "Evidence")}</h2>
         ${subject.detail ? `<p>${escapeHtml(subject.detail)}</p>` : ""}
         ${facts ? `<div>${facts}</div>` : ""}
       </section>
@@ -6459,7 +6664,23 @@
     </div>`;
   }
 
-  async function openTrailViewer(handle, { push = true } = {}) {
+  function showViewerTrailStep(index) {
+    if (index < 0 || index >= state.viewerTrailHistory.length) return;
+    state.viewerTrailHistory = state.viewerTrailHistory.slice(0, index + 1);
+    renderViewerTrail(state.viewerTrailHistory[index].data);
+  }
+
+  function followViewerTrailConnection(connection) {
+    if (!connection?.handle) return;
+    const earlier = viewerTrailFrameIndex(connection.handle);
+    if (earlier >= 0) {
+      showViewerTrailStep(earlier);
+      return;
+    }
+    openTrailViewer(connection.handle, { via: connection });
+  }
+
+  async function openTrailViewer(handle, { push = true, via = null } = {}) {
     if (!handle || !Object.keys(handle).length) return;
     const requestId = ++state.viewerRequestId;
     showSurfaceViewer("Follow the trail", "Resolving permission-aware company evidence");
@@ -6467,10 +6688,25 @@
     try {
       const data = await api("/api/calliope/trails", {
         method: "POST",
-        body: JSON.stringify({ handle }),
+        body: JSON.stringify({ handle, limit: 24 }),
       });
       if (requestId !== state.viewerRequestId || !els.viewerDialog.open) return;
-      if (push) state.viewerTrailHistory.push(handle);
+      const canonical = data.subject?.handle || handle;
+      if (push) {
+        const earlier = viewerTrailFrameIndex(canonical);
+        if (earlier >= 0) {
+          state.viewerTrailHistory = state.viewerTrailHistory.slice(0, earlier + 1);
+          state.viewerTrailHistory[earlier].data = data;
+        } else {
+          state.viewerTrailHistory.push({ handle: canonical, data, via });
+        }
+      } else if (state.viewerTrailHistory.length) {
+        const frame = state.viewerTrailHistory.at(-1);
+        frame.handle = canonical;
+        frame.data = data;
+      } else {
+        state.viewerTrailHistory.push({ handle: canonical, data, via });
+      }
       renderViewerTrail(data);
     } catch (error) {
       if (requestId !== state.viewerRequestId || !els.viewerDialog.open) return;
@@ -6478,9 +6714,18 @@
     }
   }
 
+  function surfaceEvidenceItems(surface) {
+    const compact = Array.isArray(surface?.payload?.items) ? surface.payload.items : [];
+    const expanded = Array.isArray(surface?.payload?.work_inventory?.items)
+      ? surface.payload.work_inventory.items : [];
+    return [...compact, ...expanded].filter(
+      (item, index, all) => item?.id && all.findIndex((candidate) => candidate?.id === item.id) === index,
+    );
+  }
+
   function openEvidenceTrail(surfaceId, evidenceId) {
     const surface = state.surfaces.find((candidate) => candidate.id === surfaceId);
-    const item = (surface?.payload?.items || []).find((candidate) => candidate.id === evidenceId);
+    const item = surfaceEvidenceItems(surface).find((candidate) => candidate.id === evidenceId);
     if (!item?.handle) return;
     state.viewerHandle = item.handle;
     state.viewerTrailHistory = [];
@@ -6500,7 +6745,7 @@
 
   async function openEvidenceViewer(surfaceId, evidenceId) {
     const surface = state.surfaces.find((candidate) => candidate.id === surfaceId);
-    const item = (surface?.payload?.items || []).find((candidate) => candidate.id === evidenceId);
+    const item = surfaceEvidenceItems(surface).find((candidate) => candidate.id === evidenceId);
     if (!surface || !item || !state.current) return;
     state.viewerHandle = item.handle || null;
     state.viewerTrailHistory = [];
@@ -6685,8 +6930,9 @@
     }
     state.brief.noteEditors.forEach((editor) => editor.destroy?.());
     state.brief.noteEditors.clear();
-    els.surfaceCount.textContent = `${state.surfaces.length} surface${state.surfaces.length === 1 ? "" : "s"}`;
-    els.stageEmpty.hidden = Boolean(state.surfaces.length);
+    const visibleSurfaces = visibleStageSurfaces();
+    els.surfaceCount.textContent = `${visibleSurfaces.length} surface${visibleSurfaces.length === 1 ? "" : "s"}`;
+    els.stageEmpty.hidden = Boolean(visibleSurfaces.length);
     const turns = [...state.turns].reverse().filter((turn) => surfacesForTurn(turn.id).length);
     els.stage.innerHTML = turns.map((turn) => `
       <section class="stratum" data-stratum-turn="${escapeHtml(turn.id)}">
@@ -6714,7 +6960,7 @@
 
   function evidenceItem(surfaceId, evidenceId) {
     const surface = state.surfaces.find((item) => item.id === surfaceId && item.kind === "evidence");
-    const item = (surface?.payload?.items || []).find((candidate) => candidate.id === evidenceId);
+    const item = surfaceEvidenceItems(surface).find((candidate) => candidate.id === evidenceId);
     return surface && item ? { surface, item } : null;
   }
 
@@ -6726,8 +6972,9 @@
       card.setAttribute("aria-pressed", String(active));
       const button = $("[data-evidence-select]", card);
       if (button) {
-        const compactCalendarEvent = card.classList.contains("brief-calendar-event");
-        button.textContent = compactCalendarEvent ? (active ? "✓" : "+") : (active ? "Added ✓" : "+ Add");
+        const compactEvidence = card.classList.contains("brief-calendar-event")
+          || card.classList.contains("brief-work-row");
+        button.textContent = compactEvidence ? (active ? "✓" : "+") : (active ? "Added ✓" : "+ Add");
         button.setAttribute("aria-label", `${active ? "Remove" : "Add"} evidence ${active ? "from" : "to"} Calliope context`);
       }
     });
@@ -8824,15 +9071,19 @@
       }
       if (event.target.closest("[data-viewer-trail-back]")) {
         if (state.viewerTrailHistory.length > 1) {
-          state.viewerTrailHistory.pop();
-          openTrailViewer(state.viewerTrailHistory.at(-1), { push: false });
+          showViewerTrailStep(state.viewerTrailHistory.length - 2);
         }
+        return;
+      }
+      const trailStep = event.target.closest("[data-viewer-trail-step]");
+      if (trailStep) {
+        showViewerTrailStep(Number(trailStep.dataset.viewerTrailStep));
         return;
       }
       const trailHop = event.target.closest("[data-viewer-follow-trail]");
       if (trailHop && state.viewerTrailData) {
         const connection = (state.viewerTrailData.connections || [])[Number(trailHop.dataset.viewerFollowTrail)];
-        if (connection?.handle) openTrailViewer(connection.handle);
+        followViewerTrailConnection(connection);
         return;
       }
       const tab = event.target.closest("[data-view]");

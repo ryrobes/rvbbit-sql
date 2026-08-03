@@ -9865,6 +9865,12 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .trail-head-copy strong{overflow:hidden;color:var(--bone-bright);font:italic 400 20px/1.1 var(--serif);text-overflow:ellipsis;white-space:nowrap}
 .trail-head-copy small{overflow:hidden;color:var(--dim);font:7px/1.3 var(--mono);letter-spacing:.08em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}
 .trail-content{min-height:0;overflow:auto;padding:18px;scrollbar-color:var(--line-hot) color-mix(in oklch,var(--void) 65%,transparent)}
+.trail-loom{position:static;z-index:auto;display:block;height:auto;margin-bottom:14px;padding:12px;border:1px solid color-mix(in oklch,var(--amber) 28%,var(--line));background:color-mix(in oklch,var(--void) 32%,transparent);backdrop-filter:none}
+.trail-loom>header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:9px}.trail-loom>header span{color:var(--amber);font:700 7px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}.trail-loom>header b{color:var(--dim);font:500 6px/1.2 var(--mono);letter-spacing:.06em;text-align:right;text-transform:uppercase}
+.trail-loom-track{display:flex;align-items:stretch;overflow-x:auto;padding-bottom:3px;scrollbar-color:var(--line-hot) transparent;scroll-snap-type:x proximity}
+.trail-loom-step{position:relative;width:184px;min-height:104px;display:flex;align-items:flex-start;flex:0 0 184px;flex-direction:column;padding:10px;border:1px solid var(--line);background:color-mix(in oklch,var(--panel) 70%,transparent);color:var(--fog);text-align:left;cursor:pointer;scroll-snap-align:start}.trail-loom-step:hover{border-color:color-mix(in oklch,var(--jade) 42%,var(--line))}.trail-loom-step.current{border-color:color-mix(in oklch,var(--jade) 62%,var(--line));background:color-mix(in oklch,var(--jade) 8%,var(--panel))}
+.trail-loom-step small{color:var(--jade);font:700 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}.trail-loom-step strong{display:-webkit-box;overflow:hidden;margin-top:7px;color:var(--bone-bright);font:italic 400 15px/1.15 var(--serif);-webkit-box-orient:vertical;-webkit-line-clamp:2}.trail-loom-step>span{margin-top:6px;color:var(--dim);font:6px/1.2 var(--mono);text-transform:uppercase}.trail-loom-step em{display:flex;flex-wrap:wrap;gap:3px;margin-top:7px;font-style:normal}.trail-loom-step em i{padding:3px 4px;border:1px solid var(--line);color:var(--fog);font:5px/1 var(--mono);font-style:normal}.trail-loom-step u{position:absolute;right:7px;bottom:6px;color:var(--jade);font:700 5px/1 var(--mono);letter-spacing:.08em;text-decoration:none;text-transform:uppercase}
+.trail-loom-link{width:88px;min-width:88px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:6px;padding:8px;color:var(--dim);text-align:center}.trail-loom-link b{font:600 6px/1.25 var(--mono);letter-spacing:.05em;text-transform:uppercase}.trail-loom-link i{color:var(--amber);font:400 15px/1 var(--serif);font-style:normal}
 .trail-loading,.trail-error,.trail-empty{min-height:220px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:var(--dim);font:9px/1.5 var(--mono);text-align:center}
 .trail-loading i{width:22px;height:22px;border:1px solid var(--jade);border-right-color:transparent;border-radius:50%;animation:semantic-spin .8s linear infinite}
 .trail-subject{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;padding:15px;border:1px solid color-mix(in oklch,var(--jade) 34%,var(--line));background:color-mix(in oklch,var(--jade) 5%,transparent)}
@@ -9883,6 +9889,7 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .trail-card-copy{min-width:0}.trail-card-copy>span{display:block;color:var(--jade);font:650 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}
 .trail-card-copy strong{display:block;overflow:hidden;margin:6px 0 3px;color:var(--bone-bright);font:italic 400 16px/1.15 var(--serif);text-overflow:ellipsis;white-space:nowrap}
 .trail-card-copy p{display:-webkit-box;overflow:hidden;color:var(--dim);font-size:8px;line-height:1.4;-webkit-box-orient:vertical;-webkit-line-clamp:2}
+.trail-route-context{display:inline-block;margin-top:7px;padding:4px 5px;border:1px solid color-mix(in oklch,var(--amber) 36%,var(--line));color:var(--amber);font:600 5px/1 var(--mono);font-style:normal;letter-spacing:.06em;text-transform:uppercase}.trail-route-context.return{border-color:color-mix(in oklch,var(--jade) 35%,var(--line));color:var(--jade)}
 .trail-shared{display:flex;gap:3px;overflow:hidden;margin-top:7px}.trail-shared i{overflow:hidden;padding:3px 5px;border:1px solid var(--line);border-radius:999px;color:var(--fog);font:5px/1 var(--mono);font-style:normal;text-overflow:ellipsis;white-space:nowrap}
 .trail-card-actions{display:flex;align-items:flex-end;flex-direction:column;gap:5px}.trail-card-actions button,.trail-card-actions a{padding:5px 7px;border:1px solid var(--line);background:transparent;color:var(--fog);font:6px/1 var(--mono);cursor:pointer;text-transform:uppercase;white-space:nowrap}
 .trail-card-actions button:hover{border-color:var(--jade);color:var(--jade)}.trail-card-actions a:hover{border-color:var(--amber);color:var(--amber)}
@@ -10020,6 +10027,8 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .calliope-float-action{display:none}
   .trail-dialog{width:100vw;height:100dvh;margin:0;border:0}
   .trail-content{padding:12px}
+  .trail-loom>header{align-items:flex-start;flex-direction:column}.trail-loom>header b{text-align:left}
+  .trail-loom-track{align-items:stretch;flex-direction:column}.trail-loom-step{width:100%;min-height:92px;flex-basis:auto}.trail-loom-link{width:auto;min-width:0;min-height:34px;flex-direction:row}.trail-loom-link i{transform:rotate(90deg)}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
@@ -10309,14 +10318,68 @@ _LANDING_JS = """
  function trailSectionLabel(section){
    return {meaning:'What it means',artifacts:'Where it lives',knowledge:'What the company knows',data:'What it is built from'}[section]||'Related evidence';
  }
+ function trailStableValue(value){
+   if(Array.isArray(value))return '['+value.map(trailStableValue).join(',')+']';
+   if(value&&typeof value==='object')return '{'+Object.keys(value).sort().map(function(key){
+     return JSON.stringify(key)+':'+trailStableValue(value[key]);
+   }).join(',')+'}';
+   return JSON.stringify(value);
+ }
+ function trailHandleKey(handle){return trailStableValue(handle||{});}
+ function trailFrameIndex(handle){
+   var key=trailHandleKey(handle);
+   return trailHistory.findIndex(function(frame){return trailHandleKey(frame.handle)===key;});
+ }
+ function trailRouteSummary(data){
+   data=data||{};
+   var connections=data.connections||[],raw=data.route_summary||{},sections={meaning:0,artifacts:0,knowledge:0,data:0};
+   connections.forEach(function(connection){
+     var section=connection.section||'knowledge';sections[section]=(sections[section]||0)+1;
+   });
+   if(raw.sections)Object.keys(sections).forEach(function(section){
+     sections[section]=Number(raw.sections[section]||0);
+   });
+   return {resolved:Number(raw.resolved==null?connections.length:raw.resolved),bounded:!!raw.bounded,sections:sections};
+ }
+ function trailConnectionContext(handle){
+   var key=trailHandleKey(handle),pathStep=trailFrameIndex(handle);
+   if(pathStep>=0)return {kind:'return',step:pathStep,label:'Returns to step '+(pathStep+1)};
+   for(var step=0;step<trailHistory.length-1;step+=1){
+     var found=((trailHistory[step].data||{}).connections||[]).some(function(connection){
+       return trailHandleKey(connection.handle)===key;
+     });
+     if(found)return {kind:'converges',step:step,label:'Also reachable from step '+(step+1)};
+   }
+   return null;
+ }
+ function trailLoomMarkup(){
+   if(!trailHistory.length)return '';
+   var retained=trailHistory.reduce(function(total,frame){return total+trailRouteSummary(frame.data).resolved;},0);
+   var steps=trailHistory.map(function(frame,index){
+     var subject=(frame.data||{}).subject||{},summary=trailRouteSummary(frame.data),current=index===trailHistory.length-1;
+     var mixes=[['meaning','Meaning'],['artifacts','Places'],['knowledge','Knowledge'],['data','Data']].map(function(pair){
+       var count=summary.sections[pair[0]]||0;return count?'<i>'+pair[1]+' '+count+'</i>':'';
+     }).join('');
+     var link=index&&frame.via?'<span class="trail-loom-link"><b>'+escapeHome(frame.via.relationship||'related to')+'</b><i>→</i></span>':'';
+     return link+'<button type="button" class="trail-loom-step'+(current?' current':'')+'" data-trail-step="'+index+'"'+(current?' aria-current="step"':'')+'>'
+       +'<small>'+escapeHome(String(subject.kind||'evidence').replaceAll('_',' '))+'</small>'
+       +'<strong>'+escapeHome(subject.label||'Evidence')+'</strong>'
+       +'<span>'+(summary.resolved||0)+(summary.bounded?'+':'')+' nearby route'+(summary.resolved===1?'':'s')+'</span>'
+       +(mixes?'<em>'+mixes+'</em>':'')+(current?'<u>You are here</u>':'')+'</button>';
+   }).join('');
+   return '<nav class="trail-loom" aria-label="How you got here"><header><span>How you got here</span><b>'
+     +trailHistory.length+' step'+(trailHistory.length===1?'':'s')+' · '+retained+' route choice'+(retained===1?'':'s')+' retained</b></header>'
+     +'<div class="trail-loom-track">'+steps+'</div></nav>';
+ }
  function trailConnectionMarkup(connection,index){
-   var shared=(connection.shared||[]).slice(0,3).map(function(item){return '<i>'+escapeHome(item)+'</i>';}).join('');
+   var shared=(connection.shared||[]).slice(0,3).map(function(item){return '<i>'+escapeHome(item)+'</i>';}).join(''),context=trailConnectionContext(connection.handle);
    return '<article class="trail-card"><div class="trail-card-copy">'
      +'<span>'+escapeHome(connection.relationship||'related to')+'</span>'
      +'<strong title="'+escapeHome(connection.label||'Related evidence')+'">'+escapeHome(connection.label||'Related evidence')+'</strong>'
      +(connection.detail?'<p>'+escapeHome(connection.detail)+'</p>':'')
+     +(context?'<em class="trail-route-context '+context.kind+'">'+escapeHome(context.label)+'</em>':'')
      +(shared?'<div class="trail-shared">'+shared+'</div>':'')+'</div>'
-     +'<div class="trail-card-actions"><button type="button" data-trail-follow="'+index+'">Follow</button>'
+     +'<div class="trail-card-actions"><button type="button" data-trail-follow="'+index+'">'+(context&&context.kind==='return'?'Return':'Follow')+'</button>'
      +(connection.url?'<a href="'+escapeHome(connection.url)+'" target="_blank" rel="noopener">Open ↗</a>':'')
      +'</div></article>';
  }
@@ -10324,7 +10387,8 @@ _LANDING_JS = """
    trailData=data||{};
    var subject=trailData.subject||{},facts=(trailData.facts||[]).slice(0,8);
    trailTitle.textContent=subject.label||'Follow the trail';
-   trailMeta.textContent=(subject.kind||'evidence').replaceAll('_',' ')+' · '+(trailData.connections||[]).length+' next hop'+((trailData.connections||[]).length===1?'':'s');
+   var routeSummary=trailRouteSummary(trailData);
+   trailMeta.textContent=(subject.kind||'evidence').replaceAll('_',' ')+' · '+routeSummary.resolved+(routeSummary.bounded?'+':'')+' nearby route'+(routeSummary.resolved===1?'':'s');
    trailBack.hidden=trailHistory.length<2;
    var factMarkup=facts.length?'<div class="trail-facts">'+facts.map(function(fact){
      return '<span><b>'+escapeHome(fact.label)+'</b>'+escapeHome(fact.value)+'</span>';
@@ -10339,22 +10403,41 @@ _LANDING_JS = """
      return '<section class="trail-section"><h3>'+trailSectionLabel(section)+'</h3><div class="trail-list">'
        +items.map(function(item){return trailConnectionMarkup(item.connection,item.index);}).join('')+'</div></section>';
    }).join('');
-   trailContent.innerHTML='<section class="trail-subject"><div><span>You are here</span><h2>'+escapeHome(subject.label||'Evidence')+'</h2>'
+   trailContent.innerHTML=trailLoomMarkup()+'<section class="trail-subject"><div><span>Current evidence</span><h2>'+escapeHome(subject.label||'Evidence')+'</h2>'
      +(subject.detail?'<p>'+escapeHome(subject.detail)+'</p>':'')+factMarkup+'</div>'
      +(subject.url?'<a href="'+escapeHome(subject.url)+'" target="_blank" rel="noopener">Open source ↗</a>':'')
      +'</section>'+(sections||'<div class="trail-empty"><b>No further breadcrumbs surfaced.</b><span>This object is still a valid endpoint.</span></div>');
  }
- async function openTrail(handle,push){
+ function showTrailStep(index){
+   if(index<0||index>=trailHistory.length)return;
+   trailHistory=trailHistory.slice(0,index+1);
+   renderTrail(trailHistory[index].data);
+ }
+ function followTrailConnection(connection){
+   if(!connection||!connection.handle)return;
+   var earlier=trailFrameIndex(connection.handle);
+   if(earlier>=0){showTrailStep(earlier);return;}
+   openTrail(connection.handle,true,connection);
+ }
+ async function openTrail(handle,push,via){
    if(!trailDialog||!handle)return;
    if(!trailDialog.open)trailDialog.showModal();
    var request=++trailRequest;
    trailContent.innerHTML='<div class="trail-loading"><i></i><strong>Following the evidence…</strong><span>Resolving only what your account can see</span></div>';
    try{
-     var response=await fetch('/api/calliope/trails',{method:'POST',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify({handle:handle})}),data={};
+     var response=await fetch('/api/calliope/trails',{method:'POST',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify({handle:handle,limit:24})}),data={};
      try{data=await response.json();}catch(ignore){}
      if(request!==trailRequest)return;
      if(!response.ok)throw new Error(data.error&&data.error.message||'Could not follow that trail');
-     if(push!==false)trailHistory.push(handle);
+     var canonical=(data.subject||{}).handle||handle;
+     if(push!==false){
+       var earlier=trailFrameIndex(canonical);
+       if(earlier>=0){trailHistory=trailHistory.slice(0,earlier+1);trailHistory[earlier].data=data;}
+       else trailHistory.push({handle:canonical,data:data,via:via||null});
+     }else if(trailHistory.length){
+       trailHistory[trailHistory.length-1].handle=canonical;
+       trailHistory[trailHistory.length-1].data=data;
+     }else trailHistory.push({handle:canonical,data:data,via:via||null});
      renderTrail(data);
    }catch(error){
      if(request!==trailRequest)return;
@@ -10700,12 +10783,14 @@ _LANDING_JS = """
  if(trailDialog){
    document.getElementById('trail-close').addEventListener('click',function(){trailRequest++;trailDialog.close();});
    trailBack.addEventListener('click',function(){
-     if(trailHistory.length<2)return;trailHistory.pop();openTrail(trailHistory[trailHistory.length-1],false);
+     if(trailHistory.length<2)return;showTrailStep(trailHistory.length-2);
    });
    trailContent.addEventListener('click',function(event){
+     var step=event.target.closest('[data-trail-step]');
+     if(step){showTrailStep(Number(step.dataset.trailStep));return;}
      var button=event.target.closest('[data-trail-follow]');if(!button||!trailData)return;
      var connection=(trailData.connections||[])[Number(button.dataset.trailFollow)];
-     if(connection&&connection.handle)openTrail(connection.handle,true);
+     followTrailConnection(connection);
    });
    trailDialog.addEventListener('close',function(){trailRequest++;trailHistory=[];trailData=null;});
  }
@@ -14128,10 +14213,27 @@ def _calliope_follow_trail(value, owner, limit=14):
         subject, facts, connections, searched = _trail_metric(handle, owner, limit)
     else:
         subject, facts, connections, searched = _trail_catalog_node(handle, owner, limit)
+    visible_connections = connections[:limit]
+    section_counts = {
+        section: sum(
+            1 for connection in visible_connections
+            if connection.get("section") == section
+        )
+        for section in ("meaning", "artifacts", "knowledge", "data")
+    }
     return {
         "subject": subject,
         "facts": [fact for fact in facts if fact.get("label") and fact.get("value")],
-        "connections": connections[:limit],
+        "connections": visible_connections,
+        "route_summary": {
+            "resolved": len(visible_connections),
+            "limit": limit,
+            # Resolvers deliberately bound their neighborhoods. Equal-to-limit
+            # means additional edges may exist; the UI must not present the
+            # returned neighborhood as the complete company graph.
+            "bounded": len(visible_connections) >= limit,
+            "sections": section_counts,
+        },
         "searched": searched,
         "elapsed_ms": int((time.time() - started) * 1000),
     }
