@@ -266,6 +266,16 @@ def test_calendar_trail_keeps_event_private_and_follows_only_visible_canonical_e
             return _Result(edges if "visible_docs" in statement else [event])
 
     monkeypatch.setattr(server, "_conn", lambda: Connection())
+    monkeypatch.setattr(server, "tool_brain_entity", lambda label, owner: {
+        "found": True,
+        "kind": "person",
+        "docs": [{
+            "doc_id": 11,
+            "title": "Atlas decision history",
+            "source": "Company memory",
+            "score": .91,
+        }],
+    })
     monkeypatch.setattr(server, "_calliope_brain_evidence", lambda query, owner, limit: [{
         "doc_id": 11,
         "title": "Atlas decision history",
@@ -282,7 +292,7 @@ def test_calendar_trail_keeps_event_private_and_follows_only_visible_canonical_e
         "kind": "calendar_event", "calendar_id": "primary", "event_id": "evt-1",
     }
     assert {connection["relationship"] for connection in result["connections"]} == {
-        "organized by", "preparation context",
+        "organized by", "context for attendee",
     }
     person = next(
         connection for connection in result["connections"]
@@ -290,6 +300,12 @@ def test_calendar_trail_keeps_event_private_and_follows_only_visible_canonical_e
     )
     assert person["handle"] == {"kind": "brain_entity", "label": "Ada Lovelace"}
     assert person["confidence"] == 1.0
+    document = next(
+        connection for connection in result["connections"]
+        if connection["relationship"] == "context for attendee"
+    )
+    assert document["handle"] == {"kind": "document", "doc_id": 11}
+    assert document["shared"] == ["Ada Lovelace"]
     assert calls[0][1] == ("owner@example.com", "primary", "evt-1")
     assert calls[1][1] == (
         "owner@example.com", "owner@example.com", "primary", "evt-1",

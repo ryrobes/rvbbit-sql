@@ -13181,7 +13181,7 @@ def _trail_calendar_event(handle, owner, limit):
     if attendee_count:
         facts.append({"label": "Attendees", "value": str(attendee_count)})
 
-    connections, seen, canonical_labels = [], set(), []
+    connections, seen, canonical_labels, canonical_entities = [], set(), [], []
     relationship_labels = {
         "organized_by": "organized by",
         "involves": "meeting with",
@@ -13196,6 +13196,10 @@ def _trail_calendar_event(handle, owner, limit):
         if not canonical_label:
             continue
         canonical_labels.append(canonical_label)
+        canonical_entities.append({
+            "label": canonical_label,
+            "kind": str(edge.get("object_kind") or edge.get("node_kind") or "entity"),
+        })
         _trail_append(connections, seen, _trail_connection(
             relationship_labels.get(
                 str(edge.get("predicate") or ""),
@@ -13219,12 +13223,52 @@ def _trail_calendar_event(handle, owner, limit):
             "label": "Company objects",
             "value": str(len(set(canonical_labels))),
         })
+
+    # The explicit edge should immediately pay off: pull a small number of
+    # ACL-filtered documents already attached to the canonical entity.  This is
+    # more grounded than hoping a broad event-title search rediscovers the same
+    # relationship, and it still leaves the entity hop available for deeper
+    # inspection.
+    direct_documents = 0
+    unique_entities = list({
+        (entity["label"], entity["kind"]): entity
+        for entity in canonical_entities
+    }.values())
+    for entity in unique_entities[:3]:
+        try:
+            context = tool_brain_entity(entity["label"], owner)
+        except Exception:  # noqa: BLE001 — one entity cannot blank the event trail
+            continue
+        if not isinstance(context, dict) or not context.get("found"):
+            continue
+        relationship = (
+            "context for attendee"
+            if entity["kind"] == "person"
+            else "context for location"
+        )
+        for doc in (context.get("docs") or [])[:2]:
+            if not isinstance(doc, dict) or not doc.get("doc_id"):
+                continue
+            before = len(connections)
+            _trail_append(
+                connections,
+                seen,
+                _trail_brain_document_connection(
+                    doc, relationship, shared=[entity["label"]]
+                ),
+            )
+            if len(connections) > before:
+                direct_documents += 1
+            if direct_documents >= 5 or len(connections) >= limit:
+                break
+        if direct_documents >= 5 or len(connections) >= limit:
+            break
     query = " ".join(filter(None, [
         title,
         description[:600] if description else None,
         *list(dict.fromkeys(canonical_labels))[:6],
     ]))
-    if query and title.lower() != "private event":
+    if query and title.lower() != "private event" and len(connections) < limit:
         try:
             for doc in _calliope_brain_evidence(query, owner, min(4, limit)):
                 _trail_append(
