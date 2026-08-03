@@ -564,10 +564,19 @@ body.chat-resizing iframe{pointer-events:none}
 .speech-action.recording,.brief-note-speech.recording{color:var(--danger)}
 .speech-action.recording svg,.brief-note-speech.recording svg{filter:drop-shadow(0 0 5px color-mix(in oklch,var(--danger) 55%,transparent));animation:pulse .85s ease-in-out infinite}
 .speech-action.transcribing,.brief-note-speech.transcribing{color:var(--jade)}
+.speech-action.connecting,.brief-note-speech.connecting{color:var(--jade)}
 .speech-action:disabled,.brief-note-speech:disabled{opacity:.42;cursor:not-allowed}
 .brief-note-speech{height:27px;padding:0 7px;border:1px solid color-mix(in oklch,var(--jade) 30%,var(--line));color:var(--jade);font-size:6px}
 .brief-note-speech.recording{border-color:color-mix(in oklch,var(--danger) 55%,var(--line));color:var(--danger)}
 .speech-status{overflow:hidden;max-width:150px;color:var(--jade);font:7px/1 var(--mono);text-overflow:ellipsis;white-space:nowrap}
+.speech-live-preview{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:8px;margin-top:6px;padding:7px 9px;border:1px solid color-mix(in oklch,var(--jade) 30%,var(--line));background:linear-gradient(90deg,color-mix(in oklch,var(--jade) 8%,transparent),color-mix(in oklch,var(--panel) 86%,transparent));box-shadow:inset 2px 0 0 color-mix(in oklch,var(--jade) 58%,transparent)}
+.speech-live-preview[hidden]{display:none}
+.speech-live-preview>span{padding-top:2px;color:var(--jade);font:6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;white-space:nowrap}
+.speech-live-preview>p{max-height:52px;overflow:auto;margin:0;color:color-mix(in oklch,var(--bone) 78%,var(--jade));font:10px/1.42 var(--sans);overflow-wrap:anywhere;white-space:pre-wrap}
+.speech-live-preview.is-waiting>p{color:var(--dim);font-style:italic}
+.speech-live-preview.is-fallback{border-color:color-mix(in oklch,var(--amber) 34%,var(--line));box-shadow:inset 2px 0 0 color-mix(in oklch,var(--amber) 62%,transparent)}
+.speech-live-preview.is-fallback>span{color:var(--amber)}
+.brief-note-speech-preview{margin:7px 0 0}
 .compose-hint{margin-left:auto;color:rgba(232,221,204,.20);font:7px/1 var(--mono)}
 .send-action{width:30px;height:30px;border:1px solid var(--line-hot);background:var(--amber);color:#201606;font:700 16px/1 var(--sans);cursor:pointer}
 .send-action:disabled{border-color:var(--line);background:transparent;color:var(--dim);cursor:not-allowed}

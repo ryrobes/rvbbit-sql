@@ -513,12 +513,17 @@ the configured cell cap.
 
 The chat composer and private Daily Notes editor expose **Dictate** only when a
 server-side speech provider is configured and the browser supports microphone capture.
-Recording is deliberately review-first: stop the microphone, wait for transcription,
-then edit the text inserted at the current cursor. It never sends a chat turn or appends
-a note automatically. Warehouse validates and bounds the audio, forwards it directly to
-the provider, and does not persist the recording. The first adapter uses OpenAI file
-transcription; the route and browser contract remain provider-neutral for a later
-self-hosted adapter.
+With OpenAI Realtime enabled, a provisional transcript appears while the user speaks;
+stopping the microphone finalizes it and inserts only the final text at the captured
+cursor. Dictation remains deliberately review-first: it never sends a chat turn or
+appends a note automatically. Warehouse authenticates the user, adds the bounded
+transcription configuration, and exchanges the browser's WebRTC offer without exposing
+the provider key. The live audio then flows directly between the browser and the
+provider. Recognition hints are bounded to configured organization terms plus current
+notebook titles, identity names, and recent private linked-object labels already visible
+to that user. A simultaneous browser recording supplies an automatic file-transcription
+fallback if live setup, connectivity, or finalization fails. Warehouse validates that
+fallback audio and does not persist it.
 
 ```bash
 export WAREHOUSE_HERMES_URL="http://127.0.0.1:8642"
@@ -534,6 +539,10 @@ export WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES="134217728" # 128 MiB; ceiling 512 Mi
 # Optional dictation; WAREHOUSE_CALLIOPE_STT_KEY overrides OPENAI_API_KEY
 export WAREHOUSE_CALLIOPE_STT_PROVIDER="openai"         # set off to disable
 export WAREHOUSE_CALLIOPE_STT_MODEL="gpt-transcribe"
+export WAREHOUSE_CALLIOPE_STT_REALTIME_MODEL="gpt-live-transcribe" # set off for batch-only
+# Optional literal recognition hints and expected language codes for live dictation
+export WAREHOUSE_CALLIOPE_STT_KEYWORDS="RVBBIT,Calliope,Linear,ENG-42"
+export WAREHOUSE_CALLIOPE_STT_LANGUAGES="en"
 export WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS="120"
 ```
 
@@ -697,7 +706,11 @@ Compose set the single shared host path with `WAREHOUSE_CALLIOPE_EXPORT_DIR`) ·
 `WAREHOUSE_CALLIOPE_STT_PROVIDER` (`openai`, or `off`) ·
 `WAREHOUSE_CALLIOPE_STT_KEY` (optional override for `OPENAI_API_KEY`) ·
 `WAREHOUSE_CALLIOPE_STT_BASE_URL` · `WAREHOUSE_CALLIOPE_STT_MODEL`
-(`gpt-transcribe`) · `WAREHOUSE_CALLIOPE_MAX_AUDIO_BYTES` (12 MiB default,
+(`gpt-transcribe`, batch fallback) · `WAREHOUSE_CALLIOPE_STT_REALTIME_MODEL`
+(`gpt-live-transcribe`; `off` keeps batch-only dictation) ·
+`WAREHOUSE_CALLIOPE_STT_KEYWORDS` (optional comma-separated literal hints) ·
+`WAREHOUSE_CALLIOPE_STT_LANGUAGES` (optional comma-separated expected language codes) ·
+`WAREHOUSE_CALLIOPE_MAX_AUDIO_BYTES` (12 MiB default,
 25 MiB ceiling) · `WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS` (120 default, 600 ceiling).
 **Artifact semantic compiler:** `WAREHOUSE_SEMANTIC_ENRICHMENT` (default `1`; set `0` to
 disable queueing and the worker) · `WAREHOUSE_SEMANTIC_ENRICH_MODEL` (default

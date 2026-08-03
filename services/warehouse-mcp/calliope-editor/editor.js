@@ -177,22 +177,34 @@ function mount(host, options = {}) {
   });
   return {
     getValue: () => view.state.doc.toString(),
+    getSelection: () => ({
+      from: view.state.selection.main.from,
+      to: view.state.selection.main.to,
+    }),
     setValue(value = "") {
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: String(value) } });
     },
-    insertText(value = "") {
-      const selection = view.state.selection.main;
+    insertText(value = "", requestedSelection = null) {
       const documentText = view.state.doc.toString();
-      const insert = speechInsertion(documentText, selection.from, selection.to, value);
+      const requestedFrom = Number(requestedSelection?.from);
+      const requestedTo = Number(requestedSelection?.to);
+      const liveSelection = view.state.selection.main;
+      const from = Number.isInteger(requestedFrom)
+        ? Math.max(0, Math.min(requestedFrom, documentText.length))
+        : liveSelection.from;
+      const to = Number.isInteger(requestedTo)
+        ? Math.max(from, Math.min(requestedTo, documentText.length))
+        : liveSelection.to;
+      const insert = speechInsertion(documentText, from, to, value);
       if (!insert) return false;
       const maxLength = Number(options.maxLength || 0);
       if (
         maxLength > 0
-        && documentText.length - (selection.to - selection.from) + insert.length > maxLength
+        && documentText.length - (to - from) + insert.length > maxLength
       ) return false;
       view.dispatch({
-        changes: { from: selection.from, to: selection.to, insert },
-        selection: { anchor: selection.from + insert.length },
+        changes: { from, to, insert },
+        selection: { anchor: from + insert.length },
         userEvent: "input",
       });
       view.focus();

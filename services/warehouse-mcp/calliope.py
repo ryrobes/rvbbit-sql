@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import inspect
 import ipaddress
 import json
@@ -68,6 +69,9 @@ _DEFAULT_MAX_AUDIO_BYTES = 12 * 1024 * 1024
 _MAX_AUDIO_BYTES_CEILING = 25 * 1024 * 1024
 _DEFAULT_MAX_AUDIO_SECONDS = 120
 _MAX_AUDIO_SECONDS_CEILING = 10 * 60
+_MAX_REALTIME_SDP_BYTES = 128 * 1024
+_MAX_TRANSCRIPTION_KEYWORDS = 40
+_MAX_TRANSCRIPTION_KEYWORD_CHARS = 120
 _EXPORT_EXTENSIONS = {
     ".csv",
     ".doc",
@@ -460,6 +464,9 @@ class CalliopeConfig:
     transcription_api_key: str = ""
     transcription_base_url: str = "https://api.openai.com/v1"
     transcription_model: str = "gpt-transcribe"
+    transcription_realtime_model: str = "gpt-live-transcribe"
+    transcription_keywords: tuple[str, ...] = ()
+    transcription_languages: tuple[str, ...] = ()
     max_audio_bytes: int = _DEFAULT_MAX_AUDIO_BYTES
     max_audio_seconds: int = _DEFAULT_MAX_AUDIO_SECONDS
 
@@ -472,6 +479,10 @@ class CalliopeConfig:
         return self.transcription_provider == "openai" and bool(
             self.transcription_api_key
         )
+
+    @property
+    def realtime_transcription_enabled(self) -> bool:
+        return self.transcription_enabled and bool(self.transcription_realtime_model)
 
     @classmethod
     def from_env(cls) -> "CalliopeConfig":
@@ -511,6 +522,36 @@ class CalliopeConfig:
         ).strip().lower()
         if transcription_provider in {"disabled", "none", "off"}:
             transcription_provider = ""
+        realtime_model = os.environ.get(
+            "WAREHOUSE_CALLIOPE_STT_REALTIME_MODEL", "gpt-live-transcribe"
+        ).strip()
+        if realtime_model.lower() in {"disabled", "none", "off"}:
+            realtime_model = ""
+        keywords = []
+        for raw_keyword in re.split(
+            r"[,;\n]+", os.environ.get("WAREHOUSE_CALLIOPE_STT_KEYWORDS", "")
+        ):
+            keyword = re.sub(r"\s+", " ", raw_keyword).strip()
+            if (
+                1 < len(keyword) <= _MAX_TRANSCRIPTION_KEYWORD_CHARS
+                and not re.search(r"[<>\r\n]", keyword)
+                and keyword.casefold() not in {value.casefold() for value in keywords}
+            ):
+                keywords.append(keyword)
+            if len(keywords) >= _MAX_TRANSCRIPTION_KEYWORDS:
+                break
+        languages = []
+        for raw_language in re.split(
+            r"[,;\s]+", os.environ.get("WAREHOUSE_CALLIOPE_STT_LANGUAGES", "")
+        ):
+            language = raw_language.strip().lower()
+            if (
+                re.fullmatch(r"[a-z]{2,3}(?:-[a-z]{2})?", language)
+                and language not in languages
+            ):
+                languages.append(language)
+            if len(languages) >= 8:
+                break
         export_roots = tuple(
             Path(value.strip()).expanduser()
             for value in os.environ.get("WAREHOUSE_CALLIOPE_EXPORT_ROOTS", "").split(os.pathsep)
@@ -542,6 +583,9 @@ class CalliopeConfig:
                 os.environ.get("WAREHOUSE_CALLIOPE_STT_MODEL", "gpt-transcribe").strip()
                 or "gpt-transcribe"
             )[:160],
+            transcription_realtime_model=realtime_model[:160],
+            transcription_keywords=tuple(keywords),
+            transcription_languages=tuple(languages),
             max_audio_bytes=max(
                 256 * 1024,
                 min(max_audio, _MAX_AUDIO_BYTES_CEILING),
@@ -598,6 +642,191 @@ def _transcription_endpoint(config: CalliopeConfig) -> str:
     if base.endswith("/audio/transcriptions"):
         return base
     return f"{base}/audio/transcriptions"
+
+
+def _realtime_transcription_endpoint(config: CalliopeConfig) -> str:
+    base = config.transcription_base_url.rstrip("/")
+    if base.endswith("/realtime/calls"):
+        return base
+    if base.endswith("/audio/transcriptions"):
+        base = base[: -len("/audio/transcriptions")]
+    return f"{base}/realtime/calls"
+
+
+def _transcription_safety_identifier(config: CalliopeConfig, owner: str) -> str:
+    """Create a stable, non-reversible provider identifier for one Calliope user."""
+    key = (config.transcription_api_key or config.hermes_api_key).encode("utf-8")
+    return hmac.new(key, owner.casefold().encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _clean_transcription_keyword(value: Any) -> str:
+    keyword = re.sub(r"\s+", " ", str(value or "")).strip()
+    if (
+        len(keyword) < 2
+        or len(keyword) > _MAX_TRANSCRIPTION_KEYWORD_CHARS
+        or re.search(r"[<>\r\n]", keyword)
+    ):
+        return ""
+    return keyword
+
+
+def _transcription_context_keywords(
+    conn_factory: Callable[..., Any],
+    config: CalliopeConfig,
+    owner: str,
+    session_id: Any = None,
+) -> tuple[str, ...]:
+    """Bound literal hints to configuration and objects already visible to this user."""
+    candidates: list[Any] = list(config.transcription_keywords)
+    normalized_session = _uuid(session_id)
+    try:
+        with conn_factory() as conn:
+            if normalized_session:
+                rows = conn.execute(
+                    "SELECT title AS label,0 AS source_rank,updated_at AS observed_at "
+                    "FROM rvbbit.calliope_sessions "
+                    "WHERE id=%s::uuid AND lower(owner_email)=lower(%s) "
+                    "UNION ALL "
+                    "SELECT f.title AS label,1 AS source_rank,f.created_at AS observed_at "
+                    "FROM rvbbit.calliope_surfaces f "
+                    "JOIN rvbbit.calliope_sessions s ON s.id=f.session_id "
+                    "WHERE f.session_id=%s::uuid AND lower(s.owner_email)=lower(%s) "
+                    "ORDER BY source_rank,observed_at DESC LIMIT 20",
+                    (normalized_session, owner, normalized_session, owner),
+                ).fetchall()
+                candidates.extend(
+                    row.get("label") if hasattr(row, "get") else row[0]
+                    for row in rows
+                )
+            rows = conn.execute(
+                "SELECT l.label,0 AS source_rank,max(l.created_at) AS observed_at "
+                "FROM rvbbit.calliope_daily_note_links l "
+                "JOIN rvbbit.calliope_daily_notes n ON n.id=l.note_id "
+                "WHERE lower(n.owner_email)=lower(%s) "
+                "AND n.note_date >= current_date - 180 GROUP BY l.label "
+                "UNION ALL "
+                "SELECT alias_value AS label,1 AS source_rank,created_at AS observed_at "
+                "FROM rvbbit.calliope_identity_aliases "
+                "WHERE lower(owner_email)=lower(%s) AND alias_kind='name' "
+                "ORDER BY source_rank,observed_at DESC LIMIT 20",
+                (owner, owner),
+            ).fetchall()
+            candidates.extend(
+                row.get("label") if hasattr(row, "get") else row[0]
+                for row in rows
+            )
+    except Exception:
+        # Context should improve recognition, never make dictation unavailable.
+        pass
+    keywords = []
+    seen = set()
+    for candidate in candidates:
+        keyword = _clean_transcription_keyword(candidate)
+        folded = keyword.casefold()
+        if not keyword or folded in seen:
+            continue
+        seen.add(folded)
+        keywords.append(keyword)
+        if len(keywords) >= _MAX_TRANSCRIPTION_KEYWORDS:
+            break
+    return tuple(keywords)
+
+
+def _realtime_transcription_session(
+    config: CalliopeConfig,
+    surface: str,
+    keywords: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    transcription: dict[str, Any] = {
+        "model": config.transcription_realtime_model,
+        "prompt": _transcription_prompt(surface),
+    }
+    if keywords:
+        transcription["keywords"] = list(keywords)
+    if config.transcription_languages:
+        transcription["languages"] = list(config.transcription_languages)
+    return {
+        "type": "transcription",
+        "audio": {
+            "input": {
+                "format": {"type": "audio/pcm", "rate": 24000},
+                "transcription": transcription,
+                "turn_detection": None,
+            }
+        },
+    }
+
+
+async def _create_realtime_transcription_call(
+    config: CalliopeConfig,
+    sdp: str,
+    *,
+    owner: str,
+    surface: str,
+    keywords: tuple[str, ...] = (),
+) -> str:
+    """Exchange a browser WebRTC offer for an OpenAI transcription answer."""
+    if not config.realtime_transcription_enabled:
+        raise TranscriptionProviderError(
+            "Live transcription is not configured for this installation.",
+            "REALTIME_TRANSCRIPTION_UNAVAILABLE",
+        )
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            follow_redirects=False,
+        ) as client:
+            response = await client.post(
+                _realtime_transcription_endpoint(config),
+                headers={
+                    "Authorization": f"Bearer {config.transcription_api_key}",
+                    "OpenAI-Safety-Identifier": _transcription_safety_identifier(
+                        config, owner
+                    ),
+                },
+                files={
+                    "sdp": (None, sdp, "application/sdp"),
+                    "session": (
+                        None,
+                        json.dumps(
+                            _realtime_transcription_session(
+                                config, surface, keywords
+                            ),
+                            separators=(",", ":"),
+                        ),
+                        "application/json",
+                    ),
+                },
+            )
+    except httpx.HTTPError as exc:
+        raise TranscriptionProviderError(
+            "Live transcription could not be reached. The recording will use fallback transcription.",
+            "REALTIME_PROVIDER_UNAVAILABLE",
+        ) from exc
+    if response.status_code in {401, 403}:
+        raise TranscriptionProviderError(
+            "The speech provider rejected the configured live-transcription credentials.",
+            "TRANSCRIPTION_PROVIDER_AUTH",
+        )
+    if response.status_code == 429:
+        raise TranscriptionProviderError(
+            "Live transcription is temporarily at capacity.",
+            "TRANSCRIPTION_RATE_LIMITED",
+        )
+    if response.status_code >= 400:
+        raise TranscriptionProviderError(
+            "The speech provider could not start live transcription.",
+            "REALTIME_PROVIDER_ERROR",
+        )
+    # SDP is line-oriented and Chromium requires the final line terminator. Do
+    # not normalize or strip the provider answer before returning it verbatim.
+    answer = response.text
+    if not answer.startswith("v=0") or "m=audio" not in answer:
+        raise TranscriptionProviderError(
+            "The speech provider returned an unreadable live-session response.",
+            "REALTIME_BAD_RESPONSE",
+        )
+    return answer
 
 
 async def _transcribe_audio(
@@ -12282,8 +12511,154 @@ def register_calliope_routes(
                 "max_audio_bytes": config.max_audio_bytes,
                 "max_audio_seconds": config.max_audio_seconds,
                 "retains_audio": False,
+                "realtime": {
+                    "enabled": config.realtime_transcription_enabled,
+                    "model": (
+                        config.transcription_realtime_model
+                        if config.realtime_transcription_enabled
+                        else None
+                    ),
+                    "transport": "webrtc",
+                    "batch_fallback": True,
+                },
             },
         })
+
+    @mcp.custom_route(
+        "/api/calliope/realtime-transcription", methods=["POST"]
+    )
+    async def create_calliope_realtime_transcription(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        if not config.realtime_transcription_enabled:
+            return json_response({
+                "error": {
+                    "code": "REALTIME_TRANSCRIPTION_UNAVAILABLE",
+                    "message": "Live transcription is not configured for this installation.",
+                }
+            }, 503)
+        try:
+            content_length = int(request.headers.get("content-length") or 0)
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > _MAX_REALTIME_SDP_BYTES + 32 * 1024:
+            return json_response({
+                "error": {
+                    "code": "REALTIME_OFFER_TOO_LARGE",
+                    "message": "That live-transcription connection offer is too large.",
+                }
+            }, 413)
+        content_type = str(request.headers.get("content-type") or "").lower()
+        surface = "chat"
+        session_id = None
+        try:
+            if content_type.startswith("multipart/form-data"):
+                form = await request.form()
+                sdp_value = form.get("sdp")
+                surface = str(form.get("surface") or "chat").strip().lower()
+                session_id = form.get("session_id")
+                if callable(getattr(sdp_value, "read", None)):
+                    sdp_value = await sdp_value.read(_MAX_REALTIME_SDP_BYTES + 1)
+                if isinstance(sdp_value, bytes):
+                    sdp = sdp_value.decode("utf-8", "strict")
+                else:
+                    sdp = str(sdp_value or "")
+            elif content_type.startswith(("application/sdp", "text/plain")):
+                payload = await request.body()
+                if len(payload) > _MAX_REALTIME_SDP_BYTES:
+                    raise OverflowError
+                sdp = payload.decode("utf-8", "strict")
+                surface = str(
+                    request.query_params.get("surface") or "chat"
+                ).strip().lower()
+                session_id = request.query_params.get("session_id")
+            else:
+                return json_response({
+                    "error": {
+                        "code": "BAD_REALTIME_OFFER",
+                        "message": "Calliope could not read that live-transcription connection offer.",
+                    }
+                }, 415)
+        except OverflowError:
+            return json_response({
+                "error": {
+                    "code": "REALTIME_OFFER_TOO_LARGE",
+                    "message": "That live-transcription connection offer is too large.",
+                }
+            }, 413)
+        except (UnicodeDecodeError, ValueError):
+            return json_response({
+                "error": {
+                    "code": "BAD_REALTIME_OFFER",
+                    "message": "Calliope could not read that live-transcription connection offer.",
+                }
+            }, 400)
+        except Exception:
+            return json_response({
+                "error": {
+                    "code": "BAD_REALTIME_OFFER",
+                    "message": "Calliope could not read that live-transcription connection offer.",
+                }
+            }, 400)
+        if surface not in {"chat", "daily_note"}:
+            return json_response({
+                "error": {
+                    "code": "BAD_TRANSCRIPTION_SURFACE",
+                    "message": "That speech destination is not supported.",
+                }
+            }, 400)
+        if len(sdp.encode("utf-8")) > _MAX_REALTIME_SDP_BYTES:
+            return json_response({
+                "error": {
+                    "code": "REALTIME_OFFER_TOO_LARGE",
+                    "message": "That live-transcription connection offer is too large.",
+                }
+            }, 413)
+        if (
+            not sdp.startswith("v=0")
+            or "m=audio" not in sdp
+            or "m=video" in sdp
+            or "\x00" in sdp
+        ):
+            return json_response({
+                "error": {
+                    "code": "BAD_REALTIME_OFFER",
+                    "message": "That live-transcription connection offer is invalid.",
+                }
+            }, 400)
+        keywords = await asyncio.to_thread(
+            _transcription_context_keywords,
+            conn_factory,
+            config,
+            owner,
+            session_id,
+        )
+        try:
+            answer = await _create_realtime_transcription_call(
+                config,
+                sdp,
+                owner=owner,
+                surface=surface,
+                keywords=keywords,
+            )
+        except TranscriptionProviderError as exc:
+            status = 503 if exc.code in {
+                "REALTIME_TRANSCRIPTION_UNAVAILABLE",
+                "REALTIME_PROVIDER_UNAVAILABLE",
+                "TRANSCRIPTION_RATE_LIMITED",
+            } else 502
+            return json_response({
+                "error": {"code": exc.code, "message": str(exc)[:400]}
+            }, status)
+        return Response(
+            answer,
+            media_type="application/sdp",
+            headers={
+                "cache-control": "no-store",
+                "x-content-type-options": "nosniff",
+            },
+        )
 
     @mcp.custom_route("/api/calliope/transcriptions", methods=["POST"])
     async def create_calliope_transcription(request):

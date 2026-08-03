@@ -319,6 +319,17 @@
       timeout: null,
       cancelled: false,
       controller: null,
+      realtimeController: null,
+      peerConnection: null,
+      dataChannel: null,
+      realtimeAttempted: false,
+      realtimeConnected: false,
+      realtimeFailed: false,
+      realtimeError: "",
+      liveTranscript: "",
+      finalTranscript: "",
+      finalPromise: null,
+      resolveFinal: null,
     },
     stageAtLiveEdge: true,
     chatAtLiveEdge: true,
@@ -5633,6 +5644,11 @@
       <div class="brief-note-list" data-brief-note-list>${cached ? briefNoteListMarkup(cached) : '<div class="brief-note-loading"><i></i><span>Loading this day’s notes…</span></div>'}</div>
       <div class="brief-note-compose">
         <div class="brief-note-editor" data-brief-note-editor></div>
+        <div class="speech-live-preview brief-note-speech-preview" data-speech-preview="daily_note"
+             data-speech-surface-id="${escapeHtml(surface.id)}"
+             aria-label="Provisional live transcript" aria-live="off" hidden>
+          <span>Live transcript</span><p></p>
+        </div>
         <footer>
           <span>Type <b>[[</b> plus a person, place, thing, project, or ticket · <kbd>⌘/Ctrl</kbd> + <kbd>Enter</kbd> to append</span>
           <button type="button" class="brief-note-speech" data-speech-record="daily_note"
@@ -5727,11 +5743,21 @@
     });
     return {
       getValue: () => textarea.value,
+      getSelection: () => ({
+        from: Number.isInteger(textarea.selectionStart) ? textarea.selectionStart : textarea.value.length,
+        to: Number.isInteger(textarea.selectionEnd) ? textarea.selectionEnd : textarea.value.length,
+      }),
       setValue: (value = "") => { textarea.value = String(value); options.onChange?.(textarea.value); },
-      insertText(value = "") {
-        const start = Number.isInteger(textarea.selectionStart)
-          ? textarea.selectionStart : textarea.value.length;
-        const end = Number.isInteger(textarea.selectionEnd) ? textarea.selectionEnd : start;
+      insertText(value = "", requestedSelection = null) {
+        const requestedStart = Number(requestedSelection?.from);
+        const requestedEnd = Number(requestedSelection?.to);
+        const start = Number.isInteger(requestedStart)
+          ? Math.max(0, Math.min(requestedStart, textarea.value.length))
+          : Number.isInteger(textarea.selectionStart)
+            ? textarea.selectionStart : textarea.value.length;
+        const end = Number.isInteger(requestedEnd)
+          ? Math.max(start, Math.min(requestedEnd, textarea.value.length))
+          : Number.isInteger(textarea.selectionEnd) ? textarea.selectionEnd : start;
         const insert = speechInsertion(textarea.value, start, end, value);
         if (!insert || textarea.value.length - (end - start) + insert.length > BRIEF_NOTE_MAX_CHARS) {
           return false;
@@ -7094,14 +7120,38 @@
     );
   }
 
+  function realtimeSpeechSupported() {
+    return Boolean(
+      speechSupported()
+      && state.config?.speech_to_text?.realtime?.enabled
+      && window.RTCPeerConnection,
+    );
+  }
+
   function speechTargetFromButton(button) {
     if (!button) return null;
     if (button.dataset.speechRecord === "chat") {
-      return state.current ? { kind: "chat", sessionId: state.current.id } : null;
+      if (!state.current) return null;
+      const start = Number.isInteger(els.input.selectionStart)
+        ? els.input.selectionStart : els.input.value.length;
+      const end = Number.isInteger(els.input.selectionEnd)
+        ? els.input.selectionEnd : start;
+      return {
+        kind: "chat",
+        sessionId: state.current.id,
+        selection: { from: start, to: end },
+      };
     }
     if (button.dataset.speechRecord === "daily_note") {
       const surfaceId = button.dataset.speechSurfaceId;
-      return surfaceId ? { kind: "daily_note", surfaceId } : null;
+      if (!surfaceId) return null;
+      const editor = state.brief.noteEditors.get(surfaceId);
+      return {
+        kind: "daily_note",
+        surfaceId,
+        sessionId: state.current?.id || "",
+        selection: editor?.getSelection?.() || null,
+      };
     }
     return null;
   }
@@ -7136,21 +7186,24 @@
         || (recording && !active) || waiting;
       button.classList.toggle("recording", recording && active);
       button.classList.toggle("transcribing", state.speech.phase === "transcribing" && active);
+      button.classList.toggle("connecting", state.speech.phase === "requesting" && active);
       button.setAttribute("aria-pressed", String(recording && active));
       const label = $("span", button);
       if (label) {
         label.textContent = recording && active
           ? speechElapsedLabel()
           : state.speech.phase === "requesting" && active
-            ? "Allow mic"
+            ? state.speech.stream ? "Connecting" : "Allow mic"
             : state.speech.phase === "transcribing" && active
-              ? "Transcribing"
+              ? state.speech.realtimeConnected ? "Finalizing" : "Transcribing"
               : "Dictate";
       }
       const accessible = recording && active
         ? "Stop recording"
         : state.speech.phase === "transcribing" && active
-          ? "Transcribing speech"
+          ? state.speech.realtimeConnected
+            ? "Finalizing live transcription"
+            : "Transcribing speech"
           : target?.kind === "daily_note"
             ? "Dictate a private note"
             : "Dictate a message";
@@ -7159,16 +7212,62 @@
     });
     if (els.speechStatus) {
       const status = recording
-        ? `Recording ${speechElapsedLabel()} · tap Dictate to stop`
+        ? `${state.speech.realtimeConnected ? "Live" : "Recording"} ${speechElapsedLabel()} · tap Dictate to stop`
         : state.speech.phase === "requesting"
-          ? "Waiting for microphone permission…"
+          ? state.speech.stream
+            ? "Connecting live transcription…"
+            : "Waiting for microphone permission…"
           : state.speech.phase === "transcribing"
-            ? "Transcribing recording…"
+            ? state.speech.realtimeConnected
+              ? "Finalizing live transcript…"
+              : "Transcribing recording…"
             : "";
       els.speechStatus.textContent = status;
       els.speechStatus.hidden = !status;
     }
+    syncSpeechPreviews();
     els.send.disabled = !state.current || state.busy || state.speech.phase !== "idle";
+  }
+
+  function syncSpeechPreviews() {
+    const activeKey = speechTargetKey(state.speech.target);
+    $$('[data-speech-preview]').forEach((preview) => {
+      const kind = preview.dataset.speechPreview;
+      const target = kind === "chat"
+        ? { kind: "chat", sessionId: state.current?.id || "" }
+        : { kind: "daily_note", surfaceId: preview.dataset.speechSurfaceId || "" };
+      const active = Boolean(activeKey && speechTargetKey(target) === activeKey);
+      const show = active && state.speech.phase !== "idle" && (
+        state.speech.realtimeAttempted
+        || state.speech.realtimeConnected
+        || state.speech.liveTranscript
+      );
+      preview.hidden = !show;
+      if (!show) {
+        preview.removeAttribute("title");
+        return;
+      }
+      const fallback = state.speech.realtimeFailed;
+      const label = $("span", preview);
+      const copy = $("p", preview);
+      preview.classList.toggle("is-fallback", fallback);
+      preview.classList.toggle("is-waiting", !state.speech.liveTranscript);
+      if (fallback && state.speech.realtimeError) {
+        preview.title = `Live preview unavailable: ${state.speech.realtimeError.slice(0, 240)}`;
+      } else {
+        preview.removeAttribute("title");
+      }
+      if (label) label.textContent = fallback ? "Batch fallback" : "Live transcript";
+      if (copy) {
+        copy.textContent = state.speech.liveTranscript
+          || (fallback
+            ? "Live preview is unavailable. The complete recording will still be transcribed when you stop."
+            : state.speech.phase === "transcribing"
+              ? "Finalizing the live transcript…"
+              : "Listening…");
+        copy.scrollTop = copy.scrollHeight;
+      }
+    });
   }
 
   function clearSpeechTimers() {
@@ -7182,8 +7281,39 @@
     (stream?.getTracks?.() || []).forEach((track) => track.stop());
   }
 
+  function settleRealtimeTranscript(value = null) {
+    const resolve = state.speech.resolveFinal;
+    state.speech.resolveFinal = null;
+    if (resolve) resolve(value);
+  }
+
+  function releaseRealtimeConnection() {
+    const controller = state.speech.realtimeController;
+    const channel = state.speech.dataChannel;
+    const peer = state.speech.peerConnection;
+    state.speech.realtimeController = null;
+    state.speech.dataChannel = null;
+    state.speech.peerConnection = null;
+    state.speech.realtimeConnected = false;
+    controller?.abort();
+    try { channel?.close(); } catch { /* already closed */ }
+    try { peer?.close(); } catch { /* already closed */ }
+  }
+
+  function markRealtimeSpeechFailed(message = "Live preview was interrupted.") {
+    if (["idle", "cancelling"].includes(state.speech.phase) || state.speech.finalTranscript) return;
+    state.speech.realtimeFailed = true;
+    state.speech.realtimeError = String(message || "Live preview was interrupted.");
+    settleRealtimeTranscript(null);
+    releaseRealtimeConnection();
+    syncSpeechControls();
+  }
+
   function resetSpeechState() {
     clearSpeechTimers();
+    state.speech.controller?.abort();
+    settleRealtimeTranscript(null);
+    releaseRealtimeConnection();
     stopSpeechStream();
     state.speech.phase = "idle";
     state.speech.recorder = null;
@@ -7193,7 +7323,181 @@
     state.speech.startedAt = 0;
     state.speech.cancelled = false;
     state.speech.controller = null;
+    state.speech.realtimeAttempted = false;
+    state.speech.realtimeFailed = false;
+    state.speech.realtimeError = "";
+    state.speech.liveTranscript = "";
+    state.speech.finalTranscript = "";
+    state.speech.finalPromise = null;
     syncSpeechControls();
+  }
+
+  function realtimeEventMessage(event) {
+    return String(
+      event?.error?.message
+      || event?.message
+      || "Live preview was interrupted.",
+    ).slice(0, 300);
+  }
+
+  function handleRealtimeSpeechEvent(event) {
+    if (!event || ["idle", "cancelling"].includes(state.speech.phase)) return;
+    if (event.type === "conversation.item.input_audio_transcription.delta") {
+      const delta = String(event.delta || "");
+      if (delta) {
+        state.speech.liveTranscript = `${state.speech.liveTranscript}${delta}`
+          .slice(0, 40_000);
+        syncSpeechPreviews();
+      }
+      return;
+    }
+    if (event.type === "conversation.item.input_audio_transcription.completed") {
+      const transcript = String(event.transcript || "").trim();
+      if (transcript) {
+        state.speech.finalTranscript = transcript.slice(0, 40_000);
+        state.speech.liveTranscript = state.speech.finalTranscript;
+        settleRealtimeTranscript(state.speech.finalTranscript);
+        syncSpeechPreviews();
+      } else {
+        markRealtimeSpeechFailed("No speech was detected in the live recording.");
+      }
+      return;
+    }
+    if (
+      event.type === "conversation.item.input_audio_transcription.failed"
+      || event.type === "error"
+    ) {
+      markRealtimeSpeechFailed(realtimeEventMessage(event));
+    }
+  }
+
+  function waitForRealtimeChannel(channel, timeoutMs = 8_000) {
+    if (channel.readyState === "open") return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish(new Error("Live transcription took too long to connect.")), timeoutMs);
+      const finish = (error) => {
+        clearTimeout(timer);
+        channel.removeEventListener("open", opened);
+        channel.removeEventListener("error", failed);
+        channel.removeEventListener("close", failed);
+        if (error) reject(error);
+        else resolve();
+      };
+      const opened = () => finish();
+      const failed = () => finish(new Error("Live transcription could not open its event channel."));
+      channel.addEventListener("open", opened, { once: true });
+      channel.addEventListener("error", failed, { once: true });
+      channel.addEventListener("close", failed, { once: true });
+    });
+  }
+
+  async function connectRealtimeSpeech(stream, target) {
+    state.speech.realtimeAttempted = true;
+    state.speech.realtimeFailed = false;
+    state.speech.realtimeError = "";
+    state.speech.liveTranscript = "";
+    state.speech.finalTranscript = "";
+    state.speech.finalPromise = new Promise((resolve) => {
+      state.speech.resolveFinal = resolve;
+    });
+    const track = stream.getAudioTracks?.()[0];
+    if (!track) throw new Error("No microphone audio track was available.");
+    track.enabled = false;
+    const peer = new RTCPeerConnection();
+    const channel = peer.createDataChannel("oai-events");
+    state.speech.peerConnection = peer;
+    state.speech.dataChannel = channel;
+    peer.addTrack(track, stream);
+    channel.addEventListener("message", (message) => {
+      try {
+        handleRealtimeSpeechEvent(JSON.parse(message.data));
+      } catch { /* ignore malformed provider events */ }
+    });
+    channel.addEventListener("close", () => {
+      if (
+        state.speech.dataChannel === channel
+        && !state.speech.finalTranscript
+        && ["recording", "transcribing"].includes(state.speech.phase)
+      ) {
+        markRealtimeSpeechFailed("The live transcript channel closed early.");
+      }
+    });
+    peer.addEventListener("connectionstatechange", () => {
+      if (
+        state.speech.peerConnection === peer
+        && peer.connectionState === "failed"
+      ) {
+        markRealtimeSpeechFailed("The live audio connection was interrupted.");
+      }
+    });
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    const form = new FormData();
+    form.append("sdp", offer.sdp || "");
+    form.append("surface", target.kind);
+    if (target.sessionId) form.append("session_id", target.sessionId);
+    const controller = new AbortController();
+    state.speech.realtimeController = controller;
+    const connectionTimeout = setTimeout(() => controller.abort(), 8_000);
+    let response;
+    let responseBody;
+    try {
+      response = await fetch("/api/calliope/realtime-transcription", {
+        method: "POST",
+        body: form,
+        signal: controller.signal,
+        headers: { Accept: "application/sdp, application/json" },
+      });
+      responseBody = await response.text();
+    } finally {
+      clearTimeout(connectionTimeout);
+      if (state.speech.realtimeController === controller) {
+        state.speech.realtimeController = null;
+      }
+    }
+    if (!response.ok) {
+      let message = `Live transcription could not start (${response.status}).`;
+      try { message = JSON.parse(responseBody)?.error?.message || message; } catch { /* use status */ }
+      throw new Error(message);
+    }
+    if (!responseBody.startsWith("v=0")) {
+      throw new Error("Live transcription returned an invalid connection answer.");
+    }
+    await peer.setRemoteDescription({ type: "answer", sdp: responseBody });
+    await waitForRealtimeChannel(channel);
+    if (state.speech.cancelled) {
+      const error = new Error("Live transcription was cancelled.");
+      error.name = "AbortError";
+      throw error;
+    }
+    state.speech.realtimeConnected = true;
+    return true;
+  }
+
+  async function finishRealtimeTranscript() {
+    const channel = state.speech.dataChannel;
+    const pending = state.speech.finalPromise;
+    if (!state.speech.realtimeConnected || channel?.readyState !== "open" || !pending) {
+      return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 140));
+    try {
+      channel.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      stopSpeechStream();
+      state.speech.stream = null;
+    } catch {
+      markRealtimeSpeechFailed("The live transcript could not be finalized.");
+      return null;
+    }
+    const transcript = await Promise.race([
+      pending,
+      new Promise((resolve) => setTimeout(() => resolve(null), 7_000)),
+    ]);
+    if (!transcript) {
+      markRealtimeSpeechFailed("The live transcript did not finalize in time.");
+      return null;
+    }
+    return String(transcript).trim();
   }
 
   function speechInsertion(value, start, end, transcript) {
@@ -7209,10 +7513,15 @@
   function insertSpeechTranscript(target, transcript) {
     if (target?.kind === "chat") {
       if (!state.current || state.current.id !== target.sessionId) return false;
-      const start = Number.isInteger(els.input.selectionStart)
-        ? els.input.selectionStart : els.input.value.length;
-      const end = Number.isInteger(els.input.selectionEnd)
-        ? els.input.selectionEnd : start;
+      const requestedStart = Number(target.selection?.from);
+      const requestedEnd = Number(target.selection?.to);
+      const start = Number.isInteger(requestedStart)
+        ? Math.max(0, Math.min(requestedStart, els.input.value.length))
+        : Number.isInteger(els.input.selectionStart)
+          ? els.input.selectionStart : els.input.value.length;
+      const end = Number.isInteger(requestedEnd)
+        ? Math.max(start, Math.min(requestedEnd, els.input.value.length))
+        : Number.isInteger(els.input.selectionEnd) ? els.input.selectionEnd : start;
       const insert = speechInsertion(els.input.value, start, end, transcript);
       if (!insert || els.input.value.length - (end - start) + insert.length > 40_000) {
         return false;
@@ -7224,12 +7533,25 @@
     }
     if (target?.kind === "daily_note") {
       const editor = state.brief.noteEditors.get(target.surfaceId);
-      if (!editor?.insertText || !editor.insertText(transcript)) return false;
+      if (!editor?.insertText || !editor.insertText(transcript, target.selection)) return false;
       const panel = $(`[data-brief-notes][data-surface-id="${CSS.escape(target.surfaceId)}"]`, els.stage);
       if (panel) syncBriefNoteComposer(panel, editor);
       return true;
     }
     return false;
+  }
+
+  function acceptSpeechTranscript(target, transcript) {
+    const text = String(transcript || "").trim();
+    if (!text) throw new Error("No speech was detected in that recording.");
+    if (!insertSpeechTranscript(target, text)) {
+      throw new Error(target.kind === "daily_note"
+        ? "That transcript would make this note too long, or the note is no longer open."
+        : "That transcript no longer has an open message box.");
+    }
+    toast(target.kind === "daily_note"
+      ? "Transcript inserted into your private note"
+      : "Transcript inserted · review it before sending");
   }
 
   async function transcribeSpeechRecording(blob, target, startedAt) {
@@ -7253,16 +7575,7 @@
     if (!response.ok) {
       throw new Error(data?.error?.message || `Speech transcription failed (${response.status})`);
     }
-    const transcript = String(data.text || "").trim();
-    if (!transcript) throw new Error("No speech was detected in that recording.");
-    if (!insertSpeechTranscript(target, transcript)) {
-      throw new Error(target.kind === "daily_note"
-        ? "That transcript would make this note too long, or the note is no longer open."
-        : "That transcript no longer has an open message box.");
-    }
-    toast(target.kind === "daily_note"
-      ? "Transcript inserted into your private note"
-      : "Transcript inserted · review it before sending");
+    acceptSpeechTranscript(target, data.text);
   }
 
   async function finishSpeechRecording() {
@@ -7273,18 +7586,30 @@
     const cancelled = state.speech.cancelled;
     const mediaType = recorder?.mimeType || chunks.find((chunk) => chunk.type)?.type || "audio/webm";
     clearSpeechTimers();
-    stopSpeechStream();
     state.speech.recorder = null;
-    state.speech.stream = null;
     state.speech.chunks = [];
     if (cancelled || !target) {
+      stopSpeechStream();
       resetSpeechState();
       return;
     }
     state.speech.phase = "transcribing";
     syncSpeechControls();
     try {
-      await transcribeSpeechRecording(new Blob(chunks, { type: mediaType }), target, startedAt);
+      let transcript = null;
+      if (state.speech.realtimeConnected) {
+        transcript = await finishRealtimeTranscript();
+      }
+      stopSpeechStream();
+      state.speech.stream = null;
+      if (state.speech.cancelled) return;
+      if (transcript) {
+        acceptSpeechTranscript(target, transcript);
+      } else {
+        await transcribeSpeechRecording(
+          new Blob(chunks, { type: mediaType }), target, startedAt,
+        );
+      }
     } catch (error) {
       if (error?.name !== "AbortError") toast(error.message || "Speech transcription failed", true);
     } finally {
@@ -7295,8 +7620,12 @@
   function stopSpeechRecording({ cancel = false } = {}) {
     if (state.speech.phase === "transcribing") {
       if (cancel) {
+        state.speech.cancelled = true;
         state.speech.phase = "cancelling";
         state.speech.controller?.abort();
+        settleRealtimeTranscript(null);
+        releaseRealtimeConnection();
+        stopSpeechStream();
         syncSpeechControls();
       }
       return;
@@ -7305,6 +7634,10 @@
       if (cancel) {
         state.speech.cancelled = true;
         state.speech.phase = "cancelling";
+        state.speech.realtimeController?.abort();
+        settleRealtimeTranscript(null);
+        releaseRealtimeConnection();
+        stopSpeechStream();
         syncSpeechControls();
       }
       return;
@@ -7314,8 +7647,15 @@
     state.speech.cancelled = cancel;
     state.speech.phase = cancel ? "cancelling" : "transcribing";
     clearSpeechTimers();
+    (state.speech.stream?.getAudioTracks?.() || []).forEach((track) => {
+      track.enabled = false;
+    });
     recorder.stop();
-    stopSpeechStream();
+    if (cancel) {
+      settleRealtimeTranscript(null);
+      releaseRealtimeConnection();
+      stopSpeechStream();
+    }
     syncSpeechControls();
   }
 
@@ -7334,6 +7674,8 @@
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
+      state.speech.stream = stream;
+      syncSpeechControls();
       if (state.speech.cancelled) {
         stopSpeechStream(stream);
         resetSpeechState();
@@ -7348,7 +7690,6 @@
         } catch { /* try the next browser format */ }
       }
       if (!recorder) recorder = new MediaRecorder(stream);
-      state.speech.stream = stream;
       state.speech.recorder = recorder;
       state.speech.chunks = [];
       state.speech.startedAt = Date.now();
@@ -7361,6 +7702,28 @@
         toast("The browser stopped the microphone recording.", true);
         if (recorder.state !== "inactive") recorder.stop();
         else resetSpeechState();
+      });
+      if (realtimeSpeechSupported()) {
+        try {
+          await connectRealtimeSpeech(stream, target);
+        } catch (error) {
+          if (state.speech.cancelled) {
+            resetSpeechState();
+            return;
+          }
+          state.speech.realtimeAttempted = true;
+          state.speech.realtimeFailed = true;
+          state.speech.realtimeError = error?.message || "Live preview is unavailable.";
+          settleRealtimeTranscript(null);
+          releaseRealtimeConnection();
+        }
+      }
+      if (state.speech.cancelled) {
+        resetSpeechState();
+        return;
+      }
+      (stream.getAudioTracks?.() || []).forEach((track) => {
+        track.enabled = true;
       });
       recorder.start(500);
       state.speech.phase = "recording";

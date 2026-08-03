@@ -155,6 +155,10 @@ __CALLIOPE_BACKGROUND__
         <span class="sr-only">Message Calliope</span>
         <textarea id="message-input" rows="1" placeholder="Ask Calliope to explore, compare, or make something…" disabled></textarea>
       </label>
+      <div id="speech-preview" class="speech-live-preview" data-speech-preview="chat"
+           aria-label="Provisional live transcript" aria-live="off" hidden>
+        <span>Live transcript</span><p></p>
+      </div>
       <div class="compose-actions">
         <label class="attach-action" title="Attach images">
           <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
