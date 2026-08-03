@@ -315,6 +315,16 @@ and pins the card's exact published artifact version to the stage; the immutable
 URL is used for rendering even if the gallery alias advances later. **Pin** remains a
 separate action for adding the artifact to the user's Semantic Home.
 
+Named business-object Home pins open that exact stored dashboard/app version at
+`/d/<slug>/versions/<n>` or `/apps/<slug>/versions/<n>`; they never fall through to a
+newer live-app runner. A scalar pin can also be **Promoted to metric**. Warehouse
+rehydrates and executes the immutable semantic definition under the mapped user, freezes
+its resolved context, carries its meaning/formula/unit/display/source metadata into an
+append-versioned `metric_defs` row, materializes the first observation, and replaces the
+source pin with the resulting governed metric. The browser can edit only the catalog name
+and description—not the SQL or provenance—and an unrelated existing metric name is never
+overwritten.
+
 Governed metrics use the same three-intent split. **Brief me** quietly contributes recent
 durable observations to that user's Personal Brief without creating an alert. **Pin**
 tracks the latest observation on Semantic Home. **Ask Calliope** freezes either the
@@ -606,7 +616,10 @@ email-owner-gated download URLs. The originating host path is never sent to the 
 
 Configure the Hermes default profile's `mcp_servers` entry to use this warehouse's
 `/mcp` URL and a server-side `WAREHOUSE_MCP_KEY`. Calliope does not create or select a
-Hermes profile. Enable that same profile's API server and pin its advertised model to
+Hermes profile. Set `forward_session_identity: true` only on this trusted first-party
+Warehouse entry when Google Chat is enabled. Hermes then forwards the adapter-verified
+sender email in per-call MCP metadata so artifacts created from Chat are attributed to
+the human; it is not a tool argument, PG role, or authorization grant. Enable that same profile's API server and pin its advertised model to
 the real provider-routable model ID:
 
 ```bash

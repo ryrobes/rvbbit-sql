@@ -216,6 +216,8 @@ mcp_servers:
     url: https://warehouse.example.com/mcp
     headers:
       Authorization: Bearer ...
+    # Trusted first-party server only: preserve verified native-chat authorship.
+    forward_session_identity: true
 
 platforms:
   api_server:

@@ -1,6 +1,7 @@
 """Focused contracts for the private, handle-based Semantic Home."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -175,6 +176,201 @@ def test_pinned_rendered_value_survives_as_a_non_authoritative_replay_fallback(m
     assert item["presentation"]["last_rendered_value"] == "$42,000"
 
 
+def test_version_document_reads_the_exact_immutable_html(monkeypatch):
+    calls = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params):
+            calls.append((query, params))
+            if "FROM rvbbit.dashboards" in query:
+                return type("Result", (), {"fetchone": lambda _self: {
+                    "id": 42,
+                    "slug": "regional-brief",
+                    "latest_version": 6,
+                }})()
+            return type("Result", (), {"fetchone": lambda _self: {
+                "html": "<main>version four</main>",
+                "manifest": {"semantic_map": {"objects": []}},
+            }})()
+
+    monkeypatch.setattr(server, "_conn", lambda: Connection())
+    monkeypatch.setattr(
+        server,
+        "_dash_shim",
+        lambda slug, version, manifest: f"<!-- {slug}:v{version}:{bool(manifest)} -->",
+    )
+
+    document = server._dashboard_version_document("regional-brief", 4)
+
+    assert document["version"] == 4
+    assert document["latest_version"] == 6
+    assert document["html"] == (
+        "<!-- regional-brief:v4:True --><main>version four</main>"
+    )
+    assert calls[1][1] == (42, 4)
+
+
+def test_versioned_routes_cover_dashboards_and_full_page_apps():
+    source = (_HERE / "server.py").read_text(encoding="utf-8")
+
+    assert '@m.custom_route("/d/{slug}/versions/{version}", methods=["GET"])' in source
+    app_version = source.index(
+        '@m.custom_route("/apps/{slug}/versions/{version}", methods=["GET"])'
+    )
+    app_catchall = source.index(
+        '@m.custom_route("/apps/{slug}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])'
+    )
+    assert app_version < app_catchall
+
+
+def test_metric_promotion_draft_freezes_context_and_keeps_sql_server_owned(monkeypatch):
+    monkeypatch.setattr(server, "_semantic_home_artifact_row", _artifact_fixture)
+    monkeypatch.setattr(server, "_semantic_home_source_trail", lambda _tables: [])
+    monkeypatch.setattr(
+        server,
+        "tool_validate_sql",
+        lambda *_args, **_kwargs: {"valid": True, "safe_select": True},
+    )
+    monkeypatch.setattr(
+        server,
+        "_semantic_home_preview",
+        lambda *_args, **_kwargs: {
+            "status": "recreated",
+            "value": 42000,
+            "value_column": "value",
+            "row_count": 1,
+        },
+    )
+    semantic_object = _fixture_manifest()["semantic_map"]["objects"][0]
+    source = {
+        "kind": "artifact_object",
+        "slug": "regional-brief",
+        "version": 4,
+        "object_id": "regional_revenue",
+        "definition_hash": semantic_object["definition_hash"],
+        "context": {"region": "North"},
+    }
+
+    draft = server._semantic_home_metric_draft(source, "analyst-role")
+    public = server._semantic_home_metric_draft_public(draft)
+
+    assert "region='North'" in draft["definition_sql"]
+    assert draft["title"] == "Regional revenue"
+    assert draft["display"]["title"] == "Regional revenue"
+    assert draft["display"]["unit"] == "USD"
+    assert draft["current"] == 42000
+    assert draft["suggested_name"].startswith("regional_brief_regional_revenue_")
+    assert "definition_sql" not in public
+    assert public["artifact"]["version"] == 4
+
+
+def test_metric_promotion_defines_materializes_and_replaces_the_home_pin(monkeypatch):
+    item_id = "018f3d10-6e84-7d51-b8bd-07c75a67c2a1"
+    board_id = "018f3d10-6e84-7d51-b8bd-07c75a67c2a2"
+    calls = []
+    draft = {
+        "suggested_name": "regional_brief_regional_revenue",
+        "title": "Regional revenue",
+        "description": "Recognized revenue for one dashboard region.",
+        "grain": "One scalar value from Regional Brief version 4.",
+        "display": {"title": "Regional revenue", "prefix": "$", "decimals": 0},
+        "formula": "Sum recognized revenue for the selected region.",
+        "definition_sql": "select sum(revenue) as value from sales.orders where region='North'",
+        "value_column": "value",
+        "parameters": {"region": {"type": "text", "default": "North"}},
+        "source_canonical_key": "artifact-object:regional-brief:v4:regional_revenue:abc",
+        "artifact": {
+            "slug": "regional-brief",
+            "name": "Regional Brief",
+            "version": 4,
+            "latest_version": 6,
+            "object_id": "regional_revenue",
+            "definition_hash": "deadbeef",
+            "context": {"region": "North"},
+        },
+    }
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return Transaction()
+
+        def execute(self, query, params):
+            calls.append((query, params))
+            if "SELECT i.*,b.id AS owned_board_id" in query:
+                return Result({
+                    "id": item_id,
+                    "board_id": board_id,
+                    "owned_board_id": board_id,
+                    "item_kind": "artifact_object",
+                    "source": {"kind": "artifact_object"},
+                })
+            if "FROM rvbbit.metric_catalog WHERE name" in query:
+                return Result(None)
+            if "rvbbit.define_metric" in query:
+                return Result({"version": 1})
+            if "rvbbit.materialize_metric" in query:
+                return Result({"id": 99})
+            if "canonical_key=%s AND id<>" in query:
+                return Result(None)
+            if "UPDATE rvbbit.calliope_board_items SET item_kind='metric',canonical_key" in query:
+                return Result({
+                    "id": item_id,
+                    "board_id": board_id,
+                    "item_kind": "metric",
+                    "source": json.loads(params[1]),
+                    "presentation": json.loads(params[2]),
+                    "sort_order": 1000,
+                })
+            return Result(None)
+
+    monkeypatch.setattr(server, "_conn", lambda: Connection())
+    monkeypatch.setattr(server, "_semantic_home_metric_draft", lambda *_args, **_kwargs: draft)
+    monkeypatch.setattr(server, "_semantic_home_public_item", lambda row: dict(row))
+
+    result = server._promote_semantic_home_metric(
+        "analyst@example.com", "analyst-role", item_id, {}
+    )
+
+    assert result["created"] is True
+    assert result["metric"] == "regional_brief_regional_revenue"
+    assert result["observation_id"] == 99
+    define = next(params for query, params in calls if "rvbbit.define_metric" in query)
+    assert define[1] == draft["definition_sql"]
+    assert define[5] == "analyst@example.com"
+    labels = json.loads(define[6])
+    assert labels["metric_value_column"] == "value"
+    assert labels["promoted_from"]["version"] == 4
+    assert labels["promoted_from"]["context"] == {"region": "North"}
+    assert result["item"]["source"]["kind"] == "metric"
+    assert result["item"]["source"]["pinned_version"] == 1
+
+
 def test_home_schema_and_surfaces_preserve_private_composition_contract():
     migration = (
         _HERE.parent.parent / "crates" / "pg_rvbbit" / "sql" / "migrations"
@@ -202,6 +398,11 @@ def test_home_schema_and_surfaces_preserve_private_composition_contract():
     assert "function hydrateHomeThumbnails" in landing
     assert "hydrateHomeThumbnails(homeGrid)" in landing
     assert ".home-thumb.ready img" in landing
+    assert "data-home-promote" in landing
+    assert 'id="metric-promote-dialog"' in landing
+    assert "/metric-promotion" in landing
+    assert "rvbbit.define_metric" in landing
+    assert "rvbbit.materialize_metric" in landing
     assert '<button type="button" class="home-pin">Pin to Home</button>' in lens
     assert "definition_hash: semanticObject.definition_hash" in lens
     assert "context: semanticObject.context || {}" in lens

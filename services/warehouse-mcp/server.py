@@ -95,6 +95,12 @@ _BURROW_ROLE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_$@.\-]{0,62}$")
 # an extra role arg never leaks into the MCP tool schemas.
 import contextvars
 _SESSION_SUB = contextvars.ContextVar("rvbbit_session_sub", default=None)
+# A native messaging adapter can call Warehouse through one long-lived shared
+# MCP connection even though each turn belongs to a different human.  Hermes
+# forwards that already-verified turn identity in request metadata.  Keep it in
+# a task-local override so it can improve attribution without ever changing the
+# access token, PG role, or authorization decision for the call.
+_FORWARDED_CALLER = contextvars.ContextVar("rvbbit_forwarded_caller", default=None)
 
 
 def _session_pg_role(sub=None):
@@ -2569,8 +2575,8 @@ def _ensure_activity_table():
         print(f"WARNING: activity logging disabled (could not ensure {ACTIVITY_TABLE}): {e}", file=sys.stderr)
 
 
-def _caller():
-    """The authenticated caller (email, client_id) from the OAuth token, if any."""
+def _authenticated_caller():
+    """The caller carried by the actual Warehouse access token."""
     try:
         from mcp.server.auth.middleware.auth_context import get_access_token
         t = get_access_token()
@@ -2579,6 +2585,89 @@ def _caller():
     except Exception:  # noqa: BLE001 — no auth context (stdio / shared-key) → anonymous
         pass
     return None, None
+
+
+def _caller():
+    """The audited caller, retaining the access token's client identity.
+
+    A forwarded human identity is deliberately attribution-only and is honored
+    only behind the legacy/static Hermes connection.  OAuth callers always
+    remain whatever their own signed token says they are.
+    """
+    caller, client_id = _authenticated_caller()
+    forwarded = _FORWARDED_CALLER.get()
+    if client_id == "static-key" and forwarded:
+        return forwarded, client_id
+    return caller, client_id
+
+
+_FORWARDED_EMAIL_RE = re.compile(r"^[^@\s]{1,128}@[^@\s]{1,190}$")
+_HERMES_CALLER_META_KEY = "rvbbit.ai/hermes-caller"
+
+
+def _mcp_request_metadata(ctx):
+    """Return MCP request metadata across supported SDK/Pydantic shapes."""
+    request_context = getattr(ctx, "request_context", None) if ctx is not None else None
+    # Current FastMCP lifts request.params._meta onto RequestContext.meta.
+    # Retain the raw-request fallback for older SDKs and lightweight harnesses.
+    metadata = getattr(request_context, "meta", None)
+    if metadata is None:
+        request = getattr(request_context, "request", None)
+        request = getattr(request, "root", request)
+        if isinstance(request, dict):
+            params = request.get("params") or {}
+        else:
+            params = getattr(request, "params", None)
+        if isinstance(params, dict):
+            metadata = params.get("_meta") or params.get("meta") or {}
+        else:
+            metadata = getattr(params, "meta", None)
+    if metadata is None:
+        return {}
+    if isinstance(metadata, dict):
+        return metadata
+    dump = getattr(metadata, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump(exclude_none=True)
+        except TypeError:
+            return dump()
+    extra = getattr(metadata, "model_extra", None)
+    return dict(extra) if isinstance(extra, dict) else {}
+
+
+def _forwarded_mcp_caller(ctx):
+    """Resolve a verified Hermes/Google Chat email for display attribution.
+
+    This does not confer permissions.  The shared key remains the authenticated
+    principal and database access still follows that connection's normal rules.
+    """
+    _token_caller, client_id = _authenticated_caller()
+    if client_id != "static-key":
+        return None
+    envelope = _mcp_request_metadata(ctx).get(_HERMES_CALLER_META_KEY)
+    if not isinstance(envelope, dict):
+        return None
+    if str(envelope.get("source") or "").strip().lower() != "hermes":
+        return None
+    platform = str(envelope.get("platform") or "").strip().lower().replace("-", "_")
+    if platform not in {"google_chat", "gchat"}:
+        return None
+    email = str(envelope.get("user_id") or "").strip().lower()
+    if len(email) > 254 or not _FORWARDED_EMAIL_RE.fullmatch(email):
+        return None
+    return email
+
+
+def _with_forwarded_mcp_caller(ctx, fn):
+    email = _forwarded_mcp_caller(ctx)
+    if not email:
+        return fn()
+    token = _FORWARDED_CALLER.set(email)
+    try:
+        return fn()
+    finally:
+        _FORWARDED_CALLER.reset(token)
 
 
 def _objects(tool, args, res):
@@ -6059,21 +6148,23 @@ def tool_dashboard_dependents(object_ref):
 
 
 # MCP wrappers (named, so their docstring becomes the tool description Claude reads)
-def _mcp_upload_artifact(content, name=None, artifact_id=None, append=False):
+def _mcp_upload_artifact(content, name=None, artifact_id=None, append=False, ctx=None):
     """Stage a large HTML/source payload server-side and get an artifact_id handle back.
     Then publish WITHOUT re-transmitting the document: pass source_artifact_id to
     publish_dashboard / update_dashboard / create_live_app / update_live_app. For very large
     payloads, send chunks: first call returns the artifact_id, subsequent calls pass it with
     append=true. Returns bytes + sha256 for integrity checking. Artifacts expire after ~48h —
     they are a staging area, not storage."""
-    return _logged("upload_artifact",
-                   {"name": name, "artifact_id": artifact_id, "append": append,
-                    "content_bytes": len(content or "")},
-                   lambda: tool_upload_artifact(content, name, artifact_id, append))
+    return _with_forwarded_mcp_caller(ctx, lambda: _logged(
+        "upload_artifact",
+        {"name": name, "artifact_id": artifact_id, "append": append,
+         "content_bytes": len(content or "")},
+        lambda: tool_upload_artifact(content, name, artifact_id, append),
+    ))
 
 
 def _mcp_publish_dashboard(name, html=None, team=None, description=None, kind="live",
-                           source_artifact_id=None, manifest=None):
+                           source_artifact_id=None, manifest=None, ctx=None):
     """Persist a dashboard so it lives + works OUTSIDE Cowork (a shareable URL + the lens app).
     Build `html` from the `dashboard_template` boilerplate (call that tool FIRST): it gets LIVE
     data through Cowork's callMcpTool→run_sql bridge in-app, and the host's injected rvbbitQuery
@@ -6086,26 +6177,29 @@ def _mcp_publish_dashboard(name, html=None, team=None, description=None, kind="l
     queues RVBBIT's semantic compiler, which derives and verifies business-object bindings without
     changing the HTML. An authored manifest.semantic_map is optional and takes precedence when the
     builder already knows an especially precise meaning or evaluator."""
-    return _logged("publish_dashboard", {"name": name, "team": team, "kind": kind,
-                                         "html_bytes": len(html or ""),
-                                         "semantic_objects": len(
-                                             ((manifest or {}).get("semantic_map") or {}).get("objects") or []
-                                         ) if isinstance(manifest, dict) else None,
-                                         "source_artifact_id": source_artifact_id},
-                   lambda: tool_publish_dashboard(
-                       name, html, team, description, kind, source_artifact_id, manifest
-                   ))
+    return _with_forwarded_mcp_caller(ctx, lambda: _logged(
+        "publish_dashboard", {"name": name, "team": team, "kind": kind,
+                              "html_bytes": len(html or ""),
+                              "semantic_objects": len(
+                                  ((manifest or {}).get("semantic_map") or {}).get("objects") or []
+                              ) if isinstance(manifest, dict) else None,
+                              "source_artifact_id": source_artifact_id},
+        lambda: tool_publish_dashboard(
+            name, html, team, description, kind, source_artifact_id, manifest
+        ),
+    ))
 
 
-def _mcp_update_dashboard(slug, html=None, notes=None, source_artifact_id=None, manifest=None):
+def _mcp_update_dashboard(slug, html=None, notes=None, source_artifact_id=None, manifest=None,
+                          ctx=None):
     """Publish a new version of an existing dashboard (by slug). Accepts inline html or an
     upload_artifact handle via source_artifact_id. Omit manifest to retain the current semantic
     map; pass a manifest patch to revise its versioned business-object definitions."""
-    return _logged("update_dashboard", {"slug": slug, "html_bytes": len(html or ""), "notes": notes,
-                                        "source_artifact_id": source_artifact_id},
-                   lambda: tool_update_dashboard(
-                       slug, html, notes, source_artifact_id, manifest
-                   ))
+    return _with_forwarded_mcp_caller(ctx, lambda: _logged(
+        "update_dashboard", {"slug": slug, "html_bytes": len(html or ""), "notes": notes,
+                             "source_artifact_id": source_artifact_id},
+        lambda: tool_update_dashboard(slug, html, notes, source_artifact_id, manifest),
+    ))
 
 
 def _mcp_list_dashboards(team=None, search=None):
@@ -6141,35 +6235,39 @@ def _mcp_live_app_template(runtime_kind="html", app_kind="dashboard"):
 
 def _mcp_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboard",
                          team=None, description=None, manifest=None, source_files=None,
-                         source_artifact_id=None):
+                         source_artifact_id=None, ctx=None):
     """Create a versioned RVBBIT live app. HTML apps are hosted immediately at /d/<slug> and
     call rvbbitQuery(sql) for live, read-only data. Publication automatically queues a separate
     semantic compiler pass; an authored manifest.semantic_map remains an optional precise hint.
     Accepts inline html or an upload_artifact handle via source_artifact_id."""
-    return _logged("create_live_app", {
-        "name": name,
-        "runtime_kind": runtime_kind,
-        "app_kind": app_kind,
-        "team": team,
-        "html_bytes": len(html or ""),
-        "source_artifact_id": source_artifact_id,
-    }, lambda: tool_create_live_app(name, html, runtime_kind, app_kind, team, description,
-                                    manifest, source_files, source_artifact_id))
+    return _with_forwarded_mcp_caller(ctx, lambda: _logged(
+        "create_live_app", {
+            "name": name,
+            "runtime_kind": runtime_kind,
+            "app_kind": app_kind,
+            "team": team,
+            "html_bytes": len(html or ""),
+            "source_artifact_id": source_artifact_id,
+        }, lambda: tool_create_live_app(name, html, runtime_kind, app_kind, team, description,
+                                        manifest, source_files, source_artifact_id),
+    ))
 
 
 def _mcp_update_live_app(slug, html=None, notes=None, manifest=None, source_files=None,
-                         runtime_kind=None, app_kind=None, source_artifact_id=None):
+                         runtime_kind=None, app_kind=None, source_artifact_id=None, ctx=None):
     """Publish a new version of a live app. Omitted source fields are preserved. Accepts inline
     html or an upload_artifact handle via source_artifact_id. Omit manifest to retain the current
     semantic map; pass a manifest patch whenever visible meanings, bindings, filters, or replay
     SQL change."""
-    return _logged("update_live_app", {
-        "slug": slug,
-        "html_bytes": len(html or ""),
-        "notes": notes,
-        "source_artifact_id": source_artifact_id,
-    }, lambda: tool_update_live_app(slug, html, notes, manifest, source_files, runtime_kind,
-                                    app_kind, source_artifact_id))
+    return _with_forwarded_mcp_caller(ctx, lambda: _logged(
+        "update_live_app", {
+            "slug": slug,
+            "html_bytes": len(html or ""),
+            "notes": notes,
+            "source_artifact_id": source_artifact_id,
+        }, lambda: tool_update_live_app(slug, html, notes, manifest, source_files, runtime_kind,
+                                        app_kind, source_artifact_id),
+    ))
 
 
 def _mcp_semantic_enrichment_status(slug, version=None):
@@ -8680,6 +8778,279 @@ def _semantic_home_preview(source, execution_subject=None):
     }
 
 
+_PROMOTED_METRIC_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+
+def _semantic_home_metric_name(source):
+    """Suggest one stable SQL-friendly metric name for an immutable object."""
+    source = source if isinstance(source, dict) else {}
+    raw = f"{source.get('slug') or 'artifact'}_{source.get('object_id') or 'value'}"
+    base = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_") or "artifact_metric"
+    context = source.get("context") if isinstance(source.get("context"), dict) else {}
+    if context:
+        base += "_" + _semantic_home_context_key(context)[:8]
+    if not base[0].isalpha():
+        base = "metric_" + base
+    if len(base) > 63:
+        digest = hashlib.sha256(base.encode("utf-8")).hexdigest()[:8]
+        base = base[:54].rstrip("_") + "_" + digest
+    return base
+
+
+def _semantic_home_metric_draft(source, execution_subject=None, *, preview=True):
+    """Rehydrate a pin into a server-owned governed-metric definition draft."""
+    resolved = _semantic_home_resolve_handle(source, validate_sql=True)
+    if resolved.get("kind") != "artifact_object":
+        raise ValueError("Only named business objects can become governed metrics")
+    dashboard, _, manifest, _ = _semantic_home_artifact_row(
+        resolved["source"]["slug"], resolved["source"]["version"]
+    )
+    semantic_object = _semantic_object_from_manifest(manifest, {
+        "id": resolved["source"]["object_id"],
+        "definition_hash": resolved["source"]["definition_hash"],
+    })
+    evaluator = (semantic_object or {}).get("evaluator") or {}
+    if not semantic_object or evaluator.get("shape") != "scalar":
+        raise ValueError("Only a single scalar business value can become a metric")
+    if int(evaluator.get("row_index") or 0) != 0:
+        raise ValueError("This object selects one row from a dataset and is not a scalar metric")
+    definition_sql, context = _render_semantic_sql(
+        semantic_object, resolved["source"].get("context") or {}
+    )
+    observed = None
+    if preview:
+        observed = _semantic_home_preview(resolved["source"], execution_subject)
+        if observed.get("status") == "error":
+            raise ValueError(str(observed.get("error") or "The current value could not be read"))
+        if observed.get("row_count") not in (None, 1):
+            raise ValueError("A governed metric must return exactly one row")
+        if not observed.get("value_column"):
+            raise ValueError("The metric value column could not be identified")
+    meaning = semantic_object.get("meaning") or {}
+    title = _semantic_text(meaning.get("label") or resolved.get("title"), 240, required=True)
+    description = _semantic_text(
+        meaning.get("description") or resolved.get("description")
+        or f"Promoted from {dashboard.get('name') or dashboard['slug']}.",
+        1400,
+        required=True,
+    )
+    display = dict(semantic_object.get("display") or {})
+    display.setdefault("title", title)
+    if meaning.get("unit") and not display.get("unit"):
+        display["unit"] = meaning["unit"]
+    context_copy = _semantic_json_value(context) if context else {}
+    context_phrase = ", ".join(
+        f"{str(key).replace('_', ' ')}={value}"
+        for key, value in list((context_copy or {}).items())[:8]
+    )
+    grain = (
+        f"One scalar value from {dashboard.get('name') or dashboard['slug']} "
+        f"version {resolved['version']}"
+        + (f", fixed at {context_phrase}" if context_phrase else "")
+        + "."
+    )
+    source_tables = _referenced_tables(definition_sql)
+    return {
+        "suggested_name": _semantic_home_metric_name(resolved["source"]),
+        "title": title,
+        "description": description,
+        "grain": grain,
+        "display": display,
+        "formula": meaning.get("formula") or "",
+        "unit": meaning.get("unit") or "",
+        "definition_sql": definition_sql,
+        "value_column": (observed or {}).get("value_column")
+        or evaluator.get("value_column") or "value",
+        "current": (observed or {}).get("value"),
+        "source_tables": source_tables,
+        "parameters": semantic_object.get("parameters") or {},
+        "source": resolved["source"],
+        "source_canonical_key": resolved["canonical_key"],
+        "artifact": {
+            "slug": dashboard["slug"],
+            "name": dashboard.get("name") or dashboard["slug"],
+            "version": resolved["version"],
+            "latest_version": resolved["latest_version"],
+            "object_id": resolved["source"]["object_id"],
+            "definition_hash": resolved["source"]["definition_hash"],
+            "context": context_copy or {},
+        },
+    }
+
+
+def _semantic_home_metric_draft_public(draft):
+    """The confirmation payload: descriptive metadata, never client-authored SQL."""
+    return {
+        key: draft.get(key)
+        for key in (
+            "suggested_name", "title", "description", "grain", "display", "formula",
+            "unit", "current", "source_tables", "artifact",
+        )
+    }
+
+
+def _promote_semantic_home_metric(owner, execution_subject, item_id, values=None):
+    """Create an append-versioned metric and replace its source Home pin atomically."""
+    item_id = str(uuid.UUID(str(item_id)))
+    values = values if isinstance(values, dict) else {}
+    with _conn() as conn:
+        item = conn.execute(
+            "SELECT i.*,b.id AS owned_board_id FROM rvbbit.calliope_board_items i "
+            "JOIN rvbbit.calliope_boards b ON b.id=i.board_id "
+            "WHERE i.id=%s::uuid AND lower(b.owner_email)=lower(%s) AND b.slug='home'",
+            (item_id, owner),
+        ).fetchone()
+    if not item:
+        raise LookupError("That Home item is no longer available")
+    if item.get("item_kind") != "artifact_object":
+        raise ValueError("Only named business objects can become governed metrics")
+
+    # Re-run the immutable definition under the mapped viewer before creating
+    # anything. The browser supplies only the desired name/description; SQL,
+    # provenance, display metadata, and value-column selection stay server-owned.
+    draft = _semantic_home_metric_draft(
+        item.get("source") or {}, execution_subject, preview=True
+    )
+    requested_name = str(values.get("name") or draft["suggested_name"]).strip().lower()
+    if not _PROMOTED_METRIC_NAME_RE.fullmatch(requested_name):
+        raise ValueError(
+            "Metric name must start with a letter and use at most 63 lowercase letters, numbers, or underscores"
+        )
+    description = _semantic_text(
+        values.get("description") or draft["description"], 1400, required=True
+    )
+    promoted_from = {
+        "kind": "artifact_object",
+        "canonical_key": draft["source_canonical_key"],
+        **draft["artifact"],
+        "parameters": draft["parameters"],
+    }
+    labels = {
+        "display": draft["display"],
+        "metric_value_column": draft["value_column"],
+        "formula": draft["formula"],
+        "semantic_kind": "scalar",
+        "promoted_from": promoted_from,
+    }
+    metric_source = {
+        "kind": "metric",
+        "name": requested_name,
+        "params": {},
+        "tracking": "latest",
+    }
+    metric_key = _metric_canonical_key(requested_name, {})
+    metric_presentation = {
+        "title": draft["title"],
+        "description": description,
+        "grain": draft["grain"],
+        "display": draft["display"],
+    }
+    created = False
+    observation_id = None
+    with _conn() as conn:
+        with conn.transaction():
+            locked_item = conn.execute(
+                "SELECT i.*,b.id AS owned_board_id FROM rvbbit.calliope_board_items i "
+                "JOIN rvbbit.calliope_boards b ON b.id=i.board_id "
+                "WHERE i.id=%s::uuid AND lower(b.owner_email)=lower(%s) AND b.slug='home' "
+                "FOR UPDATE OF i",
+                (item_id, owner),
+            ).fetchone()
+            if not locked_item:
+                raise LookupError("That Home item is no longer available")
+            if (
+                locked_item.get("item_kind") != "artifact_object"
+                or (locked_item.get("source") or {}) != (item.get("source") or {})
+            ):
+                raise ValueError("That Home item changed while its metric draft was open; review it again")
+            item = locked_item
+            # Serialize the name check with define_metric's own lock. Without
+            # this pre-check lock, two different Home objects promoted to the
+            # same new name could both observe "missing" and append unrelated
+            # v1/v2 definitions in a race.
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended('rvbbit.metric:' || %s,0))",
+                (requested_name,),
+            )
+            existing = conn.execute(
+                "SELECT name,version,labels FROM rvbbit.metric_catalog WHERE name=%s",
+                (requested_name,),
+            ).fetchone()
+            if existing:
+                existing_origin = (existing.get("labels") or {}).get("promoted_from") or {}
+                if existing_origin.get("canonical_key") != draft["source_canonical_key"]:
+                    raise FileExistsError(
+                        f"A different governed metric already uses the name {requested_name}"
+                    )
+                metric_version = int(existing["version"])
+            else:
+                metric_version = int(conn.execute(
+                    "SELECT rvbbit.define_metric(%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,NULL) AS version",
+                    (
+                        requested_name,
+                        draft["definition_sql"],
+                        json.dumps({}),
+                        draft["grain"],
+                        description,
+                        owner,
+                        json.dumps(labels, default=str),
+                    ),
+                ).fetchone()["version"])
+                metric_source["pinned_version"] = metric_version
+                observation = conn.execute(
+                    "SELECT rvbbit.materialize_metric(%s,%s::jsonb,now(),NULL,NULL,%s) AS id",
+                    (requested_name, json.dumps({}), "semantic_home_promotion"),
+                ).fetchone()
+                observation_id = (observation or {}).get("id")
+                created = True
+            metric_source["pinned_version"] = metric_version
+
+            board_id = item["owned_board_id"]
+            existing_pin = conn.execute(
+                "SELECT * FROM rvbbit.calliope_board_items "
+                "WHERE board_id=%s::uuid AND canonical_key=%s AND id<>%s::uuid",
+                (board_id, metric_key, item_id),
+            ).fetchone()
+            if existing_pin:
+                conn.execute(
+                    "DELETE FROM rvbbit.calliope_board_items WHERE id=%s::uuid",
+                    (item_id,),
+                )
+                promoted_item = conn.execute(
+                    "UPDATE rvbbit.calliope_board_items SET item_kind='metric',source=%s::jsonb,"
+                    "presentation=%s::jsonb,updated_at=now() WHERE id=%s::uuid RETURNING *",
+                    (
+                        json.dumps(metric_source),
+                        json.dumps(metric_presentation, default=str),
+                        existing_pin["id"],
+                    ),
+                ).fetchone()
+            else:
+                promoted_item = conn.execute(
+                    "UPDATE rvbbit.calliope_board_items SET item_kind='metric',canonical_key=%s,"
+                    "source=%s::jsonb,presentation=%s::jsonb,updated_at=now() "
+                    "WHERE id=%s::uuid RETURNING *",
+                    (
+                        metric_key,
+                        json.dumps(metric_source),
+                        json.dumps(metric_presentation, default=str),
+                        item_id,
+                    ),
+                ).fetchone()
+            conn.execute(
+                "UPDATE rvbbit.calliope_boards SET updated_at=now() WHERE id=%s::uuid",
+                (board_id,),
+            )
+    return {
+        "created": created,
+        "metric": requested_name,
+        "version": metric_version,
+        "observation_id": observation_id,
+        "open_url": _semantic_home_metric_href(requested_name, {}),
+        "item": _semantic_home_public_item(promoted_item),
+    }
+
+
 # ── Semantic Watches ────────────────────────────────────────────────────────
 #
 # A watch replays the exact semantic-object handle under the authenticated
@@ -9229,6 +9600,46 @@ def _start_calliope_watch_worker():
     return True
 
 
+def _dashboard_version_document(slug, version=None):
+    """Load one exact stored dashboard/app document, or the current version.
+
+    Named Home objects intentionally retain the artifact version whose semantic
+    definition they came from.  Rendering that URL must therefore read the
+    immutable ``dashboard_versions`` row instead of falling through to the
+    current live-app runner.
+    """
+    if not _SEMANTIC_HOME_SLUG_RE.fullmatch(str(slug or "")):
+        raise ValueError("artifact slug is invalid")
+    try:
+        selected = int(version) if version not in (None, "") else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("version must be a positive integer") from exc
+    if selected is not None and selected < 1:
+        raise ValueError("version must be a positive integer")
+    with _conn() as conn:
+        dashboard = conn.execute(
+            "SELECT id,slug,latest_version FROM rvbbit.dashboards WHERE slug=%s",
+            (slug,),
+        ).fetchone()
+        if not dashboard:
+            return None
+        selected = selected or int(dashboard["latest_version"])
+        version_row = conn.execute(
+            "SELECT html,manifest FROM rvbbit.dashboard_versions "
+            "WHERE dashboard_id=%s AND version=%s",
+            (dashboard["id"], selected),
+        ).fetchone()
+    if not version_row:
+        return None
+    return {
+        "slug": str(dashboard["slug"]),
+        "version": selected,
+        "latest_version": int(dashboard["latest_version"]),
+        "html": _dash_shim(slug, selected, version_row.get("manifest"))
+        + (version_row.get("html") or ""),
+    }
+
+
 # ── the landing page: this server's own front door ───────────────────────────
 # For the install shape where nobody opens DataRabbit at all — people talk to
 # the warehouse through Claude, artifacts get published here, and the links go
@@ -9428,12 +9839,13 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   color:var(--fog);font:6px/1 var(--mono);white-space:nowrap}
 .home-crumb:not(:last-child)::after{content:"›";position:relative;right:-9px;color:var(--jade)}
 .home-crumb span{overflow:hidden;text-overflow:ellipsis}
-.home-tile-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:7px 9px;border-top:1px solid var(--line);background:rgba(0,0,0,.12)}
+.home-tile-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap;padding:7px 9px;border-top:1px solid var(--line);background:rgba(0,0,0,.12)}
 .home-tile-actions a,.home-tile-actions button{padding:5px 8px;border:1px solid var(--line);background:transparent;color:var(--fog);
   font:6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;cursor:pointer}
 .home-tile-actions a:hover{border-color:var(--line-hot);color:var(--amber)}
 .home-tile-actions button[data-home-trail]:hover{border-color:color-mix(in oklch,var(--jade) 52%,var(--line));color:var(--jade)}
 .home-tile-actions button:hover{border-color:color-mix(in oklch,#ef8178 52%,var(--line));color:#ef9b91}
+.home-tile-actions button[data-home-promote]:hover{border-color:var(--amber);background:var(--amber-soft);color:var(--amber)}
 .home-version-note{margin-right:auto;color:var(--amber);font:6px/1.2 var(--mono);letter-spacing:.06em;text-transform:uppercase}
 
 [data-gallery-tooltip]{cursor:help}[data-gallery-tooltip]:focus-visible{outline:1px solid color-mix(in oklch,var(--amber) 68%,var(--jade));outline-offset:2px}.home-crumb[data-gallery-tooltip],.home-context span[data-gallery-tooltip],.home-value[data-gallery-tooltip]{transition:border-color .15s,box-shadow .15s,filter .15s}.home-crumb[data-gallery-tooltip]:hover,.home-context span[data-gallery-tooltip]:hover{border-color:color-mix(in oklch,var(--jade) 48%,var(--line));box-shadow:inset 0 -1px 0 color-mix(in oklch,var(--jade) 46%,transparent)}.home-value[data-gallery-tooltip]:hover{filter:brightness(1.08)}
@@ -9474,6 +9886,20 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .trail-shared{display:flex;gap:3px;overflow:hidden;margin-top:7px}.trail-shared i{overflow:hidden;padding:3px 5px;border:1px solid var(--line);border-radius:999px;color:var(--fog);font:5px/1 var(--mono);font-style:normal;text-overflow:ellipsis;white-space:nowrap}
 .trail-card-actions{display:flex;align-items:flex-end;flex-direction:column;gap:5px}.trail-card-actions button,.trail-card-actions a{padding:5px 7px;border:1px solid var(--line);background:transparent;color:var(--fog);font:6px/1 var(--mono);cursor:pointer;text-transform:uppercase;white-space:nowrap}
 .trail-card-actions button:hover{border-color:var(--jade);color:var(--jade)}.trail-card-actions a:hover{border-color:var(--amber);color:var(--amber)}
+
+.metric-promote-dialog{width:min(640px,calc(100vw - 32px));max-width:none;margin:auto;padding:0;border:1px solid color-mix(in oklch,var(--amber) 58%,var(--line));
+  background:color-mix(in oklch,var(--panel) 95%,transparent);color:var(--bone);box-shadow:0 34px 120px color-mix(in oklch,var(--void) 88%,transparent);color-scheme:dark}
+.metric-promote-dialog::backdrop{background:color-mix(in oklch,var(--void) 74%,transparent);backdrop-filter:blur(8px)}
+.metric-promote-shell{display:flex;flex-direction:column;max-height:calc(100dvh - 32px)}
+.metric-promote-head{display:flex;align-items:center;gap:13px;min-height:68px;padding:12px 13px 12px 18px;border-bottom:1px solid var(--line);background:color-mix(in oklch,var(--gallery-rail-bg) 94%,transparent);backdrop-filter:blur(20px)}
+.metric-promote-mark{width:34px;height:34px;display:grid;place-items:center;flex:none;border:1px solid color-mix(in oklch,var(--amber) 48%,var(--line));border-radius:50%;color:var(--amber);font:italic 400 18px/1 var(--serif)}
+.metric-promote-heading{min-width:0;display:flex;flex:1;flex-direction:column;gap:4px}.metric-promote-heading strong{overflow:hidden;color:var(--bone-bright);font:italic 400 20px/1.1 var(--serif);text-overflow:ellipsis;white-space:nowrap}.metric-promote-heading small{color:var(--dim);font:7px/1.3 var(--mono);letter-spacing:.08em;text-transform:uppercase}
+.metric-promote-close{width:34px;height:34px;display:grid;place-items:center;flex:none;border:1px solid var(--line);background:transparent;color:var(--fog);cursor:pointer}.metric-promote-close:hover{border-color:var(--amber);color:var(--amber)}
+.metric-promote-body{min-height:220px;overflow:auto;padding:18px}.metric-promote-loading{min-height:210px;display:grid;place-items:center;color:var(--dim);font:8px/1.4 var(--mono);letter-spacing:.08em;text-transform:uppercase}.metric-promote-loading[hidden],.metric-promote-form[hidden]{display:none}
+.metric-promote-source{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;margin-bottom:16px;padding:12px;border:1px solid color-mix(in oklch,var(--jade) 28%,var(--line));background:color-mix(in oklch,var(--jade) 4%,transparent)}.metric-promote-source span{color:var(--jade);font:650 6px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}.metric-promote-source strong{display:block;margin-top:6px;color:var(--bone-bright);font:italic 400 18px/1.15 var(--serif)}.metric-promote-source p{margin-top:5px;color:var(--fog);font-size:9px;line-height:1.45}.metric-promote-current{align-self:start;color:var(--bone-bright);font:650 20px/1 var(--sans);letter-spacing:-.03em;text-align:right}
+.metric-promote-field{display:flex;flex-direction:column;gap:6px;margin-top:12px}.metric-promote-field>span{color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase}.metric-promote-field input,.metric-promote-field textarea{width:100%;padding:10px 11px;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 58%,transparent);color:var(--bone-bright);font:10px/1.4 var(--mono);outline:none;resize:vertical}.metric-promote-field textarea{min-height:82px;font-family:var(--sans);font-size:11px}.metric-promote-field input:focus,.metric-promote-field textarea:focus{border-color:var(--amber)}
+.metric-promote-facts{display:flex;flex-wrap:wrap;gap:5px;margin-top:13px}.metric-promote-facts span{max-width:100%;overflow:hidden;padding:5px 7px;border:1px solid var(--line);color:var(--fog);font:6px/1.2 var(--mono);text-overflow:ellipsis;white-space:nowrap}.metric-promote-error{min-height:12px;margin-top:11px;color:#f2a28f;font:8px/1.4 var(--mono)}
+.metric-promote-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:15px}.metric-promote-actions button{min-height:32px;padding:0 12px;border:1px solid var(--line);background:transparent;color:var(--fog);font:650 7px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;cursor:pointer}.metric-promote-actions button[type=submit]{border-color:var(--amber);background:var(--amber);color:#1a1206}.metric-promote-actions button:disabled{opacity:.5;cursor:wait}
 
 .toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
   padding:16px 0;border-bottom:1px solid var(--line)}
@@ -9755,6 +10181,13 @@ _LANDING_JS = """
      trailContent=document.getElementById('trail-content'),
      trailBack=document.getElementById('trail-back'),
      trailHistory=[],trailData=null,trailRequest=0;
+ var metricPromoteDialog=document.getElementById('metric-promote-dialog'),
+     metricPromoteForm=document.getElementById('metric-promote-form'),
+     metricPromoteLoading=document.getElementById('metric-promote-loading'),
+     metricPromoteName=document.getElementById('metric-promote-name'),
+     metricPromoteDescription=document.getElementById('metric-promote-description'),
+     metricPromoteError=document.getElementById('metric-promote-error'),
+     metricPromotionItemId='',metricPromotionRequest=0;
  function escapeHome(value){
    return String(value==null?'':value).replace(/[&<>"']/g,function(char){
      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char];
@@ -10048,6 +10481,7 @@ _LANDING_JS = """
      +' · v'+escapeHome(item.latest_version)+' exists</span>':'<span class="home-version-note"></span>';
    var open=item.open_url?'<a href="'+escapeHome(item.open_url)+'"'+(metric?'':' target="_blank" rel="noopener"')+'>Open</a>':'';
    var ask=metric?'<button type="button" data-home-metric-ask="'+escapeHome((item.source||{}).name||item.title)+'" data-home-metric-params="'+escapeHome(JSON.stringify((item.source||{}).params||{}))+'">✦ Ask Calliope</button>':'';
+   var promote=object&&item.status==='ready'&&item.evaluator_shape==='scalar'?'<button type="button" data-home-promote="'+escapeHome(item.id)+'">Promote to metric</button>':'';
    return '<article class="home-tile '+(metric?'metric':object?'object':'artifact')+(unavailable?' unavailable':'')+'" data-home-id="'+escapeHome(item.id)+'">'
      +(metric?homeMetricSparkline(item):'')+'<div class="home-tile-content">'+thumbnail+'<div class="home-tile-main">'
      +'<span class="home-kicker"><i></i>'+(metric?'Governed metric':object?'Named business object':escapeHome(item.app_kind||'artifact'))+'</span>'
@@ -10055,7 +10489,7 @@ _LANDING_JS = """
      +value
      +(item.description?'<p class="home-tile-desc">'+escapeHome(item.description)+'</p>':'')
      +context+homeTrailMarkup(item.trail)+'</div></div>'
-     +'<div class="home-tile-actions">'+versionNote+open+ask
+     +'<div class="home-tile-actions">'+versionNote+open+ask+promote
      +'<button type="button" data-home-trail="'+escapeHome(item.id)+'">Follow trail</button>'
      +'<button type="button" data-home-remove="'+escapeHome(item.id)+'">Remove</button></div></article>';
  }
@@ -10165,6 +10599,51 @@ _LANDING_JS = """
      homeStatus.textContent=error&&error.message?error.message:'Could not remove the pin';
    }
  }
+ async function openMetricPromotion(itemId,button){
+   if(!metricPromoteDialog||!itemId)return;
+   metricPromotionItemId=itemId;var requestId=++metricPromotionRequest;
+   metricPromoteForm.hidden=true;metricPromoteLoading.hidden=false;
+   metricPromoteLoading.textContent='Checking the immutable definition…';metricPromoteError.textContent='';
+   if(!metricPromoteDialog.open)metricPromoteDialog.showModal();
+   if(button)button.disabled=true;
+   try{
+     var response=await fetch('/api/calliope/home/items/'+encodeURIComponent(itemId)+'/metric-promotion',{headers:{accept:'application/json'}}),data={};
+     try{data=await response.json();}catch(ignore){}
+     if(requestId!==metricPromotionRequest)return;
+     if(!response.ok||!data.draft)throw new Error(data.error&&data.error.message||'This object cannot become a metric');
+     var draft=data.draft||{},artifact=draft.artifact||{},facts=[];
+     document.getElementById('metric-promote-title').textContent=draft.title||'Promote to metric';
+     document.getElementById('metric-promote-source-title').textContent=draft.title||artifact.object_id||'Named value';
+     document.getElementById('metric-promote-source-copy').textContent=(artifact.name||artifact.slug||'Published artifact')+' · version '+(artifact.version||'?')+' · '+(artifact.object_id||'semantic object');
+     document.getElementById('metric-promote-current').textContent=draft.current===null||draft.current===undefined?'':formatHomeValue(draft.current,draft.display,draft.unit);
+     metricPromoteName.value=draft.suggested_name||'';metricPromoteDescription.value=draft.description||'';
+     if(draft.formula)facts.push(['Formula',draft.formula]);
+     if(draft.grain)facts.push(['Grain',draft.grain]);
+     if((draft.source_tables||[]).length)facts.push(['Sources',draft.source_tables.join(', ')]);
+     if(artifact.context&&Object.keys(artifact.context).length)facts.push(['Frozen context',JSON.stringify(artifact.context)]);
+     document.getElementById('metric-promote-facts').innerHTML=facts.map(function(fact){return '<span title="'+escapeHome(fact[1])+'"><b>'+escapeHome(fact[0])+':</b> '+escapeHome(fact[1])+'</span>';}).join('');
+     metricPromoteLoading.hidden=true;metricPromoteForm.hidden=false;metricPromoteName.focus();metricPromoteName.select();
+   }catch(error){
+     if(requestId!==metricPromotionRequest)return;
+     metricPromoteLoading.textContent=error&&error.message?error.message:'This object cannot become a metric';
+   }finally{if(button)button.disabled=false;}
+ }
+ async function submitMetricPromotion(event){
+   event.preventDefault();if(!metricPromotionItemId||!metricPromoteForm.reportValidity())return;
+   var submit=document.getElementById('metric-promote-submit');submit.disabled=true;
+   metricPromoteError.textContent='';
+   try{
+     var response=await fetch('/api/calliope/home/items/'+encodeURIComponent(metricPromotionItemId)+'/metric-promotion',{
+       method:'POST',headers:{'content-type':'application/json',accept:'application/json'},
+       body:JSON.stringify({name:metricPromoteName.value,description:metricPromoteDescription.value})
+     }),data={};
+     try{data=await response.json();}catch(ignore){}
+     if(!response.ok)throw new Error(data.error&&data.error.message||'The metric could not be created');
+     var metricName=data.metric||metricPromoteName.value;metricPromoteDialog.close();await loadHome();
+     homeStatus.classList.remove('error');homeStatus.textContent=metricName+' is now a governed metric';
+   }catch(error){metricPromoteError.textContent=error&&error.message?error.message:'The metric could not be created';}
+   finally{submit.disabled=false;}
+ }
  async function toggleArtifactPin(button){
    if(button.disabled)return;
    button.disabled=true;
@@ -10202,6 +10681,8 @@ _LANDING_JS = """
    }
  }
  if(homeGrid)homeGrid.addEventListener('click',function(event){
+   var promoteButton=event.target.closest('[data-home-promote]');
+   if(promoteButton){openMetricPromotion(promoteButton.dataset.homePromote,promoteButton);return;}
    var trailButton=event.target.closest('[data-home-trail]');
    if(trailButton){
      var item=homeItems.find(function(candidate){return candidate.id===trailButton.dataset.homeTrail;});
@@ -10210,6 +10691,12 @@ _LANDING_JS = """
    var button=event.target.closest('[data-home-remove]');
    if(button)removeHomeItem(button.dataset.homeRemove,button);
  });
+ if(metricPromoteDialog){
+   metricPromoteForm.addEventListener('submit',submitMetricPromotion);
+   document.getElementById('metric-promote-close').addEventListener('click',function(){metricPromoteDialog.close();});
+   document.getElementById('metric-promote-cancel').addEventListener('click',function(){metricPromoteDialog.close();});
+   metricPromoteDialog.addEventListener('close',function(){metricPromotionRequest++;metricPromotionItemId='';metricPromoteError.textContent='';});
+ }
  if(trailDialog){
    document.getElementById('trail-close').addEventListener('click',function(){trailRequest++;trailDialog.close();});
    trailBack.addEventListener('click',function(){
@@ -10803,6 +11290,33 @@ def _landing_html(rows, viewer):
         '</header><div id="trail-content" class="trail-content"></div></div></dialog>'
         if calliope_enabled else ""
     )
+    _metric_promote_dialog = (
+        '<dialog id="metric-promote-dialog" class="metric-promote-dialog" '
+        'aria-labelledby="metric-promote-title">'
+        '<div class="metric-promote-shell"><header class="metric-promote-head">'
+        '<span class="metric-promote-mark" aria-hidden="true">↗</span>'
+        '<div class="metric-promote-heading"><strong id="metric-promote-title">Promote to metric</strong>'
+        '<small id="metric-promote-meta">Turn this pinned meaning into a durable governed measure</small></div>'
+        '<button id="metric-promote-close" class="metric-promote-close" type="button" aria-label="Close">×</button>'
+        '</header><div class="metric-promote-body">'
+        '<div id="metric-promote-loading" class="metric-promote-loading">Checking the immutable definition…</div>'
+        '<form id="metric-promote-form" class="metric-promote-form" hidden>'
+        '<div class="metric-promote-source"><div><span>Source business object</span>'
+        '<strong id="metric-promote-source-title">Named value</strong>'
+        '<p id="metric-promote-source-copy"></p></div>'
+        '<b id="metric-promote-current" class="metric-promote-current"></b></div>'
+        '<label class="metric-promote-field"><span>Metric name</span>'
+        '<input id="metric-promote-name" name="name" required maxlength="63" '
+        'pattern="[a-z][a-z0-9_]{0,62}" autocomplete="off" spellcheck="false"></label>'
+        '<label class="metric-promote-field"><span>Catalog description</span>'
+        '<textarea id="metric-promote-description" name="description" required maxlength="1400"></textarea></label>'
+        '<div id="metric-promote-facts" class="metric-promote-facts"></div>'
+        '<div id="metric-promote-error" class="metric-promote-error" role="status"></div>'
+        '<div class="metric-promote-actions"><button id="metric-promote-cancel" type="button">Cancel</button>'
+        '<button id="metric-promote-submit" type="submit">Create governed metric</button></div>'
+        '</form></div></div></dialog>'
+        if calliope_enabled else ""
+    )
     _metric_browser = (
         '<section id="metrics-browser" class="metrics-browser" '
         f'data-calliope="{str(calliope_enabled).lower()}" hidden>'
@@ -10907,6 +11421,7 @@ def _landing_html(rows, viewer):
 </main>
 {_calliope_link}
 {_trail_dialog}
+{_metric_promote_dialog}
 {_metric_dialog}
 <script>{_LANDING_JS}</script><script>{_GALLERY_METRICS_JS}</script></body></html>"""
 
@@ -11038,24 +11553,25 @@ def register_dashboard_routes(m):
         return Response(fp.read_bytes(), media_type="application/pdf",
                         headers={"content-disposition": f'inline; filename="{nm}.pdf"'})
 
-    @m.custom_route("/d/{slug}", methods=["GET"])
-    async def _view(request):
+    async def _render_artifact_document(request, version=None):
         if not auth.read_session(request):
             return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
         slug = request.path_params["slug"]
-        with _conn() as c:
-            d = c.execute("SELECT id, latest_version FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
-            if not d:
-                return HTMLResponse("<h1>404 — no such dashboard</h1>", status_code=404)
-            v = c.execute(
-                "SELECT html, manifest FROM rvbbit.dashboard_versions "
-                "WHERE dashboard_id=%s AND version=%s",
-                (d["id"], d["latest_version"]),
-            ).fetchone()
-        return HTMLResponse(
-            _dash_shim(slug, d["latest_version"], (v or {}).get("manifest"))
-            + ((v or {}).get("html") or "")
-        )
+        try:
+            document = _dashboard_version_document(slug, version)
+        except ValueError as exc:
+            return HTMLResponse(f"<h1>400 — {str(exc)}</h1>", status_code=400)
+        if not document:
+            return HTMLResponse("<h1>404 — no such artifact version</h1>", status_code=404)
+        return HTMLResponse(document["html"], headers={"cache-control": "no-store"})
+
+    @m.custom_route("/d/{slug}/versions/{version}", methods=["GET"])
+    async def _view_version(request):
+        return await _render_artifact_document(request, request.path_params.get("version"))
+
+    @m.custom_route("/d/{slug}", methods=["GET"])
+    async def _view(request):
+        return await _render_artifact_document(request)
 
     @m.custom_route("/api/d/{slug}/time-travel", methods=["GET"])
     async def _time_travel(request):
@@ -11460,6 +11976,73 @@ def register_dashboard_routes(m):
             }, 500)
         return _json({"preview": preview})
 
+    @m.custom_route(
+        "/api/calliope/home/items/{item_id}/metric-promotion",
+        methods=["GET", "POST"],
+    )
+    async def _promote_calliope_home_metric(request):
+        if not _semantic_home_enabled():
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        owner, session, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            item_id = str(uuid.UUID(str(request.path_params["item_id"])))
+        except (TypeError, ValueError):
+            return _json({"error": {"code": "NOT_FOUND"}}, 404)
+        execution_subject = session.get("sub") or owner
+        try:
+            if request.method == "GET":
+                with _conn() as conn:
+                    row = conn.execute(
+                        "SELECT i.source,i.item_kind FROM rvbbit.calliope_board_items i "
+                        "JOIN rvbbit.calliope_boards b ON b.id=i.board_id "
+                        "WHERE i.id=%s::uuid AND lower(b.owner_email)=lower(%s) AND b.slug='home'",
+                        (item_id, owner),
+                    ).fetchone()
+                if not row:
+                    raise LookupError("That Home item is no longer available")
+                if row.get("item_kind") != "artifact_object":
+                    raise ValueError("Only named business objects can become governed metrics")
+                draft = _semantic_home_metric_draft(
+                    row.get("source") or {}, execution_subject, preview=True
+                )
+                return _json({"draft": _semantic_home_metric_draft_public(draft)})
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            started = time.time()
+            result = _promote_semantic_home_metric(
+                owner,
+                execution_subject,
+                item_id,
+                body if isinstance(body, dict) else {},
+            )
+            _record(
+                "promote_home_metric",
+                {"item_id": item_id, "metric": result["metric"]},
+                result,
+                None,
+                int((time.time() - started) * 1000),
+                caller_override=owner,
+            )
+            return _json(result, 201 if result.get("created") else 200)
+        except LookupError as exc:
+            return _json({"error": {"code": "NOT_FOUND", "message": str(exc)}}, 404)
+        except FileExistsError as exc:
+            return _json({"error": {"code": "METRIC_NAME_TAKEN", "message": str(exc)}}, 409)
+        except ValueError as exc:
+            return _json({"error": {"code": "NOT_PROMOTABLE", "message": str(exc)}}, 400)
+        except Exception as exc:  # noqa: BLE001 — keep Home usable after a failed promotion
+            print(f"semantic home metric promotion ({owner}:{item_id}): {exc}", file=sys.stderr)
+            return _json({
+                "error": {
+                    "code": "METRIC_PROMOTION_FAILED",
+                    "message": "That business object could not be promoted safely.",
+                }
+            }, 500)
+
     @m.custom_route("/api/calliope/watches", methods=["GET", "POST"])
     async def _calliope_watches(request):
         if not _semantic_home_enabled():
@@ -11682,6 +12265,12 @@ def register_dashboard_routes(m):
                 res, res.get("error"), int((time.time() - t0) * 1000), caller_override=email)
         return _json(res, 400 if res.get("error") else 200)
 
+    @m.custom_route("/apps/{slug}/versions/{version}", methods=["GET"])
+    async def _view_app_version(request):
+        # Historical app URLs are immutable documents.  Never proxy them to a
+        # currently running Python app, whose code may have advanced versions.
+        return await _render_artifact_document(request, request.path_params.get("version"))
+
     @m.custom_route("/apps/{slug}", methods=["GET"])
     async def _view_app(request):
         proxied = await _proxy_runner(request)
@@ -11702,6 +12291,19 @@ def register_dashboard_routes(m):
 # ── MCP server ───────────────────────────────────────────────────────────────
 
 def _register(mcp):
+    # FastMCP detects injected Context parameters from the concrete runtime
+    # annotation.  This module postpones annotations, so attach it explicitly
+    # and keep request metadata out of each public tool schema.
+    from mcp.server.fastmcp import Context as FastMCPContext
+    for attributed_tool in (
+        _mcp_upload_artifact,
+        _mcp_publish_dashboard,
+        _mcp_update_dashboard,
+        _mcp_create_live_app,
+        _mcp_update_live_app,
+    ):
+        attributed_tool.__annotations__["ctx"] = FastMCPContext
+
     mcp.tool(name="search_data")(lambda query, limit=8, schema=None: _logged(
         "search_data", {"query": query, "limit": limit, "schema": schema},
         lambda: tool_search_data(query, limit, schema)))
