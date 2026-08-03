@@ -1,7 +1,8 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -c "from mcp.server.fastmcp import FastMCP"
 RUN python -m playwright install --with-deps chromium
 COPY server.py auth.py calliope.py warehouse_theme.py dashboard_template.html ./
 COPY backgrounds ./backgrounds
