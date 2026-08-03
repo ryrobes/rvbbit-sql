@@ -18,10 +18,14 @@ _SPEC.loader.exec_module(warehouse_theme)
 
 def test_lens_wallpaper_library_is_shipped_as_web_sized_pairs():
     items = warehouse_theme.theme_library()
-    assert len(items) == 74
+    assert len(items) == 76
     assert len({item["id"] for item in items}) == len(items)
     assert all(item["thumb"].startswith("/theme/images/thumb/") for item in items)
     assert all(item["url"].startswith("/theme/images/full/") for item in items)
+
+    by_id = {item["id"]: item for item in items}
+    assert by_id["callie-bg-bright"]["label"] == "Callie Bright"
+    assert by_id["callie-bg-dark"]["label"] == "Callie Dark"
 
     total = 0
     for item in items:

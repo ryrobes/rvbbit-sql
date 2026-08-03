@@ -80,6 +80,8 @@
     composer: $("#composer"),
     input: $("#message-input"),
     send: $("#send-message"),
+    speechRecord: $("#speech-record"),
+    speechStatus: $("#speech-status"),
     designProfileChip: $("#design-profile-chip"),
     imageInput: $("#image-input"),
     attachmentTray: $("#attachment-tray"),
@@ -224,6 +226,11 @@
     toast: $("#toast"),
   };
   const EVIDENCE_SET_HANDLE = "@search-set";
+  const MICROPHONE_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M12 15a3.5 3.5 0 0 0 3.5-3.5v-5a3.5 3.5 0 1 0-7 0v5A3.5 3.5 0 0 0 12 15Z"></path>
+    <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M8.5 21h7"></path>
+  </svg>`;
+  const SPEECH_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
   const SQL_KEYWORDS = new Set(`
     all alter analyze and any array as asc asof at between both by case cast check
     collate column constraint create cross current_date current_time current_timestamp
@@ -301,6 +308,18 @@
     viewerTrailHistory: [],
     viewerTrailData: null,
     busy: false,
+    speech: {
+      phase: "idle",
+      recorder: null,
+      stream: null,
+      chunks: [],
+      target: null,
+      startedAt: 0,
+      timer: null,
+      timeout: null,
+      cancelled: false,
+      controller: null,
+    },
     stageAtLiveEdge: true,
     chatAtLiveEdge: true,
     newSurfaceCount: 0,
@@ -1241,9 +1260,11 @@
       setStatus(state.config.healthy ? "ready" : "unavailable", state.config.healthy ? "" : "offline");
       els.actionOpen.hidden = state.config.action_library === false;
       syncEvidenceSearchControls();
+      syncSpeechControls();
     } catch (error) {
       setStatus("unavailable", "offline");
       syncEvidenceSearchControls();
+      syncSpeechControls();
       throw error;
     }
   }
@@ -3619,6 +3640,7 @@
   }
 
   function clearSession() {
+    cancelSpeechRecording();
     clearSpatialSelections();
     clearLiveActivity();
     state.current = null;
@@ -3640,10 +3662,12 @@
     renderChat();
     renderStage();
     syncEvidenceSearchControls();
+    syncSpeechControls();
   }
 
   async function selectSession(id, options = {}) {
     if ((state.busy && !options.force) || state.evidenceSearching) return;
+    cancelSpeechRecording();
     const selectedSummary = state.sessions.find((session) => session.id === id);
     clearSpatialSelections();
     if (!options.preserveActivity) clearLiveActivity();
@@ -3669,6 +3693,7 @@
     renderChat(true);
     renderStage(true);
     syncEvidenceSearchControls();
+    syncSpeechControls();
     setMobilePanel();
     if (options.focusComposer !== false) {
       requestAnimationFrame(() => els.input.focus());
@@ -5610,6 +5635,11 @@
         <div class="brief-note-editor" data-brief-note-editor></div>
         <footer>
           <span>Type <b>[[</b> plus a person, place, thing, project, or ticket · <kbd>⌘/Ctrl</kbd> + <kbd>Enter</kbd> to append</span>
+          <button type="button" class="brief-note-speech" data-speech-record="daily_note"
+                  data-speech-surface-id="${escapeHtml(surface.id)}" aria-label="Dictate a private note"
+                  aria-pressed="false" title="Dictate a private note" hidden>
+            ${MICROPHONE_ICON}<span>Dictate</span>
+          </button>
           <span data-brief-note-count>0 / 12,000</span>
           <button type="button" data-append-brief-note disabled>Append note</button>
         </footer>
@@ -5698,6 +5728,19 @@
     return {
       getValue: () => textarea.value,
       setValue: (value = "") => { textarea.value = String(value); options.onChange?.(textarea.value); },
+      insertText(value = "") {
+        const start = Number.isInteger(textarea.selectionStart)
+          ? textarea.selectionStart : textarea.value.length;
+        const end = Number.isInteger(textarea.selectionEnd) ? textarea.selectionEnd : start;
+        const insert = speechInsertion(textarea.value, start, end, value);
+        if (!insert || textarea.value.length - (end - start) + insert.length > BRIEF_NOTE_MAX_CHARS) {
+          return false;
+        }
+        textarea.setRangeText(insert, start, end, "end");
+        options.onChange?.(textarea.value);
+        textarea.focus();
+        return true;
+      },
       setDisabled: (disabled) => { textarea.disabled = Boolean(disabled); },
       focus: () => textarea.focus(),
       destroy: () => textarea.remove(),
@@ -5714,6 +5757,7 @@
       const options = {
         placeholder: "A decision, loose end, conversation, or thing worth remembering…",
         ariaLabel: `Append a private note to the ${date} Personal Brief`,
+        maxLength: BRIEF_NOTE_MAX_CHARS,
         lookup: lookupBriefNoteObjects,
         onChange: () => editor && syncBriefNoteComposer(panel, editor),
         onSubmit: () => appendBriefNote(panel).catch((error) => toast(error.message, true)),
@@ -5725,6 +5769,7 @@
       syncBriefNoteComposer(panel, editor);
       loadBriefNotes(surfaceId, date).catch(() => {});
     });
+    syncSpeechControls();
   }
 
   async function appendBriefNote(panel) {
@@ -5740,6 +5785,7 @@
     state.brief.noteSaving.add(surfaceId);
     editor.setDisabled(true);
     syncBriefNoteComposer(panel, editor);
+    syncSpeechControls();
     try {
       const data = await api("/api/calliope/briefs/notes", {
         method: "POST",
@@ -5758,6 +5804,7 @@
       state.brief.noteSaving.delete(surfaceId);
       editor.setDisabled(false);
       syncBriefNoteComposer(panel, editor);
+      syncSpeechControls();
       editor.focus();
     }
   }
@@ -6225,6 +6272,9 @@
 
   function renderStage(initial = false) {
     if (workflowNodeTooltipTarget?.closest("#stage")) hideWorkflowNodeTooltip();
+    if (state.speech.target?.kind === "daily_note" && state.speech.phase !== "idle") {
+      cancelSpeechRecording();
+    }
     state.brief.noteEditors.forEach((editor) => editor.destroy?.());
     state.brief.noteEditors.clear();
     els.surfaceCount.textContent = `${state.surfaces.length} surface${state.surfaces.length === 1 ? "" : "s"}`;
@@ -7031,6 +7081,320 @@
     els.input.style.height = `${Math.min(180, els.input.scrollHeight)}px`;
   }
 
+  function speechSupported() {
+    const recorder = window.MediaRecorder;
+    return Boolean(
+      state.config?.speech_to_text?.enabled
+      && navigator.mediaDevices?.getUserMedia
+      && recorder
+      && (
+        !recorder.isTypeSupported
+        || SPEECH_MIME_TYPES.some((mimeType) => recorder.isTypeSupported(mimeType))
+      ),
+    );
+  }
+
+  function speechTargetFromButton(button) {
+    if (!button) return null;
+    if (button.dataset.speechRecord === "chat") {
+      return state.current ? { kind: "chat", sessionId: state.current.id } : null;
+    }
+    if (button.dataset.speechRecord === "daily_note") {
+      const surfaceId = button.dataset.speechSurfaceId;
+      return surfaceId ? { kind: "daily_note", surfaceId } : null;
+    }
+    return null;
+  }
+
+  function speechTargetKey(target) {
+    if (!target) return "";
+    return target.kind === "chat"
+      ? `chat:${target.sessionId || ""}`
+      : `daily_note:${target.surfaceId || ""}`;
+  }
+
+  function speechElapsedLabel() {
+    const elapsed = Math.max(0, Math.floor((Date.now() - state.speech.startedAt) / 1000));
+    return `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
+  }
+
+  function syncSpeechControls() {
+    const available = speechSupported();
+    const activeKey = speechTargetKey(state.speech.target);
+    const recording = state.speech.phase === "recording";
+    const waiting = ["requesting", "transcribing", "cancelling"].includes(state.speech.phase);
+    $$('[data-speech-record]').forEach((button) => {
+      const target = speechTargetFromButton(button);
+      const active = Boolean(activeKey && speechTargetKey(target) === activeKey);
+      const noteSaving = target?.kind === "daily_note"
+        && state.brief.noteSaving.has(target.surfaceId);
+      const destinationDisabled = target?.kind === "chat"
+        ? !state.current || state.busy || els.input.disabled
+        : !target || noteSaving || !state.brief.noteEditors.has(target.surfaceId);
+      button.hidden = !available;
+      button.disabled = !available || destinationDisabled
+        || (recording && !active) || waiting;
+      button.classList.toggle("recording", recording && active);
+      button.classList.toggle("transcribing", state.speech.phase === "transcribing" && active);
+      button.setAttribute("aria-pressed", String(recording && active));
+      const label = $("span", button);
+      if (label) {
+        label.textContent = recording && active
+          ? speechElapsedLabel()
+          : state.speech.phase === "requesting" && active
+            ? "Allow mic"
+            : state.speech.phase === "transcribing" && active
+              ? "Transcribing"
+              : "Dictate";
+      }
+      const accessible = recording && active
+        ? "Stop recording"
+        : state.speech.phase === "transcribing" && active
+          ? "Transcribing speech"
+          : target?.kind === "daily_note"
+            ? "Dictate a private note"
+            : "Dictate a message";
+      button.setAttribute("aria-label", accessible);
+      button.title = accessible;
+    });
+    if (els.speechStatus) {
+      const status = recording
+        ? `Recording ${speechElapsedLabel()} · tap Dictate to stop`
+        : state.speech.phase === "requesting"
+          ? "Waiting for microphone permission…"
+          : state.speech.phase === "transcribing"
+            ? "Transcribing recording…"
+            : "";
+      els.speechStatus.textContent = status;
+      els.speechStatus.hidden = !status;
+    }
+    els.send.disabled = !state.current || state.busy || state.speech.phase !== "idle";
+  }
+
+  function clearSpeechTimers() {
+    clearInterval(state.speech.timer);
+    clearTimeout(state.speech.timeout);
+    state.speech.timer = null;
+    state.speech.timeout = null;
+  }
+
+  function stopSpeechStream(stream = state.speech.stream) {
+    (stream?.getTracks?.() || []).forEach((track) => track.stop());
+  }
+
+  function resetSpeechState() {
+    clearSpeechTimers();
+    stopSpeechStream();
+    state.speech.phase = "idle";
+    state.speech.recorder = null;
+    state.speech.stream = null;
+    state.speech.chunks = [];
+    state.speech.target = null;
+    state.speech.startedAt = 0;
+    state.speech.cancelled = false;
+    state.speech.controller = null;
+    syncSpeechControls();
+  }
+
+  function speechInsertion(value, start, end, transcript) {
+    const text = String(transcript || "").replace(/\r\n?/g, "\n").trim();
+    if (!text) return "";
+    const before = value.slice(0, start);
+    const after = value.slice(end);
+    const prefix = before && !/\s$/.test(before) && !/^[,.;:!?)}\]]/.test(text) ? " " : "";
+    const suffix = after && !/^\s/.test(after) && !/[\s([{]$/.test(text) ? " " : "";
+    return `${prefix}${text}${suffix}`;
+  }
+
+  function insertSpeechTranscript(target, transcript) {
+    if (target?.kind === "chat") {
+      if (!state.current || state.current.id !== target.sessionId) return false;
+      const start = Number.isInteger(els.input.selectionStart)
+        ? els.input.selectionStart : els.input.value.length;
+      const end = Number.isInteger(els.input.selectionEnd)
+        ? els.input.selectionEnd : start;
+      const insert = speechInsertion(els.input.value, start, end, transcript);
+      if (!insert || els.input.value.length - (end - start) + insert.length > 40_000) {
+        return false;
+      }
+      els.input.setRangeText(insert, start, end, "end");
+      els.input.dispatchEvent(new Event("input", { bubbles: true }));
+      els.input.focus();
+      return true;
+    }
+    if (target?.kind === "daily_note") {
+      const editor = state.brief.noteEditors.get(target.surfaceId);
+      if (!editor?.insertText || !editor.insertText(transcript)) return false;
+      const panel = $(`[data-brief-notes][data-surface-id="${CSS.escape(target.surfaceId)}"]`, els.stage);
+      if (panel) syncBriefNoteComposer(panel, editor);
+      return true;
+    }
+    return false;
+  }
+
+  async function transcribeSpeechRecording(blob, target, startedAt) {
+    const maxBytes = Number(state.config?.speech_to_text?.max_audio_bytes || 0);
+    if (!blob.size) throw new Error("That recording was empty. Try again and speak after the microphone appears.");
+    if (maxBytes && blob.size > maxBytes) throw new Error("That recording is larger than this installation allows.");
+    const extension = blob.type.includes("mp4") ? "m4a" : "webm";
+    const body = new FormData();
+    body.append("file", blob, `calliope-recording.${extension}`);
+    body.append("surface", target.kind);
+    body.append("duration_seconds", String(Math.max(0, (Date.now() - startedAt) / 1000)));
+    state.speech.controller = new AbortController();
+    const response = await fetch("/api/calliope/transcriptions", {
+      method: "POST",
+      body,
+      signal: state.speech.controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    let data = {};
+    try { data = await response.json(); } catch { /* handled by the status below */ }
+    if (!response.ok) {
+      throw new Error(data?.error?.message || `Speech transcription failed (${response.status})`);
+    }
+    const transcript = String(data.text || "").trim();
+    if (!transcript) throw new Error("No speech was detected in that recording.");
+    if (!insertSpeechTranscript(target, transcript)) {
+      throw new Error(target.kind === "daily_note"
+        ? "That transcript would make this note too long, or the note is no longer open."
+        : "That transcript no longer has an open message box.");
+    }
+    toast(target.kind === "daily_note"
+      ? "Transcript inserted into your private note"
+      : "Transcript inserted · review it before sending");
+  }
+
+  async function finishSpeechRecording() {
+    const recorder = state.speech.recorder;
+    const target = state.speech.target;
+    const chunks = [...state.speech.chunks];
+    const startedAt = state.speech.startedAt;
+    const cancelled = state.speech.cancelled;
+    const mediaType = recorder?.mimeType || chunks.find((chunk) => chunk.type)?.type || "audio/webm";
+    clearSpeechTimers();
+    stopSpeechStream();
+    state.speech.recorder = null;
+    state.speech.stream = null;
+    state.speech.chunks = [];
+    if (cancelled || !target) {
+      resetSpeechState();
+      return;
+    }
+    state.speech.phase = "transcribing";
+    syncSpeechControls();
+    try {
+      await transcribeSpeechRecording(new Blob(chunks, { type: mediaType }), target, startedAt);
+    } catch (error) {
+      if (error?.name !== "AbortError") toast(error.message || "Speech transcription failed", true);
+    } finally {
+      resetSpeechState();
+    }
+  }
+
+  function stopSpeechRecording({ cancel = false } = {}) {
+    if (state.speech.phase === "transcribing") {
+      if (cancel) {
+        state.speech.phase = "cancelling";
+        state.speech.controller?.abort();
+        syncSpeechControls();
+      }
+      return;
+    }
+    if (state.speech.phase === "requesting") {
+      if (cancel) {
+        state.speech.cancelled = true;
+        state.speech.phase = "cancelling";
+        syncSpeechControls();
+      }
+      return;
+    }
+    const recorder = state.speech.recorder;
+    if (!recorder || !["recording", "paused"].includes(recorder.state)) return;
+    state.speech.cancelled = cancel;
+    state.speech.phase = cancel ? "cancelling" : "transcribing";
+    clearSpeechTimers();
+    recorder.stop();
+    stopSpeechStream();
+    syncSpeechControls();
+  }
+
+  function cancelSpeechRecording() {
+    if (state.speech.phase !== "idle") stopSpeechRecording({ cancel: true });
+  }
+
+  async function startSpeechRecording(target) {
+    if (!target || !speechSupported() || state.speech.phase !== "idle") return;
+    state.speech.target = target;
+    state.speech.phase = "requesting";
+    state.speech.cancelled = false;
+    syncSpeechControls();
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      if (state.speech.cancelled) {
+        stopSpeechStream(stream);
+        resetSpeechState();
+        return;
+      }
+      let recorder = null;
+      for (const mimeType of SPEECH_MIME_TYPES) {
+        if (MediaRecorder.isTypeSupported && !MediaRecorder.isTypeSupported(mimeType)) continue;
+        try {
+          recorder = new MediaRecorder(stream, { mimeType });
+          break;
+        } catch { /* try the next browser format */ }
+      }
+      if (!recorder) recorder = new MediaRecorder(stream);
+      state.speech.stream = stream;
+      state.speech.recorder = recorder;
+      state.speech.chunks = [];
+      state.speech.startedAt = Date.now();
+      recorder.addEventListener("dataavailable", (event) => {
+        if (event.data?.size) state.speech.chunks.push(event.data);
+      });
+      recorder.addEventListener("stop", () => finishSpeechRecording());
+      recorder.addEventListener("error", () => {
+        state.speech.cancelled = true;
+        toast("The browser stopped the microphone recording.", true);
+        if (recorder.state !== "inactive") recorder.stop();
+        else resetSpeechState();
+      });
+      recorder.start(500);
+      state.speech.phase = "recording";
+      state.speech.timer = setInterval(syncSpeechControls, 500);
+      const maxSeconds = Number(state.config?.speech_to_text?.max_audio_seconds || 120);
+      state.speech.timeout = setTimeout(() => stopSpeechRecording(), maxSeconds * 1000);
+      syncSpeechControls();
+    } catch (error) {
+      const cancelled = state.speech.cancelled;
+      stopSpeechStream(stream);
+      resetSpeechState();
+      if (cancelled) return;
+      const message = error?.name === "NotAllowedError"
+        ? "Microphone access was not granted."
+        : error?.name === "NotFoundError"
+          ? "No microphone was found on this device."
+          : "This browser could not start a supported microphone recording.";
+      toast(message, true);
+    }
+  }
+
+  function toggleSpeechRecording(button) {
+    const target = speechTargetFromButton(button);
+    if (!target) return;
+    if (
+      state.speech.phase === "recording"
+      && speechTargetKey(target) === speechTargetKey(state.speech.target)
+    ) {
+      stopSpeechRecording();
+      return;
+    }
+    startSpeechRecording(target);
+  }
+
   function optimisticTurn(message, hasSpatialSelection = false, evidenceRefs = []) {
     const maxOrdinal = Math.max(0, ...state.turns.map((turn) => Number(turn.ordinal || 0)));
     const turn = {
@@ -7086,7 +7450,7 @@
   }
 
   async function sendTurn() {
-    if (!state.current || state.busy) return;
+    if (!state.current || state.busy || state.speech.phase !== "idle") return;
     const message = els.input.value.trim();
     if (!message && !state.attachments.length && !state.spatialSelections.length && !state.evidenceSelections.length) return;
     const outgoingAttachments = [...state.attachments];
@@ -7109,6 +7473,7 @@
     state.busy = true;
     els.send.disabled = true;
     els.input.disabled = true;
+    syncSpeechControls();
     setStatus("working", "working");
     beginLiveActivity();
 
@@ -7209,6 +7574,7 @@
       els.input.disabled = false;
       els.send.disabled = false;
       setStatus(state.config?.healthy ? "ready" : "unavailable", state.config?.healthy ? "" : "offline");
+      syncSpeechControls();
       els.input.focus();
     }
   }
@@ -7606,6 +7972,8 @@
       event.preventDefault();
       sendTurn();
     });
+    els.speechRecord.addEventListener("click", () => toggleSpeechRecording(els.speechRecord));
+    window.addEventListener("pagehide", cancelSpeechRecording);
     els.input.addEventListener("input", resizeComposer);
     els.input.addEventListener("paste", pasteImages);
     els.input.addEventListener("keydown", (event) => {
@@ -7775,6 +8143,11 @@
       const refreshBrief = event.target.closest("[data-refresh-brief]");
       if (refreshBrief) {
         openPersonalBrief(true).catch((error) => toast(error.message, true));
+        return;
+      }
+      const briefNoteSpeech = event.target.closest('[data-speech-record="daily_note"]');
+      if (briefNoteSpeech) {
+        toggleSpeechRecording(briefNoteSpeech);
         return;
       }
       const appendBriefNoteButton = event.target.closest("[data-append-brief-note]");

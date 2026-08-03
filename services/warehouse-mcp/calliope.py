@@ -64,6 +64,10 @@ _MAX_ASSISTANT_CHARS = 40_000
 _MAX_WORKING_NOTE_CHARS = 800
 _DEFAULT_MAX_EXPORT_BYTES = 128 * 1024 * 1024
 _MAX_EXPORT_BYTES_CEILING = 512 * 1024 * 1024
+_DEFAULT_MAX_AUDIO_BYTES = 12 * 1024 * 1024
+_MAX_AUDIO_BYTES_CEILING = 25 * 1024 * 1024
+_DEFAULT_MAX_AUDIO_SECONDS = 120
+_MAX_AUDIO_SECONDS_CEILING = 10 * 60
 _EXPORT_EXTENSIONS = {
     ".csv",
     ".doc",
@@ -452,10 +456,22 @@ class CalliopeConfig:
     max_export_bytes: int = _DEFAULT_MAX_EXPORT_BYTES
     export_roots: tuple[Path, ...] = ()
     style_allow_private_urls: bool = False
+    transcription_provider: str = ""
+    transcription_api_key: str = ""
+    transcription_base_url: str = "https://api.openai.com/v1"
+    transcription_model: str = "gpt-transcribe"
+    max_audio_bytes: int = _DEFAULT_MAX_AUDIO_BYTES
+    max_audio_seconds: int = _DEFAULT_MAX_AUDIO_SECONDS
 
     @property
     def enabled(self) -> bool:
         return bool(self.hermes_url and self.hermes_api_key)
+
+    @property
+    def transcription_enabled(self) -> bool:
+        return self.transcription_provider == "openai" and bool(
+            self.transcription_api_key
+        )
 
     @classmethod
     def from_env(cls) -> "CalliopeConfig":
@@ -472,6 +488,29 @@ class CalliopeConfig:
             )
         except (TypeError, ValueError):
             max_export = _DEFAULT_MAX_EXPORT_BYTES
+        try:
+            max_audio = int(
+                os.environ.get(
+                    "WAREHOUSE_CALLIOPE_MAX_AUDIO_BYTES",
+                    str(_DEFAULT_MAX_AUDIO_BYTES),
+                )
+            )
+        except (TypeError, ValueError):
+            max_audio = _DEFAULT_MAX_AUDIO_BYTES
+        try:
+            max_audio_seconds = int(
+                os.environ.get(
+                    "WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS",
+                    str(_DEFAULT_MAX_AUDIO_SECONDS),
+                )
+            )
+        except (TypeError, ValueError):
+            max_audio_seconds = _DEFAULT_MAX_AUDIO_SECONDS
+        transcription_provider = os.environ.get(
+            "WAREHOUSE_CALLIOPE_STT_PROVIDER", "openai"
+        ).strip().lower()
+        if transcription_provider in {"disabled", "none", "off"}:
+            transcription_provider = ""
         export_roots = tuple(
             Path(value.strip()).expanduser()
             for value in os.environ.get("WAREHOUSE_CALLIOPE_EXPORT_ROOTS", "").split(os.pathsep)
@@ -491,11 +530,166 @@ class CalliopeConfig:
             style_allow_private_urls=os.environ.get(
                 "WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS", ""
             ).strip().lower() in {"1", "true", "yes", "on"},
+            transcription_provider=transcription_provider,
+            transcription_api_key=(
+                os.environ.get("WAREHOUSE_CALLIOPE_STT_KEY", "").strip()
+                or os.environ.get("OPENAI_API_KEY", "").strip()
+            ),
+            transcription_base_url=os.environ.get(
+                "WAREHOUSE_CALLIOPE_STT_BASE_URL", "https://api.openai.com/v1"
+            ).strip().rstrip("/") or "https://api.openai.com/v1",
+            transcription_model=(
+                os.environ.get("WAREHOUSE_CALLIOPE_STT_MODEL", "gpt-transcribe").strip()
+                or "gpt-transcribe"
+            )[:160],
+            max_audio_bytes=max(
+                256 * 1024,
+                min(max_audio, _MAX_AUDIO_BYTES_CEILING),
+            ),
+            max_audio_seconds=max(
+                10,
+                min(max_audio_seconds, _MAX_AUDIO_SECONDS_CEILING),
+            ),
         )
 
 
 def is_enabled() -> bool:
     return CalliopeConfig.from_env().enabled
+
+
+class TranscriptionProviderError(RuntimeError):
+    """A bounded, user-safe failure from the configured speech provider."""
+
+    def __init__(self, message: str, code: str = "TRANSCRIPTION_FAILED"):
+        super().__init__(message)
+        self.code = code
+
+
+def _transcription_audio_format(payload: bytes) -> tuple[str, str] | None:
+    """Identify only formats accepted by the upstream transcription contract."""
+    if len(payload) >= 4 and payload[:4] == b"\x1aE\xdf\xa3":
+        return "webm", "audio/webm"
+    if len(payload) >= 12 and payload[:4] == b"RIFF" and payload[8:12] == b"WAVE":
+        return "wav", "audio/wav"
+    if len(payload) >= 12 and payload[4:8] == b"ftyp":
+        return "m4a", "audio/mp4"
+    if payload[:3] == b"ID3" or (
+        len(payload) >= 2 and payload[0] == 0xFF and payload[1] & 0xE0 == 0xE0
+    ):
+        return "mp3", "audio/mpeg"
+    return None
+
+
+def _transcription_prompt(surface: str) -> str:
+    purpose = (
+        "a private Daily Brief note"
+        if surface == "daily_note"
+        else "a message to Calliope"
+    )
+    return (
+        f"This recording is {purpose} in an analytics and company knowledge workspace. "
+        "Preserve names, project codes, ticket IDs, metric names, acronyms, and SQL terms "
+        "exactly. Transcribe only what was spoken."
+    )
+
+
+def _transcription_endpoint(config: CalliopeConfig) -> str:
+    base = config.transcription_base_url.rstrip("/")
+    if base.endswith("/audio/transcriptions"):
+        return base
+    return f"{base}/audio/transcriptions"
+
+
+async def _transcribe_audio(
+    config: CalliopeConfig,
+    payload: bytes,
+    *,
+    extension: str,
+    media_type: str,
+    surface: str,
+) -> dict[str, Any]:
+    """Forward one bounded recording through the selected server-side adapter."""
+    if config.transcription_provider != "openai":
+        raise TranscriptionProviderError(
+            "Speech transcription is not configured for this installation.",
+            "TRANSCRIPTION_UNAVAILABLE",
+        )
+    if not config.transcription_api_key:
+        raise TranscriptionProviderError(
+            "Speech transcription needs a server-side provider key.",
+            "TRANSCRIPTION_UNAVAILABLE",
+        )
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(75.0, connect=10.0),
+            follow_redirects=False,
+        ) as client:
+            response = await client.post(
+                _transcription_endpoint(config),
+                headers={"Authorization": f"Bearer {config.transcription_api_key}"},
+                data={
+                    "model": config.transcription_model,
+                    "prompt": _transcription_prompt(surface),
+                },
+                files={
+                    "file": (
+                        f"calliope-recording.{extension}",
+                        payload,
+                        media_type,
+                    )
+                },
+            )
+    except httpx.HTTPError as exc:
+        raise TranscriptionProviderError(
+            "The speech provider could not be reached. Try again in a moment.",
+            "TRANSCRIPTION_PROVIDER_UNAVAILABLE",
+        ) from exc
+
+    if response.status_code in {401, 403}:
+        raise TranscriptionProviderError(
+            "The speech provider rejected the configured credentials.",
+            "TRANSCRIPTION_PROVIDER_AUTH",
+        )
+    if response.status_code == 429:
+        raise TranscriptionProviderError(
+            "Speech transcription is temporarily at capacity. Try again shortly.",
+            "TRANSCRIPTION_RATE_LIMITED",
+        )
+    if response.status_code == 413:
+        raise TranscriptionProviderError(
+            "The speech provider rejected this recording as too large.",
+            "AUDIO_TOO_LARGE",
+        )
+    if response.status_code >= 400:
+        raise TranscriptionProviderError(
+            "The speech provider could not process this recording.",
+            "TRANSCRIPTION_PROVIDER_ERROR",
+        )
+    try:
+        result = response.json()
+    except (TypeError, ValueError) as exc:
+        raise TranscriptionProviderError(
+            "The speech provider returned an unreadable response.",
+            "TRANSCRIPTION_BAD_RESPONSE",
+        ) from exc
+    text = str((result or {}).get("text") or "").strip()
+    if not text:
+        raise TranscriptionProviderError(
+            "No speech was detected in that recording.",
+            "NO_SPEECH_DETECTED",
+        )
+    languages = []
+    for item in (result or {}).get("languages") or []:
+        code = item.get("code") if isinstance(item, dict) else item
+        code = str(code or "").strip().lower()
+        if re.fullmatch(r"[a-z]{2,3}(?:-[a-z]{2})?", code):
+            languages.append(code)
+    return {
+        "text": text[:_MAX_ASSISTANT_CHARS],
+        "languages": languages[:8],
+        "provider": config.transcription_provider,
+        "model": config.transcription_model,
+    }
 
 
 # Shape-identical to migration 0222. Fresh extension installs get the migration;
@@ -4987,9 +5181,9 @@ def _brief_followed_metric_observations(
             ).fetchall()
     except Exception as exc:
         return [], [{
-            "key": "followed-metrics", "label": "Followed metrics", "count": 0,
+            "key": "followed-metrics", "label": "Metrics in Briefs", "count": 0,
             "status": "unavailable", "scope": "personal",
-        }], [f"Followed metrics are unavailable: {type(exc).__name__}: {exc}"]
+        }], [f"Metrics in Briefs are unavailable: {type(exc).__name__}: {exc}"]
 
     observations = []
     observed_count = 0
@@ -5044,10 +5238,10 @@ def _brief_followed_metric_observations(
                 "kind": "metric", "name": row["metric_name"],
                 "relation": row["metric_name"], "params": params,
             },
-            "subtype": "followed metric",
+            "subtype": "metric in briefs",
             "title": title,
             "summary": summary,
-            "source": "Followed metrics",
+            "source": "Metrics in Briefs",
             "url": "/gallery?" + urlencode(query),
             "occurred_at": occurred,
             "provenance": {
@@ -5067,14 +5261,14 @@ def _brief_followed_metric_observations(
                     "kind": "metric_follow",
                     "confidence": "exact",
                     "truth": "observed",
-                    "evidence": "This metric is quietly followed by the OAuth identity.",
+                    "evidence": "This metric is included in Personal Briefs for the OAuth identity.",
                 },
                 "feedback_allowed": False,
             },
         })
     return observations, [{
         "key": "followed-metrics",
-        "label": "Followed metrics",
+        "label": "Metrics in Briefs",
         "count": len(observations),
         "available": len(rows),
         "observed": observed_count,
@@ -12073,7 +12267,131 @@ def register_calliope_routes(
             "evidence_search": evidence_search is not None,
             "evidence_open": evidence_open is not None,
             "max_image_bytes": config.max_image_bytes,
+            "speech_to_text": {
+                "enabled": config.transcription_enabled,
+                "provider": (
+                    config.transcription_provider
+                    if config.transcription_enabled
+                    else None
+                ),
+                "model": (
+                    config.transcription_model
+                    if config.transcription_enabled
+                    else None
+                ),
+                "max_audio_bytes": config.max_audio_bytes,
+                "max_audio_seconds": config.max_audio_seconds,
+                "retains_audio": False,
+            },
         })
+
+    @mcp.custom_route("/api/calliope/transcriptions", methods=["POST"])
+    async def create_calliope_transcription(request):
+        _, err = api_owner(request)
+        if err:
+            return err
+        if not config.transcription_enabled:
+            return json_response({
+                "error": {
+                    "code": "TRANSCRIPTION_UNAVAILABLE",
+                    "message": "Speech transcription is not configured for this installation.",
+                }
+            }, 503)
+        try:
+            content_length = int(request.headers.get("content-length") or 0)
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > config.max_audio_bytes + 128 * 1024:
+            return json_response({
+                "error": {
+                    "code": "AUDIO_TOO_LARGE",
+                    "message": "That recording is larger than this installation allows.",
+                }
+            }, 413)
+        try:
+            form = await request.form()
+        except Exception:
+            return json_response({
+                "error": {
+                    "code": "BAD_AUDIO_UPLOAD",
+                    "message": "Calliope could not read that recording.",
+                }
+            }, 400)
+        upload = form.get("file")
+        surface = str(form.get("surface") or "chat").strip().lower()
+        if surface not in {"chat", "daily_note"}:
+            try:
+                await upload.close()
+            except Exception:
+                pass
+            return json_response({
+                "error": {
+                    "code": "BAD_TRANSCRIPTION_SURFACE",
+                    "message": "That speech destination is not supported.",
+                }
+            }, 400)
+        if upload is None or not callable(getattr(upload, "read", None)):
+            return json_response({
+                "error": {
+                    "code": "AUDIO_REQUIRED",
+                    "message": "Record some speech before asking Calliope to transcribe it.",
+                }
+            }, 400)
+        try:
+            payload = await upload.read(config.max_audio_bytes + 1)
+        except Exception:
+            return json_response({
+                "error": {
+                    "code": "BAD_AUDIO_UPLOAD",
+                    "message": "Calliope could not read that recording.",
+                }
+            }, 400)
+        finally:
+            try:
+                await upload.close()
+            except Exception:
+                pass
+        if len(payload) > config.max_audio_bytes:
+            return json_response({
+                "error": {
+                    "code": "AUDIO_TOO_LARGE",
+                    "message": "That recording is larger than this installation allows.",
+                }
+            }, 413)
+        if len(payload) < 32:
+            return json_response({
+                "error": {
+                    "code": "EMPTY_AUDIO",
+                    "message": "That recording was too short to transcribe.",
+                }
+            }, 400)
+        detected = _transcription_audio_format(payload)
+        if not detected:
+            return json_response({
+                "error": {
+                    "code": "UNSUPPORTED_AUDIO",
+                    "message": "Use a browser recording in WebM, MP4/M4A, WAV, or MP3 format.",
+                }
+            }, 415)
+        extension, media_type = detected
+        try:
+            result = await _transcribe_audio(
+                config,
+                payload,
+                extension=extension,
+                media_type=media_type,
+                surface=surface,
+            )
+        except TranscriptionProviderError as exc:
+            status = 503 if exc.code in {
+                "TRANSCRIPTION_UNAVAILABLE",
+                "TRANSCRIPTION_PROVIDER_UNAVAILABLE",
+                "TRANSCRIPTION_RATE_LIMITED",
+            } else 502
+            return json_response({
+                "error": {"code": exc.code, "message": str(exc)[:400]}
+            }, status)
+        return json_response({**result, "retained_audio": False})
 
     @mcp.custom_route("/api/calliope/actions", methods=["GET"])
     async def list_calliope_actions(request):

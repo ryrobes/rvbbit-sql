@@ -15,7 +15,7 @@ NODE_PATH="$PWD/../rvbbit-lens/node_modules" \
   --outfile=services/warehouse-mcp/theme/warehouse-theme.js
 ```
 
-The 74 images under `images/` are intentionally standalone derivatives of the
+The 76 images under `images/` are intentionally standalone derivatives of the
 Lens wallpaper library, not a live mirror. Full images fit within 1920×1080 and
 thumbnail tiles are center-cropped to 420×260; both are stripped WebP files.
 This keeps the copied library around 19 MB instead of shipping the roughly

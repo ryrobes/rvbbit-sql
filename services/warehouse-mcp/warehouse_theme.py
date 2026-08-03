@@ -28,6 +28,10 @@ TANSTACK_CHARTS_VERSION = "0.3.1"
 TANSTACK_CHARTS_SRC = f"/charts/rvbbit-tanstack-charts-{TANSTACK_CHARTS_VERSION}.js"
 _TANSTACK_CHARTS_JS = _CHARTS_DIR / f"rvbbit-tanstack-charts-{TANSTACK_CHARTS_VERSION}.js"
 _THEME_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,160}$")
+_THEME_LABELS = {
+    "callie-bg-bright": "Callie Bright",
+    "callie-bg-dark": "Callie Dark",
+}
 _TANSTACK_SCRIPT_TAG = re.compile(
     r"<script\b[^>]*\bsrc\s*=\s*(['\"])"
     + re.escape(TANSTACK_CHARTS_SRC)
@@ -75,6 +79,8 @@ def head_assets() -> str:
 
 
 def _label(image_id: str) -> str:
+    if image_id in _THEME_LABELS:
+        return _THEME_LABELS[image_id]
     if image_id.startswith("grok-"):
         return f"Grok {image_id[5:13]}"
     label = image_id

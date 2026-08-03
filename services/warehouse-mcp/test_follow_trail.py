@@ -161,6 +161,57 @@ def test_catalog_trail_turns_edges_into_ranked_plain_language_hops(monkeypatch):
     }
 
 
+def test_metric_trail_uses_governed_source_without_requiring_a_kg_node(monkeypatch):
+    monkeypatch.setattr(server, "_metric_detail_snapshot", lambda *args, **kwargs: {
+        "name": "net_revenue",
+        "title": "Net Revenue",
+        "description": "Recognized revenue after credits.",
+        "version": 3,
+        "grain": "day",
+        "params": {"region": "North"},
+        "snapshot": {
+            "value": 42500,
+            "status": "healthy",
+            "data_as_of": "2026-08-01T00:00:00Z",
+        },
+        "trend": {"direction": "up", "percent": 6.25},
+        "dependencies": [{
+            "table_name": "sales.orders", "age": "01:00:00", "stale": False,
+        }],
+        "source_tables": ["sales.orders"],
+        "artifacts": [{
+            "slug": "revenue-room", "name": "Revenue Room",
+            "description": "Finance operating dashboard", "app_kind": "dashboard",
+            "latest_version": 4,
+        }],
+    })
+    monkeypatch.setattr(server, "_calliope_brain_evidence", lambda *_args: [])
+    monkeypatch.setattr(
+        server, "_trail_catalog_node",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("metric must not require kg_nodes")),
+    )
+
+    result = server._calliope_follow_trail({
+        "kind": "metric", "name": "net_revenue", "params": {"region": "North"},
+    }, "analyst@example.com", 12)
+
+    assert result["subject"]["label"] == "Net Revenue"
+    assert result["subject"]["handle"] == {
+        "kind": "metric", "relation": "net_revenue", "name": "net_revenue",
+        "params": {"region": "North"},
+    }
+    assert {item["relationship"] for item in result["connections"]} == {
+        "derived from", "used by",
+    }
+    assert result["connections"][0]["handle"] == {
+        "kind": "db_table", "schema": "sales", "relation": "orders",
+    }
+    assert result["connections"][1]["handle"] == {
+        "kind": "artifact", "slug": "revenue-room", "version": 4,
+    }
+    assert "governed metric" in result["searched"]
+
+
 def test_search_normalizer_preserves_rehydratable_trail_handle():
     result = calliope._normalize_evidence_search_result({
         "items": [{

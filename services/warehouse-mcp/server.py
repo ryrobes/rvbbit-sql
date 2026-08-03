@@ -8236,6 +8236,18 @@ def _semantic_home_artifact_href(slug, app_kind, version=None):
     return f"{prefix}/{slug}{suffix}"
 
 
+def _semantic_home_metric_href(name, params=None):
+    from urllib.parse import quote, urlencode
+
+    query = {"view": "metrics", "metric": _metric_name(name)}
+    normalized_params = _metric_params(params)
+    if normalized_params:
+        query["params"] = json.dumps(
+            normalized_params, separators=(",", ":"), ensure_ascii=False
+        )
+    return "/gallery?" + urlencode(query, quote_via=quote)
+
+
 def _semantic_home_artifact_row(slug, version=None):
     if not _SEMANTIC_HOME_SLUG_RE.fullmatch(str(slug or "")):
         raise ValueError("artifact slug is invalid")
@@ -8330,8 +8342,6 @@ def _semantic_home_resolve_handle(value, *, validate_sql=False):
     if kind not in _SEMANTIC_HOME_ITEM_KINDS:
         raise ValueError("Home items must be artifacts, named artifact objects, or metrics")
     if kind == "metric":
-        from urllib.parse import quote, urlencode
-
         name = _metric_name(body.get("name") or body.get("metric") or body.get("relation"))
         params = _metric_params(body.get("params"))
         detail = _metric_detail_snapshot(name, params, days=90, bucket="raw")
@@ -8350,9 +8360,6 @@ def _semantic_home_resolve_handle(value, *, validate_sql=False):
             "subcategory": detail.get("subcategory"),
             "display": detail.get("display") or {},
         }
-        query = {"view": "metrics", "metric": name}
-        if params:
-            query["params"] = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
         trail = [{
             "kind": "metric",
             "relationship": "governed measure",
@@ -8384,7 +8391,7 @@ def _semantic_home_resolve_handle(value, *, validate_sql=False):
             "snapshot": detail.get("snapshot"),
             "series": (detail.get("series") or [])[-_GALLERY_METRIC_SERIES_LIMIT:],
             "trend": detail.get("trend"),
-            "open_url": "/gallery?" + urlencode(query, quote_via=quote),
+            "open_url": _semantic_home_metric_href(name, params),
             "thumbnail_url": None,
             "trail": trail,
             "status": "ready" if detail.get("snapshot") else "unobserved",
@@ -9596,7 +9603,7 @@ _GALLERY_METRICS_CSS = """
 .metrics-browser{padding-top:16px}
 .metrics-browser-head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding:0 0 14px;border-bottom:1px solid var(--line)}
 .metrics-browser-head>div:first-child{display:flex;flex-direction:column;gap:6px}.metrics-browser-head>div:first-child>span{color:var(--jade);font:700 7px/1 var(--mono);letter-spacing:.15em;text-transform:uppercase}
-.metrics-browser-head>div:first-child>strong{color:var(--fog);font:italic 400 16px/1.2 var(--serif)}
+.metrics-browser-head>div:first-child>strong{color:var(--fog);font:italic 400 16px/1.2 var(--serif)}.metrics-browser-head>div:first-child>small{color:var(--dim);font:6px/1.45 var(--mono);letter-spacing:.05em}
 .metric-browser-filters{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 #metric-category{height:30px;max-width:210px;padding:0 25px 0 9px;border:1px solid var(--line);border-radius:0;background:var(--panel);color:var(--fog);font:7px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;outline:none}
 #metric-category:focus{border-color:var(--jade)}
@@ -10338,7 +10345,7 @@ _GALLERY_METRICS_JS = """
  function actionMarkup(metric){
    if(!calliope)return '';
    return '<div class="metric-card-actions">'
-     +'<button type="button" data-metric-follow="'+esc(metric.name)+'" class="'+(metric.followed?'active':'')+'" aria-pressed="'+String(Boolean(metric.followed))+'" title="'+(metric.followed?'Stop quietly following this metric':'Follow meaningful movement in your Personal Brief')+'">'+(metric.followed?'✓ Follow':'Follow')+'</button>'
+     +'<button type="button" data-metric-follow="'+esc(metric.name)+'" class="'+(metric.followed?'active':'')+'" aria-pressed="'+String(Boolean(metric.followed))+'" title="'+(metric.followed?'Included in future Personal Briefs — click to remove':'Include meaningful changes in future Personal Briefs')+'">'+(metric.followed?'✓ In Briefs':'Brief me')+'</button>'
      +'<button type="button" data-metric-pin="'+esc(metric.name)+'" class="'+(metric.pinned?'active':'')+'" aria-pressed="'+String(Boolean(metric.pinned))+'" title="'+(metric.pinned?'Remove from Semantic Home':'Pin to Semantic Home')+'">'+(metric.pinned?'✓ Home':'Pin')+'</button>'
      +'<button type="button" class="ask" data-metric-ask="'+esc(metric.name)+'" title="Freeze this observation on a new Calliope stage">✦ Ask</button></div>';
  }
@@ -10364,7 +10371,7 @@ _GALLERY_METRICS_JS = """
  function renderMetrics(){
    if(!state.loaded)return;var visible=visibleMetrics();grid.innerHTML=visible.map(cardMarkup).join('');
    empty.hidden=Boolean(visible.length);statusNode.hidden=true;
-   tally.textContent=visible.length+' of '+state.metrics.length+' governed metric'+(state.metrics.length===1?'':'s')+(state.relation!=='all'?' · '+state.relation:'');
+   var relationLabel=state.relation==='followed'?'in briefs':state.relation;tally.textContent=visible.length+' of '+state.metrics.length+' governed metric'+(state.metrics.length===1?'':'s')+(state.relation!=='all'?' · '+relationLabel:'');
  }
  async function loadPinIds(){
    if(!calliope)return;try{var response=await fetch('/api/calliope/home',{headers:{accept:'application/json'}}),data=await response.json();if(!response.ok)return;state.pinIds={};(data.items||[]).forEach(function(item){if(item.kind==='metric'&&item.canonical_key)state.pinIds[item.canonical_key]=item.id;});}catch(ignore){}
@@ -10389,9 +10396,9 @@ _GALLERY_METRICS_JS = """
  function metricByName(name){return state.metrics.find(function(metric){return metric.name===name;})||(state.detail&&state.detail.name===name?state.detail:null);}
  function setBusy(button,busy){if(!button)return;button.disabled=busy;button.classList.toggle('loading',busy);}
  async function toggleFollow(metric,button){
-   if(!metric||!calliope)return;setBusy(button,true);try{var response=await fetch('/api/calliope/metrics/'+encodeURIComponent(metric.name)+'/follow',{method:metric.followed?'DELETE':'POST',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify({params:metric.params||{}})}),data=await response.json();if(!response.ok)throw new Error(data.error&&data.error.message||'Could not update follow');
+   if(!metric||!calliope)return;setBusy(button,true);try{var response=await fetch('/api/calliope/metrics/'+encodeURIComponent(metric.name)+'/follow',{method:metric.followed?'DELETE':'POST',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify({params:metric.params||{}})}),data=await response.json();if(!response.ok)throw new Error(data.error&&data.error.message||'Could not update Briefs');
      var followed=!metric.followed;state.metrics.filter(function(item){return item.canonical_key===metric.canonical_key;}).forEach(function(item){item.followed=followed;});if(state.detail&&state.detail.canonical_key===metric.canonical_key)state.detail.followed=followed;renderMetrics();if(state.detail)renderLens();
-   }catch(error){window.alert(error&&error.message||'Could not update follow');}finally{setBusy(button,false);}
+   }catch(error){window.alert(error&&error.message||'Could not update Briefs');}finally{setBusy(button,false);}
  }
  async function togglePin(metric,button){
    if(!metric||!calliope)return;setBusy(button,true);try{var itemId=state.pinIds[metric.canonical_key]||'',response=await fetch(itemId?'/api/calliope/home/items/'+encodeURIComponent(itemId):'/api/calliope/home/items',{method:itemId?'DELETE':'POST',headers:{'content-type':'application/json',accept:'application/json'},body:itemId?undefined:JSON.stringify({kind:'metric',name:metric.name,params:metric.params||{}})}),data=await response.json();if(!response.ok)throw new Error(data.error&&data.error.message||'Could not update Home');
@@ -10406,7 +10413,7 @@ _GALLERY_METRICS_JS = """
      var response=await fetch('/api/calliope/gallery/metrics/'+encodeURIComponent(metric.name)+'/ask',{method:'POST',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify(body)}),data=await response.json();if(!response.ok)throw new Error(data.error&&data.error.message||'Could not open metric in Calliope');if(!data.url)throw new Error('Calliope did not return a metric notebook');window.location.assign(data.url);
    }catch(error){window.alert(error&&error.message||'Could not open Calliope');setBusy(button,false);}
  }
- function lensActionsMarkup(metric){if(!calliope)return '';return '<button type="button" data-lens-follow class="'+(metric.followed?'active':'')+'"><span>'+(metric.followed?'✓ Following':'Follow')+'</span></button><button type="button" data-lens-pin class="'+(metric.pinned?'active':'')+'"><span>'+(metric.pinned?'✓ Home':'Pin')+'</span></button><button type="button" class="ask" data-lens-ask>✦ <span>'+(state.selected.length>1?'Ask about range':'Ask Calliope')+'</span></button>';}
+ function lensActionsMarkup(metric){if(!calliope)return '';return '<button type="button" data-lens-follow class="'+(metric.followed?'active':'')+'" title="'+(metric.followed?'Included in future Personal Briefs — click to remove':'Include meaningful changes in future Personal Briefs')+'"><span>'+(metric.followed?'✓ In Briefs':'Brief me')+'</span></button><button type="button" data-lens-pin class="'+(metric.pinned?'active':'')+'"><span>'+(metric.pinned?'✓ Home':'Pin')+'</span></button><button type="button" class="ask" data-lens-ask>✦ <span>'+(state.selected.length>1?'Ask about range':'Ask Calliope')+'</span></button>';}
  function chartMarkup(metric){
    var list=points(metric);if(list.length<2)return '<div class="metric-lens-error"><strong>No timeline yet.</strong><span>This metric has fewer than two materialized numeric observations.</span></div>';
    var w=980,h=310,left=54,right=18,top=20,bottom=35,values=list.map(function(item){return item.value;}),min=Math.min.apply(null,values),max=Math.max.apply(null,values);if(max===min){var lensFlatPad=Math.abs(max)*.08||1;min-=lensFlatPad;max+=lensFlatPad;}var range=max-min;
@@ -10748,13 +10755,14 @@ def _landing_html(rows, viewer):
         '<section id="metrics-browser" class="metrics-browser" '
         f'data-calliope="{str(calliope_enabled).lower()}" hidden>'
         '<header class="metrics-browser-head"><div><span>Governed measures</span>'
-        '<strong>Current observations, not ad-hoc calculations.</strong></div>'
+        '<strong>Current observations, not ad-hoc calculations.</strong>'
+        '<small>Brief me includes meaningful changes in future Briefs · Pin keeps the latest value on Home</small></div>'
         '<div class="metric-browser-filters">'
         '<select id="metric-category" aria-label="Filter metrics by category">'
         '<option value="">Every category</option></select>'
         '<div class="metric-relation-filter" role="group" aria-label="Filter personal metrics">'
         '<button type="button" data-metric-relation="all" aria-pressed="true">All</button>'
-        '<button type="button" data-metric-relation="followed" aria-pressed="false">Following</button>'
+        '<button type="button" data-metric-relation="followed" aria-pressed="false">In Briefs</button>'
         '<button type="button" data-metric-relation="pinned" aria-pressed="false">Pinned</button>'
         '</div></div></header>'
         '<div id="metric-browser-status" class="metric-browser-status" role="status">'
@@ -11173,7 +11181,7 @@ def register_dashboard_routes(m):
             return _json({
                 "error": {
                     "code": "METRIC_FOLLOW_FAILED",
-                    "message": "That metric follow could not be changed.",
+                    "message": "That metric's Brief setting could not be changed.",
                 }
             }, 500)
 
@@ -12940,6 +12948,109 @@ def _trail_artifact(handle, owner, limit):
     return subject, facts[:8], connections[:limit], ["artifact map", "warehouse lineage", "company memory"]
 
 
+def _trail_metric(handle, owner, limit):
+    """Resolve governed metrics from their source of truth, not the catalog KG.
+
+    Metric definitions and observations live in ``rvbbit.metric_catalog`` and
+    ``rvbbit.metric_observations``.  A metric may also be projected into
+    ``kg_nodes``, but that projection is optional and must not gate its trail.
+    """
+    name = handle["name"]
+    params = handle.get("params") or {}
+    detail = _metric_detail_snapshot(
+        name, params, owner=owner, days=90, bucket="raw"
+    )
+    snapshot = detail.get("snapshot") or {}
+    trend = detail.get("trend") or {}
+    subject = {
+        "kind": "metric",
+        "label": detail.get("title") or name.replace("_", " ").title(),
+        "detail": detail.get("description") or detail.get("grain") or "Governed metric",
+        "handle": _trail_handle({"kind": "metric", "name": name, "params": params}),
+        "url": _semantic_home_metric_href(name, params),
+    }
+
+    def fact(label, value):
+        if value in (None, ""):
+            return
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False, default=str)
+        text = _semantic_text(value, 240)
+        if text:
+            facts.append({"label": label, "value": text})
+
+    facts = []
+    fact("Current", snapshot.get("value"))
+    fact("Status", snapshot.get("status") or ("Observed" if snapshot else "Not observed"))
+    fact("As Of", snapshot.get("data_as_of") or snapshot.get("observed_at"))
+    if trend:
+        percent = trend.get("percent")
+        if percent is not None:
+            fact("Trend", f"{str(trend.get('direction') or 'changed').title()} {abs(float(percent)):.1f}%")
+        elif trend.get("absolute") is not None:
+            fact("Trend", f"{str(trend.get('direction') or 'changed').title()} {abs(float(trend['absolute'])):g}")
+    fact("Grain", detail.get("grain"))
+    fact("Definition", f"Version {detail.get('version')}" if detail.get("version") else None)
+    fact("Parameters", params if params else None)
+
+    connections, seen = [], set()
+    dependencies = {
+        str(item.get("table_name")): item
+        for item in detail.get("dependencies") or []
+        if isinstance(item, dict) and item.get("table_name")
+    }
+    tables = list(dict.fromkeys(
+        str(table) for table in detail.get("source_tables") or [] if table
+    ))[:12]
+    for table in tables:
+        dependency = dependencies.get(table) or {}
+        freshness = []
+        if dependency.get("age"):
+            freshness.append(f"freshness age {dependency['age']}")
+        if dependency.get("stale"):
+            freshness.append("stale")
+        try:
+            _trail_append(connections, seen, _trail_connection(
+                "derived from", table,
+                kind="db_table", handle={"kind": "db_table", "table": table},
+                section="data", detail=" · ".join(freshness) or "Warehouse source",
+                confidence=1,
+            ))
+        except ValueError:
+            # Hidden/internal schemas never become public trail handles.
+            continue
+
+    for artifact in (detail.get("artifacts") or [])[:6]:
+        if not isinstance(artifact, dict) or not artifact.get("slug"):
+            continue
+        app_kind = artifact.get("app_kind") or "dashboard"
+        _trail_append(connections, seen, _trail_connection(
+            "used by", artifact.get("name") or artifact["slug"],
+            kind="artifact",
+            handle={
+                "kind": "artifact", "slug": artifact["slug"],
+                "version": artifact.get("latest_version") or 1,
+            },
+            section="artifacts", detail=artifact.get("description") or "Published artifact",
+            url=_semantic_home_artifact_href(artifact["slug"], app_kind),
+            thumbnail_url=f"/thumbs/{_artifact_kind(app_kind)}/{artifact['slug']}.png",
+            confidence=1,
+        ))
+
+    query = " ".join(filter(None, [
+        subject["label"], detail.get("description"), *tables[:2],
+    ]))
+    if query:
+        try:
+            for item in _calliope_brain_evidence(query, owner, 3):
+                _trail_append(connections, seen, _trail_brain_document_connection(item))
+        except Exception:  # noqa: BLE001 — Brain is one optional breadcrumb layer
+            pass
+    return subject, facts[:8], connections[:limit], [
+        "governed metric", "warehouse lineage", "artifact lineage", "company memory",
+    ]
+
+
 def _trail_document(handle, owner, limit):
     doc_id = int(handle["doc_id"])
     document = tool_brain_get_doc(doc_id, owner)
@@ -13175,6 +13286,8 @@ def _calliope_follow_trail(value, owner, limit=14):
         subject, facts, connections, searched = _trail_document(handle, owner, limit)
     elif handle["kind"] == "brain_entity":
         subject, facts, connections, searched = _trail_brain_entity(handle, owner, limit)
+    elif handle["kind"] == "metric":
+        subject, facts, connections, searched = _trail_metric(handle, owner, limit)
     else:
         subject, facts, connections, searched = _trail_catalog_node(handle, owner, limit)
     return {

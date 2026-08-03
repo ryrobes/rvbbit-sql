@@ -297,7 +297,7 @@ and pins the card's exact published artifact version to the stage; the immutable
 URL is used for rendering even if the gallery alias advances later. **Pin** remains a
 separate action for adding the artifact to the user's Semantic Home.
 
-Governed metrics use the same three-intent split. **Follow** quietly contributes recent
+Governed metrics use the same three-intent split. **Brief me** quietly contributes recent
 durable observations to that user's Personal Brief without creating an alert. **Pin**
 tracks the latest observation on Semantic Home. **Ask Calliope** freezes either the
 current observation or a selected Metric Lens range onto a fresh Stage, preserving the
@@ -511,6 +511,15 @@ without asking Hermes or requiring a governed metric. The backend validates ever
 field against the materialized cube, quotes identifiers, and rejects results above
 the configured cell cap.
 
+The chat composer and private Daily Notes editor expose **Dictate** only when a
+server-side speech provider is configured and the browser supports microphone capture.
+Recording is deliberately review-first: stop the microphone, wait for transcription,
+then edit the text inserted at the current cursor. It never sends a chat turn or appends
+a note automatically. Warehouse validates and bounds the audio, forwards it directly to
+the provider, and does not persist the recording. The first adapter uses OpenAI file
+transcription; the route and browser contract remain provider-neutral for a later
+self-hosted adapter.
+
 ```bash
 export WAREHOUSE_HERMES_URL="http://127.0.0.1:8642"
 export WAREHOUSE_HERMES_API_KEY="..."       # Hermes API_SERVER_KEY
@@ -522,6 +531,10 @@ export WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS="false"
 # Optional but required for browser downloads created by external Hermes:
 export WAREHOUSE_CALLIOPE_EXPORT_ROOTS="/var/lib/hermes/exports"
 export WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES="134217728" # 128 MiB; ceiling 512 MiB
+# Optional dictation; WAREHOUSE_CALLIOPE_STT_KEY overrides OPENAI_API_KEY
+export WAREHOUSE_CALLIOPE_STT_PROVIDER="openai"         # set off to disable
+export WAREHOUSE_CALLIOPE_STT_MODEL="gpt-transcribe"
+export WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS="120"
 ```
 
 For the uber Compose stack with Hermes running directly on the Docker host,
@@ -680,7 +693,12 @@ put it on a volume, else a restart strands connectors with "client_id not found"
 opt-in for private/local Design Profile URL references) ·
 `WAREHOUSE_CALLIOPE_EXPORT_ROOTS` (OS-path-separated allowed Hermes output roots) ·
 `WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES` (128 MiB default, 512 MiB ceiling; in uber
-Compose set the single shared host path with `WAREHOUSE_CALLIOPE_EXPORT_DIR`).
+Compose set the single shared host path with `WAREHOUSE_CALLIOPE_EXPORT_DIR`) ·
+`WAREHOUSE_CALLIOPE_STT_PROVIDER` (`openai`, or `off`) ·
+`WAREHOUSE_CALLIOPE_STT_KEY` (optional override for `OPENAI_API_KEY`) ·
+`WAREHOUSE_CALLIOPE_STT_BASE_URL` · `WAREHOUSE_CALLIOPE_STT_MODEL`
+(`gpt-transcribe`) · `WAREHOUSE_CALLIOPE_MAX_AUDIO_BYTES` (12 MiB default,
+25 MiB ceiling) · `WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS` (120 default, 600 ceiling).
 **Artifact semantic compiler:** `WAREHOUSE_SEMANTIC_ENRICHMENT` (default `1`; set `0` to
 disable queueing and the worker) · `WAREHOUSE_SEMANTIC_ENRICH_MODEL` (default
 `openai/gpt-5.6-sol`) · `WAREHOUSE_SEMANTIC_ENRICH_MAX_ATTEMPTS` (default `3`) ·

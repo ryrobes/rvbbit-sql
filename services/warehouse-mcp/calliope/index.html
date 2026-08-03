@@ -160,6 +160,15 @@ __CALLIOPE_BACKGROUND__
           <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
           <span aria-hidden="true">⌁</span> Image
         </label>
+        <button id="speech-record" class="speech-action" type="button" data-speech-record="chat"
+                aria-label="Dictate a message" aria-pressed="false" title="Dictate a message" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 15a3.5 3.5 0 0 0 3.5-3.5v-5a3.5 3.5 0 1 0-7 0v5A3.5 3.5 0 0 0 12 15Z"></path>
+            <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M8.5 21h7"></path>
+          </svg>
+          <span>Dictate</span>
+        </button>
+        <span id="speech-status" class="speech-status" role="status" aria-live="polite" hidden></span>
         <span class="compose-hint">Enter to send · Shift+Enter for line break</span>
         <button id="send-message" class="send-action" type="submit" disabled aria-label="Send message">↑</button>
       </div>

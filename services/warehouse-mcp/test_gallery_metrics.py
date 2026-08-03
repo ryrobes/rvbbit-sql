@@ -173,11 +173,13 @@ def test_quiet_metric_follow_projects_durable_observation_into_personal_brief():
     assert len(items) == 1
     assert items[0]["kind"] == "metric"
     assert items[0]["title"] == "Active accounts"
+    assert items[0]["source"] == "Metrics in Briefs"
     assert "10.0% up" in items[0]["summary"]
     assert items[0]["provenance"]["brief_section"] == "data_moved"
     assert items[0]["provenance"]["viewer_relation"]["kind"] == "metric_follow"
     assert items[0]["handle"]["params"] == {"segment": "SMB"}
     assert coverage[0]["count"] == 1
+    assert coverage[0]["label"] == "Metrics in Briefs"
     assert "metric_observations" in queries[0][0]
     assert "NOT EXISTS" in queries[0][0]  # A Home pin owns the Brief projection once pinned.
 
@@ -214,6 +216,9 @@ def test_gallery_metric_schema_routes_and_renderers_ship_as_one_contract():
     assert "Definition default" in landing
     assert "function metricViewActive()" in landing
     assert "!metricViewActive()&&queryText().length>=2" in landing
+    assert "Brief me includes meaningful changes in future Briefs" in landing
+    assert "✓ In Briefs" in landing
+    assert '>In Briefs</button>' in landing
     assert "/api/gallery/metrics/{name}" in landing
     assert "/api/calliope/metrics/{name}/follow" in landing
     assert "/api/calliope/gallery/metrics/{name}/ask" in backend

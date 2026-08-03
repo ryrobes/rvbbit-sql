@@ -36,6 +36,16 @@ function safeLabel(value) {
     .slice(0, 240) || "Object";
 }
 
+function speechInsertion(documentText, from, to, value) {
+  const text = String(value || "").replace(/\r\n?/g, "\n").trim();
+  if (!text) return "";
+  const before = documentText.slice(0, from);
+  const after = documentText.slice(to);
+  const prefix = before && !/\s$/.test(before) && !/^[,.;:!?)}\]]/.test(text) ? " " : "";
+  const suffix = after && !/^\s/.test(after) && !/[\s([{]$/.test(text) ? " " : "";
+  return `${prefix}${text}${suffix}`;
+}
+
 function objectCompletionSource(lookup) {
   return async (context) => {
     const token = context.matchBefore(/\[\[(?:(?:person|place|thing|project|ticket):)?[^\]\n]{0,100}$/i);
@@ -169,6 +179,24 @@ function mount(host, options = {}) {
     getValue: () => view.state.doc.toString(),
     setValue(value = "") {
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: String(value) } });
+    },
+    insertText(value = "") {
+      const selection = view.state.selection.main;
+      const documentText = view.state.doc.toString();
+      const insert = speechInsertion(documentText, selection.from, selection.to, value);
+      if (!insert) return false;
+      const maxLength = Number(options.maxLength || 0);
+      if (
+        maxLength > 0
+        && documentText.length - (selection.to - selection.from) + insert.length > maxLength
+      ) return false;
+      view.dispatch({
+        changes: { from: selection.from, to: selection.to, insert },
+        selection: { anchor: selection.from + insert.length },
+        userEvent: "input",
+      });
+      view.focus();
+      return true;
     },
     setDisabled(disabled) {
       view.dispatch({ effects: editable.reconfigure(EditorView.editable.of(!disabled)) });
