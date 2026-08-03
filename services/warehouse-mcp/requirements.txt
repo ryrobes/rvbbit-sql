@@ -7,3 +7,4 @@ uvicorn[standard]>=0.32
 httpx>=0.27
 python-multipart>=0.0.18
 playwright>=1.49
+cryptography>=42

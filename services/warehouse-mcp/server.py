@@ -13553,11 +13553,22 @@ def _build_mcp_oauth(public: str):
     _ensure_activity_table()
     _ensure_dashboard_tables()
     _start_semantic_enrichment_worker()
-    auth.register_login_route(m, provider, _RABBIT_SVG)
+    import calliope
+    calendar_grant = None
+    if auth.google_enabled() and calliope.CalliopeConfig.from_env().enabled:
+        calendar_grant = calliope.google_calendar_grant_handler(_conn)
+    if calendar_grant:
+        auth.register_login_route(
+            m,
+            provider,
+            _RABBIT_SVG,
+            google_calendar_grant=calendar_grant,
+        )
+    else:
+        auth.register_login_route(m, provider, _RABBIT_SVG)
     import warehouse_theme
     warehouse_theme.register_theme_routes(m)
     register_dashboard_routes(m)
-    import calliope
     if calliope.register_calliope_routes(
         m,
         _conn,

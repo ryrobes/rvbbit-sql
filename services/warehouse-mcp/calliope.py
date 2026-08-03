@@ -218,6 +218,19 @@ _BRIEF_NOTE_MAX_CHARS = 12_000
 _BRIEF_NOTE_MAX_LINKS = 24
 _BRIEF_NOTE_LOOKBACK_DAYS = 30
 _BRIEF_NOTE_ENTITY_KINDS = {"person", "place", "thing", "project", "ticket"}
+_GOOGLE_CALENDAR_SCOPE = (
+    "https://www.googleapis.com/auth/calendar.events.owned.readonly"
+)
+_GOOGLE_CALENDAR_EVENTS_URL = (
+    "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+)
+_GOOGLE_CALENDAR_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+_GOOGLE_CALENDAR_STALE_SECONDS = 5 * 60
+_GOOGLE_CALENDAR_FULL_SYNC_DAYS = 30
+_GOOGLE_CALENDAR_PAST_DAYS = 7
+_GOOGLE_CALENDAR_FUTURE_DAYS = 90
+_GOOGLE_CALENDAR_MAX_PAGES = 20
+_GOOGLE_CALENDAR_MAX_EVENTS = 20_000
 _BRIEF_NOTE_MARKER_RE = re.compile(
     r"\[\[(person|place|thing|project|ticket):(\d{1,20})\|([^\]\r\n]{1,240})\]\]",
     re.I,
@@ -1471,6 +1484,91 @@ SELECT n.owner_email,n.note_date,n.id AS note_id,
   JOIN rvbbit.calliope_daily_note_links l ON l.note_id=n.id;
 """
 
+_GOOGLE_CALENDAR_DDL = """
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_google_calendar_connections (
+    owner_email text PRIMARY KEY,
+    google_email text NOT NULL,
+    refresh_token_ciphertext text NOT NULL,
+    scopes text[] NOT NULL DEFAULT '{}'::text[],
+    sync_token text,
+    status text NOT NULL DEFAULT 'connected',
+    connected_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    last_synced_at timestamptz,
+    last_full_sync_at timestamptz,
+    last_error text,
+    CONSTRAINT calliope_google_calendar_connections_status_check
+        CHECK (status IN ('connected','needs_reconnect','error'))
+);
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_google_calendar_events (
+    owner_email text NOT NULL REFERENCES rvbbit.calliope_google_calendar_connections(owner_email)
+        ON DELETE CASCADE,
+    calendar_id text NOT NULL DEFAULT 'primary',
+    event_id text NOT NULL,
+    recurring_event_id text,
+    ical_uid text,
+    status text NOT NULL DEFAULT 'confirmed',
+    visibility text NOT NULL DEFAULT 'default',
+    event_type text NOT NULL DEFAULT 'default',
+    summary text NOT NULL DEFAULT '',
+    description text NOT NULL DEFAULT '',
+    location text NOT NULL DEFAULT '',
+    html_link text,
+    meeting_link text,
+    organizer jsonb NOT NULL DEFAULT '{}'::jsonb,
+    attendees jsonb NOT NULL DEFAULT '[]'::jsonb,
+    starts_at timestamptz,
+    ends_at timestamptz,
+    all_day boolean NOT NULL DEFAULT false,
+    response_status text,
+    transparency text,
+    etag text,
+    google_updated_at timestamptz,
+    synced_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner_email,calendar_id,event_id),
+    CONSTRAINT calliope_google_calendar_events_organizer_check
+        CHECK (jsonb_typeof(organizer) = 'object'),
+    CONSTRAINT calliope_google_calendar_events_attendees_check
+        CHECK (jsonb_typeof(attendees) = 'array')
+);
+CREATE INDEX IF NOT EXISTS calliope_google_calendar_events_owner_start_idx
+    ON rvbbit.calliope_google_calendar_events (owner_email,starts_at)
+    WHERE status <> 'cancelled';
+CREATE INDEX IF NOT EXISTS calliope_google_calendar_events_owner_updated_idx
+    ON rvbbit.calliope_google_calendar_events (owner_email,google_updated_at DESC NULLS LAST);
+CREATE OR REPLACE VIEW rvbbit.calliope_private_calendar_edges AS
+SELECT e.owner_email,e.calendar_id,e.event_id,
+       'calendar_event'::text AS subject_kind,e.event_id AS subject_key,
+       'involves'::text AS predicate,'person'::text AS object_kind,
+       lower(a.item->>'email') AS object_key,
+       coalesce(nullif(a.item->>'display_name',''),a.item->>'email') AS label,
+       jsonb_strip_nulls(jsonb_build_object(
+           'email',lower(a.item->>'email'),
+           'response_status',a.item->>'response_status',
+           'organizer',(a.item->>'organizer')::boolean,
+           'self',(a.item->>'self')::boolean
+       )) AS properties,e.starts_at,e.ends_at
+  FROM rvbbit.calliope_google_calendar_events e
+ CROSS JOIN LATERAL jsonb_array_elements(e.attendees) AS a(item)
+ WHERE e.status <> 'cancelled' AND nullif(a.item->>'email','') IS NOT NULL
+UNION ALL
+SELECT e.owner_email,e.calendar_id,e.event_id,
+       'calendar_event'::text,e.event_id,'organized_by'::text,'person'::text,
+       lower(e.organizer->>'email'),
+       coalesce(nullif(e.organizer->>'display_name',''),e.organizer->>'email'),
+       jsonb_strip_nulls(jsonb_build_object('email',lower(e.organizer->>'email'))),
+       e.starts_at,e.ends_at
+  FROM rvbbit.calliope_google_calendar_events e
+ WHERE e.status <> 'cancelled' AND nullif(e.organizer->>'email','') IS NOT NULL
+UNION ALL
+SELECT e.owner_email,e.calendar_id,e.event_id,
+       'calendar_event'::text,e.event_id,'at'::text,'place'::text,
+       lower(e.location),e.location,jsonb_build_object('label',e.location),
+       e.starts_at,e.ends_at
+  FROM rvbbit.calliope_google_calendar_events e
+ WHERE e.status <> 'cancelled' AND nullif(e.location,'') IS NOT NULL;
+"""
+
 _INSTRUMENT_DDL = """
 CREATE TABLE IF NOT EXISTS rvbbit.calliope_instruments (
     id uuid PRIMARY KEY,
@@ -1772,6 +1870,7 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
         conn.execute(_WATCH_DDL)
         conn.execute(_INBOX_DDL)
         conn.execute(_BRIEF_DDL)
+        conn.execute(_GOOGLE_CALENDAR_DDL)
         conn.execute(_INSTRUMENT_DDL)
         conn.execute(_COST_CALLER_DDL)
         conn.execute(_WORKFLOW_DDL)
@@ -5569,6 +5668,708 @@ def _brief_is_closed(status: Any) -> bool:
     }
 
 
+def _google_calendar_cipher():
+    """Return a stable Fernet cipher without ever persisting the key itself."""
+    import auth
+    from cryptography.fernet import Fernet
+
+    seed = (
+        os.environ.get("WAREHOUSE_GOOGLE_TOKEN_KEY", "").strip()
+        or str(auth.JWT_SECRET or "")
+    )
+    if not seed:
+        raise RuntimeError(
+            "WAREHOUSE_GOOGLE_TOKEN_KEY or WAREHOUSE_JWT_SECRET is required"
+        )
+    digest = hashlib.sha256(
+        f"rvbbit:calliope:google-calendar:v1:{seed}".encode("utf-8")
+    ).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def _encrypt_google_calendar_token(value: str) -> str:
+    token = str(value or "").strip()
+    if not token:
+        raise ValueError("Google did not return an offline refresh token")
+    return _google_calendar_cipher().encrypt(token.encode("utf-8")).decode("ascii")
+
+
+def _decrypt_google_calendar_token(value: str) -> str:
+    encrypted = str(value or "").strip()
+    if not encrypted:
+        raise ValueError("The Calendar connection has no refresh token")
+    try:
+        return _google_calendar_cipher().decrypt(encrypted.encode("ascii")).decode("utf-8")
+    except Exception as exc:  # noqa: BLE001 — do not expose cipher details
+        raise ValueError("The Calendar connection must be reconnected") from exc
+
+
+def _google_calendar_scopes(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw = value.split()
+    elif isinstance(value, (list, tuple, set)):
+        raw = [str(item) for item in value]
+    else:
+        raw = []
+    return sorted({scope.strip() for scope in raw if scope.strip()})
+
+
+def _google_calendar_connection(
+    conn_factory: Callable[..., Any], owner: str
+) -> dict[str, Any] | None:
+    with conn_factory() as conn:
+        row = conn.execute(
+            "SELECT * FROM rvbbit.calliope_google_calendar_connections "
+            "WHERE lower(owner_email)=lower(%s)",
+            (owner,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _google_calendar_status(
+    conn_factory: Callable[..., Any], owner: str
+) -> dict[str, Any]:
+    connection = _google_calendar_connection(conn_factory, owner)
+    if not connection:
+        return {
+            "available": True,
+            "connected": False,
+            "status": "disconnected",
+            "event_count": 0,
+            "upcoming_count": 0,
+        }
+    with conn_factory() as conn:
+        counts = conn.execute(
+            "SELECT count(*) FILTER (WHERE status<>'cancelled') AS event_count,"
+            "count(*) FILTER (WHERE status<>'cancelled' AND starts_at>=now() "
+            "AND starts_at<now()+interval '14 days' "
+            "AND coalesce(response_status,'')<>'declined') AS upcoming_count "
+            "FROM rvbbit.calliope_google_calendar_events "
+            "WHERE lower(owner_email)=lower(%s)",
+            (owner,),
+        ).fetchone() or {}
+    status = str(connection.get("status") or "connected")
+    return {
+        "available": True,
+        "connected": status != "needs_reconnect",
+        "needs_reconnect": status == "needs_reconnect",
+        "status": status,
+        "google_email": str(connection.get("google_email") or owner),
+        "event_count": int(counts.get("event_count") or 0),
+        "upcoming_count": int(counts.get("upcoming_count") or 0),
+        "last_synced_at": _now_iso(connection.get("last_synced_at"))
+        if connection.get("last_synced_at") else None,
+        "last_full_sync_at": _now_iso(connection.get("last_full_sync_at"))
+        if connection.get("last_full_sync_at") else None,
+        "last_error": str(connection.get("last_error") or "")[:600] or None,
+    }
+
+
+def _google_calendar_clean_text(value: Any, limit: int) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def _google_calendar_datetime(
+    value: Any, fallback_timezone: str = "UTC"
+) -> tuple[datetime | None, bool]:
+    raw = value if isinstance(value, dict) else {}
+    date_time = str(raw.get("dateTime") or "").strip()
+    if date_time:
+        try:
+            parsed = datetime.fromisoformat(date_time.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                zone_name = str(raw.get("timeZone") or fallback_timezone or "UTC")
+                try:
+                    parsed = parsed.replace(tzinfo=ZoneInfo(zone_name))
+                except (ZoneInfoNotFoundError, ValueError):
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc), False
+        except ValueError:
+            return None, False
+    date_value = str(raw.get("date") or "").strip()
+    if not date_value:
+        return None, False
+    try:
+        day = datetime.fromisoformat(date_value).date()
+        try:
+            zone = ZoneInfo(str(raw.get("timeZone") or fallback_timezone or "UTC"))
+        except (ZoneInfoNotFoundError, ValueError):
+            zone = timezone.utc
+        return datetime.combine(day, datetime_time.min, tzinfo=zone).astimezone(timezone.utc), True
+    except ValueError:
+        return None, True
+
+
+def _normalize_google_calendar_event(
+    event: Any,
+    *,
+    owner: str,
+    calendar_timezone: str = "UTC",
+) -> dict[str, Any] | None:
+    raw = event if isinstance(event, dict) else {}
+    event_id = _google_calendar_clean_text(raw.get("id"), 1_024)
+    if not event_id:
+        return None
+    status = _google_calendar_clean_text(raw.get("status") or "confirmed", 60).lower()
+    if status == "cancelled":
+        return {"event_id": event_id, "status": "cancelled"}
+    starts_at, all_day = _google_calendar_datetime(
+        raw.get("start"), calendar_timezone
+    )
+    ends_at, _ = _google_calendar_datetime(raw.get("end"), calendar_timezone)
+    if not starts_at:
+        return None
+    if not ends_at or ends_at <= starts_at:
+        ends_at = starts_at + (timedelta(days=1) if all_day else timedelta(hours=1))
+
+    visibility = _google_calendar_clean_text(
+        raw.get("visibility") or "default", 40
+    ).lower()
+    private = visibility == "private"
+    attendees = []
+    response_status = None
+    if not private:
+        for candidate in (raw.get("attendees") or [])[:50]:
+            if not isinstance(candidate, dict):
+                continue
+            email = _google_calendar_clean_text(candidate.get("email"), 320).lower()
+            if not email:
+                continue
+            attendee = {
+                "email": email,
+                "display_name": _google_calendar_clean_text(
+                    candidate.get("displayName"), 240
+                ),
+                "response_status": _google_calendar_clean_text(
+                    candidate.get("responseStatus"), 40
+                ).lower(),
+                "organizer": bool(candidate.get("organizer")),
+                "self": bool(candidate.get("self")),
+            }
+            attendees.append({
+                key: value for key, value in attendee.items() if value != ""
+            })
+            if attendee["self"] or email == owner:
+                response_status = attendee["response_status"] or response_status
+    organizer_raw = raw.get("organizer") if isinstance(raw.get("organizer"), dict) else {}
+    organizer = {} if private else {
+        key: value
+        for key, value in {
+            "email": _google_calendar_clean_text(organizer_raw.get("email"), 320).lower(),
+            "display_name": _google_calendar_clean_text(
+                organizer_raw.get("displayName"), 240
+            ),
+            "self": bool(organizer_raw.get("self")),
+        }.items()
+        if value != ""
+    }
+    meeting_link = ""
+    if not private:
+        meeting_link = _google_calendar_clean_text(raw.get("hangoutLink"), 2_000)
+        if not meeting_link:
+            conference = raw.get("conferenceData") if isinstance(raw.get("conferenceData"), dict) else {}
+            for point in conference.get("entryPoints") or []:
+                if isinstance(point, dict) and point.get("entryPointType") == "video":
+                    meeting_link = _google_calendar_clean_text(point.get("uri"), 2_000)
+                    if meeting_link:
+                        break
+    updated_at, _ = _google_calendar_datetime(
+        {"dateTime": raw.get("updated")}, "UTC"
+    )
+    return {
+        "event_id": event_id,
+        "recurring_event_id": _google_calendar_clean_text(
+            raw.get("recurringEventId"), 1_024
+        ) or None,
+        "ical_uid": _google_calendar_clean_text(raw.get("iCalUID"), 1_024) or None,
+        "status": status,
+        "visibility": visibility,
+        "event_type": _google_calendar_clean_text(
+            raw.get("eventType") or "default", 80
+        ).lower(),
+        "summary": "Private event" if private else _google_calendar_clean_text(
+            raw.get("summary") or "Untitled event", 500
+        ),
+        "description": "" if private else _google_calendar_clean_text(
+            raw.get("description"), 4_000
+        ),
+        "location": "" if private else _google_calendar_clean_text(
+            raw.get("location"), 1_000
+        ),
+        "html_link": None if private else _google_calendar_clean_text(
+            raw.get("htmlLink"), 2_000
+        ) or None,
+        "meeting_link": meeting_link or None,
+        "organizer": organizer,
+        "attendees": attendees,
+        "starts_at": starts_at,
+        "ends_at": ends_at,
+        "all_day": all_day,
+        "response_status": response_status,
+        "transparency": _google_calendar_clean_text(raw.get("transparency"), 40).lower() or None,
+        "etag": _google_calendar_clean_text(raw.get("etag"), 500) or None,
+        "google_updated_at": updated_at,
+    }
+
+
+def _save_google_calendar_grant(
+    conn_factory: Callable[..., Any], owner: str, token_payload: dict[str, Any]
+) -> None:
+    scopes = _google_calendar_scopes(token_payload.get("scope"))
+    if _GOOGLE_CALENDAR_SCOPE not in scopes:
+        raise ValueError("Google Calendar read access was not granted")
+    owner = str(owner or "").strip().lower()
+    if not owner:
+        raise ValueError("The Calendar grant has no authenticated owner")
+    with conn_factory() as conn:
+        existing = conn.execute(
+            "SELECT refresh_token_ciphertext FROM "
+            "rvbbit.calliope_google_calendar_connections "
+            "WHERE lower(owner_email)=lower(%s)",
+            (owner,),
+        ).fetchone()
+        refresh_token = str(token_payload.get("refresh_token") or "").strip()
+        encrypted = (
+            _encrypt_google_calendar_token(refresh_token)
+            if refresh_token
+            else str((existing or {}).get("refresh_token_ciphertext") or "")
+        )
+        if not encrypted:
+            raise ValueError("Google did not return an offline refresh token")
+        conn.execute(
+            "INSERT INTO rvbbit.calliope_google_calendar_connections "
+            "(owner_email,google_email,refresh_token_ciphertext,scopes,status,"
+            "connected_at,updated_at,last_error) "
+            "VALUES (%s,%s,%s,%s,'connected',now(),now(),NULL) "
+            "ON CONFLICT (owner_email) DO UPDATE SET "
+            "google_email=excluded.google_email,"
+            "refresh_token_ciphertext=excluded.refresh_token_ciphertext,"
+            "scopes=excluded.scopes,status='connected',updated_at=now(),last_error=NULL",
+            (owner, owner, encrypted, scopes),
+        )
+
+
+def _google_calendar_mark_error(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    error: Exception | str,
+    *,
+    needs_reconnect: bool = False,
+) -> None:
+    message = re.sub(r"\s+", " ", str(error or "Calendar sync failed")).strip()[:600]
+    with conn_factory() as conn:
+        conn.execute(
+            "UPDATE rvbbit.calliope_google_calendar_connections "
+            "SET status=%s,last_error=%s,updated_at=now() "
+            "WHERE lower(owner_email)=lower(%s)",
+            ("needs_reconnect" if needs_reconnect else "error", message, owner),
+        )
+
+
+async def _google_calendar_access_token(
+    conn_factory: Callable[..., Any], owner: str
+) -> str:
+    import auth
+
+    connection = _google_calendar_connection(conn_factory, owner)
+    if not connection:
+        raise LookupError("Google Calendar is not connected")
+    try:
+        refresh_token = _decrypt_google_calendar_token(
+            connection.get("refresh_token_ciphertext")
+        )
+    except Exception as exc:
+        _google_calendar_mark_error(
+            conn_factory, owner, exc, needs_reconnect=True
+        )
+        raise
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                auth._GOOGLE_TOKEN_URI,
+                data={
+                    "client_id": auth.GOOGLE_CLIENT_ID,
+                    "client_secret": auth.GOOGLE_CLIENT_SECRET,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                },
+            )
+        if response.status_code >= 400:
+            detail = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+            code = str((detail or {}).get("error") or "")
+            if code == "invalid_grant":
+                raise PermissionError("Google Calendar authorization expired")
+            response.raise_for_status()
+        token = str((response.json() or {}).get("access_token") or "").strip()
+        if not token:
+            raise RuntimeError("Google returned no Calendar access token")
+        return token
+    except PermissionError as exc:
+        _google_calendar_mark_error(
+            conn_factory, owner, exc, needs_reconnect=True
+        )
+        raise
+
+
+class _GoogleCalendarSyncTokenExpired(RuntimeError):
+    pass
+
+
+async def _fetch_google_calendar_events(
+    access_token: str,
+    *,
+    sync_token: str | None,
+    now: datetime,
+) -> tuple[list[tuple[dict[str, Any], str]], str]:
+    full_sync = not sync_token
+    params: dict[str, Any] = {
+        "singleEvents": "true",
+        "showDeleted": "true",
+        "maxResults": "2500",
+    }
+    if full_sync:
+        params.update({
+            "orderBy": "startTime",
+            "timeMin": (now - timedelta(days=_GOOGLE_CALENDAR_PAST_DAYS)).isoformat(),
+            "timeMax": (now + timedelta(days=_GOOGLE_CALENDAR_FUTURE_DAYS)).isoformat(),
+        })
+    else:
+        params["syncToken"] = sync_token
+    items: list[tuple[dict[str, Any], str]] = []
+    next_sync_token = ""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for _page in range(_GOOGLE_CALENDAR_MAX_PAGES):
+            response = await client.get(
+                _GOOGLE_CALENDAR_EVENTS_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params=params,
+            )
+            if response.status_code == 410:
+                raise _GoogleCalendarSyncTokenExpired("Google Calendar sync token expired")
+            response.raise_for_status()
+            payload = response.json() or {}
+            calendar_timezone = str(payload.get("timeZone") or "UTC")[:100]
+            for raw in payload.get("items") or []:
+                if isinstance(raw, dict):
+                    items.append((raw, calendar_timezone))
+                    if len(items) >= _GOOGLE_CALENDAR_MAX_EVENTS:
+                        raise RuntimeError("Google Calendar sync exceeded the bounded event limit")
+            page_token = str(payload.get("nextPageToken") or "")
+            if not page_token:
+                next_sync_token = str(payload.get("nextSyncToken") or "")
+                break
+            params["pageToken"] = page_token
+        else:
+            raise RuntimeError("Google Calendar sync exceeded the bounded page limit")
+    if not next_sync_token:
+        raise RuntimeError("Google Calendar returned no incremental sync token")
+    return items, next_sync_token
+
+
+def _persist_google_calendar_events(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    raw_items: list[tuple[dict[str, Any], str]],
+    next_sync_token: str,
+    *,
+    full_sync: bool,
+) -> None:
+    normalized = [
+        value
+        for raw, calendar_timezone in raw_items
+        if (value := _normalize_google_calendar_event(
+            raw, owner=owner, calendar_timezone=calendar_timezone
+        )) is not None
+    ]
+    with conn_factory() as conn:
+        with conn.transaction():
+            if full_sync:
+                conn.execute(
+                    "DELETE FROM rvbbit.calliope_google_calendar_events "
+                    "WHERE lower(owner_email)=lower(%s)",
+                    (owner,),
+                )
+            for event in normalized:
+                if event["status"] == "cancelled":
+                    conn.execute(
+                        "DELETE FROM rvbbit.calliope_google_calendar_events "
+                        "WHERE lower(owner_email)=lower(%s) AND calendar_id='primary' "
+                        "AND event_id=%s",
+                        (owner, event["event_id"]),
+                    )
+                    continue
+                conn.execute(
+                    "INSERT INTO rvbbit.calliope_google_calendar_events "
+                    "(owner_email,calendar_id,event_id,recurring_event_id,ical_uid,status,"
+                    "visibility,event_type,summary,description,location,html_link,meeting_link,"
+                    "organizer,attendees,starts_at,ends_at,all_day,response_status,transparency,"
+                    "etag,google_updated_at,synced_at) "
+                    "VALUES (%s,'primary',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                    "%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,now()) "
+                    "ON CONFLICT (owner_email,calendar_id,event_id) DO UPDATE SET "
+                    "recurring_event_id=excluded.recurring_event_id,ical_uid=excluded.ical_uid,"
+                    "status=excluded.status,visibility=excluded.visibility,event_type=excluded.event_type,"
+                    "summary=excluded.summary,description=excluded.description,location=excluded.location,"
+                    "html_link=excluded.html_link,meeting_link=excluded.meeting_link,"
+                    "organizer=excluded.organizer,attendees=excluded.attendees,"
+                    "starts_at=excluded.starts_at,ends_at=excluded.ends_at,all_day=excluded.all_day,"
+                    "response_status=excluded.response_status,transparency=excluded.transparency,"
+                    "etag=excluded.etag,google_updated_at=excluded.google_updated_at,synced_at=now()",
+                    (
+                        owner, event["event_id"], event["recurring_event_id"], event["ical_uid"],
+                        event["status"], event["visibility"], event["event_type"], event["summary"],
+                        event["description"], event["location"], event["html_link"],
+                        event["meeting_link"], json.dumps(event["organizer"]),
+                        json.dumps(event["attendees"]), event["starts_at"], event["ends_at"],
+                        event["all_day"], event["response_status"], event["transparency"],
+                        event["etag"], event["google_updated_at"],
+                    ),
+                )
+            conn.execute(
+                "UPDATE rvbbit.calliope_google_calendar_connections "
+                "SET sync_token=%s,status='connected',last_synced_at=now(),"
+                "last_full_sync_at=CASE WHEN %s THEN now() ELSE last_full_sync_at END,"
+                "last_error=NULL,updated_at=now() WHERE lower(owner_email)=lower(%s)",
+                (next_sync_token, full_sync, owner),
+            )
+
+
+async def _sync_google_calendar(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    *,
+    force: bool = False,
+    access_token: str | None = None,
+) -> dict[str, Any]:
+    connection = _google_calendar_connection(conn_factory, owner)
+    if not connection:
+        raise LookupError("Google Calendar is not connected")
+    if str(connection.get("status") or "") == "needs_reconnect":
+        raise PermissionError("Google Calendar must be reconnected")
+    now = datetime.now(timezone.utc)
+    last_synced = _brief_parse_datetime(connection.get("last_synced_at"), ZoneInfo("UTC"))
+    if (
+        not force
+        and last_synced
+        and (now - last_synced).total_seconds() < _GOOGLE_CALENDAR_STALE_SECONDS
+    ):
+        return _google_calendar_status(conn_factory, owner)
+    last_full = _brief_parse_datetime(connection.get("last_full_sync_at"), ZoneInfo("UTC"))
+    sync_token = str(connection.get("sync_token") or "") or None
+    if not last_full or now - last_full >= timedelta(days=_GOOGLE_CALENDAR_FULL_SYNC_DAYS):
+        sync_token = None
+    try:
+        token = access_token or await _google_calendar_access_token(conn_factory, owner)
+        try:
+            raw_items, next_sync_token = await _fetch_google_calendar_events(
+                token, sync_token=sync_token, now=now
+            )
+        except _GoogleCalendarSyncTokenExpired:
+            sync_token = None
+            raw_items, next_sync_token = await _fetch_google_calendar_events(
+                token, sync_token=None, now=now
+            )
+        await asyncio.to_thread(
+            _persist_google_calendar_events,
+            conn_factory,
+            owner,
+            raw_items,
+            next_sync_token,
+            full_sync=not sync_token,
+        )
+        return _google_calendar_status(conn_factory, owner)
+    except Exception as exc:
+        if not isinstance(exc, PermissionError):
+            _google_calendar_mark_error(conn_factory, owner, exc)
+        raise
+
+
+async def _disconnect_google_calendar(
+    conn_factory: Callable[..., Any], owner: str
+) -> None:
+    connection = _google_calendar_connection(conn_factory, owner)
+    if connection:
+        try:
+            refresh_token = _decrypt_google_calendar_token(
+                connection.get("refresh_token_ciphertext")
+            )
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                await client.post(
+                    _GOOGLE_CALENDAR_REVOKE_URL, data={"token": refresh_token}
+                )
+        except Exception:
+            pass
+    with conn_factory() as conn:
+        conn.execute(
+            "DELETE FROM rvbbit.calliope_google_calendar_connections "
+            "WHERE lower(owner_email)=lower(%s)",
+            (owner,),
+        )
+
+
+def google_calendar_grant_handler(conn_factory: Callable[..., Any]):
+    """Build the auth callback sink without coupling auth.py back to Calliope."""
+    async def handle(owner: str, token_payload: dict[str, Any]) -> None:
+        await asyncio.to_thread(
+            _save_google_calendar_grant, conn_factory, owner, token_payload
+        )
+        access_token = str(token_payload.get("access_token") or "").strip() or None
+        try:
+            await _sync_google_calendar(
+                conn_factory, owner, force=True, access_token=access_token
+            )
+        except Exception:
+            # Consent is durable even when Google's event API is momentarily
+            # unavailable.  The UI reports the sync error and can retry.
+            pass
+
+    return handle
+
+
+def _brief_calendar_observations(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    window_start: datetime,
+    window_end: datetime,
+    now: datetime,
+    zone: ZoneInfo,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    coverage_key = "google-calendar"
+    try:
+        connection = _google_calendar_connection(conn_factory, owner)
+        if not connection:
+            return [], [{
+                "key": coverage_key,
+                "label": "Google Calendar",
+                "count": 0,
+                "status": "ready",
+                "scope": "personal",
+                "available": 0,
+                "identity_status": "mapped",
+            }], []
+        with conn_factory() as conn:
+            rows = conn.execute(
+                "SELECT * FROM rvbbit.calliope_google_calendar_events "
+                "WHERE lower(owner_email)=lower(%s) AND status<>'cancelled' "
+                "AND coalesce(response_status,'')<>'declined' "
+                "AND starts_at<%s AND coalesce(ends_at,starts_at)>%s "
+                "ORDER BY starts_at,event_id LIMIT 500",
+                (owner, window_end, window_start),
+            ).fetchall()
+    except Exception as exc:
+        warning = f"Google Calendar observations are unavailable: {type(exc).__name__}: {exc}"
+        return [], [{
+            "key": coverage_key,
+            "label": "Google Calendar",
+            "count": 0,
+            "status": "unavailable",
+            "scope": "personal",
+        }], [warning]
+
+    observations = []
+    for row in rows:
+        starts_at = _brief_parse_datetime(row.get("starts_at"), zone)
+        ends_at = _brief_parse_datetime(row.get("ends_at"), zone)
+        if not starts_at:
+            continue
+        attendees = row.get("attendees") if isinstance(row.get("attendees"), list) else []
+        organizer = row.get("organizer") if isinstance(row.get("organizer"), dict) else {}
+        entity_refs = []
+        seen_entities = set()
+        for attendee in attendees[:12]:
+            if not isinstance(attendee, dict):
+                continue
+            email = str(attendee.get("email") or "").strip().lower()
+            if not email or email == owner or email in seen_entities:
+                continue
+            seen_entities.add(email)
+            entity_refs.append({
+                "kind": "person",
+                "key": email,
+                "label": attendee.get("display_name") or email,
+                "relationship": "involves",
+                "source": "Google Calendar",
+                "confidence": "exact",
+            })
+        organizer_email = str(organizer.get("email") or "").strip().lower()
+        if organizer_email and organizer_email != owner and organizer_email not in seen_entities:
+            entity_refs.append({
+                "kind": "person",
+                "key": organizer_email,
+                "label": organizer.get("display_name") or organizer_email,
+                "relationship": "organized_by",
+                "source": "Google Calendar",
+                "confidence": "exact",
+            })
+        location = str(row.get("location") or "").strip()
+        if location:
+            entity_refs.append({
+                "kind": "place",
+                "key": location.lower(),
+                "label": location,
+                "relationship": "at",
+                "source": "Google Calendar",
+                "confidence": "exact",
+            })
+        event_id = str(row.get("event_id") or "")
+        observation_key = f"calendar:primary:{event_id}"
+        future = bool((ends_at or starts_at) >= now)
+        summary = _google_calendar_clean_text(row.get("description"), 1_600)
+        if not summary:
+            if location:
+                summary = f"Scheduled at {location}."
+            elif row.get("all_day"):
+                summary = "All-day event on your primary Google Calendar."
+            else:
+                summary = "Scheduled on your primary Google Calendar."
+        observations.append({
+            "id": observation_key,
+            "group": "knowledge",
+            "kind": "calendar-event",
+            "subtype": "calendar",
+            "title": row.get("summary") or "Untitled event",
+            "summary": summary,
+            "source": "Google Calendar",
+            "url": row.get("html_link") or row.get("meeting_link"),
+            "occurred_at": starts_at.isoformat(),
+            "provenance": {
+                "resolver": "private_google_calendar",
+                "coverage_key": coverage_key,
+                "brief_section": "coming_up" if future else "changed",
+                "observation_key": observation_key,
+                "viewer_relation": {
+                    "kind": "calendar_owner",
+                    "confidence": "exact",
+                    "truth": "observed",
+                    "evidence": "Read from your connected primary Google Calendar.",
+                },
+                "status": row.get("status") or "confirmed",
+                "starts_at": starts_at.isoformat(),
+                "ends_at": ends_at.isoformat() if ends_at else None,
+                "all_day": bool(row.get("all_day")),
+                "event_type": row.get("event_type") or "default",
+                "entity_refs": entity_refs,
+                "feedback_allowed": False,
+            },
+        })
+    connection_status = str(connection.get("status") or "connected")
+    warnings = []
+    if connection_status in {"error", "needs_reconnect"} and connection.get("last_error"):
+        warnings.append(
+            "Google Calendar needs attention: "
+            + _google_calendar_clean_text(connection.get("last_error"), 400)
+        )
+    return observations, [{
+        "key": coverage_key,
+        "label": "Google Calendar",
+        "count": len(observations),
+        "status": "unavailable" if connection_status == "needs_reconnect" else "ready",
+        "scope": "personal",
+        "available": len(rows),
+        "identity_status": "mapped",
+    }], warnings
+
+
 def _brief_section(
     *,
     now: datetime,
@@ -6829,6 +7630,7 @@ def _personal_brief_snapshot(
     brief: dict[str, Any],
     *,
     now: datetime | None = None,
+    include_google_calendar: bool = False,
 ) -> dict[str, Any]:
     generated_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     timezone_name, zone = _brief_timezone(brief.get("timezone"))
@@ -6850,9 +7652,23 @@ def _personal_brief_snapshot(
     note_items, note_coverage, note_warnings = _brief_note_observations(
         conn_factory, owner, brief.get("brief_date")
     )
+    calendar_items: list[dict[str, Any]] = []
+    calendar_coverage: list[dict[str, Any]] = []
+    calendar_warnings: list[str] = []
+    if include_google_calendar:
+        calendar_items, calendar_coverage, calendar_warnings = (
+            _brief_calendar_observations(
+                conn_factory,
+                owner,
+                window_start,
+                window_end,
+                generated_at,
+                zone,
+            )
+        )
     items = []
     seen = set()
-    for item in [*brain_items, *internal_items, *note_items]:
+    for item in [*calendar_items, *brain_items, *internal_items, *note_items]:
         key = str((item.get("provenance") or {}).get("observation_key") or item.get("id") or "")
         if not key or key in seen or feedback.get(key) == "not_mine":
             continue
@@ -6888,7 +7704,12 @@ def _personal_brief_snapshot(
         if coverage_key:
             included_counts[coverage_key] = included_counts.get(coverage_key, 0) + 1
     coverage = []
-    for raw_source in [*brain_coverage, *internal_coverage, *note_coverage]:
+    for raw_source in [
+        *calendar_coverage,
+        *brain_coverage,
+        *internal_coverage,
+        *note_coverage,
+    ]:
         source = dict(raw_source)
         key = str(source.get("key") or "")
         reported = max(0, int(source.get("count") or 0))
@@ -6923,7 +7744,12 @@ def _personal_brief_snapshot(
             }
             for source in coverage
         ],
-        "warnings": [*brain_warnings, *internal_warnings, *note_warnings],
+        "warnings": [
+            *calendar_warnings,
+            *brain_warnings,
+            *internal_warnings,
+            *note_warnings,
+        ],
         "elapsed_ms": 0,
         "mode": "personal_brief",
         "brief": {
@@ -13048,6 +13874,9 @@ def register_calliope_routes(
 
     ensure_tables(conn_factory)
     config.file_root.mkdir(parents=True, exist_ok=True)
+    google_calendar_enabled = bool(
+        getattr(auth, "google_enabled", lambda: False)()
+    )
 
     def json_response(value: Any, status: int = 200) -> Response:
         return Response(
@@ -13162,7 +13991,7 @@ def register_calliope_routes(
             detail = result
         except Exception as exc:
             detail = str(exc)[:240]
-        return json_response({
+        payload = {
             "enabled": True,
             "name": "Calliope",
             "healthy": healthy,
@@ -13201,7 +14030,77 @@ def register_calliope_routes(
                     "batch_fallback": True,
                 },
             },
-        })
+        }
+        if google_calendar_enabled:
+            payload["google_calendar"] = True
+        return json_response(payload)
+
+    if google_calendar_enabled:
+        @mcp.custom_route("/api/calliope/calendar", methods=["GET"])
+        async def calliope_calendar_status(request):
+            owner, err = api_owner(request)
+            if err:
+                return err
+            try:
+                status = await asyncio.to_thread(
+                    _google_calendar_status, conn_factory, owner
+                )
+            except Exception as exc:
+                return json_response({
+                    "error": {
+                        "code": "CALENDAR_STATUS_FAILED",
+                        "message": str(exc)[:600],
+                    }
+                }, 502)
+            return json_response({"calendar": status})
+
+        @mcp.custom_route("/api/calliope/calendar/sync", methods=["POST"])
+        async def calliope_calendar_sync(request):
+            owner, err = api_owner(request)
+            if err:
+                return err
+            try:
+                status = await _sync_google_calendar(
+                    conn_factory, owner, force=True
+                )
+            except LookupError as exc:
+                return json_response({
+                    "error": {
+                        "code": "CALENDAR_NOT_CONNECTED",
+                        "message": str(exc),
+                    }
+                }, 409)
+            except PermissionError as exc:
+                return json_response({
+                    "error": {
+                        "code": "CALENDAR_RECONNECT_REQUIRED",
+                        "message": str(exc),
+                    }
+                }, 409)
+            except Exception as exc:
+                return json_response({
+                    "error": {
+                        "code": "CALENDAR_SYNC_FAILED",
+                        "message": str(exc)[:600],
+                    }
+                }, 502)
+            return json_response({"calendar": status})
+
+        @mcp.custom_route("/api/calliope/calendar", methods=["DELETE"])
+        async def calliope_calendar_disconnect(request):
+            owner, err = api_owner(request)
+            if err:
+                return err
+            await _disconnect_google_calendar(conn_factory, owner)
+            return json_response({
+                "calendar": {
+                    "available": True,
+                    "connected": False,
+                    "status": "disconnected",
+                    "event_count": 0,
+                    "upcoming_count": 0,
+                }
+            })
 
     @mcp.custom_route(
         "/api/calliope/realtime-transcription", methods=["POST"]
@@ -14377,7 +15276,23 @@ def register_calliope_routes(
             stored = stored_brief_bundle(owner, brief)
             if stored:
                 return *stored, created, False
-        raw = await asyncio.to_thread(_personal_brief_snapshot, conn_factory, owner, brief)
+        if google_calendar_enabled:
+            try:
+                await _sync_google_calendar(conn_factory, owner)
+            except LookupError:
+                pass
+            except Exception:
+                # The resolver will preserve the cached rows and expose a
+                # source warning; a Calendar outage must not erase the rest of
+                # a user's Brief.
+                pass
+        raw = await asyncio.to_thread(
+            _personal_brief_snapshot,
+            conn_factory,
+            owner,
+            brief,
+            include_google_calendar=google_calendar_enabled,
+        )
         result = _normalize_personal_brief_result(raw)
         label = f"Brief · {brief['brief_date']}"
         session = _session_for_owner(conn_factory, str(brief["session_id"]), owner)
@@ -14420,7 +15335,12 @@ def register_calliope_routes(
                 {"error": {"code": "INVALID_TIMEZONE", "message": str(exc)}},
                 400,
             )
-        return json_response({"brief": brief_status_row(owner, timezone_name, zone)})
+        payload = {"brief": brief_status_row(owner, timezone_name, zone)}
+        if google_calendar_enabled:
+            payload["calendar"] = await asyncio.to_thread(
+                _google_calendar_status, conn_factory, owner
+            )
+        return json_response(payload)
 
     @mcp.custom_route("/api/calliope/briefs/today", methods=["POST"])
     async def personal_brief_today(request):

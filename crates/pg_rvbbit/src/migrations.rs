@@ -965,6 +965,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0236_calliope_metrics",
         include_str!("../sql/migrations/0236_calliope_metrics.sql"),
     ),
+    (
+        "0237_calliope_google_calendar",
+        include_str!("../sql/migrations/0237_calliope_google_calendar.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

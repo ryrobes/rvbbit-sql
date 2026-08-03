@@ -134,6 +134,20 @@ set `WAREHOUSE_GOOGLE_ONLY=1`, which stops `POST /login` from accepting a passwo
 — not merely hiding the form. ID tokens are verified, never just decoded: RS256 against
 Google's JWKS, audience, issuer, expiry, and a server-planted single-use `nonce`.
 
+When Google Sign-In and Calliope are both enabled, Personal Briefs also expose an
+optional **Connect Calendar** control. It uses a separate incremental consent grant for
+`calendar.events.owned.readonly`; adding Calendar never silently broadens the sign-in
+scope. The same registered callback URI is reused, so no second redirect URI is needed.
+The returned Google account must exactly match the signed-in Warehouse identity.
+Calliope syncs a bounded window from that user's primary calendar, stores only normalized
+event fields, and keeps them in an owner-keyed private overlay rather than shared Brain or
+Hermes memory. Google access tokens are never stored. The offline refresh token is Fernet
+encrypted with `WAREHOUSE_GOOGLE_TOKEN_KEY` when set, or a key derived from
+`WAREHOUSE_JWT_SECRET`; private events are reduced to title `Private event` plus timing
+before storage. Disconnect revokes the grant best-effort and deletes the local cache.
+On installations without Google Sign-In, the Calendar control, config flag, consent
+route, and Calendar API routes are absent/invisible.
+
 ### Burrow + Google: one door, Postgres still decides
 With `WAREHOUSE_AUTH=pg`, Google proves **who** you are and Postgres still decides **what**
 you may touch. A verified identity is resolved to a role by `rvbbit.resolve_identity()`
@@ -375,6 +389,13 @@ ordinary prose creates no inferred edge. Note bodies stay out of the shared Brai
 graph and shared Hermes memory. Instead, the owner-keyed graph overlay and recent
 prior notes feed later Personal Briefs under **From your notes**, labeled **You
 noted** so user context is never presented as independently observed fact.
+
+An optionally connected Google Calendar follows the same private-overlay contract.
+Upcoming and recently completed events enter Briefs as directly **observed** Calendar
+facts; normalized attendee, organizer, and location fields produce owner-keyed
+person/place edges for later personal context. They never create organization-wide KG
+edges. Brief refreshes sync Calendar first when the local cache is stale, while a Google
+API outage leaves the last private cache and every other Brief resolver intact.
 
 Brain resolution is sampled fairly per visible source before applying the overall bound,
 so a high-volume fresh corpus cannot starve another source. System-learning records remain
@@ -712,6 +733,11 @@ No `rvbbitQuery`/metric found ⇒ flagged `materialized` (a "dead tree" — nudg
 `WAREHOUSE_ACCESS_TTL` (3600) · `WAREHOUSE_REFRESH_TTL` (30d) ·
 `WAREHOUSE_STATE_FILE` (persist registered clients + refresh tokens across restarts —
 put it on a volume, else a restart strands connectors with "client_id not found").
+**Google Sign-In / Calendar:** `WAREHOUSE_GOOGLE_CLIENT_ID` +
+`WAREHOUSE_GOOGLE_CLIENT_SECRET` · `WAREHOUSE_GOOGLE_HD` and/or
+`WAREHOUSE_ALLOWED_EMAILS` (audience gate) · `WAREHOUSE_GOOGLE_ONLY` (optional) ·
+`WAREHOUSE_GOOGLE_TOKEN_KEY` (optional dedicated Calendar-token encryption secret;
+otherwise derives from `WAREHOUSE_JWT_SECRET`).
 **Calliope:** `WAREHOUSE_HERMES_URL` + `WAREHOUSE_HERMES_API_KEY` (both required) ·
 `WAREHOUSE_HERMES_MEMORY_KEY` (optional shared company scope) ·
 `WAREHOUSE_CALLIOPE_DIR` (attachment storage) ·

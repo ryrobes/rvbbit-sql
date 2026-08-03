@@ -18,6 +18,7 @@
     inboxList: $("#work-inbox-list"),
     briefOpen: $("#personal-brief-open"),
     briefCount: $("#personal-brief-count"),
+    calendarOpen: $("#google-calendar-open"),
     actionOpen: $("#action-library-open"),
     actionDialog: $("#action-library-dialog"),
     actionClose: $("#action-library-close"),
@@ -293,6 +294,8 @@
     },
     brief: {
       status: null,
+      calendar: null,
+      calendarLoading: false,
       loading: false,
       timer: null,
       notesByDate: new Map(),
@@ -1029,13 +1032,88 @@
         : "Create today's private Personal Brief";
   }
 
+  function renderCalendarStatus() {
+    if (!els.calendarOpen) return;
+    const enabled = Boolean(state.config?.google_calendar);
+    els.calendarOpen.hidden = !enabled;
+    if (!enabled) return;
+    const calendar = state.brief.calendar || {};
+    const connected = Boolean(calendar.connected);
+    const needsAttention = Boolean(calendar.needs_reconnect || calendar.status === "error");
+    els.calendarOpen.disabled = state.brief.calendarLoading;
+    els.calendarOpen.classList.toggle("loading", state.brief.calendarLoading);
+    els.calendarOpen.classList.toggle("connected", connected && !needsAttention);
+    els.calendarOpen.classList.toggle("needs-attention", needsAttention);
+    const count = Math.max(0, Number(calendar.upcoming_count) || 0);
+    els.calendarOpen.setAttribute("aria-label", connected
+      ? `Google Calendar connected · ${count} upcoming event${count === 1 ? "" : "s"}`
+      : needsAttention ? "Reconnect Google Calendar" : "Connect Google Calendar");
+    els.calendarOpen.title = state.brief.calendarLoading
+      ? "Syncing your private Calendar context…"
+      : connected
+        ? `${count} upcoming event${count === 1 ? "" : "s"} available to Personal Briefs · click to sync`
+        : needsAttention
+          ? "Google Calendar needs to be reconnected"
+          : "Add your primary Google Calendar to private Personal Brief context";
+  }
+
+  function connectGoogleCalendar() {
+    if (!state.config?.google_calendar) return;
+    const current = new URL(window.location.href);
+    current.searchParams.delete("calendar");
+    const next = `${current.pathname}${current.search}`;
+    window.location.assign(`/auth/google/calendar/start?next=${encodeURIComponent(next)}`);
+  }
+
+  async function syncGoogleCalendar({ refreshBrief = false } = {}) {
+    if (!state.config?.google_calendar || state.brief.calendarLoading) return null;
+    if (state.brief.calendar?.needs_reconnect) {
+      connectGoogleCalendar();
+      return null;
+    }
+    state.brief.calendarLoading = true;
+    renderCalendarStatus();
+    if (state.current) renderStage();
+    try {
+      const data = await api("/api/calliope/calendar/sync", { method: "POST" });
+      state.brief.calendar = data.calendar || null;
+      const count = Math.max(0, Number(data.calendar?.upcoming_count) || 0);
+      toast(`Calendar synced · ${count} upcoming event${count === 1 ? "" : "s"}`);
+      if (refreshBrief && state.current) await openPersonalBrief(true);
+      return data.calendar;
+    } finally {
+      state.brief.calendarLoading = false;
+      renderCalendarStatus();
+      if (state.current) renderStage();
+    }
+  }
+
+  async function disconnectGoogleCalendar() {
+    if (!state.config?.google_calendar || state.brief.calendarLoading) return;
+    if (!window.confirm("Disconnect Google Calendar and remove its private cached events from Calliope?")) return;
+    state.brief.calendarLoading = true;
+    renderCalendarStatus();
+    if (state.current) renderStage();
+    try {
+      const data = await api("/api/calliope/calendar", { method: "DELETE" });
+      state.brief.calendar = data.calendar || null;
+      toast("Google Calendar disconnected and cached events removed");
+    } finally {
+      state.brief.calendarLoading = false;
+      renderCalendarStatus();
+      if (state.current) renderStage();
+    }
+  }
+
   async function loadBriefStatus({ silent = false } = {}) {
     if (!state.config?.personal_briefs) return null;
     try {
       const zone = encodeURIComponent(browserTimezone());
       const data = await api(`/api/calliope/briefs/status?timezone=${zone}`);
       state.brief.status = data.brief || null;
+      if (state.config?.google_calendar) state.brief.calendar = data.calendar || null;
       renderBriefStatus();
+      renderCalendarStatus();
       return state.brief.status;
     } catch (error) {
       if (!silent) toast(error.message, true);
@@ -1272,10 +1350,12 @@
       els.actionOpen.hidden = state.config.action_library === false;
       syncEvidenceSearchControls();
       syncSpeechControls();
+      renderCalendarStatus();
     } catch (error) {
       setStatus("unavailable", "offline");
       syncEvidenceSearchControls();
       syncSpeechControls();
+      renderCalendarStatus();
       throw error;
     }
   }
@@ -5862,6 +5942,37 @@
     }
   }
 
+  function renderBriefCalendarConnection() {
+    if (!state.config?.google_calendar) return "";
+    const calendar = state.brief.calendar || {};
+    const loading = state.brief.calendarLoading;
+    const connected = Boolean(calendar.connected);
+    const needsAttention = Boolean(calendar.needs_reconnect || calendar.status === "error");
+    const synced = calendar.last_synced_at ? new Date(calendar.last_synced_at) : null;
+    const syncedLabel = synced && !Number.isNaN(synced.getTime())
+      ? `synced ${synced.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`
+      : "not synced yet";
+    const upcoming = Math.max(0, Number(calendar.upcoming_count) || 0);
+    const copy = connected
+      ? `${upcoming} upcoming event${upcoming === 1 ? "" : "s"} · ${syncedLabel} · read-only and private to you`
+      : needsAttention
+        ? `${calendar.last_error || "Google authorization needs attention"} · reconnect to resume Brief context`
+        : "Optionally add your primary company calendar as read-only, private Brief context.";
+    return `<div class="brief-calendar-connection ${needsAttention ? "needs-attention" : ""}">
+      <span class="brief-calendar-glyph" aria-hidden="true">▦</span>
+      <div class="brief-calendar-copy">
+        <strong>${connected ? "Google Calendar is part of this private layer" : needsAttention ? "Google Calendar needs attention" : "Bring your schedule into Personal Briefs"}</strong>
+        <span title="${escapeHtml(copy)}">${escapeHtml(copy)}</span>
+      </div>
+      <div class="brief-calendar-actions">
+        ${connected && !needsAttention
+          ? `<button type="button" data-calendar-sync ${loading ? "disabled" : ""}>${loading ? "Syncing…" : "Sync + refresh"}</button>`
+          : `<button type="button" data-calendar-connect ${loading ? "disabled" : ""}>${needsAttention ? "Reconnect" : "Connect Calendar"}</button>`}
+        ${calendar.status && calendar.status !== "disconnected" ? `<button type="button" data-calendar-disconnect ${loading ? "disabled" : ""}>Disconnect</button>` : ""}
+      </div>
+    </div>`;
+  }
+
   function renderPersonalBrief(surface) {
     const payload = surface.payload || {};
     const brief = payload.brief || {};
@@ -5930,6 +6041,7 @@
         </div>
       </div>
       ${coverage ? `<div class="evidence-source-status brief-source-status">${coverage}</div>` : ""}
+      ${renderBriefCalendarConnection()}
       ${warnings}
       ${sections || `<div class="evidence-empty"><strong>Your Personal Brief is quiet.</strong><span>${Number(brief.person_mapped_source_count || 0) ? "No matching observations changed in this bounded window." : "Connect or map a person-aware source, pin a focus artifact, or create a Work Inbox handoff."}</span></div>`}
       ${renderBriefNotes(surface)}
@@ -8296,6 +8408,13 @@
     els.briefOpen.addEventListener("click", () => {
       openPersonalBrief(false).catch((error) => toast(error.message, true));
     });
+    els.calendarOpen.addEventListener("click", () => {
+      if (state.brief.calendar?.connected && !state.brief.calendar?.needs_reconnect) {
+        syncGoogleCalendar().catch((error) => toast(error.message, true));
+      } else {
+        connectGoogleCalendar();
+      }
+    });
     els.inboxOpen.addEventListener("click", openInbox);
     els.inboxClose.addEventListener("click", () => els.inboxDialog.close());
     els.inboxDialog.addEventListener("cancel", (event) => {
@@ -8517,6 +8636,19 @@
       state.chatAtLiveEdge = isChatAtLiveEdge();
     }, { passive: true });
     els.stage.addEventListener("click", (event) => {
+      if (event.target.closest("[data-calendar-connect]")) {
+        connectGoogleCalendar();
+        return;
+      }
+      if (event.target.closest("[data-calendar-sync]")) {
+        syncGoogleCalendar({ refreshBrief: true })
+          .catch((error) => toast(error.message, true));
+        return;
+      }
+      if (event.target.closest("[data-calendar-disconnect]")) {
+        disconnectGoogleCalendar().catch((error) => toast(error.message, true));
+        return;
+      }
       const briefFeedback = event.target.closest("[data-brief-feedback]");
       if (briefFeedback) {
         const card = briefFeedback.closest(".evidence-card");
@@ -8829,8 +8961,25 @@
       const launchAction = launch.get("action");
       const launchInbox = launch.get("inbox");
       const launchBrief = launch.get("brief");
+      const launchCalendar = launch.get("calendar");
       await loadConfig();
       await loadBriefStatus({ silent: true });
+      if (launchCalendar && state.config?.google_calendar) {
+        const message = ({
+          connected: "Google Calendar connected to your private Personal Brief layer",
+          cancelled: "Google Calendar connection cancelled",
+          account_mismatch: "Use the same Google account that is signed in to Calliope",
+          error: "Google Calendar could not be connected; you can try again",
+        })[launchCalendar] || "Google Calendar connection updated";
+        toast(message, ["account_mismatch", "error"].includes(launchCalendar));
+        launch.delete("calendar");
+        const cleanQuery = launch.toString();
+        window.history.replaceState(
+          {},
+          "",
+          `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}`,
+        );
+      }
       if (launchBrief && launchBrief !== "0" && state.config?.personal_briefs) {
         state.brief.loading = true;
         renderBriefStatus();

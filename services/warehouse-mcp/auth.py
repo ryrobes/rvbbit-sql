@@ -538,6 +538,40 @@ class _GoogleFlows:
 
 
 _GFLOWS = _GoogleFlows()
+
+
+class _GoogleCalendarFlows:
+    """Single-use state for an authenticated, incremental Calendar grant.
+
+    The owner is captured from the signed Warehouse session before leaving for
+    Google, then compared with the verified Google email on return.  This keeps
+    a second Google account in the browser from attaching its calendar to the
+    first user's private Calliope context.
+    """
+
+    def __init__(self):
+        self._m: dict[str, tuple[str, str, str, float]] = {}
+
+    def begin(self, owner: str, nxt: str) -> tuple[str, str]:
+        self._sweep()
+        while len(self._m) >= MAX_PENDING:
+            self._m.pop(next(iter(self._m)))
+        state, nonce = secrets.token_urlsafe(24), secrets.token_urlsafe(16)
+        self._m[state] = (owner, nxt, nonce, time.time())
+        return state, nonce
+
+    def take(self, state: str) -> tuple[str, str, str] | None:
+        entry = self._m.pop(state, None)
+        if not entry or time.time() - entry[3] > CODE_TTL:
+            return None
+        return entry[0], entry[1], entry[2]
+
+    def _sweep(self) -> None:
+        now = time.time()
+        self._m = {key: value for key, value in self._m.items() if now - value[3] < CODE_TTL}
+
+
+_GCAL_FLOWS = _GoogleCalendarFlows()
 _JWKS_CLIENT = None
 
 
@@ -805,7 +839,12 @@ def _login_form(hidden: dict, error: str | None = None,
 _EXPIRED = "<h1>Session expired</h1><p class=sub>Re-launch the connector from Claude to try again.</p>"
 
 
-def register_login_route(mcp, provider: WarehouseAuthProvider, rabbit_svg: str = ""):
+def register_login_route(
+    mcp,
+    provider: WarehouseAuthProvider,
+    rabbit_svg: str = "",
+    google_calendar_grant=None,
+):
     global _LOGIN_RABBIT_SVG
     _LOGIN_RABBIT_SVG = str(rabbit_svg or "")
 
@@ -861,6 +900,14 @@ def register_login_route(mcp, provider: WarehouseAuthProvider, rabbit_svg: str =
         return _login_form({"txn": txn} if txn else {"next": nxt}, error=msg,
                            cta="Authorize Claude" if txn else "Sign in")
 
+    def _calendar_return(nxt: str, result: str):
+        target = _safe_next(nxt or "/calliope")
+        separator = "&" if "?" in target else "?"
+        return RedirectResponse(
+            f"{target}{separator}{urlencode({'calendar': result})}",
+            status_code=303,
+        )
+
     @mcp.custom_route("/auth/google/start", methods=["GET"])
     async def google_start(request: Request):
         if not google_enabled():
@@ -883,23 +930,78 @@ def register_login_route(mcp, provider: WarehouseAuthProvider, rabbit_svg: str =
             params["hd"] = GOOGLE_HD     # chooser hint ONLY — the claim check below is the gate
         return RedirectResponse(f"{_GOOGLE_AUTH_URI}?{urlencode(params)}", status_code=302)
 
+    # This route does not exist at all unless Calliope supplied a grant sink.
+    # Non-Google and non-Calliope installations therefore expose no Calendar
+    # affordance or half-configured endpoint.
+    if google_calendar_grant is not None:
+        @mcp.custom_route("/auth/google/calendar/start", methods=["GET"])
+        async def google_calendar_start(request: Request):
+            if not google_enabled():
+                return _page("<h1>Google Calendar is not configured</h1>", 404)
+            session = read_session_full(request)
+            if not session:
+                nxt = _safe_next(request.query_params.get("next", "/calliope"))
+                return RedirectResponse(
+                    f"/login?{urlencode({'next': nxt})}", status_code=302
+                )
+            if not session.get("mapped", True):
+                return _page("<h1>Your account is still awaiting access</h1>", 403)
+            owner = str(session.get("identity") or "").strip().lower()
+            if not owner:
+                return _page("<h1>Your signed-in identity is unavailable</h1>", 401)
+            nxt = _safe_next(request.query_params.get("next", "/calliope"))
+            state, nonce = _GCAL_FLOWS.begin(owner, nxt)
+            params = {
+                "client_id": GOOGLE_CLIENT_ID,
+                "redirect_uri": google_redirect_uri(provider.public),
+                "response_type": "code",
+                "scope": (
+                    "openid email "
+                    "https://www.googleapis.com/auth/calendar.events.owned.readonly"
+                ),
+                "state": state,
+                "nonce": nonce,
+                "access_type": "offline",
+                "include_granted_scopes": "true",
+                "prompt": "consent",
+                "login_hint": owner,
+            }
+            if GOOGLE_HD:
+                params["hd"] = GOOGLE_HD
+            return RedirectResponse(
+                f"{_GOOGLE_AUTH_URI}?{urlencode(params)}", status_code=302
+            )
+
     @mcp.custom_route("/auth/google/callback", methods=["GET"])
     async def google_callback(request: Request):
         if not google_enabled():
             return _page("<h1>Google sign-in is not configured</h1>", 404)
-        entry = _GFLOWS.take(request.query_params.get("state", ""))
-        if not entry:
+        state_value = request.query_params.get("state", "")
+        calendar_entry = (
+            _GCAL_FLOWS.take(state_value) if google_calendar_grant is not None else None
+        )
+        entry = None if calendar_entry else _GFLOWS.take(state_value)
+        if not entry and not calendar_entry:
             # Unknown/expired/replayed state. We have no trustworthy txn or
             # next to resume, so stop here rather than guess.
             return _page("<h1>Sign-in expired</h1>"
                          "<p class=sub>Start again from the login page.</p>", 400)
-        txn, nxt, nonce = entry
+        calendar_owner = calendar_entry[0] if calendar_entry else ""
+        if calendar_entry:
+            _, nxt, nonce = calendar_entry
+            txn = ""
+        else:
+            txn, nxt, nonce = entry
         if txn and not provider.has_pending(txn):
             return _page(_EXPIRED, 400)
         if request.query_params.get("error"):
+            if calendar_entry:
+                return _calendar_return(nxt, "cancelled")
             return _bounce(txn, nxt, "Google sign-in was cancelled.")
         code = request.query_params.get("code", "")
         if not code:
+            if calendar_entry:
+                return _calendar_return(nxt, "error")
             return _bounce(txn, nxt, "Google sign-in returned no authorization code.")
 
         import httpx
@@ -913,7 +1015,8 @@ def register_login_route(mcp, provider: WarehouseAuthProvider, rabbit_svg: str =
                     "grant_type": "authorization_code",
                 })
             r.raise_for_status()
-            id_token = (r.json() or {}).get("id_token")
+            token_payload = r.json() or {}
+            id_token = token_payload.get("id_token")
             if not id_token:
                 raise ValueError("no id_token in Google's token response")
             # Verification fetches/caches JWKS and does RSA work — keep it off
@@ -921,16 +1024,36 @@ def register_login_route(mcp, provider: WarehouseAuthProvider, rabbit_svg: str =
             claims = await asyncio.to_thread(verify_google_id_token, id_token, nonce)
         except Exception as e:   # noqa: BLE001 — any failure is a failed login, never a partial one
             print(f"google callback: {type(e).__name__}: {e}", file=sys.stderr)
+            if calendar_entry:
+                return _calendar_return(nxt, "error")
             return _bounce(txn, nxt, "Could not verify your Google sign-in.")
 
         email = str(claims.get("email", "")).strip().lower()
         ip = _client_ip(request)
         if not google_domain_ok(claims):
             _LIMITER.record_fail(ip)
+            if calendar_entry:
+                return _calendar_return(nxt, "account_mismatch")
             return _bounce(txn, nxt, f"That account is not in the {GOOGLE_HD} organization.")
         if not _email_allowed(email):
             _LIMITER.record_fail(ip)
+            if calendar_entry:
+                return _calendar_return(nxt, "account_mismatch")
             return _bounce(txn, nxt, "That account is not allowed to sign in here.")
+        if calendar_entry:
+            if not hmac.compare_digest(email, calendar_owner):
+                _LIMITER.record_fail(ip)
+                return _calendar_return(nxt, "account_mismatch")
+            try:
+                await google_calendar_grant(calendar_owner, token_payload)
+            except Exception as e:  # noqa: BLE001 — grant is all-or-nothing
+                print(
+                    f"google calendar grant: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+                return _calendar_return(nxt, "error")
+            _LIMITER.record_success(ip)
+            return _calendar_return(nxt, "connected")
         _LIMITER.record_success(ip)
         # via="google" matters: it is what tells _finish_login this identity was
         # proven by the IdP and still needs resolving to a Postgres role. A
