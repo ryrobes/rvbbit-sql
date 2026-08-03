@@ -146,7 +146,10 @@ build_image() {
         "$@"
     )
     if [[ "$PUSH" -eq 1 ]]; then
-        cmd+=(--push)
+        # A release must not silently reuse a stale local copy of a mutable
+        # base tag (for example postgres:18). Refresh every base before
+        # publishing while leaving ordinary local builds cache-friendly.
+        cmd+=(--pull --push)
     else
         cmd+=(--load)
     fi

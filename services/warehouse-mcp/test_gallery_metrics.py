@@ -240,3 +240,18 @@ def test_metric_browser_remains_available_without_artifacts_or_calliope(monkeypa
     assert 'id="metrics-browser"' in page
     assert 'id="artifact-browser"' in page
     assert 'data-calliope="false"' in page
+
+
+def test_gallery_identity_and_data_desktop_link_match_the_current_product(monkeypatch):
+    monkeypatch.setenv("LENS_PUBLIC_URL", "https://desktop.example")
+
+    page = server._landing_html([], "reader@example.com")
+
+    assert "DATA RABBIT<small>an operational answer engine</small>" in page
+    assert "WAREHOUSE</small>" not in page
+    assert (
+        '<a class=applink href="https://desktop.example/" target="_blank" '
+        'rel="noopener" title="Open Data Desktop in a new window">'
+        "Open Data Desktop &rarr;</a>"
+    ) in page
+    assert "Open DataRabbit" not in page

@@ -136,7 +136,12 @@ def main() -> None:
                 f"dev.rvbbit.capability.id={item['id']}",
             ]
         )
-        cmd.append("--push" if args.push else "--load")
+        if args.push:
+            # Publishing from a long-lived builder must refresh mutable base
+            # tags instead of inheriting whatever happens to be cached locally.
+            cmd.extend(["--pull", "--push"])
+        else:
+            cmd.append("--load")
         cmd.append(str(build_dir))
         run(cmd, dry_run=args.dry_run)
 

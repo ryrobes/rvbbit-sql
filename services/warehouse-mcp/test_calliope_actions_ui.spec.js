@@ -128,3 +128,41 @@ test("Action Library plans, applies, verifies, and remediates a Workflow", async
   await expect(page.locator(`#session-tab-panel [data-session-id="${actionSessionId}"]`)).toHaveClass(/active/);
   await page.screenshot({ path: "/tmp/calliope-session-tabs.png", fullPage: true });
 });
+
+test("Custom MCP connector reveals only the selected transport contract", async ({ page }) => {
+  test.skip(!password, "WAREHOUSE_TEST_LOGIN_PASSWORD is required for the local authenticated UI test");
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto(`${baseURL}/login?next=/calliope`);
+  await page.locator('input[name="email"]').fill("pilot@example.com");
+  await page.locator('input[name="password"]').fill(password);
+  await Promise.all([
+    page.waitForURL(/\/calliope/),
+    page.locator('button[type="submit"]').click(),
+  ]);
+
+  await page.locator("#action-library-open").click();
+  const searched = page.waitForResponse((response) => response.url().includes("/api/calliope/actions?"));
+  await page.locator("#action-library-search").fill("custom MCP server");
+  await searched;
+  await page.locator('[data-action-id="mcp.connect_custom"]').click();
+  await expect(page.locator("#action-detail-title")).toHaveText("Connect a custom MCP server");
+  await expect(page.locator("#action-library-empty")).toBeHidden();
+  await expect(page.locator("#action-library-selected")).toBeVisible();
+  await expect(page.locator('[name="transport"]')).toHaveValue("http");
+  await expect(page.locator('[name="url"]')).toBeVisible();
+  await expect(page.locator('[name="auth_token_name"]')).toBeVisible();
+  await expect(page.locator('[name="command"]')).toBeHidden();
+  await expect(page.locator('[name="args"]')).toBeHidden();
+
+  await page.locator('[name="transport"]').selectOption("stdio");
+  await expect(page.locator('[name="url"]')).toBeHidden();
+  await expect(page.locator('[name="auth_token_name"]')).toBeHidden();
+  await expect(page.locator('[name="command"]')).toBeVisible();
+  await expect(page.locator('[name="args"]')).toBeVisible();
+  await expect(page.locator('[name="environment"]')).toBeVisible();
+  await expect(page.locator('[name="secret_names"]')).toBeVisible();
+  await expect(page.locator('[name="secret:MCP_SECRET_VALUES"]')).toHaveAttribute("type", "password");
+  await expect(page.locator('[name="create_sql_functions"]')).toBeChecked();
+  await expect(page.locator('[name="create_operators"]')).toBeChecked();
+  await page.screenshot({ path: "/tmp/calliope-custom-mcp-action.png", fullPage: true });
+});

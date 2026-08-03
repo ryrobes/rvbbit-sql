@@ -503,6 +503,20 @@ secret names may be shown, but values are never returned. Set the same
 environments; `MCP_GATEWAY_URL` can override endpoint discovery when needed. An absent
 required credential or an unavailable gateway fails the action closed before activation.
 
+The Library's **Connect a custom MCP server** action exposes the same generic RVBBIT
+connection path for servers that are not in `capability_catalog`. It supports streamable
+HTTP (no authentication or one Bearer token) and stdio executables that run on the MCP
+gateway host/container. Stdio arguments are an explicit array rather than a shell command;
+non-secret environment values stay in the registration while `${NAME}` values resolve from
+the gateway's secret store. Apply registers the reviewed transport, calls
+`refresh_mcp_server` to introspect live tools and resources, generates both per-tool typed
+functions such as `server_name.tool_name(...)` and optional RVBBIT operators, then runs an
+active probe and records the resulting counts. The universal fallback remains
+`rvbbit.mcp_call(server, tool, args_jsonb)`. Wrapper generation refuses reserved names or
+an unrelated existing SQL schema so its recreate-on-drift behavior cannot erase another
+application surface. Older SSE and interactive OAuth transports are not implied by the
+form; those require a stdio bridge or a future gateway transport.
+
 Cube schema surfaces are also direct interactive analysis tables. Add one or more
 dimensions to Rows and one or more numeric aggregations to Values; this produces a
 normal grouped table with named columns. Columns is optional—adding dimensions there

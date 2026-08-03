@@ -235,6 +235,20 @@ _ACTION_FIELD_TYPES = {"text", "textarea", "select", "boolean", "secret"}
 _ACTION_RUN_STATUSES = {"planned", "running", "complete", "failed"}
 _MAX_ACTION_INPUT_CHARS = 40_000
 _MAX_ACTION_SEARCH_RESULTS = 100
+_MCP_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_MCP_SECRET_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]{0,127})\}")
+_MCP_SECRETISH_ENV_RE = re.compile(
+    r"(?:^|_)(?:API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)(?:_|$)",
+    re.I,
+)
+_MAX_MCP_SECRET_NAMES = 32
+_MAX_MCP_ARGS = 256
+_MAX_MCP_ENV_KEYS = 128
+_RESERVED_MCP_SCHEMA_NAMES = {
+    "information_schema",
+    "public",
+    "rvbbit",
+}
 
 # These are outcome recipes, not raw prompts.  They are copied into the SQL
 # action catalog at startup so discovery, receipts, and future policy all share
@@ -409,6 +423,115 @@ _ACTION_LIBRARY_SEED: tuple[dict[str, Any], ...] = (
             "ask for the missing threshold, then create and test the watch."
         ),
         "sort_order": 40,
+    },
+    {
+        "id": "mcp.connect_custom",
+        "category": "connect",
+        "title": "Connect a custom MCP server",
+        "summary": (
+            "Add a hosted or local MCP server, inspect its live tools, and expose "
+            "typed SQL functions."
+        ),
+        "description": (
+            "Register a streamable HTTP or stdio MCP connection, keep declared credentials "
+            "in the encrypted gateway store, discover its tools and resources, generate a "
+            "server-scoped SQL function for every tool, and actively verify the connection."
+        ),
+        "executor": "mcp_connect",
+        "risk": "organization_change",
+        "requirements": [],
+        "tags": [
+            "mcp", "custom mcp", "hosted", "http", "stdio", "integration",
+            "sql functions", "operators", "admin",
+        ],
+        "fields": [
+            {
+                "key": "server_name", "label": "Connection name", "type": "text",
+                "required": True, "pattern": r"^[A-Za-z_][A-Za-z0-9_]{0,62}$",
+                "placeholder": "client_tools",
+                "help": "Stable SQL schema, operator namespace, and Workflow name.",
+            },
+            {
+                "key": "transport", "label": "Transport", "type": "select",
+                "required": True, "default": "http",
+                "options": [
+                    {"value": "http", "label": "Hosted · streamable HTTP"},
+                    {"value": "stdio", "label": "Local · stdio on the gateway"},
+                ],
+            },
+            {
+                "key": "url", "label": "MCP endpoint URL", "type": "text",
+                "required": True, "placeholder": "https://mcp.example.com/mcp",
+                "help": "The streamable HTTP endpoint. Credentials do not belong in this URL.",
+                "visible_when": {"field": "transport", "value": "http"},
+            },
+            {
+                "key": "auth_token_name", "label": "Bearer token name", "type": "text",
+                "required": False, "placeholder": "MCP_AUTH_TOKEN",
+                "pattern": r"^[A-Za-z_][A-Za-z0-9_]{0,127}$",
+                "help": "Optional. HTTP currently supports no auth or one Bearer token stored under this name.",
+                "visible_when": {"field": "transport", "value": "http"},
+            },
+            {
+                "key": "command", "label": "Executable", "type": "text",
+                "required": True, "placeholder": "npx",
+                "help": "Runs inside the MCP gateway host/container. Put flags and package names below.",
+                "visible_when": {"field": "transport", "value": "stdio"},
+            },
+            {
+                "key": "args", "label": "Arguments", "type": "textarea",
+                "required": False, "default": "[]",
+                "placeholder": "[\"-y\", \"@acme/custom-mcp\"]",
+                "help": "A JSON string array, or one literal argument per line. No shell expansion is used.",
+                "visible_when": {"field": "transport", "value": "stdio"},
+            },
+            {
+                "key": "environment", "label": "Non-secret environment", "type": "textarea",
+                "required": False, "default": "{}",
+                "placeholder": "{\"REGION\":\"us-east-2\",\"API_TOKEN\":\"${API_TOKEN}\"}",
+                "help": "JSON object. Use ${NAME} references for secrets; literal secret-like values are rejected.",
+                "visible_when": {"field": "transport", "value": "stdio"},
+            },
+            {
+                "key": "secret_names", "label": "Additional secret names", "type": "text",
+                "required": False, "placeholder": "API_TOKEN, CLIENT_SECRET",
+                "help": "Optional comma-separated env names. Each is injected as ${NAME} for stdio.",
+                "visible_when": {"field": "transport", "value": "stdio"},
+            },
+            {
+                "key": "secret:MCP_SECRET_VALUES", "secret_name": "MCP_SECRET_VALUES",
+                "secret_group": True, "label": "Secure values · JSON", "type": "secret",
+                "required": False,
+                "placeholder": "{\"API_TOKEN\":\"…\"}",
+                "help": (
+                    "Optional JSON object matching the declared names above. Values go only to "
+                    "the encrypted gateway and are cleared from this form after apply."
+                ),
+            },
+            {
+                "key": "timeout_ms", "label": "Timeout · milliseconds", "type": "text",
+                "required": True, "default": "30000", "pattern": r"^[0-9]{1,6}$",
+                "help": "1–600000 ms for connect, discovery, and calls.",
+            },
+            {
+                "key": "description", "label": "Description", "type": "text",
+                "required": False, "placeholder": "Client operations tools",
+                "help": "A short catalog note for admins inspecting this connection later.",
+            },
+            {
+                "key": "create_sql_functions", "label": "Generate typed SQL functions",
+                "type": "boolean", "default": True,
+                "help": "Creates server_name.tool_name(...) wrappers returning rows of jsonb.",
+            },
+            {
+                "key": "create_operators", "label": "Generate RVBBIT operators",
+                "type": "boolean", "default": True,
+                "help": "Also exposes each tool to RVBBIT pipelines, Workflows, and operator search.",
+            },
+        ],
+        "prompt_template": "",
+        "config": {"generic_mcp": True},
+        "sort_order": 45,
     },
     {
         "id": "admin.brain_query_source",
@@ -1630,6 +1753,7 @@ def _seed_action_catalog(conn: Any) -> None:
                 item["description"], item["executor"], item["risk"], item["tags"],
                 json.dumps({"fields": item.get("fields") or []}),
                 json.dumps({
+                    **dict(item.get("config") or {}),
                     "requirements": item.get("requirements") or [],
                     "prompt_template": item.get("prompt_template") or "",
                 }),
@@ -1991,11 +2115,14 @@ def _dynamic_capability_actions(inventory: dict[str, Any]) -> list[dict[str, Any
                 "version": 1,
                 "category": "connect",
                 "title": f"{'Review' if installed else 'Connect'} {title}",
-                "summary": description or f"Install {title} and expose its tools as SQL operators.",
+                "summary": (
+                    description
+                    or f"Install {title} and expose its tools as typed SQL functions and operators."
+                ),
                 "description": (
                     f"Register the published {title} MCP connection, keep credentials in the "
-                    "encrypted gateway store, discover its live tools, generate SQL operators, "
-                    "and verify reachability."
+                    "encrypted gateway store, discover its live tools, generate typed SQL "
+                    "functions and RVBBIT operators, and verify reachability."
                 ),
                 "executor": "mcp_connect",
                 "risk": "organization_change",
@@ -2104,7 +2231,10 @@ def _action_catalog_snapshot(
         action["requirement_states"] = requirement_states
         missing = [item for item in requirement_states if not item["available"]]
         action["missing_requirements"] = missing
-        if "state" not in action:
+        if (action.get("config") or {}).get("generic_mcp"):
+            action["state"] = "connect"
+            action["state_label"] = "Connect"
+        elif "state" not in action:
             action["state"] = "blocked" if missing else "ready"
             action["state_label"] = "Needs setup" if missing else (
                 "Guided" if action.get("executor") == "conversation" else "Ready"
@@ -2155,6 +2285,22 @@ def _action_by_id(
     )
 
 
+def _action_field_is_visible(
+    field: dict[str, Any], resolved_inputs: dict[str, Any]
+) -> bool:
+    condition = field.get("visible_when")
+    if not isinstance(condition, dict):
+        return True
+    controller = str(condition.get("field") or "").strip()
+    if not controller:
+        return True
+    expected = condition.get("values")
+    if not isinstance(expected, list):
+        expected = [condition.get("value")]
+    actual = resolved_inputs.get(controller)
+    return str(actual) in {str(value) for value in expected}
+
+
 def _normalize_action_inputs(
     action: dict[str, Any],
     raw_inputs: Any,
@@ -2162,6 +2308,13 @@ def _normalize_action_inputs(
     require_secrets: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     supplied = dict(raw_inputs) if isinstance(raw_inputs, dict) else {}
+    resolved_inputs = {
+        str(field.get("key") or "").strip(): supplied.get(
+            str(field.get("key") or "").strip(), field.get("default")
+        )
+        for field in action.get("fields") or []
+        if isinstance(field, dict) and str(field.get("key") or "").strip()
+    }
     values: dict[str, Any] = {}
     redacted: dict[str, Any] = {}
     secrets: dict[str, str] = {}
@@ -2171,6 +2324,8 @@ def _normalize_action_inputs(
         key = str(field.get("key") or "").strip()
         kind = str(field.get("type") or "text").strip().lower()
         if not key or kind not in _ACTION_FIELD_TYPES:
+            continue
+        if not _action_field_is_visible(field, resolved_inputs):
             continue
         value = supplied.get(key, field.get("default"))
         if kind == "secret":
@@ -2212,18 +2367,273 @@ def _normalize_action_inputs(
     return values, redacted, secrets
 
 
+def _parse_custom_mcp_args(raw: Any) -> list[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        parsed_json = True
+    except json.JSONDecodeError:
+        parsed = None
+        parsed_json = False
+    if not parsed_json:
+        args = [line.strip() for line in text.splitlines() if line.strip()]
+        if any(re.search(r"\s", arg) for arg in args):
+            raise ValueError(
+                "Arguments must be a JSON string array or one whitespace-free argument per line"
+            )
+    elif isinstance(parsed, list):
+        args = parsed
+    else:
+        raise ValueError("Arguments must be a JSON string array")
+    if len(args) > _MAX_MCP_ARGS:
+        raise ValueError(f"Arguments can contain at most {_MAX_MCP_ARGS} entries")
+    if any(not isinstance(arg, str) or not arg or len(arg) > 4_000 for arg in args):
+        raise ValueError("Every MCP argument must be a non-empty string of at most 4000 characters")
+    if any("\x00" in arg or "\r" in arg or "\n" in arg for arg in args):
+        raise ValueError("MCP arguments cannot contain control characters")
+    return args
+
+
+def _parse_custom_mcp_environment(raw: Any) -> dict[str, str]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Non-secret environment must be a valid JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Non-secret environment must be a JSON object")
+    if len(parsed) > _MAX_MCP_ENV_KEYS:
+        raise ValueError(
+            f"Non-secret environment can contain at most {_MAX_MCP_ENV_KEYS} entries"
+        )
+    environment: dict[str, str] = {}
+    for raw_name, raw_value in parsed.items():
+        name = str(raw_name or "").strip()
+        if not _MCP_ENV_NAME_RE.fullmatch(name):
+            raise ValueError(f"Environment name {name or '(empty)'} has an invalid format")
+        if not isinstance(raw_value, str) or len(raw_value) > 8_000:
+            raise ValueError(
+                f"Environment value {name} must be a string of at most 8000 characters"
+            )
+        if "\x00" in raw_value or "\r" in raw_value or "\n" in raw_value:
+            raise ValueError(f"Environment value {name} cannot contain control characters")
+        if _MCP_SECRETISH_ENV_RE.search(name) and not _MCP_SECRET_REF_RE.search(raw_value):
+            raise ValueError(
+                f"Environment value {name} looks secret; use a ${{{name}}} reference and "
+                "provide its value in Secure values"
+            )
+        environment[name] = raw_value
+    return environment
+
+
+def _parse_custom_mcp_secret_names(raw: Any) -> set[str]:
+    names = {
+        value for value in re.split(r"[\s,]+", str(raw or "").strip()) if value
+    }
+    invalid = sorted(name for name in names if not _MCP_ENV_NAME_RE.fullmatch(name))
+    if invalid:
+        raise ValueError("Secret name has an invalid format: " + ", ".join(invalid))
+    if len(names) > _MAX_MCP_SECRET_NAMES:
+        raise ValueError(f"At most {_MAX_MCP_SECRET_NAMES} secret names can be declared")
+    return names
+
+
+def _parse_custom_mcp_secure_values(raw: Any) -> dict[str, str]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Secure values must be a valid JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Secure values must be a JSON object")
+    if len(parsed) > _MAX_MCP_SECRET_NAMES:
+        raise ValueError(f"At most {_MAX_MCP_SECRET_NAMES} secure values can be supplied")
+    values: dict[str, str] = {}
+    for raw_name, raw_value in parsed.items():
+        name = str(raw_name or "").strip()
+        if not _MCP_ENV_NAME_RE.fullmatch(name):
+            raise ValueError(f"Secure value name {name or '(empty)'} has an invalid format")
+        if not isinstance(raw_value, str) or not raw_value or len(raw_value) > 16_000:
+            raise ValueError(
+                f"Secure value {name} must be a non-empty string of at most 16000 characters"
+            )
+        values[name] = raw_value
+    return values
+
+
+def _custom_mcp_spec(
+    values: dict[str, Any], secret_envelope: dict[str, str]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    server = str(values.get("server_name") or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", server):
+        raise ValueError("Connection name must be an identifier of at most 63 characters")
+    if server.lower() in _RESERVED_MCP_SCHEMA_NAMES or server.lower().startswith("pg_"):
+        raise ValueError(
+            "Connection name is reserved by Postgres or RVBBIT; choose a distinct MCP name"
+        )
+    transport = str(values.get("transport") or "http").strip().lower()
+    if transport not in {"http", "stdio"}:
+        raise ValueError("Transport must be hosted HTTP or local stdio")
+    try:
+        timeout_ms = int(str(values.get("timeout_ms") or "30000"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Timeout must be a whole number of milliseconds") from exc
+    if not 1 <= timeout_ms <= 600_000:
+        raise ValueError("Timeout must be between 1 and 600000 milliseconds")
+    description = str(values.get("description") or "").strip()
+    if len(description) > 2_000:
+        raise ValueError("Description must be at most 2000 characters")
+
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = []
+    environment: dict[str, str] = {}
+    auth_token_name: str | None = None
+    declared_secret_names: set[str] = set()
+    if transport == "http":
+        url = str(values.get("url") or "").strip()
+        try:
+            parsed_url = urlsplit(url)
+            parsed_port = parsed_url.port
+        except ValueError as exc:
+            raise ValueError("MCP endpoint URL has an invalid host or port") from exc
+        if (
+            parsed_url.scheme.lower() not in {"http", "https"}
+            or not parsed_url.hostname
+            or parsed_url.username
+            or parsed_url.password
+            or parsed_url.fragment
+        ):
+            raise ValueError(
+                "MCP endpoint must be an HTTP(S) URL without credentials or a fragment"
+            )
+        if parsed_port is not None and not 1 <= parsed_port <= 65_535:
+            raise ValueError("MCP endpoint URL has an invalid port")
+        for key, query_value in parse_qsl(parsed_url.query, keep_blank_values=True):
+            normalized_key = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_")
+            if query_value and _MCP_SECRETISH_ENV_RE.search(normalized_key):
+                raise ValueError(
+                    "MCP endpoint URL appears to contain a credential; use Bearer token name "
+                    "and Secure values instead"
+                )
+        auth_token_name = str(values.get("auth_token_name") or "").strip() or None
+        if auth_token_name and not _MCP_ENV_NAME_RE.fullmatch(auth_token_name):
+            raise ValueError("Bearer token name has an invalid format")
+        if auth_token_name:
+            declared_secret_names.add(auth_token_name)
+    else:
+        command = str(values.get("command") or "").strip()
+        if not command:
+            raise ValueError("Executable is required for a stdio MCP server")
+        if len(command) > 1_000 or "\x00" in command or re.search(r"[\r\n]", command):
+            raise ValueError("Executable has an invalid format")
+        if re.search(r"\s", command):
+            raise ValueError("Executable must not include arguments; put them in Arguments")
+        args = _parse_custom_mcp_args(values.get("args"))
+        environment = _parse_custom_mcp_environment(values.get("environment"))
+        declared_secret_names.update(
+            _parse_custom_mcp_secret_names(values.get("secret_names"))
+        )
+        for candidate in [*args, *environment.values()]:
+            declared_secret_names.update(_MCP_SECRET_REF_RE.findall(candidate))
+        if len(declared_secret_names) > _MAX_MCP_SECRET_NAMES:
+            raise ValueError(f"At most {_MAX_MCP_SECRET_NAMES} secret names can be declared")
+        for name in declared_secret_names:
+            environment.setdefault(name, f"${{{name}}}")
+
+    secure_values = _parse_custom_mcp_secure_values(
+        secret_envelope.get("MCP_SECRET_VALUES")
+    )
+    undeclared = sorted(set(secure_values).difference(declared_secret_names))
+    if undeclared:
+        raise ValueError(
+            "Secure value name was not declared in the reviewed connection: "
+            + ", ".join(undeclared)
+        )
+    spec = {
+        "server": server,
+        "transport": transport,
+        "command": command,
+        "args": args,
+        "environment": environment,
+        "url": url,
+        "auth_token_name": auth_token_name,
+        "timeout_ms": timeout_ms,
+        "description": description or None,
+        "create_sql_functions": bool(values.get("create_sql_functions", True)),
+        "create_operators": bool(values.get("create_operators", True)),
+        "declared_secret_names": declared_secret_names,
+    }
+    return spec, secure_values
+
+
 def _action_plan_document(action: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
     executor = action.get("executor")
     if executor == "mcp_connect":
-        steps = [
-            ("inspect", "Inspect published connection", "Validate the exact catalog manifest and current registration."),
-            ("register", "Register MCP server", "Apply the catalog-owned command, transport, and environment references."),
-            ("secrets", "Store credentials securely", "Send only typed secret values to the encrypted gateway store."),
-            ("discover", "Discover tools and generate operators", "Refresh the live server, reconcile drift, and create SQL wrappers."),
-            ("verify", "Verify reachability", "Actively probe tools/list and confirm the installed operator surface."),
-        ]
-        change = f"Connect {action.get('config', {}).get('capability_name') or action.get('title')} as {values.get('server_name')}"
-        rollback = "Drop the MCP registration and remove its gateway secret entries."
+        if (action.get("config") or {}).get("generic_mcp"):
+            steps = [
+                (
+                    "inspect", "Inspect custom connection",
+                    "Validate the reviewed transport, endpoint or executable, secret references, and current registration.",
+                ),
+                (
+                    "register", "Register MCP server",
+                    "Store only the approved connection shape and ${NAME} references in Postgres.",
+                ),
+                (
+                    "secrets", "Store credentials securely",
+                    "Send declared secret values only to the encrypted gateway store.",
+                ),
+                (
+                    "discover", "Discover tools and build SQL surface",
+                    "Introspect live tools and resources, then generate typed SQL functions and optional RVBBIT operators.",
+                ),
+                (
+                    "verify", "Verify reachability and functions",
+                    "Actively probe tools/list and count the live SQL, resource, and operator surfaces.",
+                ),
+            ]
+            change = (
+                f"Connect custom {values.get('transport') or 'http'} MCP server "
+                f"{values.get('server_name')}"
+            )
+        else:
+            steps = [
+                (
+                    "inspect", "Inspect published connection",
+                    "Validate the exact catalog manifest and current registration.",
+                ),
+                (
+                    "register", "Register MCP server",
+                    "Apply the catalog-owned command, transport, and environment references.",
+                ),
+                (
+                    "secrets", "Store credentials securely",
+                    "Send only typed secret values to the encrypted gateway store.",
+                ),
+                (
+                    "discover", "Discover tools and build SQL surface",
+                    "Refresh the live server, reconcile drift, and create typed SQL functions and RVBBIT operators.",
+                ),
+                (
+                    "verify", "Verify reachability",
+                    "Actively probe tools/list and confirm the installed SQL and operator surfaces.",
+                ),
+            ]
+            change = (
+                f"Connect {action.get('config', {}).get('capability_name') or action.get('title')} "
+                f"as {values.get('server_name')}"
+            )
+        rollback = (
+            "Drop a new MCP registration, or restore the prior reviewed connection when "
+            "reusing a name, then remove its gateway secret entries."
+        )
     elif executor == "capability_install":
         steps = [
             ("inspect", "Inspect packaged capability", "Validate the active SQL catalog row and chosen install mode."),
@@ -2682,6 +3092,228 @@ async def _push_mcp_gateway_secret(
         )
 
 
+def _sql_string_literal(value: Any) -> str:
+    return "'" + str(value or "").replace("'", "''") + "'"
+
+
+def _sql_identifier(value: Any) -> str:
+    return '"' + str(value or "").replace('"', '""') + '"'
+
+
+async def _execute_custom_mcp_steps(
+    conn_factory: Callable[..., Any],
+    run_id: str,
+    spec: dict[str, Any],
+    secrets: dict[str, str],
+    saved_names: set[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    server = str(spec["server"])
+    declared_names = set(spec.get("declared_secret_names") or set())
+    _set_action_step(conn_factory, run_id, "inspect", "running")
+    with conn_factory() as conn:
+        existing = conn.execute(
+            "SELECT name,transport,command,args,env,url,auth_header_env,timeout_ms,"
+            "description FROM rvbbit.mcp_servers WHERE name=%s",
+            (server,),
+        ).fetchone()
+        schema_state = conn.execute(
+            "SELECT "
+            "EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=%s) AS schema_exists,"
+            "(SELECT count(*)::int FROM pg_class c JOIN pg_namespace n "
+            " ON n.oid=c.relnamespace WHERE n.nspname=%s) AS schema_relations,"
+            "(SELECT count(*)::int FROM pg_proc p JOIN pg_namespace n "
+            " ON n.oid=p.pronamespace WHERE n.nspname=%s "
+            " AND (p.prokind<>'f' OR position('rvbbit.mcp_rows' in p.prosrc)=0)) "
+            "AS foreign_functions",
+            (server, server, server),
+        ).fetchone() or {}
+    schema_exists = bool(schema_state.get("schema_exists"))
+    if (
+        spec.get("create_sql_functions")
+        and schema_exists
+        and (
+            not existing
+            or int(schema_state.get("schema_relations") or 0) > 0
+            or int(schema_state.get("foreign_functions") or 0) > 0
+        )
+    ):
+        raise ValueError(
+            f"SQL schema {server} already exists and is not an RVBBIT-generated MCP wrapper "
+            "schema; choose another connection name"
+        )
+    endpoint = ""
+    if spec.get("url"):
+        parsed_url = urlsplit(str(spec["url"]))
+        endpoint = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+    _set_action_step(conn_factory, run_id, "inspect", "complete", {
+        "server": server,
+        "transport": spec["transport"],
+        "endpoint": endpoint or None,
+        "executable": spec.get("command"),
+        "declared_secret_names": sorted(declared_names),
+        "replaces_existing": bool(existing),
+        "existing_transport": (existing or {}).get("transport") if existing else None,
+        "wrapper_schema_reused": bool(schema_exists and existing),
+    })
+
+    _set_action_step(conn_factory, run_id, "register", "running")
+    environment_json = (
+        json.dumps(spec.get("environment") or {})
+        if spec["transport"] == "stdio"
+        else None
+    )
+    with conn_factory() as conn:
+        conn.execute(
+            "SELECT rvbbit.register_mcp_server("
+            "server_name => %s,server_transport => %s,server_command => %s,"
+            "server_args => %s,server_env => %s::jsonb,server_url => %s,"
+            "server_auth_env => %s,server_timeout_ms => %s,server_description => %s)",
+            (
+                server,
+                spec["transport"],
+                spec.get("command"),
+                spec.get("args") if spec["transport"] == "stdio" else None,
+                environment_json,
+                spec.get("url"),
+                spec.get("auth_token_name"),
+                spec["timeout_ms"],
+                spec.get("description"),
+            ),
+        )
+    _set_action_step(conn_factory, run_id, "register", "complete", {
+        "server": server,
+        "transport": spec["transport"],
+        "secret_values_persisted_in_postgres": False,
+    })
+
+    _set_action_step(conn_factory, run_id, "secrets", "running")
+    for name, value in secrets.items():
+        await _push_mcp_gateway_secret(conn_factory, server, name, value)
+    _set_action_step(conn_factory, run_id, "secrets", "complete", {
+        "stored": sorted(secrets),
+        "reused": sorted(declared_names.intersection(saved_names).difference(secrets)),
+        "values_persisted_in_postgres": False,
+    })
+
+    _set_action_step(conn_factory, run_id, "discover", "running")
+    with conn_factory() as conn:
+        refreshed = conn.execute(
+            "SELECT rvbbit.refresh_mcp_server(%s) AS tools", (server,)
+        ).fetchone() or {}
+        tool_rows = conn.execute(
+            "SELECT name,description FROM rvbbit.mcp_tools "
+            "WHERE server=%s ORDER BY name LIMIT 200",
+            (server,),
+        ).fetchall()
+        conflicts = conn.execute(
+            "SELECT coalesce(array_agg(o.name ORDER BY o.name),ARRAY[]::text[]) AS names "
+            "FROM rvbbit.operators o JOIN rvbbit.mcp_tools t ON t.server=%s "
+            "AND o.name=%s || '_' || CASE "
+            " WHEN left(t.name,length(%s)+1)=%s || '_' THEN substr(t.name,length(%s)+2) "
+            " ELSE t.name END "
+            "WHERE position('[MCP ' || %s || '.' in coalesce(o.description,''))=0",
+            (server, server, server, server, server, server),
+        ).fetchone() or {}
+    operator_conflicts = [str(value) for value in (conflicts.get("names") or [])]
+    if spec.get("create_operators") and operator_conflicts:
+        raise ValueError(
+            "Generated RVBBIT operator names would replace unrelated operators: "
+            + ", ".join(operator_conflicts[:12])
+        )
+    tools = [str(row.get("name") or "") for row in tool_rows if row.get("name")]
+    sql_functions_created = 0
+    if spec.get("create_sql_functions"):
+        with conn_factory() as conn:
+            wrappers = conn.execute(
+                "SELECT rvbbit.generate_mcp_wrappers(%s) AS sql_functions", (server,)
+            ).fetchone() or {}
+        sql_functions_created = int(wrappers.get("sql_functions") or 0)
+    operators_created = 0
+    if spec.get("create_operators"):
+        with conn_factory() as conn:
+            operators = conn.execute(
+                "SELECT rvbbit.generate_mcp_operators(%s) AS operators", (server,)
+            ).fetchone() or {}
+        operators_created = int(operators.get("operators") or 0)
+    _set_action_step(conn_factory, run_id, "discover", "complete", {
+        "tools_discovered": int(refreshed.get("tools") or len(tools)),
+        "sql_functions_created": sql_functions_created,
+        "operators_created": operators_created,
+        "tools": tools[:24],
+    })
+
+    _set_action_step(conn_factory, run_id, "verify", "running")
+    with conn_factory() as conn:
+        probe_row = conn.execute(
+            "SELECT rvbbit.mcp_probe(%s) AS probe", (server,)
+        ).fetchone() or {}
+        counts = conn.execute(
+            "SELECT "
+            "(SELECT count(*)::int FROM rvbbit.mcp_tools WHERE server=%s) AS tools,"
+            "(SELECT count(*)::int FROM rvbbit.mcp_resources WHERE server=%s) AS resources,"
+            "(SELECT count(*)::int FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+            " WHERE n.nspname=%s) AS sql_functions,"
+            "(SELECT count(*)::int FROM rvbbit.operators o "
+            " WHERE position('[MCP ' || %s || '.' in coalesce(o.description,'')) > 0) AS operators",
+            (server, server, server, server),
+        ).fetchone() or {}
+        function_rows = conn.execute(
+            "SELECT p.proname AS name,pg_get_function_identity_arguments(p.oid) AS arguments "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+            "WHERE n.nspname=%s ORDER BY p.proname LIMIT 24",
+            (server,),
+        ).fetchall()
+    probe = _json_object(probe_row.get("probe"))
+    verification = {
+        "server": server,
+        "transport": spec["transport"],
+        "reachable": bool(probe.get("reachable")),
+        "latency_ms": probe.get("latency_ms"),
+        "tools": int(counts.get("tools") or probe.get("n_tools") or 0),
+        "resources": int(counts.get("resources") or 0),
+        "sql_functions": int(counts.get("sql_functions") or 0),
+        "operators": int(counts.get("operators") or 0),
+    }
+    if not verification["reachable"]:
+        raise RuntimeError(
+            str(probe.get("error") or "The custom MCP server did not pass its active probe")
+        )
+    functions = [
+        {
+            "name": str(row.get("name") or ""),
+            "arguments": str(row.get("arguments") or ""),
+        }
+        for row in function_rows
+        if row.get("name")
+    ]
+    _set_action_step(conn_factory, run_id, "verify", "complete", verification)
+    direct_sql = None
+    typed_sql = None
+    if tools:
+        direct_sql = (
+            "SELECT rvbbit.mcp_call("
+            f"{_sql_string_literal(server)}, {_sql_string_literal(tools[0])}, "
+            "'{}'::jsonb);"
+        )
+    if functions:
+        typed_sql = (
+            f"SELECT * FROM {_sql_identifier(server)}."
+            f"{_sql_identifier(functions[0]['name'])}(/* named arguments */);"
+        )
+    result = {
+        "server": server,
+        "transport": spec["transport"],
+        "tools": tools,
+        "functions": functions,
+        "sql_functions_created": sql_functions_created,
+        "operators_created": operators_created,
+        "base_sql_function": "rvbbit.mcp_call(server, tool, args jsonb)",
+        "direct_sql_example": direct_sql,
+        "typed_sql_example": typed_sql,
+    }
+    return result, verification
+
+
 async def execute_action_with_secure_inputs(
     conn_factory: Callable[..., Any],
     owner: str,
@@ -2710,11 +3342,22 @@ async def execute_action_with_secure_inputs(
         })
     values, _redacted, secrets = _normalize_action_inputs(action, merged_inputs)
     server = str(values.get("server_name") or "")
-    required_secrets = {
-        str(field.get("secret_name") or str(field.get("key") or "").removeprefix("secret:"))
-        for field in action.get("fields") or []
-        if isinstance(field, dict) and field.get("type") == "secret" and field.get("required")
-    }
+    generic_mcp = bool((action.get("config") or {}).get("generic_mcp"))
+    custom_spec: dict[str, Any] | None = None
+    if generic_mcp:
+        custom_spec, secrets = _custom_mcp_spec(values, secrets)
+        required_secrets = set(custom_spec["declared_secret_names"])
+    else:
+        required_secrets = {
+            str(
+                field.get("secret_name")
+                or str(field.get("key") or "").removeprefix("secret:")
+            )
+            for field in action.get("fields") or []
+            if isinstance(field, dict)
+            and field.get("type") == "secret"
+            and field.get("required")
+        }
     saved_names, saved_known = await _mcp_gateway_secret_names(conn_factory, server)
     if not saved_known:
         raise ValueError(
@@ -2728,6 +3371,23 @@ async def execute_action_with_secure_inputs(
         )
     _mark_action_running(conn_factory, owner, run["id"])
     try:
+        if custom_spec is not None:
+            result, verification = await _execute_custom_mcp_steps(
+                conn_factory,
+                run["id"],
+                custom_spec,
+                secrets,
+                saved_names,
+            )
+            _finish_action_run(
+                conn_factory,
+                run["id"],
+                "complete",
+                result=result,
+                verification=verification,
+            )
+            return {"run": _action_run_for_owner(conn_factory, owner, run["id"])}
+
         catalog_id = str((action.get("config") or {}).get("catalog_id") or "")
         _set_action_step(conn_factory, run["id"], "inspect", "running")
         with conn_factory() as conn:
@@ -2769,6 +3429,14 @@ async def execute_action_with_secure_inputs(
                 (catalog_id, server),
             ).fetchone()
         finalize_result = _json_object((finalized or {}).get("result"))
+        with conn_factory() as conn:
+            wrapper_row = conn.execute(
+                "SELECT rvbbit.generate_mcp_wrappers(%s) AS sql_functions",
+                (server,),
+            ).fetchone() or {}
+        finalize_result["sql_functions_created"] = int(
+            wrapper_row.get("sql_functions") or 0
+        )
         _set_action_step(conn_factory, run["id"], "discover", "complete", finalize_result)
 
         _set_action_step(conn_factory, run["id"], "verify", "running")
@@ -2777,12 +3445,14 @@ async def execute_action_with_secure_inputs(
                 "SELECT rvbbit.mcp_probe(%s) AS probe", (server,)
             ).fetchone()
             counts = conn.execute(
-                "SELECT count(*)::int AS tools,"
+                "SELECT "
+                "(SELECT count(*)::int FROM rvbbit.mcp_tools WHERE server=%s) AS tools,"
                 "(SELECT count(*)::int FROM rvbbit.operators o "
-                " WHERE o.name=ANY(coalesce(c.operators,ARRAY[]::text[]))) AS operators "
-                "FROM rvbbit.mcp_tools t CROSS JOIN rvbbit.capability_catalog c "
-                "WHERE t.server=%s AND c.id=%s GROUP BY c.operators",
-                (server, catalog_id),
+                " WHERE o.name=ANY(coalesce((SELECT c.operators "
+                " FROM rvbbit.capability_catalog c WHERE c.id=%s),ARRAY[]::text[]))) AS operators,"
+                "(SELECT count(*)::int FROM pg_proc p JOIN pg_namespace n "
+                " ON n.oid=p.pronamespace WHERE n.nspname=%s) AS sql_functions",
+                (server, catalog_id, server),
             ).fetchone() or {}
         probe = _json_object((probe_row or {}).get("probe"))
         verification = {
@@ -2791,6 +3461,11 @@ async def execute_action_with_secure_inputs(
             "latency_ms": probe.get("latency_ms"),
             "tools": int(counts.get("tools") or probe.get("n_tools") or 0),
             "operators": int(counts.get("operators") or finalize_result.get("operators_created") or 0),
+            "sql_functions": int(
+                counts.get("sql_functions")
+                or finalize_result.get("sql_functions_created")
+                or 0
+            ),
             "drift": finalize_result.get("drift") or {},
         }
         if not verification["reachable"]:
@@ -2802,7 +3477,10 @@ async def execute_action_with_secure_inputs(
             "catalog_id": catalog_id,
             "server": server,
             "operators_created": finalize_result.get("operators_created"),
+            "sql_functions_created": finalize_result.get("sql_functions_created"),
             "tools": finalize_result.get("tools") or [],
+            "base_sql_function": "rvbbit.mcp_call(server, tool, args jsonb)",
+            "typed_sql_schema": server,
         }
         _finish_action_run(
             conn_factory, run["id"], "complete", result=result, verification=verification
@@ -12815,7 +13493,11 @@ def register_calliope_routes(
                 )
                 or ""
             )
-            saved, known = await _mcp_gateway_secret_names(conn_factory, server)
+            saved, known = (
+                await _mcp_gateway_secret_names(conn_factory, server)
+                if server
+                else (set(), True)
+            )
             action["secure_state"] = {
                 "server": server,
                 "known": known,

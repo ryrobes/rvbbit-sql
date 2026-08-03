@@ -48,6 +48,13 @@ def _linear_capability(*, connected: bool = False) -> tuple[dict, dict]:
     return capability, inventory
 
 
+def _custom_mcp_action() -> dict:
+    return next(
+        action for action in calliope._ACTION_LIBRARY_SEED
+        if action["id"] == "mcp.connect_custom"
+    )
+
+
 def test_action_schema_routes_tools_and_ui_ship_as_one_contract():
     migration = (
         ROOT / "crates" / "pg_rvbbit" / "sql" / "migrations"
@@ -80,8 +87,12 @@ def test_action_schema_routes_tools_and_ui_ship_as_one_contract():
     assert 'id="action-apply"' in page
     assert "function openActionLibrary" in script
     assert "function pollActionRun" in script
+    assert "function syncActionFieldVisibility" in script
+    assert "field.visible_when" in script
     assert 'data-resolve-action="' in script
     assert ".surface.kind-action" in css
+    assert ".action-field[hidden]" in css
+    assert ".action-library-empty[hidden],.action-library-selected[hidden]" in css
     assert compose.count("RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}") >= 3
 
 
@@ -182,6 +193,104 @@ def test_action_input_normalization_never_places_secret_values_in_plan_inputs():
     assert [step["id"] for step in plan["steps"]] == [
         "inspect", "register", "secrets", "discover", "verify",
     ]
+
+
+def test_custom_mcp_action_is_seeded_with_transport_aware_secure_contract():
+    action = _custom_mcp_action()
+    captured = []
+
+    class Connection:
+        def execute(self, _query, params):
+            captured.append(params)
+
+    calliope._seed_action_catalog(Connection())
+    seeded = next(params for params in captured if params[0] == action["id"])
+    config = json.loads(seeded[9])
+
+    assert action["category"] == "connect"
+    assert action["executor"] == "mcp_connect"
+    assert action["risk"] == "organization_change"
+    assert config["generic_mcp"] is True
+    assert config["requirements"] == []
+    assert any(field.get("visible_when") for field in action["fields"])
+    assert next(
+        field for field in action["fields"] if field["key"] == "secret:MCP_SECRET_VALUES"
+    )["secret_group"] is True
+
+
+def test_custom_http_mcp_plan_freezes_config_and_redacts_named_secure_values():
+    action = _custom_mcp_action()
+    secret_value = "client-token-must-never-persist"
+    values, redacted, envelope = calliope._normalize_action_inputs(action, {
+        "server_name": "client_ops",
+        "transport": "http",
+        "url": "https://mcp.client.example/mcp",
+        "auth_token_name": "CLIENT_MCP_TOKEN",
+        "secret:MCP_SECRET_VALUES": json.dumps({"CLIENT_MCP_TOKEN": secret_value}),
+    })
+    spec, secure_values = calliope._custom_mcp_spec(values, envelope)
+    plan = calliope._action_plan_document(action, values)
+
+    assert values["transport"] == "http"
+    assert values["url"] == "https://mcp.client.example/mcp"
+    assert "command" not in values
+    assert "args" not in values
+    assert redacted["secret:MCP_SECRET_VALUES"] == "••••••"
+    assert secure_values == {"CLIENT_MCP_TOKEN": secret_value}
+    assert spec["declared_secret_names"] == {"CLIENT_MCP_TOKEN"}
+    assert secret_value not in json.dumps(spec, default=list)
+    assert secret_value not in json.dumps(plan)
+    assert "custom http MCP server client_ops" in plan["summary"]
+
+
+def test_custom_stdio_mcp_declares_refs_and_rejects_literal_or_undeclared_secrets():
+    action = _custom_mcp_action()
+    values, _redacted, envelope = calliope._normalize_action_inputs(action, {
+        "server_name": "client_stdio",
+        "transport": "stdio",
+        "command": "npx",
+        "args": json.dumps(["-y", "@client/custom-mcp", "--token=${CLIENT_TOKEN}"]),
+        "environment": json.dumps({"REGION": "us-east-2"}),
+        "secret_names": "CLIENT_SECRET",
+        "secret:MCP_SECRET_VALUES": json.dumps({
+            "CLIENT_TOKEN": "token-value",
+            "CLIENT_SECRET": "secret-value",
+        }),
+    })
+    spec, secure_values = calliope._custom_mcp_spec(values, envelope)
+
+    assert "url" not in values
+    assert spec["args"] == ["-y", "@client/custom-mcp", "--token=${CLIENT_TOKEN}"]
+    assert spec["declared_secret_names"] == {"CLIENT_TOKEN", "CLIENT_SECRET"}
+    assert spec["environment"]["CLIENT_TOKEN"] == "${CLIENT_TOKEN}"
+    assert spec["environment"]["CLIENT_SECRET"] == "${CLIENT_SECRET}"
+    assert set(secure_values) == {"CLIENT_TOKEN", "CLIENT_SECRET"}
+    assert "token-value" not in json.dumps(spec, default=list)
+
+    bad_values = dict(values)
+    bad_values["environment"] = json.dumps({"API_TOKEN": "literal-secret"})
+    with pytest.raises(ValueError, match="looks secret"):
+        calliope._custom_mcp_spec(bad_values, {})
+    with pytest.raises(ValueError, match="not declared"):
+        calliope._custom_mcp_spec(
+            values,
+            {"MCP_SECRET_VALUES": json.dumps({"SURPRISE_TOKEN": "not-reviewed"})},
+        )
+
+
+def test_custom_mcp_rejects_credentials_in_endpoint_url():
+    action = _custom_mcp_action()
+    values, _redacted, envelope = calliope._normalize_action_inputs(action, {
+        "server_name": "unsafe_url",
+        "transport": "http",
+        "url": "https://mcp.example/mcp?api_key=must-not-persist",
+    })
+    with pytest.raises(ValueError, match="appears to contain a credential"):
+        calliope._custom_mcp_spec(values, envelope)
+
+    reserved = dict(values, server_name="public", url="https://mcp.example/mcp")
+    with pytest.raises(ValueError, match="reserved"):
+        calliope._custom_mcp_spec(reserved, {})
 
 
 def test_plan_receipt_is_immutable_redacted_and_requires_a_separate_apply(monkeypatch):
@@ -298,6 +407,263 @@ def test_secure_mcp_apply_requires_gateway_preflight_before_registration(monkeyp
             {"secret:LINEAR_API_KEY": "lin_api_transient-only"},
         ))
     assert mutations == []
+
+
+def test_custom_mcp_apply_uses_only_frozen_config_and_one_way_secret_envelope(monkeypatch):
+    action = _custom_mcp_action()
+    planned_values, _redacted, _secrets = calliope._normalize_action_inputs(action, {
+        "server_name": "client_custom",
+        "transport": "http",
+        "url": "https://mcp.client.example/mcp",
+        "auth_token_name": "CLIENT_TOKEN",
+    })
+    run_id = str(uuid.uuid4())
+    run = {
+        "id": run_id,
+        "status": "planned",
+        "action_snapshot": action,
+        "input_values": planned_values,
+    }
+    final_run = {**run}
+    captured = {}
+    mutations = []
+
+    monkeypatch.setattr(
+        calliope,
+        "_action_run_for_owner",
+        lambda *_args: final_run,
+    )
+
+    async def no_saved_secrets(_conn_factory, server):
+        assert server == "client_custom"
+        return set(), True
+
+    async def execute_steps(_factory, passed_run_id, spec, secrets, saved_names):
+        captured.update({
+            "run_id": passed_run_id,
+            "spec": spec,
+            "secrets": secrets,
+            "saved_names": saved_names,
+        })
+        return ({"server": spec["server"]}, {"reachable": True})
+
+    def finish(_factory, _run_id, status, **kwargs):
+        final_run.update({"status": status, **kwargs})
+
+    monkeypatch.setattr(calliope, "_mcp_gateway_secret_names", no_saved_secrets)
+    monkeypatch.setattr(calliope, "_execute_custom_mcp_steps", execute_steps)
+    monkeypatch.setattr(
+        calliope,
+        "_mark_action_running",
+        lambda *_args: mutations.append("running"),
+    )
+    monkeypatch.setattr(calliope, "_finish_action_run", finish)
+
+    result = asyncio.run(calliope.execute_action_with_secure_inputs(
+        object,
+        "trusted@example.com",
+        run_id,
+        {
+            # This ordinary value must not be allowed to rewrite the frozen plan.
+            "url": "https://attacker.invalid/mcp",
+            "secret:MCP_SECRET_VALUES": json.dumps({
+                "CLIENT_TOKEN": "transient-client-token",
+            }),
+        },
+    ))
+
+    assert mutations == ["running"]
+    assert captured["run_id"] == run_id
+    assert captured["spec"]["url"] == "https://mcp.client.example/mcp"
+    assert captured["secrets"] == {"CLIENT_TOKEN": "transient-client-token"}
+    assert captured["saved_names"] == set()
+    assert result["run"]["status"] == "complete"
+    assert "transient-client-token" not in json.dumps(result)
+
+
+def test_custom_mcp_steps_register_discover_generate_and_verify_without_sql_secrets(monkeypatch):
+    calls = []
+    pushed = []
+    step_updates = []
+    secret_value = "opaque-client-token"
+
+    class Result:
+        def __init__(self, rows=None):
+            self.rows = rows if isinstance(rows, list) else ([] if rows is None else [rows])
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params):
+            calls.append((query, params))
+            if query.startswith("SELECT name,transport"):
+                return Result()
+            if query.startswith("SELECT EXISTS"):
+                return Result({
+                    "schema_exists": False,
+                    "schema_relations": 0,
+                    "foreign_functions": 0,
+                })
+            if "register_mcp_server" in query:
+                return Result({})
+            if "refresh_mcp_server" in query:
+                return Result({"tools": 2})
+            if "generate_mcp_wrappers" in query:
+                return Result({"sql_functions": 2})
+            if "generate_mcp_operators" in query:
+                return Result({"operators": 2})
+            if query.startswith("SELECT name,description"):
+                return Result([
+                    {"name": "lookup_customer", "description": "Find a customer"},
+                    {"name": "list_projects", "description": "List projects"},
+                ])
+            if query.startswith("SELECT coalesce(array_agg"):
+                return Result({"names": []})
+            if "mcp_probe" in query:
+                return Result({
+                    "probe": {"reachable": True, "latency_ms": 11, "n_tools": 2},
+                })
+            if query.startswith("SELECT (SELECT count"):
+                return Result({
+                    "tools": 2,
+                    "resources": 1,
+                    "sql_functions": 2,
+                    "operators": 2,
+                })
+            if query.startswith("SELECT p.proname"):
+                return Result([
+                    {"name": "lookup_customer", "arguments": "customer_id text"},
+                    {"name": "list_projects", "arguments": ""},
+                ])
+            raise AssertionError(query)
+
+    async def push_secret(_factory, server, name, value):
+        pushed.append((server, name, value))
+
+    monkeypatch.setattr(calliope, "_push_mcp_gateway_secret", push_secret)
+    monkeypatch.setattr(
+        calliope,
+        "_set_action_step",
+        lambda _factory, _run_id, step, status, result=None: step_updates.append(
+            (step, status, result or {})
+        ),
+    )
+    spec = {
+        "server": "client_custom",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@client/custom-mcp"],
+        "environment": {"CLIENT_TOKEN": "${CLIENT_TOKEN}"},
+        "url": None,
+        "auth_token_name": None,
+        "timeout_ms": 30_000,
+        "description": "Client tools",
+        "create_sql_functions": True,
+        "create_operators": True,
+        "declared_secret_names": {"CLIENT_TOKEN"},
+    }
+
+    result, verification = asyncio.run(calliope._execute_custom_mcp_steps(
+        Connection,
+        str(uuid.uuid4()),
+        spec,
+        {"CLIENT_TOKEN": secret_value},
+        set(),
+    ))
+
+    register_call = next(call for call in calls if "register_mcp_server" in call[0])
+    assert register_call[1][0:4] == (
+        "client_custom", "stdio", "npx", ["-y", "@client/custom-mcp"],
+    )
+    assert json.loads(register_call[1][4]) == {"CLIENT_TOKEN": "${CLIENT_TOKEN}"}
+    assert pushed == [("client_custom", "CLIENT_TOKEN", secret_value)]
+    assert any("refresh_mcp_server" in query for query, _params in calls)
+    assert any("generate_mcp_wrappers" in query for query, _params in calls)
+    assert any("generate_mcp_operators" in query for query, _params in calls)
+    assert verification == {
+        "server": "client_custom",
+        "transport": "stdio",
+        "reachable": True,
+        "latency_ms": 11,
+        "tools": 2,
+        "resources": 1,
+        "sql_functions": 2,
+        "operators": 2,
+    }
+    assert result["base_sql_function"] == "rvbbit.mcp_call(server, tool, args jsonb)"
+    assert "rvbbit.mcp_call('client_custom', 'lookup_customer'" in result["direct_sql_example"]
+    assert '"client_custom"."lookup_customer"' in result["typed_sql_example"]
+    assert [update[:2] for update in step_updates] == [
+        ("inspect", "running"), ("inspect", "complete"),
+        ("register", "running"), ("register", "complete"),
+        ("secrets", "running"), ("secrets", "complete"),
+        ("discover", "running"), ("discover", "complete"),
+        ("verify", "running"), ("verify", "complete"),
+    ]
+    assert secret_value not in json.dumps(calls)
+    assert secret_value not in json.dumps(result)
+
+
+def test_custom_mcp_refuses_to_replace_an_unrelated_sql_schema(monkeypatch):
+    queries = []
+
+    class Result:
+        def __init__(self, value=None):
+            self.value = value
+
+        def fetchone(self):
+            return self.value
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, _params):
+            queries.append(query)
+            if query.startswith("SELECT name,transport"):
+                return Result()
+            if query.startswith("SELECT EXISTS"):
+                return Result({
+                    "schema_exists": True,
+                    "schema_relations": 3,
+                    "foreign_functions": 0,
+                })
+            raise AssertionError("registration must not run after a schema collision")
+
+    monkeypatch.setattr(calliope, "_set_action_step", lambda *_args, **_kwargs: None)
+    spec = {
+        "server": "client_data",
+        "transport": "http",
+        "command": None,
+        "args": [],
+        "environment": {},
+        "url": "https://mcp.client.example/mcp",
+        "auth_token_name": None,
+        "timeout_ms": 30_000,
+        "description": None,
+        "create_sql_functions": True,
+        "create_operators": True,
+        "declared_secret_names": set(),
+    }
+
+    with pytest.raises(ValueError, match="already exists"):
+        asyncio.run(calliope._execute_custom_mcp_steps(
+            Connection, str(uuid.uuid4()), spec, {}, set()
+        ))
+    assert not any("register_mcp_server" in query for query in queries)
 
 
 def test_gateway_rejection_never_echoes_response_body_or_secret(monkeypatch):

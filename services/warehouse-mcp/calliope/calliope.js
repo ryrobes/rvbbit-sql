@@ -1366,14 +1366,39 @@
     }
     if (field.type === "secret") {
       const secretName = String(field.secret_name || key.replace(/^secret:/, ""));
-      const saved = Boolean(state.action?.secure_state?.saved_names?.includes(secretName));
+      const savedNames = state.action?.secure_state?.saved_names || [];
+      const saved = field.secret_group ? Boolean(savedNames.length) : savedNames.includes(secretName);
       const savedHelp = saved
-        ? `<small class="action-secret-saved">Saved securely for ${escapeHtml(state.action.secure_state?.server || "this connection")} · leave blank to reuse</small>`
+        ? `<small class="action-secret-saved">${field.secret_group
+          ? `${savedNames.length} named ${savedNames.length === 1 ? "value" : "values"} already saved securely`
+          : `Saved securely for ${escapeHtml(state.action.secure_state?.server || "this connection")}`} · leave blank to reuse</small>`
         : "";
-      return `<label class="action-field"><span>${label}${marker}</span><input type="password" name="${escapeHtml(key)}" maxlength="12000" autocomplete="new-password" placeholder="${saved ? "Saved — enter only to replace" : "Enter securely when applying"}">${savedHelp}${help}</label>`;
+      const placeholder = saved ? "Saved — enter only to replace" : field.placeholder || "Enter securely when applying";
+      return `<label class="action-field"><span>${label}${marker}</span><input type="password" name="${escapeHtml(key)}" maxlength="12000" autocomplete="new-password" placeholder="${escapeHtml(placeholder)}">${savedHelp}${help}</label>`;
     }
     const pattern = field.pattern ? ` pattern="${escapeHtml(field.pattern)}"` : "";
     return `<label class="action-field"><span>${label}${marker}</span><input type="text" name="${escapeHtml(key)}" value="${escapeHtml(value ?? "")}" maxlength="12000" ${required ? "required" : ""}${pattern} placeholder="${escapeHtml(field.placeholder || "")}">${help}</label>`;
+  }
+
+  function syncActionFieldVisibility(running = state.actionExecuting || state.actionPlan?.status === "running") {
+    for (const field of state.action?.fields || []) {
+      const control = els.actionDetailForm.elements.namedItem(field.key);
+      if (!control) continue;
+      const condition = field.visible_when;
+      let visible = true;
+      if (condition?.field) {
+        const controller = els.actionDetailForm.elements.namedItem(condition.field);
+        const actual = controller?.type === "checkbox" ? String(Boolean(controller.checked)) : String(controller?.value ?? "");
+        const expected = Array.isArray(condition.values) ? condition.values : [condition.value];
+        visible = expected.map(String).includes(actual);
+      }
+      const wrapper = control.closest(".action-field");
+      if (wrapper) wrapper.hidden = !visible;
+      control.disabled = Boolean(running || !visible);
+      if (field.type !== "secret" && field.type !== "boolean") {
+        control.required = Boolean(visible && field.required);
+      }
+    }
   }
 
   function renderActionRequirements() {
@@ -1430,6 +1455,7 @@
     els.actionApply.disabled = running;
     els.actionApply.textContent = running ? "Applying…" : "Approve & apply →";
     [...els.actionDetailForm.elements].forEach((control) => { control.disabled = running; });
+    syncActionFieldVisibility(running);
     if (!action) return;
     if (guided) {
       els.actionDetailNote.textContent = action.missing_requirements?.length
@@ -1471,6 +1497,7 @@
     for (const field of state.action?.fields || []) {
       const control = els.actionDetailForm.elements.namedItem(field.key);
       if (!control) continue;
+      if (control.closest(".action-field")?.hidden) continue;
       if (field.type === "secret") {
         if (includeSecrets && control.value) values[field.key] = control.value;
       } else if (field.type === "boolean") {
@@ -8018,6 +8045,7 @@
         .catch((error) => toast(error.message, true));
     });
     els.actionDetailForm.addEventListener("input", (event) => {
+      syncActionFieldVisibility();
       if (event.target.matches('input[type="password"]')) return;
       clearActionPlanForEdit();
     });

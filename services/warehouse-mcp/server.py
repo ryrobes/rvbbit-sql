@@ -10687,8 +10687,10 @@ def _landing_html(rows, viewer):
     # affordance is the honest move, not a lesser one. Everyone else gets a
     # browsable index that works, uncluttered by a surface they can't use.
     lens = _lens_url()
-    _app_link = (f'<a class=applink href="{e(lens)}/" title="Open the full DataRabbit desktop">'
-                 f'Open DataRabbit &rarr;</a>') if lens else ""
+    _app_link = (
+        f'<a class=applink href="{e(lens)}/" target="_blank" rel="noopener" '
+        f'title="Open Data Desktop in a new window">Open Data Desktop &rarr;</a>'
+    ) if lens else ""
     # Calliope is a true opt-in surface: when Hermes is not configured there is
     # no gallery launcher and its routes are not registered.
     _calliope_link = (
@@ -10843,7 +10845,7 @@ def _landing_html(rows, viewer):
 {_bg_layer}
 <div class="wash"></div>
 <nav data-warehouse-header>{_RABBIT_SVG}
- <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
+ <span class="wordmark">DATA RABBIT<small>an operational answer engine</small></span>
  <span class="who"><span data-warehouse-theme-anchor></span>{_brief_link}{_inbox_link}{_app_link}{f'<span class="viewer">{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
 <main>
  <header class="hero">

@@ -92,7 +92,7 @@ async def run():
         check("mapped = true", j.get("mapped") is True)
         idx = await c.get("/", headers={"cookie": cookie})
         check("index renders the gallery", 'class="card"' in idx.text, f"{idx.text.count('class=\"card\"')} cards")
-        check("index offers DataRabbit", "Open DataRabbit" in idx.text)
+        check("index offers Data Desktop", "Open Data Desktop" in idx.text)
 
         print("\nunmapped identity (verified by Google, unknown to Postgres)")
         cb, cookie = await login("stranger@acme.com")
@@ -106,7 +106,7 @@ async def run():
         idx = await c.get("/gallery", headers={"cookie": cookie})
         check("shows access-pending, not artifacts", "Access pending" in idx.text
               and 'class="card"' not in idx.text)
-        check("withholds the DataRabbit rung", "Open DataRabbit" not in idx.text)
+        check("withholds the Data Desktop rung", "Open Data Desktop" not in idx.text)
         check("no artifact titles leak", "Bigfoot" not in idx.text)
 
 
