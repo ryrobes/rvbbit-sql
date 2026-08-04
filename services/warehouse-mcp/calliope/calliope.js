@@ -79,6 +79,7 @@
     toolActivityDraft: $("#tool-activity-draft"),
     toolActivityDraftCopy: $("#tool-activity-draft-copy"),
     composer: $("#composer"),
+    inputHost: $("#message-editor"),
     input: $("#message-input"),
     send: $("#send-message"),
     speechRecord: $("#speech-record"),
@@ -282,8 +283,11 @@
     selectedSurfaceId: null,
     spatialSelections: [],
     inspectingSurfaceId: null,
+    markupCaptureRequests: new Map(),
     attachments: [],
     evidenceSelections: [],
+    composerEditor: null,
+    composerObjectCache: new Map(),
     evidenceSearching: false,
     inbox: {
       items: [],
@@ -3779,7 +3783,7 @@
     state.cubeBuilders.clear();
     els.sessionTitle.textContent = "Choose or start a session";
     els.archiveSession.disabled = true;
-    els.input.disabled = true;
+    composerSetDisabled(true);
     els.send.disabled = true;
     renderSelected();
     renderEvidenceContextTray();
@@ -3809,7 +3813,7 @@
     rememberSession(selectedSummary || state.current);
     els.sessionTitle.textContent = state.current.title;
     els.archiveSession.disabled = false;
-    els.input.disabled = false;
+    composerSetDisabled(false);
     els.send.disabled = false;
     renderSessions();
     renderSelected();
@@ -3822,7 +3826,7 @@
     syncSpeechControls();
     setMobilePanel();
     if (options.focusComposer !== false) {
-      requestAnimationFrame(() => els.input.focus());
+      requestAnimationFrame(composerFocus);
     }
   }
 
@@ -3866,17 +3870,62 @@
     toast("Notebook archived");
   }
 
+  function surfaceArtifactVersion(surface) {
+    const raw = surface?.artifact_version ?? surface?.payload?.version;
+    const version = Number(raw);
+    return Number.isInteger(version) && version > 0 ? version : null;
+  }
+
+  function isArtifactCaptureCompanion(surface) {
+    if (surface?.kind !== "image" || !surface.artifact_slug) return false;
+    const tool = String(surface.tool_name || "");
+    return tool === "capture_live_app"
+      || tool.endsWith("__capture_live_app")
+      || surface.source?.origin === "calliope_markup_capture"
+      || surface.presentation?.companion === true;
+  }
+
+  function artifactForCapture(capture) {
+    if (!isArtifactCaptureCompanion(capture)) return null;
+    const version = surfaceArtifactVersion(capture);
+    if (!version) return null;
+    return state.surfaces.find((surface) =>
+      surface.kind === "artifact"
+      && surface.artifact_slug === capture.artifact_slug
+      && surfaceArtifactVersion(surface) === version
+    ) || null;
+  }
+
+  function captureCompanion(artifact) {
+    if (artifact?.kind !== "artifact" || !artifact.artifact_slug) return null;
+    const version = surfaceArtifactVersion(artifact);
+    if (!version) return null;
+    return state.surfaces
+      .filter((surface) =>
+        isArtifactCaptureCompanion(surface)
+        && surface.artifact_slug === artifact.artifact_slug
+        && surfaceArtifactVersion(surface) === version
+        && surface.payload?.image_url
+      )
+      .sort((left, right) =>
+        new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime()
+      )[0] || null;
+  }
+
   function visibleStageSurfaces() {
-    const briefs = state.surfaces.filter(
+    const visible = state.surfaces.filter(
+      (surface) => !isArtifactCaptureCompanion(surface) || !artifactForCapture(surface),
+    );
+    const briefs = visible.filter(
       (surface) => surface.kind === "evidence" && surface.payload?.mode === "personal_brief",
     );
-    if (briefs.length <= 1) return state.surfaces;
+    if (briefs.length <= 1) return visible;
     const latest = [...briefs].sort((left, right) => {
       const created = new Date(right.created_at || 0).getTime()
         - new Date(left.created_at || 0).getTime();
       return created || String(right.id || "").localeCompare(String(left.id || ""));
     })[0];
-    return state.surfaces.filter(
+    return visible.filter(
       (surface) => surface.payload?.mode !== "personal_brief" || surface.id === latest.id,
     );
   }
@@ -3937,6 +3986,60 @@
     </div>`;
   }
 
+  function turnObjectLink(item, turnId, index, source = "turn") {
+    const kind = String(item?.kind || "object").replaceAll("_", " ");
+    const label = item?.label || item?.ref_id || "Company object";
+    const attrs = `data-open-object-turn="${escapeHtml(turnId || "")}" data-open-object-source="${escapeHtml(source)}" data-open-object-index="${index}"`;
+    const copy = `<b>${escapeHtml(kind)}</b>${escapeHtml(label)}`;
+    if (item?.handle && Object.keys(item.handle).length) {
+      return `<button type="button" ${attrs} title="Follow this exact object’s trail">${copy}</button>`;
+    }
+    if (String(item?.url || "").startsWith("/")) {
+      return `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener" title="Open this exact object">${copy}</a>`;
+    }
+    return `<span>${copy}</span>`;
+  }
+
+  function renderTurnObjectRefs(turn) {
+    const refs = Array.isArray(turn.object_refs) ? turn.object_refs : [];
+    if (!refs.length) return "";
+    return `<div class="message-objects" aria-label="Exact objects referenced in this turn">
+      <span>Referenced</span>
+      ${refs.map((item, index) => turnObjectLink(item, turn.id, index)).join("")}
+    </div>`;
+  }
+
+  function renderTurnReceipt(turn) {
+    const receipt = turn.response_receipt && typeof turn.response_receipt === "object"
+      ? turn.response_receipt : {};
+    const evidence = Array.isArray(receipt.evidence) ? receipt.evidence : [];
+    const objects = Array.isArray(receipt.objects) ? receipt.objects : [];
+    const tools = Array.isArray(receipt.tools) ? receipt.tools : [];
+    const outputs = Array.isArray(receipt.outputs) ? receipt.outputs : [];
+    const toolCount = tools.reduce((total, item) => total + Number(item.count || 1), 0);
+    const contextCount = evidence.length + objects.length;
+    if (!contextCount && !toolCount && !outputs.length) return "";
+    const summary = [
+      contextCount ? `Used ${contextCount}` : "",
+      toolCount ? `Ran ${toolCount}` : "",
+      outputs.length ? `Made ${outputs.length}` : "",
+    ].filter(Boolean).join(" · ");
+    const contextMarkup = [
+      ...evidence.map((item) => `<button type="button" data-focus-evidence-surface="${escapeHtml(item.surface_id || "")}" title="${escapeHtml(item.source || item.title || "Selected evidence")}">${surfaceGlyph("evidence")} ${escapeHtml(item.title || "Evidence")}</button>`),
+      ...objects.map((item, index) => turnObjectLink(item, turn.id, index, "receipt")),
+    ].join("");
+    const toolMarkup = tools.map((item) => `<span class="${item.status === "failed" ? "failed" : ""}" title="${escapeHtml(item.status === "failed" ? "Tool reported a failure" : "Tool completed")}">${escapeHtml(friendlyTool(item.name))}${Number(item.count || 1) > 1 ? ` ×${Number(item.count)}` : ""}</span>`).join("");
+    const outputMarkup = outputs.map((item) => `<button type="button" data-focus-surface="${escapeHtml(item.surface_id || "")}" title="${escapeHtml(item.effect === "changed" ? "Changed during this response" : "Created during this response")}">${surfaceGlyph(item.kind)} ${escapeHtml(item.title || "Output")}</button>`).join("");
+    return `<details class="message-receipt">
+      <summary><span>Receipt</span><b>${escapeHtml(summary)}</b><i aria-hidden="true">›</i></summary>
+      <div class="message-receipt-body">
+        ${contextMarkup ? `<section><label>Context</label><div>${contextMarkup}</div></section>` : ""}
+        ${toolMarkup ? `<section><label>Tools</label><div>${toolMarkup}</div></section>` : ""}
+        ${outputMarkup ? `<section><label>Outputs</label><div>${outputMarkup}</div></section>` : ""}
+      </div>
+    </details>`;
+  }
+
   function renderChat(initial = false) {
     const chatTurns = state.turns.filter((turn) => (turn.turn_kind || "chat") === "chat");
     els.chatEmpty.hidden = Boolean(chatTurns.length);
@@ -3952,6 +4055,7 @@
           ${surfaceGlyph(surface.kind)} ${escapeHtml(surface.title)}
         </button>`
       ).join("");
+      const receipt = renderTurnReceipt(turn);
       const failed = turn.status === "failed";
       return `
         <article class="message user" data-turn-id="${escapeHtml(turn.id)}">
@@ -3959,12 +4063,13 @@
           <div class="message-body">${safeMarkdown(turn.user_message)}</div>
           ${attachments ? `<div class="message-attachments">${attachments}</div>` : ""}
           ${renderTurnEvidenceRefs(turn)}
+          ${renderTurnObjectRefs(turn)}
         </article>
         <article class="message assistant ${turn.status === "running" ? "streaming" : ""} ${failed ? "error" : ""}"
                  data-assistant-turn-id="${escapeHtml(turn.id)}">
           <div class="message-label"><span>Calliope</span></div>
           <div class="message-body">${assistantBody(turn, failed)}</div>
-          ${links ? `<div class="surface-links">${links}</div>` : ""}
+          ${receipt || (links ? `<div class="surface-links">${links}</div>` : "")}
         </article>`;
     }).join("");
     window.CalliopeThinkingOrbs?.mountAll(els.messages);
@@ -6044,6 +6149,121 @@
     return pending;
   }
 
+  async function lookupComposerObjects(query, kind = "") {
+    const key = `${kind}:${String(query).trim().toLowerCase()}`;
+    if (state.composerObjectCache.has(key)) return state.composerObjectCache.get(key);
+    const params = new URLSearchParams({ q: query, limit: "16" });
+    if (kind) params.set("kind", kind);
+    const data = await api(`/api/calliope/objects?${params}`);
+    const objects = Array.isArray(data.objects) ? data.objects : [];
+    if (state.composerObjectCache.size >= 100) {
+      state.composerObjectCache.delete(state.composerObjectCache.keys().next().value);
+    }
+    state.composerObjectCache.set(key, objects);
+    return objects;
+  }
+
+  async function lookupComposerObjectHints(candidates, signal) {
+    if (!Array.isArray(candidates) || !candidates.length) return [];
+    const data = await api("/api/calliope/object-hints", {
+      method: "POST",
+      body: JSON.stringify({ candidates }),
+      signal,
+    });
+    return Array.isArray(data.hints) ? data.hints : [];
+  }
+
+  function composerValue() {
+    return state.composerEditor?.getValue?.() ?? els.input.value;
+  }
+
+  function composerPlainValue() {
+    return state.composerEditor?.getPlainText?.()
+      ?? window.CalliopeObjectEditor?.plainText?.(els.input.value)
+      ?? els.input.value;
+  }
+
+  function composerObjectRefs() {
+    return state.composerEditor?.getObjectRefs?.()
+      ?? window.CalliopeObjectEditor?.parseObjectMarkers?.(els.input.value)
+      ?? [];
+  }
+
+  function composerSelection() {
+    if (state.composerEditor?.getSelection) return state.composerEditor.getSelection();
+    const end = Number.isInteger(els.input.selectionEnd)
+      ? els.input.selectionEnd : els.input.value.length;
+    return {
+      from: Number.isInteger(els.input.selectionStart) ? els.input.selectionStart : end,
+      to: end,
+    };
+  }
+
+  function composerSetValue(value = "") {
+    const next = String(value);
+    if (state.composerEditor?.setValue) state.composerEditor.setValue(next);
+    els.input.value = next;
+    resizeComposer();
+  }
+
+  function composerSetDisabled(disabled) {
+    const next = Boolean(disabled);
+    els.input.disabled = next;
+    state.composerEditor?.setDisabled?.(next);
+    els.inputHost?.classList.toggle("is-disabled", next);
+  }
+
+  function composerSetPlaceholder(value) {
+    const next = String(value || "");
+    els.input.placeholder = next;
+    state.composerEditor?.setPlaceholder?.(next);
+  }
+
+  function composerFocus() {
+    if (state.composerEditor?.focus) state.composerEditor.focus();
+    else els.input.focus();
+  }
+
+  function composerInsertText(value, selection = null) {
+    if (state.composerEditor?.insertText) {
+      return state.composerEditor.insertText(value, selection);
+    }
+    const current = els.input.value;
+    const from = Number.isInteger(selection?.from)
+      ? Math.max(0, Math.min(selection.from, current.length))
+      : Number.isInteger(els.input.selectionStart) ? els.input.selectionStart : current.length;
+    const to = Number.isInteger(selection?.to)
+      ? Math.max(from, Math.min(selection.to, current.length))
+      : Number.isInteger(els.input.selectionEnd) ? els.input.selectionEnd : from;
+    const insert = speechInsertion(current, from, to, value);
+    if (!insert || current.length - (to - from) + insert.length > 40_000) return false;
+    els.input.setRangeText(insert, from, to, "end");
+    els.input.dispatchEvent(new Event("input", { bubbles: true }));
+    els.input.focus();
+    return true;
+  }
+
+  function initializeComposerEditor() {
+    if (!els.inputHost || !window.CalliopeObjectEditor?.mount) return;
+    let editor;
+    editor = window.CalliopeObjectEditor.mount(els.inputHost, {
+      variant: "composer",
+      value: els.input.value,
+      placeholder: els.input.placeholder,
+      ariaLabel: "Message Calliope. Type two opening brackets to reference a company object.",
+      maxLength: 40_000,
+      lookup: lookupComposerObjects,
+      hints: lookupComposerObjectHints,
+      onChange: (value) => { els.input.value = value; },
+      onSubmit: () => sendTurn(),
+      onPaste: pasteImages,
+    });
+    state.composerEditor = editor;
+    els.input.hidden = true;
+    els.inputHost.hidden = false;
+    editor.setDisabled(els.input.disabled);
+  }
+
   async function lookupBriefNoteObjects(query, kind = "") {
     const key = `${kind}:${String(query).trim().toLowerCase()}`;
     if (state.brief.noteObjectCache.has(key)) return state.brief.noteObjectCache.get(key);
@@ -6905,7 +7125,8 @@
             ? `<button type="button" data-markup-surface="${escapeHtml(surface.id)}" title="Select or draw on this image">Markup</button>`
             : ""}
           ${surface.kind === "artifact"
-            ? `<button type="button" data-inspect-artifact="${escapeHtml(surface.id)}" aria-pressed="${
+            ? `<button type="button" data-markup-artifact="${escapeHtml(surface.id)}" title="Draw on an exact snapshot of this artifact">Markup</button>
+              <button type="button" data-inspect-artifact="${escapeHtml(surface.id)}" aria-pressed="${
               state.inspectingSurfaceId === surface.id ? "true" : "false"
             }" title="Select an object inside this artifact">${
               state.inspectingSurfaceId === surface.id ? "Picking…" : "Select"
@@ -7013,9 +7234,9 @@
           <button type="button" data-remove-evidence="${escapeHtml(selection.key)}" aria-label="Remove ${escapeHtml(selection.title)}">×</button>
         </div>`).join("")}
       </div>` : "";
-    els.input.placeholder = selections.length
+    composerSetPlaceholder(selections.length
       ? `Ask Calliope about ${selections.length} attached evidence context item${selections.length === 1 ? "" : "s"}…`
-      : "Ask Calliope to explore, compare, or make something…";
+      : "Ask Calliope to explore, compare, or make something…");
     syncEvidenceSelectionCards();
   }
 
@@ -7090,13 +7311,12 @@
       resume: "Help me resume the work represented by the attached Brief observation. Reconstruct the last useful state from governed evidence, identify what remains, and propose the next concrete step.",
       connect: "Help me connect the attached private note to my current work. Treat it as context I wrote, not as an independently verified fact; follow its linked company objects, verify anything material against governed evidence, and suggest the useful next connection or action.",
     };
-    const preservedDraft = Boolean(els.input.value.trim());
+    const preservedDraft = Boolean(composerValue().trim());
     if (!preservedDraft) {
-      els.input.value = (prompts[action] || prompts.investigate).slice(0, 6000);
-      resizeComposer();
+      composerSetValue((prompts[action] || prompts.investigate).slice(0, 6000));
     }
     setMobilePanel("chat");
-    els.input.focus();
+    composerFocus();
     toast(preservedDraft
       ? `“${title}” is attached · your existing draft was preserved`
       : `“${title}” is attached · review the prepared prompt, then send when ready`);
@@ -7258,17 +7478,57 @@
   function matchingCapture(selection) {
     if (selection?.type !== "artifact_element") return null;
     const source = state.surfaces.find((item) => item.id === selection.source_surface_id);
-    if (!source?.artifact_slug) return null;
-    return state.surfaces.find((item) =>
-      item.kind === "image"
-      && item.payload?.image_url
-      && item.artifact_slug === source.artifact_slug
-      && (
-        !source.artifact_version
-        || !item.artifact_version
-        || item.artifact_version === source.artifact_version
-      )
-    ) || null;
+    return captureCompanion(source);
+  }
+
+  async function ensureArtifactCapture(surfaceId) {
+    const artifact = state.surfaces.find(
+      (surface) => surface.id === surfaceId && surface.kind === "artifact",
+    );
+    if (!artifact || !state.current) throw new Error("That artifact is not available for markup");
+    const existing = captureCompanion(artifact);
+    if (existing) return existing;
+    if (state.markupCaptureRequests.has(surfaceId)) {
+      return state.markupCaptureRequests.get(surfaceId);
+    }
+    const pending = (async () => {
+      const data = await api(
+        `/api/calliope/sessions/${state.current.id}/surfaces/${surfaceId}/capture`,
+        { method: "POST", body: "{}" },
+      );
+      const surface = data.surface;
+      if (!surface?.id || !surface.payload?.image_url) {
+        throw new Error("The artifact snapshot is not available for markup");
+      }
+      state.surfaces = [
+        surface,
+        ...state.surfaces.filter((item) => item.id !== surface.id),
+      ];
+      return surface;
+    })();
+    state.markupCaptureRequests.set(surfaceId, pending);
+    try {
+      return await pending;
+    } finally {
+      state.markupCaptureRequests.delete(surfaceId);
+    }
+  }
+
+  async function openArtifactMarkup(surfaceId, pendingSelection = null, button = null) {
+    const prior = button?.textContent;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Preparing…";
+    }
+    try {
+      const capture = await ensureArtifactCapture(surfaceId);
+      openMarkup(capture.id, pendingSelection);
+    } finally {
+      if (button?.isConnected) {
+        button.disabled = false;
+        button.textContent = prior || "Markup";
+      }
+    }
   }
 
   function renderSpatialSelectionTray() {
@@ -7287,7 +7547,7 @@
           <span title="${escapeHtml(detail)}">${escapeHtml(source?.title || "Surface")} · ${escapeHtml(detail)}</span>
         </div>
         <div class="spatial-selection-actions">
-          ${capture ? `<button type="button" data-draw-selection="${escapeHtml(selection.selection_id)}">Draw too</button>` : ""}
+          ${capture || source?.kind === "artifact" ? `<button type="button" data-draw-selection="${escapeHtml(selection.selection_id)}">Draw too</button>` : ""}
           <button type="button" data-remove-spatial-selection="${escapeHtml(selection.selection_id)}" aria-label="Remove target">×</button>
         </div>
       </div>`;
@@ -7659,7 +7919,7 @@
     renderSpatialSelectionTray();
     closeMarkup();
     setMobilePanel("chat");
-    els.input.focus();
+    composerFocus();
     toast(regions.length ? "Spatial target and marked image added to the next message" : "Annotated image added to the next message");
   }
 
@@ -7707,7 +7967,7 @@
 
   function pasteImages(event) {
     const images = pastedImageFiles(event);
-    if (!images.length) return;
+    if (!images.length) return false;
     event.preventDefault();
     readFiles(images)
       .then((added) => {
@@ -7718,6 +7978,7 @@
         }
       })
       .catch((error) => toast(error.message, true));
+    return true;
   }
 
   function renderAttachmentTray() {
@@ -7733,6 +7994,7 @@
   }
 
   function resizeComposer() {
+    if (state.composerEditor) return;
     els.input.style.height = "auto";
     els.input.style.height = `${Math.min(180, els.input.scrollHeight)}px`;
   }
@@ -7762,14 +8024,11 @@
     if (!button) return null;
     if (button.dataset.speechRecord === "chat") {
       if (!state.current) return null;
-      const start = Number.isInteger(els.input.selectionStart)
-        ? els.input.selectionStart : els.input.value.length;
-      const end = Number.isInteger(els.input.selectionEnd)
-        ? els.input.selectionEnd : start;
+      const selection = composerSelection();
       return {
         kind: "chat",
         sessionId: state.current.id,
-        selection: { from: start, to: end },
+        selection,
       };
     }
     if (button.dataset.speechRecord === "daily_note") {
@@ -8143,23 +8402,7 @@
   function insertSpeechTranscript(target, transcript) {
     if (target?.kind === "chat") {
       if (!state.current || state.current.id !== target.sessionId) return false;
-      const requestedStart = Number(target.selection?.from);
-      const requestedEnd = Number(target.selection?.to);
-      const start = Number.isInteger(requestedStart)
-        ? Math.max(0, Math.min(requestedStart, els.input.value.length))
-        : Number.isInteger(els.input.selectionStart)
-          ? els.input.selectionStart : els.input.value.length;
-      const end = Number.isInteger(requestedEnd)
-        ? Math.max(start, Math.min(requestedEnd, els.input.value.length))
-        : Number.isInteger(els.input.selectionEnd) ? els.input.selectionEnd : start;
-      const insert = speechInsertion(els.input.value, start, end, transcript);
-      if (!insert || els.input.value.length - (end - start) + insert.length > 40_000) {
-        return false;
-      }
-      els.input.setRangeText(insert, start, end, "end");
-      els.input.dispatchEvent(new Event("input", { bubbles: true }));
-      els.input.focus();
-      return true;
+      return composerInsertText(transcript, target.selection);
     }
     if (target?.kind === "daily_note") {
       const editor = state.brief.noteEditors.get(target.surfaceId);
@@ -8388,7 +8631,12 @@
     startSpeechRecording(target);
   }
 
-  function optimisticTurn(message, hasSpatialSelection = false, evidenceRefs = []) {
+  function optimisticTurn(
+    message,
+    hasSpatialSelection = false,
+    evidenceRefs = [],
+    objectRefs = [],
+  ) {
     const maxOrdinal = Math.max(0, ...state.turns.map((turn) => Number(turn.ordinal || 0)));
     const turn = {
       id: `pending-${Date.now()}`,
@@ -8401,6 +8649,8 @@
       })),
       status: "running",
       evidence_refs: evidenceRefs,
+      object_refs: objectRefs,
+      response_receipt: {},
       created_at: new Date().toISOString(),
     };
     state.turns.push(turn);
@@ -8444,8 +8694,19 @@
 
   async function sendTurn() {
     if (!state.current || state.busy || state.speech.phase !== "idle") return;
-    const message = els.input.value.trim();
-    if (!message && !state.attachments.length && !state.spatialSelections.length && !state.evidenceSelections.length) return;
+    const rawMessage = composerValue().trim();
+    const message = composerPlainValue().trim();
+    const outgoingObjectRefs = composerObjectRefs().slice(0, 24).map((item) => ({
+      ...item,
+      kind: String(item.kind || ""),
+      ref_id: String(item.ref_id || ""),
+      label: String(item.label || "Object"),
+    }));
+    const outgoingObjectHandles = outgoingObjectRefs.map(({ kind, ref_id }) => ({
+      kind,
+      ref_id,
+    }));
+    if (!rawMessage && !state.attachments.length && !state.spatialSelections.length && !state.evidenceSelections.length) return;
     const outgoingAttachments = [...state.attachments];
     const outgoingSpatialSelections = state.spatialSelections.map((selection) => ({ ...selection }));
     const outgoingEvidenceSelections = state.evidenceSelections.map((selection) => ({ ...selection }));
@@ -8454,8 +8715,13 @@
       evidence_id: selection.evidence_id,
     }));
     const outgoingDesignProfileVersionId = state.nextTurnDesignProfileVersionId;
-    const pending = optimisticTurn(message, Boolean(outgoingSpatialSelections.length), outgoingEvidenceSelections);
-    els.input.value = "";
+    const pending = optimisticTurn(
+      message,
+      Boolean(outgoingSpatialSelections.length),
+      outgoingEvidenceSelections,
+      outgoingObjectRefs,
+    );
+    composerSetValue("");
     state.attachments = [];
     clearSpatialSelections();
     clearEvidenceSelections();
@@ -8465,7 +8731,7 @@
     resizeComposer();
     state.busy = true;
     els.send.disabled = true;
-    els.input.disabled = true;
+    composerSetDisabled(true);
     syncSpeechControls();
     setStatus("working", "working");
     beginLiveActivity();
@@ -8475,7 +8741,8 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message,
+          message: rawMessage,
+          object_refs: outgoingObjectHandles,
           attachments: outgoingAttachments,
           spatial_selections: outgoingSpatialSelections,
           evidence_refs: outgoingEvidenceHandles,
@@ -8491,6 +8758,7 @@
           pending.ordinal = data.ordinal;
           pending.attachments = data.attachments || pending.attachments;
           pending.evidence_refs = data.evidence_refs || pending.evidence_refs;
+          pending.object_refs = data.object_refs || pending.object_refs;
           renderChat();
           completeLiveContext();
           scrollChatToLiveEdge();
@@ -8527,6 +8795,7 @@
         } else if (event === "calliope.turn.completed") {
           pending.status = "complete";
           pending.assistant_message = data.assistant_message || pending.assistant_message;
+          pending.response_receipt = data.response_receipt || pending.response_receipt || {};
           if (data.session_title && state.current) {
             state.current.title = data.session_title;
             state.current.title_source = data.title_source || "generated";
@@ -8544,6 +8813,7 @@
     } catch (error) {
       pending.status = "failed";
       pending.error = error.message;
+      if (rawMessage && !composerValue().trim()) composerSetValue(rawMessage);
       if (outgoingDesignProfileVersionId && !state.nextTurnDesignProfileVersionId) {
         state.nextTurnDesignProfileVersionId = outgoingDesignProfileVersionId;
         renderDesignProfileChip();
@@ -8564,11 +8834,11 @@
       }
     } finally {
       state.busy = false;
-      els.input.disabled = false;
+      composerSetDisabled(false);
       els.send.disabled = false;
       setStatus(state.config?.healthy ? "ready" : "unavailable", state.config?.healthy ? "" : "offline");
       syncSpeechControls();
-      els.input.focus();
+      composerFocus();
     }
   }
 
@@ -8836,7 +9106,7 @@
       renderDesignEditor();
       renderDesignProfileChip();
       els.styleDialog.close();
-      els.input.focus();
+      composerFocus();
       toast(`${selected.profile.name} will guide the next turn`);
     });
     els.styleUseSession.addEventListener("click", () => {
@@ -8845,7 +9115,7 @@
       applyDesignProfileToSession(selected.version.id)
         .then(() => {
           els.styleDialog.close();
-          els.input.focus();
+          composerFocus();
           toast(`${selected.profile.name} is now the session Design Profile`);
         })
         .catch((error) => toast(error.message, true));
@@ -8975,14 +9245,16 @@
     });
     els.speechRecord.addEventListener("click", () => toggleSpeechRecording(els.speechRecord));
     window.addEventListener("pagehide", cancelSpeechRecording);
-    els.input.addEventListener("input", resizeComposer);
-    els.input.addEventListener("paste", pasteImages);
-    els.input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-        event.preventDefault();
-        sendTurn();
-      }
-    });
+    if (!state.composerEditor) {
+      els.input.addEventListener("input", resizeComposer);
+      els.input.addEventListener("paste", pasteImages);
+      els.input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+          event.preventDefault();
+          sendTurn();
+        }
+      });
+    }
     els.imageInput.addEventListener("change", () => {
       readFiles(els.imageInput.files).catch((error) => toast(error.message, true));
       els.imageInput.value = "";
@@ -9016,12 +9288,9 @@
       const selection = state.spatialSelections.find(
         (item) => item.selection_id === draw.dataset.drawSelection,
       );
-      const capture = matchingCapture(selection);
-      if (!capture) {
-        toast("No matching capture is available for markup yet", true);
-        return;
-      }
-      openMarkup(capture.id, selection);
+      if (!selection) return;
+      openArtifactMarkup(selection.source_surface_id, selection, draw)
+        .catch((error) => toast(error.message, true));
     });
     els.markupToolbar.addEventListener("click", (event) => {
       const tool = event.target.closest("[data-markup-tool]");
@@ -9118,6 +9387,23 @@
       clearSurfaceSelection();
     });
     els.messages.addEventListener("click", (event) => {
+      const objectButton = event.target.closest("[data-open-object-turn]");
+      if (objectButton) {
+        const turn = state.turns.find(
+          (item) => String(item.id) === objectButton.dataset.openObjectTurn,
+        );
+        const source = objectButton.dataset.openObjectSource === "receipt"
+          ? turn?.response_receipt?.objects : turn?.object_refs;
+        const object = Array.isArray(source)
+          ? source[Number(objectButton.dataset.openObjectIndex)] : null;
+        if (object?.handle) {
+          state.viewerHandle = object.handle;
+          state.viewerTrailHistory = [];
+          state.viewerTrailData = null;
+          openTrailViewer(object.handle);
+        }
+        return;
+      }
       const evidence = event.target.closest("[data-focus-evidence-surface]");
       if (evidence) {
         setMobilePanel();
@@ -9221,7 +9507,7 @@
         const wholeSetAttached = Boolean(selectedEvidence(surfaceId, EVIDENCE_SET_HANDLE));
         if (!selectedCount && !wholeSetAttached && !attachEvidenceSet(surfaceId)) return;
         setMobilePanel("chat");
-        els.input.focus();
+        composerFocus();
         const surface = state.surfaces.find((item) => item.id === surfaceId);
         const isBrief = surface?.payload?.mode === "personal_brief";
         toast(selectedCount
@@ -9266,6 +9552,15 @@
       const inspect = event.target.closest("[data-inspect-artifact]");
       if (inspect) {
         startArtifactInspection(inspect.dataset.inspectArtifact);
+        return;
+      }
+      const artifactMarkup = event.target.closest("[data-markup-artifact]");
+      if (artifactMarkup) {
+        openArtifactMarkup(
+          artifactMarkup.dataset.markupArtifact,
+          null,
+          artifactMarkup,
+        ).catch((error) => toast(error.message, true));
         return;
       }
       const markup = event.target.closest("[data-markup-surface]");
@@ -9444,6 +9739,7 @@
     scheduleAvatarClock();
     restoreChatWidth();
     restoreSessionRailState();
+    initializeComposerEditor();
     setupEvents();
     try {
       const launch = new URLSearchParams(window.location.search);
@@ -9522,12 +9818,11 @@
         });
       }
       if (launchPrompt && state.current) {
-        els.input.value = launchPrompt.slice(0, 6000);
-        resizeComposer();
+        composerSetValue(launchPrompt.slice(0, 6000));
         const autoRunWorkflow = launchAutorun === "workflow";
         requestAnimationFrame(() => {
           if (autoRunWorkflow) sendTurn();
-          else els.input.focus();
+          else composerFocus();
         });
         launch.delete("prompt");
         launch.delete("autorun");

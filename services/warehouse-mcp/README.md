@@ -336,14 +336,17 @@ Calliope is a three-column business-user surface: the signed-in user's private s
 rail, a newest-first living artifact record, and chat. Hermes owns the agent run and uses
 its current/default profile and shared company memory; the warehouse stores only the
 email-owned UI index, mirrored turn prose, image attachments, and immutable projections
-of MCP results. Queries, KPI timelines, dashboards, apps,
-captures, and downloadable documents appear as stage surfaces linked back to their
-source message. Selecting a surface adds it to chat context; selecting it again clears
+of MCP results. Queries, KPI timelines, dashboards, apps, and downloadable documents
+appear as stage surfaces linked back to their source message. Visual-validation captures
+are retained as exact-version companions to their live artifact rather than duplicated
+as a second Stage card. The artifact's **Markup** action reuses that companion—or renders
+one on demand—so pen, arrow, box, and optional selected-element targets annotate the same
+pinned version. Selecting a surface adds it to chat context; selecting it again clears
 that context. The chat edge is draggable (and keyboard adjustable) within
 viewport-derived bounds. Updating a published artifact creates a new exact-version
 surface linked to the older one. Visual builds get a bounded
 capture-and-review continuation: Calliope receives the real screenshot as vision input
-before finishing. Any image surface can also be opened in the pen/arrow/box markup
+before finishing. Any standalone image surface can also be opened in the pen/arrow/box markup
 editor; the flattened annotation is sent with the next message while its separately
 stored overlay becomes a toggleable, lineage-linked stage surface.
 
@@ -619,7 +622,21 @@ Configure the Hermes default profile's `mcp_servers` entry to use this warehouse
 Hermes profile. Set `forward_session_identity: true` only on this trusted first-party
 Warehouse entry when Google Chat is enabled. Hermes then forwards the adapter-verified
 sender email in per-call MCP metadata so artifacts created from Chat are attributed to
-the human; it is not a tool argument, PG role, or authorization grant. Enable that same profile's API server and pin its advertised model to
+the human and all of that turn's MCP activity is audited to the human. Keep the flag on
+the individual Warehouse MCP entry—not under `platforms.google_chat`, where it is ignored
+so identities cannot accidentally be forwarded to every configured MCP server:
+
+```yaml
+mcp_servers:
+  Datamarket:
+    url: https://warehouse.example.com/mcp
+    headers:
+      Authorization: Bearer ${WAREHOUSE_MCP_KEY}
+    forward_session_identity: true
+```
+
+The forwarded email is not a tool argument, PG role, or authorization grant; the
+authenticated Calliope/static-key principal continues to control access. Enable that same profile's API server and pin its advertised model to
 the real provider-routable model ID:
 
 ```bash

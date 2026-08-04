@@ -38,6 +38,7 @@ import asyncio, hashlib, hmac, json, math, os, re, secrets, shutil, socket, subp
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 from psycopg import sql as pgsql
@@ -2591,11 +2592,18 @@ def _caller():
     """The audited caller, retaining the access token's client identity.
 
     A forwarded human identity is deliberately attribution-only and is honored
-    only behind the legacy/static Hermes connection.  OAuth callers always
-    remain whatever their own signed token says they are.
+    only behind the legacy/static Hermes connection.  Request metadata is read
+    from the SDK's task-local request context so every MCP tool gets the same
+    attribution behavior, including tools that do not inject a FastMCP Context
+    parameter.  OAuth callers always remain whatever their own signed token
+    says they are.
     """
     caller, client_id = _authenticated_caller()
     forwarded = _FORWARDED_CALLER.get()
+    if client_id == "static-key" and not forwarded:
+        forwarded = _forwarded_mcp_caller(
+            None, authenticated=(caller, client_id)
+        )
     if client_id == "static-key" and forwarded:
         return forwarded, client_id
     return caller, client_id
@@ -2608,6 +2616,19 @@ _HERMES_CALLER_META_KEY = "rvbbit.ai/hermes-caller"
 def _mcp_request_metadata(ctx):
     """Return MCP request metadata across supported SDK/Pydantic shapes."""
     request_context = getattr(ctx, "request_context", None) if ctx is not None else None
+    if request_context is None:
+        # FastMCP's injected Context is only needed when a tool wants to use it
+        # directly.  The low-level server keeps the same RequestContext in a
+        # ContextVar for the lifetime of every tool invocation, including sync
+        # handlers dispatched through AnyIO's worker thread.  Reading it here
+        # makes forwarded attribution consistent across the whole MCP surface
+        # without adding a public-looking ``ctx`` argument to every tool.
+        try:
+            from mcp.server.lowlevel.server import request_ctx
+
+            request_context = request_ctx.get(None)
+        except Exception:  # noqa: BLE001 — older optional MCP SDKs
+            request_context = None
     # Current FastMCP lifts request.params._meta onto RequestContext.meta.
     # Retain the raw-request fallback for older SDKs and lightweight harnesses.
     metadata = getattr(request_context, "meta", None)
@@ -2636,13 +2657,13 @@ def _mcp_request_metadata(ctx):
     return dict(extra) if isinstance(extra, dict) else {}
 
 
-def _forwarded_mcp_caller(ctx):
+def _forwarded_mcp_caller(ctx=None, *, authenticated=None):
     """Resolve a verified Hermes/Google Chat email for display attribution.
 
     This does not confer permissions.  The shared key remains the authenticated
     principal and database access still follows that connection's normal rules.
     """
-    _token_caller, client_id = _authenticated_caller()
+    _token_caller, client_id = authenticated or _authenticated_caller()
     if client_id != "static-key":
         return None
     envelope = _mcp_request_metadata(ctx).get(_HERMES_CALLER_META_KEY)
@@ -2681,6 +2702,11 @@ def _objects(tool, args, res):
     ):
         slug = res.get("slug") or args.get("slug")
         return [f"live_app:{slug}"] if slug else None
+    if tool == "artifact_view":
+        slug = res.get("slug") or args.get("slug")
+        return [f"artifact:{slug}"] if slug else None
+    if tool == "dashboard_query" and args.get("dashboard"):
+        return [f"artifact:{args['dashboard']}"]
     if tool == "search_data":
         return [m.get("object") for m in res.get("matches", []) if m.get("object")] or None
     if tool == "describe_table":
@@ -2725,6 +2751,12 @@ def _summary(tool, res):
         return {"count": len(res.get("live_apps", []))}
     if tool == "live_app_logs":
         return {"slug": res.get("slug"), "events": len(res.get("events", []))}
+    if tool == "artifact_view":
+        return {
+            "slug": res.get("slug"),
+            "version": res.get("version"),
+            "app_kind": res.get("app_kind"),
+        }
     if tool == "system_learning_status":
         return {
             "indexed_items": res.get("indexed_items"),
@@ -2801,6 +2833,173 @@ def _logged(tool, args, thunk):
         return res
     finally:
         _record(tool, args, res, err, int((time.time() - t0) * 1000))
+
+
+def _identity_key(value):
+    return str(value or "").strip().casefold()
+
+
+def _artifact_activity_days(value):
+    try:
+        return max(7, min(int(value or 30), 90))
+    except (TypeError, ValueError):
+        return 30
+
+
+def _artifact_activity_timezone(value):
+    name = str(value or "UTC").strip()[:100] or "UTC"
+    try:
+        return name, ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return "UTC", ZoneInfo("UTC")
+
+
+def _artifact_activity_snapshot(slug, viewer, days=30, timezone_name="UTC"):
+    """Shared, authenticated human page-view activity backed by mcp_activity.
+
+    Query execution is intentionally not treated as a page view: one dashboard
+    can issue ten bridge queries while another issues none.  The dedicated
+    ``artifact_view`` activity event is emitted once after a real document has
+    been resolved, so totals remain comparable across dashboards and apps.
+    Gallery authentication is the access boundary: anyone who can see the
+    artifact can inspect its audience, just as they can inspect its lineage.
+    """
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", str(slug or ""), re.I):
+        raise ValueError("artifact slug is invalid")
+    days = _artifact_activity_days(days)
+    timezone_name, local_zone = _artifact_activity_timezone(timezone_name)
+    viewer_key = _identity_key(viewer)
+    if not viewer_key:
+        raise PermissionError("signed-in identity is unavailable")
+
+    with _conn() as conn:
+        artifact = conn.execute(
+            "SELECT slug,name,owner_email,app_kind,latest_version "
+            "FROM rvbbit.dashboards WHERE slug=%s",
+            (slug,),
+        ).fetchone()
+        if not artifact:
+            raise LookupError("artifact not found")
+        owner = str(artifact.get("owner_email") or "").strip()
+
+        summary = conn.execute(
+            "SELECT count(*)::int AS total_views,"
+            "count(DISTINCT lower(caller))::int AS unique_viewers,"
+            "count(*) FILTER (WHERE ts>=now()-(%s::int*interval '1 day'))::int "
+            "AS window_views,min(ts) AS tracked_since,max(ts) AS last_viewed_at "
+            f"FROM {ACTIVITY_TABLE} WHERE tool='artifact_view' AND ok IS TRUE "
+            "AND caller IS NOT NULL AND args->>'slug'=%s",
+            (days, slug),
+        ).fetchone() or {}
+        daily_rows = conn.execute(
+            "SELECT timezone(%s,ts)::date AS day,count(*)::int AS views,"
+            "count(DISTINCT lower(caller))::int AS viewers "
+            f"FROM {ACTIVITY_TABLE} WHERE tool='artifact_view' AND ok IS TRUE "
+            "AND caller IS NOT NULL AND args->>'slug'=%s "
+            "AND ts>=now()-(%s::int*interval '1 day') "
+            "GROUP BY 1 ORDER BY 1",
+            (timezone_name, slug, days),
+        ).fetchall()
+        viewer_rows = conn.execute(
+            "SELECT lower(caller) AS viewer,count(*)::int AS views,"
+            "count(DISTINCT timezone(%s,ts)::date)::int AS active_days,"
+            "min(ts) AS first_viewed_at,max(ts) AS last_viewed_at "
+            f"FROM {ACTIVITY_TABLE} WHERE tool='artifact_view' AND ok IS TRUE "
+            "AND caller IS NOT NULL AND args->>'slug'=%s "
+            "GROUP BY lower(caller) ORDER BY max(ts) DESC,count(*) DESC LIMIT 50",
+            (timezone_name, slug),
+        ).fetchall()
+        version_rows = conn.execute(
+            "SELECT coalesce(nullif(args->>'version',''),'unknown') AS version,"
+            "count(*)::int AS views "
+            f"FROM {ACTIVITY_TABLE} WHERE tool='artifact_view' AND ok IS TRUE "
+            "AND caller IS NOT NULL AND args->>'slug'=%s "
+            "GROUP BY 1 ORDER BY count(*) DESC,1",
+            (slug,),
+        ).fetchall()
+
+    by_day = {str(row["day"]): dict(row) for row in daily_rows}
+    today = datetime.now(local_zone).date()
+    series = []
+    for offset in range(days - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        observed = by_day.get(day.isoformat()) or {}
+        series.append({
+            "day": day.isoformat(),
+            "views": int(observed.get("views") or 0),
+            "viewers": int(observed.get("viewers") or 0),
+        })
+
+    total_views = int(summary.get("total_views") or 0)
+    unique_viewers = int(summary.get("unique_viewers") or 0)
+    return {
+        "artifact": {
+            "slug": str(artifact["slug"]),
+            "name": str(artifact.get("name") or artifact["slug"]),
+            "app_kind": str(artifact.get("app_kind") or "dashboard"),
+            "owner": owner,
+            "latest_version": int(artifact.get("latest_version") or 1),
+        },
+        "window_days": days,
+        "timezone": timezone_name,
+        "summary": {
+            "total_views": total_views,
+            "unique_viewers": unique_viewers,
+            "repeat_views": max(0, total_views - unique_viewers),
+            "window_views": int(summary.get("window_views") or 0),
+            "tracked_since": summary.get("tracked_since"),
+            "last_viewed_at": summary.get("last_viewed_at"),
+        },
+        "series": series,
+        "viewers": [
+            {
+                **dict(row),
+                "is_you": _identity_key(row.get("viewer")) == viewer_key,
+            }
+            for row in viewer_rows
+        ],
+        "versions": [dict(row) for row in version_rows],
+    }
+
+
+def _artifact_view_surface(request):
+    referer = str(request.headers.get("referer") or "")
+    try:
+        from urllib.parse import urlsplit
+        path = urlsplit(referer).path
+    except ValueError:
+        path = ""
+    if path in {"/", "/gallery"}:
+        return "gallery"
+    if path.startswith("/calliope"):
+        return "calliope"
+    return "internal" if path.startswith("/") else "direct"
+
+
+def _record_artifact_view(request, document, viewer, auth_via=None):
+    """Best-effort one-event receipt for an actual artifact document open."""
+    if str(getattr(request, "method", "GET")).upper() != "GET":
+        return
+    purpose = " ".join(str(request.headers.get(name) or "").lower()
+                       for name in ("purpose", "sec-purpose"))
+    if "prefetch" in purpose:
+        return
+    slug = str(document.get("slug") or request.path_params.get("slug") or "")
+    if not slug or not viewer:
+        return
+    args = {
+        "slug": slug,
+        "version": document.get("version"),
+        "app_kind": document.get("app_kind") or "dashboard",
+        "surface": _artifact_view_surface(request),
+        "auth_via": str(auth_via or "session")[:32],
+    }
+    result = {
+        "slug": slug,
+        "version": document.get("version"),
+        "app_kind": document.get("app_kind") or "dashboard",
+    }
+    _record("artifact_view", args, result, None, 0, caller_override=str(viewer))
 
 
 # ── dashboards registry (Phase 0: publish → store → serve live, outside Claude) ──
@@ -9618,7 +9817,7 @@ def _dashboard_version_document(slug, version=None):
         raise ValueError("version must be a positive integer")
     with _conn() as conn:
         dashboard = conn.execute(
-            "SELECT id,slug,latest_version FROM rvbbit.dashboards WHERE slug=%s",
+            "SELECT id,slug,latest_version,app_kind FROM rvbbit.dashboards WHERE slug=%s",
             (slug,),
         ).fetchone()
         if not dashboard:
@@ -9635,6 +9834,7 @@ def _dashboard_version_document(slug, version=None):
         "slug": str(dashboard["slug"]),
         "version": selected,
         "latest_version": int(dashboard["latest_version"]),
+        "app_kind": str(dashboard.get("app_kind") or "dashboard"),
         "html": _dash_shim(slug, selected, version_row.get("manifest"))
         + (version_row.get("html") or ""),
     }
@@ -9771,6 +9971,30 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
 .calliope-float-copy{display:flex;flex-direction:column;align-items:flex-start;gap:5px;padding-top:3px}
 .calliope-float-action{color:var(--calliope-capsule-muted);font:7px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;white-space:nowrap}
 .calliope-float-action b{margin-left:4px;color:color-mix(in oklch,var(--calliope-capsule-ink) 62%,var(--amber));font-size:10px;font-weight:700}
+
+.gallery-presence{
+  position:fixed;z-index:19;top:70px;right:max(20px,4vw);width:min(344px,calc(100vw - 40px));
+  overflow:visible;isolation:isolate;border:0;background:transparent;box-shadow:none;
+  transition:width .24s ease,transform .24s ease,background .24s ease,box-shadow .24s ease}
+.gallery-presence::before{content:"";position:absolute;z-index:-1;inset:-42% -12% auto 24%;height:118px;pointer-events:none;background:radial-gradient(ellipse,color-mix(in oklch,var(--amber) 9%,transparent),transparent 68%);opacity:.8}
+.presence-clock{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:70px;padding:11px 16px 10px 18px;border-radius:21px;background:linear-gradient(135deg,color-mix(in oklch,var(--panel) 38%,transparent),color-mix(in oklch,var(--void) 13%,transparent));-webkit-backdrop-filter:blur(28px) saturate(1.28);backdrop-filter:blur(28px) saturate(1.28);box-shadow:0 17px 45px rgba(0,0,0,.18),0 3px 12px rgba(0,0,0,.10),inset 0 1px 0 color-mix(in oklch,var(--bone) 7%,transparent)}
+.presence-time-row{display:flex;align-items:baseline;min-width:0;color:var(--bone-bright)}
+.presence-time{font:400 35px/.88 var(--serif);font-variant-numeric:tabular-nums lining-nums;letter-spacing:-.025em;text-shadow:0 3px 18px color-mix(in oklch,var(--void) 62%,transparent)}
+.presence-time .colon{display:inline-block;margin:0 .035em;color:color-mix(in oklch,var(--amber) 82%,var(--bone));font-weight:300;animation:clock-breathe 2s ease-in-out infinite}
+.presence-seconds{margin-left:8px;color:var(--fog);font:650 8px/1 var(--mono);font-variant-numeric:tabular-nums;letter-spacing:.08em}
+.presence-period{margin-left:4px;color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase}
+.presence-calendar{min-width:0;text-align:right}
+.presence-date{display:block;overflow:hidden;color:var(--fog);font:italic 400 13px/1.15 var(--serif);text-overflow:ellipsis;white-space:nowrap}
+.presence-zone{display:block;margin-top:6px;color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
+.presence-meeting{position:relative;display:grid;grid-template-columns:7px minmax(0,1fr) auto;align-items:center;gap:10px;min-height:49px;margin-top:6px;padding:9px 15px 10px 18px;border:0;border-radius:16px;background:linear-gradient(100deg,color-mix(in oklch,var(--jade) 6%,transparent),color-mix(in oklch,var(--panel) 27%,transparent) 42%,color-mix(in oklch,var(--void) 9%,transparent));-webkit-backdrop-filter:blur(25px) saturate(1.22);backdrop-filter:blur(25px) saturate(1.22);color:var(--bone);box-shadow:0 12px 34px rgba(0,0,0,.15),inset 0 1px 0 color-mix(in oklch,var(--bone) 5%,transparent);transition:background .18s,box-shadow .18s,transform .18s}
+.presence-meeting[hidden]{display:none}.presence-meeting:hover{transform:translateY(-1px);background:linear-gradient(100deg,color-mix(in oklch,var(--jade) 11%,transparent),color-mix(in oklch,var(--panel) 34%,transparent) 48%,color-mix(in oklch,var(--void) 12%,transparent));box-shadow:0 15px 38px rgba(0,0,0,.18),inset 0 1px 0 color-mix(in oklch,var(--jade) 12%,transparent)}
+.presence-meeting-dot{width:6px;height:6px;border:1px solid var(--jade);border-radius:50%;box-shadow:0 0 0 3px color-mix(in oklch,var(--jade) 7%,transparent)}
+.presence-meeting-copy{min-width:0;display:flex;flex-direction:column;gap:5px}.presence-meeting-copy small{overflow:hidden;color:var(--jade);font:700 6px/1 var(--mono);letter-spacing:.11em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.presence-meeting-copy strong{overflow:hidden;color:var(--bone-bright);font:italic 400 14px/1.12 var(--serif);text-overflow:ellipsis;white-space:nowrap}
+.presence-meeting-time{display:flex;align-items:flex-end;flex-direction:column;gap:5px;color:var(--fog);font:650 8px/1 var(--mono);font-variant-numeric:tabular-nums}.presence-meeting-time small{color:var(--dim);font-size:5px;letter-spacing:.06em;text-transform:uppercase}
+.gallery-presence.soon .presence-meeting-dot{border-color:var(--amber);background:var(--amber);box-shadow:0 0 11px color-mix(in oklch,var(--amber) 60%,transparent)}.gallery-presence.soon .presence-meeting-copy small{color:var(--amber)}
+.gallery-presence.live .presence-meeting-dot{border-color:var(--jade);background:var(--jade);animation:meeting-pulse 1.7s ease-in-out infinite}.gallery-presence.live .presence-meeting-copy small{color:var(--jade)}
+.gallery-presence.compact{width:183px;background:transparent;box-shadow:none}.gallery-presence.compact .presence-calendar,.gallery-presence.compact .presence-meeting{display:none}.gallery-presence.compact .presence-clock{min-height:52px;padding-block:9px;background:linear-gradient(135deg,color-mix(in oklch,var(--panel) 34%,transparent),color-mix(in oklch,var(--void) 10%,transparent));box-shadow:0 12px 34px rgba(0,0,0,.15),inset 0 1px 0 color-mix(in oklch,var(--bone) 6%,transparent)}.gallery-presence.compact .presence-time{font-size:28px}.gallery-presence.compact .presence-seconds{font-size:7px}
+@keyframes clock-breathe{0%,100%{opacity:.45}50%{opacity:1}}@keyframes meeting-pulse{50%{box-shadow:0 0 0 5px color-mix(in oklch,var(--jade) 8%,transparent),0 0 12px color-mix(in oklch,var(--jade) 55%,transparent)}}
 
 main{position:relative;z-index:1;padding:0 max(20px,4vw) 90px}
 header.hero{padding:66px 0 30px;border-bottom:1px solid var(--line)}
@@ -9955,13 +10179,16 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .card:hover{background:var(--panel-2)}
 .card-link{display:flex;flex:1;flex-direction:column;min-height:100%}
 .card-actions{position:absolute;top:10px;right:10px;z-index:5;display:flex;align-items:center;gap:5px}
-.card-pin,.card-ask{display:flex;align-items:center;gap:6px;min-height:27px;padding:6px 8px;
+.card-pin,.card-ask,.card-activity{display:flex;align-items:center;gap:6px;min-height:27px;padding:6px 8px;
   border:1px solid color-mix(in oklch,var(--bone) 18%,transparent);border-radius:999px;background:color-mix(in oklch,var(--void) 76%,transparent);
   -webkit-backdrop-filter:blur(13px);backdrop-filter:blur(13px);color:var(--fog);font:650 6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;
   box-shadow:0 5px 16px rgba(0,0,0,.28);cursor:pointer;transition:border-color .18s,background .18s,color .18s,transform .18s}
 .card-pin:hover,.card-pin:focus-visible{outline:0;transform:translateY(-1px);border-color:var(--amber);background:color-mix(in oklch,var(--void) 86%,var(--amber) 4%);color:var(--amber)}
 .card-ask{border-color:color-mix(in oklch,var(--jade) 36%,var(--line));color:var(--jade)}
 .card-ask:hover,.card-ask:focus-visible{outline:0;transform:translateY(-1px);border-color:var(--jade);background:color-mix(in oklch,var(--jade) 12%,var(--void));color:color-mix(in oklch,var(--jade) 82%,#fff)}
+.card-activity{border-color:color-mix(in oklch,var(--bone) 22%,var(--line));color:var(--fog)}
+.card-activity:hover,.card-activity:focus-visible{outline:0;transform:translateY(-1px);border-color:color-mix(in oklch,var(--amber) 68%,var(--jade));background:color-mix(in oklch,var(--amber) 7%,var(--void));color:var(--bone-bright)}
+.card-activity b{color:var(--amber);font-size:8px;font-weight:500}
 .card-ask:disabled{cursor:wait;opacity:.72}.card-ask.loading span{font-size:0}.card-ask.loading span::after{content:"…";font-size:6px}
 .card-pin[aria-pressed=true]{border-color:color-mix(in oklch,var(--jade) 62%,transparent);background:color-mix(in oklch,var(--jade) 15%,var(--void));color:var(--jade)}
 .card-pin:disabled{cursor:wait;opacity:.62}
@@ -9999,6 +10226,19 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   color:var(--dim);font:9px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
 .foot b{color:var(--fog);font-weight:400}
 
+.artifact-activity-dialog{width:min(820px,calc(100vw - 32px));max-width:none;margin:auto;padding:0;border:1px solid color-mix(in oklch,var(--amber) 45%,var(--line));background:color-mix(in oklch,var(--panel) 96%,transparent);color:var(--bone);box-shadow:0 34px 120px color-mix(in oklch,var(--void) 88%,transparent);color-scheme:dark}
+.artifact-activity-dialog::backdrop{background:color-mix(in oklch,var(--void) 72%,transparent);backdrop-filter:blur(8px)}
+.activity-shell{display:flex;max-height:calc(100dvh - 32px);flex-direction:column}.activity-head{display:flex;align-items:center;gap:13px;min-height:72px;padding:12px 13px 12px 18px;border-bottom:1px solid var(--line);background:color-mix(in oklch,var(--gallery-rail-bg) 94%,transparent);backdrop-filter:blur(20px)}
+.activity-head-mark{width:36px;height:36px;display:grid;place-items:center;flex:none;border:1px solid color-mix(in oklch,var(--amber) 45%,var(--line));border-radius:50%;color:var(--amber);font:15px/1 var(--mono)}
+.activity-heading{min-width:0;display:flex;flex:1;flex-direction:column;gap:4px}.activity-heading>span{color:var(--amber);font:700 6px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}.activity-heading strong{overflow:hidden;color:var(--bone-bright);font:italic 400 21px/1.08 var(--serif);text-overflow:ellipsis;white-space:nowrap}.activity-heading small{color:var(--dim);font:7px/1.3 var(--mono);letter-spacing:.07em;text-transform:uppercase}
+.activity-range{display:flex;align-items:center;border:1px solid var(--line)}.activity-range button{min-height:29px;padding:0 9px;border:0;border-right:1px solid var(--line);background:transparent;color:var(--dim);font:700 6px/1 var(--mono);letter-spacing:.08em;cursor:pointer}.activity-range button:last-child{border-right:0}.activity-range button:hover{color:var(--bone)}.activity-range button[aria-pressed=true]{background:var(--amber);color:#1a1206}
+.activity-close{width:36px;height:36px;display:grid;place-items:center;flex:none;border:1px solid var(--line);background:transparent;color:var(--fog);font-size:18px;cursor:pointer}.activity-close:hover{border-color:var(--amber);color:var(--amber)}
+.activity-content{overflow:auto;min-height:330px;padding:18px}.activity-loading{min-height:300px;display:grid;place-items:center;color:var(--dim);font:8px/1.5 var(--mono);letter-spacing:.09em;text-transform:uppercase}.activity-loading i{width:22px;height:22px;margin-bottom:-100px;border:1px solid var(--line-hot);border-right-color:transparent;border-radius:50%;animation:semantic-spin .8s linear infinite}
+.activity-stats{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);background:color-mix(in oklch,var(--void) 38%,transparent)}.activity-stat{min-width:0;padding:13px 14px;border-right:1px solid var(--line)}.activity-stat:last-child{border-right:0}.activity-stat span{display:block;color:var(--dim);font:700 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}.activity-stat strong{display:block;overflow:hidden;margin-top:8px;color:var(--bone-bright);font:600 25px/1 var(--sans);font-variant-numeric:tabular-nums;letter-spacing:-.04em;text-overflow:ellipsis;white-space:nowrap}.activity-stat small{display:block;margin-top:6px;color:var(--fog);font:7px/1.25 var(--mono)}
+.activity-chart-panel,.activity-viewers-panel{margin-top:12px;padding:14px;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 30%,transparent)}.activity-panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.activity-panel-head h3{color:var(--bone-bright);font:italic 400 17px/1 var(--serif)}.activity-panel-head span{color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase}
+.activity-chart{height:126px;display:flex;align-items:flex-end;gap:3px;margin-top:15px;padding-top:8px;border-bottom:1px solid var(--line);background-image:linear-gradient(to bottom,var(--line) 1px,transparent 1px);background-size:100% 33.333%}.activity-bar{position:relative;min-width:2px;flex:1;height:max(2px,var(--bar-height));background:linear-gradient(to top,color-mix(in oklch,var(--jade) 30%,transparent),var(--jade));box-shadow:0 -3px 11px color-mix(in oklch,var(--jade) 12%,transparent);transition:filter .15s,opacity .15s}.activity-bar:hover{filter:brightness(1.32)}.activity-bar.zero{opacity:.14}.activity-chart-axis{display:flex;justify-content:space-between;margin-top:7px;color:var(--dim);font:6px/1 var(--mono);letter-spacing:.05em;text-transform:uppercase}
+.activity-viewer-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:11px}.activity-viewer{display:grid;grid-template-columns:29px minmax(0,1fr) auto;align-items:center;gap:9px;padding:8px;border:1px solid var(--line);background:color-mix(in oklch,var(--panel-raised) 64%,transparent)}.activity-viewer-avatar{width:29px;height:29px;display:grid;place-items:center;border:1px solid color-mix(in oklch,var(--jade) 35%,var(--line));border-radius:50%;color:var(--jade);font:700 7px/1 var(--mono)}.activity-viewer-copy{min-width:0}.activity-viewer-copy strong{display:block;overflow:hidden;color:var(--bone-bright);font:9px/1.2 var(--mono);text-overflow:ellipsis;white-space:nowrap}.activity-viewer-copy small{display:block;margin-top:4px;color:var(--dim);font:6px/1.2 var(--mono)}.activity-viewer-count{color:var(--fog);font:700 7px/1 var(--mono);text-align:right}.activity-viewer-count b{display:block;color:var(--amber);font-size:12px}.activity-empty{min-height:250px;display:grid;place-items:center;padding:35px;text-align:center}.activity-empty div{max-width:430px}.activity-empty b{display:block;color:var(--bone-bright);font:italic 400 24px/1.1 var(--serif)}.activity-empty p{margin-top:10px;color:var(--fog);font-size:11px;line-height:1.6}.activity-error{min-height:260px;display:grid;place-items:center;color:#f2a28f;font:9px/1.5 var(--mono);text-align:center}
+
 .empty{padding:80px 0;text-align:center;color:var(--fog);font:12px/1.7 var(--mono);letter-spacing:.06em}
 .empty code{color:var(--amber)}
 #none{display:none;padding:60px 0;text-align:center;color:var(--dim);
@@ -10013,6 +10253,8 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .semantic-launch-cta{grid-column:2;justify-content:flex-start;text-align:left}
   .home-head{align-items:flex-start;flex-direction:column;gap:8px}
   .home-status{text-align:left}
+  .gallery-presence{top:64px;right:12px;width:205px}.gallery-presence .presence-calendar,.gallery-presence .presence-meeting{display:none}.gallery-presence .presence-clock{min-height:54px;padding-block:9px}.gallery-presence .presence-time{font-size:26px}
+  .activity-stats{grid-template-columns:repeat(2,1fr)}.activity-stat:nth-child(2){border-right:0}.activity-stat:nth-child(-n+2){border-bottom:1px solid var(--line)}.activity-viewer-list{grid-template-columns:1fr}
 }
 @media (max-width:520px){
   nav{padding-inline:14px}
@@ -10029,7 +10271,9 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .trail-content{padding:12px}
   .trail-loom>header{align-items:flex-start;flex-direction:column}.trail-loom>header b{text-align:left}
   .trail-loom-track{align-items:stretch;flex-direction:column}.trail-loom-step{width:100%;min-height:92px;flex-basis:auto}.trail-loom-link{width:auto;min-width:0;min-height:34px;flex-direction:row}.trail-loom-link i{transform:rotate(90deg)}
+  .artifact-activity-dialog{width:100vw;height:100dvh;margin:0;border:0}.activity-head{gap:8px;padding-left:11px}.activity-head-mark,.activity-heading small{display:none}.activity-range button{padding-inline:7px}.activity-content{padding:10px}
 }
+@media (min-width:900px){header.hero{padding-right:min(390px,32vw)}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
@@ -10109,6 +10353,94 @@ _LANDING_JS = """
    calliopeTimer=setTimeout(scheduleCalliopeAvatar,60050-(Date.now()%60000));
  }
  if(calliopeFrame)scheduleCalliopeAvatar();
+
+ var galleryPresence=document.getElementById('gallery-presence'),
+     presenceHours=document.getElementById('presence-hours'),
+     presenceMinutes=document.getElementById('presence-minutes'),
+     presenceSeconds=document.getElementById('presence-seconds'),
+     presencePeriod=document.getElementById('presence-period'),
+     presenceDate=document.getElementById('presence-date'),
+     presenceZone=document.getElementById('presence-zone'),
+     presenceMeeting=document.getElementById('presence-meeting'),
+     presenceMeetingLabel=document.getElementById('presence-meeting-label'),
+     presenceMeetingTitle=document.getElementById('presence-meeting-title'),
+     presenceMeetingTime=document.getElementById('presence-meeting-time'),
+     presenceEvents=[],presenceClockTimer=null,presenceCalendarTimer=null;
+ function presencePart(parts,type,fallback){var match=parts.find(function(part){return part.type===type;});return match?match.value:fallback;}
+ function presenceTimeText(value){
+   try{return new Intl.DateTimeFormat(undefined,{hour:'numeric',minute:'2-digit'}).format(value);}catch(ignore){return value.toLocaleTimeString();}
+ }
+ function presenceMeetingMarkup(now){
+   if(!galleryPresence||!presenceMeeting)return;
+   var activeEvents=presenceEvents.filter(function(item){var end=item.ends_at?new Date(item.ends_at).getTime():new Date(item.starts_at).getTime()+3600000;return Number.isFinite(end)&&end>now.getTime();}),event=activeEvents[0];
+   if(!event){presenceMeeting.hidden=true;galleryPresence.classList.remove('soon','live');return;}
+   var start=new Date(event.starts_at),end=event.ends_at?new Date(event.ends_at):new Date(start.getTime()+3600000),delta=start.getTime()-now.getTime(),live=delta<=0&&end.getTime()>now.getTime(),minutes=Math.max(0,Math.round(delta/60000)),label='Coming up';
+   if(live)label='Happening now';
+   else if(minutes<1)label='Starting now';
+   else if(minutes<60)label='Next · in '+minutes+' min';
+   else if(minutes<1440){var hours=Math.floor(minutes/60),rest=minutes%60;label='Next · in '+hours+' hr'+(rest?' '+rest+' min':'');}
+   else label=start.toDateString()===new Date(now.getFullYear(),now.getMonth(),now.getDate()+1).toDateString()?'Tomorrow':'Coming up';
+   galleryPresence.classList.toggle('live',live);galleryPresence.classList.toggle('soon',!live&&minutes<=15);
+   presenceMeetingLabel.textContent=label;presenceMeetingTitle.textContent=event.title||'Busy';
+   presenceMeetingTime.textContent=presenceTimeText(start);
+   if(activeEvents.length>1){var later=document.createElement('small');later.textContent='+'+(activeEvents.length-1)+' later';presenceMeetingTime.appendChild(later);}
+   var url=event.meeting_url||event.calendar_url||'';
+   try{var parsed=new URL(url,window.location.origin);if(parsed.protocol!=='https:')throw new Error('unsafe');presenceMeeting.href=parsed.href;presenceMeeting.removeAttribute('aria-disabled');}
+   catch(ignore){presenceMeeting.removeAttribute('href');presenceMeeting.setAttribute('aria-disabled','true');}
+   presenceMeeting.title=(live?'Open current meeting':'Open upcoming meeting')+' · '+(event.title||'Busy');presenceMeeting.hidden=false;
+ }
+ function updatePresenceClock(){
+   if(!galleryPresence)return;
+   var now=new Date(),parts=[];
+   try{parts=new Intl.DateTimeFormat(undefined,{hour:'2-digit',minute:'2-digit',second:'2-digit'}).formatToParts(now);}catch(ignore){}
+   presenceHours.textContent=presencePart(parts,'hour',String(now.getHours()).padStart(2,'0'));
+   presenceMinutes.textContent=presencePart(parts,'minute',String(now.getMinutes()).padStart(2,'0'));
+   presenceSeconds.textContent=presencePart(parts,'second',String(now.getSeconds()).padStart(2,'0'));
+   presencePeriod.textContent=presencePart(parts,'dayPeriod','');
+   try{presenceDate.textContent=new Intl.DateTimeFormat(undefined,{weekday:'long',month:'short',day:'numeric'}).format(now);var zoneParts=new Intl.DateTimeFormat(undefined,{timeZoneName:'short'}).formatToParts(now);presenceZone.textContent=presencePart(zoneParts,'timeZoneName',Intl.DateTimeFormat().resolvedOptions().timeZone||'Local time');}catch(ignore){}
+   presenceMeetingMarkup(now);
+   clearTimeout(presenceClockTimer);presenceClockTimer=setTimeout(updatePresenceClock,1005-(Date.now()%1000));
+ }
+ function compactPresence(){if(!galleryPresence)return;galleryPresence.classList.toggle('compact',window.scrollY>180&&!galleryPresence.classList.contains('soon')&&!galleryPresence.classList.contains('live'));}
+ async function loadPresenceMeetings(){
+   if(!galleryPresence)return;
+   try{var response=await fetch('/api/gallery/meetings',{headers:{accept:'application/json'}}),data={};try{data=await response.json();}catch(ignore){}if(!response.ok)throw new Error('Calendar unavailable');presenceEvents=Array.isArray(data.events)?data.events:[];presenceMeetingMarkup(new Date());compactPresence();}
+   catch(ignore){presenceEvents=[];presenceMeeting.hidden=true;galleryPresence.classList.remove('soon','live');}
+ }
+ if(galleryPresence){updatePresenceClock();loadPresenceMeetings();window.addEventListener('scroll',compactPresence,{passive:true});compactPresence();presenceCalendarTimer=setInterval(loadPresenceMeetings,120000);document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'){updatePresenceClock();loadPresenceMeetings();}});}
+
+ var activityDialog=document.getElementById('artifact-activity-dialog'),
+     activityTitle=document.getElementById('activity-title'),
+     activityMeta=document.getElementById('activity-meta'),
+     activityContent=document.getElementById('activity-content'),
+     activityRange=document.getElementById('activity-range'),
+     activityClose=document.getElementById('activity-close'),
+     activitySlug='',activityDays=30,activityRequest=0;
+ function escapeActivity(value){return String(value===null||value===undefined?'':value).replace(/[&<>"']/g,function(char){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char];});}
+ function activityNumber(value){try{return new Intl.NumberFormat(undefined,{notation:Number(value)>=10000?'compact':'standard',maximumFractionDigits:1}).format(Number(value)||0);}catch(ignore){return String(Number(value)||0);}}
+ function activityRelative(value){var stamp=new Date(value),seconds=Math.round((Date.now()-stamp.getTime())/1000);if(!Number.isFinite(seconds))return 'never';if(seconds<60)return 'just now';if(seconds<3600)return Math.floor(seconds/60)+'m ago';if(seconds<86400)return Math.floor(seconds/3600)+'h ago';if(seconds<604800)return Math.floor(seconds/86400)+'d ago';try{return new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric',year:stamp.getFullYear()===new Date().getFullYear()?undefined:'numeric'}).format(stamp);}catch(ignore){return stamp.toLocaleDateString();}}
+ function activityDay(value){var stamp=new Date(value+'T12:00:00');try{return new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric'}).format(stamp);}catch(ignore){return value;}}
+ function activityInitials(value){var local=String(value||'').split('@')[0].replace(/[^a-z0-9]+/ig,' ').trim().split(/\\s+/).filter(Boolean);return (local.length>1?local[0][0]+local[1][0]:(local[0]||'?').slice(0,2)).toUpperCase();}
+ function activityLoading(){if(activityContent)activityContent.innerHTML='<div class="activity-loading"><i></i><span>Reading authenticated views…</span></div>';}
+ function renderActivity(data){
+   var summary=data.summary||{},series=Array.isArray(data.series)?data.series:[],viewers=Array.isArray(data.viewers)?data.viewers:[],artifact=data.artifact||{};
+   activityTitle.textContent=artifact.name||activitySlug;activityMeta.textContent=(artifact.app_kind||'artifact')+' · shared authenticated audience · tracking since '+(summary.tracked_since?activityRelative(summary.tracked_since):'this release');
+   if(!Number(summary.total_views||0)){activityContent.innerHTML='<div class="activity-empty"><div><b>The room is quiet—for now.</b><p>Authenticated view tracking is live. The first real dashboard or app open will appear here; thumbnails, prefetches, and background queries are not counted.</p></div></div>';return;}
+   var max=Math.max.apply(null,series.map(function(item){return Number(item.views)||0;}).concat([1])),bars=series.map(function(item){var views=Number(item.views)||0,height=views?Math.max(4,(views/max)*100):2;return '<i class="activity-bar '+(views?'':'zero')+'" style="--bar-height:'+height.toFixed(2)+'%" title="'+escapeActivity(activityDay(item.day)+' · '+views+' view'+(views===1?'':'s')+' · '+(Number(item.viewers)||0)+' '+((Number(item.viewers)||0)===1?'person':'people'))+'"></i>';}).join(''),axis=series.length?'<div class="activity-chart-axis"><span>'+escapeActivity(activityDay(series[0].day))+'</span><span>'+escapeActivity(activityDay(series[Math.floor((series.length-1)/2)].day))+'</span><span>'+escapeActivity(activityDay(series[series.length-1].day))+'</span></div>':'';
+   var people=viewers.map(function(item){return '<article class="activity-viewer"><span class="activity-viewer-avatar" aria-hidden="true">'+escapeActivity(activityInitials(item.viewer))+'</span><span class="activity-viewer-copy"><strong>'+escapeActivity(item.viewer)+(item.is_you?' · you':'')+'</strong><small>Last opened '+escapeActivity(activityRelative(item.last_viewed_at))+' · '+escapeActivity(item.active_days||1)+' active day'+(Number(item.active_days)===1?'':'s')+'</small></span><span class="activity-viewer-count"><b>'+escapeActivity(activityNumber(item.views))+'</b>view'+(Number(item.views)===1?'':'s')+'</span></article>';}).join('');
+   activityContent.innerHTML='<section class="activity-stats"><div class="activity-stat"><span>All views</span><strong>'+escapeActivity(activityNumber(summary.total_views))+'</strong><small>real document opens</small></div><div class="activity-stat"><span>People</span><strong>'+escapeActivity(activityNumber(summary.unique_viewers))+'</strong><small>authenticated viewers</small></div><div class="activity-stat"><span>'+escapeActivity(data.window_days)+' day views</span><strong>'+escapeActivity(activityNumber(summary.window_views))+'</strong><small>selected window</small></div><div class="activity-stat"><span>Last opened</span><strong>'+escapeActivity(activityRelative(summary.last_viewed_at))+'</strong><small>'+escapeActivity(activityNumber(summary.repeat_views))+' return view'+(Number(summary.repeat_views)===1?'':'s')+'</small></div></section><section class="activity-chart-panel"><header class="activity-panel-head"><h3>Viewing rhythm</h3><span>Hover a day for people + views</span></header><div class="activity-chart">'+bars+'</div>'+axis+'</section><section class="activity-viewers-panel"><header class="activity-panel-head"><h3>Who came through</h3><span>'+escapeActivity(viewers.length)+' authenticated '+(viewers.length===1?'person':'people')+'</span></header><div class="activity-viewer-list">'+people+'</div></section>';
+ }
+ async function loadActivity(){
+   if(!activitySlug||!activityContent)return;var request=++activityRequest;activityLoading();
+   [].forEach.call(activityRange.querySelectorAll('[data-activity-days]'),function(button){button.setAttribute('aria-pressed',String(Number(button.dataset.activityDays)===activityDays));});
+   var zone='UTC';try{zone=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';}catch(ignore){}
+   try{var response=await fetch('/api/gallery/artifacts/'+encodeURIComponent(activitySlug)+'/activity?days='+activityDays+'&timezone='+encodeURIComponent(zone),{headers:{accept:'application/json'}}),data={};try{data=await response.json();}catch(ignore){}if(request!==activityRequest)return;if(!response.ok)throw new Error(data.error&&data.error.message||'Activity is unavailable');renderActivity(data);}
+   catch(error){if(request!==activityRequest)return;activityContent.innerHTML='<div class="activity-error">'+escapeActivity(error&&error.message||'Activity is unavailable')+'</div>';}
+ }
+ function openActivity(slug){if(!activityDialog)return;activitySlug=slug;activityDays=30;activityTitle.textContent='Artifact activity';activityMeta.textContent='Human document opens · shared Gallery insight';if(!activityDialog.open)activityDialog.showModal();loadActivity();}
+ document.addEventListener('click',function(event){var button=event.target.closest&&event.target.closest('[data-gallery-activity]');if(button){event.preventDefault();event.stopPropagation();openActivity(button.dataset.galleryActivity);}});
+ if(activityRange)activityRange.addEventListener('click',function(event){var button=event.target.closest&&event.target.closest('[data-activity-days]');if(!button)return;activityDays=Number(button.dataset.activityDays)||30;loadActivity();});
+ if(activityClose)activityClose.addEventListener('click',function(){activityDialog.close();});if(activityDialog)activityDialog.addEventListener('cancel',function(event){event.preventDefault();activityDialog.close();});
 
  var galleryInbox=document.getElementById('gallery-work-inbox'),
      galleryInboxCount=document.getElementById('gallery-work-inbox-count'),
@@ -11276,8 +11608,24 @@ def _landing_html(rows, viewer):
                 deps.append(f"<span><b>{r[key]}</b> {label}</span>")
         if r.get("latest_version"):
             deps.append(f"<span>v<b>{r['latest_version']}</b></span>")
-        owner = r.get("owner_email") or r.get("team") or ""
+        artifact_owner = str(r.get("owner_email") or "").strip()
+        owner = artifact_owner or r.get("team") or ""
         haystack = " ".join(str(x) for x in (name, desc, slug, app_kind, owner) if x).lower()
+        activity_action = (
+            f'<button class="card-activity" type="button" data-gallery-activity="{e(slug)}" '
+            f'title="View authenticated activity for this artifact">'
+            f'<b aria-hidden="true">▥</b><span>Views</span></button>'
+        )
+        calliope_actions = (
+            f'<button class="card-ask" type="button" data-gallery-ask="{e(slug)}" '
+            f'title="Ask Calliope about this exact published version">'
+            f'<b aria-hidden="true">✦</b><span>Ask</span></button>'
+            f'<button class="card-pin" type="button" data-home-pin="{e(slug)}" '
+            f'aria-pressed="false" title="Pin this artifact to your private Home">'
+            f'<b aria-hidden="true">＋</b><span>Pin</span></button>'
+            if calliope_enabled else ""
+        )
+        card_actions = activity_action + calliope_actions
         cards.append(
             # New tab: the index is a place you come back to, not a page you
             # navigate away from. The pin is a sibling of the link so both
@@ -11294,13 +11642,7 @@ def _landing_html(rows, viewer):
             + (f'<p class="desc">{e(desc)}</p>' if desc else "")
             + (f'<div class="foot">{"".join(deps)}</div>' if deps else "")
             + '</div></a>'
-            + (f'<div class="card-actions">'
-               f'<button class="card-ask" type="button" data-gallery-ask="{e(slug)}" '
-               f'title="Ask Calliope about this exact published version">'
-               f'<b aria-hidden="true">✦</b><span>Ask</span></button>'
-               f'<button class="card-pin" type="button" data-home-pin="{e(slug)}" '
-               f'aria-pressed="false" title="Pin this artifact to your private Home">'
-               f'<b aria-hidden="true">＋</b><span>Pin</span></button></div>' if calliope_enabled else "")
+            + (f'<div class="card-actions">{card_actions}</div>' if card_actions else "")
             + '</article>')
 
     # The rung up the ladder. Only offered when there IS an app (LENS_PUBLIC_URL)
@@ -11433,6 +11775,21 @@ def _landing_html(rows, viewer):
         '<button id="metric-lens-close" class="metric-lens-close" type="button" aria-label="Close">×</button>'
         '</header><div id="metric-lens-content" class="metric-lens-content"></div></div></dialog>'
     )
+    _activity_dialog = (
+        '<dialog id="artifact-activity-dialog" class="artifact-activity-dialog" '
+        'aria-labelledby="activity-title">'
+        '<div class="activity-shell"><header class="activity-head">'
+        '<span class="activity-head-mark" aria-hidden="true">▥</span>'
+        '<div class="activity-heading"><span>Authenticated audience</span>'
+        '<strong id="activity-title">Artifact activity</strong>'
+        '<small id="activity-meta">Human document opens · shared Gallery insight</small></div>'
+        '<div id="activity-range" class="activity-range" role="group" aria-label="Activity range">'
+        '<button type="button" data-activity-days="7" aria-pressed="false">7D</button>'
+        '<button type="button" data-activity-days="30" aria-pressed="true">30D</button>'
+        '<button type="button" data-activity-days="90" aria-pressed="false">90D</button></div>'
+        '<button id="activity-close" class="activity-close" type="button" aria-label="Close">×</button>'
+        '</header><div id="activity-content" class="activity-content"></div></div></dialog>'
+    )
 
     total = len(rows)
     tally = " · ".join([f"{total} artifact{'' if total == 1 else 's'}"]
@@ -11496,6 +11853,19 @@ def _landing_html(rows, viewer):
 <nav data-warehouse-header>{_RABBIT_SVG}
  <span class="wordmark">DATA RABBIT<small>an operational answer engine</small></span>
  <span class="who"><span data-warehouse-theme-anchor></span>{_brief_link}{_inbox_link}{_app_link}{f'<span class="viewer">{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
+<aside id="gallery-presence" class="gallery-presence" aria-label="Local time and upcoming meetings">
+ <div class="presence-clock">
+  <div class="presence-time-row" aria-label="Local time">
+   <time class="presence-time"><span id="presence-hours">--</span><span class="colon">:</span><span id="presence-minutes">--</span></time>
+   <span id="presence-seconds" class="presence-seconds">--</span><span id="presence-period" class="presence-period"></span>
+  </div>
+  <div class="presence-calendar"><time id="presence-date" class="presence-date">Today</time><span id="presence-zone" class="presence-zone">Local time</span></div>
+ </div>
+ <a id="presence-meeting" class="presence-meeting" href="#" target="_blank" rel="noopener" hidden>
+  <i class="presence-meeting-dot" aria-hidden="true"></i><span class="presence-meeting-copy"><small id="presence-meeting-label">Coming up</small><strong id="presence-meeting-title">Next meeting</strong></span>
+  <time id="presence-meeting-time" class="presence-meeting-time"></time>
+ </a>
+</aside>
 <main>
  <header class="hero">
   <div id="gallery-kicker" class="kicker">Published artifacts</div>
@@ -11508,6 +11878,7 @@ def _landing_html(rows, viewer):
 {_trail_dialog}
 {_metric_promote_dialog}
 {_metric_dialog}
+{_activity_dialog}
 <script>{_LANDING_JS}</script><script>{_GALLERY_METRICS_JS}</script></body></html>"""
 
 
@@ -11518,6 +11889,14 @@ def register_dashboard_routes(m):
 
     def _json(obj, status=200):   # default=str handles Decimal / datetime in query rows
         return Response(json.dumps(obj, default=str), media_type="application/json", status_code=status)
+
+    def _private_json(obj, status=200):
+        return Response(
+            json.dumps(obj, default=str),
+            media_type="application/json",
+            status_code=status,
+            headers={"cache-control": "no-store"},
+        )
 
     async def _proxy_runner(request, subpath=""):
         email = auth.read_session(request)
@@ -11546,6 +11925,35 @@ def register_dashboard_routes(m):
             if k.lower() in {"content-type", "cache-control", "etag", "last-modified"}
         }
         return Response(proxied.content, status_code=proxied.status_code, headers=out_headers)
+
+    def _document_navigation(request):
+        destination = str(request.headers.get("sec-fetch-dest") or "").lower()
+        return destination in {"document", "iframe"}
+
+    def _record_running_app_view(request):
+        session = auth.read_session_full(request)
+        if not session:
+            return
+        try:
+            app, version_row = _load_live_app_version(request.path_params["slug"])
+            if not app:
+                return
+            document = {
+                "slug": app["slug"],
+                "version": (version_row or {}).get("version") or app.get("latest_version"),
+                "app_kind": app.get("app_kind") or "app",
+            }
+            _record_artifact_view(
+                request,
+                document,
+                session.get("identity") or session.get("sub"),
+                session.get("via"),
+            )
+        except Exception as exc:  # noqa: BLE001 - analytics never breaks an app
+            print(
+                f"artifact view receipt ({request.path_params.get('slug')}): {exc}",
+                file=sys.stderr,
+            )
 
     @m.custom_route("/", methods=["GET"])
     async def _landing(request):
@@ -11638,8 +12046,9 @@ def register_dashboard_routes(m):
         return Response(fp.read_bytes(), media_type="application/pdf",
                         headers={"content-disposition": f'inline; filename="{nm}.pdf"'})
 
-    async def _render_artifact_document(request, version=None):
-        if not auth.read_session(request):
+    async def _render_artifact_document(request, version=None, record_view=True):
+        session = auth.read_session_full(request)
+        if not session:
             return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
         slug = request.path_params["slug"]
         try:
@@ -11648,6 +12057,13 @@ def register_dashboard_routes(m):
             return HTMLResponse(f"<h1>400 — {str(exc)}</h1>", status_code=400)
         if not document:
             return HTMLResponse("<h1>404 — no such artifact version</h1>", status_code=404)
+        if record_view:
+            _record_artifact_view(
+                request,
+                document,
+                session.get("identity") or session.get("sub"),
+                session.get("via"),
+            )
         return HTMLResponse(document["html"], headers={"cache-control": "no-store"})
 
     @m.custom_route("/d/{slug}/versions/{version}", methods=["GET"])
@@ -11735,6 +12151,70 @@ def register_dashboard_routes(m):
         if not owner:
             return None, session, _json({"error": {"code": "UNAUTHORIZED"}}, 401)
         return owner, session, None
+
+    @m.custom_route("/api/gallery/meetings", methods=["GET"])
+    async def _gallery_meetings(request):
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            import calliope
+            if not calliope.is_enabled() or not getattr(auth, "google_enabled", lambda: False)():
+                return _private_json({
+                    "available": False,
+                    "connected": False,
+                    "events": [],
+                })
+            snapshot = await calliope.google_calendar_upcoming_snapshot(
+                _conn, owner, horizon_hours=48, limit=4
+            )
+            return _private_json(snapshot)
+        except Exception as exc:  # noqa: BLE001 - a clock never depends on Calendar
+            print(f"gallery calendar ({owner}): {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _private_json({
+                "available": True,
+                "connected": True,
+                "stale": True,
+                "events": [],
+            })
+
+    @m.custom_route("/api/gallery/artifacts/{slug}/activity", methods=["GET"])
+    async def _gallery_artifact_activity(request):
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            snapshot = _artifact_activity_snapshot(
+                request.path_params["slug"],
+                owner,
+                request.query_params.get("days") or 30,
+                request.query_params.get("timezone") or "UTC",
+            )
+            return _private_json(snapshot)
+        except LookupError as exc:
+            return _private_json({
+                "error": {"code": "NOT_FOUND", "message": str(exc)}
+            }, 404)
+        except PermissionError as exc:
+            return _private_json({
+                "error": {"code": "FORBIDDEN", "message": str(exc)}
+            }, 403)
+        except ValueError as exc:
+            return _private_json({
+                "error": {"code": "BAD_ACTIVITY_QUERY", "message": str(exc)}
+            }, 400)
+        except Exception as exc:  # noqa: BLE001 - Gallery remains browsable
+            print(
+                f"artifact activity ({request.path_params['slug']}): "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return _private_json({
+                "error": {
+                    "code": "ACTIVITY_UNAVAILABLE",
+                    "message": "View activity could not be loaded right now.",
+                }
+            }, 503)
 
     @m.custom_route("/api/gallery/metrics", methods=["GET"])
     async def _gallery_metrics(request):
@@ -12359,12 +12839,23 @@ def register_dashboard_routes(m):
     @m.custom_route("/apps/{slug}", methods=["GET"])
     async def _view_app(request):
         proxied = await _proxy_runner(request)
-        return proxied if proxied is not None else await _view(request)
+        if proxied is not None:
+            if 200 <= proxied.status_code < 300:
+                _record_running_app_view(request)
+            return proxied
+        return await _view(request)
 
     @m.custom_route("/apps/{slug}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def _proxy_app_path(request):
         proxied = await _proxy_runner(request, request.path_params.get("path") or "")
-        return proxied if proxied is not None else await _view(request)
+        if proxied is not None:
+            if 200 <= proxied.status_code < 300 and _document_navigation(request):
+                _record_running_app_view(request)
+            return proxied
+        return await _render_artifact_document(
+            request,
+            record_view=_document_navigation(request),
+        )
 
     @m.custom_route("/api/apps/{slug}/q", methods=["POST"])
     async def _data_app(request):
@@ -12802,6 +13293,78 @@ def _calliope_cube_pivot(
         result,
         result.get("error") if isinstance(result, dict) else None,
         int((time.time() - t0) * 1000),
+        caller_override=owner,
+    )
+    return result
+
+
+def _calliope_artifact_capture(slug, version, execution_subject, owner):
+    """Render one exact HTML artifact version for owner-private Calliope markup."""
+    args = {
+        "slug": str(slug or ""),
+        "version": version,
+        "width": 1200,
+        "height": 800,
+        "full_page": False,
+        "wait_ms": 900,
+        "origin": "calliope_markup",
+    }
+    started = time.time()
+    token = _SESSION_SUB.set(execution_subject)
+    try:
+        app, row = _load_live_app_version(args["slug"], version)
+        if not app or not row:
+            result = {
+                "error": {
+                    "code": "VERSION_NOT_FOUND",
+                    "message": "That artifact version is no longer available.",
+                }
+            }
+        elif _normalize_runtime_kind(app.get("runtime_kind")) != "html":
+            result = {
+                "error": {
+                    "code": "CAPTURE_UNAVAILABLE",
+                    "message": "Interactive runtime snapshots are not available for markup yet.",
+                }
+            }
+        else:
+            resolved_version = int(row["version"])
+            out = _default_capture_path(args["slug"], resolved_version)
+            telemetry = _capture_html_with_playwright(
+                row.get("html") or "",
+                out,
+                args["width"],
+                args["height"],
+                args["full_page"],
+                args["wait_ms"],
+            )
+            result = {
+                "slug": args["slug"],
+                "version": resolved_version,
+                "runtime_kind": "html",
+                "path": str(out),
+                "bytes": out.stat().st_size if out.is_file() else None,
+                "width": args["width"],
+                "height": args["height"],
+                "full_page": args["full_page"],
+                "source": "stored-html",
+                "bridge": telemetry,
+            }
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "error": {
+                "code": "CAPTURE_FAILED",
+                "message": f"{type(exc).__name__}: {exc}"[:600],
+            }
+        }
+    finally:
+        _SESSION_SUB.reset(token)
+    _record(
+        "capture_live_app",
+        args,
+        result,
+        result.get("error") if isinstance(result, dict) else None,
+        int((time.time() - started) * 1000),
         caller_override=owner,
     )
     return result
@@ -14466,6 +15029,7 @@ def _build_mcp_oauth(public: str):
         evidence_search=_calliope_evidence_search,
         evidence_open=_calliope_evidence_open,
         metric_detail=_metric_detail_snapshot,
+        artifact_capture=_calliope_artifact_capture,
     ):
         print("Calliope enabled (Hermes-backed living artifact notebook)", file=sys.stderr)
         _start_calliope_watch_worker()

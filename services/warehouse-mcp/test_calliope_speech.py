@@ -449,7 +449,8 @@ def test_speech_ui_is_review_first_and_available_in_chat_and_daily_notes():
     assert "conversation.item.input_audio_transcription.completed" in script
     assert 'type: "input_audio_buffer.commit"' in script
     assert 'fetch("/api/calliope/transcriptions"' in script
-    assert 'els.input.setRangeText(insert, start, end, "end")' in script
+    assert "composerInsertText(transcript, target.selection)" in script
+    assert 'els.input.setRangeText(insert, from, to, "end")' in script
     assert "Transcript inserted · review it before sending" in script
     assert "getSelection" in editor
     assert "insertText(value" in editor

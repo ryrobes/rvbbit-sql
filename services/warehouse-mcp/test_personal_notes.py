@@ -242,7 +242,8 @@ def test_notes_ship_with_codemirror_lookup_ui_and_authenticated_routes():
     assert editor_bundle.stat().st_size > 100_000
     assert "@codemirror/autocomplete" in editor_source
     assert "objectCompletionSource" in editor_source
-    assert "[[${kind}:${object.node_id}|${label}]]" in editor_source
+    assert "[[${kind}:${refId}|${label}]]" in editor_source
+    assert "window.CalliopeObjectEditor" in editor_source
     assert "function renderBriefNotes" in script
     assert "function appendBriefNote" in script
     assert "private graph edge" in script

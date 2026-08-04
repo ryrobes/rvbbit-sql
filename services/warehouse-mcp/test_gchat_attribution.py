@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
+from mcp.shared.memory import create_connected_server_and_client_session
 
 
 _HERE = Path(__file__).resolve().parent
@@ -100,3 +101,52 @@ def test_real_mcp_meta_shape_is_read_and_context_stays_out_of_tool_schemas(monke
         "create_live_app", "update_live_app",
     ):
         assert "ctx" not in schemas[name]
+
+
+def test_request_metadata_attributes_an_ordinary_tool_without_injected_context(monkeypatch):
+    """The request envelope applies to every MCP tool, not only publishers."""
+    observed = {}
+    monkeypatch.setattr(
+        server, "_authenticated_caller",
+        lambda: ("calliope@example.com", "static-key"),
+    )
+    monkeypatch.setattr(
+        server, "tool_search_data",
+        lambda *_args, **_kwargs: {"matches": []},
+    )
+    monkeypatch.setattr(
+        server, "_record",
+        lambda tool, *_args, **_kwargs: observed.update(
+            tool=tool, caller=server._caller()
+        ),
+    )
+
+    async def exercise():
+        mcp = FastMCP("all-tool-attribution")
+        server._register(mcp)
+        metadata = {
+            server._HERMES_CALLER_META_KEY: {
+                "source": "hermes",
+                "platform": "google_chat",
+                "user_id": "Person@Example.com",
+            }
+        }
+        async with create_connected_server_and_client_session(mcp._mcp_server) as client:
+            params = mcp_types.CallToolRequestParams(
+                name="search_data",
+                arguments={"query": "revenue"},
+                **{"_meta": metadata},
+            )
+            request = mcp_types.ClientRequest(
+                mcp_types.CallToolRequest(method="tools/call", params=params)
+            )
+            result = await client.send_request(request, mcp_types.CallToolResult)
+            assert result.isError is False
+
+    asyncio.run(exercise())
+
+    assert observed == {
+        "tool": "search_data",
+        "caller": ("person@example.com", "static-key"),
+    }
+    assert server._FORWARDED_CALLER.get() is None

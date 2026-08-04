@@ -977,6 +977,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0239_calliope_brain_work_inventory",
         include_str!("../sql/migrations/0239_calliope_brain_work_inventory.sql"),
     ),
+    (
+        "0240_calliope_object_refs_and_response_receipts",
+        include_str!("../sql/migrations/0240_calliope_object_refs_and_response_receipts.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\
