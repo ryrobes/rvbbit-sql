@@ -7996,6 +7996,81 @@ def _mcp_execute_calliope_action(session_id: str, run_id: str):
     return _logged("execute_calliope_action", args, execute)
 
 
+def _mcp_export_to_google_sheets(
+    session_id: str,
+    sql: str,
+    title: str,
+    as_of: str | None = None,
+    limit: int = 1000,
+    sheet_name: str = "Data",
+):
+    """Run a governed read-only query and export its result to the user's Google Sheets.
+
+    Use the exact `session_id` from Calliope's internal work-routing context;
+    it resolves the owning human and their private Google Workspace grant, so
+    this tool intentionally accepts no email, access token, or recipient. SQL
+    passes through the same validation, read-only transaction, row cap, and
+    database-role boundary as `run_sql`. The result is a durable export receipt
+    plus a Google Sheets URL. If Workspace is not connected, direct the user to
+    the native `Sheet` action on any query result; it performs the incremental
+    least-privilege grant without putting credentials in chat.
+    """
+    args = {
+        "session_id": session_id,
+        "sql": sql,
+        "title": title,
+        "as_of": as_of,
+        "limit": limit,
+        "sheet_name": sheet_name,
+    }
+
+    def export():
+        import calliope
+        import auth
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        owner = calliope._owner_for_calliope_session(_conn, session_id)
+        execution_subject = owner
+        if getattr(auth, "AUTH_MODE", "shared") == "pg" and "@" in owner:
+            execution_subject = auth.resolve_identity(owner, "google") or auth.GUEST_ROLE
+        token = _SESSION_SUB.set(execution_subject)
+        try:
+            query = tool_run_sql(sql, as_of, limit)
+        finally:
+            _SESSION_SUB.reset(token)
+        if query.get("error"):
+            error = query["error"]
+            raise ValueError(str(error.get("message") or error.get("code") or "Query failed"))
+        receipt = asyncio.run(calliope.export_google_sheet(
+            _conn,
+            owner,
+            title,
+            query.get("columns"),
+            query.get("rows"),
+            session_id=session_id,
+            sheet_name=sheet_name,
+            source={
+                "origin": "calliope_mcp",
+                "query_hash": hashlib.sha256(str(sql).encode("utf-8")).hexdigest(),
+                "as_of": query.get("as_of_applied"),
+                "engine": query.get("engine"),
+            },
+        ))
+        return {
+            "sheet": receipt,
+            "query": {
+                "row_count": query.get("row_count"),
+                "column_count": len(query.get("columns") or []),
+                "truncated": bool(query.get("truncated")),
+                "engine": query.get("engine"),
+                "as_of_applied": query.get("as_of_applied"),
+            },
+        }
+
+    return _logged("export_to_google_sheets", args, export)
+
+
 # Warehouse currently ships a FastMCP release that inspects raw annotations
 # while discovering Context parameters.  This module postpones annotations, so
 # expose concrete runtime types for directly registered typed tools (matching
@@ -8014,6 +8089,14 @@ _mcp_plan_calliope_action.__annotations__ = {
 _mcp_execute_calliope_action.__annotations__ = {
     "session_id": str,
     "run_id": str,
+}
+_mcp_export_to_google_sheets.__annotations__ = {
+    "session_id": str,
+    "sql": str,
+    "title": str,
+    "as_of": str | None,
+    "limit": int,
+    "sheet_name": str,
 }
 
 
@@ -14418,6 +14501,7 @@ def _register(mcp):
     mcp.tool(name="search_calliope_actions")(_mcp_search_calliope_actions)
     mcp.tool(name="plan_calliope_action")(_mcp_plan_calliope_action)
     mcp.tool(name="execute_calliope_action")(_mcp_execute_calliope_action)
+    mcp.tool(name="export_to_google_sheets")(_mcp_export_to_google_sheets)
     mcp.tool(name="begin_calliope_workflow_run")(_mcp_begin_calliope_workflow_run)
     mcp.tool(name="get_calliope_personal_context")(_mcp_get_calliope_personal_context)
     mcp.tool(name="finish_calliope_workflow_run")(_mcp_finish_calliope_workflow_run)
@@ -16343,14 +16427,17 @@ def _build_mcp_oauth(public: str):
     _start_artifact_catalog_worker()
     import calliope
     calendar_grant = None
+    workspace_grant = None
     if auth.google_enabled() and calliope.CalliopeConfig.from_env().enabled:
         calendar_grant = calliope.google_calendar_grant_handler(_conn)
-    if calendar_grant:
+        workspace_grant = calliope.google_workspace_grant_handler(_conn)
+    if calendar_grant or workspace_grant:
         auth.register_login_route(
             m,
             provider,
             _RABBIT_SVG,
             google_calendar_grant=calendar_grant,
+            google_workspace_grant=workspace_grant,
         )
     else:
         auth.register_login_route(m, provider, _RABBIT_SVG)

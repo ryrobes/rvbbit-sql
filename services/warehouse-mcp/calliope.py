@@ -164,6 +164,7 @@ _KNOWN_TOOLS = {
     "begin_calliope_workflow_run",
     "get_calliope_personal_context",
     "finish_calliope_workflow_run",
+    "export_to_google_sheets",
 }
 _ARTIFACT_TOOLS = {
     "publish_dashboard",
@@ -345,6 +346,12 @@ _GOOGLE_CALENDAR_PAST_DAYS = 7
 _GOOGLE_CALENDAR_FUTURE_DAYS = 90
 _GOOGLE_CALENDAR_MAX_PAGES = 20
 _GOOGLE_CALENDAR_MAX_EVENTS = 20_000
+_GOOGLE_WORKSPACE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+_GOOGLE_SHEETS_CREATE_URL = "https://sheets.googleapis.com/v4/spreadsheets"
+_GOOGLE_WORKSPACE_MAX_ROWS = 10_000
+_GOOGLE_WORKSPACE_MAX_COLUMNS = 256
+_GOOGLE_WORKSPACE_MAX_CELL_CHARS = 50_000
+_GOOGLE_WORKSPACE_MAX_CELLS = 250_000
 _BRIEF_NOTE_MARKER_RE = re.compile(
     r"\[\[(person|place|thing|project|ticket):(\d{1,20})\|([^\]\r\n]{1,240})\]\]",
     re.I,
@@ -1923,6 +1930,53 @@ SELECT r.owner_email,r.calendar_id,r.event_id,r.subject_kind,r.subject_key,
   ) resolved ON true;
 """
 
+_GOOGLE_WORKSPACE_DDL = """
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_google_workspace_connections (
+    owner_email text PRIMARY KEY,
+    google_email text NOT NULL,
+    refresh_token_ciphertext text NOT NULL,
+    scopes text[] NOT NULL DEFAULT '{}'::text[],
+    status text NOT NULL DEFAULT 'connected',
+    connected_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    last_used_at timestamptz,
+    last_error text,
+    CONSTRAINT calliope_google_workspace_connections_status_check
+        CHECK (status IN ('connected','needs_reconnect','error'))
+);
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_google_exports (
+    id uuid PRIMARY KEY,
+    owner_email text NOT NULL
+        REFERENCES rvbbit.calliope_google_workspace_connections(owner_email)
+        ON DELETE CASCADE,
+    session_id uuid REFERENCES rvbbit.calliope_sessions(id) ON DELETE SET NULL,
+    surface_id uuid REFERENCES rvbbit.calliope_surfaces(id) ON DELETE SET NULL,
+    provider text NOT NULL DEFAULT 'google_sheets',
+    provider_file_id text,
+    title text NOT NULL,
+    url text,
+    sheet_name text NOT NULL DEFAULT 'Data',
+    row_count integer NOT NULL DEFAULT 0,
+    column_count integer NOT NULL DEFAULT 0,
+    status text NOT NULL DEFAULT 'pending',
+    source jsonb NOT NULL DEFAULT '{}'::jsonb,
+    error text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    completed_at timestamptz,
+    CONSTRAINT calliope_google_exports_provider_check
+        CHECK (provider IN ('google_sheets')),
+    CONSTRAINT calliope_google_exports_status_check
+        CHECK (status IN ('pending','complete','failed')),
+    CONSTRAINT calliope_google_exports_source_check
+        CHECK (jsonb_typeof(source) = 'object')
+);
+CREATE INDEX IF NOT EXISTS calliope_google_exports_owner_created_idx
+    ON rvbbit.calliope_google_exports (owner_email,created_at DESC);
+CREATE INDEX IF NOT EXISTS calliope_google_exports_surface_idx
+    ON rvbbit.calliope_google_exports (surface_id,created_at DESC)
+    WHERE surface_id IS NOT NULL;
+"""
+
 _INSTRUMENT_DDL = """
 CREATE TABLE IF NOT EXISTS rvbbit.calliope_instruments (
     id uuid PRIMARY KEY,
@@ -2553,6 +2607,7 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
         conn.execute(_BRIEF_DDL)
         conn.execute(_BRAIN_WORK_DDL)
         conn.execute(_GOOGLE_CALENDAR_DDL)
+        conn.execute(_GOOGLE_WORKSPACE_DDL)
         conn.execute(_INSTRUMENT_DDL)
         conn.execute(_COST_CALLER_DDL)
         conn.execute(_WORKFLOW_DDL)
@@ -3270,6 +3325,50 @@ def _library_personal_inventory(conn: Any, owner: str) -> list[dict[str, Any]]:
                 "last_full_sync_at": connection.get("last_full_sync_at"),
             },
             intents=["inspect", "sync", "change"],
+        ))
+
+    workspace = conn.execute(
+        "SELECT owner_email,google_email,status,connected_at,updated_at,last_used_at,last_error,"
+        "(SELECT count(*)::int FROM rvbbit.calliope_google_exports e "
+        " WHERE lower(e.owner_email)=lower(w.owner_email) AND e.status='complete') AS exports "
+        "FROM rvbbit.calliope_google_workspace_connections w "
+        "WHERE lower(owner_email)=lower(%s)",
+        (owner,),
+    ).fetchone()
+    if workspace:
+        status = str(workspace.get("status") or "connected")
+        if status in {"error", "needs_reconnect"} or workspace.get("last_error"):
+            state, health = "attention", "Google Workspace needs attention before Calliope can export files."
+        elif workspace.get("last_used_at"):
+            state, health = "healthy", "Google Sheets exports are connected with file-scoped access."
+        else:
+            state, health = "ready", "Google Workspace is connected and ready for its first Sheets export."
+        items.append(_library_inventory_item(
+            ref="workspace:google:sheets",
+            kind="personal_source",
+            section="tools",
+            label="Google Sheets",
+            summary="Export governed query results to user-owned spreadsheets without broad Drive access.",
+            state=state,
+            health=health,
+            facts=[
+                _library_inventory_fact("Account", workspace.get("google_email")),
+                _library_inventory_fact("Exports", int(workspace.get("exports") or 0)),
+                _library_inventory_fact("Last used", workspace.get("last_used_at")),
+                _library_inventory_fact("Access", "Files Calliope creates"),
+            ],
+            owner=owner,
+            visibility="private",
+            updated_at=workspace.get("updated_at"),
+            last_activity_at=workspace.get("last_used_at") or workspace.get("connected_at"),
+            detail={
+                "provider": "google_workspace",
+                "google_email": workspace.get("google_email"),
+                "status": status,
+                "export_count": int(workspace.get("exports") or 0),
+                "scope": "drive.file",
+            },
+            intents=["inspect", "export", "change"],
         ))
 
     alias_row = conn.execute(
@@ -8864,6 +8963,526 @@ def google_calendar_grant_handler(conn_factory: Callable[..., Any]):
             # Consent is durable even when Google's event API is momentarily
             # unavailable.  The UI reports the sync error and can retry.
             pass
+
+    return handle
+
+
+def _google_workspace_cipher():
+    """Return the stable, purpose-separated cipher for Workspace refresh tokens."""
+    import auth
+    from cryptography.fernet import Fernet
+
+    seed = (
+        os.environ.get("WAREHOUSE_GOOGLE_TOKEN_KEY", "").strip()
+        or str(auth.JWT_SECRET or "")
+    )
+    if not seed:
+        raise RuntimeError(
+            "WAREHOUSE_GOOGLE_TOKEN_KEY or WAREHOUSE_JWT_SECRET is required"
+        )
+    digest = hashlib.sha256(
+        f"rvbbit:calliope:google-workspace:v1:{seed}".encode("utf-8")
+    ).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def _encrypt_google_workspace_token(value: str) -> str:
+    token = str(value or "").strip()
+    if not token:
+        raise ValueError("Google did not return an offline refresh token")
+    return _google_workspace_cipher().encrypt(token.encode("utf-8")).decode("ascii")
+
+
+def _decrypt_google_workspace_token(value: str) -> str:
+    encrypted = str(value or "").strip()
+    if not encrypted:
+        raise ValueError("The Workspace connection has no refresh token")
+    try:
+        return _google_workspace_cipher().decrypt(
+            encrypted.encode("ascii")
+        ).decode("utf-8")
+    except Exception as exc:  # noqa: BLE001 - do not expose cipher details
+        raise ValueError("The Workspace connection must be reconnected") from exc
+
+
+def _google_workspace_connection(
+    conn_factory: Callable[..., Any], owner: str
+) -> dict[str, Any] | None:
+    with conn_factory() as conn:
+        row = conn.execute(
+            "SELECT * FROM rvbbit.calliope_google_workspace_connections "
+            "WHERE lower(owner_email)=lower(%s)",
+            (owner,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _google_workspace_status(
+    conn_factory: Callable[..., Any], owner: str
+) -> dict[str, Any]:
+    connection = _google_workspace_connection(conn_factory, owner)
+    if not connection:
+        return {
+            "available": True,
+            "connected": False,
+            "status": "disconnected",
+            "export_count": 0,
+            "last_exported_at": None,
+        }
+    with conn_factory() as conn:
+        exports = conn.execute(
+            "SELECT count(*) FILTER (WHERE status='complete')::int AS export_count,"
+            "max(completed_at) FILTER (WHERE status='complete') AS last_exported_at "
+            "FROM rvbbit.calliope_google_exports "
+            "WHERE lower(owner_email)=lower(%s)",
+            (owner,),
+        ).fetchone() or {}
+    status = str(connection.get("status") or "connected")
+    return {
+        "available": True,
+        # A transient API error must remain retryable without another consent
+        # round-trip. Only invalid/expired authorization breaks the grant.
+        "connected": status != "needs_reconnect",
+        "needs_reconnect": status == "needs_reconnect",
+        "status": status,
+        "google_email": str(connection.get("google_email") or owner),
+        "scopes": list(connection.get("scopes") or []),
+        "export_count": int(exports.get("export_count") or 0),
+        "last_exported_at": _now_iso(exports.get("last_exported_at"))
+        if exports.get("last_exported_at") else None,
+        "last_used_at": _now_iso(connection.get("last_used_at"))
+        if connection.get("last_used_at") else None,
+        "last_error": str(connection.get("last_error") or "")[:600] or None,
+    }
+
+
+def _save_google_workspace_grant(
+    conn_factory: Callable[..., Any], owner: str, token_payload: dict[str, Any]
+) -> None:
+    scopes = _google_calendar_scopes(token_payload.get("scope"))
+    if _GOOGLE_WORKSPACE_SCOPE not in scopes:
+        raise ValueError("Google Workspace file access was not granted")
+    owner = str(owner or "").strip().lower()
+    if not owner:
+        raise ValueError("The Workspace grant has no authenticated owner")
+    with conn_factory() as conn:
+        existing = conn.execute(
+            "SELECT refresh_token_ciphertext FROM "
+            "rvbbit.calliope_google_workspace_connections "
+            "WHERE lower(owner_email)=lower(%s)",
+            (owner,),
+        ).fetchone()
+        refresh_token = str(token_payload.get("refresh_token") or "").strip()
+        encrypted = (
+            _encrypt_google_workspace_token(refresh_token)
+            if refresh_token
+            else str((existing or {}).get("refresh_token_ciphertext") or "")
+        )
+        if not encrypted:
+            raise ValueError("Google did not return an offline refresh token")
+        conn.execute(
+            "INSERT INTO rvbbit.calliope_google_workspace_connections "
+            "(owner_email,google_email,refresh_token_ciphertext,scopes,status,"
+            "connected_at,updated_at,last_error) "
+            "VALUES (%s,%s,%s,%s,'connected',now(),now(),NULL) "
+            "ON CONFLICT (owner_email) DO UPDATE SET "
+            "google_email=excluded.google_email,"
+            "refresh_token_ciphertext=excluded.refresh_token_ciphertext,"
+            "scopes=excluded.scopes,status='connected',updated_at=now(),last_error=NULL",
+            (owner, owner, encrypted, scopes),
+        )
+
+
+def _google_workspace_mark_error(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    error: Exception | str,
+    *,
+    needs_reconnect: bool = False,
+) -> None:
+    message = re.sub(
+        r"\s+", " ", str(error or "Google Workspace request failed")
+    ).strip()[:600]
+    with conn_factory() as conn:
+        conn.execute(
+            "UPDATE rvbbit.calliope_google_workspace_connections "
+            "SET status=%s,last_error=%s,updated_at=now() "
+            "WHERE lower(owner_email)=lower(%s)",
+            ("needs_reconnect" if needs_reconnect else "error", message, owner),
+        )
+
+
+async def _google_workspace_access_token(
+    conn_factory: Callable[..., Any], owner: str
+) -> str:
+    import auth
+
+    connection = _google_workspace_connection(conn_factory, owner)
+    if not connection:
+        raise LookupError("Google Workspace is not connected")
+    try:
+        refresh_token = _decrypt_google_workspace_token(
+            connection.get("refresh_token_ciphertext")
+        )
+    except Exception as exc:
+        _google_workspace_mark_error(
+            conn_factory, owner, exc, needs_reconnect=True
+        )
+        raise PermissionError(str(exc)) from exc
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                auth._GOOGLE_TOKEN_URI,
+                data={
+                    "client_id": auth.GOOGLE_CLIENT_ID,
+                    "client_secret": auth.GOOGLE_CLIENT_SECRET,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                },
+            )
+        if response.status_code >= 400:
+            try:
+                detail = response.json() or {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                detail = {}
+            if str(detail.get("error") or "") == "invalid_grant":
+                raise PermissionError("Google Workspace authorization expired")
+            response.raise_for_status()
+        token = str((response.json() or {}).get("access_token") or "").strip()
+        if not token:
+            raise RuntimeError("Google returned no Workspace access token")
+        return token
+    except PermissionError as exc:
+        _google_workspace_mark_error(
+            conn_factory, owner, exc, needs_reconnect=True
+        )
+        raise
+
+
+def _google_workspace_http_error(response: httpx.Response) -> RuntimeError:
+    try:
+        payload = response.json() or {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    error = payload.get("error") if isinstance(payload, dict) else {}
+    error = error if isinstance(error, dict) else {}
+    message = re.sub(r"\s+", " ", str(error.get("message") or "")).strip()[:500]
+    reasons = {
+        str(item.get("reason") or "")
+        for item in error.get("errors") or []
+        if isinstance(item, dict)
+    }
+    for detail in error.get("details") or []:
+        if isinstance(detail, dict):
+            reasons.add(str(detail.get("reason") or ""))
+    if "SERVICE_DISABLED" in reasons or "accessNotConfigured" in reasons:
+        return RuntimeError(
+            "The Google Sheets API is disabled for this Google Cloud project. "
+            "Enable it, wait a few minutes, then retry the export."
+        )
+    return RuntimeError(message or f"Google Sheets returned HTTP {response.status_code}")
+
+
+def _google_sheet_title(value: Any, fallback: str, limit: int = 100) -> str:
+    title = re.sub(r"[\[\]:*?/\\]+", " ", str(value or ""))
+    title = re.sub(r"\s+", " ", title).strip().strip("'")
+    return (title or fallback)[:limit]
+
+
+def _google_sheet_cell(value: Any) -> str | int | float | bool:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, (datetime,)):
+        return value.isoformat()
+    if isinstance(value, (dict, list, tuple, set)):
+        text = json.dumps(value, default=str, ensure_ascii=False, sort_keys=True)
+    else:
+        text = str(value)
+    return text.replace("\x00", "")[:_GOOGLE_WORKSPACE_MAX_CELL_CHARS]
+
+
+def _google_sheet_values(
+    columns: Any, rows: Any
+) -> tuple[list[str], list[list[str | int | float | bool]]]:
+    raw_columns = columns if isinstance(columns, list) else []
+    names = []
+    for index, column in enumerate(raw_columns[:_GOOGLE_WORKSPACE_MAX_COLUMNS]):
+        name = column.get("name") if isinstance(column, dict) else column
+        names.append(str(name or f"column_{index + 1}")[:300])
+    if not names:
+        raise ValueError("The query result has no columns to export")
+    max_rows = min(
+        _GOOGLE_WORKSPACE_MAX_ROWS,
+        max(1, (_GOOGLE_WORKSPACE_MAX_CELLS // len(names)) - 1),
+    )
+    values: list[list[str | int | float | bool]] = []
+    for row in (rows if isinstance(rows, list) else [])[:max_rows]:
+        if isinstance(row, dict):
+            values.append([_google_sheet_cell(row.get(name)) for name in names])
+        elif isinstance(row, (list, tuple)):
+            values.append([
+                _google_sheet_cell(row[index] if index < len(row) else "")
+                for index in range(len(names))
+            ])
+        else:
+            values.append([_google_sheet_cell(row)] + [""] * (len(names) - 1))
+    return names, values
+
+
+def _google_export_public(row: Any) -> dict[str, Any]:
+    item = _row_json(row)
+    for key in ("id", "session_id", "surface_id"):
+        if item.get(key) is not None:
+            item[key] = str(item[key])
+    allowed = {
+        key: item.get(key)
+        for key in (
+            "id", "session_id", "surface_id", "provider", "provider_file_id",
+            "title", "url", "sheet_name", "row_count", "column_count", "status",
+            "error", "created_at", "completed_at",
+        )
+        if item.get(key) is not None
+    }
+    return json.loads(json.dumps(allowed, default=str))
+
+
+async def export_google_sheet(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    title: Any,
+    columns: Any,
+    rows: Any,
+    *,
+    session_id: Any = None,
+    surface_id: Any = None,
+    sheet_name: Any = "Data",
+    source: Any = None,
+) -> dict[str, Any]:
+    """Create one user-owned Sheet from a bounded, already-governed rowset."""
+    owner = str(owner or "").strip().lower()
+    if not owner:
+        raise ValueError("The Sheets export has no authenticated owner")
+    connection = _google_workspace_connection(conn_factory, owner)
+    if not connection:
+        raise LookupError("Google Workspace is not connected")
+    if str(connection.get("status") or "connected") == "needs_reconnect":
+        raise PermissionError("Google Workspace authorization expired")
+    names, values = _google_sheet_values(columns, rows)
+    clean_title = _google_sheet_title(title, "Calliope export", 240)
+    clean_sheet_name = _google_sheet_title(sheet_name, "Data")
+    sid = _uuid(session_id)
+    fid = _uuid(surface_id)
+    export_id = str(uuid.uuid4())
+    bounded_source = source if isinstance(source, dict) else {}
+    bounded_source = json.loads(json.dumps(bounded_source, default=str))
+    with conn_factory() as conn:
+        conn.execute(
+            "INSERT INTO rvbbit.calliope_google_exports "
+            "(id,owner_email,session_id,surface_id,title,sheet_name,row_count,column_count,source) "
+            "VALUES (%s::uuid,%s,%s::uuid,%s::uuid,%s,%s,%s,%s,%s::jsonb)",
+            (
+                export_id, owner, sid, fid, clean_title, clean_sheet_name,
+                len(values), len(names), json.dumps(bounded_source),
+            ),
+        )
+    try:
+        access_token = await _google_workspace_access_token(conn_factory, owner)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            created = await client.post(
+                _GOOGLE_SHEETS_CREATE_URL,
+                headers=headers,
+                json={
+                    "properties": {"title": clean_title},
+                    "sheets": [{
+                        "properties": {
+                            "title": clean_sheet_name,
+                            "gridProperties": {
+                                "rowCount": max(1000, len(values) + 1),
+                                "columnCount": max(26, len(names)),
+                            },
+                        }
+                    }],
+                },
+            )
+            if created.status_code >= 400:
+                raise _google_workspace_http_error(created)
+            created_payload = created.json() or {}
+            spreadsheet_id = str(created_payload.get("spreadsheetId") or "").strip()
+            spreadsheet_url = str(created_payload.get("spreadsheetUrl") or "").strip()
+            sheet_properties = (
+                ((created_payload.get("sheets") or [{}])[0] or {}).get("properties")
+                or {}
+            )
+            sheet_id = int(sheet_properties.get("sheetId") or 0)
+            if not spreadsheet_id:
+                raise RuntimeError("Google created no spreadsheet identifier")
+            try:
+                sheet_url_parts = urlsplit(spreadsheet_url)
+                trusted_sheet_url = (
+                    sheet_url_parts.scheme == "https"
+                    and sheet_url_parts.hostname == "docs.google.com"
+                )
+            except ValueError:
+                trusted_sheet_url = False
+            if not trusted_sheet_url:
+                spreadsheet_url = (
+                    "https://docs.google.com/spreadsheets/d/"
+                    f"{quote(spreadsheet_id, safe='')}/edit"
+                )
+            escaped_range = quote(f"'{clean_sheet_name.replace(chr(39), chr(39) * 2)}'!A1", safe="")
+            write = await client.put(
+                f"{_GOOGLE_SHEETS_CREATE_URL}/{quote(spreadsheet_id, safe='')}/values/{escaped_range}",
+                params={"valueInputOption": "RAW"},
+                headers=headers,
+                json={"majorDimension": "ROWS", "values": [names, *values]},
+            )
+            if write.status_code >= 400:
+                raise _google_workspace_http_error(write)
+            formatted = await client.post(
+                f"{_GOOGLE_SHEETS_CREATE_URL}/{quote(spreadsheet_id, safe='')}:batchUpdate",
+                headers=headers,
+                json={"requests": [
+                    {
+                        "updateSheetProperties": {
+                            "properties": {
+                                "sheetId": sheet_id,
+                                "gridProperties": {"frozenRowCount": 1},
+                            },
+                            "fields": "gridProperties.frozenRowCount",
+                        }
+                    },
+                    {
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 0,
+                                "endRowIndex": 1,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": len(names),
+                            },
+                            "cell": {"userEnteredFormat": {
+                                "backgroundColor": {"red": 0.08, "green": 0.24, "blue": 0.22},
+                                "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "bold": True},
+                            }},
+                            "fields": "userEnteredFormat(backgroundColor,textFormat)",
+                        }
+                    },
+                    {
+                        "autoResizeDimensions": {
+                            "dimensions": {
+                                "sheetId": sheet_id,
+                                "dimension": "COLUMNS",
+                                "startIndex": 0,
+                                "endIndex": len(names),
+                            }
+                        }
+                    },
+                ]},
+            )
+            if formatted.status_code >= 400:
+                raise _google_workspace_http_error(formatted)
+        with conn_factory() as conn:
+            row = conn.execute(
+                "UPDATE rvbbit.calliope_google_exports SET status='complete',"
+                "provider_file_id=%s,url=%s,completed_at=now(),error=NULL "
+                "WHERE id=%s::uuid RETURNING *",
+                (spreadsheet_id, spreadsheet_url, export_id),
+            ).fetchone()
+            conn.execute(
+                "UPDATE rvbbit.calliope_google_workspace_connections "
+                "SET status='connected',last_used_at=now(),updated_at=now(),last_error=NULL "
+                "WHERE lower(owner_email)=lower(%s)",
+                (owner,),
+            )
+        return _google_export_public(row)
+    except Exception as exc:
+        message = re.sub(r"\s+", " ", f"{type(exc).__name__}: {exc}").strip()[:600]
+        with conn_factory() as conn:
+            conn.execute(
+                "UPDATE rvbbit.calliope_google_exports "
+                "SET status='failed',error=%s,completed_at=now() WHERE id=%s::uuid",
+                (message, export_id),
+            )
+        if not isinstance(exc, (LookupError, PermissionError)):
+            _google_workspace_mark_error(conn_factory, owner, exc)
+        raise
+
+
+async def export_query_surface_to_google_sheet(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    session_id: Any,
+    surface_id: Any,
+    *,
+    title: Any = None,
+) -> dict[str, Any]:
+    sid = _uuid(session_id)
+    fid = _uuid(surface_id)
+    if not sid or not fid:
+        raise LookupError("That query surface is no longer available")
+    with conn_factory() as conn:
+        row = conn.execute(
+            "SELECT f.* FROM rvbbit.calliope_surfaces f "
+            "JOIN rvbbit.calliope_sessions s ON s.id=f.session_id "
+            "WHERE f.id=%s::uuid AND f.session_id=%s::uuid AND f.kind='query' "
+            "AND lower(s.owner_email)=lower(%s)",
+            (fid, sid, owner),
+        ).fetchone()
+    if not row:
+        raise LookupError("That query surface is no longer available")
+    surface = _surface_json(row)
+    payload = surface.get("payload") or {}
+    source = surface.get("source") or {}
+    sql = str(source.get("sql") or "")
+    receipt = await export_google_sheet(
+        conn_factory,
+        owner,
+        title or surface.get("title") or "Calliope query",
+        payload.get("columns"),
+        payload.get("rows"),
+        session_id=sid,
+        surface_id=fid,
+        source={
+            "origin": "calliope_query_surface",
+            "query_hash": hashlib.sha256(sql.encode("utf-8")).hexdigest() if sql else None,
+            "surface_id": fid,
+            "truncated": bool(payload.get("truncated")),
+        },
+    )
+    public_receipt = {
+        key: receipt.get(key)
+        for key in (
+            "id", "provider", "provider_file_id", "title", "url", "sheet_name",
+            "row_count", "column_count", "status", "completed_at",
+        )
+    }
+    with conn_factory() as conn:
+        updated = conn.execute(
+            "UPDATE rvbbit.calliope_surfaces SET presentation="
+            "jsonb_set(coalesce(presentation,'{}'::jsonb),'{google_sheet}',%s::jsonb,true) "
+            "WHERE id=%s::uuid AND session_id=%s::uuid RETURNING *",
+            (json.dumps(public_receipt, default=str), fid, sid),
+        ).fetchone()
+    return {
+        "export": receipt,
+        "surface": _surface_json(updated),
+        "query": {"truncated": bool(payload.get("truncated"))},
+    }
+
+
+def google_workspace_grant_handler(conn_factory: Callable[..., Any]):
+    """Build the incremental Workspace auth sink without coupling auth.py back."""
+    async def handle(owner: str, token_payload: dict[str, Any]) -> None:
+        await asyncio.to_thread(
+            _save_google_workspace_grant, conn_factory, owner, token_payload
+        )
 
     return handle
 
@@ -15812,6 +16431,32 @@ def _project_tool_result(
             "payload": value,
             "source": {"args": args},
         }]
+    if tool == "export_to_google_sheets" and isinstance(value, dict):
+        sheet = value.get("sheet") if isinstance(value.get("sheet"), dict) else {}
+        export_id = _uuid(sheet.get("id"))
+        url = str(sheet.get("url") or "").strip()
+        if not export_id or not url:
+            return []
+        return [{
+            "kind": "document",
+            "title": str(sheet.get("title") or "Google Sheets export")[:240],
+            "lineage_key": f"google-sheet:{export_id}",
+            "payload": {
+                "provider": "google_sheets",
+                "filename": str(sheet.get("title") or "Google Sheets export")[:240],
+                "download_url": url,
+                "row_count": sheet.get("row_count"),
+                "column_count": sheet.get("column_count"),
+                "export_id": export_id,
+            },
+            "source": {
+                "args": {
+                    "session_id": args.get("session_id"),
+                    "title": args.get("title"),
+                },
+                "receipt": sheet,
+            },
+        }]
     return []
 
 
@@ -17882,6 +18527,7 @@ def register_calliope_routes(
     google_calendar_enabled = bool(
         getattr(auth, "google_enabled", lambda: False)()
     )
+    google_workspace_enabled = google_calendar_enabled
 
     def json_response(value: Any, status: int = 200) -> Response:
         return Response(
@@ -18066,6 +18712,12 @@ def register_calliope_routes(
         }
         if google_calendar_enabled:
             payload["google_calendar"] = True
+        if google_workspace_enabled:
+            payload["google_workspace"] = {
+                "enabled": True,
+                "sheets_export": True,
+                "scope": "drive.file",
+            }
         return json_response(payload)
 
     @mcp.custom_route("/api/calliope/dreams", methods=["GET"])
@@ -18325,6 +18977,76 @@ def register_calliope_routes(
                     "upcoming_count": 0,
                 }
             })
+
+    if google_workspace_enabled:
+        @mcp.custom_route("/api/calliope/workspace", methods=["GET"])
+        async def calliope_workspace_status(request):
+            owner, err = api_owner(request)
+            if err:
+                return err
+            try:
+                status = await asyncio.to_thread(
+                    _google_workspace_status, conn_factory, owner
+                )
+            except Exception as exc:
+                return json_response({
+                    "error": {
+                        "code": "WORKSPACE_STATUS_FAILED",
+                        "message": str(exc)[:600],
+                    }
+                }, 502)
+            return json_response({"workspace": status})
+
+        @mcp.custom_route(
+            "/api/calliope/sessions/{session_id}/surfaces/{surface_id}/google-sheet",
+            methods=["POST"],
+        )
+        async def calliope_query_google_sheet(request):
+            owner, err = api_owner(request)
+            if err:
+                return err
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            body = body if isinstance(body, dict) else {}
+            try:
+                result = await export_query_surface_to_google_sheet(
+                    conn_factory,
+                    owner,
+                    request.path_params.get("session_id"),
+                    request.path_params.get("surface_id"),
+                    title=body.get("title"),
+                )
+            except LookupError as exc:
+                code = (
+                    "WORKSPACE_NOT_CONNECTED"
+                    if "not connected" in str(exc).lower()
+                    else "QUERY_SURFACE_NOT_FOUND"
+                )
+                return json_response(
+                    {"error": {"code": code, "message": str(exc)}},
+                    409 if code == "WORKSPACE_NOT_CONNECTED" else 404,
+                )
+            except PermissionError as exc:
+                return json_response({
+                    "error": {
+                        "code": "WORKSPACE_RECONNECT_REQUIRED",
+                        "message": str(exc),
+                    }
+                }, 409)
+            except ValueError as exc:
+                return json_response({
+                    "error": {"code": "SHEET_EXPORT_INVALID", "message": str(exc)}
+                }, 400)
+            except Exception as exc:
+                return json_response({
+                    "error": {
+                        "code": "SHEET_EXPORT_FAILED",
+                        "message": str(exc)[:600],
+                    }
+                }, 502)
+            return json_response(result, 201)
 
     @mcp.custom_route(
         "/api/calliope/realtime-transcription", methods=["POST"]

@@ -148,6 +148,18 @@ before storage. Disconnect revokes the grant best-effort and deletes the local c
 On installations without Google Sign-In, the Calendar control, config flag, consent
 route, and Calendar API routes are absent/invisible.
 
+Query surfaces also expose a contextual **Sheet** action. Its first use requests a
+separate incremental Google Workspace grant with only `drive.file`; sign-in and
+Calendar consent still do not imply file access. Calliope can create and update files
+it created for that user, but cannot enumerate or read the rest of their Drive. The
+same action resumes automatically after consent, exports the exact frozen result shown
+on the Stage, freezes and formats the header, and saves an owner-scoped receipt and link.
+The MCP tool `export_to_google_sheets` uses the same connection and receipt ledger while
+running its SQL through the normal governed read-only path. Enable the **Google Sheets
+API** in the OAuth client's Google Cloud project; no additional service account or env
+variable is required. Refresh tokens use the same configured encryption secret as
+Calendar, with a purpose-separated encryption context.
+
 ### Burrow + Google: one door, Postgres still decides
 With `WAREHOUSE_AUTH=pg`, Google proves **who** you are and Postgres still decides **what**
 you may touch. A verified identity is resolved to a role by `rvbbit.resolve_identity()`
@@ -848,10 +860,10 @@ No `rvbbitQuery`/metric found ⇒ flagged `materialized` (a "dead tree" — nudg
 `WAREHOUSE_ACCESS_TTL` (3600) · `WAREHOUSE_REFRESH_TTL` (30d) ·
 `WAREHOUSE_STATE_FILE` (persist registered clients + refresh tokens across restarts —
 put it on a volume, else a restart strands connectors with "client_id not found").
-**Google Sign-In / Calendar:** `WAREHOUSE_GOOGLE_CLIENT_ID` +
+**Google Sign-In / Calendar / Workspace:** `WAREHOUSE_GOOGLE_CLIENT_ID` +
 `WAREHOUSE_GOOGLE_CLIENT_SECRET` · `WAREHOUSE_GOOGLE_HD` and/or
 `WAREHOUSE_ALLOWED_EMAILS` (audience gate) · `WAREHOUSE_GOOGLE_ONLY` (optional) ·
-`WAREHOUSE_GOOGLE_TOKEN_KEY` (optional dedicated Calendar-token encryption secret;
+`WAREHOUSE_GOOGLE_TOKEN_KEY` (optional dedicated Google grant-token encryption secret;
 otherwise derives from `WAREHOUSE_JWT_SECRET`).
 **Calliope:** `WAREHOUSE_HERMES_URL` + `WAREHOUSE_HERMES_API_KEY` (both required) ·
 `WAREHOUSE_HERMES_MEMORY_KEY` (optional shared company scope) ·

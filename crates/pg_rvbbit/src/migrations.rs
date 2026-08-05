@@ -997,6 +997,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0244_artifact_catalog_and_session_synopses",
         include_str!("../sql/migrations/0244_artifact_catalog_and_session_synopses.sql"),
     ),
+    (
+        "0245_calliope_google_workspace",
+        include_str!("../sql/migrations/0245_calliope_google_workspace.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

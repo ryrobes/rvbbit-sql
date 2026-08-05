@@ -344,6 +344,10 @@
       noteSaving: new Set(),
       noteObjectCache: new Map(),
     },
+    workspace: {
+      status: null,
+      exporting: new Set(),
+    },
     dreams: {
       items: [],
       counts: { active: 0, new: 0, exploring: 0, adopted: 0, backlog: 0, sleeping: 0 },
@@ -1181,6 +1185,83 @@
     }
   }
 
+  async function loadGoogleWorkspaceStatus({ silent = false } = {}) {
+    if (!state.config?.google_workspace?.enabled) return null;
+    try {
+      const data = await api("/api/calliope/workspace");
+      state.workspace.status = data.workspace || null;
+      return state.workspace.status;
+    } catch (error) {
+      if (!silent) toast(error.message, true);
+      return null;
+    }
+  }
+
+  function connectGoogleWorkspace(surfaceId = "") {
+    if (!state.config?.google_workspace?.enabled) return;
+    if (surfaceId) sessionStorage.setItem("calliope.pendingWorkspaceExport.v1", surfaceId);
+    const current = new URL(window.location.href);
+    current.searchParams.delete("workspace");
+    const next = `${current.pathname}${current.search}`;
+    window.location.assign(`/auth/google/workspace/start?next=${encodeURIComponent(next)}`);
+  }
+
+  async function exportQueryToGoogleSheet(surfaceId) {
+    const surface = state.surfaces.find((item) => item.id === surfaceId && item.kind === "query");
+    if (!surface || !state.current || state.workspace.exporting.has(surfaceId)) return;
+    const connected = Boolean(state.workspace.status?.connected);
+    if (!connected || state.workspace.status?.needs_reconnect) {
+      connectGoogleWorkspace(surfaceId);
+      return;
+    }
+    state.workspace.exporting.add(surfaceId);
+    renderStage();
+    const target = window.open("", "_blank");
+    if (target) {
+      target.opener = null;
+      target.document.title = "Creating Google Sheet…";
+      target.document.body.textContent = "Calliope is creating your Google Sheet…";
+    }
+    try {
+      const data = await api(
+        `/api/calliope/sessions/${encodeURIComponent(state.current.id)}/surfaces/${encodeURIComponent(surfaceId)}/google-sheet`,
+        { method: "POST", body: JSON.stringify({ title: surface.title }) },
+      );
+      if (data.surface) {
+        const index = state.surfaces.findIndex((item) => item.id === data.surface.id);
+        if (index >= 0) state.surfaces[index] = data.surface;
+      }
+      state.workspace.status = {
+        ...(state.workspace.status || {}),
+        connected: true,
+        status: "connected",
+        export_count: Number(state.workspace.status?.export_count || 0) + 1,
+        last_exported_at: data.export?.completed_at || new Date().toISOString(),
+      };
+      const url = data.export?.url;
+      if (target && url) target.location.replace(url);
+      else if (url) window.open(url, "_blank", "noopener");
+      toast(`Google Sheet created · ${Number(data.export?.row_count || 0).toLocaleString()} ${
+        data.query?.truncated ? "visible preview rows" : "rows"
+      }`);
+    } catch (error) {
+      target?.close();
+      if (["WORKSPACE_NOT_CONNECTED", "WORKSPACE_RECONNECT_REQUIRED"].includes(error.code)) {
+        state.workspace.status = {
+          ...(state.workspace.status || {}),
+          connected: false,
+          needs_reconnect: error.code === "WORKSPACE_RECONNECT_REQUIRED",
+        };
+        connectGoogleWorkspace(surfaceId);
+        return;
+      }
+      throw error;
+    } finally {
+      state.workspace.exporting.delete(surfaceId);
+      renderStage();
+    }
+  }
+
   async function loadBriefStatus({ silent = false } = {}) {
     if (!state.config?.personal_briefs) return null;
     try {
@@ -1643,7 +1724,10 @@
       data = { error: { message: text } };
     }
     if (!response.ok) {
-      throw new Error(data?.error?.message || data?.error?.code || `Request failed (${response.status})`);
+      const error = new Error(data?.error?.message || data?.error?.code || `Request failed (${response.status})`);
+      error.code = data?.error?.code || "REQUEST_FAILED";
+      error.status = response.status;
+      throw error;
     }
     return data;
   }
@@ -6362,13 +6446,20 @@
     const payload = surface.payload || {};
     const url = payload.download_url;
     const filename = payload.filename || payload.original_name || surface.title;
-    const extension = String(filename).split(".").at(-1)?.toUpperCase() || "FILE";
-    return `<div class="document-body"><div class="document-glyph">§</div>
+    const googleSheet = payload.provider === "google_sheets";
+    const extension = googleSheet ? "GOOGLE SHEET" : String(filename).split(".").at(-1)?.toUpperCase() || "FILE";
+    return `<div class="document-body"><div class="document-glyph">${googleSheet ? "▦" : "§"}</div>
       <div class="document-name" title="${escapeHtml(filename)}">${escapeHtml(filename)}</div>
       <div class="document-meta">${escapeHtml(extension)}${
-        payload.bytes ? ` · ${escapeHtml(Number(payload.bytes).toLocaleString())} bytes` : ""
+        googleSheet
+          ? ` · ${escapeHtml(Number(payload.row_count || 0).toLocaleString())} rows · ${escapeHtml(Number(payload.column_count || 0).toLocaleString())} columns`
+          : payload.bytes ? ` · ${escapeHtml(Number(payload.bytes).toLocaleString())} bytes` : ""
       }</div>
-      ${url ? `<a href="${escapeHtml(url)}" download="${escapeHtml(filename)}">Download file</a>` : `<span>File is not available from this server</span>`}
+      ${url
+        ? googleSheet
+          ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">Open in Google Sheets ↗</a>`
+          : `<a href="${escapeHtml(url)}" download="${escapeHtml(filename)}">Download file</a>`
+        : `<span>File is not available from this server</span>`}
     </div>`;
   }
 
@@ -7975,6 +8066,15 @@
             : ""
         }</p></div>
         <div class="surface-tools">
+          ${surface.kind === "query" && !metadata && state.config?.google_workspace?.sheets_export
+            ? surface.presentation?.google_sheet?.url
+              ? `<a href="${escapeHtml(surface.presentation.google_sheet.url)}" target="_blank" rel="noopener" title="Open the exported Google Sheet">Sheet ↗</a>`
+              : `<button type="button" data-export-google-sheet="${escapeHtml(surface.id)}" title="Export this exact ${
+                surface.payload?.truncated ? "visible preview" : "result"
+              } to your Google Sheets" ${
+                state.workspace.exporting.has(surface.id) ? "disabled" : ""
+              }>${state.workspace.exporting.has(surface.id) ? "Exporting…" : "Sheet"}</button>`
+            : ""}
           ${surface.kind === "query" && !metadata
             ? `<button type="button" data-open-query-surface="${escapeHtml(surface.id)}" title="Open in the large viewer">Open</button>`
             : ""}
@@ -10488,6 +10588,12 @@
         runEvidenceSearch(surface?.payload?.query).catch((error) => toast(error.message, true));
         return;
       }
+      const exportSheet = event.target.closest("[data-export-google-sheet]");
+      if (exportSheet) {
+        exportQueryToGoogleSheet(exportSheet.dataset.exportGoogleSheet)
+          .catch((error) => toast(error.message, true));
+        return;
+      }
       const openQuery = event.target.closest("[data-open-query-surface]");
       if (openQuery) {
         openQuerySurface(openQuery.dataset.openQuerySurface);
@@ -10757,8 +10863,10 @@
       const launchInbox = launch.get("inbox");
       const launchBrief = launch.get("brief");
       const launchCalendar = launch.get("calendar");
+      const launchWorkspace = launch.get("workspace");
       await loadConfig();
       await loadBriefStatus({ silent: true });
+      await loadGoogleWorkspaceStatus({ silent: true });
       await loadDreams({ silent: true });
       if (launchCalendar && state.config?.google_calendar) {
         const message = ({
@@ -10769,6 +10877,25 @@
         })[launchCalendar] || "Google Calendar connection updated";
         toast(message, ["account_mismatch", "error"].includes(launchCalendar));
         launch.delete("calendar");
+        const cleanQuery = launch.toString();
+        window.history.replaceState(
+          {},
+          "",
+          `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}`,
+        );
+      }
+      if (launchWorkspace && state.config?.google_workspace?.enabled) {
+        const message = ({
+          connected: "Google Workspace connected · Sheets export is ready",
+          cancelled: "Google Workspace connection cancelled",
+          account_mismatch: "Use the same Google account that is signed in to Calliope",
+          error: "Google Workspace could not be connected; you can try again",
+        })[launchWorkspace] || "Google Workspace connection updated";
+        toast(message, ["account_mismatch", "error"].includes(launchWorkspace));
+        if (launchWorkspace !== "connected") {
+          sessionStorage.removeItem("calliope.pendingWorkspaceExport.v1");
+        }
+        launch.delete("workspace");
         const cleanQuery = launch.toString();
         window.history.replaceState(
           {},
@@ -10815,6 +10942,16 @@
       await loadInstruments();
       await loadWorkflows();
       await loadSessions(launchSession);
+      const pendingWorkspaceExport = sessionStorage.getItem("calliope.pendingWorkspaceExport.v1");
+      if (pendingWorkspaceExport && state.workspace.status?.connected) {
+        sessionStorage.removeItem("calliope.pendingWorkspaceExport.v1");
+        if (state.surfaces.some((surface) => surface.id === pendingWorkspaceExport)) {
+          requestAnimationFrame(() => {
+            exportQueryToGoogleSheet(pendingWorkspaceExport)
+              .catch((error) => toast(error.message, true));
+          });
+        }
+      }
       clearInterval(state.sessionRefreshTimer);
       state.sessionRefreshTimer = setInterval(() => {
         if (!document.hidden) loadSessions().catch(() => {});

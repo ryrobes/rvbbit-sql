@@ -210,6 +210,7 @@ body.chat-resizing iframe{pointer-events:none}
 .surface-tools{margin-left:auto;display:flex;align-items:center;gap:3px}
 .surface-tools button,.surface-tools a{height:27px;min-width:27px;display:grid;place-items:center;padding:0 7px;border:1px solid transparent;background:transparent;color:var(--dim);font:8px/1 var(--mono);cursor:pointer}
 .surface-tools button:hover,.surface-tools a:hover{border-color:var(--line);color:var(--amber)}
+.surface-tools button:disabled{cursor:wait;opacity:.58}
 .surface-body{min-height:120px}
 .instrument-surface{min-height:190px;display:grid;grid-template-columns:54px minmax(0,1fr) auto;align-items:center;gap:16px;padding:20px;background:radial-gradient(380px 180px at 0 100%,color-mix(in oklch,var(--jade) 9%,transparent),transparent 76%)}
 .instrument-surface-mark{width:52px;height:52px;display:grid;place-items:center;border:1px solid color-mix(in oklch,var(--jade) 46%,transparent);border-radius:50%;background:color-mix(in oklch,var(--jade) 7%,transparent);color:var(--jade);font:italic 400 25px/1 var(--serif)}
