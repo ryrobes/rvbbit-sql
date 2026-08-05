@@ -44,10 +44,82 @@ def test_calliope_header_requests_homemade_apple_and_local_time_avatars():
     page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
     script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
     assert "family=Homemade+Apple" in page
+    assert "family=IBM+Plex+Mono" in page
+    assert "family=Newsreader" in page
+    assert '<span class="calliope-brand-name">Calliope</span>' in page
+    assert '<span class="calliope-brand-byline">by RVBBIT.AI</span>' in page
+    assert "DATA RABBIT" not in page
     assert 'data-warehouse-page="calliope"' in page
     assert "callie-avatar-day.jpg" in page
     assert "callie-avatar-night.jpg" in page
     assert "now.getHours()" in script
+
+
+def test_calliope_page_renders_the_shared_account_control(monkeypatch, tmp_path):
+    routes = {}
+
+    class MCP:
+        @staticmethod
+        def custom_route(path, methods):
+            def register(handler):
+                routes[(path, tuple(methods))] = handler
+                return handler
+            return register
+
+    fake_auth = types.SimpleNamespace(
+        read_session_full=lambda request: request.session,
+        google_enabled=lambda: False,
+        background_layer=lambda *_args, **_kwargs: '<div class="bg"></div>',
+    )
+    monkeypatch.setitem(sys.modules, "auth", fake_auth)
+    monkeypatch.setattr(calliope, "ensure_tables", lambda _factory: None)
+    monkeypatch.setenv("WAREHOUSE_HERMES_URL", "http://hermes:8642")
+    monkeypatch.setenv("WAREHOUSE_HERMES_API_KEY", "hermes-key")
+    monkeypatch.setenv("WAREHOUSE_CALLIOPE_DIR", str(tmp_path))
+    assert calliope.register_calliope_routes(
+        MCP(), lambda: None, "", lambda document: document
+    ) is True
+
+    class Request:
+        session = {
+            "identity": "ada@example.com",
+            "sub": "analyst_role",
+            "mapped": True,
+            "via": "google",
+            "name": "Ada Lovelace",
+            "picture": "https://lh3.googleusercontent.com/a/ada",
+        }
+
+    response = asyncio.run(routes[("/calliope", ("GET",))](Request()))
+    page = response.body.decode("utf-8")
+    assert 'data-warehouse-account' in page
+    assert 'src="/auth/avatar"' in page
+    assert "Ada Lovelace" in page
+    assert "__CALLIOPE_ACCOUNT__" not in page
+    assert "__CALLIOPE_ASSET_VERSION__" not in page
+    assert page.count(f"?v={calliope._ASSET_VERSION}") == 4
+    assert response.headers["cache-control"] == (
+        "private, no-store, max-age=0, must-revalidate"
+    )
+
+    class VersionedAssetRequest(Request):
+        query_params = {"v": calliope._ASSET_VERSION}
+
+    class UnversionedAssetRequest(Request):
+        query_params = {}
+
+    versioned = asyncio.run(
+        routes[("/calliope/calliope.js", ("GET",))](VersionedAssetRequest())
+    )
+    fallback = asyncio.run(
+        routes[("/calliope/calliope.js", ("GET",))](UnversionedAssetRequest())
+    )
+    assert versioned.headers["cache-control"] == (
+        "private, max-age=31536000, immutable"
+    )
+    assert fallback.headers["cache-control"] == (
+        "private, no-cache, max-age=0, must-revalidate"
+    )
 
 
 def test_chat_composer_accepts_clipboard_images_through_the_upload_pipeline():
@@ -79,6 +151,24 @@ def test_calliope_ships_the_same_three_thinking_orb_states_as_data_rabbit():
     assert "/calliope/thinking-orbs.js" in page
     assert all(f"{state}:" in orbs for state in ("working", "composing", "solving"))
     assert (calliope._ASSET_DIR / "THINKING-ORBS-LICENSE").is_file()
+
+
+def test_artifact_revision_loader_reuses_the_theme_aware_orb_without_copy():
+    page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    orbs = (calliope._ASSET_DIR / "thinking-orbs.js").read_text(encoding="utf-8")
+    css = (calliope._ASSET_DIR / "calliope.css").read_text(encoding="utf-8")
+
+    assert page.count("?v=__CALLIOPE_ASSET_VERSION__") == 4
+    assert 'data-artifact-loading-orb data-thinking-orb="working"' in script
+    assert 'data-thinking-orb-size="112" data-thinking-orb-tint="theme"' in script
+    assert "startArtifactFrameLoader(frame)" in script
+    assert "stopArtifactFrameLoader(frame)" in script
+    assert "window.getComputedStyle(canvas).color" in orbs
+    assert "function unmount(canvas)" in orbs
+    assert ".artifact-frame-loader" in css
+    assert "backdrop-filter:blur(24px) saturate(1.18)" in css
+    assert "Loading visible dashboard revision" not in css
 
 
 def test_calliope_live_activity_is_temporary_distinct_and_collapses_after_final():
@@ -134,7 +224,8 @@ def test_owner_is_signed_human_identity_not_execution_subject(monkeypatch):
     assert session["sub"] == "analyst_execution_role"
 
 
-def test_new_artifact_versions_are_attributed_to_the_signed_turn_owner():
+def test_new_artifact_versions_are_attributed_to_the_signed_turn_owner(monkeypatch):
+    monkeypatch.setenv("WAREHOUSE_MCP_STATIC_CALLER", " Calliope@Acme.com ")
     queries = []
 
     class Result:
@@ -169,7 +260,12 @@ def test_new_artifact_versions_are_attributed_to_the_signed_turn_owner():
         "kind": "artifact",
         "artifact_slug": "growth-brief",
         "artifact_version": 4,
-        "payload": {"slug": "growth-brief", "version": 4, "owner": "static-key"},
+        "payload": {
+            "slug": "growth-brief",
+            "version": 4,
+            "owner": "Calliope@Acme.com",
+            "created_by": "calliope@acme.com",
+        },
     }]
     attributed = calliope._attribute_turn_artifacts(
         Connection,
@@ -181,26 +277,106 @@ def test_new_artifact_versions_are_attributed_to_the_signed_turn_owner():
     assert attributed[0]["payload"]["created_by"] == "business.user@example.com"
     assert any(
         query.startswith("UPDATE rvbbit.dashboards")
-        and params == ("business.user@example.com", "dashboard-1")
+        and params == (
+            "business.user@example.com",
+            "dashboard-1",
+            ["calliope@acme.com", "static-key"],
+        )
         for query, params in queries
     )
 
 
-def test_startup_attribution_backfill_only_replaces_service_identities():
+def test_selected_design_profile_is_frozen_into_the_published_artifact_manifest():
+    queries = []
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            queries.append((query, params))
+            if query.startswith("UPDATE rvbbit.dashboard_versions v SET created_by"):
+                return Result({"dashboard_id": 42})
+            return Result()
+
+    profile = {
+        "id": calliope._ADAPTIVE_DESIGN_PROFILE_VERSION_ID,
+        "profile_id": calliope._ADAPTIVE_DESIGN_PROFILE_ID,
+        "profile_name": "Adaptive Calliope",
+        "version": 1,
+        "tokens": {
+            "behavior": {
+                "theme_source": "viewer",
+                "runtime": "rvbbit.adaptive-theme.v1",
+            },
+            "palette": {"accent": "#68c7b2"},
+        },
+    }
+    calliope._attribute_turn_artifacts(
+        Connection,
+        "business.user@example.com",
+        "09fe1c22-5802-4bb0-9e14-2f26ab0223af",
+        [{
+            "kind": "artifact",
+            "artifact_slug": "adaptive-brief",
+            "artifact_version": 3,
+            "payload": {"slug": "adaptive-brief", "version": 3},
+        }],
+        profile,
+    )
+
+    manifest_updates = [
+        (query, params) for query, params in queries
+        if "'{design_profile}'" in query
+    ]
+    assert len(manifest_updates) == 2
+    frozen = json.loads(manifest_updates[0][1][0])
+    assert frozen["schema_version"] == "rvbbit.artifact-design-profile.v1"
+    assert frozen["profile_id"] == calliope._ADAPTIVE_DESIGN_PROFILE_ID
+    assert frozen["adaptive"] is True
+    assert frozen["behavior"]["theme_source"] == "viewer"
+    assert frozen["tokens"]["palette"]["accent"] == "#68c7b2"
+
+
+def test_startup_attribution_backfill_only_replaces_service_identities(monkeypatch):
+    monkeypatch.setenv("WAREHOUSE_MCP_STATIC_CALLER", "Calliope@Acme.com")
     queries = []
 
     class Connection:
-        def execute(self, query):
-            queries.append(query)
+        def execute(self, query, params=None):
+            queries.append((query, params))
 
     calliope._backfill_artifact_attribution(Connection())
     assert len(queries) == 2
-    assert all("calliope_surfaces" in query for query in queries)
-    assert "dashboard_versions" in queries[0]
-    assert "created_by=a.owner_email" in queries[0]
-    assert "dashboards" in queries[1]
-    assert "owner_email=o.owner_email" in queries[1]
-    assert all("'static-key'" in query for query in queries)
+    assert all("calliope_surfaces" in query for query, _params in queries)
+    assert "dashboard_versions" in queries[0][0]
+    assert "created_by=a.owner_email" in queries[0][0]
+    assert "dashboards" in queries[1][0]
+    assert "owner_email=o.owner_email" in queries[1][0]
+    assert all("ANY(%s::text[])" in query for query, _params in queries)
+    assert all(
+        params == (["calliope@acme.com", "static-key"],)
+        for _query, params in queries
+    )
+
+
+def test_calliope_service_identity_does_not_claim_human_owners(monkeypatch):
+    monkeypatch.setenv("WAREHOUSE_MCP_STATIC_CALLER", "Calliope@Acme.com")
+
+    assert calliope._is_calliope_service_identity(None) is True
+    assert calliope._is_calliope_service_identity("STATIC-KEY") is True
+    assert calliope._is_calliope_service_identity("calliope@acme.com") is True
+    assert calliope._is_calliope_service_identity("person@example.com") is False
 
 
 def test_shared_memory_header_is_company_scope_only():
@@ -237,6 +413,41 @@ def test_design_profiles_are_versioned_in_schema_and_extension_migrations():
     assert migration.count("ADD COLUMN IF NOT EXISTS design_profile_version_id") == 3
     assert "0223_calliope_design_profiles" in registry
     assert "calliope_design_profile_versions" in calliope._STYLE_DDL
+
+
+def test_adaptive_calliope_profile_is_shipped_seeded_and_immutable():
+    spec = calliope._builtin_design_profile_spec()
+    assert spec["id"] == calliope._ADAPTIVE_DESIGN_PROFILE_ID
+    assert spec["version_id"] == calliope._ADAPTIVE_DESIGN_PROFILE_VERSION_ID
+    assert spec["name"] == "Adaptive Calliope"
+    assert spec["owner_email"] == "calliope@system"
+    assert spec["tokens"]["behavior"] == {
+        "theme_source": "viewer",
+        "runtime": "rvbbit.adaptive-theme.v1",
+        "live": True,
+        "fallback": "calliope-editorial-dark",
+    }
+    assert "Newsreader" in spec["markdown"]
+    assert "IBM Plex Sans" in spec["markdown"]
+    assert "IBM Plex Mono" in spec["markdown"]
+    assert "12-column editorial grid" in spec["markdown"]
+    assert "rvbbit:adaptive-theme" in spec["markdown"]
+    assert "execution_subject text NOT NULL" not in calliope._STYLE_DDL
+    assert "ALTER COLUMN execution_subject DROP NOT NULL" in calliope._STYLE_DDL
+
+    statements = []
+
+    class Connection:
+        def execute(self, query, params=None):
+            statements.append((query, params))
+
+    calliope._seed_builtin_design_profiles(Connection())
+    assert len(statements) == 2
+    assert "ON CONFLICT (id) DO UPDATE" in statements[0][0]
+    assert "ON CONFLICT DO NOTHING" in statements[1][0]
+    assert calliope._ADAPTIVE_DESIGN_PROFILE_ID in statements[0][1]
+    assert "DESIGN PROFILE — Adaptive Calliope" in statements[1][1][4]
+    assert "Exact profile:" in statements[1][1][4]
 
 
 def test_design_profile_prompt_is_exact_versioned_and_separate_from_ui_theme():
@@ -310,7 +521,13 @@ def test_design_profile_library_ui_supports_sources_preview_versions_and_scope()
     assert "design_profile_version_id" in script
     assert "selected artifact" in script
     assert "Live token preview" in page
+    assert "family=IBM+Plex+Sans" in page
+    assert "family=Newsreader" in page
     assert ".style-preview" in css
+    assert ".style-preview-spread" in css
+    assert "stylePreviewNote" in script
+    assert "profile.is_adaptive" in script
+    assert "your current Calliope room" in script
     # The library chrome follows the browser-selected Warehouse theme while
     # the miniature dashboard remains an honest preview of the profile itself.
     assert "--style-accent:var(--main,var(--amber))" in css
@@ -939,6 +1156,11 @@ def test_historical_artifact_uses_parent_bridge_only_when_embedded():
         "<main>historical</main>",
         direct_shim,
         embedded=True,
+        manifest={
+            "design_profile": {
+                "behavior": {"theme_source": "viewer"},
+            },
+        },
     )
     assert "/api/d/artifact-one/q" in full
     assert "Calliope data bridge timed out" not in full
@@ -946,12 +1168,38 @@ def test_historical_artifact_uses_parent_bridge_only_when_embedded():
     assert "/api/d/artifact-one/q" not in embedded
     assert "historical:true,version:7" in full
     assert "historical:true,version:7" in embedded
+    assert 'src="/theme/adaptive-artifact.js"' in embedded
+    assert '"theme_source":"viewer"' in embedded
     assert not calliope._artifact_version_csp(False).startswith("sandbox")
     assert calliope._artifact_version_csp(True).startswith("sandbox")
 
     browser = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
     assert "function artifactEmbedUrl(value)" in browser
     assert 'url.searchParams.set("embed", "1")' in browser
+
+
+def test_adaptive_artifact_runtime_is_opt_in_sanitized_and_stage_bridge_aware():
+    runtime = (
+        _HERE / "theme" / "adaptive-artifact.js"
+    ).read_text(encoding="utf-8")
+    browser = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    server = (_HERE / "server.py").read_text(encoding="utf-8")
+
+    assert 'behavior.theme_source !== "viewer"' in runtime
+    assert "rvbbit-warehouse-adaptive-theme-v1" in runtime
+    assert "rvbbit.adaptive-theme.request" in runtime
+    assert "rvbbit.adaptive-theme.apply" in runtime
+    assert "event.source !== window.parent" in runtime
+    assert "TOKEN_KEYS.has(key)" in runtime
+    assert "rvbbit:adaptive-theme" in runtime
+    assert "Newsreader" in runtime
+    assert "IBM Plex Sans" in runtime
+    assert "IBM Plex Mono" in runtime
+    assert "window.indexedDB" in runtime
+    assert "rvbbit.adaptive-theme.request" in browser
+    assert "sendViewerThemeToArtifact" in browser
+    assert "warehouse-theme-change" in browser
+    assert 'src="/theme/adaptive-artifact.js"' in server
 
 
 def test_calliope_spatial_prompt_ui_supports_objects_regions_and_drawing():

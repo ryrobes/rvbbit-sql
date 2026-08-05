@@ -213,7 +213,7 @@ fn _exec_op_jsonb(op_name: &str, inputs: JsonB, opts: JsonB) -> Option<JsonB> {
     // parser == "json" expects the model/specialist output to BE valid JSON.
     // For non-json parsers we wrap the raw string as a JSON string value.
     match op.parser.as_str() {
-        "json" => match serde_json::from_str::<serde_json::Value>(&s) {
+        "json" => match parse_json_output(&s) {
             Ok(v) => Some(JsonB(v)),
             Err(_) => {
                 pgrx::warning!(
@@ -261,18 +261,14 @@ fn _exec_op_float8(op_name: &str, inputs: JsonB, opts: JsonB) -> f64 {
 
 fn split_output_for_dim(s: &str) -> Vec<String> {
     let trimmed = s.trim();
-    if trimmed.starts_with('[') {
-        if let Ok(serde_json::Value::Array(arr)) =
-            serde_json::from_str::<serde_json::Value>(trimmed)
-        {
-            return arr
-                .into_iter()
-                .map(|v| match v {
-                    serde_json::Value::String(s) => s,
-                    other => other.to_string(),
-                })
-                .collect();
-        }
+    if let Ok(serde_json::Value::Array(arr)) = parse_json_output(trimmed) {
+        return arr
+            .into_iter()
+            .map(|v| match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            })
+            .collect();
     }
     let lines: Vec<String> = trimmed
         .lines()
@@ -355,7 +351,7 @@ fn infer_columns(rows: &[serde_json::Value]) -> Vec<String> {
 /// single object (one row). Non-object array elements become {"value": elem}.
 pub(crate) fn parse_rowset_output(raw: &str) -> Vec<serde_json::Value> {
     let trimmed = raw.trim();
-    let v: serde_json::Value = match serde_json::from_str(trimmed) {
+    let v: serde_json::Value = match parse_json_output(trimmed) {
         Ok(v) => v,
         Err(_) => return vec![serde_json::json!({ "value": trimmed })],
     };
@@ -516,9 +512,58 @@ fn _agg_run_op_float8(op_name: &str, state: Option<JsonB>) -> Option<f64> {
 #[pg_extern(parallel_safe)]
 fn _agg_run_op_jsonb(op_name: &str, state: Option<JsonB>) -> Option<JsonB> {
     let raw = agg_run_inner(op_name, state, "jsonb")?;
-    serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .map(JsonB)
+    parse_json_output(&raw).ok().map(JsonB)
+}
+
+/// Parse a strict JSON response while tolerating the one harmless formatting
+/// mistake common across otherwise compliant chat models: wrapping the entire
+/// value in a single `json` (or unlabeled) Markdown code fence. Prose around a
+/// value is still rejected so typed operators do not silently accept a model's
+/// explanation or an ambiguous substring.
+fn parse_json_output(raw: &str) -> Result<serde_json::Value, serde_json::Error> {
+    let trimmed = raw.trim();
+    let candidate = if let Some(after_open) = trimmed.strip_prefix("```") {
+        match after_open.split_once('\n') {
+            Some((language, body))
+                if language.trim().is_empty()
+                    || language.trim().eq_ignore_ascii_case("json") =>
+            {
+                body.trim_end()
+                    .strip_suffix("```")
+                    .map(str::trim)
+                    .unwrap_or(trimmed)
+            }
+            _ => trimmed,
+        }
+    } else {
+        trimmed
+    };
+    serde_json::from_str(candidate)
+}
+
+#[cfg(test)]
+mod json_output_tests {
+    use super::parse_json_output;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_bare_and_fenced_json_values() {
+        assert_eq!(parse_json_output(" [1, 2] ").unwrap(), json!([1, 2]));
+        assert_eq!(
+            parse_json_output("```json\n[{\"event\":\"signed\"}]\n```").unwrap(),
+            json!([{"event": "signed"}])
+        );
+        assert_eq!(
+            parse_json_output("```\n{\"ok\":true}\n```").unwrap(),
+            json!({"ok": true})
+        );
+    }
+
+    #[test]
+    fn rejects_prose_and_non_json_fences() {
+        assert!(parse_json_output("Here is the result: {\"ok\":true}").is_err());
+        assert!(parse_json_output("```text\n{\"ok\":true}\n```").is_err());
+    }
 }
 
 fn agg_run_inner(op_name: &str, state: Option<JsonB>, expected_return: &str) -> Option<String> {

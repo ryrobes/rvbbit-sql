@@ -3,7 +3,7 @@
  *
  * Calliope is intentionally framework-free, so this keeps the three states
  * DataRabbit uses (working/orbits, composing/ribbon, solving/rubik) while
- * preserving the library's drawing math and tuned 64px presets.
+ * preserving the library's drawing math and tuned 64px chat preset.
  *
  * MIT License
  * Copyright (c) 2026 Jakub Antalik
@@ -35,18 +35,25 @@
     };
   }
 
-  function drawDots(ctx, dots, dark = true, minRadius = 0.3) {
+  function drawDots(ctx, dots, dark = true, minRadius = 0.3, tint = "") {
     dots.sort((left, right) => left.z - right.z);
     for (const dot of dots) {
       const alpha = dot.a ?? 1;
       if (alpha < 0.02) continue;
       const white = Math.min(1, Math.max(0, dot.white));
-      const channel = Math.round((dark ? 1 - white : white) * 255);
-      ctx.fillStyle = `rgba(${channel},${channel},${channel},${alpha})`;
+      const intensity = dark ? 1 - white : white;
+      if (tint) {
+        ctx.fillStyle = tint;
+        ctx.globalAlpha = alpha * (0.2 + 0.8 * intensity);
+      } else {
+        const channel = Math.round(intensity * 255);
+        ctx.fillStyle = `rgba(${channel},${channel},${channel},${alpha})`;
+      }
       ctx.beginPath();
       ctx.arc(dot.x, dot.y, Math.max(minRadius, dot.r), 0, Math.PI * 2);
       ctx.fill();
     }
+    ctx.globalAlpha = 1;
   }
 
   function radiusScale(size, exponent) {
@@ -116,7 +123,7 @@
     return moves;
   }
 
-  function drawSolving(ctx, size, time) {
+  function drawSolving(ctx, size, time, tint = "") {
     const center = size / 2;
     const radius = size / 2 * 0.82;
     const project = rotate(
@@ -155,10 +162,10 @@
         });
       }
     }
-    drawDots(ctx, dots);
+    drawDots(ctx, dots, true, 0.3, tint);
   }
 
-  function drawWorking(ctx, size, time) {
+  function drawWorking(ctx, size, time, tint = "") {
     const center = size / 2;
     const radius = size / 2 * 0.82;
     const project = rotate(time * 0.12, 0.3, center, center, 1);
@@ -221,7 +228,7 @@
         });
       }
     }
-    drawDots(ctx, dots);
+    drawDots(ctx, dots, true, 0.3, tint);
   }
 
   function fibonacciSphere(index, count) {
@@ -232,7 +239,7 @@
     return [radius * Math.cos(angle), y, radius * Math.sin(angle)];
   }
 
-  function drawComposing(ctx, size, time) {
+  function drawComposing(ctx, size, time, tint = "") {
     const center = size / 2;
     const radius = size / 2 * 0.78;
     const project = rotate(0, 0.3, center, center, 1);
@@ -282,7 +289,7 @@
         });
       }
     }
-    drawDots(ctx, dots);
+    drawDots(ctx, dots, true, 0.3, tint);
   }
 
   const states = {
@@ -295,6 +302,9 @@
     if (!(canvas instanceof HTMLCanvasElement)) return;
     active.get(canvas)?.();
     const state = states[stateName] || states.working;
+    const tint = canvas.dataset.thinkingOrbTint === "theme"
+      ? window.getComputedStyle(canvas).color
+      : "";
     const pixelRatio = Math.min(2, window.devicePixelRatio || 1);
     canvas.width = Math.round(size * pixelRatio);
     canvas.height = Math.round(size * pixelRatio);
@@ -309,7 +319,7 @@
     const paint = (seconds) => {
       ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
       ctx.clearRect(0, 0, size, size);
-      state.draw(ctx, size, seconds * state.speed);
+      state.draw(ctx, size, seconds * state.speed, tint);
     };
     const tick = (now) => {
       if (stopped || !canvas.isConnected) return;
@@ -328,11 +338,20 @@
     active.set(canvas, stop);
   }
 
+  function unmount(canvas) {
+    active.get(canvas)?.();
+    active.delete(canvas);
+  }
+
   function mountAll(root = document) {
     root.querySelectorAll("canvas[data-thinking-orb]").forEach((canvas) => {
-      if (!active.has(canvas)) mount(canvas, canvas.dataset.thinkingOrb, 64);
+      if (!active.has(canvas)) {
+        const requestedSize = Number(canvas.dataset.thinkingOrbSize);
+        const size = Number.isFinite(requestedSize) && requestedSize > 0 ? requestedSize : 64;
+        mount(canvas, canvas.dataset.thinkingOrb, size);
+      }
     });
   }
 
-  window.CalliopeThinkingOrbs = { mount, mountAll, states: Object.keys(states) };
+  window.CalliopeThinkingOrbs = { mount, unmount, mountAll, states: Object.keys(states) };
 })();

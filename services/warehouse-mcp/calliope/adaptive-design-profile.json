@@ -1,0 +1,68 @@
+{
+  "id": "ca1100e0-0000-4000-8000-000000000001",
+  "version_id": "ca1100e0-0000-4000-8000-000000000101",
+  "name": "Adaptive Calliope",
+  "description": "A dense editorial dashboard system that adopts each viewer's Calliope room.",
+  "owner_email": "calliope@system",
+  "source_summary": "Built into Calliope. Structure, typography, and information-design rules are fixed; palette, mode, wallpaper, and material tokens resolve from each viewer's browser with a deterministic editorial fallback for captures and exports.",
+  "markdown": "# Adaptive Calliope\n\n## Creative direction\nBuild an analytical publication, not a generic application shell: a data-viz magazine assembled for decisions. It should feel authored, information-rich, and calm under load. Use a clear editorial hierarchy, compact spacing, hairline rules, strong alignment, and deliberate changes of scale. The result may be dense, but it must never feel cramped or noisy. Prefer one strong composition over a uniform grid of interchangeable cards.\n\nThis profile is viewer-adaptive. The artifact runtime supplies the signed-in viewer's Calliope room through canonical CSS custom properties. Use those properties exactly; do not freeze the viewer's current colors into the HTML. A server capture, PDF, thumbnail, or browser without saved appearance state must still render completely using the fallbacks below.\n\nLoad these Google Fonts with `display=swap`:\n`https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&display=swap`\n\n## Runtime theme contract\nUse the following variables with the shown fallbacks. They are present before a direct artifact renders and are delivered through a safe parent bridge inside the Calliope Stage.\n\n- Page: `var(--artifact-bg, #0b1218)` and `var(--artifact-text, #edf2f4)`\n- Panels: `var(--artifact-panel, #111d25)`, `var(--artifact-panel-raised, #172731)`, and `var(--artifact-panel-soft, rgba(17,29,37,.76))`\n- Text hierarchy: `var(--artifact-text, #edf2f4)`, `var(--artifact-muted, #9aa8ae)`, and `var(--artifact-faint, rgba(237,242,244,.38))`\n- Structure: `var(--artifact-border, rgba(237,242,244,.15))` and `var(--artifact-border-hot, rgba(100,199,178,.52))`\n- Accents: `var(--artifact-accent, #68c7b2)`, `var(--artifact-accent-alt, #f5b446)`, `var(--artifact-positive, #67c587)`, `var(--artifact-warning, #e8b85d)`, and `var(--artifact-danger, #e17868)`\n- Charts: `var(--artifact-chart-1)` through `var(--artifact-chart-6)`\n- Materials: `var(--artifact-glass-bg)`, `var(--artifact-glass-border)`, `var(--artifact-shadow)`, and `var(--artifact-backdrop-blur)`\n- Fonts: `var(--artifact-font-display)`, `var(--artifact-font-body)`, and `var(--artifact-font-mono)`\n- Backdrop: `var(--artifact-wallpaper)` and `var(--artifact-wallpaper-opacity)`; let the runtime own the page backdrop and keep the authored body transparent\n\nFor canvas or JavaScript charts, read colors from `getComputedStyle(document.documentElement)` instead of copying fallback values into JavaScript. Redraw or update chart colors on the `rvbbit:adaptive-theme` window event. Do not read parent storage or parent DOM directly.\n\n## Typography\nUse Newsreader for editorial display headings, section openers, and short narrative annotations. Use IBM Plex Sans for body copy, controls, tables, and dense explanatory text. Use IBM Plex Mono for labels, timestamps, units, axes, statuses, identifiers, and numeric metadata. Enable tabular numerals for values and tables.\n\nCreate a real type ladder rather than one heading plus one body size. A useful desktop range is: 11-12px metadata, 13-15px body, 18-24px section headings, 30-48px feature values, and one optional 52-72px hero value when the data truly deserves it. Tighten display leading; keep body leading near 1.4-1.55. Never use tiny type to manufacture density: essential text should remain legible at normal zoom.\n\n## Layout and density\nUse a 12-column editorial grid with compact fluid gutters (`clamp(12px, 1.4vw, 22px)`) and a practical maximum canvas near 1800px. Establish one primary reading path, then support it with sidebars, comparison rails, small multiples, compact tables, or annotated evidence. Mix widths and visual weights. A 7/5, 8/4, or feature-plus-rail composition is usually stronger than three equal cards.\n\nUse whitespace as punctuation, not inventory. Keep related labels, values, and context close. Separate sections with alignment, rules, tonal shifts, and typographic rhythm before adding containers. Panels should be square to subtly rounded, translucent when wallpaper is visible, and locally overlaid enough to preserve contrast. Reserve elevated shadows for one or two foreground elements; use hairline borders for ordinary grouping.\n\nEvery dashboard needs a compact masthead containing title, purpose or decision question, data freshness, and the active period. It must not consume the first screen. Put the most important decision signal above the fold, with supporting evidence immediately adjacent.\n\n## KPI and comparison defaults\nA KPI is not just a large number. When data permits, include the current value, unit, comparison period, signed delta, direction, and a benchmark, target, or previous-period context. Add a compact sparkline only when its shape adds information. Make favorable versus unfavorable semantics explicit rather than assuming up is always good.\n\nUse large feature values sparingly. Secondary metrics should be compact enough to scan as a group. Align decimals and units. Use labels that state the business meaning, not raw field names. Show missing, partial, and stale states honestly.\n\n## Data visualization\nChoose the mark from the analytical question: lines for change over ordered time, bars or dots for comparison, distributions for spread, tables for exact lookup, and small multiples for repeated comparisons. Prefer direct labels and annotations over detached legends. State units, date windows, filters, and denominators. Use visible baselines where they matter and never truncate a bar scale in a misleading way.\n\nUse the viewer-adaptive six-color chart series in order, but do not use color alone to distinguish critical states. Keep gridlines quiet and sparse. Add reference lines, targets, previous-period bands, or short annotations when they clarify a decision. Avoid decorative chart chrome. Tooltips may add detail, but critical values and conclusions cannot exist only on hover.\n\nFor tables, use sticky headers, tabular numerals, right-aligned measures, compact rows, restrained zebra or hover treatment, and a visible total or summary when meaningful. Freeze the identifying column when a wide table scrolls. For long result sets, provide sorting or filtering and an honest visible row count.\n\n## Components and materials\nTreat cards as editorial modules, not the default unit for every fact. A module may be a ruled section, a tinted strip, an inset chart, a compact table, or a glass panel. Use the adaptive accent for focus and active states; use the alternate accent for comparison or editorial emphasis. Semantic success, warning, and danger colors are reserved for meaning.\n\nButtons and filters should be compact, visibly interactive, keyboard accessible, and consistent. Use mono uppercase sparingly for short labels; never set paragraphs in all caps. Put definitions, provenance, and methodology close to the affected visual without letting them dominate the main reading path.\n\n## Interaction and motion\nFavor immediate inspection: useful hover details, direct filtering, linked highlighting, and clear selected states. Preserve context when filters change. Motion should explain state change and remain under roughly 220ms; avoid looping decorative motion. Respect `prefers-reduced-motion`. Ensure focus indicators, semantic HTML, keyboard operation, and text alternatives.\n\n## Responsive behavior\nAt narrower widths, preserve reading order rather than merely shrinking the desktop grid. Collapse 12 columns to a deliberate one- or two-column sequence, keep key values and units together, allow tables and dense timelines to scroll within bounded regions, and move secondary context below the primary signal. Avoid horizontal page scrolling.\n\n## Visual self-check\nAt capture time, verify: the primary decision is obvious within three seconds; the first viewport contains useful evidence; hierarchy survives grayscale; labels and units are readable; wallpaper never competes with data; charts remain truthful; the composition is not a sea of equal cards; and both sparse and crowded data states remain coherent.\n\n## Avoid\nDo not produce a generic SaaS dashboard, a sparse hero page, or a wall of identical rounded cards. Avoid giant mastheads, oversized empty gutters, neon bloom, ornamental gradients, gratuitous doughnut charts, unlabeled axes, mystery icons, low-contrast glass, excessive pills, fake precision, and decorative data. Do not hardcode the current Calliope wallpaper or palette. Do not make critical information hover-only. Do not add content merely to fill the grid.",
+  "tokens": {
+    "schema_version": "rvbbit.design-profile.v1",
+    "behavior": {
+      "theme_source": "viewer",
+      "runtime": "rvbbit.adaptive-theme.v1",
+      "live": true,
+      "fallback": "calliope-editorial-dark"
+    },
+    "fonts": {
+      "stylesheet": "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&display=swap",
+      "display": "Newsreader",
+      "body": "IBM Plex Sans",
+      "mono": "IBM Plex Mono"
+    },
+    "palette": {
+      "background": "#0b1218",
+      "surface": "#111d25",
+      "surface_alt": "#172731",
+      "text": "#edf2f4",
+      "muted": "#9aa8ae",
+      "accent": "#68c7b2",
+      "accent_alt": "#f5b446",
+      "positive": "#67c587",
+      "warning": "#e8b85d",
+      "danger": "#e17868",
+      "border": "rgba(237,242,244,.15)"
+    },
+    "typography": {
+      "display": "\"Newsreader\", Georgia, serif",
+      "body": "\"IBM Plex Sans\", Inter, ui-sans-serif, sans-serif",
+      "mono": "\"IBM Plex Mono\", ui-monospace, monospace"
+    },
+    "shape": {
+      "radius": "2px",
+      "border_width": "1px"
+    },
+    "effects": {
+      "shadow": "0 20px 64px rgba(0,0,0,.32)",
+      "glass": "Use translucent theme panels with 18px backdrop blur and a local contrast veil over wallpaper.",
+      "texture": "Hairline rules, restrained grid rhythm, and no decorative noise."
+    },
+    "charts": {
+      "series": ["#68c7b2", "#f5b446", "#78a9db", "#cc88d8", "#85b95f", "#df7d6b"],
+      "grid": "rgba(237,242,244,.12)",
+      "positive": "#67c587",
+      "negative": "#e17868"
+    },
+    "layout": {
+      "density": "compact",
+      "gutter": "clamp(12px, 1.4vw, 22px)",
+      "max_width": "1800px",
+      "grid": "12 columns",
+      "preferred_compositions": ["8/4 feature and evidence rail", "7/5 comparison spread", "small-multiple field", "compact table with annotated lead chart"]
+    },
+    "adaptive": {
+      "event": "rvbbit:adaptive-theme",
+      "variables": ["--artifact-bg", "--artifact-panel", "--artifact-panel-raised", "--artifact-panel-soft", "--artifact-text", "--artifact-muted", "--artifact-faint", "--artifact-border", "--artifact-border-hot", "--artifact-accent", "--artifact-accent-alt", "--artifact-positive", "--artifact-warning", "--artifact-danger", "--artifact-chart-1", "--artifact-chart-2", "--artifact-chart-3", "--artifact-chart-4", "--artifact-chart-5", "--artifact-chart-6", "--artifact-glass-bg", "--artifact-glass-border", "--artifact-shadow", "--artifact-backdrop-blur", "--artifact-font-display", "--artifact-font-body", "--artifact-font-mono", "--artifact-wallpaper", "--artifact-wallpaper-opacity"]
+    }
+  }
+}

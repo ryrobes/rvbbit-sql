@@ -25,6 +25,7 @@ import re
 import shutil
 import socket
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -36,10 +37,29 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsp
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+import calliope_dreams
 
 
 _HERE = Path(__file__).resolve().parent
 _ASSET_DIR = _HERE / "calliope"
+_CACHE_VERSIONED_ASSETS = (
+    "calliope.css",
+    "calliope.js",
+    "daily-notes-editor.js",
+    "thinking-orbs.js",
+)
+
+
+def _asset_version() -> str:
+    """One immutable URL generation for the coupled Calliope browser bundle."""
+    digest = hashlib.sha256()
+    for name in _CACHE_VERSIONED_ASSETS:
+        digest.update(name.encode("utf-8"))
+        digest.update((_ASSET_DIR / name).read_bytes())
+    return digest.hexdigest()[:16]
+
+
+_ASSET_VERSION = _asset_version()
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.I,
@@ -72,6 +92,9 @@ _MAX_AUDIO_SECONDS_CEILING = 10 * 60
 _MAX_REALTIME_SDP_BYTES = 128 * 1024
 _MAX_TRANSCRIPTION_KEYWORDS = 40
 _MAX_TRANSCRIPTION_KEYWORD_CHARS = 120
+_SYNOPSIS_WAKE = threading.Event()
+_SYNOPSIS_THREAD = None
+_SYNOPSIS_THREAD_LOCK = threading.Lock()
 _EXPORT_EXTENSIONS = {
     ".csv",
     ".doc",
@@ -155,6 +178,9 @@ _VISUAL_FEEDBACK_BUDGET = 2
 _MAX_STYLE_MARKDOWN_CHARS = 32_000
 _MAX_STYLE_SOURCE_TEXT_CHARS = 24_000
 _MAX_STYLE_SOURCES = 6
+_ADAPTIVE_DESIGN_PROFILE_ID = "ca1100e0-0000-4000-8000-000000000001"
+_ADAPTIVE_DESIGN_PROFILE_VERSION_ID = "ca1100e0-0000-4000-8000-000000000101"
+_ADAPTIVE_DESIGN_PROFILE_SPEC = _ASSET_DIR / "adaptive-design-profile.json"
 _MAX_EVIDENCE_REFS = 12
 _MAX_EVIDENCE_RESULTS = 36
 _MAX_EVIDENCE_QUERY_CHARS = 600
@@ -346,6 +372,29 @@ _ACTION_FIELD_TYPES = {"text", "textarea", "select", "boolean", "secret"}
 _ACTION_RUN_STATUSES = {"planned", "running", "complete", "failed"}
 _MAX_ACTION_INPUT_CHARS = 40_000
 _MAX_ACTION_SEARCH_RESULTS = 100
+_LIBRARY_INVENTORY_SECTIONS = {
+    "knowledge": "Knowledge",
+    "tools": "Tools",
+    "meaning": "Meaning",
+    "routines": "Routines",
+    "people": "People & access",
+}
+_LIBRARY_INVENTORY_STATES = {
+    "attention": "Needs attention",
+    "syncing": "Working",
+    "healthy": "Healthy",
+    "ready": "Ready",
+    "inactive": "Inactive",
+}
+_LIBRARY_INVENTORY_STATE_ORDER = {
+    "attention": 0,
+    "syncing": 1,
+    "healthy": 2,
+    "ready": 3,
+    "inactive": 4,
+}
+_MAX_LIBRARY_INVENTORY_RESULTS = 500
+_MAX_LIBRARY_HANDOFF_ITEMS = 24
 _MCP_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _MCP_SECRET_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]{0,127})\}")
 _MCP_SECRETISH_ENV_RE = re.compile(
@@ -703,6 +752,11 @@ class CalliopeConfig:
     transcription_languages: tuple[str, ...] = ()
     max_audio_bytes: int = _DEFAULT_MAX_AUDIO_BYTES
     max_audio_seconds: int = _DEFAULT_MAX_AUDIO_SECONDS
+    dreaming_enabled: bool = True
+    dream_evidence_lab_enabled: bool = True
+    dream_timezone: str = "UTC"
+    dream_hour: int = 3
+    dream_interval_seconds: int = 15 * 60
 
     @property
     def enabled(self) -> bool:
@@ -751,6 +805,16 @@ class CalliopeConfig:
             )
         except (TypeError, ValueError):
             max_audio_seconds = _DEFAULT_MAX_AUDIO_SECONDS
+        try:
+            dream_hour = int(os.environ.get("WAREHOUSE_CALLIOPE_DREAM_HOUR", "3"))
+        except (TypeError, ValueError):
+            dream_hour = 3
+        try:
+            dream_interval = int(
+                os.environ.get("WAREHOUSE_CALLIOPE_DREAM_TICK_SECONDS", str(15 * 60))
+            )
+        except (TypeError, ValueError):
+            dream_interval = 15 * 60
         transcription_provider = os.environ.get(
             "WAREHOUSE_CALLIOPE_STT_PROVIDER", "openai"
         ).strip().lower()
@@ -828,11 +892,28 @@ class CalliopeConfig:
                 10,
                 min(max_audio_seconds, _MAX_AUDIO_SECONDS_CEILING),
             ),
+            dreaming_enabled=os.environ.get(
+                "WAREHOUSE_CALLIOPE_DREAMS", "1"
+            ).strip().lower() not in {"0", "false", "no", "off", "disabled"},
+            dream_evidence_lab_enabled=os.environ.get(
+                "WAREHOUSE_CALLIOPE_DREAM_EVIDENCE_LAB", "1"
+            ).strip().lower() not in {"0", "false", "no", "off", "disabled"},
+            dream_timezone=(
+                os.environ.get("WAREHOUSE_CALLIOPE_DREAM_TIMEZONE", "").strip()
+                or os.environ.get("TZ", "").strip()
+                or "UTC"
+            )[:100],
+            dream_hour=max(0, min(dream_hour, 23)),
+            dream_interval_seconds=max(60, min(dream_interval, 6 * 60 * 60)),
         )
 
 
 def is_enabled() -> bool:
     return CalliopeConfig.from_env().enabled
+
+
+def start_dream_worker(conn_factory: Callable[..., Any]) -> bool:
+    return calliope_dreams.start_worker(conn_factory, CalliopeConfig.from_env())
 
 
 class TranscriptionProviderError(RuntimeError):
@@ -1250,13 +1331,32 @@ CREATE TABLE IF NOT EXISTS rvbbit.calliope_attachments (
 );
 CREATE INDEX IF NOT EXISTS calliope_attachments_session_idx
     ON rvbbit.calliope_attachments (session_id, created_at);
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_session_synopses (
+    session_id uuid PRIMARY KEY REFERENCES rvbbit.calliope_sessions(id) ON DELETE CASCADE,
+    status text NOT NULL DEFAULT 'pending',
+    input_hash text,
+    synopsis text,
+    through_ordinal integer NOT NULL DEFAULT 0,
+    provider text,
+    model text,
+    attempts integer NOT NULL DEFAULT 0,
+    last_error text,
+    not_before timestamptz NOT NULL DEFAULT now(),
+    enqueued_at timestamptz NOT NULL DEFAULT now(),
+    started_at timestamptz,
+    completed_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_session_synopses_status_check
+        CHECK (status IN ('pending','running','ready','failed','disabled'))
+);
+CREATE INDEX IF NOT EXISTS calliope_session_synopses_queue_idx
+    ON rvbbit.calliope_session_synopses (status,not_before,enqueued_at);
 """
 
 _STYLE_DDL = """
 CREATE TABLE IF NOT EXISTS rvbbit.calliope_design_profiles (
     id uuid PRIMARY KEY,
     owner_email text NOT NULL,
-    execution_subject text NOT NULL,
     name text NOT NULL,
     description text NOT NULL DEFAULT '',
     current_version integer NOT NULL DEFAULT 1,
@@ -1264,6 +1364,21 @@ CREATE TABLE IF NOT EXISTS rvbbit.calliope_design_profiles (
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+DO $do$
+BEGIN
+    -- Early service-only builds accidentally placed this unused identity
+    -- column on Design Profiles. Keep those databases readable without making
+    -- a non-executable visual contract require an execution identity.
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='rvbbit' AND table_name='calliope_design_profiles'
+          AND column_name='execution_subject' AND is_nullable='NO'
+    ) THEN
+        ALTER TABLE rvbbit.calliope_design_profiles
+            ALTER COLUMN execution_subject DROP NOT NULL;
+    END IF;
+END
+$do$;
 CREATE UNIQUE INDEX IF NOT EXISTS calliope_design_profiles_owner_name_idx
     ON rvbbit.calliope_design_profiles (owner_email, lower(name))
     WHERE NOT archived;
@@ -2007,6 +2122,259 @@ CREATE INDEX IF NOT EXISTS calliope_workflow_runs_cost_pending_idx
     WHERE trigger_kind='scheduled' AND status <> 'running' AND cost_receipt_id IS NULL;
 """
 
+_DREAM_DDL = """
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_dream_cycles (
+    id uuid PRIMARY KEY,
+    cycle_date date NOT NULL,
+    cycle_kind text NOT NULL DEFAULT 'nightly',
+    timezone text NOT NULL DEFAULT 'UTC',
+    lens text NOT NULL,
+    status text NOT NULL DEFAULT 'running',
+    generated_by text NOT NULL DEFAULT 'calliope@system',
+    window_start timestamptz NOT NULL,
+    window_end timestamptz NOT NULL,
+    source_summary jsonb NOT NULL DEFAULT '{}'::jsonb,
+    model_receipt jsonb NOT NULL DEFAULT '{}'::jsonb,
+    observation_count integer NOT NULL DEFAULT 0,
+    dream_count integer NOT NULL DEFAULT 0,
+    candidate_count integer NOT NULL DEFAULT 0,
+    probe_count integer NOT NULL DEFAULT 0,
+    probe_success_count integer NOT NULL DEFAULT 0,
+    error text,
+    started_at timestamptz NOT NULL DEFAULT now(),
+    completed_at timestamptz,
+    CONSTRAINT calliope_dream_cycles_kind_check
+        CHECK (cycle_kind IN ('nightly','manual')),
+    CONSTRAINT calliope_dream_cycles_status_check
+        CHECK (status IN ('running','complete','failed')),
+    CONSTRAINT calliope_dream_cycles_window_check CHECK (window_end > window_start),
+    CONSTRAINT calliope_dream_cycles_counts_check
+        CHECK (observation_count >= 0 AND dream_count >= 0),
+    CONSTRAINT calliope_dream_cycles_source_check
+        CHECK (jsonb_typeof(source_summary)='object'),
+    CONSTRAINT calliope_dream_cycles_receipt_check
+        CHECK (jsonb_typeof(model_receipt)='object')
+);
+ALTER TABLE rvbbit.calliope_dream_cycles
+    ADD COLUMN IF NOT EXISTS candidate_count integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS probe_count integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS probe_success_count integer NOT NULL DEFAULT 0;
+UPDATE rvbbit.calliope_dream_cycles SET candidate_count=dream_count
+ WHERE candidate_count=0 AND dream_count>0;
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname='calliope_dream_cycles_candidate_count_check'
+           AND conrelid='rvbbit.calliope_dream_cycles'::regclass
+    ) THEN
+        ALTER TABLE rvbbit.calliope_dream_cycles
+            ADD CONSTRAINT calliope_dream_cycles_candidate_count_check
+            CHECK (candidate_count>=0 AND dream_count<=candidate_count);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname='calliope_dream_cycles_probe_count_check'
+           AND conrelid='rvbbit.calliope_dream_cycles'::regclass
+    ) THEN
+        ALTER TABLE rvbbit.calliope_dream_cycles
+            ADD CONSTRAINT calliope_dream_cycles_probe_count_check
+            CHECK (probe_count>=0 AND probe_success_count>=0 AND probe_success_count<=probe_count);
+    END IF;
+END
+$do$;
+CREATE UNIQUE INDEX IF NOT EXISTS calliope_dream_cycles_nightly_date_idx
+    ON rvbbit.calliope_dream_cycles (cycle_date) WHERE cycle_kind='nightly';
+CREATE INDEX IF NOT EXISTS calliope_dream_cycles_started_idx
+    ON rvbbit.calliope_dream_cycles (started_at DESC);
+
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_dream_observations (
+    id uuid PRIMARY KEY,
+    cycle_id uuid NOT NULL REFERENCES rvbbit.calliope_dream_cycles(id) ON DELETE CASCADE,
+    fingerprint text NOT NULL,
+    kind text NOT NULL,
+    title text NOT NULL,
+    summary text NOT NULL,
+    evidence jsonb NOT NULL DEFAULT '[]'::jsonb,
+    entities jsonb NOT NULL DEFAULT '[]'::jsonb,
+    signal_count integer NOT NULL DEFAULT 1,
+    confidence numeric(5,4) NOT NULL DEFAULT 0.5,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_dream_observations_kind_check
+        CHECK (kind IN ('friction','repetition','connection','gap','success','change')),
+    CONSTRAINT calliope_dream_observations_evidence_check
+        CHECK (jsonb_typeof(evidence)='array'),
+    CONSTRAINT calliope_dream_observations_entities_check
+        CHECK (jsonb_typeof(entities)='array'),
+    CONSTRAINT calliope_dream_observations_signal_check CHECK (signal_count >= 1),
+    CONSTRAINT calliope_dream_observations_confidence_check
+        CHECK (confidence BETWEEN 0 AND 1),
+    CONSTRAINT calliope_dream_observations_cycle_key UNIQUE (cycle_id,fingerprint)
+);
+CREATE INDEX IF NOT EXISTS calliope_dream_observations_cycle_idx
+    ON rvbbit.calliope_dream_observations (cycle_id,confidence DESC,created_at);
+
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_dream_probes (
+    id uuid PRIMARY KEY,
+    cycle_id uuid NOT NULL REFERENCES rvbbit.calliope_dream_cycles(id) ON DELETE CASCADE,
+    probe_key text NOT NULL,
+    kind text NOT NULL,
+    operator text,
+    hypothesis text NOT NULL,
+    falsifier text NOT NULL,
+    purpose text NOT NULL DEFAULT '',
+    observation_refs jsonb NOT NULL DEFAULT '[]'::jsonb,
+    sql_text text NOT NULL,
+    sql_sha256 text NOT NULL,
+    operator_args jsonb NOT NULL DEFAULT '{}'::jsonb,
+    execution_status text NOT NULL DEFAULT 'planned',
+    verdict text NOT NULL DEFAULT 'untested',
+    result_summary text NOT NULL DEFAULT '',
+    result_preview jsonb NOT NULL DEFAULT '{}'::jsonb,
+    row_count integer NOT NULL DEFAULT 0,
+    elapsed_ms integer NOT NULL DEFAULT 0,
+    error text,
+    cache_source_id uuid REFERENCES rvbbit.calliope_dream_probes(id) ON DELETE SET NULL,
+    executed_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_dream_probes_kind_check CHECK (kind IN ('sql','clover')),
+    CONSTRAINT calliope_dream_probes_execution_check
+        CHECK (execution_status IN ('planned','complete','error','skipped')),
+    CONSTRAINT calliope_dream_probes_verdict_check
+        CHECK (verdict IN ('supported','contradicted','inconclusive','untested')),
+    CONSTRAINT calliope_dream_probes_observation_refs_check CHECK (jsonb_typeof(observation_refs)='array'),
+    CONSTRAINT calliope_dream_probes_operator_args_check CHECK (jsonb_typeof(operator_args)='object'),
+    CONSTRAINT calliope_dream_probes_result_preview_check CHECK (jsonb_typeof(result_preview)='object'),
+    CONSTRAINT calliope_dream_probes_counts_check CHECK (row_count>=0 AND elapsed_ms>=0),
+    CONSTRAINT calliope_dream_probes_cycle_key UNIQUE (cycle_id,probe_key)
+);
+CREATE INDEX IF NOT EXISTS calliope_dream_probes_cycle_idx
+    ON rvbbit.calliope_dream_probes (cycle_id,execution_status,executed_at);
+CREATE INDEX IF NOT EXISTS calliope_dream_probes_cache_idx
+    ON rvbbit.calliope_dream_probes (sql_sha256,operator,executed_at DESC)
+    WHERE execution_status='complete';
+
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_dreams (
+    id uuid PRIMARY KEY,
+    fingerprint text NOT NULL UNIQUE,
+    first_cycle_id uuid REFERENCES rvbbit.calliope_dream_cycles(id) ON DELETE SET NULL,
+    latest_cycle_id uuid REFERENCES rvbbit.calliope_dream_cycles(id) ON DELETE SET NULL,
+    version integer NOT NULL DEFAULT 1,
+    dream_type text NOT NULL,
+    output_kind text NOT NULL,
+    status text NOT NULL DEFAULT 'proposed',
+    title text NOT NULL,
+    thesis text NOT NULL,
+    rationale text NOT NULL DEFAULT '',
+    output jsonb NOT NULL DEFAULT '{}'::jsonb,
+    evidence jsonb NOT NULL DEFAULT '[]'::jsonb,
+    probe_receipts jsonb NOT NULL DEFAULT '[]'::jsonb,
+    entities jsonb NOT NULL DEFAULT '[]'::jsonb,
+    novelty numeric(5,4) NOT NULL DEFAULT 0.5,
+    confidence numeric(5,4) NOT NULL DEFAULT 0.5,
+    impact text NOT NULL DEFAULT 'medium',
+    effort text NOT NULL DEFAULT 'medium',
+    recurrence_count integer NOT NULL DEFAULT 1,
+    portfolio_state text NOT NULL DEFAULT 'promoted',
+    portfolio_rank smallint,
+    rank_score numeric(5,4) NOT NULL DEFAULT 0.5,
+    promoted_at timestamptz,
+    adopted_by text,
+    adopted_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_dreams_version_check CHECK (version >= 1),
+    CONSTRAINT calliope_dreams_type_check
+        CHECK (dream_type IN ('quick_win','connection','automation','strategic','question')),
+    CONSTRAINT calliope_dreams_output_kind_check
+        CHECK (output_kind IN ('prototype','project_plan','question')),
+    CONSTRAINT calliope_dreams_status_check
+        CHECK (status IN ('proposed','exploring','adopted','retired')),
+    CONSTRAINT calliope_dreams_output_check CHECK (jsonb_typeof(output)='object'),
+    CONSTRAINT calliope_dreams_evidence_check CHECK (jsonb_typeof(evidence)='array'),
+    CONSTRAINT calliope_dreams_probe_receipts_check CHECK (jsonb_typeof(probe_receipts)='array'),
+    CONSTRAINT calliope_dreams_entities_check CHECK (jsonb_typeof(entities)='array'),
+    CONSTRAINT calliope_dreams_score_check
+        CHECK (novelty BETWEEN 0 AND 1 AND confidence BETWEEN 0 AND 1),
+    CONSTRAINT calliope_dreams_impact_check CHECK (impact IN ('low','medium','high')),
+    CONSTRAINT calliope_dreams_effort_check CHECK (effort IN ('small','medium','large')),
+    CONSTRAINT calliope_dreams_recurrence_check CHECK (recurrence_count >= 1)
+);
+ALTER TABLE rvbbit.calliope_dreams
+    ADD COLUMN IF NOT EXISTS portfolio_state text NOT NULL DEFAULT 'promoted',
+    ADD COLUMN IF NOT EXISTS portfolio_rank smallint,
+    ADD COLUMN IF NOT EXISTS rank_score numeric(5,4) NOT NULL DEFAULT 0.5,
+    ADD COLUMN IF NOT EXISTS promoted_at timestamptz,
+    ADD COLUMN IF NOT EXISTS probe_receipts jsonb NOT NULL DEFAULT '[]'::jsonb;
+UPDATE rvbbit.calliope_dreams SET promoted_at=coalesce(promoted_at,updated_at,created_at)
+ WHERE portfolio_state='promoted' AND promoted_at IS NULL;
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname='calliope_dreams_portfolio_state_check'
+           AND conrelid='rvbbit.calliope_dreams'::regclass
+    ) THEN
+        ALTER TABLE rvbbit.calliope_dreams
+            ADD CONSTRAINT calliope_dreams_portfolio_state_check
+            CHECK (portfolio_state IN ('promoted','backlog'));
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname='calliope_dreams_portfolio_rank_check'
+           AND conrelid='rvbbit.calliope_dreams'::regclass
+    ) THEN
+        ALTER TABLE rvbbit.calliope_dreams
+            ADD CONSTRAINT calliope_dreams_portfolio_rank_check
+            CHECK (portfolio_rank IS NULL OR portfolio_rank BETWEEN 1 AND 3);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname='calliope_dreams_rank_score_check'
+           AND conrelid='rvbbit.calliope_dreams'::regclass
+    ) THEN
+        ALTER TABLE rvbbit.calliope_dreams
+            ADD CONSTRAINT calliope_dreams_rank_score_check
+            CHECK (rank_score BETWEEN 0 AND 1);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname='calliope_dreams_probe_receipts_check'
+           AND conrelid='rvbbit.calliope_dreams'::regclass
+    ) THEN
+        ALTER TABLE rvbbit.calliope_dreams
+            ADD CONSTRAINT calliope_dreams_probe_receipts_check
+            CHECK (jsonb_typeof(probe_receipts)='array');
+    END IF;
+END
+$do$;
+CREATE INDEX IF NOT EXISTS calliope_dreams_status_updated_idx
+    ON rvbbit.calliope_dreams (status,updated_at DESC);
+CREATE INDEX IF NOT EXISTS calliope_dreams_latest_cycle_idx
+    ON rvbbit.calliope_dreams (latest_cycle_id,updated_at DESC);
+CREATE INDEX IF NOT EXISTS calliope_dreams_portfolio_idx
+    ON rvbbit.calliope_dreams
+       (portfolio_state,status,portfolio_rank NULLS LAST,rank_score DESC,updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_dream_events (
+    event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dream_id uuid NOT NULL REFERENCES rvbbit.calliope_dreams(id) ON DELETE CASCADE,
+    actor_email text NOT NULL,
+    event_kind text NOT NULL,
+    note text NOT NULL DEFAULT '',
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_dream_events_kind_check
+        CHECK (event_kind IN ('viewed','exploring','adopted','dismissed','sleeping','reopened')),
+    CONSTRAINT calliope_dream_events_payload_check CHECK (jsonb_typeof(payload)='object')
+);
+CREATE INDEX IF NOT EXISTS calliope_dream_events_actor_idx
+    ON rvbbit.calliope_dream_events (actor_email,created_at DESC,event_id DESC);
+CREATE INDEX IF NOT EXISTS calliope_dream_events_dream_idx
+    ON rvbbit.calliope_dream_events (dream_id,created_at DESC,event_id DESC);
+"""
+
 _ACTION_DDL = """
 CREATE TABLE IF NOT EXISTS rvbbit.calliope_action_catalog (
     id text PRIMARY KEY,
@@ -2099,6 +2467,75 @@ def _seed_action_catalog(conn: Any) -> None:
         )
 
 
+def _builtin_design_profile_spec() -> dict[str, Any]:
+    """Load the checked-in system profile used by both fresh and upgraded UI installs."""
+    try:
+        spec = json.loads(_ADAPTIVE_DESIGN_PROFILE_SPEC.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Adaptive Calliope Design Profile is missing or invalid") from exc
+    if not isinstance(spec, dict):
+        raise RuntimeError("Adaptive Calliope Design Profile must be a JSON object")
+    if str(spec.get("id")) != _ADAPTIVE_DESIGN_PROFILE_ID:
+        raise RuntimeError("Adaptive Calliope Design Profile id changed unexpectedly")
+    if str(spec.get("version_id")) != _ADAPTIVE_DESIGN_PROFILE_VERSION_ID:
+        raise RuntimeError("Adaptive Calliope Design Profile version id changed unexpectedly")
+    return spec
+
+
+def _seed_builtin_design_profiles(conn: Any) -> None:
+    """Make immutable system profiles available even before an extension upgrade."""
+    spec = _builtin_design_profile_spec()
+    markdown = str(spec.get("markdown") or "").strip()
+    if not 1 <= len(markdown) <= _MAX_STYLE_MARKDOWN_CHARS:
+        raise RuntimeError("Adaptive Calliope Design Profile Markdown is out of bounds")
+    tokens = _normalize_design_tokens(spec.get("tokens"))
+    compiled = _compile_design_profile(
+        str(spec["name"]),
+        markdown,
+        tokens,
+        _ADAPTIVE_DESIGN_PROFILE_ID,
+        1,
+    )
+    conn.execute(
+        "INSERT INTO rvbbit.calliope_design_profiles "
+        "(id,owner_email,name,description,current_version,archived) "
+        "VALUES (%s::uuid,%s,%s,%s,1,false) "
+        "ON CONFLICT (id) DO UPDATE SET "
+        "owner_email=excluded.owner_email,name=excluded.name,"
+        "description=excluded.description,current_version=1,archived=false "
+        "WHERE (rvbbit.calliope_design_profiles.owner_email,"
+        "rvbbit.calliope_design_profiles.name,"
+        "rvbbit.calliope_design_profiles.description,"
+        "rvbbit.calliope_design_profiles.current_version,"
+        "rvbbit.calliope_design_profiles.archived) IS DISTINCT FROM "
+        "(excluded.owner_email,excluded.name,excluded.description,1,false)",
+        (
+            _ADAPTIVE_DESIGN_PROFILE_ID,
+            str(spec.get("owner_email") or "calliope@system"),
+            str(spec["name"]),
+            str(spec.get("description") or "")[:500],
+        ),
+    )
+    conn.execute(
+        "INSERT INTO rvbbit.calliope_design_profile_versions "
+        "(id,profile_id,version,markdown,tokens,compiled_prompt,"
+        "source_summary,created_by) "
+        "SELECT %s::uuid,%s::uuid,1,%s,%s::jsonb,%s,%s,%s "
+        "WHERE EXISTS (SELECT 1 FROM rvbbit.calliope_design_profiles "
+        "WHERE id=%s::uuid) ON CONFLICT DO NOTHING",
+        (
+            _ADAPTIVE_DESIGN_PROFILE_VERSION_ID,
+            _ADAPTIVE_DESIGN_PROFILE_ID,
+            markdown,
+            json.dumps(tokens, ensure_ascii=False),
+            compiled,
+            str(spec.get("source_summary") or "")[:4_000],
+            str(spec.get("owner_email") or "calliope@system"),
+            _ADAPTIVE_DESIGN_PROFILE_ID,
+        ),
+    )
+
+
 def ensure_tables(conn_factory: Callable[..., Any]) -> None:
     orphaned_manual_runs: list[dict[str, Any]] = []
     with conn_factory() as conn:
@@ -2108,6 +2545,7 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
         # migration prevent the HTTP service from starting at all.
         conn.execute(_DDL)
         conn.execute(_STYLE_DDL)
+        _seed_builtin_design_profiles(conn)
         conn.execute(_HOME_DDL)
         conn.execute(_METRIC_FOLLOW_DDL)
         conn.execute(_WATCH_DDL)
@@ -2118,6 +2556,7 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
         conn.execute(_INSTRUMENT_DDL)
         conn.execute(_COST_CALLER_DDL)
         conn.execute(_WORKFLOW_DDL)
+        conn.execute(_DREAM_DDL)
         conn.execute(_ACTION_DDL)
         _seed_action_catalog(conn)
         # A server restart cannot preserve an in-flight SSE/agent task. Clear
@@ -2174,6 +2613,26 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
             )
 
 
+def _calliope_service_identities() -> list[str]:
+    """Return the non-human principals Hermes may publish artifacts as.
+
+    The shared bearer always has ``client_id=static-key``, but installations
+    may give its caller a readable label through WAREHOUSE_MCP_STATIC_CALLER.
+    That configured label is still the same service principal and is safe to
+    replace only at the trusted Calliope session/surface boundary below.
+    """
+    values = {"static-key"}
+    configured = str(os.environ.get("WAREHOUSE_MCP_STATIC_CALLER") or "").strip().lower()
+    if configured:
+        values.add(configured)
+    return sorted(values)
+
+
+def _is_calliope_service_identity(value: Any) -> bool:
+    normalized = str(value or "").strip().lower() or "static-key"
+    return normalized in _calliope_service_identities()
+
+
 def _backfill_artifact_attribution(conn: Any) -> None:
     """Replace shared-key creator labels when Calliope has signed provenance.
 
@@ -2197,12 +2656,14 @@ def _backfill_artifact_attribution(conn: Any) -> None:
                  abs(extract(epoch FROM (v.created_at-t.created_at))),
                  f.created_at
     """
+    service_identities = _calliope_service_identities()
     conn.execute(
         "WITH attributed AS (" + candidates + ") "
         "UPDATE rvbbit.dashboard_versions v SET created_by=a.owner_email "
         "FROM attributed a "
         "WHERE v.dashboard_id=a.dashboard_id AND v.version=a.version "
-        "AND coalesce(nullif(lower(btrim(v.created_by)),''),'static-key')='static-key'"
+        "AND coalesce(nullif(lower(btrim(v.created_by)),''),'static-key')=ANY(%s::text[])",
+        (service_identities,),
     )
     conn.execute(
         "WITH attributed AS (" + candidates + "), "
@@ -2212,7 +2673,8 @@ def _backfill_artifact_attribution(conn: Any) -> None:
         ") "
         "UPDATE rvbbit.dashboards d SET owner_email=o.owner_email "
         "FROM owners o WHERE d.id=o.dashboard_id "
-        "AND coalesce(nullif(lower(btrim(d.owner_email)),''),'static-key')='static-key'"
+        "AND coalesce(nullif(lower(btrim(d.owner_email)),''),'static-key')=ANY(%s::text[])",
+        (service_identities,),
     )
 
 
@@ -2257,6 +2719,715 @@ def _json_array(value: Any) -> list[Any]:
 
 def _capability_action_key(catalog_id: Any) -> str:
     return str(catalog_id or "").strip().lower().replace("~", "-").replace("/", "~")
+
+
+def _library_inventory_fact(label: str, value: Any) -> dict[str, Any] | None:
+    if value is None or value == "":
+        return None
+    return {"label": str(label)[:80], "value": value}
+
+
+def _library_inventory_item(
+    *,
+    ref: str,
+    kind: str,
+    section: str,
+    label: str,
+    summary: str,
+    state: str = "ready",
+    health: str = "Configured and available to Calliope.",
+    facts: list[dict[str, Any] | None] | None = None,
+    owner: str | None = None,
+    visibility: str | None = None,
+    updated_at: Any = None,
+    last_activity_at: Any = None,
+    detail: dict[str, Any] | None = None,
+    open_url: str | None = None,
+    intents: list[str] | None = None,
+) -> dict[str, Any]:
+    normalized_state = state if state in _LIBRARY_INVENTORY_STATES else "ready"
+    item = {
+        "ref": str(ref)[:320],
+        "kind": str(kind)[:80],
+        "section": section if section in _LIBRARY_INVENTORY_SECTIONS else "tools",
+        "section_label": _LIBRARY_INVENTORY_SECTIONS.get(section, "Tools"),
+        "label": str(label or ref)[:240],
+        "summary": str(summary or "Configured for this Calliope installation.")[:1200],
+        "state": normalized_state,
+        "state_label": _LIBRARY_INVENTORY_STATES[normalized_state],
+        "health": str(health or "Configured and available to Calliope.")[:1200],
+        "facts": [fact for fact in (facts or []) if fact],
+        "owner": str(owner)[:320] if owner else None,
+        "visibility": str(visibility)[:80] if visibility else None,
+        "updated_at": _now_iso(updated_at),
+        "last_activity_at": _now_iso(last_activity_at),
+        "detail": detail or {},
+        "open_url": str(open_url)[:2000] if open_url else None,
+        "intents": list(dict.fromkeys(str(intent)[:80] for intent in (intents or ["inspect"]))),
+    }
+    # Normalize Decimal, UUID, datetime, and driver-specific values once at the
+    # boundary. The inventory is also pinned into Stage payloads, so it must be
+    # stable JSON rather than a live psycopg row shape.
+    return json.loads(json.dumps(item, default=str))
+
+
+def _library_metric_value(value: Any) -> str:
+    if value is None:
+        return "Not observed"
+    if isinstance(value, dict):
+        candidate = value.get("value")
+        if isinstance(candidate, dict):
+            candidate = candidate.get("value")
+        if candidate is not None and not isinstance(candidate, (dict, list)):
+            return str(candidate)[:120]
+    if not isinstance(value, (dict, list)):
+        return str(value)[:120]
+    return json.dumps(value, default=str, ensure_ascii=False)[:120]
+
+
+def _library_safe_endpoint(value: Any) -> str | None:
+    """Expose endpoint identity without leaking URL credentials or query tokens."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return raw.split("?", 1)[0].split("#", 1)[0][:1200]
+    if not parts.scheme or not parts.netloc:
+        return raw.split("?", 1)[0].split("#", 1)[0][:1200]
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))[:1200]
+
+
+def _library_brain_inventory(conn: Any, _owner: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT to_jsonb(s) AS source,"
+        "(SELECT count(*)::int FROM rvbbit.brain_documents d "
+        " WHERE d.source_id=s.source_id AND d.deleted_at IS NULL) AS docs,"
+        "(SELECT count(*)::int FROM rvbbit.brain_chunks c "
+        " JOIN rvbbit.brain_documents d ON d.doc_id=c.doc_id "
+        " WHERE d.source_id=s.source_id AND d.deleted_at IS NULL) AS chunks,"
+        "(SELECT to_jsonb(r) FROM rvbbit.brain_sync_runs r "
+        " WHERE r.source_id=s.source_id ORDER BY r.started_at DESC LIMIT 1) AS last_sync,"
+        "(SELECT count(*)::int FROM rvbbit.brain_pending_grants g "
+        " WHERE g.source_id=s.source_id AND NOT g.approved) AS pending_grants "
+        "FROM rvbbit.brain_sources s ORDER BY s.label,s.source_id"
+    ).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        source = _json_object(row.get("source"))
+        sync = _json_object(row.get("last_sync"))
+        docs = int(row.get("docs") or 0)
+        chunks = int(row.get("chunks") or 0)
+        pending = int(row.get("pending_grants") or 0)
+        enabled = source.get("enabled", True) is not False
+        errors = int(sync.get("errors") or 0)
+        running = bool(sync and not sync.get("finished_at"))
+        if not enabled:
+            state, health = "inactive", "This knowledge source is currently disabled."
+        elif running:
+            state, health = "syncing", "A document synchronization is currently running."
+        elif errors:
+            state, health = "attention", f"The latest synchronization reported {errors} error{'s' if errors != 1 else ''}."
+        elif pending:
+            state, health = "attention", f"{pending} discovered access grant{'s' if pending != 1 else ''} still need review."
+        elif docs:
+            state, health = "healthy", "Indexed documents are available to search, Briefs, and Workflows."
+        else:
+            state, health = "ready", "The source is configured but has not produced indexed documents yet."
+        provider = str(_json_object(source.get("config")).get("provider") or source.get("kind") or "document")
+        label = str(source.get("label") or f"Knowledge source {source.get('source_id')}")
+        items.append(_library_inventory_item(
+            ref=f"brain_source:{source.get('source_id')}",
+            kind="brain_source",
+            section="knowledge",
+            label=label,
+            summary=f"{provider.replace('_', ' ')} documents indexed into Company Brain.",
+            state=state,
+            health=health,
+            facts=[
+                _library_inventory_fact("Documents", docs),
+                _library_inventory_fact("Chunks", chunks),
+                _library_inventory_fact("Source type", provider.replace("_", " ")),
+                _library_inventory_fact("Last sync", source.get("last_synced_at") or sync.get("finished_at")),
+                _library_inventory_fact("Access reviews", pending if pending else None),
+            ],
+            visibility="governed",
+            updated_at=source.get("last_synced_at") or source.get("created_at"),
+            last_activity_at=sync.get("finished_at") or sync.get("started_at") or source.get("last_synced_at"),
+            detail={
+                "source_id": source.get("source_id"),
+                "provider": provider,
+                "kind": source.get("kind"),
+                "folder_prefix": source.get("folder_prefix"),
+                "default_roles": source.get("default_roles") or [],
+                "latest_sync": {
+                    key: sync.get(key) for key in (
+                        "trigger", "started_at", "finished_at", "added", "changed",
+                        "removed", "skipped", "errors", "elapsed_sec",
+                    ) if sync.get(key) is not None
+                },
+            },
+            intents=["inspect", "sync", "change"],
+        ))
+    return items
+
+
+def _library_mcp_inventory(conn: Any, _owner: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT s.name,s.transport,s.url,s.command,s.timeout_ms,s.description,s.created_at,"
+        "(SELECT count(*)::int FROM rvbbit.mcp_tools t WHERE t.server=s.name) AS tools,"
+        "(SELECT count(*)::int FROM rvbbit.mcp_resources r WHERE r.server=s.name) AS resources,"
+        "(SELECT array_agg(t.name ORDER BY t.name) FROM rvbbit.mcp_tools t WHERE t.server=s.name) AS tool_names,"
+        "(SELECT jsonb_build_object('at',i.invocation_at,'failed',i.error IS NOT NULL,"
+        " 'latency_ms',i.latency_ms,'tool',i.tool) FROM rvbbit.mcp_invocations i "
+        " WHERE i.server=s.name ORDER BY i.invocation_at DESC LIMIT 1) AS last_call "
+        "FROM rvbbit.mcp_servers s ORDER BY s.name"
+    ).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        tools = int(row.get("tools") or 0)
+        resources = int(row.get("resources") or 0)
+        tool_names = [str(value) for value in (row.get("tool_names") or [])]
+        read_names = [
+            name for name in tool_names
+            if re.search(r"(?:^|_)(?:get|list|search|read|fetch|find|query|lookup|browse|retrieve)(?:_|$)", name, re.I)
+        ]
+        last_call = _json_object(row.get("last_call"))
+        if not tools and not resources:
+            state, health = "attention", "The server is registered but no tools or resources have been discovered."
+        elif last_call.get("failed"):
+            state, health = "attention", "The latest observed MCP invocation reported an error."
+        else:
+            state, health = "healthy", "Discovered MCP surfaces are available as governed tools and SQL functions."
+        intents = ["inspect", "test", "change"]
+        if read_names or resources:
+            intents.append("knowledge_source")
+        name = str(row.get("name") or "MCP server")
+        endpoint = (
+            _library_safe_endpoint(row.get("url"))
+            if row.get("transport") == "http"
+            else str(row.get("command") or "")[:1200] or None
+        )
+        items.append(_library_inventory_item(
+            ref=f"mcp:{name.lower()}",
+            kind="mcp_server",
+            section="tools",
+            label=name,
+            summary=str(row.get("description") or f"{row.get('transport') or 'MCP'} connection exposing company tools."),
+            state=state,
+            health=health,
+            facts=[
+                _library_inventory_fact("Tools", tools),
+                _library_inventory_fact("Resources", resources),
+                _library_inventory_fact("Read surfaces", len(read_names) + resources),
+                _library_inventory_fact("Transport", row.get("transport")),
+                _library_inventory_fact("Last call", last_call.get("at")),
+            ],
+            visibility="organization",
+            updated_at=row.get("created_at"),
+            last_activity_at=last_call.get("at"),
+            detail={
+                "transport": row.get("transport"),
+                "endpoint": endpoint,
+                "timeout_ms": row.get("timeout_ms"),
+                "tool_names": tool_names[:120],
+                "read_candidate_tools": read_names[:40],
+                "resource_count": resources,
+                "last_call": last_call,
+                "knowledge_source_candidate": bool(read_names or resources),
+            },
+            intents=intents,
+        ))
+    return items
+
+
+def _library_cube_inventory(conn: Any, _owner: str) -> list[dict[str, Any]]:
+    status_row = conn.execute(
+        "SELECT to_regclass('rvbbit.cube_refresh_status') IS NOT NULL AS present"
+    ).fetchone() or {}
+    if status_row.get("present"):
+        rows = conn.execute(
+            "SELECT to_jsonb(c) AS catalog,to_jsonb(s) AS refresh "
+            "FROM rvbbit.cube_catalog c LEFT JOIN rvbbit.cube_refresh_status s ON s.name=c.name "
+            "ORDER BY c.name"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT to_jsonb(c) AS catalog,NULL::jsonb AS refresh "
+            "FROM rvbbit.cube_catalog c ORDER BY c.name"
+        ).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        cube = _json_object(row.get("catalog"))
+        refresh = _json_object(row.get("refresh"))
+        enabled = refresh.get("enabled", True) is not False
+        recommended = str(refresh.get("recommended_action") or "")
+        if not enabled:
+            state, health = "inactive", "Automatic refresh is disabled for this cube."
+        elif refresh.get("last_error"):
+            state, health = "attention", "The latest cube refresh reported an error."
+        elif recommended in {"fix_error", "refresh_cube", "maintain_storage"}:
+            state, health = "attention", {
+                "fix_error": "The cube needs a refresh error reviewed.",
+                "refresh_cube": "The cube is stale or its source has changed since the latest refresh.",
+                "maintain_storage": "The cube is current but its optimized storage needs maintenance.",
+            }[recommended]
+        elif refresh.get("refreshed_at"):
+            state, health = "healthy", "The governed cube is refreshed and available for analysis."
+        else:
+            state, health = "ready", "The cube is defined but has no observed refresh state yet."
+        name = str(cube.get("name") or "cube")
+        items.append(_library_inventory_item(
+            ref=f"cube:{name}",
+            kind="cube",
+            section="meaning",
+            label=name.replace("_", " ").title(),
+            summary=str(cube.get("description") or f"Governed analytical cube at the {cube.get('grain') or 'declared'} grain."),
+            state=state,
+            health=health,
+            facts=[
+                _library_inventory_fact("Version", cube.get("version")),
+                _library_inventory_fact("Grain", cube.get("grain")),
+                _library_inventory_fact("Rows", refresh.get("last_rows")),
+                _library_inventory_fact("Last refresh", refresh.get("refreshed_at")),
+                _library_inventory_fact("Sources", refresh.get("source_count")),
+            ],
+            owner=cube.get("owner"),
+            visibility="organization",
+            updated_at=cube.get("created_at"),
+            last_activity_at=refresh.get("refreshed_at"),
+            detail={
+                "name": name,
+                "version": cube.get("version"),
+                "grain": cube.get("grain"),
+                "category": cube.get("category"),
+                "subcategory": cube.get("subcategory"),
+                "refresh_cron": cube.get("refresh_cron"),
+                "refresh": {key: refresh.get(key) for key in (
+                    "enabled", "refresh_mode", "refreshed_at", "last_rows", "last_refresh_seconds",
+                    "recommended_action", "source_count", "dirty_source_count", "source_tables",
+                ) if refresh.get(key) is not None},
+            },
+            intents=["inspect", "refresh", "change"],
+        ))
+    return items
+
+
+def _library_metric_inventory(conn: Any, _owner: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT to_jsonb(m) AS metric,"
+        "(SELECT to_jsonb(o) FROM rvbbit.metric_observations o WHERE o.metric_name=m.name "
+        " ORDER BY coalesce(o.data_as_of,o.observed_at) DESC,o.observation_id DESC LIMIT 1) AS observation,"
+        "(SELECT to_jsonb(mm) FROM rvbbit.metric_materialize mm WHERE mm.metric_name=m.name) AS materialize,"
+        "(SELECT count(*)::int FROM rvbbit.metric_dependencies d WHERE d.metric_name=m.name) AS dependencies,"
+        "(SELECT count(*)::int FROM rvbbit.calliope_metric_follows f WHERE f.metric_name=m.name) AS follows "
+        "FROM rvbbit.metric_catalog m ORDER BY m.name"
+    ).fetchall()
+    items: list[dict[str, Any]] = []
+    failing = {"fail", "failed", "failing", "breach", "breaching", "error"}
+    for row in rows:
+        metric = _json_object(row.get("metric"))
+        observation = _json_object(row.get("observation"))
+        materialize = _json_object(row.get("materialize"))
+        labels = _json_object(metric.get("labels"))
+        display = _json_object(labels.get("display"))
+        status = str(observation.get("status") or "").lower()
+        if materialize and materialize.get("enabled") is False:
+            state, health = "inactive", "Automatic metric observation is disabled."
+        elif status in failing:
+            state, health = "attention", f"The latest governed observation is {status}."
+        elif observation:
+            state, health = "healthy", "A durable governed observation is available."
+        else:
+            state, health = "ready", "The metric is defined but has not produced a durable observation yet."
+        name = str(metric.get("name") or "metric")
+        title = str(display.get("title") or labels.get("title") or name.replace("_", " ").title())
+        observed_at = observation.get("data_as_of") or observation.get("observed_at")
+        items.append(_library_inventory_item(
+            ref=f"metric:{name}",
+            kind="metric",
+            section="meaning",
+            label=title,
+            summary=str(metric.get("description") or "A governed metric definition with versioned observations."),
+            state=state,
+            health=health,
+            facts=[
+                _library_inventory_fact("Current", _library_metric_value(observation.get("value"))),
+                _library_inventory_fact("Version", metric.get("version")),
+                _library_inventory_fact("Grain", metric.get("grain")),
+                _library_inventory_fact("Observed", observed_at),
+                _library_inventory_fact("Brief subscribers", int(row.get("follows") or 0)),
+            ],
+            owner=metric.get("owner"),
+            visibility="organization",
+            updated_at=metric.get("created_at"),
+            last_activity_at=observed_at,
+            detail={
+                "name": name,
+                "version": metric.get("version"),
+                "grain": metric.get("grain"),
+                "params": metric.get("params") or {},
+                "category": metric.get("category"),
+                "subcategory": metric.get("subcategory"),
+                "dependencies": int(row.get("dependencies") or 0),
+                "brief_subscribers": int(row.get("follows") or 0),
+                "observation": {key: observation.get(key) for key in (
+                    "observation_id", "metric_version", "value", "verdict", "status",
+                    "data_as_of", "observed_at", "trigger",
+                ) if observation.get(key) is not None},
+                "materialize": materialize,
+            },
+            open_url="/gallery?" + urlencode({"view": "metrics", "metric": name}),
+            intents=["inspect", "watch", "change"],
+        ))
+    return items
+
+
+def _library_routine_inventory(conn: Any, owner: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    workflow_rows = conn.execute(
+        "SELECT to_jsonb(w) AS routine,to_jsonb(v) AS version,"
+        "(SELECT to_jsonb(r) FROM rvbbit.calliope_workflow_runs r "
+        " WHERE r.workflow_id=w.id ORDER BY r.started_at DESC LIMIT 1) AS last_run "
+        "FROM rvbbit.calliope_workflows w JOIN LATERAL ("
+        " SELECT vv.* FROM rvbbit.calliope_workflow_versions vv WHERE vv.workflow_id=w.id "
+        " AND vv.version=CASE WHEN lower(w.owner_email)=lower(%s) THEN w.latest_version ELSE w.published_version END"
+        ") v ON true WHERE NOT w.archived AND (lower(w.owner_email)=lower(%s) OR "
+        "(w.visibility='company' AND w.published_version IS NOT NULL)) ORDER BY v.name,w.updated_at DESC",
+        (owner, owner),
+    ).fetchall()
+    for row in workflow_rows:
+        routine = _json_object(row.get("routine"))
+        version = _json_object(row.get("version"))
+        last_run = _json_object(row.get("last_run"))
+        if routine.get("schedule_state") == "error" or routine.get("schedule_error"):
+            state, health = "attention", "The scheduled Workflow needs attention before its next run."
+        elif str(last_run.get("status") or "") in {"failed", "blocked"}:
+            state, health = "attention", f"The latest Workflow run is {last_run.get('status')}."
+        elif routine.get("schedule_enabled"):
+            state, health = "healthy", "The Workflow is published to its configured schedule."
+        else:
+            state, health = "ready", "The Workflow is available on demand and is not currently scheduled."
+        name = str(version.get("name") or routine.get("slug") or "Workflow")
+        items.append(_library_inventory_item(
+            ref=f"workflow:{routine.get('id')}",
+            kind="workflow",
+            section="routines",
+            label=name,
+            summary=str(version.get("description") or version.get("goal") or "A reusable Calliope Workflow."),
+            state=state,
+            health=health,
+            facts=[
+                _library_inventory_fact("Version", version.get("version")),
+                _library_inventory_fact("Visibility", routine.get("visibility")),
+                _library_inventory_fact("Schedule", "enabled" if routine.get("schedule_enabled") else "on demand"),
+                _library_inventory_fact("Next run", routine.get("schedule_next_run_at")),
+                _library_inventory_fact("Last result", last_run.get("status")),
+            ],
+            owner=routine.get("owner_email"),
+            visibility=routine.get("visibility"),
+            updated_at=routine.get("updated_at"),
+            last_activity_at=last_run.get("completed_at") or last_run.get("started_at") or routine.get("updated_at"),
+            detail={
+                "id": routine.get("id"), "slug": routine.get("slug"),
+                "version": version.get("version"), "goal": version.get("goal"),
+                "schedule_enabled": routine.get("schedule_enabled"),
+                "schedule_state": routine.get("schedule_state"),
+                "schedule_next_run_at": routine.get("schedule_next_run_at"),
+                "last_run": {key: last_run.get(key) for key in (
+                    "id", "workflow_version", "trigger_kind", "status", "result_summary",
+                    "started_at", "completed_at",
+                ) if last_run.get(key) is not None},
+            },
+            intents=["inspect", "run", "change"],
+        ))
+
+    instrument_rows = conn.execute(
+        "SELECT to_jsonb(i) AS routine,to_jsonb(v) AS version "
+        "FROM rvbbit.calliope_instruments i JOIN LATERAL ("
+        " SELECT vv.* FROM rvbbit.calliope_instrument_versions vv WHERE vv.instrument_id=i.id "
+        " AND vv.version=CASE WHEN lower(i.owner_email)=lower(%s) THEN i.latest_version ELSE i.published_version END"
+        ") v ON true WHERE NOT i.archived AND (lower(i.owner_email)=lower(%s) OR "
+        "(i.visibility='company' AND i.published_version IS NOT NULL)) ORDER BY v.name,i.updated_at DESC",
+        (owner, owner),
+    ).fetchall()
+    for row in instrument_rows:
+        routine = _json_object(row.get("routine"))
+        version = _json_object(row.get("version"))
+        name = str(version.get("name") or routine.get("slug") or "Instrument")
+        fields = version.get("fields") if isinstance(version.get("fields"), list) else []
+        items.append(_library_inventory_item(
+            ref=f"instrument:{routine.get('id')}",
+            kind="instrument",
+            section="routines",
+            label=name,
+            summary=str(version.get("description") or "A reusable guided Calliope Instrument."),
+            state="healthy" if routine.get("published_version") else "ready",
+            health="A human-approved revision is published." if routine.get("published_version") else "A private draft is available to its owner.",
+            facts=[
+                _library_inventory_fact("Version", version.get("version")),
+                _library_inventory_fact("Visibility", routine.get("visibility")),
+                _library_inventory_fact("Inputs", len(fields)),
+                _library_inventory_fact("Published", routine.get("published_at")),
+            ],
+            owner=routine.get("owner_email"),
+            visibility=routine.get("visibility"),
+            updated_at=routine.get("updated_at"),
+            last_activity_at=routine.get("updated_at"),
+            detail={
+                "id": routine.get("id"), "slug": routine.get("slug"),
+                "version": version.get("version"), "field_count": len(fields),
+                "published_version": routine.get("published_version"),
+            },
+            intents=["inspect", "run", "change"],
+        ))
+
+    watch_rows = conn.execute(
+        "SELECT id,name,comparator,threshold,cadence,consecutive_n,active,last_value,last_status,"
+        "last_evaluated_at,last_triggered_at,last_error,created_at,updated_at,source "
+        "FROM rvbbit.calliope_watches WHERE lower(owner_email)=lower(%s) ORDER BY updated_at DESC",
+        (owner,),
+    ).fetchall()
+    for row in watch_rows:
+        if not row.get("active"):
+            state, health = "inactive", "This private data watch is paused."
+        elif row.get("last_error"):
+            state, health = "attention", "The latest watch evaluation reported an error."
+        elif row.get("last_evaluated_at"):
+            state, health = "healthy", "The watch is active and has a recent evaluation."
+        else:
+            state, health = "ready", "The watch is active and waiting for its first evaluation."
+        items.append(_library_inventory_item(
+            ref=f"watch:{row.get('id')}",
+            kind="watch",
+            section="routines",
+            label=str(row.get("name") or "Data watch"),
+            summary=f"Notify when the selected value is {row.get('comparator') or 'outside'} {row.get('threshold')}.",
+            state=state,
+            health=health,
+            facts=[
+                _library_inventory_fact("Rule", f"{row.get('comparator')} {row.get('threshold')}"),
+                _library_inventory_fact("Cadence", row.get("cadence")),
+                _library_inventory_fact("Last value", row.get("last_value")),
+                _library_inventory_fact("Evaluated", row.get("last_evaluated_at")),
+            ],
+            owner=owner,
+            visibility="private",
+            updated_at=row.get("updated_at"),
+            last_activity_at=row.get("last_evaluated_at") or row.get("updated_at"),
+            detail={
+                "id": str(row.get("id")), "source": row.get("source") or {},
+                "comparator": row.get("comparator"), "threshold": row.get("threshold"),
+                "cadence": row.get("cadence"), "consecutive_n": row.get("consecutive_n"),
+                "last_status": row.get("last_status"), "last_triggered_at": row.get("last_triggered_at"),
+            },
+            intents=["inspect", "test", "change"],
+        ))
+    return items
+
+
+def _library_personal_inventory(conn: Any, owner: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    connection = conn.execute(
+        "SELECT owner_email,google_email,status,connected_at,updated_at,last_synced_at,"
+        "last_full_sync_at,last_error,(SELECT count(*)::int FROM rvbbit.calliope_google_calendar_events e "
+        " WHERE lower(e.owner_email)=lower(c.owner_email)) AS events "
+        "FROM rvbbit.calliope_google_calendar_connections c WHERE lower(owner_email)=lower(%s)",
+        (owner,),
+    ).fetchone()
+    if connection:
+        status = str(connection.get("status") or "connected")
+        if status in {"error", "needs_reconnect"} or connection.get("last_error"):
+            state, health = "attention", "Google Calendar needs attention before Calliope can refresh it."
+        elif connection.get("last_synced_at"):
+            state, health = "healthy", "Calendar events are available to private Briefs and personal context."
+        else:
+            state, health = "ready", "Google Calendar is connected and waiting for its first sync."
+        items.append(_library_inventory_item(
+            ref="calendar:google:primary",
+            kind="personal_source",
+            section="knowledge",
+            label="Google Calendar",
+            summary="Private meeting context for Daily Briefs, personal knowledge, and follow-up.",
+            state=state,
+            health=health,
+            facts=[
+                _library_inventory_fact("Account", connection.get("google_email")),
+                _library_inventory_fact("Events", int(connection.get("events") or 0)),
+                _library_inventory_fact("Last sync", connection.get("last_synced_at")),
+                _library_inventory_fact("Status", status.replace("_", " ")),
+            ],
+            owner=owner,
+            visibility="private",
+            updated_at=connection.get("updated_at"),
+            last_activity_at=connection.get("last_synced_at") or connection.get("connected_at"),
+            detail={
+                "provider": "google_calendar", "google_email": connection.get("google_email"),
+                "status": status, "event_count": int(connection.get("events") or 0),
+                "last_synced_at": connection.get("last_synced_at"),
+                "last_full_sync_at": connection.get("last_full_sync_at"),
+            },
+            intents=["inspect", "sync", "change"],
+        ))
+
+    alias_row = conn.execute(
+        "SELECT count(*)::int AS aliases,count(DISTINCT source)::int AS sources "
+        "FROM rvbbit.calliope_identity_aliases WHERE lower(owner_email)=lower(%s)",
+        (owner,),
+    ).fetchone() or {}
+    role_rows = conn.execute(
+        "SELECT r.role,r.label,r.description,"
+        "(SELECT count(*)::int FROM rvbbit.brain_doc_roles dr "
+        " JOIN rvbbit.brain_documents d ON d.doc_id=dr.doc_id "
+        " WHERE dr.role=r.role AND d.deleted_at IS NULL) AS documents "
+        "FROM rvbbit.brain_role_members rm JOIN rvbbit.brain_roles r ON r.role=rm.role "
+        "WHERE lower(rm.principal)=lower(%s) ORDER BY coalesce(r.label,r.role),r.role",
+        (owner,),
+    ).fetchall()
+    aliases = int(alias_row.get("aliases") or 0)
+    items.append(_library_inventory_item(
+        ref=f"identity:{owner.lower()}",
+        kind="identity",
+        section="people",
+        label=owner,
+        summary="The signed-in identity Calliope uses for ownership, private context, and governed access.",
+        state="healthy",
+        health="Requests, personal context, and ownership are scoped to this verified identity.",
+        facts=[
+            _library_inventory_fact("Identity aliases", aliases),
+            _library_inventory_fact("Access roles", len(role_rows)),
+            _library_inventory_fact("Alias sources", int(alias_row.get("sources") or 0)),
+        ],
+        owner=owner,
+        visibility="private",
+        detail={
+            "email": owner, "identity_aliases": aliases,
+            "roles": [str(row.get("role")) for row in role_rows],
+        },
+        intents=["inspect", "change"],
+    ))
+    for row in role_rows:
+        role = str(row.get("role") or "role")
+        items.append(_library_inventory_item(
+            ref=f"access_role:{role}",
+            kind="access_role",
+            section="people",
+            label=str(row.get("label") or role),
+            summary=str(row.get("description") or "A governed Company Brain access role assigned to you."),
+            state="healthy",
+            health="This role contributes to the signed-in user's governed document visibility.",
+            facts=[
+                _library_inventory_fact("Role", role),
+                _library_inventory_fact("Documents", int(row.get("documents") or 0)),
+            ],
+            owner=owner,
+            visibility="governed",
+            detail={"role": role, "document_count": int(row.get("documents") or 0)},
+            intents=["inspect", "change"],
+        ))
+    return items
+
+
+def _library_inventory_matches(item: dict[str, Any], query: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(query or "").strip().lower())
+    if not normalized:
+        return True
+    body = " ".join((
+        str(item.get("ref") or ""), str(item.get("kind") or ""),
+        str(item.get("section_label") or ""), str(item.get("label") or ""),
+        str(item.get("summary") or ""), str(item.get("health") or ""),
+        " ".join(str(value) for value in (item.get("intents") or [])),
+        json.dumps(item.get("facts") or [], default=str, ensure_ascii=False),
+        json.dumps(item.get("detail") or {}, default=str, ensure_ascii=False),
+    )).lower()
+    return all(token in body for token in re.findall(r"[a-z0-9_.:@/-]+", normalized))
+
+
+def _library_inventory_snapshot(
+    conn_factory: Callable[..., Any],
+    owner: str,
+    *,
+    query: str = "",
+    section: str | None = None,
+    state: str | None = None,
+    refs: list[str] | None = None,
+    limit: int = _MAX_LIBRARY_INVENTORY_RESULTS,
+) -> dict[str, Any]:
+    normalized_section = str(section or "").strip().lower()
+    normalized_state = str(state or "").strip().lower()
+    if normalized_section and normalized_section not in _LIBRARY_INVENTORY_SECTIONS:
+        raise ValueError("Unknown Library section")
+    if normalized_state and normalized_state not in _LIBRARY_INVENTORY_STATES:
+        raise ValueError("Unknown Library state")
+    requested_refs = {str(value)[:320] for value in (refs or []) if str(value).strip()}
+    collectors = (
+        ("Knowledge sources", _library_brain_inventory),
+        ("MCP servers", _library_mcp_inventory),
+        ("Cubes", _library_cube_inventory),
+        ("Metrics", _library_metric_inventory),
+        ("Routines", _library_routine_inventory),
+        ("Personal context", _library_personal_inventory),
+    )
+    all_items: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for label, collector in collectors:
+        try:
+            with conn_factory() as conn:
+                all_items.extend(collector(conn, owner))
+        except Exception as exc:
+            warnings.append(f"{label} are temporarily unavailable ({type(exc).__name__}).")
+    all_items.sort(key=lambda item: (
+        _LIBRARY_INVENTORY_STATE_ORDER.get(str(item.get("state")), 9),
+        list(_LIBRARY_INVENTORY_SECTIONS).index(str(item.get("section")))
+        if item.get("section") in _LIBRARY_INVENTORY_SECTIONS else 99,
+        str(item.get("label") or "").casefold(),
+        str(item.get("ref") or ""),
+    ))
+    section_counts = {
+        key: sum(item.get("section") == key for item in all_items)
+        for key in _LIBRARY_INVENTORY_SECTIONS
+    }
+    state_counts = {
+        key: sum(item.get("state") == key for item in all_items)
+        for key in _LIBRARY_INVENTORY_STATES
+    }
+    filtered = [
+        item for item in all_items
+        if (not requested_refs or item.get("ref") in requested_refs)
+        and (not normalized_section or item.get("section") == normalized_section)
+        and (not normalized_state or item.get("state") == normalized_state)
+        and _library_inventory_matches(item, query)
+    ]
+    bounded_limit = max(1, min(int(limit or _MAX_LIBRARY_INVENTORY_RESULTS), _MAX_LIBRARY_INVENTORY_RESULTS))
+    bounded = filtered[:bounded_limit]
+    return {
+        "query": str(query or ""),
+        "section": normalized_section or None,
+        "state": normalized_state or None,
+        "items": bounded,
+        "total": len(filtered),
+        "available_total": len(all_items),
+        "truncated": len(filtered) > len(bounded),
+        "sections": [
+            {"id": key, "label": label, "count": section_counts[key]}
+            for key, label in _LIBRARY_INVENTORY_SECTIONS.items()
+        ],
+        "states": [
+            {"id": key, "label": label, "count": state_counts[key]}
+            for key, label in _LIBRARY_INVENTORY_STATES.items()
+        ],
+        "summary": {
+            "total": len(all_items),
+            "needs_attention": state_counts["attention"],
+            "healthy": state_counts["healthy"],
+            "ready": state_counts["ready"],
+            "working": state_counts["syncing"],
+            "inactive": state_counts["inactive"],
+        },
+        "warnings": warnings,
+    }
 
 
 def _action_runtime_inventory(conn: Any, owner: str | None = None) -> dict[str, Any]:
@@ -4681,6 +5852,17 @@ def _sandbox_bridge_shim(slug: str) -> str:
     return "<script>\n" + script + "</script>\n"
 
 
+def _artifact_script_json(value: Any) -> str:
+    return (
+        json.dumps(value, default=str, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
 def _artifact_version_document(
     slug: str,
     version: int,
@@ -4725,9 +5907,16 @@ def _artifact_version_document(
     version_context = (
         "<script>window.RVBBIT_DASHBOARD=Object.assign({},"
         "window.RVBBIT_DASHBOARD||{},"
-        f"{{historical:true,version:{int(version)}}});</script>\n"
+        f"{{historical:true,version:{int(version)},manifest:"
+        + _artifact_script_json(manifest or {})
+        + "});</script>\n"
     )
-    return bridge + version_context + (html or "")
+    adaptive_runtime = (
+        '<script src="/theme/adaptive-artifact.js"></script>\n'
+        if embedded
+        else ""
+    )
+    return bridge + version_context + adaptive_runtime + (html or "")
 
 
 def _artifact_version_csp(embedded: bool) -> str:
@@ -4817,7 +6006,12 @@ def _design_profile_json(
             return None
         result = _row_json(profile)
         result["id"] = str(result["id"])
-        result["can_edit"] = str(result["owner_email"]).lower() == viewer.lower()
+        result["is_builtin"] = result["id"] == _ADAPTIVE_DESIGN_PROFILE_ID
+        result["is_adaptive"] = result["id"] == _ADAPTIVE_DESIGN_PROFILE_ID
+        result["can_edit"] = (
+            not result["is_builtin"]
+            and str(result["owner_email"]).lower() == viewer.lower()
+        )
         if include_versions:
             rows = conn.execute(
                 (
@@ -4909,11 +6103,33 @@ def _design_profile_version(
 def _design_profile_snapshot(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if not row:
         return None
-    return {
+    snapshot = {
         "profile_id": str(row["profile_id"]),
         "version_id": str(row["id"]),
         "name": str(row["profile_name"]),
         "version": int(row["version"]),
+    }
+    tokens = row.get("tokens") if isinstance(row.get("tokens"), dict) else {}
+    behavior = tokens.get("behavior") if isinstance(tokens.get("behavior"), dict) else {}
+    if behavior.get("theme_source") == "viewer":
+        snapshot["adaptive"] = True
+    return snapshot
+
+
+def _artifact_design_profile_manifest(
+    row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Freeze the selected authoring contract into an immutable artifact version."""
+    snapshot = _design_profile_snapshot(row)
+    if not snapshot or not row:
+        return None
+    tokens = _normalize_design_tokens(row.get("tokens"))
+    behavior = tokens.get("behavior") if isinstance(tokens.get("behavior"), dict) else {}
+    return {
+        "schema_version": "rvbbit.artifact-design-profile.v1",
+        **snapshot,
+        "behavior": _bounded_style_json(behavior),
+        "tokens": tokens,
     }
 
 
@@ -14240,6 +15456,7 @@ def _attribute_turn_artifacts(
     owner: str,
     turn_id: str,
     projected: list[dict[str, Any]],
+    design_profile: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Attribute newly published versions to the signed Calliope user.
 
@@ -14263,6 +15480,8 @@ def _attribute_turn_artifacts(
     if not references:
         return projected
 
+    service_identities = _calliope_service_identities()
+    design_manifest = _artifact_design_profile_manifest(design_profile)
     with conn_factory() as conn:
         for (slug, version), surfaces in references.items():
             row = conn.execute(
@@ -14278,18 +15497,34 @@ def _attribute_turn_artifacts(
             ).fetchone()
             if not row:
                 continue
+            if design_manifest:
+                encoded_design = json.dumps(design_manifest, ensure_ascii=False)
+                conn.execute(
+                    "UPDATE rvbbit.dashboard_versions SET "
+                    "manifest=jsonb_set(coalesce(manifest,'{}'::jsonb),"
+                    "'{design_profile}',%s::jsonb,true) "
+                    "WHERE dashboard_id=%s AND version=%s",
+                    (encoded_design, row["dashboard_id"], version),
+                )
+                conn.execute(
+                    "UPDATE rvbbit.dashboards SET "
+                    "manifest=jsonb_set(coalesce(manifest,'{}'::jsonb),"
+                    "'{design_profile}',%s::jsonb,true) "
+                    "WHERE id=%s AND latest_version=%s",
+                    (encoded_design, row["dashboard_id"], version),
+                )
             conn.execute(
                 "UPDATE rvbbit.dashboards SET owner_email=%s "
                 "WHERE id=%s "
                 "AND coalesce(nullif(lower(btrim(owner_email)),''),'static-key')="
-                "'static-key'",
-                (owner, row["dashboard_id"]),
+                "ANY(%s::text[])",
+                (owner, row["dashboard_id"], service_identities),
             )
             for surface in surfaces:
                 payload = dict(surface.get("payload") or {})
-                if payload.get("owner") in {None, "", "static-key"}:
+                if _is_calliope_service_identity(payload.get("owner")):
                     payload["owner"] = owner
-                if payload.get("created_by") in {None, "", "static-key"}:
+                if _is_calliope_service_identity(payload.get("created_by")):
                     payload["created_by"] = owner
                 surface["payload"] = payload
     return projected
@@ -14827,7 +16062,7 @@ def _insert_surfaces(
     with conn_factory() as conn:
         with conn.transaction():
             profile_row = conn.execute(
-                "SELECT v.id,v.profile_id,v.version,p.name AS profile_name "
+                "SELECT v.id,v.profile_id,v.version,v.tokens,p.name AS profile_name "
                 "FROM rvbbit.calliope_turns t "
                 "LEFT JOIN rvbbit.calliope_design_profile_versions v "
                 "ON v.id=t.design_profile_version_id "
@@ -14835,15 +16070,8 @@ def _insert_surfaces(
                 "WHERE t.id=%s::uuid",
                 (turn_id,),
             ).fetchone()
-            profile_snapshot = (
-                {
-                    "profile_id": str(profile_row["profile_id"]),
-                    "version_id": str(profile_row["id"]),
-                    "name": str(profile_row["profile_name"]),
-                    "version": int(profile_row["version"]),
-                }
-                if profile_row and profile_row.get("id")
-                else None
+            profile_snapshot = _design_profile_snapshot(
+                _row_json(profile_row) if profile_row and profile_row.get("id") else None
             )
             current = conn.execute(
                 "SELECT coalesce(max(ordinal),0)::int AS n "
@@ -15887,6 +17115,334 @@ async def _maybe_generate_session_title(
     return row
 
 
+def _synopsis_enabled() -> bool:
+    return os.environ.get("WAREHOUSE_CALLIOPE_SESSION_SYNOPSES", "1").strip().lower() not in {
+        "0", "false", "no", "off", "",
+    }
+
+
+def _synopsis_delay_seconds() -> int:
+    try:
+        value = int(os.environ.get("WAREHOUSE_CALLIOPE_SYNOPSIS_DEBOUNCE_SECONDS", "90"))
+    except (TypeError, ValueError):
+        value = 90
+    return max(30, min(value, 900))
+
+
+def _clean_session_synopsis(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"^(?:synopsis|summary|thread)\s*:\s*", "", text, flags=re.I)
+    text = re.sub(r"[*_`#]+", "", text).strip(" \"'–—-")
+    words = text.split()
+    if len(words) > 28:
+        text = " ".join(words[:28]).rstrip(" ,;:-") + "…"
+    if len(text) > 220:
+        text = text[:217].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+    return text if len(text) >= 4 else ""
+
+
+def _enqueue_session_synopsis(
+    conn_factory: Callable[..., Any],
+    session_id: str,
+) -> bool:
+    """Reset the quiet debounce after a completed turn without touching session order."""
+    if not _synopsis_enabled():
+        return False
+    delay = _synopsis_delay_seconds()
+    try:
+        with conn_factory() as conn:
+            conn.execute(
+                "INSERT INTO rvbbit.calliope_session_synopses "
+                "(session_id,status,not_before,enqueued_at,updated_at) "
+                "VALUES (%s::uuid,'pending',now()+(%s*interval '1 second'),now(),now()) "
+                "ON CONFLICT (session_id) DO UPDATE SET status='pending',input_hash=NULL,"
+                "attempts=0,last_error=NULL,not_before=now()+(%s*interval '1 second'),"
+                "enqueued_at=now(),started_at=NULL,completed_at=NULL,updated_at=now()",
+                (session_id, delay, delay),
+            )
+        _SYNOPSIS_WAKE.set()
+        return True
+    except Exception as exc:
+        print(f"WARNING: Calliope synopsis enqueue failed for {session_id}: {exc}", file=os.sys.stderr)
+        return False
+
+
+def _backfill_session_synopses(conn_factory: Callable[..., Any], limit: int = 250) -> int:
+    if not _synopsis_enabled():
+        return 0
+    delay = _synopsis_delay_seconds()
+    try:
+        with conn_factory() as conn:
+            rows = conn.execute(
+                "INSERT INTO rvbbit.calliope_session_synopses "
+                "(session_id,status,not_before,enqueued_at,updated_at) "
+                "SELECT s.id,'pending',now()+(%s*interval '1 second'),now(),now() "
+                "FROM rvbbit.calliope_sessions s "
+                "WHERE NOT s.archived AND EXISTS (SELECT 1 FROM rvbbit.calliope_turns t "
+                " WHERE t.session_id=s.id AND t.status IN ('complete','partial','failed','interrupted')) "
+                "AND NOT EXISTS (SELECT 1 FROM rvbbit.calliope_session_synopses x WHERE x.session_id=s.id) "
+                "ORDER BY s.updated_at DESC LIMIT %s ON CONFLICT DO NOTHING RETURNING session_id",
+                (delay, max(1, min(int(limit), 1000))),
+            ).fetchall()
+        if rows:
+            _SYNOPSIS_WAKE.set()
+        return len(rows)
+    except Exception as exc:
+        print(f"WARNING: Calliope synopsis backfill unavailable: {exc}", file=os.sys.stderr)
+        return 0
+
+
+def _claim_session_synopsis(
+    conn_factory: Callable[..., Any],
+) -> dict[str, Any] | None:
+    try:
+        max_attempts = int(os.environ.get("WAREHOUSE_CALLIOPE_SYNOPSIS_MAX_ATTEMPTS", "3"))
+    except (TypeError, ValueError):
+        max_attempts = 3
+    max_attempts = max(1, min(max_attempts, 8))
+    with conn_factory() as conn:
+        conn.execute(
+            "UPDATE rvbbit.calliope_session_synopses SET status='pending',not_before=now(),"
+            "last_error=coalesce(last_error,'') || CASE WHEN coalesce(last_error,'')='' THEN '' ELSE E'\\n' END || "
+            "'Recovered stale synopsis claim',updated_at=now() "
+            "WHERE status='running' AND started_at<now()-interval '10 minutes' AND attempts<%s",
+            (max_attempts,),
+        )
+        conn.execute(
+            "UPDATE rvbbit.calliope_session_synopses SET status='failed',completed_at=now(),"
+            "last_error=coalesce(last_error,'Synopsis retry budget exhausted'),updated_at=now() "
+            "WHERE status='running' AND started_at<now()-interval '10 minutes' AND attempts>=%s",
+            (max_attempts,),
+        )
+        row = conn.execute(
+            "WITH candidate AS ("
+            " SELECT x.session_id FROM rvbbit.calliope_session_synopses x "
+            " JOIN rvbbit.calliope_sessions s ON s.id=x.session_id "
+            " WHERE x.status='pending' AND x.not_before<=now() AND NOT s.archived "
+            " ORDER BY x.enqueued_at FOR UPDATE OF x SKIP LOCKED LIMIT 1"
+            ") UPDATE rvbbit.calliope_session_synopses x SET status='running',"
+            "attempts=x.attempts+1,started_at=now(),last_error=NULL,updated_at=now() "
+            "FROM candidate c,rvbbit.calliope_sessions s "
+            "WHERE x.session_id=c.session_id AND s.id=x.session_id "
+            "RETURNING x.*,s.owner_email,s.title"
+        ).fetchone()
+        if not row:
+            return None
+        job = dict(row)
+    return job
+
+
+def _session_synopsis_input(
+    conn_factory: Callable[..., Any],
+    job: dict[str, Any],
+) -> tuple[str, int, str]:
+    through = int(job.get("through_ordinal") or 0)
+    with conn_factory() as conn:
+        rows = conn.execute(
+            "SELECT ordinal,user_message,assistant_message,error,status FROM rvbbit.calliope_turns "
+            "WHERE session_id=%s::uuid AND status IN ('complete','partial','failed','interrupted') "
+            "AND ordinal>%s ORDER BY ordinal DESC LIMIT 8",
+            (str(job["session_id"]), through),
+        ).fetchall()
+        if not rows and through:
+            rows = conn.execute(
+                "SELECT ordinal,user_message,assistant_message,error,status FROM rvbbit.calliope_turns "
+                "WHERE session_id=%s::uuid AND status IN ('complete','partial','failed','interrupted') "
+                "ORDER BY ordinal DESC LIMIT 4",
+                (str(job["session_id"]),),
+            ).fetchall()
+    rows = list(reversed(rows))
+    newest = max((int(row.get("ordinal") or 0) for row in rows), default=through)
+    blocks = []
+    if job.get("synopsis"):
+        blocks.append(f"Previous synopsis: {job['synopsis']}")
+    for row in rows:
+        blocks.append(
+            f"User: {str(row.get('user_message') or '')[:1800]}\n"
+            f"Calliope: {str(row.get('assistant_message') or row.get('error') or '')[:1800]}"
+            + (f"\nStatus: {row.get('status')}" if row.get("status") in {"failed", "interrupted"} else "")
+        )
+    source = "\n\n".join(blocks)[-12_000:]
+    input_hash = hashlib.sha256(
+        f"session-synopsis.v1|{newest}|{source}".encode("utf-8")
+    ).hexdigest()
+    return source, newest, input_hash
+
+
+def _fallback_session_synopsis(source: str) -> str:
+    users = re.findall(r"(?:^|\n)User:\s*(.+?)(?=\nCalliope:|\Z)", source, flags=re.S)
+    assistants = re.findall(r"(?:^|\n)Calliope:\s*(.+?)(?=\n\nUser:|\Z)", source, flags=re.S)
+    generic = re.compile(r"^(?:try again|continue|go ahead|yes|yep|ok(?:ay)?|please do|do it)[.! ]*$", re.I)
+    candidate = next(
+        (
+            item for item in reversed(users)
+            if len(re.sub(r"\s+", " ", item).strip()) >= 20 and not generic.match(item.strip())
+        ),
+        users[-1] if users else (assistants[-1] if assistants else source),
+    )
+    candidate = re.sub(r"\[\[[^\]]+\]\]", lambda m: m.group(0)[2:-2].split("|")[0], candidate)
+    candidate = re.split(r"(?<=[.!?])\s+", candidate.strip(), maxsplit=1)[0]
+    return _clean_session_synopsis(candidate)
+
+
+def _generate_session_synopsis(
+    conn_factory: Callable[..., Any],
+    source: str,
+    owner: str,
+) -> tuple[str, str, str | None]:
+    instruction = (
+        "Write one plain-text synopsis of this private work thread in 12 to 24 words. "
+        "State the current objective, useful result, or blocker. Do not say 'this thread', "
+        "do not use a heading, markdown, names of speakers, or quotation marks."
+    )
+    started_at = datetime.now(timezone.utc)
+    provider, model, synopsis = "local", None, ""
+    operator = None
+    operator_input = source
+    try:
+        with conn_factory() as conn:
+            available = conn.execute(
+                "SELECT to_regprocedure('rvbbit.clover_llm_apply(text,text)') IS NOT NULL AS clover,"
+                "to_regprocedure('rvbbit.summarize(text)') IS NOT NULL AS summarize"
+            ).fetchone()
+        if available and available.get("clover"):
+            with conn_factory() as conn:
+                raw = conn.execute(
+                    "SELECT rvbbit.clover_llm_apply(%s,%s) AS synopsis",
+                    (source, instruction),
+                ).fetchone()
+            synopsis = _clean_session_synopsis((raw or {}).get("synopsis"))
+            provider, model, operator = "clover", "clover_llm_apply", "clover_llm_apply"
+        elif available and available.get("summarize"):
+            operator_input = instruction + "\n\n" + source
+            with conn_factory() as conn:
+                raw = conn.execute(
+                    "SELECT rvbbit.summarize(%s) AS synopsis",
+                    (operator_input,),
+                ).fetchone()
+            synopsis = _clean_session_synopsis((raw or {}).get("synopsis"))
+            provider, model, operator = "rvbbit", "summarize", "summarize"
+    except Exception as exc:
+        print(f"WARNING: semantic session synopsis unavailable: {exc}", file=os.sys.stderr)
+    if not synopsis:
+        synopsis = _fallback_session_synopsis(source)
+        provider, model, operator = "local", None, None
+    if operator:
+        try:
+            with conn_factory() as conn:
+                receipts = conn.execute(
+                    "UPDATE rvbbit.receipts SET caller=%s WHERE operator=%s AND caller IS NULL "
+                    "AND invocation_at>=%s AND inputs::text LIKE %s RETURNING receipt_id",
+                    (owner, operator, started_at, "%" + operator_input[:500] + "%"),
+                ).fetchall()
+                receipt_ids = [str(item["receipt_id"]) for item in receipts]
+                if receipt_ids:
+                    conn.execute(
+                        "UPDATE rvbbit.cost_events SET caller=%s WHERE receipt_id=ANY(%s::uuid[]) "
+                        "AND caller IS NULL",
+                        (owner, receipt_ids),
+                    )
+        except Exception:
+            pass
+    return synopsis, provider, model
+
+
+def _complete_session_synopsis(
+    conn_factory: Callable[..., Any],
+    job: dict[str, Any],
+    synopsis: str,
+    provider: str,
+    model: str | None,
+    through_ordinal: int,
+    input_hash: str,
+) -> None:
+    with conn_factory() as conn:
+        conn.execute(
+            "UPDATE rvbbit.calliope_session_synopses SET status='ready',input_hash=%s,synopsis=%s,"
+            "through_ordinal=%s,provider=%s,model=%s,completed_at=now(),last_error=NULL,updated_at=now() "
+            "WHERE session_id=%s::uuid AND status='running'",
+            (input_hash, synopsis, through_ordinal, provider, model, str(job["session_id"])),
+        )
+
+
+def _fail_session_synopsis(
+    conn_factory: Callable[..., Any],
+    job: dict[str, Any],
+    exc: Exception,
+) -> None:
+    try:
+        max_attempts = max(1, min(int(os.environ.get("WAREHOUSE_CALLIOPE_SYNOPSIS_MAX_ATTEMPTS", "3")), 8))
+    except (TypeError, ValueError):
+        max_attempts = 3
+    attempts = int(job.get("attempts") or 1)
+    retry = attempts < max_attempts
+    delay = min(300, 15 * (2 ** max(0, attempts - 1)))
+    with conn_factory() as conn:
+        conn.execute(
+            "UPDATE rvbbit.calliope_session_synopses SET status=%s,last_error=%s,"
+            "not_before=now()+(%s*interval '1 second'),completed_at=%s,updated_at=now() "
+            "WHERE session_id=%s::uuid AND status='running'",
+            (
+                "pending" if retry else "failed", f"{type(exc).__name__}: {exc}"[:2000],
+                delay if retry else 0, None if retry else datetime.now(timezone.utc),
+                str(job["session_id"]),
+            ),
+        )
+    if retry:
+        _SYNOPSIS_WAKE.set()
+
+
+def _session_synopsis_worker(conn_factory: Callable[..., Any]) -> None:
+    while True:
+        if not _synopsis_enabled():
+            _SYNOPSIS_WAKE.wait(30)
+            _SYNOPSIS_WAKE.clear()
+            continue
+        try:
+            job = _claim_session_synopsis(conn_factory)
+        except Exception as exc:
+            print(f"WARNING: Calliope synopsis queue unavailable: {exc}", file=os.sys.stderr)
+            _SYNOPSIS_WAKE.wait(15)
+            _SYNOPSIS_WAKE.clear()
+            continue
+        if not job:
+            _SYNOPSIS_WAKE.wait(10)
+            _SYNOPSIS_WAKE.clear()
+            continue
+        try:
+            source, through, input_hash = _session_synopsis_input(conn_factory, job)
+            if not source.strip():
+                raise ValueError("session has no completed prose to summarize")
+            synopsis, provider, model = _generate_session_synopsis(
+                conn_factory, source, str(job.get("owner_email") or "")
+            )
+            if not synopsis:
+                raise ValueError("session synopsis was empty")
+            _complete_session_synopsis(
+                conn_factory, job, synopsis, provider, model, through, input_hash
+            )
+        except Exception as exc:
+            _fail_session_synopsis(conn_factory, job, exc)
+
+
+def _start_session_synopsis_worker(conn_factory: Callable[..., Any]) -> bool:
+    global _SYNOPSIS_THREAD
+    if not _synopsis_enabled():
+        return False
+    _backfill_session_synopses(conn_factory)
+    with _SYNOPSIS_THREAD_LOCK:
+        if _SYNOPSIS_THREAD and _SYNOPSIS_THREAD.is_alive():
+            return True
+        _SYNOPSIS_THREAD = threading.Thread(
+            target=_session_synopsis_worker,
+            args=(conn_factory,),
+            name="calliope-session-synopses",
+            daemon=True,
+        )
+        _SYNOPSIS_THREAD.start()
+    return True
+
+
 def _bounded_nonnegative_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -16311,6 +17867,7 @@ def register_calliope_routes(
         return False
 
     import auth
+    import warehouse_theme
     from starlette.responses import (
         FileResponse,
         HTMLResponse,
@@ -16320,6 +17877,7 @@ def register_calliope_routes(
     )
 
     ensure_tables(conn_factory)
+    _start_session_synopsis_worker(conn_factory)
     config.file_root.mkdir(parents=True, exist_ok=True)
     google_calendar_enabled = bool(
         getattr(auth, "google_enabled", lambda: False)()
@@ -16331,6 +17889,23 @@ def register_calliope_routes(
             status_code=status,
             media_type="application/json",
             headers={"cache-control": "no-store"},
+        )
+
+    def browser_asset(request: Any, name: str, media_type: str) -> FileResponse:
+        """Cache a content-addressed bundle forever; revalidate unversioned fallbacks."""
+        requested = str(request.query_params.get("v") or "")
+        cache_control = (
+            "private, max-age=31536000, immutable"
+            if requested == _ASSET_VERSION
+            else "private, no-cache, max-age=0, must-revalidate"
+        )
+        return FileResponse(
+            _ASSET_DIR / name,
+            media_type=media_type,
+            headers={
+                "cache-control": cache_control,
+                "x-content-type-options": "nosniff",
+            },
         )
 
     def api_owner(request: Any) -> tuple[str | None, Response | None]:
@@ -16358,12 +17933,15 @@ def register_calliope_routes(
         html = (
             template.replace("__CALLIOPE_BACKGROUND__", background)
             .replace("__CALLIOPE_RABBIT__", rabbit_svg)
-            .replace("__CALLIOPE_VIEWER__", escape(owner))
+            .replace("__CALLIOPE_ACCOUNT__", warehouse_theme.account_control(session))
+            .replace("__CALLIOPE_ASSET_VERSION__", _ASSET_VERSION)
         )
         return HTMLResponse(
             html,
             headers={
-                "cache-control": "no-store",
+                "cache-control": "private, no-store, max-age=0, must-revalidate",
+                "pragma": "no-cache",
+                "expires": "0",
                 "content-security-policy": (
                     "default-src 'self'; script-src 'self'; "
                     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
@@ -16381,32 +17959,28 @@ def register_calliope_routes(
         owner, _ = _canonical_owner(request)
         if not owner:
             return Response(status_code=401)
-        return FileResponse(_ASSET_DIR / "calliope.css", media_type="text/css")
+        return browser_asset(request, "calliope.css", "text/css")
 
     @mcp.custom_route("/calliope/calliope.js", methods=["GET"])
     async def calliope_js(request):
         owner, _ = _canonical_owner(request)
         if not owner:
             return Response(status_code=401)
-        return FileResponse(_ASSET_DIR / "calliope.js", media_type="text/javascript")
+        return browser_asset(request, "calliope.js", "text/javascript")
 
     @mcp.custom_route("/calliope/daily-notes-editor.js", methods=["GET"])
     async def calliope_daily_notes_editor(request):
         owner, _ = _canonical_owner(request)
         if not owner:
             return Response(status_code=401)
-        return FileResponse(
-            _ASSET_DIR / "daily-notes-editor.js",
-            media_type="text/javascript",
-            headers={"cache-control": "no-store"},
-        )
+        return browser_asset(request, "daily-notes-editor.js", "text/javascript")
 
     @mcp.custom_route("/calliope/thinking-orbs.js", methods=["GET"])
     async def calliope_thinking_orbs(request):
         owner, _ = _canonical_owner(request)
         if not owner:
             return Response(status_code=401)
-        return FileResponse(_ASSET_DIR / "thinking-orbs.js", media_type="text/javascript")
+        return browser_asset(request, "thinking-orbs.js", "text/javascript")
 
     @mcp.custom_route("/calliope/callie-avatar-{period}.jpg", methods=["GET"])
     async def calliope_avatar(request):
@@ -16446,6 +18020,18 @@ def register_calliope_routes(
             "shared_memory": True,
             "personal_briefs": True,
             "personal_notes": True,
+            "dreams": {
+                "enabled": config.dreaming_enabled,
+                "timezone": config.dream_timezone,
+                "hour": config.dream_hour,
+                "max_per_cycle": calliope_dreams.MAX_DREAMS,
+                "promoted_per_cycle": calliope_dreams.MAX_DREAMS,
+                "candidates_per_cycle": calliope_dreams.MAX_CANDIDATES,
+                "manual_window_days": calliope_dreams.MANUAL_WINDOW_DAYS,
+                "horizon_window_days": calliope_dreams.HORIZON_WINDOW_DAYS,
+                "evidence_lab": config.dream_evidence_lab_enabled,
+                "automatic": config.dreaming_enabled,
+            },
             "action_library": True,
             "trusted_organization_actions": True,
             "evidence_search": evidence_search is not None,
@@ -16481,6 +18067,197 @@ def register_calliope_routes(
         if google_calendar_enabled:
             payload["google_calendar"] = True
         return json_response(payload)
+
+    @mcp.custom_route("/api/calliope/dreams", methods=["GET"])
+    async def list_calliope_dreams(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        if not config.dreaming_enabled:
+            return json_response({
+                "dreams": [], "counts": {}, "latest_cycle": None,
+                "enabled": False,
+            })
+        try:
+            limit = max(1, min(int(request.query_params.get("limit") or 60), 120))
+            result = await asyncio.to_thread(
+                calliope_dreams.snapshot,
+                conn_factory,
+                owner,
+                view=request.query_params.get("view") or "active",
+                limit=limit,
+            )
+        except ValueError as exc:
+            return json_response(
+                {"error": {"code": "BAD_DREAM_VIEW", "message": str(exc)}}, 400
+            )
+        return json_response({**result, "enabled": True})
+
+    @mcp.custom_route("/api/calliope/dreams/run", methods=["POST"])
+    async def run_calliope_dream_cycle(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        if not config.dreaming_enabled:
+            return json_response({
+                "error": {
+                    "code": "DREAMING_DISABLED",
+                    "message": "Calliope Dreaming is disabled on this installation.",
+                }
+            }, 503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = await asyncio.to_thread(
+                calliope_dreams.run_cycle,
+                conn_factory,
+                config,
+                generated_by=owner,
+                cycle_kind="manual",
+                mode=body.get("mode") or "deepen",
+            )
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            status = 409 if "cycle is starting" in message or "already running" in message else 502
+            return json_response({
+                "error": {"code": "DREAM_CYCLE_UNAVAILABLE", "message": str(exc)[:800]}
+            }, status)
+        except Exception as exc:
+            return json_response({
+                "error": {
+                    "code": "DREAM_CYCLE_FAILED",
+                    "message": f"{type(exc).__name__}: {exc}"[:800],
+                }
+            }, 502)
+        return json_response(result, 201 if result.get("created") else 200)
+
+    @mcp.custom_route("/api/calliope/dreams/{dream_id}", methods=["PATCH"])
+    async def update_calliope_dream(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            dream = await asyncio.to_thread(
+                calliope_dreams.record_event,
+                conn_factory,
+                owner,
+                request.path_params["dream_id"],
+                body.get("action"),
+                note=body.get("note"),
+                days=body.get("days"),
+            )
+        except LookupError as exc:
+            return json_response(
+                {"error": {"code": "DREAM_NOT_FOUND", "message": str(exc)}}, 404
+            )
+        except ValueError as exc:
+            return json_response(
+                {"error": {"code": "BAD_DREAM_ACTION", "message": str(exc)}}, 400
+            )
+        return json_response({"dream": dream})
+
+    @mcp.custom_route(
+        "/api/calliope/dreams/{dream_id}/handoff", methods=["POST"]
+    )
+    async def handoff_calliope_dream(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        dream_id = _uuid(request.path_params.get("dream_id"))
+        if not dream_id:
+            return json_response({"error": {"code": "DREAM_NOT_FOUND"}}, 404)
+        with conn_factory() as conn:
+            dream_row = conn.execute(
+                "SELECT * FROM rvbbit.calliope_dreams WHERE id=%s::uuid AND status<>'retired'",
+                (dream_id,),
+            ).fetchone()
+        if not dream_row:
+            return json_response({"error": {"code": "DREAM_NOT_FOUND"}}, 404)
+        dream = calliope_dreams.dream_public(dream_row)
+        try:
+            session = await _create_session_record(
+                config, conn_factory, owner, f"Dream · {dream['title']}"[:120]
+            )
+        except Exception as exc:
+            return json_response(
+                {"error": {"code": "HERMES_UNAVAILABLE", "message": str(exc)[:600]}},
+                502,
+            )
+        output = _json_object(dream.get("output"))
+        prompt = str(output.get("implementation_prompt") or "").strip() or (
+            f"Investigate and safely develop the pinned Dream “{dream['title']}”."
+        )
+        prompt += (
+            "\n\nTreat the Dream as an evidence-backed hypothesis, not established fact. "
+            "Recheck its saved observations against governed sources, state what remains uncertain, "
+            "and prefer a reversible draft. Do not mutate an external system, publish company-wide, "
+            "or schedule work without explicit approval."
+        )
+        turn_id = str(uuid.uuid4())
+        with conn_factory() as conn:
+            turn = conn.execute(
+                "INSERT INTO rvbbit.calliope_turns "
+                "(id,session_id,ordinal,user_message,assistant_message,status,completed_at,turn_kind) "
+                "VALUES (%s::uuid,%s::uuid,1,%s,%s,'complete',now(),'dream') RETURNING *",
+                (
+                    turn_id,
+                    str(session["id"]),
+                    f"Explore Dream · {dream['title']}"[:4_000],
+                    "This evidence-backed Dream is pinned on the Stage. Continue in chat to verify, refine, or build it.",
+                ),
+            ).fetchone()
+        surfaces = _insert_surfaces(conn_factory, str(session["id"]), turn_id, [{
+            "kind": "dream",
+            "title": str(dream["title"])[:240],
+            "tool_name": "calliope_dream_handoff",
+            "tool_call_id": f"dream-handoff:{dream_id}:{turn_id}",
+            "lineage_key": f"dream:{dream_id}",
+            "payload": {"mode": "company_dream", "dream": dream},
+            "source": {
+                "origin": "calliope_dreams",
+                "dream_id": dream_id,
+                "cycle_id": dream.get("latest_cycle_id"),
+            },
+            "presentation": {"view": "dream_contract"},
+        }])
+        if not surfaces:
+            await discard_created_session(session)
+            return json_response({
+                "error": {
+                    "code": "DREAM_HANDOFF_FAILED",
+                    "message": "Could not pin the Dream on the Stage.",
+                }
+            }, 500)
+        try:
+            await asyncio.to_thread(
+                calliope_dreams.record_event,
+                conn_factory,
+                owner,
+                dream_id,
+                "exploring",
+            )
+        except Exception:
+            pass
+        url = "/calliope?" + urlencode({
+            "session": str(session["id"]),
+            "surface": str(surfaces[0]["id"]),
+            "prompt": prompt[:6_000],
+        })
+        return json_response({
+            "new_session": True,
+            "session": _session_json(session),
+            "turn": _turn_json(turn),
+            "surface": surfaces[0],
+            "url": url,
+        }, 201)
 
     if google_calendar_enabled:
         @mcp.custom_route("/api/calliope/calendar", methods=["GET"])
@@ -16793,6 +18570,209 @@ def register_calliope_routes(
             }, status)
         return json_response({**result, "retained_audio": False})
 
+    @mcp.custom_route("/api/calliope/inventory", methods=["GET"])
+    async def list_calliope_inventory(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        query = str(request.query_params.get("q") or "")[:600]
+        section = request.query_params.get("section")
+        state = request.query_params.get("state")
+        try:
+            limit = max(
+                1,
+                min(
+                    int(request.query_params.get("limit") or _MAX_LIBRARY_INVENTORY_RESULTS),
+                    _MAX_LIBRARY_INVENTORY_RESULTS,
+                ),
+            )
+            snapshot = await asyncio.to_thread(
+                _library_inventory_snapshot,
+                conn_factory,
+                owner,
+                query=query,
+                section=section,
+                state=state,
+                limit=limit,
+            )
+        except ValueError as exc:
+            return json_response(
+                {"error": {"code": "BAD_INVENTORY_QUERY", "message": str(exc)}}, 400
+            )
+        return json_response(snapshot)
+
+    @mcp.custom_route("/api/calliope/inventory/handoff", methods=["POST"])
+    async def handoff_calliope_inventory(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        raw_refs = body.get("refs")
+        if not isinstance(raw_refs, list):
+            raw_refs = [body.get("ref")] if body.get("ref") else []
+        refs = list(dict.fromkeys(
+            str(value).strip()[:320] for value in raw_refs if str(value or "").strip()
+        ))
+        if not refs:
+            return json_response({
+                "error": {
+                    "code": "INVENTORY_SELECTION_REQUIRED",
+                    "message": "Choose at least one configured item to inspect.",
+                }
+            }, 400)
+        if len(refs) > _MAX_LIBRARY_HANDOFF_ITEMS:
+            return json_response({
+                "error": {
+                    "code": "INVENTORY_SELECTION_TOO_LARGE",
+                    "message": f"Choose at most {_MAX_LIBRARY_HANDOFF_ITEMS} items at a time.",
+                }
+            }, 400)
+        intent = str(body.get("intent") or "inspect").strip().lower()
+        if intent not in {"inspect", "change", "knowledge_source"}:
+            return json_response({
+                "error": {"code": "BAD_INVENTORY_INTENT", "message": "Unknown inventory intent."}
+            }, 400)
+        snapshot = await asyncio.to_thread(
+            _library_inventory_snapshot,
+            conn_factory,
+            owner,
+            refs=refs,
+            limit=len(refs),
+        )
+        items = snapshot.get("items") or []
+        found_refs = {str(item.get("ref")) for item in items}
+        missing = [ref for ref in refs if ref not in found_refs]
+        if missing:
+            return json_response({
+                "error": {
+                    "code": "INVENTORY_ITEM_NOT_FOUND",
+                    "message": "One or more configured items are no longer available.",
+                }
+            }, 404)
+        if intent == "knowledge_source" and any(
+            item.get("kind") != "mcp_server"
+            or not _json_object(item.get("detail")).get("knowledge_source_candidate")
+            for item in items
+        ):
+            return json_response({
+                "error": {
+                    "code": "INVENTORY_INTENT_UNAVAILABLE",
+                    "message": "Only MCP servers with discovered read surfaces can be considered as knowledge sources.",
+                }
+            }, 400)
+        first = items[0]
+        label = str(first.get("label") or "System inventory")
+        if len(items) == 1:
+            surface_title = f"System · {label}"[:240]
+            session_title = f"System · {label}"[:120]
+        else:
+            shared_sections = {str(item.get("section_label") or "") for item in items}
+            scope = next(iter(shared_sections)) if len(shared_sections) == 1 else "System inventory"
+            surface_title = f"{scope} · {len(items)} configured items"[:240]
+            session_title = f"System · {scope}"[:120]
+        try:
+            session = await _create_session_record(
+                config, conn_factory, owner, session_title
+            )
+        except Exception as exc:
+            return json_response(
+                {"error": {"code": "HERMES_UNAVAILABLE", "message": str(exc)[:600]}},
+                502,
+            )
+        prompt = (
+            "Review the exact configured Calliope system object"
+            + ("" if len(items) == 1 else "s")
+            + " pinned on the Stage. Explain what "
+            + ("it is" if len(items) == 1 else "they are")
+            + ", what Calliope can currently use "
+            + ("it" if len(items) == 1 else "them")
+            + " for, and whether the observed health needs attention. Treat the pinned refs as "
+            "authoritative identities. Verify live state with governed read-only SQL when useful. "
+            "If I request a change, resolve it through the typed Action Library plan, approval, "
+            "test, and receipt flow; do not mutate configuration from a guess."
+        )
+        if intent == "knowledge_source":
+            prompt += (
+                " Evaluate the selected MCP read/search/resource surfaces as a possible governed "
+                "Company Brain source. Sample minimally, identify a stable artifact ID, title, body, "
+                "updated timestamp, pagination and bounded polling arguments, then propose the safest "
+                "generic configuration. Do not create the source until I approve the plan."
+            )
+        elif intent == "change":
+            prompt += " Start by asking what outcome I want changed, while preserving the exact pinned object identity."
+        turn_id = str(uuid.uuid4())
+        with conn_factory() as conn:
+            turn = conn.execute(
+                "INSERT INTO rvbbit.calliope_turns "
+                "(id,session_id,ordinal,user_message,assistant_message,status,completed_at,turn_kind) "
+                "VALUES (%s::uuid,%s::uuid,1,%s,%s,'complete',now(),'action') RETURNING *",
+                (
+                    turn_id,
+                    str(session["id"]),
+                    f"Inspect configured system · {label}"[:4000],
+                    "The exact configured object is pinned on the Stage. Ask about its health, use, lineage, or a governed change.",
+                ),
+            ).fetchone()
+        action_snapshot = {
+            "id": "system.inspect",
+            "title": surface_title,
+            "summary": "A read-only snapshot of exact configured Calliope objects.",
+            "category": "admin",
+            "category_label": "System inventory",
+            "risk": "read_only",
+            "state": "ready",
+            "state_label": "Pinned",
+        }
+        lineage_value = "|".join(sorted(refs))
+        surfaces = _insert_surfaces(conn_factory, str(session["id"]), turn_id, [{
+            "kind": "inventory",
+            "title": surface_title,
+            "tool_name": "calliope_inventory_handoff",
+            "tool_call_id": f"inventory-handoff:{turn_id}",
+            "lineage_key": "inventory:" + hashlib.sha256(lineage_value.encode("utf-8")).hexdigest()[:24],
+            "payload": {
+                "mode": "system_inventory",
+                "items": items,
+                "summary": {
+                    "selected": len(items),
+                    "needs_attention": sum(item.get("state") == "attention" for item in items),
+                    "sections": list(dict.fromkeys(str(item.get("section_label")) for item in items)),
+                },
+                "action": action_snapshot,
+                "intent": intent,
+            },
+            "source": {
+                "origin": "calliope_action_library",
+                "library_origin": "system_inventory",
+                "action_id": "system.inspect",
+                "inventory_refs": refs,
+            },
+            "presentation": {"view": "system_inventory"},
+        }])
+        if not surfaces:
+            return json_response({
+                "error": {
+                    "code": "INVENTORY_HANDOFF_FAILED",
+                    "message": "Could not pin the configured objects on the Stage.",
+                }
+            }, 500)
+        url = "/calliope?" + urlencode({
+            "session": str(session["id"]),
+            "surface": str(surfaces[0]["id"]),
+            "prompt": prompt,
+        })
+        return json_response({
+            "new_session": True,
+            "session": _session_json(session),
+            "turn": _turn_json(turn),
+            "surface": surfaces[0],
+            "url": url,
+        }, 201)
+
     @mcp.custom_route("/api/calliope/actions", methods=["GET"])
     async def list_calliope_actions(request):
         owner, err = api_owner(request)
@@ -17054,8 +19034,8 @@ def register_calliope_routes(
                 " JOIN rvbbit.calliope_sessions s "
                 " ON s.design_profile_version_id=v.id "
                 " WHERE s.owner_email=%s AND NOT s.archived"
-                ") ORDER BY archived,updated_at DESC LIMIT 200",
-                (owner,),
+                ") ORDER BY (id=%s::uuid) DESC,archived,updated_at DESC LIMIT 200",
+                (owner, _ADAPTIVE_DESIGN_PROFILE_ID),
             ).fetchall()
         profiles = [
             profile
@@ -19816,6 +21796,7 @@ def register_calliope_routes(
                 "SELECT s.*, count(DISTINCT t.id)::int AS turn_count,"
                 " count(DISTINCT f.id)::int AS surface_count,"
                 " max(f.created_at) AS last_surface_at,"
+                " sn.synopsis,sn.status AS synopsis_status,sn.updated_at AS synopsis_updated_at,"
                 " b.id AS brief_id,b.brief_date,b.timezone AS brief_timezone,"
                 " wr.workflow_run_id,wr.workflow_id,wr.workflow_version,"
                 " wr.workflow_name,wr.workflow_run_status,wr.workflow_run_trigger_kind,"
@@ -19866,6 +21847,7 @@ def register_calliope_routes(
                 " AND sf.source->>'origin'='calliope_action_library' "
                 " ORDER BY sf.created_at LIMIT 1"
                 ") ac ON true "
+                "LEFT JOIN rvbbit.calliope_session_synopses sn ON sn.session_id=s.id "
                 "LEFT JOIN rvbbit.calliope_turns t ON t.session_id=s.id "
                 "LEFT JOIN rvbbit.calliope_surfaces f ON f.session_id=s.id "
                 "WHERE s.owner_email=%s AND NOT s.archived "
@@ -19876,7 +21858,7 @@ def register_calliope_routes(
                 " ir.instrument_run_surface_id,ir.instrument_id,"
                 " ir.instrument_version,ir.instrument_name,"
                 " ac.action_handoff_surface_id,ac.action_id,ac.action_title,"
-                " ac.action_created_at "
+                " ac.action_created_at,sn.session_id,sn.synopsis,sn.status,sn.updated_at "
                 "ORDER BY s.updated_at DESC",
                 (owner,),
             ).fetchall()
@@ -21192,6 +23174,7 @@ def register_calliope_routes(
                             owner,
                             turn_id,
                             projected,
+                            design_profile,
                         )
                         hop_surfaces = _insert_surfaces(
                             conn_factory,
@@ -21271,6 +23254,7 @@ def register_calliope_routes(
                         f"WARNING: Calliope response receipt failed for {turn_id}: {exc}",
                         file=os.sys.stderr,
                     )
+                _enqueue_session_synopsis(conn_factory, str(session["id"]))
                 generated_title = await _maybe_generate_session_title(
                     config,
                     conn_factory,
@@ -21308,6 +23292,7 @@ def register_calliope_routes(
                     "interrupted",
                     "browser disconnected",
                 )
+                _enqueue_session_synopsis(conn_factory, str(session["id"]))
                 _try_finalize_unfinished_manual_workflow_run(
                     conn_factory,
                     str(session["id"]),
@@ -21334,6 +23319,7 @@ def register_calliope_routes(
                     "failed",
                     message_text,
                 )
+                _enqueue_session_synopsis(conn_factory, str(session["id"]))
                 _try_finalize_unfinished_manual_workflow_run(
                     conn_factory,
                     str(session["id"]),

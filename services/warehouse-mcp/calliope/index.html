@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <style>html{background:#100d0b}body{background:transparent}</style>
-  <title>Calliope · Data Rabbit</title>
+  <title>Calliope · RVBBIT.AI</title>
   <link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Homemade+Apple&display=swap">
-  <link rel="stylesheet" href="/calliope/calliope.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Homemade+Apple&amp;family=IBM+Plex+Mono:wght@400;500;600;700&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&amp;display=swap">
+  <link rel="stylesheet" href="/calliope/calliope.css?v=__CALLIOPE_ASSET_VERSION__">
   <link rel="stylesheet" href="/theme/warehouse-theme.css">
   <script src="/theme/warehouse-theme.js"></script>
 </head>
@@ -17,9 +19,9 @@ __CALLIOPE_BACKGROUND__
 <div class="grid-wash" aria-hidden="true"></div>
 
 <nav class="topbar" data-warehouse-header>
-  <a class="brand" href="/gallery" aria-label="Data Rabbit artifacts">
+  <a class="brand" href="/gallery" aria-label="Calliope artifacts">
     __CALLIOPE_RABBIT__
-    <span class="wordmark">DATA RABBIT<small>CALLIOPE</small></span>
+    <span class="calliope-brand"><span class="calliope-brand-name">Calliope</span><span class="calliope-brand-byline">by RVBBIT.AI</span></span>
   </a>
   <div class="mobile-switcher" aria-label="Notebook views">
     <button id="mobile-sessions-toggle" type="button" aria-label="Show sessions" aria-controls="calliope-sessions" aria-expanded="false">
@@ -35,6 +37,9 @@ __CALLIOPE_BACKGROUND__
     <button id="personal-brief-open" class="personal-brief-open" type="button" title="Open today's private Personal Brief">
       <span>Brief</span><b id="personal-brief-count" hidden>0</b>
     </button>
+    <button id="calliope-dreams-open" class="calliope-dreams-open" type="button" title="See what Calliope noticed and imagined overnight" hidden>
+      <span>Dreams</span><b id="calliope-dreams-count" hidden>0</b>
+    </button>
     <button id="google-calendar-open" class="google-calendar-open" type="button" hidden aria-label="Connect Google Calendar">
       <span aria-hidden="true">▦</span><b>Calendar</b><i aria-hidden="true"></i>
     </button>
@@ -43,8 +48,7 @@ __CALLIOPE_BACKGROUND__
     <button id="workflow-library-open" class="workflow-library-open" type="button">Workflows</button>
     <button id="style-library-open" class="style-library-open" type="button">Design Profiles</button>
     <span data-warehouse-theme-anchor></span>
-    <span class="viewer">__CALLIOPE_VIEWER__</span>
-    <a href="/auth/logout">Sign out</a>
+    __CALLIOPE_ACCOUNT__
   </div>
 </nav>
 
@@ -294,34 +298,105 @@ __CALLIOPE_BACKGROUND__
   </div>
 </dialog>
 
+<dialog id="calliope-dreams-dialog" class="calliope-dreams-dialog" aria-labelledby="calliope-dreams-title">
+  <div class="calliope-dreams-shell">
+    <header class="calliope-dreams-head">
+      <div>
+        <p class="eyebrow">Company reflection · evidence first</p>
+        <h2 id="calliope-dreams-title">Calliope Dreams</h2>
+        <p>Three strong things Calliope surfaced from recent work and longer company memory. Credible runners-up wait quietly in the wings.</p>
+      </div>
+      <div class="calliope-dreams-head-actions">
+        <button id="calliope-dreams-run" class="primary-action" type="button" title="Revisit the last 30 days against a 90-day company horizon">Dream deeper</button>
+        <button id="calliope-dreams-refresh" type="button" aria-label="Refresh Dreams">↻</button>
+        <button id="calliope-dreams-close" class="markup-close" type="button" aria-label="Close Dreams">×</button>
+      </div>
+    </header>
+    <nav id="calliope-dreams-filters" class="calliope-dreams-filters" aria-label="Dream views">
+      <button type="button" data-dream-view="active" aria-pressed="true">Awake <b data-dream-count="active">0</b></button>
+      <button type="button" data-dream-view="new" aria-pressed="false">New <b data-dream-count="new">0</b></button>
+      <button type="button" data-dream-view="exploring" aria-pressed="false">Exploring <b data-dream-count="exploring">0</b></button>
+      <button type="button" data-dream-view="adopted" aria-pressed="false">Adopted <b data-dream-count="adopted">0</b></button>
+      <button type="button" data-dream-view="backlog" aria-pressed="false" title="Evidence-backed candidates that were not selected for the three-item shelf">In the wings <b data-dream-count="backlog">0</b></button>
+      <button type="button" data-dream-view="sleeping" aria-pressed="false">Sleeping <b data-dream-count="sleeping">0</b></button>
+      <span id="calliope-dreams-summary">Waiting for the first reflection…</span>
+    </nav>
+    <div class="calliope-dreams-workspace">
+      <aside id="calliope-dreams-list" class="calliope-dreams-list" aria-live="polite">
+        <div class="calliope-dreams-loading"><i></i><span>Remembering what the company has been doing…</span></div>
+      </aside>
+      <section id="calliope-dreams-detail" class="calliope-dreams-detail">
+        <div class="calliope-dreams-empty">
+          <i aria-hidden="true">☾</i>
+          <p class="eyebrow">An accumulating institutional instinct</p>
+          <h3>Calliope notices what the company is becoming capable of.</h3>
+          <p>Each Dream preserves its evidence, novelty, recurrence, and response. Similar ideas deepen instead of stacking up.</p>
+        </div>
+      </section>
+    </div>
+  </div>
+</dialog>
+
 <dialog id="action-library-dialog" class="action-library-dialog" aria-labelledby="action-library-title">
   <div class="action-library-shell">
     <header class="action-library-head">
       <div>
-        <p class="eyebrow">Discover · connect · automate</p>
-        <h2 id="action-library-title">Ways Callie can help</h2>
-        <p>Search for an outcome—even if you do not know which capability, source, or SQL function makes it possible.</p>
+        <p class="eyebrow">See · understand · connect · change</p>
+        <h2 id="action-library-title">Calliope Library</h2>
+        <p>See what Calliope knows and can use, discover new outcomes, and review every governed change.</p>
       </div>
       <span class="action-trust-note"><i></i>Trusted organization mode</span>
       <button id="action-library-close" class="markup-close" type="button" aria-label="Close Calliope Library">×</button>
     </header>
     <div class="action-library-discovery">
+      <nav id="library-modes" class="library-mode-tabs" aria-label="Library views">
+        <button type="button" data-library-mode="inventory" aria-pressed="true">In use <b id="library-inventory-count">0</b></button>
+        <button type="button" data-library-mode="discover" aria-pressed="false">Discover <b id="library-discover-count">0</b></button>
+        <button type="button" data-library-mode="changes" aria-pressed="false">Changes <b id="library-changes-count">0</b></button>
+      </nav>
       <label class="action-library-search">
         <span aria-hidden="true">⌕</span>
-        <input id="action-library-search" type="search" maxlength="600" placeholder="What would you like to connect, change, or make possible?" autocomplete="off">
+        <input id="action-library-search" type="search" maxlength="600" placeholder="Search what Calliope currently knows and can use" autocomplete="off">
       </label>
-      <nav id="action-library-categories" class="action-library-categories" aria-label="Action categories"></nav>
+      <nav id="action-library-categories" class="action-library-categories" aria-label="Library filters"></nav>
     </div>
     <div class="action-library-workspace">
       <aside class="action-library-results">
-        <header><span id="action-library-summary">Loading possibilities…</span><button id="action-library-refresh" type="button" aria-label="Refresh Calliope Library">↻</button></header>
+        <header><span id="action-library-summary">Loading your system…</span><button id="inventory-open-view" type="button" aria-label="Inspect the current Library view with Calliope" title="Pin the current view on the Stage">✦</button><button id="action-library-refresh" type="button" aria-label="Refresh Calliope Library">↻</button></header>
         <div id="action-library-list" class="action-library-list" aria-live="polite"></div>
-        <section class="action-history-block">
-          <header><span>Recent changes</span><button id="action-history-refresh" type="button" aria-label="Refresh recent changes">↻</button></header>
-          <div id="action-history-list" class="action-history-list"><p>No changes recorded yet.</p></div>
-        </section>
       </aside>
       <section class="action-library-detail">
+        <div id="inventory-empty" class="inventory-empty">
+          <i aria-hidden="true">◎</i>
+          <p class="eyebrow">What Calliope knows and can use</p>
+          <h3>Your working system, made visible.</h3>
+          <p id="inventory-empty-summary">Sources, tools, meaning, routines, and personal access appear here with their current observed health.</p>
+          <div id="inventory-overview" class="inventory-overview"></div>
+          <p id="inventory-warnings" class="inventory-warnings" hidden></p>
+        </div>
+        <article id="inventory-selected" class="inventory-selected" hidden>
+          <header class="inventory-detail-head">
+            <div>
+              <span id="inventory-detail-state" class="inventory-state">Ready</span>
+              <p id="inventory-detail-section" class="eyebrow">Configured item</p>
+              <h3 id="inventory-detail-title">System item</h3>
+              <p id="inventory-detail-summary"></p>
+            </div>
+            <span id="inventory-detail-kind" class="inventory-kind"></span>
+          </header>
+          <section class="inventory-health"><span>Observed health</span><p id="inventory-detail-health"></p></section>
+          <div id="inventory-detail-facts" class="inventory-detail-facts"></div>
+          <details class="inventory-detail-contract">
+            <summary>Configuration context <span>⌄</span></summary>
+            <div id="inventory-detail-context"></div>
+          </details>
+          <footer class="inventory-detail-actions">
+            <p>Calliope receives this exact typed reference—not a name inferred from prose.</p>
+            <a id="inventory-detail-open" href="#" hidden>Open →</a>
+            <button id="inventory-knowledge-source" type="button" hidden>Consider as knowledge</button>
+            <button id="inventory-ask" class="primary-action" type="button">Ask Calliope →</button>
+          </footer>
+        </article>
         <div id="action-library-empty" class="action-library-empty">
           <i aria-hidden="true">✦</i>
           <p class="eyebrow">You do not need to know the command</p>
@@ -358,6 +433,12 @@ __CALLIOPE_BACKGROUND__
             <button id="action-apply" class="primary-action" type="button" hidden>Approve &amp; apply →</button>
           </footer>
         </article>
+        <div id="library-changes-empty" class="inventory-empty" hidden>
+          <i aria-hidden="true">✓</i>
+          <p class="eyebrow">Durable change receipts</p>
+          <h3>No governed changes yet.</h3>
+          <p>Approved Library changes will remain here with their frozen plan, verification, and rollback guidance.</p>
+        </div>
       </section>
     </div>
   </div>
@@ -677,11 +758,11 @@ __CALLIOPE_BACKGROUND__
           <div class="style-preview-column">
             <p class="style-section-label">Live token preview</p>
             <div id="style-preview" class="style-preview"></div>
-            <p class="style-preview-note">The preview follows generated tokens. Edited Markdown is authoritative for Calliope.</p>
+            <p id="style-preview-note" class="style-preview-note">The preview follows generated tokens. Edited Markdown is authoritative for Calliope.</p>
             <div id="style-source-summary" class="style-source-summary"></div>
           </div>
           <label class="style-markdown-column">
-            <span class="style-section-label">Editable profile Markdown</span>
+            <span id="style-markdown-label" class="style-section-label">Editable profile Markdown</span>
             <textarea id="style-markdown" spellcheck="false" maxlength="32000"></textarea>
           </label>
         </div>
@@ -699,8 +780,8 @@ __CALLIOPE_BACKGROUND__
 </dialog>
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
-<script src="/calliope/thinking-orbs.js" defer></script>
-<script src="/calliope/daily-notes-editor.js?v=20260803-object-hints-2" defer></script>
-<script src="/calliope/calliope.js?v=20260803-object-hints-2" defer></script>
+<script src="/calliope/thinking-orbs.js?v=__CALLIOPE_ASSET_VERSION__" defer></script>
+<script src="/calliope/daily-notes-editor.js?v=__CALLIOPE_ASSET_VERSION__" defer></script>
+<script src="/calliope/calliope.js?v=__CALLIOPE_ASSET_VERSION__" defer></script>
 </body>
 </html>

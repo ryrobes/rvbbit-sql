@@ -46,7 +46,13 @@ impl LaneRegistry {
     pub fn snapshot(&self) -> Vec<(String, usize, usize)> {
         let map = self.inner.lock().expect("lane registry poisoned");
         map.iter()
-            .map(|(id, (max, sem))| (id.clone(), max.saturating_sub(sem.available_permits()), *max))
+            .map(|(id, (max, sem))| {
+                (
+                    id.clone(),
+                    max.saturating_sub(sem.available_permits()),
+                    *max,
+                )
+            })
             .collect()
     }
 }

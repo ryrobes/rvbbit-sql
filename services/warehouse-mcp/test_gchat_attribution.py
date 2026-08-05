@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,13 +17,18 @@ sys.path.insert(0, str(_HERE))
 import server  # noqa: E402
 
 
-def _context(email="analyst@example.com", *, platform="google_chat"):
+def _context(
+    email="analyst@example.com",
+    *,
+    platform="google_chat",
+    session_id="gchat:spaces/abc:analyst@example.com",
+):
     metadata = {
         server._HERMES_CALLER_META_KEY: {
             "source": "hermes",
             "platform": platform,
             "user_id": email,
-            "session_id": "gchat:spaces/abc:analyst@example.com",
+            "session_id": session_id,
         }
     }
     return SimpleNamespace(
@@ -45,6 +51,46 @@ def test_static_hermes_publication_uses_verified_gchat_email(monkeypatch):
         "Chat-created dashboard", html="<main>ok</main>", ctx=_context("Person@Example.com")
     )
 
+    assert result["caller"] == ("person@example.com", "static-key")
+    assert server._FORWARDED_CALLER.get() is None
+
+
+def test_static_hermes_api_publication_uses_signed_calliope_session_owner(monkeypatch):
+    observed = {}
+    monkeypatch.setattr(
+        server,
+        "_authenticated_caller",
+        lambda: ("calliope@example.com", "static-key"),
+    )
+    monkeypatch.setattr(server, "_conn", lambda: nullcontext(object()))
+
+    def linked(_conn, session_ref):
+        observed["session_ref"] = session_ref
+        return {
+            "owner": "person@example.com",
+            "calliope_session_id": "755303d5-7f91-42c3-bbea-b989e34a56c9",
+            "kind": "session",
+        }
+
+    monkeypatch.setattr(server, "_calliope_activity_for_hermes_session", linked)
+    monkeypatch.setattr(server, "_logged", lambda _tool, _args, fn: fn())
+    monkeypatch.setattr(
+        server,
+        "tool_publish_dashboard",
+        lambda *_args, **_kwargs: {"caller": server._caller()},
+    )
+
+    result = server._mcp_publish_dashboard(
+        "Web-created dashboard",
+        html="<main>ok</main>",
+        ctx=_context(
+            "forged@example.com",
+            platform="api_server",
+            session_id="calliope_123",
+        ),
+    )
+
+    assert observed["session_ref"] == "calliope_123"
     assert result["caller"] == ("person@example.com", "static-key")
     assert server._FORWARDED_CALLER.get() is None
 
@@ -117,7 +163,9 @@ def test_request_metadata_attributes_an_ordinary_tool_without_injected_context(m
     monkeypatch.setattr(
         server, "_record",
         lambda tool, *_args, **_kwargs: observed.update(
-            tool=tool, caller=server._caller()
+            tool=tool,
+            caller=server._caller(),
+            client=server._mcp_client_implementation(),
         ),
     )
 
@@ -131,7 +179,12 @@ def test_request_metadata_attributes_an_ordinary_tool_without_injected_context(m
                 "user_id": "Person@Example.com",
             }
         }
-        async with create_connected_server_and_client_session(mcp._mcp_server) as client:
+        client_info = mcp_types.Implementation(
+            name="hermes-agent", title="Hermes Agent", version="0.19.0"
+        )
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server, client_info=client_info
+        ) as client:
             params = mcp_types.CallToolRequestParams(
                 name="search_data",
                 arguments={"query": "revenue"},
@@ -148,5 +201,10 @@ def test_request_metadata_attributes_an_ordinary_tool_without_injected_context(m
     assert observed == {
         "tool": "search_data",
         "caller": ("person@example.com", "static-key"),
+        "client": {
+            "name": "hermes-agent",
+            "title": "Hermes Agent",
+            "version": "0.19.0",
+        },
     }
     assert server._FORWARDED_CALLER.get() is None

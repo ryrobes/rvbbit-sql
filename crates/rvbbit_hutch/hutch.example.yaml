@@ -55,6 +55,24 @@ backends:
     mock_output: "mock generalist answer"
     mock_delay_ms: 400
 
+# In proxy mode a specialist can override the shared base URL while retaining
+# Hutch auth, entitlements, lanes, metering, and model-version receipts:
+#   - name: web_scrape
+#     entitlement: clover
+#     upstream_base: "http://127.0.0.1:8091"
+#     upstream_path: /v1/scrape
+#     model_version: "clover-web-v0.2/conditional-http"
+#     unit_microusd: 100
+#     timeout_ms: 60000
+#   - name: web_research
+#     entitlement: clover_llm
+#     forward_tenant_scope: true
+#     upstream_base: "http://127.0.0.1:8092"
+#     upstream_path: /v1/research
+#     model_version: "clover-research-v0.2/openrouter-gemma-4-31b-it+exa+clover-web+memory"
+#     unit_microusd: 5000
+#     timeout_ms: 180000
+
 # Hosted LLMs on the OpenAI-compatible surface (/v1/chat/completions,
 # routed by the request's `model` field; GET /v1/models lists entitled).
 # llms:
@@ -65,3 +83,22 @@ backends:
 #     model_version: "gemma-4-31b-it-nvfp4"
 #     prompt_microusd_per_1k: 100
 #     completion_microusd_per_1k: 300
+#
+# A hosted OpenAI-compatible backend uses the same public model name and
+# supplies its credential only through the process environment:
+#   - name: gemma4
+#     entitlement: gemma
+#     upstream_base: "https://openrouter.ai/api"
+#     upstream_bearer_token_env: OPENROUTER_API_KEY
+#     upstream_model: "~deepseek/deepseek-v4-flash-latest"
+#     model_version: "openrouter/deepseek-v4-flash-latest"
+#     request_defaults:
+#       reasoning: { enabled: false }
+#       temperature: 0
+#       seed: 0
+#     request_overrides:
+#       provider:
+#         zdr: true
+#         data_collection: deny
+#     prompt_microusd_per_1k: 90
+#     completion_microusd_per_1k: 180

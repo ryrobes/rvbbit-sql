@@ -3,13 +3,15 @@
   "id": "managed/clover",
   "name": "clover",
   "title": "Clover",
-  "description": "All of Clover in one subscription: 50 semantic SQL operators — 29 calibrated ML specialists plus 21 LLM operators. ML operators are unmetered on every tier; lanes buy LLM generation speed.",
+  "description": "All of Clover in one subscription: 62 semantic SQL operators — 35 calibrated ML specialists, 22 LLM operators, structured document parsing, forecasting with business drivers, and CPU-side time-series anomaly/imputation/similarity, plus safe web extraction and cited research. ML and extraction operators are unmetered on every tier; lanes buy LLM generation speed.",
   "tags": [
     "managed",
     "clover",
     "bundle",
     "specialists",
     "llm",
+    "web",
+    "documents",
     "lanes",
     "verified"
   ],
@@ -45,8 +47,14 @@
       "clover_extract",
       "clover_pii",
       "clover_ocr",
+      "clover_document_parse",
       "clover_transcribe",
       "clover_forecast",
+      "clover_forecast_drivers",
+      "clover_series_anomalies",
+      "clover_series_impute",
+      "clover_series_embed",
+      "clover_series_similarity",
       "clover_image_similar",
       "clover_image_embed",
       "clover_cluster",
@@ -76,7 +84,13 @@
       "clover_llm_merge_records",
       "clover_llm_timeline",
       "clover_llm_consensus",
-      "clover_llm_make_operator"
+      "clover_llm_make_operator",
+      "clover_triples",
+      "clover_web_scrape",
+      "clover_web_markdown",
+      "clover_web_research",
+      "clover_web_research_deep",
+      "clover_web_watch"
     ]
   },
   "install": {

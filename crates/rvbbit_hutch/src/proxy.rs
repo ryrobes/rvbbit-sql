@@ -11,6 +11,7 @@ pub struct ForwardOk {
     pub upstream_ms: f64,
 }
 
+#[derive(Debug)]
 pub enum ForwardErr {
     /// Upstream answered non-2xx: propagate enough detail to diagnose.
     Status { status: u16, body_head: String },
@@ -23,6 +24,7 @@ pub async fn forward(
     upstream: &Upstream,
     backend: &BackendCfg,
     inputs: &[Value],
+    tenant_scope: Option<&str>,
 ) -> Result<ForwardOk, ForwardErr> {
     let t0 = Instant::now();
     match upstream {
@@ -41,17 +43,27 @@ pub async fn forward(
         }
         Upstream::Proxy { base_url } => {
             let path = backend.upstream_path.as_deref().unwrap_or("/predict");
+            let base_url = backend.upstream_base.as_deref().unwrap_or(base_url);
             let url = format!("{}{}", base_url.trim_end_matches('/'), path);
             let outputs = match backend.adapter {
                 Adapter::Predict => {
-                    let parsed =
-                        post_json(http, &url, backend, &json!({ "inputs": inputs })).await?;
+                    let parsed = post_json_scoped(
+                        http,
+                        &url,
+                        backend,
+                        &json!({ "inputs": inputs }),
+                        if backend.forward_tenant_scope {
+                            tenant_scope
+                        } else {
+                            None
+                        },
+                    )
+                    .await?;
                     json_array(&parsed, "outputs")?
                 }
                 Adapter::OpenaiEmbeddings => {
                     let texts = input_texts(inputs)?;
-                    let parsed =
-                        post_json(http, &url, backend, &json!({ "input": texts })).await?;
+                    let parsed = post_json(http, &url, backend, &json!({ "input": texts })).await?;
                     json_array(&parsed, "data")?
                         .iter()
                         .map(|item| {
@@ -63,8 +75,7 @@ pub async fn forward(
                 }
                 Adapter::ZooSentiment => {
                     let texts = input_texts(inputs)?;
-                    let parsed =
-                        post_json(http, &url, backend, &json!({ "texts": texts })).await?;
+                    let parsed = post_json(http, &url, backend, &json!({ "texts": texts })).await?;
                     let scores = json_array(&parsed, "scores")?;
                     let labels = json_array(&parsed, "labels")?;
                     scores
@@ -222,9 +233,23 @@ async fn post_json(
     backend: &BackendCfg,
     body: &Value,
 ) -> Result<Value, ForwardErr> {
-    let resp = http
+    post_json_scoped(http, url, backend, body, None).await
+}
+
+async fn post_json_scoped(
+    http: &reqwest::Client,
+    url: &str,
+    backend: &BackendCfg,
+    body: &Value,
+    tenant_scope: Option<&str>,
+) -> Result<Value, ForwardErr> {
+    let mut request = http
         .post(url)
-        .timeout(std::time::Duration::from_millis(backend.timeout_ms))
+        .timeout(std::time::Duration::from_millis(backend.timeout_ms));
+    if let Some(tenant_scope) = tenant_scope {
+        request = request.header("x-clover-tenant-scope", tenant_scope);
+    }
+    let resp = request
         .json(body)
         .send()
         .await
@@ -393,4 +418,59 @@ async fn rerank_grouped(
         }
     }
     Ok(outputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{http::HeaderMap, routing::post, Json, Router};
+
+    async fn echo_scope(headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+        let scope = headers
+            .get("x-clover-tenant-scope")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let count = body
+            .get("inputs")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        Json(json!({"outputs": vec![json!({"scope":scope}); count]}))
+    }
+
+    #[tokio::test]
+    async fn predict_adapter_forwards_only_the_one_way_tenant_scope() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/predict", post(echo_scope)))
+                .await
+                .unwrap();
+        });
+        let backend: BackendCfg = serde_yaml::from_str(
+            r#"
+            name: web_research
+            entitlement: clover_llm
+            forward_tenant_scope: true
+            upstream_path: /predict
+            model_version: test
+            "#,
+        )
+        .unwrap();
+        let upstream = Upstream::Proxy {
+            base_url: format!("http://{address}"),
+        };
+        let scope = "a".repeat(64);
+        let output = forward(
+            &reqwest::Client::new(),
+            &upstream,
+            &backend,
+            &[json!({"question":"test"})],
+            Some(&scope),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.outputs[0]["scope"], scope);
+        server.abort();
+    }
 }

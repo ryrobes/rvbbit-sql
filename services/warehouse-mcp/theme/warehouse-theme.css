@@ -80,6 +80,55 @@ body[data-warehouse-page="calliope"] > main > .chat-column > * {
   animation: warehouse-page-in .24s cubic-bezier(.16, 1, .3, 1) backwards;
 }
 
+/* Product identity shared by the login, Gallery, access gate, and Calliope.
+   RVBBIT.AI is deliberately provenance beneath the product, not a peer label. */
+.calliope-brand {
+  display: inline-flex;
+  min-width: max-content;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  color: var(--bone-bright, #fff7e9);
+  text-decoration: none;
+}
+
+.calliope-brand-name {
+  color: inherit;
+  font: 400 17px/1.08 "Homemade Apple", cursive;
+  letter-spacing: -.012em;
+  text-shadow: 0 2px 13px color-mix(in oklch, var(--void, #100d0b) 62%, transparent);
+  white-space: nowrap;
+}
+
+.calliope-brand-byline {
+  margin-top: 1px;
+  color: var(--amber, #f5b446);
+  font: 600 5.5px/1 "IBM Plex Mono", ui-monospace, monospace;
+  letter-spacing: .19em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.calliope-brand--hero {
+  align-items: flex-end;
+}
+
+.calliope-brand--hero .calliope-brand-name {
+  font-size: clamp(37px, 10vw, 45px);
+  line-height: 1.22;
+  -webkit-text-stroke: .45px currentColor;
+  paint-order: stroke fill;
+  text-shadow: 0 4px 22px color-mix(in oklch, var(--void, #100d0b) 72%, transparent);
+}
+
+.calliope-brand--hero .calliope-brand-byline {
+  margin-top: 1px;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: .24em;
+  transform: translateX(40px);
+}
+
 @keyframes warehouse-page-in {
   from {
     opacity: 0;
@@ -231,6 +280,175 @@ body[data-warehouse-page="calliope"] > main > .chat-column > * {
   z-index: 80;
   top: 12px;
   right: 18px;
+}
+
+.warehouse-account {
+  position: relative;
+  min-width: 0;
+  flex: none;
+  color: var(--fog, rgba(232, 221, 204, .62));
+  font-family: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.warehouse-account-trigger {
+  min-width: 0;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  padding: 2px 3px 2px 11px;
+  border: 1px solid var(--line, rgba(232, 221, 204, .16));
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--panel-raised, #1d1813) 70%, transparent);
+  color: inherit;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 color-mix(in oklch, var(--bone, #e8ddcc) 4%, transparent);
+  transition: border-color .18s, background .18s, color .18s, transform .18s;
+}
+
+.warehouse-account-trigger:hover,
+.warehouse-account-trigger:focus-visible,
+.warehouse-account-trigger[aria-expanded="true"] {
+  outline: 0;
+  border-color: color-mix(in oklch, var(--amber, #f5b446) 50%, var(--line, transparent));
+  background: color-mix(in oklch, var(--amber-soft, rgba(245, 180, 70, .12)) 72%, var(--panel-raised, #1d1813));
+  color: var(--bone, #e8ddcc);
+}
+
+.warehouse-account-trigger:hover {
+  transform: translateY(-1px);
+}
+
+.warehouse-account-email {
+  max-width: min(220px, 22vw);
+  overflow: hidden;
+  color: inherit;
+  font: 500 9px/1 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: .035em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.warehouse-account-avatar {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid color-mix(in oklch, var(--jade, #68c7b2) 44%, var(--line, transparent));
+  border-radius: 50%;
+  background: linear-gradient(145deg, var(--jade-soft, rgba(104, 199, 178, .10)), var(--amber-soft, rgba(245, 180, 70, .12)));
+  color: var(--jade, #68c7b2);
+}
+
+.warehouse-account-initials {
+  font: 800 7px/1 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: .04em;
+}
+
+.warehouse-account-avatar-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity .16s ease;
+}
+
+.warehouse-account-avatar-image.is-ready {
+  opacity: 1;
+}
+
+.warehouse-account-avatar.has-image {
+  border: 0;
+  background: transparent;
+}
+
+.warehouse-account-menu {
+  position: absolute;
+  z-index: 140;
+  top: calc(100% + 9px);
+  right: 0;
+  width: min(270px, calc(100vw - 26px));
+  overflow: hidden;
+  border: 1px solid color-mix(in oklch, var(--amber, #f5b446) 30%, var(--line, transparent));
+  background: color-mix(in oklch, var(--panel, #171310) 96%, transparent);
+  color: var(--bone, #e8ddcc);
+  box-shadow: 0 22px 58px color-mix(in oklch, var(--void, #100d0b) 78%, transparent), inset 0 1px 0 color-mix(in oklch, var(--bone, #e8ddcc) 4%, transparent);
+  -webkit-backdrop-filter: blur(24px) saturate(1.16);
+  backdrop-filter: blur(24px) saturate(1.16);
+  animation: warehouse-account-in .14s ease-out;
+}
+
+.warehouse-account-menu[hidden] {
+  display: none;
+}
+
+.warehouse-account-menu-profile {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 14px 15px 13px;
+  border-bottom: 1px solid var(--line, rgba(232, 221, 204, .13));
+}
+
+.warehouse-account-menu-profile > span {
+  color: var(--jade, #68c7b2);
+  font: 700 6px/1 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.warehouse-account-menu-profile strong,
+.warehouse-account-menu-email {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.warehouse-account-menu-profile strong {
+  margin-top: 3px;
+  color: var(--bone-bright, #fff7e9);
+  font: 600 11px/1.25 Inter, ui-sans-serif, sans-serif;
+}
+
+.warehouse-account-menu-email {
+  color: var(--dim, rgba(232, 221, 204, .4));
+  font: 7px/1.3 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+}
+
+.warehouse-account-signout {
+  min-height: 39px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 15px;
+  color: var(--fog, rgba(232, 221, 204, .62));
+  font: 700 7px/1 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+.warehouse-account-signout:hover,
+.warehouse-account-signout:focus-visible {
+  outline: 0;
+  background: var(--amber-soft, rgba(245, 180, 70, .12));
+  color: var(--amber, #f5b446);
+}
+
+@keyframes warehouse-account-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(.985);
+  }
 }
 
 .warehouse-theme-dialog {
@@ -1026,7 +1244,27 @@ html[data-warehouse-color-mode="light"] ::-webkit-scrollbar-thumb {
   background: color-mix(in oklch, var(--bone) 22%, transparent);
 }
 
+@media (max-width: 880px) {
+  body[data-warehouse-page="calliope"] .warehouse-account-email {
+    display: none;
+  }
+
+  body[data-warehouse-page="calliope"] .warehouse-account-trigger {
+    width: 34px;
+    padding: 2px;
+  }
+}
+
 @media (max-width: 760px) {
+  .warehouse-account-email {
+    display: none;
+  }
+
+  .warehouse-account-trigger {
+    width: 34px;
+    padding: 2px;
+  }
+
   .warehouse-theme-dialog {
     width: 100vw;
     height: 100dvh;
@@ -1077,7 +1315,13 @@ html[data-warehouse-color-mode="light"] ::-webkit-scrollbar-thumb {
 
   .warehouse-theme-button,
   .warehouse-theme-mode-button,
+  .warehouse-account-trigger,
+  .warehouse-account-avatar-image,
   .warehouse-theme-tile {
     transition: none;
+  }
+
+  .warehouse-account-menu {
+    animation: none;
   }
 }

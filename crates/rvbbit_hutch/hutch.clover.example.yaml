@@ -81,9 +81,16 @@ backends:
     entitlement: clover
     adapter: zoo-json
     upstream_path: /document/ocr
-    model_version: "clover-v1/got-ocr-2.0"
+    model_version: "clover-v2/granite-docling-258m-text-compat"
     unit_microusd: 500
     timeout_ms: 180000
+  - name: document_parse
+    entitlement: clover
+    adapter: zoo-json
+    upstream_path: /document/parse
+    model_version: "clover-v2/granite-docling-258m-structured"
+    unit_microusd: 750
+    timeout_ms: 300000
   - name: transcribe
     entitlement: clover
     adapter: zoo-json
@@ -95,8 +102,40 @@ backends:
     entitlement: clover
     adapter: zoo-json
     upstream_path: /forecast
-    model_version: "clover-v1/chronos-bolt-base"
+    model_version: "clover-v2/chronos-2"
     unit_microusd: 100
+    timeout_ms: 60000
+  - name: timeseries_anomalies
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-json
+    upstream_path: /timeseries/anomalies
+    model_version: "clover-v2/tspulse-r1-anomaly"
+    unit_microusd: 50
+    timeout_ms: 120000
+  - name: timeseries_impute
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-json
+    upstream_path: /timeseries/impute
+    model_version: "clover-v2/tspulse-r1-imputation"
+    unit_microusd: 50
+    timeout_ms: 120000
+  - name: timeseries_embed
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-json
+    upstream_path: /timeseries/embedding
+    model_version: "clover-v2/tspulse-r1-search"
+    unit_microusd: 10
+    timeout_ms: 60000
+  - name: timeseries_similarity
+    entitlement: clover
+    unlaned: true
+    adapter: zoo-json
+    upstream_path: /timeseries/similarity
+    model_version: "clover-v2/tspulse-r1-search"
+    unit_microusd: 10
     timeout_ms: 60000
   - name: image_embed
     entitlement: clover
@@ -154,6 +193,22 @@ backends:
     model_version: "clover-v1/arctic-embed-l-v2.0+kmeans-hdbscan"
     unit_microusd: 200
     timeout_ms: 300000
+  - name: web_scrape
+    entitlement: clover
+    unlaned: true
+    upstream_base: "http://127.0.0.1:8091"
+    upstream_path: /v1/scrape
+    model_version: "clover-web-v0.2/anydoc-0.1.3+firecrawl-html-extractor+conditional-http"
+    unit_microusd: 100
+    timeout_ms: 60000
+  - name: web_research
+    entitlement: clover_llm
+    forward_tenant_scope: true
+    upstream_base: "http://127.0.0.1:8092"
+    upstream_path: /v1/research
+    model_version: "clover-research-v0.2/openrouter-gemma-4-31b-it+exa+clover-web+memory"
+    unit_microusd: 5000
+    timeout_ms: 180000
 
 llms:
   - name: gemma4

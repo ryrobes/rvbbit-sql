@@ -5,13 +5,15 @@ framework-free, but they should still feel like one application.  This module
 owns the public theme asset routes and the small HTML include all three shells
 use. Published HTML/JS artifacts never inherit the Warehouse theme; the
 system-owned Artifact Lens mounts its own isolated Shadow DOM when requested by
-the serving shim, so authored styles remain untouched.
+the serving shim. The explicit Adaptive Calliope Design Profile is the sole
+opt-in exception: its artifact runtime receives a sanitized viewer snapshot.
 """
 from __future__ import annotations
 
 import json
 import re
 from functools import lru_cache
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +25,13 @@ _IMAGE_DIR = _ASSET_DIR / "images"
 _FAVICON = _ASSET_DIR / "datarabbit.svg"
 _ARTIFACT_LENS_JS = _ASSET_DIR / "artifact-lens.js"
 _ARTIFACT_LENS_CSS = _ASSET_DIR / "artifact-lens.css"
+_ADAPTIVE_ARTIFACT_JS = _ASSET_DIR / "adaptive-artifact.js"
 _CHARTS_DIR = Path(__file__).resolve().parent / "charts"
 TANSTACK_CHARTS_VERSION = "0.3.1"
 TANSTACK_CHARTS_SRC = f"/charts/rvbbit-tanstack-charts-{TANSTACK_CHARTS_VERSION}.js"
 _TANSTACK_CHARTS_JS = _CHARTS_DIR / f"rvbbit-tanstack-charts-{TANSTACK_CHARTS_VERSION}.js"
 _THEME_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,160}$")
+_ACCOUNT_EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,189}$")
 _THEME_LABELS = {
     "callie-bg-bright": "Callie Bright",
     "callie-bg-dark": "Callie Dark",
@@ -73,8 +77,75 @@ def head_assets() -> str:
     """The shared, public include used in each first-party Warehouse page."""
     return (
         '<link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">'
+        '<link rel="preconnect" href="https://fonts.googleapis.com">'
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+        'family=Homemade+Apple&family=IBM+Plex+Mono:wght@400;500;600;700&'
+        'family=IBM+Plex+Sans:wght@400;500;600;700&'
+        'family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&display=swap">'
         '<link rel="stylesheet" href="/theme/warehouse-theme.css">'
         '<script src="/theme/warehouse-theme.js"></script>'
+    )
+
+
+def _account_initials(name: str, identity: str) -> str:
+    source = name or identity.split("@", 1)[0]
+    words = [word for word in re.split(r"[^A-Za-z0-9]+", source) if word]
+    if len(words) > 1:
+        initials = words[0][0] + words[-1][0]
+    elif words:
+        initials = words[0][:2]
+    else:
+        initials = "?"
+    return initials.upper()
+
+
+def account_control(session: dict[str, Any] | None) -> str:
+    """Render the shared right-aligned account menu for authenticated shells."""
+    session = session or {}
+    identity = str(session.get("identity") or session.get("sub") or "").strip()
+    if not identity:
+        return ""
+    name = re.sub(r"\s+", " ", str(session.get("name") or "")).strip()[:160]
+    via = str(session.get("via") or "password").strip().lower()
+    provider = {
+        "google": "Google",
+        "pg": "Calliope account",
+        "password": "Calliope account",
+    }.get(via, "Calliope account")
+    initials = _account_initials(name, identity)
+    raw_email_avatar = (
+        via in {"password", "pg"}
+        and len(identity) <= 254
+        and _ACCOUNT_EMAIL.fullmatch(identity) is not None
+    )
+    avatar = (
+        '<img class="warehouse-account-avatar-image" src="/auth/avatar" alt="" '
+        'width="28" height="28" decoding="async" referrerpolicy="no-referrer">'
+        if session.get("picture") or raw_email_avatar else ""
+    )
+    heading = name or identity
+    email_line = (
+        f'<small class="warehouse-account-menu-email">{escape(identity)}</small>'
+        if name and name.casefold() != identity.casefold() else ""
+    )
+    return (
+        '<div class="warehouse-account" data-warehouse-account>'
+        '<button class="warehouse-account-trigger" type="button" '
+        'aria-haspopup="menu" aria-expanded="false" '
+        f'aria-label="Open account menu for {escape(identity, quote=True)}">'
+        f'<span class="warehouse-account-email">{escape(identity)}</span>'
+        '<span class="warehouse-account-avatar" aria-hidden="true">'
+        f'<span class="warehouse-account-initials">{escape(initials)}</span>{avatar}'
+        '</span></button>'
+        '<div class="warehouse-account-menu" role="menu" aria-label="Account options" hidden>'
+        '<div class="warehouse-account-menu-profile" role="none">'
+        f'<span>Signed in with {escape(provider)}</span>'
+        f'<strong>{escape(heading)}</strong>{email_line}'
+        '</div>'
+        '<a class="warehouse-account-signout" href="/auth/logout" role="menuitem">'
+        '<span>Sign out</span><span aria-hidden="true">→</span></a>'
+        '</div></div>'
     )
 
 
@@ -163,6 +234,14 @@ def register_theme_routes(mcp: Any) -> None:
         return FileResponse(
             _ARTIFACT_LENS_CSS,
             media_type="text/css",
+            headers={"cache-control": "no-cache", "x-content-type-options": "nosniff"},
+        )
+
+    @mcp.custom_route("/theme/adaptive-artifact.js", methods=["GET"])
+    async def adaptive_artifact_js(_request):
+        return FileResponse(
+            _ADAPTIVE_ARTIFACT_JS,
+            media_type="text/javascript",
             headers={"cache-control": "no-cache", "x-content-type-options": "nosniff"},
         )
 

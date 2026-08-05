@@ -89,6 +89,32 @@ SELECT rvbbit.define_metric(
 -- → 1   (the new version number)
 ```
 
+### Display semantics and favorable movement
+
+The optional `labels.display` definition metadata controls how a metric is
+presented without changing its SQL. In particular,
+`preferred_direction` tells consumers whether a rising or falling value is
+favorable. This is definition metadata, so it is versioned with the metric and
+is not guessed from its name or its latest KPI verdict.
+
+```sql
+SELECT rvbbit.define_metric(
+  'open_support_backlog',
+  'SELECT count(*) AS value FROM support_cases WHERE closed_at IS NULL',
+  '{}'::jsonb,
+  'one scalar value',
+  'Support cases still awaiting resolution',
+  'analytics',
+  '{"display":{"unit":"tickets","decimals":0,"preferred_direction":"lower"}}'::jsonb
+);
+```
+
+Use `"higher"` when increases are favorable, `"lower"` when decreases are
+favorable, and `"neutral"` (the default) when movement should not be given a
+red/green judgment. Gallery and Calliope trend arrows still show the actual
+direction; this field controls only whether that movement is semantically good
+or bad. KPI `check_sql` status remains a separate, point-in-time target verdict.
+
 ### Template tokens
 
 | Token | Resolves to |

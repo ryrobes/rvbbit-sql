@@ -333,11 +333,12 @@ Fresh box (NVIDIA GPU) — PREFLIGHT first (validated on GCP g4/Blackwell):
       sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker; }
     # 3. sanity: GPU visible inside the release image
     docker run --rm --gpus all ghcr.io/ryrobes/rvbbit-postgres:${VERSION} nvidia-smi -L
-    # 4. start with the GPU overlay — pulls the prebuilt GQE image (~9GB,
-    #    covers all CUDA CC 8.0+ GPUs: RTX 30/40/50-series, A100/H100/B200):
+    # 4. build GQE once on the GPU box from the published Postgres base.
+    #    The general release does not push it because its CUDA/RAPIDS toolchain
+    #    layer exceeds GHCR's layer limit:
+    RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.release.yml -f docker-compose.release-gqe.yml build postgres
+    # 5. start with the locally built GPU overlay:
     RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.release.yml -f docker-compose.release-gqe.yml up -d
-    # (building GQE from source instead stays supported — see the comments in
-    #  docker-compose.release-gqe.yml)
 
 Turnkey (lens + warren + bootstrap + capabilities):
     RVBBIT_VERSION=${VERSION} docker compose -f docker-compose.uber.yml up -d
@@ -385,6 +386,7 @@ if [[ "$CHECK_PUBLIC" -eq 1 ]]; then
     [[ "$SKIP_DB" -eq 1 ]] && public_args+=(--skip-db)
     [[ "$SKIP_LENS" -eq 1 ]] && public_args+=(--skip-lens)
     [[ "$SKIP_WARREN" -eq 1 ]] && public_args+=(--skip-warren)
+    [[ "$SKIP_WAREHOUSE_MCP" -eq 1 ]] && public_args+=(--skip-warehouse-mcp)
     [[ "$BUILD_CAPABILITIES" -eq 1 ]] && public_args+=(--with-capabilities)
     run "${public_args[@]}"
 fi

@@ -33,7 +33,7 @@ import re
 import secrets
 import sys
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlsplit
 
 import jwt
 from pydantic import AnyHttpUrl
@@ -93,6 +93,13 @@ LOGIN_WINDOW = 300        # ... within this many seconds → lockout
 MIN_PASSWORD_LEN = 12
 SESSION_COOKIE = "wh_session"
 SESSION_TTL = _env_int("WAREHOUSE_SESSION_TTL", 12 * 3600, maximum=24 * 3600)   # browser view session
+_PROFILE_NAME_MAX = 160
+_PROFILE_PICTURE_MAX = 2048
+_AVATAR_MAX_BYTES = 2 * 1024 * 1024
+_AVATAR_MEDIA_TYPES = frozenset(
+    {"image/avif", "image/gif", "image/jpeg", "image/png", "image/webp"}
+)
+_RAW_EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,189}$")
 
 
 def validate_config() -> list[str]:
@@ -222,6 +229,29 @@ class WarehouseAuthProvider:
         self._cap(self._clients, MAX_CLIENTS)
         self._clients[client_info.client_id] = client_info
         self._persist()
+
+    def activity_client_metadata(self, client_id: str) -> dict[str, str]:
+        """Return bounded, non-secret software labels for activity receipts.
+
+        Dynamic-registration metadata is supplied by the MCP client and is
+        therefore useful provenance, not an authorization assertion. Never
+        expose the registered client secret or redirect URIs through this path.
+        """
+        client = self._clients.get(str(client_id or ""))
+        if client is None:
+            return {}
+
+        def bounded(value, limit):
+            return str(value or "").strip()[:limit]
+
+        metadata = {
+            "client_name": bounded(getattr(client, "client_name", None), 160),
+            "software_id": bounded(getattr(client, "software_id", None), 160),
+            "software_version": bounded(
+                getattr(client, "software_version", None), 80
+            ),
+        }
+        return {key: value for key, value in metadata.items() if value}
 
     # — /authorize: hand the browser to our own login page —
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
@@ -614,8 +644,136 @@ def google_domain_ok(claims: dict) -> bool:
 
 # ── browser view session (cookie, for /d/<slug> dashboards) ──────────────────
 
+def _profile_name(value) -> str:
+    """Bound an IdP display label before it becomes part of our cookie."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:_PROFILE_NAME_MAX]
+
+
+def _trusted_avatar_url(value, domain: str) -> str:
+    """Accept a bounded HTTPS URL on one provider-controlled domain."""
+    value = str(value or "").strip()[:_PROFILE_PICTURE_MAX]
+    if not value or any(ord(character) < 32 for character in value):
+        return ""
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return ""
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or not (host == domain or host.endswith(f".{domain}"))
+    ):
+        return ""
+    return value
+
+
+def _google_picture_url(value) -> str:
+    """Accept only Google's HTTPS profile-image hosts.
+
+    The signed ID-token claim is trustworthy as a claim, but it is still a URL
+    the server will fetch. Keeping every hop on googleusercontent.com prevents
+    the avatar convenience from becoming an SSRF primitive.
+    """
+    return _trusted_avatar_url(value, "googleusercontent.com")
+
+
+def _raw_email(value) -> str:
+    email = str(value or "").strip().lower()
+    return email if len(email) <= 254 and _RAW_EMAIL.fullmatch(email) else ""
+
+
+def _gravatar_url(identity: str) -> str:
+    """Build a Gravatar request that can never return a generated avatar."""
+    email = _raw_email(identity)
+    if not email:
+        return ""
+    digest = hashlib.sha256(email.encode("utf-8")).hexdigest()
+    return f"https://www.gravatar.com/avatar/{digest}?s=96&d=404&r=g"
+
+
+def _gravatar_picture_url(value) -> str:
+    return _trusted_avatar_url(value, "gravatar.com")
+
+
+def google_profile(claims: dict) -> dict[str, str]:
+    """The small, presentation-only subset retained from a verified token."""
+    return {
+        "name": _profile_name(claims.get("name")),
+        "picture": _google_picture_url(claims.get("picture")),
+    }
+
+
+class _AvatarNotFound(Exception):
+    """A provider deliberately reported that this identity has no image."""
+
+
+async def _fetch_remote_avatar(
+    url: str,
+    validate_url,
+    provider_name: str,
+) -> tuple[bytes, str]:
+    """Fetch a bounded profile image while validating every redirect hop."""
+    import httpx
+
+    current = validate_url(url)
+    if not current:
+        raise ValueError(f"invalid {provider_name} profile image URL")
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        for _hop in range(4):
+            async with client.stream(
+                "GET",
+                current,
+                headers={"accept": "image/avif,image/webp,image/png,image/jpeg,image/gif"},
+            ) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    target = validate_url(
+                        urljoin(current, response.headers.get("location", ""))
+                    )
+                    if not target:
+                        raise ValueError(f"unsafe {provider_name} profile image redirect")
+                    current = target
+                    continue
+                if response.status_code == 404:
+                    raise _AvatarNotFound
+                response.raise_for_status()
+                media_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                if media_type not in _AVATAR_MEDIA_TYPES:
+                    raise ValueError(f"unexpected {provider_name} profile image type")
+                try:
+                    declared_size = int(response.headers.get("content-length", "0"))
+                except ValueError:
+                    declared_size = 0
+                if declared_size > _AVATAR_MAX_BYTES:
+                    raise ValueError(f"{provider_name} profile image is too large")
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > _AVATAR_MAX_BYTES:
+                        raise ValueError(f"{provider_name} profile image is too large")
+                if not body:
+                    raise ValueError(f"empty {provider_name} profile image")
+                return bytes(body), media_type
+    raise ValueError(f"too many {provider_name} profile image redirects")
+
+
+async def _fetch_google_avatar(picture: str) -> tuple[bytes, str]:
+    return await _fetch_remote_avatar(picture, _google_picture_url, "Google")
+
+
+async def _fetch_gravatar_avatar(identity: str) -> tuple[bytes, str]:
+    return await _fetch_remote_avatar(
+        _gravatar_url(identity), _gravatar_picture_url, "Gravatar"
+    )
+
+
 def set_session(resp, sub: str, secure: bool, identity: str | None = None,
-                mapped: bool = True, via: str = "password") -> None:
+                mapped: bool = True, via: str = "password", name: str = "",
+                picture: str = "") -> None:
     """Sign the session into wh_session (same JWT secret as the OAuth tokens).
 
     `sub` keeps its established meaning — what surfaces SET ROLE as — so every
@@ -624,16 +782,21 @@ def set_session(resp, sub: str, secure: bool, identity: str | None = None,
     `ryan`, or as rvbbit_guest when the database doesn't know them yet.
     """
     now = int(time.time())
-    tok = jwt.encode({"sub": sub, "idt": identity or sub, "mpd": bool(mapped), "via": via,
-                      "typ": "session", "iat": now, "exp": now + SESSION_TTL},
-                     JWT_SECRET, algorithm=JWT_ALG)
+    claims = {"sub": sub, "idt": identity or sub, "mpd": bool(mapped), "via": via,
+              "typ": "session", "iat": now, "exp": now + SESSION_TTL}
+    clean_name = _profile_name(name)
+    clean_picture = _google_picture_url(picture) if via == "google" else ""
+    if clean_name:
+        claims["nam"] = clean_name
+    if clean_picture:
+        claims["pic"] = clean_picture
+    tok = jwt.encode(claims, JWT_SECRET, algorithm=JWT_ALG)
     resp.set_cookie(SESSION_COOKIE, tok, max_age=SESSION_TTL, httponly=True,
                     secure=secure, samesite="lax", path="/")
 
 
 def read_session_full(request: Request) -> dict | None:
-    """{sub, identity, mapped, via} or None. Sessions minted before 4.2.1 carry
-    only `sub`; they read back as mapped, which is what they were."""
+    """Full browser identity, remaining compatible with older sparse cookies."""
     tok = request.cookies.get(SESSION_COOKIE)
     if not tok:
         return None
@@ -643,8 +806,11 @@ def read_session_full(request: Request) -> dict | None:
         return None
     if c.get("typ") != "session" or not c.get("sub"):
         return None
+    via = c.get("via", "password")
     return {"sub": c["sub"], "identity": c.get("idt") or c["sub"],
-            "mapped": c.get("mpd", True), "via": c.get("via", "password")}
+            "mapped": c.get("mpd", True), "via": via,
+            "name": _profile_name(c.get("nam")),
+            "picture": _google_picture_url(c.get("pic")) if via == "google" else ""}
 
 
 def read_session(request: Request) -> str | None:
@@ -659,7 +825,7 @@ def _safe_next(nxt: str) -> str:
 
 
 def _finish_login(request: Request, provider, identity: str, txn: str, nxt: str,
-                  via: str = "password"):
+                  via: str = "password", name: str = "", picture: str = ""):
     """THE one place a verified identity becomes a session.
 
     Every authentication path — typed password, Postgres role, Google — lands
@@ -681,7 +847,8 @@ def _finish_login(request: Request, provider, identity: str, txn: str, nxt: str,
         nxt = UNMAPPED_LANDING
     resp = RedirectResponse(nxt, status_code=302)
     set_session(resp, sub, secure=request.url.scheme == "https",
-                identity=identity, mapped=mapped, via=via)
+                identity=identity, mapped=mapped, via=via,
+                name=name, picture=picture)
     return resp
 
 
@@ -738,6 +905,20 @@ _BG_CSS = """
 
 _LOGIN_RABBIT_SVG = ""
 
+_CALLIOPE_BRAND = (
+    '<span class="calliope-brand">'
+    '<span class="calliope-brand-name">Calliope</span>'
+    '<span class="calliope-brand-byline">by RVBBIT.AI</span>'
+    '</span>'
+)
+
+_CALLIOPE_HERO = (
+    '<h1 class="calliope-brand calliope-brand--hero">'
+    '<span class="calliope-brand-name">Calliope</span>'
+    '<span class="calliope-brand-byline">by RVBBIT.AI</span>'
+    '</h1>'
+)
+
 
 def _page(body: str, status: int = 200) -> HTMLResponse:
     import warehouse_theme
@@ -745,45 +926,56 @@ def _page(body: str, status: int = 200) -> HTMLResponse:
         f"""<!doctype html><html lang="en"><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <meta name=color-scheme content="dark light">
-<title>rvbbit warehouse</title>
+<title>Calliope · RVBBIT.AI</title>
 <style>
  /* Base colour on <html>, body transparent — a negative-z-index layer paints
     BEFORE in-flow backgrounds, so an opaque body would hide .bg entirely.
     (This page only ever worked because it had no html background and body's
     propagated to the canvas; don't leave that to luck.) */
- html{{background:#15110d}}
- body{{background:transparent;color:#f0e6d8;font:15px/1.5 ui-monospace,Menlo,monospace;display:grid;place-items:center;min-height:100vh;margin:0;padding-top:56px;box-sizing:border-box}}
+ html{{background:var(--void,#15110d)}}
+ body{{background:transparent;color:var(--bone,#f0e6d8);font:15px/1.5 "IBM Plex Sans",ui-sans-serif,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;padding-top:56px;box-sizing:border-box}}
 {_BG_CSS}
  .loginbar{{position:fixed;z-index:20;inset:0 0 auto;height:56px;display:flex;align-items:center;
-   padding:0 max(20px,4vw);border-bottom:1px solid #3a2f24;background:rgba(21,17,13,.82);
+   padding:0 max(20px,4vw);border-bottom:1px solid var(--line,#3a2f24);background:color-mix(in oklch,var(--void,#15110d) 82%,transparent);
    backdrop-filter:blur(18px);box-sizing:border-box}}
- .loginbrand{{display:flex;align-items:center;color:#f0e6d8;font:700 12px/1 ui-monospace,Menlo,monospace;
-   letter-spacing:.14em;text-decoration:none}}
+ .loginbrand{{display:flex;align-items:center;color:var(--bone-bright,#f0e6d8);text-decoration:none}}
  .loginbrand .mark{{display:block;width:auto;height:15px;margin-right:12px;flex:none;
    color:var(--amber,#e8b572)}}
- .loginbrand small{{margin-left:10px;padding-left:10px;border-left:1px solid #3a2f24;
-   color:#8a8078;font-size:9px;font-weight:400;letter-spacing:.16em}}
  .loginbar [data-warehouse-theme-anchor]{{margin-left:auto}}
- .card{{box-sizing:border-box;background:rgba(30,24,19,.86);backdrop-filter:blur(3px);border:1px solid #3a2f24;border-radius:12px;padding:28px 30px;max-width:360px;width:90%;box-shadow:0 10px 40px #000a}}
- h1{{font-size:16px;margin:0 0 4px;color:#e8b572}} p.sub{{margin:0 0 18px;color:#a99}}
- label{{display:block;font-size:12px;color:#bba;margin:12px 0 4px}}
- input{{width:100%;box-sizing:border-box;background:#15110d;border:1px solid #4a3d2e;border-radius:7px;color:#f0e6d8;padding:9px 11px;font:inherit}}
- input:focus{{outline:none;border-color:#e8b572}}
- button{{width:100%;margin-top:20px;background:#e8b572;color:#1a1206;border:0;border-radius:7px;padding:10px;font:inherit;font-weight:600;cursor:pointer}}
+ .card{{position:relative;isolation:isolate;overflow:hidden;box-sizing:border-box;background:color-mix(in oklch,var(--panel,#1e1813) 86%,transparent);-webkit-backdrop-filter:blur(18px) saturate(1.08);backdrop-filter:blur(18px) saturate(1.08);border:1px solid var(--line,#3a2f24);border-radius:14px;padding:30px 32px;max-width:400px;width:92%;box-shadow:0 22px 70px color-mix(in oklch,var(--void,#000) 72%,transparent),inset 0 1px 0 color-mix(in oklch,var(--bone,#fff) 4%,transparent);transition:transform .35s cubic-bezier(.16,1,.3,1);animation:calliope-gate-in .62s cubic-bezier(.16,1,.3,1) backwards}}
+ .card>*{{position:relative;z-index:1}}
+ .card::before{{content:"";position:absolute;z-index:2;top:0;left:-55%;width:52%;height:1px;pointer-events:none;background:linear-gradient(90deg,transparent,color-mix(in oklch,var(--amber,#e8b572) 78%,white),transparent);opacity:0;filter:drop-shadow(0 0 5px color-mix(in oklch,var(--amber,#e8b572) 42%,transparent));animation:calliope-threshold-line 11s ease-in-out 1.2s infinite}}
+ .card::after{{content:"";position:absolute;z-index:0;inset:0;pointer-events:none;background:radial-gradient(70% 34% at 50% 0%,color-mix(in oklch,var(--amber,#e8b572) 10%,transparent),transparent 72%);opacity:.38;transition:opacity .35s ease}}
+ .card:focus-within{{transform:translateY(-1px)}}
+ .card:focus-within::after{{opacity:.82}}
+ .login-product{{display:flex;justify-content:center;margin:0 0 10px}}
+ .login-product .calliope-brand{{align-items:flex-end}}
+ .login-product .calliope-brand-name{{animation:calliope-ink-settle .82s cubic-bezier(.16,1,.3,1) .12s both}}
+ .tagline{{max-width:310px;margin:0 auto;color:var(--bone-bright,#f0e6d8);font:500 15px/1.45 "IBM Plex Sans",ui-sans-serif,sans-serif;letter-spacing:-.01em;text-align:center}}
+ .flow-context{{margin:7px auto 20px;color:var(--dim,#8a8078);font:600 8px/1.45 "IBM Plex Mono",ui-monospace,monospace;letter-spacing:.08em;text-align:center;text-transform:uppercase}}
+ h1:not(.calliope-brand){{font:600 18px/1.25 "IBM Plex Sans",ui-sans-serif,sans-serif;margin:0 0 7px;color:var(--amber,#e8b572)}} p.sub{{margin:0 0 18px;color:var(--fog,#a99)}}
+ label{{display:block;font:500 10px/1.2 "IBM Plex Mono",ui-monospace,monospace;color:var(--fog,#bba);letter-spacing:.08em;text-transform:uppercase;margin:14px 0 5px}}
+ input{{width:100%;box-sizing:border-box;background:color-mix(in oklch,var(--void,#15110d) 74%,transparent);border:1px solid var(--line,#4a3d2e);border-radius:7px;color:var(--bone,#f0e6d8);padding:10px 11px;font:14px/1.3 "IBM Plex Sans",ui-sans-serif,sans-serif}}
+ input:focus{{outline:none;border-color:var(--amber,#e8b572)}}
+ button{{width:100%;margin-top:20px;background:var(--amber,#e8b572);color:var(--void,#1a1206);border:0;border-radius:7px;padding:10px;font:600 14px/1.3 "IBM Plex Sans",ui-sans-serif,sans-serif;cursor:pointer}}
  .err{{background:#3a1f1c;border:1px solid #6a3530;color:#f0b8b0;border-radius:7px;padding:8px 11px;font-size:13px;margin-top:14px}}
  .goog{{display:flex;align-items:center;justify-content:center;gap:9px;width:100%;margin-top:14px;
-   background:#f0e6d8;color:#1a1206;border-radius:7px;padding:10px;font:inherit;font-weight:600;
+   background:#f0e6d8;color:#1a1206;border-radius:7px;padding:10px;font:600 14px/1.3 "IBM Plex Sans",ui-sans-serif,sans-serif;
    text-decoration:none;box-sizing:border-box}}
  .goog:hover{{background:#fff}}
  .goog svg{{width:17px;height:17px;display:block}}
- .or{{display:flex;align-items:center;gap:10px;margin:18px 0 4px;color:#8a8078;font-size:11px}}
- .or::before,.or::after{{content:"";flex:1;height:1px;background:#3a2f24}}
+ .or{{display:flex;align-items:center;gap:10px;margin:18px 0 4px;color:var(--dim,#8a8078);font:500 9px/1 "IBM Plex Mono",ui-monospace,monospace;letter-spacing:.12em}}
+ .or::before,.or::after{{content:"";flex:1;height:1px;background:var(--line,#3a2f24)}}
+ @keyframes calliope-gate-in{{from{{opacity:0;transform:translateY(8px) scale(.988);filter:blur(3px)}}to{{opacity:1;transform:none;filter:none}}}}
+ @keyframes calliope-ink-settle{{from{{opacity:.22;transform:translateY(3px);filter:blur(2.4px)}}to{{opacity:1;transform:none;filter:none}}}}
+ @keyframes calliope-threshold-line{{0%,7%{{left:-55%;opacity:0}}12%{{opacity:.58}}34%{{left:103%;opacity:.42}}40%,100%{{left:103%;opacity:0}}}}
+ @media (prefers-reduced-motion:reduce){{.card,.login-product .calliope-brand-name,.card::before{{animation:none}}.card{{transition:none}}}}
 </style>
 {warehouse_theme.head_assets()}
 </head><body>
 {background_layer(0.62, "radial-gradient(1000px 700px at 50% 45%, rgba(21,17,13,.34) 0%, rgba(21,17,13,.70) 55%, rgba(21,17,13,.93) 100%)")}
 <nav class=loginbar data-warehouse-header>
- <span class=loginbrand>{_LOGIN_RABBIT_SVG}DATA RABBIT<small>WAREHOUSE</small></span>
+ <span class=loginbrand>{_LOGIN_RABBIT_SVG}{_CALLIOPE_BRAND}</span>
  <span data-warehouse-theme-anchor></span>
 </nav>
 <div class=card>{body}</div>
@@ -811,12 +1003,17 @@ def _google_button(hidden: dict) -> str:
 
 
 def _login_form(hidden: dict, error: str | None = None,
-                cta: str = "Sign in", sub: str = "Sign in to your warehouse.") -> HTMLResponse:
+                cta: str = "Sign in", sub: str = "") -> HTMLResponse:
     err = f'<div class=err>{html.escape(error)}</div>' if error else ""
     fields = "".join(f'<input type=hidden name="{html.escape(k)}" value="{html.escape(str(v))}">'
                      for k, v in hidden.items() if v)
     goog = _google_button(hidden)
-    head = f'<h1>Data Warehouse</h1><p class=sub>{html.escape(sub)}</p>'
+    context = f'<p class=flow-context>{html.escape(sub)}</p>' if sub else ""
+    head = (
+        f'<div class=login-product>{_CALLIOPE_HERO}</div>'
+        '<p class=tagline>Your company&rsquo;s knowledge, put to work.</p>'
+        f'{context}'
+    )
     # Password retired on this box: Google is the only door, so don't render a
     # form that cannot succeed.
     if GOOGLE_ONLY and google_enabled():
@@ -854,11 +1051,11 @@ def register_login_route(
             txn = request.query_params.get("txn", "")
             if txn:   # OAuth (Claude) flow
                 return _login_form({"txn": txn}, cta="Authorize Claude",
-                                   sub="Sign in to connect Claude to your warehouse.") \
+                                   sub="Authorize Claude to work with your company knowledge.") \
                     if provider.has_pending(txn) else _page(_EXPIRED, 400)
             # browser view session (a dashboard sent us here with ?next=)
             nxt = _safe_next(request.query_params.get("next", "/"))
-            return _login_form({"next": nxt}, cta="Sign in", sub="Sign in to view your dashboards.")
+            return _login_form({"next": nxt}, cta="Sign in")
 
         form = await request.form()
         txn = str(form.get("txn", ""))
@@ -885,7 +1082,9 @@ def register_login_route(
                     return RedirectResponse(f"/login?{q}", status_code=303)
                 hidden = {"txn": txn} if txn else {"next": nxt}
                 return _login_form(hidden, error="Invalid email or password.",
-                                   cta="Authorize Claude" if txn else "Sign in")
+                                   cta="Authorize Claude" if txn else "Sign in",
+                                   sub=("Authorize Claude to work with your company knowledge."
+                                        if txn else ""))
             _LIMITER.record_success(ip)
 
         return _finish_login(request, provider, email, txn, nxt,
@@ -898,7 +1097,9 @@ def register_login_route(
             q = f"err=1&txn={txn}" if txn else f"err=1&next={nxt}"
             return RedirectResponse(f"/login?{q}", status_code=303)
         return _login_form({"txn": txn} if txn else {"next": nxt}, error=msg,
-                           cta="Authorize Claude" if txn else "Sign in")
+                           cta="Authorize Claude" if txn else "Sign in",
+                           sub=("Authorize Claude to work with your company knowledge."
+                                if txn else ""))
 
     def _calendar_return(nxt: str, result: str):
         target = _safe_next(nxt or "/calliope")
@@ -921,7 +1122,7 @@ def register_login_route(
             "client_id": GOOGLE_CLIENT_ID,
             "redirect_uri": google_redirect_uri(provider.public),
             "response_type": "code",
-            "scope": "openid email",
+            "scope": "openid email profile",
             "state": state,
             "nonce": nonce,
             "prompt": "select_account",
@@ -1060,7 +1261,17 @@ def register_login_route(
         # password login in pg mode proved possession of the role itself and
         # skips resolution — conflating the two would hand every federated user
         # a role named after their email whether or not it exists.
-        return _finish_login(request, provider, email, txn, nxt, via="google")
+        profile = google_profile(claims)
+        return _finish_login(
+            request,
+            provider,
+            email,
+            txn,
+            nxt,
+            via="google",
+            name=profile["name"],
+            picture=profile["picture"],
+        )
 
     # Session introspection for sibling services (lens gates on this in
     # Burrow mode — no JWT-secret sharing, just a cookie round-trip on the
@@ -1083,6 +1294,53 @@ def register_login_route(
                                         "identity": s["identity"], "mapped": s["mapped"],
                                         "via": s["via"]}),
                             media_type="application/json")
+
+    @mcp.custom_route("/auth/avatar", methods=["GET"])
+    async def avatar(request: Request):
+        """Serve a real profile image without exposing provider URLs in markup."""
+        session = read_session_full(request)
+        if not session:
+            return Response(
+                status_code=404,
+                headers={"cache-control": "private, no-store", "x-content-type-options": "nosniff"},
+            )
+
+        picture = session.get("picture", "")
+        identity = session.get("identity", "")
+        via = session.get("via", "")
+        if picture:
+            source = "Google"
+            fetch = _fetch_google_avatar(picture)
+        elif via in {"password", "pg"} and _raw_email(identity):
+            source = "Gravatar"
+            fetch = _fetch_gravatar_avatar(identity)
+        else:
+            return Response(
+                status_code=404,
+                headers={"cache-control": "private, no-store", "x-content-type-options": "nosniff"},
+            )
+        try:
+            data, media_type = await fetch
+        except _AvatarNotFound:
+            return Response(
+                status_code=404,
+                headers={"cache-control": "private, no-store", "x-content-type-options": "nosniff"},
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed image must never affect the shell
+            print(f"{source.lower()} avatar: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return Response(
+                status_code=404,
+                headers={"cache-control": "private, no-store", "x-content-type-options": "nosniff"},
+            )
+        return Response(
+            data,
+            media_type=media_type,
+            headers={
+                "cache-control": "private, no-store",
+                "cross-origin-resource-policy": "same-origin",
+                "x-content-type-options": "nosniff",
+            },
+        )
 
     @mcp.custom_route("/bg/{name}.jpg", methods=["GET"])
     async def background(request: Request):

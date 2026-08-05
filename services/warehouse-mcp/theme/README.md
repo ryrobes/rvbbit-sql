@@ -4,6 +4,13 @@
 checked-in browser bundle, including `node-vibrant`; the Warehouse image has no
 JavaScript build step at runtime.
 
+`adaptive-artifact.js` is intentionally dependency-free and unbundled. It is
+loaded by every hosted artifact shim but exits before touching the DOM unless
+that immutable artifact manifest names a Design Profile whose
+`behavior.theme_source` is `viewer`. Direct pages read the sanitized
+`rvbbit-warehouse-adaptive-theme-v1` snapshot; sandboxed Calliope frames receive
+the same shape through the validated parent bridge.
+
 From the `rvbbit-sql` repository root, with the sibling `rvbbit-lens` checkout
 installed:
 

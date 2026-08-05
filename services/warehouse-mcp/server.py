@@ -37,7 +37,9 @@ from __future__ import annotations
 import asyncio, hashlib, hmac, json, math, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
@@ -2543,6 +2545,10 @@ CREATE TABLE IF NOT EXISTS {ACTIVITY_TABLE} (
   ts             timestamptz NOT NULL DEFAULT now(),
   caller         text,                 -- email from the OAuth token (or null for the static key)
   client_id      text,
+  channel        text,                 -- google_chat | web | direct_mcp | automation | hermes | unknown
+  client_app     text,                 -- calliope, hermes, or the OAuth client's declared software name
+  session_ref    text,                 -- bounded Hermes/client correlation id; never an authorization input
+  provenance     jsonb,                -- sanitized request-path details; no credentials or tool payload copies
   tool           text NOT NULL,
   args           jsonb,                -- the tool input, including the SQL / search query
   ok             boolean,
@@ -2554,9 +2560,14 @@ CREATE TABLE IF NOT EXISTS {ACTIVITY_TABLE} (
   as_of          text,
   result_summary jsonb                 -- compact: match scores, columns+row_count, metric value
 );
+ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS channel text;
+ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS client_app text;
+ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS session_ref text;
+ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS provenance jsonb;
 CREATE INDEX IF NOT EXISTS mcp_activity_ts_idx      ON {ACTIVITY_TABLE} (ts DESC);
 CREATE INDEX IF NOT EXISTS mcp_activity_caller_idx  ON {ACTIVITY_TABLE} (caller, ts DESC);
 CREATE INDEX IF NOT EXISTS mcp_activity_tool_idx    ON {ACTIVITY_TABLE} (tool, ts DESC);
+CREATE INDEX IF NOT EXISTS mcp_activity_channel_idx ON {ACTIVITY_TABLE} (channel, ts DESC);
 CREATE INDEX IF NOT EXISTS mcp_activity_objects_idx ON {ACTIVITY_TABLE} USING gin (objects);
 CREATE OR REPLACE VIEW rvbbit.mcp_activity_summary AS
   SELECT tool, caller, count(*) AS calls, count(*) FILTER (WHERE NOT ok) AS errors,
@@ -2565,7 +2576,20 @@ CREATE OR REPLACE VIEW rvbbit.mcp_activity_summary AS
 CREATE OR REPLACE VIEW rvbbit.mcp_popular_objects AS
   SELECT obj AS object, count(*) AS touches, count(DISTINCT caller) AS users, max(ts) AS last_touch
   FROM {ACTIVITY_TABLE}, unnest(objects) AS obj GROUP BY obj ORDER BY touches DESC;
+CREATE OR REPLACE VIEW rvbbit.mcp_activity_channel_summary AS
+  SELECT coalesce(channel, 'legacy_unknown') AS channel,
+         coalesce(client_app, 'unknown') AS client_app,
+         tool, count(*) AS calls,
+         count(*) FILTER (WHERE NOT ok) AS errors,
+         count(DISTINCT caller) AS users,
+         round(avg(elapsed_ms)) AS avg_ms,
+         max(ts) AS last_seen
+  FROM {ACTIVITY_TABLE}
+  GROUP BY coalesce(channel, 'legacy_unknown'),
+           coalesce(client_app, 'unknown'), tool;
 """
+
+_ACTIVITY_AUTH_PROVIDER = None
 
 
 def _ensure_activity_table():
@@ -2613,8 +2637,8 @@ _FORWARDED_EMAIL_RE = re.compile(r"^[^@\s]{1,128}@[^@\s]{1,190}$")
 _HERMES_CALLER_META_KEY = "rvbbit.ai/hermes-caller"
 
 
-def _mcp_request_metadata(ctx):
-    """Return MCP request metadata across supported SDK/Pydantic shapes."""
+def _mcp_request_context(ctx=None):
+    """Return the active MCP request context across supported SDK shapes."""
     request_context = getattr(ctx, "request_context", None) if ctx is not None else None
     if request_context is None:
         # FastMCP's injected Context is only needed when a tool wants to use it
@@ -2629,6 +2653,12 @@ def _mcp_request_metadata(ctx):
             request_context = request_ctx.get(None)
         except Exception:  # noqa: BLE001 — older optional MCP SDKs
             request_context = None
+    return request_context
+
+
+def _mcp_request_metadata(ctx=None):
+    """Return MCP request metadata across supported SDK/Pydantic shapes."""
+    request_context = _mcp_request_context(ctx)
     # Current FastMCP lifts request.params._meta onto RequestContext.meta.
     # Retain the raw-request fallback for older SDKs and lightweight harnesses.
     metadata = getattr(request_context, "meta", None)
@@ -2657,11 +2687,44 @@ def _mcp_request_metadata(ctx):
     return dict(extra) if isinstance(extra, dict) else {}
 
 
-def _forwarded_mcp_caller(ctx=None, *, authenticated=None):
-    """Resolve a verified Hermes/Google Chat email for display attribution.
+def _mcp_client_implementation(ctx=None):
+    """Return the MCP handshake's bounded, self-declared client software."""
+    request_context = _mcp_request_context(ctx)
+    session = getattr(request_context, "session", None)
+    params = getattr(session, "client_params", None)
+    implementation = getattr(params, "clientInfo", None)
+    if implementation is None and isinstance(params, dict):
+        implementation = params.get("clientInfo") or params.get("client_info")
+    if implementation is None:
+        return {}
+    if isinstance(implementation, dict):
+        raw = implementation
+    else:
+        dump = getattr(implementation, "model_dump", None)
+        if callable(dump):
+            try:
+                raw = dump(exclude_none=True)
+            except TypeError:
+                raw = dump()
+        else:
+            raw = {
+                "name": getattr(implementation, "name", None),
+                "title": getattr(implementation, "title", None),
+                "version": getattr(implementation, "version", None),
+            }
+    limits = {"name": 160, "title": 160, "version": 80}
+    return {
+        key: str(raw.get(key) or "").strip()[:limit]
+        for key, limit in limits.items()
+        if str(raw.get(key) or "").strip()
+    }
 
-    This does not confer permissions.  The shared key remains the authenticated
-    principal and database access still follows that connection's normal rules.
+
+def _hermes_mcp_envelope(ctx=None, *, authenticated=None):
+    """Return bounded Hermes provenance behind the opted-in static principal.
+
+    The envelope is attribution data, never authorization. A direct OAuth
+    caller cannot replace its signed identity with forwarded metadata.
     """
     _token_caller, client_id = authenticated or _authenticated_caller()
     if client_id != "static-key":
@@ -2672,16 +2735,67 @@ def _forwarded_mcp_caller(ctx=None, *, authenticated=None):
     if str(envelope.get("source") or "").strip().lower() != "hermes":
         return None
     platform = str(envelope.get("platform") or "").strip().lower().replace("-", "_")
-    if platform not in {"google_chat", "gchat"}:
+    if platform == "gchat":
+        platform = "google_chat"
+    if platform not in {"google_chat", "api_server", "cron"}:
         return None
+    normalized = {"source": "hermes", "platform": platform}
+    session_ref = re.sub(
+        r"[\x00-\x1f\x7f]", "", str(envelope.get("session_id") or "")
+    ).strip()[:240]
+    if session_ref:
+        normalized["session_id"] = session_ref
     email = str(envelope.get("user_id") or "").strip().lower()
-    if len(email) > 254 or not _FORWARDED_EMAIL_RE.fullmatch(email):
+    if email and len(email) <= 254 and _FORWARDED_EMAIL_RE.fullmatch(email):
+        normalized["user_id"] = email
+    return normalized
+
+
+def _forwarded_mcp_caller(ctx=None, *, authenticated=None):
+    """Resolve a verified Hermes/Google Chat email for display attribution.
+
+    This does not confer permissions. The shared key remains the authenticated
+    principal and database access still follows that connection's normal rules.
+    Non-Chat Hermes provenance is retained for activity classification but can
+    never directly override the authenticated caller.
+    """
+    envelope = _hermes_mcp_envelope(ctx, authenticated=authenticated)
+    if not envelope or envelope.get("platform") != "google_chat":
         return None
-    return email
+    email = str(envelope.get("user_id") or "")
+    return email if _FORWARDED_EMAIL_RE.fullmatch(email) else None
+
+
+def _trusted_calliope_session_caller(ctx=None, *, authenticated=None):
+    """Resolve a web publication owner from Warehouse's own session ledger.
+
+    Hermes' API-server envelope deliberately carries no asserted human ID. Its
+    opaque session ID is enough for this Warehouse to join back to the signed
+    Calliope session it created. This is used only around publication wrappers;
+    it does not turn forwarded metadata into a general authorization identity.
+    """
+    token_caller, client_id = authenticated or _authenticated_caller()
+    if client_id != "static-key":
+        return None
+    envelope = _hermes_mcp_envelope(
+        ctx, authenticated=(token_caller, client_id)
+    )
+    if not envelope or envelope.get("platform") != "api_server":
+        return None
+    session_ref = str(envelope.get("session_id") or "").strip()
+    if not session_ref:
+        return None
+    try:
+        with _conn() as conn:
+            linked = _calliope_activity_for_hermes_session(conn, session_ref)
+    except Exception:  # noqa: BLE001 — attribution must never break publication
+        return None
+    email = str((linked or {}).get("owner") or "").strip().lower()
+    return email if _FORWARDED_EMAIL_RE.fullmatch(email) else None
 
 
 def _with_forwarded_mcp_caller(ctx, fn):
-    email = _forwarded_mcp_caller(ctx)
+    email = _forwarded_mcp_caller(ctx) or _trusted_calliope_session_caller(ctx)
     if not email:
         return fn()
     token = _FORWARDED_CALLER.set(email)
@@ -2791,23 +2905,274 @@ def _summary(tool, res):
     return None
 
 
+def _activity_oauth_client_metadata(client_id):
+    provider = _ACTIVITY_AUTH_PROVIDER
+    resolver = getattr(provider, "activity_client_metadata", None)
+    if not client_id or not callable(resolver):
+        return {}
+    try:
+        value = resolver(client_id)
+    except Exception:  # noqa: BLE001 — provenance enrichment must never break logging
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _native_web_client_app(tool, args):
+    args = args if isinstance(args, dict) else {}
+    surface = str(args.get("surface") or "").strip().lower()
+    origin = str(args.get("origin") or "").strip().lower()
+    if surface == "calliope" or origin.startswith("calliope"):
+        return "calliope"
+    if surface == "gallery" or origin == "gallery":
+        return "gallery"
+    if tool == "promote_home_metric" or origin == "semantic-lens":
+        return "home"
+    if tool in {"artifact_view", "dashboard_query"} or origin in {
+        "dashboard", "artifact-lens",
+    }:
+        return "dashboard"
+    return "warehouse_web"
+
+
+_DASHBOARD_QUERY_ORIGINS = {
+    "dashboard", "artifact-lens", "semantic-lens", "calliope",
+}
+
+
+def _dashboard_query_origin(value):
+    origin = str(value or "dashboard").strip().lower()
+    return origin if origin in _DASHBOARD_QUERY_ORIGINS else "dashboard"
+
+
+def _initial_activity_context(tool, args, client_id, caller_override=None):
+    """Classify request-local signals without consulting durable tables."""
+    mcp_client = _mcp_client_implementation()
+    if caller_override:
+        app = _native_web_client_app(tool, args)
+        return {
+            "channel": "web",
+            "client_app": app,
+            "session_ref": None,
+            "provenance": {
+                "source": "browser_session",
+                "surface": app,
+            },
+        }
+
+    envelope = _hermes_mcp_envelope()
+    if envelope:
+        platform = envelope["platform"]
+        session_ref = envelope.get("session_id")
+        if platform == "google_chat":
+            channel, client_app = "google_chat", "hermes"
+        elif platform == "cron":
+            channel, client_app = "automation", "hermes_cron"
+        elif platform == "api_server":
+            channel, client_app = "hermes", "hermes_api"
+        else:
+            channel, client_app = "hermes", "hermes"
+        provenance = {
+            "source": "hermes",
+            "platform": platform,
+            "identity_forwarded": bool(
+                platform == "google_chat" and envelope.get("user_id")
+            ),
+        }
+        if mcp_client:
+            provenance["mcp_client"] = mcp_client
+        return {
+            "channel": channel,
+            "client_app": client_app,
+            "session_ref": session_ref,
+            "provenance": provenance,
+        }
+
+    if client_id and client_id != "static-key":
+        provenance = {"source": "direct_mcp", "auth": "oauth"}
+        if mcp_client:
+            provenance["mcp_client"] = mcp_client
+        return {
+            "channel": "direct_mcp",
+            "client_app": mcp_client.get("title") or mcp_client.get("name") or "oauth_client",
+            "session_ref": None,
+            "provenance": provenance,
+        }
+    if client_id == "static-key":
+        declared_client = mcp_client.get("title") or mcp_client.get("name")
+        # The Python SDK's default handshake is literally "mcp". It provides
+        # no evidence that this is a direct harness rather than an older
+        # Hermes connection that has not enabled forwarded provenance.
+        if declared_client and declared_client.casefold() != "mcp":
+            return {
+                "channel": "direct_mcp",
+                "client_app": declared_client,
+                "session_ref": None,
+                "provenance": {
+                    "source": "direct_mcp",
+                    "auth": "static_key",
+                    "mcp_client": mcp_client,
+                },
+            }
+        return {
+            "channel": "unknown",
+            "client_app": "static_key",
+            "session_ref": None,
+            "provenance": {
+                "source": "static_key",
+                "note": "legacy Hermes and direct shared-key calls are ambiguous",
+                **({"mcp_client": mcp_client} if mcp_client else {}),
+            },
+        }
+    provenance = {"source": "direct_mcp", "auth": "none_or_stdio"}
+    if mcp_client:
+        provenance["mcp_client"] = mcp_client
+    return {
+        "channel": "direct_mcp",
+        "client_app": mcp_client.get("title") or mcp_client.get("name") or "unknown",
+        "session_ref": None,
+        "provenance": provenance,
+    }
+
+
+def _calliope_activity_for_hermes_session(conn, session_ref):
+    """Resolve one Hermes API session against Warehouse-owned Calliope state."""
+    if not session_ref:
+        return None
+    available = conn.execute(
+        "SELECT to_regclass('rvbbit.calliope_sessions') IS NOT NULL AS sessions,"
+        "to_regclass('rvbbit.calliope_workflow_runs') IS NOT NULL AS workflow_runs"
+    ).fetchone() or {}
+    if available.get("workflow_runs"):
+        workflow = conn.execute(
+            "SELECT owner_email,session_id::text AS calliope_session_id,trigger_kind,status "
+            "FROM rvbbit.calliope_workflow_runs "
+            "WHERE hermes_session_id=%s "
+            "ORDER BY started_at DESC LIMIT 1",
+            (session_ref,),
+        ).fetchone()
+        if workflow:
+            return {
+                "owner": str(workflow.get("owner_email") or "").strip().lower(),
+                "calliope_session_id": str(workflow.get("calliope_session_id") or ""),
+                "kind": "workflow",
+                "trigger_kind": str(workflow.get("trigger_kind") or "manual"),
+                "status": str(workflow.get("status") or ""),
+            }
+    if available.get("sessions"):
+        session = conn.execute(
+            "SELECT owner_email,id::text AS calliope_session_id "
+            "FROM rvbbit.calliope_sessions WHERE hermes_session_id=%s",
+            (session_ref,),
+        ).fetchone()
+        if session:
+            return {
+                "owner": str(session.get("owner_email") or "").strip().lower(),
+                "calliope_session_id": str(session.get("calliope_session_id") or ""),
+                "kind": "session",
+            }
+    return None
+
+
+def _resolve_activity_context(conn, context, caller, client_id, *, tool=None):
+    """Enrich request provenance from trusted local state and OAuth metadata."""
+    context = {
+        **context,
+        "provenance": dict(context.get("provenance") or {}),
+    }
+    if context["provenance"].get("platform") == "api_server":
+        linked = _calliope_activity_for_hermes_session(
+            conn, context.get("session_ref")
+        )
+        if linked:
+            scheduled = (
+                linked.get("kind") == "workflow"
+                and linked.get("trigger_kind") == "scheduled"
+                and (
+                    linked.get("status") == "running"
+                    or tool == "finish_calliope_workflow_run"
+                )
+            )
+            context["channel"] = "automation" if scheduled else "web"
+            context["client_app"] = (
+                "calliope_workflow"
+                if linked.get("kind") == "workflow"
+                else "calliope"
+            )
+            context["provenance"].update({
+                "calliope_session_id": linked.get("calliope_session_id"),
+                "calliope_kind": linked.get("kind"),
+            })
+            if linked.get("trigger_kind"):
+                context["provenance"]["trigger_kind"] = linked["trigger_kind"]
+            if client_id == "static-key" and linked.get("owner"):
+                caller = linked["owner"]
+        elif str(context.get("session_ref") or "").startswith("calliope_"):
+            # Short-lived Calliope helper sessions (for example design-profile
+            # generation) are not all persisted in calliope_sessions.
+            context["channel"] = "web"
+            context["client_app"] = "calliope"
+            context["provenance"]["calliope_kind"] = "ephemeral"
+
+    if context.get("channel") == "direct_mcp" and client_id not in {
+        None, "", "static-key",
+    }:
+        metadata = _activity_oauth_client_metadata(client_id)
+        if metadata:
+            context["provenance"]["oauth_client"] = metadata
+            context["client_app"] = (
+                metadata.get("client_name")
+                or metadata.get("software_id")
+                or context["client_app"]
+            )[:160]
+    return caller, context
+
+
 def _record(tool, args, res, err, elapsed_ms, caller_override=None):
     caller, client_id = _caller()
     if caller_override:                  # browser/dashboard sessions aren't OAuth-token calls
         caller = caller_override
+    context = _initial_activity_context(
+        tool, args, client_id, caller_override=caller_override
+    )
     rows = res.get("row_count") if isinstance(res, dict) else None
     engine = res.get("engine") if isinstance(res, dict) else None
     as_of = args.get("as_of") if isinstance(args, dict) else None
     try:
         with _conn() as c:
-            c.execute(
-                f"INSERT INTO {ACTIVITY_TABLE} "
-                "(caller, client_id, tool, args, ok, error, objects, rows, engine, elapsed_ms, as_of, result_summary) "
-                "VALUES (%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb)",
-                (caller, client_id, tool, json.dumps(args, default=str), err is None,
-                 json.dumps(err, default=str) if err is not None else None,
-                 _objects(tool, args, res), rows, engine, elapsed_ms, as_of,
-                 json.dumps(_summary(tool, res), default=str)))
+            caller, context = _resolve_activity_context(
+                c, context, caller, client_id, tool=tool
+            )
+            legacy_values = (
+                caller, client_id, tool, json.dumps(args, default=str), err is None,
+                json.dumps(err, default=str) if err is not None else None,
+                _objects(tool, args, res), rows, engine, elapsed_ms, as_of,
+                json.dumps(_summary(tool, res), default=str),
+            )
+            try:
+                c.execute(
+                    f"INSERT INTO {ACTIVITY_TABLE} "
+                    "(caller,client_id,channel,client_app,session_ref,provenance,"
+                    "tool,args,ok,error,objects,rows,engine,elapsed_ms,as_of,result_summary) "
+                    "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s::jsonb,"
+                    "%s,%s,%s,%s,%s,%s::jsonb)",
+                    (
+                        caller, client_id, context["channel"], context["client_app"],
+                        context.get("session_ref"),
+                        json.dumps(context["provenance"], default=str),
+                        *legacy_values[2:],
+                    ),
+                )
+            except psycopg.errors.UndefinedColumn:
+                # An INSERT-only deployment may be unable to run the additive
+                # ALTERs. Preserve its existing activity log instead of making
+                # provenance enrichment an all-or-nothing upgrade.
+                c.execute(
+                    f"INSERT INTO {ACTIVITY_TABLE} "
+                    "(caller,client_id,tool,args,ok,error,objects,rows,engine,"
+                    "elapsed_ms,as_of,result_summary) "
+                    "VALUES (%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb)",
+                    legacy_values,
+                )
     except Exception:  # noqa: BLE001 — never let logging break a tool call
         pass
 
@@ -3030,6 +3395,10 @@ ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS app_kind text NOT NULL DE
 ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS manifest jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS last_health jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS last_debug_at timestamptz;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS area_id text;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS area_source text;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS area_confidence real;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS area_updated_at timestamptz;
 CREATE TABLE IF NOT EXISTS rvbbit.dashboard_versions (
   dashboard_id bigint NOT NULL REFERENCES rvbbit.dashboards(id) ON DELETE CASCADE,
   version      int NOT NULL,
@@ -3070,6 +3439,77 @@ CREATE TABLE IF NOT EXISTS rvbbit.artifact_semantic_enrichments (
 );
 CREATE INDEX IF NOT EXISTS artifact_semantic_enrichments_queue_idx
   ON rvbbit.artifact_semantic_enrichments (status, not_before, enqueued_at);
+-- A deliberately small, shared vocabulary keeps automatic classification from
+-- inventing a new department for every artifact. Administrators may rename,
+-- disable, or extend it; the worker can only choose an active existing row.
+CREATE TABLE IF NOT EXISTS rvbbit.artifact_areas (
+  id text PRIMARY KEY,
+  label text UNIQUE NOT NULL,
+  description text NOT NULL DEFAULT '',
+  keywords text[] NOT NULL DEFAULT '{}'::text[],
+  sort_order int NOT NULL DEFAULT 100,
+  source text NOT NULL DEFAULT 'system',
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO rvbbit.artifact_areas (id,label,description,keywords,sort_order) VALUES
+ ('executive','Executive','Leadership, strategy, company health, and board-level planning',ARRAY['executive','leadership','strategy','board','company plan','forecast'],10),
+ ('revenue','Revenue','Sales, pipeline, bookings, accounts, and commercial performance',ARRAY['revenue','sales','pipeline','booking','deal','lead','account','conversion'],20),
+ ('marketing','Marketing','Campaigns, acquisition, attribution, audience, and brand',ARRAY['marketing','campaign','attribution','acquisition','web traffic','audience','brand','channel'],30),
+ ('customer','Customer','Customer success, service, support, retention, and experience',ARRAY['customer','support','case','ticket','retention','churn','service','success'],40),
+ ('product','Product','Product usage, roadmap, feature, quality, and delivery',ARRAY['product','feature','roadmap','usage','release','sprint','bug','quality'],50),
+ ('operations','Operations','Operational delivery, process, capacity, inventory, and logistics',ARRAY['operation','workflow','process','capacity','inventory','logistics','fulfillment','sla'],60),
+ ('finance','Finance','Financial planning, accounting, cash, cost, margin, and budget',ARRAY['finance','financial','budget','cost','expense','margin','cash','invoice'],70),
+ ('people','People','Hiring, workforce, talent, compensation, and organizational health',ARRAY['people','employee','workforce','hiring','talent','compensation','headcount','hr'],80),
+ ('technology','Technology','Engineering, data, infrastructure, security, and reliability',ARRAY['technology','engineering','database','infrastructure','security','reliability','etl','pipeline failure'],90),
+ ('risk','Risk','Compliance, controls, audit, legal, fraud, and business risk',ARRAY['risk','compliance','audit','legal','fraud','control','privacy','governance'],100),
+ ('other','Other','Cross-functional or not yet confidently classified',ARRAY[]::text[],999)
+ON CONFLICT DO NOTHING;
+DO $do$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname='dashboards_area_id_fkey'
+      AND conrelid='rvbbit.dashboards'::regclass
+  ) THEN
+    ALTER TABLE rvbbit.dashboards ADD CONSTRAINT dashboards_area_id_fkey
+      FOREIGN KEY (area_id) REFERENCES rvbbit.artifact_areas(id) ON DELETE SET NULL;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname='dashboards_area_source_check'
+      AND conrelid='rvbbit.dashboards'::regclass
+  ) THEN
+    ALTER TABLE rvbbit.dashboards ADD CONSTRAINT dashboards_area_source_check
+      CHECK (area_source IS NULL OR area_source IN ('auto','manual'));
+  END IF;
+END
+$do$;
+CREATE TABLE IF NOT EXISTS rvbbit.artifact_catalog_enrichments (
+  dashboard_id bigint NOT NULL,
+  version int NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  input_hash text NOT NULL,
+  area_id text REFERENCES rvbbit.artifact_areas(id) ON DELETE SET NULL,
+  confidence real,
+  rationale text,
+  context jsonb NOT NULL DEFAULT '{}'::jsonb,
+  model text,
+  attempts int NOT NULL DEFAULT 0,
+  last_error text,
+  not_before timestamptz NOT NULL DEFAULT now(),
+  enqueued_at timestamptz NOT NULL DEFAULT now(),
+  started_at timestamptz,
+  completed_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (dashboard_id, version),
+  FOREIGN KEY (dashboard_id, version)
+    REFERENCES rvbbit.dashboard_versions(dashboard_id, version) ON DELETE CASCADE,
+  CONSTRAINT artifact_catalog_enrichments_status_check CHECK (
+    status IN ('pending','running','ready','failed','disabled')
+  )
+);
+CREATE INDEX IF NOT EXISTS artifact_catalog_enrichments_queue_idx
+  ON rvbbit.artifact_catalog_enrichments (status, not_before, enqueued_at);
 -- staged artifact uploads: lets an agent ship a large HTML/source payload once
 -- (optionally in chunks) and then publish by handle, instead of re-transmitting
 -- the whole document through every publish/update call. Short-lived by design.
@@ -3091,8 +3531,10 @@ CREATE TABLE IF NOT EXISTS rvbbit.dashboard_deps (
   base_sql     text,                 -- the panel/evaluator SQL
   source       text,                 -- 'parse' | 'runtime' | 'llm'
   confidence   real DEFAULT 1.0,
+  metadata     jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at   timestamptz DEFAULT now()
 );
+ALTER TABLE rvbbit.dashboard_deps ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS dashboard_deps_did_idx ON rvbbit.dashboard_deps (dashboard_id);
 CREATE INDEX IF NOT EXISTS dashboard_deps_obj_idx ON rvbbit.dashboard_deps (object_ref);
 CREATE OR REPLACE VIEW rvbbit.dashboard_sources AS   -- forward: a dashboard's data edges
@@ -3113,8 +3555,10 @@ CREATE OR REPLACE VIEW rvbbit.live_apps AS
          coalesce(dep.queries, 0)::int AS queries,
          coalesce(dep.tables, 0)::int AS tables,
          coalesce(dep.metrics, 0)::int AS metrics,
-         coalesce(dep.semantic_objects, 0)::int AS semantic_objects
+         coalesce(dep.semantic_objects, 0)::int AS semantic_objects,
+         d.area_id,area.label AS area_label,d.area_source,d.area_confidence,d.area_updated_at
   FROM rvbbit.dashboards d
+  LEFT JOIN rvbbit.artifact_areas area ON area.id=d.area_id
   LEFT JOIN LATERAL (
     SELECT
            count(*) FILTER (WHERE kind = 'query') AS queries,
@@ -3731,6 +4175,10 @@ _SEMANTIC_ENRICH_MODEL = os.environ.get(
 _SEMANTIC_ENRICH_WAKE = threading.Event()
 _SEMANTIC_ENRICH_THREAD = None
 _SEMANTIC_ENRICH_THREAD_LOCK = threading.Lock()
+_ARTIFACT_CATALOG_WAKE = threading.Event()
+_ARTIFACT_CATALOG_THREAD = None
+_ARTIFACT_CATALOG_THREAD_LOCK = threading.Lock()
+_ARTIFACT_CATALOG_PROMPT_VERSION = "artifact-area.v1"
 
 
 def _semantic_enrichment_enabled():
@@ -4400,10 +4848,12 @@ def tool_publish_dashboard(name, html=None, team=None, description=None, kind="l
         )
     crawl = _crawl_safe(slug, use_llm=False)   # fast deterministic deps at publish
     enrichment = _enqueue_semantic_enrichment(d["id"], 1)
+    catalog_enrichment = _enqueue_artifact_catalog_enrichment(d["id"], 1)
     _auto_thumb("dashboard", slug)
     return {"slug": slug, "version": 1, "url": _dash_url(slug), "hub_url": _hub_url("dashboard", slug),
             "owner": caller, "kind": kind, "manifest": manifest_doc,
             "semantic_validation": semantic_validation, "semantic_enrichment": enrichment,
+            "catalog_enrichment": catalog_enrichment,
             "deps": crawl}
 
 
@@ -4464,16 +4914,19 @@ def tool_update_dashboard(slug, html=None, notes=None, source_artifact_id=None, 
         )
     crawl = _crawl_safe(slug, use_llm=False)
     enrichment = _enqueue_semantic_enrichment(d["id"], nv)
+    catalog_enrichment = _enqueue_artifact_catalog_enrichment(d["id"], nv)
     _auto_thumb("dashboard", slug)
     return {"slug": slug, "version": nv, "url": _dash_url(slug), "hub_url": _hub_url("dashboard", slug),
             "manifest": next_manifest, "semantic_validation": semantic_validation,
-            "semantic_enrichment": enrichment, "deps": crawl}
+            "semantic_enrichment": enrichment, "catalog_enrichment": catalog_enrichment,
+            "deps": crawl}
 
 
 def tool_list_dashboards(team=None, search=None):
     with _conn() as c:
         rows = c.execute(
-            "SELECT slug, name, description, owner_email, team, status, latest_version, updated_at "
+            "SELECT slug, name, description, owner_email, team, status, latest_version,"
+            "area_id,area_source,area_confidence,updated_at "
             "FROM rvbbit.dashboards "
             "WHERE (%s::text IS NULL OR team=%s::text) "
             "AND (%s::text IS NULL OR name ILIKE '%%'||%s::text||'%%' OR description ILIKE '%%'||%s::text||'%%') "
@@ -4484,7 +4937,7 @@ def tool_list_dashboards(team=None, search=None):
 def tool_get_dashboard(slug, version=None):
     with _conn() as c:
         d = c.execute("SELECT id, slug, name, description, owner_email, team, status, "
-                      "latest_version, manifest, created_at "
+                      "latest_version, manifest, area_id,area_source,area_confidence,created_at "
                       "FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
         if not d:
             return {"error": {"code": "NOT_FOUND", "message": slug}}
@@ -4500,12 +4953,15 @@ def tool_get_dashboard(slug, version=None):
             )
         d["version"] = version_row
         d["sources"] = c.execute(
-            "SELECT kind, object_ref, base_sql, source FROM rvbbit.dashboard_deps "
+            "SELECT kind, object_ref, base_sql, source, confidence, metadata FROM rvbbit.dashboard_deps "
             "WHERE dashboard_id=%s AND version=%s ORDER BY kind, object_ref NULLS LAST",
             (d["id"], v),
         ).fetchall()
     d["semantic_enrichment"] = _semantic_enrichment_public(
         _semantic_enrichment_row(d["id"], v)
+    )
+    d["catalog_enrichment"] = _artifact_catalog_public(
+        _artifact_catalog_enrichment_row(d["id"], v)
     )
     d["url"] = _dash_url(slug)
     return d
@@ -4612,6 +5068,7 @@ def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
             (d["id"], html, runtime_kind, caller, _json_default(manifest_doc), _json_default(source_files)))
     crawl = _crawl_safe(slug, use_llm=False)
     enrichment = _enqueue_semantic_enrichment(d["id"], 1)
+    catalog_enrichment = _enqueue_artifact_catalog_enrichment(d["id"], 1)
     if runtime_kind == "html":
         _auto_thumb(app_kind, slug)
     return {
@@ -4625,6 +5082,7 @@ def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
         "manifest": manifest_doc,
         "semantic_validation": semantic_validation,
         "semantic_enrichment": enrichment,
+        "catalog_enrichment": catalog_enrichment,
         "health": health,
         "deps": crawl,
     }
@@ -4694,6 +5152,7 @@ def tool_update_live_app(slug, html=None, notes=None, manifest=None, source_file
         return {"error": {"code": "INVALID_ARGUMENT", "message": str(e)}}
     crawl = _crawl_safe(slug, use_llm=False)
     enrichment = _enqueue_semantic_enrichment(d["id"], nv)
+    catalog_enrichment = _enqueue_artifact_catalog_enrichment(d["id"], nv)
     if next_runtime == "html":
         _auto_thumb(next_app_kind, slug)
     return {
@@ -4706,6 +5165,7 @@ def tool_update_live_app(slug, html=None, notes=None, manifest=None, source_file
         "manifest": next_manifest,
         "semantic_validation": semantic_validation,
         "semantic_enrichment": enrichment,
+        "catalog_enrichment": catalog_enrichment,
         "health": health,
         "deps": crawl,
     }
@@ -4722,7 +5182,7 @@ def tool_list_live_apps(team=None, search=None, runtime_kind=None, app_kind=None
         rows = c.execute(
             "SELECT slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
             "latest_version, manifest, last_health, last_debug_at, queries, tables, metrics, "
-            "semantic_objects, updated_at "
+            "semantic_objects,area_id,area_label,area_source,area_confidence,area_updated_at,updated_at "
             "FROM rvbbit.live_apps "
             "WHERE (%s::text IS NULL OR team=%s::text) "
             "AND (%s::text IS NULL OR runtime_kind=%s::text) "
@@ -4747,7 +5207,8 @@ def tool_get_live_app(slug, version=None, include_source=True):
     with _conn() as c:
         app = c.execute(
             "SELECT id, slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
-            "latest_version, manifest, last_health, last_debug_at, created_at, updated_at "
+            "latest_version, manifest, last_health, last_debug_at,area_id,area_source,"
+            "area_confidence,area_updated_at,created_at,updated_at "
             "FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
         if not app:
             return {"error": {"code": "NOT_FOUND", "message": slug}}
@@ -4771,7 +5232,7 @@ def tool_get_live_app(slug, version=None, include_source=True):
             version_doc["source_files"] = sorted(source_files.keys())
         app["version"] = version_doc
         app["sources"] = c.execute(
-            "SELECT kind, object_ref, base_sql, source FROM rvbbit.dashboard_deps "
+            "SELECT kind, object_ref, base_sql, source, confidence, metadata FROM rvbbit.dashboard_deps "
             "WHERE dashboard_id=%s AND version=%s ORDER BY kind, object_ref NULLS LAST",
             (app["id"], v),
         ).fetchall()
@@ -4784,6 +5245,9 @@ def tool_get_live_app(slug, version=None, include_source=True):
     app["path"] = f"/apps/{slug}"
     app["semantic_enrichment"] = _semantic_enrichment_public(
         _semantic_enrichment_row(app["id"], v)
+    )
+    app["catalog_enrichment"] = _artifact_catalog_public(
+        _artifact_catalog_enrichment_row(app["id"], v)
     )
     app["runner"] = _live_app_runner_status(slug, probe=False)
     return app
@@ -6138,6 +6602,14 @@ _RVBBIT_QUERY_RE = re.compile(r"rvbbitQuery\(\s*([`'\"])(.*?)\1", re.DOTALL)
 # is the filter: a candidate that resolves to real tables is a real query; junk is dropped.
 _SQL_LIT_RE = re.compile(r"([`'\"])\s*((?:select|with)\b.*?\bfrom\b.*?)\1", re.IGNORECASE | re.DOTALL)
 _METRIC_RE = re.compile(r"""(?:rvbbitMetric|rvbbit\.metric|\bmetric)\(\s*['"]([a-zA-Z0-9_]+)['"]""")
+_ARTIFACT_ROUTE_RE = re.compile(
+    r"^/(?:d|apps)/([a-z0-9][a-z0-9-]{0,79})(?:/versions/(\d+))?(?:/.*)?$",
+    re.IGNORECASE,
+)
+_QUOTED_ARTIFACT_ROUTE_RE = re.compile(
+    r"(['\"])(/(?:d|apps)/[a-z0-9][a-z0-9-]{0,79}(?:/versions/\d+)?(?:[?#][^'\"]*)?)\1",
+    re.IGNORECASE,
+)
 EXTRACT_MODEL = os.environ.get("WAREHOUSE_EXTRACT_MODEL", "anthropic/claude-3.5-sonnet")
 
 
@@ -6155,6 +6627,92 @@ def _extract_sql_literals(html):
             seen.add(s)
             out.append(s)
     return out
+
+
+def _artifact_link_target(raw_url):
+    """Resolve a safe internal artifact route into immutable lineage metadata."""
+    raw = str(raw_url or "").strip()
+    if not raw or raw.startswith(("#", "javascript:", "mailto:", "data:")):
+        return None
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return None
+    if parts.scheme or parts.netloc:
+        public = urlsplit(os.environ.get("WAREHOUSE_PUBLIC_URL", ""))
+        if not public.netloc or parts.netloc.lower() != public.netloc.lower():
+            return None
+        if parts.scheme and public.scheme and parts.scheme.lower() != public.scheme.lower():
+            return None
+    path = parts.path or ""
+    if not path.startswith("/"):
+        path = "/" + path.lstrip("./")
+    match = _ARTIFACT_ROUTE_RE.match(path)
+    if not match:
+        return None
+    return {
+        "slug": match.group(1).lower(),
+        "target_version": int(match.group(2)) if match.group(2) else None,
+        "path": path,
+        "route_kind": "app" if path.lower().startswith("/apps/") else "dashboard",
+    }
+
+
+class _ArtifactLinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self._active = None
+        self._text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        href = next((value for name, value in attrs if name.lower() == "href"), None)
+        target = _artifact_link_target(href)
+        if target:
+            self._active = target
+            self._text = []
+
+    def handle_data(self, data):
+        if self._active is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "a" and self._active is not None:
+            target = dict(self._active)
+            target["link_text"] = re.sub(r"\s+", " ", " ".join(self._text)).strip()[:240]
+            target["source"] = "html-link"
+            self.links.append(target)
+            self._active = None
+            self._text = []
+
+
+def _extract_artifact_links(html, source_slug=None):
+    """Find directed artifact links without executing page code or requiring an LLM."""
+    source = str(source_slug or "").lower()
+    found = []
+    parser = _ArtifactLinkParser()
+    try:
+        parser.feed(html or "")
+        found.extend(parser.links)
+    except Exception:  # noqa: BLE001 — malformed HTML still gets regex extraction
+        pass
+    for match in _QUOTED_ARTIFACT_ROUTE_RE.finditer(html or ""):
+        target = _artifact_link_target(match.group(2))
+        if target:
+            target["link_text"] = ""
+            target["source"] = "script-link"
+            found.append(target)
+    deduped = {}
+    for item in found:
+        if item["slug"] == source:
+            continue
+        key = (item["slug"], item.get("target_version"))
+        existing = deduped.get(key)
+        if not existing or (item.get("source") == "html-link" and existing.get("source") != "html-link"):
+            deduped[key] = item
+    return list(deduped.values())
 
 
 def _referenced_tables(sql):
@@ -6293,7 +6851,7 @@ def dashboard_crawl(slug, use_llm=True):
     tables = {}                                   # table -> source
     rows = []
     for sql, src in sql_src.items():
-        rows.append(("query", None, sql, src))
+        rows.append(("query", None, sql, src, 1.0, {}))
         for t in sql_tables.get(sql, []):
             tables.setdefault(t, src)
     for sql, object_id, resolved in semantic_tables:
@@ -6301,11 +6859,28 @@ def dashboard_crawl(slug, use_llm=True):
         # share identical evaluator SQL. The manifest is a semantic map, not
         # merely a deduplicated list of query strings.
         source = f"semantic-map:{object_id}"
-        rows.append(("semantic", object_id, sql, source))
+        rows.append(("semantic", object_id, sql, source, 1.0, {}))
         for table in resolved:
             tables.setdefault(table, source)
-    rows += [("table", t, None, src) for t, src in tables.items()]
-    rows += [("metric", m, None, "parse") for m in metric_names]
+    rows += [("table", t, None, src, 1.0, {}) for t, src in tables.items()]
+    rows += [("metric", m, None, "parse", 1.0, {}) for m in metric_names]
+    artifact_links = _extract_artifact_links(html, slug)
+    rows += [
+        (
+            "artifact",
+            item["slug"],
+            None,
+            item["source"],
+            1.0,
+            {
+                "path": item.get("path"),
+                "target_version": item.get("target_version"),
+                "link_text": item.get("link_text") or None,
+                "route_kind": item.get("route_kind"),
+            },
+        )
+        for item in artifact_links
+    ]
     status = "live" if (sql_src or semantic_sql or metric_names) else "materialized"
 
     with _conn() as c:
@@ -6316,9 +6891,13 @@ def dashboard_crawl(slug, use_llm=True):
             "DELETE FROM rvbbit.dashboard_deps WHERE dashboard_id=%s AND version=%s",
             (did, ver),
         )
-        for kind, obj, bsql, src in rows:
-            c.execute("INSERT INTO rvbbit.dashboard_deps (dashboard_id,version,kind,object_ref,base_sql,source) "
-                      "VALUES (%s,%s,%s,%s,%s,%s)", (did, ver, kind, obj, bsql, src))
+        for kind, obj, bsql, src, confidence, metadata in rows:
+            c.execute(
+                "INSERT INTO rvbbit.dashboard_deps "
+                "(dashboard_id,version,kind,object_ref,base_sql,source,confidence,metadata) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+                (did, ver, kind, obj, bsql, src, confidence, _json_default(metadata)),
+            )
         c.execute("UPDATE rvbbit.dashboards SET status=%s WHERE id=%s", (status, did))
     return {
         "slug": slug,
@@ -6327,6 +6906,7 @@ def dashboard_crawl(slug, use_llm=True):
         "semantic_objects": len(semantic_sql),
         "tables": sorted(tables),
         "metrics": sorted(metric_names),
+        "artifacts": [item["slug"] for item in artifact_links],
     }
 
 
@@ -6335,6 +6915,457 @@ def _crawl_safe(slug, use_llm=False):
         return dashboard_crawl(slug, use_llm=use_llm)
     except Exception as e:   # noqa: BLE001 — never let a crawl failure break publish
         return {"error": str(e)}
+
+
+# ── post-publish artifact catalog enrichment ────────────────────────────────
+
+def _artifact_catalog_enrichment_enabled():
+    return os.environ.get("WAREHOUSE_ARTIFACT_CATALOG_ENRICHMENT", "1").strip().lower() not in {
+        "0", "false", "no", "off", "",
+    }
+
+
+def _artifact_catalog_input_hash(row):
+    payload = {
+        "name": row.get("name"),
+        "description": row.get("description"),
+        "app_kind": row.get("app_kind"),
+        "html": row.get("html"),
+        "manifest": row.get("manifest") or {},
+        "source_files": row.get("source_files") or {},
+        "prompt_version": _ARTIFACT_CATALOG_PROMPT_VERSION,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def _artifact_catalog_public(row):
+    if not row:
+        return {"status": "none"}
+    return {
+        "status": row.get("status"),
+        "version": int(row.get("version") or 0),
+        "area_id": row.get("area_id"),
+        "confidence": row.get("confidence"),
+        "rationale": row.get("rationale"),
+        "model": row.get("model"),
+        "attempts": int(row.get("attempts") or 0),
+        "last_error": _semantic_text(row.get("last_error"), 600) or None,
+        "updated_at": _iso_utc(row.get("updated_at")),
+    }
+
+
+def _artifact_catalog_enrichment_row(dashboard_id, version):
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT * FROM rvbbit.artifact_catalog_enrichments "
+                "WHERE dashboard_id=%s AND version=%s",
+                (dashboard_id, version),
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception:  # noqa: BLE001 — older installs simply have no derived row
+        return None
+
+
+def _enqueue_artifact_catalog_enrichment(dashboard_id, version, *, force=False):
+    """Schedule Area classification after crawl; publication never waits for it."""
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT d.name,d.description,d.app_kind,v.html,v.manifest,v.source_files "
+                "FROM rvbbit.dashboards d JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
+                "WHERE d.id=%s AND v.version=%s",
+                (dashboard_id, version),
+            ).fetchone()
+            if not row:
+                return {"status": "none"}
+            input_hash = _artifact_catalog_input_hash(row)
+            existing = c.execute(
+                "SELECT * FROM rvbbit.artifact_catalog_enrichments "
+                "WHERE dashboard_id=%s AND version=%s",
+                (dashboard_id, version),
+            ).fetchone()
+            if (
+                existing and not force and existing.get("input_hash") == input_hash
+                and existing.get("status") in {"pending", "running", "ready"}
+            ):
+                return _artifact_catalog_public(dict(existing))
+            status = "pending" if _artifact_catalog_enrichment_enabled() else "disabled"
+            saved = c.execute(
+                "INSERT INTO rvbbit.artifact_catalog_enrichments "
+                "(dashboard_id,version,status,input_hash,not_before,enqueued_at,updated_at) "
+                "VALUES (%s,%s,%s,%s,now(),now(),now()) "
+                "ON CONFLICT (dashboard_id,version) DO UPDATE SET "
+                "status=EXCLUDED.status,input_hash=EXCLUDED.input_hash,area_id=NULL,confidence=NULL,"
+                "rationale=NULL,context='{}'::jsonb,model=NULL,attempts=0,last_error=NULL,"
+                "not_before=now(),enqueued_at=now(),started_at=NULL,completed_at=NULL,updated_at=now() "
+                "RETURNING *",
+                (dashboard_id, version, status, input_hash),
+            ).fetchone()
+        if status == "pending":
+            _ARTIFACT_CATALOG_WAKE.set()
+        return _artifact_catalog_public(dict(saved))
+    except Exception as exc:  # noqa: BLE001 — catalog metadata cannot gate publication
+        print(f"WARNING: could not enqueue artifact catalog enrichment: {exc}", file=sys.stderr)
+        return {"status": "unavailable", "last_error": _semantic_text(exc, 600)}
+
+
+def _artifact_catalog_backfill(limit=200):
+    """Seed missing latest-version jobs without resetting completed or manual work."""
+    try:
+        with _conn() as c:
+            rows = c.execute(
+                "SELECT d.id,d.slug,d.latest_version FROM rvbbit.dashboards d "
+                "LEFT JOIN rvbbit.artifact_catalog_enrichments e "
+                "ON e.dashboard_id=d.id AND e.version=d.latest_version "
+                "WHERE e.dashboard_id IS NULL ORDER BY d.updated_at DESC LIMIT %s",
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        for row in rows:
+            _crawl_safe(row["slug"], use_llm=False)
+            _enqueue_artifact_catalog_enrichment(row["id"], row["latest_version"])
+        return len(rows)
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: artifact catalog backfill unavailable: {exc}", file=sys.stderr)
+        return 0
+
+
+def _claim_artifact_catalog_job():
+    max_attempts = _env_int("WAREHOUSE_ARTIFACT_CATALOG_MAX_ATTEMPTS", 3, minimum=1, maximum=8)
+    with psycopg.connect(DSN, row_factory=dict_row, autocommit=False) as c:
+        c.execute(
+            "UPDATE rvbbit.artifact_catalog_enrichments SET status='pending',not_before=now(),"
+            "last_error=coalesce(last_error,'') || CASE WHEN coalesce(last_error,'')='' THEN '' ELSE E'\\n' END || "
+            "'Recovered stale worker claim',updated_at=now() "
+            "WHERE status='running' AND started_at < now()-interval '10 minutes' AND attempts < %s",
+            (max_attempts,),
+        )
+        c.execute(
+            "UPDATE rvbbit.artifact_catalog_enrichments SET status='failed',completed_at=now(),"
+            "last_error=coalesce(last_error,'Artifact catalog enrichment exhausted its retry budget'),updated_at=now() "
+            "WHERE status='running' AND started_at < now()-interval '10 minutes' AND attempts >= %s",
+            (max_attempts,),
+        )
+        row = c.execute(
+            "SELECT e.*,d.slug,d.name,d.description,d.app_kind,d.area_source,d.owner_email,"
+            "v.html,v.manifest,v.source_files FROM rvbbit.artifact_catalog_enrichments e "
+            "JOIN rvbbit.dashboards d ON d.id=e.dashboard_id "
+            "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=e.dashboard_id AND v.version=e.version "
+            "WHERE e.status='pending' AND e.not_before<=now() "
+            "ORDER BY e.enqueued_at FOR UPDATE OF e SKIP LOCKED LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        c.execute(
+            "UPDATE rvbbit.artifact_catalog_enrichments SET status='running',attempts=attempts+1,"
+            "started_at=now(),last_error=NULL,updated_at=now() WHERE dashboard_id=%s AND version=%s",
+            (row["dashboard_id"], row["version"]),
+        )
+        job = dict(row)
+        job["attempts"] = int(row.get("attempts") or 0) + 1
+    return job
+
+
+def _enqueue_artifact_context_refinement(limit=200):
+    """One convergence pass after a legacy backfill, now that peers have Areas."""
+    try:
+        with _conn() as c:
+            rows = c.execute(
+                "SELECT d.id,d.latest_version FROM rvbbit.dashboards d "
+                "JOIN rvbbit.artifact_catalog_enrichments e "
+                "ON e.dashboard_id=d.id AND e.version=d.latest_version "
+                "WHERE d.area_source='auto' AND e.status='ready' "
+                "ORDER BY d.updated_at DESC LIMIT %s",
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        for row in rows:
+            _enqueue_artifact_catalog_enrichment(row["id"], row["latest_version"], force=True)
+        return len(rows)
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: artifact Area context refinement unavailable: {exc}", file=sys.stderr)
+        return 0
+
+
+def _artifact_area_context(job):
+    with _conn() as c:
+        areas = [dict(row) for row in c.execute(
+            "SELECT id,label,description,keywords,sort_order FROM rvbbit.artifact_areas "
+            "WHERE active ORDER BY sort_order,label"
+        ).fetchall()]
+        deps = [dict(row) for row in c.execute(
+            "SELECT kind,object_ref FROM rvbbit.dashboard_deps "
+            "WHERE dashboard_id=%s AND version=%s AND object_ref IS NOT NULL",
+            (job["dashboard_id"], job["version"]),
+        ).fetchall()]
+        votes = [dict(row) for row in c.execute(
+            "WITH neighbors AS ("
+            " SELECT target.id,4::numeric AS weight FROM rvbbit.dashboard_deps edge "
+            " JOIN rvbbit.dashboards target ON target.slug=edge.object_ref "
+            " WHERE edge.dashboard_id=%s AND edge.version=%s AND edge.kind='artifact' "
+            " UNION ALL "
+            " SELECT source.id,4::numeric FROM rvbbit.dashboard_deps edge "
+            " JOIN rvbbit.dashboards source ON source.id=edge.dashboard_id AND source.latest_version=edge.version "
+            " WHERE edge.kind='artifact' AND edge.object_ref=%s "
+            " UNION ALL "
+            " SELECT other.dashboard_id,1::numeric FROM rvbbit.dashboard_deps mine "
+            " JOIN rvbbit.dashboard_deps other ON other.kind='table' AND other.object_ref=mine.object_ref "
+            " JOIN rvbbit.dashboards od ON od.id=other.dashboard_id AND od.latest_version=other.version "
+            " WHERE mine.dashboard_id=%s AND mine.version=%s AND mine.kind='table' "
+            " AND other.dashboard_id<>mine.dashboard_id"
+            ") SELECT d.area_id,sum(neighbors.weight)::float AS weight,count(*)::int AS routes "
+            "FROM neighbors JOIN rvbbit.dashboards d ON d.id=neighbors.id "
+            "JOIN rvbbit.artifact_areas a ON a.id=d.area_id AND a.active "
+            "WHERE d.area_id IS NOT NULL AND (d.area_source='manual' OR d.area_confidence>=.7) "
+            "GROUP BY d.area_id ORDER BY weight DESC",
+            (
+                job["dashboard_id"], job["version"], job["slug"],
+                job["dashboard_id"], job["version"],
+            ),
+        ).fetchall()]
+    return areas, deps, votes
+
+
+def _artifact_catalog_text(job, deps):
+    pieces = [job.get("name"), job.get("description"), job.get("app_kind")]
+    pieces.extend(row.get("object_ref") for row in deps if row.get("object_ref"))
+    manifest = job.get("manifest") or {}
+    for item in (manifest.get("semantic_map") or {}).get("objects") or []:
+        if not isinstance(item, dict):
+            continue
+        meaning = item.get("meaning") or {}
+        pieces.extend((meaning.get("label"), meaning.get("description"), meaning.get("formula")))
+    source_text = re.sub(r"<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>", " ", job.get("html") or "", flags=re.I | re.S)
+    source_text = re.sub(r"<[^>]+>", " ", source_text)
+    pieces.append(source_text[:8_000])
+    return re.sub(r"\s+", " ", " ".join(str(item) for item in pieces if item)).strip()[:16_000]
+
+
+def _clover_area_score(text, areas):
+    labels = ", ".join(area["label"] for area in areas if area["id"] != "other")
+    if not labels:
+        return None
+    try:
+        with _conn() as c:
+            available = c.execute(
+                "SELECT to_regprocedure('rvbbit.clover_classify_scores(text,text)') IS NOT NULL AS ok"
+            ).fetchone()
+            if not available or not available.get("ok"):
+                return None
+            raw = c.execute(
+                "SELECT rvbbit.clover_classify_scores(%s,%s) AS result",
+                (text, labels),
+            ).fetchone()["result"]
+    except Exception as exc:  # noqa: BLE001 — keyword/context fallback is intentional
+        print(f"WARNING: Clover artifact Area classification unavailable: {exc}", file=sys.stderr)
+        return None
+    result = raw if isinstance(raw, dict) else {}
+    winner = str(
+        result.get("label") or result.get("top_label") or result.get("winner") or ""
+    ).strip().lower()
+    confidence = result.get("score") or result.get("confidence")
+    scores = result.get("scores") or []
+    if isinstance(scores, dict) and not winner and scores:
+        winner, confidence = max(scores.items(), key=lambda item: float(item[1] or 0))
+    elif isinstance(scores, list):
+        ranked = [item for item in scores if isinstance(item, dict)]
+        if ranked:
+            top = max(ranked, key=lambda item: float(item.get("score") or item.get("confidence") or 0))
+            winner = winner or str(top.get("label") or top.get("name") or "").strip().lower()
+            confidence = confidence or top.get("score") or top.get("confidence")
+    by_label = {area["label"].strip().lower(): area["id"] for area in areas}
+    by_id = {area["id"].strip().lower(): area["id"] for area in areas}
+    area_id = by_label.get(winner) or by_id.get(winner)
+    if not area_id:
+        return None
+    try:
+        confidence = max(0.0, min(1.0, float(confidence)))
+    except (TypeError, ValueError):
+        confidence = 0.72
+    return area_id, confidence
+
+
+def _classify_artifact_area(job):
+    areas, deps, votes = _artifact_area_context(job)
+    if not areas:
+        raise ValueError("no active Artifact Areas are configured")
+    area_ids = {area["id"] for area in areas}
+    text = _artifact_catalog_text(job, deps)
+    text_lower = text.lower()
+    total_vote = sum(float(row.get("weight") or 0) for row in votes)
+    leader = votes[0] if votes else None
+    if leader and float(leader.get("weight") or 0) >= 4 and float(leader.get("weight") or 0) / max(total_vote, 1) >= .67:
+        area_id = leader["area_id"]
+        confidence = min(.95, .72 + .04 * float(leader.get("weight") or 0))
+        method = "context"
+        rationale = f"Nearby linked and shared-source artifacts consistently use {area_id}."
+        model = None
+    else:
+        clover = _clover_area_score(text, areas)
+        if clover and clover[0] in area_ids:
+            area_id, confidence = clover
+            method = "clover"
+            rationale = "Clover selected the closest configured Area from artifact meaning and source context."
+            model = "clover_classify_scores"
+        else:
+            scored = []
+            for area in areas:
+                matches = sum(
+                    1 for keyword in (area.get("keywords") or [])
+                    if re.search(
+                        r"(?<![a-z0-9])" + re.escape(str(keyword).lower()) + r"(?![a-z0-9])",
+                        text_lower,
+                    )
+                )
+                if matches:
+                    scored.append((matches, -int(area.get("sort_order") or 100), area["id"]))
+            if scored:
+                matches, _order, area_id = max(scored)
+                confidence = min(.86, .58 + .08 * matches)
+                method = "keywords"
+                rationale = f"Matched {matches} configured Area signal{'s' if matches != 1 else ''}."
+            else:
+                area_id = "other" if "other" in area_ids else areas[-1]["id"]
+                confidence = .35
+                method = "fallback"
+                rationale = "No configured Area had enough evidence; kept in the shared fallback Area."
+            model = None
+    if leader and leader.get("area_id") == area_id and method != "context":
+        confidence = min(.96, confidence + .08)
+        rationale += " Nearby artifacts support the same Area."
+    return {
+        "area_id": area_id,
+        "confidence": round(float(confidence), 3),
+        "rationale": rationale,
+        "model": model,
+        "context": {
+            "method": method,
+            "neighbor_votes": votes[:12],
+            "dependency_count": len(deps),
+            "prompt_version": _ARTIFACT_CATALOG_PROMPT_VERSION,
+        },
+    }
+
+
+def _complete_artifact_catalog_job(job, result):
+    with _conn() as c:
+        c.execute(
+            "UPDATE rvbbit.artifact_catalog_enrichments SET status='ready',area_id=%s,confidence=%s,"
+            "rationale=%s,context=%s::jsonb,model=%s,completed_at=now(),last_error=NULL,updated_at=now() "
+            "WHERE dashboard_id=%s AND version=%s",
+            (
+                result["area_id"], result["confidence"], result["rationale"],
+                _json_default(result["context"]), result.get("model"),
+                job["dashboard_id"], job["version"],
+            ),
+        )
+        c.execute(
+            "UPDATE rvbbit.dashboards SET area_id=%s,area_source='auto',area_confidence=%s,area_updated_at=now() "
+            "WHERE id=%s AND latest_version=%s AND coalesce(area_source,'auto')<>'manual'",
+            (result["area_id"], result["confidence"], job["dashboard_id"], job["version"]),
+        )
+
+
+def _fail_artifact_catalog_job(job, exc):
+    max_attempts = _env_int("WAREHOUSE_ARTIFACT_CATALOG_MAX_ATTEMPTS", 3, minimum=1, maximum=8)
+    attempts = int(job.get("attempts") or 1)
+    retry = attempts < max_attempts
+    delay = min(300, 10 * (2 ** max(0, attempts - 1)))
+    with _conn() as c:
+        c.execute(
+            "UPDATE rvbbit.artifact_catalog_enrichments SET status=%s,last_error=%s,"
+            "not_before=now()+(%s*interval '1 second'),completed_at=%s,updated_at=now() "
+            "WHERE dashboard_id=%s AND version=%s",
+            (
+                "pending" if retry else "failed", _semantic_text(f"{type(exc).__name__}: {exc}", 2000),
+                delay if retry else 0, None if retry else datetime.now(timezone.utc),
+                job["dashboard_id"], job["version"],
+            ),
+        )
+    if retry:
+        _ARTIFACT_CATALOG_WAKE.set()
+
+
+def _artifact_catalog_worker():
+    # Upgrade backfill is deliberately inside the daemon: even deterministic
+    # EXPLAIN/crawl work should never lengthen HTTP service startup.
+    backfilled = _artifact_catalog_backfill()
+    refine_after_backfill = backfilled > 1 and _artifact_catalog_enrichment_enabled()
+    while True:
+        if not _artifact_catalog_enrichment_enabled():
+            _ARTIFACT_CATALOG_WAKE.wait(30)
+            _ARTIFACT_CATALOG_WAKE.clear()
+            continue
+        try:
+            job = _claim_artifact_catalog_job()
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: artifact catalog queue unavailable: {exc}", file=sys.stderr)
+            _ARTIFACT_CATALOG_WAKE.wait(15)
+            _ARTIFACT_CATALOG_WAKE.clear()
+            continue
+        if not job:
+            if refine_after_backfill:
+                refine_after_backfill = False
+                if _enqueue_artifact_context_refinement(backfilled):
+                    continue
+            _ARTIFACT_CATALOG_WAKE.wait(10)
+            _ARTIFACT_CATALOG_WAKE.clear()
+            continue
+        try:
+            _complete_artifact_catalog_job(job, _classify_artifact_area(job))
+        except Exception as exc:  # noqa: BLE001
+            _fail_artifact_catalog_job(job, exc)
+            print(f"WARNING: artifact Area enrichment failed for {job['slug']}: {exc}", file=sys.stderr)
+
+
+def _start_artifact_catalog_worker():
+    global _ARTIFACT_CATALOG_THREAD
+    with _ARTIFACT_CATALOG_THREAD_LOCK:
+        if _ARTIFACT_CATALOG_THREAD and _ARTIFACT_CATALOG_THREAD.is_alive():
+            return True
+        _ARTIFACT_CATALOG_THREAD = threading.Thread(
+            target=_artifact_catalog_worker,
+            name="artifact-catalog-enricher",
+            daemon=True,
+        )
+        _ARTIFACT_CATALOG_THREAD.start()
+    return _artifact_catalog_enrichment_enabled()
+
+
+def tool_list_artifact_areas():
+    _ensure_dashboard_tables()
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT a.id,a.label,a.description,a.sort_order,a.active,count(d.id)::int AS artifacts "
+            "FROM rvbbit.artifact_areas a LEFT JOIN rvbbit.dashboards d ON d.area_id=a.id "
+            "GROUP BY a.id ORDER BY a.sort_order,a.label"
+        ).fetchall()
+    return {"areas": rows}
+
+
+def tool_set_artifact_area(slug, area_id=None):
+    """Assign an existing controlled Area, or clear the manual override for auto-classification."""
+    _ensure_dashboard_tables()
+    normalized = str(area_id or "").strip().lower() or None
+    with _conn() as c:
+        if normalized and not c.execute(
+            "SELECT 1 FROM rvbbit.artifact_areas WHERE id=%s AND active", (normalized,)
+        ).fetchone():
+            return {"error": {"code": "UNKNOWN_AREA", "message": normalized}}
+        row = c.execute(
+            "UPDATE rvbbit.dashboards SET area_id=%s,area_source=%s,area_confidence=%s,"
+            "area_updated_at=now() WHERE slug=%s RETURNING id,slug,latest_version,area_id,area_source",
+            (normalized, "manual" if normalized else None, 1.0 if normalized else None, slug),
+        ).fetchone()
+    if not row:
+        return {"error": {"code": "NOT_FOUND", "message": slug}}
+    if not normalized:
+        row = dict(row)
+        row["enrichment"] = _enqueue_artifact_catalog_enrichment(
+            row["id"], row["latest_version"], force=True
+        )
+    return row
 
 
 def tool_dashboard_dependents(object_ref):
@@ -6485,6 +7516,20 @@ def _mcp_enrich_live_app(slug, version=None, force=False):
         "enrich_live_app",
         {"slug": slug, "version": version, "force": force},
         lambda: tool_enrich_live_app(slug, version, force),
+    )
+
+
+def _mcp_list_artifact_areas():
+    """List the controlled Artifact Areas used to organize the Gallery without one-off categories."""
+    return _logged("list_artifact_areas", {}, tool_list_artifact_areas)
+
+
+def _mcp_set_artifact_area(slug, area_id=None):
+    """Manually assign a published artifact to an existing Area. Pass null to resume automatic classification."""
+    return _logged(
+        "set_artifact_area",
+        {"slug": slug, "area_id": area_id},
+        lambda: tool_set_artifact_area(slug, area_id),
     )
 
 
@@ -7304,6 +8349,7 @@ _DASH_SHIM = (
     "const d=await window.rvbbitQuery(args.sql||'',{as_of:args.as_of||null});"
     "return{structuredContent:{...d,rows:(d&&d.rows)||[]}};};}\n"
     "</script>\n"
+    '<script src="/theme/adaptive-artifact.js"></script>\n'
     '<script src="/theme/artifact-lens.js" defer></script>\n')
 
 
@@ -8093,7 +9139,13 @@ def _dashboard_inspection(
 # same parameter-aware metric identity.  Gallery reads materialized
 # observations only: opening the page must never execute every metric.
 _GALLERY_METRIC_LIMIT = 600
+# Other compact surfaces still use a bounded tail from the richer detail API.
 _GALLERY_METRIC_SERIES_LIMIT = 32
+_GALLERY_METRIC_RANGES = {
+    7: "6 hours",
+    30: "1 day",
+    90: "3 days",
+}
 _METRIC_BUCKETS = {"raw", "day", "week", "month", "quarter", "year"}
 
 
@@ -8262,8 +9314,15 @@ def _metric_user_relations(owner):
     return followed, pinned
 
 
-def _metric_catalog_snapshot(owner=None, search=None, category=None, limit=None):
+def _metric_catalog_snapshot(owner=None, search=None, category=None, limit=None, days=7):
     limit = max(1, min(int(limit or _GALLERY_METRIC_LIMIT), _GALLERY_METRIC_LIMIT))
+    try:
+        days = int(days or 7)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("metric range must be week, month, or quarter") from exc
+    if days not in _GALLERY_METRIC_RANGES:
+        raise ValueError("metric range must be week, month, or quarter")
+    bucket_interval = _GALLERY_METRIC_RANGES[days]
     search = re.sub(r"\s+", " ", str(search or "")).strip()[:300] or None
     category = re.sub(r"\s+", " ", str(category or "")).strip()[:160] or None
     with _conn() as conn:
@@ -8278,17 +9337,35 @@ def _metric_catalog_snapshot(owner=None, search=None, category=None, limit=None)
         ).fetchall()
         names = [str(row["name"]) for row in definitions]
         observations = []
+        latest_observations = []
         if names:
             observations = conn.execute(
-                "SELECT * FROM (SELECT o.observation_id,o.metric_name,o.metric_version,"
+                "SELECT observation_id,metric_name,metric_version,value,verdict,status,"
+                "trigger,params,data_as_of,observed_at FROM ("
+                "SELECT o.observation_id,o.metric_name,o.metric_version,"
                 "o.value,o.verdict,o.status,o.trigger,o.params,o.data_as_of,o.observed_at,"
-                "row_number() OVER (PARTITION BY o.metric_name ORDER BY "
+                "row_number() OVER (PARTITION BY o.metric_name,date_bin(%s::interval,"
+                "coalesce(o.data_as_of,o.observed_at),timestamptz '2000-01-01') ORDER BY "
                 "coalesce(o.data_as_of,o.observed_at) DESC,o.observed_at DESC,o.observation_id DESC) AS rn "
                 "FROM rvbbit.metric_observations o WHERE o.metric_name=ANY(%s::text[]) "
                 "AND o.params='{}'::jsonb "
-                "AND coalesce(o.data_as_of,o.observed_at)<=now()) ranked WHERE rn<=%s "
+                "AND coalesce(o.data_as_of,o.observed_at)>=now()-(%s * interval '1 day') "
+                "AND coalesce(o.data_as_of,o.observed_at)<=now()) ranked WHERE rn=1 "
                 "ORDER BY metric_name,coalesce(data_as_of,observed_at),observed_at,observation_id",
-                (names, _GALLERY_METRIC_SERIES_LIMIT),
+                (bucket_interval, names, days),
+            ).fetchall()
+            # The tile's current value is independent of its selected chart
+            # window. A quiet-but-valid metric should not become "unobserved"
+            # merely because its latest materialization is older than a week.
+            latest_observations = conn.execute(
+                "SELECT DISTINCT ON (o.metric_name) o.observation_id,o.metric_name,"
+                "o.metric_version,o.value,o.verdict,o.status,o.trigger,o.params,"
+                "o.data_as_of,o.observed_at FROM rvbbit.metric_observations o "
+                "WHERE o.metric_name=ANY(%s::text[]) AND o.params='{}'::jsonb "
+                "AND coalesce(o.data_as_of,o.observed_at)<=now() ORDER BY o.metric_name,"
+                "coalesce(o.data_as_of,o.observed_at) DESC,o.observed_at DESC,"
+                "o.observation_id DESC",
+                (names,),
             ).fetchall()
         category_rows = conn.execute(
             "SELECT coalesce(category,'Uncategorized') AS category,count(*)::int AS count "
@@ -8299,6 +9376,11 @@ def _metric_catalog_snapshot(owner=None, search=None, category=None, limit=None)
         point = _metric_observation_public(raw)
         if point:
             by_name.setdefault(str(raw["metric_name"]), []).append(point)
+    latest_by_name = {}
+    for raw in latest_observations:
+        point = _metric_observation_public(raw)
+        if point:
+            latest_by_name[str(raw["metric_name"])] = point
     followed, pinned = _metric_user_relations(owner)
     metrics = []
     for raw in definitions:
@@ -8307,7 +9389,7 @@ def _metric_catalog_snapshot(owner=None, search=None, category=None, limit=None)
         canonical_key = _metric_canonical_key(definition["name"], params)
         series = by_name.get(str(definition["name"]), [])
         display = _metric_display(definition)
-        latest = series[-1] if series else None
+        latest = latest_by_name.get(str(definition["name"]))
         metrics.append({
             "name": definition["name"],
             "title": _metric_title(definition),
@@ -8334,6 +9416,7 @@ def _metric_catalog_snapshot(owner=None, search=None, category=None, limit=None)
         "count": len(metrics),
         "categories": [dict(row) for row in category_rows],
         "observation_contract": "materialized",
+        "range_days": days,
     }
 
 
@@ -8553,7 +9636,8 @@ def _semantic_home_artifact_row(slug, version=None):
     with _conn() as conn:
         dashboard = conn.execute(
             "SELECT id,slug,name,description,owner_email,team,runtime_kind,app_kind,"
-            "latest_version,updated_at FROM rvbbit.dashboards WHERE slug=%s",
+            "latest_version,area_id,area_source,area_confidence,updated_at "
+            "FROM rvbbit.dashboards WHERE slug=%s",
             (slug,),
         ).fetchone()
         if not dashboard:
@@ -9863,6 +10947,7 @@ _LANDING_CSS = """
   --amber:#f5b446; --amber-soft:rgba(245,180,70,.12);
   --jade:#68c7b2; --jade-soft:rgba(104,199,178,.10);
   --gallery-rail-bg:color-mix(in oklch,var(--void) 85%,transparent);
+  --gallery-control-height:34px;
   --mono:ui-monospace,"JetBrains Mono",SFMono-Regular,Menlo,monospace;
   --sans:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   --serif:"Iowan Old Style",Baskerville,"Times New Roman",serif;
@@ -9898,9 +10983,6 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
   height:56px;padding:0 max(20px,4vw);border-bottom:1px solid var(--line);
   background:var(--gallery-rail-bg);backdrop-filter:blur(18px)}
 .mark{display:block;height:15px;width:auto;color:var(--amber);flex:none}
-.wordmark{font:700 12px/1 var(--mono);letter-spacing:.14em}
-.wordmark small{margin-left:10px;padding-left:10px;border-left:1px solid var(--line);
-  font-weight:400;font-size:9px;letter-spacing:.16em;color:var(--dim)}
 .who{margin-left:auto;display:flex;align-items:center;gap:14px;
   font:10px/1 var(--mono);letter-spacing:.1em;color:var(--fog)}
 .who a{color:var(--dim)}
@@ -9932,10 +11014,6 @@ nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
 .brief-rail-link:hover,.brief-rail-link.has-brief{border-color:var(--amber);color:var(--bone-bright)!important;background:var(--amber-soft)}
 .brief-rail-count{min-width:17px;padding:3px 5px;border-radius:999px;background:var(--amber);color:var(--void);font:800 7px/1 var(--mono);letter-spacing:0;text-align:center}
 .brief-rail-count[hidden]{display:none}
-.applink{padding:6px 11px;border:1px solid var(--line-hot);color:var(--amber)!important;
-  letter-spacing:.12em}
-.applink:hover{background:var(--amber);color:#1a1206!important}
-
 .calliope-float{
   --calliope-edge:clamp(18px,2vw,28px);
   --calliope-capsule-bg:color-mix(in oklch,#fffaf1 86%,var(--amber));
@@ -10013,8 +11091,14 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .home-title-copy{display:flex;flex-direction:column;gap:3px;min-width:0}
 .home-title-copy strong{color:var(--bone-bright);font:italic 400 19px/1 var(--serif)}
 .home-title-copy small{overflow:hidden;color:var(--dim);font:7px/1.35 var(--mono);letter-spacing:.1em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}
+.home-head-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px;min-width:0}
 .home-status{min-height:11px;color:var(--dim);font:7px/1.35 var(--mono);letter-spacing:.08em;text-align:right;text-transform:uppercase}
 .home-status.error{color:#f2a28f}
+.home-toggle{min-height:27px;display:inline-flex;align-items:center;gap:6px;flex:none;padding:0 8px;border:1px solid var(--line);background:transparent;color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;cursor:pointer;transition:border-color .16s,color .16s,background .16s}
+.home-toggle:hover,.home-toggle:focus-visible{outline:0;border-color:color-mix(in oklch,var(--jade) 44%,var(--line));background:var(--jade-soft);color:var(--jade)}
+.home-toggle b{font-size:9px;font-weight:400;transition:transform .18s}.semantic-home.collapsed .home-toggle b{transform:rotate(180deg)}
+.semantic-home.collapsed{padding:10px 0}.semantic-home.collapsed .home-head{align-items:center;margin-bottom:0}.semantic-home.collapsed .home-content{display:none}
+.semantic-home.is-empty:not(.collapsed) .home-grid{display:none}
 .home-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:8px}
 .home-empty{display:flex;align-items:center;gap:11px;min-height:62px;padding:11px 13px;border:1px dashed color-mix(in oklch,var(--jade) 25%,var(--line));
   background:color-mix(in oklch,var(--void) 60%,transparent);color:var(--fog)}
@@ -10031,7 +11115,9 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .home-tile.unavailable{opacity:.66}
 .home-tile-content{display:grid;grid-template-columns:74px minmax(0,1fr);min-height:132px}
 .home-tile.object .home-tile-content,.home-tile.metric .home-tile-content{grid-template-columns:1fr}
-.home-thumb{position:relative;display:block;min-height:100%;overflow:hidden;isolation:isolate;background:#0d0b09;color:var(--amber)}
+.home-thumb{position:relative;display:block;min-height:100%;overflow:hidden;isolation:isolate;background:#0d0b09;color:var(--amber);
+  -webkit-mask-image:linear-gradient(90deg,#000 0%,#000 44%,transparent 100%);mask-image:linear-gradient(90deg,#000 0%,#000 44%,transparent 100%);
+  -webkit-mask-repeat:no-repeat;mask-repeat:no-repeat}
 .home-thumb-fallback{position:absolute;z-index:0;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:7px;
   background:radial-gradient(circle at 42% 42%,color-mix(in oklch,var(--amber) 7%,transparent),transparent 64%);transition:opacity .25s}
 .home-thumb-fallback b{color:var(--amber);font:italic 400 25px/1 var(--serif);opacity:.28}
@@ -10041,7 +11127,6 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .home-thumb.ready img{visibility:visible;opacity:.67}
 .home-thumb.ready .home-thumb-fallback{opacity:0}
 .home-tile:hover .home-thumb.ready img{opacity:.88;transform:scale(1.035)}
-.home-thumb::after{content:"";position:absolute;z-index:2;inset:0;background:linear-gradient(90deg,transparent 45%,var(--panel-raised) 100%);pointer-events:none}
 .home-tile-main{display:flex;flex-direction:column;min-width:0;padding:12px 12px 10px}
 .home-tile.object .home-tile-main,.home-tile.metric .home-tile-main{position:relative;z-index:1;padding-left:14px}
 .home-kicker{display:flex;align-items:center;gap:7px;margin-bottom:6px;color:var(--jade);font:650 6px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
@@ -10134,16 +11219,17 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 
 .toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
   padding:16px 0;border-bottom:1px solid var(--line)}
-#q{flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--line);
+#q{height:var(--gallery-control-height);flex:1;min-width:220px;padding:0 12px;border:1px solid var(--line);
   background:rgba(232,221,204,.04);color:var(--bone);
   font:12px/1 var(--mono);letter-spacing:.04em;outline:none}
 #q:focus{border-color:var(--line-hot)}
 #q::placeholder{color:var(--dim)}
-.chip{padding:8px 13px;border:1px solid var(--line);background:transparent;color:var(--fog);
-  font:9px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;cursor:pointer}
-.chip:hover{color:var(--bone);border-color:var(--line-hot)}
-.chip[aria-pressed=true]{color:#1a1206;background:var(--amber);border-color:var(--amber);font-weight:700}
-
+.gallery-artifact-controls{display:flex;align-items:center;gap:7px}.gallery-artifact-controls[hidden]{display:none}
+.artifact-sort,.artifact-area-filter{position:relative;display:flex;align-items:center}.artifact-sort>span,.artifact-area-filter>span{position:absolute;left:9px;color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;pointer-events:none}
+#artifact-sort,#artifact-area{height:var(--gallery-control-height);min-width:158px;padding:0 26px 0 40px;border:1px solid var(--line);border-radius:0;background:color-mix(in oklch,var(--panel) 86%,transparent);color:var(--fog);font:7px/1 var(--mono);letter-spacing:.07em;text-transform:uppercase;outline:none;cursor:pointer}
+#artifact-area{min-width:132px;padding-left:40px}#artifact-sort:focus,#artifact-area:focus{border-color:var(--line-hot);color:var(--bone)}
+.artifact-pinned-filter{height:var(--gallery-control-height);display:inline-flex;align-items:center;gap:6px;padding:0 10px;border:1px solid var(--line);background:transparent;color:var(--dim);font:700 7px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:border-color .16s,color .16s,background .16s}
+.artifact-pinned-filter:hover,.artifact-pinned-filter:focus-visible{outline:0;border-color:color-mix(in oklch,var(--jade) 42%,var(--line));color:var(--jade)}.artifact-pinned-filter[aria-pressed=true]{border-color:color-mix(in oklch,var(--jade) 58%,var(--line));background:var(--jade-soft);color:var(--jade)}
 .semantic-launch{padding:10px 0 12px;border-bottom:1px solid var(--line)}
 .semantic-launch[hidden]{display:none}
 .semantic-launch-button{width:100%;min-height:68px;display:grid;grid-template-columns:42px minmax(0,1fr) auto;
@@ -10177,18 +11263,19 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   gap:1px;margin-top:1px;background:var(--line);border:1px solid var(--line)}
 .card{position:relative;display:flex;flex-direction:column;background:var(--panel);transition:background .25s}
 .card:hover{background:var(--panel-2)}
-.card-link{display:flex;flex:1;flex-direction:column;min-height:100%}
-.card-actions{position:absolute;top:10px;right:10px;z-index:5;display:flex;align-items:center;gap:5px}
-.card-pin,.card-ask,.card-activity{display:flex;align-items:center;gap:6px;min-height:27px;padding:6px 8px;
+.card:focus-within{z-index:2}
+.card-link{display:flex;min-height:0;flex:1;flex-direction:column}
+.card-actions{position:absolute;top:10px;right:10px;z-index:5;display:flex;align-items:center;opacity:0;pointer-events:none;transform:translateY(-4px);transition:opacity .16s,transform .16s}
+.card:hover .card-actions,.card:focus-within .card-actions{opacity:1;pointer-events:auto;transform:none}
+.card-action-items{display:flex;align-items:center;gap:5px}
+.card-pin,.card-ask,.card-more{display:flex;align-items:center;gap:6px;min-height:27px;padding:6px 8px;
   border:1px solid color-mix(in oklch,var(--bone) 18%,transparent);border-radius:999px;background:color-mix(in oklch,var(--void) 76%,transparent);
   -webkit-backdrop-filter:blur(13px);backdrop-filter:blur(13px);color:var(--fog);font:650 6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;
   box-shadow:0 5px 16px rgba(0,0,0,.28);cursor:pointer;transition:border-color .18s,background .18s,color .18s,transform .18s}
+.card-more{display:none;width:31px;padding-inline:0;justify-content:center}.card-more b{font-size:10px;font-weight:500;letter-spacing:.08em}
 .card-pin:hover,.card-pin:focus-visible{outline:0;transform:translateY(-1px);border-color:var(--amber);background:color-mix(in oklch,var(--void) 86%,var(--amber) 4%);color:var(--amber)}
 .card-ask{border-color:color-mix(in oklch,var(--jade) 36%,var(--line));color:var(--jade)}
 .card-ask:hover,.card-ask:focus-visible{outline:0;transform:translateY(-1px);border-color:var(--jade);background:color-mix(in oklch,var(--jade) 12%,var(--void));color:color-mix(in oklch,var(--jade) 82%,#fff)}
-.card-activity{border-color:color-mix(in oklch,var(--bone) 22%,var(--line));color:var(--fog)}
-.card-activity:hover,.card-activity:focus-visible{outline:0;transform:translateY(-1px);border-color:color-mix(in oklch,var(--amber) 68%,var(--jade));background:color-mix(in oklch,var(--amber) 7%,var(--void));color:var(--bone-bright)}
-.card-activity b{color:var(--amber);font-size:8px;font-weight:500}
 .card-ask:disabled{cursor:wait;opacity:.72}.card-ask.loading span{font-size:0}.card-ask.loading span::after{content:"…";font-size:6px}
 .card-pin[aria-pressed=true]{border-color:color-mix(in oklch,var(--jade) 62%,transparent);background:color-mix(in oklch,var(--jade) 15%,var(--void));color:var(--jade)}
 .card-pin:disabled{cursor:wait;opacity:.62}
@@ -10213,16 +11300,23 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .shot img.ok+.glyph{display:none}
 .shot.pending .glyph{animation:breathe 1.9s ease-in-out infinite}
 @keyframes breathe{0%,100%{opacity:.16}50%{opacity:.34}}
-.body{display:flex;flex-direction:column;gap:8px;flex:1;padding:16px 18px 18px}
-.meta{display:flex;align-items:center;gap:9px;flex-wrap:wrap;
+.body{display:flex;min-height:0;flex:1;flex-direction:column;gap:8px;padding:16px 18px 10px}
+.meta{display:flex;min-width:0;align-items:center;gap:9px;flex-wrap:nowrap;
   font:9px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase}
 .pill{padding:3px 8px;border:1px solid var(--line-hot);color:var(--amber)}
 .pill.dim{border-color:var(--line);color:var(--dim)}
-.when{color:var(--dim)}
+.card-owner{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.when{margin-left:auto;flex:none;color:var(--dim);white-space:nowrap}
 .card h2{font:italic 400 21px/1.2 var(--serif);letter-spacing:-.01em}
 .desc{color:var(--fog);font-size:12.5px;line-height:1.55;
   display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.foot{margin-top:auto;padding-top:12px;display:flex;gap:14px;
+.card-details{padding:0 18px 18px}
+.card-utility{min-height:21px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.card-view-count{padding:3px 0;border:0;background:transparent;color:var(--dim);font:650 7px/1 var(--mono);font-variant-numeric:tabular-nums;letter-spacing:.12em;text-transform:uppercase;cursor:pointer;transition:color .15s}
+.card-view-count b{color:color-mix(in oklch,var(--amber) 72%,var(--fog));font-size:9px;font-weight:500;letter-spacing:.04em}
+.card-view-count:hover,.card-view-count:focus-visible{outline:0;color:var(--bone-bright)}.card-view-count:focus-visible{box-shadow:0 1px 0 var(--amber)}
+.card-utility-tags{min-width:0;display:flex;align-items:center;gap:6px;margin-left:auto}.card-area{overflow:hidden;max-width:120px;color:var(--jade);font:7px/1 var(--mono);letter-spacing:.08em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.card-pin-state{display:none;color:var(--jade);font:7px/1 var(--mono)}.card.pinned .card-pin-state{display:inline-block}
+.foot{padding-top:8px;display:flex;gap:14px;
   color:var(--dim);font:9px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
 .foot b{color:var(--fog);font-weight:400}
 
@@ -10247,43 +11341,53 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   header.hero{padding:44px 0 24px}
   .who{gap:8px}
   .who .viewer{display:none}
-  .applink{padding:6px 8px}
   .semantic-launch-button{grid-template-columns:38px minmax(0,1fr)}
   .semantic-launch-mark{width:38px;height:38px}
   .semantic-launch-cta{grid-column:2;justify-content:flex-start;text-align:left}
-  .home-head{align-items:flex-start;flex-direction:column;gap:8px}
-  .home-status{text-align:left}
-  .gallery-presence{top:64px;right:12px;width:205px}.gallery-presence .presence-calendar,.gallery-presence .presence-meeting{display:none}.gallery-presence .presence-clock{min-height:54px;padding-block:9px}.gallery-presence .presence-time{font-size:26px}
+  .home-head{align-items:flex-start;flex-direction:column;gap:8px}.home-head-actions{width:100%;justify-content:space-between}.home-status{text-align:left}.semantic-home.collapsed .home-head{flex-direction:row}.semantic-home.collapsed .home-head-actions{width:auto;margin-left:auto}.semantic-home.collapsed .home-status{display:none}
+  .toolbar{position:sticky;z-index:18;top:56px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:8px 0 9px;background:color-mix(in oklch,var(--void) 88%,transparent);-webkit-backdrop-filter:blur(18px) saturate(1.16);backdrop-filter:blur(18px) saturate(1.16);box-shadow:0 11px 28px rgba(0,0,0,.2)}
+  .toolbar .gallery-view-switch{grid-column:1;width:auto}.toolbar #q{grid-column:1/-1;grid-row:2;width:100%;min-width:0}.gallery-artifact-controls{grid-column:2;grid-row:1}.artifact-sort>span,.artifact-area-filter>span{display:none}#artifact-sort,#artifact-area{min-width:112px;padding-left:9px}.artifact-pinned-filter{padding-inline:9px}
+  .gallery-presence{top:64px;right:12px;width:205px;transition:width .24s ease,transform .24s ease,opacity .18s ease}.gallery-presence .presence-calendar,.gallery-presence .presence-meeting{display:none}.gallery-presence .presence-clock{min-height:54px;padding-block:9px}.gallery-presence .presence-time{font-size:26px}
+  body.gallery-mobile-scrolled .gallery-presence{opacity:0;pointer-events:none;transform:translateY(-10px)}
+  body.gallery-mobile-scrolled .calliope-float{gap:0;width:52px;min-height:52px;padding:4px;border-radius:50%}
+  body.gallery-mobile-scrolled .calliope-float-avatar{width:42px;height:42px}
+  body.gallery-mobile-scrolled .calliope-float-copy{display:none}
   .activity-stats{grid-template-columns:repeat(2,1fr)}.activity-stat:nth-child(2){border-right:0}.activity-stat:nth-child(-n+2){border-bottom:1px solid var(--line)}.activity-viewer-list{grid-template-columns:1fr}
 }
 @media (max-width:520px){
   nav{padding-inline:14px}
-  .wordmark small{display:none}
+  .calliope-brand-byline{display:none}
   .inbox-rail-label,.brief-rail-label{display:none}
   .inbox-rail-link,.brief-rail-link{gap:5px;padding-inline:8px}
-  .applink{display:none}
   .calliope-float{gap:11px;min-height:60px;padding:5px 17px 5px 5px}
   .calliope-float-avatar{width:42px;height:42px}
   .calliope-float-name{font-size:20px}
   .calliope-float-copy{padding-top:1px}
   .calliope-float-action{display:none}
+  .toolbar{grid-template-columns:1fr auto}.gallery-artifact-controls{grid-column:1/-1;grid-row:3;justify-content:flex-start;overflow-x:auto;padding-bottom:2px}
   .trail-dialog{width:100vw;height:100dvh;margin:0;border:0}
   .trail-content{padding:12px}
   .trail-loom>header{align-items:flex-start;flex-direction:column}.trail-loom>header b{text-align:left}
   .trail-loom-track{align-items:stretch;flex-direction:column}.trail-loom-step{width:100%;min-height:92px;flex-basis:auto}.trail-loom-link{width:auto;min-width:0;min-height:34px;flex-direction:row}.trail-loom-link i{transform:rotate(90deg)}
   .artifact-activity-dialog{width:100vw;height:100dvh;margin:0;border:0}.activity-head{gap:8px;padding-left:11px}.activity-head-mark,.activity-heading small{display:none}.activity-range button{padding-inline:7px}.activity-content{padding:10px}
 }
+@media (hover:none){
+  .card-actions{opacity:1;pointer-events:auto;transform:none}
+  .card-more{display:flex}
+  .card-action-items{position:absolute;top:35px;right:0;display:none;align-items:stretch;flex-direction:column;padding:5px;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 94%,transparent);box-shadow:0 12px 32px rgba(0,0,0,.42)}
+  .card-actions.open .card-action-items{display:flex}
+  .card-action-items .card-ask,.card-action-items .card-pin{min-width:82px;justify-content:flex-start;box-shadow:none}
+}
 @media (min-width:900px){header.hero{padding-right:min(390px,32vw)}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
 _GALLERY_METRICS_CSS = """
-.gallery-view-switch{display:inline-flex;align-items:center;flex:none;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 62%,transparent)}
-.gallery-view-switch button{min-height:34px;padding:0 12px;border:0;border-right:1px solid var(--line);background:transparent;color:var(--dim);font:700 8px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;cursor:pointer}
+.gallery-view-switch{height:var(--gallery-control-height);display:inline-flex;align-items:center;flex:none;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 62%,transparent)}
+.gallery-view-switch button{height:100%;min-height:0;padding:0 12px;border:0;border-right:1px solid var(--line);background:transparent;color:var(--dim);font:700 8px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;cursor:pointer}
 .gallery-view-switch button:last-child{border-right:0}.gallery-view-switch button:hover{color:var(--bone)}
 .gallery-view-switch button[aria-selected=true]{background:var(--amber);color:#1a1206}
 .gallery-view-switch b{display:inline-grid;min-width:17px;margin-left:6px;padding:3px 4px;border-radius:999px;background:color-mix(in oklch,currentColor 14%,transparent);font-size:6px;place-items:center}.gallery-view-switch b[hidden]{display:none}
-.artifact-kind-chips{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.artifact-kind-chips[hidden]{display:none}
 #artifact-browser[hidden],.metrics-browser[hidden]{display:none}
 .metrics-browser{padding-top:16px}
 .metrics-browser-head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding:0 0 14px;border-bottom:1px solid var(--line)}
@@ -10292,19 +11396,20 @@ _GALLERY_METRICS_CSS = """
 .metric-browser-filters{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 #metric-category{height:30px;max-width:210px;padding:0 25px 0 9px;border:1px solid var(--line);border-radius:0;background:var(--panel);color:var(--fog);font:7px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;outline:none}
 #metric-category:focus{border-color:var(--jade)}
-.metric-relation-filter{display:inline-flex;border:1px solid var(--line)}.metric-relation-filter button{height:28px;padding:0 9px;border:0;border-right:1px solid var(--line);background:transparent;color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;cursor:pointer}.metric-relation-filter button:last-child{border:0}.metric-relation-filter button:hover{color:var(--jade)}.metric-relation-filter button[aria-pressed=true]{background:var(--jade-soft);color:var(--jade)}
+.metric-gallery-range,.metric-relation-filter{display:inline-flex;border:1px solid var(--line)}.metric-gallery-range button,.metric-relation-filter button{height:28px;padding:0 9px;border:0;border-right:1px solid var(--line);background:transparent;color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;cursor:pointer}.metric-gallery-range button:last-child,.metric-relation-filter button:last-child{border:0}.metric-gallery-range button:hover,.metric-relation-filter button:hover{color:var(--jade)}.metric-gallery-range button[aria-pressed=true],.metric-relation-filter button[aria-pressed=true]{background:var(--jade-soft);color:var(--jade)}.metric-gallery-range button:disabled{opacity:.48;cursor:wait}
 .metric-browser-status,.metric-gallery-empty{min-height:190px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:var(--dim);font:8px/1.5 var(--mono);letter-spacing:.08em;text-align:center;text-transform:uppercase}.metric-browser-status[hidden],.metric-gallery-empty[hidden]{display:none}.metric-browser-status i{width:21px;height:21px;border:1px solid var(--jade);border-right-color:transparent;border-radius:50%;animation:semantic-spin .75s linear infinite}.metric-browser-status.error{color:#f2a28f}.metric-browser-status.error i{display:none}.metric-gallery-empty strong{color:var(--fog);font:italic 400 18px/1.2 var(--serif);letter-spacing:0;text-transform:none}.metric-gallery-empty span{font-size:7px}
-.metric-gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:1px;margin-top:1px;border:1px solid var(--line);background:var(--line)}.metric-gallery-grid:empty{display:none}
-.metric-gallery-card{--metric-card-trend:var(--jade);--metric-card-floor:var(--panel);position:relative;min-height:280px;overflow:hidden;background:linear-gradient(145deg,color-mix(in oklch,var(--panel) 95%,var(--jade) 5%),var(--panel));cursor:pointer;isolation:isolate;transition:background .22s,transform .2s}.metric-gallery-card:hover{--metric-card-floor:var(--panel-2);z-index:2;background:linear-gradient(145deg,color-mix(in oklch,var(--panel-2) 90%,var(--jade) 10%),var(--panel-2))}.metric-gallery-card:focus-within{z-index:3;outline:1px solid var(--jade);outline-offset:-1px}.metric-gallery-card.bad{--metric-card-trend:#df765f}
+.metric-gallery-sections{display:flex;flex-direction:column;gap:25px;padding-top:17px}.metric-gallery-sections:empty{display:none}
+.metric-category-section{min-width:0}.metric-category-head{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;min-height:38px;padding:0 2px 9px}.metric-category-heading{min-width:0;display:flex;align-items:baseline;gap:10px}.metric-category-heading span{color:var(--jade);font:750 6px/1 var(--mono);letter-spacing:.15em;text-transform:uppercase}.metric-category-heading h2{overflow:hidden;color:var(--bone-bright);font:italic 400 19px/1.05 var(--serif);text-overflow:ellipsis;white-space:nowrap}.metric-category-count{flex:none;color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}
+.metric-gallery-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:1px;border:1px solid var(--line);background:var(--line)}.metric-gallery-grid:empty{display:none}.metric-gallery-grid.sparse{width:fit-content;max-width:100%;grid-template-columns:repeat(var(--metric-columns),minmax(290px,420px))}
+.metric-gallery-card{--metric-card-trend:var(--jade);--metric-card-floor:var(--panel);position:relative;min-height:280px;overflow:hidden;background:linear-gradient(145deg,color-mix(in oklch,var(--panel) 95%,var(--jade) 5%),var(--panel));container-type:inline-size;cursor:pointer;isolation:isolate;transition:background .22s,transform .2s}.metric-gallery-card:hover{--metric-card-floor:var(--panel-2);z-index:2;background:linear-gradient(145deg,color-mix(in oklch,var(--panel-2) 90%,var(--jade) 10%),var(--panel-2))}.metric-gallery-card:focus-within{z-index:3;outline:1px solid var(--jade);outline-offset:-1px}.metric-gallery-card.bad{--metric-card-trend:#df765f}
 .metric-card-grid{position:absolute;z-index:-1;inset:0;opacity:.62;background-image:linear-gradient(color-mix(in oklch,var(--bone) 4%,transparent) 1px,transparent 1px),linear-gradient(90deg,color-mix(in oklch,var(--bone) 3%,transparent) 1px,transparent 1px);background-size:100% 25%,16.66% 100%;mask-image:linear-gradient(to top,#000,transparent 92%)}
-.metric-card-chart{position:absolute;z-index:-1;inset:50px 0 0;opacity:.72;pointer-events:none}.metric-card-chart svg{width:100%;height:100%;display:block;overflow:visible}.metric-card-area-top{stop-color:var(--metric-card-trend);stop-opacity:.24}.metric-card-area-mid{stop-color:var(--metric-card-trend);stop-opacity:.07}.metric-card-area-clear{stop-color:var(--metric-card-floor);stop-opacity:0}.metric-card-area-floor{stop-color:var(--metric-card-floor);stop-opacity:.96}.metric-card-line{fill:none;stroke:var(--metric-card-trend);stroke-width:1.8;vector-effect:non-scaling-stroke;filter:drop-shadow(0 0 7px color-mix(in oklch,var(--metric-card-trend) 42%,transparent))}
+.metric-card-chart{position:absolute;z-index:-1;inset:32px 0 140px;opacity:.72;pointer-events:none}.metric-card-chart svg{width:100%;height:100%;display:block;overflow:visible}.metric-card-area-top{stop-color:var(--metric-card-trend);stop-opacity:.24}.metric-card-area-mid{stop-color:var(--metric-card-trend);stop-opacity:.07}.metric-card-area-clear{stop-color:var(--metric-card-floor);stop-opacity:0}.metric-card-area-floor{stop-color:var(--metric-card-floor);stop-opacity:.96}.metric-card-line{fill:none;stroke:var(--metric-card-trend);stroke-width:1.8;vector-effect:non-scaling-stroke;filter:drop-shadow(0 0 7px color-mix(in oklch,var(--metric-card-trend) 42%,transparent))}
 .metric-card-open{position:absolute;z-index:1;inset:0;width:100%;border:0;background:transparent;color:inherit;cursor:pointer}.metric-card-open:focus-visible{outline:2px solid var(--jade);outline-offset:-3px}
-.metric-card-actions{position:absolute;z-index:3;top:12px;right:12px;display:flex;gap:5px}.metric-card-actions button,.metric-lens-actions button{display:inline-flex;align-items:center;gap:5px;min-height:27px;padding:5px 8px;border:1px solid color-mix(in oklch,var(--bone) 17%,transparent);border-radius:999px;background:color-mix(in oklch,var(--void) 72%,transparent);color:var(--fog);font:700 6px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;cursor:pointer;backdrop-filter:blur(12px);transition:border-color .16s,color .16s,background .16s,transform .16s}.metric-card-actions button:hover,.metric-lens-actions button:hover{transform:translateY(-1px);border-color:var(--jade);color:var(--jade)}.metric-card-actions button.active,.metric-lens-actions button.active{border-color:color-mix(in oklch,var(--jade) 58%,var(--line));background:color-mix(in oklch,var(--jade) 13%,var(--void));color:var(--jade)}.metric-card-actions button.ask,.metric-lens-actions button.ask{border-color:color-mix(in oklch,var(--amber) 46%,var(--line));color:var(--amber)}.metric-card-actions button:disabled,.metric-lens-actions button:disabled{opacity:.55;cursor:wait;transform:none}
+.metric-card-actions{position:absolute;z-index:3;top:103px;right:12px;display:flex;gap:5px;opacity:0;pointer-events:none;transform:translateY(-4px);transition:opacity .16s ease,transform .16s ease}.metric-gallery-card:hover .metric-card-actions,.metric-gallery-card:focus-within .metric-card-actions{opacity:1;pointer-events:auto;transform:none}.metric-card-actions button,.metric-lens-actions button{display:inline-flex;align-items:center;gap:5px;min-height:27px;padding:5px 8px;border:1px solid color-mix(in oklch,var(--bone) 17%,transparent);border-radius:999px;background:color-mix(in oklch,var(--void) 72%,transparent);color:var(--fog);font:700 6px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;cursor:pointer;backdrop-filter:blur(12px);transition:border-color .16s,color .16s,background .16s,transform .16s}.metric-card-actions button:hover,.metric-lens-actions button:hover{transform:translateY(-1px);border-color:var(--jade);color:var(--jade)}.metric-card-actions button.active,.metric-lens-actions button.active{border-color:color-mix(in oklch,var(--jade) 58%,var(--line));background:color-mix(in oklch,var(--jade) 13%,var(--void));color:var(--jade)}.metric-card-actions button.ask,.metric-lens-actions button.ask{border-color:color-mix(in oklch,var(--amber) 46%,var(--line));color:var(--amber)}.metric-card-actions button:disabled,.metric-lens-actions button:disabled{opacity:.55;cursor:wait;transform:none}
 .metric-card-content{position:relative;z-index:2;min-height:280px;display:flex;flex-direction:column;justify-content:flex-end;padding:18px;pointer-events:none;text-shadow:0 1px 1px color-mix(in oklch,var(--void) 98%,transparent),0 2px 7px color-mix(in oklch,var(--void) 96%,transparent),0 8px 22px color-mix(in oklch,var(--void) 84%,transparent)}
-.metric-card-kicker{position:absolute;top:18px;left:18px;right:168px;display:flex;align-items:center;gap:7px;overflow:hidden;color:var(--jade);font:700 6px/1 var(--mono);letter-spacing:.12em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.metric-card-kicker::before{content:"";width:13px;height:1px;flex:none;background:currentColor}.metric-gallery-card.bad .metric-card-kicker{color:#df765f}
-.metric-card-status{align-self:flex-start;margin-bottom:auto;padding:4px 6px;border:1px solid var(--line);color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}.metric-card-status.good{border-color:color-mix(in oklch,var(--jade) 38%,var(--line));color:var(--jade)}.metric-card-status.bad{border-color:color-mix(in oklch,#df765f 48%,var(--line));color:#ef9b91}
-.metric-card-value{display:flex;align-items:baseline;gap:10px;color:var(--bone-bright);font:600 clamp(34px,4vw,57px)/.92 var(--sans);letter-spacing:-.06em}.metric-card-value small{color:var(--jade);font:650 8px/1 var(--mono);letter-spacing:0}.metric-card-value small.bad{color:#ef9b91}.metric-card-value small.neutral{color:var(--fog)}
-.metric-card-title{margin-top:9px;color:var(--bone-bright);font:italic 400 20px/1.15 var(--serif)}.metric-card-description{display:-webkit-box;overflow:hidden;margin-top:6px;color:var(--fog);font-size:9px;line-height:1.45;-webkit-box-orient:vertical;-webkit-line-clamp:2}.metric-card-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;padding-top:9px;border-top:1px solid var(--line);color:var(--dim);font:6px/1.3 var(--mono);letter-spacing:.09em;text-transform:uppercase}.metric-card-foot span:last-child{text-align:right}
+.metric-card-status{position:absolute;top:18px;left:18px;padding:4px 6px;border:1px solid var(--line);color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}.metric-card-status.bad{border-color:color-mix(in oklch,#df765f 48%,var(--line));color:#ef9b91}.metric-card-status.missing{width:22px;height:22px;display:grid;padding:0;border-color:color-mix(in oklch,#df765f 34%,var(--line));border-radius:50%;color:#ef9b91;font:500 15px/1 var(--sans);place-items:center}
+.metric-card-value{position:absolute;top:18px;right:18px;max-width:calc(100% - 36px);display:flex;align-items:flex-end;flex-direction:column;gap:7px;color:var(--bone-bright);font:600 clamp(32px,13cqw,57px)/.92 var(--sans);letter-spacing:-.06em;text-align:right;white-space:nowrap}.metric-card-value>strong{overflow:hidden;max-width:100%;font:inherit;letter-spacing:inherit;text-overflow:ellipsis}.metric-card-delta{--metric-delta-color:var(--fog);display:inline-flex;align-items:center;gap:4px;align-self:flex-end;padding:5px 7px;border:1px solid color-mix(in oklch,var(--metric-delta-color) 40%,transparent);border-radius:999px;background:color-mix(in oklch,var(--metric-delta-color) 10%,var(--panel));color:var(--metric-delta-color);font:800 clamp(9px,3cqw,12px)/1 var(--mono);letter-spacing:.01em;text-shadow:0 1px 7px color-mix(in oklch,var(--void) 80%,transparent);white-space:nowrap}.metric-card-delta.good{--metric-delta-color:var(--success,#58c982)}.metric-card-delta.bad{--metric-delta-color:var(--danger,#df765f)}.metric-card-delta.neutral{--metric-delta-color:var(--fog)}.metric-card-delta b{font-size:.82em;font-weight:900}
+.metric-card-title{display:-webkit-box;overflow:hidden;height:46px;margin-top:0;color:var(--bone-bright);font:italic 400 20px/1.15 var(--serif);-webkit-box-orient:vertical;-webkit-line-clamp:2}.metric-card-description{display:-webkit-box;overflow:hidden;height:27px;margin-top:6px;color:var(--fog);font-size:9px;line-height:1.45;-webkit-box-orient:vertical;-webkit-line-clamp:2}.metric-card-foot{display:grid;align-items:center;grid-template-columns:minmax(0,1fr) auto;gap:10px;min-height:18px;margin-top:12px;padding-top:9px;border-top:1px solid var(--line);color:var(--dim);font:6px/1.3 var(--mono);letter-spacing:.09em;text-transform:uppercase}.metric-card-foot span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.metric-card-foot span:last-child{max-width:76px;text-align:right}
 .metric-lens{width:min(1120px,calc(100vw - 28px));max-width:none;height:min(850px,calc(100dvh - 28px));max-height:none;margin:auto;padding:0;border:1px solid color-mix(in oklch,var(--jade) 46%,var(--line));background:color-mix(in oklch,var(--panel) 96%,transparent);color:var(--bone);box-shadow:0 38px 140px color-mix(in oklch,var(--void) 90%,transparent)}.metric-lens::backdrop{background:color-mix(in oklch,var(--void) 76%,transparent);backdrop-filter:blur(9px)}.metric-lens-shell{height:100%;display:grid;grid-template-rows:auto minmax(0,1fr)}
 .metric-lens-head{display:flex;align-items:center;gap:16px;min-height:72px;padding:11px 13px 11px 19px;border-bottom:1px solid var(--line);background:color-mix(in oklch,var(--gallery-rail-bg) 92%,transparent);backdrop-filter:blur(18px)}.metric-lens-heading{min-width:0;display:flex;flex:1;flex-direction:column;gap:4px}.metric-lens-heading>span{color:var(--jade);font:750 6px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase}.metric-lens-heading>strong{overflow:hidden;color:var(--bone-bright);font:italic 400 22px/1.05 var(--serif);text-overflow:ellipsis;white-space:nowrap}.metric-lens-heading>small{overflow:hidden;color:var(--dim);font:7px/1.25 var(--mono);letter-spacing:.08em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.metric-lens-actions{display:flex;align-items:center;gap:5px}.metric-lens-close{width:36px;height:36px;display:grid;place-items:center;flex:none;border:1px solid var(--line);background:transparent;color:var(--fog);font:19px/1 var(--sans);cursor:pointer}.metric-lens-close:hover{border-color:var(--amber);color:var(--amber)}
 .metric-lens-content{min-height:0;overflow:auto;padding:18px;scrollbar-color:color-mix(in oklch,var(--jade) 48%,var(--line)) color-mix(in oklch,var(--void) 60%,transparent)}.metric-lens-loading,.metric-lens-error{min-height:300px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:11px;color:var(--dim);font:8px/1.5 var(--mono);text-align:center}.metric-lens-loading i{width:25px;height:25px;border:1px solid var(--jade);border-right-color:transparent;border-radius:50%;animation:semantic-spin .75s linear infinite}.metric-lens-error strong{color:#ef9b91;font:italic 400 20px/1.2 var(--serif)}
@@ -10312,7 +11417,8 @@ _GALLERY_METRICS_CSS = """
 .metric-lens-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding:9px 10px;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 35%,transparent)}.metric-range-buttons{display:flex;gap:4px}.metric-range-buttons button{height:27px;padding:0 8px;border:1px solid var(--line);background:transparent;color:var(--dim);font:650 6px/1 var(--mono);text-transform:uppercase;cursor:pointer}.metric-range-buttons button:hover,.metric-range-buttons button.active{border-color:var(--jade);color:var(--jade);background:var(--jade-soft)}.metric-range-selection{color:var(--dim);font:7px/1.35 var(--mono);letter-spacing:.06em;text-align:right}.metric-range-selection.active{color:var(--jade)}
 .metric-lens-chart{position:relative;margin-top:1px;min-height:310px;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 38%,transparent)}.metric-lens-chart svg{display:block;width:100%;height:310px}.metric-lens-chart .grid-line{stroke:color-mix(in oklch,var(--bone) 7%,transparent);stroke-width:1;vector-effect:non-scaling-stroke}.metric-lens-chart .axis-label{fill:var(--dim);font:7px var(--mono)}.metric-lens-chart .area{fill:color-mix(in oklch,var(--jade) 10%,transparent)}.metric-lens-chart .line{fill:none;stroke:var(--jade);stroke-width:2;vector-effect:non-scaling-stroke}.metric-lens-chart .point{fill:var(--panel);stroke:var(--jade);stroke-width:2;vector-effect:non-scaling-stroke;cursor:pointer}.metric-lens-chart .point:hover,.metric-lens-chart .point.selected{fill:var(--amber);stroke:var(--amber);r:5}.metric-lens-chart .version-mark{stroke:color-mix(in oklch,var(--amber) 45%,transparent);stroke-dasharray:3 3;vector-effect:non-scaling-stroke}.metric-chart-tooltip{position:absolute;z-index:3;max-width:240px;padding:8px 9px;border:1px solid color-mix(in oklch,var(--jade) 45%,var(--line));background:color-mix(in oklch,var(--panel) 97%,transparent);box-shadow:0 10px 35px rgba(0,0,0,.35);color:var(--fog);font:7px/1.4 var(--mono);pointer-events:none;transform:translate(-50%,-112%)}.metric-chart-tooltip[hidden]{display:none}.metric-chart-tooltip strong{display:block;margin-bottom:3px;color:var(--bone-bright);font-size:9px}.metric-chart-tooltip b{color:var(--jade);font-weight:500}
 .metric-lens-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(260px,.75fr);gap:12px;margin-top:14px}.metric-lens-panel{min-width:0;padding:15px;border:1px solid var(--line);background:color-mix(in oklch,var(--panel-raised) 72%,transparent)}.metric-lens-panel>h3{display:flex;align-items:center;gap:8px;margin-bottom:11px;color:var(--jade);font:700 7px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}.metric-lens-panel>h3::after{content:"";height:1px;flex:1;background:var(--line)}.metric-lens-panel>p{color:var(--fog);font-size:11px;line-height:1.6}.metric-definition-facts,.metric-source-list,.metric-artifact-list{display:flex;flex-wrap:wrap;gap:6px}.metric-definition-facts span,.metric-source-list span,.metric-artifact-list a{padding:6px 8px;border:1px solid var(--line);color:var(--fog);font:7px/1.3 var(--mono)}.metric-definition-facts b{margin-right:6px;color:var(--dim);font-weight:500;text-transform:uppercase}.metric-source-list span.stale{border-color:color-mix(in oklch,#df765f 45%,var(--line));color:#ef9b91}.metric-artifact-list a:hover{border-color:var(--amber);color:var(--amber)}.metric-sql{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}.metric-sql summary{color:var(--dim);font:7px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;cursor:pointer}.metric-sql pre{max-height:260px;overflow:auto;margin-top:10px;padding:11px;border:1px solid var(--line);background:var(--void);color:var(--fog);font:8px/1.55 var(--mono);white-space:pre-wrap}.metric-param-list{display:flex;flex-direction:column;gap:5px}.metric-param-list div{display:grid;grid-template-columns:minmax(90px,.55fr) minmax(0,1fr);gap:8px;padding:7px 8px;border:1px solid var(--line);font:7px/1.35 var(--mono)}.metric-param-list dt{color:var(--dim)}.metric-param-list dt small{display:block;margin-top:3px;color:var(--jade);font:5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}.metric-param-list dd{overflow-wrap:anywhere;color:var(--fog)}
-@media(max-width:760px){.gallery-view-switch{width:100%}.gallery-view-switch button{flex:1}.artifact-kind-chips{width:100%;overflow:auto;flex-wrap:nowrap}.metrics-browser-head{align-items:flex-start;flex-direction:column}.metric-browser-filters{width:100%;justify-content:flex-start}.metric-lens{width:100vw;height:100dvh;margin:0;border:0}.metric-lens-head{gap:9px}.metric-lens-heading>small{display:none}.metric-lens-actions button span{display:none}.metric-lens-content{padding:11px}.metric-lens-hero{grid-template-columns:1fr}.metric-lens-hero-facts{align-items:flex-start}.metric-lens-toolbar{align-items:flex-start;flex-direction:column}.metric-range-selection{text-align:left}.metric-lens-grid{grid-template-columns:1fr}}
+@media(max-width:760px){.gallery-view-switch{width:100%}.gallery-view-switch button{flex:1}.metric-gallery-sections{gap:20px}.metric-category-heading{gap:7px}.metric-gallery-grid.sparse{width:100%;grid-template-columns:minmax(0,1fr)}.metrics-browser-head{align-items:flex-start;flex-direction:column}.metric-browser-filters{width:100%;justify-content:flex-start}.metric-lens{width:100vw;height:100dvh;margin:0;border:0}.metric-lens-head{gap:9px}.metric-lens-heading>small{display:none}.metric-lens-actions button span{display:none}.metric-lens-content{padding:11px}.metric-lens-hero{grid-template-columns:1fr}.metric-lens-hero-facts{align-items:flex-start}.metric-lens-toolbar{align-items:flex-start;flex-direction:column}.metric-range-selection{text-align:left}.metric-lens-grid{grid-template-columns:1fr}}
+@media(hover:none){.metric-card-actions{opacity:1;pointer-events:auto;transform:none}}
 """
 
 _LANDING_JS = """
@@ -10401,13 +11507,18 @@ _LANDING_JS = """
    presenceMeetingMarkup(now);
    clearTimeout(presenceClockTimer);presenceClockTimer=setTimeout(updatePresenceClock,1005-(Date.now()%1000));
  }
- function compactPresence(){if(!galleryPresence)return;galleryPresence.classList.toggle('compact',window.scrollY>180&&!galleryPresence.classList.contains('soon')&&!galleryPresence.classList.contains('live'));}
+ function compactPresence(){
+   var mobile=window.matchMedia&&window.matchMedia('(max-width:760px)').matches,
+       scrolled=mobile&&window.scrollY>180;
+   if(galleryPresence)galleryPresence.classList.toggle('compact',scrolled);
+   document.body.classList.toggle('gallery-mobile-scrolled',scrolled);
+ }
  async function loadPresenceMeetings(){
    if(!galleryPresence)return;
    try{var response=await fetch('/api/gallery/meetings',{headers:{accept:'application/json'}}),data={};try{data=await response.json();}catch(ignore){}if(!response.ok)throw new Error('Calendar unavailable');presenceEvents=Array.isArray(data.events)?data.events:[];presenceMeetingMarkup(new Date());compactPresence();}
    catch(ignore){presenceEvents=[];presenceMeeting.hidden=true;galleryPresence.classList.remove('soon','live');}
  }
- if(galleryPresence){updatePresenceClock();loadPresenceMeetings();window.addEventListener('scroll',compactPresence,{passive:true});compactPresence();presenceCalendarTimer=setInterval(loadPresenceMeetings,120000);document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'){updatePresenceClock();loadPresenceMeetings();}});}
+ if(galleryPresence){updatePresenceClock();loadPresenceMeetings();window.addEventListener('scroll',compactPresence,{passive:true});window.addEventListener('resize',compactPresence,{passive:true});compactPresence();presenceCalendarTimer=setInterval(loadPresenceMeetings,120000);document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'){updatePresenceClock();loadPresenceMeetings();}});}
 
  var activityDialog=document.getElementById('artifact-activity-dialog'),
      activityTitle=document.getElementById('activity-title'),
@@ -10441,6 +11552,20 @@ _LANDING_JS = """
  document.addEventListener('click',function(event){var button=event.target.closest&&event.target.closest('[data-gallery-activity]');if(button){event.preventDefault();event.stopPropagation();openActivity(button.dataset.galleryActivity);}});
  if(activityRange)activityRange.addEventListener('click',function(event){var button=event.target.closest&&event.target.closest('[data-activity-days]');if(!button)return;activityDays=Number(button.dataset.activityDays)||30;loadActivity();});
  if(activityClose)activityClose.addEventListener('click',function(){activityDialog.close();});if(activityDialog)activityDialog.addEventListener('cancel',function(event){event.preventDefault();activityDialog.close();});
+
+ function closeCardActionMenus(except,restoreFocus){
+   [].forEach.call(document.querySelectorAll('.card-actions.open'),function(menu){
+     if(menu===except)return;menu.classList.remove('open');var trigger=menu.querySelector('[data-card-more]');if(trigger)trigger.setAttribute('aria-expanded','false');if(restoreFocus&&trigger)trigger.focus();
+   });
+ }
+ document.addEventListener('click',function(event){
+   var trigger=event.target.closest&&event.target.closest('[data-card-more]');
+   if(trigger){event.preventDefault();event.stopPropagation();var menu=trigger.closest('.card-actions'),opening=!menu.classList.contains('open');closeCardActionMenus(menu,false);menu.classList.toggle('open',opening);trigger.setAttribute('aria-expanded',String(opening));return;}
+   var action=event.target.closest&&event.target.closest('.card-action-items button');
+   if(action){var actionMenu=action.closest('.card-actions');if(actionMenu){actionMenu.classList.remove('open');var actionTrigger=actionMenu.querySelector('[data-card-more]');if(actionTrigger)actionTrigger.setAttribute('aria-expanded','false');}return;}
+   if(!(event.target.closest&&event.target.closest('.card-actions')))closeCardActionMenus(null,false);
+ });
+ document.addEventListener('keydown',function(event){if(event.key==='Escape'&&document.querySelector('.card-actions.open')){event.preventDefault();closeCardActionMenus(null,true);}});
 
  var galleryInbox=document.getElementById('gallery-work-inbox'),
      galleryInboxCount=document.getElementById('gallery-work-inbox-count'),
@@ -10515,7 +11640,9 @@ _LANDING_JS = """
      homeEmpty=document.getElementById('home-empty'),
      homeTitle=document.getElementById('home-title'),
      homeStatus=document.getElementById('home-status'),
-     homeItems=[],homeSparkGradientSequence=0,
+     homeToggle=document.getElementById('semantic-home-toggle'),
+     homeToggleLabel=document.getElementById('semantic-home-toggle-label'),
+     homeItems=[],homeSparkGradientSequence=0,homeCollapsePreference=null,
      trailDialog=document.getElementById('trail-dialog'),
      trailTitle=document.getElementById('trail-title'),
      trailMeta=document.getElementById('trail-meta'),
@@ -10529,6 +11656,17 @@ _LANDING_JS = """
      metricPromoteDescription=document.getElementById('metric-promote-description'),
      metricPromoteError=document.getElementById('metric-promote-error'),
      metricPromotionItemId='',metricPromotionRequest=0;
+ try{
+   var storedHomeCollapse=window.localStorage.getItem('rvbbit.gallery.home.collapsed.v1');
+   if(storedHomeCollapse==='true'||storedHomeCollapse==='false')homeCollapsePreference=storedHomeCollapse==='true';
+ }catch(ignore){}
+ function setHomeCollapsed(collapsed,remember){
+   if(!homeSection)return;homeSection.classList.toggle('collapsed',Boolean(collapsed));
+   if(homeToggle){homeToggle.setAttribute('aria-expanded',String(!collapsed));homeToggle.title=(collapsed?'Expand':'Collapse')+' your private working set';}
+   if(homeToggleLabel)homeToggleLabel.textContent=collapsed?'Expand':'Collapse';
+   if(remember){homeCollapsePreference=Boolean(collapsed);try{window.localStorage.setItem('rvbbit.gallery.home.collapsed.v1',String(homeCollapsePreference));}catch(ignore){}}
+ }
+ function syncHomeCollapse(){setHomeCollapsed(homeCollapsePreference===null?!homeItems.length:homeCollapsePreference,false);}
  function escapeHome(value){
    return String(value==null?'':value).replace(/[&<>"']/g,function(char){
      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char];
@@ -10948,9 +12086,11 @@ _LANDING_JS = """
      var itemId=pinned[button.dataset.homePin]||'';
      button.dataset.homeItemId=itemId;
      button.setAttribute('aria-pressed',String(Boolean(itemId)));
+     var card=button.closest('.card');if(card)card.classList.toggle('pinned',Boolean(itemId));
      button.innerHTML=itemId?'<b aria-hidden="true">✓</b><span>Home</span>':'<b aria-hidden="true">＋</b><span>Pin</span>';
      button.title=itemId?'Remove this artifact from your private Home':'Pin this artifact to your private Home';
    });
+   window.dispatchEvent(new CustomEvent('gallery-pins-synced'));
  }
  async function previewHomeItem(item){
    if(item.kind!=='artifact_object'||item.status!=='ready')return;
@@ -10980,8 +12120,10 @@ _LANDING_JS = """
    homeSparkGradientSequence=0;
    homeGrid.innerHTML=homeItems.map(homeTileMarkup).join('');
    homeEmpty.hidden=Boolean(homeItems.length);
+   homeSection.classList.toggle('is-empty',!homeItems.length);
    homeStatus.classList.remove('error');
-   homeStatus.textContent=homeItems.length?homeItems.length+' pinned object'+(homeItems.length===1?'':'s'):'Private to your signed-in account';
+   homeStatus.textContent=homeItems.length?homeItems.length+' pinned object'+(homeItems.length===1?'':'s'):'Empty · private to your signed-in account';
+   syncHomeCollapse();
    hydrateHomeThumbnails(homeGrid);
    syncGalleryPins();
    homeItems.forEach(previewHomeItem);
@@ -10995,6 +12137,7 @@ _LANDING_JS = """
      renderHome(data);
    }catch(error){
      homeSection.hidden=false;
+     homeSection.classList.remove('is-empty');setHomeCollapsed(false,false);
      homeStatus.classList.add('error');
      homeStatus.textContent=error&&error.message?error.message:'Could not load your Home';
      homeEmpty.hidden=false;
@@ -11134,8 +12277,12 @@ _LANDING_JS = """
  });
 
  var q=document.getElementById('q'),
-     chips=[].slice.call(document.querySelectorAll('.chip')),
      cards=[].slice.call(document.querySelectorAll('.card')),
+     artifactGrid=document.querySelector('#artifact-browser .grid'),
+     sortSelect=document.getElementById('artifact-sort'),
+     areaSelect=document.getElementById('artifact-area'),
+     pinnedFilter=document.getElementById('artifact-pinned-filter'),
+     tallyNode=document.getElementById('gallery-tally'),
      none=document.getElementById('none'),
      semantic=document.getElementById('semantic-launch'),
      semanticButton=document.getElementById('semantic-launch-button'),
@@ -11143,7 +12290,7 @@ _LANDING_JS = """
      semanticLocal=document.getElementById('semantic-launch-local'),
      semanticScope=document.getElementById('semantic-launch-scope'),
      semanticError=document.getElementById('semantic-launch-error'),
-     kind='',semanticBusy=false;
+     area='',pinnedOnly=false,semanticBusy=false;
  function queryText(){return q?(q.value||'').trim().replace(/\\s+/g,' '):'';}
  function metricViewActive(){var metricsBrowser=document.getElementById('metrics-browser');return Boolean(metricsBrowser&&!metricsBrowser.hidden);}
  function syncSemantic(shown){
@@ -11160,14 +12307,47 @@ _LANDING_JS = """
      semanticScope.textContent='docs · artifacts · warehouse semantics';
    }
  }
- function apply(){
+ function artifactSortMode(){return sortSelect&&/^(updated|views|name)$/.test(sortSelect.value)?sortSelect.value:'updated';}
+ function sortArtifactCards(){
+   var mode=artifactSortMode();
+   cards.sort(function(a,b){
+     var fallback=Number(a.dataset.sortOrder||0)-Number(b.dataset.sortOrder||0);
+     if(mode==='name')return String(a.dataset.sortName||'').localeCompare(String(b.dataset.sortName||''),undefined,{sensitivity:'base'})||fallback;
+     if(mode==='views')return Number(b.dataset.sortViews||-1)-Number(a.dataset.sortViews||-1)||Number(b.dataset.sortUpdated||0)-Number(a.dataset.sortUpdated||0)||fallback;
+     return Number(b.dataset.sortUpdated||0)-Number(a.dataset.sortUpdated||0)||fallback;
+   });
+   if(artifactGrid)cards.forEach(function(card){artifactGrid.appendChild(card);});
+ }
+ function syncArtifactUrl(){
+   var url=new URL(window.location.href),text=queryText(),mode=artifactSortMode();
+   if(text)url.searchParams.set('q',text);else url.searchParams.delete('q');
+   url.searchParams.delete('kind');
+   if(area)url.searchParams.set('area',area);else url.searchParams.delete('area');
+   if(mode!=='updated')url.searchParams.set('sort',mode);else url.searchParams.delete('sort');
+   if(pinnedOnly)url.searchParams.set('pinned','1');else url.searchParams.delete('pinned');
+   history.replaceState(history.state||{},'',url);
+ }
+ function apply(persist){
    var t=queryText().toLowerCase(),shown=0;
+   sortArtifactCards();
    cards.forEach(function(c){
-     var ok=(!kind||c.dataset.kind===kind)&&(!t||c.dataset.search.indexOf(t)>=0);
+     var ok=(!area||c.dataset.area===area)&&(!t||c.dataset.search.indexOf(t)>=0)&&(!pinnedOnly||c.classList.contains('pinned'));
      c.style.display=ok?'':'none'; if(ok)shown++;
    });
-   if(none)none.style.display=shown?'none':'block';
+   if(none){none.style.display=shown?'none':'block';none.textContent=pinnedOnly?'No pinned artifacts match these filters.':'No published artifacts match. Explore the company evidence above.';}
+   if(tallyNode&&!metricViewActive())tallyNode.textContent=(t||area||pinnedOnly)?shown+' of '+cards.length+' published artifact'+(cards.length===1?'':'s'):tallyNode.dataset.artifactTally||'';
    syncSemantic(shown);
+   if(persist!==false)syncArtifactUrl();
+ }
+ function restoreArtifactState(){
+   var url=new URL(window.location.href),nextArea=url.searchParams.get('area')||'',nextSort=url.searchParams.get('sort')||'updated';
+   if(q)q.value=url.searchParams.get('q')||'';
+   area=areaSelect&&[].some.call(areaSelect.options,function(option){return option.value===nextArea;})?nextArea:'';
+   if(areaSelect)areaSelect.value=area;
+   if(sortSelect)sortSelect.value=/^(updated|views|name)$/.test(nextSort)?nextSort:'updated';
+   pinnedOnly=Boolean(pinnedFilter&&url.searchParams.get('pinned')==='1');
+   if(pinnedFilter)pinnedFilter.setAttribute('aria-pressed',String(pinnedOnly));
+   apply(false);
  }
  async function launchSemantic(){
    var text=queryText();
@@ -11200,27 +12380,28 @@ _LANDING_JS = """
    }
  }
  if(q){
-   q.addEventListener('input',apply);
+   q.addEventListener('input',function(){apply(true);});
    q.addEventListener('keydown',function(e){
      if(e.key==='Enter'&&!e.isComposing&&!metricViewActive()&&queryText().length>=2){e.preventDefault();launchSemantic();}
    });
  }
  if(semanticButton)semanticButton.addEventListener('click',launchSemantic);
- chips.forEach(function(ch){ch.addEventListener('click',function(){
-   kind=ch.dataset.kind||'';
-   chips.forEach(function(o){o.setAttribute('aria-pressed',String(o===ch))});
-   apply();
- })});
+ if(sortSelect)sortSelect.addEventListener('change',function(){apply(true);});
+ if(areaSelect)areaSelect.addEventListener('change',function(){area=areaSelect.value||'';apply(true);});
+ if(pinnedFilter)pinnedFilter.addEventListener('click',function(){pinnedOnly=!pinnedOnly;pinnedFilter.setAttribute('aria-pressed',String(pinnedOnly));apply(true);});
+ window.addEventListener('gallery-pins-synced',function(){apply(false);});
+ window.addEventListener('popstate',restoreArtifactState);
  // "/" focuses search, the way every browse page should behave
  document.addEventListener('keydown',function(e){
    if(q&&e.key==='/'&&document.activeElement!==q){e.preventDefault();q.focus();}
-   if(q&&e.key==='Escape'&&document.activeElement===q){q.value='';apply();q.blur();}
+   if(q&&e.key==='Escape'&&document.activeElement===q){q.value='';apply(true);q.blur();}
  });
  if(homeSection){
+   if(homeToggle)homeToggle.addEventListener('click',function(){setHomeCollapsed(!homeSection.classList.contains('collapsed'),true);});
    loadHome();
    window.addEventListener('gallery-home-changed',loadHome);
  }
- apply();
+ restoreArtifactState();
 })();
 """
 
@@ -11231,16 +12412,18 @@ _GALLERY_METRICS_JS = """
  var grid=document.getElementById('metric-gallery-grid'),statusNode=document.getElementById('metric-browser-status'),
      empty=document.getElementById('metric-gallery-empty'),category=document.getElementById('metric-category'),
      countNode=document.getElementById('gallery-metric-count'),q=document.getElementById('q'),
-     artifactChips=document.getElementById('artifact-kind-chips'),kicker=document.getElementById('gallery-kicker'),
+     kicker=document.getElementById('gallery-kicker'),
+     artifactControls=document.getElementById('gallery-artifact-controls'),
      title=document.getElementById('gallery-title'),tally=document.getElementById('gallery-tally'),
-     viewButtons=[].slice.call(document.querySelectorAll('[data-gallery-view]')),
-     relationButtons=[].slice.call(document.querySelectorAll('[data-metric-relation]')),
+	     viewButtons=[].slice.call(document.querySelectorAll('[data-gallery-view]')),
+	     relationButtons=[].slice.call(document.querySelectorAll('[data-metric-relation]')),
+	     rangeButtons=[].slice.call(document.querySelectorAll('[data-metric-range]')),
      lens=document.getElementById('metric-lens'),lensTitle=document.getElementById('metric-lens-title'),
      lensMeta=document.getElementById('metric-lens-meta'),lensActions=document.getElementById('metric-lens-actions'),
      lensContent=document.getElementById('metric-lens-content'),lensClose=document.getElementById('metric-lens-close'),
      calliope=browser.dataset.calliope==='true';
- var state={view:'artifacts',loaded:false,loading:false,metrics:[],categories:[],relation:'all',
-   pinIds:{},detail:null,detailDays:90,selected:[],request:0,busy:new Set()};
+	 var state={view:'artifacts',loaded:false,loading:false,metrics:[],categories:[],relation:'all',
+	   rangeDays:7,catalogRequest:0,catalogPromise:null,pinIds:{},detail:null,detailDays:90,selected:[],request:0,busy:new Set()};
  var sparkGradientSequence=0;
  function esc(value){return String(value==null?'':value).replace(/[&<>"']/g,function(char){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char];});}
  function text(value){return String(value==null?'':value).replace(/\\s+/g,' ').trim();}
@@ -11277,22 +12460,25 @@ _GALLERY_METRICS_JS = """
    if(display.unit&&!display.prefix&&!display.suffix&&!/(?:%|usd|currency)/i.test(String(display.unit)))rendered+=' '+display.unit;
    return rendered;
  }
- function points(metric){return (metric.series||[]).map(function(point){return {value:numeric(point.numeric_value!=null?point.numeric_value:point.value),point:point};}).filter(function(item){return item.value!==null;});}
- function sparkline(metric){
-   var values=points(metric);if(values.length<2)return '';
-   var w=600,h=210,pad=0,min=Math.min.apply(null,values.map(function(item){return item.value;})),max=Math.max.apply(null,values.map(function(item){return item.value;}));if(max===min){var cardFlatPad=Math.abs(max)*.08||1;min-=cardFlatPad;max+=cardFlatPad;}var range=max-min;
-   var x=function(index){return pad+index/Math.max(1,values.length-1)*(w-pad*2);},y=function(value){return 18+(max-value)/range*(h-36);};
-   var path=values.map(function(item,index){return (index?'L':'M')+' '+x(index).toFixed(2)+' '+y(item.value).toFixed(2);}).join(' '),gradientId='metric-card-area-gradient-'+(++sparkGradientSequence);
-   return '<div class="metric-card-chart" aria-hidden="true"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><defs><linearGradient id="'+gradientId+'" x1="0" y1="0" x2="0" y2="1"><stop class="metric-card-area-top" offset="0%"></stop><stop class="metric-card-area-mid" offset="54%"></stop><stop class="metric-card-area-clear" offset="82%"></stop><stop class="metric-card-area-floor" offset="100%"></stop></linearGradient></defs><path class="metric-card-area" fill="url(#'+gradientId+')" d="'+path+' L '+x(values.length-1)+' '+h+' L 0 '+h+' Z"></path><path class="metric-card-line" d="'+path+'"></path></svg></div>';
- }
- function statusInfo(metric){
-   var snapshot=metric.snapshot||{},raw=String(snapshot.status||'').toLowerCase(),bad=snapshot.ok===false||/(fail|breach|error)/.test(raw),good=snapshot.ok===true||/(pass|healthy|ok)/.test(raw);
-   return {label:snapshot.status||(snapshot.observation_id?'observed':'not observed'),className:bad?'bad':good?'good':'neutral',bad:bad};
- }
+	 function points(metric){return (metric.series||[]).map(function(point){return {value:numeric(point.numeric_value!=null?point.numeric_value:point.value),point:point};}).filter(function(item){return item.value!==null;});}
+	 function sparkline(metric){
+	   var values=points(metric);if(values.length<2)return '';
+	   var w=600,h=160,pad=0,min=Math.min.apply(null,values.map(function(item){return item.value;})),max=Math.max.apply(null,values.map(function(item){return item.value;}));if(max===min){var cardFlatPad=Math.abs(max)*.08||1;min-=cardFlatPad;max+=cardFlatPad;}var range=max-min;
+	   var windowEnd=Date.now(),windowStart=windowEnd-state.rangeDays*86400000;
+	   var x=function(item,index){var stamp=Date.parse(item.point.data_as_of||item.point.observed_at||'');if(!Number.isFinite(stamp))return pad+index/Math.max(1,values.length-1)*(w-pad*2);return pad+Math.max(0,Math.min(1,(stamp-windowStart)/Math.max(1,windowEnd-windowStart)))*(w-pad*2);},y=function(value){return 12+(max-value)/range*(h-24);};
+	   var path=values.map(function(item,index){return (index?'L':'M')+' '+x(item,index).toFixed(2)+' '+y(item.value).toFixed(2);}).join(' '),gradientId='metric-card-area-gradient-'+(++sparkGradientSequence),firstX=x(values[0],0),lastX=x(values[values.length-1],values.length-1);
+	   return '<div class="metric-card-chart" aria-hidden="true"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><defs><linearGradient id="'+gradientId+'" x1="0" y1="0" x2="0" y2="1"><stop class="metric-card-area-top" offset="0%"></stop><stop class="metric-card-area-mid" offset="54%"></stop><stop class="metric-card-area-clear" offset="82%"></stop><stop class="metric-card-area-floor" offset="100%"></stop></linearGradient></defs><path class="metric-card-area" fill="url(#'+gradientId+')" d="'+path+' L '+lastX+' '+h+' L '+firstX+' '+h+' Z"></path><path class="metric-card-line" d="'+path+'"></path></svg></div>';
+	 }
+	 function statusInfo(metric){
+	   var snapshot=metric.snapshot||{},observed=Boolean(snapshot.observation_id||snapshot.data_as_of||snapshot.observed_at),raw=String(snapshot.status||'').toLowerCase(),bad=observed&&(snapshot.ok===false||/(fail|breach|error)/.test(raw)),good=observed&&(snapshot.ok===true||/(pass|healthy|ok)/.test(raw));
+	   return {label:snapshot.status||(observed?'observed':'not observed'),className:bad?'bad':good?'good':'neutral',bad:bad,observed:observed};
+	 }
+	 function statusMarkup(status){if(!status.observed)return '<span class="metric-card-status missing" title="No materialized observation" aria-label="Not observed">×</span>';if(status.bad)return '<span class="metric-card-status bad">'+esc(status.label)+'</span>';return '';}
  function deltaMarkup(metric){
    var trend=metric.trend;if(!trend)return '';
-   var sign=trend.direction==='up'?'▲':trend.direction==='down'?'▼':'–',value=trend.percent==null?'':Math.abs(Number(trend.percent)).toFixed(1)+'%';
-   return '<small class="'+esc(trend.meaning||'neutral')+'">'+sign+(value?' '+esc(value):'')+'</small>';
+   var meaning=trend.meaning==='good'?'good':trend.meaning==='bad'?'bad':'neutral',sign=trend.direction==='up'?'▲':trend.direction==='down'?'▼':'–',value=trend.percent==null?'':Math.abs(Number(trend.percent)).toFixed(1)+'%';
+   var direction=trend.direction==='up'?'Up':trend.direction==='down'?'Down':'No change',meaningLabel=meaning==='good'?'favorable':meaning==='bad'?'unfavorable':'with no preferred direction defined',label=direction+(value?' '+value:'')+' · '+meaningLabel;
+   return '<small class="metric-card-delta '+meaning+'" title="'+esc(label)+'" aria-label="'+esc(label)+'"><b aria-hidden="true">'+sign+'</b>'+(value?'<span>'+esc(value)+'</span>':'')+'</small>';
  }
  function actionMarkup(metric){
    if(!calliope)return '';
@@ -11301,16 +12487,23 @@ _GALLERY_METRICS_JS = """
      +'<button type="button" data-metric-pin="'+esc(metric.name)+'" class="'+(metric.pinned?'active':'')+'" aria-pressed="'+String(Boolean(metric.pinned))+'" title="'+(metric.pinned?'Remove from Semantic Home':'Pin to Semantic Home')+'">'+(metric.pinned?'✓ Home':'Pin')+'</button>'
      +'<button type="button" class="ask" data-metric-ask="'+esc(metric.name)+'" title="Freeze this observation on a new Calliope stage">✦ Ask</button></div>';
  }
- function cardMarkup(metric){
-   var snapshot=metric.snapshot||{},status=statusInfo(metric),stamp=snapshot.data_as_of||snapshot.observed_at;
-   return '<article class="metric-gallery-card '+(status.bad?'bad':'')+'" data-metric-card="'+esc(metric.name)+'">'
-     +'<div class="metric-card-grid"></div>'+sparkline(metric)
-     +'<button type="button" class="metric-card-open" data-metric-open="'+esc(metric.name)+'" aria-label="Open Metric Lens for '+esc(metric.title)+'"></button>'
-     +actionMarkup(metric)+'<div class="metric-card-content"><div class="metric-card-kicker">'+esc(metric.category)+(metric.subcategory?' · '+esc(metric.subcategory):'')+'</div>'
-     +'<span class="metric-card-status '+status.className+'">'+esc(status.label)+'</span>'
-     +'<div class="metric-card-value">'+esc(formatValue(snapshot.value,metric.display,metric.name))+deltaMarkup(metric)+'</div>'
-     +'<h2 class="metric-card-title">'+esc(metric.title)+'</h2>'+(metric.description?'<p class="metric-card-description">'+esc(metric.description)+'</p>':'')
-     +'<footer class="metric-card-foot"><span>v'+esc(metric.version)+(metric.grain?' · '+esc(metric.grain):'')+(metric.parameter_count?' · '+metric.parameter_count+' params':'')+'</span><span>'+esc(stamp?'observed '+relative(stamp):'no materialized history')+'</span></footer></div></article>';
+	 function cardMarkup(metric){
+	   var snapshot=metric.snapshot||{},status=statusInfo(metric),stamp=snapshot.data_as_of||snapshot.observed_at,meta=(metric.subcategory?metric.subcategory+' · ':'')+'v'+metric.version+(metric.grain?' · '+metric.grain:'')+(metric.parameter_count?' · '+metric.parameter_count+' params':''),age=stamp?relative(stamp):'no history';
+	   return '<article class="metric-gallery-card '+(status.bad?'bad':'')+'" data-metric-card="'+esc(metric.name)+'">'
+	     +'<div class="metric-card-grid"></div>'+sparkline(metric)
+	     +'<button type="button" class="metric-card-open" data-metric-open="'+esc(metric.name)+'" aria-label="Open Metric Lens for '+esc(metric.title)+'"></button>'
+	     +actionMarkup(metric)+'<div class="metric-card-content">'
+	     +statusMarkup(status)
+	     +'<div class="metric-card-value"><strong>'+esc(formatValue(snapshot.value,metric.display,metric.name))+'</strong>'+deltaMarkup(metric)+'</div>'
+	     +'<h2 class="metric-card-title" title="'+esc(metric.title)+'">'+esc(metric.title)+'</h2><p class="metric-card-description" title="'+esc(metric.description||'')+'">'+esc(metric.description||'')+'</p>'
+	     +'<footer class="metric-card-foot"><span title="'+esc(meta)+'">'+esc(meta)+'</span><span title="'+esc(stamp?'Observed '+age:'No materialized history')+'">'+esc(age)+'</span></footer></div></article>';
+	 }
+ function groupedMetrics(metrics){
+   var groups=[],indexes=Object.create(null);metrics.forEach(function(metric){var label=text(metric.category)||'Uncategorized',key=label.toLocaleLowerCase();if(indexes[key]===undefined){indexes[key]=groups.length;groups.push({label:label,metrics:[]});}groups[indexes[key]].metrics.push(metric);});return groups;
+ }
+ function categorySectionMarkup(group,index){
+   var count=group.metrics.length,headingId='metric-category-heading-'+index,gridClass='metric-gallery-grid'+(count<=2?' sparse':'');
+   return '<section class="metric-category-section" aria-labelledby="'+headingId+'"><header class="metric-category-head"><div class="metric-category-heading"><span>Subject area</span><h2 id="'+headingId+'">'+esc(group.label)+'</h2></div><small class="metric-category-count">'+count+' metric'+(count===1?'':'s')+'</small></header><div class="'+gridClass+'" style="--metric-columns:'+Math.max(1,count)+'">'+group.metrics.map(cardMarkup).join('')+'</div></section>';
  }
  function visibleMetrics(){
    var needle=queryText(),selected=category.value||'';
@@ -11321,28 +12514,31 @@ _GALLERY_METRICS_JS = """
    });
  }
  function renderMetrics(){
-   if(!state.loaded)return;var visible=visibleMetrics();grid.innerHTML=visible.map(cardMarkup).join('');
+   if(!state.loaded)return;var visible=visibleMetrics();grid.innerHTML=groupedMetrics(visible).map(categorySectionMarkup).join('');
    empty.hidden=Boolean(visible.length);statusNode.hidden=true;
    var relationLabel=state.relation==='followed'?'in briefs':state.relation;tally.textContent=visible.length+' of '+state.metrics.length+' governed metric'+(state.metrics.length===1?'':'s')+(state.relation!=='all'?' · '+relationLabel:'');
  }
  async function loadPinIds(){
    if(!calliope)return;try{var response=await fetch('/api/calliope/home',{headers:{accept:'application/json'}}),data=await response.json();if(!response.ok)return;state.pinIds={};(data.items||[]).forEach(function(item){if(item.kind==='metric'&&item.canonical_key)state.pinIds[item.canonical_key]=item.id;});}catch(ignore){}
  }
- async function loadMetrics(){
-   if(state.loaded||state.loading)return;state.loading=true;statusNode.hidden=false;statusNode.classList.remove('error');statusNode.innerHTML='<i></i><span>Loading governed metrics…</span>';
-   try{var response=await fetch('/api/gallery/metrics?limit=600',{headers:{accept:'application/json'}}),data=await response.json();if(!response.ok)throw new Error(data.error&&data.error.message||'Metric catalog unavailable');
-     state.metrics=data.metrics||[];state.categories=data.categories||[];state.loaded=true;
-     category.innerHTML='<option value="">Every category</option>'+state.categories.map(function(item){return '<option value="'+esc(item.category)+'">'+esc(item.category)+' · '+esc(item.count)+'</option>';}).join('');
-     countNode.hidden=false;countNode.textContent=state.metrics.length>999?'999+':String(state.metrics.length);await loadPinIds();renderMetrics();
-   }catch(error){statusNode.classList.add('error');statusNode.innerHTML='<span>'+esc(error&&error.message||'Metric catalog unavailable')+'</span>';}
-   finally{state.loading=false;}
- }
+	 function updateRangeButtons(){rangeButtons.forEach(function(button){button.setAttribute('aria-pressed',String(Number(button.dataset.metricRange)===state.rangeDays));button.disabled=state.loading;});}
+	 async function loadMetrics(days,force){
+	   days=Number(days||state.rangeDays);if([7,30,90].indexOf(days)<0)days=7;
+	   if(!force&&state.loaded&&state.rangeDays===days)return;if(state.loading&&state.rangeDays===days&&state.catalogPromise)return state.catalogPromise;
+	   var priorDays=state.rangeDays;state.rangeDays=days;state.loading=true;var request=++state.catalogRequest;updateRangeButtons();browser.setAttribute('aria-busy','true');statusNode.hidden=false;statusNode.classList.remove('error');statusNode.innerHTML='<i></i><span>Loading '+(days===7?'week':days===90?'quarter':'month')+' timeline…</span>';
+	   var promise=(async function(){try{var response=await fetch('/api/gallery/metrics?limit=600&days='+days,{headers:{accept:'application/json'}}),data=await response.json();if(request!==state.catalogRequest)return;if(!response.ok)throw new Error(data.error&&data.error.message||'Metric catalog unavailable');
+	     state.metrics=data.metrics||[];state.categories=data.categories||[];state.rangeDays=Number(data.range_days)||days;state.loaded=true;
+	     var selectedCategory=category.value;category.innerHTML='<option value="">Every category</option>'+state.categories.map(function(item){return '<option value="'+esc(item.category)+'">'+esc(item.category)+' · '+esc(item.count)+'</option>';}).join('');if([].slice.call(category.options).some(function(option){return option.value===selectedCategory;}))category.value=selectedCategory;
+	     countNode.hidden=false;countNode.textContent=state.metrics.length>999?'999+':String(state.metrics.length);await loadPinIds();if(request===state.catalogRequest)renderMetrics();
+	   }catch(error){if(request!==state.catalogRequest)return;state.rangeDays=priorDays;statusNode.classList.add('error');statusNode.innerHTML='<span>'+esc(error&&error.message||'Metric catalog unavailable')+'</span>';}
+	   finally{if(request===state.catalogRequest){state.loading=false;state.catalogPromise=null;browser.removeAttribute('aria-busy');updateRangeButtons();}}})();state.catalogPromise=promise;return promise;
+	 }
  function setView(view,updateUrl){
-   state.view=view==='metrics'?'metrics':'artifacts';var metrics=state.view==='metrics';browser.hidden=!metrics;if(artifactBrowser)artifactBrowser.hidden=metrics;if(artifactChips)artifactChips.hidden=metrics;
+   state.view=view==='metrics'?'metrics':'artifacts';var metrics=state.view==='metrics';browser.hidden=!metrics;if(artifactBrowser)artifactBrowser.hidden=metrics;if(artifactControls)artifactControls.hidden=metrics;
    viewButtons.forEach(function(button){button.setAttribute('aria-selected',String(button.dataset.galleryView===state.view));});
    q.placeholder=metrics?'Search metrics…  (press /)':'Search artifacts…  (press /)';kicker.textContent=metrics?'Governed metric catalog':'Published artifacts';title.innerHTML=metrics?'The numbers that <em>matter</em>.':'Your data, <em>live</em>.';
-   if(q)q.dispatchEvent(new Event('input'));
    if(metrics){loadMetrics().then(renderMetrics);}else tally.textContent=tally.dataset.artifactTally||'';
+   if(q)q.dispatchEvent(new Event('input'));
    if(updateUrl!==false){var url=new URL(window.location.href);if(metrics)url.searchParams.set('view','metrics');else{url.searchParams.delete('view');url.searchParams.delete('metric');url.searchParams.delete('params');}history.replaceState({},'',url);}
  }
  function metricByName(name){return state.metrics.find(function(metric){return metric.name===name;})||(state.detail&&state.detail.name===name?state.detail:null);}
@@ -11382,6 +12578,10 @@ _GALLERY_METRICS_JS = """
    if(!keys.length)return '<p>This metric has no parameters.</p>';
    return '<dl class="metric-param-list">'+keys.map(function(key){var active=Object.prototype.hasOwnProperty.call(current,key),value=active?current[key]:defaults[key];return '<div><dt>'+esc(key)+'<small>'+(active?'Current instance':'Definition default')+'</small></dt><dd>'+esc(typeof value==='object'?JSON.stringify(value):value)+'</dd></div>';}).join('')+'</dl>';
  }
+ function preferredDirectionLabel(metric){
+   var direction=metric&&metric.display&&metric.display.preferred_direction;
+   return direction==='higher'?'Higher is favorable':direction==='lower'?'Lower is favorable':'Neutral · movement is not color-coded';
+ }
  function renderLens(){
    var metric=state.detail;if(!metric)return;var snapshot=metric.snapshot||{},info=statusInfo(metric),stamp=snapshot.data_as_of||snapshot.observed_at;
    lensTitle.textContent=metric.title;lensMeta.textContent=[metric.category,metric.subcategory,'definition v'+metric.version].filter(Boolean).join(' · ');lensActions.innerHTML=lensActionsMarkup(metric);
@@ -11390,7 +12590,7 @@ _GALLERY_METRICS_JS = """
    var artifacts=(metric.artifacts||[]).map(function(item){var path=(item.app_kind||'dashboard')==='dashboard'?'/d/':'/apps/';return '<a href="'+path+esc(item.slug)+'" target="_blank" rel="noopener">'+esc(item.name||item.slug)+' ↗</a>';}).join('');
    lensContent.innerHTML='<section class="metric-lens-hero"><div class="metric-lens-hero-copy"><span>'+esc(info.label)+'</span><strong>'+esc(formatValue(snapshot.value,metric.display,metric.name))+'</strong><p>'+esc(metric.description||'Governed warehouse metric.')+'</p></div><div class="metric-lens-hero-facts"><span><b>Observed</b>'+esc(stamp?relative(stamp):'never')+'</span><span><b>Grain</b>'+esc(metric.grain||'unspecified')+'</span><span><b>Definition</b>v'+esc(metric.version)+'</span><span><b>History</b>'+esc((metric.series||[]).length)+' points</span></div></section>'
      +'<div class="metric-lens-toolbar"><div class="metric-range-buttons">'+[7,30,90,365].map(function(days){return '<button type="button" data-metric-days="'+days+'" class="'+(state.detailDays===days?'active':'')+'">'+(days===365?'1 year':days+' days')+'</button>';}).join('')+'</div><span class="metric-range-selection '+(state.selected.length?'active':'')+'">'+esc(selection)+'</span></div>'
-     +chartMarkup(metric)+'<div class="metric-lens-grid"><section class="metric-lens-panel"><h3>Definition</h3><p>'+esc(metric.description||'No business definition supplied.')+'</p><div class="metric-definition-facts"><span><b>Canonical name</b>'+esc(metric.name)+'</span><span><b>Category</b>'+esc(metric.category)+(metric.subcategory?' · '+esc(metric.subcategory):'')+'</span><span><b>Check</b>'+(metric.has_check?'Governed target':'No target check')+'</span><span><b>Versions</b>'+esc((metric.versions||[]).length)+'</span></div><details class="metric-sql"><summary>Advanced · definition SQL</summary><pre>'+esc(metric.definition_sql||'SQL unavailable')+'</pre></details></section>'
+     +chartMarkup(metric)+'<div class="metric-lens-grid"><section class="metric-lens-panel"><h3>Definition</h3><p>'+esc(metric.description||'No business definition supplied.')+'</p><div class="metric-definition-facts"><span><b>Canonical name</b>'+esc(metric.name)+'</span><span><b>Category</b>'+esc(metric.category)+(metric.subcategory?' · '+esc(metric.subcategory):'')+'</span><span><b>Movement</b>'+esc(preferredDirectionLabel(metric))+'</span><span><b>Check</b>'+(metric.has_check?'Governed target':'No target check')+'</span><span><b>Versions</b>'+esc((metric.versions||[]).length)+'</span></div><details class="metric-sql"><summary>Advanced · definition SQL</summary><pre>'+esc(metric.definition_sql||'SQL unavailable')+'</pre></details></section>'
      +'<section class="metric-lens-panel"><h3>Parameters</h3>'+parameterMarkup(metric)+'</section><section class="metric-lens-panel"><h3>Sources & freshness</h3><div class="metric-source-list">'+(dependencies||'<span>No source lineage resolved</span>')+'</div></section><section class="metric-lens-panel"><h3>Used by artifacts</h3><div class="metric-artifact-list">'+(artifacts||'<span>No published artifact dependency recorded</span>')+'</div></section></div>';
  }
  async function openMetric(name,params,days,updateUrl){
@@ -11401,8 +12601,9 @@ _GALLERY_METRICS_JS = """
  }
  function closeLens(updateUrl){state.request++;state.detail=null;state.selected=[];if(lens&&lens.open)lens.close();if(updateUrl!==false){var url=new URL(window.location.href);url.searchParams.delete('metric');url.searchParams.delete('params');history.replaceState({},'',url);}}
  function choosePoint(id){id=Number(id);if(!Number.isFinite(id))return;if(!state.selected.length)state.selected=[id];else if(state.selected.length===1&&state.selected[0]!==id)state.selected=[state.selected[0],id];else state.selected=[id];renderLens();}
- viewButtons.forEach(function(button){button.addEventListener('click',function(){setView(button.dataset.galleryView,true);});});
- relationButtons.forEach(function(button){button.addEventListener('click',function(){state.relation=button.dataset.metricRelation;relationButtons.forEach(function(item){item.setAttribute('aria-pressed',String(item===button));});renderMetrics();});});
+	 viewButtons.forEach(function(button){button.addEventListener('click',function(){setView(button.dataset.galleryView,true);});});
+	 relationButtons.forEach(function(button){button.addEventListener('click',function(){state.relation=button.dataset.metricRelation;relationButtons.forEach(function(item){item.setAttribute('aria-pressed',String(item===button));});renderMetrics();});});
+	 rangeButtons.forEach(function(button){button.addEventListener('click',function(){var days=Number(button.dataset.metricRange);if(days===state.rangeDays||state.loading)return;loadMetrics(days,true);});});updateRangeButtons();
  category.addEventListener('change',renderMetrics);if(q)q.addEventListener('input',function(){if(state.view==='metrics')renderMetrics();});
  grid.addEventListener('click',function(event){var open=event.target.closest('[data-metric-open]'),follow=event.target.closest('[data-metric-follow]'),pin=event.target.closest('[data-metric-pin]'),ask=event.target.closest('[data-metric-ask]'),target=open||follow||pin||ask;if(!target)return;var name=target.dataset.metricOpen||target.dataset.metricFollow||target.dataset.metricPin||target.dataset.metricAsk,metric=metricByName(name);if(open)openMetric(name,metric&&metric.params,90,true);else if(follow)toggleFollow(metric,follow);else if(pin)togglePin(metric,pin);else askMetric(metric,ask);});
  lensActions.addEventListener('click',function(event){var metric=state.detail;if(!metric)return;var follow=event.target.closest('[data-lens-follow]'),pin=event.target.closest('[data-lens-pin]'),ask=event.target.closest('[data-lens-ask]');if(follow)toggleFollow(metric,follow);else if(pin)togglePin(metric,pin);else if(ask)askMetric(metric,ask);});
@@ -11471,10 +12672,44 @@ def _landing_rows():
     live in rvbbit.plates and never appear here), so no filtering is needed and
     none is wanted: decks and custom app_kinds have public URLs too."""
     with _conn() as c:
-        return c.execute(
+        rows = c.execute(
             "SELECT slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
-            "latest_version, queries, tables, metrics, semantic_objects, updated_at "
+            "latest_version, queries, tables, metrics, semantic_objects,area_id,area_label,"
+            "area_source,area_confidence,updated_at "
             "FROM rvbbit.live_apps ORDER BY updated_at DESC").fetchall()
+    if not rows:
+        return rows
+
+    # Keep the Gallery usable if activity logging is unavailable on an older or
+    # restricted install. A missing total is omitted on the card; a successful
+    # aggregate still distinguishes a genuinely quiet artifact with zero views.
+    totals = None
+    try:
+        slugs = [str(row["slug"]) for row in rows]
+        with _conn() as c:
+            activity_rows = c.execute(
+                "SELECT args->>'slug' AS slug,count(*)::int AS total_views "
+                f"FROM {ACTIVITY_TABLE} WHERE tool='artifact_view' AND ok IS TRUE "
+                "AND caller IS NOT NULL AND args->>'slug'=ANY(%s::text[]) "
+                "GROUP BY args->>'slug'",
+                (slugs,),
+            ).fetchall()
+        totals = {
+            str(row["slug"]): int(row.get("total_views") or 0)
+            for row in activity_rows
+            if row.get("slug")
+        }
+    except Exception as exc:  # noqa: BLE001 — usage insight must not hide the Gallery
+        print(f"landing activity totals: {exc}", file=sys.stderr)
+
+    enriched = []
+    for row in rows:
+        item = dict(row)
+        item["total_views"] = (
+            totals.get(str(item["slug"]), 0) if totals is not None else None
+        )
+        enriched.append(item)
+    return enriched
 
 
 def _warm_thumbs(rows):
@@ -11498,13 +12733,7 @@ def _warm_thumbs(rows):
             print(f"warm thumb {r.get('slug')}: {e}", file=sys.stderr)
 
 
-def _lens_url():
-    """The DataRabbit origin, when there is one. Absent = warehouse-only
-    install, so there is no app to offer."""
-    return os.environ.get("LENS_PUBLIC_URL", "").rstrip("/")
-
-
-def _unmapped_html(identity):
+def _unmapped_html(identity, session=None):
     """Signed in, unknown to the database.
 
     Deliberately a dead end with a next step rather than a 403: the person is
@@ -11520,10 +12749,13 @@ def _unmapped_html(identity):
         0.34, "radial-gradient(1000px 700px at 50% 42%, rgba(16,13,11,.52) 0%, "
               "rgba(16,13,11,.84) 58%, rgba(16,13,11,.95) 100%)",
         scene_key=identity)
+    account = warehouse_theme.account_control(
+        session or {"identity": identity, "via": "password"}
+    )
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
-<title>Access pending — Warehouse</title>
+<title>Access pending · Calliope</title>
 <style>{_LANDING_CSS}
 .gate{{min-height:100vh;display:grid;place-items:center;padding:24px}}
 .gate-card{{max-width:520px;width:100%;border:1px solid var(--line);background:var(--panel);
@@ -11541,26 +12773,30 @@ def _unmapped_html(identity):
 {bg}
 <div class="wash"></div>
 <nav data-warehouse-header>{_RABBIT_SVG}
- <span class="wordmark">DATA RABBIT<small>WAREHOUSE</small></span>
- <span class="who"><span data-warehouse-theme-anchor></span><span class="viewer">{e(identity)}</span><a href="/auth/logout">Sign out</a></span></nav>
+ <span class="calliope-brand"><span class="calliope-brand-name">Calliope</span><span class="calliope-brand-byline">by RVBBIT.AI</span></span>
+ <span class="who"><span data-warehouse-theme-anchor></span>{account}</span></nav>
 <div class="gate"><div class="gate-card">
   <div class="kicker">Access pending</div>
   <h1>You&rsquo;re signed in.</h1>
   <div class="gate-who">{e(identity)}</div>
-  <p>Your sign-in was verified, but this warehouse doesn&rsquo;t have an account
+  <p>Your sign-in was verified, but this workspace doesn&rsquo;t have an account
      for you yet — so there&rsquo;s nothing here you can read.</p>
   <p>Someone with database access needs to map you to a role. Your request has
-     already been recorded, so ask whoever administers this warehouse to grant
+     already been recorded, so ask whoever administers this workspace to grant
      you access; nothing else is needed from you.</p>
   <div class="gate-foot">Once granted, sign in again &mdash; <a href="/auth/logout">sign out</a></div>
 </div></div>
 </body></html>"""
 
 
-def _landing_html(rows, viewer):
+def _landing_html(rows, viewer, session=None):
     import auth
     import warehouse_theme
     from html import escape as e
+
+    account = warehouse_theme.account_control(
+        session or {"identity": viewer, "via": "password"}
+    )
 
     # Far dimmer than the login page's 0.42: a wall of cards has to stay the
     # subject. Cards are opaque, so the scene only ever reads in the hero band
@@ -11580,10 +12816,13 @@ def _landing_html(rows, viewer):
     import calliope
     calliope_enabled = calliope.is_enabled()
 
-    kinds, cards = {}, []
-    for r in rows:
+    areas, cards = {}, []
+    for card_index, r in enumerate(rows):
         app_kind = (r.get("app_kind") or "dashboard").lower()
-        kinds[app_kind] = kinds.get(app_kind, 0) + 1
+        area_id = str(r.get("area_id") or "").strip().lower()
+        area_label = str(r.get("area_label") or "").strip()
+        if area_id and area_label:
+            areas[area_id] = area_label
         slug = r["slug"]
         # Link where the publish tools already told the user to look, so the
         # cards match the URLs sitting in their chat history.
@@ -11608,14 +12847,26 @@ def _landing_html(rows, viewer):
                 deps.append(f"<span><b>{r[key]}</b> {label}</span>")
         if r.get("latest_version"):
             deps.append(f"<span>v<b>{r['latest_version']}</b></span>")
+        raw_total_views = r.get("total_views")
+        try:
+            total_views = int(raw_total_views) if raw_total_views is not None else None
+        except (TypeError, ValueError):
+            total_views = None
+        view_count = (
+            f'<button class="card-view-count" type="button" data-gallery-activity="{e(slug)}" '
+            f'aria-label="View authenticated activity for {e(name)}"><b>{total_views:,}</b> total '
+            f'view{"" if total_views == 1 else "s"}</button>'
+            if total_views is not None else ""
+        )
         artifact_owner = str(r.get("owner_email") or "").strip()
         owner = artifact_owner or r.get("team") or ""
-        haystack = " ".join(str(x) for x in (name, desc, slug, app_kind, owner) if x).lower()
-        activity_action = (
-            f'<button class="card-activity" type="button" data-gallery-activity="{e(slug)}" '
-            f'title="View authenticated activity for this artifact">'
-            f'<b aria-hidden="true">▥</b><span>Views</span></button>'
-        )
+        haystack = " ".join(
+            str(x) for x in (name, desc, slug, owner, area_id, area_label) if x
+        ).lower()
+        try:
+            updated_sort = int(r["updated_at"].timestamp() * 1000)
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            updated_sort = 0
         calliope_actions = (
             f'<button class="card-ask" type="button" data-gallery-ask="{e(slug)}" '
             f'title="Ask Calliope about this exact published version">'
@@ -11625,36 +12876,42 @@ def _landing_html(rows, viewer):
             f'<b aria-hidden="true">＋</b><span>Pin</span></button>'
             if calliope_enabled else ""
         )
-        card_actions = activity_action + calliope_actions
+        card_actions = (
+            '<div class="card-actions">'
+            '<button class="card-more" type="button" data-card-more aria-expanded="false" '
+            'aria-label="Show artifact actions"><b aria-hidden="true">•••</b></button>'
+            f'<div class="card-action-items">{calliope_actions}</div></div>'
+            if calliope_actions else ""
+        )
+        utility_tags = (
+            ('<span class="card-pin-state" aria-hidden="true" title="Pinned to private Home">◆</span>'
+             if calliope_enabled else "")
+            + (f'<span class="pill dim card-area">{e(area_label)}</span>' if area_label else "")
+        )
         cards.append(
             # New tab: the index is a place you come back to, not a page you
-            # navigate away from. The pin is a sibling of the link so both
-            # controls keep valid, predictable browser semantics.
-            f'<article class="card" data-kind="{e(app_kind)}" data-search="{e(haystack)}" '
-            f'data-slug="{e(slug)}">'
+            # navigate away from. Footer and hover actions are siblings of the
+            # link so every control keeps valid, predictable browser semantics.
+            f'<article class="card" data-area="{e(area_id)}" data-search="{e(haystack)}" '
+            f'data-slug="{e(slug)}" data-sort-name="{e(str(name).lower())}" '
+            f'data-sort-updated="{updated_sort}" data-sort-views="{total_views if total_views is not None else -1}" '
+            f'data-sort-order="{card_index}">'
             f'<a class="card-link" href="{e(href)}" target="_blank" rel="noopener">'
             f'<div class="shot">{thumb}<div class="glyph">{_KIND_GLYPH.get(app_kind, "◇")}</div></div>'
             f'<div class="body">'
-            f'<div class="meta"><span class="pill">{e(app_kind)}</span>'
-            + (f'<span class="pill dim">{e(owner)}</span>' if owner else "")
+            f'<div class="meta">'
+            + (f'<span class="pill dim card-owner" title="{e(owner)}">{e(owner)}</span>' if owner else "")
             + f'<span class="when">{e(_rel_time(r.get("updated_at")))}</span></div>'
             f'<h2>{e(name)}</h2>'
             + (f'<p class="desc">{e(desc)}</p>' if desc else "")
-            + (f'<div class="foot">{"".join(deps)}</div>' if deps else "")
             + '</div></a>'
-            + (f'<div class="card-actions">{card_actions}</div>' if card_actions else "")
+            + f'<div class="card-details"><div class="card-utility">{view_count}'
+            + f'<span class="card-utility-tags">{utility_tags}</span></div>'
+            + (f'<div class="foot">{"".join(deps)}</div>' if deps else "")
+            + '</div>'
+            + card_actions
             + '</article>')
 
-    # The rung up the ladder. Only offered when there IS an app (LENS_PUBLIC_URL)
-    # and only to viewers the database can place — an unmapped session reaching
-    # DataRabbit lands in a desktop where every query fails, so withholding the
-    # affordance is the honest move, not a lesser one. Everyone else gets a
-    # browsable index that works, uncluttered by a surface they can't use.
-    lens = _lens_url()
-    _app_link = (
-        f'<a class=applink href="{e(lens)}/" target="_blank" rel="noopener" '
-        f'title="Open Data Desktop in a new window">Open Data Desktop &rarr;</a>'
-    ) if lens else ""
     # Calliope is a true opt-in surface: when Hermes is not configured there is
     # no gallery launcher and its routes are not registered.
     _calliope_link = (
@@ -11700,10 +12957,13 @@ def _landing_html(rows, viewer):
         '<span class="home-title-mark" aria-hidden="true">⌂</span>'
         '<span class="home-title-copy"><strong id="home-title">My Home</strong>'
         '<small>Your private working set · metrics, artifacts, and named business objects</small></span></div>'
-        '<span id="home-status" class="home-status" role="status">Loading your working set…</span></div>'
-        '<div id="home-grid" class="home-grid"></div>'
+        '<div class="home-head-actions"><span id="home-status" class="home-status" role="status">Loading your working set…</span>'
+        '<button id="semantic-home-toggle" class="home-toggle" type="button" aria-controls="home-content" '
+        'aria-expanded="true" title="Collapse your private working set"><span id="semantic-home-toggle-label">Collapse</span>'
+        '<b aria-hidden="true">⌃</b></button></div></div>'
+        '<div id="home-content" class="home-content"><div id="home-grid" class="home-grid"></div>'
         '<div id="home-empty" class="home-empty" hidden><b>Make this yours.</b>'
-        '<span>Pin a metric or artifact here, or use Artifact Lens to pin a named value.</span></div>'
+        '<span>Pin a metric or artifact here, or use Artifact Lens to pin a named value.</span></div></div>'
         '</section>'
         if calliope_enabled else ""
     )
@@ -11753,6 +13013,11 @@ def _landing_html(rows, viewer):
         '<div class="metric-browser-filters">'
         '<select id="metric-category" aria-label="Filter metrics by category">'
         '<option value="">Every category</option></select>'
+        '<div class="metric-gallery-range" role="group" aria-label="Metric timeline range">'
+        '<button type="button" data-metric-range="7" aria-pressed="true">Week</button>'
+        '<button type="button" data-metric-range="30" aria-pressed="false">Month</button>'
+        '<button type="button" data-metric-range="90" aria-pressed="false">Quarter</button>'
+        '</div>'
         '<div class="metric-relation-filter" role="group" aria-label="Filter personal metrics">'
         '<button type="button" data-metric-relation="all" aria-pressed="true">All</button>'
         '<button type="button" data-metric-relation="followed" aria-pressed="false">In Briefs</button>'
@@ -11760,7 +13025,7 @@ def _landing_html(rows, viewer):
         '</div></div></header>'
         '<div id="metric-browser-status" class="metric-browser-status" role="status">'
         '<i></i><span>Loading governed metrics…</span></div>'
-        '<div id="metric-gallery-grid" class="metric-gallery-grid"></div>'
+        '<div id="metric-gallery-grid" class="metric-gallery-sections"></div>'
         '<div id="metric-gallery-empty" class="metric-gallery-empty" hidden>'
         '<strong>No metrics match this view.</strong><span>Try another category or clear the search.</span></div>'
         '</section>'
@@ -11792,12 +13057,11 @@ def _landing_html(rows, viewer):
     )
 
     total = len(rows)
-    tally = " · ".join([f"{total} artifact{'' if total == 1 else 's'}"]
-                       + [f"{n} {k}{'' if n == 1 else 's'}" for k, n in
-                          sorted(kinds.items(), key=lambda kv: -kv[1])])
-    chips = ('<button class="chip" data-kind="" aria-pressed="true">All</button>'
-             + "".join(f'<button class="chip" data-kind="{e(k)}" aria-pressed="false">{e(k)}s</button>'
-                       for k, _ in sorted(kinds.items(), key=lambda kv: -kv[1])))
+    tally = f"{total} artifact{'' if total == 1 else 's'}"
+    area_options = "".join(
+        f'<option value="{e(area_id)}">{e(label)}</option>'
+        for area_id, label in sorted(areas.items(), key=lambda item: item[1].lower())
+    )
 
     toolbar = (
         f'<div class="toolbar"><div class="gallery-view-switch" role="tablist" aria-label="Gallery view">'
@@ -11806,7 +13070,17 @@ def _landing_html(rows, viewer):
         f'<b id="gallery-metric-count" hidden>0</b></button></div>'
         f'<input id="q" type="search" maxlength="600" '
         f'placeholder="Search artifacts…  (press /)" autocomplete="off" spellcheck="false">'
-        f'<div id="artifact-kind-chips" class="artifact-kind-chips">{chips if rows else ""}</div></div>'
+        f'<div id="gallery-artifact-controls" class="gallery-artifact-controls">'
+        + (f'<label class="artifact-area-filter"><span>Area</span>'
+           f'<select id="artifact-area" aria-label="Filter artifacts by Area">'
+           f'<option value="">All areas</option>{area_options}</select></label>' if area_options else '')
+        + f'<label class="artifact-sort"><span>Sort</span><select id="artifact-sort" aria-label="Sort artifacts">'
+        f'<option value="updated">Recently updated</option><option value="views">Most viewed</option>'
+        f'<option value="name">Name A–Z</option></select></label>'
+        + ('<button id="artifact-pinned-filter" class="artifact-pinned-filter" type="button" '
+           'aria-pressed="false" title="Show only artifacts pinned to My Home">◆ Pinned</button>'
+           if calliope_enabled else '')
+        + '</div></div>'
     )
     if rows:
         body = (
@@ -11843,16 +13117,15 @@ def _landing_html(rows, viewer):
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
-<title>Warehouse — published artifacts</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Homemade+Apple&display=swap">
+<title>Calliope · Artifacts</title>
 <style>{_LANDING_CSS}{_GALLERY_METRICS_CSS}</style>
 {warehouse_theme.head_assets()}
 </head><body>
 {_bg_layer}
 <div class="wash"></div>
 <nav data-warehouse-header>{_RABBIT_SVG}
- <span class="wordmark">DATA RABBIT<small>an operational answer engine</small></span>
- <span class="who"><span data-warehouse-theme-anchor></span>{_brief_link}{_inbox_link}{_app_link}{f'<span class="viewer">{e(viewer)}</span>' if viewer else ''}<a href="/auth/logout">Sign out</a></span></nav>
+ <span class="calliope-brand"><span class="calliope-brand-name">Calliope</span><span class="calliope-brand-byline">by RVBBIT.AI</span></span>
+ <span class="who"><span data-warehouse-theme-anchor></span>{_brief_link}{_inbox_link}{account}</span></nav>
 <aside id="gallery-presence" class="gallery-presence" aria-label="Local time and upcoming meetings">
  <div class="presence-clock">
   <div class="presence-time-row" aria-label="Local time">
@@ -11886,6 +13159,12 @@ def register_dashboard_routes(m):
     import auth
     from urllib.parse import quote
     from starlette.responses import HTMLResponse, RedirectResponse, Response
+
+    browser_page_headers = {
+        "cache-control": "private, no-store, max-age=0, must-revalidate",
+        "pragma": "no-cache",
+        "expires": "0",
+    }
 
     def _json(obj, status=200):   # default=str handles Decimal / datetime in query rows
         return Response(json.dumps(obj, default=str), media_type="application/json", status_code=status)
@@ -11969,16 +13248,16 @@ def register_dashboard_routes(m):
         # card would be a dead link, and artifact titles are themselves a
         # disclosure. A closed door beats a broken gallery.
         if not s["mapped"]:
-            return HTMLResponse(_unmapped_html(s["identity"]),
-                                headers={"cache-control": "no-store"})
+            return HTMLResponse(_unmapped_html(s["identity"], s),
+                                headers=browser_page_headers)
         try:
             rows = _landing_rows()
         except Exception as ex:   # noqa: BLE001 — an index that can't query is still a page
             print(f"landing page: {ex}", file=sys.stderr)
             rows = []
         _warm_thumbs(rows)        # background; the page renders immediately
-        return HTMLResponse(_landing_html(rows, s["identity"]),
-                            headers={"cache-control": "no-store"})
+        return HTMLResponse(_landing_html(rows, s["identity"], s),
+                            headers=browser_page_headers)
 
     @m.custom_route("/gallery", methods=["GET"])
     async def _landing_alias(request):
@@ -12227,6 +13506,7 @@ def register_dashboard_routes(m):
                 search=request.query_params.get("search"),
                 category=request.query_params.get("category"),
                 limit=request.query_params.get("limit") or _GALLERY_METRIC_LIMIT,
+                days=request.query_params.get("days") or 7,
             ))
         except (TypeError, ValueError) as exc:
             return _json({"error": {"code": "BAD_METRIC_QUERY", "message": str(exc)}}, 400)
@@ -12810,9 +14090,7 @@ def register_dashboard_routes(m):
         if not sql:
             return _json({"error": {"code": "MISSING_SQL"}}, 400)
         as_of = (body or {}).get("as_of")
-        origin = str((body or {}).get("origin") or "dashboard")
-        if origin not in {"dashboard", "artifact-lens", "semantic-lens"}:
-            origin = "dashboard"
+        origin = _dashboard_query_origin((body or {}).get("origin"))
         t0 = time.time()
         # Burrow: the viewer's session identity IS a PG role — app queries run
         # under it (parked in a contextvar; tool schemas stay clean).
@@ -13148,6 +14426,8 @@ def _register(mcp):
     mcp.tool(name="update_live_app")(_mcp_update_live_app)
     mcp.tool(name="semantic_enrichment_status")(_mcp_semantic_enrichment_status)
     mcp.tool(name="enrich_live_app")(_mcp_enrich_live_app)
+    mcp.tool(name="list_artifact_areas")(_mcp_list_artifact_areas)
+    mcp.tool(name="set_artifact_area")(_mcp_set_artifact_area)
     mcp.tool(name="list_live_apps")(_mcp_list_live_apps)
     mcp.tool(name="get_live_app")(_mcp_get_live_app)
     mcp.tool(name="debug_live_app")(_mcp_debug_live_app)
@@ -13252,6 +14532,7 @@ def _build_mcp():
     _ensure_activity_table()
     _ensure_dashboard_tables()
     _start_semantic_enrichment_worker()
+    _start_artifact_catalog_worker()
     return m
 
 
@@ -13273,6 +14554,7 @@ def _calliope_cube_pivot(
         "measure": measure,
         "aggregate": aggregate,
         "measures": measures,
+        "origin": "calliope_cube",
     }
     t0 = time.time()
     token = _SESSION_SUB.set(execution_subject)
@@ -13782,13 +15064,14 @@ def _calliope_artifact_evidence(query, limit):
     with _conn() as c:
         rows = c.execute(
             "SELECT d.id,d.slug,d.name,d.description,d.owner_email,d.team,d.status,"
-            "d.latest_version,d.updated_at,d.runtime_kind,d.app_kind,v.manifest,"
+            "d.latest_version,d.updated_at,d.runtime_kind,d.app_kind,d.area_id,a.label AS area_label,v.manifest,"
             "e.status AS semantic_status,e.semantic_map,e.verification,e.prompt_version,e.model,"
             "e.updated_at AS semantic_updated_at,coalesce(dep.lineage,'[]'::jsonb) AS lineage "
             "FROM rvbbit.dashboards d "
             "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id AND v.version=d.latest_version "
             "LEFT JOIN rvbbit.artifact_semantic_enrichments e "
             "ON e.dashboard_id=d.id AND e.version=d.latest_version "
+            "LEFT JOIN rvbbit.artifact_areas a ON a.id=d.area_id "
             "LEFT JOIN LATERAL ("
             " SELECT jsonb_agg(DISTINCT jsonb_build_object('kind',x.kind,'ref',x.object_ref)) "
             " FILTER (WHERE x.object_ref IS NOT NULL) AS lineage "
@@ -13817,6 +15100,7 @@ def _calliope_artifact_evidence(query, limit):
         artifact_body = " ".join(
             text for value in (
                 row.get("description"), row.get("slug"), row.get("team"), row.get("app_kind"),
+                row.get("area_id"), row.get("area_label"),
                 semantic_map.get("description"), " ".join(lineage_refs), objects,
             )
             if (text := _calliope_evidence_text(value, 20_000))
@@ -13852,6 +15136,8 @@ def _calliope_artifact_evidence(query, limit):
                     "slug": row.get("slug"),
                     "version": int(row.get("latest_version") or 1),
                     "app_kind": row.get("app_kind"),
+                    "area_id": row.get("area_id"),
+                    "area_label": row.get("area_label"),
                     "semantic_status": row.get("semantic_status") or "none",
                     "lineage": lineage[:16],
                 },
@@ -14146,6 +15432,29 @@ def _trail_artifact_neighbors(table_refs, exclude_slug, limit=5):
     return [dict(row) for row in rows]
 
 
+def _trail_artifact_links(dashboard_id, version, slug, limit=8):
+    """Directed navigation edges, kept distinct from coincidental shared data."""
+    with _conn() as conn:
+        outbound = conn.execute(
+            "SELECT 'outbound' AS direction,target.slug,target.name,target.description,"
+            "target.app_kind,target.latest_version,edge.metadata,edge.source "
+            "FROM rvbbit.dashboard_deps edge JOIN rvbbit.dashboards target "
+            "ON target.slug=edge.object_ref WHERE edge.dashboard_id=%s AND edge.version=%s "
+            "AND edge.kind='artifact' ORDER BY target.name LIMIT %s",
+            (dashboard_id, version, int(limit)),
+        ).fetchall()
+        inbound = conn.execute(
+            "SELECT 'inbound' AS direction,source.slug,source.name,source.description,"
+            "source.app_kind,source.latest_version,edge.metadata,edge.source "
+            "FROM rvbbit.dashboard_deps edge JOIN rvbbit.dashboards source "
+            "ON source.id=edge.dashboard_id AND source.latest_version=edge.version "
+            "WHERE edge.kind='artifact' AND edge.object_ref=%s "
+            "ORDER BY source.name LIMIT %s",
+            (slug, int(limit)),
+        ).fetchall()
+    return [dict(row) for row in [*outbound, *inbound]][:limit]
+
+
 def _trail_brain_document_connection(doc, relationship="mentioned by", *, shared=None):
     doc_id = doc.get("doc_id") if isinstance(doc, dict) else None
     try:
@@ -14194,6 +15503,8 @@ def _trail_artifact(handle, owner, limit):
             facts.append({"label": str(key).replace("_", " ").title(), "value": _semantic_text(value, 160)})
     else:
         facts.append({"label": "Type", "value": str(app_kind).replace("_", " ").title()})
+        if dashboard.get("area_id"):
+            facts.append({"label": "Area", "value": str(dashboard["area_id"]).replace("-", " ").title()})
 
     connections, seen = [], set()
     tables = sorted({
@@ -14232,6 +15543,29 @@ def _trail_artifact(handle, owner, limit):
             if len(connections) >= min(6, limit):
                 break
 
+    for linked in _trail_artifact_links(dashboard["id"], version, slug, 8):
+        target_kind = linked.get("app_kind") or "dashboard"
+        metadata = linked.get("metadata") or {}
+        linked_version = (
+            metadata.get("target_version")
+            if linked.get("direction") == "outbound" and metadata.get("target_version")
+            else linked.get("latest_version")
+        )
+        relationship = "links to" if linked.get("direction") == "outbound" else "linked from"
+        detail = metadata.get("link_text") or linked.get("description") or (
+            "Explicit navigation in this published artifact"
+            if linked.get("direction") == "outbound"
+            else "Explicit navigation from another published artifact"
+        )
+        _trail_append(connections, seen, _trail_connection(
+            relationship, linked.get("name") or linked.get("slug"),
+            kind="artifact",
+            handle={"kind": "artifact", "slug": linked["slug"], "version": linked_version},
+            section="artifacts", detail=detail,
+            url=_semantic_home_artifact_href(linked["slug"], target_kind, linked_version),
+            thumbnail_url=f"/thumbs/{_artifact_kind(target_kind)}/{linked['slug']}.png",
+            confidence=1,
+        ))
     for table in tables[:6]:
         _trail_append(connections, seen, _trail_connection(
             "recreated from" if kind == "artifact_object" else "built from",
@@ -14985,6 +16319,7 @@ def _build_mcp_oauth(public: str):
     /token, /register + the .well-known metadata and verifies PKCE; auth.py supplies
     the storage, the /login page, and signed tokens. The static WAREHOUSE_MCP_KEY is
     still accepted as a bearer (Claude Code), so both auth paths coexist."""
+    global _ACTIVITY_AUTH_PROVIDER
     from mcp.server.fastmcp import FastMCP
     from starlette.responses import PlainTextResponse
     import auth
@@ -14996,6 +16331,7 @@ def _build_mcp_oauth(public: str):
     for w in auth.config_warnings():
         print(f"WARNING: {w}", file=sys.stderr)
     provider = auth.WarehouseAuthProvider(public)
+    _ACTIVITY_AUTH_PROVIDER = provider
     m = FastMCP("rvbbit-warehouse",
                 instructions=_INSTRUCTIONS,
                 auth_server_provider=provider,
@@ -15004,6 +16340,7 @@ def _build_mcp_oauth(public: str):
     _ensure_activity_table()
     _ensure_dashboard_tables()
     _start_semantic_enrichment_worker()
+    _start_artifact_catalog_worker()
     import calliope
     calendar_grant = None
     if auth.google_enabled() and calliope.CalliopeConfig.from_env().enabled:
@@ -15033,6 +16370,7 @@ def _build_mcp_oauth(public: str):
     ):
         print("Calliope enabled (Hermes-backed living artifact notebook)", file=sys.stderr)
         _start_calliope_watch_worker()
+        calliope.start_dream_worker(_conn)
 
     @m.custom_route("/health", methods=["GET"])
     async def _health(_req):

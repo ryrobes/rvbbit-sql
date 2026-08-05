@@ -49,7 +49,9 @@ impl PolarSync {
     }
 
     fn token(&self) -> Option<String> {
-        std::env::var(&self.cfg.token_env).ok().filter(|v| !v.is_empty())
+        std::env::var(&self.cfg.token_env)
+            .ok()
+            .filter(|v| !v.is_empty())
     }
 
     pub async fn lookup(&self, http: &reqwest::Client, raw_key: &str) -> PolarLookup {
@@ -67,7 +69,9 @@ impl PolarSync {
         let stale: Option<Tenant> = {
             let cache = self.cache.lock().expect("polar cache poisoned");
             match cache.get(&h) {
-                Some(e) if e.fetched_at.elapsed() < Duration::from_secs(self.cfg.revalidate_secs) => {
+                Some(e)
+                    if e.fetched_at.elapsed() < Duration::from_secs(self.cfg.revalidate_secs) =>
+                {
                     let t = e.tenant.clone();
                     return if t.status == TenantStatus::Active {
                         PolarLookup::Tenant(t)

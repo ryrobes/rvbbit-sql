@@ -1,9 +1,14 @@
 """Focused contracts for the shared Warehouse image-theme shell."""
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
+from http.cookies import SimpleCookie
 from pathlib import Path
+from types import SimpleNamespace
+
+from starlette.responses import Response
 
 
 _HERE = Path(__file__).resolve().parent
@@ -45,6 +50,8 @@ def test_theme_assets_are_shared_by_every_first_party_warehouse_shell():
     assets = warehouse_theme.head_assets()
     assert '/theme/datarabbit.svg' in assets
     assert 'rel="icon"' in assets
+    assert "family=Homemade+Apple" in assets
+    assert "family=IBM+Plex+Sans" in assets
     assert "/theme/warehouse-theme.css" in assets
     assert "/theme/warehouse-theme.js" in assets
 
@@ -57,12 +64,220 @@ def test_theme_assets_are_shared_by_every_first_party_warehouse_shell():
     assert "/theme/datarabbit.svg" in calliope
     assert all("data-warehouse-theme-anchor" in page for page in (auth, server, calliope))
     assert "auth.register_login_route(m, provider, _RABBIT_SVG)" in server
-    assert "{_LOGIN_RABBIT_SVG}DATA RABBIT" in auth
+    assert "{_LOGIN_RABBIT_SVG}{_CALLIOPE_BRAND}" in auth
+    assert 'class="calliope-brand-name">Calliope' in server
+    assert 'class="calliope-brand-byline">by RVBBIT.AI' in server
+    assert 'class="calliope-brand-name">Calliope' in calliope
+    assert "DATA RABBIT" not in calliope
     assert "var(--amber,#e8b572)" in auth
     favicon = warehouse_theme._FAVICON
     assert favicon.is_file()
     assert 'viewBox="0 0 32 32"' in favicon.read_text(encoding="utf-8")
     assert "/theme/datarabbit.svg" in server
+
+
+def test_authenticated_shells_share_a_right_aligned_accessible_account_menu():
+    markup = warehouse_theme.account_control({
+        "identity": "long.person@example.com",
+        "name": "Long Person",
+        "via": "google",
+        "picture": "https://lh3.googleusercontent.com/a/example",
+    })
+    fallback = warehouse_theme.account_control({
+        "identity": "warehouse.user@example.com",
+        "via": "password",
+    })
+    initials_only = warehouse_theme.account_control({
+        "identity": "warehouse_role",
+        "via": "pg",
+    })
+    calliope_page = (_HERE / "calliope" / "index.html").read_text(encoding="utf-8")
+    calliope_source = (_HERE / "calliope.py").read_text(encoding="utf-8")
+    server_source = (_HERE / "server.py").read_text(encoding="utf-8")
+    theme_source = (_HERE / "theme" / "warehouse-theme.src.js").read_text(encoding="utf-8")
+    theme_bundle = (_HERE / "theme" / "warehouse-theme.js").read_text(encoding="utf-8")
+    theme_css = (_HERE / "theme" / "warehouse-theme.css").read_text(encoding="utf-8")
+    calliope_css = (_HERE / "calliope" / "calliope.css").read_text(encoding="utf-8")
+
+    assert 'data-warehouse-account' in markup
+    assert 'aria-haspopup="menu"' in markup
+    assert 'aria-expanded="false"' in markup
+    assert 'src="/auth/avatar"' in markup
+    assert "googleusercontent.com" not in markup
+    assert "Long Person" in markup
+    assert 'href="/auth/logout" role="menuitem"' in markup
+    assert "WU" in fallback
+    assert 'src="/auth/avatar"' in fallback
+    assert "gravatar.com" not in fallback
+    assert "WR" in initials_only
+    assert 'src="/auth/avatar"' not in initials_only
+
+    header = calliope_page.split('<nav class="topbar"', 1)[1].split("</nav>", 1)[0]
+    assert "__CALLIOPE_ACCOUNT__" in header
+    assert "/auth/logout" not in header
+    assert 'warehouse_theme.account_control(session)' in calliope_source
+    assert '_landing_html(rows, s["identity"], s)' in server_source
+    assert "installAccountControls();" in theme_source
+    assert 'event.key !== "Escape"' in theme_source
+    assert 'avatar?.classList.add("has-image")' in theme_source
+    assert "warehouse-account-avatar-image" in theme_bundle
+    assert ".warehouse-account-menu" in theme_css
+    assert ".warehouse-account-avatar.has-image" in theme_css
+    assert "border: 0" in theme_css
+    assert "body[data-warehouse-page=\"calliope\"] .warehouse-account-email" in theme_css
+    assert ".top-context .instrument-library-open" in calliope_css
+    assert ".brand .calliope-brand{display:none}" in calliope_css
+
+
+def test_google_profile_claims_are_bounded_and_round_trip_only_in_google_sessions(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "warehouse_account_auth_test_module",
+        _HERE / "auth.py",
+    )
+    account_auth = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = account_auth
+    spec.loader.exec_module(account_auth)
+    monkeypatch.setattr(account_auth, "JWT_SECRET", "account-control-test-secret")
+
+    picture = "https://lh3.googleusercontent.com/a/profile-photo"
+    profile = account_auth.google_profile({
+        "name": "  Ada   Lovelace  ",
+        "picture": picture,
+    })
+    assert profile == {"name": "Ada Lovelace", "picture": picture}
+    assert account_auth._google_picture_url("https://example.com/avatar.png") == ""
+    assert account_auth._google_picture_url(
+        "https://googleusercontent.com.evil.example/avatar.png"
+    ) == ""
+    assert account_auth._google_picture_url(
+        "https://user@lh3.googleusercontent.com/avatar.png"
+    ) == ""
+    digest = account_auth.hashlib.sha256(b"user@example.com").hexdigest()
+    assert account_auth._gravatar_url("  User@Example.com ") == (
+        f"https://www.gravatar.com/avatar/{digest}?s=96&d=404&r=g"
+    )
+    assert account_auth._gravatar_url("not-an-email") == ""
+    assert account_auth._gravatar_picture_url(
+        "https://gravatar.com.evil.example/avatar.png"
+    ) == ""
+    auth_source = (_HERE / "auth.py").read_text(encoding="utf-8")
+    assert '"scope": "openid email profile"' in auth_source
+    assert '@mcp.custom_route("/auth/avatar", methods=["GET"])' in auth_source
+    assert "urljoin(current" in auth_source
+    assert "_fetch_gravatar_avatar(identity)" in auth_source
+
+    response = Response()
+    account_auth.set_session(
+        response,
+        "analyst_role",
+        secure=False,
+        identity="ada@example.com",
+        mapped=True,
+        via="google",
+        name=profile["name"],
+        picture=profile["picture"],
+    )
+    cookies = SimpleCookie()
+    cookies.load(response.headers["set-cookie"])
+    request = SimpleNamespace(cookies={
+        account_auth.SESSION_COOKIE: cookies[account_auth.SESSION_COOKIE].value,
+    })
+    session = account_auth.read_session_full(request)
+    assert session["name"] == "Ada Lovelace"
+    assert session["picture"] == picture
+
+    password_response = Response()
+    account_auth.set_session(
+        password_response,
+        "analyst_role",
+        secure=False,
+        identity="ada@example.com",
+        via="password",
+        picture=picture,
+    )
+    cookies = SimpleCookie()
+    cookies.load(password_response.headers["set-cookie"])
+    password_session = account_auth.read_session_full(SimpleNamespace(cookies={
+        account_auth.SESSION_COOKIE: cookies[account_auth.SESSION_COOKIE].value,
+    }))
+    assert password_session["picture"] == ""
+
+    routes = {}
+
+    class MCP:
+        @staticmethod
+        def custom_route(path, methods):
+            def register(handler):
+                routes[(path, tuple(methods))] = handler
+                return handler
+            return register
+
+    class Provider:
+        public = "https://warehouse.example"
+
+        @staticmethod
+        def has_pending(_txn):
+            return True
+
+    active_session = {"value": {
+        "identity": "ada@example.com",
+        "via": "password",
+        "picture": "",
+    }}
+    avatar_calls = []
+
+    async def google_avatar(value):
+        avatar_calls.append(("google", value))
+        return b"google-image", "image/jpeg"
+
+    async def gravatar_avatar(value):
+        avatar_calls.append(("gravatar", value))
+        return b"gravatar-image", "image/png"
+
+    monkeypatch.setattr(
+        account_auth, "read_session_full", lambda _request: active_session["value"]
+    )
+    monkeypatch.setattr(account_auth, "_fetch_google_avatar", google_avatar)
+    monkeypatch.setattr(account_auth, "_fetch_gravatar_avatar", gravatar_avatar)
+    account_auth.register_login_route(MCP(), Provider())
+    avatar_route = routes[("/auth/avatar", ("GET",))]
+
+    result = asyncio.run(avatar_route(SimpleNamespace()))
+    assert result.status_code == 200
+    assert result.body == b"gravatar-image"
+    assert result.media_type == "image/png"
+    assert avatar_calls == [("gravatar", "ada@example.com")]
+
+    active_session["value"] = {
+        "identity": "ada@example.com",
+        "via": "google",
+        "picture": picture,
+    }
+    result = asyncio.run(avatar_route(SimpleNamespace()))
+    assert result.body == b"google-image"
+    assert avatar_calls[-1] == ("google", picture)
+
+    active_session["value"] = {
+        "identity": "warehouse_role",
+        "via": "pg",
+        "picture": "",
+    }
+    result = asyncio.run(avatar_route(SimpleNamespace()))
+    assert result.status_code == 404
+    assert avatar_calls[-1] == ("google", picture)
+
+    async def gravatar_missing(_value):
+        raise account_auth._AvatarNotFound
+
+    active_session["value"] = {
+        "identity": "nobody@example.com",
+        "via": "password",
+        "picture": "",
+    }
+    monkeypatch.setattr(account_auth, "_fetch_gravatar_avatar", gravatar_missing)
+    result = asyncio.run(avatar_route(SimpleNamespace()))
+    assert result.status_code == 404
+    assert result.headers["cache-control"] == "private, no-store"
 
 
 def test_navigation_prepaints_the_desktop_and_never_uses_cross_document_snapshots():
@@ -113,6 +328,10 @@ def test_theme_pipeline_uses_vibrant_tokens_and_browser_storage():
     assert "warehouseBackground" in source
     assert "rvbbit-warehouse-color-mode" in source
     assert "rvbbit-warehouse-background-bridge-v1" in source
+    assert "rvbbit-warehouse-adaptive-theme-v1" in source
+    assert "getSnapshot: getAdaptiveSnapshot" in source
+    assert "adaptiveThemeSnapshot" in source
+    assert "snapshot," in source
     assert "sessionStorage.setItem(BACKGROUND_BRIDGE_KEY" in source
     assert "settleBackgroundBridge" in source
     assert "deriveLightWarehouseTokens" in source
@@ -123,6 +342,7 @@ def test_theme_pipeline_uses_vibrant_tokens_and_browser_storage():
     assert "rvbbit-warehouse-theme-v1" in bundle
     assert "rvbbit-warehouse-color-mode" in bundle
     assert "rvbbit-warehouse-background-bridge-v1" in bundle
+    assert "rvbbit-warehouse-adaptive-theme-v1" in bundle
     assert "/theme/library" in bundle
     assert "data-theme-background-mode" in bundle
     assert "warehouseBackground" in bundle
@@ -158,6 +378,10 @@ def test_container_and_unified_origin_ship_theme_assets():
     assert "warehouse_theme.register_theme_routes(m)" in server
     assert warehouse_theme._ARTIFACT_LENS_JS.is_file()
     assert warehouse_theme._ARTIFACT_LENS_CSS.is_file()
+    assert warehouse_theme._ADAPTIVE_ARTIFACT_JS.is_file()
+    assert "/theme/adaptive-artifact.js" in (
+        _HERE / "warehouse_theme.py"
+    ).read_text(encoding="utf-8")
 
 
 def test_optional_tanstack_runtime_is_versioned_public_and_inlineable_for_captures():
@@ -191,7 +415,7 @@ def test_gallery_calliope_entry_is_a_floating_time_aware_avatar():
     assert 'class="calliope-float-name">Calliope</span>' in server
     assert 'data-day-src="/calliope/callie-avatar-day.jpg"' in server
     assert 'data-night-src="/calliope/callie-avatar-night.jpg"' in server
-    assert "family=Homemade+Apple&display=swap" in server
+    assert "family=Homemade+Apple" in warehouse_theme.head_assets()
     assert "position:fixed;right:var(--calliope-edge);bottom:var(--calliope-edge)" in server
     assert "--gallery-rail-bg:color-mix(in oklch,var(--void) 85%,transparent)" in server
     assert server.count("background:var(--gallery-rail-bg)") == 1
@@ -218,7 +442,7 @@ def test_gallery_calliope_entry_is_a_floating_time_aware_avatar():
     assert "border-bottom" not in shot_rule
     assert (
         '<span class="who"><span data-warehouse-theme-anchor></span>'
-        "{_brief_link}{_inbox_link}{_app_link}"
+        "{_brief_link}{_inbox_link}{account}"
     ) in server
     assert (
         '<span class="who"><span data-warehouse-theme-anchor></span>'

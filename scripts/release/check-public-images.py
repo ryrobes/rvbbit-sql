@@ -53,6 +53,11 @@ def release_capability_images(
     images: set[str] = set()
     prefix = image_prefix.rstrip("/") + "/"
     for entry in doc["capabilities"]:
+        # Managed/external capabilities (for example Clover) are catalog
+        # references, not images produced by capability-images.py. Keep the
+        # public audit aligned with the actual release build eligibility.
+        if entry.get("install_warren") is not True or entry.get("install_docker") is not True:
+            continue
         if not include_all and entry.get("id") not in CORE_CAPABILITY_IDS:
             continue
         image = entry.get("runtime_image")
@@ -62,13 +67,17 @@ def release_capability_images(
 
 
 def product_images(image_prefix: str, version: str, args: argparse.Namespace) -> list[str]:
-    names: list[str] = []
+    # These document sidecars are part of every release, regardless of which
+    # optional core builds were skipped while resuming a release.
+    names: list[str] = ["rvbbit-doc-extract", "rvbbit-gdrive-connector"]
     if not args.skip_db:
         names.append("rvbbit-postgres")
     if not args.skip_lens:
         names.append("rvbbit-lens")
     if not args.skip_warren:
         names.append("rvbbit-warren-agent")
+    if not args.skip_warehouse_mcp:
+        names.append("rvbbit-warehouse-mcp")
     return [f"{image_prefix.rstrip('/')}/{name}:{version}" for name in names]
 
 
@@ -100,6 +109,7 @@ def main() -> None:
     parser.add_argument("--skip-db", action="store_true")
     parser.add_argument("--skip-lens", action="store_true")
     parser.add_argument("--skip-warren", action="store_true")
+    parser.add_argument("--skip-warehouse-mcp", action="store_true")
     parser.add_argument(
         "--with-capabilities",
         action="store_true",

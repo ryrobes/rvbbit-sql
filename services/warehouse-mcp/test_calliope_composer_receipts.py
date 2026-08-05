@@ -643,6 +643,189 @@ def test_rendered_composer_selects_exact_objects_and_shows_durable_receipt(tmp_p
     ]
 
 
+def test_stage_only_runs_artifact_iframes_inside_its_scroll_viewport():
+    playwright = pytest.importorskip("playwright.sync_api")
+
+    class QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        partial(QuietHandler, directory=str(HERE)),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    session_id = "viewport-artifact-session"
+    artifact_loads = []
+    errors = []
+    turns = []
+    surfaces = []
+    for index in range(10):
+        turn_id = f"viewport-turn-{index}"
+        slug = f"viewport-dashboard-{index}"
+        turns.append({
+            "id": turn_id,
+            "session_id": session_id,
+            "ordinal": index + 1,
+            "user_message": f"Revision {index + 1}",
+            "assistant_message": "Revision ready.",
+            "attachments": [],
+            "status": "complete",
+            "turn_kind": "chat",
+            "created_at": f"2026-08-03T14:{index:02d}:00Z",
+            "completed_at": f"2026-08-03T14:{index:02d}:04Z",
+        })
+        surfaces.append({
+            "id": f"viewport-surface-{index}",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "ordinal": 1,
+            "kind": "artifact",
+            "title": f"Dashboard revision {index + 1}",
+            "tool_name": "warehouse__create_live_app",
+            "tool_call_id": f"viewport-call-{index}",
+            "lineage_key": "artifact:viewport-dashboard",
+            "artifact_slug": slug,
+            "artifact_version": index + 1,
+            "payload": {
+                "slug": slug,
+                "version": index + 1,
+                "display_url": f"/calliope/artifacts/{slug}/versions/{index + 1}",
+            },
+            "source": {},
+            "presentation": {},
+            "created_at": f"2026-08-03T14:{index:02d}:01Z",
+        })
+
+    def api_route(route):
+        request = route.request
+        path = urlparse(request.url).path
+        if path == "/api/calliope/config":
+            payload = {
+                "healthy": True,
+                "evidence_search": True,
+                "personal_briefs": False,
+                "google_calendar": False,
+                "action_library": True,
+                "speech_to_text": {"enabled": False},
+            }
+        elif path == "/api/calliope/inbox":
+            payload = {
+                "items": [],
+                "counts": {"unread": 0, "open": 0, "shown": 0, "by_kind": {}},
+            }
+        elif path == "/api/calliope/styles":
+            payload = {"profiles": []}
+        elif path == "/api/calliope/instruments":
+            payload = {"instruments": []}
+        elif path == "/api/calliope/workflows":
+            payload = {"workflows": []}
+        elif path == "/api/calliope/sessions" and request.method == "GET":
+            payload = {"sessions": [{
+                "id": session_id,
+                "title": "Viewport iframe check",
+                "updated_at": "2026-08-03T15:00:00Z",
+                "surface_count": len(surfaces),
+            }]}
+        elif path == f"/api/calliope/sessions/{session_id}" and request.method == "GET":
+            payload = {
+                "session": {
+                    "id": session_id,
+                    "title": "Viewport iframe check",
+                    "updated_at": "2026-08-03T15:00:00Z",
+                },
+                "turns": turns,
+                "surfaces": surfaces,
+            }
+        else:
+            route.fulfill(
+                status=404,
+                content_type="application/json",
+                body='{"error":{"message":"missing fixture"}}',
+            )
+            return
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+
+    def artifact_route(route):
+        slug = urlparse(route.request.url).path.split("/")[3]
+        artifact_loads.append(slug)
+        route.fulfill(
+            status=200,
+            content_type="text/html",
+            body=(
+                "<!doctype html><html><body style='margin:0;background:#071018;color:white'>"
+                f"<main style='height:540px;padding:30px'>{slug}</main>"
+                "</body></html>"
+            ),
+        )
+
+    viewport_contract = """() => {
+      const root = document.querySelector('#stage-scroll');
+      const rootRect = root.getBoundingClientRect();
+      const frames = [...document.querySelectorAll('#stage iframe[data-artifact-src]')];
+      return frames.length === 10 && frames.every(frame => {
+        const rect = frame.getBoundingClientRect();
+        const visible = Math.min(rect.bottom, rootRect.bottom)
+          - Math.max(rect.top, rootRect.top) > 0;
+        const active = frame.dataset.artifactActive === 'true';
+        return active === visible && Boolean(frame.getAttribute('src')) === active;
+      });
+    }"""
+
+    try:
+        with playwright.sync_playwright() as runtime:
+            browser = runtime.chromium.launch(
+                headless=True,
+                executable_path="/usr/bin/chromium",
+            )
+            page = browser.new_page(viewport={"width": 1500, "height": 950})
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.route("**/api/**", api_route)
+            page.route("**/calliope/artifacts/**", artifact_route)
+            page.goto(
+                f"http://127.0.0.1:{server.server_port}/calliope/index.html?session={session_id}",
+                wait_until="networkidle",
+            )
+            page.wait_for_function(viewport_contract)
+            initial_active = page.locator(
+                '#stage iframe[data-artifact-active="true"]'
+            ).count()
+            assert 0 < initial_active < len(surfaces)
+            assert len(set(artifact_loads)) == initial_active
+
+            page.locator("#stage-scroll").evaluate(
+                "node => { node.style.scrollBehavior = 'auto'; node.scrollTop = node.scrollHeight; }"
+            )
+            page.wait_for_timeout(1_100)
+            page.wait_for_function(viewport_contract)
+            bottom_active = page.locator(
+                '#stage iframe[data-artifact-active="true"]'
+            ).count()
+            assert 0 < bottom_active < len(surfaces)
+            assert page.locator(
+                '#stage iframe[data-artifact-active="false"][src]'
+            ).count() == 0
+
+            # Selecting the already-open session rebuilds the Stage just like a
+            # surface mutation. Historical cards must remain dormant afterward.
+            page.locator(f'[data-session-id="{session_id}"]').click()
+            page.wait_for_function(
+                "document.querySelector('#stage-scroll').scrollTop < 1"
+            )
+            page.wait_for_function(viewport_contract)
+            assert page.locator(
+                '#stage iframe[data-artifact-active="true"]'
+            ).count() < len(surfaces)
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert errors == []
+
+
 def test_rendered_artifact_markup_uses_folded_exact_version_capture(tmp_path):
     playwright = pytest.importorskip("playwright.sync_api")
 

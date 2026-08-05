@@ -21,6 +21,14 @@ test("Action Library plans, applies, verifies, and remediates a Workflow", async
 
   await page.locator("#action-library-open").click();
   await expect(page.locator("#action-library-dialog")).toBeVisible();
+  await expect(page.locator('[data-library-mode="inventory"]')).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator("#action-library-list .inventory-card").first()).toBeVisible();
+  await page.locator("#action-library-list .inventory-card").first().click();
+  await expect(page.locator("#inventory-selected")).toBeVisible();
+  await expect(page.locator("#inventory-detail-health")).not.toBeEmpty();
+  const discoverLoaded = page.waitForResponse((response) => response.url().includes("/api/calliope/actions?"));
+  await page.locator('[data-library-mode="discover"]').click();
+  await discoverLoaded;
   const firstSearch = page.waitForResponse((response) => response.url().includes("/api/calliope/actions?"));
   await page.locator("#action-library-search").fill("SQL-backed document source");
   await firstSearch;
@@ -141,6 +149,9 @@ test("Custom MCP connector reveals only the selected transport contract", async 
   ]);
 
   await page.locator("#action-library-open").click();
+  const discoverLoaded = page.waitForResponse((response) => response.url().includes("/api/calliope/actions?"));
+  await page.locator('[data-library-mode="discover"]').click();
+  await discoverLoaded;
   const searched = page.waitForResponse((response) => response.url().includes("/api/calliope/actions?"));
   await page.locator("#action-library-search").fill("custom MCP server");
   await searched;

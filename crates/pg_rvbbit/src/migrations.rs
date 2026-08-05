@@ -981,6 +981,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0240_calliope_object_refs_and_response_receipts",
         include_str!("../sql/migrations/0240_calliope_object_refs_and_response_receipts.sql"),
     ),
+    (
+        "0241_calliope_dreams",
+        include_str!("../sql/migrations/0241_calliope_dreams.sql"),
+    ),
+    (
+        "0242_calliope_dream_portfolio",
+        include_str!("../sql/migrations/0242_calliope_dream_portfolio.sql"),
+    ),
+    (
+        "0243_calliope_dream_evidence_lab",
+        include_str!("../sql/migrations/0243_calliope_dream_evidence_lab.sql"),
+    ),
+    (
+        "0244_artifact_catalog_and_session_synopses",
+        include_str!("../sql/migrations/0244_artifact_catalog_and_session_synopses.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

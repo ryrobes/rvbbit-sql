@@ -187,7 +187,10 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
 /// front doors eat Authorization, so both are first-class).
 fn extract_key(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(k) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
+        if let Some(k) = auth
+            .strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "))
+        {
             if !k.trim().is_empty() {
                 return Some(k.trim().to_string());
             }
@@ -262,7 +265,10 @@ async fn reload_tenants(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         }
         Err(e) => {
             tracing::error!("tenants reload failed, keeping previous store: {e}");
-            (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"ok": false, "error": e})))
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"ok": false, "error": e})),
+            )
                 .into_response()
         }
     }
@@ -271,6 +277,47 @@ async fn reload_tenants(State(state): State<Arc<AppState>>, headers: HeaderMap) 
 #[derive(Deserialize)]
 struct PredictIn {
     inputs: Vec<Value>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct SpecialistUsage {
+    seen: bool,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cost_microusd: i64,
+}
+
+/// Predict-shaped specialist responses may carry their own nested model
+/// usage. This lets composed backends such as web_research preserve the
+/// actual token/provider-cost receipt while ordinary fixed-cost specialists
+/// continue using unit_microusd unchanged.
+fn specialist_usage(outputs: &[Value]) -> SpecialistUsage {
+    let mut total = SpecialistUsage::default();
+    for output in outputs {
+        let Some(usage) = output.get("usage").and_then(Value::as_object) else {
+            continue;
+        };
+        total.seen = true;
+        total.prompt_tokens = total.prompt_tokens.saturating_add(
+            usage
+                .get("prompt_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+        );
+        total.completion_tokens = total.completion_tokens.saturating_add(
+            usage
+                .get("completion_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+        );
+        total.cost_microusd = total.cost_microusd.saturating_add(
+            usage
+                .get("cost_microusd")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+        );
+    }
+    total
 }
 
 async fn predict(
@@ -316,7 +363,11 @@ async fn predict(
             &state,
         );
     }
-    if !tenant.entitlements.iter().any(|e| e == &backend.entitlement) {
+    if !tenant
+        .entitlements
+        .iter()
+        .any(|e| e == &backend.entitlement)
+    {
         return refuse(
             HutchError::not_entitled(&tenant.id, &backend.name, &backend.entitlement),
             "not_entitled",
@@ -356,10 +407,19 @@ async fn predict(
     };
 
     // 5. forward
-    let fwd = forward(&state.http, &state.cfg.upstream, &backend, &inputs).await;
+    let tenant_scope = tenants::hash_key(&format!("clover-research:{}", tenant.id));
+    let fwd = forward(
+        &state.http,
+        &state.cfg.upstream,
+        &backend,
+        &inputs,
+        Some(&tenant_scope),
+    )
+    .await;
     let duration_ms = t0.elapsed().as_secs_f64() * 1000.0;
     match fwd {
         Ok(ok) => {
+            let usage = specialist_usage(&ok.outputs);
             state.meter.record(MeterRow {
                 tenant: &tenant.id,
                 backend: &backend.name,
@@ -369,9 +429,13 @@ async fn predict(
                 duration_ms,
                 upstream_ms: Some(ok.upstream_ms),
                 model_version: &backend.model_version,
-                would_be_cost_microusd: backend.unit_microusd * n as i64,
-                prompt_tokens: None,
-                completion_tokens: None,
+                would_be_cost_microusd: if usage.seen {
+                    usage.cost_microusd
+                } else {
+                    backend.unit_microusd * n as i64
+                },
+                prompt_tokens: usage.seen.then_some(usage.prompt_tokens),
+                completion_tokens: usage.seen.then_some(usage.completion_tokens),
             });
             // Extra fields are ignored by pg_rvbbit's PredictResponse parse;
             // humans with curl get the provenance breadcrumb in-band.
@@ -391,9 +455,10 @@ async fn predict(
                     HutchError::upstream(&backend.name, format!("HTTP {status}: {body_head}")),
                     "upstream_error",
                 ),
-                ForwardErr::Transport(detail) => {
-                    (HutchError::upstream(&backend.name, detail), "upstream_error")
-                }
+                ForwardErr::Transport(detail) => (
+                    HutchError::upstream(&backend.name, detail),
+                    "upstream_error",
+                ),
             };
             state.meter.record(MeterRow {
                 tenant: &tenant.id,
@@ -509,7 +574,7 @@ async fn chat_completions(
         }
     };
 
-    payload["model"] = json!(llm.upstream_model);
+    route_llm_payload(&mut payload, &llm);
     let is_stream = payload
         .get("stream")
         .and_then(|s| s.as_bool())
@@ -518,16 +583,34 @@ async fn chat_completions(
         "{}/v1/chat/completions",
         llm.upstream_base.trim_end_matches('/')
     );
-    let upstream = state
+    let mut request = state
         .http
         .post(&url)
-        .timeout(std::time::Duration::from_millis(llm.timeout_ms))
-        .json(&payload)
-        .send()
-        .await;
+        .timeout(std::time::Duration::from_millis(llm.timeout_ms));
+    match resolve_upstream_bearer_token(&llm, |name| std::env::var(name).ok()) {
+        Ok(Some(token)) => request = request.bearer_auth(token),
+        Ok(None) => {}
+        Err(detail) => {
+            return refuse(
+                HutchError::upstream(&llm.name, detail),
+                "upstream_not_configured",
+            )
+        }
+    }
+    let request = request.json(&payload);
+    // OpenRouter occasionally returns HTTP 200 with an empty/malformed choice
+    // and zero usage. Keep one clone for a bounded non-streaming retry; stream
+    // bodies and valid tool-call responses are never retried.
+    let retry_request = if is_stream { None } else { request.try_clone() };
+    let upstream = request.send().await;
     let resp = match upstream {
         Ok(r) => r,
-        Err(e) => return refuse(HutchError::upstream(&llm.name, e.to_string()), "upstream_error"),
+        Err(e) => {
+            return refuse(
+                HutchError::upstream(&llm.name, e.to_string()),
+                "upstream_error",
+            )
+        }
     };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
@@ -578,7 +661,7 @@ async fn chat_completions(
             .expect("stream response build");
     }
 
-    let out: Value = match resp.json().await {
+    let mut out: Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
             return refuse(
@@ -587,6 +670,52 @@ async fn chat_completions(
             )
         }
     };
+    if !llm_response_has_answer(&out) {
+        let Some(retry) = retry_request else {
+            return refuse(
+                HutchError::upstream(&llm.name, "upstream returned no answer".into()),
+                "upstream_error",
+            );
+        };
+        let retried = match retry.send().await {
+            Ok(response) => response,
+            Err(e) => {
+                return refuse(
+                    HutchError::upstream(&llm.name, format!("retry failed: {e}")),
+                    "upstream_error",
+                )
+            }
+        };
+        if !retried.status().is_success() {
+            let status = retried.status().as_u16();
+            let head: String = retried
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect();
+            return refuse(
+                HutchError::upstream(&llm.name, format!("retry HTTP {status}: {head}")),
+                "upstream_error",
+            );
+        }
+        out = match retried.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return refuse(
+                    HutchError::upstream(&llm.name, format!("bad retry JSON: {e}")),
+                    "upstream_error",
+                )
+            }
+        };
+        if !llm_response_has_answer(&out) {
+            return refuse(
+                HutchError::upstream(&llm.name, "upstream returned no answer after retry".into()),
+                "upstream_error",
+            );
+        }
+    }
     let duration_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let pt = out.pointer("/usage/prompt_tokens").and_then(|v| v.as_i64());
     let ct = out
@@ -612,4 +741,242 @@ async fn chat_completions(
         resp_out.headers_mut().insert("x-hutch-model-version", v);
     }
     resp_out
+}
+
+fn route_llm_payload(payload: &mut Value, llm: &config::LlmCfg) {
+    if let Some(object) = payload.as_object_mut() {
+        for (key, value) in &llm.request_defaults {
+            if key != "model" {
+                match object.get_mut(key) {
+                    Some(current) => merge_json_defaults(current, value),
+                    None => {
+                        object.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        for (key, value) in &llm.request_overrides {
+            if key != "model" {
+                match object.get_mut(key) {
+                    Some(current) => merge_json_overrides(current, value),
+                    None => {
+                        object.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        object.insert("model".into(), json!(llm.upstream_model));
+    }
+}
+
+fn llm_response_has_answer(out: &Value) -> bool {
+    let Some(message) = out.pointer("/choices/0/message") else {
+        return false;
+    };
+    let has_content = match message.get("content") {
+        Some(Value::String(_)) => true,
+        Some(Value::Array(parts)) => !parts.is_empty(),
+        _ => false,
+    };
+    let has_tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
+    let has_refusal = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .is_some_and(|refusal| !refusal.is_empty());
+    has_content || has_tool_calls || has_refusal
+}
+
+fn merge_json_defaults(target: &mut Value, defaults: &Value) {
+    let (Some(target), Some(defaults)) = (target.as_object_mut(), defaults.as_object()) else {
+        return;
+    };
+    for (key, value) in defaults {
+        match target.get_mut(key) {
+            Some(current) => merge_json_defaults(current, value),
+            None => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn merge_json_overrides(target: &mut Value, overrides: &Value) {
+    match (target.as_object_mut(), overrides.as_object()) {
+        (Some(target), Some(overrides)) => {
+            for (key, value) in overrides {
+                match target.get_mut(key) {
+                    Some(current) => merge_json_overrides(current, value),
+                    None => {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        _ => *target = overrides.clone(),
+    }
+}
+
+/// Resolve a hosted LLM credential without ever putting its value in config,
+/// logs, or error messages.  The injected lookup keeps the behavior directly
+/// testable without mutating process-global environment variables.
+fn resolve_upstream_bearer_token<F>(
+    llm: &config::LlmCfg,
+    lookup: F,
+) -> Result<Option<String>, String>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    let Some(raw_env_name) = llm.upstream_bearer_token_env.as_deref() else {
+        return Ok(None);
+    };
+    let env_name = raw_env_name.trim();
+    if env_name.is_empty() {
+        return Err("upstream_bearer_token_env is configured but blank".into());
+    }
+    let token = lookup(env_name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("credential environment variable '{env_name}' is unset or empty"))?;
+    Ok(Some(token))
+}
+
+#[cfg(test)]
+mod llm_upstream_tests {
+    use super::*;
+
+    fn llm(env_name: Option<&str>) -> config::LlmCfg {
+        config::LlmCfg {
+            name: "gemma4".into(),
+            entitlement: "clover_llm".into(),
+            upstream_base: "https://openrouter.ai/api".into(),
+            upstream_bearer_token_env: env_name.map(str::to_string),
+            upstream_model: "~deepseek/deepseek-v4-flash-latest".into(),
+            model_version: "openrouter/deepseek-v4-flash-latest".into(),
+            request_overrides: std::collections::BTreeMap::new(),
+            request_defaults: std::collections::BTreeMap::new(),
+            prompt_microusd_per_1k: 90,
+            completion_microusd_per_1k: 180,
+            timeout_ms: 120_000,
+        }
+    }
+
+    #[test]
+    fn local_llm_needs_no_upstream_credential() {
+        let got = resolve_upstream_bearer_token(&llm(None), |_| None).unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn hosted_llm_resolves_and_trims_credential() {
+        let got = resolve_upstream_bearer_token(&llm(Some("OPENROUTER_API_KEY")), |name| {
+            assert_eq!(name, "OPENROUTER_API_KEY");
+            Some("  secret-token  ".into())
+        })
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn hosted_llm_fails_closed_when_credential_is_missing() {
+        let err =
+            resolve_upstream_bearer_token(&llm(Some("OPENROUTER_API_KEY")), |_| None).unwrap_err();
+        assert!(err.contains("OPENROUTER_API_KEY"));
+        assert!(!err.contains("secret-token"));
+    }
+
+    #[test]
+    fn hosted_llm_fails_closed_when_credential_name_is_blank() {
+        let err = resolve_upstream_bearer_token(&llm(Some("  ")), |_| {
+            panic!("blank environment name must not be looked up")
+        })
+        .unwrap_err();
+        assert!(err.contains("configured but blank"));
+    }
+
+    #[test]
+    fn hosted_llm_request_policy_preserves_explicit_values_and_forces_overrides() {
+        let mut cfg = llm(Some("OPENROUTER_API_KEY"));
+        cfg.request_defaults.insert("temperature".into(), json!(0));
+        cfg.request_defaults.insert("seed".into(), json!(0));
+        cfg.request_defaults.insert(
+            "provider".into(),
+            json!({"allow_fallbacks": true, "sort": "price"}),
+        );
+        cfg.request_overrides
+            .insert("reasoning".into(), json!({"enabled": false}));
+        cfg.request_overrides.insert(
+            "provider".into(),
+            json!({"zdr": true, "data_collection": "deny"}),
+        );
+        cfg.request_overrides
+            .insert("model".into(), json!("must-not-win"));
+        let mut payload = json!({
+            "model": "gemma4",
+            "reasoning": {"enabled": true},
+            "temperature": 0.7,
+            "provider": {"order": ["DeepInfra"], "allow_fallbacks": false},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        route_llm_payload(&mut payload, &cfg);
+
+        assert_eq!(payload["model"], "~deepseek/deepseek-v4-flash-latest");
+        assert_eq!(payload["reasoning"]["enabled"], false);
+        assert_eq!(payload["temperature"], 0.7);
+        assert_eq!(payload["seed"], 0);
+        assert_eq!(payload["provider"]["order"], json!(["DeepInfra"]));
+        assert_eq!(payload["provider"]["allow_fallbacks"], false);
+        assert_eq!(payload["provider"]["sort"], "price");
+        assert_eq!(payload["provider"]["zdr"], true);
+        assert_eq!(payload["provider"]["data_collection"], "deny");
+    }
+
+    #[test]
+    fn hosted_llm_answer_validation_distinguishes_empty_from_tool_calls() {
+        assert!(llm_response_has_answer(
+            &json!({"choices":[{"message":{"content":"ready"}}]})
+        ));
+        assert!(llm_response_has_answer(
+            &json!({"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1"}]}}]})
+        ));
+        assert!(llm_response_has_answer(
+            &json!({"choices":[{"message":{"content":null,"refusal":"cannot comply"}}]})
+        ));
+        assert!(!llm_response_has_answer(&json!({"choices":[]})));
+        assert!(!llm_response_has_answer(
+            &json!({"choices":[{"message":{"content":null}}]})
+        ));
+        assert!(!llm_response_has_answer(
+            &json!({"error":{"message":"temporary"}})
+        ));
+    }
+
+    #[test]
+    fn aggregates_composed_specialist_usage() {
+        let usage = specialist_usage(&[
+            json!({"usage":{"prompt_tokens":100,"completion_tokens":20,"cost_microusd":1200}}),
+            json!({"usage":{"prompt_tokens":50,"completion_tokens":10,"cost_microusd":700}}),
+            json!({"ok":false}),
+        ]);
+        assert_eq!(
+            usage,
+            SpecialistUsage {
+                seen: true,
+                prompt_tokens: 150,
+                completion_tokens: 30,
+                cost_microusd: 1900,
+            }
+        );
+    }
+
+    #[test]
+    fn ordinary_specialists_have_no_composed_usage() {
+        assert_eq!(
+            specialist_usage(&[json!({"score":0.9})]),
+            SpecialistUsage::default()
+        );
+    }
 }

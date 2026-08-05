@@ -83,6 +83,68 @@ def test_metric_display_and_trend_use_governed_direction_not_arrow_color():
     assert rising["direction"] == "up" and rising["meaning"] == "bad"
 
 
+def test_metric_gallery_range_buckets_history_but_keeps_latest_value(monkeypatch):
+    definition = {
+        "name": "monthly_revenue",
+        "version": 4,
+        "description": "Recognized revenue.",
+        "params": {},
+        "grain": "company",
+        "labels": {"display": {"preferred_direction": "higher"}},
+        "has_check": True,
+        "category": "Finance",
+        "subcategory": "Revenue",
+        "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+    }
+    series = [{
+        "observation_id": observation_id,
+        "metric_name": "monthly_revenue",
+        "metric_version": 4,
+        "value": value,
+        "verdict": {"ok": True},
+        "status": "healthy",
+        "trigger": "schedule",
+        "params": {},
+        "data_as_of": datetime(2026, 8, day, tzinfo=timezone.utc),
+        "observed_at": datetime(2026, 8, day, 1, tzinfo=timezone.utc),
+    } for observation_id, value, day in ((40, 100, 1), (41, 110, 4))]
+    latest = [{**series[-1], "observation_id": 42, "value": 999}]
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            if "FROM rvbbit.metric_catalog" in query and "GROUP BY" not in query:
+                return _Result([definition])
+            if "date_bin" in query:
+                assert params == ("3 days", ["monthly_revenue"], 90)
+                return _Result(series)
+            if "DISTINCT ON (o.metric_name)" in query:
+                assert params == (["monthly_revenue"],)
+                return _Result(latest)
+            if "GROUP BY category" in query:
+                return _Result([{"category": "Finance", "count": 1}])
+            raise AssertionError(query)
+
+    monkeypatch.setattr(server, "_conn", lambda: Connection())
+    monkeypatch.setattr(server, "_metric_user_relations", lambda _owner: (set(), set()))
+
+    payload = server._metric_catalog_snapshot(
+        owner="analyst@example.com", days="90",
+    )
+
+    assert payload["range_days"] == 90
+    assert payload["metrics"][0]["snapshot"]["value"] == 999
+    assert [point["value"] for point in payload["metrics"][0]["series"]] == [100, 110]
+    assert payload["metrics"][0]["trend"]["percent"] == pytest.approx(10)
+    with pytest.raises(ValueError, match="week, month, or quarter"):
+        server._metric_catalog_snapshot(days=14)
+
+
 def test_metric_home_handle_tracks_latest_observation_without_replaying_sql(monkeypatch):
     monkeypatch.setattr(server, "_metric_detail_snapshot", lambda *args, **kwargs: {
         "name": "recognized_revenue",
@@ -231,6 +293,36 @@ def test_gallery_metric_schema_routes_and_renderers_ship_as_one_contract():
     assert ".metric-delta.bad" in stage_css
 
 
+def test_metric_gallery_groups_categories_and_explains_semantic_movement():
+    landing = (HERE / "server.py").read_text(encoding="utf-8")
+    docs = (ROOT / "docs" / "METRICS.md").read_text(encoding="utf-8")
+
+    assert 'class="metric-gallery-sections"' in landing
+    assert "function groupedMetrics(metrics)" in landing
+    assert "function categorySectionMarkup(group,index)" in landing
+    assert "groupedMetrics(visible).map(categorySectionMarkup)" in landing
+    assert "metric-card-kicker" not in landing
+    assert "metric-card-delta good" not in landing  # meaning is data-driven, never assumed.
+    assert "metric-card-delta '+meaning" in landing
+    assert "var(--success,#58c982)" in landing
+    assert "var(--danger,#df765f)" in landing
+    assert ".metric-gallery-card:hover .metric-card-actions" in landing
+    assert ".metric-card-chart{position:absolute;z-index:-1;inset:32px 0 140px" in landing
+    assert 'data-metric-range="7"' in landing
+    assert 'data-metric-range="7" aria-pressed="true">Week' in landing
+    assert 'data-metric-range="90"' in landing
+    assert "fetch('/api/gallery/metrics?limit=600&days='+days" in landing
+    assert "function statusMarkup(status)" in landing
+    assert "metric-card-status missing" in landing
+    assert ".metric-card-value{position:absolute;top:18px;right:18px" in landing
+    assert ".metric-card-foot span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" in landing
+    assert "Higher is favorable" in landing
+    assert "Lower is favorable" in landing
+    assert "labels.display" in docs
+    assert '`preferred_direction`' in docs
+    assert '`"neutral"` (the default)' in docs
+
+
 def test_metric_browser_remains_available_without_artifacts_or_calliope(monkeypatch):
     monkeypatch.setattr(calliope, "is_enabled", lambda: False)
 
@@ -242,16 +334,14 @@ def test_metric_browser_remains_available_without_artifacts_or_calliope(monkeypa
     assert 'data-calliope="false"' in page
 
 
-def test_gallery_identity_and_data_desktop_link_match_the_current_product(monkeypatch):
+def test_gallery_identity_does_not_expose_the_expert_data_desktop(monkeypatch):
     monkeypatch.setenv("LENS_PUBLIC_URL", "https://desktop.example")
 
     page = server._landing_html([], "reader@example.com")
 
-    assert "DATA RABBIT<small>an operational answer engine</small>" in page
-    assert "WAREHOUSE</small>" not in page
-    assert (
-        '<a class=applink href="https://desktop.example/" target="_blank" '
-        'rel="noopener" title="Open Data Desktop in a new window">'
-        "Open Data Desktop &rarr;</a>"
-    ) in page
+    assert '<span class="calliope-brand-name">Calliope</span>' in page
+    assert '<span class="calliope-brand-byline">by RVBBIT.AI</span>' in page
+    assert "DATA RABBIT" not in page
+    assert "Open Data Desktop" not in page
+    assert "https://desktop.example/" not in page
     assert "Open DataRabbit" not in page

@@ -14,6 +14,7 @@ import { Vibrant } from "node-vibrant/browser";
 const STORAGE_KEY = "rvbbit-warehouse-theme-v1";
 const MODE_STORAGE_KEY = "rvbbit-warehouse-color-mode";
 const BACKGROUND_BRIDGE_KEY = "rvbbit-warehouse-background-bridge-v1";
+const ADAPTIVE_SNAPSHOT_KEY = "rvbbit-warehouse-adaptive-theme-v1";
 const DB_NAME = "rvbbit-warehouse-browser";
 const DB_VERSION = 1;
 const DB_STORE = "appearance";
@@ -110,9 +111,11 @@ if (document.readyState === "loading") {
 function init() {
   captureBackgroundBridge();
   settleBackgroundBridge();
+  installAccountControls();
   installButton();
   installDialog();
   refreshButton();
+  persistAdaptiveSnapshot();
   if (current?.source?.kind === "upload") {
     void restoreUploadImage(current);
   }
@@ -124,7 +127,66 @@ function init() {
     reset: resetTheme,
     getState: () => current,
     getMode: () => colorMode,
+    getSnapshot: getAdaptiveSnapshot,
     setMode: (mode) => setColorMode(mode),
+  });
+}
+
+function installAccountControls() {
+  document.querySelectorAll("[data-warehouse-account]").forEach((account) => {
+    const trigger = account.querySelector(".warehouse-account-trigger");
+    const menu = account.querySelector(".warehouse-account-menu");
+    if (!(trigger instanceof HTMLButtonElement) || !(menu instanceof HTMLElement)) return;
+
+    const menuItem = menu.querySelector('[role="menuitem"]');
+    const setOpen = (open, focusItem = false) => {
+      trigger.setAttribute("aria-expanded", String(open));
+      menu.hidden = !open;
+      if (open && focusItem && menuItem instanceof HTMLElement) menuItem.focus();
+    };
+    const isOpen = () => trigger.getAttribute("aria-expanded") === "true";
+
+    trigger.addEventListener("click", () => setOpen(!isOpen()));
+    trigger.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+      event.preventDefault();
+      setOpen(true, true);
+    });
+    account.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape" || !isOpen()) return;
+      event.preventDefault();
+      setOpen(false);
+      trigger.focus();
+    });
+    account.addEventListener("focusout", () => {
+      window.setTimeout(() => {
+        if (!account.contains(document.activeElement)) setOpen(false);
+      }, 0);
+    });
+    document.addEventListener("pointerdown", (event) => {
+      if (isOpen() && !account.contains(event.target)) setOpen(false);
+    });
+
+    account.querySelectorAll(".warehouse-account-avatar-image").forEach((image) => {
+      if (!(image instanceof HTMLImageElement)) return;
+      const avatar = image.closest(".warehouse-account-avatar");
+      const reveal = () => {
+        if (image.naturalWidth <= 0) return;
+        image.classList.add("is-ready");
+        avatar?.classList.add("has-image");
+      };
+      const reject = () => {
+        image.classList.remove("is-ready");
+        avatar?.classList.remove("has-image");
+        image.remove();
+      };
+      image.addEventListener("load", reveal, { once: true });
+      image.addEventListener("error", reject, { once: true });
+      if (image.complete) {
+        if (image.naturalWidth > 0) reveal();
+        else reject();
+      }
+    });
   });
 }
 
@@ -230,8 +292,8 @@ function installButton() {
   button = document.createElement("button");
   button.type = "button";
   button.className = "warehouse-theme-button";
-  button.title = "Warehouse appearance";
-  button.setAttribute("aria-label", "Choose warehouse appearance");
+  button.title = "Calliope appearance";
+  button.setAttribute("aria-label", "Choose Calliope appearance");
   button.setAttribute("aria-haspopup", "dialog");
   button.setAttribute("aria-expanded", "false");
   button.innerHTML = '<span class="warehouse-theme-button-thumb" aria-hidden="true"></span>';
@@ -319,8 +381,8 @@ function installDialog() {
         </section>
         <aside class="warehouse-theme-preview">
           <div class="warehouse-theme-preview-image" data-theme-preview-image></div>
-          <h3 data-theme-preview-title>Current warehouse background</h3>
-          <p data-theme-preview-copy>Choose an image. Data Rabbit will derive the interface and chart colors automatically.</p>
+          <h3 data-theme-preview-title>Current Calliope background</h3>
+          <p data-theme-preview-copy>Choose an image. Calliope will derive the interface and chart colors automatically.</p>
           <div class="warehouse-theme-swatches" data-theme-swatches aria-label="Derived color palette"></div>
           <div class="warehouse-theme-background">
             <div class="warehouse-theme-background-head">
@@ -670,6 +732,7 @@ async function restoreUploadImage(state) {
     activeObjectUrl = URL.createObjectURL(blob);
     if (themeBackground(state).mode === "image") setWallpaper(activeObjectUrl);
     refreshButton();
+    notifyThemeChange();
   } catch {
     // Keep the derived colors. The reset action can clear a stale record.
   }
@@ -700,7 +763,7 @@ function refreshButton() {
     ? `Appearance · ${current.source.label || current.source.name || "custom image"} · ${
       themeBackground(current).mode === "solid" ? "solid background" : "wallpaper"
     }`
-    : "Warehouse appearance";
+    : "Calliope appearance";
 }
 
 function showCurrentPreview() {
@@ -715,7 +778,7 @@ function showCurrentPreview() {
   selectedSolidColor = background.solidColor;
   solidColorTouched = Boolean(current?.background?.solidColor);
   const url = current?.source?.kind === "library" ? current.source.url : activeObjectUrl;
-  const label = current?.source?.label || current?.source?.name || "Current warehouse background";
+  const label = current?.source?.label || current?.source?.name || "Current Calliope background";
   renderPreview(url, label, current?.palette || null);
   if (!url && selectedBackgroundMode === "image") {
     const fallback = document.querySelector(".bg");
@@ -820,6 +883,100 @@ function themeBackground(state) {
   };
 }
 
+function adaptiveThemeTokens() {
+  const computed = getComputedStyle(ROOT);
+  const tokens = {};
+  for (const key of THEME_KEYS) {
+    if (key === "--warehouse-wallpaper" || key === "--warehouse-solid-background") continue;
+    const value = String(computed.getPropertyValue(key) || appliedTokens?.[key] || "").trim();
+    if (value && value.length <= 240 && !/[<>{};]/.test(value)) tokens[key] = value;
+  }
+  return tokens;
+}
+
+function adaptiveBackdrop(includeTransient = true) {
+  const background = current ? themeBackground(current) : {
+    mode: ROOT.dataset.warehouseBackground === "solid" ? "solid" : "image",
+    solidColor: String(
+      getComputedStyle(ROOT).getPropertyValue("--warehouse-solid-background")
+      || getComputedStyle(ROOT).getPropertyValue("--background")
+      || "#100d0b",
+    ).trim(),
+  };
+  const backdrop = document.querySelector(".warehouse-desktop-background");
+  const bridge = readBackgroundBridge();
+  let wallpaper = null;
+  let opacity = Number(backdrop?.dataset.warehouseBackgroundOpacity || bridge?.opacity || .64);
+  if (background.mode === "image") {
+    if (current?.source?.kind === "library") wallpaper = current.source.url;
+    else if (current?.source?.kind === "upload") wallpaper = includeTransient ? activeObjectUrl : null;
+    else wallpaper = backdrop?.dataset.warehouseBackgroundUrl || bridge?.url || null;
+  }
+  if (!Number.isFinite(opacity)) opacity = .64;
+  return {
+    mode: background.mode,
+    solid_color: SOLID_COLOR.test(background.solidColor) ? background.solidColor : "#100d0b",
+    wallpaper: wallpaper && (BACKGROUND_BRIDGE_URL.test(wallpaper) || wallpaper.startsWith("blob:"))
+      ? wallpaper
+      : null,
+    wallpaper_opacity: clamp(opacity, .18, 1),
+    upload: current?.source?.kind === "upload" && background.mode === "image",
+  };
+}
+
+function adaptiveThemeSnapshot({ includeTransient = true } = {}) {
+  return {
+    schema_version: "rvbbit.viewer-theme.v1",
+    mode: colorMode,
+    source: {
+      kind: current?.source?.kind || "default",
+      id: current?.source?.id || null,
+      label: current?.source?.label || current?.source?.name || "Calliope default",
+    },
+    tokens: adaptiveThemeTokens(),
+    background: adaptiveBackdrop(includeTransient),
+    material: {
+      glass_background: "color-mix(in oklch, var(--panel) 78%, transparent)",
+      glass_border: "color-mix(in oklch, var(--bone) 15%, transparent)",
+      backdrop_blur: "18px",
+      shadow: colorMode === "light"
+        ? "0 20px 64px rgba(38,42,48,.18)"
+        : "0 20px 64px rgba(0,0,0,.34)",
+    },
+    updated_at: current?.updatedAt || new Date().toISOString(),
+  };
+}
+
+function persistAdaptiveSnapshot(snapshot = null) {
+  try {
+    localStorage.setItem(
+      ADAPTIVE_SNAPSHOT_KEY,
+      JSON.stringify(snapshot || adaptiveThemeSnapshot({ includeTransient: false })),
+    );
+  } catch {
+    // Adaptive artifacts still receive the in-memory snapshot through Calliope.
+  }
+}
+
+async function getAdaptiveSnapshot() {
+  if (
+    current?.source?.kind === "upload"
+    && themeBackground(current).mode === "image"
+    && !activeObjectUrl
+  ) {
+    const blob = await loadUploadBlob().catch(() => null);
+    if (blob) {
+      releaseObjectUrl();
+      activeObjectUrl = URL.createObjectURL(blob);
+      setWallpaper(activeObjectUrl);
+      refreshButton();
+    }
+  }
+  const snapshot = adaptiveThemeSnapshot();
+  persistAdaptiveSnapshot();
+  return snapshot;
+}
+
 function derivedSolidColor(palette) {
   const hue = Number.isFinite(Number(palette?.baseHue))
     ? Number(palette.baseHue)
@@ -884,12 +1041,15 @@ function onStorage(event) {
 }
 
 function notifyThemeChange() {
+  const snapshot = adaptiveThemeSnapshot();
+  persistAdaptiveSnapshot();
   window.dispatchEvent(new CustomEvent("warehouse-theme-change", {
     detail: {
       source: current?.source || null,
       tokens: appliedTokens,
       background: current ? themeBackground(current) : null,
       mode: colorMode,
+      snapshot,
     },
   }));
 }

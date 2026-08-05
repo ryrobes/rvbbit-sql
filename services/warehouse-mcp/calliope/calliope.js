@@ -18,17 +18,46 @@
     inboxList: $("#work-inbox-list"),
     briefOpen: $("#personal-brief-open"),
     briefCount: $("#personal-brief-count"),
+    dreamsOpen: $("#calliope-dreams-open"),
+    dreamsCount: $("#calliope-dreams-count"),
+    dreamsDialog: $("#calliope-dreams-dialog"),
+    dreamsClose: $("#calliope-dreams-close"),
+    dreamsRun: $("#calliope-dreams-run"),
+    dreamsRefresh: $("#calliope-dreams-refresh"),
+    dreamsFilters: $("#calliope-dreams-filters"),
+    dreamsSummary: $("#calliope-dreams-summary"),
+    dreamsList: $("#calliope-dreams-list"),
+    dreamsDetail: $("#calliope-dreams-detail"),
     calendarOpen: $("#google-calendar-open"),
     actionOpen: $("#action-library-open"),
     actionDialog: $("#action-library-dialog"),
     actionClose: $("#action-library-close"),
+    libraryModes: $("#library-modes"),
+    libraryInventoryCount: $("#library-inventory-count"),
+    libraryDiscoverCount: $("#library-discover-count"),
+    libraryChangesCount: $("#library-changes-count"),
     actionSearch: $("#action-library-search"),
     actionCategories: $("#action-library-categories"),
     actionRefresh: $("#action-library-refresh"),
     actionSummary: $("#action-library-summary"),
     actionList: $("#action-library-list"),
-    actionHistoryRefresh: $("#action-history-refresh"),
-    actionHistoryList: $("#action-history-list"),
+    inventoryOpenView: $("#inventory-open-view"),
+    inventoryEmpty: $("#inventory-empty"),
+    inventoryEmptySummary: $("#inventory-empty-summary"),
+    inventoryOverview: $("#inventory-overview"),
+    inventoryWarnings: $("#inventory-warnings"),
+    inventorySelected: $("#inventory-selected"),
+    inventoryDetailState: $("#inventory-detail-state"),
+    inventoryDetailSection: $("#inventory-detail-section"),
+    inventoryDetailTitle: $("#inventory-detail-title"),
+    inventoryDetailSummary: $("#inventory-detail-summary"),
+    inventoryDetailKind: $("#inventory-detail-kind"),
+    inventoryDetailHealth: $("#inventory-detail-health"),
+    inventoryDetailFacts: $("#inventory-detail-facts"),
+    inventoryDetailContext: $("#inventory-detail-context"),
+    inventoryDetailOpen: $("#inventory-detail-open"),
+    inventoryAsk: $("#inventory-ask"),
+    inventoryKnowledgeSource: $("#inventory-knowledge-source"),
     actionEmpty: $("#action-library-empty"),
     actionSelected: $("#action-library-selected"),
     actionDetailState: $("#action-detail-state"),
@@ -48,6 +77,7 @@
     actionOpenWithCalliope: $("#action-open-with-calliope"),
     actionCreatePlan: $("#action-create-plan"),
     actionApply: $("#action-apply"),
+    libraryChangesEmpty: $("#library-changes-empty"),
     newSession: $("#new-session"),
     dialog: $("#new-session-dialog"),
     newSessionForm: $("#new-session-form"),
@@ -218,7 +248,9 @@
     styleVersion: $("#style-version"),
     styleReferenceStrip: $("#style-reference-strip"),
     stylePreview: $("#style-preview"),
+    stylePreviewNote: $("#style-preview-note"),
     styleSourceSummary: $("#style-source-summary"),
+    styleMarkdownLabel: $("#style-markdown-label"),
     styleMarkdown: $("#style-markdown"),
     styleArchive: $("#style-archive"),
     styleFork: $("#style-fork"),
@@ -278,12 +310,16 @@
     sessionTab: "chats",
     lastSessionId: null,
     lastSessionsByTab: {},
+    sessionRefreshTimer: null,
     turns: [],
     surfaces: [],
     selectedSurfaceId: null,
     spatialSelections: [],
     inspectingSurfaceId: null,
     markupCaptureRequests: new Map(),
+    artifactFrameObserver: null,
+    artifactFrameUnloadTimers: new Map(),
+    artifactFrameHeights: new Map(),
     attachments: [],
     evidenceSelections: [],
     composerEditor: null,
@@ -307,6 +343,16 @@
       noteEditors: new Map(),
       noteSaving: new Set(),
       noteObjectCache: new Map(),
+    },
+    dreams: {
+      items: [],
+      counts: { active: 0, new: 0, exploring: 0, adopted: 0, backlog: 0, sleeping: 0 },
+      view: "active",
+      selectedId: null,
+      latestCycle: null,
+      loading: false,
+      running: false,
+      viewedIds: new Set(),
     },
     viewerRequestId: 0,
     viewerSurface: null,
@@ -342,7 +388,23 @@
     chatAtLiveEdge: true,
     newSurfaceCount: 0,
     config: null,
+    libraryMode: "inventory",
+    inventoryItems: [],
+    inventorySections: [],
+    inventoryStates: [],
+    inventorySummary: { total: 0, needs_attention: 0, healthy: 0, ready: 0, working: 0, inactive: 0 },
+    inventoryWarnings: [],
+    inventorySection: "",
+    inventoryState: "",
+    inventoryRef: null,
+    inventoryItem: null,
+    inventoryLoading: false,
+    inventorySearchTimer: null,
+    inventoryHandoffLoading: false,
+    inventoryQuery: "",
     actions: [],
+    actionQuery: "",
+    actionTotal: 0,
     actionCategories: [],
     actionCategory: "",
     actionRequirement: "",
@@ -404,10 +466,12 @@
   };
 
   const THINKING_STATES = ["working", "composing", "solving"];
+  const ARTIFACT_FRAME_UNLOAD_DELAY_MS = 900;
   const CHAT_WIDTH_KEY = "rvbbit-calliope-chat-width-v1";
   const LAST_SESSION_KEY = "rvbbit-calliope-last-session-v1";
   const SESSION_TAB_KEY = "rvbbit-calliope-session-tab-v1";
   const TAB_SESSIONS_KEY = "rvbbit-calliope-tab-sessions-v1";
+  const LIBRARY_MODE_KEY = "rvbbit-calliope-library-mode-v1";
   const SESSION_TABS = [
     { id: "chats", label: "Chats", empty: "No conversations here yet." },
     { id: "briefs", label: "Briefs", empty: "No Daily Brief notebooks yet." },
@@ -1248,6 +1312,267 @@
     loadInbox().catch(() => {});
   }
 
+  function dreamTypeLabel(value) {
+    return ({
+      quick_win: "Quick win",
+      connection: "Connection",
+      automation: "Automation",
+      strategic: "Project",
+      question: "Question",
+    })[value] || String(value || "Dream").replaceAll("_", " ");
+  }
+
+  function dreamOutputLabel(value) {
+    return ({ prototype: "Inspect now", project_plan: "Project plan", question: "Unlocking question" })[value]
+      || String(value || "prototype").replaceAll("_", " ");
+  }
+
+  function dreamListCard(dream) {
+    const selected = dream.id === state.dreams.selectedId;
+    const recurrence = Number(dream.recurrence_count || 1);
+    const inWings = dream.portfolio_state === "backlog";
+    const editorialScore = Math.round(Number(dream.rank_score || 0) * 100);
+    return `<button class="calliope-dream-card ${selected ? "active" : ""}" type="button"
+      data-dream-id="${escapeHtml(dream.id)}" data-impact="${escapeHtml(dream.impact || "medium")}" data-portfolio-state="${inWings ? "backlog" : "promoted"}">
+      <span class="calliope-dream-card-mark" aria-hidden="true">${dream.output_kind === "project_plan" ? "◇" : dream.output_kind === "question" ? "?" : "✦"}</span>
+      <span class="calliope-dream-card-copy">
+        <small>${inWings ? "In the wings · " : ""}${escapeHtml(dreamTypeLabel(dream.dream_type))} · ${escapeHtml(dreamOutputLabel(dream.output_kind))}</small>
+        <strong>${escapeHtml(dream.title || "Untitled Dream")}</strong>
+        <p>${escapeHtml(dream.thesis || "")}</p>
+        <em>${escapeHtml(relativeTime(dream.updated_at))}${recurrence > 1 ? ` · returned ${recurrence}×` : ""}${inWings && editorialScore ? ` · ${editorialScore}% signal` : ""}</em>
+      </span>
+      <i aria-hidden="true">›</i>
+    </button>`;
+  }
+
+  function dreamOutputMarkup(dream) {
+    const output = dream.output && typeof dream.output === "object" ? dream.output : {};
+    const sections = Array.isArray(output.sections) ? output.sections.slice(0, 8) : [];
+    const phases = Array.isArray(output.phases) ? output.phases.slice(0, 8) : [];
+    const metrics = Array.isArray(output.suggested_metrics) ? output.suggested_metrics.slice(0, 10) : [];
+    const measures = Array.isArray(output.success_measures) ? output.success_measures.slice(0, 10) : [];
+    return `<section class="calliope-dream-output" data-output-kind="${escapeHtml(dream.output_kind || "prototype")}">
+      <header><span>${escapeHtml(dreamOutputLabel(dream.output_kind))}</span><b>${escapeHtml(String(output.artifact_type || "analysis").replaceAll("_", " "))}</b></header>
+      <h4>${escapeHtml(output.headline || dream.title || "Dream output")}</h4>
+      ${output.summary ? `<p>${escapeHtml(output.summary)}</p>` : ""}
+      ${sections.length ? `<div class="calliope-dream-sections">${sections.map((section) => `<article><span>${escapeHtml(section?.title || "Idea")}</span><p>${escapeHtml(section?.content || "")}</p></article>`).join("")}</div>` : ""}
+      ${phases.length ? `<div class="calliope-dream-phases"><span>Proposed path</span>${phases.map((phase, index) => `<article><i>${index + 1}</i><div><strong>${escapeHtml(phase?.name || `Phase ${index + 1}`)}</strong><p>${escapeHtml(phase?.outcome || "")}</p></div></article>`).join("")}</div>` : ""}
+      ${metrics.length || measures.length ? `<div class="calliope-dream-chips">
+        ${metrics.map((item) => `<span><b>Metric</b>${escapeHtml(item)}</span>`).join("")}
+        ${measures.map((item) => `<span><b>Success</b>${escapeHtml(item)}</span>`).join("")}
+      </div>` : ""}
+    </section>`;
+  }
+
+  function dreamEvidenceMarkup(dream) {
+    const evidence = Array.isArray(dream.evidence) ? dream.evidence.slice(0, 8) : [];
+    if (!evidence.length) return `<section class="calliope-dream-evidence"><header><span>Why this appeared</span><b>Evidence pending</b></header><p>Calliope kept this tentative because the supporting pattern was weak.</p></section>`;
+    return `<section class="calliope-dream-evidence">
+      <header><span>Why this appeared</span><b>${evidence.length} observation${evidence.length === 1 ? "" : "s"}</b></header>
+      <div>${evidence.map((item) => `<article>
+        <i aria-hidden="true"></i><div><small>${escapeHtml(String(item?.kind || "observation").replaceAll("_", " "))} · ${Number(item?.signal_count || 1)} signal${Number(item?.signal_count || 1) === 1 ? "" : "s"}</small>
+        <strong>${escapeHtml(item?.title || "Observed company pattern")}</strong><p>${escapeHtml(item?.summary || "")}</p></div>
+      </article>`).join("")}</div>
+    </section>`;
+  }
+
+  function dreamProbeMarkup(dream) {
+    const probes = Array.isArray(dream.probe_receipts) ? dream.probe_receipts.slice(0, 8) : [];
+    if (!probes.length) return "";
+    const completed = probes.filter((item) => item?.execution_status === "complete").length;
+    const supported = probes.filter((item) => item?.verdict === "supported").length;
+    const contradicted = probes.filter((item) => item?.verdict === "contradicted").length;
+    const statusLine = [
+      `${completed}/${probes.length} ran`,
+      supported ? `${supported} supported` : "",
+      contradicted ? `${contradicted} complicated` : "",
+    ].filter(Boolean).join(" · ");
+    return `<details class="calliope-dream-tests">
+      <summary><span><i aria-hidden="true">⌁</i> What Calliope tested</span><b>${escapeHtml(statusLine)}</b><em aria-hidden="true">⌄</em></summary>
+      <div>${probes.map((item) => {
+        const verdict = item?.execution_status === "error" ? "error" : (item?.verdict || "untested");
+        const elapsed = Number(item?.elapsed_ms || 0);
+        const preview = item?.result_preview && typeof item.result_preview === "object"
+          ? JSON.stringify(item.result_preview, null, 2).slice(0, 2400)
+          : "";
+        return `<article data-verdict="${escapeHtml(verdict)}">
+          <header><span>${escapeHtml(String(verdict).replaceAll("_", " "))}</span><b>${escapeHtml(item?.operator || "read-only SQL")}</b></header>
+          <h5>${escapeHtml(item?.hypothesis || "Bounded company hypothesis")}</h5>
+          <p>${escapeHtml(item?.result_summary || item?.error || "This test did not produce an interpretable result.")}</p>
+          <dl>
+            <div><dt>Could disprove it</dt><dd>${escapeHtml(item?.falsifier || "No explicit falsifier was retained.")}</dd></div>
+            <div><dt>Receipt</dt><dd>${Number(item?.row_count || 0)} bounded row${Number(item?.row_count || 0) === 1 ? "" : "s"}${elapsed ? ` · ${elapsed < 1000 ? `${elapsed}ms` : `${(elapsed / 1000).toFixed(1)}s`}` : ""}${item?.cached ? " · reused within 24h" : ""}</dd></div>
+          </dl>
+          ${preview ? `<details><summary>Result preview</summary><pre>${escapeHtml(preview)}</pre></details>` : ""}
+          ${item?.sql ? `<details><summary>Inspect the bounded query</summary><code>${escapeHtml(item.sql)}</code></details>` : ""}
+        </article>`;
+      }).join("")}</div>
+    </details>`;
+  }
+
+  function renderDreamDetail() {
+    const dream = state.dreams.items.find((item) => item.id === state.dreams.selectedId);
+    if (!dream) {
+      els.dreamsDetail.innerHTML = `<div class="calliope-dreams-empty"><i aria-hidden="true">☾</i><p class="eyebrow">Nothing in this view</p><h3>The quiet state is valid.</h3><p>Dreams appear only when recent activity clears the evidence and novelty bar.</p></div>`;
+      return;
+    }
+    const asleep = dream.viewer_state === "sleeping";
+    const dismissed = dream.viewer_state === "dismissed";
+    const adopted = dream.status === "adopted";
+    const inWings = dream.portfolio_state === "backlog";
+    const entities = Array.isArray(dream.entities) ? dream.entities.slice(0, 12) : [];
+    els.dreamsDetail.innerHTML = `<article class="calliope-dream-detail-card" data-dream-status="${escapeHtml(dream.status || "proposed")}">
+      <header class="calliope-dream-detail-head">
+        <div><span>${inWings ? "In the wings · " : ""}${escapeHtml(dreamTypeLabel(dream.dream_type))}</span><h3>${escapeHtml(dream.title)}</h3><p>${escapeHtml(dream.thesis || "")}</p></div>
+        <aside><b>${escapeHtml(dream.impact || "medium")} impact</b><b>${escapeHtml(dream.effort || "medium")} effort</b><b>${Math.round(Number(dream.confidence || 0) * 100)}% confidence</b>${inWings ? `<b>${Math.round(Number(dream.rank_score || 0) * 100)}% editorial signal</b>` : ""}</aside>
+      </header>
+      ${entities.length ? `<div class="calliope-dream-entities">${entities.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>` : ""}
+      ${dreamOutputMarkup(dream)}
+      ${dream.rationale ? `<section class="calliope-dream-rationale"><span>Calliope’s reasoning</span><p>${escapeHtml(dream.rationale)}</p></section>` : ""}
+      ${dreamProbeMarkup(dream)}
+      ${dreamEvidenceMarkup(dream)}
+      <footer class="calliope-dream-actions">
+        <p>${adopted ? "Adopted into the company’s working memory." : asleep ? "Sleeping until more time or evidence passes." : dismissed ? "Hidden for you; the company Dream remains intact." : inWings ? "A credible candidate held quietly outside the three-item shelf. Exploring it promotes it into active work." : "The Dream is a hypothesis. Calliope will verify it again before building."}</p>
+        ${asleep || dismissed ? `<button type="button" data-dream-action="reopen">Wake it</button>` : `
+          <button type="button" data-dream-action="sleep">Sleep on it</button>
+          <button type="button" data-dream-action="dismiss">Not useful</button>`}
+        ${adopted ? "" : `<button type="button" data-dream-action="adopt">Adopt</button>`}
+        <button class="primary-action" type="button" data-dream-handoff>Explore with Calliope →</button>
+      </footer>
+    </article>`;
+  }
+
+  function renderDreams() {
+    const counts = state.dreams.counts || {};
+    $$('[data-dream-view]', els.dreamsFilters).forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.dreamView === state.dreams.view));
+    });
+    $$('[data-dream-count]', els.dreamsFilters).forEach((node) => {
+      node.textContent = Number(counts[node.dataset.dreamCount] || 0) > 99 ? "99+" : String(Number(counts[node.dataset.dreamCount] || 0));
+    });
+    const newCount = Number(counts.new || 0);
+    els.dreamsCount.hidden = !newCount;
+    els.dreamsCount.textContent = newCount > 99 ? "99+" : String(newCount);
+    const cycle = state.dreams.latestCycle;
+    const promotedCount = Number(cycle?.dream_count || 0);
+    const candidateCount = Number(cycle?.candidate_count ?? cycle?.source_summary?.candidate_count ?? promotedCount);
+    const heldCount = Math.max(0, candidateCount - promotedCount);
+    els.dreamsSummary.textContent = state.dreams.running
+      ? "Calliope is comparing recent work with longer company memory…"
+      : cycle?.status === "failed"
+        ? `Last reflection needs attention · ${cycle.error || "model unavailable"}`
+        : cycle?.completed_at
+          ? `${cycle.source_summary?.cycle_summary || `${promotedCount} Dreams surfaced`}${heldCount ? ` · ${heldCount} in the wings` : ""} · ${relativeTime(cycle.completed_at)}`
+          : "Waiting for the first reflection…";
+    els.dreamsRun.disabled = state.dreams.running;
+    els.dreamsRun.textContent = state.dreams.running ? "Dreaming…" : "Dream deeper";
+    if (state.dreams.loading && !state.dreams.items.length) {
+      els.dreamsList.innerHTML = '<div class="calliope-dreams-loading"><i></i><span>Remembering what the company has been doing…</span></div>';
+    } else if (!state.dreams.items.length) {
+      els.dreamsList.innerHTML = '<div class="calliope-dreams-list-empty"><span>☾</span><strong>No Dreams in this view.</strong><p>Quiet is better than repetitive or weak suggestions.</p></div>';
+    } else {
+      els.dreamsList.innerHTML = state.dreams.items.map(dreamListCard).join("");
+    }
+    renderDreamDetail();
+  }
+
+  async function loadDreams({ view = state.dreams.view, silent = false, selectId = null } = {}) {
+    if (state.config?.dreams?.enabled !== true) return;
+    state.dreams.view = view;
+    state.dreams.loading = true;
+    if (!silent) renderDreams();
+    try {
+      const pageLimit = view === "backlog" ? 120 : 60;
+      const data = await api(`/api/calliope/dreams?view=${encodeURIComponent(view)}&limit=${pageLimit}`);
+      state.dreams.items = Array.isArray(data.dreams) ? data.dreams : [];
+      state.dreams.counts = data.counts || state.dreams.counts;
+      state.dreams.latestCycle = data.latest_cycle || null;
+      state.dreams.selectedId = state.dreams.items.some((item) => item.id === (selectId || state.dreams.selectedId))
+        ? (selectId || state.dreams.selectedId)
+        : state.dreams.items[0]?.id || null;
+    } finally {
+      state.dreams.loading = false;
+      renderDreams();
+    }
+  }
+
+  async function openDreams() {
+    if (state.config?.dreams?.enabled !== true) {
+      toast("Calliope Dreaming is not enabled on this installation", true);
+      return;
+    }
+    if (!els.dreamsDialog.open) els.dreamsDialog.showModal();
+    await loadDreams();
+    markDreamViewed().catch(() => {});
+  }
+
+  async function markDreamViewed(id = state.dreams.selectedId) {
+    if (!id || state.dreams.viewedIds.has(id)) return;
+    const dream = state.dreams.items.find((item) => item.id === id);
+    if (!dream || dream.viewer_event) return;
+    state.dreams.viewedIds.add(id);
+    try {
+      await api(`/api/calliope/dreams/${encodeURIComponent(id)}`, {
+        method: "PATCH", body: JSON.stringify({ action: "viewed" }),
+      });
+      dream.viewer_event = { kind: "viewed", created_at: new Date().toISOString() };
+      dream.viewer_state = "viewed";
+      if (dream.portfolio_state !== "backlog" && dream.status === "proposed") {
+        state.dreams.counts.new = Math.max(0, Number(state.dreams.counts.new || 0) - 1);
+      }
+      renderDreams();
+    } catch (error) {
+      state.dreams.viewedIds.delete(id);
+      throw error;
+    }
+  }
+
+  async function runDreamCycle() {
+    if (state.dreams.running) return;
+    state.dreams.running = true;
+    renderDreams();
+    try {
+      const data = await api("/api/calliope/dreams/run", {
+        method: "POST", body: JSON.stringify({ mode: "deepen" }),
+      });
+      const count = Number(data.dreams?.length || data.cycle?.dream_count || 0);
+      const held = Number(data.backlog_count || 0);
+      toast(count
+        ? `Calliope surfaced ${count} Dream${count === 1 ? "" : "s"}${held ? ` and kept ${held} in the wings` : ""}`
+        : "The reflection was quiet; nothing cleared the evidence bar");
+      await loadDreams({ view: "active", selectId: data.dreams?.[0]?.id });
+    } finally {
+      state.dreams.running = false;
+      renderDreams();
+    }
+  }
+
+  async function mutateDream(action) {
+    const id = state.dreams.selectedId;
+    if (!id) return;
+    const body = { action };
+    if (action === "sleep") {
+      const value = window.prompt("How many days should this Dream sleep?", "30");
+      if (value === null) return;
+      body.days = Number(value) || 30;
+    }
+    await api(`/api/calliope/dreams/${encodeURIComponent(id)}`, {
+      method: "PATCH", body: JSON.stringify(body),
+    });
+    const nextView = action === "adopt" ? "adopted" : action === "sleep" ? "sleeping" : action === "dismiss" ? "active" : "active";
+    await loadDreams({ view: nextView, selectId: id });
+    toast(action === "adopt" ? "Dream adopted" : action === "sleep" ? "Dream is sleeping" : action === "dismiss" ? "Dream hidden for you" : "Dream awakened");
+  }
+
+  async function handoffDream() {
+    const id = state.dreams.selectedId;
+    if (!id) return;
+    const data = await api(`/api/calliope/dreams/${encodeURIComponent(id)}/handoff`, {
+      method: "POST", body: "{}",
+    });
+    window.location.assign(data.url);
+  }
+
   function chatWidthBounds() {
     const compact = window.innerWidth <= 1120;
     const rail = compact ? 205 : 238;
@@ -1360,6 +1685,7 @@
       state.config = await api("/api/calliope/config");
       setStatus(state.config.healthy ? "ready" : "unavailable", state.config.healthy ? "" : "offline");
       els.actionOpen.hidden = state.config.action_library === false;
+      els.dreamsOpen.hidden = state.config.dreams?.enabled !== true;
       syncEvidenceSearchControls();
       syncSpeechControls();
       renderCalendarStatus();
@@ -1384,6 +1710,221 @@
       : available ? "docs · artifacts · data" : "resolver unavailable";
   }
 
+  function inventoryGlyph(kind) {
+    return ({
+      brain_source: "▱",
+      personal_source: "◷",
+      mcp_server: "⌁",
+      cube: "▦",
+      metric: "◆",
+      workflow: "⌘",
+      instrument: "⌁",
+      watch: "◌",
+      identity: "◎",
+      access_role: "◇",
+    })[kind] || "◇";
+  }
+
+  function renderLibraryModeTabs() {
+    $$('[data-library-mode]', els.libraryModes).forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.libraryMode === state.libraryMode));
+    });
+    els.libraryInventoryCount.textContent = Number(state.inventorySummary.total || 0).toLocaleString();
+    els.libraryDiscoverCount.textContent = Number(state.actionTotal || 0).toLocaleString();
+    els.libraryChangesCount.textContent = Number(state.actionRuns.length || 0).toLocaleString();
+    els.libraryInventoryCount.classList.toggle("attention", Number(state.inventorySummary.needs_attention || 0) > 0);
+  }
+
+  function renderInventoryCategories() {
+    const total = Number(state.inventorySummary.total || 0);
+    const attention = Number(state.inventorySummary.needs_attention || 0);
+    els.actionCategories.hidden = false;
+    els.actionCategories.innerHTML = [
+      `<button type="button" data-inventory-section="" aria-pressed="${String(!state.inventorySection && !state.inventoryState)}">All<b>${total.toLocaleString()}</b></button>`,
+      attention ? `<button class="inventory-attention-filter" type="button" data-inventory-state="attention" aria-pressed="${String(state.inventoryState === "attention")}">Needs attention<b>${attention.toLocaleString()}</b></button>` : "",
+      ...state.inventorySections.map((section) => `<button type="button" data-inventory-section="${escapeHtml(section.id)}" aria-pressed="${String(state.inventorySection === section.id && !state.inventoryState)}">${escapeHtml(section.label)}<b>${Number(section.count || 0).toLocaleString()}</b></button>`),
+    ].join("");
+  }
+
+  function renderInventoryList() {
+    if (state.libraryMode !== "inventory") return;
+    els.inventoryOpenView.disabled = state.inventoryLoading || !state.inventoryItems.length;
+    if (state.inventoryLoading) {
+      els.actionList.innerHTML = '<div class="action-library-loading"><i></i>Resolving what Calliope can use…</div>';
+      return;
+    }
+    if (!state.inventoryItems.length) {
+      els.actionList.innerHTML = '<div class="action-library-no-results">No configured items match this view.<br>Try another section or search.</div>';
+      return;
+    }
+    els.actionList.innerHTML = state.inventoryItems.map((item) => `
+      <button class="inventory-card ${state.inventoryRef === item.ref ? "active" : ""}" type="button"
+              data-inventory-ref="${escapeHtml(item.ref)}" data-state="${escapeHtml(item.state || "ready")}">
+        <span class="inventory-card-mark" aria-hidden="true">${escapeHtml(inventoryGlyph(item.kind))}</span>
+        <span class="inventory-card-copy"><strong>${escapeHtml(item.label)}</strong><p>${escapeHtml(item.summary || "Configured for Calliope")}</p><small>${escapeHtml(item.section_label || item.section || "System")}</small></span>
+        <span class="inventory-card-state"><i></i>${escapeHtml(item.state_label || item.state || "Ready")}</span>
+      </button>`).join("");
+  }
+
+  function inventoryContextValue(value) {
+    if (value === null || value === undefined || value === "") return "—";
+    if (Array.isArray(value)) {
+      if (!value.length) return "None";
+      return value.slice(0, 16).map((item) => typeof item === "object" ? JSON.stringify(item) : String(item)).join(" · ");
+    }
+    if (typeof value === "object") return JSON.stringify(value, null, 2);
+    return String(value);
+  }
+
+  function renderInventoryDetail() {
+    const item = state.inventoryItem;
+    const visible = state.libraryMode === "inventory";
+    els.inventorySelected.hidden = !visible || !item;
+    els.inventoryEmpty.hidden = !visible || Boolean(item);
+    if (!visible) return;
+    const summary = state.inventorySummary || {};
+    els.inventoryEmptySummary.textContent = `${Number(summary.total || 0).toLocaleString()} configured item${Number(summary.total || 0) === 1 ? "" : "s"} are visible across knowledge, tools, meaning, routines, and access.`;
+    els.inventoryOverview.innerHTML = [
+      ["Healthy", summary.healthy || 0, "healthy"],
+      ["Ready", summary.ready || 0, "ready"],
+      ["Needs attention", summary.needs_attention || 0, "attention"],
+      ["Working", summary.working || 0, "syncing"],
+      ...(Number(summary.inactive || 0) ? [["Inactive", summary.inactive, "inactive"]] : []),
+    ].map(([label, value, tone]) => `<span class="${tone}"><b>${Number(value).toLocaleString()}</b>${label}</span>`).join("");
+    els.inventoryWarnings.hidden = !state.inventoryWarnings.length;
+    els.inventoryWarnings.textContent = state.inventoryWarnings.join(" ");
+    if (!item) return;
+    els.inventoryDetailState.className = `inventory-state ${escapeHtml(item.state || "ready")}`;
+    els.inventoryDetailState.textContent = item.state_label || item.state || "Ready";
+    els.inventoryDetailSection.textContent = item.section_label || item.section || "Configured item";
+    els.inventoryDetailTitle.textContent = item.label || "System item";
+    els.inventoryDetailSummary.textContent = item.summary || "Configured for Calliope.";
+    els.inventoryDetailKind.textContent = String(item.kind || "configured item").replaceAll("_", " ");
+    els.inventoryDetailHealth.textContent = item.health || "No observed health detail is available.";
+    els.inventoryDetailFacts.innerHTML = (item.facts || []).map((fact) => `<span><small>${escapeHtml(fact.label || "Fact")}</small><b>${escapeHtml(inventoryContextValue(fact.value))}</b></span>`).join("");
+    els.inventoryDetailContext.innerHTML = Object.entries(item.detail || {})
+      .filter(([, value]) => value !== null && value !== "" && !(Array.isArray(value) && !value.length))
+      .slice(0, 24)
+      .map(([key, value]) => `<div><span>${escapeHtml(key.replaceAll("_", " "))}</span><pre>${escapeHtml(inventoryContextValue(value))}</pre></div>`)
+      .join("") || "<p>No additional configuration context is exposed here.</p>";
+    els.inventoryDetailOpen.hidden = !item.open_url;
+    if (item.open_url) els.inventoryDetailOpen.href = item.open_url;
+    const knowledgeCandidate = item.kind === "mcp_server" && item.detail?.knowledge_source_candidate;
+    els.inventoryKnowledgeSource.hidden = !knowledgeCandidate;
+    els.inventoryAsk.disabled = state.inventoryHandoffLoading;
+    els.inventoryKnowledgeSource.disabled = state.inventoryHandoffLoading;
+  }
+
+  function selectInventory(ref) {
+    state.inventoryRef = ref || null;
+    state.inventoryItem = state.inventoryItems.find((item) => item.ref === state.inventoryRef) || null;
+    renderInventoryList();
+    renderInventoryDetail();
+  }
+
+  async function loadInventory({ query = state.inventoryQuery, section = state.inventorySection, inventoryState = state.inventoryState } = {}) {
+    state.inventoryLoading = true;
+    renderInventoryList();
+    const params = new URLSearchParams({ q: query || "", limit: "500" });
+    if (section) params.set("section", section);
+    if (inventoryState) params.set("state", inventoryState);
+    try {
+      const data = await api(`/api/calliope/inventory?${params}`);
+      state.inventoryItems = Array.isArray(data.items) ? data.items : [];
+      state.inventorySections = Array.isArray(data.sections) ? data.sections : [];
+      state.inventoryStates = Array.isArray(data.states) ? data.states : [];
+      state.inventorySummary = data.summary || { total: data.available_total || 0, needs_attention: 0, healthy: 0, ready: 0, working: 0, inactive: 0 };
+      state.inventoryWarnings = Array.isArray(data.warnings) ? data.warnings : [];
+      const stillVisible = state.inventoryItems.some((item) => item.ref === state.inventoryRef);
+      if (!stillVisible) {
+        state.inventoryRef = null;
+        state.inventoryItem = null;
+      } else {
+        state.inventoryItem = state.inventoryItems.find((item) => item.ref === state.inventoryRef) || null;
+      }
+      if (state.libraryMode === "inventory") {
+        els.actionSummary.textContent = `${Number(data.total || 0).toLocaleString()} configured ${Number(data.total || 0) === 1 ? "item" : "items"}${data.truncated ? " · first 500 shown" : ""}`;
+      }
+    } finally {
+      state.inventoryLoading = false;
+      if (state.libraryMode === "inventory") {
+        renderInventoryCategories();
+        renderInventoryList();
+        renderInventoryDetail();
+      }
+      renderLibraryModeTabs();
+    }
+  }
+
+  async function handoffInventory(refs, intent = "inspect") {
+    const selected = [...new Set((refs || []).filter(Boolean))].slice(0, 24);
+    if (!selected.length || state.inventoryHandoffLoading) return;
+    state.inventoryHandoffLoading = true;
+    renderInventoryDetail();
+    try {
+      const data = await api("/api/calliope/inventory/handoff", {
+        method: "POST",
+        body: JSON.stringify({ refs: selected, intent }),
+      });
+      window.location.assign(data.url);
+    } finally {
+      state.inventoryHandoffLoading = false;
+      renderInventoryDetail();
+    }
+  }
+
+  function renderLibraryDetails() {
+    const inventory = state.libraryMode === "inventory";
+    const discover = state.libraryMode === "discover";
+    const changes = state.libraryMode === "changes";
+    els.inventoryEmpty.hidden = !inventory || Boolean(state.inventoryItem);
+    els.inventorySelected.hidden = !inventory || !state.inventoryItem;
+    els.actionEmpty.hidden = !discover || Boolean(state.action);
+    els.actionSelected.hidden = !(discover && state.action) && !(changes && state.actionPlan?.id && state.action);
+    els.libraryChangesEmpty.hidden = !changes || Boolean(state.actionRuns.length);
+  }
+
+  async function activateLibraryMode(mode, { persist = true, load = true } = {}) {
+    const next = ["inventory", "discover", "changes"].includes(mode) ? mode : "inventory";
+    const previous = state.libraryMode;
+    if (state.libraryMode === "inventory") state.inventoryQuery = els.actionSearch.value;
+    if (state.libraryMode === "discover") state.actionQuery = els.actionSearch.value;
+    state.libraryMode = next;
+    if (next === "discover" && previous === "changes") state.actionPlan = null;
+    if (persist) {
+      try { localStorage.setItem(LIBRARY_MODE_KEY, next); } catch {}
+    }
+    els.actionSearch.closest("label").hidden = next === "changes";
+    els.inventoryOpenView.hidden = next !== "inventory";
+    els.actionSearch.placeholder = next === "inventory"
+      ? "Search what Calliope currently knows and can use"
+      : "What would you like to connect, change, or make possible?";
+    els.actionSearch.value = next === "inventory" ? state.inventoryQuery : next === "discover" ? state.actionQuery : "";
+    renderLibraryModeTabs();
+    renderLibraryDetails();
+    if (next === "inventory") {
+      const total = Number(state.inventorySummary.total || state.inventoryItems.length || 0);
+      els.actionSummary.textContent = `${total.toLocaleString()} configured ${total === 1 ? "item" : "items"}`;
+      renderInventoryCategories();
+      renderInventoryList();
+      renderInventoryDetail();
+      if (load) await loadInventory();
+    } else if (next === "discover") {
+      const total = Number(state.actionTotal || state.actions.length || 0);
+      els.actionSummary.textContent = `${total.toLocaleString()} possible ${total === 1 ? "outcome" : "outcomes"}`;
+      renderActionCategories();
+      renderActionList();
+      renderActionDetail();
+      if (load) await loadActions({ query: state.actionQuery });
+    } else {
+      els.actionCategories.hidden = true;
+      els.actionSummary.textContent = `${state.actionRuns.length.toLocaleString()} durable ${state.actionRuns.length === 1 ? "change" : "changes"}`;
+      renderActionHistory();
+      if (load) await loadActionHistory({ selectFirst: true });
+    }
+    requestAnimationFrame(() => (next === "changes" ? els.actionList : els.actionSearch).focus?.());
+  }
+
   function actionGlyph(category) {
     return ({ connect: "↗", knowledge: "◉", automate: "⌘", data: "◆", monitor: "◌", admin: "⚙" })[category] || "✦";
   }
@@ -1394,12 +1935,14 @@
 
   function renderActionCategories() {
     const total = state.actionCategories.reduce((sum, category) => sum + Number(category.count || 0), 0);
+    els.actionCategories.hidden = state.libraryMode !== "discover";
     els.actionCategories.innerHTML = [{ id: "", label: "All", count: total }, ...state.actionCategories]
       .map((category) => `<button type="button" data-action-category="${escapeHtml(category.id)}" aria-pressed="${String(state.actionCategory === category.id)}">${escapeHtml(category.label)}<b>${Number(category.count || 0).toLocaleString()}</b></button>`)
       .join("");
   }
 
   function renderActionList() {
+    if (state.libraryMode !== "discover") return;
     if (state.actionLoading) {
       els.actionList.innerHTML = '<div class="action-library-loading"><i></i>Looking through Calliope’s capabilities…</div>';
       return;
@@ -1418,13 +1961,15 @@
   }
 
   function renderActionHistory() {
+    if (state.libraryMode !== "changes") return;
     if (!state.actionRuns.length) {
-      els.actionHistoryList.innerHTML = "<p>No changes recorded yet.</p>";
+      els.actionList.innerHTML = '<div class="action-library-no-results">No governed changes yet.<br>Approved plans and verification receipts will remain here.</div>';
+      renderLibraryDetails();
       return;
     }
-    els.actionHistoryList.innerHTML = state.actionRuns.map((run) => {
+    els.actionList.innerHTML = state.actionRuns.map((run) => {
       const action = run.action_snapshot || {};
-      return `<button class="action-history-item ${escapeHtml(run.status || "planned")}" type="button" data-action-run="${escapeHtml(run.id)}">
+      return `<button class="action-history-item ${escapeHtml(run.status || "planned")} ${state.actionPlan?.id === run.id ? "active" : ""}" type="button" data-action-run="${escapeHtml(run.id)}">
         <i aria-hidden="true"></i><span><strong>${escapeHtml(action.title || run.action_id || "Calliope change")}</strong><small>${escapeHtml(run.status || "planned")}</small></span>
         <span>${escapeHtml(relativeTime(run.completed_at || run.created_at))}</span>
       </button>`;
@@ -1554,7 +2099,7 @@
         ? "Calliope will help resolve the missing setup before using this outcome."
         : "Your structured choices seed a fresh Calliope notebook; nothing changes yet.";
     } else if (run?.status === "complete") {
-      els.actionDetailNote.textContent = "Applied and verified. The durable receipt remains available under Recent changes.";
+      els.actionDetailNote.textContent = "Applied and verified. The durable receipt remains available under Changes.";
     } else if (run?.status === "failed") {
       els.actionDetailNote.textContent = run.error || "The change stopped safely. Inspect the failed step before trying again.";
     } else if (running) {
@@ -1568,9 +2113,8 @@
 
   function renderActionDetail() {
     const action = state.action;
-    els.actionEmpty.hidden = Boolean(action);
-    els.actionSelected.hidden = !action;
-    if (!action) return;
+    renderLibraryDetails();
+    if (!action || !["discover", "changes"].includes(state.libraryMode)) return;
     els.actionDetailState.textContent = actionStateLabel(action);
     els.actionDetailState.className = `action-state ${escapeHtml(action.state || "ready")}`;
     els.actionDetailCategory.textContent = action.category_label || String(action.category || "action").replaceAll("_", " ");
@@ -1609,6 +2153,7 @@
     if (run?.action_snapshot) {
       state.action = { ...run.action_snapshot };
       renderActionDetail();
+      renderActionHistory();
       return;
     }
     els.actionSelected.setAttribute("aria-busy", "true");
@@ -1618,12 +2163,14 @@
       if (state.actionId !== actionId) return;
       state.action = data.action;
       renderActionDetail();
+      renderActionHistory();
     } finally {
       if (state.actionId === actionId) els.actionSelected.setAttribute("aria-busy", "false");
     }
   }
 
-  async function loadActions({ query = els.actionSearch.value, category = state.actionCategory, requirement = state.actionRequirement, selectId = null } = {}) {
+  async function loadActions({ query = state.actionQuery, category = state.actionCategory, requirement = state.actionRequirement, selectId = null } = {}) {
+    state.actionQuery = query || "";
     state.actionLoading = true;
     renderActionList();
     const params = new URLSearchParams({ q: query || "", limit: "100" });
@@ -1633,8 +2180,18 @@
       const data = await api(`/api/calliope/actions?${params}`);
       state.actions = Array.isArray(data.actions) ? data.actions : [];
       state.actionCategories = Array.isArray(data.categories) ? data.categories : [];
-      els.actionSummary.textContent = `${Number(data.total || state.actions.length).toLocaleString()} possible ${Number(data.total || state.actions.length) === 1 ? "outcome" : "outcomes"}`;
+      state.actionTotal = Number(data.total || state.actions.length);
+      if (state.libraryMode === "discover" && !selectId && state.actionId && !state.actions.some((action) => action.id === state.actionId)) {
+        state.actionId = null;
+        state.action = null;
+        state.actionPlan = null;
+        renderLibraryDetails();
+      }
+      if (state.libraryMode === "discover") {
+        els.actionSummary.textContent = `${Number(data.total || state.actions.length).toLocaleString()} possible ${Number(data.total || state.actions.length) === 1 ? "outcome" : "outcomes"}`;
+      }
       renderActionCategories();
+      renderLibraryModeTabs();
     } finally {
       state.actionLoading = false;
       renderActionList();
@@ -1642,10 +2199,22 @@
     if (selectId) await selectAction(selectId);
   }
 
-  async function loadActionHistory() {
+  async function loadActionHistory({ selectFirst = false } = {}) {
     const data = await api("/api/calliope/action-runs?limit=30");
     state.actionRuns = Array.isArray(data.runs) ? data.runs : [];
+    if (state.libraryMode === "changes") {
+      els.actionSummary.textContent = `${state.actionRuns.length.toLocaleString()} durable ${state.actionRuns.length === 1 ? "change" : "changes"}`;
+      if (selectFirst && state.actionRuns.length) {
+        const selectedRun = state.actionRuns.find((run) => run.id === state.actionPlan?.id) || state.actionRuns[0];
+        await selectAction(selectedRun.action_id, { run: selectedRun });
+      } else if (!state.actionRuns.length) {
+        state.action = null;
+        state.actionPlan = null;
+      }
+    }
     renderActionHistory();
+    renderLibraryDetails();
+    renderLibraryModeTabs();
   }
 
   async function openActionLibrary(actionId = null, { requirement = "" } = {}) {
@@ -1660,17 +2229,26 @@
       // the rail claim there are zero matches while the requested card is open.
       state.actionCategory = "";
       els.actionSearch.value = "";
+      state.actionQuery = "";
     }
     if (!els.actionDialog.open) els.actionDialog.showModal();
-    await Promise.all([
-      loadActions({ requirement: state.actionRequirement, selectId: actionId }),
+    let remembered = "inventory";
+    try { remembered = localStorage.getItem(LIBRARY_MODE_KEY) || "inventory"; } catch {}
+    const mode = actionId || requirement ? "discover" : remembered;
+    await activateLibraryMode(mode, { persist: false, load: false });
+    if (mode === "inventory") await Promise.all([loadInventory(), loadActionHistory(), loadActions()]);
+    else if (mode === "changes") await Promise.all([loadActionHistory({ selectFirst: true }), loadInventory(), loadActions()]);
+    else await Promise.all([
+      loadActions({ query: state.actionQuery, requirement: state.actionRequirement, selectId: actionId }),
       loadActionHistory(),
+      loadInventory(),
     ]);
     requestAnimationFrame(() => (actionId ? els.actionSelected : els.actionSearch).focus?.());
   }
 
   async function openActionReceipt(actionId, runId) {
     if (!els.actionDialog.open) els.actionDialog.showModal();
+    await activateLibraryMode("changes", { load: false });
     const [runData] = await Promise.all([
       api(`/api/calliope/action-runs/${encodeURIComponent(runId)}`),
       loadActions(),
@@ -3154,11 +3732,13 @@
       return;
     }
     els.styleList.innerHTML = visibleProfiles.map((profile) => `
-      <button class="style-list-card ${state.designProfileId === profile.id ? "active" : ""}"
+      <button class="style-list-card ${profile.is_builtin ? "builtin" : ""} ${profile.is_adaptive ? "adaptive" : ""} ${state.designProfileId === profile.id ? "active" : ""}"
               type="button" data-design-profile="${escapeHtml(profile.id)}">
         <i aria-hidden="true"></i>
-        <strong>${escapeHtml(profile.name)}</strong>
-        <span>v${escapeHtml(profile.current_version)} · ${escapeHtml(profile.can_edit ? "yours" : profile.owner_email)}</span>
+        <strong>${escapeHtml(profile.name)}${profile.is_adaptive ? "<em>Adaptive</em>" : ""}</strong>
+        <span>v${escapeHtml(profile.current_version)} · ${escapeHtml(
+          profile.is_builtin ? "built in · your room" : profile.can_edit ? "yours" : profile.owner_email
+        )}</span>
       </button>`).join("");
   }
 
@@ -3251,41 +3831,36 @@
     return candidate && !/[;{}<>]|url\s*\(/i.test(candidate) ? candidate : fallback;
   }
 
-  function renderDesignPreview(profile, version) {
+  function safeStyleWallpaper(value) {
+    const candidate = String(value || "").trim();
+    if (!/^\/(?:bg\/[A-Za-z0-9_-]{1,80}\.jpg|theme\/images\/full\/[A-Za-z0-9][A-Za-z0-9_-]{0,160}\.webp)$/.test(candidate)
+        && !/^blob:[^\s"'<>]{1,2048}$/.test(candidate)) return "none";
+    return `url("${candidate.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}")`;
+  }
+
+  function applyDesignPreviewVariables(version, snapshot = null) {
     const tokens = version.tokens || {};
     const palette = tokens.palette || {};
     const typography = tokens.typography || {};
     const shape = tokens.shape || {};
     const effects = tokens.effects || {};
-    const chart = tokens.charts || {};
+    const viewer = snapshot?.tokens || {};
     const colors = {
-      bg: safeStyleColor(palette.background, "#10151a"),
-      surface: safeStyleColor(palette.surface, "#172027"),
-      surfaceAlt: safeStyleColor(palette.surface_alt, "#121b21"),
-      text: safeStyleColor(palette.text, "#f3f5f6"),
-      muted: safeStyleColor(palette.muted, "#87929a"),
-      accent: safeStyleColor(palette.accent, "#68c7b2"),
-      accentAlt: safeStyleColor(palette.accent_alt, "#f5b446"),
-      border: safeStyleColor(palette.border, "rgba(255,255,255,.12)"),
+      bg: safeStyleColor(viewer["--background"] || palette.background, "#10151a"),
+      surface: safeStyleColor(viewer["--panel"] || palette.surface, "#172027"),
+      surfaceAlt: safeStyleColor(viewer["--panel-raised"] || palette.surface_alt, "#121b21"),
+      text: safeStyleColor(viewer["--foreground"] || palette.text, "#f3f5f6"),
+      muted: safeStyleColor(viewer["--fog"] || palette.muted, "#87929a"),
+      accent: safeStyleColor(viewer["--main"] || palette.accent, "#68c7b2"),
+      accentAlt: safeStyleColor(viewer["--rvbbit-accent"] || palette.accent_alt, "#f5b446"),
+      border: safeStyleColor(viewer["--line"] || palette.border, "rgba(255,255,255,.12)"),
     };
-    const series = Array.isArray(chart.series)
-      ? chart.series.map((color) => safeStyleColor(color, colors.accent)).slice(0, 6)
-      : [];
-    const bars = [38, 66, 49, 84, 58, 96, 73].map((height, index) =>
-      `<i style="--bar:${height}%;--bar-color:${escapeHtml(series[index % Math.max(1, series.length)] || (index % 3 === 1 ? colors.accentAlt : colors.accent))}"></i>`
-    ).join("");
-    els.stylePreview.innerHTML = `
-      <div class="style-preview-top"><i></i><strong>${escapeHtml(profile.name)}</strong><span>Operations overview</span></div>
-      <div class="style-preview-body">
-        <div class="style-preview-kicker">Live signal · current period</div>
-        <div class="style-preview-title">Clarity at decision speed.</div>
-        <div class="style-preview-metrics">
-          <div class="style-preview-metric"><span>Pipeline</span><b>$2.4m</b></div>
-          <div class="style-preview-metric"><span>Conversion</span><b>18.7%</b></div>
-          <div class="style-preview-metric"><span>At risk</span><b>14</b></div>
-        </div>
-        <div class="style-preview-chart">${bars}</div>
-      </div>`;
+    const series = Array.from({ length: 6 }, (_unused, index) =>
+      safeStyleColor(
+        viewer[`--chart-${index + 1}`] || tokens.charts?.series?.[index],
+        index % 3 === 1 ? colors.accentAlt : colors.accent,
+      )
+    );
     const variables = {
       "--sp-bg": colors.bg,
       "--sp-surface": colors.surface,
@@ -3293,14 +3868,56 @@
       "--sp-text": colors.text,
       "--sp-muted": colors.muted,
       "--sp-accent": colors.accent,
+      "--sp-accent-alt": colors.accentAlt,
       "--sp-border": colors.border,
-      "--sp-display": safeStyleFont(typography.display, "ui-sans-serif, sans-serif"),
-      "--sp-body": safeStyleFont(typography.body, "ui-sans-serif, sans-serif"),
-      "--sp-mono": safeStyleFont(typography.mono, "ui-monospace, monospace"),
+      "--sp-display": safeStyleFont(typography.display, '"Newsreader", Georgia, serif'),
+      "--sp-body": safeStyleFont(typography.body, '"IBM Plex Sans", ui-sans-serif, sans-serif'),
+      "--sp-mono": safeStyleFont(typography.mono, '"IBM Plex Mono", ui-monospace, monospace'),
       "--sp-radius": safeStyleLength("border-radius", shape.radius, "0px"),
-      "--sp-shadow": safeStyleLength("box-shadow", effects.shadow, "0 18px 45px rgba(0,0,0,.3)"),
+      "--sp-shadow": safeStyleLength("box-shadow", snapshot?.material?.shadow || effects.shadow, "0 18px 45px rgba(0,0,0,.3)"),
+      "--sp-wallpaper": safeStyleWallpaper(snapshot?.background?.wallpaper),
+      "--sp-wallpaper-opacity": String(Math.max(.18, Math.min(1, Number(snapshot?.background?.wallpaper_opacity) || .62))),
     };
+    series.forEach((color, index) => { variables[`--sp-series-${index + 1}`] = color; });
     Object.entries(variables).forEach(([name, value]) => els.stylePreview.style.setProperty(name, value));
+  }
+
+  function renderDesignPreview(profile, version) {
+    const tokens = version.tokens || {};
+    const chart = tokens.charts || {};
+    const bars = [38, 66, 49, 84, 58, 96, 73].map((height, index) =>
+      `<i style="--bar:${height}%;--bar-color:var(--sp-series-${(index % Math.max(1, chart.series?.length || 6)) + 1},var(--sp-accent))"></i>`
+    ).join("");
+    els.stylePreview.dataset.adaptive = String(Boolean(profile.is_adaptive));
+    els.stylePreview.innerHTML = `
+      <div class="style-preview-top"><i></i><strong>${escapeHtml(profile.name)}</strong><span>${profile.is_adaptive ? "Your room · live" : "Operations overview"}</span></div>
+      <div class="style-preview-body">
+        <div class="style-preview-spread">
+          <div class="style-preview-lead">
+            <div class="style-preview-kicker">Quarterly field report · current period</div>
+            <div class="style-preview-title">Momentum is real.<br><em>Capacity is the constraint.</em></div>
+            <div class="style-preview-value"><b>$2.4m</b><span>qualified pipeline</span><i>+18.7% vs prior</i></div>
+          </div>
+          <div class="style-preview-rail">
+            <div class="style-preview-metric"><span>Coverage</span><b>3.8×</b><small>target 3.2×</small></div>
+            <div class="style-preview-metric"><span>At risk</span><b>14</b><small>4 need action</small></div>
+          </div>
+        </div>
+        <div class="style-preview-chart"><span>Weekly contribution</span>${bars}</div>
+        <div class="style-preview-ledger"><span>West · Enterprise</span><b>$684k</b><i>31%</i><span>Mid-market</span><b>$511k</b><i>24%</i></div>
+      </div>`;
+    applyDesignPreviewVariables(version);
+    els.stylePreviewNote.textContent = profile.is_adaptive
+      ? "This live preview uses your current Calliope room. Other viewers see the same design system through their own palette and wallpaper."
+      : "The preview follows generated tokens. Edited Markdown is authoritative for Calliope.";
+    if (profile.is_adaptive && window.WarehouseTheme?.getSnapshot) {
+      const expectedVersion = version.id;
+      void window.WarehouseTheme.getSnapshot().then((snapshot) => {
+        if (selectedDesignVersion()?.version.id === expectedVersion) {
+          applyDesignPreviewVariables(version, snapshot);
+        }
+      }).catch(() => {});
+    }
   }
 
   function renderDesignReferences(version) {
@@ -3330,9 +3947,11 @@
     els.styleEditorPane.hidden = false;
     els.styleEditorName.textContent = profile.name;
     els.styleEditorDescription.textContent = profile.description || "No description supplied.";
-    els.styleOwner.textContent = profile.can_edit
-      ? `Created by you · company visible`
-      : `Created by ${profile.owner_email} · duplicate to revise`;
+    els.styleOwner.textContent = profile.is_builtin
+      ? "Built into Calliope · adapts safely to each viewer"
+      : profile.can_edit
+        ? "Created by you · company visible"
+        : `Created by ${profile.owner_email} · duplicate to revise`;
     els.styleVersion.innerHTML = designVersions(profile).map((item) =>
       `<option value="${escapeHtml(item.id)}" ${item.id === version.id ? "selected" : ""}>v${escapeHtml(item.version)}${
         Number(item.version) === Number(profile.current_version) ? " · current" : ""
@@ -3340,6 +3959,11 @@
     ).join("");
     els.styleMarkdown.value = version.markdown || "";
     els.styleMarkdown.readOnly = !profile.can_edit;
+    els.styleMarkdownLabel.textContent = profile.is_builtin
+      ? "Built-in profile contract · read only"
+      : profile.can_edit
+        ? "Editable profile Markdown"
+        : "Profile Markdown · read only";
     els.styleSaveVersion.disabled = !profile.can_edit;
     els.styleArchive.disabled = !profile.can_edit;
     els.styleUseOnce.disabled = !state.current || profile.archived;
@@ -3558,6 +4182,7 @@
     if (!query) return true;
     const terms = [
       session.title,
+      session.synopsis,
       session.brief_date,
       session.workflow_name,
       session.workflow_run_status,
@@ -3696,6 +4321,7 @@
       : action
         ? `guided action · ${count} surface${count === 1 ? "" : "s"}`
       : `${count} surface${count === 1 ? "" : "s"}`;
+    const synopsis = String(session.synopsis || "").trim();
     return `
       <button class="session-card ${brief ? "brief-session-card" : ""} ${run ? "run-session-card" : ""} ${action ? "action-session-card" : ""} ${state.current?.id === session.id ? "active" : ""}"
               type="button" role="listitem" data-session-id="${escapeHtml(session.id)}"
@@ -3704,7 +4330,8 @@
               ${action ? `data-session-action-id="${escapeHtml(session.action_id)}"` : ""}
               ${brief || run || action ? `title="${escapeHtml(session.title)}"` : ""}>
         <h3>${escapeHtml(title)}</h3>
-        <p><span>${escapeHtml(relativeTime(session.updated_at))}</span><span>${escapeHtml(detail)}</span></p>
+        ${synopsis ? `<div class="session-synopsis">${escapeHtml(synopsis)}</div>` : ""}
+        <p class="session-meta"><span>${escapeHtml(relativeTime(session.updated_at))}</span><span>${escapeHtml(detail)}</span></p>
         <span class="session-glyphs" aria-hidden="true">${dots}</span>
       </button>`;
   }
@@ -4343,7 +4970,7 @@
   }
 
   function surfaceGlyph(kind) {
-    return ({ query: "▤", metric: "◆", cube: "▦", artifact: "▦", image: "▧", document: "▱", selection: "⌖", evidence: "⌕", action: "✦", instrument: "⌁", workflow: "⌘" })[kind] || "◇";
+    return ({ query: "▤", metric: "◆", cube: "▦", artifact: "▦", image: "▧", document: "▱", selection: "⌖", evidence: "⌕", inventory: "◎", action: "✦", dream: "☾", instrument: "⌁", workflow: "⌘" })[kind] || "◇";
   }
 
   function formatValue(value) {
@@ -5448,16 +6075,243 @@
     </div>`;
   }
 
+  function renderDreamSurface(surface) {
+    const dream = surface.payload?.dream || {};
+    return `<div class="dream-surface">
+      <div class="dream-surface-intro">
+        <span>${escapeHtml(dreamTypeLabel(dream.dream_type))} · ${escapeHtml(dreamOutputLabel(dream.output_kind))}</span>
+        <h4>${escapeHtml(dream.title || surface.title || "Calliope Dream")}</h4>
+        <p>${escapeHtml(dream.thesis || "An evidence-backed company hypothesis.")}</p>
+        <div><b>${escapeHtml(dream.impact || "medium")} impact</b><b>${escapeHtml(dream.effort || "medium")} effort</b><b>${Math.round(Number(dream.confidence || 0) * 100)}% confidence</b></div>
+      </div>
+      ${dreamOutputMarkup(dream)}
+      ${dreamProbeMarkup(dream)}
+      ${dreamEvidenceMarkup(dream)}
+    </div>`;
+  }
+
+  function renderInventory(surface) {
+    const payload = surface.payload || {};
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    if (!items.length) {
+      return '<div class="chart-empty">The configured Library items are no longer available.</div>';
+    }
+    const summary = payload.summary || {};
+    const attention = Number(summary.needs_attention || items.filter((item) => item?.state === "attention").length);
+    const sections = Array.isArray(summary.sections)
+      ? summary.sections.filter(Boolean)
+      : [...new Set(items.map((item) => item?.section_label).filter(Boolean))];
+    const rows = items.map((item) => {
+      const facts = (Array.isArray(item?.facts) ? item.facts : []).slice(0, 4)
+        .map((fact) => `<span><small>${escapeHtml(fact?.label || "Fact")}</small><b>${escapeHtml(inventoryContextValue(fact?.value))}</b></span>`)
+        .join("");
+      return `<article class="inventory-surface-item" data-state="${escapeHtml(item?.state || "ready")}">
+        <i class="inventory-surface-state" aria-hidden="true"></i>
+        <div class="inventory-surface-copy">
+          <span>${escapeHtml(item?.section_label || item?.section || "Configured item")} · ${escapeHtml(String(item?.kind || "item").replaceAll("_", " "))}</span>
+          <h4>${escapeHtml(item?.label || item?.ref || "Configured item")}</h4>
+          <p>${escapeHtml(item?.health || item?.summary || "Configured for Calliope.")}</p>
+          ${facts ? `<div class="inventory-surface-facts">${facts}</div>` : ""}
+        </div>
+        <div class="inventory-surface-actions">
+          <code title="Exact Library reference">${escapeHtml(item?.ref || "")}</code>
+          <button type="button" data-inventory-focus="${escapeHtml(item?.ref || "")}">Ask about this →</button>
+        </div>
+      </article>`;
+    }).join("");
+    return `<div class="inventory-surface">
+      <header>
+        <div><span>Exact configured state</span><strong>${items.length.toLocaleString()} item${items.length === 1 ? "" : "s"} pinned from the Library</strong></div>
+        <div class="inventory-surface-summary">
+          <span>${escapeHtml(sections.join(" · ") || "System inventory")}</span>
+          <b class="${attention ? "attention" : "healthy"}">${attention ? `${attention} need${attention === 1 ? "s" : ""} attention` : "Observed healthy"}</b>
+        </div>
+      </header>
+      <div class="inventory-surface-items">${rows}</div>
+      <footer>These typed references preserve identity when you ask Calliope to inspect, explain, test, or change them.</footer>
+    </div>`;
+  }
+
   function renderArtifact(surface) {
     const url = surface.payload?.display_url || surface.payload?.url;
     if (!url) return `<div class="chart-empty">Artifact URL unavailable</div>`;
     const embedUrl = artifactEmbedUrl(url);
-    return `<div class="artifact-frame">
-      <iframe src="${escapeHtml(embedUrl)}" title="${escapeHtml(surface.title)}"
+    const adaptive = Boolean(surface.presentation?.design_profile?.adaptive);
+    const rememberedHeight = Number(state.artifactFrameHeights.get(surface.id));
+    const retainedHeight = Number.isFinite(rememberedHeight) && rememberedHeight >= 280
+      ? Math.ceil(rememberedHeight) : null;
+    return `<div class="artifact-frame" data-frame-state="dormant"${
+      retainedHeight
+        ? ` data-auto-height="true" style="height:${retainedHeight}px"`
+        : ""
+    }>
+      <div class="artifact-frame-loader" aria-hidden="true">
+        <canvas data-artifact-loading-orb data-thinking-orb="working"
+          data-thinking-orb-size="112" data-thinking-orb-tint="theme"></canvas>
+      </div>
+      <iframe title="${escapeHtml(surface.title)}"
+        data-artifact-src="${escapeHtml(embedUrl)}"
+        data-artifact-active="false"
         data-artifact-slug="${escapeHtml(surface.artifact_slug || "")}"
+        data-adaptive-theme="${String(adaptive)}"
         sandbox="allow-scripts allow-forms allow-popups allow-downloads"
         loading="lazy" scrolling="no" referrerpolicy="same-origin"></iframe>
     </div>`;
+  }
+
+  function artifactFrameSurfaceId(frame) {
+    return frame.closest("[data-surface-id]")?.dataset.surfaceId || "";
+  }
+
+  function artifactFrameIsActive(frame) {
+    return frame?.dataset.artifactActive === "true";
+  }
+
+  function artifactFrameIsReady(frame) {
+    return artifactFrameIsActive(frame)
+      && frame.closest(".artifact-frame")?.dataset.frameState === "ready";
+  }
+
+  function clearArtifactFrameUnload(frame) {
+    const timer = state.artifactFrameUnloadTimers.get(frame);
+    if (timer) clearTimeout(timer);
+    state.artifactFrameUnloadTimers.delete(frame);
+  }
+
+  function artifactFrameLoaderCanvas(frame) {
+    return frame?.closest(".artifact-frame")?.querySelector("[data-artifact-loading-orb]") || null;
+  }
+
+  function startArtifactFrameLoader(frame) {
+    const canvas = artifactFrameLoaderCanvas(frame);
+    if (!canvas) return;
+    const requestedSize = Number(canvas.dataset.thinkingOrbSize);
+    const size = Number.isFinite(requestedSize) && requestedSize > 0 ? requestedSize : 64;
+    window.CalliopeThinkingOrbs?.mount(canvas, canvas.dataset.thinkingOrb, size);
+  }
+
+  function stopArtifactFrameLoader(frame) {
+    const canvas = artifactFrameLoaderCanvas(frame);
+    if (canvas) window.CalliopeThinkingOrbs?.unmount(canvas);
+  }
+
+  function activateArtifactFrame(frame) {
+    if (!frame?.isConnected) return false;
+    clearArtifactFrameUnload(frame);
+    const source = frame.dataset.artifactSrc;
+    if (!source) return false;
+    if (artifactFrameIsActive(frame)) return true;
+    frame.dataset.artifactActive = "true";
+    const shell = frame.closest(".artifact-frame");
+    if (shell) {
+      shell.dataset.frameState = "loading";
+      shell.setAttribute("aria-busy", "true");
+      shell.setAttribute("aria-label", "Loading dashboard revision");
+    }
+    startArtifactFrameLoader(frame);
+    frame.setAttribute("src", source);
+    return true;
+  }
+
+  function deactivateArtifactFrame(frame, { immediate = false } = {}) {
+    clearArtifactFrameUnload(frame);
+    if (!artifactFrameIsActive(frame)) return;
+    const unload = () => {
+      state.artifactFrameUnloadTimers.delete(frame);
+      const surfaceId = artifactFrameSurfaceId(frame);
+      if (
+        !frame.isConnected
+        || frame.dataset.artifactVisible === "true"
+        || state.inspectingSurfaceId === surfaceId
+      ) return;
+      frame.dataset.artifactActive = "false";
+      const shell = frame.closest(".artifact-frame");
+      if (shell) {
+        shell.dataset.frameState = "dormant";
+        shell.removeAttribute("aria-busy");
+        shell.removeAttribute("aria-label");
+      }
+      stopArtifactFrameLoader(frame);
+      // Removing src tears down scripts, timers, queries, and rendering work in
+      // the historical dashboard while data-artifact-src preserves its URL.
+      frame.removeAttribute("src");
+    };
+    if (immediate) unload();
+    else {
+      state.artifactFrameUnloadTimers.set(
+        frame,
+        window.setTimeout(unload, ARTIFACT_FRAME_UNLOAD_DELAY_MS),
+      );
+    }
+  }
+
+  function teardownArtifactFrameObserver() {
+    state.artifactFrameObserver?.disconnect();
+    state.artifactFrameObserver = null;
+    state.artifactFrameUnloadTimers.forEach((timer) => clearTimeout(timer));
+    state.artifactFrameUnloadTimers.clear();
+    $$('iframe[data-artifact-src]', els.stage).forEach(stopArtifactFrameLoader);
+  }
+
+  function initializeArtifactFrames() {
+    teardownArtifactFrameObserver();
+    const frames = $$('iframe[data-artifact-src]', els.stage);
+    if (!frames.length) return;
+    frames.forEach((frame) => {
+      frame.addEventListener("load", () => {
+        if (!artifactFrameIsActive(frame)) return;
+        const shell = frame.closest(".artifact-frame");
+        if (shell) {
+          shell.dataset.frameState = "ready";
+          shell.removeAttribute("aria-busy");
+          shell.removeAttribute("aria-label");
+        }
+        stopArtifactFrameLoader(frame);
+        if (frame.dataset.adaptiveTheme === "true") {
+          void sendViewerThemeToArtifact(frame.contentWindow);
+        }
+        const surfaceId = artifactFrameSurfaceId(frame);
+        if (state.inspectingSurfaceId === surfaceId) {
+          frame.contentWindow?.postMessage({ type: "calliope.artifact.inspect.start" }, "*");
+        }
+      });
+    });
+    if (!("IntersectionObserver" in window)) {
+      frames.forEach(activateArtifactFrame);
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (state.artifactFrameObserver !== observer) return;
+      entries.forEach((entry) => {
+        const frame = entry.target;
+        const visible = entry.isIntersecting && entry.intersectionRatio > 0;
+        frame.dataset.artifactVisible = String(visible);
+        if (visible) activateArtifactFrame(frame);
+        else deactivateArtifactFrame(frame);
+      });
+    }, {
+      root: els.stageScroll,
+      rootMargin: "0px",
+      threshold: 0.01,
+    });
+    state.artifactFrameObserver = observer;
+    frames.forEach((frame) => observer.observe(frame));
+  }
+
+  async function sendViewerThemeToArtifact(targetWindow) {
+    if (!targetWindow || !window.WarehouseTheme?.getSnapshot) return;
+    try {
+      const snapshot = await window.WarehouseTheme.getSnapshot();
+      targetWindow.postMessage({ type: "rvbbit.adaptive-theme.apply", snapshot }, "*");
+    } catch {
+      // The artifact's deterministic profile fallback remains complete.
+    }
+  }
+
+  function broadcastViewerThemeToArtifacts() {
+    $$('iframe[data-artifact-active="true"][data-adaptive-theme="true"]').forEach((frame) => {
+      void sendViewerThemeToArtifact(frame.contentWindow);
+    });
   }
 
   function resetArtifactFrameHeights() {
@@ -5465,8 +6319,12 @@
       frame.style.removeProperty("height");
       delete frame.dataset.autoHeight;
       const iframe = $("iframe", frame);
+      const surfaceId = iframe ? artifactFrameSurfaceId(iframe) : "";
+      if (surfaceId) state.artifactFrameHeights.delete(surfaceId);
       requestAnimationFrame(() => requestAnimationFrame(() => {
-        iframe?.contentWindow?.postMessage({ type: "calliope.artifact.measure" }, "*");
+        if (artifactFrameIsActive(iframe)) {
+          iframe.contentWindow?.postMessage({ type: "calliope.artifact.measure" }, "*");
+        }
       }));
     });
   }
@@ -7055,7 +7913,9 @@
       document: renderDocument,
       selection: renderSelection,
       evidence: renderEvidenceSet,
+      inventory: renderInventory,
       action: renderAction,
+      dream: renderDreamSurface,
       instrument: renderInstrument,
       workflow: renderWorkflow,
     })[surface.kind]?.(surface) || `<div class="chart-empty">Surface unavailable</div>`;
@@ -7151,6 +8011,11 @@
     }
     state.brief.noteEditors.forEach((editor) => editor.destroy?.());
     state.brief.noteEditors.clear();
+    teardownArtifactFrameObserver();
+    const currentSurfaceIds = new Set(state.surfaces.map((surface) => surface.id));
+    state.artifactFrameHeights.forEach((_height, surfaceId) => {
+      if (!currentSurfaceIds.has(surfaceId)) state.artifactFrameHeights.delete(surfaceId);
+    });
     const visibleSurfaces = visibleStageSurfaces();
     els.surfaceCount.textContent = `${visibleSurfaces.length} surface${visibleSurfaces.length === 1 ? "" : "s"}`;
     els.stageEmpty.hidden = Boolean(visibleSurfaces.length);
@@ -7167,6 +8032,7 @@
         <div class="surface-grid">${surfacesForTurn(turn.id).map(surfaceCard).join("")}</div>
       </section>
     `).join("");
+    initializeArtifactFrames();
     hydrateEvidenceThumbnails();
     syncEvidenceSelectionCards();
     requestAnimationFrame(() => {
@@ -7471,8 +8337,13 @@
     cancelArtifactInspection();
     state.inspectingSurfaceId = surfaceId;
     setInspectionButton(surfaceId, true);
-    iframe.contentWindow.postMessage({ type: "calliope.artifact.inspect.start" }, "*");
-    toast("Move over the artifact and click the object you mean · Esc cancels");
+    if (artifactFrameIsReady(iframe)) {
+      iframe.contentWindow.postMessage({ type: "calliope.artifact.inspect.start" }, "*");
+      toast("Move over the artifact and click the object you mean · Esc cancels");
+    } else {
+      activateArtifactFrame(iframe);
+      toast("Loading this artifact for object selection…");
+    }
   }
 
   function matchingCapture(selection) {
@@ -8857,6 +9728,50 @@
       state.liveActivity.expanded = !state.liveActivity.expanded;
       renderLiveActivity();
     });
+    els.dreamsOpen.addEventListener("click", () => {
+      openDreams().catch((error) => toast(error.message, true));
+    });
+    els.dreamsClose.addEventListener("click", () => els.dreamsDialog.close());
+    els.dreamsDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      els.dreamsDialog.close();
+    });
+    els.dreamsDialog.addEventListener("click", (event) => {
+      if (event.target === els.dreamsDialog) els.dreamsDialog.close();
+    });
+    els.dreamsRefresh.addEventListener("click", () => {
+      loadDreams().catch((error) => toast(error.message, true));
+    });
+    els.dreamsRun.addEventListener("click", () => {
+      runDreamCycle().catch((error) => {
+        state.dreams.running = false;
+        renderDreams();
+        toast(error.message, true);
+      });
+    });
+    els.dreamsFilters.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-dream-view]");
+      if (!button) return;
+      loadDreams({ view: button.dataset.dreamView })
+        .catch((error) => toast(error.message, true));
+    });
+    els.dreamsList.addEventListener("click", (event) => {
+      const card = event.target.closest("[data-dream-id]");
+      if (!card) return;
+      state.dreams.selectedId = card.dataset.dreamId;
+      renderDreams();
+      markDreamViewed().catch(() => {});
+    });
+    els.dreamsDetail.addEventListener("click", (event) => {
+      const action = event.target.closest("[data-dream-action]");
+      if (action) {
+        mutateDream(action.dataset.dreamAction).catch((error) => toast(error.message, true));
+        return;
+      }
+      if (event.target.closest("[data-dream-handoff]")) {
+        handoffDream().catch((error) => toast(error.message, true));
+      }
+    });
     els.actionOpen.addEventListener("click", () => {
       openActionLibrary().catch((error) => toast(error.message, true));
     });
@@ -8867,48 +9782,98 @@
     });
     els.actionDialog.addEventListener("close", () => {
       clearTimeout(state.actionSearchTimer);
+      clearTimeout(state.inventorySearchTimer);
       clearTimeout(state.actionPollTimer);
       state.actionRequirement = "";
     });
     els.actionDialog.addEventListener("click", (event) => {
       if (event.target === els.actionDialog) els.actionDialog.close();
     });
+    els.libraryModes.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-library-mode]");
+      if (!button) return;
+      activateLibraryMode(button.dataset.libraryMode).catch((error) => toast(error.message, true));
+    });
     els.actionSearch.addEventListener("input", () => {
-      clearTimeout(state.actionSearchTimer);
-      state.actionSearchTimer = setTimeout(() => {
-        state.actionRequirement = "";
-        loadActions().catch((error) => toast(error.message, true));
-      }, 220);
+      if (state.libraryMode === "inventory") {
+        state.inventoryQuery = els.actionSearch.value;
+        clearTimeout(state.inventorySearchTimer);
+        state.inventorySearchTimer = setTimeout(() => {
+          loadInventory({ query: state.inventoryQuery }).catch((error) => toast(error.message, true));
+        }, 220);
+      } else if (state.libraryMode === "discover") {
+        state.actionQuery = els.actionSearch.value;
+        clearTimeout(state.actionSearchTimer);
+        state.actionSearchTimer = setTimeout(() => {
+          state.actionRequirement = "";
+          loadActions({ query: state.actionQuery }).catch((error) => toast(error.message, true));
+        }, 220);
+      }
     });
     els.actionCategories.addEventListener("click", (event) => {
+      const inventoryState = event.target.closest("[data-inventory-state]");
+      if (inventoryState && state.libraryMode === "inventory") {
+        state.inventoryState = inventoryState.dataset.inventoryState || "";
+        state.inventorySection = "";
+        loadInventory().catch((error) => toast(error.message, true));
+        return;
+      }
+      const inventorySection = event.target.closest("[data-inventory-section]");
+      if (inventorySection && state.libraryMode === "inventory") {
+        state.inventorySection = inventorySection.dataset.inventorySection || "";
+        state.inventoryState = "";
+        loadInventory().catch((error) => toast(error.message, true));
+        return;
+      }
       const button = event.target.closest("[data-action-category]");
-      if (!button) return;
+      if (!button || state.libraryMode !== "discover") return;
       state.actionCategory = button.dataset.actionCategory;
       state.actionRequirement = "";
       loadActions().catch((error) => toast(error.message, true));
     });
     els.actionRefresh.addEventListener("click", () => {
-      loadActions().catch((error) => toast(error.message, true));
-    });
-    els.actionHistoryRefresh.addEventListener("click", () => {
-      loadActionHistory().catch((error) => toast(error.message, true));
+      const request = state.libraryMode === "inventory"
+        ? loadInventory()
+        : state.libraryMode === "changes"
+          ? loadActionHistory({ selectFirst: true })
+          : loadActions();
+      request.catch((error) => toast(error.message, true));
     });
     els.actionList.addEventListener("click", (event) => {
+      const inventory = event.target.closest("[data-inventory-ref]");
+      if (inventory && state.libraryMode === "inventory") {
+        selectInventory(inventory.dataset.inventoryRef);
+        return;
+      }
+      const receipt = event.target.closest("[data-action-run]");
+      if (receipt && state.libraryMode === "changes") {
+        const run = state.actionRuns.find((candidate) => candidate.id === receipt.dataset.actionRun);
+        if (run) selectAction(run.action_id, { run }).catch((error) => toast(error.message, true));
+        return;
+      }
       const button = event.target.closest("[data-action-id]");
-      if (!button) return;
+      if (!button || state.libraryMode !== "discover") return;
       selectAction(button.dataset.actionId).catch((error) => toast(error.message, true));
     });
-    els.actionHistoryList.addEventListener("click", (event) => {
-      const button = event.target.closest("[data-action-run]");
-      const run = state.actionRuns.find((candidate) => candidate.id === button?.dataset.actionRun);
-      if (run) selectAction(run.action_id, { run }).catch((error) => toast(error.message, true));
+    els.inventoryOpenView.addEventListener("click", () => {
+      const refs = state.inventoryItems.map((item) => item.ref);
+      if (refs.length > 24) toast("Pinned the first 24 items in this view; narrow the Library to inspect a more specific set.");
+      handoffInventory(refs, "inspect")
+        .catch((error) => toast(error.message, true));
+    });
+    els.inventoryAsk.addEventListener("click", () => {
+      handoffInventory([state.inventoryRef], "inspect").catch((error) => toast(error.message, true));
+    });
+    els.inventoryKnowledgeSource.addEventListener("click", () => {
+      handoffInventory([state.inventoryRef], "knowledge_source").catch((error) => toast(error.message, true));
     });
     els.actionEmpty.addEventListener("click", (event) => {
       const example = event.target.closest("[data-action-example]");
       if (!example) return;
       els.actionSearch.value = example.dataset.actionExample;
+      state.actionQuery = els.actionSearch.value;
       state.actionRequirement = "";
-      loadActions().catch((error) => toast(error.message, true));
+      loadActions({ query: state.actionQuery }).catch((error) => toast(error.message, true));
     });
     els.actionDetailRequirements.addEventListener("click", (event) => {
       const button = event.target.closest("[data-action-remediation]");
@@ -9549,6 +10514,19 @@
         opening.catch((error) => toast(error.message, true));
         return;
       }
+      const inventoryFocus = event.target.closest("[data-inventory-focus]");
+      if (inventoryFocus) {
+        const ref = inventoryFocus.dataset.inventoryFocus;
+        const surfaceId = inventoryFocus.closest("[data-surface-id]")?.dataset.surfaceId;
+        const surface = state.surfaces.find((item) => item.id === surfaceId);
+        const item = (surface?.payload?.items || []).find((candidate) => candidate?.ref === ref);
+        const prompt = `Review the exact configured item ${ref}${item?.label ? ` (${item.label})` : ""} pinned on the Stage. `;
+        const current = composerValue().trim();
+        composerSetValue((current ? `${current}\n${prompt}` : prompt).slice(0, 6000));
+        setMobilePanel("chat");
+        composerFocus();
+        return;
+      }
       const inspect = event.target.closest("[data-inspect-artifact]");
       if (inspect) {
         startArtifactInspection(inspect.dataset.inspectArtifact);
@@ -9673,6 +10651,11 @@
       if (!iframe) return;
       const surfaceId = iframe.closest("[data-surface-id]")?.dataset.surfaceId;
       const surface = state.surfaces.find((item) => item.id === surfaceId);
+      if (data.type === "rvbbit.adaptive-theme.request") {
+        if (iframe.dataset.adaptiveTheme !== "true") return;
+        await sendViewerThemeToArtifact(event.source);
+        return;
+      }
       if (data.type === "calliope.artifact.inspect.selected") {
         if (!surface || state.inspectingSurfaceId !== surface.id) return;
         cancelArtifactInspection(false);
@@ -9688,8 +10671,10 @@
         if (!Number.isFinite(height) || height < 1) return;
         const frame = iframe.closest(".artifact-frame");
         if (!frame) return;
-        frame.style.height = `${Math.max(280, height)}px`;
+        const retainedHeight = Math.max(280, height);
+        frame.style.height = `${retainedHeight}px`;
         frame.dataset.autoHeight = "true";
+        if (surfaceId) state.artifactFrameHeights.set(surfaceId, retainedHeight);
         return;
       }
       if (data.type !== "calliope.query" || !data.id) return;
@@ -9703,19 +10688,36 @@
             name,
             await api(`/api/d/${encodeURIComponent(slug)}/q`, {
               method: "POST",
-              body: JSON.stringify({ sql, as_of: data.opts?.as_of }),
+              body: JSON.stringify({
+                sql,
+                as_of: data.opts?.as_of,
+                origin: "calliope",
+              }),
             }),
           ]));
           result = { results: Object.fromEntries(settled) };
         } else {
           result = await api(`/api/d/${encodeURIComponent(slug)}/q`, {
             method: "POST",
-            body: JSON.stringify({ sql: data.sql, as_of: data.opts?.as_of }),
+            body: JSON.stringify({
+              sql: data.sql,
+              as_of: data.opts?.as_of,
+              origin: "calliope",
+            }),
           });
         }
         event.source.postMessage({ type: "calliope.query.result", id: data.id, result }, "*");
       } catch (error) {
         event.source.postMessage({ type: "calliope.query.result", id: data.id, error: error.message }, "*");
+      }
+    });
+    window.addEventListener("warehouse-theme-change", () => {
+      broadcastViewerThemeToArtifacts();
+      $$('.artifact-frame[data-frame-state="loading"] iframe', els.stage)
+        .forEach(startArtifactFrameLoader);
+      const selected = selectedDesignVersion();
+      if (selected && selected.profile.is_adaptive) {
+        renderDesignPreview(selected.profile, selected.version);
       }
     });
     document.addEventListener("dragover", (event) => {
@@ -9724,8 +10726,10 @@
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden) {
         updateCalliopeAvatar();
+        loadSessions().catch(() => {});
         loadInbox({ silent: true }).catch(() => {});
         loadBriefStatus({ silent: true }).catch(() => {});
+        loadDreams({ silent: true }).catch(() => {});
       }
     });
     document.addEventListener("drop", (event) => {
@@ -9755,6 +10759,7 @@
       const launchCalendar = launch.get("calendar");
       await loadConfig();
       await loadBriefStatus({ silent: true });
+      await loadDreams({ silent: true });
       if (launchCalendar && state.config?.google_calendar) {
         const message = ({
           connected: "Google Calendar connected to your private Personal Brief layer",
@@ -9810,6 +10815,10 @@
       await loadInstruments();
       await loadWorkflows();
       await loadSessions(launchSession);
+      clearInterval(state.sessionRefreshTimer);
+      state.sessionRefreshTimer = setInterval(() => {
+        if (!document.hidden) loadSessions().catch(() => {});
+      }, 60_000);
       if (launchSurface && state.surfaces.some((surface) => surface.id === launchSurface)) {
         const launched = state.surfaces.find((surface) => surface.id === launchSurface);
         requestAnimationFrame(() => {

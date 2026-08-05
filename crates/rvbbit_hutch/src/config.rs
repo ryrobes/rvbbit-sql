@@ -4,6 +4,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 fn default_bind() -> String {
     "0.0.0.0:8090".into()
@@ -118,6 +119,12 @@ pub struct BackendCfg {
     /// Path on the upstream in proxy mode (e.g. "/sentiment").
     #[serde(default)]
     pub upstream_path: Option<String>,
+    /// Optional base URL for this backend. When absent, the shared
+    /// `upstream.base_url` remains the default. This keeps the model zoo
+    /// configuration terse while allowing CPU sidecars (for example a web
+    /// fetch/extract service) to stay isolated behind the same Hutch door.
+    #[serde(default)]
+    pub upstream_base: Option<String>,
     #[serde(default)]
     pub adapter: Adapter,
     /// Extra fields merged into the upstream request body (e.g. NLI model
@@ -138,6 +145,11 @@ pub struct BackendCfg {
     /// classification. Metering still records every call.
     #[serde(default)]
     pub unlaned: bool,
+    /// Forward a stable, one-way tenant scope to trusted local sidecars that
+    /// maintain durable per-customer state. The raw tenant ID and bearer key
+    /// are never forwarded.
+    #[serde(default)]
+    pub forward_tenant_scope: bool,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     /// Mock mode: the output emitted per input (default {"mock": true}).
@@ -202,9 +214,28 @@ pub struct LlmCfg {
     pub entitlement: String,
     #[serde(default = "default_llm_upstream")]
     pub upstream_base: String,
+    /// Optional environment variable containing the upstream API token.
+    /// When set, Hutch adds `Authorization: Bearer <token>` to the upstream
+    /// request.  The variable name is configuration; the credential itself
+    /// never belongs in YAML (useful for OpenRouter and other hosted,
+    /// OpenAI-compatible backends).
+    #[serde(default)]
+    pub upstream_bearer_token_env: Option<String>,
     /// Served model name at the upstream (e.g. the vLLM --model id).
     pub upstream_model: String,
     pub model_version: String,
+    /// Server-owned fields recursively merged into every upstream request.
+    /// These win over subscriber input so privacy policy and hosted-model
+    /// quirks stay behind the stable public model alias without replacing
+    /// unrelated nested preferences. `model` is reserved and always comes
+    /// from upstream_model.
+    #[serde(default)]
+    pub request_overrides: BTreeMap<String, Value>,
+    /// Fields recursively supplied only when the subscriber did not send
+    /// them. This lets deterministic semantic operators get stable hosted-
+    /// model defaults while callers can still opt into different values.
+    #[serde(default)]
+    pub request_defaults: BTreeMap<String, Value>,
     /// Would-be à la carte rates for receipts, micro-USD per 1k tokens.
     #[serde(default)]
     pub prompt_microusd_per_1k: i64,
@@ -233,6 +264,16 @@ impl HutchConfig {
                 }
             }
         }
+        for llm in &cfg.llms {
+            if llm.request_overrides.contains_key("model")
+                || llm.request_defaults.contains_key("model")
+            {
+                return Err(format!(
+                    "llm '{}' request policy cannot replace the routed model",
+                    llm.name
+                ));
+            }
+        }
         Ok(cfg)
     }
 
@@ -254,7 +295,7 @@ mod tests {
         let cfg: HutchConfig = serde_yaml::from_str(include_str!("../hutch.clover.example.yaml"))
             .expect("production-shaped Clover example should parse");
 
-        assert_eq!(cfg.backends.len(), 20);
+        assert_eq!(cfg.backends.len(), 27);
         assert_eq!(cfg.llms.len(), 1);
 
         let cluster = cfg.backend("cluster").expect("cluster backend");
@@ -269,9 +310,112 @@ mod tests {
         assert_eq!(explain.upstream_path.as_deref(), Some("/tabular/explain"));
         assert_eq!(explain.timeout_ms, 600_000);
 
+        let document_parse = cfg
+            .backend("document_parse")
+            .expect("structured document backend");
+        assert_eq!(
+            document_parse.upstream_path.as_deref(),
+            Some("/document/parse")
+        );
+        assert_eq!(
+            document_parse.model_version,
+            "clover-v2/granite-docling-258m-structured"
+        );
+
+        let forecast = cfg.backend("forecast").expect("forecast backend");
+        assert_eq!(forecast.upstream_path.as_deref(), Some("/forecast"));
+        assert_eq!(forecast.model_version, "clover-v2/chronos-2");
+
+        let anomalies = cfg
+            .backend("timeseries_anomalies")
+            .expect("TSPulse anomaly backend");
+        assert_eq!(
+            anomalies.upstream_path.as_deref(),
+            Some("/timeseries/anomalies")
+        );
+        assert!(anomalies.unlaned);
+
+        let research = cfg.backend("web_research").expect("research backend");
+        assert!(!research.unlaned);
+        assert!(research.forward_tenant_scope);
+        assert_eq!(
+            research.upstream_base.as_deref(),
+            Some("http://127.0.0.1:8092")
+        );
+        assert_eq!(research.upstream_path.as_deref(), Some("/v1/research"));
+        assert_eq!(research.timeout_ms, 180_000);
+
         let gemma = cfg.llm("gemma4").expect("Gemma LLM");
         assert_eq!(gemma.upstream_model, "nvidia/Gemma-4-31B-IT-NVFP4");
+        assert!(gemma.upstream_bearer_token_env.is_none());
         assert_eq!(gemma.prompt_microusd_per_1k, 100);
         assert_eq!(gemma.completion_microusd_per_1k, 200);
+    }
+
+    #[test]
+    fn hosted_llm_credentials_are_referenced_by_environment_name() {
+        let cfg: HutchConfig = serde_yaml::from_str(
+            r#"
+            upstream: { mode: mock }
+            backends:
+              - name: embed
+                entitlement: clover
+                model_version: mock
+            llms:
+              - name: gemma4
+                entitlement: clover_llm
+                upstream_base: https://openrouter.ai/api
+                upstream_bearer_token_env: OPENROUTER_API_KEY
+                upstream_model: ~deepseek/deepseek-v4-flash-latest
+                model_version: openrouter/deepseek-v4-flash-latest
+                request_defaults:
+                  reasoning: { enabled: false }
+                  temperature: 0
+                  seed: 0
+                request_overrides:
+                  provider:
+                    zdr: true
+                    data_collection: deny
+            "#,
+        )
+        .expect("hosted OpenAI-compatible LLM config should parse");
+
+        let gemma = cfg.llm("gemma4").expect("Gemma LLM");
+        assert_eq!(gemma.upstream_base, "https://openrouter.ai/api");
+        assert_eq!(
+            gemma.upstream_bearer_token_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
+        assert_eq!(gemma.upstream_model, "~deepseek/deepseek-v4-flash-latest");
+        assert_eq!(gemma.request_defaults["reasoning"]["enabled"], false);
+        assert_eq!(gemma.request_defaults["temperature"], 0);
+        assert_eq!(gemma.request_defaults["seed"], 0);
+        assert_eq!(gemma.request_overrides["provider"]["zdr"], true);
+        assert_eq!(
+            gemma.request_overrides["provider"]["data_collection"],
+            "deny"
+        );
+    }
+
+    #[test]
+    fn specialist_can_override_the_shared_upstream_base() {
+        let cfg: HutchConfig = serde_yaml::from_str(
+            r#"
+            upstream:
+              mode: proxy
+              base_url: http://127.0.0.1:8085
+            backends:
+              - name: web_scrape
+                entitlement: clover
+                upstream_base: http://127.0.0.1:8091
+                upstream_path: /v1/scrape
+                model_version: clover-web-v0.2
+            "#,
+        )
+        .expect("per-backend upstream should parse");
+
+        let web = cfg.backend("web_scrape").expect("web backend");
+        assert_eq!(web.upstream_base.as_deref(), Some("http://127.0.0.1:8091"));
+        assert_eq!(web.upstream_path.as_deref(), Some("/v1/scrape"));
     }
 }
