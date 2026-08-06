@@ -61,7 +61,22 @@ CREATE INDEX IF NOT EXISTS calliope_google_calendar_events_owner_updated_idx
 
 -- A graph-shaped, owner-keyed projection for personal context.  It deliberately
 -- omits event descriptions and never mutates the shared organization graph.
+--
+-- Keep the six canonical-match columns introduced by 0238 in this initial
+-- shape as NULL placeholders.  The Warehouse application may have installed
+-- the forward 0238 view before an older pg_rvbbit image records 0237 in
+-- schema_migrations; replacing that 18-column view with the original
+-- 12-column shape would fail with SQLSTATE 42P16.  Migration 0238 immediately
+-- fills these columns with the real Brain lookup.
 CREATE OR REPLACE VIEW rvbbit.calliope_private_calendar_edges AS
+SELECT raw_edges.*,
+       NULL::bigint AS kg_node_id,
+       NULL::text AS graph_id,
+       NULL::text AS node_kind,
+       NULL::text AS canonical_label,
+       NULL::text AS match_basis,
+       NULL::double precision AS match_confidence
+  FROM (
 SELECT e.owner_email,
        e.calendar_id,
        e.event_id,
@@ -102,7 +117,8 @@ SELECT e.owner_email,e.calendar_id,e.event_id,
        jsonb_build_object('label',e.location),
        e.starts_at,e.ends_at
   FROM rvbbit.calliope_google_calendar_events e
- WHERE e.status <> 'cancelled' AND nullif(e.location,'') IS NOT NULL;
+ WHERE e.status <> 'cancelled' AND nullif(e.location,'') IS NOT NULL
+  ) raw_edges;
 
 COMMENT ON TABLE rvbbit.calliope_google_calendar_connections IS
     'Private per-user Google Calendar grant state; refresh_token_ciphertext is application-encrypted.';
