@@ -714,6 +714,91 @@ body[data-warehouse-page="calliope"] > main > .chat-column > * {
   background: color-mix(in oklch, var(--panel-raised, #1d1813) 66%, transparent);
 }
 
+.warehouse-theme-voice {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--line, rgba(232, 221, 204, .13));
+  background:
+    linear-gradient(135deg, color-mix(in oklch, var(--amber, #f5b446) 7%, transparent), transparent 62%),
+    color-mix(in oklch, var(--panel-raised, #1d1813) 64%, transparent);
+}
+
+.warehouse-theme-voice-modes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  padding: 2px;
+  border: 1px solid var(--line, rgba(232, 221, 204, .13));
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--void, #100d0b) 58%, transparent);
+}
+
+.warehouse-theme-voice-modes button {
+  min-height: 27px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dim, rgba(232, 221, 204, .38));
+  font: 7px/1 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: .075em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease, box-shadow .16s ease;
+}
+
+.warehouse-theme-voice-modes button[aria-pressed="true"] {
+  background: color-mix(in oklch, var(--amber, #f5b446) 88%, white 4%);
+  color: var(--main-foreground, #1a1206);
+  box-shadow: 0 3px 12px color-mix(in oklch, var(--amber, #f5b446) 24%, transparent);
+  font-weight: 800;
+}
+
+.warehouse-theme-voice-personality {
+  display: grid;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.warehouse-theme-voice-personality > span {
+  display: flex;
+  justify-content: space-between;
+  color: var(--fog, rgba(232, 221, 204, .62));
+  font: 7px/1.2 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+
+.warehouse-theme-voice-personality output {
+  color: var(--dim, rgba(232, 221, 204, .38));
+}
+
+.warehouse-theme-voice-personality textarea {
+  min-height: 48px;
+  resize: vertical;
+  padding: 8px 9px;
+  border: 1px solid var(--line, rgba(232, 221, 204, .13));
+  border-radius: 2px;
+  outline: 0;
+  background: color-mix(in oklch, var(--void, #100d0b) 58%, transparent);
+  color: var(--bone, #e8ddcc);
+  font: 10px/1.4 Inter, ui-sans-serif, sans-serif;
+}
+
+.warehouse-theme-voice-personality textarea:focus {
+  border-color: var(--line-hot, rgba(245, 180, 70, .45));
+  box-shadow: 0 0 0 2px color-mix(in oklch, var(--amber, #f5b446) 10%, transparent);
+}
+
+.warehouse-theme-voice[data-mode="off"] .warehouse-theme-voice-personality {
+  opacity: .42;
+}
+
+.warehouse-theme-voice > p {
+  margin: 7px 0 0 !important;
+  color: var(--dim, rgba(232, 221, 204, .38)) !important;
+  font: 7px/1.45 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace !important;
+}
+
 .warehouse-theme-background-head {
   display: flex;
   align-items: baseline;

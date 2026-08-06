@@ -6,6 +6,7 @@ x-rvbbit-secret-env: &rvbbit-secret-env
   GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
   GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
   GOOGLE_CLOUD_QUOTA_PROJECT: ${GOOGLE_CLOUD_QUOTA_PROJECT:-}
+  GMEET_CONNECTOR_TOKEN: ${GMEET_CONNECTOR_TOKEN:-}
 
 services:
   postgres:
@@ -140,6 +141,31 @@ services:
       CONNECTOR_TOKEN: ${GDRIVE_CONNECTOR_TOKEN:-}
     volumes:
       - rvbbit_staging:/staging
+    restart: unless-stopped
+
+  # Google Meet transcripts -> governed Brain documents. The REST poll is the
+  # reliable baseline; standard Cloud Pub/Sub can later accelerate notification
+  # without changing this source contract.
+  gmeet-connector:
+    profiles: ["gmeet"]
+    image: ${RVBBIT_GMEET_CONNECTOR_IMAGE:-ghcr.io/ryrobes/rvbbit-gmeet-connector:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-gmeet-connector
+    environment:
+      GMEET_SA_KEY: ${GMEET_SA_KEY:-/run/secrets/gmeet-service-account.json}
+      GMEET_ADMIN_SUBJECT: ${GMEET_ADMIN_SUBJECT:-}
+      GMEET_SUBJECTS: ${GMEET_SUBJECTS:-}
+      GMEET_DOMAIN: ${GMEET_DOMAIN:-}
+      GMEET_DISCOVER_USERS: ${GMEET_DISCOVER_USERS:-true}
+      GMEET_MAX_SUBJECTS: ${GMEET_MAX_SUBJECTS:-500}
+      GMEET_LOOKBACK_DAYS: ${GMEET_LOOKBACK_DAYS:-29}
+      GMEET_CALENDAR_LOOKUP: ${GMEET_CALENDAR_LOOKUP:-true}
+      GMEET_AUTO_TRANSCRIBE: ${GMEET_AUTO_TRANSCRIBE:-false}
+      GMEET_AUTO_TRANSCRIBE_DAYS: ${GMEET_AUTO_TRANSCRIBE_DAYS:-7}
+      GMEET_DRIVE_ACL: ${GMEET_DRIVE_ACL:-true}
+      GMEET_ACL_MODE: ${GMEET_ACL_MODE:-calendar_invitees_strict}
+      CONNECTOR_TOKEN: ${GMEET_CONNECTOR_TOKEN:-}
+    volumes:
+      - ${GMEET_SA_KEY_FILE:-/dev/null}:/run/secrets/gmeet-service-account.json:ro
     restart: unless-stopped
 
 networks:

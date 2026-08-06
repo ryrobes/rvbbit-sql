@@ -33,6 +33,15 @@ class _McpConnection:
         return _Rows(self.rows)
 
 
+class _BrainConnection:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def execute(self, query, _params=None):
+        assert "FROM rvbbit.brain_sources" in query
+        return _Rows(self.rows)
+
+
 class _Connection:
     def __enter__(self):
         return self
@@ -136,6 +145,58 @@ def test_mcp_inventory_marks_read_surfaces_without_exposing_server_environment()
     assert calliope._library_safe_endpoint(
         "https://user:password@mcp.example.test/path?token=secret#fragment"
     ) == "https://mcp.example.test/path"
+
+
+def test_google_meet_inventory_surfaces_transcript_coverage():
+    rows = [{
+        "source": {
+            "source_id": 42,
+            "label": "Google Meet",
+            "kind": "google_meet",
+            "enabled": True,
+            "config": {"provider": "google-meet", "connector": "gmeet_connector"},
+            "last_synced_at": "2026-08-06T08:00:00+00:00",
+        },
+        "docs": 18,
+        "meeting_briefs": 7,
+        "chunks": 93,
+        "pending_grants": 0,
+        "last_sync": {
+            "trigger": "auto",
+            "finished_at": "2026-08-06T08:00:00+00:00",
+            "added": 3,
+            "errors": 0,
+            "detail": {
+                "connector_stats": {
+                    "transcript_files": 3,
+                    "meetings_without_transcript": 2,
+                    "subjects_polled": 64,
+                    "warnings": 0,
+                    "auto_transcription": {"enabled": 4, "errors": 0},
+                },
+                "meeting_summaries": {
+                    "available": True,
+                    "created": 2,
+                    "updated": 1,
+                    "skipped": 0,
+                },
+            },
+        },
+    }]
+
+    item = calliope._library_brain_inventory(_BrainConnection(rows), "person@example.com")[0]
+
+    assert item["state"] == "attention"
+    assert "2 recent meetings" in item["health"]
+    facts = {fact["label"]: fact["value"] for fact in item["facts"]}
+    assert facts["Transcripts found"] == 3
+    assert facts["Meeting briefs"] == 7
+    assert facts["Summary status"] == "Available"
+    assert facts["Missing transcripts"] == 2
+    assert facts["Workspace users polled"] == 64
+    assert facts["Auto-transcripts enabled"] == 4
+    assert item["detail"]["connector_stats"]["transcript_files"] == 3
+    assert item["detail"]["meeting_summaries"]["created"] == 2
 
 
 def test_inventory_snapshot_isolates_collectors_and_filters_exact_refs(monkeypatch):

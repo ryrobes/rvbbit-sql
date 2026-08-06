@@ -140,6 +140,13 @@
     send: $("#send-message"),
     speechRecord: $("#speech-record"),
     speechStatus: $("#speech-status"),
+    voiceDialog: $("#voice-dialog"),
+    voiceDialogClose: $("#voice-dialog-close"),
+    voiceDialogScript: $("#voice-dialog-script"),
+    voiceDialogMeta: $("#voice-dialog-meta"),
+    voiceDialogCopy: $("#voice-dialog-copy"),
+    voiceDialogStop: $("#voice-dialog-stop"),
+    voiceDialogReplay: $("#voice-dialog-replay"),
     designProfileChip: $("#design-profile-chip"),
     imageInput: $("#image-input"),
     attachmentTray: $("#attachment-tray"),
@@ -291,6 +298,7 @@
     <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M8.5 21h7"></path>
   </svg>`;
   const SPEECH_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+  const VOICE_STORAGE_KEY = "rvbbit-calliope-voice-v1";
   const SQL_KEYWORDS = new Set(`
     all alter analyze and any array as asc asof at between both by case cast check
     collate column constraint create cross current_date current_time current_timestamp
@@ -431,6 +439,26 @@
       finalTranscript: "",
       finalPromise: null,
       resolveFinal: null,
+    },
+    voice: {
+      preferences: { version: 1, mode: "off", personality: "" },
+      phase: "idle",
+      controller: null,
+      context: null,
+      sources: new Set(),
+      nextStartAt: 0,
+      playbackStartedAt: 0,
+      turnId: null,
+      renderId: null,
+      dialogTurnId: null,
+      requestSequence: 0,
+      streamComplete: false,
+      karaokeFrame: null,
+      karaokeTurnId: null,
+      alignmentCursor: 0,
+      wordRanges: [],
+      wordCues: [],
+      charWordMap: null,
     },
     stageAtLiveEdge: true,
     chatAtLiveEdge: true,
@@ -5213,6 +5241,7 @@
 
   function clearSession() {
     cancelSpeechRecording();
+    stopVoicePlayback();
     clearSpatialSelections();
     clearLiveActivity();
     state.current = null;
@@ -5241,6 +5270,7 @@
   async function selectSession(id, options = {}) {
     if ((state.busy && !options.force) || state.evidenceSearching) return;
     cancelSpeechRecording();
+    stopVoicePlayback();
     const selectedSummary = state.sessions.find((session) => session.id === id);
     clearSpatialSelections();
     if (!options.preserveActivity) clearLiveActivity();
@@ -5393,11 +5423,61 @@
     return turn.thinking_state;
   }
 
+  function voiceWordRanges(scriptValue) {
+    const script = String(scriptValue || "");
+    const ignored = new Uint8Array(script.length);
+    for (const match of script.matchAll(/\[[a-z][a-z -]{0,30}\]/gi)) {
+      const start = Number(match.index || 0);
+      for (let index = start; index < start + match[0].length; index += 1) {
+        ignored[index] = 1;
+      }
+    }
+    const words = [];
+    let index = 0;
+    while (index < script.length) {
+      while (index < script.length && (/\s/.test(script[index]) || ignored[index])) index += 1;
+      if (index >= script.length) break;
+      const characters = [];
+      const positions = [];
+      while (index < script.length && !/\s/.test(script[index])) {
+        if (!ignored[index]) {
+          characters.push(script[index]);
+          positions.push(index);
+        }
+        index += 1;
+      }
+      const text = characters.join("");
+      if (text) words.push({ text, positions });
+    }
+    return words;
+  }
+
+  function voicePresentationEnabled(turn) {
+    return Boolean(
+      voiceConfigured()
+      && state.voice.preferences.mode !== "off"
+      && voiceReceipt(turn),
+    );
+  }
+
+  function renderVoiceTranscript(turn, render) {
+    const words = voiceWordRanges(render?.script);
+    if (!words.length) return safeMarkdown(render?.script || "");
+    return `<span class="voice-transcript" aria-label="Spoken response">
+      ${words.map((word, index) => `<span class="voice-word"
+        data-voice-word-turn="${escapeHtml(turn.id || "")}" data-voice-word-index="${index}">${escapeHtml(word.text)}</span>`).join(" ")}
+    </span>`;
+  }
+
   function assistantBody(turn, failed) {
     if (turn.status === "running" && !turn.assistant_message) {
       return `<div class="thinking-indicator">
         <canvas data-thinking-orb="${thinkingState(turn)}"></canvas>
       </div>`;
+    }
+    const spoken = !failed ? voiceReceipt(turn) : null;
+    if (spoken && voicePresentationEnabled(turn)) {
+      return renderVoiceTranscript(turn, spoken);
     }
     return safeMarkdown(
       failed ? turn.error || "That turn did not complete." : turn.assistant_message || "",
@@ -5511,7 +5591,7 @@
         </article>
         <article class="message assistant ${turn.status === "running" ? "streaming" : ""} ${failed ? "error" : ""}"
                  data-assistant-turn-id="${escapeHtml(turn.id)}">
-          <div class="message-label"><span>Calliope</span></div>
+          <div class="message-label"><span>Calliope</span>${renderVoiceControl(turn)}</div>
           <div class="message-body">${assistantBody(turn, failed)}</div>
           ${receipt || (links ? `<div class="surface-links">${links}</div>` : "")}
         </article>`;
@@ -10419,6 +10499,478 @@
     startSpeechRecording(target);
   }
 
+  function readVoicePreferences() {
+    try {
+      const supplied = window.WarehouseTheme?.getVoice?.();
+      const parsed = supplied && typeof supplied === "object"
+        ? supplied
+        : JSON.parse(localStorage.getItem(VOICE_STORAGE_KEY) || "null");
+      return {
+        version: 1,
+        mode: ["fast", "expressive"].includes(parsed?.mode) ? parsed.mode : "off",
+        personality: typeof parsed?.personality === "string"
+          ? parsed.personality.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 600)
+          : "",
+      };
+    } catch {
+      return { version: 1, mode: "off", personality: "" };
+    }
+  }
+
+  function applyVoicePreferences(value = readVoicePreferences()) {
+    state.voice.preferences = {
+      version: 1,
+      mode: ["fast", "expressive"].includes(value?.mode) ? value.mode : "off",
+      personality: typeof value?.personality === "string"
+        ? value.personality.slice(0, 600) : "",
+    };
+    if (state.voice.preferences.mode === "off") stopVoicePlayback();
+  }
+
+  function voiceConfigured() {
+    return state.config?.text_to_speech?.enabled === true;
+  }
+
+  function voiceReceipt(turn) {
+    const voice = turn?.response_receipt?.voice;
+    return voice && typeof voice === "object" && voice.id && voice.script ? voice : null;
+  }
+
+  function voiceAudioUrl(turnId, renderId) {
+    return `/api/calliope/voice/turns/${encodeURIComponent(turnId)}/audio?render=${encodeURIComponent(renderId)}`;
+  }
+
+  function prepareVoiceAudioContext() {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return null;
+    if (!state.voice.context || state.voice.context.state === "closed") {
+      state.voice.context = new AudioContextClass({ latencyHint: "interactive" });
+    }
+    if (state.voice.context.state === "suspended") {
+      void state.voice.context.resume().catch(() => {});
+    }
+    return state.voice.context;
+  }
+
+  function syncVoiceUi() {
+    const active = state.voice.phase !== "idle";
+    $$("[data-open-voice-turn]", els.messages).forEach((button) => {
+      const thisTurn = button.dataset.openVoiceTurn === String(state.voice.turnId || "");
+      button.classList.toggle("active", active && thisTurn);
+      const label = $("[data-voice-label]", button);
+      if (label) {
+        label.textContent = active && thisTurn
+          ? state.voice.phase === "preparing" ? "Preparing" : "Playing"
+          : "Voice";
+      }
+      button.title = active && thisTurn
+        ? "Open the complete answer · audio is playing"
+        : "Open the complete answer or replay the spoken cut";
+    });
+    const dialogActive = active
+      && state.voice.dialogTurnId === String(state.voice.turnId || "");
+    els.voiceDialog?.classList.toggle("playing", dialogActive);
+    if (els.voiceDialogStop) els.voiceDialogStop.disabled = !dialogActive;
+    if (els.voiceDialogReplay) {
+      els.voiceDialogReplay.textContent = dialogActive ? "Playing…" : "Replay";
+      els.voiceDialogReplay.disabled = state.voice.phase === "preparing";
+    }
+  }
+
+  function clearVoiceKaraoke() {
+    if (state.voice.karaokeFrame != null) {
+      cancelAnimationFrame(state.voice.karaokeFrame);
+      state.voice.karaokeFrame = null;
+    }
+    $$(".voice-word.is-speaking,.voice-word.was-spoken", els.messages).forEach((word) => {
+      word.classList.remove("is-speaking", "was-spoken");
+    });
+    state.voice.karaokeTurnId = null;
+    state.voice.alignmentCursor = 0;
+    state.voice.wordRanges = [];
+    state.voice.wordCues = [];
+    state.voice.charWordMap = null;
+    state.voice.playbackStartedAt = 0;
+  }
+
+  function paintVoiceKaraoke() {
+    state.voice.karaokeFrame = null;
+    if (
+      state.voice.phase === "idle"
+      || !state.voice.context
+      || !state.voice.karaokeTurnId
+    ) return;
+    const now = state.voice.context.currentTime;
+    const selector = `[data-voice-word-turn="${CSS.escape(state.voice.karaokeTurnId)}"]`;
+    $$(selector, els.messages).forEach((element) => {
+      const cue = state.voice.wordCues[Number(element.dataset.voiceWordIndex)];
+      const speaking = Boolean(cue && now >= cue.start && now < cue.end + 0.045);
+      const spoken = Boolean(cue && now >= cue.end + 0.045);
+      element.classList.toggle("is-speaking", speaking);
+      element.classList.toggle("was-spoken", spoken);
+    });
+    state.voice.karaokeFrame = requestAnimationFrame(paintVoiceKaraoke);
+  }
+
+  function initializeVoiceKaraoke(turn, render, startAt) {
+    const script = String(render?.script || "");
+    const words = voiceWordRanges(script);
+    const charWordMap = new Int32Array(script.length);
+    charWordMap.fill(-1);
+    words.forEach((word, wordIndex) => {
+      word.positions.forEach((position) => { charWordMap[position] = wordIndex; });
+    });
+
+    // Alignment is expected on the timed ElevenLabs stream. These measured-
+    // cadence cues keep the UI useful if a model omits alignment for a chunk;
+    // each cue is replaced as soon as a real character timestamp arrives.
+    const weights = words.map((word) => {
+      const letters = word.text.replace(/[^\p{L}\p{N}]/gu, "").length;
+      return Math.max(1.2, Math.min(4.2, letters / 3.2))
+        + (/[.!?…]$/.test(word.text) ? 0.9 : /[,;:]$/.test(word.text) ? 0.35 : 0);
+    });
+    const estimatedSeconds = Math.max(1.2, words.length / 2.55);
+    const unit = estimatedSeconds / Math.max(1, weights.reduce((sum, value) => sum + value, 0));
+    let cursor = startAt;
+    const cues = weights.map((weight) => {
+      const duration = Math.max(0.11, weight * unit);
+      const cue = { start: cursor, end: cursor + duration, actual: false };
+      cursor = cue.end;
+      return cue;
+    });
+
+    state.voice.playbackStartedAt = startAt;
+    state.voice.karaokeTurnId = String(turn.id);
+    state.voice.alignmentCursor = 0;
+    state.voice.wordRanges = words;
+    state.voice.wordCues = cues;
+    state.voice.charWordMap = charWordMap;
+    if (state.voice.karaokeFrame == null) {
+      state.voice.karaokeFrame = requestAnimationFrame(paintVoiceKaraoke);
+    }
+  }
+
+  function voiceCharactersEqual(left, right) {
+    if (left === right) return true;
+    return /^\s+$/.test(left || "") && /^\s+$/.test(right || "");
+  }
+
+  function absorbVoiceAlignment(render, alignment, schedule, audioOffset) {
+    if (!alignment || !schedule || !state.voice.charWordMap) return;
+    const characters = Array.isArray(alignment.characters) ? alignment.characters : [];
+    const starts = Array.isArray(alignment.character_start_times_seconds)
+      ? alignment.character_start_times_seconds : [];
+    const ends = Array.isArray(alignment.character_end_times_seconds)
+      ? alignment.character_end_times_seconds : [];
+    const size = Math.min(characters.length, starts.length, ends.length);
+    if (!size) return;
+    const finiteStarts = starts.slice(0, size).map(Number).filter(Number.isFinite);
+    const finiteEnds = ends.slice(0, size).map(Number).filter(Number.isFinite);
+    if (!finiteStarts.length || !finiteEnds.length) return;
+    const minimumStart = Math.min(...finiteStarts);
+    const maximumEnd = Math.max(...finiteEnds);
+    const relativeTiming = audioOffset < 0.04
+      || maximumEnd <= schedule.duration + 0.4
+      || minimumStart < Math.max(0, audioOffset - 0.3);
+    const script = String(render?.script || "");
+    let cursor = state.voice.alignmentCursor;
+
+    for (let index = 0; index < size; index += 1) {
+      const character = String(characters[index] ?? "");
+      if (!character) continue;
+      let found = -1;
+      if (voiceCharactersEqual(script.slice(cursor, cursor + character.length), character)) {
+        found = cursor;
+      } else {
+        const limit = Math.min(script.length, cursor + 48);
+        for (let probe = cursor + 1; probe < limit; probe += 1) {
+          if (voiceCharactersEqual(script.slice(probe, probe + character.length), character)) {
+            found = probe;
+            break;
+          }
+        }
+      }
+      if (found < 0) continue;
+      cursor = found + character.length;
+      const startValue = Number(starts[index]);
+      const endValue = Number(ends[index]);
+      if (!Number.isFinite(startValue) || !Number.isFinite(endValue)) continue;
+      const base = relativeTiming ? schedule.startAt : schedule.startAt - audioOffset;
+      const startAt = base + Math.max(0, startValue);
+      const endAt = base + Math.max(startValue, endValue);
+      for (let position = found; position < cursor; position += 1) {
+        const wordIndex = state.voice.charWordMap[position];
+        if (wordIndex < 0) continue;
+        const cue = state.voice.wordCues[wordIndex];
+        if (!cue) continue;
+        if (!cue.actual) {
+          cue.start = startAt;
+          cue.end = endAt;
+          cue.actual = true;
+        } else {
+          cue.start = Math.min(cue.start, startAt);
+          cue.end = Math.max(cue.end, endAt);
+        }
+      }
+    }
+    state.voice.alignmentCursor = Math.max(state.voice.alignmentCursor, cursor);
+  }
+
+  function finishVoicePlayback(requestSequence) {
+    if (requestSequence !== state.voice.requestSequence) return;
+    state.voice.phase = "idle";
+    state.voice.controller = null;
+    state.voice.nextStartAt = 0;
+    state.voice.turnId = null;
+    state.voice.renderId = null;
+    state.voice.streamComplete = false;
+    clearVoiceKaraoke();
+    syncVoiceUi();
+  }
+
+  function stopVoicePlayback() {
+    state.voice.requestSequence += 1;
+    state.voice.controller?.abort();
+    state.voice.controller = null;
+    state.voice.sources.forEach((source) => {
+      try { source.stop(); } catch {}
+      try { source.disconnect(); } catch {}
+    });
+    state.voice.sources.clear();
+    state.voice.phase = "idle";
+    state.voice.nextStartAt = 0;
+    state.voice.turnId = null;
+    state.voice.renderId = null;
+    state.voice.streamComplete = false;
+    clearVoiceKaraoke();
+    syncVoiceUi();
+  }
+
+  function enqueueVoicePcm(bytes, sampleRate, requestSequence) {
+    if (!bytes.length || requestSequence !== state.voice.requestSequence) return null;
+    const context = prepareVoiceAudioContext();
+    if (!context) throw new Error("This browser cannot play streamed speech.");
+    const frames = Math.floor(bytes.length / 2);
+    const samples = new Float32Array(frames);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, frames * 2);
+    for (let index = 0; index < frames; index += 1) {
+      const value = view.getInt16(index * 2, true);
+      samples[index] = value < 0 ? value / 32768 : value / 32767;
+    }
+    const buffer = context.createBuffer(1, frames, sampleRate);
+    buffer.copyToChannel(samples, 0);
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(context.destination);
+    const startAt = Math.max(
+      context.currentTime + 0.045,
+      state.voice.nextStartAt || 0,
+    );
+    state.voice.nextStartAt = startAt + buffer.duration;
+    state.voice.sources.add(source);
+    source.onended = () => {
+      state.voice.sources.delete(source);
+      try { source.disconnect(); } catch {}
+      if (
+        requestSequence === state.voice.requestSequence
+        && state.voice.streamComplete
+        && !state.voice.sources.size
+      ) {
+        finishVoicePlayback(requestSequence);
+      }
+    };
+    source.start(startAt);
+    return { startAt, duration: buffer.duration };
+  }
+
+  function decodeVoiceBase64(value) {
+    const binary = atob(String(value || ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes;
+  }
+
+  async function playVoiceAudio(turn, render) {
+    if (!turn?.id || !render?.id) return;
+    stopVoicePlayback();
+    const context = prepareVoiceAudioContext();
+    if (!context) throw new Error("This browser cannot play streamed speech.");
+    const requestSequence = state.voice.requestSequence;
+    const controller = new AbortController();
+    state.voice.controller = controller;
+    state.voice.phase = "streaming";
+    state.voice.turnId = String(turn.id);
+    state.voice.renderId = String(render.id);
+    state.voice.nextStartAt = context.currentTime + 0.045;
+    state.voice.streamComplete = false;
+    syncVoiceUi();
+    try {
+      const response = await fetch(voiceAudioUrl(turn.id, render.id), {
+        signal: controller.signal,
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        let message = `Spoken response failed (${response.status})`;
+        try {
+          const body = await response.json();
+          message = body?.error?.message || message;
+        } catch {}
+        throw new Error(message);
+      }
+      if (!response.body) throw new Error("This browser could not read the audio stream.");
+      const protocol = response.headers.get("x-calliope-audio-protocol");
+      if (protocol !== "timed-pcm-ndjson-v1") {
+        throw new Error("This Calliope voice stream needs a page refresh before playback.");
+      }
+      const sampleRate = Number(response.headers.get("x-audio-sample-rate")) || 24000;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      let initialized = false;
+      const consumeLine = (line) => {
+        if (!line.trim()) return;
+        let frame;
+        try { frame = JSON.parse(line); } catch { throw new Error("The spoken response stream was malformed."); }
+        if (frame?.type === "error") {
+          throw new Error(frame.message || "The spoken response stream stopped unexpectedly.");
+        }
+        if (frame?.type !== "audio" || !frame.audio_base64) return;
+        const bytes = decodeVoiceBase64(frame.audio_base64);
+        const schedule = enqueueVoicePcm(bytes, sampleRate, requestSequence);
+        if (!schedule) return;
+        if (!initialized) {
+          initializeVoiceKaraoke(turn, render, schedule.startAt);
+          initialized = true;
+        }
+        absorbVoiceAlignment(
+          render,
+          frame.alignment,
+          schedule,
+          Number(frame.audio_offset_seconds) || 0,
+        );
+      };
+      while (requestSequence === state.voice.requestSequence) {
+        const { value, done } = await reader.read();
+        pending += decoder.decode(value || new Uint8Array(), { stream: !done });
+        let boundary;
+        while ((boundary = pending.indexOf("\n")) >= 0) {
+          consumeLine(pending.slice(0, boundary));
+          pending = pending.slice(boundary + 1);
+        }
+        if (done) break;
+      }
+      if (requestSequence !== state.voice.requestSequence) return;
+      if (pending.trim()) consumeLine(pending);
+      if (!initialized) throw new Error("The voice provider returned no playable audio.");
+      state.voice.streamComplete = true;
+      state.voice.controller = null;
+      if (!state.voice.sources.size) {
+        finishVoicePlayback(requestSequence);
+        return;
+      }
+      syncVoiceUi();
+    } catch (error) {
+      if (error?.name === "AbortError" || requestSequence !== state.voice.requestSequence) return;
+      stopVoicePlayback();
+      throw error;
+    }
+  }
+
+  function renderVoiceControl(turn) {
+    const render = voiceReceipt(turn);
+    const preparing = state.voice.phase === "preparing"
+      && String(state.voice.turnId || "") === String(turn?.id || "");
+    if (!render && !preparing) return "";
+    const active = state.voice.phase !== "idle"
+      && String(state.voice.turnId || "") === String(turn?.id || "");
+    const label = active ? state.voice.phase === "preparing" ? "Preparing" : "Playing" : "Voice";
+    return `<button type="button" class="message-voice ${active ? "active" : ""}"
+      data-open-voice-turn="${escapeHtml(turn.id || "")}" ${render ? "" : "disabled"}
+      title="${active ? "Open the complete answer · audio is playing" : "Open the complete answer or replay the spoken cut"}">
+      <i aria-hidden="true"></i><span data-voice-label>${escapeHtml(label)}</span>
+    </button>`;
+  }
+
+  function openVoiceDialog(turnId) {
+    const turn = state.turns.find((item) => String(item.id) === String(turnId));
+    const render = voiceReceipt(turn);
+    if (!turn || !render) return;
+    state.voice.dialogTurnId = String(turn.id);
+    els.voiceDialogScript.innerHTML = safeMarkdown(turn.assistant_message || "");
+    const mode = String(render.mode || "fast");
+    const originalWords = String(turn.assistant_message || "").trim().split(/\s+/).filter(Boolean).length;
+    const spokenWords = voiceWordRanges(render.script).length;
+    els.voiceDialogMeta.innerHTML = [
+      `${originalWords} word original`,
+      `${spokenWords} word spoken cut`,
+      mode,
+      render.rewrite_provider === "local" ? "local fallback" : `${render.rewrite_provider || "semantic"} rewrite`,
+      render.created_at ? relativeTime(render.created_at) : "saved with turn",
+    ].map((item) => `<span>${escapeHtml(item)}</span>`).join("");
+    if (!els.voiceDialog.open) els.voiceDialog.showModal();
+    syncVoiceUi();
+  }
+
+  async function replayVoiceDialog() {
+    const turn = state.turns.find(
+      (item) => String(item.id) === String(state.voice.dialogTurnId || ""),
+    );
+    const render = voiceReceipt(turn);
+    if (!turn || !render) return;
+    try {
+      await playVoiceAudio(turn, render);
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }
+
+  async function maybeSpeakTurn(turnId) {
+    applyVoicePreferences(readVoicePreferences());
+    if (!voiceConfigured() || state.voice.preferences.mode === "off") return;
+    const turn = state.turns.find((item) => String(item.id) === String(turnId));
+    const sessionId = state.current?.id;
+    if (!turn || !sessionId || turn.status !== "complete") return;
+    stopVoicePlayback();
+    const requestSequence = state.voice.requestSequence;
+    state.voice.phase = "preparing";
+    state.voice.turnId = String(turn.id);
+    syncVoiceUi();
+    renderChat();
+    let data;
+    try {
+      data = await api("/api/calliope/voice/renders", {
+        method: "POST",
+        body: JSON.stringify({
+          session_id: sessionId,
+          turn_id: turn.id,
+          mode: state.voice.preferences.mode,
+          personality: state.voice.preferences.personality,
+        }),
+      });
+      if (
+        requestSequence !== state.voice.requestSequence
+        || state.current?.id !== sessionId
+      ) return;
+    } catch (error) {
+      if (requestSequence !== state.voice.requestSequence) return;
+      stopVoicePlayback();
+      toast(error.message, true);
+      return;
+    }
+    turn.response_receipt = {
+      ...(turn.response_receipt || {}),
+      voice: data.render,
+    };
+    renderChat();
+    try {
+      await playVoiceAudio(turn, data.render);
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }
+
   function optimisticTurn(
     message,
     hasSpatialSelection = false,
@@ -10482,6 +11034,13 @@
 
   async function sendTurn() {
     if (!state.current || state.busy || state.speech.phase !== "idle") return;
+    applyVoicePreferences(readVoicePreferences());
+    stopVoicePlayback();
+    if (voiceConfigured() && state.voice.preferences.mode !== "off") {
+      // This runs inside the send gesture so browsers unlock Web Audio before
+      // Hermes and the semantic spoken digest finish asynchronously.
+      prepareVoiceAudioContext();
+    }
     const rawMessage = composerValue().trim();
     const message = composerPlainValue().trim();
     const outgoingObjectRefs = composerObjectRefs().slice(0, 24).map((item) => ({
@@ -10600,6 +11159,7 @@
         }
       });
       await loadSessions(state.current.id, true);
+      if (pending.status === "complete") void maybeSpeakTurn(pending.id);
     } catch (error) {
       pending.status = "failed";
       pending.error = error.message;
@@ -10643,6 +11203,32 @@
 
   function setupEvents() {
     setupWorkflowNodeTooltips();
+    window.addEventListener("warehouse-voice-change", (event) => {
+      applyVoicePreferences(event.detail);
+      renderChat();
+    });
+    els.voiceDialogClose.addEventListener("click", () => els.voiceDialog.close());
+    els.voiceDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      els.voiceDialog.close();
+    });
+    els.voiceDialog.addEventListener("click", (event) => {
+      if (event.target === els.voiceDialog) els.voiceDialog.close();
+    });
+    els.voiceDialog.addEventListener("close", () => {
+      state.voice.dialogTurnId = null;
+      syncVoiceUi();
+    });
+    els.voiceDialogReplay.addEventListener("click", replayVoiceDialog);
+    els.voiceDialogStop.addEventListener("click", stopVoicePlayback);
+    els.voiceDialogCopy.addEventListener("click", () => {
+      const turn = state.turns.find(
+        (item) => String(item.id) === String(state.voice.dialogTurnId || ""),
+      );
+      navigator.clipboard.writeText(String(turn?.assistant_message || ""))
+        .then(() => toast("Complete answer copied"))
+        .catch(() => toast("The browser could not copy that answer", true));
+    });
     els.toolActivityToggle.addEventListener("click", () => {
       if (state.liveActivity.phase === "idle") return;
       state.liveActivity.expanded = !state.liveActivity.expanded;
@@ -11130,6 +11716,7 @@
     });
     els.speechRecord.addEventListener("click", () => toggleSpeechRecording(els.speechRecord));
     window.addEventListener("pagehide", cancelSpeechRecording);
+    window.addEventListener("pagehide", stopVoicePlayback);
     if (!state.composerEditor) {
       els.input.addEventListener("input", resizeComposer);
       els.input.addEventListener("paste", pasteImages);
@@ -11336,6 +11923,11 @@
       clearSurfaceSelection();
     });
     els.messages.addEventListener("click", (event) => {
+      const voiceButton = event.target.closest("[data-open-voice-turn]");
+      if (voiceButton) {
+        openVoiceDialog(voiceButton.dataset.openVoiceTurn);
+        return;
+      }
       const objectButton = event.target.closest("[data-open-object-turn]");
       if (objectButton) {
         const turn = state.turns.find(
@@ -11751,6 +12343,7 @@
     scheduleAvatarClock();
     restoreChatWidth();
     restoreSessionRailState();
+    applyVoicePreferences(readVoicePreferences());
     initializeComposerEditor();
     setupEvents();
     try {

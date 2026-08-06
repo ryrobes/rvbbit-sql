@@ -69,7 +69,7 @@ def release_capability_images(
 def product_images(image_prefix: str, version: str, args: argparse.Namespace) -> list[str]:
     # These document sidecars are part of every release, regardless of which
     # optional core builds were skipped while resuming a release.
-    names: list[str] = ["rvbbit-doc-extract", "rvbbit-gdrive-connector"]
+    names: list[str] = ["rvbbit-doc-extract", "rvbbit-gdrive-connector", "rvbbit-gmeet-connector"]
     if not args.skip_db:
         names.append("rvbbit-postgres")
     if not args.skip_lens:

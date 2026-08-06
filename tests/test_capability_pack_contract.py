@@ -161,6 +161,67 @@ def test_llm_provider_pack_renders_chat_backend_and_provider_registration():
     assert "ports:" not in compose
 
 
+def test_google_meet_pack_renders_as_a_governed_brain_connector():
+    pack = PACKS / "integrations" / "google-meet-brain"
+    register = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "register",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    compose = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "render",
+            "--part",
+            "compose",
+            str(pack),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+
+    assert "rvbbit.register_backend" in register
+    assert "rvbbit.brain_configure_source" in register
+    assert "'gmeet_connector'" in register
+    assert '"acl_mode":"calendar_invitees_strict"' in register
+    assert '"summarize_meetings":true' in register
+    assert "rvbbit.register_python_runtime" not in register
+    assert "rvbbit.register_memory_service" not in register
+    assert "rvbbit-gmeet-connector:latest" in compose
+    assert 'GMEET_ACL_MODE: "${GMEET_ACL_MODE:-calendar_invitees_strict}"' in compose
+
+    seed = subprocess.run(
+        [
+            str(ROOT / "capabilities" / "tools" / "rvbbit-capability"),
+            "catalog",
+            "seed-json",
+            "--root",
+            str(PACKS),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    item = next(
+        row for row in json.loads(seed.stdout)["capabilities"]
+        if row["catalog_entry"]["id"] == "integrations/google-meet-brain"
+    )
+    assert item["catalog_entry"]["install_mode"] == "image"
+    assert item["catalog_entry"]["backend_name"] == "gmeet_connector"
+    assert item["capability_manifest"]["runtime"]["language"] == "brain_connector"
+    assert item["capability_manifest"]["brain_source"]["config"]["acl_mode"] == (
+        "calendar_invitees_strict"
+    )
+
+
 def test_deploy_manifest_preserves_smoke_probe_inputs():
     pack = PACKS / "tabular" / "wine-quality-sklearn"
     proc = subprocess.run(

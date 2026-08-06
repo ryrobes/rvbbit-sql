@@ -13,6 +13,7 @@ import { Vibrant } from "node-vibrant/browser";
 
 const STORAGE_KEY = "rvbbit-warehouse-theme-v1";
 const MODE_STORAGE_KEY = "rvbbit-warehouse-color-mode";
+const VOICE_STORAGE_KEY = "rvbbit-calliope-voice-v1";
 const BACKGROUND_BRIDGE_KEY = "rvbbit-warehouse-background-bridge-v1";
 const ADAPTIVE_SNAPSHOT_KEY = "rvbbit-warehouse-adaptive-theme-v1";
 const DB_NAME = "rvbbit-warehouse-browser";
@@ -82,6 +83,7 @@ const THEME_KEYS = [
 ];
 
 let colorMode = readColorMode();
+let voice = readVoicePreferences();
 let appliedTokens = null;
 let current = readStoredState();
 let selectedBackgroundMode = themeBackground(current).mode;
@@ -97,6 +99,7 @@ let selectedItem = null;
 let selectedPalette = null;
 let selectedPalettePromise = null;
 let previewSequence = 0;
+let voicePersonalityTimer = null;
 
 applyColorModeRoot();
 applyBackgroundBridgeRoot(preferredBackgroundBridge(current, readBackgroundBridge()));
@@ -127,6 +130,7 @@ function init() {
     reset: resetTheme,
     getState: () => current,
     getMode: () => colorMode,
+    getVoice: () => ({ ...voice }),
     getSnapshot: getAdaptiveSnapshot,
     setMode: (mode) => setColorMode(mode),
   });
@@ -315,6 +319,60 @@ function readColorMode() {
   }
 }
 
+function readVoicePreferences() {
+  try {
+    const value = JSON.parse(localStorage.getItem(VOICE_STORAGE_KEY) || "null");
+    const mode = ["fast", "expressive"].includes(value?.mode) ? value.mode : "off";
+    const personality = typeof value?.personality === "string"
+      ? value.personality.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 600)
+      : "";
+    return { version: 1, mode, personality };
+  } catch {
+    return { version: 1, mode: "off", personality: "" };
+  }
+}
+
+function persistVoicePreferences() {
+  try {
+    localStorage.setItem(VOICE_STORAGE_KEY, JSON.stringify(voice));
+  } catch {
+    // The setting still applies to this page when browser persistence is blocked.
+  }
+  renderVoicePreferences();
+  window.dispatchEvent(new CustomEvent("warehouse-voice-change", {
+    detail: { ...voice },
+  }));
+}
+
+function setVoiceMode(mode) {
+  voice.mode = ["fast", "expressive"].includes(mode) ? mode : "off";
+  persistVoicePreferences();
+}
+
+function onVoicePersonality(event) {
+  voice.personality = String(event.currentTarget?.value || "").slice(0, 600);
+  clearTimeout(voicePersonalityTimer);
+  voicePersonalityTimer = window.setTimeout(persistVoicePreferences, 220);
+  renderVoicePreferences();
+}
+
+function renderVoicePreferences() {
+  if (!dialog) return;
+  dialog.querySelectorAll("[data-theme-voice-mode]").forEach((control) => {
+    const active = control.dataset.themeVoiceMode === voice.mode;
+    control.setAttribute("aria-pressed", String(active));
+  });
+  const personality = dialog.querySelector("[data-theme-voice-personality]");
+  if (personality && personality.value !== voice.personality) {
+    personality.value = voice.personality;
+  }
+  if (personality) personality.disabled = voice.mode === "off";
+  const count = dialog.querySelector("[data-theme-voice-count]");
+  if (count) count.textContent = `${voice.personality.length}/600`;
+  const section = dialog.querySelector("[data-theme-voice]");
+  if (section) section.dataset.mode = voice.mode;
+}
+
 function applyColorModeRoot() {
   ROOT.dataset.theme = colorMode;
   ROOT.dataset.warehouseColorMode = colorMode;
@@ -399,6 +457,23 @@ function installDialog() {
               <output data-theme-solid-value>#100d0b</output>
             </label>
           </div>
+          <section class="warehouse-theme-voice" data-theme-voice data-mode="off">
+            <div class="warehouse-theme-background-head">
+              <b>Calliope voice</b>
+              <span>This browser · saves instantly</span>
+            </div>
+            <div class="warehouse-theme-voice-modes" role="group" aria-label="Spoken response mode">
+              <button type="button" data-theme-voice-mode="off" aria-pressed="true">Off</button>
+              <button type="button" data-theme-voice-mode="fast" aria-pressed="false">Fast</button>
+              <button type="button" data-theme-voice-mode="expressive" aria-pressed="false">Expressive</button>
+            </div>
+            <label class="warehouse-theme-voice-personality">
+              <span>Speaking personality <output data-theme-voice-count>0/600</output></span>
+              <textarea data-theme-voice-personality maxlength="600" rows="2"
+                placeholder="Warm, concise, slightly playful…"></textarea>
+            </label>
+            <p>Calliope keeps the full answer on screen and speaks a short, factual cut. Expressive adds restrained performance cues.</p>
+          </section>
           <div class="warehouse-theme-error" data-theme-error hidden></div>
           <div class="warehouse-theme-actions">
             <label class="warehouse-theme-upload">
@@ -422,6 +497,11 @@ function installDialog() {
     control.addEventListener("click", () => setBackgroundMode(control.dataset.themeBackgroundMode));
   });
   dialog.querySelector("[data-theme-solid-color]").addEventListener("input", onSolidColor);
+  dialog.querySelectorAll("[data-theme-voice-mode]").forEach((control) => {
+    control.addEventListener("click", () => setVoiceMode(control.dataset.themeVoiceMode));
+  });
+  dialog.querySelector("[data-theme-voice-personality]").addEventListener("input", onVoicePersonality);
+  renderVoicePreferences();
   dialog.addEventListener("cancel", (event) => {
     event.preventDefault();
     closeDialog();
@@ -436,6 +516,7 @@ function openDialog() {
   button?.setAttribute("aria-expanded", "true");
   setError("");
   dialog.showModal();
+  renderVoicePreferences();
   showCurrentPreview();
   if (library) {
     renderLibrary();
@@ -1026,6 +1107,14 @@ function setError(message) {
 function onStorage(event) {
   if (event.key === MODE_STORAGE_KEY) {
     setColorMode(readColorMode(), { persist: false });
+    return;
+  }
+  if (event.key === VOICE_STORAGE_KEY) {
+    voice = readVoicePreferences();
+    renderVoicePreferences();
+    window.dispatchEvent(new CustomEvent("warehouse-voice-change", {
+      detail: { ...voice },
+    }));
     return;
   }
   if (event.key !== STORAGE_KEY) return;

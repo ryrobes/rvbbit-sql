@@ -280,13 +280,15 @@ fi
 
 # Document-brain sidecars — self-contained, build straight from sidecars/.
 # doc-extract is compose-DEFAULT (the brain must read PDFs out of the box;
-# 0047 pre-registers its backend at the compose service name). The Drive
-# connector ships versioned but runs behind the "gdrive" compose profile —
-# credential-gated by nature (GDRIVE_SA_KEY).
+# 0047 pre-registers its backend at the compose service name). The Drive and
+# Meet connectors ship versioned but run behind credential-gated compose
+# profiles ("gdrive" and "gmeet").
 build_image rvbbit-doc-extract "$ROOT/sidecars/doc-extract/Dockerfile" "$ROOT/sidecars/doc-extract" "$PLATFORM" \
     --label "org.opencontainers.image.title=rvbbit-doc-extract"
 build_image rvbbit-gdrive-connector "$ROOT/sidecars/gdrive-connector/Dockerfile" "$ROOT/sidecars/gdrive-connector" "$PLATFORM" \
     --label "org.opencontainers.image.title=rvbbit-gdrive-connector"
+build_image rvbbit-gmeet-connector "$ROOT/sidecars/gmeet-connector/Dockerfile" "$ROOT/sidecars/gmeet-connector" "$PLATFORM" \
+    --label "org.opencontainers.image.title=rvbbit-gmeet-connector"
 
 # GPU/GQE image — LOCAL ONLY. The CUDA/RAPIDS toolchain layer is >40GB (over
 # GHCR's per-layer limit), so this can never be pushed; GPU deploy boxes build

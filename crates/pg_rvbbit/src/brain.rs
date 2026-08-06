@@ -7,9 +7,9 @@
 //! and otherwise drives SQL via SPI. One DB writer: rvbbit.
 //!
 //! Flow (per source):
-//!   1. SELECT rvbbit.brain_sync_request(id)  → {endpoint, auth_env, payload{folders,cursor,known}}
+//!   1. SELECT rvbbit.brain_sync_request(id)  → {endpoint, auth_env, payload{folders,cursor,known,options}}
 //!      (`folders` is the legacy key for configured Drive folder/doc locations)
-//!   2. POST {endpoint} payload               → {files[], pending_grants[], cursor}
+//!   2. POST {endpoint} payload               → {files[], pending_grants[], cursor, stats?}
 //!   3. SELECT rvbbit.brain_sync_write_manifest(id, files, pending, cursor)
 //!   4. SELECT rvbbit.brain_sync_extract_bodies(id)        (new/changed binaries → markdown)
 //!   5. SELECT rvbbit.brain_sync_apply_manifest(id, trig)  → reconcile (ingest/ACL/tombstone)
@@ -41,7 +41,11 @@ fn brain_sync_sources(p_trigger: default!(String, "'auto'")) -> JsonB {
         let mut out = Vec::new();
         if let Ok(table) = client.select(
             "SELECT source_id FROM rvbbit.brain_sources \
-             WHERE enabled AND coalesce(config->>'endpoint', \
+             WHERE enabled \
+               AND (nullif(config->>'connector','') IS NOT NULL \
+                    OR nullif(config->>'endpoint','') IS NOT NULL \
+                    OR nullif(config->>'provider','') IS NULL) \
+               AND coalesce(config->>'endpoint', \
                    (SELECT endpoint_url FROM rvbbit.backends b WHERE b.name = coalesce(config->>'connector','gdrive_connector'))) IS NOT NULL \
              ORDER BY source_id",
             None, &[],
@@ -104,6 +108,7 @@ fn sync_one(source_id: i64, trigger: &str) -> Result<Value, String> {
 
     let files = parsed.get("files").cloned().unwrap_or_else(|| json!([]));
     let pending = parsed.get("pending_grants").cloned().unwrap_or_else(|| json!([]));
+    let connector_stats = parsed.get("stats").cloned();
     let cursor_sql = match parsed.get("cursor").and_then(Value::as_str) {
         Some(c) => sql_lit(c),
         None => "NULL".to_string(),
@@ -132,8 +137,29 @@ fn sync_one(source_id: i64, trigger: &str) -> Result<Value, String> {
     .ok_or_else(|| "apply_manifest returned NULL".to_string())?;
 
     let mut out = summary.0;
+    let mut stats_persist_error = None;
+    if let (Some(run_id), Some(stats)) = (
+        out.get("run_id").and_then(Value::as_i64),
+        connector_stats.as_ref(),
+    ) {
+        let detail = json!({"connector_stats": stats});
+        if let Err(err) = Spi::run(&format!(
+            "UPDATE rvbbit.brain_sync_runs SET detail = detail || {} WHERE run_id = {run_id}::bigint",
+            jsonb_lit(&detail)
+        )) {
+            // The documents are already safely reconciled. Telemetry failure
+            // should be visible without turning a successful sync into a retry.
+            stats_persist_error = Some(format!("brain sync stats: {err}"));
+        }
+    }
     if let Value::Object(ref mut m) = out {
         m.insert("extracted".into(), json!(extracted));
+        if let Some(stats) = connector_stats {
+            m.insert("stats".into(), stats);
+        }
+        if let Some(error) = stats_persist_error {
+            m.insert("stats_persist_error".into(), json!(error));
+        }
     }
     Ok(out)
 }

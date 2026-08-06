@@ -8,6 +8,7 @@ x-rvbbit-secret-env: &rvbbit-secret-env
   GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
   GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
   GOOGLE_CLOUD_QUOTA_PROJECT: ${GOOGLE_CLOUD_QUOTA_PROJECT:-}
+  GMEET_CONNECTOR_TOKEN: ${GMEET_CONNECTOR_TOKEN:-}
 
 services:
   postgres:
@@ -284,6 +285,13 @@ services:
       WAREHOUSE_CALLIOPE_STT_LANGUAGES: ${WAREHOUSE_CALLIOPE_STT_LANGUAGES:-}
       WAREHOUSE_CALLIOPE_MAX_AUDIO_BYTES: ${WAREHOUSE_CALLIOPE_MAX_AUDIO_BYTES:-12582912}
       WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS: ${WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS:-120}
+      # Optional spoken-response projection. Credentials stay server-side;
+      # browsers receive a governed short script and streamed PCM audio only.
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+      WAREHOUSE_CALLIOPE_TTS_FAST_MODEL: ${WAREHOUSE_CALLIOPE_TTS_FAST_MODEL:-eleven_flash_v2_5}
+      WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_MODEL: ${WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_MODEL:-eleven_v3}
+      WAREHOUSE_CALLIOPE_TTS_SAMPLE_RATE: ${WAREHOUSE_CALLIOPE_TTS_SAMPLE_RATE:-24000}
       RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}
       WAREHOUSE_CALLIOPE_DIR: /app/data/calliope
       # URL-backed Design Profile references reject private/local targets by
@@ -356,6 +364,34 @@ services:
       CONNECTOR_TOKEN: ${GDRIVE_CONNECTOR_TOKEN:-}
     volumes:
       - rvbbit_staging:/staging
+    restart: unless-stopped
+
+  # Google Meet transcript connector for the governed document Brain. Uses a
+  # Workspace service account with domain-wide delegation; standard Cloud
+  # Pub/Sub is optional because the connector performs a complete REST catch-up
+  # over the configured (maximum 29-day) Meet retention window.
+  #
+  #   docker compose -f docker/docker-compose.uber.yml --profile gmeet up -d
+  gmeet-connector:
+    profiles: ["gmeet"]
+    image: ${RVBBIT_GMEET_CONNECTOR_IMAGE:-ghcr.io/ryrobes/rvbbit-gmeet-connector:${RVBBIT_VERSION:-latest}}
+    container_name: rvbbit-gmeet-connector
+    environment:
+      GMEET_SA_KEY: ${GMEET_SA_KEY:-/run/secrets/gmeet-service-account.json}
+      GMEET_ADMIN_SUBJECT: ${GMEET_ADMIN_SUBJECT:-}
+      GMEET_SUBJECTS: ${GMEET_SUBJECTS:-}
+      GMEET_DOMAIN: ${GMEET_DOMAIN:-}
+      GMEET_DISCOVER_USERS: ${GMEET_DISCOVER_USERS:-true}
+      GMEET_MAX_SUBJECTS: ${GMEET_MAX_SUBJECTS:-500}
+      GMEET_LOOKBACK_DAYS: ${GMEET_LOOKBACK_DAYS:-29}
+      GMEET_CALENDAR_LOOKUP: ${GMEET_CALENDAR_LOOKUP:-true}
+      GMEET_AUTO_TRANSCRIBE: ${GMEET_AUTO_TRANSCRIBE:-false}
+      GMEET_AUTO_TRANSCRIBE_DAYS: ${GMEET_AUTO_TRANSCRIBE_DAYS:-7}
+      GMEET_DRIVE_ACL: ${GMEET_DRIVE_ACL:-true}
+      GMEET_ACL_MODE: ${GMEET_ACL_MODE:-calendar_invitees_strict}
+      CONNECTOR_TOKEN: ${GMEET_CONNECTOR_TOKEN:-}
+    volumes:
+      - ${GMEET_SA_KEY_FILE:-/dev/null}:/run/secrets/gmeet-service-account.json:ro
     restart: unless-stopped
 
 networks:

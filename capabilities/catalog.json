@@ -1420,6 +1420,85 @@
         "target_selector": {
           "capability": true,
           "docker": true,
+          "google_workspace": true,
+          "gpu": false
+        },
+        "teardown_sql": [],
+        "tests": [
+          {
+            "description": "Assert the connector backend and strict governed Brain source were registered.",
+            "name": "google_meet_brain_connector_registered",
+            "sql": "DO $$\nBEGIN\n    IF to_regprocedure('rvbbit.brain_configure_google_meet_source(text,boolean,jsonb)') IS NULL THEN\n        RAISE EXCEPTION 'Google Meet Brain connector requires pg_rvbbit migration 0250 or newer';\n    END IF;\n    IF NOT EXISTS (\n        SELECT 1 FROM rvbbit.backends\n         WHERE name='gmeet_connector' AND endpoint_url LIKE '%/sync'\n    ) THEN\n        RAISE EXCEPTION 'gmeet_connector backend is not registered';\n    END IF;\n    IF NOT EXISTS (\n        SELECT 1 FROM rvbbit.brain_sources\n         WHERE label='Google Meet' AND kind='google_meet' AND enabled\n           AND config->>'acl_mode'='calendar_invitees_strict'\n           AND coalesce((config->>'summarize_meetings')::boolean,false)\n    ) THEN\n        RAISE EXCEPTION 'Google Meet source is missing strict ACL or optional-summary policy';\n    END IF;\nEND\n$$;\n"
+          }
+        ]
+      },
+      "acceptance_tests": [
+        "google_meet_brain_connector_registered"
+      ],
+      "backend_name": "gmeet_connector",
+      "backend_transport": "rvbbit",
+      "capability_role": "brain_connector",
+      "catalog_visibility": "public",
+      "description": "Generated Google Meet transcripts become searchable, invitee-governed Company Brain evidence, with optional derived briefs that inherit the transcript ACL.",
+      "device": "cpu",
+      "endpoint_path": "/sync",
+      "gpu_placement": null,
+      "gpu_required": false,
+      "health_path": "/health",
+      "id": "integrations/google-meet-brain",
+      "install_docker": true,
+      "install_mode": "image",
+      "install_warren": true,
+      "kind": "runtime_sidecar",
+      "license": "apache-2.0",
+      "manifest_path": "capabilities/packs/integrations/google-meet-brain/capability.yaml",
+      "model_size_bytes": null,
+      "name": "google_meet_brain_connector",
+      "operators": [],
+      "pack_api_version": "rvbbit.pack/v1",
+      "pack_id": "integrations/google-meet-brain",
+      "pack_manifest_path": "capabilities/packs/integrations/google-meet-brain/rvbbit-pack.yaml",
+      "pack_path": "capabilities/packs/integrations/google-meet-brain",
+      "provider_model": null,
+      "provider_name": null,
+      "provider_set_default": false,
+      "repo_url": null,
+      "resources": {},
+      "runtime_handler": "google_meet",
+      "runtime_image": "${RVBBIT_GMEET_CONNECTOR_IMAGE:-ghcr.io/ryrobes/rvbbit-gmeet-connector:latest}",
+      "runtime_language": "brain_connector",
+      "runtime_mode": "image",
+      "runtime_name": "gmeet_connector",
+      "runtime_port": 8080,
+      "runtime_template": "runtime-sidecar",
+      "source_model": "workspace/google-meet-transcripts",
+      "source_provider": "google",
+      "source_revision": null,
+      "source_url": "https://developers.google.com/workspace/meet/api/guides/artifacts",
+      "system_runtime": false,
+      "tags": [
+        "google",
+        "workspace",
+        "meet",
+        "transcripts",
+        "meetings",
+        "documents",
+        "brain",
+        "knowledge",
+        "calendar",
+        "governed",
+        "cpu"
+      ],
+      "title": "Google Meet Brain Connector",
+      "vram_headroom_pct": null,
+      "vram_required_bytes": null
+    },
+    {
+      "acceptance": {
+        "setup_sql": [],
+        "target_selector": {
+          "capability": true,
+          "docker": true,
           "gpu": true
         },
         "teardown_sql": [],

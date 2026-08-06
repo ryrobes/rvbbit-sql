@@ -709,6 +709,24 @@ to that user. A simultaneous browser recording supplies an automatic file-transc
 fallback if live setup, connectivity, or finalization fails. Warehouse validates that
 fallback audio and does not persist it.
 
+Spoken responses are an independent, opt-in browser preference in the shared
+**Appearance** dialog. **Off** is the default. **Fast** rewrites each newly completed
+answer into a factual two- or three-sentence spoken digest and streams it through
+ElevenLabs Flash without performance tags. **Expressive** uses the same bounded semantic
+rewrite, permits at most two validated v3 audio tags, and synthesizes with ElevenLabs v3.
+The full assistant answer remains canonical and unchanged in the turn record. While voice
+is enabled, the conversation displays the concise spoken cut and the small Voice control
+opens the complete answer; switching voice off restores the complete answer directly in
+chat. The latest derived script and non-secret render metadata live under that turn's
+response receipt for reload-safe replay and debugging. The optional speaking-personality
+text lives only in browser storage. Warehouse sends it transiently as untrusted tone
+guidance and retains only its hash. Provider credentials remain server-side. The timed
+ElevenLabs stream supplies per-character alignment alongside PCM, so the browser decorates
+each word as it is spoken; a cadence estimate is used only when alignment is absent. Audio
+begins playing while the HTTP response is still arriving, completed audio and its timing
+manifest are cached in the owner-gated Calliope store, and starting another turn, changing
+notebooks, switching voice off, or pressing Stop interrupts playback.
+
 ```bash
 export WAREHOUSE_HERMES_URL="http://127.0.0.1:8642"
 export WAREHOUSE_HERMES_API_KEY="..."       # Hermes API_SERVER_KEY
@@ -736,6 +754,13 @@ export WAREHOUSE_CALLIOPE_STT_REALTIME_MODEL="gpt-live-transcribe" # set off for
 export WAREHOUSE_CALLIOPE_STT_KEYWORDS="RVBBIT,Calliope,Linear,ENG-42"
 export WAREHOUSE_CALLIOPE_STT_LANGUAGES="en"
 export WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS="120"
+# Optional spoken responses; both values are required to expose the feature
+export ELEVENLABS_API_KEY="..."
+export ELEVENLABS_VOICE_ID="..."
+# Optional adapters/defaults shown here for explicit deployment control
+export WAREHOUSE_CALLIOPE_TTS_FAST_MODEL="eleven_flash_v2_5"
+export WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_MODEL="eleven_v3"
+export WAREHOUSE_CALLIOPE_TTS_SAMPLE_RATE="24000"
 ```
 
 For the uber Compose stack with Hermes running directly on the Docker host,
@@ -946,7 +971,14 @@ Compose set the single shared host path with `WAREHOUSE_CALLIOPE_EXPORT_DIR`) ·
 `WAREHOUSE_CALLIOPE_STT_KEYWORDS` (optional comma-separated literal hints) ·
 `WAREHOUSE_CALLIOPE_STT_LANGUAGES` (optional comma-separated expected language codes) ·
 `WAREHOUSE_CALLIOPE_MAX_AUDIO_BYTES` (12 MiB default,
-25 MiB ceiling) · `WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS` (120 default, 600 ceiling).
+25 MiB ceiling) · `WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS` (120 default, 600 ceiling) ·
+`ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID` (both required for spoken responses;
+dedicated overrides are `WAREHOUSE_CALLIOPE_TTS_KEY` and
+`WAREHOUSE_CALLIOPE_TTS_VOICE_ID`) · `WAREHOUSE_CALLIOPE_TTS_BASE_URL` ·
+`WAREHOUSE_CALLIOPE_TTS_FAST_MODEL` (`eleven_flash_v2_5`) ·
+`WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_MODEL` (`eleven_v3`) ·
+`WAREHOUSE_CALLIOPE_TTS_SAMPLE_RATE` (24000; supported PCM rates only) ·
+`WAREHOUSE_CALLIOPE_TTS_MAX_AUDIO_BYTES` (16 MiB default, 64 MiB ceiling).
 **Artifact semantic compiler:** `WAREHOUSE_SEMANTIC_ENRICHMENT` (default `1`; set `0` to
 disable queueing and the worker) · `WAREHOUSE_SEMANTIC_ENRICH_MODEL` (default
 `openai/gpt-5.6-sol`) · `WAREHOUSE_SEMANTIC_ENRICH_MAX_ATTEMPTS` (default `3`) ·

@@ -1017,6 +1017,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0249_calliope_google_sheet_lifecycle",
         include_str!("../sql/migrations/0249_calliope_google_sheet_lifecycle.sql"),
     ),
+    (
+        "0250_google_meet_brain_connector",
+        include_str!("../sql/migrations/0250_google_meet_brain_connector.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -217,6 +217,30 @@ __CALLIOPE_BACKGROUND__
   </form>
 </dialog>
 
+<dialog id="voice-dialog" class="voice-dialog" aria-labelledby="voice-dialog-title">
+  <div class="voice-dialog-shell">
+    <header>
+      <div>
+        <p class="eyebrow">Complete response</p>
+        <h2 id="voice-dialog-title">Behind the spoken cut</h2>
+      </div>
+      <button id="voice-dialog-close" class="markup-close" type="button" aria-label="Close spoken response">×</button>
+    </header>
+    <div class="voice-dialog-body">
+      <div class="voice-dialog-signal" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <div id="voice-dialog-script" class="voice-dialog-script"></div>
+      <div id="voice-dialog-meta" class="voice-dialog-meta"></div>
+      <small>When voice is on, the conversation follows the concise words Calliope speaks. This modal keeps her complete, canonical answer available without adding another chat message.</small>
+    </div>
+    <footer>
+      <button id="voice-dialog-copy" class="quiet-action" type="button">Copy full answer</button>
+      <span></span>
+      <button id="voice-dialog-stop" class="quiet-action" type="button" disabled>Stop</button>
+      <button id="voice-dialog-replay" class="primary-action" type="button">Replay</button>
+    </footer>
+  </div>
+</dialog>
+
 <dialog id="markup-dialog" class="markup-dialog" aria-labelledby="markup-title">
   <div class="markup-shell">
     <header class="markup-head">

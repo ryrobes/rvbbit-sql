@@ -1,0 +1,73 @@
+api_version: rvbbit.pack/v1
+id: integrations/google-meet-brain
+name: google_meet_brain_connector
+title: Google Meet Brain Connector
+description: "Generated Google Meet transcripts become searchable, invitee-governed Company Brain evidence, with optional derived briefs that inherit the transcript ACL."
+license: apache-2.0
+catalog_visibility: public
+system_runtime: false
+capability_role: brain_connector
+tags:
+- google
+- workspace
+- meet
+- transcripts
+- meetings
+- documents
+- brain
+- knowledge
+- calendar
+- governed
+- cpu
+capability: capability.yaml
+source:
+  provider: google
+  model: workspace/google-meet-transcripts
+  url: https://developers.google.com/workspace/meet/api/guides/artifacts
+runtime:
+  mode: image
+  image: "${RVBBIT_GMEET_CONNECTOR_IMAGE:-ghcr.io/ryrobes/rvbbit-gmeet-connector:latest}"
+  handler: google_meet
+  device: cpu
+  port: 8080
+  health_path: /health
+exports:
+  runtime: gmeet_connector
+  backend: gmeet_connector
+install:
+  mode: image
+  warren: true
+  docker: true
+acceptance:
+  # Credentialed acceptance belongs on a node whose Warren environment has
+  # the delegated Google service account and admin subject configured.
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+    google_workspace: true
+  tests:
+  - name: google_meet_brain_connector_registered
+    description: Assert the connector backend and strict governed Brain source were registered.
+    sql: |
+      DO $$
+      BEGIN
+          IF to_regprocedure('rvbbit.brain_configure_google_meet_source(text,boolean,jsonb)') IS NULL THEN
+              RAISE EXCEPTION 'Google Meet Brain connector requires pg_rvbbit migration 0250 or newer';
+          END IF;
+          IF NOT EXISTS (
+              SELECT 1 FROM rvbbit.backends
+               WHERE name='gmeet_connector' AND endpoint_url LIKE '%/sync'
+          ) THEN
+              RAISE EXCEPTION 'gmeet_connector backend is not registered';
+          END IF;
+          IF NOT EXISTS (
+              SELECT 1 FROM rvbbit.brain_sources
+               WHERE label='Google Meet' AND kind='google_meet' AND enabled
+                 AND config->>'acl_mode'='calendar_invitees_strict'
+                 AND coalesce((config->>'summarize_meetings')::boolean,false)
+          ) THEN
+              RAISE EXCEPTION 'Google Meet source is missing strict ACL or optional-summary policy';
+          END IF;
+      END
+      $$;

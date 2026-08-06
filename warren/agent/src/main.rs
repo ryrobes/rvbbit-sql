@@ -2933,6 +2933,140 @@ fn register_runtime(db: &mut Client, manifest: &Value, result: &DeploymentResult
             )
             .context("registering MCP gateway runtime")?;
         }
+        "brain_connector" | "document_connector" => {
+            let backend = manifest
+                .get("backend")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow!("Brain connector manifest needs backend object"))?;
+            let backend_name = backend
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&runtime_name)
+                .to_string();
+            let transport = backend
+                .get("transport")
+                .and_then(Value::as_str)
+                .unwrap_or("rvbbit")
+                .to_string();
+            let batch_size = backend
+                .get("batch_size")
+                .and_then(Value::as_i64)
+                .unwrap_or(1) as i32;
+            let max_concurrent = backend
+                .get("max_concurrent")
+                .and_then(Value::as_i64)
+                .unwrap_or(1) as i32;
+            let timeout_ms = backend
+                .get("timeout_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(900_000) as i32;
+            let auth_env: Option<String> = backend
+                .get("auth_env")
+                .and_then(Value::as_str)
+                .or_else(|| runtime_registration.get("auth_env").and_then(Value::as_str))
+                .map(str::to_string);
+            let backend_opts = backend
+                .get("opts")
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+                .to_string();
+            let description: Option<String> = backend
+                .get("description")
+                .and_then(Value::as_str)
+                .or_else(|| manifest.get("description").and_then(Value::as_str))
+                .map(str::to_string);
+            let source = manifest.get("source").unwrap_or(&Value::Null);
+            let source_provider: Option<String> = source
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let source_model: Option<String> = source
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let source_revision: Option<String> = source
+                .get("revision")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+
+            db.execute(
+                "SELECT rvbbit.register_backend(\
+                 backend_name => $1, backend_endpoint => $2, backend_transport => $3, \
+                 backend_batch_size => $4, backend_max_concur => $5, backend_timeout_ms => $6, \
+                 backend_auth_env => $7, backend_opts => $8::text::jsonb, backend_description => $9, \
+                 backend_source_provider => $10, backend_source_model => $11, \
+                 backend_source_revision => $12, backend_install_manifest => $13::text::jsonb)",
+                &[
+                    &backend_name,
+                    &result.endpoint_url,
+                    &transport,
+                    &batch_size,
+                    &max_concurrent,
+                    &timeout_ms,
+                    &auth_env,
+                    &backend_opts,
+                    &description,
+                    &source_provider,
+                    &source_model,
+                    &source_revision,
+                    &install_manifest,
+                ],
+            )
+            .context("registering Brain connector backend")?;
+
+            let brain_source = manifest
+                .get("brain_source")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow!("Brain connector manifest needs brain_source object"))?;
+            let source_label = brain_source
+                .get("label")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("Brain connector brain_source.label is required"))?
+                .to_string();
+            let source_kind = brain_source
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("remote")
+                .to_string();
+            let mut source_config = brain_source
+                .get("config")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let source_config_obj = source_config
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("Brain connector brain_source.config must be an object"))?;
+            source_config_obj
+                .entry("connector")
+                .or_insert_with(|| json!(backend_name));
+            let source_config = source_config.to_string();
+            let creds_ref: Option<String> = brain_source
+                .get("creds_ref")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| auth_env.clone());
+            let folder_prefix: Option<String> = brain_source
+                .get("folder_prefix")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let enabled = brain_source
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            db.execute(
+                "SELECT rvbbit.brain_configure_source($1,$2,$3::text::jsonb,$4,$5,$6)",
+                &[
+                    &source_label,
+                    &source_kind,
+                    &source_config,
+                    &creds_ref,
+                    &folder_prefix,
+                    &enabled,
+                ],
+            )
+            .context("configuring Brain connector source")?;
+            db.execute("SELECT rvbbit.reload_backends()", &[])
+                .context("reloading Brain connector backend cache")?;
+        }
         "memory" | "hindsight" | "http_service" => {
             let provider = runtime_registration
                 .get("provider")
@@ -2976,7 +3110,13 @@ fn probe_runtime(manifest: &Value, result: &DeploymentResult) -> Result<Value> {
     let language = runtime_language(manifest);
     if matches!(
         language.as_str(),
-        "mcp" | "mcp_gateway" | "memory" | "hindsight" | "http_service"
+        "mcp"
+            | "mcp_gateway"
+            | "memory"
+            | "hindsight"
+            | "http_service"
+            | "brain_connector"
+            | "document_connector"
     ) {
         let parsed = if result.published_host_port {
             http_get_json(&result.probe_url)
