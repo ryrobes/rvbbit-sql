@@ -151,14 +151,66 @@ route, and Calendar API routes are absent/invisible.
 Query surfaces also expose a contextual **Sheet** action. Its first use requests a
 separate incremental Google Workspace grant with only `drive.file`; sign-in and
 Calendar consent still do not imply file access. Calliope can create and update files
-it created for that user, but cannot enumerate or read the rest of their Drive. The
-same action resumes automatically after consent, exports the exact frozen result shown
-on the Stage, freezes and formats the header, and saves an owner-scoped receipt and link.
+it created for that user, but cannot enumerate the rest of their Drive. The same action
+resumes automatically after consent, exports the exact frozen result shown on the Stage,
+freezes and formats the header, and saves an owner-scoped receipt and link.
+
+With Google Picker configured, the Stage also exposes **Bring in Sheet**. Picker lets the
+user explicitly choose one workbook without granting Calliope broad Drive listing access.
+Calliope then shows its grid tabs and a bounded row preview; the user can choose an A1
+range and whether the first row contains field names. Confirming the import re-reads that
+selection, freezes up to 1,000 rows / 50,000 cells in the private notebook, and records workbook, tab,
+range, source link, owner, and content hash. It is deliberately a snapshot rather than a
+silent sync. The active grid has an explicit **Refresh** action: an unchanged check advances
+its freshness timestamp without adding another turn, while changed content supersedes the active
+receipt and creates a linked immutable Stage revision that is selected automatically. Selecting
+that Stage grid attaches its exact workbook, tab, range, schema, and a bounded row preview to
+the current turn. Calliope can page through the rest of that owner-checked immutable snapshot
+with `calliope_sheet_snapshot`; it does not silently re-read the live Google file. For analysis,
+`calliope_sheet_query` exposes that exact selected snapshot inside one governed read-only statement
+as a typed `selected_sheet` relation. Calliope can join it to ordinary warehouse tables, aggregate
+it, and place the result back on the Stage without creating a persistent database object. Imported
+headers receive stable SQL-safe aliases (`sql_name`), and every result retains the source surface,
+snapshot hash/time, original workbook/tab/range, query, and resolved warehouse relations as lineage.
+If the user explicitly asks for current/latest/live values, `read_mode=live` performs one bounded
+Google API read for that query and records both the saved and observed hashes; it never mutates the
+Stage snapshot. Snapshot mode remains the default, and there is no background polling.
+
+**Bring in Doc** uses the same Picker grant for Google Docs. Calliope re-reads the selected
+document on confirmation, extracts its current tab-aware text representation, and indexes
+up to 250,000 characters as a normal Brain document. A deterministic private role is granted
+only to the authenticated uploader, so Brain search, Trails, `brain_get_doc`, and future
+Personal Briefs can use it for that owner without placing its prose in company-visible
+knowledge. Re-importing the same file refreshes that owner's indexed copy and appends a
+linked receipt on the Stage. The active receipt exposes two deliberately explicit lifecycle
+actions: **Refresh** checks the live Doc and creates a new linked revision only when its
+extracted content changed; **Forget** removes the indexed body, chunks, ACL attachment, and
+document KG node while leaving the original Google Drive file untouched. Earlier Stage
+receipts remain as lineage but cannot be mistaken for current Brain context. There is no
+silent background synchronization in this slice, and sharing or promoting private documents
+is intentionally deferred to the broader permissions pass.
+
+Enable the **Google Picker API** plus the surface APIs used by the installation: **Google
+Sheets API** for Sheet import/export and **Google Docs API** for private Doc import. Create a
+browser API key, restrict its HTTP referrers to the exact public Warehouse origin, restrict
+its API access to Google Picker, and set:
+
+```bash
+export WAREHOUSE_GOOGLE_PICKER_API_KEY="..."       # public browser key; origin-restrict it
+# Optional: GCP project number. Normally derived from the numeric OAuth client-ID prefix.
+export WAREHOUSE_GOOGLE_PICKER_APP_ID="123456789012"
+```
+
+The Picker key is intentionally sent to the authenticated browser and therefore is not a
+secret; its referrer and API restrictions are the security boundary. Short-lived Google
+OAuth access tokens are returned only by an authenticated, non-cacheable POST and are
+never persisted by Calliope or put in browser storage.
+
 The MCP tool `export_to_google_sheets` uses the same connection and receipt ledger while
 running its SQL through the normal governed read-only path. Enable the **Google Sheets
-API** in the OAuth client's Google Cloud project; no additional service account or env
-variable is required. Refresh tokens use the same configured encryption secret as
-Calendar, with a purpose-separated encryption context.
+API** in the OAuth client's Google Cloud project; exports need no Picker key or service
+account. Refresh tokens use the same configured encryption secret as Calendar, with a
+purpose-separated encryption context.
 
 ### Burrow + Google: one door, Postgres still decides
 With `WAREHOUSE_AUTH=pg`, Google proves **who** you are and Postgres still decides **what**
@@ -864,7 +916,10 @@ put it on a volume, else a restart strands connectors with "client_id not found"
 `WAREHOUSE_GOOGLE_CLIENT_SECRET` · `WAREHOUSE_GOOGLE_HD` and/or
 `WAREHOUSE_ALLOWED_EMAILS` (audience gate) · `WAREHOUSE_GOOGLE_ONLY` (optional) ·
 `WAREHOUSE_GOOGLE_TOKEN_KEY` (optional dedicated Google grant-token encryption secret;
-otherwise derives from `WAREHOUSE_JWT_SECRET`).
+otherwise derives from `WAREHOUSE_JWT_SECRET`) · `WAREHOUSE_GOOGLE_PICKER_API_KEY`
+(optional origin-restricted browser key enabling Sheet and Google Doc import) ·
+`WAREHOUSE_GOOGLE_PICKER_APP_ID` (optional GCP project number; normally derived from the
+OAuth client ID).
 **Calliope:** `WAREHOUSE_HERMES_URL` + `WAREHOUSE_HERMES_API_KEY` (both required) ·
 `WAREHOUSE_HERMES_MEMORY_KEY` (optional shared company scope) ·
 `WAREHOUSE_CALLIOPE_DIR` (attachment storage) ·

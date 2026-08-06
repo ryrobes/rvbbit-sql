@@ -89,6 +89,20 @@ __CALLIOPE_BACKGROUND__
       </div>
       <div class="stage-actions">
         <span id="surface-count" class="surface-count">0 surfaces</span>
+        <button id="google-sheet-import" class="google-sheet-import" type="button" hidden disabled title="Bring an explicitly selected Google Sheet into this private Stage">
+          <svg viewBox="0 0 16 18" aria-hidden="true">
+            <path d="M2.25 1.25h7.1l4.4 4.4v11.1H2.25z"></path>
+            <path d="M9.35 1.25v4.4h4.4M4.65 8.15h6.7v5.85h-6.7zm0 2.05h6.7m-4.45-2.05V14m2.25-5.85V14"></path>
+          </svg>
+          <span>Bring in Sheet</span>
+        </button>
+        <button id="google-document-import" class="google-document-import" type="button" hidden disabled title="Add an explicitly selected Google Doc to your private Brain">
+          <svg viewBox="0 0 16 18" aria-hidden="true">
+            <path d="M2.25 1.25h7.1l4.4 4.4v11.1H2.25z"></path>
+            <path d="M9.35 1.25v4.4h4.4M4.65 8.25h6.3M4.65 10.7h6.3M4.65 13.15h4.2"></path>
+          </svg>
+          <span>Bring in Doc</span>
+        </button>
         <button id="archive-session" class="quiet-action" type="button" disabled>Archive</button>
       </div>
     </header>
@@ -264,6 +278,106 @@ __CALLIOPE_BACKGROUND__
       <button id="surface-viewer-close" class="markup-close" type="button" aria-label="Close expanded surface">×</button>
     </header>
     <div id="surface-viewer-content" class="surface-viewer-content" aria-live="polite"></div>
+  </div>
+</dialog>
+
+<dialog id="sheet-import-dialog" class="sheet-import-dialog" aria-labelledby="sheet-import-title">
+  <div class="sheet-import-shell">
+    <header class="sheet-import-head">
+      <div class="sheet-import-mark" aria-hidden="true">
+        <svg viewBox="0 0 16 18">
+          <path d="M2.25 1.25h7.1l4.4 4.4v11.1H2.25z"></path>
+          <path d="M9.35 1.25v4.4h4.4M4.65 8.15h6.7v5.85h-6.7zm0 2.05h6.7m-4.45-2.05V14m2.25-5.85V14"></path>
+        </svg>
+      </div>
+      <div>
+        <p class="eyebrow">Private Google Sheet snapshot</p>
+        <h2 id="sheet-import-title">Choose a tab and range</h2>
+        <p id="sheet-import-workbook">Inspecting the selected workbook…</p>
+      </div>
+      <a id="sheet-import-source" href="#" target="_blank" rel="noopener" hidden>Open source ↗</a>
+      <button id="sheet-import-close" class="markup-close" type="button" aria-label="Close Sheet import">×</button>
+    </header>
+    <div class="sheet-import-workspace">
+      <aside class="sheet-import-tabs-wrap">
+        <span>Workbook tabs</span>
+        <div id="sheet-import-tabs" class="sheet-import-tabs" role="listbox" aria-label="Google Sheet tabs"></div>
+        <p>Only the tab and bounded range you confirm will enter this private notebook.</p>
+      </aside>
+      <section class="sheet-import-preview-pane">
+        <div class="sheet-import-controls">
+          <label>
+            <span>Range <i>optional</i></span>
+            <input id="sheet-import-range" type="text" maxlength="32" placeholder="A1:Z500" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="sheet-import-header-toggle">
+            <input id="sheet-import-header" type="checkbox" checked>
+            <span><b>First row is headers</b><i>Creates stable field names for Calliope</i></span>
+          </label>
+          <button id="sheet-import-preview-refresh" type="button">Refresh preview</button>
+        </div>
+        <div id="sheet-import-preview" class="sheet-import-preview" aria-live="polite">
+          <div class="sheet-import-loading"><i></i><strong>Reading the selected Sheet…</strong><span>Only a bounded preview is being requested.</span></div>
+        </div>
+      </section>
+    </div>
+    <footer class="sheet-import-foot">
+      <div>
+        <strong>Frozen, not silently synced.</strong>
+        <span id="sheet-import-status">The imported rows retain their workbook, tab, range, and content hash.</span>
+      </div>
+      <button id="sheet-import-cancel" class="quiet-action" type="button">Cancel</button>
+      <button id="sheet-import-commit" class="primary-action" type="button" disabled>Bring into Stage →</button>
+    </footer>
+  </div>
+</dialog>
+
+<dialog id="document-import-dialog" class="sheet-import-dialog document-import-dialog" aria-labelledby="document-import-title">
+  <div class="sheet-import-shell document-import-shell">
+    <header class="sheet-import-head document-import-head">
+      <div class="sheet-import-mark document-import-mark" aria-hidden="true">
+        <svg viewBox="0 0 16 18">
+          <path d="M2.25 1.25h7.1l4.4 4.4v11.1H2.25z"></path>
+          <path d="M9.35 1.25v4.4h4.4M4.65 8.25h6.3M4.65 10.7h6.3M4.65 13.15h4.2"></path>
+        </svg>
+      </div>
+      <div>
+        <p class="eyebrow">Private Brain document</p>
+        <h2 id="document-import-title">Inspecting the selected Google Doc…</h2>
+        <p id="document-import-subtitle">Reading its structure without listing the rest of your Drive.</p>
+      </div>
+      <a id="document-import-source" href="#" target="_blank" rel="noopener" hidden>Open source ↗</a>
+      <button id="document-import-close" class="markup-close" type="button" aria-label="Close document import">×</button>
+    </header>
+    <div class="document-import-workspace">
+      <aside class="document-import-facts">
+        <div class="document-private-seal">
+          <i aria-hidden="true"></i>
+          <span><strong>Only you</strong><small>Owner-scoped Brain access</small></span>
+        </div>
+        <dl id="document-import-stats">
+          <div><dt>Words</dt><dd>—</dd></div>
+          <div><dt>Characters</dt><dd>—</dd></div>
+          <div><dt>Tabs</dt><dd>—</dd></div>
+        </dl>
+        <div class="document-import-tabs-block">
+          <span>Document structure</span>
+          <div id="document-import-tabs" class="document-import-tabs"><i>Inspecting tabs…</i></div>
+        </div>
+        <p>The document becomes searchable private evidence and can inform your future Briefs. It is not shared with the company.</p>
+      </aside>
+      <section id="document-import-preview" class="document-import-preview" aria-live="polite">
+        <div class="sheet-import-loading"><i></i><strong>Reading the selected document…</strong><span>Calliope is extracting a bounded text representation for your private Brain.</span></div>
+      </section>
+    </div>
+    <footer class="sheet-import-foot document-import-foot">
+      <div>
+        <strong>Private by default.</strong>
+        <span id="document-import-status">The source, revision, content hash, and authenticated owner will be retained.</span>
+      </div>
+      <button id="document-import-cancel" class="quiet-action" type="button">Cancel</button>
+      <button id="document-import-commit" class="primary-action" type="button" disabled>Add to private Brain →</button>
+    </footer>
   </div>
 </dialog>
 

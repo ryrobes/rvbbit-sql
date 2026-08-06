@@ -8,6 +8,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1630,6 +1631,180 @@ def test_selected_query_surface_sends_result_preview_to_hermes():
     assert selected["sql"] == "select region from marts.sales"
     assert selected["evidence"]["query_result"]["rows"] == [{"region": "North"}]
     assert "abc123" in calliope._instructions(compact, selected)
+
+
+def test_selected_sheet_outside_recent_window_is_authoritative_and_readable():
+    session_id = "45f8a9da-5ff7-488f-b377-211c6e94aff0"
+    selected_id = "f8db6009-66e0-4471-85b9-06e704334431"
+    recent_id = "bac8e23c-ccb7-41de-891b-ac3cd6ee955d"
+    columns = [
+        {"name": f"field_{index}", "type": "text"}
+        for index in range(30)
+    ]
+    rows = [
+        {f"field_{index}": f"row {row_index} value {index}" for index in range(30)}
+        for row_index in range(10)
+    ]
+    selected_row = {
+        "id": selected_id,
+        "kind": "query",
+        "title": "Enrollment Pace · Fall 2026",
+        "artifact_slug": None,
+        "artifact_version": None,
+        "lineage_key": "google-sheet:abc",
+        "payload": {
+            "columns": columns,
+            "rows": rows,
+            "row_count": 10,
+            "column_count": 30,
+        },
+        "source": {
+            "origin": "google_sheet_import",
+            "spreadsheet_id": "sheet-file-id",
+            "spreadsheet_title": "Enrollment Pace",
+            "sheet_id": 123,
+            "sheet_name": "Fall 2026",
+            "selected_range": "A1:AD11",
+            "resolved_range": "'Fall 2026'!A1:AD11",
+            "first_row_header": True,
+        },
+        "created_at": "2026-08-05T20:00:00Z",
+    }
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, params):
+            if "LIMIT 24" in statement:
+                return SimpleNamespace(fetchall=lambda: [{
+                    "id": recent_id,
+                    "kind": "document",
+                    "title": "A newer surface",
+                    "artifact_slug": None,
+                    "artifact_version": None,
+                    "lineage_key": "document:newer",
+                    "payload": {},
+                    "source": {},
+                    "created_at": "2026-08-05T21:00:00Z",
+                }])
+            assert params == (session_id, selected_id)
+            return SimpleNamespace(fetchone=lambda: selected_row)
+
+    compact, selected = calliope._compact_surface_context(
+        lambda: Connection(), session_id, selected_id
+    )
+
+    assert len(compact) == 2
+    assert selected["surface_id"] == selected_id
+    sheet = selected["private_sheet"]
+    assert sheet["spreadsheet_id"] == "sheet-file-id"
+    assert sheet["sheet_name"] == "Fall 2026"
+    assert sheet["selected_range"] == "A1:AD11"
+    assert len(sheet["columns"]) == 24
+    assert sheet["columns"][0]["sql_name"] == "field_0"
+    assert len(sheet["preview_rows"]) == 8
+    assert sheet["preview_truncated"] is True
+    assert sheet["reader"] == {
+        "tool": "calliope_sheet_snapshot",
+        "surface_id": selected_id,
+    }
+    assert sheet["sql_relation"]["tool"] == "calliope_sheet_query"
+    assert sheet["sql_relation"]["name"] == "selected_sheet"
+    assert sheet["sql_relation"]["default_read_mode"] == "snapshot"
+    assert sheet["sql_relation"]["live_read_mode"] == "live"
+    assert sheet["sql_relation"]["columns_truncated"] is True
+    turn_context = calliope._selected_surface_context_text(selected)
+    assert "replaces any surface selected in an earlier turn" in turn_context
+    assert selected_id in turn_context
+    instructions = calliope._instructions(compact, selected)
+    assert "calliope_sheet_snapshot" in instructions
+    assert "calliope_sheet_query" in instructions
+    assert "typed selected_sheet relation" in instructions
+    assert "only then use read_mode=live" in instructions
+    assert "current selected_surface is authoritative" in instructions
+    assert "invoke the exact discovered tool name through tool_call" in instructions
+    assert "direct exposure is neither required nor expected" in instructions
+    assert "a snapshot join may use the existing run_sql or run_sql_multi" in instructions
+    assert "compatibility path is snapshot-only" in instructions
+    assert "call it directly" not in instructions
+
+
+def test_sheet_query_projects_a_stage_grid_with_snapshot_lineage():
+    surface_id = "f8db6009-66e0-4471-85b9-06e704334431"
+    snapshot_hash = "c" * 64
+    result = {
+        "columns": [{"name": "owner", "type": "text"}],
+        "rows": [{"owner": "Ada"}],
+        "row_count": 1,
+        "truncated": False,
+        "engine": "postgres",
+        "sheet": {
+            "surface_id": surface_id,
+            "snapshot_hash": snapshot_hash,
+            "spreadsheet_title": "Pipeline Plan",
+            "read_mode": "snapshot",
+        },
+        "warehouse_objects": ["public.accounts"],
+        "lineage": {
+            "sheet_surface_id": surface_id,
+            "sheet_snapshot_hash": snapshot_hash,
+            "warehouse_objects": ["public.accounts"],
+        },
+    }
+    args = {
+        "surface_id": surface_id,
+        "sql": "select owner from selected_sheet",
+    }
+
+    first = calliope._project_tool_result(
+        "calliope_sheet_query", result, args, "sheet-query-1"
+    )
+    second = calliope._project_tool_result(
+        "calliope_sheet_query",
+        {**result, "sheet": {**result["sheet"], "snapshot_hash": "d" * 64}},
+        args,
+        "sheet-query-2",
+    )
+
+    assert len(first) == 1
+    assert first[0]["kind"] == "query"
+    assert first[0]["payload"]["sheet"]["surface_id"] == surface_id
+    assert first[0]["payload"]["warehouse_objects"] == ["public.accounts"]
+    assert first[0]["source"]["lineage"]["sheet_snapshot_hash"] == snapshot_hash
+    assert first[0]["parent_surface_id"] == surface_id
+    assert first[0]["lineage_key"] != second[0]["lineage_key"]
+
+    live = calliope._project_tool_result(
+        "calliope_sheet_query",
+        {**result, "sheet": {**result["sheet"], "read_mode": "live"}},
+        {**args, "read_mode": "live"},
+        "sheet-query-3",
+    )
+    assert live[0]["lineage_key"] != first[0]["lineage_key"]
+
+    fallback = calliope._project_tool_result(
+        "run_sql",
+        result,
+        {"sql": "select owner from selected_sheet"},
+        "sheet-query-fallback",
+    )
+    assert fallback[0]["parent_surface_id"] == surface_id
+    assert fallback[0]["source"]["args"]["surface_id"] == surface_id
+    assert fallback[0]["lineage_key"] == first[0]["lineage_key"]
+
+    batch_fallback = calliope._project_tool_result(
+        "run_sql_multi",
+        {"results": {"sheet_join": result}, "result_mode": "full"},
+        {"queries": {"sheet_join": "select owner from selected_sheet"}},
+        "sheet-query-batch-fallback",
+    )
+    assert batch_fallback[0]["parent_surface_id"] == surface_id
+    assert batch_fallback[0]["source"]["args"]["surface_id"] == surface_id
+    assert batch_fallback[0]["payload"]["sheet"]["snapshot_hash"] == snapshot_hash
 
 
 def test_assistant_prose_strips_inline_image_payloads():

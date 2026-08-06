@@ -1001,6 +1001,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0245_calliope_google_workspace",
         include_str!("../sql/migrations/0245_calliope_google_workspace.sql"),
     ),
+    (
+        "0246_calliope_google_sheet_imports",
+        include_str!("../sql/migrations/0246_calliope_google_sheet_imports.sql"),
+    ),
+    (
+        "0247_calliope_google_document_imports",
+        include_str!("../sql/migrations/0247_calliope_google_document_imports.sql"),
+    ),
+    (
+        "0248_calliope_google_document_lifecycle",
+        include_str!("../sql/migrations/0248_calliope_google_document_lifecycle.sql"),
+    ),
+    (
+        "0249_calliope_google_sheet_lifecycle",
+        include_str!("../sql/migrations/0249_calliope_google_sheet_lifecycle.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

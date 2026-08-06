@@ -34,7 +34,7 @@ from __future__ import annotations
 # (DictRow vs TupleRow covariance); the code is correct at runtime (see --selftest).
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
-import asyncio, hashlib, hmac, json, math, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
+import asyncio, hashlib, hmac, json, math, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, unicodedata, uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html.parser import HTMLParser
@@ -2827,6 +2827,18 @@ def _objects(tool, args, res):
         return [res.get("table") or args.get("table")]
     if tool == "metric" and args.get("name"):
         return [args["name"]]
+    if tool == "calliope_sheet_query":
+        sheet = res.get("sheet") if isinstance(res.get("sheet"), dict) else {}
+        sheet_object = (
+            f"google_sheet_surface:{sheet.get('surface_id')}"
+            if sheet.get("surface_id")
+            else None
+        )
+        return [
+            item
+            for item in [sheet_object, *(res.get("warehouse_objects") or [])]
+            if item
+        ] or None
     if tool in ("validate_sql", "run_sql"):
         return res.get("rvbbit_tables") or None
     return None
@@ -2840,6 +2852,17 @@ def _summary(tool, res):
     if tool == "run_sql":
         return {"columns": [c.get("name") for c in res.get("columns", [])],
                 "row_count": res.get("row_count"), "truncated": res.get("truncated")}
+    if tool == "calliope_sheet_query":
+        sheet = res.get("sheet") if isinstance(res.get("sheet"), dict) else {}
+        return {
+            "columns": [c.get("name") for c in res.get("columns", [])],
+            "row_count": res.get("row_count"),
+            "truncated": res.get("truncated"),
+            "sheet_surface_id": sheet.get("surface_id"),
+            "sheet_read_mode": sheet.get("read_mode") or "snapshot",
+            "sheet_snapshot_hash": sheet.get("snapshot_hash"),
+            "warehouse_objects": res.get("warehouse_objects") or [],
+        }
     if tool == "run_sql_multi":
         rs = res.get("results") or {}
         return {"queries": {k: {"row_count": (v or {}).get("row_count"),
@@ -3198,6 +3221,758 @@ def _logged(tool, args, thunk):
         return res
     finally:
         _record(tool, args, res, err, int((time.time() - t0) * 1000))
+
+
+def _selected_calliope_private_document_caller(doc_id, ctx=None):
+    """Resolve the owner of the exact private Doc selected for this web turn.
+
+    Hermes reaches Warehouse through one shared MCP credential, so its ordinary
+    token identity cannot read an owner-only Brain document.  Do not promote the
+    forwarded Hermes email to a general authorization identity.  Instead, join
+    the opaque API-session reference back to Warehouse-owned Calliope state and
+    require all of these facts at once:
+
+    * the request is an API-server Hermes turn behind the shared credential;
+    * that Calliope turn is still running;
+    * the turn selected the exact Stage surface being requested; and
+    * that surface is the active private Google Doc receipt for this doc_id.
+
+    This grants one read path for one selected document during one active turn;
+    it cannot expose another private document or broaden ask_brain searches.
+    """
+    authenticated = _authenticated_caller()
+    if authenticated[1] != "static-key":
+        return None
+    envelope = _hermes_mcp_envelope(ctx, authenticated=authenticated)
+    if not envelope or envelope.get("platform") != "api_server":
+        return None
+    session_ref = str(envelope.get("session_id") or "").strip()
+    try:
+        requested_doc_id = int(doc_id)
+    except (TypeError, ValueError):
+        return None
+    if not session_ref or requested_doc_id < 1:
+        return None
+    try:
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT s.owner_email FROM rvbbit.calliope_sessions s "
+                "JOIN rvbbit.calliope_turns t ON t.session_id=s.id "
+                "JOIN rvbbit.calliope_google_document_imports i "
+                "ON i.session_id=s.id AND i.surface_id=t.selected_surface_id "
+                "WHERE s.hermes_session_id=%s AND t.status='running' "
+                "AND i.brain_doc_id=%s::bigint AND i.status='active' "
+                "AND lower(i.owner_email)=lower(s.owner_email) "
+                "ORDER BY t.created_at DESC LIMIT 1",
+                (session_ref, requested_doc_id),
+            ).fetchone()
+    except Exception:  # noqa: BLE001 - optional mixed-version Calliope schema
+        return None
+    owner = str((row or {}).get("owner_email") or "").strip().lower()
+    return owner if _FORWARDED_EMAIL_RE.fullmatch(owner) else None
+
+
+def _private_document_read_caller(doc_id, ctx=None):
+    """Keep normal Brain identity, with one exact selected-Doc web exception."""
+    return _selected_calliope_private_document_caller(doc_id, ctx) or _caller()[0]
+
+
+def _mcp_brain_get_doc(doc_id, ctx=None):
+    """Open one visible Brain document; selected private Calliope Docs are turn-scoped."""
+    return _logged(
+        "brain_get_doc",
+        {"doc_id": doc_id},
+        lambda: tool_brain_get_doc(doc_id, _private_document_read_caller(doc_id, ctx)),
+    )
+
+
+def _mcp_brain_context(doc_id, chunk_idx, window=2, ctx=None):
+    """Read nearby chunks from a visible Brain document, including the selected private Doc."""
+    return _logged(
+        "brain_context",
+        {"doc_id": doc_id, "chunk_idx": chunk_idx, "window": window},
+        lambda: tool_brain_context(
+            doc_id,
+            chunk_idx,
+            window,
+            _private_document_read_caller(doc_id, ctx),
+        ),
+    )
+
+
+def _mcp_brain_related(doc_id, ctx=None):
+    """Traverse a visible Brain document's neighborhood with selected-Doc turn scope."""
+    return _logged(
+        "brain_related",
+        {"doc_id": doc_id},
+        lambda: tool_brain_related(doc_id, _private_document_read_caller(doc_id, ctx)),
+    )
+
+
+def _selected_calliope_sheet_row(surface_id, ctx=None):
+    """Fetch the exact Sheet receipt selected by the active browser-owned turn."""
+    authenticated = _authenticated_caller()
+    if authenticated[1] != "static-key":
+        return None
+    envelope = _hermes_mcp_envelope(ctx, authenticated=authenticated)
+    if not envelope or envelope.get("platform") != "api_server":
+        return None
+    session_ref = str(envelope.get("session_id") or "").strip()
+    try:
+        selected_surface_id = str(uuid.UUID(str(surface_id)))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if not session_ref:
+        return None
+    try:
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT f.id::text AS surface_id,f.title,f.payload,i.owner_email,"
+                "i.provider_file_id,i.provider_sheet_id,i.spreadsheet_title,i.sheet_name,"
+                "i.selected_range,i.first_row_header,i.row_count,i.column_count,"
+                "i.snapshot_hash,i.operation,i.status,i.last_checked_at,"
+                "i.superseded_at,i.created_at "
+                "FROM rvbbit.calliope_sessions s "
+                "JOIN rvbbit.calliope_turns t ON t.session_id=s.id "
+                "JOIN rvbbit.calliope_surfaces f "
+                "ON f.id=t.selected_surface_id AND f.session_id=s.id "
+                "JOIN rvbbit.calliope_google_imports i "
+                "ON i.surface_id=f.id AND i.session_id=s.id "
+                "WHERE s.hermes_session_id=%s AND t.status='running' "
+                "AND f.id=%s::uuid AND lower(i.owner_email)=lower(s.owner_email) "
+                "ORDER BY t.created_at DESC LIMIT 1",
+                (session_ref, selected_surface_id),
+            ).fetchone()
+    except Exception:  # noqa: BLE001 - optional mixed-version Calliope schema
+        return None
+    return dict(row) if row else None
+
+
+def _active_calliope_sheet_surface_id(ctx=None):
+    """Resolve the exact private Sheet selected by this active API turn.
+
+    This is the compatibility half of the ``selected_sheet`` relation. A
+    long-running Hermes gateway can retain an older MCP schema catalog after a
+    Warehouse container rolls forward, so it may know ``run_sql`` but not the
+    newer ``calliope_sheet_query`` tool yet. Resolve only Warehouse-owned turn
+    state here; never accept an owner or surface identifier from model SQL.
+    The specialized query tool performs the full check again before reading.
+    """
+    authenticated = _authenticated_caller()
+    if authenticated[1] != "static-key":
+        return None
+    envelope = _hermes_mcp_envelope(ctx, authenticated=authenticated)
+    if not envelope or envelope.get("platform") != "api_server":
+        return None
+    session_ref = str(envelope.get("session_id") or "").strip()
+    if not session_ref:
+        return None
+    try:
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT f.id::text AS surface_id "
+                "FROM rvbbit.calliope_sessions s "
+                "JOIN rvbbit.calliope_turns t ON t.session_id=s.id "
+                "JOIN rvbbit.calliope_surfaces f "
+                "ON f.id=t.selected_surface_id AND f.session_id=s.id "
+                "JOIN rvbbit.calliope_google_imports i "
+                "ON i.surface_id=f.id AND i.session_id=s.id "
+                "WHERE s.hermes_session_id=%s AND t.status='running' "
+                "AND lower(i.owner_email)=lower(s.owner_email) "
+                "ORDER BY t.created_at DESC LIMIT 1",
+                (session_ref,),
+            ).fetchone()
+    except Exception:  # noqa: BLE001 - optional mixed-version Calliope schema
+        return None
+    surface_id = str((row or {}).get("surface_id") or "").strip()
+    try:
+        return str(uuid.UUID(surface_id))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _sheet_page_number(value, default, minimum, maximum):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _sheet_snapshot_cell(value):
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return str(value)[:4_000]
+
+
+_SHEET_SQL_RESERVED = {
+    "all", "analyse", "analyze", "and", "any", "array", "as", "asc",
+    "asymmetric", "both", "case", "cast", "check", "collate", "column",
+    "constraint", "create", "current_catalog", "current_date", "current_role",
+    "current_time", "current_timestamp", "current_user", "default", "deferrable",
+    "desc", "distinct", "do", "else", "end", "except", "false", "fetch", "for",
+    "foreign", "from", "grant", "group", "having", "in", "initially", "intersect",
+    "into", "lateral", "leading", "limit", "localtime", "localtimestamp", "new",
+    "not", "null", "off", "offset", "old", "on", "only", "or", "order",
+    "placing", "primary", "references", "returning", "select", "session_user",
+    "some", "symmetric", "table", "then", "to", "trailing", "true", "union",
+    "unique", "user", "using", "variadic", "when", "where", "window", "with",
+}
+_SHEET_SQL_TYPES = {
+    "boolean": "boolean",
+    "integer": "bigint",
+    "number": "double precision",
+    "text": "text",
+}
+
+
+def _sheet_sql_columns(raw_columns):
+    """Give imported headers stable, agent-friendly PostgreSQL identifiers."""
+    columns = []
+    used = set()
+    for index, raw in enumerate(raw_columns or []):
+        item = raw if isinstance(raw, dict) else {"name": raw}
+        source_name = str(item.get("name") or "").strip()[:240]
+        if not source_name:
+            source_name = f"column_{index + 1}"
+        stored_name = str(item.get("sql_name") or "").strip().lower()
+        if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", stored_name):
+            ascii_name = unicodedata.normalize("NFKD", source_name).encode(
+                "ascii", "ignore"
+            ).decode("ascii")
+            stored_name = re.sub(r"[^a-z0-9]+", "_", ascii_name.lower()).strip("_")
+            stored_name = stored_name[:48] or f"column_{index + 1}"
+            if stored_name[0].isdigit():
+                stored_name = f"column_{stored_name}"
+        # route_explain deliberately blocks pg_* catalog access with a broad
+        # token guard. Avoid producing an otherwise innocent alias that trips it.
+        stored_name = stored_name.replace("pg_", "postgres_")
+        if stored_name in _SHEET_SQL_RESERVED:
+            stored_name = f"sheet_{stored_name}"
+        candidate = stored_name[:60]
+        suffix = 1
+        while candidate in used:
+            suffix += 1
+            candidate = f"{stored_name[: max(1, 60 - len(str(suffix)) - 1)]}_{suffix}"
+        used.add(candidate)
+        declared_type = str(item.get("type") or "text").strip().lower()
+        if declared_type not in _SHEET_SQL_TYPES:
+            declared_type = "text"
+        columns.append({
+            "name": source_name,
+            "sql_name": candidate,
+            "type": declared_type,
+            "sql_type": _SHEET_SQL_TYPES[declared_type],
+        })
+    return columns
+
+
+def _sheet_query_cell(value, declared_type):
+    """Normalize sparse Sheet cells so typed jsonb_to_recordset casts cannot drift."""
+    if value in (None, ""):
+        return None if declared_type != "text" else value
+    if declared_type == "boolean":
+        return value if isinstance(value, bool) else None
+    if declared_type == "integer":
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    if declared_type == "number":
+        return (
+            value
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and (not isinstance(value, float) or math.isfinite(value))
+            else None
+        )
+    return str(value).replace("\x00", "")[:50_000]
+
+
+def _sheet_query_statement(user_sql, columns, rows_json):
+    """Compose the private snapshot relation around one already-gated SELECT."""
+    definitions = pgsql.SQL(", ").join(
+        pgsql.SQL("{} {}").format(
+            pgsql.Identifier(column["sql_name"]),
+            pgsql.SQL(column["sql_type"]),
+        )
+        for column in columns
+    )
+    return pgsql.SQL(
+        "WITH selected_sheet AS MATERIALIZED ("
+        "SELECT * FROM jsonb_to_recordset(CAST({} AS jsonb)) "
+        "AS _calliope_sheet({})"
+        ") SELECT * FROM ({}) AS _calliope_sheet_result"
+    ).format(
+        pgsql.Literal(rows_json),
+        definitions,
+        pgsql.SQL(user_sql),
+    )
+
+
+def _sheet_query_sql(value):
+    text = str(value or "").strip()
+    if text.endswith(";"):
+        text = text[:-1].rstrip()
+    return text
+
+
+def _mcp_calliope_sheet_snapshot(
+    surface_id,
+    offset=0,
+    limit=50,
+    column_offset=0,
+    column_limit=60,
+    ctx=None,
+):
+    """Page through the private frozen Google Sheet explicitly selected for this Calliope turn.
+
+    Pass the exact surface_id from CALLIOPE_SELECTED_SURFACE. Rows and columns are bounded;
+    advance offset or column_offset to inspect more of a large snapshot. This never reads the
+    live Google file and cannot open an unselected or another user's Sheet.
+    """
+    args = {
+        "surface_id": surface_id,
+        "offset": offset,
+        "limit": limit,
+        "column_offset": column_offset,
+        "column_limit": column_limit,
+    }
+
+    def read_snapshot():
+        row = _selected_calliope_sheet_row(surface_id, ctx)
+        if not row:
+            return {
+                "error": {
+                    "code": "NOT_VISIBLE",
+                    "message": "That Sheet is not the private surface selected for this active Calliope turn",
+                }
+            }
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        raw_columns = payload.get("columns") if isinstance(payload.get("columns"), list) else []
+        raw_rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+        row_offset = _sheet_page_number(offset, 0, 0, len(raw_rows))
+        row_limit = _sheet_page_number(limit, 50, 1, 100)
+        mapped_columns = _sheet_sql_columns(raw_columns)
+        col_offset = _sheet_page_number(column_offset, 0, 0, len(mapped_columns))
+        col_limit = _sheet_page_number(column_limit, 60, 1, 80)
+        columns = mapped_columns[col_offset:col_offset + col_limit]
+        names = [column["name"] for column in columns]
+        page = []
+        page_bytes = 0
+        response_truncated = False
+        for raw in raw_rows[row_offset:row_offset + row_limit]:
+            if not isinstance(raw, dict):
+                continue
+            item = {name: _sheet_snapshot_cell(raw.get(name)) for name in names}
+            item_bytes = len(json.dumps(item, ensure_ascii=False, default=str))
+            if page and page_bytes + item_bytes > 500_000:
+                response_truncated = True
+                break
+            page.append(item)
+            page_bytes += item_bytes
+        next_offset = row_offset + len(page)
+        next_column_offset = col_offset + len(columns)
+        return {
+            "surface_id": str(row.get("surface_id") or surface_id),
+            "provider": "google_sheets",
+            "spreadsheet_id": str(row.get("provider_file_id") or ""),
+            "spreadsheet_title": str(row.get("spreadsheet_title") or row.get("title") or "Google Sheet"),
+            "sheet_id": row.get("provider_sheet_id"),
+            "sheet_name": str(row.get("sheet_name") or "Sheet"),
+            "selected_range": row.get("selected_range"),
+            "first_row_header": bool(row.get("first_row_header")),
+            "snapshot_hash": str(row.get("snapshot_hash") or ""),
+            "snapshot_created_at": str(row.get("created_at") or ""),
+            "private": True,
+            "frozen_snapshot": True,
+            "row_count": max(0, int(row.get("row_count") or len(raw_rows))),
+            "column_count": max(0, int(row.get("column_count") or len(raw_columns))),
+            "offset": row_offset,
+            "returned_rows": len(page),
+            "next_offset": next_offset if next_offset < len(raw_rows) else None,
+            "column_offset": col_offset,
+            "returned_columns": len(columns),
+            "next_column_offset": (
+                next_column_offset if next_column_offset < len(raw_columns) else None
+            ),
+            "columns": [
+                {key: value for key, value in column.items() if value not in (None, "")}
+                for column in columns
+            ],
+            "rows": page,
+            "response_truncated": response_truncated,
+            "note": "This is the immutable Stage snapshot, not a live Google Sheets read.",
+        }
+
+    return _logged("calliope_sheet_snapshot", args, read_snapshot)
+
+
+def _mcp_calliope_sheet_query(
+    surface_id,
+    sql,
+    as_of=None,
+    limit=None,
+    read_mode="snapshot",
+    ctx=None,
+):
+    """Join a selected private Google Sheet to governed warehouse SQL.
+
+    The default read_mode=snapshot exposes the immutable Stage snapshot only inside this call
+    as a typed relation named ``selected_sheet``. Use read_mode=live only when the user explicitly
+    asks for current/latest/live Sheet values; it performs one bounded Google API read but does
+    not replace the saved Stage snapshot. Use the exact ``sql_name`` fields supplied in the
+    selected-surface context or by ``calliope_sheet_snapshot``. The statement must be one
+    read-only SELECT/CTE and reference ``selected_sheet``; ordinary warehouse relations may be
+    joined normally. The result retains the Sheet observation and resolved warehouse objects as
+    lineage.
+    """
+    args = {
+        "surface_id": surface_id,
+        "sql": sql,
+        "as_of": as_of,
+        "limit": limit,
+        "read_mode": read_mode,
+    }
+
+    def query_snapshot():
+        row = _selected_calliope_sheet_row(surface_id, ctx)
+        if not row:
+            return {
+                "error": {
+                    "code": "NOT_VISIBLE",
+                    "message": "That Sheet is not the private surface selected for this active Calliope turn",
+                }
+            }
+        query_sql = _sheet_query_sql(sql)
+        if not query_sql:
+            return {"error": {"code": "MISSING_SQL", "message": "sql is required"}}
+        if not re.search(r"\bselected_sheet\b", query_sql, re.IGNORECASE):
+            return {
+                "error": {
+                    "code": "MISSING_SHEET_RELATION",
+                    "message": "The query must reference the selected_sheet relation",
+                }
+            }
+        mode = str(read_mode or "snapshot").strip().lower()
+        if mode not in {"snapshot", "live"}:
+            return {
+                "error": {
+                    "code": "BAD_READ_MODE",
+                    "message": "read_mode must be snapshot or live",
+                }
+            }
+        stored_payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        observed_at = str(row.get("created_at") or "")
+        source_snapshot_hash = str(row.get("snapshot_hash") or "")
+        effective_snapshot_hash = source_snapshot_hash
+        payload = stored_payload
+        if mode == "live":
+            try:
+                import calliope
+
+                live_snapshot = asyncio.run(calliope.inspect_google_sheet(
+                    _conn,
+                    str(row.get("owner_email") or ""),
+                    row.get("provider_file_id"),
+                    sheet_id=row.get("provider_sheet_id"),
+                    selected_range=row.get("selected_range"),
+                    first_row_header=bool(row.get("first_row_header")),
+                    preview=False,
+                ))
+            except LookupError as exc:
+                return {"error": {"code": "WORKSPACE_NOT_CONNECTED", "message": str(exc)}}
+            except PermissionError as exc:
+                return {"error": {"code": "WORKSPACE_RECONNECT_REQUIRED", "message": str(exc)}}
+            except ValueError as exc:
+                return {"error": {"code": "LIVE_SHEET_INVALID", "message": str(exc)}}
+            except Exception as exc:  # noqa: BLE001 - return a bounded MCP error
+                return {
+                    "error": {
+                        "code": "LIVE_SHEET_FAILED",
+                        "message": str(exc)[:600],
+                    }
+                }
+            payload = live_snapshot if isinstance(live_snapshot, dict) else {}
+            effective_snapshot_hash = str(payload.get("snapshot_hash") or "")
+            observed_at = datetime.now(timezone.utc).isoformat()
+        raw_columns = payload.get("columns") if isinstance(payload.get("columns"), list) else []
+        raw_rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+        columns = _sheet_sql_columns(raw_columns)
+        if not columns:
+            return {
+                "error": {
+                    "code": "EMPTY_SHEET",
+                    "message": "The selected Sheet snapshot has no queryable columns",
+                }
+            }
+        try:
+            normalized_as_of = _normalize_as_of(as_of)
+        except ValueError as exc:
+            return {"error": {"code": "BAD_AS_OF", "message": str(exc)}}
+
+        # Validate the exact query shape against an empty relation. No private
+        # Sheet values enter the planner or activity args, and the same
+        # route_explain safety contract as run_sql still gates the statement.
+        validation_sql = _sheet_query_statement(query_sql, columns, "[]").as_string()
+        validation = tool_validate_sql(validation_sql, normalized_as_of)
+        if not validation.get("valid"):
+            return {
+                "error": {
+                    "code": "INVALID_SQL",
+                    "message": validation.get("error") or "The query could not be planned",
+                }
+            }
+        if not validation.get("safe_select"):
+            return {
+                "error": {
+                    "code": "NOT_SELECT",
+                    "message": "only a read-only SELECT/CTE is allowed",
+                    "reason": validation.get("reason"),
+                }
+            }
+
+        relation_rows = []
+        for raw in raw_rows:
+            if not isinstance(raw, dict):
+                continue
+            relation_rows.append({
+                column["sql_name"]: _sheet_query_cell(
+                    raw.get(column["name"]), column["type"]
+                )
+                for column in columns
+            })
+        rows_json = json.dumps(
+            relation_rows,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        statement = _sheet_query_statement(query_sql, columns, rows_json)
+        if normalized_as_of:
+            statement = pgsql.SQL(
+                f"-- rvbbit: as_of {normalized_as_of}\n"
+            ) + statement
+        row_limit = _sheet_page_number(limit, ROW_CAP, 1, ROW_CAP)
+        t0 = time.time()
+        with _conn(read_only=True, role=_session_pg_role()) as conn, conn.cursor() as cur:
+            cur.execute(statement)
+            result_columns = (
+                [
+                    {"name": desc.name, "type": _TYPE.get(desc.type_code, str(desc.type_code))}
+                    for desc in cur.description
+                ]
+                if cur.description
+                else []
+            )
+            result_rows = cur.fetchmany(row_limit + 1)
+        truncated = len(result_rows) > row_limit
+        result_rows = result_rows[:row_limit]
+        warehouse_objects = _referenced_tables(validation_sql)
+        sheet = {
+            "surface_id": str(row.get("surface_id") or surface_id),
+            "spreadsheet_id": str(row.get("provider_file_id") or ""),
+            "spreadsheet_title": str(
+                row.get("spreadsheet_title") or row.get("title") or "Google Sheet"
+            ),
+            "sheet_id": row.get("provider_sheet_id"),
+            "sheet_name": str(row.get("sheet_name") or "Sheet"),
+            "selected_range": row.get("selected_range"),
+            "snapshot_hash": effective_snapshot_hash,
+            "source_snapshot_hash": source_snapshot_hash,
+            "snapshot_created_at": str(row.get("created_at") or ""),
+            "observed_at": observed_at,
+            "row_count": len(relation_rows),
+            "column_count": len(columns),
+            "columns": columns,
+            "private": True,
+            "read_mode": mode,
+            "frozen_snapshot": mode == "snapshot",
+            "live_read": mode == "live",
+            "relation": "selected_sheet",
+        }
+        return {
+            "columns": result_columns,
+            "rows": result_rows,
+            "row_count": len(result_rows),
+            "truncated": truncated,
+            "engine": validation.get("engine") or "postgres",
+            "elapsed_ms": int((time.time() - t0) * 1000),
+            "as_of_applied": normalized_as_of,
+            "sql": query_sql,
+            "sheet": sheet,
+            "warehouse_objects": warehouse_objects,
+            "rvbbit_tables": validation.get("rvbbit_tables") or [],
+            "lineage": {
+                "sheet_surface_id": sheet["surface_id"],
+                "sheet_read_mode": mode,
+                "sheet_snapshot_hash": sheet["snapshot_hash"],
+                "sheet_source_snapshot_hash": sheet["source_snapshot_hash"],
+                "sheet_snapshot_created_at": sheet["snapshot_created_at"],
+                "sheet_observed_at": sheet["observed_at"],
+                "warehouse_objects": warehouse_objects,
+            },
+            "note": (
+                "selected_sheet was read live once from Google Sheets for this query; the saved "
+                "Stage snapshot was not changed."
+                if mode == "live"
+                else "selected_sheet is the immutable Stage snapshot, not a live Google Sheets read."
+            ),
+        }
+
+    return _logged("calliope_sheet_query", args, query_snapshot)
+
+
+_SELECTED_SHEET_FROM_RE = re.compile(
+    r'\b(?:from|join)\s+(?:only\s+)?(?:"selected_sheet"|selected_sheet\b)',
+    re.IGNORECASE,
+)
+
+
+def _mcp_run_sql(sql, as_of=None, limit=None, ctx=None):
+    """Run governed SQL, binding the active private Sheet when referenced.
+
+    The ordinary behavior is unchanged. The reserved, unqualified
+    ``selected_sheet`` relation is recognized only when this request maps to
+    an active browser-owned Calliope turn with a selected Sheet. Execution then
+    delegates to the same owner-checked implementation as
+    ``calliope_sheet_query``; this is not a second or weaker authorization path.
+    """
+    query_sql = _sheet_query_sql(sql)
+    if _SELECTED_SHEET_FROM_RE.search(query_sql):
+        surface_id = _active_calliope_sheet_surface_id(ctx)
+        if surface_id:
+            return _mcp_calliope_sheet_query(
+                surface_id,
+                query_sql,
+                as_of=as_of,
+                limit=limit,
+                read_mode="snapshot",
+                ctx=ctx,
+            )
+    return _logged(
+        "run_sql",
+        {"sql": sql, "as_of": as_of, "limit": limit},
+        lambda: tool_run_sql(sql, as_of, limit),
+    )
+
+
+def _mcp_run_sql_multi(
+    queries,
+    as_of=None,
+    limit=None,
+    result_mode="full",
+    preview_rows=3,
+    ctx=None,
+):
+    """Batch governed SQL with the same selected-Sheet compatibility binding.
+
+    Keep ordinary batches on the optimized implementation. If at least one
+    statement uses the reserved transient relation and this request maps to an
+    active private Sheet selection, execute each Sheet statement through the
+    exact same authorization/query gate as ``calliope_sheet_query``. This
+    covers older Hermes catalogs without teaching generic SQL about private
+    rows or exposing request context in the public schema.
+    """
+    args = {
+        "queries": queries,
+        "as_of": as_of,
+        "limit": limit,
+        "result_mode": result_mode,
+        "preview_rows": preview_rows,
+    }
+    if not isinstance(queries, dict) or not any(
+        _SELECTED_SHEET_FROM_RE.search(_sheet_query_sql(statement))
+        for statement in queries.values()
+    ):
+        return _logged(
+            "run_sql_multi",
+            args,
+            lambda: tool_run_sql_multi(
+                queries, as_of, limit, result_mode, preview_rows
+            ),
+        )
+    surface_id = _active_calliope_sheet_surface_id(ctx)
+    if not surface_id:
+        return _logged(
+            "run_sql_multi",
+            args,
+            lambda: tool_run_sql_multi(
+                queries, as_of, limit, result_mode, preview_rows
+            ),
+        )
+
+    def execute_batch():
+        if not queries:
+            return {
+                "error": {
+                    "code": "BAD_QUERIES",
+                    "message": "queries must be a non-empty {name: sql} object",
+                }
+            }
+        if len(queries) > 24:
+            return {
+                "error": {
+                    "code": "TOO_MANY_QUERIES",
+                    "message": "max 24 queries per batch",
+                }
+            }
+        if result_mode not in ("full", "summary"):
+            return {
+                "error": {
+                    "code": "BAD_RESULT_MODE",
+                    "message": "result_mode must be 'full' or 'summary'",
+                }
+            }
+        try:
+            normalized_as_of = _normalize_as_of(as_of)
+        except ValueError as exc:
+            return {"error": {"code": "BAD_AS_OF", "message": str(exc)}}
+        try:
+            bounded_preview_rows = max(0, min(int(preview_rows), 25))
+        except (TypeError, ValueError):
+            bounded_preview_rows = 3
+        started = time.time()
+        results = {}
+        for name, statement in queries.items():
+            query_sql = _sheet_query_sql(statement)
+            if _SELECTED_SHEET_FROM_RE.search(query_sql):
+                results[str(name)] = _mcp_calliope_sheet_query(
+                    surface_id,
+                    query_sql,
+                    as_of=normalized_as_of,
+                    limit=limit,
+                    read_mode="snapshot",
+                    ctx=ctx,
+                )
+            else:
+                results[str(name)] = tool_run_sql(
+                    statement, normalized_as_of, limit
+                )
+        if result_mode == "summary":
+            compact = {}
+            for name, result in results.items():
+                if result.get("error"):
+                    compact[name] = {"error": result["error"]}
+                    continue
+                compact[name] = {
+                    "row_count": result.get("row_count"),
+                    "columns": [
+                        column["name"] for column in result.get("columns", [])
+                    ],
+                    "truncated": result.get("truncated"),
+                    "engine": result.get("engine"),
+                    "elapsed_ms": result.get("elapsed_ms"),
+                    "preview": (result.get("rows") or [])[:bounded_preview_rows],
+                }
+            results = compact
+        return {
+            "results": results,
+            "result_mode": result_mode,
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "as_of_applied": normalized_as_of,
+        }
+
+    return _logged("run_sql_multi", args, execute_batch)
 
 
 def _identity_key(value):
@@ -14227,6 +15002,37 @@ def register_dashboard_routes(m):
 
 # ── MCP server ───────────────────────────────────────────────────────────────
 
+async def _notify_tool_list_changed_once(ctx, notified_session_ids):
+    """Ask one connected MCP client per server process to refresh its catalog.
+
+    A Warehouse image replacement creates a new server process but can leave a
+    long-running Hermes client alive with the previous callable registry. The
+    first catalog lookup on each new MCP session emits the protocol-standard
+    notification. Hermes then refreshes the same registry that ``tool_call``
+    uses, instead of merely learning about the tool through Warehouse prose.
+    """
+    if ctx is None:
+        return False
+    try:
+        session = ctx.session
+    except Exception:
+        return False
+    session_key = id(session)
+    if session_key in notified_session_ids:
+        return False
+    # Keep this process-local guard bounded for installations with many short
+    # connector sessions. Clearing only causes one harmless extra refresh.
+    if len(notified_session_ids) >= 2048:
+        notified_session_ids.clear()
+    notified_session_ids.add(session_key)
+    try:
+        await session.send_tool_list_changed()
+    except Exception:
+        notified_session_ids.discard(session_key)
+        return False
+    return True
+
+
 def _register(mcp):
     # FastMCP detects injected Context parameters from the concrete runtime
     # annotation.  This module postpones annotations, so attach it explicitly
@@ -14238,6 +15044,13 @@ def _register(mcp):
         _mcp_update_dashboard,
         _mcp_create_live_app,
         _mcp_update_live_app,
+        _mcp_brain_get_doc,
+        _mcp_brain_context,
+        _mcp_brain_related,
+        _mcp_calliope_sheet_snapshot,
+        _mcp_calliope_sheet_query,
+        _mcp_run_sql,
+        _mcp_run_sql_multi,
     ):
         attributed_tool.__annotations__["ctx"] = FastMCPContext
 
@@ -14373,13 +15186,11 @@ def _register(mcp):
         "brain_facets", {}, lambda: tool_brain_facets(_caller()[0])))
     mcp.tool(name="brain_browse")(lambda: _logged(
         "brain_browse", {}, lambda: tool_brain_browse(_caller()[0])))
-    mcp.tool(name="brain_get_doc")(lambda doc_id: _logged(
-        "brain_get_doc", {"doc_id": doc_id}, lambda: tool_brain_get_doc(doc_id, _caller()[0])))
-    mcp.tool(name="brain_context")(lambda doc_id, chunk_idx, window=2: _logged(
-        "brain_context", {"doc_id": doc_id, "chunk_idx": chunk_idx, "window": window},
-        lambda: tool_brain_context(doc_id, chunk_idx, window, _caller()[0])))
-    mcp.tool(name="brain_related")(lambda doc_id: _logged(
-        "brain_related", {"doc_id": doc_id}, lambda: tool_brain_related(doc_id, _caller()[0])))
+    mcp.tool(name="brain_get_doc")(_mcp_brain_get_doc)
+    mcp.tool(name="brain_context")(_mcp_brain_context)
+    mcp.tool(name="brain_related")(_mcp_brain_related)
+    mcp.tool(name="calliope_sheet_snapshot")(_mcp_calliope_sheet_snapshot)
+    mcp.tool(name="calliope_sheet_query")(_mcp_calliope_sheet_query)
     mcp.tool(name="brain_entity")(lambda name: _logged(
         "brain_entity", {"name": name}, lambda: tool_brain_entity(name, _caller()[0])))
     mcp.tool(name="brain_ingest")(lambda source, title, body, roles=None, folder=None, uri=None, author=None, occurred_at=None: _logged(
@@ -14399,9 +15210,7 @@ def _register(mcp):
         lambda: tool_brain_set_doc_roles(doc_id, roles)))
     mcp.tool(name="validate_sql")(lambda sql, as_of=None: _logged(
         "validate_sql", {"sql": sql, "as_of": as_of}, lambda: tool_validate_sql(sql, as_of)))
-    mcp.tool(name="run_sql")(lambda sql, as_of=None, limit=None: _logged(
-        "run_sql", {"sql": sql, "as_of": as_of, "limit": limit},
-        lambda: tool_run_sql(sql, as_of, limit)))
+    mcp.tool(name="run_sql")(_mcp_run_sql)
 
     # ── tool discovery: search the catalog instead of "tasting" tools ────────
     # This server exposes ~80 tools; agents burn calls (and context) probing
@@ -14409,6 +15218,8 @@ def _register(mcp):
     # get_tool_help returns full descriptions + schemas for the shortlist.
     # Index is built lazily from the SAME registry agents see (the FastMCP
     # tool manager), so it can never drift from reality.
+    catalog_notified_sessions = set()
+
     def _tool_index():
         out = []
         for t in mcp._tool_manager.list_tools():
@@ -14477,15 +15288,27 @@ def _register(mcp):
             res["missing"] = missing
         return res
 
-    mcp.tool(name="search_tools")(lambda query, limit=8: _logged(
-        "search_tools", {"query": query, "limit": limit},
-        lambda: tool_search_tools(query, limit)))
-    mcp.tool(name="get_tool_help")(lambda names: _logged(
-        "get_tool_help", {"names": names},
-        lambda: tool_get_tool_help(names)))
-    mcp.tool(name="run_sql_multi")(lambda queries, as_of=None, limit=None, result_mode="full", preview_rows=3: _logged(
-        "run_sql_multi", {"queries": queries, "as_of": as_of, "limit": limit, "result_mode": result_mode},
-        lambda: tool_run_sql_multi(queries, as_of, limit, result_mode, preview_rows)))
+    async def mcp_search_tools(query, limit=8, ctx=None):
+        result = _logged(
+            "search_tools",
+            {"query": query, "limit": limit},
+            lambda: tool_search_tools(query, limit),
+        )
+        await _notify_tool_list_changed_once(ctx, catalog_notified_sessions)
+        return result
+
+    async def mcp_get_tool_help(names, ctx=None):
+        result = _logged(
+            "get_tool_help", {"names": names}, lambda: tool_get_tool_help(names)
+        )
+        await _notify_tool_list_changed_once(ctx, catalog_notified_sessions)
+        return result
+
+    mcp_search_tools.__annotations__["ctx"] = FastMCPContext
+    mcp_get_tool_help.__annotations__["ctx"] = FastMCPContext
+    mcp.tool(name="search_tools")(mcp_search_tools)
+    mcp.tool(name="get_tool_help")(mcp_get_tool_help)
+    mcp.tool(name="run_sql_multi")(_mcp_run_sql_multi)
     mcp.tool(name="upload_artifact")(_mcp_upload_artifact)
     mcp.tool(name="publish_dashboard")(_mcp_publish_dashboard)
     mcp.tool(name="update_dashboard")(_mcp_update_dashboard)

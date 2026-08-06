@@ -91,6 +91,32 @@
     stage: $("#stage"),
     stageEmpty: $("#stage-empty"),
     surfaceCount: $("#surface-count"),
+    googleSheetImport: $("#google-sheet-import"),
+    googleDocumentImport: $("#google-document-import"),
+    sheetImportDialog: $("#sheet-import-dialog"),
+    sheetImportClose: $("#sheet-import-close"),
+    sheetImportCancel: $("#sheet-import-cancel"),
+    sheetImportTitle: $("#sheet-import-title"),
+    sheetImportWorkbook: $("#sheet-import-workbook"),
+    sheetImportSource: $("#sheet-import-source"),
+    sheetImportTabs: $("#sheet-import-tabs"),
+    sheetImportRange: $("#sheet-import-range"),
+    sheetImportHeader: $("#sheet-import-header"),
+    sheetImportPreviewRefresh: $("#sheet-import-preview-refresh"),
+    sheetImportPreview: $("#sheet-import-preview"),
+    sheetImportStatus: $("#sheet-import-status"),
+    sheetImportCommit: $("#sheet-import-commit"),
+    documentImportDialog: $("#document-import-dialog"),
+    documentImportClose: $("#document-import-close"),
+    documentImportCancel: $("#document-import-cancel"),
+    documentImportTitle: $("#document-import-title"),
+    documentImportSubtitle: $("#document-import-subtitle"),
+    documentImportSource: $("#document-import-source"),
+    documentImportStats: $("#document-import-stats"),
+    documentImportTabs: $("#document-import-tabs"),
+    documentImportPreview: $("#document-import-preview"),
+    documentImportStatus: $("#document-import-status"),
+    documentImportCommit: $("#document-import-commit"),
     newSurfaces: $("#new-surfaces"),
     evidenceSearch: $("#evidence-search"),
     evidenceQuery: $("#evidence-query"),
@@ -347,6 +373,24 @@
     workspace: {
       status: null,
       exporting: new Set(),
+      pickerLoading: false,
+      inspecting: false,
+      importing: false,
+      inspectRequestId: 0,
+      fileId: "",
+      workbook: null,
+      sheet: null,
+      preview: null,
+      previewDirty: false,
+      importError: "",
+      documentInspecting: false,
+      documentImporting: false,
+      documentRequestId: 0,
+      documentFileId: "",
+      documentPreview: null,
+      documentError: "",
+      documentMutating: new Set(),
+      sheetMutating: new Set(),
     },
     dreams: {
       items: [],
@@ -476,6 +520,9 @@
   const SESSION_TAB_KEY = "rvbbit-calliope-session-tab-v1";
   const TAB_SESSIONS_KEY = "rvbbit-calliope-tab-sessions-v1";
   const LIBRARY_MODE_KEY = "rvbbit-calliope-library-mode-v1";
+  const PENDING_WORKSPACE_PICKER_KEY = "calliope.pendingWorkspacePicker.v1";
+  const PENDING_WORKSPACE_DOCUMENT_PICKER_KEY = "calliope.pendingWorkspaceDocumentPicker.v1";
+  let googlePickerApiPromise = null;
   const SESSION_TABS = [
     { id: "chats", label: "Chats", empty: "No conversations here yet." },
     { id: "briefs", label: "Briefs", empty: "No Daily Brief notebooks yet." },
@@ -1190,6 +1237,7 @@
     try {
       const data = await api("/api/calliope/workspace");
       state.workspace.status = data.workspace || null;
+      syncGoogleSheetImportControls();
       return state.workspace.status;
     } catch (error) {
       if (!silent) toast(error.message, true);
@@ -1197,13 +1245,694 @@
     }
   }
 
-  function connectGoogleWorkspace(surfaceId = "") {
+  function connectGoogleWorkspace(surfaceId = "", {
+    resumePicker = false,
+    resumeDocumentPicker = false,
+  } = {}) {
     if (!state.config?.google_workspace?.enabled) return;
     if (surfaceId) sessionStorage.setItem("calliope.pendingWorkspaceExport.v1", surfaceId);
+    if (resumePicker && state.current?.id) {
+      sessionStorage.setItem(PENDING_WORKSPACE_PICKER_KEY, state.current.id);
+    }
+    if (resumeDocumentPicker && state.current?.id) {
+      sessionStorage.setItem(PENDING_WORKSPACE_DOCUMENT_PICKER_KEY, state.current.id);
+    }
     const current = new URL(window.location.href);
     current.searchParams.delete("workspace");
     const next = `${current.pathname}${current.search}`;
     window.location.assign(`/auth/google/workspace/start?next=${encodeURIComponent(next)}`);
+  }
+
+  function syncGoogleSheetImportControls() {
+    if (!els.googleSheetImport) return;
+    const configured = Boolean(
+      state.config?.google_workspace?.sheets_import
+      && state.config?.google_workspace?.picker?.enabled,
+    );
+    const waiting = state.workspace.pickerLoading
+      || state.workspace.inspecting
+      || state.workspace.importing
+      || state.workspace.documentInspecting
+      || state.workspace.documentImporting
+      || state.workspace.documentMutating.size
+      || state.workspace.sheetMutating.size;
+    els.googleSheetImport.hidden = !configured;
+    els.googleSheetImport.disabled = !state.current || state.busy || waiting;
+    els.googleSheetImport.setAttribute("aria-busy", String(state.workspace.pickerLoading));
+    els.googleSheetImport.title = state.workspace.pickerLoading
+      ? "Opening Google Drive…"
+      : !state.current
+        ? "Choose a private notebook before bringing in a Google Sheet"
+        : "Bring an explicitly selected Google Sheet into this private Stage";
+    syncGoogleDocumentImportControls();
+  }
+
+  function syncGoogleDocumentImportControls() {
+    if (!els.googleDocumentImport) return;
+    const configured = Boolean(
+      state.config?.google_workspace?.documents_import
+      && state.config?.google_workspace?.picker?.enabled,
+    );
+    const waiting = state.workspace.pickerLoading
+      || state.workspace.inspecting
+      || state.workspace.importing
+      || state.workspace.documentInspecting
+      || state.workspace.documentImporting
+      || state.workspace.documentMutating.size
+      || state.workspace.sheetMutating.size;
+    els.googleDocumentImport.hidden = !configured;
+    els.googleDocumentImport.disabled = !state.current || state.busy || waiting;
+    els.googleDocumentImport.setAttribute("aria-busy", String(state.workspace.pickerLoading));
+    els.googleDocumentImport.title = state.workspace.pickerLoading
+      ? "Opening Google Drive…"
+      : !state.current
+        ? "Choose a private notebook before bringing in a Google Doc"
+        : "Add an explicitly selected Google Doc to your private Brain";
+  }
+
+  function loadGooglePickerApi() {
+    if (window.google?.picker && window.gapi) return Promise.resolve(window.google.picker);
+    if (googlePickerApiPromise) return googlePickerApiPromise;
+    googlePickerApiPromise = new Promise((resolve, reject) => {
+      const loadPicker = () => {
+        if (!window.gapi?.load) {
+          reject(new Error("Google Picker could not be loaded."));
+          return;
+        }
+        window.gapi.load("picker", {
+          callback: () => window.google?.picker
+            ? resolve(window.google.picker)
+            : reject(new Error("Google Picker did not initialize.")),
+          onerror: () => reject(new Error("Google Picker could not be loaded.")),
+          timeout: 12_000,
+          ontimeout: () => reject(new Error("Google Picker took too long to load.")),
+        });
+      };
+      if (window.gapi?.load) {
+        loadPicker();
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = "https://apis.google.com/js/api.js";
+      script.async = true;
+      script.defer = true;
+      script.onload = loadPicker;
+      script.onerror = () => reject(new Error("Google Picker could not be loaded."));
+      document.head.append(script);
+    }).catch((error) => {
+      googlePickerApiPromise = null;
+      throw error;
+    });
+    return googlePickerApiPromise;
+  }
+
+  function chooseGooglePickerFile(pickerApi, token, settings, {
+    viewId,
+    mimeType,
+    title,
+  }) {
+    return new Promise((resolve, reject) => {
+      try {
+        const view = new pickerApi.DocsView(viewId).setMimeTypes(mimeType);
+        const picker = new pickerApi.PickerBuilder()
+          .addView(view)
+          .enableFeature(pickerApi.Feature.SUPPORT_DRIVES)
+          .setAppId(String(settings.app_id))
+          .setDeveloperKey(settings.api_key)
+          .setOAuthToken(token.access_token)
+          .setOrigin(window.location.origin)
+          .setTitle(title)
+          .setCallback((data) => {
+            const action = data?.[pickerApi.Response.ACTION];
+            if (action === pickerApi.Action.PICKED) {
+              resolve((data[pickerApi.Response.DOCUMENTS] || [])[0] || null);
+            } else if (action === pickerApi.Action.CANCEL) {
+              resolve(null);
+            }
+          })
+          .build();
+        picker.setVisible(true);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  function sheetImportColumns() {
+    return (state.workspace.preview?.columns || []).map((column) =>
+      typeof column === "string" ? column : column?.name
+    ).filter(Boolean);
+  }
+
+  function renderGoogleSheetImport() {
+    if (!els.sheetImportDialog) return;
+    const workbook = state.workspace.workbook;
+    const sheet = state.workspace.sheet;
+    const preview = state.workspace.preview;
+    const columns = sheetImportColumns();
+    const rows = Array.isArray(preview?.rows) ? preview.rows : [];
+    const busy = state.workspace.inspecting || state.workspace.importing;
+    els.sheetImportTitle.textContent = sheet?.title
+      ? `Bring in “${sheet.title}”`
+      : "Choose a tab and range";
+    els.sheetImportWorkbook.textContent = workbook?.title || "Inspecting the selected workbook…";
+    if (workbook?.url) {
+      els.sheetImportSource.href = workbook.url;
+      els.sheetImportSource.hidden = false;
+    } else {
+      els.sheetImportSource.removeAttribute("href");
+      els.sheetImportSource.hidden = true;
+    }
+    els.sheetImportTabs.innerHTML = (workbook?.sheets || []).map((item) => `
+      <button class="sheet-import-tab" type="button" role="option"
+              data-sheet-import-tab="${escapeHtml(item.id)}"
+              data-hidden="${Boolean(item.hidden)}"
+              aria-selected="${item.id === sheet?.id}">
+        <i aria-hidden="true"></i><span><strong>${escapeHtml(item.title)}</strong>
+        <small>${Number(item.row_count || 0).toLocaleString()} rows · ${Number(item.column_count || 0).toLocaleString()} cols${item.hidden ? " · hidden" : ""}</small></span>
+      </button>`).join("");
+    els.sheetImportRange.disabled = busy;
+    els.sheetImportHeader.disabled = busy;
+    els.sheetImportPreviewRefresh.disabled = busy || !state.workspace.fileId || !sheet;
+    els.sheetImportCommit.disabled = busy || !state.current || !columns.length
+      || state.workspace.previewDirty || Boolean(state.workspace.importError);
+    els.sheetImportCommit.textContent = state.workspace.importing
+      ? "Importing snapshot…"
+      : "Bring into Stage →";
+    if (state.workspace.inspecting) {
+      els.sheetImportPreview.innerHTML = '<div class="sheet-import-loading"><i></i><strong>Reading the selected Sheet…</strong><span>Only a bounded preview is being requested.</span></div>';
+      els.sheetImportStatus.textContent = "Resolving the selected workbook, tab, and bounded preview…";
+      return;
+    }
+    if (state.workspace.importError) {
+      els.sheetImportPreview.innerHTML = `<div class="sheet-import-error"><strong>That preview could not be read.</strong><span>${escapeHtml(state.workspace.importError)}</span></div>`;
+      els.sheetImportStatus.textContent = "Nothing will be imported until the preview is valid.";
+      return;
+    }
+    if (!columns.length) {
+      els.sheetImportPreview.innerHTML = '<div class="sheet-import-empty"><strong>No populated columns found.</strong><span>Choose another tab or enter a bounded range such as A1:Z500.</span></div>';
+      els.sheetImportStatus.textContent = "The chosen range is empty; no Stage surface has been created.";
+      return;
+    }
+    const headers = columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("");
+    const tableRows = rows.length
+      ? rows.map((row) => queryRowHtml(row, columns)).join("")
+      : `<tr><td class="query-grid-empty" colspan="${columns.length}">Headers found; this preview has no populated data rows.</td></tr>`;
+    const rangeLabel = preview.selected_range || preview.resolved_range || "bounded used range";
+    els.sheetImportPreview.innerHTML = `
+      <div class="sheet-import-preview-meta">
+        <span><b>${rows.length.toLocaleString()}</b> preview rows</span>
+        <span><b>${columns.length.toLocaleString()}</b> fields</span>
+        <span>${escapeHtml(rangeLabel)}</span>
+        ${preview.truncated ? "<span>bounded preview</span>" : ""}
+      </div>
+      <div class="table-wrap"><table class="data-table"><thead><tr>${headers}</tr></thead><tbody>${tableRows}</tbody></table></div>`;
+    els.sheetImportStatus.textContent = state.workspace.previewDirty
+      ? "The range changed. Refresh the preview before bringing this selection into the Stage."
+      : preview.truncated
+      ? "This is a bounded preview. Import re-reads the range and freezes up to 1,000 rows with a content hash."
+      : "Import re-reads this selection and freezes its rows with workbook, tab, range, and content hash.";
+  }
+
+  function closeGoogleSheetImport() {
+    if (state.workspace.importing) return;
+    state.workspace.inspectRequestId += 1;
+    state.workspace.inspecting = false;
+    state.workspace.fileId = "";
+    state.workspace.workbook = null;
+    state.workspace.sheet = null;
+    state.workspace.preview = null;
+    state.workspace.previewDirty = false;
+    state.workspace.importError = "";
+    if (els.sheetImportDialog?.open) els.sheetImportDialog.close();
+    syncGoogleSheetImportControls();
+  }
+
+  async function inspectSelectedGoogleSheet(fileId, {
+    sheetId = null,
+    range = "",
+    firstRowHeader = true,
+    reset = false,
+  } = {}) {
+    if (!fileId) return;
+    const requestId = ++state.workspace.inspectRequestId;
+    state.workspace.fileId = fileId;
+    state.workspace.inspecting = true;
+    state.workspace.importError = "";
+    if (reset) {
+      state.workspace.workbook = null;
+      state.workspace.sheet = null;
+      state.workspace.preview = null;
+      state.workspace.previewDirty = false;
+      els.sheetImportRange.value = "";
+      els.sheetImportHeader.checked = true;
+    }
+    if (!els.sheetImportDialog.open) els.sheetImportDialog.showModal();
+    renderGoogleSheetImport();
+    syncGoogleSheetImportControls();
+    try {
+      const data = await api("/api/calliope/workspace/google-sheet/inspect", {
+        method: "POST",
+        body: JSON.stringify({
+          file_id: fileId,
+          sheet_id: sheetId,
+          range,
+          first_row_header: Boolean(firstRowHeader),
+        }),
+      });
+      if (requestId !== state.workspace.inspectRequestId || !els.sheetImportDialog.open) return;
+      state.workspace.workbook = data.workbook || null;
+      state.workspace.sheet = data.sheet || null;
+      state.workspace.preview = data;
+      state.workspace.previewDirty = false;
+      els.sheetImportRange.value = data.selected_range || "";
+      els.sheetImportHeader.checked = data.first_row_header !== false;
+    } catch (error) {
+      if (requestId !== state.workspace.inspectRequestId) return;
+      if (["WORKSPACE_NOT_CONNECTED", "WORKSPACE_RECONNECT_REQUIRED"].includes(error.code)) {
+        closeGoogleSheetImport();
+        connectGoogleWorkspace("", { resumePicker: true });
+        return;
+      }
+      state.workspace.importError = error.message;
+    } finally {
+      if (requestId === state.workspace.inspectRequestId) {
+        state.workspace.inspecting = false;
+        renderGoogleSheetImport();
+        syncGoogleSheetImportControls();
+      }
+    }
+  }
+
+  async function openGoogleSheetPicker() {
+    if (!state.current || state.busy || state.workspace.pickerLoading) return;
+    if (!state.config?.google_workspace?.picker?.enabled) {
+      toast("Google Sheet importing is not configured on this installation", true);
+      return;
+    }
+    if (!state.workspace.status?.connected || state.workspace.status?.needs_reconnect) {
+      connectGoogleWorkspace("", { resumePicker: true });
+      return;
+    }
+    state.workspace.pickerLoading = true;
+    syncGoogleSheetImportControls();
+    try {
+      const [pickerApi, token] = await Promise.all([
+        loadGooglePickerApi(),
+        api("/api/calliope/workspace/picker-token", {
+          method: "POST",
+          body: "{}",
+        }),
+      ]);
+      const settings = state.config.google_workspace.picker;
+      const document = await chooseGooglePickerFile(pickerApi, token, settings, {
+        viewId: pickerApi.ViewId.SPREADSHEETS,
+        mimeType: settings.sheet_mime_type
+          || settings.mime_type
+          || "application/vnd.google-apps.spreadsheet",
+        title: "Bring a Google Sheet into Calliope",
+      });
+      if (!document) return;
+      const fileId = document[pickerApi.Document.ID] || document.id;
+      await inspectSelectedGoogleSheet(fileId, { reset: true });
+    } catch (error) {
+      if (["WORKSPACE_NOT_CONNECTED", "WORKSPACE_RECONNECT_REQUIRED"].includes(error.code)) {
+        connectGoogleWorkspace("", { resumePicker: true });
+        return;
+      }
+      toast(error.message || "Google Picker could not be opened", true);
+    } finally {
+      state.workspace.pickerLoading = false;
+      syncGoogleSheetImportControls();
+    }
+  }
+
+  async function commitGoogleSheetImport() {
+    const sessionId = state.current?.id;
+    const fileId = state.workspace.fileId;
+    const sheetId = state.workspace.sheet?.id;
+    if (!sessionId || !fileId || sheetId == null || state.workspace.importing
+      || state.workspace.previewDirty || state.workspace.importError) return;
+    state.workspace.importing = true;
+    state.workspace.importError = "";
+    renderGoogleSheetImport();
+    syncGoogleSheetImportControls();
+    try {
+      const data = await api(
+        `/api/calliope/sessions/${encodeURIComponent(sessionId)}/google-sheet-import`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            file_id: fileId,
+            sheet_id: sheetId,
+            range: els.sheetImportRange.value.trim(),
+            first_row_header: els.sheetImportHeader.checked,
+          }),
+        },
+      );
+      state.workspace.status = {
+        ...(state.workspace.status || {}),
+        connected: true,
+        status: "connected",
+        import_count: Number(state.workspace.status?.import_count || 0)
+          + (data.changed === false ? 0 : 1),
+        sheet_count: Number(state.workspace.status?.sheet_count || 0)
+          + (data.changed !== false && data.operation === "import" ? 1 : 0),
+        last_imported_at: data.import?.created_at || new Date().toISOString(),
+      };
+      state.workspace.importing = false;
+      closeGoogleSheetImport();
+      await loadSessions(sessionId, true);
+      if (data.surface?.id) requestAnimationFrame(() => focusSurface(data.surface.id));
+      const rowCount = Number(data.surface?.payload?.row_count || 0);
+      toast(data.changed === false
+        ? "That Google Sheet snapshot is already current"
+        : `Google Sheet snapshot added · ${rowCount.toLocaleString()} row${rowCount === 1 ? "" : "s"}${data.surface?.payload?.truncated ? " · bounded at the import limit" : ""}`);
+    } catch (error) {
+      if (["WORKSPACE_NOT_CONNECTED", "WORKSPACE_RECONNECT_REQUIRED"].includes(error.code)) {
+        state.workspace.importing = false;
+        closeGoogleSheetImport();
+        connectGoogleWorkspace("", { resumePicker: true });
+        return;
+      }
+      state.workspace.importError = error.message;
+      toast(error.message, true);
+    } finally {
+      state.workspace.importing = false;
+      renderGoogleSheetImport();
+      syncGoogleSheetImportControls();
+    }
+  }
+
+  function renderGoogleDocumentImport() {
+    if (!els.documentImportDialog) return;
+    const preview = state.workspace.documentPreview;
+    const busy = state.workspace.documentInspecting || state.workspace.documentImporting;
+    els.documentImportTitle.textContent = preview?.title
+      ? `Add “${preview.title}”`
+      : "Inspecting the selected Google Doc…";
+    els.documentImportSubtitle.textContent = preview
+      ? "A bounded text representation will be indexed under your owner-only Brain role."
+      : "Reading its structure without listing the rest of your Drive.";
+    if (preview?.url) {
+      els.documentImportSource.href = preview.url;
+      els.documentImportSource.hidden = false;
+    } else {
+      els.documentImportSource.removeAttribute("href");
+      els.documentImportSource.hidden = true;
+    }
+    const facts = [
+      ["Words", Number(preview?.word_count || 0).toLocaleString()],
+      ["Characters", Number(preview?.character_count || 0).toLocaleString()],
+      ["Tabs", Number(preview?.tab_count || 0).toLocaleString()],
+    ];
+    els.documentImportStats.innerHTML = facts.map(([label, value]) =>
+      `<div><dt>${escapeHtml(label)}</dt><dd>${preview ? escapeHtml(value) : "—"}</dd></div>`
+    ).join("");
+    const tabs = Array.isArray(preview?.tab_titles) ? preview.tab_titles : [];
+    els.documentImportTabs.innerHTML = preview
+      ? tabs.length
+        ? tabs.map((title) => `<span>${escapeHtml(title)}</span>`).join("")
+        : "<span>Primary document body</span>"
+      : "<i>Inspecting tabs…</i>";
+    els.documentImportCommit.disabled = busy || !preview || Boolean(state.workspace.documentError);
+    els.documentImportCommit.textContent = state.workspace.documentImporting
+      ? "Indexing private document…"
+      : "Add to private Brain →";
+    if (state.workspace.documentInspecting) {
+      els.documentImportPreview.innerHTML = '<div class="sheet-import-loading"><i></i><strong>Reading the selected document…</strong><span>Calliope is extracting a bounded text representation for your private Brain.</span></div>';
+      els.documentImportStatus.textContent = "Resolving the selected Google Doc and its current revision…";
+      return;
+    }
+    if (state.workspace.documentError) {
+      els.documentImportPreview.innerHTML = `<div class="sheet-import-error"><strong>That document could not be read.</strong><span>${escapeHtml(state.workspace.documentError)}</span></div>`;
+      els.documentImportStatus.textContent = "Nothing has entered the Brain.";
+      return;
+    }
+    if (!preview) {
+      els.documentImportPreview.innerHTML = '<div class="sheet-import-loading"><i></i><strong>Waiting for Google Drive…</strong><span>Only the document you explicitly choose can be opened.</span></div>';
+      return;
+    }
+    els.documentImportPreview.innerHTML = `<article class="document-import-preview-copy">
+      <span>Extracted preview · untrusted document evidence</span>
+      <pre>${escapeHtml(preview.excerpt || "No readable preview was returned.")}</pre>
+    </article>`;
+    const clipped = String(preview.excerpt || "").length < Number(preview.character_count || 0);
+    els.documentImportStatus.textContent = clipped
+      ? "Preview shortened here; the complete bounded document will be indexed with its content hash."
+      : "The complete document will be indexed with its source revision and content hash.";
+  }
+
+  function closeGoogleDocumentImport() {
+    if (state.workspace.documentImporting) return;
+    state.workspace.documentRequestId += 1;
+    state.workspace.documentInspecting = false;
+    state.workspace.documentFileId = "";
+    state.workspace.documentPreview = null;
+    state.workspace.documentError = "";
+    if (els.documentImportDialog?.open) els.documentImportDialog.close();
+    syncGoogleSheetImportControls();
+  }
+
+  async function inspectSelectedGoogleDocument(fileId) {
+    if (!fileId) return;
+    const requestId = ++state.workspace.documentRequestId;
+    state.workspace.documentFileId = fileId;
+    state.workspace.documentInspecting = true;
+    state.workspace.documentPreview = null;
+    state.workspace.documentError = "";
+    if (!els.documentImportDialog.open) els.documentImportDialog.showModal();
+    renderGoogleDocumentImport();
+    syncGoogleSheetImportControls();
+    try {
+      const data = await api("/api/calliope/workspace/google-document/inspect", {
+        method: "POST",
+        body: JSON.stringify({ file_id: fileId }),
+      });
+      if (requestId !== state.workspace.documentRequestId || !els.documentImportDialog.open) return;
+      state.workspace.documentPreview = data;
+    } catch (error) {
+      if (requestId !== state.workspace.documentRequestId) return;
+      if (["WORKSPACE_NOT_CONNECTED", "WORKSPACE_RECONNECT_REQUIRED"].includes(error.code)) {
+        closeGoogleDocumentImport();
+        connectGoogleWorkspace("", { resumeDocumentPicker: true });
+        return;
+      }
+      state.workspace.documentError = error.message;
+    } finally {
+      if (requestId === state.workspace.documentRequestId) {
+        state.workspace.documentInspecting = false;
+        renderGoogleDocumentImport();
+        syncGoogleSheetImportControls();
+      }
+    }
+  }
+
+  async function openGoogleDocumentPicker() {
+    if (!state.current || state.busy || state.workspace.pickerLoading) return;
+    if (!state.config?.google_workspace?.documents_import
+      || !state.config?.google_workspace?.picker?.enabled) {
+      toast("Google document importing is not configured on this installation", true);
+      return;
+    }
+    if (!state.workspace.status?.connected || state.workspace.status?.needs_reconnect) {
+      connectGoogleWorkspace("", { resumeDocumentPicker: true });
+      return;
+    }
+    state.workspace.pickerLoading = true;
+    syncGoogleSheetImportControls();
+    try {
+      const [pickerApi, token] = await Promise.all([
+        loadGooglePickerApi(),
+        api("/api/calliope/workspace/picker-token", {
+          method: "POST",
+          body: "{}",
+        }),
+      ]);
+      const settings = state.config.google_workspace.picker;
+      const document = await chooseGooglePickerFile(pickerApi, token, settings, {
+        viewId: pickerApi.ViewId.DOCUMENTS,
+        mimeType: settings.document_mime_type || "application/vnd.google-apps.document",
+        title: "Add a Google Doc to your private Calliope Brain",
+      });
+      if (!document) return;
+      const fileId = document[pickerApi.Document.ID] || document.id;
+      await inspectSelectedGoogleDocument(fileId);
+    } catch (error) {
+      if (["WORKSPACE_NOT_CONNECTED", "WORKSPACE_RECONNECT_REQUIRED"].includes(error.code)) {
+        connectGoogleWorkspace("", { resumeDocumentPicker: true });
+        return;
+      }
+      toast(error.message || "Google Picker could not be opened", true);
+    } finally {
+      state.workspace.pickerLoading = false;
+      syncGoogleSheetImportControls();
+    }
+  }
+
+  async function commitGoogleDocumentImport() {
+    const sessionId = state.current?.id;
+    const fileId = state.workspace.documentFileId;
+    if (!sessionId || !fileId || !state.workspace.documentPreview
+      || state.workspace.documentImporting || state.workspace.documentError) return;
+    state.workspace.documentImporting = true;
+    state.workspace.documentError = "";
+    renderGoogleDocumentImport();
+    syncGoogleSheetImportControls();
+    try {
+      const data = await api(
+        `/api/calliope/sessions/${encodeURIComponent(sessionId)}/google-document-import`,
+        {
+          method: "POST",
+          body: JSON.stringify({ file_id: fileId }),
+        },
+      );
+      state.workspace.status = {
+        ...(state.workspace.status || {}),
+        connected: true,
+        status: "connected",
+        document_import_count: Number(
+          state.workspace.status?.document_import_count || 0
+        ) + (data.changed === false ? 0 : 1),
+        document_count: Number(state.workspace.status?.document_count || 0)
+          + (data.changed !== false && data.operation === "import" ? 1 : 0),
+        last_document_imported_at: data.import?.created_at || new Date().toISOString(),
+      };
+      state.workspace.documentImporting = false;
+      closeGoogleDocumentImport();
+      await loadSessions(sessionId, true);
+      if (data.surface?.id) requestAnimationFrame(() => focusSurface(data.surface.id));
+      const words = Number(data.surface?.payload?.word_count || 0);
+      toast(data.changed === false
+        ? "That private Brain document is already current"
+        : `${data.operation === "refresh" ? "Private Brain document refreshed" : "Private Brain document indexed"} · ${words.toLocaleString()} word${words === 1 ? "" : "s"}`);
+    } catch (error) {
+      if (["WORKSPACE_NOT_CONNECTED", "WORKSPACE_RECONNECT_REQUIRED"].includes(error.code)) {
+        state.workspace.documentImporting = false;
+        closeGoogleDocumentImport();
+        connectGoogleWorkspace("", { resumeDocumentPicker: true });
+        return;
+      }
+      state.workspace.documentError = error.message;
+      toast(error.message, true);
+    } finally {
+      state.workspace.documentImporting = false;
+      renderGoogleDocumentImport();
+      syncGoogleSheetImportControls();
+    }
+  }
+
+  async function refreshPrivateGoogleDocument(surfaceId) {
+    const sessionId = state.current?.id;
+    const surface = state.surfaces.find((item) => item.id === surfaceId);
+    if (!sessionId || !surface || state.workspace.documentMutating.has(surfaceId)) return;
+    state.workspace.documentMutating.add(surfaceId);
+    renderStage();
+    syncGoogleSheetImportControls();
+    try {
+      const data = await api(
+        `/api/calliope/sessions/${encodeURIComponent(sessionId)}/google-document/${encodeURIComponent(surfaceId)}/refresh`,
+        { method: "POST", body: "{}" },
+      );
+      await loadSessions(sessionId, true);
+      if (data.surface?.id) requestAnimationFrame(() => focusSurface(data.surface.id));
+      toast(data.changed
+        ? `Private Google Doc refreshed · ${Number(data.surface?.payload?.word_count || 0).toLocaleString()} words`
+        : "Private Google Doc is already current");
+    } catch (error) {
+      if (["WORKSPACE_NOT_CONNECTED", "WORKSPACE_RECONNECT_REQUIRED"].includes(error.code)) {
+        connectGoogleWorkspace();
+        return;
+      }
+      if (error.code === "GOOGLE_DOCUMENT_NOT_ACTIVE") {
+        await loadSessions(sessionId, true).catch(() => {});
+      }
+      toast(error.message, true);
+    } finally {
+      state.workspace.documentMutating.delete(surfaceId);
+      if (state.current?.id === sessionId) renderStage();
+      syncGoogleSheetImportControls();
+    }
+  }
+
+  async function refreshPrivateGoogleSheet(surfaceId) {
+    const sessionId = state.current?.id;
+    const surface = state.surfaces.find((item) => item.id === surfaceId);
+    if (!sessionId || !surface || state.workspace.sheetMutating.has(surfaceId)) return;
+    state.workspace.sheetMutating.add(surfaceId);
+    renderStage();
+    syncGoogleSheetImportControls();
+    try {
+      const data = await api(
+        `/api/calliope/sessions/${encodeURIComponent(sessionId)}/google-sheet/${encodeURIComponent(surfaceId)}/refresh`,
+        { method: "POST", body: "{}" },
+      );
+      state.workspace.status = {
+        ...(state.workspace.status || {}),
+        connected: true,
+        status: "connected",
+        import_count: Number(state.workspace.status?.import_count || 0)
+          + (data.changed ? 1 : 0),
+        last_imported_at: data.import?.created_at
+          || state.workspace.status?.last_imported_at
+          || null,
+      };
+      await loadSessions(sessionId, true);
+      if (data.surface?.id) requestAnimationFrame(() => focusSurface(data.surface.id));
+      const rowCount = Number(data.surface?.payload?.row_count || 0);
+      toast(data.changed
+        ? `Google Sheet refreshed · ${rowCount.toLocaleString()} row${rowCount === 1 ? "" : "s"}`
+        : "Google Sheet snapshot is already current");
+    } catch (error) {
+      if (["WORKSPACE_NOT_CONNECTED", "WORKSPACE_RECONNECT_REQUIRED"].includes(error.code)) {
+        connectGoogleWorkspace();
+        return;
+      }
+      if (error.code === "GOOGLE_SHEET_NOT_ACTIVE") {
+        await loadSessions(sessionId, true).catch(() => {});
+      }
+      toast(error.message, true);
+    } finally {
+      state.workspace.sheetMutating.delete(surfaceId);
+      if (state.current?.id === sessionId) renderStage();
+      syncGoogleSheetImportControls();
+    }
+  }
+
+  async function forgetPrivateGoogleDocument(surfaceId) {
+    const sessionId = state.current?.id;
+    const surface = state.surfaces.find((item) => item.id === surfaceId);
+    if (!sessionId || !surface || state.workspace.documentMutating.has(surfaceId)) return;
+    if (!window.confirm(
+      `Forget “${surface.title || "this Google Doc"}” from your private Brain? The original in Google Drive will not be changed.`,
+    )) return;
+    state.workspace.documentMutating.add(surfaceId);
+    renderStage();
+    syncGoogleSheetImportControls();
+    try {
+      const data = await api(
+        `/api/calliope/sessions/${encodeURIComponent(sessionId)}/google-document/${encodeURIComponent(surfaceId)}`,
+        { method: "DELETE" },
+      );
+      state.workspace.status = {
+        ...(state.workspace.status || {}),
+        document_count: Math.max(0, Number(
+          state.workspace.status?.document_count || 1
+        ) - 1),
+      };
+      await loadSessions(sessionId, true);
+      if (data.surface?.id) requestAnimationFrame(() => focusSurface(data.surface.id));
+      toast("Private Brain copy forgotten · Google Drive original untouched");
+    } catch (error) {
+      if (error.code === "GOOGLE_DOCUMENT_NOT_ACTIVE") {
+        await loadSessions(sessionId, true).catch(() => {});
+      }
+      toast(error.message, true);
+    } finally {
+      state.workspace.documentMutating.delete(surfaceId);
+      if (state.current?.id === sessionId) renderStage();
+      syncGoogleSheetImportControls();
+    }
   }
 
   async function exportQueryToGoogleSheet(surfaceId) {
@@ -1773,11 +2502,13 @@
       syncEvidenceSearchControls();
       syncSpeechControls();
       renderCalendarStatus();
+      syncGoogleSheetImportControls();
     } catch (error) {
       setStatus("unavailable", "offline");
       syncEvidenceSearchControls();
       syncSpeechControls();
       renderCalendarStatus();
+      syncGoogleSheetImportControls();
       throw error;
     }
   }
@@ -4504,6 +5235,7 @@
     renderStage();
     syncEvidenceSearchControls();
     syncSpeechControls();
+    syncGoogleSheetImportControls();
   }
 
   async function selectSession(id, options = {}) {
@@ -4535,6 +5267,7 @@
     renderStage(true);
     syncEvidenceSearchControls();
     syncSpeechControls();
+    syncGoogleSheetImportControls();
     setMobilePanel();
     if (options.focusComposer !== false) {
       requestAnimationFrame(composerFocus);
@@ -5057,6 +5790,32 @@
     return ({ query: "▤", metric: "◆", cube: "▦", artifact: "▦", image: "▧", document: "▱", selection: "⌖", evidence: "⌕", inventory: "◎", action: "✦", dream: "☾", instrument: "⌁", workflow: "⌘" })[kind] || "◇";
   }
 
+  function googleSheetsGlyph() {
+    return `<svg class="google-sheets-glyph" viewBox="0 0 16 18" aria-hidden="true">
+      <path class="sheet-page" d="M2.25 1.25h7.1l4.4 4.4v11.1H2.25z"/>
+      <path class="sheet-fold" d="M9.35 1.25v4.4h4.4"/>
+      <path class="sheet-grid" d="M4.65 8.15h6.7v5.85h-6.7zm0 2.05h6.7m-4.45-2.05V14m2.25-5.85V14"/>
+    </svg>`;
+  }
+
+  function renderGoogleSheetAction(surface) {
+    const sheet = surface.presentation?.google_sheet;
+    if (sheet?.url) {
+      const rowCount = Number(sheet.row_count);
+      const sourceSheet = sheet.source === true || surface.source?.origin === "google_sheet_import";
+      const detail = Number.isFinite(rowCount)
+        ? `Open the ${sourceSheet ? "source" : "exported"} Google Sheet · ${rowCount.toLocaleString()} row${rowCount === 1 ? "" : "s"}`
+        : `Open the ${sourceSheet ? "source" : "exported"} Google Sheet`;
+      return `<a class="surface-sheet-link" href="${escapeHtml(sheet.url)}" target="_blank" rel="noopener" title="${escapeHtml(detail)}" aria-label="${escapeHtml(detail)}">
+        ${googleSheetsGlyph()}<span>Sheet</span><i aria-hidden="true">↗</i>
+      </a>`;
+    }
+    const exporting = state.workspace.exporting.has(surface.id);
+    return `<button type="button" data-export-google-sheet="${escapeHtml(surface.id)}" title="Export this exact ${
+      surface.payload?.truncated ? "visible preview" : "result"
+    } to your Google Sheets" ${exporting ? "disabled" : ""}>${exporting ? "Exporting…" : "Sheet"}</button>`;
+  }
+
   function formatValue(value) {
     if (value === null || value === undefined) return "—";
     if (typeof value === "object") return JSON.stringify(value);
@@ -5365,6 +6124,20 @@
     const rows = queryRows(surface);
     const chart = classifyChart(surface);
     const sql = String(surface.source?.sql || "").trim();
+    const importedSheet = surface.source?.origin === "google_sheet_import";
+    const queriedSheet = surface.payload?.sheet && typeof surface.payload.sheet === "object"
+      ? surface.payload.sheet
+      : null;
+    const sheetReadMode = queriedSheet?.read_mode || null;
+    const sheetState = importedSheet
+      ? (surface.payload?.lifecycle_status || "active") === "active"
+        ? `Frozen Sheet · checked ${relativeTime(surface.payload?.last_checked_at || surface.created_at)}`
+        : "Earlier Sheet snapshot"
+      : sheetReadMode === "live"
+        ? `Live Sheet read · observed ${relativeTime(queriedSheet.observed_at)}`
+        : queriedSheet
+          ? "Sheet snapshot"
+          : "";
     const renderedSql = sql ? highlightSql(formatSql(sql)) : "SQL unavailable";
     const requestedView = options.defaultView || surface.payload?.default_view;
     const defaultView = requestedView === "chart" && chart
@@ -5378,17 +6151,18 @@
       <div class="surface-tabs">
         ${chart ? `<button type="button" class="${defaultView === "chart" ? "active" : ""}" data-view="chart">Chart</button>` : ""}
         <button type="button" class="${defaultView === "table" ? "active" : ""}" data-view="table">Table</button>
-        <button type="button" data-view="sql">SQL</button>
+        ${sql ? '<button type="button" data-view="sql">SQL</button>' : ""}
       </div>
       <div class="query-meta">
         <span><b>${escapeHtml(surface.payload?.row_count ?? rows.length)}</b> rows</span>
         ${surface.payload?.engine ? `<span><b>${escapeHtml(surface.payload.engine)}</b> engine</span>` : ""}
         ${surface.payload?.elapsed_ms != null ? `<span><b>${escapeHtml(surface.payload.elapsed_ms)}ms</b></span>` : ""}
         ${surface.payload?.truncated ? "<span>preview truncated</span>" : ""}
+        ${sheetState ? `<span class="query-sheet-state ${sheetReadMode === "live" ? "live" : importedSheet && (surface.payload?.lifecycle_status || "active") !== "active" ? "superseded" : "snapshot"}">${googleSheetsGlyph()}<b>${escapeHtml(sheetState)}</b></span>` : ""}
       </div>
       ${chart ? `<div class="query-view" data-query-view="chart" ${defaultView === "chart" ? "" : "hidden"}>${renderChart(surface, chart)}</div>` : ""}
       <div class="query-view" data-query-view="table" ${defaultView === "table" ? "" : "hidden"}>${table}</div>
-      <div class="query-view" data-query-view="sql" hidden><pre class="sql-view sql-code"><code>${renderedSql}</code></pre></div>
+      ${sql ? `<div class="query-view" data-query-view="sql" hidden><pre class="sql-view sql-code"><code>${renderedSql}</code></pre></div>` : ""}
       </div>`;
   }
 
@@ -6447,19 +7221,46 @@
     const url = payload.download_url;
     const filename = payload.filename || payload.original_name || surface.title;
     const googleSheet = payload.provider === "google_sheets";
-    const extension = googleSheet ? "GOOGLE SHEET" : String(filename).split(".").at(-1)?.toUpperCase() || "FILE";
-    return `<div class="document-body"><div class="document-glyph">${googleSheet ? "▦" : "§"}</div>
+    const googleDocument = payload.provider === "google_docs";
+    const lifecycle = googleDocument ? (payload.lifecycle_status || "active") : "";
+    const removed = lifecycle === "removed";
+    const superseded = lifecycle === "superseded";
+    const checkedAt = payload.last_checked_at || payload.imported_at || surface.created_at;
+    const extension = googleSheet
+      ? "GOOGLE SHEET"
+      : googleDocument
+        ? removed
+          ? "REMOVED FROM PRIVATE BRAIN"
+          : superseded
+            ? "EARLIER PRIVATE DOC SNAPSHOT"
+            : "PRIVATE GOOGLE DOC"
+        : String(filename).split(".").at(-1)?.toUpperCase() || "FILE";
+    const lifecycleNote = googleDocument
+      ? removed
+        ? "Its indexed text was forgotten; the Google Drive original is unchanged."
+        : superseded
+          ? "A newer revision now supplies this private Brain document."
+          : `${payload.sync_status === "current" ? "Checked" : payload.operation === "refresh" ? "Refreshed" : "Indexed"} ${escapeHtml(relativeTime(checkedAt) || "now")}`
+      : "";
+    return `<div class="document-body${googleDocument ? ` google-document ${escapeHtml(lifecycle)}` : ""}"><div class="document-glyph">${googleSheet ? "▦" : googleDocument ? "¶" : "§"}</div>
       <div class="document-name" title="${escapeHtml(filename)}">${escapeHtml(filename)}</div>
       <div class="document-meta">${escapeHtml(extension)}${
         googleSheet
           ? ` · ${escapeHtml(Number(payload.row_count || 0).toLocaleString())} rows · ${escapeHtml(Number(payload.column_count || 0).toLocaleString())} columns`
+          : googleDocument
+            ? ` · ${escapeHtml(Number(payload.word_count || 0).toLocaleString())} words · ${escapeHtml(Number(payload.tab_count || 1).toLocaleString())} tab${Number(payload.tab_count || 1) === 1 ? "" : "s"}`
           : payload.bytes ? ` · ${escapeHtml(Number(payload.bytes).toLocaleString())} bytes` : ""
       }</div>
+      ${lifecycleNote ? `<div class="document-lifecycle"><i aria-hidden="true"></i><span>${lifecycleNote}</span></div>` : ""}
       ${url
         ? googleSheet
           ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">Open in Google Sheets ↗</a>`
+          : googleDocument
+            ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">Open in Google Docs ↗</a>`
           : `<a href="${escapeHtml(url)}" download="${escapeHtml(filename)}">Download file</a>`
-        : `<span>File is not available from this server</span>`}
+        : googleDocument
+          ? `<span>Indexed in your private Brain</span>`
+          : `<span>File is not available from this server</span>`}
     </div>`;
   }
 
@@ -7942,7 +8743,8 @@
     const source = state.surfaces.find((surface) => surface.id === surfaceId && surface.kind === "query");
     if (!source) return;
     state.viewerRequestId += 1;
-    showSurfaceViewer(source.title, `Query result · ${source.payload?.row_count ?? queryRows(source).length} rows`);
+    const importedSheet = source.source?.origin === "google_sheet_import";
+    showSurfaceViewer(source.title, `${importedSheet ? "Frozen Google Sheet snapshot" : "Query result"} · ${source.payload?.row_count ?? queryRows(source).length} rows`, importedSheet ? source.source?.spreadsheet_url : null);
     renderViewerQuery({
       title: source.title,
       kind: "query",
@@ -7950,7 +8752,9 @@
       query: {
         ...(source.payload || {}),
         sql: source.source?.sql || "",
-        default_view: classifyChart(source) && !isMetadataQuery(source) ? "chart" : "table",
+        default_view: importedSheet
+          ? "table"
+          : classifyChart(source) && !isMetadataQuery(source) ? "chart" : "table",
       },
     });
   }
@@ -7995,6 +8799,17 @@
       relativeTime(surface.created_at),
     ].filter(Boolean).join(" · ");
     const metadata = surface.kind === "query" && isMetadataQuery(surface);
+    const privateGoogleDocument = surface.kind === "document"
+      && surface.payload?.provider === "google_docs";
+    const googleDocumentActive = privateGoogleDocument
+      && (surface.payload?.lifecycle_status || "active") === "active"
+      && surface.payload?.indexed !== false;
+    const googleDocumentBusy = state.workspace.documentMutating.has(surface.id);
+    const privateGoogleSheet = surface.kind === "query"
+      && surface.source?.origin === "google_sheet_import";
+    const googleSheetActive = privateGoogleSheet
+      && (surface.payload?.lifecycle_status || "active") === "active";
+    const googleSheetBusy = state.workspace.sheetMutating.has(surface.id);
     const body = ({
       query: renderQuery,
       metric: renderMetric,
@@ -8066,14 +8881,15 @@
             : ""
         }</p></div>
         <div class="surface-tools">
+          ${googleSheetActive
+            ? `<button type="button" data-refresh-google-sheet="${escapeHtml(surface.id)}" title="Check Google Sheets and create a linked Stage revision only when this range changed" ${googleSheetBusy ? "disabled" : ""}>${googleSheetBusy ? "Checking…" : "Refresh"}</button>`
+            : ""}
+          ${googleDocumentActive
+            ? `<button type="button" data-refresh-google-document="${escapeHtml(surface.id)}" title="Check Google Drive and replace this private Brain snapshot only when its content changed" ${googleDocumentBusy ? "disabled" : ""}>${googleDocumentBusy ? "Checking…" : "Refresh"}</button>
+              <button class="surface-tool-danger" type="button" data-forget-google-document="${escapeHtml(surface.id)}" title="Remove the indexed private Brain copy without changing Google Drive" ${googleDocumentBusy ? "disabled" : ""}>Forget</button>`
+            : ""}
           ${surface.kind === "query" && !metadata && state.config?.google_workspace?.sheets_export
-            ? surface.presentation?.google_sheet?.url
-              ? `<a href="${escapeHtml(surface.presentation.google_sheet.url)}" target="_blank" rel="noopener" title="Open the exported Google Sheet">Sheet ↗</a>`
-              : `<button type="button" data-export-google-sheet="${escapeHtml(surface.id)}" title="Export this exact ${
-                surface.payload?.truncated ? "visible preview" : "result"
-              } to your Google Sheets" ${
-                state.workspace.exporting.has(surface.id) ? "disabled" : ""
-              }>${state.workspace.exporting.has(surface.id) ? "Exporting…" : "Sheet"}</button>`
+            ? renderGoogleSheetAction(surface)
             : ""}
           ${surface.kind === "query" && !metadata
             ? `<button type="button" data-open-query-surface="${escapeHtml(surface.id)}" title="Open in the large viewer">Open</button>`
@@ -8117,15 +8933,16 @@
       if (!currentSurfaceIds.has(surfaceId)) state.artifactFrameHeights.delete(surfaceId);
     });
     const visibleSurfaces = visibleStageSurfaces();
+    syncGoogleSheetImportControls();
     els.surfaceCount.textContent = `${visibleSurfaces.length} surface${visibleSurfaces.length === 1 ? "" : "s"}`;
     els.stageEmpty.hidden = Boolean(visibleSurfaces.length);
     const turns = [...state.turns].reverse().filter((turn) => surfacesForTurn(turn.id).length);
     els.stage.innerHTML = turns.map((turn) => `
       <section class="stratum" data-stratum-turn="${escapeHtml(turn.id)}">
-        <header class="stratum-head ${turn.turn_kind === "evidence_search" ? "search-stratum" : turn.turn_kind === "brief" ? "brief-stratum" : ""}">
-          <span>${turn.turn_kind === "evidence_search" ? "Search" : turn.turn_kind === "brief" ? "Brief" : `Turn ${escapeHtml(turn.ordinal)}`}</span>
-          ${["evidence_search", "brief"].includes(turn.turn_kind)
-            ? `<em>${turn.turn_kind === "brief" ? "Observed snapshot" : `“${escapeHtml(turn.user_message)}”`}</em>`
+        <header class="stratum-head ${turn.turn_kind === "evidence_search" ? "search-stratum" : turn.turn_kind === "brief" ? "brief-stratum" : ["sheet_import", "sheet_refresh", "document_import", "document_refresh", "document_remove"].includes(turn.turn_kind) ? "sheet-import-stratum" : ""}">
+          <span>${turn.turn_kind === "evidence_search" ? "Search" : turn.turn_kind === "brief" ? "Brief" : turn.turn_kind === "sheet_import" ? "Sheet import" : turn.turn_kind === "sheet_refresh" ? "Sheet refresh" : turn.turn_kind === "document_import" ? "Private document" : turn.turn_kind === "document_refresh" ? "Private document refresh" : turn.turn_kind === "document_remove" ? "Private document removed" : `Turn ${escapeHtml(turn.ordinal)}`}</span>
+          ${["evidence_search", "brief", "sheet_import", "sheet_refresh", "document_import", "document_refresh", "document_remove"].includes(turn.turn_kind)
+            ? `<em>${turn.turn_kind === "brief" ? "Observed snapshot" : ["sheet_import", "sheet_refresh", "document_import", "document_refresh", "document_remove"].includes(turn.turn_kind) ? escapeHtml(turn.user_message) : `“${escapeHtml(turn.user_message)}”`}</em>`
             : `<button type="button" data-source-turn="${escapeHtml(turn.id)}">“${escapeHtml(turn.user_message)}”</button>`}
           <span>${escapeHtml(relativeTime(turn.created_at))}</span>
         </header>
@@ -9685,6 +10502,7 @@
       surface_id: selection.surface_id,
       evidence_id: selection.evidence_id,
     }));
+    const outgoingSelectedSurfaceId = state.selectedSurfaceId;
     const outgoingDesignProfileVersionId = state.nextTurnDesignProfileVersionId;
     const pending = optimisticTurn(
       message,
@@ -9701,6 +10519,7 @@
     renderDesignProfileChip();
     resizeComposer();
     state.busy = true;
+    syncGoogleSheetImportControls();
     els.send.disabled = true;
     composerSetDisabled(true);
     syncSpeechControls();
@@ -9717,7 +10536,7 @@
           attachments: outgoingAttachments,
           spatial_selections: outgoingSpatialSelections,
           evidence_refs: outgoingEvidenceHandles,
-          selected_surface_id: state.selectedSurfaceId,
+          selected_surface_id: outgoingSelectedSurfaceId,
           ...(outgoingDesignProfileVersionId
             ? { design_profile_version_id: outgoingDesignProfileVersionId }
             : {}),
@@ -9805,6 +10624,7 @@
       }
     } finally {
       state.busy = false;
+      syncGoogleSheetImportControls();
       composerSetDisabled(false);
       els.send.disabled = false;
       setStatus(state.config?.healthy ? "ready" : "unavailable", state.config?.healthy ? "" : "offline");
@@ -10388,6 +11208,70 @@
       event.preventDefault();
       closeMarkup();
     });
+    els.googleSheetImport.addEventListener("click", () => {
+      openGoogleSheetPicker().catch((error) => toast(error.message, true));
+    });
+    els.sheetImportClose.addEventListener("click", closeGoogleSheetImport);
+    els.sheetImportCancel.addEventListener("click", closeGoogleSheetImport);
+    els.sheetImportDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeGoogleSheetImport();
+    });
+    els.sheetImportDialog.addEventListener("click", (event) => {
+      if (event.target === els.sheetImportDialog) closeGoogleSheetImport();
+    });
+    els.sheetImportTabs.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-sheet-import-tab]");
+      if (!button || state.workspace.inspecting || state.workspace.importing) return;
+      els.sheetImportRange.value = "";
+      inspectSelectedGoogleSheet(state.workspace.fileId, {
+        sheetId: button.dataset.sheetImportTab,
+        range: "",
+        firstRowHeader: els.sheetImportHeader.checked,
+      }).catch((error) => toast(error.message, true));
+    });
+    els.sheetImportPreviewRefresh.addEventListener("click", () => {
+      inspectSelectedGoogleSheet(state.workspace.fileId, {
+        sheetId: state.workspace.sheet?.id,
+        range: els.sheetImportRange.value.trim(),
+        firstRowHeader: els.sheetImportHeader.checked,
+      }).catch((error) => toast(error.message, true));
+    });
+    els.sheetImportHeader.addEventListener("change", () => {
+      inspectSelectedGoogleSheet(state.workspace.fileId, {
+        sheetId: state.workspace.sheet?.id,
+        range: els.sheetImportRange.value.trim(),
+        firstRowHeader: els.sheetImportHeader.checked,
+      }).catch((error) => toast(error.message, true));
+    });
+    els.sheetImportRange.addEventListener("input", () => {
+      state.workspace.previewDirty = true;
+      state.workspace.importError = "";
+      renderGoogleSheetImport();
+    });
+    els.sheetImportRange.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      els.sheetImportPreviewRefresh.click();
+    });
+    els.sheetImportCommit.addEventListener("click", () => {
+      commitGoogleSheetImport().catch((error) => toast(error.message, true));
+    });
+    els.googleDocumentImport.addEventListener("click", () => {
+      openGoogleDocumentPicker().catch((error) => toast(error.message, true));
+    });
+    els.documentImportClose.addEventListener("click", closeGoogleDocumentImport);
+    els.documentImportCancel.addEventListener("click", closeGoogleDocumentImport);
+    els.documentImportDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeGoogleDocumentImport();
+    });
+    els.documentImportDialog.addEventListener("click", (event) => {
+      if (event.target === els.documentImportDialog) closeGoogleDocumentImport();
+    });
+    els.documentImportCommit.addEventListener("click", () => {
+      commitGoogleDocumentImport().catch((error) => toast(error.message, true));
+    });
     els.viewerClose.addEventListener("click", closeSurfaceViewer);
     els.viewerDialog.addEventListener("cancel", (event) => {
       event.preventDefault();
@@ -10586,6 +11470,24 @@
       if (repeatEvidence) {
         const surface = state.surfaces.find((item) => item.id === repeatEvidence.dataset.repeatEvidence);
         runEvidenceSearch(surface?.payload?.query).catch((error) => toast(error.message, true));
+        return;
+      }
+      const refreshGoogleDocument = event.target.closest("[data-refresh-google-document]");
+      if (refreshGoogleDocument) {
+        refreshPrivateGoogleDocument(refreshGoogleDocument.dataset.refreshGoogleDocument)
+          .catch((error) => toast(error.message, true));
+        return;
+      }
+      const refreshGoogleSheet = event.target.closest("[data-refresh-google-sheet]");
+      if (refreshGoogleSheet) {
+        refreshPrivateGoogleSheet(refreshGoogleSheet.dataset.refreshGoogleSheet)
+          .catch((error) => toast(error.message, true));
+        return;
+      }
+      const forgetGoogleDocument = event.target.closest("[data-forget-google-document]");
+      if (forgetGoogleDocument) {
+        forgetPrivateGoogleDocument(forgetGoogleDocument.dataset.forgetGoogleDocument)
+          .catch((error) => toast(error.message, true));
         return;
       }
       const exportSheet = event.target.closest("[data-export-google-sheet]");
@@ -10886,7 +11788,7 @@
       }
       if (launchWorkspace && state.config?.google_workspace?.enabled) {
         const message = ({
-          connected: "Google Workspace connected · Sheets export is ready",
+          connected: "Google Workspace connected · Sheets and private Docs are ready",
           cancelled: "Google Workspace connection cancelled",
           account_mismatch: "Use the same Google account that is signed in to Calliope",
           error: "Google Workspace could not be connected; you can try again",
@@ -10894,6 +11796,8 @@
         toast(message, ["account_mismatch", "error"].includes(launchWorkspace));
         if (launchWorkspace !== "connected") {
           sessionStorage.removeItem("calliope.pendingWorkspaceExport.v1");
+          sessionStorage.removeItem(PENDING_WORKSPACE_PICKER_KEY);
+          sessionStorage.removeItem(PENDING_WORKSPACE_DOCUMENT_PICKER_KEY);
         }
         launch.delete("workspace");
         const cleanQuery = launch.toString();
@@ -10949,6 +11853,35 @@
           requestAnimationFrame(() => {
             exportQueryToGoogleSheet(pendingWorkspaceExport)
               .catch((error) => toast(error.message, true));
+          });
+        }
+      }
+      const pendingWorkspacePicker = sessionStorage.getItem(PENDING_WORKSPACE_PICKER_KEY);
+      if (pendingWorkspacePicker && state.workspace.status?.connected) {
+        sessionStorage.removeItem(PENDING_WORKSPACE_PICKER_KEY);
+        if (state.sessions.some((session) => session.id === pendingWorkspacePicker)) {
+          if (state.current?.id !== pendingWorkspacePicker) {
+            await selectSession(pendingWorkspacePicker, { force: true, focusComposer: false });
+          }
+          requestAnimationFrame(() => {
+            openGoogleSheetPicker().catch((error) => toast(error.message, true));
+          });
+        }
+      }
+      const pendingWorkspaceDocumentPicker = sessionStorage.getItem(
+        PENDING_WORKSPACE_DOCUMENT_PICKER_KEY,
+      );
+      if (pendingWorkspaceDocumentPicker && state.workspace.status?.connected) {
+        sessionStorage.removeItem(PENDING_WORKSPACE_DOCUMENT_PICKER_KEY);
+        if (state.sessions.some((session) => session.id === pendingWorkspaceDocumentPicker)) {
+          if (state.current?.id !== pendingWorkspaceDocumentPicker) {
+            await selectSession(
+              pendingWorkspaceDocumentPicker,
+              { force: true, focusComposer: false },
+            );
+          }
+          requestAnimationFrame(() => {
+            openGoogleDocumentPicker().catch((error) => toast(error.message, true));
           });
         }
       }

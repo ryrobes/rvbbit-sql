@@ -241,6 +241,11 @@ services:
       WAREHOUSE_GOOGLE_CLIENT_SECRET: ${WAREHOUSE_GOOGLE_CLIENT_SECRET:-}
       WAREHOUSE_GOOGLE_HD: ${WAREHOUSE_GOOGLE_HD:-}
       WAREHOUSE_GOOGLE_ONLY: ${WAREHOUSE_GOOGLE_ONLY:-}
+      # Optional Google Picker import. Restrict this browser key to the public
+      # Warehouse origin and the Google Picker API. APP_ID is the GCP project
+      # number; it is derived from the OAuth client ID when omitted.
+      WAREHOUSE_GOOGLE_PICKER_API_KEY: ${WAREHOUSE_GOOGLE_PICKER_API_KEY:-}
+      WAREHOUSE_GOOGLE_PICKER_APP_ID: ${WAREHOUSE_GOOGLE_PICKER_APP_ID:-}
       WAREHOUSE_STATE_FILE: /app/data/oauth_state.json   # survives restarts (no re-add of connectors)
       # Shared-key fallback (Claude Code / optional):
       WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:-}
