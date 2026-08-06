@@ -545,8 +545,27 @@ def test_uber_compose_bootstraps_baseline_capabilities():
     )
     assert services["bootstrap"]["command"] == ["rvbbit-uber-bootstrap"]
 
-    warren_volumes = services["warren"]["volumes"]
-    assert "${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock" in warren_volumes
+    socket_mount = "${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
+    for service_name in ("lens", "warren"):
+        service = services[service_name]
+        assert service["environment"]["DOCKER_HOST"] == (
+            "${RVBBIT_DOCKER_HOST:-unix:///var/run/docker.sock}"
+        )
+        assert socket_mount in service["volumes"]
 
     dockerfile = (ROOT / "docker" / "Dockerfile.rvbbit").read_text(encoding="utf-8")
     assert "docker/uber/bootstrap.sh /usr/local/bin/rvbbit-uber-bootstrap" in dockerfile
+
+
+def test_release_compose_exposes_configurable_docker_socket_to_capability_runners():
+    compose_path = ROOT / "docker" / "docker-compose.release.yml"
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    services = compose["services"]
+    socket_mount = "${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
+
+    for service_name in ("lens", "warren"):
+        service = services[service_name]
+        assert service["environment"]["DOCKER_HOST"] == (
+            "${RVBBIT_DOCKER_HOST:-unix:///var/run/docker.sock}"
+        )
+        assert socket_mount in service["volumes"]
