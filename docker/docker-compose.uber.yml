@@ -118,6 +118,22 @@ services:
       RVBBIT_CAPABILITY_CLI: ${RVBBIT_CAPABILITY_CLI:-/usr/share/rvbbit/capabilities/tools/rvbbit-capability}
       DOCKER_HOST: ${RVBBIT_DOCKER_HOST:-unix:///var/run/docker.sock}
       RVBBIT_DOCKER_NETWORK: ${RVBBIT_DOCKER_NETWORK:-rvbbit_uber}
+      # Local catalog installs run Compose from Lens. Forward the Meet policy
+      # settings and let Lens read the approved key file into GMEET_SA_KEY for
+      # the child sidecar (public capability manifests cannot bind host files).
+      GMEET_SA_KEY_FILE: /run/secrets/gmeet-service-account.json
+      GMEET_ADMIN_SUBJECT: ${GMEET_ADMIN_SUBJECT:-}
+      GMEET_SUBJECTS: ${GMEET_SUBJECTS:-}
+      GMEET_DOMAIN: ${GMEET_DOMAIN:-}
+      GMEET_DISCOVER_USERS: ${GMEET_DISCOVER_USERS:-true}
+      GMEET_MAX_SUBJECTS: ${GMEET_MAX_SUBJECTS:-500}
+      GMEET_LOOKBACK_DAYS: ${GMEET_LOOKBACK_DAYS:-29}
+      GMEET_CALENDAR_LOOKUP: ${GMEET_CALENDAR_LOOKUP:-true}
+      GMEET_AUTO_TRANSCRIBE: ${GMEET_AUTO_TRANSCRIBE:-false}
+      GMEET_AUTO_TRANSCRIBE_DAYS: ${GMEET_AUTO_TRANSCRIBE_DAYS:-7}
+      GMEET_DRIVE_ACL: ${GMEET_DRIVE_ACL:-true}
+      GMEET_ACL_MODE: ${GMEET_ACL_MODE:-calendar_invitees_strict}
+      GMEET_CONNECTOR_TOKEN: ${GMEET_CONNECTOR_TOKEN:-}
       # The Hub (docs/HUB_PLAN.md): rv-frame islands embed live apps from the
       # warehouse origin (browser-reachable URL); the thumb proxy fetches
       # captures server-side over the compose network with the static key.
@@ -133,6 +149,7 @@ services:
     volumes:
       - rvbbit_lens:/data
       - ${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      - ${GMEET_SA_KEY_FILE:-/dev/null}:/run/secrets/gmeet-service-account.json:ro
     restart: unless-stopped
 
   warren:

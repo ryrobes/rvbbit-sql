@@ -553,6 +553,16 @@ def test_uber_compose_bootstraps_baseline_capabilities():
         )
         assert socket_mount in service["volumes"]
 
+    lens = services["lens"]
+    assert lens["environment"]["GMEET_SA_KEY_FILE"] == (
+        "/run/secrets/gmeet-service-account.json"
+    )
+    assert lens["environment"]["GMEET_ADMIN_SUBJECT"] == "${GMEET_ADMIN_SUBJECT:-}"
+    assert (
+        "${GMEET_SA_KEY_FILE:-/dev/null}:/run/secrets/gmeet-service-account.json:ro"
+        in lens["volumes"]
+    )
+
     dockerfile = (ROOT / "docker" / "Dockerfile.rvbbit").read_text(encoding="utf-8")
     assert "docker/uber/bootstrap.sh /usr/local/bin/rvbbit-uber-bootstrap" in dockerfile
 
@@ -569,3 +579,13 @@ def test_release_compose_exposes_configurable_docker_socket_to_capability_runner
             "${RVBBIT_DOCKER_HOST:-unix:///var/run/docker.sock}"
         )
         assert socket_mount in service["volumes"]
+
+    lens = services["lens"]
+    assert lens["environment"]["GMEET_SA_KEY_FILE"] == (
+        "/run/secrets/gmeet-service-account.json"
+    )
+    assert lens["environment"]["GMEET_ADMIN_SUBJECT"] == "${GMEET_ADMIN_SUBJECT:-}"
+    assert (
+        "${GMEET_SA_KEY_FILE:-/dev/null}:/run/secrets/gmeet-service-account.json:ro"
+        in lens["volumes"]
+    )
