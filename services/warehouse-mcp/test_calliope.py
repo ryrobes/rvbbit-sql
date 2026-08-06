@@ -56,6 +56,29 @@ def test_calliope_header_requests_homemade_apple_and_local_time_avatars():
     assert "now.getHours()" in script
 
 
+def test_empty_stage_rotates_inviting_headlines_without_motion_or_layout_jolts():
+    page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    css = (calliope._ASSET_DIR / "calliope.css").read_text(encoding="utf-8")
+
+    assert 'id="stage-empty-headline"' in page
+    assert ">Ideas become things here.</h2>" in page
+    for headline in (
+        "Tell me what you’re trying to understand.",
+        "You don’t need to know the data. You need to know what problem you can’t stop thinking about.",
+        "Ask for the thing you wish existed.",
+        "Start with the question. Keep what works.",
+    ):
+        assert headline in script
+    assert "const STAGE_EMPTY_ROTATION_MS = 10_000" in script
+    assert 'window.matchMedia("(prefers-reduced-motion: reduce)")' in script
+    assert "stageEmptyHeadlineQueue" in script
+    assert "syncStageEmptyHeadlineRotation();" in script
+    assert ".stage-empty h2.is-changing" in css
+    assert 'h2[data-length="long"]' in css
+    assert "text-wrap:balance" in css
+
+
 def test_calliope_page_renders_the_shared_account_control(monkeypatch, tmp_path):
     routes = {}
 

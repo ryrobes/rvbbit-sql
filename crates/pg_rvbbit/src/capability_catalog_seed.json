@@ -4114,7 +4114,6 @@
             "provider": "google-meet",
             "source_kind": "google_meet",
             "summarize_meetings": true,
-            "summary_max_docs": 12,
             "tombstone_missing": false
           },
           "creds_ref": "GMEET_CONNECTOR_TOKEN",

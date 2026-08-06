@@ -90,6 +90,7 @@
     stageScroll: $("#stage-scroll"),
     stage: $("#stage"),
     stageEmpty: $("#stage-empty"),
+    stageEmptyHeadline: $("#stage-empty-headline"),
     surfaceCount: $("#surface-count"),
     googleSheetImport: $("#google-sheet-import"),
     googleDocumentImport: $("#google-document-import"),
@@ -451,6 +452,8 @@
       turnId: null,
       renderId: null,
       dialogTurnId: null,
+      pendingTurns: new Set(),
+      revealingTurnId: null,
       requestSequence: 0,
       streamComplete: false,
       karaokeFrame: null,
@@ -561,6 +564,20 @@
   const CHAT_DEFAULT_WIDTH = 390;
   const LIVE_ACTIVITY_ENTRY_LIMIT = 10;
   const LIVE_ACTIVITY_DRAFT_LIMIT = 6000;
+  const STAGE_EMPTY_ROTATION_MS = 10_000;
+  const STAGE_EMPTY_FADE_MS = 520;
+  const STAGE_EMPTY_HEADLINES = Object.freeze([
+    "Ideas become things here.",
+    "Tell me what you’re trying to understand.",
+    "You don’t need to know the data. You need to know what problem you can’t stop thinking about.",
+    "Ask for the thing you wish existed.",
+    "Start with the question. Keep what works.",
+  ]);
+  const stageEmptyMotionPreference = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let stageEmptyHeadlineIndex = 0;
+  let stageEmptyHeadlineQueue = [];
+  let stageEmptyHeadlineTimer = null;
+  let stageEmptyHeadlineSwapTimer = null;
   const WORKFLOW_TEMPLATES = {
     blank: {
       name: "",
@@ -5242,6 +5259,8 @@
   function clearSession() {
     cancelSpeechRecording();
     stopVoicePlayback();
+    state.voice.pendingTurns.clear();
+    state.voice.revealingTurnId = null;
     clearSpatialSelections();
     clearLiveActivity();
     state.current = null;
@@ -5271,6 +5290,10 @@
     if ((state.busy && !options.force) || state.evidenceSearching) return;
     cancelSpeechRecording();
     stopVoicePlayback();
+    if (!options.preserveActivity || String(state.current?.id || "") !== String(id || "")) {
+      state.voice.pendingTurns.clear();
+      state.voice.revealingTurnId = null;
+    }
     const selectedSummary = state.sessions.find((session) => session.id === id);
     clearSpatialSelections();
     if (!options.preserveActivity) clearLiveActivity();
@@ -5460,6 +5483,19 @@
     );
   }
 
+  function voiceProjectionRequested() {
+    return voiceConfigured() && state.voice.preferences.mode !== "off";
+  }
+
+  function voicePresentationPending(turn) {
+    return Boolean(
+      voiceProjectionRequested()
+      && turn?.status === "complete"
+      && !voiceReceipt(turn)
+      && state.voice.pendingTurns.has(String(turn?.id || "")),
+    );
+  }
+
   function renderVoiceTranscript(turn, render) {
     const words = voiceWordRanges(render?.script);
     if (!words.length) return safeMarkdown(render?.script || "");
@@ -5478,6 +5514,15 @@
     const spoken = !failed ? voiceReceipt(turn) : null;
     if (spoken && voicePresentationEnabled(turn)) {
       return renderVoiceTranscript(turn, spoken);
+    }
+    if (!failed && voicePresentationPending(turn)) {
+      return `<div class="voice-preparing" role="status" aria-live="polite">
+        <span class="voice-preparing-signal" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <span class="voice-preparing-copy">
+          <strong>Shaping the spoken version</strong>
+          <small>The complete answer is ready · making it conversational</small>
+        </span>
+      </div>`;
     }
     return safeMarkdown(
       failed ? turn.error || "That turn did not complete." : turn.assistant_message || "",
@@ -5581,6 +5626,10 @@
       ).join("");
       const receipt = renderTurnReceipt(turn);
       const failed = turn.status === "failed";
+      const voicePending = !failed && voicePresentationPending(turn);
+      const voicePresented = !failed && voicePresentationEnabled(turn);
+      const voiceRevealing = voicePresented
+        && String(state.voice.revealingTurnId || "") === String(turn.id || "");
       return `
         <article class="message user" data-turn-id="${escapeHtml(turn.id)}">
           <div class="message-label"><span>You · ${escapeHtml(relativeTime(turn.created_at))}</span></div>
@@ -5589,7 +5638,7 @@
           ${renderTurnEvidenceRefs(turn)}
           ${renderTurnObjectRefs(turn)}
         </article>
-        <article class="message assistant ${turn.status === "running" ? "streaming" : ""} ${failed ? "error" : ""}"
+        <article class="message assistant ${turn.status === "running" ? "streaming" : ""} ${failed ? "error" : ""} ${voicePending || voicePresented ? "voice-presentation" : ""} ${voicePending ? "voice-awaiting" : ""} ${voiceRevealing ? "voice-reveal" : ""}"
                  data-assistant-turn-id="${escapeHtml(turn.id)}">
           <div class="message-label"><span>Calliope</span>${renderVoiceControl(turn)}</div>
           <div class="message-body">${assistantBody(turn, failed)}</div>
@@ -9000,6 +9049,92 @@
     </article>`;
   }
 
+  function setStageEmptyHeadline(index) {
+    stageEmptyHeadlineIndex = index;
+    const headline = STAGE_EMPTY_HEADLINES[index];
+    els.stageEmptyHeadline.textContent = headline;
+    els.stageEmptyHeadline.dataset.length = headline.length > 64 ? "long" : "short";
+  }
+
+  function refillStageEmptyHeadlineQueue() {
+    stageEmptyHeadlineQueue = STAGE_EMPTY_HEADLINES
+      .map((_headline, index) => index)
+      .filter((index) => index !== stageEmptyHeadlineIndex);
+    for (let index = stageEmptyHeadlineQueue.length - 1; index > 0; index -= 1) {
+      const swapIndex = Math.floor(Math.random() * (index + 1));
+      [stageEmptyHeadlineQueue[index], stageEmptyHeadlineQueue[swapIndex]] = [
+        stageEmptyHeadlineQueue[swapIndex],
+        stageEmptyHeadlineQueue[index],
+      ];
+    }
+  }
+
+  function nextStageEmptyHeadlineIndex() {
+    if (!stageEmptyHeadlineQueue.length) refillStageEmptyHeadlineQueue();
+    return stageEmptyHeadlineQueue.pop();
+  }
+
+  function stageEmptyHeadlineCanRotate() {
+    return !els.stageEmpty.hidden
+      && !document.hidden
+      && !stageEmptyMotionPreference.matches;
+  }
+
+  function stopStageEmptyHeadlineRotation({ reset = false } = {}) {
+    window.clearTimeout(stageEmptyHeadlineTimer);
+    window.clearTimeout(stageEmptyHeadlineSwapTimer);
+    stageEmptyHeadlineTimer = null;
+    stageEmptyHeadlineSwapTimer = null;
+    els.stageEmptyHeadline.classList.remove("is-changing");
+    if (reset) {
+      stageEmptyHeadlineQueue = [];
+      setStageEmptyHeadline(0);
+    }
+  }
+
+  function scheduleStageEmptyHeadlineRotation() {
+    if (!stageEmptyHeadlineCanRotate() || stageEmptyHeadlineTimer || stageEmptyHeadlineSwapTimer) return;
+    stageEmptyHeadlineTimer = window.setTimeout(() => {
+      stageEmptyHeadlineTimer = null;
+      if (!stageEmptyHeadlineCanRotate()) {
+        stopStageEmptyHeadlineRotation();
+        return;
+      }
+      els.stageEmptyHeadline.classList.add("is-changing");
+      stageEmptyHeadlineSwapTimer = window.setTimeout(() => {
+        stageEmptyHeadlineSwapTimer = null;
+        if (!stageEmptyHeadlineCanRotate()) {
+          stopStageEmptyHeadlineRotation();
+          return;
+        }
+        setStageEmptyHeadline(nextStageEmptyHeadlineIndex());
+        window.requestAnimationFrame(() => {
+          els.stageEmptyHeadline.classList.remove("is-changing");
+          scheduleStageEmptyHeadlineRotation();
+        });
+      }, STAGE_EMPTY_FADE_MS);
+    }, STAGE_EMPTY_ROTATION_MS);
+  }
+
+  function syncStageEmptyHeadlineRotation() {
+    if (stageEmptyHeadlineCanRotate()) {
+      scheduleStageEmptyHeadlineRotation();
+      return;
+    }
+    stopStageEmptyHeadlineRotation({
+      reset: els.stageEmpty.hidden || stageEmptyMotionPreference.matches,
+    });
+  }
+
+  function initializeStageEmptyHeadlines() {
+    setStageEmptyHeadline(0);
+    stageEmptyMotionPreference.addEventListener?.(
+      "change",
+      syncStageEmptyHeadlineRotation,
+    );
+    syncStageEmptyHeadlineRotation();
+  }
+
   function renderStage(initial = false) {
     if (workflowNodeTooltipTarget?.closest("#stage")) hideWorkflowNodeTooltip();
     if (state.speech.target?.kind === "daily_note" && state.speech.phase !== "idle") {
@@ -9016,6 +9151,7 @@
     syncGoogleSheetImportControls();
     els.surfaceCount.textContent = `${visibleSurfaces.length} surface${visibleSurfaces.length === 1 ? "" : "s"}`;
     els.stageEmpty.hidden = Boolean(visibleSurfaces.length);
+    syncStageEmptyHeadlineRotation();
     const turns = [...state.turns].reverse().filter((turn) => surfacesForTurn(turn.id).length);
     els.stage.innerHTML = turns.map((turn) => `
       <section class="stratum" data-stratum-turn="${escapeHtml(turn.id)}">
@@ -10524,7 +10660,11 @@
       personality: typeof value?.personality === "string"
         ? value.personality.slice(0, 600) : "",
     };
-    if (state.voice.preferences.mode === "off") stopVoicePlayback();
+    if (state.voice.preferences.mode === "off") {
+      state.voice.pendingTurns.clear();
+      state.voice.revealingTurnId = null;
+      stopVoicePlayback();
+    }
   }
 
   function voiceConfigured() {
@@ -10555,25 +10695,41 @@
   function syncVoiceUi() {
     const active = state.voice.phase !== "idle";
     $$("[data-open-voice-turn]", els.messages).forEach((button) => {
-      const thisTurn = button.dataset.openVoiceTurn === String(state.voice.turnId || "");
-      button.classList.toggle("active", active && thisTurn);
+      const buttonTurnId = button.dataset.openVoiceTurn;
+      const turn = state.turns.find((item) => String(item.id) === buttonTurnId);
+      const pending = voicePresentationPending(turn);
+      const thisTurn = buttonTurnId === String(state.voice.turnId || "");
+      button.classList.toggle("active", pending || (active && thisTurn));
       const label = $("[data-voice-label]", button);
       if (label) {
-        label.textContent = active && thisTurn
-          ? state.voice.phase === "preparing" ? "Preparing" : "Playing"
+        label.textContent = pending
+          ? "Shaping"
+          : active && thisTurn
+            ? state.voice.phase === "preparing" ? "Shaping" : "Playing"
           : "Voice";
       }
-      button.title = active && thisTurn
-        ? "Open the complete answer · audio is playing"
-        : "Open the complete answer or replay the spoken cut";
+      button.title = pending
+        ? "Open the complete answer while the spoken version is being shaped"
+        : active && thisTurn
+          ? "Open the complete answer · audio is playing"
+          : "Open the complete answer or replay the spoken cut";
     });
     const dialogActive = active
       && state.voice.dialogTurnId === String(state.voice.turnId || "");
     els.voiceDialog?.classList.toggle("playing", dialogActive);
-    if (els.voiceDialogStop) els.voiceDialogStop.disabled = !dialogActive;
+    if (els.voiceDialogStop) {
+      els.voiceDialogStop.disabled = !dialogActive || state.voice.phase === "preparing";
+    }
     if (els.voiceDialogReplay) {
-      els.voiceDialogReplay.textContent = dialogActive ? "Playing…" : "Replay";
-      els.voiceDialogReplay.disabled = state.voice.phase === "preparing";
+      const dialogTurn = state.turns.find(
+        (item) => String(item.id) === String(state.voice.dialogTurnId || ""),
+      );
+      const dialogRender = voiceReceipt(dialogTurn);
+      const dialogPending = voicePresentationPending(dialogTurn);
+      els.voiceDialogReplay.textContent = dialogPending
+        ? "Shaping…"
+        : dialogActive ? "Playing…" : "Replay";
+      els.voiceDialogReplay.disabled = !dialogRender || state.voice.phase === "preparing";
     }
   }
 
@@ -10880,15 +11036,17 @@
 
   function renderVoiceControl(turn) {
     const render = voiceReceipt(turn);
-    const preparing = state.voice.phase === "preparing"
-      && String(state.voice.turnId || "") === String(turn?.id || "");
+    const preparing = voicePresentationPending(turn) || (
+      state.voice.phase === "preparing"
+      && String(state.voice.turnId || "") === String(turn?.id || "")
+    );
     if (!render && !preparing) return "";
-    const active = state.voice.phase !== "idle"
-      && String(state.voice.turnId || "") === String(turn?.id || "");
-    const label = active ? state.voice.phase === "preparing" ? "Preparing" : "Playing" : "Voice";
+    const active = preparing || (state.voice.phase !== "idle"
+      && String(state.voice.turnId || "") === String(turn?.id || ""));
+    const label = preparing ? "Shaping" : active ? "Playing" : "Voice";
     return `<button type="button" class="message-voice ${active ? "active" : ""}"
-      data-open-voice-turn="${escapeHtml(turn.id || "")}" ${render ? "" : "disabled"}
-      title="${active ? "Open the complete answer · audio is playing" : "Open the complete answer or replay the spoken cut"}">
+      data-open-voice-turn="${escapeHtml(turn.id || "")}"
+      title="${preparing ? "Open the complete answer while the spoken version is being shaped" : active ? "Open the complete answer · audio is playing" : "Open the complete answer or replay the spoken cut"}">
       <i aria-hidden="true"></i><span data-voice-label>${escapeHtml(label)}</span>
     </button>`;
   }
@@ -10896,18 +11054,20 @@
   function openVoiceDialog(turnId) {
     const turn = state.turns.find((item) => String(item.id) === String(turnId));
     const render = voiceReceipt(turn);
-    if (!turn || !render) return;
+    if (!turn) return;
     state.voice.dialogTurnId = String(turn.id);
     els.voiceDialogScript.innerHTML = safeMarkdown(turn.assistant_message || "");
-    const mode = String(render.mode || "fast");
+    const mode = String(render?.mode || state.voice.preferences.mode || "fast");
     const originalWords = String(turn.assistant_message || "").trim().split(/\s+/).filter(Boolean).length;
-    const spokenWords = voiceWordRanges(render.script).length;
+    const spokenWords = render ? voiceWordRanges(render.script).length : 0;
     els.voiceDialogMeta.innerHTML = [
       `${originalWords} word original`,
-      `${spokenWords} word spoken cut`,
+      render ? `${spokenWords} word spoken cut` : "spoken cut shaping",
       mode,
-      render.rewrite_provider === "local" ? "local fallback" : `${render.rewrite_provider || "semantic"} rewrite`,
-      render.created_at ? relativeTime(render.created_at) : "saved with turn",
+      render
+        ? render.rewrite_provider === "local" ? "local fallback" : `${render.rewrite_provider || "semantic"} rewrite`
+        : "semantic rewrite pending",
+      render?.created_at ? relativeTime(render.created_at) : "answer ready",
     ].map((item) => `<span>${escapeHtml(item)}</span>`).join("");
     if (!els.voiceDialog.open) els.voiceDialog.showModal();
     syncVoiceUi();
@@ -10928,10 +11088,17 @@
 
   async function maybeSpeakTurn(turnId) {
     applyVoicePreferences(readVoicePreferences());
-    if (!voiceConfigured() || state.voice.preferences.mode === "off") return;
+    const pendingTurnId = String(turnId || "");
+    if (!voiceProjectionRequested()) {
+      if (state.voice.pendingTurns.delete(pendingTurnId)) renderChat();
+      return;
+    }
     const turn = state.turns.find((item) => String(item.id) === String(turnId));
     const sessionId = state.current?.id;
-    if (!turn || !sessionId || turn.status !== "complete") return;
+    if (!turn || !sessionId || turn.status !== "complete") {
+      if (state.voice.pendingTurns.delete(pendingTurnId)) renderChat();
+      return;
+    }
     stopVoicePlayback();
     const requestSequence = state.voice.requestSequence;
     state.voice.phase = "preparing";
@@ -10955,7 +11122,9 @@
       ) return;
     } catch (error) {
       if (requestSequence !== state.voice.requestSequence) return;
+      state.voice.pendingTurns.delete(String(turn.id));
       stopVoicePlayback();
+      renderChat();
       toast(error.message, true);
       return;
     }
@@ -10963,7 +11132,13 @@
       ...(turn.response_receipt || {}),
       voice: data.render,
     };
+    state.voice.pendingTurns.delete(String(turn.id));
+    state.voice.revealingTurnId = String(turn.id);
     renderChat();
+    state.voice.revealingTurnId = null;
+    if (state.voice.dialogTurnId === String(turn.id) && els.voiceDialog?.open) {
+      openVoiceDialog(turn.id);
+    }
     try {
       await playVoiceAudio(turn, data.render);
     } catch (error) {
@@ -11035,6 +11210,8 @@
   async function sendTurn() {
     if (!state.current || state.busy || state.speech.phase !== "idle") return;
     applyVoicePreferences(readVoicePreferences());
+    state.voice.pendingTurns.clear();
+    state.voice.revealingTurnId = null;
     stopVoicePlayback();
     if (voiceConfigured() && state.voice.preferences.mode !== "off") {
       // This runs inside the send gesture so browsers unlock Web Audio before
@@ -11145,6 +11322,9 @@
           pending.status = "complete";
           pending.assistant_message = data.assistant_message || pending.assistant_message;
           pending.response_receipt = data.response_receipt || pending.response_receipt || {};
+          if (voiceProjectionRequested() && !voiceReceipt(pending)) {
+            state.voice.pendingTurns.add(String(pending.id));
+          }
           if (data.session_title && state.current) {
             state.current.title = data.session_title;
             state.current.title_source = data.title_source || "generated";
@@ -11161,6 +11341,7 @@
       await loadSessions(state.current.id, true);
       if (pending.status === "complete") void maybeSpeakTurn(pending.id);
     } catch (error) {
+      state.voice.pendingTurns.delete(String(pending.id));
       pending.status = "failed";
       pending.error = error.message;
       if (rawMessage && !composerValue().trim()) composerSetValue(rawMessage);
@@ -12324,6 +12505,7 @@
       if ([...event.dataTransfer.types].includes("Files")) event.preventDefault();
     });
     document.addEventListener("visibilitychange", () => {
+      syncStageEmptyHeadlineRotation();
       if (!document.hidden) {
         updateCalliopeAvatar();
         loadSessions().catch(() => {});
@@ -12346,6 +12528,7 @@
     applyVoicePreferences(readVoicePreferences());
     initializeComposerEditor();
     setupEvents();
+    initializeStageEmptyHeadlines();
     try {
       const launch = new URLSearchParams(window.location.search);
       let launchSession = launch.get("session");

@@ -82,10 +82,11 @@ SELECT rvbbit.brain_configure_google_meet_source(
 );
 ```
 
-The normal `rvbbit.brain_nightly()` job keeps it current. Meet structured
-transcript entries expire after 30 days, so the source is append-safe: records
-outside the polling window are retained instead of being interpreted as
-deletions.
+The Document Brain pipeline keeps it current: `brain_update_drain()` checks the
+connector on the source schedule, while `brain_enrich_drain()` continuously
+processes derived summaries and knowledge edges. Meet structured transcript
+entries expire after 30 days, so the source is append-safe: records outside the
+polling window are retained instead of being interpreted as deletions.
 
 ## Optional derived meeting briefs
 
@@ -97,12 +98,15 @@ per-user exclusions as its transcript, plus a `derived_from` lineage edge.
 
 If neither function exists, or if the selected summarizer is unhealthy, raw
 transcript synchronization still succeeds and no placeholder brief is created.
-One systemic failure halts that summary batch so the nightly job does not repeat
-the same failure across every meeting. Source options are:
+Summary work is never performed inside the source-update transaction. The
+worker alternates one summary and one KG task, commits after every document,
+and retries failures with backoff while continuing through the rest of the
+backlog. There is no document-count cap; the worker yields after a time slice
+and resumes on its next invocation. The source option is:
 
 ```sql
 SELECT rvbbit.brain_configure_google_meet_source(
-  p_options => '{"summarize_meetings":true,"summary_max_docs":12}'::jsonb
+  p_options => '{"summarize_meetings":true}'::jsonb
 );
 ```
 

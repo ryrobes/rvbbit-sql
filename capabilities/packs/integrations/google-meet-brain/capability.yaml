@@ -79,7 +79,6 @@ brain_source:
     drive_acl: true
     acl_mode: calendar_invitees_strict
     summarize_meetings: true
-    summary_max_docs: 12
 warren:
   endpoint_path: /sync
   health_path: /health

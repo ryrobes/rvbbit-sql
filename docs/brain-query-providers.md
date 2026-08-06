@@ -2,9 +2,10 @@
 
 A brain **query source** indexes anything a SQL query can yield as if it were a document folder: MCP
 artifacts (Linear issues, Fireflies meetings, GitHub PRs…), other tables, computed views. A **provider**
-is the reusable recipe; a **source** binds it. Items flow through the same pipeline as files
-(embed → KG/NER enrich → ACL → retrieval), so they're semantically searchable, KG-linked, type-tagged,
-and pre-filterable alongside docs and tickets.
+is the reusable recipe; a **source** binds it. A source update fetches and reconciles content, ACLs,
+chunks, and embeddings first, making documents searchable. The durable Brain worker then processes
+optional derived briefs plus KG/NER edges one document and one commit at a time. A slow or failed
+semantic call cannot roll back already-searchable documents or earlier completed knowledge work.
 
 `rvbbit.mcp_rows(server, tool, args jsonb)` (SETOF jsonb, one row per item) is the bridge to any
 registered MCP server. The provider's `list_sql` just has to project the canonical columns.
@@ -45,9 +46,11 @@ a `document --predicate--> kind:value` edge **plus** a `mentions` edge (so the e
 `brain_related` overlap). `doc_type` is the facet agents/UI filter on — keep it low-cardinality, custom is
 fine (`document | ticket | meeting | pr | …`); see `brain_facets(email)` and `ask_brain(..., filter)`.
 
-Then: `brain_add_query_source(label, provider)` → `brain_sync_query_source(source_id)` (or the nightly /
-the lens "Index" + "Enrich" buttons). Query-source docs are **global** (visible to any authenticated
-caller); ACL is the `is_public` synthetic role.
+Then: `brain_add_query_source(label, provider)` → `brain_update_source(source_id)` (or the automatic
+source-update job / Lens **Update** button). `CALL brain_enrich_drain()` continuously drains every
+outstanding knowledge task; Lens calls that **Process now** when an operator wants to start it early.
+Query-source docs are **global** (visible to any authenticated caller); ACL is the `is_public`
+synthetic role.
 
 ## mcp_rows gotchas
 
@@ -56,8 +59,9 @@ caller); ACL is the `is_public` synthetic role.
 - **Unwrapping**: `mcp_rows` returns one row per element if the response is a top-level array or an
   object with a known array key (items/results/data/entries/rows); otherwise the whole object is one row.
   Probe the shape (`jsonb_each`, `jsonb_object_keys`) before mapping.
-- **Caps + no cursor**: tools often cap (`limit` ≤ 50) with no pagination cursor — fan out by a filter
-  dimension (project, date window) instead (see below).
+- **Caps + pagination**: tools often cap result size. Follow an offset/cursor to exhaustion when one is
+  available; otherwise fan out by a stable filter dimension. Never interpret a partial page as an
+  authoritative deletion list.
 
 ---
 
@@ -82,7 +86,7 @@ aren't covered by a by-project fan-out.
 
 ---
 
-## Worked example: Fireflies meetings (`fireflies-meetings`, single-phase, incremental date fan-out)
+## Worked example: Fireflies meetings (`fireflies-meetings`, complete offset pagination)
 
 ### The tool shape (`fireflies_get_transcripts`, `format:json`)
 `mcp_rows` unwraps to **one row per transcript**, each:
@@ -103,7 +107,8 @@ summary         object {
 }                                                    keywords → edge: about → topic
 ```
 There are **no `sentences`** in `get_transcripts` — it's metadata + summary, which is the ideal body.
-Use `format:json` (default `toon` is unparseable). `limit` ≤ 50, no cursor.
+Use `format:json` (default `toon` is unparseable). `limit` is at most 50; `skip` is the pagination
+offset.
 
 ### Mapping
 - `uri` = `'fireflies:'||id`; `content_hash` = `md5(summary.short_summary || summary.action_items)`
@@ -118,33 +123,36 @@ Use `format:json` (default `toon` is unparseable). `limit` ≤ 50, no cursor.
   (Minor noise: Google Calendar resource emails `…@resource.calendar.google.com` show as `attended_by`
   people; filter if it matters.)
 
-### Incremental fan-out without re-pulling immutable items (the pattern)
-`limit:50`/no-cursor + a "replace-all" manifest (which tombstones anything not in the list) means a naïve
-windowed fetch would prune the middle. Solution, **entirely in `list_sql`** (no engine change):
+### Complete pagination without destructive absence semantics
 
-1. Derive date **watermarks from what's already ingested** (no state table): `max(occurred_at)` = newest,
-   `min(occurred_at)` = oldest, scoped to this provider.
-2. Fetch only the **two frontiers**: forward `fromDate = newest` (catches new meetings), backward
-   `toDate = oldest` (one more history slice, ~49/sync). Repeated syncs walk back to full coverage.
-3. **UNION the existing docs back in** as `body`-null preserve rows (their stored `content_hash`), so the
-   manifest contains everything → nothing tombstoned, existing ones skipped by hash (no re-embed), only
-   new ones ingested. Immutable middle is preserved from the DB, never re-pulled from the MCP.
+The old provider sampled two 50-item date frontiers. That made repeated **Index** clicks appear to grow
+the corpus in arbitrary steps and made a partial upstream response dangerous. The shipped provider now
+walks `skip=0,50,100,...` until a short page, deduplicates by transcript ID, and preserves the established
+summary/action-item content hash so an upgrade does not re-embed historical meetings.
+
+Query/MCP sources also default to `{"tombstone_missing":false}`. A successful partial window may add or
+change documents, but absence cannot erase an older document. Only a provider that truly returns a
+complete authoritative snapshot should explicitly opt into `tombstone_missing=true`.
 
 ```sql
-WITH bounds AS (
-  SELECT max(d.occurred_at) AS hi, min(d.occurred_at) AS lo
-    FROM rvbbit.brain_documents d JOIN rvbbit.brain_sources s ON s.source_id = d.source_id
-   WHERE s.config->>'provider' = 'fireflies-meetings' AND d.deleted_at IS NULL
-),
-raw AS (
-  SELECT r FROM bounds CROSS JOIN LATERAL rvbbit.mcp_rows('fireflies','fireflies_get_transcripts',
-      jsonb_build_object('limit',50,'format','json',
-         'fromDate', to_char(coalesce(bounds.hi, now()-interval '90 days'),'YYYY-MM-DD'))) r   -- forward (new)
+WITH RECURSIVE pages(skip_n,items,n) AS (
+  SELECT 0,page.items,jsonb_array_length(page.items)
+    FROM LATERAL (
+      SELECT coalesce(jsonb_agg(r),'[]'::jsonb) AS items
+        FROM rvbbit.mcp_rows('fireflies','fireflies_get_transcripts',
+             jsonb_build_object('limit',50,'skip',0,'format','json')) r
+    ) page
   UNION ALL
-  SELECT r FROM bounds CROSS JOIN LATERAL rvbbit.mcp_rows('fireflies','fireflies_get_transcripts',
-      jsonb_build_object('limit',50,'format','json',
-         'toDate', to_char(bounds.lo,'YYYY-MM-DD'))) r                                          -- backward (backfill)
-   WHERE bounds.lo IS NOT NULL
+  SELECT pages.skip_n+50,page.items,jsonb_array_length(page.items)
+    FROM pages
+    CROSS JOIN LATERAL (
+      SELECT coalesce(jsonb_agg(r),'[]'::jsonb) AS items
+        FROM rvbbit.mcp_rows('fireflies','fireflies_get_transcripts',
+             jsonb_build_object('limit',50,'skip',pages.skip_n+50,'format','json')) r
+    ) page
+   WHERE pages.n=50 AND pages.skip_n+50 < 10000
+), raw AS (
+  SELECT item AS r FROM pages CROSS JOIN LATERAL jsonb_array_elements(items) item
 )
 SELECT 'fireflies:'||(r->>'id') AS uri,
        concat_ws(' · ', nullif(r->>'title',''), to_char((r->>'dateString')::timestamptz,'YYYY-MM-DD')) AS title,
@@ -158,15 +166,4 @@ SELECT 'fireflies:'||(r->>'id') AS uri,
          nullif('Keywords: '||array_to_string(ARRAY(SELECT jsonb_array_elements_text(r->'summary'->'keywords')),', '),'Keywords: ')) AS body,
        r AS props
   FROM raw
-UNION ALL                                                                                       -- preserve existing
-SELECT d.uri, d.title, d.content_hash, d.occurred_at, NULL::text AS body, d.props
-  FROM rvbbit.brain_documents d JOIN rvbbit.brain_sources s ON s.source_id = d.source_id
- WHERE s.config->>'provider' = 'fireflies-meetings' AND d.deleted_at IS NULL
 ```
-
-Observed: fresh sync ingests the recent window; each subsequent sync reports `added ≈ 49, removed 0,
-skipped = <already-have>` — backfilling history while never re-embedding or tombstoning existing meetings.
-
-**This "preserve-existing UNION" is the reusable recipe for any append-only / immutable source** that
-can only be fetched in windows (meetings, logs, time-series exports): window the frontiers, UNION the DB
-rows back so the replace-all manifest never prunes them.

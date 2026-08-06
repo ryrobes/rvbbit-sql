@@ -303,6 +303,16 @@ def test_voice_ui_keeps_the_original_turn_and_streams_pcm_in_the_browser():
     assert 'protocol !== "timed-pcm-ndjson-v1"' in calliope_source
     assert "absorbVoiceAlignment" in calliope_source
     assert 'class="voice-transcript"' in calliope_source
+    assert "pendingTurns: new Set()" in calliope_source
+    assert "voicePresentationPending" in calliope_source
+    assert "Shaping the spoken version" in calliope_source
+    assert "The complete answer is ready · making it conversational" in calliope_source
+    assert "state.voice.pendingTurns.add(String(pending.id))" in calliope_source
+    assert "state.voice.pendingTurns.delete(String(turn.id))" in calliope_source
+    assert "spoken cut shaping" in calliope_source
+    completion_source = calliope_source.split('event === "calliope.turn.completed"', 1)[1]
+    assert completion_source.index("state.voice.pendingTurns.add(String(pending.id))") \
+        < completion_source.index("renderChat()")
     assert "voice-word is-speaking" not in calliope_source
     assert 'els.voiceDialogScript.innerHTML = safeMarkdown(turn.assistant_message || "")' in calliope_source
     assert 'mode: state.voice.preferences.mode' in calliope_source
@@ -310,3 +320,9 @@ def test_voice_ui_keeps_the_original_turn_and_streams_pcm_in_the_browser():
     assert 'id="voice-dialog-script"' in calliope_page
     assert "the conversation follows the concise words Calliope speaks" in calliope_page
     assert "Copy full answer" in calliope_page
+
+    calliope_css = (HERE / "calliope" / "calliope.css").read_text(encoding="utf-8")
+    assert ".voice-preparing{" in calliope_css
+    assert ".message.assistant.voice-presentation .message-body{min-height:86px" in calliope_css
+    assert ".message.voice-reveal .voice-transcript" in calliope_css
+    assert "@keyframes voice-transcript-arrive" in calliope_css

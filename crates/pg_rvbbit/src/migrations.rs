@@ -1021,6 +1021,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0250_google_meet_brain_connector",
         include_str!("../sql/migrations/0250_google_meet_brain_connector.sql"),
     ),
+    (
+        "0251_brain_pipeline_flow",
+        include_str!("../sql/migrations/0251_brain_pipeline_flow.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

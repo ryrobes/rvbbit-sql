@@ -33,7 +33,9 @@ fn brain_sync_source(p_source_id: i64, p_trigger: default!(String, "'manual'")) 
     JsonB(sync_one(p_source_id, &trigger).unwrap_or_else(|e| json!({"source_id": p_source_id, "error": e})))
 }
 
-/// Sync every enabled remote source (a connector endpoint is configured). For the nightly cron.
+/// Sync every enabled connector-backed source. Manual/local Brain collections
+/// are intentionally excluded: the presence of the default gdrive backend must
+/// not make an unrelated manual source look remotely refreshable.
 #[pg_extern]
 fn brain_sync_sources(p_trigger: default!(String, "'auto'")) -> JsonB {
     let trigger = if p_trigger.trim().is_empty() { "auto".to_string() } else { p_trigger };
@@ -44,9 +46,12 @@ fn brain_sync_sources(p_trigger: default!(String, "'auto'")) -> JsonB {
              WHERE enabled \
                AND (nullif(config->>'connector','') IS NOT NULL \
                     OR nullif(config->>'endpoint','') IS NOT NULL \
-                    OR nullif(config->>'provider','') IS NULL) \
-               AND coalesce(config->>'endpoint', \
-                   (SELECT endpoint_url FROM rvbbit.backends b WHERE b.name = coalesce(config->>'connector','gdrive_connector'))) IS NOT NULL \
+                    OR (kind IN ('gdrive','google_drive','file_mirror','remote') \
+                        AND EXISTS (SELECT 1 FROM rvbbit.backends b \
+                                    WHERE b.name = 'gdrive_connector'))) \
+               AND coalesce(nullif(config->>'endpoint',''), \
+                   (SELECT endpoint_url FROM rvbbit.backends b \
+                     WHERE b.name = coalesce(nullif(config->>'connector',''),'gdrive_connector'))) IS NOT NULL \
              ORDER BY source_id",
             None, &[],
         ) {
