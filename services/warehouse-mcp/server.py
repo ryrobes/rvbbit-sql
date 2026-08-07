@@ -28,6 +28,9 @@ OAuth mode (for Claude Desktop/Cowork's native connector) — set a public URL:
                              independent of WAREHOUSE_MCP_KEY (users hold that one)
   WAREHOUSE_MCP_STATIC_CALLER optional caller label/email for the legacy shared bearer;
                              client_id remains "static-key" (default caller: "static-key")
+  WAREHOUSE_HERMES_MCP_KEY  optional Hermes-only bearer; unlike the legacy shared key,
+                            this may carry bounded delegated-human authorization context
+  WAREHOUSE_HERMES_MCP_CALLER optional service actor label (defaults to STATIC_CALLER)
 """
 from __future__ import annotations
 # psycopg's dict_row factory + sql.SQL composition trip Pyright's strict overloads
@@ -35,6 +38,7 @@ from __future__ import annotations
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
 import asyncio, hashlib, hmac, json, math, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, unicodedata, uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html.parser import HTMLParser
@@ -104,6 +108,65 @@ _SESSION_SUB = contextvars.ContextVar("rvbbit_session_sub", default=None)
 # a task-local override so it can improve attribution without ever changing the
 # access token, PG role, or authorization decision for the call.
 _FORWARDED_CALLER = contextvars.ContextVar("rvbbit_forwarded_caller", default=None)
+
+
+@dataclass(frozen=True)
+class ApplicationAuthorizationContext:
+    """One request's application-layer actor/subject decision.
+
+    ``actor`` is the principal whose credential reached Warehouse. ``subject``
+    is the human Warehouse may authorize the application request as. They are
+    deliberately different for a trusted Hermes delegation, and ``subject`` is
+    deliberately empty for legacy shared-key forwarding. ``attributed_subject``
+    retains that older display/ownership behavior without accidentally turning
+    it into an access grant.
+
+    This does not SET ROLE or alter database privileges. Team/artifact policy can
+    consume ``subject`` later while Postgres authorization remains independent.
+    """
+
+    actor: str | None
+    subject: str | None
+    attributed_subject: str | None
+    client_id: str | None
+    mode: str
+    assurance: str
+    delegated: bool = False
+    platform: str | None = None
+    session_ref: str | None = None
+
+    def audit_payload(self) -> dict:
+        payload = {
+            "actor": self.actor,
+            "subject": self.subject,
+            "attributed_subject": self.attributed_subject,
+            "client_id": self.client_id,
+            "mode": self.mode,
+            "assurance": self.assurance,
+            "delegated": self.delegated,
+            "platform": self.platform,
+            "session_ref": self.session_ref,
+        }
+        return {key: value for key, value in payload.items() if value is not None}
+
+
+# Populated for the full lifetime of a logged MCP invocation. This gives every
+# tool the same decision and prevents nested helpers from re-resolving a mutable
+# request envelope or leaking one request's subject into the next task.
+_AUTHORIZATION_CONTEXT = contextvars.ContextVar(
+    "rvbbit_application_authorization", default=None
+)
+_HERMES_SERVICE_CLIENT_ID = "hermes-service"
+_HERMES_TRANSPORT_CLIENT_IDS = frozenset({"static-key", _HERMES_SERVICE_CLIENT_ID})
+
+
+def _is_hermes_transport(client_id):
+    """Both credentials may carry provenance; only the dedicated one is trusted."""
+    return client_id in _HERMES_TRANSPORT_CLIENT_IDS
+
+
+def _is_trusted_hermes_transport(client_id):
+    return client_id == _HERMES_SERVICE_CLIENT_ID
 
 
 def _session_pg_role(sub=None):
@@ -2532,8 +2595,8 @@ def tool_run_sql_multi(queries, as_of=None, limit=None, result_mode="full", prev
 
 
 # ── activity log (audit + a substrate for usage-learning) ────────────────────
-# Every tool call is recorded to a system table: who (the token's email), the tool,
-# the args (incl. the SQL/query), outcome, the objects it touched, rows, engine, ms.
+# Every tool call is recorded to a system table: credential actor + authorized
+# human subject (when any), tool, args, outcome, touched objects, rows, engine, ms.
 # It answers "who is doing what" now, and is the raw material for a feedback loop
 # later (popular tables → search-rank boosts, common questions → suggested metrics,
 # repeated errors → catalog gaps). Best-effort: a logging failure never breaks a call.
@@ -2543,8 +2606,12 @@ _ACTIVITY_DDL = f"""
 CREATE TABLE IF NOT EXISTS {ACTIVITY_TABLE} (
   id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   ts             timestamptz NOT NULL DEFAULT now(),
-  caller         text,                 -- email from the OAuth token (or null for the static key)
+  caller         text,                 -- backwards-compatible attributed/effective display caller
   client_id      text,
+  actor          text,                 -- principal whose credential reached Warehouse
+  subject        text,                 -- human application identity, null when not authorized as one
+  auth_mode      text,                 -- direct_oauth | calliope_session | google_chat_delegation | ...
+  delegated      boolean,              -- actor and authorized human subject intentionally differ
   channel        text,                 -- google_chat | web | direct_mcp | automation | hermes | unknown
   client_app     text,                 -- calliope, hermes, or the OAuth client's declared software name
   session_ref    text,                 -- bounded Hermes/client correlation id; never an authorization input
@@ -2564,8 +2631,13 @@ ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS channel text;
 ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS client_app text;
 ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS session_ref text;
 ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS provenance jsonb;
+ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS actor text;
+ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS subject text;
+ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS auth_mode text;
+ALTER TABLE {ACTIVITY_TABLE} ADD COLUMN IF NOT EXISTS delegated boolean;
 CREATE INDEX IF NOT EXISTS mcp_activity_ts_idx      ON {ACTIVITY_TABLE} (ts DESC);
 CREATE INDEX IF NOT EXISTS mcp_activity_caller_idx  ON {ACTIVITY_TABLE} (caller, ts DESC);
+CREATE INDEX IF NOT EXISTS mcp_activity_subject_idx ON {ACTIVITY_TABLE} (subject, ts DESC);
 CREATE INDEX IF NOT EXISTS mcp_activity_tool_idx    ON {ACTIVITY_TABLE} (tool, ts DESC);
 CREATE INDEX IF NOT EXISTS mcp_activity_channel_idx ON {ACTIVITY_TABLE} (channel, ts DESC);
 CREATE INDEX IF NOT EXISTS mcp_activity_objects_idx ON {ACTIVITY_TABLE} USING gin (objects);
@@ -2613,28 +2685,72 @@ def _authenticated_caller():
 
 
 def _caller():
-    """The audited caller, retaining the access token's client identity.
+    """The backwards-compatible audited caller and token client identity.
 
-    A forwarded human identity is deliberately attribution-only and is honored
-    only behind the legacy/static Hermes connection.  Request metadata is read
-    from the SDK's task-local request context so every MCP tool gets the same
-    attribution behavior, including tools that do not inject a FastMCP Context
-    parameter.  OAuth callers always remain whatever their own signed token
-    says they are.
+    ``mcp_activity.caller`` historically contains a forwarded Google Chat or
+    Calliope owner. Keep that behavior for reports and artifact ownership. New
+    authorization code must use ``_application_authorization_context().subject``
+    instead: a legacy shared-key assertion can be attributed without being
+    authorized. Direct OAuth callers always remain their signed token subject.
     """
     caller, client_id = _authenticated_caller()
+    authorization = _AUTHORIZATION_CONTEXT.get()
+    if _is_hermes_transport(client_id) and authorization is not None:
+        if _is_trusted_hermes_transport(client_id):
+            # A dedicated service token may act only as the authorized subject.
+            # The separately retained attribution is written by _record, not
+            # exposed to mutation helpers as an ownership identity.
+            return authorization.subject or caller, client_id
+        if authorization.attributed_subject:
+            return authorization.attributed_subject, client_id
     forwarded = _FORWARDED_CALLER.get()
-    if client_id == "static-key" and not forwarded:
+    if _is_hermes_transport(client_id) and not forwarded:
         forwarded = _forwarded_mcp_caller(
             None, authenticated=(caller, client_id)
         )
-    if client_id == "static-key" and forwarded:
+    if _is_hermes_transport(client_id) and forwarded:
         return forwarded, client_id
     return caller, client_id
 
 
 _FORWARDED_EMAIL_RE = re.compile(r"^[^@\s]{1,128}@[^@\s]{1,190}$")
 _HERMES_CALLER_META_KEY = "rvbbit.ai/hermes-caller"
+
+
+def _email_identity(value):
+    email = str(value or "").strip().lower()
+    return (
+        email
+        if len(email) <= 254 and _FORWARDED_EMAIL_RE.fullmatch(email)
+        else None
+    )
+
+
+def _bounded_principal(value):
+    principal = re.sub(r"[\x00-\x1f\x7f]", "", str(value or "")).strip()
+    return principal[:254] or None
+
+
+def _delegated_email_allowed(value):
+    """Apply Warehouse's login audience to a Hermes-verified Chat sender.
+
+    Hermes proves which Google Chat account sent the message; Warehouse still
+    decides whether that account belongs to this installation. Match the same
+    email allowlist and Workspace-domain boundary used by interactive login.
+    """
+    email = _email_identity(value)
+    if not email:
+        return False
+    try:
+        import auth
+
+        allowed = getattr(auth, "_email_allowed", None)
+        if not callable(allowed) or not allowed(email):
+            return False
+        workspace_domain = str(getattr(auth, "GOOGLE_HD", "") or "").lower()
+    except Exception:  # noqa: BLE001 — trusted delegation fails closed
+        return False
+    return not workspace_domain or email.endswith(f"@{workspace_domain}")
 
 
 def _mcp_request_context(ctx=None):
@@ -2721,13 +2837,16 @@ def _mcp_client_implementation(ctx=None):
 
 
 def _hermes_mcp_envelope(ctx=None, *, authenticated=None):
-    """Return bounded Hermes provenance behind the opted-in static principal.
+    """Return bounded Hermes provenance behind a Hermes-capable transport.
 
-    The envelope is attribution data, never authorization. A direct OAuth
-    caller cannot replace its signed identity with forwarded metadata.
+    The envelope alone is never proof of identity: the application authorization
+    resolver trusts it only when the access token is the dedicated Hermes service
+    credential. The legacy shared key can retain attribution but cannot acquire a
+    human authorization subject. A direct OAuth caller can never replace its
+    signed identity with forwarded metadata.
     """
     _token_caller, client_id = authenticated or _authenticated_caller()
-    if client_id != "static-key":
+    if not _is_hermes_transport(client_id):
         return None
     envelope = _mcp_request_metadata(ctx).get(_HERMES_CALLER_META_KEY)
     if not isinstance(envelope, dict):
@@ -2745,37 +2864,36 @@ def _hermes_mcp_envelope(ctx=None, *, authenticated=None):
     ).strip()[:240]
     if session_ref:
         normalized["session_id"] = session_ref
-    email = str(envelope.get("user_id") or "").strip().lower()
-    if email and len(email) <= 254 and _FORWARDED_EMAIL_RE.fullmatch(email):
+    email = _email_identity(envelope.get("user_id"))
+    if email:
         normalized["user_id"] = email
     return normalized
 
 
 def _forwarded_mcp_caller(ctx=None, *, authenticated=None):
-    """Resolve a verified Hermes/Google Chat email for display attribution.
+    """Resolve a bounded Hermes/Google Chat email for display attribution.
 
-    This does not confer permissions. The shared key remains the authenticated
-    principal and database access still follows that connection's normal rules.
-    Non-Chat Hermes provenance is retained for activity classification but can
-    never directly override the authenticated caller.
+    Whether the same email may authorize an application action is decided by
+    ``_application_authorization_context`` from the credential, not this helper.
+    Non-Chat provenance can never directly override the authenticated caller.
     """
     envelope = _hermes_mcp_envelope(ctx, authenticated=authenticated)
     if not envelope or envelope.get("platform") != "google_chat":
         return None
-    email = str(envelope.get("user_id") or "")
-    return email if _FORWARDED_EMAIL_RE.fullmatch(email) else None
+    return _email_identity(envelope.get("user_id"))
 
 
-def _trusted_calliope_session_caller(ctx=None, *, authenticated=None):
-    """Resolve a web publication owner from Warehouse's own session ledger.
+def _trusted_calliope_session_caller(ctx=None, *, authenticated=None, conn=None):
+    """Resolve a web owner from Warehouse's own signed session ledger.
 
     Hermes' API-server envelope deliberately carries no asserted human ID. Its
     opaque session ID is enough for this Warehouse to join back to the signed
-    Calliope session it created. This is used only around publication wrappers;
-    it does not turn forwarded metadata into a general authorization identity.
+    Calliope session it created. The application resolver decides whether that
+    owner is a trusted subject (dedicated Hermes credential) or compatibility
+    attribution only (legacy shared credential).
     """
     token_caller, client_id = authenticated or _authenticated_caller()
-    if client_id != "static-key":
+    if not _is_hermes_transport(client_id):
         return None
     envelope = _hermes_mcp_envelope(
         ctx, authenticated=(token_caller, client_id)
@@ -2786,23 +2904,215 @@ def _trusted_calliope_session_caller(ctx=None, *, authenticated=None):
     if not session_ref:
         return None
     try:
-        with _conn() as conn:
+        if conn is not None:
             linked = _calliope_activity_for_hermes_session(conn, session_ref)
+        else:
+            with _conn() as local_conn:
+                linked = _calliope_activity_for_hermes_session(
+                    local_conn, session_ref
+                )
     except Exception:  # noqa: BLE001 — attribution must never break publication
         return None
-    email = str((linked or {}).get("owner") or "").strip().lower()
-    return email if _FORWARDED_EMAIL_RE.fullmatch(email) else None
+    return _email_identity((linked or {}).get("owner"))
+
+
+def _application_authorization_context(
+    ctx=None, *, authenticated=None, conn=None, caller_override=None
+):
+    """Resolve the one application-layer identity decision for this request.
+
+    Precedence is deliberately fail-closed:
+
+    1. a direct OAuth subject is authoritative and ignores all forwarding;
+    2. a dedicated Hermes service token may delegate a Google Chat sender or a
+       Warehouse-ledger Calliope web owner;
+    3. the legacy shared key may retain the same attribution, but has no human
+       authorization subject; and
+    4. browser routes may supply their already-verified Warehouse session owner.
+
+    No branch changes the Postgres role. Consumers that enforce application ACLs
+    must require ``subject``; display/audit compatibility may use
+    ``attributed_subject``.
+    """
+    cached = _AUTHORIZATION_CONTEXT.get()
+    if cached is not None:
+        return cached
+
+    token_caller, client_id = authenticated or _authenticated_caller()
+    actor = _bounded_principal(token_caller or client_id)
+
+    # A person's OAuth token wins even if a client supplies a forged Hermes
+    # envelope or an internal caller accidentally supplies a browser override.
+    # OAuth service clients without a human-shaped signed subject get an actor
+    # receipt but no application authorization subject.
+    if client_id and not _is_hermes_transport(client_id):
+        subject = _email_identity(token_caller)
+        return ApplicationAuthorizationContext(
+            actor=actor,
+            subject=subject,
+            attributed_subject=subject,
+            client_id=client_id,
+            mode="direct_oauth" if subject else "direct_service",
+            assurance="oauth_access_token",
+        )
+
+    if _is_hermes_transport(client_id):
+        envelope = _hermes_mcp_envelope(
+            ctx, authenticated=(token_caller, client_id)
+        )
+        platform = (envelope or {}).get("platform")
+        session_ref = (envelope or {}).get("session_id")
+        trusted = _is_trusted_hermes_transport(client_id)
+        attributed_subject = None
+
+        if platform == "google_chat":
+            attributed_subject = _email_identity(envelope.get("user_id"))
+            authorized_subject = (
+                attributed_subject
+                if trusted and _delegated_email_allowed(attributed_subject)
+                else None
+            )
+            return ApplicationAuthorizationContext(
+                actor=actor,
+                subject=authorized_subject,
+                attributed_subject=attributed_subject,
+                client_id=client_id,
+                mode=(
+                    "google_chat_delegation"
+                    if authorized_subject
+                    else (
+                        "google_chat_sender_not_allowed"
+                        if trusted
+                        else "legacy_hermes_attribution"
+                    )
+                ),
+                assurance=(
+                    "hermes_service_credential"
+                    if trusted
+                    else "legacy_shared_key"
+                ),
+                delegated=bool(authorized_subject),
+                platform=platform,
+                session_ref=session_ref,
+            )
+
+        if platform == "api_server":
+            attributed_subject = _trusted_calliope_session_caller(
+                ctx,
+                authenticated=(token_caller, client_id),
+                conn=conn,
+            )
+            return ApplicationAuthorizationContext(
+                actor=actor,
+                subject=attributed_subject if trusted else None,
+                attributed_subject=attributed_subject,
+                client_id=client_id,
+                mode=(
+                    "calliope_session"
+                    if trusted and attributed_subject
+                    else "legacy_hermes_attribution"
+                ),
+                assurance=(
+                    "warehouse_session_ledger"
+                    if trusted and attributed_subject
+                    else "legacy_shared_key"
+                ),
+                delegated=bool(trusted and attributed_subject),
+                platform=platform,
+                session_ref=session_ref,
+            )
+
+        if platform == "cron":
+            return ApplicationAuthorizationContext(
+                actor=actor,
+                subject=None,
+                attributed_subject=None,
+                client_id=client_id,
+                mode="hermes_automation",
+                assurance=(
+                    "hermes_service_credential" if trusted else "legacy_shared_key"
+                ),
+                platform=platform,
+                session_ref=session_ref,
+            )
+
+        return ApplicationAuthorizationContext(
+            actor=actor,
+            subject=None,
+            attributed_subject=None,
+            client_id=client_id,
+            mode="service",
+            assurance=(
+                "hermes_service_credential" if trusted else "legacy_shared_key"
+            ),
+        )
+
+    # Native browser routes have already verified a signed Warehouse session.
+    # caller_override is explicit because their tool call often happens after
+    # the temporary execution-role ContextVar has been reset. Credential-backed
+    # direct/Hermes decisions above always take precedence if both are present.
+    browser_subject = _email_identity(caller_override)
+    if browser_subject:
+        return ApplicationAuthorizationContext(
+            actor=browser_subject,
+            subject=browser_subject,
+            attributed_subject=browser_subject,
+            client_id=client_id,
+            mode="browser_session",
+            assurance="warehouse_signed_session",
+        )
+
+    # Session-cookie bridge calls park their execution subject around the tool.
+    # In today's shared/Google mode that is the email. Email-less PG roles are
+    # intentionally not guessed to be people; browser route code has the signed
+    # identity claim available and can pass it explicitly.
+    session_subject = _email_identity(_SESSION_SUB.get())
+    if session_subject:
+        return ApplicationAuthorizationContext(
+            actor=session_subject,
+            subject=session_subject,
+            attributed_subject=session_subject,
+            client_id=client_id,
+            mode="browser_session",
+            assurance="warehouse_signed_session",
+        )
+
+    return ApplicationAuthorizationContext(
+        actor=actor,
+        subject=None,
+        attributed_subject=None,
+        client_id=client_id,
+        mode="service" if actor else "anonymous",
+        assurance="authenticated_service" if actor else "none",
+    )
+
+
+def _require_application_subject(ctx=None):
+    """Return the authorized human context or fail closed for future ACL tools."""
+    authorization = _application_authorization_context(ctx)
+    if not authorization.subject:
+        raise PermissionError(
+            "This action requires a direct user session or trusted Hermes delegation"
+        )
+    return authorization
 
 
 def _with_forwarded_mcp_caller(ctx, fn):
-    email = _forwarded_mcp_caller(ctx) or _trusted_calliope_session_caller(ctx)
-    if not email:
-        return fn()
-    token = _FORWARDED_CALLER.set(email)
+    """Compatibility wrapper that also freezes the application auth context."""
+    authorization = _application_authorization_context(ctx)
+    auth_token = _AUTHORIZATION_CONTEXT.set(authorization)
+    email = (
+        authorization.subject
+        if _is_trusted_hermes_transport(authorization.client_id)
+        else authorization.attributed_subject
+    )
+    caller_token = _FORWARDED_CALLER.set(email) if email else None
     try:
         return fn()
     finally:
-        _FORWARDED_CALLER.reset(token)
+        if caller_token is not None:
+            _FORWARDED_CALLER.reset(caller_token)
+        _AUTHORIZATION_CONTEXT.reset(auth_token)
 
 
 def _objects(tool, args, res):
@@ -3010,7 +3320,7 @@ def _initial_activity_context(tool, args, client_id, caller_override=None):
             "provenance": provenance,
         }
 
-    if client_id and client_id != "static-key":
+    if client_id and not _is_hermes_transport(client_id):
         provenance = {"source": "direct_mcp", "auth": "oauth"}
         if mcp_client:
             provenance["mcp_client"] = mcp_client
@@ -3020,7 +3330,18 @@ def _initial_activity_context(tool, args, client_id, caller_override=None):
             "session_ref": None,
             "provenance": provenance,
         }
-    if client_id == "static-key":
+    if _is_hermes_transport(client_id):
+        if _is_trusted_hermes_transport(client_id):
+            return {
+                "channel": "hermes",
+                "client_app": "hermes",
+                "session_ref": None,
+                "provenance": {
+                    "source": "hermes",
+                    "auth": "service_credential",
+                    **({"mcp_client": mcp_client} if mcp_client else {}),
+                },
+            }
         declared_client = mcp_client.get("title") or mcp_client.get("name")
         # The Python SDK's default handshake is literally "mcp". It provides
         # no evidence that this is a direct harness rather than an older
@@ -3127,7 +3448,7 @@ def _resolve_activity_context(conn, context, caller, client_id, *, tool=None):
             })
             if linked.get("trigger_kind"):
                 context["provenance"]["trigger_kind"] = linked["trigger_kind"]
-            if client_id == "static-key" and linked.get("owner"):
+            if _is_hermes_transport(client_id) and linked.get("owner"):
                 caller = linked["owner"]
         elif str(context.get("session_ref") or "").startswith("calliope_"):
             # Short-lived Calliope helper sessions (for example design-profile
@@ -3136,9 +3457,11 @@ def _resolve_activity_context(conn, context, caller, client_id, *, tool=None):
             context["client_app"] = "calliope"
             context["provenance"]["calliope_kind"] = "ephemeral"
 
-    if context.get("channel") == "direct_mcp" and client_id not in {
-        None, "", "static-key",
-    }:
+    if (
+        context.get("channel") == "direct_mcp"
+        and client_id not in {None, ""}
+        and not _is_hermes_transport(client_id)
+    ):
         metadata = _activity_oauth_client_metadata(client_id)
         if metadata:
             context["provenance"]["oauth_client"] = metadata
@@ -3162,8 +3485,16 @@ def _record(tool, args, res, err, elapsed_ms, caller_override=None):
     as_of = args.get("as_of") if isinstance(args, dict) else None
     try:
         with _conn() as c:
+            authorization = _application_authorization_context(
+                conn=c, caller_override=caller_override
+            )
+            if authorization.attributed_subject:
+                caller = authorization.attributed_subject
             caller, context = _resolve_activity_context(
                 c, context, caller, client_id, tool=tool
+            )
+            context["provenance"]["authorization"] = (
+                authorization.audit_payload()
             )
             legacy_values = (
                 caller, client_id, tool, json.dumps(args, default=str), err is None,
@@ -3174,12 +3505,17 @@ def _record(tool, args, res, err, elapsed_ms, caller_override=None):
             try:
                 c.execute(
                     f"INSERT INTO {ACTIVITY_TABLE} "
-                    "(caller,client_id,channel,client_app,session_ref,provenance,"
+                    "(caller,client_id,actor,subject,auth_mode,delegated,"
+                    "channel,client_app,session_ref,provenance,"
                     "tool,args,ok,error,objects,rows,engine,elapsed_ms,as_of,result_summary) "
-                    "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s::jsonb,"
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,"
+                    "%s,%s::jsonb,%s,%s::jsonb,"
                     "%s,%s,%s,%s,%s,%s::jsonb)",
                     (
-                        caller, client_id, context["channel"], context["client_app"],
+                        caller, client_id,
+                        authorization.actor, authorization.subject,
+                        authorization.mode, authorization.delegated,
+                        context["channel"], context["client_app"],
                         context.get("session_ref"),
                         json.dumps(context["provenance"], default=str),
                         *legacy_values[2:],
@@ -3201,6 +3537,14 @@ def _record(tool, args, res, err, elapsed_ms, caller_override=None):
 
 
 def _logged(tool, args, thunk):
+    # Freeze one actor/subject decision around both execution and its receipt.
+    # The low-level MCP request ContextVar remains available here even when a
+    # FastMCP wrapper does not expose ``ctx`` in the public tool schema.
+    authorization_token = None
+    if _AUTHORIZATION_CONTEXT.get() is None:
+        authorization_token = _AUTHORIZATION_CONTEXT.set(
+            _application_authorization_context()
+        )
     t0 = time.time()
     res = err = None
     try:
@@ -3221,18 +3565,20 @@ def _logged(tool, args, thunk):
         return res
     finally:
         _record(tool, args, res, err, int((time.time() - t0) * 1000))
+        if authorization_token is not None:
+            _AUTHORIZATION_CONTEXT.reset(authorization_token)
 
 
 def _selected_calliope_private_document_caller(doc_id, ctx=None):
     """Resolve the owner of the exact private Doc selected for this web turn.
 
-    Hermes reaches Warehouse through one shared MCP credential, so its ordinary
-    token identity cannot read an owner-only Brain document.  Do not promote the
-    forwarded Hermes email to a general authorization identity.  Instead, join
-    the opaque API-session reference back to Warehouse-owned Calliope state and
+    Hermes' service actor cannot read an owner-only Brain document merely because
+    the request has a valid delegated subject. Keep private document disclosure
+    narrower than future team/artifact policy: join the opaque API-session
+    reference back to Warehouse-owned Calliope state and
     require all of these facts at once:
 
-    * the request is an API-server Hermes turn behind the shared credential;
+    * the request is an API-server Hermes turn behind a Hermes credential;
     * that Calliope turn is still running;
     * the turn selected the exact Stage surface being requested; and
     * that surface is the active private Google Doc receipt for this doc_id.
@@ -3241,7 +3587,7 @@ def _selected_calliope_private_document_caller(doc_id, ctx=None):
     it cannot expose another private document or broaden ask_brain searches.
     """
     authenticated = _authenticated_caller()
-    if authenticated[1] != "static-key":
+    if not _is_hermes_transport(authenticated[1]):
         return None
     envelope = _hermes_mcp_envelope(ctx, authenticated=authenticated)
     if not envelope or envelope.get("platform") != "api_server":
@@ -3312,7 +3658,7 @@ def _mcp_brain_related(doc_id, ctx=None):
 def _selected_calliope_sheet_row(surface_id, ctx=None):
     """Fetch the exact Sheet receipt selected by the active browser-owned turn."""
     authenticated = _authenticated_caller()
-    if authenticated[1] != "static-key":
+    if not _is_hermes_transport(authenticated[1]):
         return None
     envelope = _hermes_mcp_envelope(ctx, authenticated=authenticated)
     if not envelope or envelope.get("platform") != "api_server":
@@ -3359,7 +3705,7 @@ def _active_calliope_sheet_surface_id(ctx=None):
     The specialized query tool performs the full check again before reading.
     """
     authenticated = _authenticated_caller()
-    if authenticated[1] != "static-key":
+    if not _is_hermes_transport(authenticated[1]):
         return None
     envelope = _hermes_mcp_envelope(ctx, authenticated=authenticated)
     if not envelope or envelope.get("platform") != "api_server":

@@ -155,18 +155,25 @@ def test_chat_composer_accepts_clipboard_images_through_the_upload_pipeline():
     assert "Pasted image attached" in script
 
 
-def test_calliope_selection_toggles_and_chat_column_is_resizable():
+def test_calliope_selection_toggles_and_side_columns_are_resizable_and_persisted():
     page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
     script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
     css = (calliope._ASSET_DIR / "calliope.css").read_text(encoding="utf-8")
     assert 'id="chat-resizer"' in page
+    assert 'id="session-resizer"' in page
     assert 'role="separator"' in page
     assert "state.selectedSurfaceId === id" in script
     assert "clearSurfaceSelection();" in script
     assert "CHAT_WIDTH_KEY" in script
+    assert "SESSION_WIDTH_KEY" in script
     assert "chatWidthBounds" in script
+    assert "sessionWidthBounds" in script
+    assert "restoreChatWidth();" in script
+    assert "restoreSessionWidth();" in script
     assert ".surface.selected .surface-kind" in css
     assert ".chat-resizer" in css
+    assert ".session-resizer" in css
+    assert "--calliope-session-width" in css
 
 
 def test_calliope_ships_the_same_three_thinking_orb_states_as_data_rabbit():

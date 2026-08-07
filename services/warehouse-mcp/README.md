@@ -95,6 +95,25 @@ Because a shared bearer contains no user identity, its activity caller defaults 
 one shared integration should retain its old attribution. The audit `client_id` remains
 `static-key`, and a verified OAuth token's email always takes precedence over this fallback.
 
+**First-party Hermes delegation.** Give Hermes its own bearer instead of reusing the
+legacy/script key:
+
+```bash
+export WAREHOUSE_HERMES_MCP_KEY="$(openssl rand -hex 32)"
+export WAREHOUSE_HERMES_MCP_CALLER="calliope@example.com" # service actor, not the human
+```
+
+An access token presented with this key has `client_id=hermes-service`. Only that
+principal can turn Hermes' bounded Google Chat sender envelope, or an opaque Calliope
+API session that Warehouse resolves against its own signed session ledger, into an
+application authorization `subject`. Chat senders must also pass this Warehouse's
+`WAREHOUSE_ALLOWED_EMAILS` and Workspace-domain audience; an adapter-verified external
+sender is still not automatically a company user. A legacy `WAREHOUSE_MCP_KEY` holder may still
+produce backwards-compatible attribution, but never a delegated authorization subject.
+Direct OAuth remains authoritative and ignores any forwarded envelope. This is an
+application-layer identity decision only: it does not issue the user's Google token,
+run `SET ROLE`, or change warehouse grants.
+
 ### Google Sign-In (optional, recommended)
 Adds a **Sign in with Google** button to the login page. We stay the OAuth *server*
 for Claude and additionally become an OAuth *client* to Google; both paths converge on
@@ -276,13 +295,19 @@ server {
 
 ## Activity log (audit + usage-learning)
 Every tool call is recorded to **`rvbbit.mcp_activity`** (auto-created on startup):
-`caller` (the signed/verified user when known), `client_id`, `channel`, `client_app`,
+`caller` (the backwards-compatible attributed user), `client_id`, `actor` (the
+credential principal), `subject` (the human application request may authorize as),
+`auth_mode`, `delegated`, `channel`, `client_app`,
 `session_ref`, sanitized `provenance`, `tool`, `args` (incl. the SQL/search query),
 `ok`/`error`, `objects` (schema.tables touched), `rows`, `engine`, `elapsed_ms`, `as_of`,
 and `result_summary`. `channel` distinguishes `google_chat`, `web`, `direct_mcp`,
 `automation`, and explicitly ambiguous legacy traffic. `client_app` further identifies
 Calliope/Gallery or the MCP handshake/OAuth registration's self-declared software name
 (for example Codex or Claude Code); it is useful provenance, not an authorization claim.
+For a direct OAuth request, actor and subject are the same person. For Calliope or Google
+Chat through the dedicated Hermes credential, actor is the Calliope service and subject
+is the verified human. Legacy shared-key forwarding can still populate `caller` for old
+reports while leaving `subject` null, making the security distinction queryable.
 DataRabbit's **MCP Incoming** surface deliberately shows distinct people separately from
 MCP request volume: one dashboard open or Calliope turn can fan out into many logged SQL
 and tool requests. Historical rows and generic shared-key clients that cannot be resolved
@@ -776,7 +801,7 @@ and copies valid files into `WAREHOUSE_CALLIOPE_DIR`, and serves them through
 email-owner-gated download URLs. The originating host path is never sent to the browser.
 
 Configure the Hermes default profile's `mcp_servers` entry to use this warehouse's
-`/mcp` URL and a server-side `WAREHOUSE_MCP_KEY`. Calliope does not create or select a
+`/mcp` URL and the server-side `WAREHOUSE_HERMES_MCP_KEY`. Calliope does not create or select a
 Hermes profile. Set `forward_session_identity: true` only on this trusted first-party
 Warehouse entry. Hermes then forwards bounded platform/session provenance for Google
 Chat, Calliope's API-server sessions, and cron runs. Google Chat additionally carries the
@@ -795,12 +820,13 @@ mcp_servers:
   Datamarket:
     url: https://warehouse.example.com/mcp
     headers:
-      Authorization: Bearer ${WAREHOUSE_MCP_KEY}
+      Authorization: Bearer ${WAREHOUSE_HERMES_MCP_KEY}
     forward_session_identity: true
 ```
 
-Forwarded metadata is not a tool argument, PG role, or authorization grant; the
-authenticated Calliope/static-key principal continues to control access. A direct
+Forwarded metadata is not a tool argument or PG role. It becomes an application-layer
+human subject only when paired with the dedicated `hermes-service` credential; with the
+legacy shared key it remains attribution-only. A direct
 shared-key client that declares a specific MCP `clientInfo` is labeled from that handshake;
 an old generic client and an old Hermes connection without this flag remain deliberately
 `unknown` rather than being guessed. Enable that same profile's API server and pin its
@@ -993,9 +1019,12 @@ from the controlled `rvbbit.artifact_areas` vocabulary; automatic classification
 creates free-form categories, and `set_artifact_area` provides a durable manual override.
 **Shared-key mode:** `WAREHOUSE_MCP_KEY` (bearer; unset = auth OFF, dev only) ·
 `WAREHOUSE_MCP_STATIC_CALLER` (optional legacy caller label/email; auth `client_id`
-stays `static-key`, default caller is `static-key`).
+stays `static-key`, default caller is `static-key`) · `WAREHOUSE_HERMES_MCP_KEY`
+(distinct first-party Hermes bearer; required for delegated application identity) ·
+`WAREHOUSE_HERMES_MCP_CALLER` (service actor label; defaults to the static caller).
 
 ## Deferred to Phase 1+
-Per-user identity → scoped role (tools run as the *caller's* scope), PII masking in
+Application subjects are now explicit and auditable, but database-enforced per-user
+identity → scoped role (tools run as the *caller's* PG scope), PII masking in
 samples, `ask` (compose text-to-SQL), per-role cost caps, receipts table,
 `define_metric`/`get_connection` (promote + scoped runtime DSN).

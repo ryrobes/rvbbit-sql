@@ -1,4 +1,4 @@
-"""Verified Google Chat identity is attribution, never authorization."""
+"""Legacy Hermes forwarding stays attribution-only and turn-scoped where private."""
 from __future__ import annotations
 
 import asyncio

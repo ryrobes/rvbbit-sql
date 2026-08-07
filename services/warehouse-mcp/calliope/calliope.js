@@ -86,6 +86,7 @@
     sessionTitle: $("#session-title"),
     archiveSession: $("#archive-session"),
     notebook: $(".notebook"),
+    sessionResizer: $("#session-resizer"),
     chatResizer: $("#chat-resizer"),
     stageScroll: $("#stage-scroll"),
     stage: $("#stage"),
@@ -498,6 +499,7 @@
     workflowRemediationId: null,
     artifactResizeTimer: null,
     avatarTimer: null,
+    sessionWidth: null,
     chatWidth: null,
     cubeBuilders: new Map(),
     instruments: [],
@@ -546,6 +548,7 @@
 
   const THINKING_STATES = ["working", "composing", "solving"];
   const ARTIFACT_FRAME_UNLOAD_DELAY_MS = 900;
+  const SESSION_WIDTH_KEY = "rvbbit-calliope-session-width-v1";
   const CHAT_WIDTH_KEY = "rvbbit-calliope-chat-width-v1";
   const LAST_SESSION_KEY = "rvbbit-calliope-last-session-v1";
   const SESSION_TAB_KEY = "rvbbit-calliope-session-tab-v1";
@@ -560,6 +563,8 @@
     { id: "runs", label: "Runs", empty: "No Workflow or Instrument run notebooks yet." },
     { id: "actions", label: "Actions", empty: "No guided Action notebooks yet." },
   ];
+  const SESSION_MIN_WIDTH = 205;
+  const SESSION_MAX_WIDTH = 420;
   const CHAT_MIN_WIDTH = 320;
   const CHAT_DEFAULT_WIDTH = 390;
   const LIVE_ACTIVITY_ENTRY_LIMIT = 10;
@@ -2428,10 +2433,34 @@
     window.location.assign(data.url);
   }
 
+  function compactNotebookLayout() {
+    return window.innerWidth <= 1120;
+  }
+
+  function sessionDefaultWidth() {
+    return compactNotebookLayout() ? 205 : 238;
+  }
+
+  function notebookMinimumStageWidth() {
+    return compactNotebookLayout() ? 390 : 430;
+  }
+
+  function sessionWidthBounds() {
+    const chat = state.chatWidth || CHAT_DEFAULT_WIDTH;
+    const available = window.innerWidth - chat - notebookMinimumStageWidth();
+    return {
+      min: SESSION_MIN_WIDTH,
+      max: Math.max(
+        SESSION_MIN_WIDTH,
+        Math.min(SESSION_MAX_WIDTH, Math.floor(window.innerWidth * .36), available),
+      ),
+    };
+  }
+
   function chatWidthBounds() {
     const compact = window.innerWidth <= 1120;
-    const rail = compact ? 205 : 238;
-    const minimumStage = compact ? 390 : 430;
+    const rail = state.sessionWidth || sessionDefaultWidth();
+    const minimumStage = notebookMinimumStageWidth();
     const available = window.innerWidth - rail - minimumStage;
     return {
       min: CHAT_MIN_WIDTH,
@@ -2440,6 +2469,24 @@
         Math.min(720, Math.floor(window.innerWidth * .48), available),
       ),
     };
+  }
+
+  function setSessionWidth(value, persist = true) {
+    if (!els.notebook || !els.sessionResizer) return;
+    const bounds = sessionWidthBounds();
+    const width = Math.round(Math.min(
+      bounds.max,
+      Math.max(bounds.min, Number(value) || sessionDefaultWidth()),
+    ));
+    state.sessionWidth = width;
+    els.notebook.style.setProperty("--calliope-session-width", `${width}px`);
+    els.sessionResizer.setAttribute("aria-valuemin", String(bounds.min));
+    els.sessionResizer.setAttribute("aria-valuemax", String(bounds.max));
+    els.sessionResizer.setAttribute("aria-valuenow", String(width));
+    els.sessionResizer.title = `Sessions width · ${width}px`;
+    if (persist) {
+      try { localStorage.setItem(SESSION_WIDTH_KEY, String(width)); } catch {}
+    }
   }
 
   function setChatWidth(value, persist = true) {
@@ -2461,6 +2508,35 @@
     let saved = CHAT_DEFAULT_WIDTH;
     try { saved = Number(localStorage.getItem(CHAT_WIDTH_KEY)) || saved; } catch {}
     setChatWidth(saved, false);
+  }
+
+  function restoreSessionWidth() {
+    let saved = sessionDefaultWidth();
+    try { saved = Number(localStorage.getItem(SESSION_WIDTH_KEY)) || saved; } catch {}
+    setSessionWidth(saved, false);
+  }
+
+  function beginSessionResize(event) {
+    if (window.matchMedia("(max-width: 880px)").matches || event.button !== 0) return;
+    event.preventDefault();
+    els.sessionResizer.setPointerCapture(event.pointerId);
+    els.sessionResizer.classList.add("dragging");
+    document.body.classList.add("session-resizing");
+  }
+
+  function moveSessionResize(event) {
+    if (!els.sessionResizer.hasPointerCapture(event.pointerId)) return;
+    const notebookLeft = els.notebook.getBoundingClientRect().left;
+    setSessionWidth(event.clientX - notebookLeft, false);
+  }
+
+  function endSessionResize(event) {
+    if (!els.sessionResizer.hasPointerCapture(event.pointerId)) return;
+    els.sessionResizer.releasePointerCapture(event.pointerId);
+    els.sessionResizer.classList.remove("dragging");
+    document.body.classList.remove("session-resizing");
+    setSessionWidth(state.sessionWidth, true);
+    resetArtifactFrameHeights();
   }
 
   function beginChatResize(event) {
@@ -11785,6 +11861,28 @@
           .catch((error) => toast(error.message, true));
       }
     });
+    els.sessionResizer.addEventListener("pointerdown", beginSessionResize);
+    els.sessionResizer.addEventListener("pointermove", moveSessionResize);
+    els.sessionResizer.addEventListener("pointerup", endSessionResize);
+    els.sessionResizer.addEventListener("pointercancel", endSessionResize);
+    els.sessionResizer.addEventListener("dblclick", () => {
+      setSessionWidth(sessionDefaultWidth(), true);
+      resetArtifactFrameHeights();
+    });
+    els.sessionResizer.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home"].includes(event.key)) return;
+      event.preventDefault();
+      if (event.key === "Home") {
+        setSessionWidth(sessionDefaultWidth(), true);
+      } else {
+        setSessionWidth(
+          (state.sessionWidth || sessionDefaultWidth()) + (event.key === "ArrowLeft" ? -24 : 24),
+          true,
+        );
+      }
+      clearTimeout(state.artifactResizeTimer);
+      state.artifactResizeTimer = setTimeout(resetArtifactFrameHeights, 120);
+    });
     els.chatResizer.addEventListener("pointerdown", beginChatResize);
     els.chatResizer.addEventListener("pointermove", moveChatResize);
     els.chatResizer.addEventListener("pointerup", endChatResize);
@@ -11810,6 +11908,7 @@
     els.mobileShade.addEventListener("click", () => setMobilePanel());
     window.addEventListener("resize", () => {
       if (!window.matchMedia("(max-width: 880px)").matches) setMobilePanel();
+      if (state.sessionWidth != null) setSessionWidth(state.sessionWidth, false);
       if (state.chatWidth != null) setChatWidth(state.chatWidth, false);
       clearTimeout(state.artifactResizeTimer);
       state.artifactResizeTimer = setTimeout(resetArtifactFrameHeights, 120);
@@ -12524,6 +12623,7 @@
   async function init() {
     scheduleAvatarClock();
     restoreChatWidth();
+    restoreSessionWidth();
     restoreSessionRailState();
     applyVoicePreferences(readVoicePreferences());
     initializeComposerEditor();

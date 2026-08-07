@@ -270,6 +270,12 @@ services:
       # Optional audit principal for that shared bearer. The auth mechanism
       # remains client_id=static-key; verified OAuth email callers always win.
       WAREHOUSE_MCP_STATIC_CALLER: ${WAREHOUSE_MCP_STATIC_CALLER:-}
+      # First-party Hermes gets a distinct bearer. Only this client_id may turn
+      # Hermes' verified Google Chat sender / Warehouse-linked Calliope session
+      # into an application authorization subject; the legacy shared key remains
+      # attribution-only. Point Hermes' Warehouse MCP header at this value.
+      WAREHOUSE_HERMES_MCP_KEY: ${WAREHOUSE_HERMES_MCP_KEY:-}
+      WAREHOUSE_HERMES_MCP_CALLER: ${WAREHOUSE_HERMES_MCP_CALLER:-}
       # The Hub (docs/HUB_PLAN.md): hub_url in tool responses points at the
       # lens host; auto-thumbnails persist under the shared capture volume
       # and serve at /thumbs (lens proxies them at /api/rvbbit/thumb).

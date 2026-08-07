@@ -14,6 +14,10 @@ Identity model (Phase 1, self-contained — no external IdP):
     calls / receipts can attribute the caller.
   * Backwards-compat: a static WAREHOUSE_MCP_KEY bearer still authenticates (for
     Claude Code's --header path), so both routes work side by side.
+  * A distinct WAREHOUSE_HERMES_MCP_KEY authenticates the first-party Hermes
+    service.  Keeping it separate is what lets Warehouse trust Hermes' bounded
+    delegated-human envelope without granting that power to every legacy key
+    holder.
 
 Known limits (hardening for later): the email is self-asserted (the shared
 password is the real gate) — per-user passwords / magic-link / a real IdP fix
@@ -61,6 +65,17 @@ STATIC_KEY = os.environ.get("WAREHOUSE_MCP_KEY", "")        # legacy shared-key 
 # OAuth access tokens never use this fallback: their verified `sub` remains the
 # caller.  The default preserves existing installations byte-for-byte.
 STATIC_CALLER = os.environ.get("WAREHOUSE_MCP_STATIC_CALLER", "").strip().lower() or "static-key"
+# Hermes is an application service, not a human.  It gets its own credential and
+# client_id so Warehouse can distinguish a verified delegation path from an old
+# shared-key client that merely copied the same request metadata.  The actor label
+# defaults to the existing static-caller label to make upgrades non-disruptive,
+# while the KEY deliberately has no fallback.
+HERMES_KEY = os.environ.get("WAREHOUSE_HERMES_MCP_KEY", "")
+HERMES_CALLER = (
+    os.environ.get("WAREHOUSE_HERMES_MCP_CALLER", "").strip().lower()
+    or STATIC_CALLER
+)
+HERMES_CLIENT_ID = "hermes-service"
 # The JWT signing secret MUST be independent of STATIC_KEY: that key is *handed to
 # users* (it rides in their Authorization header, so it's in client configs, shell
 # history, proxy logs). Reusing it to sign HS256 would let any key-holder forge a
@@ -109,6 +124,13 @@ def validate_config() -> list[str]:
         errs.append("WAREHOUSE_JWT_SECRET is required and must be independent of WAREHOUSE_MCP_KEY.")
     elif STATIC_KEY and hmac.compare_digest(JWT_SECRET, STATIC_KEY):
         errs.append("WAREHOUSE_JWT_SECRET must differ from WAREHOUSE_MCP_KEY (no credential reuse).")
+    elif HERMES_KEY and hmac.compare_digest(JWT_SECRET, HERMES_KEY):
+        errs.append("WAREHOUSE_JWT_SECRET must differ from WAREHOUSE_HERMES_MCP_KEY (no credential reuse).")
+    if HERMES_KEY and STATIC_KEY and hmac.compare_digest(HERMES_KEY, STATIC_KEY):
+        errs.append(
+            "WAREHOUSE_HERMES_MCP_KEY must differ from WAREHOUSE_MCP_KEY; "
+            "delegated identity requires a Hermes-only credential."
+        )
     if AUTH_MODE == "pg":
         pass   # Burrow: credentials are Postgres accounts; no shared password.
     elif not LOGIN_PASSWORD and not google_enabled():
@@ -144,6 +166,12 @@ def config_warnings() -> list[str]:
                  "rvbbit.resolve_identity (an identity_map row, or a role named after the "
                  "email). Anyone unresolved lands on rvbbit_guest — which holds NO grants "
                  "by default — and is queued in rvbbit.identity_pending for provisioning.")
+    if os.environ.get("WAREHOUSE_HERMES_URL", "").strip() and not HERMES_KEY:
+        w.append(
+            "Calliope/Hermes is configured without WAREHOUSE_HERMES_MCP_KEY. "
+            "Forwarded users remain attribution-only; use a distinct Hermes bearer "
+            "before enabling team or artifact authorization."
+        )
     return w
 
 
@@ -315,6 +343,9 @@ class WarehouseAuthProvider:
 
     # — access-token validation, called on every /mcp request —
     async def load_access_token(self, token: str):
+        if HERMES_KEY and hmac.compare_digest(token, HERMES_KEY):
+            return _AccessToken(token=token, client_id=HERMES_CLIENT_ID, scopes=[SCOPE],
+                                expires_at=None, email=HERMES_CALLER)
         if STATIC_KEY and hmac.compare_digest(token, STATIC_KEY):
             return _AccessToken(token=token, client_id="static-key", scopes=[SCOPE],
                                 expires_at=None, email=STATIC_CALLER)

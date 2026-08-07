@@ -25,6 +25,8 @@ BASE_ENV = dict(
     WAREHOUSE_LOGIN_PASSWORD="unit-test-password-long",
     WAREHOUSE_ALLOWED_EMAILS="",
     WAREHOUSE_AUTH="shared",
+    WAREHOUSE_HERMES_MCP_KEY="",
+    WAREHOUSE_HERMES_MCP_CALLER="",
 )
 os.environ.update(BASE_ENV)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

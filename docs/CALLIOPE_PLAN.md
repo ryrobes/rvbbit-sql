@@ -204,6 +204,8 @@ Warehouse:
 WAREHOUSE_HERMES_URL=http://hermes-host:8642
 WAREHOUSE_HERMES_API_KEY=...
 WAREHOUSE_HERMES_MEMORY_KEY=...       # optional, one company scope
+WAREHOUSE_HERMES_MCP_KEY=...          # distinct bearer Hermes presents to Warehouse MCP
+WAREHOUSE_HERMES_MCP_CALLER=calliope@example.com
 WAREHOUSE_CALLIOPE_DIR=/app/data/calliope
 WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS=false
 ```
@@ -215,7 +217,7 @@ mcp_servers:
   rvbbit_warehouse:
     url: https://warehouse.example.com/mcp
     headers:
-      Authorization: Bearer ...
+      Authorization: Bearer ${WAREHOUSE_HERMES_MCP_KEY}
     # Trusted first-party server only: preserve verified native-chat authorship.
     forward_session_identity: true
 
@@ -228,6 +230,13 @@ platforms:
       key: ...                         # same value as WAREHOUSE_HERMES_API_KEY
       model_name: openai/gpt-5.6-sol
 ```
+
+The distinct MCP bearer is the application-security boundary: Warehouse records
+Hermes/Calliope as the credential actor while authorizing the verified Chat sender or
+Warehouse-linked web-session owner as the delegated human subject. Reusing the general
+`WAREHOUSE_MCP_KEY` keeps forwarding attribution-only, so direct scripts cannot claim a
+human by copying Hermes metadata. Direct OAuth users remain their own actor and subject.
+This contract does not impersonate a Postgres role.
 
 `model_name` should be the actual provider-routable model configured on that
 profile, not the default API alias `hermes-agent`. Start the existing profile
