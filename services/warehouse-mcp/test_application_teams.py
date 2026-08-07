@@ -128,6 +128,8 @@ def test_only_authorized_human_subjects_enter_the_people_directory():
         None,
         "google_chat_delegation",
         "google_chat",
+        None,
+        None,
     )
 
 

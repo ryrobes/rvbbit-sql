@@ -38,6 +38,8 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsp
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+import application_teams
+import calliope_access
 import calliope_dreams
 
 
@@ -196,6 +198,8 @@ _KNOWN_TOOLS = {
     "get_calliope_personal_context",
     "finish_calliope_workflow_run",
     "export_to_google_sheets",
+    "calliope_session_access_get",
+    "calliope_session_access_update",
 }
 _ARTIFACT_TOOLS = {
     "publish_dashboard",
@@ -818,7 +822,9 @@ class CalliopeConfig:
     dream_evidence_lab_enabled: bool = True
     dream_timezone: str = "UTC"
     dream_hour: int = 3
-    dream_interval_seconds: int = 15 * 60
+    # Queue polling is intentionally cheap: pg_cron only inserts one durable
+    # sweep row, then this worker claims it without holding a cron connection.
+    dream_interval_seconds: int = 10
 
     @property
     def enabled(self) -> bool:
@@ -894,10 +900,13 @@ class CalliopeConfig:
             dream_hour = 3
         try:
             dream_interval = int(
-                os.environ.get("WAREHOUSE_CALLIOPE_DREAM_TICK_SECONDS", str(15 * 60))
+                os.environ.get(
+                    "WAREHOUSE_CALLIOPE_DREAM_QUEUE_POLL_SECONDS",
+                    os.environ.get("WAREHOUSE_CALLIOPE_DREAM_TICK_SECONDS", "10"),
+                )
             )
         except (TypeError, ValueError):
-            dream_interval = 15 * 60
+            dream_interval = 10
         transcription_provider = os.environ.get(
             "WAREHOUSE_CALLIOPE_STT_PROVIDER", "openai"
         ).strip().lower()
@@ -1019,7 +1028,7 @@ class CalliopeConfig:
                 or "UTC"
             )[:100],
             dream_hour=max(0, min(dream_hour, 23)),
-            dream_interval_seconds=max(60, min(dream_interval, 6 * 60 * 60)),
+            dream_interval_seconds=max(2, min(dream_interval, 5 * 60)),
         )
 
 
@@ -3275,6 +3284,265 @@ CREATE INDEX IF NOT EXISTS calliope_dream_events_dream_idx
     ON rvbbit.calliope_dream_events (dream_id,created_at DESC,event_id DESC);
 """
 
+_PERSONAL_DREAM_DDL = """
+ALTER TABLE rvbbit.calliope_dream_cycles
+    ADD COLUMN IF NOT EXISTS scope_kind text NOT NULL DEFAULT 'company',
+    ADD COLUMN IF NOT EXISTS owner_email text,
+    ADD COLUMN IF NOT EXISTS input_hash text;
+DROP INDEX IF EXISTS rvbbit.calliope_dream_cycles_nightly_date_idx;
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+        WHERE conname='calliope_dream_cycles_scope_check'
+          AND conrelid='rvbbit.calliope_dream_cycles'::regclass) THEN
+        ALTER TABLE rvbbit.calliope_dream_cycles
+            ADD CONSTRAINT calliope_dream_cycles_scope_check CHECK (
+                (scope_kind='company' AND owner_email IS NULL) OR
+                (scope_kind='personal' AND owner_email IS NOT NULL
+                 AND owner_email=lower(btrim(owner_email)) AND owner_email LIKE '%@%'));
+    END IF;
+END
+$do$;
+CREATE UNIQUE INDEX IF NOT EXISTS calliope_dream_cycles_nightly_scope_idx
+    ON rvbbit.calliope_dream_cycles
+       (cycle_date,scope_kind,coalesce(owner_email,'')) WHERE cycle_kind='nightly';
+CREATE INDEX IF NOT EXISTS calliope_dream_cycles_scope_started_idx
+    ON rvbbit.calliope_dream_cycles (scope_kind,owner_email,started_at DESC);
+
+ALTER TABLE rvbbit.calliope_dreams
+    ADD COLUMN IF NOT EXISTS scope_kind text NOT NULL DEFAULT 'company',
+    ADD COLUMN IF NOT EXISTS owner_email text,
+    ADD COLUMN IF NOT EXISTS problem_key text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS semantic_key text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS relevance_kind text NOT NULL DEFAULT 'leverage',
+    ADD COLUMN IF NOT EXISTS portfolio_score numeric(5,4) NOT NULL DEFAULT 0.5,
+    ADD COLUMN IF NOT EXISTS retired_reason text,
+    ADD COLUMN IF NOT EXISTS retired_at timestamptz,
+    ADD COLUMN IF NOT EXISTS last_ranked_at timestamptz;
+UPDATE rvbbit.calliope_dreams
+   SET problem_key=left(coalesce(nullif(problem_key,''),title),500),
+       semantic_key=left(coalesce(nullif(semantic_key,''),
+           regexp_replace(lower(title),'[^a-z0-9]+',' ','g')),1000)
+ WHERE problem_key='' OR semantic_key='';
+UPDATE rvbbit.calliope_dreams SET portfolio_score=rank_score
+ WHERE portfolio_score=0.5 AND rank_score<>0.5;
+ALTER TABLE rvbbit.calliope_dreams
+    DROP CONSTRAINT IF EXISTS calliope_dreams_fingerprint_key;
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+        WHERE conname='calliope_dreams_scope_check'
+          AND conrelid='rvbbit.calliope_dreams'::regclass) THEN
+        ALTER TABLE rvbbit.calliope_dreams
+            ADD CONSTRAINT calliope_dreams_scope_check CHECK (
+                (scope_kind='company' AND owner_email IS NULL) OR
+                (scope_kind='personal' AND owner_email IS NOT NULL
+                 AND owner_email=lower(btrim(owner_email)) AND owner_email LIKE '%@%'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+        WHERE conname='calliope_dreams_relevance_kind_check'
+          AND conrelid='rvbbit.calliope_dreams'::regclass) THEN
+        ALTER TABLE rvbbit.calliope_dreams
+            ADD CONSTRAINT calliope_dreams_relevance_kind_check
+            CHECK (relevance_kind IN ('active_work','follow_up','leverage','learning','system_meta'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+        WHERE conname='calliope_dreams_portfolio_score_check'
+          AND conrelid='rvbbit.calliope_dreams'::regclass) THEN
+        ALTER TABLE rvbbit.calliope_dreams
+            ADD CONSTRAINT calliope_dreams_portfolio_score_check
+            CHECK (portfolio_score BETWEEN 0 AND 1);
+    END IF;
+END
+$do$;
+CREATE UNIQUE INDEX IF NOT EXISTS calliope_dreams_scope_fingerprint_key
+    ON rvbbit.calliope_dreams (scope_kind,coalesce(owner_email,''),fingerprint);
+CREATE INDEX IF NOT EXISTS calliope_dreams_scope_portfolio_idx
+    ON rvbbit.calliope_dreams
+       (scope_kind,owner_email,portfolio_state,status,
+        portfolio_rank NULLS LAST,portfolio_score DESC,updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_user_dossiers (
+    owner_email text PRIMARY KEY,
+    version integer NOT NULL DEFAULT 0,
+    context jsonb NOT NULL DEFAULT '{}'::jsonb,
+    evidence_receipts jsonb NOT NULL DEFAULT '[]'::jsonb,
+    user_guidance text NOT NULL DEFAULT '',
+    paused boolean NOT NULL DEFAULT false,
+    input_hash text,
+    source_watermark timestamptz,
+    evidence_count integer NOT NULL DEFAULT 0,
+    provider text,
+    model text,
+    last_error text,
+    generated_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_user_dossiers_owner_check
+        CHECK (owner_email=lower(btrim(owner_email)) AND owner_email LIKE '%@%'),
+    CONSTRAINT calliope_user_dossiers_version_check CHECK (version>=0),
+    CONSTRAINT calliope_user_dossiers_count_check CHECK (evidence_count>=0),
+    CONSTRAINT calliope_user_dossiers_json_check CHECK (
+        jsonb_typeof(context)='object' AND jsonb_typeof(evidence_receipts)='array')
+);
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_user_dossier_versions (
+    owner_email text NOT NULL REFERENCES rvbbit.calliope_user_dossiers(owner_email) ON DELETE CASCADE,
+    version integer NOT NULL,
+    context jsonb NOT NULL,
+    evidence_receipts jsonb NOT NULL DEFAULT '[]'::jsonb,
+    input_hash text NOT NULL,
+    provider text,
+    model text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner_email,version),
+    CONSTRAINT calliope_user_dossier_versions_version_check CHECK (version>=1),
+    CONSTRAINT calliope_user_dossier_versions_json_check CHECK (
+        jsonb_typeof(context)='object' AND jsonb_typeof(evidence_receipts)='array')
+);
+CREATE INDEX IF NOT EXISTS calliope_user_dossier_versions_created_idx
+    ON rvbbit.calliope_user_dossier_versions (owner_email,created_at DESC);
+
+WITH ranked AS (
+    SELECT id,row_number() OVER (ORDER BY portfolio_score DESC,updated_at DESC,id) AS ordinal
+    FROM rvbbit.calliope_dreams WHERE scope_kind='company' AND status='proposed'
+), normalized AS (
+    UPDATE rvbbit.calliope_dreams d
+       SET portfolio_state=CASE WHEN r.ordinal<=3 THEN 'promoted' ELSE 'backlog' END,
+           portfolio_rank=CASE WHEN r.ordinal<=3 THEN r.ordinal::smallint ELSE NULL END,
+           last_ranked_at=now()
+      FROM ranked r WHERE d.id=r.id
+    RETURNING d.id,d.portfolio_state,d.portfolio_score,d.updated_at
+), backlog AS (
+    SELECT id,row_number() OVER (ORDER BY portfolio_score DESC,updated_at DESC,id) AS ordinal
+    FROM normalized WHERE portfolio_state='backlog'
+)
+UPDATE rvbbit.calliope_dreams d
+   SET status='retired',retired_reason='portfolio_cap',retired_at=now(),portfolio_rank=NULL
+  FROM backlog b WHERE d.id=b.id AND b.ordinal>30;
+"""
+
+_DREAM_SCHEDULER_DDL = """
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_dream_settings (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    processing_paused boolean NOT NULL DEFAULT false,
+    company_enabled boolean NOT NULL DEFAULT true,
+    personal_enabled boolean NOT NULL DEFAULT true,
+    active_window_days integer NOT NULL DEFAULT 30,
+    min_chat_turns integer NOT NULL DEFAULT 2,
+    min_tool_calls integer NOT NULL DEFAULT 3,
+    max_personal_users integer NOT NULL DEFAULT 200,
+    telemetry_retention_days integer NOT NULL DEFAULT 90,
+    updated_by text NOT NULL DEFAULT 'calliope@system',
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT calliope_dream_settings_window_check CHECK (active_window_days BETWEEN 7 AND 90),
+    CONSTRAINT calliope_dream_settings_chat_check CHECK (min_chat_turns BETWEEN 1 AND 20),
+    CONSTRAINT calliope_dream_settings_calls_check CHECK (min_tool_calls BETWEEN 1 AND 50),
+    CONSTRAINT calliope_dream_settings_users_check CHECK (max_personal_users BETWEEN 1 AND 500),
+    CONSTRAINT calliope_dream_settings_retention_check CHECK (telemetry_retention_days BETWEEN 14 AND 730)
+);
+INSERT INTO rvbbit.calliope_dream_settings (singleton) VALUES (true)
+ON CONFLICT (singleton) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_dream_sweeps (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_date date NOT NULL DEFAULT current_date,
+    source text NOT NULL DEFAULT 'cron',
+    requested_by text NOT NULL DEFAULT 'calliope@system',
+    status text NOT NULL DEFAULT 'pending',
+    dedupe_key text UNIQUE,
+    options jsonb NOT NULL DEFAULT '{}'::jsonb,
+    active_user_count integer NOT NULL DEFAULT 0,
+    planned_job_count integer NOT NULL DEFAULT 0,
+    completed_job_count integer NOT NULL DEFAULT 0,
+    skipped_job_count integer NOT NULL DEFAULT 0,
+    failed_job_count integer NOT NULL DEFAULT 0,
+    worker_id text,
+    error text,
+    requested_at timestamptz NOT NULL DEFAULT now(),
+    started_at timestamptz,
+    completed_at timestamptz,
+    CONSTRAINT calliope_dream_sweeps_source_check CHECK (source IN ('cron','scheduler','api','manual','retry')),
+    CONSTRAINT calliope_dream_sweeps_status_check CHECK (status IN ('pending','planning','running','complete','partial','failed','paused')),
+    CONSTRAINT calliope_dream_sweeps_options_check CHECK (jsonb_typeof(options)='object'),
+    CONSTRAINT calliope_dream_sweeps_counts_check CHECK (
+        active_user_count>=0 AND planned_job_count>=0 AND completed_job_count>=0
+        AND skipped_job_count>=0 AND failed_job_count>=0)
+);
+CREATE INDEX IF NOT EXISTS calliope_dream_sweeps_status_requested_idx
+    ON rvbbit.calliope_dream_sweeps (status,requested_at);
+CREATE INDEX IF NOT EXISTS calliope_dream_sweeps_recent_idx
+    ON rvbbit.calliope_dream_sweeps (requested_at DESC);
+
+CREATE TABLE IF NOT EXISTS rvbbit.calliope_dream_jobs (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    sweep_id uuid NOT NULL REFERENCES rvbbit.calliope_dream_sweeps(id) ON DELETE CASCADE,
+    scope_kind text NOT NULL,
+    owner_email text,
+    status text NOT NULL DEFAULT 'pending',
+    outcome text,
+    cycle_id uuid REFERENCES rvbbit.calliope_dream_cycles(id) ON DELETE SET NULL,
+    attempt integer NOT NULL DEFAULT 0,
+    worker_id text,
+    error text,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    queued_at timestamptz NOT NULL DEFAULT now(),
+    started_at timestamptz,
+    completed_at timestamptz,
+    CONSTRAINT calliope_dream_jobs_scope_check CHECK (
+        (scope_kind='company' AND owner_email IS NULL) OR
+        (scope_kind='personal' AND owner_email IS NOT NULL
+         AND owner_email=lower(btrim(owner_email)) AND owner_email LIKE '%@%')),
+    CONSTRAINT calliope_dream_jobs_status_check CHECK (status IN ('pending','running','complete','skipped','failed')),
+    CONSTRAINT calliope_dream_jobs_attempt_check CHECK (attempt>=0),
+    CONSTRAINT calliope_dream_jobs_metadata_check CHECK (jsonb_typeof(metadata)='object')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS calliope_dream_jobs_sweep_scope_idx
+    ON rvbbit.calliope_dream_jobs (sweep_id,scope_kind,coalesce(owner_email,''));
+CREATE INDEX IF NOT EXISTS calliope_dream_jobs_queue_idx
+    ON rvbbit.calliope_dream_jobs (status,queued_at);
+CREATE INDEX IF NOT EXISTS calliope_dream_jobs_owner_recent_idx
+    ON rvbbit.calliope_dream_jobs (owner_email,started_at DESC) WHERE scope_kind='personal';
+
+CREATE OR REPLACE FUNCTION rvbbit.calliope_dream_enqueue(
+    p_source text DEFAULT 'cron',p_requested_by text DEFAULT 'calliope@system',p_force boolean DEFAULT false
+) RETURNS uuid LANGUAGE plpgsql SET search_path=pg_catalog,rvbbit AS $fn$
+DECLARE
+    v_source text := lower(btrim(coalesce(p_source,'cron')));
+    v_requested_by text := left(coalesce(nullif(btrim(p_requested_by),''),'calliope@system'),320);
+    v_settings rvbbit.calliope_dream_settings%ROWTYPE;
+    v_id uuid;
+    v_key text;
+BEGIN
+    IF v_source NOT IN ('cron','scheduler','api','manual','retry') THEN
+        RAISE EXCEPTION 'unsupported Dream sweep source: %',v_source;
+    END IF;
+    SELECT * INTO v_settings FROM rvbbit.calliope_dream_settings WHERE singleton;
+    IF NOT FOUND THEN
+        INSERT INTO rvbbit.calliope_dream_settings (singleton) VALUES (true)
+        RETURNING * INTO v_settings;
+    END IF;
+    v_key := CASE WHEN p_force THEN NULL ELSE v_source||':'||current_date::text END;
+    INSERT INTO rvbbit.calliope_dream_sweeps
+        (run_date,source,requested_by,status,dedupe_key,options)
+    VALUES (
+        current_date,v_source,v_requested_by,
+        CASE WHEN v_settings.processing_paused THEN 'paused' ELSE 'pending' END,
+        v_key,
+        jsonb_build_object(
+            'company_enabled',v_settings.company_enabled,
+            'personal_enabled',v_settings.personal_enabled,
+            'active_window_days',v_settings.active_window_days,
+            'min_chat_turns',v_settings.min_chat_turns,
+            'min_tool_calls',v_settings.min_tool_calls,
+            'max_personal_users',v_settings.max_personal_users)
+    ) ON CONFLICT (dedupe_key) DO UPDATE
+       SET requested_at=rvbbit.calliope_dream_sweeps.requested_at
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END
+$fn$;
+"""
+
 _ACTION_DDL = """
 CREATE TABLE IF NOT EXISTS rvbbit.calliope_action_catalog (
     id text PRIMARY KEY,
@@ -3444,6 +3712,10 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
         # rvbbit.migrate() here can make an unrelated pending extension
         # migration prevent the HTTP service from starting at all.
         conn.execute(_DDL)
+        # Teams are initialized before Calliope during Warehouse startup. Keep
+        # the sharing projection additive here as well so service and extension
+        # images can be rolled forward in either order.
+        conn.execute(calliope_access.DDL)
         conn.execute(_STYLE_DDL)
         _seed_builtin_design_profiles(conn)
         conn.execute(_HOME_DDL)
@@ -3458,6 +3730,8 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
         conn.execute(_COST_CALLER_DDL)
         conn.execute(_WORKFLOW_DDL)
         conn.execute(_DREAM_DDL)
+        conn.execute(_PERSONAL_DREAM_DDL)
+        conn.execute(_DREAM_SCHEDULER_DDL)
         conn.execute(_ACTION_DDL)
         _seed_action_catalog(conn)
         # A server restart cannot preserve an in-flight SSE/agent task. Clear
@@ -19656,6 +19930,16 @@ def _turn_json(row: Any) -> dict[str, Any]:
     item["evidence_refs"] = item.get("evidence_refs") or []
     item["object_refs"] = item.get("object_refs") or []
     item["response_receipt"] = item.get("response_receipt") or {}
+    author_key = item.pop("author_avatar_key", None)
+    profile_name = item.pop("author_profile_name", None)
+    author_email = str(item.get("author_email") or "").strip().lower()
+    item["author"] = {
+        "email": author_email,
+        "display_name": (
+            item.get("author_display_name") or profile_name or author_email
+        ),
+        "avatar_url": calliope_access.avatar_url(author_key),
+    }
     return item
 
 
@@ -19674,6 +19958,21 @@ def _session_json(row: Any) -> dict[str, Any]:
     ):
         if item.get(key) is not None:
             item[key] = str(item[key])
+    owner_key = item.pop("owner_avatar_key", None)
+    owner_name = item.pop("owner_display_name", None)
+    owner_email = str(item.get("owner_email") or "").strip().lower()
+    item["owner"] = {
+        "email": owner_email,
+        "display_name": owner_name or owner_email,
+        "avatar_url": calliope_access.avatar_url(owner_key),
+    }
+    item["access_role"] = str(item.get("access_role") or "owner")
+    item["read_only"] = item["access_role"] != "owner"
+    try:
+        item["share_count"] = int(item.get("share_count") or 0)
+    except (TypeError, ValueError):
+        item["share_count"] = 0
+    item["shared"] = item["share_count"] > 0 or item["read_only"]
     return item
 
 
@@ -20733,10 +21032,21 @@ def _generate_session_synopsis(
     try:
         with conn_factory() as conn:
             available = conn.execute(
-                "SELECT to_regprocedure('rvbbit.clover_llm_apply(text,text)') IS NOT NULL AS clover,"
-                "to_regprocedure('rvbbit.summarize(text)') IS NOT NULL AS summarize"
+                "SELECT "
+                "to_regprocedure('rvbbit.clover_llm_apply(text,text,jsonb)') IS NOT NULL AS clover3,"
+                "to_regprocedure('rvbbit.clover_llm_apply(text,text)') IS NOT NULL AS clover2,"
+                "to_regprocedure('rvbbit.summarize(text,jsonb)') IS NOT NULL AS summarize2,"
+                "to_regprocedure('rvbbit.summarize(text)') IS NOT NULL AS summarize1"
             ).fetchone()
-        if available and available.get("clover"):
+        if available and available.get("clover3"):
+            with conn_factory() as conn:
+                raw = conn.execute(
+                    "SELECT rvbbit.clover_llm_apply(%s,%s,%s::jsonb) AS synopsis",
+                    (source, instruction, "{}"),
+                ).fetchone()
+            synopsis = _clean_session_synopsis((raw or {}).get("synopsis"))
+            provider, model, operator = "clover", "clover_llm_apply", "clover_llm_apply"
+        elif available and available.get("clover2"):
             with conn_factory() as conn:
                 raw = conn.execute(
                     "SELECT rvbbit.clover_llm_apply(%s,%s) AS synopsis",
@@ -20744,12 +21054,16 @@ def _generate_session_synopsis(
                 ).fetchone()
             synopsis = _clean_session_synopsis((raw or {}).get("synopsis"))
             provider, model, operator = "clover", "clover_llm_apply", "clover_llm_apply"
-        elif available and available.get("summarize"):
+        elif available and (available.get("summarize2") or available.get("summarize1")):
             operator_input = instruction + "\n\n" + source
             with conn_factory() as conn:
                 raw = conn.execute(
-                    "SELECT rvbbit.summarize(%s) AS synopsis",
-                    (operator_input,),
+                    "SELECT rvbbit.summarize(%s,%s::jsonb) AS synopsis"
+                    if available.get("summarize2")
+                    else "SELECT rvbbit.summarize(%s) AS synopsis",
+                    (operator_input, "{}")
+                    if available.get("summarize2")
+                    else (operator_input,),
                 ).fetchone()
             synopsis = _clean_session_synopsis((raw or {}).get("synopsis"))
             provider, model, operator = "rvbbit", "summarize", "summarize"
@@ -20763,8 +21077,9 @@ def _generate_session_synopsis(
             with conn_factory() as conn:
                 receipts = conn.execute(
                     "UPDATE rvbbit.receipts SET caller=%s WHERE operator=%s AND caller IS NULL "
-                    "AND invocation_at>=%s AND inputs::text LIKE %s RETURNING receipt_id",
-                    (owner, operator, started_at, "%" + operator_input[:500] + "%"),
+                    "AND invocation_at>=%s AND (inputs->>'t'=%s OR inputs->>'text'=%s) "
+                    "RETURNING receipt_id",
+                    (owner, operator, started_at, operator_input, operator_input),
                 ).fetchall()
                 receipt_ids = [str(item["receipt_id"]) for item in receipts]
                 if receipt_ids:
@@ -21325,6 +21640,19 @@ def register_calliope_routes(
             headers={"cache-control": "no-store"},
         )
 
+    def artifact_not_found_response(owner: str, session: dict[str, Any]) -> HTMLResponse:
+        return HTMLResponse(
+            warehouse_theme.artifact_not_found_document(owner, session),
+            status_code=404,
+            headers={
+                "cache-control": "private, no-store, max-age=0, must-revalidate",
+                "pragma": "no-cache",
+                "expires": "0",
+                "vary": "Cookie, Authorization",
+                "x-content-type-options": "nosniff",
+            },
+        )
+
     def browser_asset(request: Any, name: str, media_type: str) -> FileResponse:
         """Cache a content-addressed bundle forever; revalidate unversioned fallbacks."""
         requested = str(request.query_params.get("v") or "")
@@ -21350,6 +21678,46 @@ def register_calliope_routes(
             return None, json_response({"error": {"code": "ACCESS_PENDING"}}, 403)
         return owner, None
 
+    def request_authorization(request: Any) -> dict[str, Any]:
+        owner, signed = _canonical_owner(request)
+        signed = signed or {}
+        return {
+            "actor": owner,
+            "subject": owner,
+            "mode": str(signed.get("via") or "browser_session")[:80],
+            "delegated": False,
+            "platform": "calliope",
+            "session_ref": None,
+        }
+
+    def observe_browser_principal(request: Any) -> dict[str, Any] | None:
+        owner, signed = _canonical_owner(request)
+        if not owner or not signed or not signed.get("mapped", True):
+            return signed
+        try:
+            with conn_factory() as conn:
+                application_teams.observe_principal_on_connection(
+                    conn,
+                    request_authorization(request),
+                    channel="calliope",
+                    display_name=str(signed.get("name") or "")[:160] or None,
+                    avatar_provider=(
+                        "google" if signed.get("via") == "google" else None
+                    ),
+                    avatar_source_url=str(signed.get("picture") or "") or None,
+                )
+        except Exception:
+            # Directory enrichment is presentational. A stale migration or
+            # transient database issue must not make the notebook unavailable.
+            pass
+        return signed
+
+    def access_error_response(exc: calliope_access.CalliopeAccessError) -> Response:
+        return json_response(
+            {"error": {"code": exc.code, "message": str(exc)}},
+            exc.status,
+        )
+
     @mcp.custom_route("/calliope", methods=["GET"])
     async def calliope_page(request):
         owner, session = _canonical_owner(request)
@@ -21357,6 +21725,7 @@ def register_calliope_routes(
             return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
         if not session.get("mapped", True):
             return RedirectResponse("/gallery", status_code=302)
+        observe_browser_principal(request)
         template = (_ASSET_DIR / "index.html").read_text(encoding="utf-8")
         background = auth.background_layer(
             0.74,
@@ -21435,11 +21804,58 @@ def register_calliope_routes(
             },
         )
 
+    @mcp.custom_route("/api/calliope/avatars/{avatar_key}", methods=["GET"])
+    async def calliope_person_avatar(request):
+        """Proxy observed real avatars; a provider miss intentionally stays 404."""
+        _viewer, err = api_owner(request)
+        if err:
+            return Response(status_code=404)
+        avatar_key = _uuid(request.path_params.get("avatar_key"))
+        if not avatar_key:
+            return Response(status_code=404)
+        with conn_factory() as conn:
+            row = conn.execute(
+                "SELECT email,avatar_provider,avatar_source_url "
+                "FROM rvbbit.application_principals WHERE avatar_key=%s::uuid",
+                (avatar_key,),
+            ).fetchone()
+        if not row:
+            return Response(status_code=404)
+        source_url = str(row.get("avatar_source_url") or "")
+        if row.get("avatar_provider") == "google" and source_url:
+            fetch = auth._fetch_google_avatar(source_url)
+        else:
+            fetch = auth._fetch_gravatar_avatar(str(row.get("email") or ""))
+        try:
+            data, media_type = await fetch
+        except auth._AvatarNotFound:
+            return Response(
+                status_code=404,
+                headers={"cache-control": "private, max-age=900"},
+            )
+        except Exception:
+            return Response(
+                status_code=404,
+                headers={"cache-control": "private, max-age=60"},
+            )
+        return Response(
+            data,
+            media_type=media_type,
+            headers={
+                "cache-control": "private, max-age=900",
+                "cross-origin-resource-policy": "same-origin",
+                "x-content-type-options": "nosniff",
+            },
+        )
+
     @mcp.custom_route("/api/calliope/config", methods=["GET"])
     async def calliope_config(request):
-        _, err = api_owner(request)
+        owner, err = api_owner(request)
         if err:
             return err
+        can_view_company_dreams = await asyncio.to_thread(
+            calliope_dreams.is_company_admin, conn_factory, owner
+        )
         healthy = False
         detail = None
         try:
@@ -21463,13 +21879,24 @@ def register_calliope_routes(
                 "max_per_cycle": calliope_dreams.MAX_DREAMS,
                 "promoted_per_cycle": calliope_dreams.MAX_DREAMS,
                 "candidates_per_cycle": calliope_dreams.MAX_CANDIDATES,
+                "personal_candidates_per_cycle": calliope_dreams.MAX_PERSONAL_CANDIDATES,
+                "personal_backlog": calliope_dreams.PORTFOLIO_POLICIES["personal"]["backlog"],
+                "company_backlog": calliope_dreams.PORTFOLIO_POLICIES["company"]["backlog"],
                 "manual_window_days": calliope_dreams.MANUAL_WINDOW_DAYS,
                 "horizon_window_days": calliope_dreams.HORIZON_WINDOW_DAYS,
                 "evidence_lab": config.dream_evidence_lab_enabled,
                 "automatic": config.dreaming_enabled,
+                "default_scope": "personal",
+                "can_view_company": can_view_company_dreams,
+                "scopes": ["personal", "company"] if can_view_company_dreams else ["personal"],
             },
             "action_library": True,
             "trusted_organization_actions": True,
+            "viewer": {
+                "email": owner,
+                "display_name": str((auth.read_session_full(request) or {}).get("name") or owner),
+                "avatar_url": "/auth/avatar",
+            },
             "evidence_search": evidence_search is not None,
             "evidence_open": evidence_open is not None,
             "max_image_bytes": config.max_image_bytes,
@@ -21544,12 +21971,18 @@ def register_calliope_routes(
             })
         try:
             limit = max(1, min(int(request.query_params.get("limit") or 60), 120))
+            scope_kind = str(request.query_params.get("scope") or "personal").strip().lower()
             result = await asyncio.to_thread(
                 calliope_dreams.snapshot,
                 conn_factory,
                 owner,
                 view=request.query_params.get("view") or "active",
                 limit=limit,
+                scope_kind=scope_kind,
+            )
+        except PermissionError as exc:
+            return json_response(
+                {"error": {"code": "DREAM_SCOPE_FORBIDDEN", "message": str(exc)}}, 403
             )
         except ValueError as exc:
             return json_response(
@@ -21575,6 +22008,12 @@ def register_calliope_routes(
             body = {}
         body = body if isinstance(body, dict) else {}
         try:
+            scope_kind, scoped_owner = await asyncio.to_thread(
+                calliope_dreams.require_scope_access,
+                conn_factory,
+                owner,
+                body.get("scope") or "personal",
+            )
             result = await asyncio.to_thread(
                 calliope_dreams.run_cycle,
                 conn_factory,
@@ -21582,7 +22021,13 @@ def register_calliope_routes(
                 generated_by=owner,
                 cycle_kind="manual",
                 mode=body.get("mode") or "deepen",
+                scope_kind=scope_kind,
+                owner_email=scoped_owner,
             )
+        except PermissionError as exc:
+            return json_response({
+                "error": {"code": "DREAM_SCOPE_FORBIDDEN", "message": str(exc)}
+            }, 403)
         except RuntimeError as exc:
             message = str(exc).lower()
             status = 409 if "cycle is starting" in message or "already running" in message else 502
@@ -21597,6 +22042,40 @@ def register_calliope_routes(
                 }
             }, 502)
         return json_response(result, 201 if result.get("created") else 200)
+
+    @mcp.custom_route("/api/calliope/dreams/context", methods=["GET"])
+    async def get_calliope_dream_context(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        dossier = await asyncio.to_thread(
+            calliope_dreams.load_user_dossier, conn_factory, owner
+        )
+        return json_response({"context": calliope_dreams.dossier_public(dossier)})
+
+    @mcp.custom_route("/api/calliope/dreams/context", methods=["PATCH"])
+    async def update_calliope_dream_context(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            dossier = await asyncio.to_thread(
+                calliope_dreams.modify_user_dossier,
+                conn_factory,
+                owner,
+                body.get("action"),
+                note=body.get("note"),
+            )
+        except ValueError as exc:
+            return json_response({
+                "error": {"code": "BAD_DREAM_CONTEXT_ACTION", "message": str(exc)}
+            }, 400)
+        return json_response({"context": dossier})
 
     @mcp.custom_route("/api/calliope/dreams/{dream_id}", methods=["PATCH"])
     async def update_calliope_dream(request):
@@ -21643,7 +22122,10 @@ def register_calliope_routes(
                 "SELECT * FROM rvbbit.calliope_dreams WHERE id=%s::uuid AND status<>'retired'",
                 (dream_id,),
             ).fetchone()
-        if not dream_row:
+            accessible = bool(
+                dream_row and calliope_dreams._dream_accessible(conn, owner, dream_row)
+            )
+        if not dream_row or not accessible:
             return json_response({"error": {"code": "DREAM_NOT_FOUND"}}, 404)
         dream = calliope_dreams.dream_public(dream_row)
         try:
@@ -21684,7 +22166,10 @@ def register_calliope_routes(
             "tool_name": "calliope_dream_handoff",
             "tool_call_id": f"dream-handoff:{dream_id}:{turn_id}",
             "lineage_key": f"dream:{dream_id}",
-            "payload": {"mode": "company_dream", "dream": dream},
+            "payload": {
+                "mode": "personal_dream" if dream.get("scope_kind") == "personal" else "company_dream",
+                "dream": dream,
+            },
             "source": {
                 "origin": "calliope_dreams",
                 "dream_id": dream_id,
@@ -26125,6 +26610,86 @@ def register_calliope_routes(
             status = 503
         return json_response(result, status)
 
+    @mcp.custom_route(
+        "/api/calliope/sessions/{session_id}/access", methods=["GET"]
+    )
+    async def get_session_access(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            result = await asyncio.to_thread(
+                calliope_access.get_access,
+                conn_factory,
+                request_authorization(request),
+                request.path_params["session_id"],
+            )
+        except calliope_access.CalliopeAccessError as exc:
+            return access_error_response(exc)
+        return json_response(result)
+
+    @mcp.custom_route(
+        "/api/calliope/sessions/{session_id}/access", methods=["PUT"]
+    )
+    async def update_session_access(request):
+        _owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            result = await asyncio.to_thread(
+                calliope_access.replace_access,
+                conn_factory,
+                request_authorization(request),
+                request.path_params["session_id"],
+                body.get("expected_revision"),
+                team_ids=body.get("team_ids"),
+                people=body.get("people"),
+                confirm_everyone=body.get("confirm_everyone") is True,
+            )
+        except calliope_access.CalliopeAccessError as exc:
+            return access_error_response(exc)
+        return json_response(result)
+
+    @mcp.custom_route("/api/calliope/session-events", methods=["GET"])
+    async def calliope_session_events(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+
+        async def changes() -> AsyncIterator[bytes]:
+            digest = await asyncio.to_thread(
+                calliope_access.visible_digest, conn_factory, owner
+            )
+            yield _sse("calliope.sessions.ready", {"digest": digest})
+            heartbeat_at = time.monotonic()
+            while not await request.is_disconnected():
+                await asyncio.sleep(1.5)
+                next_digest = await asyncio.to_thread(
+                    calliope_access.visible_digest, conn_factory, owner
+                )
+                if next_digest != digest:
+                    digest = next_digest
+                    yield _sse("calliope.sessions.changed", {"digest": digest})
+                    heartbeat_at = time.monotonic()
+                elif time.monotonic() - heartbeat_at >= 15:
+                    yield b": keepalive\n\n"
+                    heartbeat_at = time.monotonic()
+
+        return StreamingResponse(
+            changes(),
+            media_type="text/event-stream",
+            headers={
+                "cache-control": "no-store",
+                "x-accel-buffering": "no",
+                "connection": "keep-alive",
+            },
+        )
+
     @mcp.custom_route("/api/calliope/sessions", methods=["GET"])
     async def list_sessions(request):
         owner, err = api_owner(request)
@@ -26135,6 +26700,14 @@ def register_calliope_routes(
                 "SELECT s.*, count(DISTINCT t.id)::int AS turn_count,"
                 " count(DISTINCT f.id)::int AS surface_count,"
                 " max(f.created_at) AS last_surface_at,"
+                " CASE WHEN lower(s.owner_email)=lower(%s) THEN 'owner' ELSE 'viewer' END"
+                " AS access_role,"
+                " (SELECT p.display_name FROM rvbbit.application_principals p"
+                " WHERE p.email=lower(s.owner_email)) AS owner_display_name,"
+                " (SELECT p.avatar_key::text FROM rvbbit.application_principals p"
+                " WHERE p.email=lower(s.owner_email)) AS owner_avatar_key,"
+                " (SELECT count(*)::int FROM rvbbit.calliope_session_view_grants g"
+                " WHERE g.session_id=s.id) AS share_count,"
                 " sn.synopsis,sn.status AS synopsis_status,sn.updated_at AS synopsis_updated_at,"
                 " b.id AS brief_id,b.brief_date,b.timezone AS brief_timezone,"
                 " wr.workflow_run_id,wr.workflow_id,wr.workflow_version,"
@@ -26189,7 +26762,7 @@ def register_calliope_routes(
                 "LEFT JOIN rvbbit.calliope_session_synopses sn ON sn.session_id=s.id "
                 "LEFT JOIN rvbbit.calliope_turns t ON t.session_id=s.id "
                 "LEFT JOIN rvbbit.calliope_surfaces f ON f.session_id=s.id "
-                "WHERE s.owner_email=%s AND NOT s.archived "
+                "WHERE rvbbit.calliope_session_can_view(s.id,%s,false) "
                 "GROUP BY s.id,b.id,b.brief_date,b.timezone,"
                 " wr.workflow_run_id,wr.workflow_id,wr.workflow_version,wr.workflow_name,"
                 " wr.workflow_run_status,wr.workflow_run_trigger_kind,"
@@ -26199,7 +26772,7 @@ def register_calliope_routes(
                 " ac.action_handoff_surface_id,ac.action_id,ac.action_title,"
                 " ac.action_created_at,sn.session_id,sn.synopsis,sn.status,sn.updated_at "
                 "ORDER BY s.updated_at DESC",
-                (owner,),
+                (owner, owner),
             ).fetchall()
         return json_response({"sessions": [_session_json(row) for row in rows]})
 
@@ -26498,13 +27071,23 @@ def register_calliope_routes(
         owner, err = api_owner(request)
         if err:
             return err
-        session = _session_for_owner(conn_factory, request.path_params["session_id"], owner)
-        if not session:
-            return json_response({"error": {"code": "NOT_FOUND"}}, 404)
-        _reconcile_session_files(conn_factory, config, str(session["id"]))
+        try:
+            with conn_factory() as conn:
+                session = calliope_access.require_view(
+                    conn, request.path_params["session_id"], owner
+                )
+                audience = calliope_access._audience(conn, session)
+        except calliope_access.CalliopeAccessError as exc:
+            return access_error_response(exc)
+        if session.get("access_role") == "owner":
+            _reconcile_session_files(conn_factory, config, str(session["id"]))
         with conn_factory() as conn:
             turns = conn.execute(
-                "SELECT * FROM rvbbit.calliope_turns WHERE session_id=%s::uuid "
+                "SELECT t.*,p.display_name AS author_profile_name,"
+                "p.avatar_key::text AS author_avatar_key "
+                "FROM rvbbit.calliope_turns t "
+                "LEFT JOIN rvbbit.application_principals p "
+                "ON p.email=lower(t.author_email) WHERE t.session_id=%s::uuid "
                 "ORDER BY ordinal",
                 (str(session["id"]),),
             ).fetchall()
@@ -26517,6 +27100,7 @@ def register_calliope_routes(
             "session": _session_json(session),
             "turns": [_turn_json(row) for row in turns],
             "surfaces": [_surface_json(row) for row in surfaces],
+            "audience": audience,
         })
 
     @mcp.custom_route("/api/calliope/sessions/{session_id}", methods=["PATCH"])
@@ -26590,8 +27174,8 @@ def register_calliope_routes(
         with conn_factory() as conn:
             row = conn.execute(
                 "SELECT a.* FROM rvbbit.calliope_attachments a "
-                "JOIN rvbbit.calliope_sessions s ON s.id=a.session_id "
-                "WHERE a.id=%s::uuid AND s.owner_email=%s",
+                "WHERE a.id=%s::uuid "
+                "AND rvbbit.calliope_session_can_view(a.session_id,%s,false)",
                 (aid, owner),
             ).fetchone()
         if not row:
@@ -26625,8 +27209,8 @@ def register_calliope_routes(
         with conn_factory() as conn:
             row = conn.execute(
                 "SELECT f.* FROM rvbbit.calliope_surfaces f "
-                "JOIN rvbbit.calliope_sessions s ON s.id=f.session_id "
-                "WHERE f.id=%s::uuid AND f.kind='document' AND s.owner_email=%s",
+                "WHERE f.id=%s::uuid AND f.kind='document' "
+                "AND rvbbit.calliope_session_can_view(f.session_id,%s,false)",
                 (surface_id, owner),
             ).fetchone()
         if not row:
@@ -26852,8 +27436,8 @@ def register_calliope_routes(
             row = conn.execute(
                 "SELECT f.session_id,f.payload "
                 "FROM rvbbit.calliope_surfaces f "
-                "JOIN rvbbit.calliope_sessions s ON s.id=f.session_id "
-                "WHERE f.id=%s::uuid AND f.kind='image' AND s.owner_email=%s",
+                "WHERE f.id=%s::uuid AND f.kind='image' "
+                "AND rvbbit.calliope_session_can_view(f.session_id,%s,false)",
                 (surface_id, owner),
             ).fetchone()
         if not row:
@@ -26946,21 +27530,31 @@ def register_calliope_routes(
             return RedirectResponse("/gallery", status_code=302)
         slug = request.path_params["slug"]
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", slug, re.I):
-            return HTMLResponse("<h1>404</h1>", status_code=404)
+            return artifact_not_found_response(owner, session)
         try:
             version = int(request.path_params["version"])
         except (TypeError, ValueError):
-            return HTMLResponse("<h1>404</h1>", status_code=404)
+            return artifact_not_found_response(owner, session)
+        shared_session_id = _uuid(request.query_params.get("session"))
         with conn_factory() as conn:
             row = conn.execute(
                 "SELECT v.html,v.manifest FROM rvbbit.dashboards d "
                 "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
-                "WHERE d.slug=%s AND v.version=%s AND NOT d.archived "
-                "AND rvbbit.artifact_can_view(d.id,%s,false)",
-                (slug, version, owner),
+                "WHERE d.slug=%s AND v.version=%s AND ("
+                " (NOT d.archived AND rvbbit.artifact_can_view(d.id,%s,false))"
+                " OR (%s::uuid IS NOT NULL AND EXISTS ("
+                "  SELECT 1 FROM rvbbit.calliope_surfaces f"
+                "  WHERE f.session_id=%s::uuid AND f.kind='artifact'"
+                "  AND f.artifact_slug=d.slug AND f.artifact_version=v.version"
+                "  AND rvbbit.calliope_session_can_view(f.session_id,%s,false)"
+                " )))",
+                (
+                    slug, version, owner, shared_session_id,
+                    shared_session_id, owner,
+                ),
             ).fetchone()
         if not row:
-            return HTMLResponse("<h1>404 — no such artifact version</h1>", status_code=404)
+            return artifact_not_found_response(owner, session)
         embedded = request.query_params.get("embed") == "1"
         return HTMLResponse(
             _artifact_version_document(
@@ -26983,6 +27577,11 @@ def register_calliope_routes(
         owner, err = api_owner(request)
         if err:
             return err
+        signed_profile = observe_browser_principal(request) or {}
+        author_display_name = (
+            re.sub(r"\s+", " ", str(signed_profile.get("name") or "")).strip()[:160]
+            or owner
+        )
         session = _session_for_owner(conn_factory, request.path_params["session_id"], owner)
         if not session:
             return json_response({"error": {"code": "NOT_FOUND"}}, 404)
@@ -27158,8 +27757,9 @@ def register_calliope_routes(
                 conn.execute(
                     "INSERT INTO rvbbit.calliope_turns "
                     "(id,session_id,ordinal,user_message,selected_surface_id,"
-                    "design_profile_version_id,evidence_refs,object_refs) "
-                    "VALUES (%s::uuid,%s::uuid,%s,%s,%s::uuid,%s::uuid,%s::jsonb,%s::jsonb)",
+                    "design_profile_version_id,evidence_refs,object_refs,"
+                    "author_email,author_display_name) "
+                    "VALUES (%s::uuid,%s::uuid,%s,%s,%s::uuid,%s::uuid,%s::jsonb,%s::jsonb,%s,%s)",
                     (
                         turn_id,
                         str(session["id"]),
@@ -27174,6 +27774,8 @@ def register_calliope_routes(
                         design_profile_version_id,
                         json.dumps(evidence_refs, default=str),
                         json.dumps(object_refs, default=str),
+                        owner,
+                        author_display_name,
                     ),
                 )
                 conn.execute(
@@ -27231,6 +27833,11 @@ def register_calliope_routes(
             "for explicit approval before execute_calliope_action. Credentials never belong in "
             "chat or tool arguments: secret-required actions must finish in the secure native "
             "Calliope Library form. "
+            "When the user asks who can see this notebook or asks to share/unshare it, use "
+            "calliope_session_access_get and calliope_session_access_update with the exact "
+            "originating session_id above. Explain that recipients are view-only, inspect the "
+            "current revision first, never infer an email, and require explicit confirmation "
+            "before adding Everyone. "
             "When the user wants to make a repeatable workflow into a small reusable interface, "
             "co-design it and call draft_calliope_instrument with this session_id; that creates "
             "a private human-reviewable draft and never publishes it automatically. When the "
@@ -27282,6 +27889,11 @@ def register_calliope_routes(
             yield _sse("calliope.turn.started", {
                 "turn_id": turn_id,
                 "ordinal": next_ordinal,
+                "author": {
+                    "email": owner,
+                    "display_name": author_display_name,
+                    "avatar_url": "/auth/avatar",
+                },
                 "attachments": stored_attachments,
                 "evidence_refs": evidence_refs,
                 "object_refs": object_refs,

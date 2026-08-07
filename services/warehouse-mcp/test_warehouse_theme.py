@@ -76,6 +76,40 @@ def test_theme_assets_are_shared_by_every_first_party_warehouse_shell():
     assert "/theme/datarabbit.svg" in server
 
 
+def test_artifact_not_found_is_generic_adaptive_system_chrome(monkeypatch):
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "auth",
+        SimpleNamespace(
+            background_layer=lambda opacity, veil, scene_key=None: (
+                calls.append((opacity, veil, scene_key)) or '<div class="warehouse-desktop-background"></div>'
+            )
+        ),
+    )
+
+    html = warehouse_theme.artifact_not_found_document(
+        "Ada@Example.com",
+        {"identity": "Ada@Example.com", "name": "Ada", "via": "google"},
+    )
+
+    assert 'data-warehouse-page="artifact-not-found"' in html
+    assert "This does not exist or you might not have permission." in html
+    assert "no such artifact" not in html.lower()
+    assert "artifact version" not in html.lower()
+    assert "/theme/warehouse-theme.js" in html
+    assert 'font:500 clamp(38px,6.2vw,76px)/.96 "Newsreader"' in html
+    assert 'href="/gallery"' in html
+    assert 'href="/calliope"' in html
+    assert calls[0][2] == "ada@example.com"
+
+    server_source = (_HERE / "server.py").read_text(encoding="utf-8")
+    calliope_source = (_HERE / "calliope.py").read_text(encoding="utf-8")
+    assert "warehouse_theme.artifact_not_found_document(identity, session)" in server_source
+    assert "warehouse_theme.artifact_not_found_document(owner, session)" in calliope_source
+    assert "404 — no such artifact version" not in server_source
+
+
 def test_authenticated_shells_share_a_right_aligned_accessible_account_menu():
     markup = warehouse_theme.account_control({
         "identity": "long.person@example.com",

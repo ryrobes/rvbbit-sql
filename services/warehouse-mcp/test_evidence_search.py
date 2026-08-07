@@ -72,7 +72,9 @@ def test_artifact_ranker_searches_semantic_objects_and_keeps_parent_artifact(mon
         "lineage": [{"kind": "table", "ref": "sales.opportunities"}],
     }]
     monkeypatch.setattr(server, "_conn", lambda: _Connection(rows))
-    items = server._calliope_artifact_evidence("weighted pipeline", 8)
+    items = server._calliope_artifact_evidence(
+        "weighted pipeline", "pilot@example.com", 8
+    )
 
     assert items[0]["kind"] == "dashboard-object"
     assert items[0]["title"].startswith("Weighted pipeline")

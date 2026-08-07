@@ -17,6 +17,7 @@ import re
 import uuid
 from collections.abc import Mapping
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 
 ADMIN_TEAM_ID = "00000000-0000-4000-8000-000000000001"
@@ -62,6 +63,18 @@ CREATE TABLE IF NOT EXISTS rvbbit.application_principals (
     CONSTRAINT application_principals_email_normalized_check
         CHECK (email=lower(btrim(email)) AND email LIKE '%@%')
 );
+ALTER TABLE rvbbit.application_principals
+    ADD COLUMN IF NOT EXISTS avatar_key uuid,
+    ADD COLUMN IF NOT EXISTS avatar_provider text,
+    ADD COLUMN IF NOT EXISTS avatar_source_url text;
+UPDATE rvbbit.application_principals
+   SET avatar_key=gen_random_uuid()
+ WHERE avatar_key IS NULL;
+ALTER TABLE rvbbit.application_principals
+    ALTER COLUMN avatar_key SET DEFAULT gen_random_uuid(),
+    ALTER COLUMN avatar_key SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS application_principals_avatar_key_key
+    ON rvbbit.application_principals (avatar_key);
 
 CREATE TABLE IF NOT EXISTS rvbbit.teams (
     id uuid PRIMARY KEY,
@@ -325,12 +338,36 @@ def authorization_matches_team(team: Any, authorization: Any) -> bool:
     }
 
 
+def _google_avatar_url(value: Any) -> str | None:
+    """Retain only bounded Google-hosted URLs from a verified profile claim."""
+    candidate = str(value or "").strip()[:2048]
+    if not candidate or any(ord(character) < 32 for character in candidate):
+        return None
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or not (host == "googleusercontent.com" or host.endswith(".googleusercontent.com"))
+    ):
+        return None
+    return candidate
+
+
 def observe_principal_on_connection(
     conn: Any,
     authorization: Any,
     *,
     channel: str | None = None,
     display_name: str | None = None,
+    avatar_provider: str | None = None,
+    avatar_source_url: str | None = None,
 ) -> str | None:
     """Record only Warehouse-authorized human subjects as Team candidates."""
     raw_subject = _auth_value(authorization, "subject")
@@ -338,22 +375,34 @@ def observe_principal_on_connection(
         return None
     email = normalize_email(raw_subject)
     name = re.sub(r"\s+", " ", str(display_name or "").strip())[:160] or None
+    provider = str(avatar_provider or "").strip().lower()
+    source_url = (
+        _google_avatar_url(avatar_source_url)
+        if provider == "google"
+        else None
+    )
+    provider = "google" if source_url else None
     auth_mode = str(_auth_value(authorization, "mode") or "application")[:80]
     last_channel = str(channel or _auth_value(authorization, "platform") or "")[:80] or None
     conn.execute(
         "INSERT INTO rvbbit.application_principals "
-        "(email,display_name,last_auth_mode,last_channel) VALUES (%s,%s,%s,%s) "
+        "(email,display_name,last_auth_mode,last_channel,avatar_provider,avatar_source_url) "
+        "VALUES (%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (email) DO UPDATE SET "
         "display_name=coalesce(excluded.display_name,rvbbit.application_principals.display_name),"
         "last_seen_at=now(),last_auth_mode=excluded.last_auth_mode,"
         "last_channel=coalesce(excluded.last_channel,rvbbit.application_principals.last_channel),"
+        "avatar_provider=coalesce(excluded.avatar_provider,rvbbit.application_principals.avatar_provider),"
+        "avatar_source_url=coalesce(excluded.avatar_source_url,rvbbit.application_principals.avatar_source_url),"
         "observation_count=rvbbit.application_principals.observation_count+1 "
         "WHERE rvbbit.application_principals.last_seen_at < now()-interval '5 minutes' "
         "OR rvbbit.application_principals.last_auth_mode IS DISTINCT FROM excluded.last_auth_mode "
         "OR rvbbit.application_principals.last_channel IS DISTINCT FROM excluded.last_channel "
         "OR (excluded.display_name IS NOT NULL AND "
-        "rvbbit.application_principals.display_name IS DISTINCT FROM excluded.display_name)",
-        (email, name, auth_mode, last_channel),
+        "rvbbit.application_principals.display_name IS DISTINCT FROM excluded.display_name) "
+        "OR (excluded.avatar_source_url IS NOT NULL AND "
+        "rvbbit.application_principals.avatar_source_url IS DISTINCT FROM excluded.avatar_source_url)",
+        (email, name, auth_mode, last_channel, provider, source_url),
     )
     return email
 
@@ -579,7 +628,7 @@ def people_search(
             conn, authorization, display_name=display_name
         )
         rows = conn.execute(
-            "SELECT p.email,p.display_name,p.first_seen_at,p.last_seen_at,p.last_auth_mode,p.last_channel,"
+            "SELECT p.email,p.display_name,p.avatar_key::text,p.first_seen_at,p.last_seen_at,p.last_auth_mode,p.last_channel,"
             "p.observation_count,coalesce(array_agg(t.slug ORDER BY t.name) "
             "FILTER (WHERE t.id IS NOT NULL),ARRAY[]::text[]) AS teams "
             "FROM rvbbit.application_principals p "

@@ -1037,6 +1037,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0254_artifact_access",
         include_str!("../sql/migrations/0254_artifact_access.sql"),
     ),
+    (
+        "0255_calliope_personal_dreams",
+        include_str!("../sql/migrations/0255_calliope_personal_dreams.sql"),
+    ),
+    (
+        "0256_calliope_dream_scheduler",
+        include_str!("../sql/migrations/0256_calliope_dream_scheduler.sql"),
+    ),
+    (
+        "0257_calliope_session_sharing",
+        include_str!("../sql/migrations/0257_calliope_session_sharing.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import json
 import sys
+import types
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -91,7 +93,7 @@ def test_candidates_require_real_observations_and_keep_a_deep_editorial_reservoi
             {
                 "dream_type": "automation",
                 "output_kind": "prototype",
-                "problem_key": f"weekly reusable view {index}",
+                "problem_key": f"weekly reusable view domain{index}",
                 "title": f"A distinct domain{index} opportunity",
                 "thesis": f"Domain{index} signal{index} can produce outcome{index} through mechanism{index}, grounded in repeated governed activity.",
                 "observation_ids": ["observation:1"],
@@ -339,6 +341,205 @@ def test_semantic_similarity_can_deepen_an_idea_without_matching_unrelated_work(
     ) < 0.2
 
 
+def test_model_prior_match_and_canonical_terms_converge_paraphrases():
+    prior = [{
+        "id": "4f19b3d4-75ef-4fb5-8f80-1b20d05d34ba",
+        "fingerprint": "legacy",
+        "problem_key": "revenue::weekly reporting repetition::reusable health view",
+        "semantic_key": dreams.semantic_key(
+            "revenue::weekly reporting repetition::reusable health view",
+            ["Revenue reporting"],
+        ),
+        "title": "Reuse the weekly revenue health report",
+        "thesis": "Teams repeatedly rebuild a weekly revenue health dashboard.",
+        "entities": ["Revenue reporting"],
+        "recurrence_count": 4,
+    }]
+    candidate = {
+        "fingerprint": "new-wording",
+        "problem_key": "weekly revenue reports need one reusable health dashboard",
+        "semantic_key": dreams.semantic_key(
+            "weekly revenue reports need one reusable health dashboard",
+            ["Revenue reports"],
+        ),
+        "matched_prior_id": prior[0]["id"],
+        "title": "Stop recreating revenue views",
+        "thesis": "A governed weekly view could replace repeated dashboard assembly.",
+        "entities": ["Revenue reports"],
+    }
+
+    matched, score = dreams.match_candidate(candidate, prior)
+
+    assert matched["id"] == prior[0]["id"]
+    assert score == 1.0
+    assert "report" in candidate["semantic_key"]
+    assert "dashboards" not in candidate["semantic_key"]
+
+
+def test_bounded_portfolio_promotes_three_keeps_thirty_and_retires_tail():
+    now = datetime(2026, 8, 7, 12, tzinfo=timezone.utc)
+    rows = [{
+        "id": str(index),
+        "status": "proposed",
+        "rank_score": 1 - (index / 100),
+        "recurrence_count": 2,
+        "created_at": now - timedelta(days=index % 4),
+        "last_seen_at": now - timedelta(days=index % 4),
+    } for index in range(45)]
+
+    plan = dreams.portfolio_plan(rows, scope_kind="company", now=now)
+
+    assert len([item for item in plan if item["portfolio_state"] == "promoted"]) == 3
+    assert len([
+        item for item in plan
+        if item["status"] == "proposed" and item["portfolio_state"] == "backlog"
+    ]) == 30
+    assert len([item for item in plan if item["retired_reason"] == "portfolio_cap"]) == 12
+
+
+def test_personal_portfolio_hides_feedback_and_expires_stale_one_offs():
+    now = datetime(2026, 8, 7, 12, tzinfo=timezone.utc)
+    rows = [
+        {
+            "id": "dismissed", "status": "proposed", "rank_score": 1,
+            "recurrence_count": 5, "last_seen_at": now,
+            "viewer_event_kind": "dismissed",
+        },
+        {
+            "id": "stale", "status": "proposed", "rank_score": .9,
+            "recurrence_count": 1, "last_seen_at": now - timedelta(days=22),
+        },
+        {
+            "id": "fresh", "status": "proposed", "rank_score": .8,
+            "recurrence_count": 1, "last_seen_at": now,
+        },
+    ]
+
+    plan = {item["id"]: item for item in dreams.portfolio_plan(rows, scope_kind="personal", now=now)}
+
+    assert plan["dismissed"]["portfolio_state"] == "backlog"
+    assert plan["dismissed"]["portfolio_rank"] is None
+    assert plan["stale"]["status"] == "retired"
+    assert plan["stale"]["retired_reason"] == "stale_one_off"
+    assert plan["fresh"]["portfolio_state"] == "promoted"
+
+
+def test_personal_candidates_reject_system_meta_even_when_the_model_returns_it():
+    observations = [{"id": "observation:1", "kind": "gap"}]
+    result = dreams.normalize_candidates({"dreams": [
+        {
+            "title": "Repair the global metric scheduler",
+            "thesis": "A system-wide metric failure needs an administrator to repair its ingestion path.",
+            "problem_key": "metric system failure",
+            "relevance_kind": "system_meta",
+            "observation_ids": ["observation:1"],
+        },
+        {
+            "title": "Finish the renewal analysis",
+            "thesis": "The user's active renewal analysis has a concrete follow-up worth completing.",
+            "problem_key": "renewal analysis follow up",
+            "relevance_kind": "follow_up",
+            "observation_ids": ["observation:1"],
+        },
+    ]}, observations, scope_kind="personal")
+
+    assert [item["title"] for item in result] == ["Finish the renewal analysis"]
+
+
+def test_personal_candidates_use_a_smaller_bounded_reservoir():
+    observations = [{"id": "observation:1", "kind": "connection"}]
+    raw = {"dreams": [
+        {
+            "title": f"Personal possibility {index}",
+            "thesis": f"A grounded personal possibility number {index} with a concrete next step.",
+            "problem_key": f"personal possibility {index}",
+            "relevance_kind": "active_work",
+            "observation_ids": ["observation:1"],
+        }
+        for index in range(12)
+    ]}
+
+    result = dreams.normalize_candidates(raw, observations, scope_kind="personal")
+
+    assert len(result) == dreams.MAX_PERSONAL_CANDIDATES == 8
+
+
+def test_dossier_observations_preserve_only_receipted_private_evidence():
+    result = dreams.dossier_observations({
+        "context": {
+            "active_threads": [{
+                "label": "Renewal exception analysis",
+                "detail": "Compare renewal exceptions before the weekly operating review.",
+                "evidence_ids": ["personal:request:1", "invented:1"],
+                "confidence": .8,
+            }],
+        },
+        "evidence_receipts": [{
+            "id": "personal:request:1", "private": True,
+            "kind": "request", "label": "Recent request",
+        }],
+    })
+
+    assert len(result) == 1
+    assert result[0]["scopes"] == ["personal"]
+    assert result[0]["evidence_ids"] == ["personal:request:1"]
+    assert result[0]["evidence"][0]["private"] is True
+
+
+def test_personal_input_hash_ignores_its_own_output_but_wakes_on_user_feedback():
+    dossier = {"version": 3, "input_hash": "grounded-context"}
+    empty = dreams.personal_dream_input_hash(dossier, [])
+    proposed = dreams.personal_dream_input_hash(dossier, [{
+        "id": "dream-1", "status": "proposed", "viewer_state": "viewed",
+        "version": 9, "updated_at": "2026-08-07T12:00:00Z",
+    }])
+    adopted = dreams.personal_dream_input_hash(dossier, [{
+        "id": "dream-1", "status": "adopted", "viewer_state": "adopted",
+        "version": 9, "updated_at": "2026-08-07T12:00:00Z",
+    }])
+
+    assert proposed == empty
+    assert adopted != empty
+
+
+def test_working_context_is_bounded_evidence_linked_and_identity_free():
+    evidence = {
+        "personal:session:1": {
+            "id": "personal:session:1", "private": True,
+            "kind": "conversation", "label": "Renewal analysis",
+            "detail": "Compare the current renewal cohorts.",
+            "seen_at": "2026-08-07T12:00:00+00:00",
+        }
+    }
+    context, receipts = dreams.normalize_dossier({
+        "summary": "Ada@example.com is reviewing renewal cohorts.",
+        "active_threads": [{
+            "label": "Renewal cohort analysis",
+            "detail": "Compare current renewal cohorts and preserve the reusable view.",
+            "evidence_ids": ["personal:session:1", "invented:1"],
+            "confidence": 9,
+        }],
+        "preferences": [{
+            "label": "Unsupported preference",
+            "detail": "This should be dropped because it has no real evidence.",
+            "evidence_ids": ["invented:2"],
+        }],
+    }, evidence)
+
+    assert "ada@example.com" not in context["summary"].lower()
+    assert context["active_threads"][0]["evidence_ids"] == ["personal:session:1"]
+    assert context["active_threads"][0]["confidence"] == 1.0
+    assert context["preferences"] == []
+    assert receipts == [evidence["personal:session:1"]]
+
+
+def test_personal_scope_requires_a_verified_email_and_company_scope_has_no_owner():
+    assert dreams.normalize_scope("personal", "ADA@EXAMPLE.COM") == ("personal", "ada@example.com")
+    assert dreams.normalize_scope("company", "ignored@example.com") == ("company", None)
+    with pytest.raises(ValueError, match="verified owner"):
+        dreams.normalize_scope("personal", "static-key")
+
+
 def test_dream_feature_is_configurable_but_automatic_with_calliope(monkeypatch):
     spec = importlib.util.spec_from_file_location(
         "warehouse_calliope_dream_config_test_module", _HERE / "calliope.py"
@@ -351,16 +552,91 @@ def test_dream_feature_is_configurable_but_automatic_with_calliope(monkeypatch):
     monkeypatch.setenv("WAREHOUSE_HERMES_API_KEY", "hermes-key")
     monkeypatch.setenv("WAREHOUSE_CALLIOPE_DREAM_TIMEZONE", "America/New_York")
     monkeypatch.setenv("WAREHOUSE_CALLIOPE_DREAM_HOUR", "4")
+    monkeypatch.setenv("WAREHOUSE_CALLIOPE_DREAM_QUEUE_POLL_SECONDS", "7")
     config = calliope.CalliopeConfig.from_env()
     assert config.dreaming_enabled is True
     assert config.dream_evidence_lab_enabled is True
     assert config.dream_timezone == "America/New_York"
     assert config.dream_hour == 4
+    assert config.dream_interval_seconds == 7
 
     monkeypatch.setenv("WAREHOUSE_CALLIOPE_DREAMS", "0")
     assert calliope.CalliopeConfig.from_env().dreaming_enabled is False
     monkeypatch.setenv("WAREHOUSE_CALLIOPE_DREAM_EVIDENCE_LAB", "0")
     assert calliope.CalliopeConfig.from_env().dream_evidence_lab_enabled is False
+
+
+def test_dream_routes_default_private_and_gate_company_to_admins(monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "warehouse_calliope_dream_routes_test_module", _HERE / "calliope.py"
+    )
+    calliope = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = calliope
+    spec.loader.exec_module(calliope)
+    routes = {}
+
+    class MCP:
+        @staticmethod
+        def custom_route(path, methods):
+            def register(handler):
+                routes[(path, tuple(methods))] = handler
+                return handler
+            return register
+
+    fake_auth = types.SimpleNamespace(
+        read_session_full=lambda request: request.session,
+        google_enabled=lambda: False,
+        background_layer=lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setitem(sys.modules, "auth", fake_auth)
+    monkeypatch.setenv("WAREHOUSE_HERMES_URL", "http://hermes:8642")
+    monkeypatch.setenv("WAREHOUSE_HERMES_API_KEY", "hermes-key")
+    monkeypatch.setenv("WAREHOUSE_CALLIOPE_DIR", str(tmp_path))
+    monkeypatch.setattr(calliope, "ensure_tables", lambda _factory: None)
+    monkeypatch.setattr(calliope, "_start_session_synopsis_worker", lambda _factory: None)
+    monkeypatch.setattr(
+        calliope.calliope_dreams,
+        "is_company_admin",
+        lambda _factory, owner: owner == "admin@example.com",
+    )
+    observed = []
+
+    def fake_snapshot(_factory, owner, *, view, limit, scope_kind):
+        if scope_kind == "company" and owner != "admin@example.com":
+            raise PermissionError("Company Dreams are available to the Admins Team")
+        observed.append((owner, view, limit, scope_kind))
+        return {"dreams": [], "counts": {}, "latest_cycle": None, "scope_kind": scope_kind}
+
+    monkeypatch.setattr(calliope.calliope_dreams, "snapshot", fake_snapshot)
+    monkeypatch.setattr(calliope.calliope_dreams, "load_user_dossier", lambda _f, _o: {})
+    assert calliope.register_calliope_routes(MCP(), lambda: None, "", lambda value: value)
+
+    class Request:
+        def __init__(self, owner, query=None, body=None):
+            self.session = {"identity": owner, "mapped": True, "sub": owner}
+            self.query_params = query or {}
+            self._body = body or {}
+
+        async def json(self):
+            return self._body
+
+    list_route = routes[("/api/calliope/dreams", ("GET",))]
+    personal = asyncio.run(list_route(Request("user@example.com")))
+    assert personal.status_code == 200
+    assert observed[-1][-1] == "personal"
+
+    forbidden = asyncio.run(list_route(Request("user@example.com", {"scope": "company"})))
+    assert forbidden.status_code == 403
+    assert json.loads(forbidden.body)["error"]["code"] == "DREAM_SCOPE_FORBIDDEN"
+
+    company = asyncio.run(list_route(Request("admin@example.com", {"scope": "company"})))
+    assert company.status_code == 200
+    assert observed[-1][-1] == "company"
+
+    context_route = routes[("/api/calliope/dreams/context", ("GET",))]
+    context = asyncio.run(context_route(Request("user@example.com")))
+    assert context.status_code == 200
+    assert json.loads(context.body)["context"]["available"] is False
 
 
 def test_dream_schema_routes_ui_and_governed_handoff_ship_together():
@@ -383,6 +659,17 @@ def test_dream_schema_routes_ui_and_governed_handoff_ship_together():
         _HERE.parent.parent / "crates" / "pg_rvbbit" / "sql" / "migrations"
         / "0243_calliope_dream_evidence_lab.sql"
     ).read_text(encoding="utf-8")
+    personal_migration = (
+        _HERE.parent.parent / "crates" / "pg_rvbbit" / "sql" / "migrations"
+        / "0255_calliope_personal_dreams.sql"
+    ).read_text(encoding="utf-8")
+    scheduler_migration = (
+        _HERE.parent.parent / "crates" / "pg_rvbbit" / "sql" / "migrations"
+        / "0256_calliope_dream_scheduler.sql"
+    ).read_text(encoding="utf-8")
+    scheduler_seed = (
+        _HERE.parent.parent / "docker" / "init" / "03-seed-scheduled-tasks.sh"
+    ).read_text(encoding="utf-8")
     registry = (
         _HERE.parent.parent / "crates" / "pg_rvbbit" / "src" / "migrations.rs"
     ).read_text(encoding="utf-8")
@@ -398,13 +685,23 @@ def test_dream_schema_routes_ui_and_governed_handoff_ship_together():
     assert "raw chat exists only for a model call" in worker
     assert "observe_recent" in worker and "observe_horizon" in worker
     assert "MAX_CANDIDATES = 12" in worker and "MAX_DREAMS = 3" in worker
+    assert "MAX_PERSONAL_CANDIDATES = 8" in worker
+    assert "PERSONAL_IDEATOR_INSTRUCTIONS" in worker and "DOSSIER_INSTRUCTIONS" in worker
+    assert "active_personal_users" in worker and "scope_kind=\"personal\"" in worker
     assert 'id="calliope-dreams-dialog"' in page
     assert 'data-dream-view="backlog"' in page and "Dream deeper" in page
+    assert 'data-dream-scope="personal"' in page and 'data-dream-scope="company"' in page
+    assert 'id="calliope-dreams-context"' in page
     assert "function renderDreamSurface" in script
     assert "function markDreamViewed" in script
+    assert "function loadDreamContext" in script and "function setDreamScope" in script
+    assert "scope=${encodeURIComponent(scope)}" in script
     assert "function dreamProbeMarkup" in script and "What Calliope tested" in script
     assert ".calliope-dreams-dialog" in styles and ".dream-surface" in styles
     assert ".calliope-dream-tests" in styles
+    assert ".calliope-dreams-context" in styles and ".calliope-dreams-scope" in styles
+    assert '"/api/calliope/dreams/context"' in backend
+    assert "DREAM_SCOPE_FORBIDDEN" in backend and "can_view_company" in backend
     assert "CREATE TABLE IF NOT EXISTS rvbbit.calliope_dreams" in migration
     assert "user_message" not in migration
     assert '"0241_calliope_dreams"' in registry
@@ -413,3 +710,19 @@ def test_dream_schema_routes_ui_and_governed_handoff_ship_together():
     assert "CREATE TABLE IF NOT EXISTS rvbbit.calliope_dream_probes" in evidence_lab_migration
     assert "probe_receipts" in evidence_lab_migration
     assert '"0243_calliope_dream_evidence_lab"' in registry
+    assert "scope_kind" in personal_migration and "owner_email" in personal_migration
+    assert "CREATE TABLE IF NOT EXISTS rvbbit.calliope_user_dossiers" in personal_migration
+    assert "calliope_dreams_scope_fingerprint_key" in personal_migration
+    assert '"0255_calliope_personal_dreams"' in registry
+    assert "CREATE TABLE IF NOT EXISTS rvbbit.calliope_dream_sweeps" in scheduler_migration
+    assert "CREATE TABLE IF NOT EXISTS rvbbit.calliope_dream_jobs" in scheduler_migration
+    assert "CREATE OR REPLACE FUNCTION rvbbit.calliope_dream_enqueue" in scheduler_migration
+    assert "never private dossier or Dream content" in scheduler_migration
+    assert '"0256_calliope_dream_scheduler"' in registry
+    worker_loop = worker[worker.index("def _worker("):worker.index("def start_worker(")]
+    assert "_dream_queue_tick" in worker_loop
+    assert "cycle_due" not in worker_loop
+    assert "WAREHOUSE_CALLIOPE_DREAM_QUEUE_POLL_SECONDS" in backend
+    assert "rvbbit_calliope_dreams" in scheduler_seed
+    assert "'0 3 * * *'" in scheduler_seed
+    assert "SET active=false" in scheduler_seed

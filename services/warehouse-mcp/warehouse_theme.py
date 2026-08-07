@@ -149,6 +149,128 @@ def account_control(session: dict[str, Any] | None) -> str:
     )
 
 
+def artifact_not_found_document(
+    identity: str = "",
+    session: dict[str, Any] | None = None,
+) -> str:
+    """Return the generic, viewer-adaptive browser page for missing artifacts.
+
+    This is first-party system chrome, not a published dashboard. It therefore
+    has no artifact row or version, while still using the same browser-stored
+    palette, wallpaper, typography, and glass material as Adaptive Calliope.
+    The copy intentionally does not distinguish missing, archived, or denied.
+    """
+    import auth
+
+    identity = str(identity or "").strip().lower()
+    background = auth.background_layer(
+        0.50,
+        "linear-gradient(135deg,"
+        "color-mix(in oklch,var(--void,#0b1218) 70%,transparent),"
+        "color-mix(in oklch,var(--void,#0b1218) 91%,transparent))",
+        scene_key=identity or None,
+    )
+    account = account_control(
+        session or ({"identity": identity, "via": "password"} if identity else {})
+    )
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="color-scheme" content="dark light">
+<title>Artifact unavailable · Calliope</title>
+<style>
+*{{box-sizing:border-box}}
+html{{background:var(--void,#0b1218)}}
+body{{min-height:100vh;margin:0;background:transparent;color:var(--bone,#edf2f4);
+  font-family:"IBM Plex Sans",ui-sans-serif,sans-serif;-webkit-font-smoothing:antialiased}}
+a{{color:inherit;text-decoration:none}}
+.artifact-not-found-nav{{position:relative;z-index:3;display:flex;align-items:center;gap:14px;
+  min-height:58px;padding:8px clamp(18px,4vw,62px);border-bottom:1px solid var(--line,rgba(237,242,244,.15));
+  background:color-mix(in oklch,var(--panel,#111d25) 46%,transparent);
+  -webkit-backdrop-filter:blur(22px) saturate(1.18);backdrop-filter:blur(22px) saturate(1.18)}}
+.artifact-not-found-nav .artifact-not-found-account{{margin-left:auto;display:flex;align-items:center;gap:12px}}
+.artifact-not-found-main{{position:relative;isolation:isolate;min-height:calc(100vh - 58px);display:grid;
+  place-items:center;padding:clamp(28px,6vw,88px)}}
+.artifact-not-found-main::before{{content:"";position:absolute;z-index:-1;inset:0;pointer-events:none;
+  background-image:linear-gradient(var(--line,rgba(237,242,244,.12)) 1px,transparent 1px),
+    linear-gradient(90deg,var(--line,rgba(237,242,244,.12)) 1px,transparent 1px);
+  background-size:72px 72px;opacity:.28;
+  -webkit-mask-image:radial-gradient(ellipse at center,#000,transparent 72%);mask-image:radial-gradient(ellipse at center,#000,transparent 72%)}}
+.artifact-not-found-panel{{position:relative;width:min(920px,100%);overflow:hidden;
+  border:1px solid var(--line,rgba(237,242,244,.15));
+  background:color-mix(in oklch,var(--panel,#111d25) 79%,transparent);
+  -webkit-backdrop-filter:blur(22px) saturate(1.15);backdrop-filter:blur(22px) saturate(1.15);
+  box-shadow:0 26px 90px color-mix(in oklch,var(--void,#0b1218) 58%,transparent)}}
+.artifact-not-found-panel::before{{content:"";position:absolute;inset:0 0 auto;height:2px;
+  background:linear-gradient(90deg,var(--main,#68c7b2),var(--rvbbit-accent,#f5b446),transparent 82%)}}
+.artifact-not-found-masthead{{display:flex;align-items:center;justify-content:space-between;gap:20px;
+  padding:18px clamp(22px,4vw,46px);border-bottom:1px solid var(--line,rgba(237,242,244,.15));
+  color:var(--fog,#9aa8ae);font:600 10px/1 "IBM Plex Mono",ui-monospace,monospace;
+  letter-spacing:.16em;text-transform:uppercase}}
+.artifact-not-found-status{{display:inline-flex;align-items:center;gap:9px}}
+.artifact-not-found-status::before{{content:"";width:7px;height:7px;border:1px solid var(--main,#68c7b2);
+  background:color-mix(in oklch,var(--main,#68c7b2) 24%,transparent);box-shadow:0 0 14px color-mix(in oklch,var(--main,#68c7b2) 38%,transparent)}}
+.artifact-not-found-content{{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,.38fr);
+  gap:clamp(28px,5vw,72px);align-items:end;padding:clamp(34px,6vw,72px) clamp(24px,6vw,68px)}}
+.artifact-not-found-kicker{{margin-bottom:14px;color:var(--main,#68c7b2);
+  font:600 10px/1.2 "IBM Plex Mono",ui-monospace,monospace;letter-spacing:.16em;text-transform:uppercase}}
+.artifact-not-found-copy h1{{max-width:680px;margin:0;color:var(--bone-bright,#fff);
+  font:500 clamp(38px,6.2vw,76px)/.96 "Newsreader",Georgia,serif;letter-spacing:-.035em}}
+.artifact-not-found-copy p{{max-width:620px;margin:24px 0 0;color:var(--fog,#9aa8ae);
+  font-size:clamp(15px,1.65vw,19px);line-height:1.55}}
+.artifact-not-found-code{{align-self:start;color:color-mix(in oklch,var(--bone,#edf2f4) 16%,transparent);
+  font:500 clamp(72px,13vw,150px)/.72 "IBM Plex Sans",ui-sans-serif,sans-serif;
+  font-variant-numeric:tabular-nums;letter-spacing:-.08em;text-align:right;user-select:none}}
+.artifact-not-found-actions{{display:flex;flex-wrap:wrap;gap:10px;padding:0 clamp(24px,6vw,68px) clamp(30px,5vw,52px)}}
+.artifact-not-found-actions a{{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:0 17px;
+  border:1px solid var(--line,rgba(237,242,244,.15));color:var(--fog,#9aa8ae);
+  background:color-mix(in oklch,var(--panel-raised,#172731) 62%,transparent);
+  font:600 10px/1 "IBM Plex Mono",ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase;
+  transition:transform .18s ease,border-color .18s ease,color .18s ease,background .18s ease}}
+.artifact-not-found-actions a:first-child{{border-color:color-mix(in oklch,var(--main,#68c7b2) 54%,var(--line));
+  color:var(--bone-bright,#fff);background:color-mix(in oklch,var(--main,#68c7b2) 12%,transparent)}}
+.artifact-not-found-actions a:hover{{transform:translateY(-2px);border-color:var(--main,#68c7b2);color:var(--bone-bright,#fff)}}
+.artifact-not-found-actions a:focus-visible{{outline:2px solid var(--main,#68c7b2);outline-offset:3px}}
+@media (max-width:680px){{
+  .artifact-not-found-content{{grid-template-columns:1fr}}
+  .artifact-not-found-code{{position:absolute;right:22px;top:92px;font-size:86px;opacity:.58}}
+  .artifact-not-found-copy h1{{max-width:82%}}
+}}
+@media (prefers-reduced-motion:reduce){{.artifact-not-found-actions a{{transition:none}}}}
+</style>
+{head_assets()}
+</head><body data-warehouse-page="artifact-not-found">
+{background}
+<nav class="artifact-not-found-nav" data-warehouse-header>
+  <a class="calliope-brand" href="/gallery" aria-label="Calliope Gallery">
+    <span class="calliope-brand-name">Calliope</span>
+    <span class="calliope-brand-byline">by RVBBIT.AI</span>
+  </a>
+  <div class="artifact-not-found-account"><span data-warehouse-theme-anchor></span>{account}</div>
+</nav>
+<main class="artifact-not-found-main">
+  <article class="artifact-not-found-panel" aria-labelledby="artifact-not-found-title">
+    <header class="artifact-not-found-masthead">
+      <span class="artifact-not-found-status">Artifact route</span>
+      <span>Not available</span>
+    </header>
+    <div class="artifact-not-found-content">
+      <div class="artifact-not-found-copy">
+        <div class="artifact-not-found-kicker">Nothing to render</div>
+        <h1 id="artifact-not-found-title">This page isn&rsquo;t available here.</h1>
+        <p>This does not exist or you might not have permission.</p>
+      </div>
+      <div class="artifact-not-found-code" aria-hidden="true">404</div>
+    </div>
+    <footer class="artifact-not-found-actions">
+      <a href="/gallery">Browse your Gallery <span aria-hidden="true">&nbsp;→</span></a>
+      <a href="/calliope">Ask Calliope</a>
+    </footer>
+  </article>
+</main>
+</body></html>"""
+
+
 def _label(image_id: str) -> str:
     if image_id in _THEME_LABELS:
         return _THEME_LABELS[image_id]

@@ -5,6 +5,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -106,6 +108,96 @@ def test_session_synopsis_enqueue_resets_a_bounded_debounce(monkeypatch):
     assert calliope._enqueue_session_synopsis(lambda: Connection(), "12345678-1234-4234-9234-123456789abc")
     assert "ON CONFLICT (session_id) DO UPDATE SET status='pending'" in calls[0][0]
     assert calls[0][1][1:] == (45, 45)
+
+
+@pytest.mark.parametrize(
+    ("available", "operator_fragment", "parameter_count", "provider", "model"),
+    [
+        (
+            {"clover3": True, "clover2": False, "summarize2": True, "summarize1": False},
+            "rvbbit.clover_llm_apply(%s,%s,%s::jsonb)",
+            3,
+            "clover",
+            "clover_llm_apply",
+        ),
+        (
+            {"clover3": False, "clover2": True, "summarize2": True, "summarize1": False},
+            "rvbbit.clover_llm_apply(%s,%s)",
+            2,
+            "clover",
+            "clover_llm_apply",
+        ),
+        (
+            {"clover3": False, "clover2": False, "summarize2": True, "summarize1": False},
+            "rvbbit.summarize(%s,%s::jsonb)",
+            2,
+            "rvbbit",
+            "summarize",
+        ),
+        (
+            {"clover3": False, "clover2": False, "summarize2": False, "summarize1": True},
+            "rvbbit.summarize(%s)",
+            1,
+            "rvbbit",
+            "summarize",
+        ),
+    ],
+)
+def test_session_synopsis_supports_current_and_legacy_semantic_signatures(
+    available,
+    operator_fragment,
+    parameter_count,
+    provider,
+    model,
+):
+    calls = []
+
+    class Result:
+        def __init__(self, row=None, rows=None):
+            self.row = row
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, params=None):
+            calls.append((statement, params))
+            if "to_regprocedure" in statement:
+                return Result(row=available)
+            if " AS synopsis" in statement:
+                return Result(row={
+                    "synopsis": "Pipeline risk is concentrated in delayed enterprise renewals."
+                })
+            if "UPDATE rvbbit.receipts" in statement:
+                return Result(rows=[])
+            raise AssertionError(f"Unexpected SQL: {statement}")
+
+    synopsis, actual_provider, actual_model = calliope._generate_session_synopsis(
+        lambda: Connection(),
+        "User: Why did pipeline coverage fall?\nCalliope: Enterprise renewals moved out.",
+        "pilot@example.com",
+    )
+
+    semantic_calls = [call for call in calls if operator_fragment in call[0]]
+    receipt_calls = [call for call in calls if "UPDATE rvbbit.receipts" in call[0]]
+    assert len(semantic_calls) == 1
+    assert len(semantic_calls[0][1]) == parameter_count
+    assert len(receipt_calls) == 1
+    assert "inputs->>'t'=%s OR inputs->>'text'=%s" in receipt_calls[0][0]
+    assert receipt_calls[0][1][-2] == receipt_calls[0][1][-1]
+    assert synopsis == "Pipeline risk is concentrated in delayed enterprise renewals."
+    assert actual_provider == provider
+    assert actual_model == model
 
 
 def test_gallery_and_session_rail_expose_derived_metadata_without_new_primary_ui():

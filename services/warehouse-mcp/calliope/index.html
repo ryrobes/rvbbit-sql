@@ -80,8 +80,8 @@ __CALLIOPE_BACKGROUND__
     </button>
     <div id="session-list" class="session-list" aria-label="Calliope notebooks"></div>
     <div class="rail-note">
-      <span>Private rail</span>
-      <p>Only you see these notebooks. Published work joins the shared artifact library.</p>
+      <span>Your notebook rail</span>
+      <p>Private work stays yours. Conversations shared with you arrive here without a page refresh.</p>
     </div>
   </aside>
 
@@ -90,9 +90,11 @@ __CALLIOPE_BACKGROUND__
       <div class="stage-title-wrap">
         <p class="eyebrow">Living artifact record</p>
         <button id="session-title" class="session-title" type="button" title="Rename session">Choose or start a session</button>
+        <div id="session-access-meta" class="session-access-meta" hidden></div>
       </div>
       <div class="stage-actions">
         <span id="surface-count" class="surface-count">0 surfaces</span>
+        <button id="share-session" class="share-session" type="button" hidden aria-haspopup="dialog" aria-controls="session-share-dialog">Share</button>
         <button id="google-sheet-import" class="google-sheet-import" type="button" hidden disabled title="Bring an explicitly selected Google Sheet into this private Stage">
           <svg viewBox="0 0 16 18" aria-hidden="true">
             <path d="M2.25 1.25h7.1l4.4 4.4v11.1H2.25z"></path>
@@ -171,6 +173,11 @@ __CALLIOPE_BACKGROUND__
       </div>
     </section>
 
+    <div id="read-only-notice" class="read-only-notice" hidden>
+      <span aria-hidden="true">◇</span>
+      <p><strong>Shared with you · view only</strong><small>The owner is still the only person who can add messages or change this notebook.</small></p>
+    </div>
+
     <form id="composer" class="composer">
       <div id="design-profile-chip" class="design-profile-chip" hidden></div>
       <div id="selected-reference" class="selected-reference" hidden></div>
@@ -219,6 +226,42 @@ __CALLIOPE_BACKGROUND__
       <button id="create-session" value="default" class="primary-action">Begin session</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="session-share-dialog" class="session-share-dialog" aria-labelledby="session-share-title">
+  <div class="session-share-shell">
+    <header>
+      <div>
+        <p class="eyebrow">Notebook access</p>
+        <h2 id="session-share-title">Share this conversation</h2>
+      </div>
+      <button id="session-share-close" class="markup-close" type="button" aria-label="Close sharing">×</button>
+    </header>
+    <section class="session-share-intro">
+      <div id="session-share-avatars" class="participant-stack" aria-label="Current notebook audience"></div>
+      <div><strong id="session-share-summary">Only you</strong><small>Recipients can read the transcript and Stage. Only you can keep the conversation going.</small></div>
+    </section>
+    <label class="session-share-search">
+      <span aria-hidden="true">⌕</span>
+      <input id="session-share-search" type="search" placeholder="Find a person or Team…" autocomplete="off">
+    </label>
+    <div class="session-share-grid">
+      <section>
+        <header><span>Teams</span><small>Flat application groups</small></header>
+        <div id="session-share-teams" class="session-share-options"></div>
+      </section>
+      <section>
+        <header><span>People</span><small>Observed signed-in users</small></header>
+        <div id="session-share-people" class="session-share-options"></div>
+      </section>
+    </div>
+    <div id="session-share-warning" class="session-share-warning" hidden></div>
+    <footer>
+      <p><strong>Read-only first.</strong> Live co-editing remains deliberately off until turns have a safe multi-writer execution model.</p>
+      <button id="session-share-cancel" class="quiet-action" type="button">Cancel</button>
+      <button id="session-share-save" class="primary-action" type="button">Save access</button>
+    </footer>
+  </div>
 </dialog>
 
 <dialog id="voice-dialog" class="voice-dialog" aria-labelledby="voice-dialog-title">
@@ -444,12 +487,25 @@ __CALLIOPE_BACKGROUND__
   <div class="calliope-dreams-shell">
     <header class="calliope-dreams-head">
       <div>
-        <p class="eyebrow">Company reflection · evidence first</p>
-        <h2 id="calliope-dreams-title">Calliope Dreams</h2>
-        <p>Three strong things Calliope surfaced from recent work and longer company memory. Credible runners-up wait quietly in the wings.</p>
+        <p id="calliope-dreams-eyebrow" class="eyebrow">Private continuity · evidence first</p>
+        <h2 id="calliope-dreams-title">Dreams for you</h2>
+        <p id="calliope-dreams-copy">A few timely possibilities grounded in the work already in motion. Credible runners-up wait quietly on deck.</p>
+        <details id="calliope-dreams-context" class="calliope-dreams-context">
+          <summary><span>What Calliope is carrying forward</span><b id="calliope-dreams-context-meta">Private to you</b><em aria-hidden="true">⌄</em></summary>
+          <div id="calliope-dreams-context-body"><p>Your private working context will appear after Calliope has enough grounded activity to distill.</p></div>
+          <footer>
+            <button type="button" data-dream-context-action="correct">Correct</button>
+            <button type="button" data-dream-context-action="forget">Forget</button>
+            <button type="button" data-dream-context-action="resume" hidden>Resume</button>
+          </footer>
+        </details>
       </div>
       <div class="calliope-dreams-head-actions">
-        <button id="calliope-dreams-run" class="primary-action" type="button" title="Revisit the last 30 days against a 90-day company horizon">Dream deeper</button>
+        <div id="calliope-dreams-scope" class="calliope-dreams-scope" role="group" aria-label="Dream scope" hidden>
+          <button type="button" data-dream-scope="personal" aria-pressed="true">Mine</button>
+          <button type="button" data-dream-scope="company" aria-pressed="false">Company</button>
+        </div>
+        <button id="calliope-dreams-run" class="primary-action" type="button" title="Refresh your private working context and look for timely possibilities">Dream deeper</button>
         <button id="calliope-dreams-refresh" type="button" aria-label="Refresh Dreams">↻</button>
         <button id="calliope-dreams-close" class="markup-close" type="button" aria-label="Close Dreams">×</button>
       </div>
@@ -459,19 +515,19 @@ __CALLIOPE_BACKGROUND__
       <button type="button" data-dream-view="new" aria-pressed="false">New <b data-dream-count="new">0</b></button>
       <button type="button" data-dream-view="exploring" aria-pressed="false">Exploring <b data-dream-count="exploring">0</b></button>
       <button type="button" data-dream-view="adopted" aria-pressed="false">Adopted <b data-dream-count="adopted">0</b></button>
-      <button type="button" data-dream-view="backlog" aria-pressed="false" title="Evidence-backed candidates that were not selected for the three-item shelf">In the wings <b data-dream-count="backlog">0</b></button>
+      <button type="button" data-dream-view="backlog" aria-pressed="false" title="Evidence-backed candidates that were not selected for the three-item shelf"><span id="calliope-dreams-backlog-label">On deck</span> <b data-dream-count="backlog">0</b></button>
       <button type="button" data-dream-view="sleeping" aria-pressed="false">Sleeping <b data-dream-count="sleeping">0</b></button>
       <span id="calliope-dreams-summary">Waiting for the first reflection…</span>
     </nav>
     <div class="calliope-dreams-workspace">
       <aside id="calliope-dreams-list" class="calliope-dreams-list" aria-live="polite">
-        <div class="calliope-dreams-loading"><i></i><span>Remembering what the company has been doing…</span></div>
+        <div class="calliope-dreams-loading"><i></i><span>Remembering what you have been working through…</span></div>
       </aside>
       <section id="calliope-dreams-detail" class="calliope-dreams-detail">
         <div class="calliope-dreams-empty">
           <i aria-hidden="true">☾</i>
-          <p class="eyebrow">An accumulating institutional instinct</p>
-          <h3>Calliope notices what the company is becoming capable of.</h3>
+          <p class="eyebrow">Private continuity, without the profile</p>
+          <h3>Calliope notices useful connections in the work already in motion.</h3>
           <p>Each Dream preserves its evidence, novelty, recurrence, and response. Similar ideas deepen instead of stacking up.</p>
         </div>
       </section>

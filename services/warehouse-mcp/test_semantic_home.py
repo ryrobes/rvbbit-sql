@@ -39,8 +39,9 @@ def _fixture_manifest():
     })
 
 
-def _artifact_fixture(slug, version=None):
+def _artifact_fixture(slug, version=None, *, viewer):
     assert slug == "regional-brief"
+    assert viewer == "analyst@example.com"
     selected = int(version or 6)
     return (
         {
@@ -80,7 +81,7 @@ def test_artifact_pins_follow_latest_while_object_pins_keep_exact_meaning(monkey
     artifact = server._semantic_home_resolve_handle({
         "kind": "artifact",
         "slug": "regional-brief",
-    })
+    }, viewer="analyst@example.com")
     semantic_object = _fixture_manifest()["semantic_map"]["objects"][0]
     north = server._semantic_home_resolve_handle({
         "kind": "artifact_object",
@@ -90,11 +91,11 @@ def test_artifact_pins_follow_latest_while_object_pins_keep_exact_meaning(monkey
         "definition_hash": semantic_object["definition_hash"],
         "context": {"region": "North"},
         "rendered_value": "$42,000",
-    }, validate_sql=True)
+    }, validate_sql=True, viewer="analyst@example.com")
     south = server._semantic_home_resolve_handle({
         **north["source"],
         "context": {"region": "South"},
-    })
+    }, viewer="analyst@example.com")
 
     assert artifact["canonical_key"] == "artifact:regional-brief"
     assert artifact["source"]["tracking"] == "latest"
@@ -144,7 +145,9 @@ def test_object_preview_replays_under_the_authenticated_execution_subject(monkey
         "definition_hash": semantic_object["definition_hash"],
         "context": {"region": "North"},
     }
-    preview = server._semantic_home_preview(source, "analyst_execution_role")
+    preview = server._semantic_home_preview(
+        source, "analyst_execution_role", viewer="analyst@example.com"
+    )
 
     assert "region='North'" in observed["sql"]
     assert observed["limit"] == 2
@@ -157,13 +160,13 @@ def test_pinned_rendered_value_survives_as_a_non_authoritative_replay_fallback(m
     monkeypatch.setattr(
         server,
         "_semantic_home_resolve_handle",
-        lambda _source: {
+        lambda _source, *, viewer: {
             "kind": "artifact_object",
             "presentation": {"title": "Regional revenue", "last_rendered_value": None},
             "title": "Regional revenue",
             "trail": [],
             "status": "ready",
-        },
+        } if viewer == "analyst@example.com" else None,
     )
     item = server._semantic_home_public_item({
         "id": "018f3d10-6e84-7d51-b8bd-07c75a67c2a1",
@@ -171,7 +174,7 @@ def test_pinned_rendered_value_survives_as_a_non_authoritative_replay_fallback(m
         "source": {"kind": "artifact_object"},
         "presentation": {"last_rendered_value": "$42,000"},
         "sort_order": 1000,
-    })
+    }, viewer="analyst@example.com")
 
     assert item["presentation"]["last_rendered_value"] == "$42,000"
 
@@ -257,7 +260,9 @@ def test_metric_promotion_draft_freezes_context_and_keeps_sql_server_owned(monke
         "context": {"region": "North"},
     }
 
-    draft = server._semantic_home_metric_draft(source, "analyst-role")
+    draft = server._semantic_home_metric_draft(
+        source, "analyst-role", viewer="analyst@example.com"
+    )
     public = server._semantic_home_metric_draft_public(draft)
 
     assert "region='North'" in draft["definition_sql"]
@@ -351,7 +356,11 @@ def test_metric_promotion_defines_materializes_and_replaces_the_home_pin(monkeyp
 
     monkeypatch.setattr(server, "_conn", lambda: Connection())
     monkeypatch.setattr(server, "_semantic_home_metric_draft", lambda *_args, **_kwargs: draft)
-    monkeypatch.setattr(server, "_semantic_home_public_item", lambda row: dict(row))
+    monkeypatch.setattr(
+        server,
+        "_semantic_home_public_item",
+        lambda row, *, viewer: dict(row) if viewer == "analyst@example.com" else None,
+    )
 
     result = server._promote_semantic_home_metric(
         "analyst@example.com", "analyst-role", item_id, {}

@@ -51,6 +51,7 @@ from psycopg import sql as pgsql
 from psycopg.rows import dict_row
 import application_teams
 import artifact_access
+import calliope_access
 
 DSN = os.environ.get(
     "WAREHOUSE_DSN", "host=localhost port=55433 dbname=bench user=postgres password=rvbbit"
@@ -3170,6 +3171,10 @@ def _objects(tool, args, res):
         artifact = res.get("artifact") if isinstance(res.get("artifact"), dict) else {}
         slug = artifact.get("slug") or slug
         return [f"artifact:{slug}"] if slug else None
+    if tool in {"calliope_session_access_get", "calliope_session_access_update"}:
+        session = res.get("session") if isinstance(res.get("session"), dict) else {}
+        session_id = session.get("id") or args.get("session_id")
+        return [f"calliope_session:{session_id}"] if session_id else None
     if tool == "search_data":
         return [m.get("object") for m in res.get("matches", []) if m.get("object")] or None
     if tool == "describe_table":
@@ -3232,6 +3237,17 @@ def _summary(tool, res):
             "name": team.get("name"),
             "revision": team.get("revision"),
             "member_count": team.get("member_count"),
+            "changed": res.get("changed"),
+        }
+    if tool in {"calliope_session_access_get", "calliope_session_access_update"}:
+        session = res.get("session") if isinstance(res.get("session"), dict) else {}
+        grants = res.get("grants") if isinstance(res.get("grants"), dict) else {}
+        return {
+            "session_id": session.get("id"),
+            "revision": session.get("access_revision"),
+            "teams": len(grants.get("teams") or []),
+            "people": len(grants.get("people") or []),
+            "private": res.get("private"),
             "changed": res.get("changed"),
         }
     if tool in (
@@ -3693,6 +3709,31 @@ def _artifact_result(thunk):
         }
 
 
+# ── Calliope notebook sharing ───────────────────────────────────────────────
+
+def _calliope_access_authorization(caller_override=None):
+    authorization = _application_authorization_context(
+        caller_override=caller_override
+    )
+    if not authorization.subject:
+        raise calliope_access.CalliopeAccessError(
+            "APPLICATION_SUBJECT_REQUIRED",
+            "Notebook sharing requires a direct signed-in user or trusted Calliope delegation.",
+            403,
+        )
+    return authorization
+
+
+def _calliope_access_result(thunk):
+    try:
+        return thunk()
+    except calliope_access.CalliopeAccessError as exc:
+        return {
+            "error": {"code": exc.code, "message": str(exc)},
+            "_http_status": exc.status,
+        }
+
+
 def _artifact_require_view(slug, caller_override=None, conn=None):
     authorization = _artifact_authorization(caller_override)
     if conn is not None:
@@ -4027,6 +4068,90 @@ _mcp_artifact_access_update.__annotations__ = {
 }
 _mcp_artifact_archive.__annotations__ = {"slug": str, "expected_revision": int}
 _mcp_artifact_restore.__annotations__ = {"slug": str, "expected_revision": int}
+
+
+def tool_calliope_session_access_get(session_id, _caller_override=None):
+    return _calliope_access_result(lambda: calliope_access.get_access(
+        _conn,
+        _calliope_access_authorization(_caller_override),
+        session_id,
+    ))
+
+
+def tool_calliope_session_access_update(
+    session_id,
+    expected_revision,
+    team_ids=None,
+    people=None,
+    confirm_everyone=False,
+    _caller_override=None,
+):
+    return _calliope_access_result(lambda: calliope_access.replace_access(
+        _conn,
+        _calliope_access_authorization(_caller_override),
+        session_id,
+        expected_revision,
+        team_ids=team_ids,
+        people=people,
+        confirm_everyone=confirm_everyone,
+    ))
+
+
+def _mcp_calliope_session_access_get(session_id):
+    """Inspect read sharing for an ordinary Calliope chat notebook you own.
+
+    Returns its optimistic-lock revision, selected Teams and observed people,
+    available Teams, audience summary, and recent append-only access receipts.
+    """
+    return _logged(
+        "calliope_session_access_get",
+        {"session_id": session_id},
+        lambda: tool_calliope_session_access_get(session_id),
+    )
+
+
+def _mcp_calliope_session_access_update(
+    session_id,
+    expected_revision,
+    team_ids=None,
+    people=None,
+    confirm_everyone=False,
+):
+    """Replace an owned Calliope notebook's complete read-only audience.
+
+    Inspect first and send its expected_revision. Team IDs and observed human
+    emails are exact desired lists, not deltas. The owner remains implicit and
+    is the only person who can run, rename, archive, or change the notebook.
+    Adding Everyone for the first time requires confirm_everyone=true.
+    """
+    args = {
+        "session_id": session_id,
+        "expected_revision": expected_revision,
+        "team_ids": team_ids,
+        "people": people,
+        "confirm_everyone": confirm_everyone,
+    }
+    return _logged(
+        "calliope_session_access_update",
+        args,
+        lambda: tool_calliope_session_access_update(
+            session_id,
+            expected_revision,
+            team_ids,
+            people,
+            confirm_everyone,
+        ),
+    )
+
+
+_mcp_calliope_session_access_get.__annotations__ = {"session_id": str}
+_mcp_calliope_session_access_update.__annotations__ = {
+    "session_id": str,
+    "expected_revision": int,
+    "team_ids": list[str] | None,
+    "people": list[str] | None,
+    "confirm_everyone": bool,
+}
 
 
 def _calliope_team_service():
@@ -15134,6 +15259,7 @@ def _landing_html(rows, viewer, session=None):
 
 def register_dashboard_routes(m):
     import auth
+    import warehouse_theme
     from urllib.parse import quote
     from starlette.responses import HTMLResponse, RedirectResponse, Response
 
@@ -15152,6 +15278,19 @@ def register_dashboard_routes(m):
             media_type="application/json",
             status_code=status,
             headers={"cache-control": "no-store"},
+        )
+
+    def _artifact_not_found_response(session=None):
+        session = session or {}
+        identity = str(session.get("identity") or session.get("sub") or "").strip()
+        return HTMLResponse(
+            warehouse_theme.artifact_not_found_document(identity, session),
+            status_code=404,
+            headers={
+                **browser_page_headers,
+                "vary": "Cookie, Authorization",
+                "x-content-type-options": "nosniff",
+            },
         )
 
     def _browser_artifact(request, *, include_archived=False):
@@ -15173,11 +15312,13 @@ def register_dashboard_routes(m):
             return None, session, _json({"error": {"code": "NOT_FOUND"}}, 404)
         return subject, session, None
 
-    async def _proxy_runner(request, subpath=""):
-        email, _, access_error = _browser_artifact(request)
+    async def _proxy_runner(request, subpath="", browser_fallback=False):
+        email, session, access_error = _browser_artifact(request)
         if access_error:
             if getattr(access_error, "status_code", 0) == 401:
                 return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
+            if browser_fallback:
+                return _artifact_not_found_response(session)
             return access_error
         if not email:
             return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
@@ -15333,15 +15474,15 @@ def register_dashboard_routes(m):
         if not session:
             return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
         if not session.get("mapped", True):
-            return HTMLResponse("<h1>404 — no such artifact version</h1>", status_code=404)
+            return _artifact_not_found_response(session)
         slug = request.path_params["slug"]
         viewer = session.get("identity") or session.get("sub")
         try:
             document = _dashboard_version_document(slug, version, viewer)
-        except ValueError as exc:
-            return HTMLResponse(f"<h1>400 — {str(exc)}</h1>", status_code=400)
+        except ValueError:
+            return _artifact_not_found_response(session)
         if not document:
-            return HTMLResponse("<h1>404 — no such artifact version</h1>", status_code=404)
+            return _artifact_not_found_response(session)
         if record_view:
             _record_artifact_view(
                 request,
@@ -16243,7 +16384,7 @@ def register_dashboard_routes(m):
 
     @m.custom_route("/apps/{slug}", methods=["GET"])
     async def _view_app(request):
-        proxied = await _proxy_runner(request)
+        proxied = await _proxy_runner(request, browser_fallback=True)
         if proxied is not None:
             if 200 <= proxied.status_code < 300:
                 _record_running_app_view(request)
@@ -16252,7 +16393,11 @@ def register_dashboard_routes(m):
 
     @m.custom_route("/apps/{slug}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def _proxy_app_path(request):
-        proxied = await _proxy_runner(request, request.path_params.get("path") or "")
+        proxied = await _proxy_runner(
+            request,
+            request.path_params.get("path") or "",
+            browser_fallback=_document_navigation(request),
+        )
         if proxied is not None:
             if 200 <= proxied.status_code < 300 and _document_navigation(request):
                 _record_running_app_view(request)
@@ -16637,6 +16782,8 @@ def _register(mcp):
     mcp.tool(name="artifact_access_update")(_mcp_artifact_access_update)
     mcp.tool(name="artifact_archive")(_mcp_artifact_archive)
     mcp.tool(name="artifact_restore")(_mcp_artifact_restore)
+    mcp.tool(name="calliope_session_access_get")(_mcp_calliope_session_access_get)
+    mcp.tool(name="calliope_session_access_update")(_mcp_calliope_session_access_update)
     mcp.tool(name="draft_calliope_instrument")(_mcp_draft_calliope_instrument)
     mcp.tool(name="draft_calliope_workflow")(_mcp_draft_calliope_workflow)
     mcp.tool(name="search_calliope_actions")(_mcp_search_calliope_actions)
@@ -16747,6 +16894,11 @@ _INSTRUCTIONS = (
     "people, the owner is implicit, and adding Everyone requires explicit confirmation. Only the "
     "owner may update, enrich, run, share, archive, or restore an artifact. Archive is reversible and "
     "retains versions, grants, lineage, pins, and access receipts. "
+    "CALLIOPE NOTEBOOK ACCESS: ordinary Calliope chat notebooks may be shared read-only with "
+    "exact Teams or observed people. Use calliope_session_access_get before "
+    "calliope_session_access_update; the viewer lists are complete replacements, the owner remains "
+    "implicit and solely able to run or change the notebook, and Everyone requires explicit "
+    "confirmation. Brief, workflow-run, and action notebooks are not shareable. "
     "TO BUILD A LIVE APP: call `live_app_template(runtime_kind='html')` FIRST, edit the template, "
     "and call create_live_app. Hosted HTML apps live at /d/<slug>, are versioned, and call "
     "rvbbitQuery(sql) for live read-only data — one FLAT query per data concern (batch them with "

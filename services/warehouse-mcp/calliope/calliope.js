@@ -24,6 +24,14 @@
     dreamsClose: $("#calliope-dreams-close"),
     dreamsRun: $("#calliope-dreams-run"),
     dreamsRefresh: $("#calliope-dreams-refresh"),
+    dreamsScope: $("#calliope-dreams-scope"),
+    dreamsEyebrow: $("#calliope-dreams-eyebrow"),
+    dreamsTitle: $("#calliope-dreams-title"),
+    dreamsCopy: $("#calliope-dreams-copy"),
+    dreamsContext: $("#calliope-dreams-context"),
+    dreamsContextMeta: $("#calliope-dreams-context-meta"),
+    dreamsContextBody: $("#calliope-dreams-context-body"),
+    dreamsBacklogLabel: $("#calliope-dreams-backlog-label"),
     dreamsFilters: $("#calliope-dreams-filters"),
     dreamsSummary: $("#calliope-dreams-summary"),
     dreamsList: $("#calliope-dreams-list"),
@@ -90,7 +98,19 @@
     newSessionTitle: $("#new-session-title"),
     createSession: $("#create-session"),
     sessionTitle: $("#session-title"),
+    sessionAccessMeta: $("#session-access-meta"),
+    shareSession: $("#share-session"),
     archiveSession: $("#archive-session"),
+    shareDialog: $("#session-share-dialog"),
+    shareClose: $("#session-share-close"),
+    shareCancel: $("#session-share-cancel"),
+    shareSave: $("#session-share-save"),
+    shareSearch: $("#session-share-search"),
+    shareSummary: $("#session-share-summary"),
+    shareAvatars: $("#session-share-avatars"),
+    shareTeams: $("#session-share-teams"),
+    sharePeople: $("#session-share-people"),
+    shareWarning: $("#session-share-warning"),
     notebook: $(".notebook"),
     sessionResizer: $("#session-resizer"),
     chatResizer: $("#chat-resizer"),
@@ -143,6 +163,7 @@
     toolActivityDraft: $("#tool-activity-draft"),
     toolActivityDraftCopy: $("#tool-activity-draft-copy"),
     composer: $("#composer"),
+    readOnlyNotice: $("#read-only-notice"),
     inputHost: $("#message-editor"),
     input: $("#message-input"),
     send: $("#send-message"),
@@ -349,10 +370,13 @@
   const state = {
     sessions: [],
     current: null,
+    audience: null,
     sessionTab: "chats",
     lastSessionId: null,
     lastSessionsByTab: {},
     sessionRefreshTimer: null,
+    sessionEvents: null,
+    sessionEventRefreshTimer: null,
     turns: [],
     surfaces: [],
     selectedSurfaceId: null,
@@ -411,9 +435,13 @@
     dreams: {
       items: [],
       counts: { active: 0, new: 0, exploring: 0, adopted: 0, backlog: 0, sleeping: 0 },
+      scope: "personal",
       view: "active",
       selectedId: null,
       latestCycle: null,
+      context: null,
+      contextLoading: false,
+      requestId: 0,
       loading: false,
       running: false,
       viewedIds: new Set(),
@@ -499,6 +527,14 @@
     teamPeopleSearchSequence: 0,
     teamPeopleLoading: false,
     teamSaving: false,
+    sharing: {
+      access: null,
+      people: [],
+      selectedTeams: new Set(),
+      selectedPeople: new Set(),
+      loading: false,
+      saving: false,
+    },
     actions: [],
     actionQuery: "",
     actionTotal: 0,
@@ -576,10 +612,12 @@
   let googlePickerApiPromise = null;
   const SESSION_TABS = [
     { id: "chats", label: "Chats", empty: "No conversations here yet." },
+    { id: "shared", label: "Shared", empty: "Nothing has been shared with you yet." },
     { id: "briefs", label: "Briefs", empty: "No Daily Brief notebooks yet." },
     { id: "runs", label: "Runs", empty: "No Workflow or Instrument run notebooks yet." },
     { id: "actions", label: "Actions", empty: "No guided Action notebooks yet." },
   ];
+  const ALWAYS_VISIBLE_SESSION_TABS = new Set(["chats", "briefs"]);
   const SESSION_MIN_WIDTH = 205;
   const SESSION_MAX_WIDTH = 420;
   const CHAT_MIN_WIDTH = 320;
@@ -668,6 +706,57 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
+  }
+
+  function personName(person) {
+    return String(person?.display_name || person?.email || "Someone").trim();
+  }
+
+  function personInitials(person) {
+    const name = personName(person).replace(/@.*$/, "").replace(/[._-]+/g, " ");
+    const words = name.split(/\s+/).filter(Boolean);
+    return (words.length > 1 ? `${words[0][0]}${words.at(-1)[0]}` : name.slice(0, 2))
+      .toUpperCase() || "?";
+  }
+
+  function personAvatarUrl(person) {
+    if (person?.avatar_url) return String(person.avatar_url);
+    return person?.avatar_key
+      ? `/api/calliope/avatars/${encodeURIComponent(person.avatar_key)}`
+      : "";
+  }
+
+  function personAvatarMarkup(person, className = "person-avatar") {
+    const url = personAvatarUrl(person);
+    const name = personName(person);
+    return `<span class="${escapeHtml(className)}" title="${escapeHtml(name)}" aria-label="${escapeHtml(name)}">
+      <b aria-hidden="true">${escapeHtml(personInitials(person))}</b>
+      ${url ? `<img src="${escapeHtml(url)}" alt="" loading="lazy" decoding="async">` : ""}
+    </span>`;
+  }
+
+  function hydratePersonAvatars(root = document) {
+    $$(".person-avatar img,.participant-avatar img", root).forEach((image) => {
+      if (image.dataset.avatarBound === "true") return;
+      image.dataset.avatarBound = "true";
+      image.addEventListener("load", () => image.parentElement?.classList.add("has-image"));
+      image.addEventListener("error", () => {
+        image.parentElement?.classList.remove("has-image");
+        image.remove();
+      });
+      if (image.complete && image.naturalWidth > 0) {
+        image.parentElement?.classList.add("has-image");
+      }
+    });
+  }
+
+  function participantStackMarkup(people = [], count = null) {
+    const visible = people.filter(Boolean).slice(0, 4);
+    const knownCount = Number.isFinite(Number(count)) ? Number(count) : visible.length;
+    const remainder = Math.max(0, knownCount - visible.length);
+    return `${visible.map((person) => personAvatarMarkup(person, "participant-avatar")).join("")}${
+      remainder ? `<span class="participant-more" aria-label="${remainder} more people">+${remainder > 99 ? "99" : remainder}</span>` : ""
+    }`;
   }
 
   function highlightSql(value) {
@@ -1343,12 +1432,14 @@
       || state.workspace.documentImporting
       || state.workspace.documentMutating.size
       || state.workspace.sheetMutating.size;
-    els.googleSheetImport.hidden = !configured;
-    els.googleSheetImport.disabled = !state.current || state.busy || waiting;
+    els.googleSheetImport.hidden = !configured || currentReadOnly();
+    els.googleSheetImport.disabled = !state.current || currentReadOnly() || state.busy || waiting;
     els.googleSheetImport.setAttribute("aria-busy", String(state.workspace.pickerLoading));
     els.googleSheetImport.title = state.workspace.pickerLoading
       ? "Opening Google Drive…"
-      : !state.current
+      : currentReadOnly()
+        ? "This shared notebook is view only"
+        : !state.current
         ? "Choose a private notebook before bringing in a Google Sheet"
         : "Bring an explicitly selected Google Sheet into this private Stage";
     syncGoogleDocumentImportControls();
@@ -1367,12 +1458,14 @@
       || state.workspace.documentImporting
       || state.workspace.documentMutating.size
       || state.workspace.sheetMutating.size;
-    els.googleDocumentImport.hidden = !configured;
-    els.googleDocumentImport.disabled = !state.current || state.busy || waiting;
+    els.googleDocumentImport.hidden = !configured || currentReadOnly();
+    els.googleDocumentImport.disabled = !state.current || currentReadOnly() || state.busy || waiting;
     els.googleDocumentImport.setAttribute("aria-busy", String(state.workspace.pickerLoading));
     els.googleDocumentImport.title = state.workspace.pickerLoading
       ? "Opening Google Drive…"
-      : !state.current
+      : currentReadOnly()
+        ? "This shared notebook is view only"
+        : !state.current
         ? "Choose a private notebook before bringing in a Google Doc"
         : "Add an explicitly selected Google Doc to your private Brain";
   }
@@ -2189,6 +2282,141 @@
     loadInbox().catch(() => {});
   }
 
+  function personalDreamScope() {
+    return state.dreams.scope !== "company";
+  }
+
+  function renderDreamContext() {
+    const personal = personalDreamScope();
+    els.dreamsContext.hidden = !personal;
+    if (!personal) {
+      els.dreamsContext.open = false;
+      return;
+    }
+    const dossier = state.dreams.context || {};
+    const context = dossier.context && typeof dossier.context === "object" ? dossier.context : {};
+    const labels = {
+      focus_areas: "Focus", active_threads: "In motion", recurring_questions: "Recurring",
+      frictions: "Friction", successful_patterns: "Works well", preferences: "Preference",
+      open_loops: "Open loop", avoid: "Avoid",
+    };
+    const items = Object.entries(labels).flatMap(([field, label]) => (
+      Array.isArray(context[field])
+        ? context[field].filter((item) => item && typeof item === "object").map((item) => ({ ...item, fieldLabel: label }))
+        : []
+    )).slice(0, 16);
+    const summary = String(context.summary || "").trim();
+    const guidance = String(dossier.user_guidance || "").trim();
+    const contextError = String(dossier.last_error || "").trim();
+    els.dreamsContextMeta.textContent = dossier.paused
+      ? "Paused"
+      : dossier.generated_at
+        ? `Private · ${relativeTime(dossier.generated_at)}`
+        : "Private to you";
+    els.dreamsContextBody.innerHTML = state.dreams.contextLoading
+      ? '<p>Refreshing the private working context…</p>'
+      : dossier.paused
+        ? '<p>Calliope has forgotten this context and paused personal Dreaming. Resume when you want continuity to begin accumulating again.</p>'
+        : (summary || items.length || guidance || contextError)
+          ? `${summary ? `<p class="calliope-dreams-context-summary">${escapeHtml(summary)}</p>` : ""}
+            ${guidance ? `<div class="calliope-dreams-context-guidance"><b>Your correction</b><span>${escapeHtml(guidance)}</span></div>` : ""}
+            ${contextError ? `<div class="calliope-dreams-context-error"><b>Refresh needs attention</b><span>${escapeHtml(contextError)}</span></div>` : ""}
+            ${items.length ? `<div class="calliope-dreams-context-items">${items.map((item) => `<article><small>${escapeHtml(item.fieldLabel)}</small><strong>${escapeHtml(item.label || "Working thread")}</strong><p>${escapeHtml(item.detail || "")}</p></article>`).join("")}</div>` : ""}`
+          : '<p>Your private working context will appear after Calliope has enough grounded activity to distill.</p>';
+    const correct = $('[data-dream-context-action="correct"]', els.dreamsContext);
+    const forget = $('[data-dream-context-action="forget"]', els.dreamsContext);
+    const resume = $('[data-dream-context-action="resume"]', els.dreamsContext);
+    correct.hidden = Boolean(dossier.paused);
+    forget.hidden = Boolean(dossier.paused);
+    resume.hidden = !dossier.paused;
+  }
+
+  function renderDreamChrome() {
+    const personal = personalDreamScope();
+    const canViewCompany = state.config?.dreams?.can_view_company === true;
+    els.dreamsScope.hidden = !canViewCompany;
+    $$('[data-dream-scope]', els.dreamsScope).forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.dreamScope === state.dreams.scope));
+    });
+    els.dreamsEyebrow.textContent = personal
+      ? "Private continuity · evidence first"
+      : "Company reflection · evidence first";
+    els.dreamsTitle.textContent = personal ? "Dreams for you" : "Company Dreams";
+    els.dreamsCopy.textContent = personal
+      ? "A few timely possibilities grounded in the work already in motion. Credible runners-up wait quietly on deck."
+      : "Three strong things Calliope surfaced from recent work and longer company memory. Credible runners-up wait quietly in the wings.";
+    els.dreamsBacklogLabel.textContent = personal ? "On deck" : "In the wings";
+    els.dreamsRun.title = personal
+      ? "Refresh your private working context and look for timely possibilities"
+      : "Revisit the last 30 days against a 90-day company horizon";
+    renderDreamContext();
+  }
+
+  function setDreamScope(scope) {
+    const requested = scope === "company" ? "company" : "personal";
+    const next = requested === "company" && state.config?.dreams?.can_view_company !== true
+      ? "personal"
+      : requested;
+    if (state.dreams.scope === next) {
+      renderDreamChrome();
+      return false;
+    }
+    state.dreams.scope = next;
+    state.dreams.view = "active";
+    state.dreams.items = [];
+    state.dreams.counts = { active: 0, new: 0, exploring: 0, adopted: 0, backlog: 0, sleeping: 0 };
+    state.dreams.latestCycle = null;
+    state.dreams.selectedId = null;
+    state.dreams.viewedIds.clear();
+    renderDreamChrome();
+    return true;
+  }
+
+  async function loadDreamContext({ silent = false } = {}) {
+    if (!personalDreamScope()) return;
+    state.dreams.contextLoading = true;
+    if (!silent) renderDreamContext();
+    try {
+      const data = await api("/api/calliope/dreams/context");
+      state.dreams.context = data.context || null;
+    } finally {
+      state.dreams.contextLoading = false;
+      renderDreamContext();
+    }
+  }
+
+  async function mutateDreamContext(action) {
+    let note = "";
+    if (action === "correct") {
+      const current = String(state.dreams.context?.user_guidance || "");
+      const value = window.prompt(
+        "What should Calliope carry forward differently? This is private to you.", current,
+      );
+      if (value === null) return;
+      note = value.trim();
+      if (note.length < 4) {
+        toast("Give Calliope a little more context for the correction", true);
+        return;
+      }
+    }
+    if (action === "forget" && !window.confirm(
+      "Forget your private working context and personal Dreams? Company Dreams are not affected.",
+    )) return;
+    const data = await api("/api/calliope/dreams/context", {
+      method: "PATCH", body: JSON.stringify({ action, note }),
+    });
+    state.dreams.context = data.context || null;
+    renderDreamContext();
+    if (action === "forget") {
+      await loadDreams({ view: "active" });
+      toast("Private context and personal Dreams forgotten");
+    } else if (action === "resume") {
+      toast("Personal continuity resumed");
+    } else {
+      toast("Correction saved for the next Dream pass");
+    }
+  }
+
   function dreamTypeLabel(value) {
     return ({
       quick_win: "Quick win",
@@ -2208,12 +2436,13 @@
     const selected = dream.id === state.dreams.selectedId;
     const recurrence = Number(dream.recurrence_count || 1);
     const inWings = dream.portfolio_state === "backlog";
+    const waitingLabel = personalDreamScope() ? "On deck" : "In the wings";
     const editorialScore = Math.round(Number(dream.rank_score || 0) * 100);
     return `<button class="calliope-dream-card ${selected ? "active" : ""}" type="button"
       data-dream-id="${escapeHtml(dream.id)}" data-impact="${escapeHtml(dream.impact || "medium")}" data-portfolio-state="${inWings ? "backlog" : "promoted"}">
       <span class="calliope-dream-card-mark" aria-hidden="true">${dream.output_kind === "project_plan" ? "◇" : dream.output_kind === "question" ? "?" : "✦"}</span>
       <span class="calliope-dream-card-copy">
-        <small>${inWings ? "In the wings · " : ""}${escapeHtml(dreamTypeLabel(dream.dream_type))} · ${escapeHtml(dreamOutputLabel(dream.output_kind))}</small>
+        <small>${inWings ? `${waitingLabel} · ` : ""}${escapeHtml(dreamTypeLabel(dream.dream_type))} · ${escapeHtml(dreamOutputLabel(dream.output_kind))}</small>
         <strong>${escapeHtml(dream.title || "Untitled Dream")}</strong>
         <p>${escapeHtml(dream.thesis || "")}</p>
         <em>${escapeHtml(relativeTime(dream.updated_at))}${recurrence > 1 ? ` · returned ${recurrence}×` : ""}${inWings && editorialScore ? ` · ${editorialScore}% signal` : ""}</em>
@@ -2248,7 +2477,7 @@
       <header><span>Why this appeared</span><b>${evidence.length} observation${evidence.length === 1 ? "" : "s"}</b></header>
       <div>${evidence.map((item) => `<article>
         <i aria-hidden="true"></i><div><small>${escapeHtml(String(item?.kind || "observation").replaceAll("_", " "))} · ${Number(item?.signal_count || 1)} signal${Number(item?.signal_count || 1) === 1 ? "" : "s"}</small>
-        <strong>${escapeHtml(item?.title || "Observed company pattern")}</strong><p>${escapeHtml(item?.summary || "")}</p></div>
+        <strong>${escapeHtml(item?.title || (personalDreamScope() ? "Observed working pattern" : "Observed company pattern"))}</strong><p>${escapeHtml(item?.summary || "")}</p></div>
       </article>`).join("")}</div>
     </section>`;
   }
@@ -2297,10 +2526,12 @@
     const dismissed = dream.viewer_state === "dismissed";
     const adopted = dream.status === "adopted";
     const inWings = dream.portfolio_state === "backlog";
+    const personal = personalDreamScope();
+    const waitingLabel = personal ? "On deck" : "In the wings";
     const entities = Array.isArray(dream.entities) ? dream.entities.slice(0, 12) : [];
     els.dreamsDetail.innerHTML = `<article class="calliope-dream-detail-card" data-dream-status="${escapeHtml(dream.status || "proposed")}">
       <header class="calliope-dream-detail-head">
-        <div><span>${inWings ? "In the wings · " : ""}${escapeHtml(dreamTypeLabel(dream.dream_type))}</span><h3>${escapeHtml(dream.title)}</h3><p>${escapeHtml(dream.thesis || "")}</p></div>
+        <div><span>${inWings ? `${waitingLabel} · ` : ""}${escapeHtml(dreamTypeLabel(dream.dream_type))}</span><h3>${escapeHtml(dream.title)}</h3><p>${escapeHtml(dream.thesis || "")}</p></div>
         <aside><b>${escapeHtml(dream.impact || "medium")} impact</b><b>${escapeHtml(dream.effort || "medium")} effort</b><b>${Math.round(Number(dream.confidence || 0) * 100)}% confidence</b>${inWings ? `<b>${Math.round(Number(dream.rank_score || 0) * 100)}% editorial signal</b>` : ""}</aside>
       </header>
       ${entities.length ? `<div class="calliope-dream-entities">${entities.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>` : ""}
@@ -2309,7 +2540,7 @@
       ${dreamProbeMarkup(dream)}
       ${dreamEvidenceMarkup(dream)}
       <footer class="calliope-dream-actions">
-        <p>${adopted ? "Adopted into the company’s working memory." : asleep ? "Sleeping until more time or evidence passes." : dismissed ? "Hidden for you; the company Dream remains intact." : inWings ? "A credible candidate held quietly outside the three-item shelf. Exploring it promotes it into active work." : "The Dream is a hypothesis. Calliope will verify it again before building."}</p>
+        <p>${adopted ? (personal ? "Adopted into your private working memory." : "Adopted into the company’s working memory.") : asleep ? "Sleeping until more time or evidence passes." : dismissed ? (personal ? "Hidden from your private Dream shelf." : "Hidden for you; the company Dream remains intact.") : inWings ? "A credible candidate held quietly outside the three-item shelf. Exploring it promotes it into active work." : "The Dream is a hypothesis. Calliope will verify it again before building."}</p>
         ${asleep || dismissed ? `<button type="button" data-dream-action="reopen">Wake it</button>` : `
           <button type="button" data-dream-action="sleep">Sleep on it</button>
           <button type="button" data-dream-action="dismiss">Not useful</button>`}
@@ -2320,6 +2551,7 @@
   }
 
   function renderDreams() {
+    renderDreamChrome();
     const counts = state.dreams.counts || {};
     $$('[data-dream-view]', els.dreamsFilters).forEach((button) => {
       button.setAttribute("aria-pressed", String(button.dataset.dreamView === state.dreams.view));
@@ -2335,16 +2567,18 @@
     const candidateCount = Number(cycle?.candidate_count ?? cycle?.source_summary?.candidate_count ?? promotedCount);
     const heldCount = Math.max(0, candidateCount - promotedCount);
     els.dreamsSummary.textContent = state.dreams.running
-      ? "Calliope is comparing recent work with longer company memory…"
+      ? (personalDreamScope()
+        ? "Calliope is refreshing your private working context, then looking for useful connections…"
+        : "Calliope is comparing recent work with longer company memory…")
       : cycle?.status === "failed"
         ? `Last reflection needs attention · ${cycle.error || "model unavailable"}`
         : cycle?.completed_at
-          ? `${cycle.source_summary?.cycle_summary || `${promotedCount} Dreams surfaced`}${heldCount ? ` · ${heldCount} in the wings` : ""} · ${relativeTime(cycle.completed_at)}`
+          ? `${cycle.source_summary?.cycle_summary || `${promotedCount} Dreams surfaced`}${heldCount ? ` · ${heldCount} ${personalDreamScope() ? "on deck" : "in the wings"}` : ""} · ${relativeTime(cycle.completed_at)}`
           : "Waiting for the first reflection…";
     els.dreamsRun.disabled = state.dreams.running;
     els.dreamsRun.textContent = state.dreams.running ? "Dreaming…" : "Dream deeper";
     if (state.dreams.loading && !state.dreams.items.length) {
-      els.dreamsList.innerHTML = '<div class="calliope-dreams-loading"><i></i><span>Remembering what the company has been doing…</span></div>';
+      els.dreamsList.innerHTML = `<div class="calliope-dreams-loading"><i></i><span>${personalDreamScope() ? "Remembering what you have been working through…" : "Remembering what the company has been doing…"}</span></div>`;
     } else if (!state.dreams.items.length) {
       els.dreamsList.innerHTML = '<div class="calliope-dreams-list-empty"><span>☾</span><strong>No Dreams in this view.</strong><p>Quiet is better than repetitive or weak suggestions.</p></div>';
     } else {
@@ -2357,10 +2591,13 @@
     if (state.config?.dreams?.enabled !== true) return;
     state.dreams.view = view;
     state.dreams.loading = true;
+    const scope = state.dreams.scope;
+    const requestId = ++state.dreams.requestId;
     if (!silent) renderDreams();
     try {
-      const pageLimit = view === "backlog" ? 120 : 60;
-      const data = await api(`/api/calliope/dreams?view=${encodeURIComponent(view)}&limit=${pageLimit}`);
+      const pageLimit = view === "backlog" ? (scope === "personal" ? 12 : 30) : 60;
+      const data = await api(`/api/calliope/dreams?view=${encodeURIComponent(view)}&scope=${encodeURIComponent(scope)}&limit=${pageLimit}`);
+      if (requestId !== state.dreams.requestId || scope !== state.dreams.scope) return;
       state.dreams.items = Array.isArray(data.dreams) ? data.dreams : [];
       state.dreams.counts = data.counts || state.dreams.counts;
       state.dreams.latestCycle = data.latest_cycle || null;
@@ -2368,6 +2605,7 @@
         ? (selectId || state.dreams.selectedId)
         : state.dreams.items[0]?.id || null;
     } finally {
+      if (requestId !== state.dreams.requestId) return;
       state.dreams.loading = false;
       renderDreams();
     }
@@ -2379,7 +2617,10 @@
       return;
     }
     if (!els.dreamsDialog.open) els.dreamsDialog.showModal();
-    await loadDreams();
+    await Promise.all([
+      loadDreams(),
+      personalDreamScope() ? loadDreamContext({ silent: true }) : Promise.resolve(),
+    ]);
     markDreamViewed().catch(() => {});
   }
 
@@ -2410,13 +2651,14 @@
     renderDreams();
     try {
       const data = await api("/api/calliope/dreams/run", {
-        method: "POST", body: JSON.stringify({ mode: "deepen" }),
+        method: "POST", body: JSON.stringify({ mode: "deepen", scope: state.dreams.scope }),
       });
       const count = Number(data.dreams?.length || data.cycle?.dream_count || 0);
       const held = Number(data.backlog_count || 0);
       toast(count
-        ? `Calliope surfaced ${count} Dream${count === 1 ? "" : "s"}${held ? ` and kept ${held} in the wings` : ""}`
+        ? `Calliope surfaced ${count} Dream${count === 1 ? "" : "s"}${held ? ` and kept ${held} ${personalDreamScope() ? "on deck" : "in the wings"}` : ""}`
         : "The reflection was quiet; nothing cleared the evidence bar");
+      if (personalDreamScope()) loadDreamContext({ silent: true }).catch(() => {});
       await loadDreams({ view: "active", selectId: data.dreams?.[0]?.id });
     } finally {
       state.dreams.running = false;
@@ -2637,6 +2879,8 @@
       setStatus(state.config.healthy ? "ready" : "unavailable", state.config.healthy ? "" : "offline");
       els.actionOpen.hidden = state.config.action_library === false;
       els.dreamsOpen.hidden = state.config.dreams?.enabled !== true;
+      setDreamScope("personal");
+      renderDreamChrome();
       syncEvidenceSearchControls();
       syncSpeechControls();
       renderCalendarStatus();
@@ -2653,14 +2897,15 @@
 
   function syncEvidenceSearchControls() {
     const available = Boolean(state.config?.evidence_search);
-    const enabled = available && Boolean(state.current) && !state.evidenceSearching;
+    const enabled = available && Boolean(state.current) && !currentReadOnly() && !state.evidenceSearching;
     els.evidenceQuery.disabled = !enabled;
     els.evidenceSearchSubmit.disabled = !enabled;
     els.evidenceSearch.classList.toggle("searching", state.evidenceSearching);
     els.evidenceSearch.setAttribute("aria-busy", String(state.evidenceSearching));
     els.evidenceSearchScope.textContent = state.evidenceSearching
       ? "resolving company evidence…"
-      : available ? "docs · artifacts · data" : "resolver unavailable";
+      : currentReadOnly() ? "shared notebook · view only"
+        : available ? "docs · artifacts · data" : "resolver unavailable";
   }
 
   function inventoryGlyph(kind) {
@@ -5363,7 +5608,7 @@
   }
 
   async function applyDesignProfileToSession(versionId) {
-    if (!state.current) return;
+    if (!state.current || currentReadOnly()) return;
     const data = await api(`/api/calliope/sessions/${encodeURIComponent(state.current.id)}`, {
       method: "PATCH",
       body: JSON.stringify({ design_profile_version_id: versionId }),
@@ -5452,6 +5697,7 @@
   }
 
   function sessionTabFor(session) {
+    if (session?.access_role === "viewer" || session?.read_only) return "shared";
     if (isBriefSession(session)) return "briefs";
     if (isRunSession(session)) return "runs";
     if (isActionSession(session)) return "actions";
@@ -5484,6 +5730,8 @@
       session.instrument_name,
       session.action_title,
       session.action_id,
+      session.owner?.display_name,
+      session.owner?.email,
     ];
     if (isBriefSession(session)) {
       terms.push(briefDateLabel(session.brief_date), "daily brief", "daily briefs");
@@ -5523,6 +5771,12 @@
       ).localeCompare(String(left.action_created_at || left.updated_at || "")));
     }
     return sessions;
+  }
+
+  function visibleSessionTabs() {
+    return SESSION_TABS.filter((tab) =>
+      ALWAYS_VISIBLE_SESSION_TABS.has(tab.id) || sessionsForTab(tab.id).length > 0
+    );
   }
 
   function setSessionTabState(tab, persist = true) {
@@ -5566,6 +5820,9 @@
   async function loadSessions(selectId = null, refreshCurrent = false) {
     const data = await api("/api/calliope/sessions");
     state.sessions = data.sessions || [];
+    if (!visibleSessionTabs().some((tab) => tab.id === state.sessionTab)) {
+      setSessionTabState("chats");
+    }
     const hasSession = (id) => Boolean(
       id && state.sessions.some((session) => session.id === id)
     );
@@ -5594,7 +5851,27 @@
     }
   }
 
+  function scheduleVisibleSessionRefresh() {
+    window.clearTimeout(state.sessionEventRefreshTimer);
+    state.sessionEventRefreshTimer = window.setTimeout(() => {
+      if (state.busy || state.evidenceSearching) {
+        scheduleVisibleSessionRefresh();
+        return;
+      }
+      loadSessions(state.current?.id || null, true).catch(() => {});
+    }, state.busy ? 900 : 180);
+  }
+
+  function connectSessionEvents() {
+    state.sessionEvents?.close?.();
+    if (!("EventSource" in window)) return;
+    const events = new EventSource("/api/calliope/session-events");
+    state.sessionEvents = events;
+    events.addEventListener("calliope.sessions.changed", scheduleVisibleSessionRefresh);
+  }
+
   function sessionCardMarkup(session, kind = sessionTabFor(session)) {
+    const shared = kind === "shared";
     const brief = kind === "briefs";
     const run = kind === "runs";
     const action = kind === "actions";
@@ -5617,22 +5894,27 @@
         ? `guided action · ${count} surface${count === 1 ? "" : "s"}`
       : `${count} surface${count === 1 ? "" : "s"}`;
     const synopsis = String(session.synopsis || "").trim();
+    const owner = session.owner || { email: session.owner_email };
+    const sharedBy = shared ? `Shared by ${personName(owner)}` : "";
+    const shareMark = !shared && Number(session.share_count || 0) > 0
+      ? `<span class="session-shared-mark" title="Shared read-only">◇</span>` : "";
     return `
-      <button class="session-card ${brief ? "brief-session-card" : ""} ${run ? "run-session-card" : ""} ${action ? "action-session-card" : ""} ${state.current?.id === session.id ? "active" : ""}"
+      <button class="session-card ${shared ? "shared-session-card" : ""} ${brief ? "brief-session-card" : ""} ${run ? "run-session-card" : ""} ${action ? "action-session-card" : ""} ${state.current?.id === session.id ? "active" : ""}"
               type="button" role="listitem" data-session-id="${escapeHtml(session.id)}"
               ${brief ? `data-brief-date="${escapeHtml(session.brief_date)}"` : ""}
               ${run ? `data-run-status="${escapeHtml(workflowRun ? session.workflow_run_status || "running" : "instrument")}"` : ""}
               ${action ? `data-session-action-id="${escapeHtml(session.action_id)}"` : ""}
               ${brief || run || action ? `title="${escapeHtml(session.title)}"` : ""}>
-        <h3>${escapeHtml(title)}</h3>
+        <div class="session-card-title">${shared ? personAvatarMarkup(owner) : ""}<h3>${escapeHtml(title)}</h3>${shareMark}</div>
+        ${sharedBy ? `<span class="session-shared-by">${escapeHtml(sharedBy)} · view only</span>` : ""}
         ${synopsis ? `<div class="session-synopsis">${escapeHtml(synopsis)}</div>` : ""}
         <p class="session-meta"><span>${escapeHtml(relativeTime(session.updated_at))}</span><span>${escapeHtml(detail)}</span></p>
         <span class="session-glyphs" aria-hidden="true">${dots}</span>
       </button>`;
   }
 
-  function sessionTabsMarkup(groups, query) {
-    return `<nav class="session-tabs" role="tablist" aria-label="Notebook types">${SESSION_TABS.map((tab) => {
+  function sessionTabsMarkup(groups, query, tabs) {
+    return `<nav class="session-tabs" role="tablist" aria-label="Notebook types">${tabs.map((tab) => {
       const count = groups[tab.id].length;
       const total = sessionsForTab(tab.id).length;
       const selected = state.sessionTab === tab.id;
@@ -5647,9 +5929,13 @@
   }
 
   function renderSessions() {
+    const tabs = visibleSessionTabs();
+    if (!tabs.some((tab) => tab.id === state.sessionTab)) {
+      setSessionTabState("chats");
+    }
     const query = els.sessionSearch.value.trim().toLowerCase();
     const groups = Object.fromEntries(
-      SESSION_TABS.map((tab) => [tab.id, sessionsForTab(tab.id, query)]),
+      tabs.map((tab) => [tab.id, sessionsForTab(tab.id, query)]),
     );
     const active = groups[state.sessionTab] || [];
     const descriptor = SESSION_TABS.find((tab) => tab.id === state.sessionTab)
@@ -5657,7 +5943,7 @@
     const empty = query
       ? `No ${descriptor.label.toLowerCase()} match “${query}”.`
       : descriptor.empty;
-    els.sessionList.innerHTML = `${sessionTabsMarkup(groups, query)}
+    els.sessionList.innerHTML = `${sessionTabsMarkup(groups, query, tabs)}
       <section id="session-tab-panel" class="session-tab-panel" role="tabpanel"
                aria-labelledby="session-tab-${escapeHtml(state.sessionTab)}" tabindex="0">
         ${active.length
@@ -5670,10 +5956,168 @@
               : ""
           }</div>`}
       </section>`;
+    hydratePersonAvatars(els.sessionList);
+  }
+
+  function currentReadOnly() {
+    return Boolean(state.current?.read_only || state.current?.access_role === "viewer");
+  }
+
+  function currentShareable() {
+    return Boolean(
+      state.current
+      && !currentReadOnly()
+      && sessionTabFor(state.current) === "chats"
+    );
+  }
+
+  function renderSessionAccess() {
+    const current = state.current;
+    const readOnly = currentReadOnly();
+    const audience = state.audience;
+    els.shareSession.hidden = !currentShareable();
+    els.shareSession.disabled = !currentShareable() || state.busy;
+    els.archiveSession.disabled = !current || readOnly || state.busy;
+    els.archiveSession.hidden = readOnly;
+    els.sessionTitle.disabled = !current || readOnly || state.busy;
+    els.sessionTitle.title = readOnly ? "Shared notebook title" : "Rename session";
+    els.composer.hidden = readOnly;
+    els.readOnlyNotice.hidden = !readOnly;
+    els.sessionAccessMeta.hidden = !current;
+    if (!current) {
+      els.archiveSession.hidden = false;
+      els.sessionAccessMeta.innerHTML = "";
+    } else if (readOnly) {
+      const owner = current.owner || audience?.owner || { email: current.owner_email };
+      els.sessionAccessMeta.innerHTML = `${personAvatarMarkup(owner)}<span>Shared by <b>${escapeHtml(personName(owner))}</b> · view only</span>`;
+    } else if (audience && !audience.private) {
+      els.sessionAccessMeta.innerHTML = `<span class="participant-stack">${participantStackMarkup(
+        audience.participants || [], audience.participant_count,
+      )}</span><span>${escapeHtml(audience.summary || "Shared read-only")}</span>`;
+    } else {
+      els.sessionAccessMeta.innerHTML = '<span class="private-session-mark" aria-hidden="true">◇</span><span>Private notebook</span>';
+    }
+    hydratePersonAvatars(els.sessionAccessMeta);
+    if (current) composerSetDisabled(readOnly || state.busy);
+    syncEvidenceSearchControls();
+    syncGoogleSheetImportControls();
+  }
+
+  function renderShareDialog() {
+    const access = state.sharing.access;
+    if (!access) {
+      els.shareSummary.textContent = state.sharing.loading ? "Loading audience…" : "Audience unavailable";
+      els.shareAvatars.innerHTML = "";
+      els.shareTeams.innerHTML = state.sharing.loading ? '<div class="session-share-empty">Loading Teams…</div>' : "";
+      els.sharePeople.innerHTML = state.sharing.loading ? '<div class="session-share-empty">Loading people…</div>' : "";
+      return;
+    }
+    const query = els.shareSearch.value.trim().toLowerCase();
+    const teams = (access.teams || []).filter((team) => (
+      !query || `${team.name || ""} ${team.description || ""}`.toLowerCase().includes(query)
+    ));
+    const ownerEmail = String(access.audience?.owner?.email || "").toLowerCase();
+    const people = state.sharing.people.filter((person) => (
+      String(person.email || "").toLowerCase() !== ownerEmail
+      && (!query || `${person.display_name || ""} ${person.email || ""}`.toLowerCase().includes(query))
+    ));
+    els.shareSummary.textContent = access.summary || "Only you";
+    els.shareAvatars.innerHTML = participantStackMarkup(
+      access.audience?.participants || [access.audience?.owner].filter(Boolean),
+      access.audience?.participant_count,
+    );
+    els.shareTeams.innerHTML = teams.length ? teams.map((team) => {
+      const selected = state.sharing.selectedTeams.has(String(team.id));
+      const everyone = team.system_key === "everyone";
+      return `<label class="session-share-option ${everyone ? "everyone" : ""}">
+        <input type="checkbox" data-share-team="${escapeHtml(team.id)}" ${selected ? "checked" : ""}>
+        <span class="share-option-mark" aria-hidden="true">${everyone ? "◎" : "◉"}</span>
+        <span><strong>${escapeHtml(team.name)}</strong><small>${escapeHtml(everyone ? "Every verified signed-in user" : `${Number(team.member_count || 0)} member${Number(team.member_count || 0) === 1 ? "" : "s"}`)}</small></span>
+      </label>`;
+    }).join("") : '<div class="session-share-empty">No Teams match.</div>';
+    els.sharePeople.innerHTML = people.length ? people.map((person) => {
+      const selected = state.sharing.selectedPeople.has(String(person.email).toLowerCase());
+      return `<label class="session-share-option">
+        <input type="checkbox" data-share-person="${escapeHtml(person.email)}" ${selected ? "checked" : ""}>
+        ${personAvatarMarkup(person)}
+        <span><strong>${escapeHtml(personName(person))}</strong><small>${escapeHtml(person.email)}</small></span>
+      </label>`;
+    }).join("") : '<div class="session-share-empty">No people match.</div>';
+    const everyone = (access.teams || []).find((team) => team.system_key === "everyone");
+    const everyoneSelected = everyone && state.sharing.selectedTeams.has(String(everyone.id));
+    els.shareWarning.hidden = !everyoneSelected;
+    els.shareWarning.textContent = everyoneSelected
+      ? "Everyone means every verified person who can sign in to this Warehouse—not a public link."
+      : "";
+    els.shareSave.disabled = state.sharing.saving;
+    els.shareSave.textContent = state.sharing.saving ? "Saving…" : "Save access";
+    hydratePersonAvatars(els.shareDialog);
+  }
+
+  async function openSessionSharing() {
+    if (!currentShareable() || state.sharing.loading) return;
+    state.sharing.loading = true;
+    state.sharing.access = null;
+    els.shareSearch.value = "";
+    els.shareDialog.showModal();
+    renderShareDialog();
+    try {
+      const [access, directory] = await Promise.all([
+        api(`/api/calliope/sessions/${encodeURIComponent(state.current.id)}/access`),
+        api("/api/calliope/team-people?limit=500"),
+      ]);
+      state.sharing.access = access;
+      state.sharing.people = directory.people || [];
+      state.sharing.selectedTeams = new Set((access.grants?.teams || []).map((team) => String(team.id)));
+      state.sharing.selectedPeople = new Set((access.grants?.people || []).map((person) => String(person.email).toLowerCase()));
+    } finally {
+      state.sharing.loading = false;
+      renderShareDialog();
+    }
+  }
+
+  async function saveSessionSharing() {
+    const access = state.sharing.access;
+    if (!access || state.sharing.saving || !currentShareable()) return;
+    const everyone = (access.teams || []).find((team) => team.system_key === "everyone");
+    const everyoneWasSelected = (access.grants?.teams || []).some((team) => team.system_key === "everyone");
+    const everyoneSelected = everyone && state.sharing.selectedTeams.has(String(everyone.id));
+    let confirmEveryone = false;
+    if (everyoneSelected && !everyoneWasSelected) {
+      confirmEveryone = window.confirm(
+        "Share this notebook read-only with Everyone who can sign in to this Warehouse? This is not a public link.",
+      );
+      if (!confirmEveryone) return;
+    }
+    state.sharing.saving = true;
+    renderShareDialog();
+    try {
+      const result = await api(
+        `/api/calliope/sessions/${encodeURIComponent(state.current.id)}/access`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            expected_revision: access.session.access_revision,
+            team_ids: [...state.sharing.selectedTeams],
+            people: [...state.sharing.selectedPeople],
+            confirm_everyone: confirmEveryone,
+          }),
+        },
+      );
+      state.audience = result.audience;
+      state.sharing.access = result;
+      els.shareDialog.close();
+      await loadSessions(state.current.id, true);
+      toast(result.private ? "Notebook is private again" : result.summary);
+    } finally {
+      state.sharing.saving = false;
+      renderShareDialog();
+    }
   }
 
   async function activateSessionTab(tab) {
     if (state.busy || state.evidenceSearching) return;
+    if (!visibleSessionTabs().some((item) => item.id === tab)) return;
     setSessionTabState(tab);
     const query = els.sessionSearch.value.trim().toLowerCase();
     const visible = sessionsForTab(state.sessionTab, query);
@@ -5699,6 +6143,7 @@
     clearSpatialSelections();
     clearLiveActivity();
     state.current = null;
+    state.audience = null;
     state.turns = [];
     state.surfaces = [];
     state.selectedSurfaceId = null;
@@ -5719,6 +6164,7 @@
     syncEvidenceSearchControls();
     syncSpeechControls();
     syncGoogleSheetImportControls();
+    renderSessionAccess();
   }
 
   async function selectSession(id, options = {}) {
@@ -5733,7 +6179,8 @@
     clearSpatialSelections();
     if (!options.preserveActivity) clearLiveActivity();
     const data = await api(`/api/calliope/sessions/${encodeURIComponent(id)}`);
-    state.current = data.session;
+    state.current = { ...(selectedSummary || {}), ...(data.session || {}) };
+    state.audience = data.audience || null;
     state.turns = data.turns || [];
     state.surfaces = data.surfaces || [];
     state.selectedSurfaceId = null;
@@ -5743,9 +6190,9 @@
     state.newSurfaceCount = 0;
     rememberSession(selectedSummary || state.current);
     els.sessionTitle.textContent = state.current.title;
-    els.archiveSession.disabled = false;
-    composerSetDisabled(false);
-    els.send.disabled = false;
+    els.archiveSession.disabled = currentReadOnly();
+    composerSetDisabled(currentReadOnly());
+    els.send.disabled = currentReadOnly();
     renderSessions();
     renderSelected();
     renderEvidenceContextTray();
@@ -5756,8 +6203,9 @@
     syncEvidenceSearchControls();
     syncSpeechControls();
     syncGoogleSheetImportControls();
+    renderSessionAccess();
     setMobilePanel();
-    if (options.focusComposer !== false) {
+    if (options.focusComposer !== false && !currentReadOnly()) {
       requestAnimationFrame(composerFocus);
     }
   }
@@ -5778,7 +6226,7 @@
   }
 
   async function renameSession() {
-    if (!state.current || state.busy) return;
+    if (!state.current || state.busy || currentReadOnly()) return;
     const next = window.prompt("Rename this notebook", state.current.title);
     if (!next || next.trim() === state.current.title) return;
     const data = await api(`/api/calliope/sessions/${state.current.id}`, {
@@ -5791,7 +6239,7 @@
   }
 
   async function archiveSession() {
-    if (!state.current || state.busy) return;
+    if (!state.current || state.busy || currentReadOnly()) return;
     if (!window.confirm(`Archive “${state.current.title}”? Published artifacts remain shared.`)) return;
     await api(`/api/calliope/sessions/${state.current.id}`, {
       method: "PATCH",
@@ -6065,9 +6513,16 @@
       const voicePresented = !failed && voicePresentationEnabled(turn);
       const voiceRevealing = voicePresented
         && String(state.voice.revealingTurnId || "") === String(turn.id || "");
+      const author = turn.author || state.current?.owner || {
+        email: turn.author_email || state.current?.owner_email,
+        display_name: turn.author_display_name,
+      };
+      const isViewer = String(author.email || "").toLowerCase()
+        === String(state.config?.viewer?.email || "").toLowerCase();
+      const authorLabel = `${personName(author)}${isViewer ? " · you" : ""}`;
       return `
         <article class="message user" data-turn-id="${escapeHtml(turn.id)}">
-          <div class="message-label"><span>You · ${escapeHtml(relativeTime(turn.created_at))}</span></div>
+          <div class="message-label user-message-label">${personAvatarMarkup(author)}<span>${escapeHtml(authorLabel)} · ${escapeHtml(relativeTime(turn.created_at))}</span></div>
           <div class="message-body">${safeMarkdown(turn.user_message)}</div>
           ${attachments ? `<div class="message-attachments">${attachments}</div>` : ""}
           ${renderTurnEvidenceRefs(turn)}
@@ -6080,6 +6535,7 @@
           ${receipt || (links ? `<div class="surface-links">${links}</div>` : "")}
         </article>`;
     }).join("");
+    hydratePersonAvatars(els.messages);
     window.CalliopeThinkingOrbs?.mountAll(els.messages);
     if (initial) {
       state.chatAtLiveEdge = true;
@@ -7396,18 +7852,23 @@
     }
   }
 
-  function artifactEmbedUrl(value) {
+  function artifactSessionUrl(value, embedded = false) {
     try {
       const url = new URL(value, window.location.href);
       if (
         url.origin === window.location.origin
         && url.pathname.startsWith("/calliope/artifacts/")
       ) {
-        url.searchParams.set("embed", "1");
+        if (state.current?.id) url.searchParams.set("session", state.current.id);
+        if (embedded) url.searchParams.set("embed", "1");
         return `${url.pathname}${url.search}${url.hash}`;
       }
     } catch { /* retain the original artifact URL */ }
     return value;
+  }
+
+  function artifactEmbedUrl(value) {
+    return artifactSessionUrl(value, true);
   }
 
   function renderInstrument(surface) {
@@ -9356,6 +9817,7 @@
   }
 
   function surfaceCard(surface) {
+    const canMutateNotebook = !currentReadOnly();
     const designProfile = surface.presentation?.design_profile;
     const personalBrief = surface.kind === "evidence" && surface.payload?.mode === "personal_brief";
     const meta = [
@@ -9390,7 +9852,7 @@
       workflow: renderWorkflow,
     })[surface.kind]?.(surface) || `<div class="chart-empty">Surface unavailable</div>`;
     const openUrl = surface.kind === "artifact"
-      ? surface.payload?.display_url || surface.payload?.url
+      ? artifactSessionUrl(surface.payload?.display_url || surface.payload?.url)
       : surface.kind === "document" ? surface.payload?.download_url : null;
     const lineageLabel = surface.kind === "evidence"
       ? personalBrief
@@ -9445,14 +9907,14 @@
             : ""
         }</p></div>
         <div class="surface-tools">
-          ${googleSheetActive
+          ${canMutateNotebook && googleSheetActive
             ? `<button type="button" data-refresh-google-sheet="${escapeHtml(surface.id)}" title="Check Google Sheets and create a linked Stage revision only when this range changed" ${googleSheetBusy ? "disabled" : ""}>${googleSheetBusy ? "Checking…" : "Refresh"}</button>`
             : ""}
-          ${googleDocumentActive
+          ${canMutateNotebook && googleDocumentActive
             ? `<button type="button" data-refresh-google-document="${escapeHtml(surface.id)}" title="Check Google Drive and replace this private Brain snapshot only when its content changed" ${googleDocumentBusy ? "disabled" : ""}>${googleDocumentBusy ? "Checking…" : "Refresh"}</button>
               <button class="surface-tool-danger" type="button" data-forget-google-document="${escapeHtml(surface.id)}" title="Remove the indexed private Brain copy without changing Google Drive" ${googleDocumentBusy ? "disabled" : ""}>Forget</button>`
             : ""}
-          ${surface.kind === "query" && !metadata && state.config?.google_workspace?.sheets_export
+          ${canMutateNotebook && surface.kind === "query" && !metadata && state.config?.google_workspace?.sheets_export
             ? renderGoogleSheetAction(surface)
             : ""}
           ${surface.kind === "query" && !metadata
@@ -9461,10 +9923,10 @@
           ${surface.kind === "image" && surface.payload?.overlay_image_url
             ? `<button type="button" data-toggle-markup="${escapeHtml(surface.id)}" aria-pressed="true" title="Hide or show markup">Marks</button>`
             : ""}
-          ${surface.kind === "image" && surface.payload?.image_url
+          ${canMutateNotebook && surface.kind === "image" && surface.payload?.image_url
             ? `<button type="button" data-markup-surface="${escapeHtml(surface.id)}" title="Select or draw on this image">Markup</button>`
             : ""}
-          ${surface.kind === "artifact"
+          ${canMutateNotebook && surface.kind === "artifact"
             ? `<button type="button" data-markup-artifact="${escapeHtml(surface.id)}" title="Draw on an exact snapshot of this artifact">Markup</button>
               <button type="button" data-inspect-artifact="${escapeHtml(surface.id)}" aria-pressed="${
               state.inspectingSurfaceId === surface.id ? "true" : "false"
@@ -9472,7 +9934,7 @@
               state.inspectingSurfaceId === surface.id ? "Picking…" : "Select"
             }</button>`
             : ""}
-          ${surface.kind === "evidence"
+          ${surface.kind === "evidence" && canMutateNotebook
             ? personalBrief
               ? `<button type="button" data-refresh-brief title="Resolve a new timestamped observation snapshot" ${state.brief.loading ? "disabled" : ""}>Refresh</button>`
               : `<button type="button" data-repeat-evidence="${escapeHtml(surface.id)}" title="Run this evidence search again">Again</button>`
@@ -11601,6 +12063,7 @@
       evidence_refs: evidenceRefs,
       object_refs: objectRefs,
       response_receipt: {},
+      author: state.config?.viewer || { email: state.current?.owner_email },
       created_at: new Date().toISOString(),
     };
     state.turns.push(turn);
@@ -11643,7 +12106,7 @@
   }
 
   async function sendTurn() {
-    if (!state.current || state.busy || state.speech.phase !== "idle") return;
+    if (!state.current || currentReadOnly() || state.busy || state.speech.phase !== "idle") return;
     applyVoicePreferences(readVoicePreferences());
     state.voice.pendingTurns.clear();
     state.voice.revealingTurnId = null;
@@ -11720,6 +12183,7 @@
           pending.attachments = data.attachments || pending.attachments;
           pending.evidence_refs = data.evidence_refs || pending.evidence_refs;
           pending.object_refs = data.object_refs || pending.object_refs;
+          pending.author = data.author || pending.author;
           renderChat();
           completeLiveContext();
           scrollChatToLiveEdge();
@@ -11862,7 +12326,25 @@
       if (event.target === els.dreamsDialog) els.dreamsDialog.close();
     });
     els.dreamsRefresh.addEventListener("click", () => {
-      loadDreams().catch((error) => toast(error.message, true));
+      Promise.all([
+        loadDreams(),
+        personalDreamScope() ? loadDreamContext({ silent: true }) : Promise.resolve(),
+      ]).catch((error) => toast(error.message, true));
+    });
+    els.dreamsScope.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-dream-scope]");
+      if (!button || !setDreamScope(button.dataset.dreamScope)) return;
+      Promise.all([
+        loadDreams({ view: "active" }),
+        personalDreamScope() ? loadDreamContext({ silent: true }) : Promise.resolve(),
+      ]).then(() => markDreamViewed()).catch((error) => toast(error.message, true));
+    });
+    els.dreamsContext.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-dream-context-action]");
+      if (!button) return;
+      event.preventDefault();
+      mutateDreamContext(button.dataset.dreamContextAction)
+        .catch((error) => toast(error.message, true));
     });
     els.dreamsRun.addEventListener("click", () => {
       runDreamCycle().catch((error) => {
@@ -12337,6 +12819,47 @@
       els.dialog.showModal();
       requestAnimationFrame(() => els.newSessionTitle.focus());
     });
+    els.shareSession.addEventListener("click", () => {
+      openSessionSharing().catch((error) => {
+        els.shareDialog.close();
+        toast(error.message, true);
+      });
+    });
+    els.shareClose.addEventListener("click", () => els.shareDialog.close());
+    els.shareCancel.addEventListener("click", () => els.shareDialog.close());
+    els.shareDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      els.shareDialog.close();
+    });
+    els.shareDialog.addEventListener("click", (event) => {
+      if (event.target === els.shareDialog) els.shareDialog.close();
+    });
+    els.shareSearch.addEventListener("input", renderShareDialog);
+    els.shareTeams.addEventListener("change", (event) => {
+      const input = event.target.closest("[data-share-team]");
+      if (!input) return;
+      if (input.checked) state.sharing.selectedTeams.add(input.dataset.shareTeam);
+      else state.sharing.selectedTeams.delete(input.dataset.shareTeam);
+      renderShareDialog();
+    });
+    els.sharePeople.addEventListener("change", (event) => {
+      const input = event.target.closest("[data-share-person]");
+      if (!input) return;
+      const email = String(input.dataset.sharePerson || "").toLowerCase();
+      if (input.checked) state.sharing.selectedPeople.add(email);
+      else state.sharing.selectedPeople.delete(email);
+      renderShareDialog();
+    });
+    els.shareSave.addEventListener("click", () => {
+      saveSessionSharing().catch((error) => {
+        if (error.code === "SESSION_ACCESS_CONFLICT") {
+          toast("Sharing changed elsewhere. Reopen Share and try again.", true);
+          els.shareDialog.close();
+        } else {
+          toast(error.message, true);
+        }
+      });
+    });
     els.briefOpen.addEventListener("click", () => {
       openPersonalBrief(false).catch((error) => toast(error.message, true));
     });
@@ -12396,12 +12919,14 @@
       const tab = event.target.closest("[data-session-tab]");
       if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
-      const index = SESSION_TABS.findIndex((item) => item.id === tab.dataset.sessionTab);
+      const tabs = visibleSessionTabs();
+      const index = tabs.findIndex((item) => item.id === tab.dataset.sessionTab);
+      if (index < 0) return;
       const nextIndex = event.key === "Home" ? 0
-        : event.key === "End" ? SESSION_TABS.length - 1
-          : (index + (event.key === "ArrowRight" ? 1 : -1) + SESSION_TABS.length)
-            % SESSION_TABS.length;
-      activateSessionTab(SESSION_TABS[nextIndex].id)
+        : event.key === "End" ? tabs.length - 1
+          : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length)
+            % tabs.length;
+      activateSessionTab(tabs[nextIndex].id)
         .catch((error) => toast(error.message, true));
     });
     els.sessionTitle.addEventListener("click", () => renameSession().catch((error) => toast(error.message, true)));
@@ -12417,6 +12942,7 @@
     els.speechRecord.addEventListener("click", () => toggleSpeechRecording(els.speechRecord));
     window.addEventListener("pagehide", cancelSpeechRecording);
     window.addEventListener("pagehide", stopVoicePlayback);
+    window.addEventListener("pagehide", () => state.sessionEvents?.close?.());
     if (!state.composerEditor) {
       els.input.addEventListener("input", resizeComposer);
       els.input.addEventListener("paste", pasteImages);
@@ -13142,6 +13668,7 @@
       await loadInstruments();
       await loadWorkflows();
       await loadSessions(launchSession);
+      connectSessionEvents();
       const pendingWorkspaceExport = sessionStorage.getItem("calliope.pendingWorkspaceExport.v1");
       if (pendingWorkspaceExport && state.workspace.status?.connected) {
         sessionStorage.removeItem("calliope.pendingWorkspaceExport.v1");
