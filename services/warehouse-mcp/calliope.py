@@ -431,6 +431,7 @@ _LIBRARY_INVENTORY_SECTIONS = {
     "tools": "Tools",
     "meaning": "Meaning",
     "routines": "Routines",
+    "teams": "Teams",
     "people": "People & access",
 }
 _LIBRARY_INVENTORY_STATES = {
@@ -4166,6 +4167,83 @@ def _library_routine_inventory(conn: Any, owner: str) -> list[dict[str, Any]]:
     return items
 
 
+def _library_team_inventory(conn: Any, owner: str) -> list[dict[str, Any]]:
+    """Company-visible flat Teams in their own focused Library section."""
+    teams = conn.execute(
+        "SELECT t.id::text,t.slug,t.name,t.description,t.system_key,t.archived,t.revision,"
+        "t.created_by,t.created_at,t.updated_by,t.updated_at,"
+        "coalesce(array_agg(m.principal_email ORDER BY m.principal_email) "
+        "FILTER (WHERE m.principal_email IS NOT NULL),ARRAY[]::text[]) AS members,"
+        "(SELECT max(e.created_at) FROM rvbbit.team_events e WHERE e.team_id=t.id) AS last_changed_at "
+        "FROM rvbbit.teams t LEFT JOIN rvbbit.team_members m ON m.team_id=t.id "
+        "GROUP BY t.id ORDER BY CASE t.system_key WHEN 'admins' THEN 0 "
+        "WHEN 'everyone' THEN 1 ELSE 2 END,t.archived,t.name"
+    ).fetchall()
+    admin = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM rvbbit.team_members m JOIN rvbbit.teams t ON t.id=m.team_id "
+        "WHERE t.system_key='admins' AND NOT t.archived AND m.principal_email=lower(%s)) AS allowed",
+        (owner,),
+    ).fetchone() or {}
+    can_manage = bool(admin.get("allowed"))
+    items = []
+    for row in teams:
+        members = list(row.get("members") or [])
+        system_key = row.get("system_key")
+        everyone = system_key == "everyone"
+        protected = system_key in {"admins", "everyone"}
+        if row.get("archived"):
+            state, health = "inactive", "This Team is archived and confers no application access."
+        elif everyone:
+            state, health = (
+                "healthy",
+                "Automatically matches every verified application user; no explicit member list is stored.",
+            )
+        elif system_key == "admins" and not members:
+            state, health = "attention", "Bootstrap the first Admin before Team management is available."
+        elif system_key == "admins":
+            state, health = "healthy", "Members of this protected Team may create and change Teams."
+        elif members:
+            state, health = "healthy", "This Team has explicit observed-person membership."
+        else:
+            state, health = "ready", "This Team is active but does not have any members yet."
+        items.append(_library_inventory_item(
+            ref=f"team:{row.get('id')}",
+            kind="team",
+            section="teams",
+            label=str(row.get("name") or row.get("slug") or "Team"),
+            summary=str(row.get("description") or "A flat application access Team."),
+            state=state,
+            health=health,
+            facts=[
+                _library_inventory_fact("Members", "Any authenticated user" if everyone else len(members)),
+                _library_inventory_fact("Membership", "Automatic" if everyone else "Explicit"),
+                _library_inventory_fact("Revision", row.get("revision")),
+                _library_inventory_fact("Last changed", row.get("last_changed_at") or row.get("updated_at")),
+                _library_inventory_fact("Protected", "Yes" if protected else None),
+            ],
+            owner=row.get("created_by"),
+            visibility="organization",
+            updated_at=row.get("updated_at"),
+            last_activity_at=row.get("last_changed_at") or row.get("updated_at"),
+            detail={
+                "id": str(row.get("id")),
+                "slug": row.get("slug"),
+                "system_key": system_key,
+                "revision": row.get("revision"),
+                "members": members,
+                "member_count": None if everyone else len(members),
+                "membership_rule": "authenticated_users" if everyone else "explicit_members",
+                "dynamic_membership": everyone,
+                "archived": bool(row.get("archived")),
+                "protected": protected,
+                "can_manage": can_manage,
+                "updated_by": row.get("updated_by"),
+            },
+            intents=["inspect", "change"],
+        ))
+    return items
+
+
 def _library_personal_inventory(conn: Any, owner: str) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     connection = conn.execute(
@@ -4354,6 +4432,7 @@ def _library_inventory_snapshot(
         ("Cubes", _library_cube_inventory),
         ("Metrics", _library_metric_inventory),
         ("Routines", _library_routine_inventory),
+        ("Teams", _library_team_inventory),
         ("Personal context", _library_personal_inventory),
     )
     all_items: list[dict[str, Any]] = []
@@ -12523,9 +12602,10 @@ def _brief_home_observations(
                 "FROM rvbbit.calliope_boards b "
                 "JOIN rvbbit.calliope_board_items i ON i.board_id=b.id "
                 "LEFT JOIN rvbbit.dashboards d ON d.slug=i.source->>'slug' "
+                "AND rvbbit.artifact_can_view(d.id,%s,false) "
                 "WHERE lower(b.owner_email)=lower(%s) AND b.slug='home' "
                 "ORDER BY i.sort_order,i.created_at LIMIT 24",
-                (owner,),
+                (owner, owner),
             ).fetchall()
     except Exception as exc:
         return [], [{
@@ -13015,7 +13095,8 @@ def _brief_internal_observations(
                 "SELECT d.slug,d.name,d.description,d.app_kind,d.runtime_kind,d.latest_version,"
                 "d.updated_at,v.created_by FROM rvbbit.dashboards d "
                 "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id AND v.version=d.latest_version "
-                "WHERE d.updated_at>=%s AND (lower(coalesce(d.owner_email,''))=lower(%s) "
+                "WHERE NOT d.archived AND d.updated_at>=%s "
+                "AND (lower(coalesce(d.owner_email,''))=lower(%s) "
                 "OR lower(coalesce(v.created_by,''))=lower(%s)) "
                 "ORDER BY d.updated_at DESC LIMIT 12",
                 (window_start, owner, owner),
@@ -13395,11 +13476,12 @@ def _composer_objects(
             with conn_factory() as conn:
                 rows = conn.execute(
                     "SELECT d.slug,d.name,d.description,d.latest_version,d.app_kind "
-                    "FROM rvbbit.dashboards d WHERE d.status<>'archived' AND ("
+                    "FROM rvbbit.dashboards d WHERE NOT d.archived "
+                    "AND rvbbit.artifact_can_view(d.id,%s,false) AND ("
                     "d.slug ILIKE %s ESCAPE '\\' OR d.name ILIKE %s ESCAPE '\\' "
                     "OR d.description ILIKE %s ESCAPE '\\') ORDER BY "
                     "(lower(d.slug)=lower(%s)) DESC,(d.name ILIKE %s ESCAPE '\\') DESC,d.updated_at DESC LIMIT %s",
-                    (contains, contains, contains, needle, prefix, bounded_limit),
+                    (owner, contains, contains, contains, needle, prefix, bounded_limit),
                 ).fetchall()
             for row in rows:
                 version = int(row.get("latest_version") or 1)
@@ -13670,8 +13752,9 @@ def _resolve_composer_objects(
                 row = conn.execute(
                     "SELECT d.slug,d.name,d.description,d.app_kind,v.version FROM rvbbit.dashboards d "
                     "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
-                    "WHERE d.slug=%s AND v.version=%s AND d.status<>'archived'",
-                    (base_id, requested_version),
+                    "WHERE d.slug=%s AND v.version=%s AND NOT d.archived "
+                    "AND rvbbit.artifact_can_view(d.id,%s,false)",
+                    (base_id, requested_version, owner),
                 ).fetchone()
             if row:
                 resolved_item = _composer_object_result(
@@ -15920,7 +16003,7 @@ def _mutate_workflow(
 
 
 def _resolve_workflow_semantic_object(
-    conn: Any, context: dict[str, Any]
+    conn: Any, context: dict[str, Any], owner: str
 ) -> dict[str, Any]:
     """Resolve the exact artifact semantic-map handle emitted by evidence search."""
     ref = str(context.get("ref") or "")
@@ -15946,8 +16029,9 @@ def _resolve_workflow_semantic_object(
     row = conn.execute(
         "SELECT d.name,v.manifest FROM rvbbit.dashboards d "
         "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
-        "WHERE d.slug=%s AND v.version=%s",
-        (slug, version),
+        "WHERE d.slug=%s AND v.version=%s AND NOT d.archived "
+        "AND rvbbit.artifact_can_view(d.id,%s,false)",
+        (slug, version, owner),
     ).fetchone()
     if not row:
         return {"found": False, "ref": ref, "slug": slug, "version": version}
@@ -16010,20 +16094,25 @@ def _resolve_workflow_contexts(
         if kind == "artifact" and ref:
             if version is None:
                 row = conn.execute(
-                    "SELECT * FROM rvbbit.artifact_index WHERE ref=%s "
+                    "SELECT ai.* FROM rvbbit.artifact_index ai "
+                    "JOIN rvbbit.dashboards d ON d.slug=ai.ref "
+                    "WHERE ai.ref=%s AND rvbbit.artifact_can_view(d.id,%s,false) "
                     "ORDER BY version DESC NULLS LAST LIMIT 1",
-                    (ref,),
+                    (ref, owner),
                 ).fetchone()
             else:
                 row = conn.execute(
-                    "SELECT * FROM rvbbit.artifact_index WHERE ref=%s AND version=%s LIMIT 1",
-                    (ref, int(version)),
+                    "SELECT ai.* FROM rvbbit.artifact_index ai "
+                    "JOIN rvbbit.dashboards d ON d.slug=ai.ref "
+                    "WHERE ai.ref=%s AND ai.version=%s "
+                    "AND rvbbit.artifact_can_view(d.id,%s,false) LIMIT 1",
+                    (ref, int(version), owner),
                 ).fetchone()
             item["resolved"] = (
                 {**_row_json(row), "found": True} if row else {"found": False, "ref": ref}
             )
         elif kind == "semantic_object":
-            item["resolved"] = _resolve_workflow_semantic_object(conn, item)
+            item["resolved"] = _resolve_workflow_semantic_object(conn, item, owner)
         elif kind == "evidence" and _uuid(ref):
             row = conn.execute(
                 "SELECT f.id,f.kind,f.title,f.lineage_key,f.artifact_slug,"
@@ -16837,7 +16926,9 @@ def begin_workflow_run(
     }
 
 
-def _normalize_workflow_artifacts(conn: Any, artifacts: Any) -> list[dict[str, Any]]:
+def _normalize_workflow_artifacts(
+    conn: Any, owner: str, artifacts: Any
+) -> list[dict[str, Any]]:
     if artifacts in (None, ""):
         return []
     # Older FastMCP schemas inferred an unannotated optional parameter as a
@@ -16868,9 +16959,11 @@ def _normalize_workflow_artifacts(conn: Any, artifacts: Any) -> list[dict[str, A
             continue
         if requested_version in (None, ""):
             row = conn.execute(
-                "SELECT * FROM rvbbit.artifact_index WHERE ref=%s "
+                "SELECT ai.* FROM rvbbit.artifact_index ai "
+                "JOIN rvbbit.dashboards d ON d.slug=ai.ref "
+                "WHERE ai.ref=%s AND rvbbit.artifact_can_view(d.id,%s,false) "
                 "ORDER BY version DESC NULLS LAST LIMIT 1",
-                (ref,),
+                (ref, owner),
             ).fetchone()
         else:
             try:
@@ -16878,8 +16971,11 @@ def _normalize_workflow_artifacts(conn: Any, artifacts: Any) -> list[dict[str, A
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"artifact {ref} version must be an integer") from exc
             row = conn.execute(
-                "SELECT * FROM rvbbit.artifact_index WHERE ref=%s AND version=%s LIMIT 1",
-                (ref, requested_version),
+                "SELECT ai.* FROM rvbbit.artifact_index ai "
+                "JOIN rvbbit.dashboards d ON d.slug=ai.ref "
+                "WHERE ai.ref=%s AND ai.version=%s "
+                "AND rvbbit.artifact_can_view(d.id,%s,false) LIMIT 1",
+                (ref, requested_version, owner),
             ).fetchone()
         version = int(row["version"]) if row and row.get("version") is not None else requested_version
         key = (ref, version)
@@ -17018,7 +17114,9 @@ def finish_workflow_run(
                 }
             runtime_steps = _normalize_workflow_steps(run.get("steps") or [], source=None)
             durable_steps = runtime_steps or reported_steps
-            verified_artifacts = _normalize_workflow_artifacts(conn, artifacts)
+            verified_artifacts = _normalize_workflow_artifacts(
+                conn, str(run["owner_email"]), artifacts
+            )
             receipt_id = None
             if str(run.get("trigger_kind")) == "scheduled":
                 receipt_id = _record_unreported_workflow_cost(
@@ -18659,7 +18757,9 @@ def _verify_recovered_surfaces(
                 "FROM rvbbit.dashboards d "
                 "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
                 "JOIN rvbbit.calliope_turns t ON t.id=%s::uuid "
+                "JOIN rvbbit.calliope_sessions s ON s.id=t.session_id "
                 "WHERE d.slug=%s AND v.version=%s "
+                "AND rvbbit.artifact_can_view(d.id,s.owner_email,false) "
                 "AND (%s <> 'artifact_write' "
                 "OR v.created_at >= t.created_at - interval '5 seconds')",
                 (turn_id, slug, int(version), str(mode)),
@@ -21191,6 +21291,7 @@ def register_calliope_routes(
     evidence_open: Callable[..., Any] | None = None,
     metric_detail: Callable[..., Any] | None = None,
     artifact_capture: Callable[..., Any] | None = None,
+    team_service: dict[str, Callable[..., Any]] | None = None,
 ) -> bool:
     """Register the optional Calliope routes. Returns whether it was enabled."""
     config = CalliopeConfig.from_env()
@@ -22717,6 +22818,125 @@ def register_calliope_routes(
                 {"error": {"code": "BAD_INVENTORY_QUERY", "message": str(exc)}}, 400
             )
         return json_response(snapshot)
+
+    def team_json(value: Any, success_status: int = 200) -> Response:
+        payload = dict(value) if isinstance(value, dict) else {
+            "error": {"code": "TEAM_SERVICE_ERROR", "message": "The Team service returned an invalid response."}
+        }
+        status = int(payload.pop("_http_status", success_status))
+        if payload.get("error") and status < 400:
+            status = 400
+        return json_response(payload, status)
+
+    @mcp.custom_route("/api/calliope/teams", methods=["GET"])
+    async def list_calliope_teams(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        if not team_service:
+            return json_response({
+                "error": {"code": "TEAMS_UNAVAILABLE", "message": "Teams are not available on this installation."}
+            }, 503)
+        query = str(request.query_params.get("q") or "")[:240]
+        signed_session = auth.read_session_full(request) or {}
+        display_name = str(signed_session.get("name") or "")[:160] or None
+        try:
+            teams, people = await asyncio.gather(
+                asyncio.to_thread(team_service["list"], owner, query, True, 500),
+                asyncio.to_thread(
+                    team_service["people"], owner, query, 500, display_name
+                ),
+            )
+        except Exception as exc:
+            return json_response({
+                "error": {"code": "TEAM_SERVICE_ERROR", "message": str(exc)[:600]}
+            }, 500)
+        if teams.get("error"):
+            return team_json(teams)
+        if people.get("error"):
+            return team_json(people)
+        return json_response({
+            "subject": teams.get("subject") or people.get("subject"),
+            "can_manage": bool(teams.get("can_manage") and people.get("can_manage")),
+            "teams": teams.get("teams") or [],
+            "people": people.get("people") or [],
+        })
+
+    @mcp.custom_route("/api/calliope/team-people", methods=["GET"])
+    async def search_calliope_team_people(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        if not team_service:
+            return json_response({
+                "error": {"code": "TEAMS_UNAVAILABLE", "message": "Teams are not available on this installation."}
+            }, 503)
+        query = str(request.query_params.get("q") or "")[:240]
+        signed_session = auth.read_session_full(request) or {}
+        display_name = str(signed_session.get("name") or "")[:160] or None
+        result = await asyncio.to_thread(
+            team_service["people"], owner, query, 500, display_name
+        )
+        return team_json(result)
+
+    @mcp.custom_route("/api/calliope/teams/{team_id}", methods=["GET"])
+    async def get_calliope_team(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        if not team_service:
+            return json_response({"error": {"code": "TEAMS_UNAVAILABLE"}}, 503)
+        result = await asyncio.to_thread(
+            team_service["get"], owner, request.path_params.get("team_id")
+        )
+        return team_json(result)
+
+    @mcp.custom_route("/api/calliope/teams", methods=["POST"])
+    async def create_calliope_team(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        if not team_service:
+            return json_response({"error": {"code": "TEAMS_UNAVAILABLE"}}, 503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        result = await asyncio.to_thread(
+            team_service["create"],
+            owner,
+            body.get("name"),
+            body.get("description") or "",
+            body.get("members") or [],
+        )
+        return team_json(result, 201)
+
+    @mcp.custom_route("/api/calliope/teams/{team_id}", methods=["PATCH"])
+    async def update_calliope_team(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        if not team_service:
+            return json_response({"error": {"code": "TEAMS_UNAVAILABLE"}}, 503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        allowed = {
+            key: body[key]
+            for key in ("name", "description", "add_members", "remove_members", "archived")
+            if key in body
+        }
+        result = await asyncio.to_thread(
+            team_service["update"],
+            owner,
+            request.path_params.get("team_id"),
+            body.get("expected_revision"),
+            **allowed,
+        )
+        return team_json(result)
 
     @mcp.custom_route("/api/calliope/inventory/handoff", methods=["POST"])
     async def handoff_calliope_inventory(request):
@@ -24323,10 +24543,12 @@ def register_calliope_routes(
             return json_response({"error": {"code": "NOT_FOUND"}}, 404)
         with conn_factory() as conn:
             artifact = conn.execute(
-                "SELECT * FROM rvbbit.artifact_index WHERE ref=%s "
-                "AND kind IN ('app','dashboard') AND path IS NOT NULL "
+                "SELECT ai.* FROM rvbbit.artifact_index ai "
+                "JOIN rvbbit.dashboards d ON d.slug=ai.ref "
+                "WHERE ai.ref=%s AND rvbbit.artifact_can_view(d.id,%s,false) "
+                "AND ai.kind IN ('app','dashboard') AND ai.path IS NOT NULL "
                 "ORDER BY version DESC NULLS LAST LIMIT 1",
-                (slug,),
+                (slug, owner),
             ).fetchone()
         if not artifact or artifact.get("version") is None:
             return json_response({"error": {"code": "NOT_FOUND"}}, 404)
@@ -26058,8 +26280,9 @@ def register_calliope_routes(
                 "SELECT d.name,d.app_kind,d.runtime_kind "
                 "FROM rvbbit.dashboards d "
                 "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
-                "WHERE d.slug=%s AND v.version=%s",
-                (slug, version),
+                "WHERE d.slug=%s AND v.version=%s AND NOT d.archived "
+                "AND rvbbit.artifact_can_view(d.id,%s,false)",
+                (slug, version, owner),
             ).fetchone()
         if not artifact:
             return json_response(
@@ -26491,6 +26714,15 @@ def register_calliope_routes(
                 409,
             )
 
+        with conn_factory() as conn:
+            allowed = conn.execute(
+                "SELECT 1 FROM rvbbit.dashboards d WHERE d.slug=%s "
+                "AND rvbbit.artifact_can_view(d.id,%s,false)",
+                (slug, owner),
+            ).fetchone()
+        if not allowed:
+            return json_response({"error": {"code": "NOT_FOUND"}}, 404)
+
         # Reuse a durable exact-version capture when one is already present.
         # Markup derivatives intentionally do not qualify as base companions.
         with conn_factory() as conn:
@@ -26723,8 +26955,9 @@ def register_calliope_routes(
             row = conn.execute(
                 "SELECT v.html,v.manifest FROM rvbbit.dashboards d "
                 "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id "
-                "WHERE d.slug=%s AND v.version=%s",
-                (slug, version),
+                "WHERE d.slug=%s AND v.version=%s AND NOT d.archived "
+                "AND rvbbit.artifact_can_view(d.id,%s,false)",
+                (slug, version, owner),
             ).fetchone()
         if not row:
             return HTMLResponse("<h1>404 — no such artifact version</h1>", status_code=404)

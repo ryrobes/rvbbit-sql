@@ -361,8 +361,25 @@ def test_activity_receipt_persists_actor_subject_and_delegation(monkeypatch):
     finally:
         server._AUTHORIZATION_CONTEXT.reset(token)
 
-    assert len(connection.inserts) == 1
-    query, params = connection.inserts[0]
+    principal_inserts = [
+        (query, params)
+        for query, params in connection.inserts
+        if query.startswith("INSERT INTO rvbbit.application_principals")
+    ]
+    activity_inserts = [
+        (query, params)
+        for query, params in connection.inserts
+        if "actor,subject,auth_mode,delegated" in query
+    ]
+    assert len(principal_inserts) == 1
+    assert principal_inserts[0][1] == (
+        "person@example.com",
+        None,
+        "google_chat_delegation",
+        "google_chat",
+    )
+    assert len(activity_inserts) == 1
+    query, params = activity_inserts[0]
     assert "actor,subject,auth_mode,delegated" in query
     assert params[:6] == (
         "person@example.com",

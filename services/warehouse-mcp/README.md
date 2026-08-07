@@ -321,6 +321,58 @@ the `rvbbit` schema, so it's hidden from `search_data`. Logging is best-effort; 
 read-only data role, `GRANT INSERT ON rvbbit.mcp_activity` (and the table's privileges) so
 writes succeed.
 
+## Application Teams
+
+Calliope's Library → **Teams** contains a focused flat Team directory backed by
+`rvbbit.application_principals`, `rvbbit.teams`, and `rvbbit.team_members`. A person enters
+the candidate directory only when Warehouse has a trusted application authorization
+`subject`; a service actor, rejected sender, or legacy attribution never becomes a Team
+candidate. Observation itself grants no access.
+
+The protected **Admins** Team is created automatically and is the only capability that
+permits `team_create` or `team_update`. Admins can edit every Team, including Admins
+membership, but Admins cannot be renamed, archived, or left empty. Team changes are
+revision-checked, idempotent, and recorded in the append-only `rvbbit.team_events` ledger
+with both credential actor and authorized human subject.
+
+The protected **Everyone** Team is the organization-wide wildcard. It stores no
+`team_members` rows: membership is evaluated at request time against Warehouse's verified
+application `subject`, so a newly signed-in user matches immediately. Anonymous requests,
+service identities, rejected senders, and legacy attribution-only callers never match it.
+Everyone cannot be renamed, archived, deleted, or manually populated. Its stable
+`system_key='everyone'` is the grant target for artifacts visible to all authenticated
+users.
+
+Bootstrap the first administrator from operator-controlled configuration:
+
+```bash
+export WAREHOUSE_TEAM_BOOTSTRAP_ADMINS="admin@example.com"
+```
+
+The value is a comma-separated list and is a one-way, idempotent enrollment path. After an
+administrator adds durable replacements through Calliope, remove the environment value
+before removing that bootstrap member; otherwise the next service restart will restore it.
+
+## Artifact access and lifecycle
+
+Newly published artifacts are private to their verified human owner. Existing artifacts
+receive a one-time **Everyone** grant during migration so upgrades preserve their prior
+visibility. An owner can use the Gallery card's **Access** action, or the
+`artifact_access_get` / `artifact_access_update` MCP tools, to replace the exact viewer list
+with any combination of active Teams and observed people. The owner is always implicit and
+cannot accidentally remove themselves. Adding Everyone requires explicit confirmation.
+Grants govern current and historical versions, thumbnails, Gallery discovery, Calliope
+evidence and Trail references, semantic Home replay, and mutating artifact tools. Unauthorized
+and archived routes return the same not-found response rather than disclosing metadata.
+
+Only the owner can change sharing or lifecycle, including when that owner is also an Admin;
+Admins do not gain a hidden artifact override. **Archive** is reversible and takes the
+artifact out of normal discovery and viewing without deleting versions, grants, lineage,
+events, or pins. The owner can select **Archived** in Gallery and restore it with its prior
+viewer list intact. `artifact_archive` and `artifact_restore` expose the same flow to Calliope.
+Access writes use optimistic revisions and append actor, authorized human, before/after, and
+reason records to `rvbbit.artifact_access_events`. There is intentionally no hard-delete UI.
+
 ### Connect Claude
 - **Claude Desktop / Cowork (OAuth):** Settings → Connectors → **Add custom connector** →
   URL `https://dwmcp.example.com/mcp` → it opens the login page → enter email + the shared
@@ -339,10 +391,10 @@ Also served at **`/gallery`** — on a warehouse-only box `/` is free and you ge
 the root; behind the unified origin (`docker/origin/Caddyfile`) DataRabbit owns `/`,
 so the ingress routes `/gallery` here instead. Same page either way.
 
-It lists `rvbbit.live_apps` unfiltered — every row there is externally addressable
-(DataRabbit *plates* live in `rvbbit.plates` and never appear). Cards open in a new
-tab: the index is somewhere you come back to. No new table, no build step, no extra
-config. Routes only exist in OAuth mode (same as `/d/<slug>`).
+It lists the active `rvbbit.live_apps` each signed-in person may view, plus the owner's
+archived recovery view (DataRabbit *plates* live in `rvbbit.plates` and never appear).
+Cards open in a new tab: the index is somewhere you come back to. Routes only exist in
+OAuth mode (same as `/d/<slug>`).
 
 The adjacent **Metrics** view is explicit opt-in and stays out of artifact search by
 default. It reads governed definitions plus already-materialized
@@ -823,6 +875,68 @@ mcp_servers:
       Authorization: Bearer ${WAREHOUSE_HERMES_MCP_KEY}
     forward_session_identity: true
 ```
+
+### Hermes update compatibility
+
+The current upstream Hermes client does not yet implement RVBBIT's opted-in
+identity envelope. The config key above is therefore inert unless the compatibility
+patch shipped in this repository is present in the Hermes checkout. `hermes update`
+may replace locally modified core files, so check and reapply the patch after every
+Hermes update:
+
+```bash
+HERMES_AGENT_ROOT="${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
+RVBBIT_SQL_ROOT=/path/to/rvbbit-sql
+cd "$HERMES_AGENT_ROOT"
+
+# A successful reverse check means the patch is already installed.
+if git apply --reverse --check \
+  "$RVBBIT_SQL_ROOT/services/warehouse-mcp/hermes-forward-session-identity.patch"; then
+  echo "RVBBIT Hermes identity forwarding is already installed"
+else
+  git apply --check \
+    "$RVBBIT_SQL_ROOT/services/warehouse-mcp/hermes-forward-session-identity.patch"
+  git apply \
+    "$RVBBIT_SQL_ROOT/services/warehouse-mcp/hermes-forward-session-identity.patch"
+fi
+
+scripts/run_tests.sh tests/tools/test_mcp_session_identity.py -q
+systemctl --user restart hermes-gateway
+```
+
+If the forward check fails after an upstream refactor, do not force-apply the patch.
+Rebase its two integration points in `tools/mcp_tool.py`: capture the gateway
+ContextVars before crossing to the MCP event loop, then send the bounded envelope as
+MCP request `_meta`. Warehouse should subsequently record a Google Chat call with the
+shared Calliope principal as `actor`, the sender email as `subject`,
+`auth_mode=google_chat_delegation`, `delegated=true`, `channel=google_chat`, and a
+non-empty `session_ref`.
+
+Google Chat's working marker is separately configurable in upstream Hermes and does
+not require a source edit. Keep this beside the other platform settings so it survives
+updates:
+
+```yaml
+platforms:
+  google_chat:
+    typing_status_text: "Calliope is thinking…"
+```
+
+If Hermes uses a terminal-side MCP helper to parse a large result, that helper must
+also send the metadata envelope. Calling `server.session.call_tool(...)` directly
+bypasses the native handler and records the shared service principal instead of the
+Google Chat sender. Install the supplied helper rather than maintaining an ad-hoc copy:
+
+```bash
+install -m 0755 \
+  "$RVBBIT_SQL_ROOT/services/warehouse-mcp/hermes-dmcp.py" \
+  "$HOME/dmcp.py"
+```
+
+The helper reads the session ContextVars bridged into its subprocess environment and
+uses the same `_forwarded_session_metadata` / `_call_tool_with_metadata` path as native
+Hermes. Outside a recognized Hermes session it sends no human identity and remains a
+normal service call.
 
 Forwarded metadata is not a tool argument or PG role. It becomes an application-layer
 human subject only when paired with the dedicated `hermes-service` credential; with the

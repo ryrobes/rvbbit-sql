@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import os
 import subprocess
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -16,11 +17,14 @@ from conftest import RVBBIT_DSN
 def _load_warehouse_mcp(monkeypatch):
     monkeypatch.setenv("WAREHOUSE_DSN", os.environ.get("RVBBIT_DSN", RVBBIT_DSN))
     path = Path(__file__).resolve().parents[1] / "services" / "warehouse-mcp" / "server.py"
+    sys.path.insert(0, str(path.parent))
     module_name = f"warehouse_mcp_server_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
+    module._SESSION_SUB.set("pilot@example.com")
     return module
 
 
@@ -272,6 +276,9 @@ def test_mcp_capture_wrapper_offloads_sync_playwright(monkeypatch):
 
     monkeypatch.setattr(server, "_logged", fake_logged)
     monkeypatch.setattr(server, "tool_capture_live_app", fake_capture)
+    monkeypatch.setattr(
+        server, "_artifact_owner_result", lambda _slug, fn, **_kwargs: fn()
+    )
 
     result = asyncio.run(server._mcp_capture_live_app("capture-thread-test"))
 

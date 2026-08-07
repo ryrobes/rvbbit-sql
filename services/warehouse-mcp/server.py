@@ -37,7 +37,7 @@ from __future__ import annotations
 # (DictRow vs TupleRow covariance); the code is correct at runtime (see --selftest).
 # pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 # pyright: reportReturnType=false, reportOptionalSubscript=false, reportMissingImports=false
-import asyncio, hashlib, hmac, json, math, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, unicodedata, uuid
+import asyncio, functools, hashlib, hmac, inspect, json, math, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, unicodedata, uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -49,6 +49,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import psycopg
 from psycopg import sql as pgsql
 from psycopg.rows import dict_row
+import application_teams
+import artifact_access
 
 DSN = os.environ.get(
     "WAREHOUSE_DSN", "host=localhost port=55433 dbname=bench user=postgres password=rvbbit"
@@ -2367,6 +2369,21 @@ def tool_sync_system_learning() -> dict:
     return {"source": "RVBBIT System Learning", "result": result or {}, "status": status}
 
 
+async def _mcp_sync_system_learning():
+    """Run the potentially expensive Brain reconciliation off the ASGI loop.
+
+    FastMCP executes ordinary ``def`` tools inline on its request/event loop.
+    System Learning can scan a large workload catalog and reconcile many Brain
+    documents, so registering its synchronous implementation directly makes
+    unrelated Calliope HTTP routes and MCP keepalives wait for the whole sync.
+    ``asyncio.to_thread`` preserves request ContextVars while allowing the
+    server to continue serving the UI and other MCP sessions.
+    """
+    return await asyncio.to_thread(
+        _logged, "sync_system_learning", {}, tool_sync_system_learning
+    )
+
+
 def tool_ask_system_learning(query, k=8, caller_email=None) -> dict:
     """Ask what RVBBIT has learned about this database. This is the agent-safe shortcut over
     ask_brain(filters={"type":["system_learning"]}) so callers do not need to remember the doc_type
@@ -2670,6 +2687,14 @@ def _ensure_activity_table():
             c.execute(_ACTIVITY_DDL)
     except Exception as e:  # noqa: BLE001 — logging is best-effort (e.g. a read-only role)
         print(f"WARNING: activity logging disabled (could not ensure {ACTIVITY_TABLE}): {e}", file=sys.stderr)
+
+
+def _ensure_team_tables():
+    """Self-heal the application Team kernel on service-only upgrades."""
+    try:
+        application_teams.ensure_tables(_conn)
+    except Exception as e:  # noqa: BLE001 — keep the rest of Warehouse available
+        print(f"WARNING: Teams disabled (could not ensure tables): {e}", file=sys.stderr)
 
 
 def _authenticated_caller():
@@ -3131,6 +3156,20 @@ def _objects(tool, args, res):
         return [f"artifact:{slug}"] if slug else None
     if tool == "dashboard_query" and args.get("dashboard"):
         return [f"artifact:{args['dashboard']}"]
+    if tool == "team_people_search":
+        return ["rvbbit.application_principals"]
+    if tool in {"team_list", "team_get", "team_create", "team_update"}:
+        team = res.get("team") if isinstance(res.get("team"), dict) else {}
+        team_id = team.get("id") or args.get("team_id")
+        return [f"team:{team_id}"] if team_id else ["rvbbit.teams"]
+    if tool in {
+        "artifact_access_get", "artifact_access_update",
+        "artifact_archive", "artifact_restore",
+    }:
+        slug = res.get("slug") or args.get("slug")
+        artifact = res.get("artifact") if isinstance(res.get("artifact"), dict) else {}
+        slug = artifact.get("slug") or slug
+        return [f"artifact:{slug}"] if slug else None
     if tool == "search_data":
         return [m.get("object") for m in res.get("matches", []) if m.get("object")] or None
     if tool == "describe_table":
@@ -3182,6 +3221,19 @@ def _summary(tool, res):
         return {"result": res.get("result")}
     if tool == "validate_sql":
         return {"safe_select": res.get("safe_select"), "engine": res.get("engine")}
+    if tool == "team_people_search":
+        return {"count": res.get("count"), "can_manage": res.get("can_manage")}
+    if tool == "team_list":
+        return {"count": res.get("count"), "can_manage": res.get("can_manage")}
+    if tool in {"team_get", "team_create", "team_update"}:
+        team = res.get("team") if isinstance(res.get("team"), dict) else {}
+        return {
+            "id": team.get("id"),
+            "name": team.get("name"),
+            "revision": team.get("revision"),
+            "member_count": team.get("member_count"),
+            "changed": res.get("changed"),
+        }
     if tool in (
         "create_live_app", "update_live_app", "get_live_app", "debug_live_app",
         "start_live_app", "stop_live_app", "live_app_status", "capture_live_app",
@@ -3496,6 +3548,24 @@ def _record(tool, args, res, err, elapsed_ms, caller_override=None):
             context["provenance"]["authorization"] = (
                 authorization.audit_payload()
             )
+            # The People directory is populated only from the same trusted
+            # human subject used by application authorization.  Legacy display
+            # attribution and service actors never become Team candidates.
+            # Isolate the optional upsert in a savepoint so a mixed-version
+            # install cannot take down the activity receipt.
+            try:
+                transaction = getattr(c, "transaction", None)
+                if callable(transaction):
+                    with transaction():
+                        application_teams.observe_principal_on_connection(
+                            c, authorization, channel=context.get("channel")
+                        )
+                else:  # lightweight test/dummy connections
+                    application_teams.observe_principal_on_connection(
+                        c, authorization, channel=context.get("channel")
+                    )
+            except Exception:  # noqa: BLE001 — observation is best-effort
+                pass
             legacy_values = (
                 caller, client_id, tool, json.dumps(args, default=str), err is None,
                 json.dumps(err, default=str) if err is not None else None,
@@ -3567,6 +3637,420 @@ def _logged(tool, args, thunk):
         _record(tool, args, res, err, int((time.time() - t0) * 1000))
         if authorization_token is not None:
             _AUTHORIZATION_CONTEXT.reset(authorization_token)
+
+
+# ── application Teams ───────────────────────────────────────────────────────
+# Teams are flat application groups.  The protected Admins Team is the sole
+# write capability. The protected Everyone Team dynamically matches any
+# verified human application subject; it never matches an attributed legacy
+# caller, anonymous context, or service identity.
+
+def _team_authorization(caller_override=None):
+    authorization = _application_authorization_context(
+        caller_override=caller_override
+    )
+    if not authorization.subject:
+        raise application_teams.TeamError(
+            "APPLICATION_SUBJECT_REQUIRED",
+            "Teams require a direct signed-in user or trusted Calliope delegation.",
+            403,
+        )
+    return authorization
+
+
+def _team_result(thunk):
+    try:
+        return thunk()
+    except application_teams.TeamError as exc:
+        return {
+            "error": {"code": exc.code, "message": str(exc)},
+            "_http_status": exc.status,
+        }
+
+
+# ── published artifact authorization ────────────────────────────────────────
+
+def _artifact_authorization(caller_override=None):
+    authorization = _application_authorization_context(
+        caller_override=caller_override
+    )
+    if not authorization.subject:
+        raise artifact_access.ArtifactAccessError(
+            "APPLICATION_SUBJECT_REQUIRED",
+            "Artifact access requires a direct signed-in user or trusted Calliope delegation.",
+            403,
+        )
+    return authorization
+
+
+def _artifact_result(thunk):
+    try:
+        return thunk()
+    except artifact_access.ArtifactAccessError as exc:
+        return {
+            "error": {"code": exc.code, "message": str(exc)},
+            "_http_status": exc.status,
+        }
+
+
+def _artifact_require_view(slug, caller_override=None, conn=None):
+    authorization = _artifact_authorization(caller_override)
+    if conn is not None:
+        return artifact_access.require_view(conn, slug, authorization.subject)
+    with _conn() as local_conn:
+        return artifact_access.require_view(
+            local_conn, slug, authorization.subject
+        )
+
+
+def _artifact_require_owner(slug, caller_override=None, conn=None, *, active=False):
+    authorization = _artifact_authorization(caller_override)
+    if conn is not None:
+        artifact = artifact_access.require_owner(conn, slug, authorization)
+    else:
+        with _conn() as local_conn:
+            artifact = artifact_access.require_owner(local_conn, slug, authorization)
+    if active and artifact.get("archived"):
+        raise artifact_access.ArtifactAccessError(
+            "ARTIFACT_ARCHIVED",
+            "Restore this artifact before changing or running it.",
+            409,
+        )
+    return artifact
+
+
+def _artifact_view_result(slug, thunk):
+    def guarded():
+        _artifact_require_view(slug)
+        return thunk()
+
+    return _artifact_result(guarded)
+
+
+def _artifact_owner_result(slug, thunk, *, active=True):
+    def guarded():
+        _artifact_require_owner(slug, active=active)
+        return thunk()
+
+    return _artifact_result(guarded)
+
+
+def tool_team_people_search(
+    query=None, limit=100, _caller_override=None, _display_name=None
+):
+    return _team_result(lambda: application_teams.people_search(
+        _conn,
+        _team_authorization(_caller_override),
+        query=query,
+        limit=limit,
+        display_name=_display_name,
+    ))
+
+
+def tool_team_list(query=None, include_archived=True, limit=200, _caller_override=None):
+    return _team_result(lambda: application_teams.list_teams(
+        _conn,
+        _team_authorization(_caller_override),
+        query=query,
+        include_archived=include_archived,
+        limit=limit,
+    ))
+
+
+def tool_team_get(team_id, _caller_override=None):
+    return _team_result(lambda: application_teams.get_team(
+        _conn,
+        _team_authorization(_caller_override),
+        team_id,
+    ))
+
+
+def tool_team_create(name, description="", members=None, _caller_override=None):
+    return _team_result(lambda: application_teams.create_team(
+        _conn,
+        _team_authorization(_caller_override),
+        name,
+        description,
+        members,
+    ))
+
+
+def tool_team_update(
+    team_id,
+    expected_revision,
+    name=None,
+    description=None,
+    add_members=None,
+    remove_members=None,
+    archived=None,
+    _caller_override=None,
+):
+    return _team_result(lambda: application_teams.update_team(
+        _conn,
+        _team_authorization(_caller_override),
+        team_id,
+        expected_revision,
+        name=name,
+        description=description,
+        add_members=add_members,
+        remove_members=remove_members,
+        archived=archived,
+    ))
+
+
+def _mcp_team_people_search(query=None, limit=100):
+    """Search human emails observed through trusted Warehouse/Calliope requests.
+
+    An observed person is a candidate for explicit Team membership; observation
+    alone grants no access. Service actors and legacy attributed callers are
+    excluded.
+    """
+    return _logged(
+        "team_people_search",
+        {"query": query, "limit": limit},
+        lambda: tool_team_people_search(query, limit),
+    )
+
+
+def _mcp_team_list(query=None, include_archived=True, limit=200):
+    """List flat application Teams and their membership rules.
+
+    Ordinary Teams and Admins contain explicit observed emails. Everyone is a
+    protected dynamic rule matching any verified application subject and has
+    no materialized member list.
+    """
+    return _logged(
+        "team_list",
+        {"query": query, "include_archived": include_archived, "limit": limit},
+        lambda: tool_team_list(query, include_archived, limit),
+    )
+
+
+def _mcp_team_get(team_id):
+    """Inspect one Team, its membership rule, revision, and recent receipts."""
+    return _logged(
+        "team_get",
+        {"team_id": team_id},
+        lambda: tool_team_get(team_id),
+    )
+
+
+def _mcp_team_create(name, description="", members=None):
+    """Create a flat Team. Only a current member of the Admins Team may do this.
+
+    Members must first appear in team_people_search; arbitrary or inferred
+    email addresses are rejected.
+    """
+    return _logged(
+        "team_create",
+        {"name": name, "description": description, "members": members},
+        lambda: tool_team_create(name, description, members),
+    )
+
+
+def _mcp_team_update(
+    team_id,
+    expected_revision,
+    name=None,
+    description=None,
+    add_members=None,
+    remove_members=None,
+    archived=None,
+):
+    """Atomically change a Team after inspecting its current revision.
+
+    Only Admins may mutate Teams. The protected Admins Team cannot be renamed or
+    archived and must retain at least one member. Everyone is an immutable,
+    dynamic authenticated-user wildcard with no explicit members. Repeated
+    add/remove requests are idempotent; a stale expected_revision is rejected.
+    """
+    args = {
+        "team_id": team_id,
+        "expected_revision": expected_revision,
+        "name": name,
+        "description": description,
+        "add_members": add_members,
+        "remove_members": remove_members,
+        "archived": archived,
+    }
+    return _logged(
+        "team_update",
+        args,
+        lambda: tool_team_update(
+            team_id,
+            expected_revision,
+            name,
+            description,
+            add_members,
+            remove_members,
+            archived,
+        ),
+    )
+
+
+_mcp_team_people_search.__annotations__ = {
+    "query": str | None,
+    "limit": int,
+}
+_mcp_team_list.__annotations__ = {
+    "query": str | None,
+    "include_archived": bool,
+    "limit": int,
+}
+_mcp_team_get.__annotations__ = {"team_id": str}
+_mcp_team_create.__annotations__ = {
+    "name": str,
+    "description": str,
+    "members": list[str] | None,
+}
+_mcp_team_update.__annotations__ = {
+    "team_id": str,
+    "expected_revision": int,
+    "name": str | None,
+    "description": str | None,
+    "add_members": list[str] | None,
+    "remove_members": list[str] | None,
+    "archived": bool | None,
+}
+
+
+def tool_artifact_access_get(slug, _caller_override=None):
+    return _artifact_result(lambda: artifact_access.get_access(
+        _conn, _artifact_authorization(_caller_override), slug
+    ))
+
+
+def tool_artifact_access_update(
+    slug,
+    expected_revision,
+    team_ids=None,
+    people=None,
+    confirm_everyone=False,
+    _caller_override=None,
+):
+    return _artifact_result(lambda: artifact_access.replace_access(
+        _conn,
+        _artifact_authorization(_caller_override),
+        slug,
+        expected_revision,
+        team_ids=team_ids,
+        people=people,
+        confirm_everyone=confirm_everyone,
+    ))
+
+
+def tool_artifact_archive(
+    slug, expected_revision, archived=True, _caller_override=None
+):
+    result = _artifact_result(lambda: artifact_access.set_archived(
+        _conn,
+        _artifact_authorization(_caller_override),
+        slug,
+        expected_revision,
+        archived,
+    ))
+    if archived and isinstance(result, dict) and not result.get("error"):
+        # Archive is a visibility/lifecycle gate, not a process tombstone, but
+        # leaving a Python app listening after it disappears is surprising and
+        # wasteful. Restore does not auto-start it.
+        try:
+            tool_stop_live_app(slug)
+        except Exception:  # noqa: BLE001 — lifecycle receipt already committed
+            pass
+    return result
+
+
+def _mcp_artifact_access_get(slug):
+    """Inspect sharing for one artifact you own.
+
+    Returns the optimistic-lock revision, selected Teams and people, available
+    Teams, and recent access receipts. Readers cannot inspect its audience.
+    """
+    return _logged(
+        "artifact_access_get", {"slug": slug},
+        lambda: tool_artifact_access_get(slug),
+    )
+
+
+def _mcp_artifact_access_update(
+    slug,
+    expected_revision,
+    team_ids=None,
+    people=None,
+    confirm_everyone=False,
+):
+    """Replace an owned artifact's complete viewer list atomically.
+
+    Inspect first with artifact_access_get and send its expected_revision.
+    Team IDs and observed human emails are exact desired lists, not deltas.
+    The owner always retains access implicitly. Setting the Everyone Team for
+    the first time requires confirm_everyone=true.
+    """
+    args = {
+        "slug": slug,
+        "expected_revision": expected_revision,
+        "team_ids": team_ids,
+        "people": people,
+        "confirm_everyone": confirm_everyone,
+    }
+    return _logged(
+        "artifact_access_update", args,
+        lambda: tool_artifact_access_update(
+            slug, expected_revision, team_ids, people, confirm_everyone
+        ),
+    )
+
+
+def _mcp_artifact_archive(slug, expected_revision):
+    """Archive an artifact you own without deleting versions, grants, or history."""
+    return _logged(
+        "artifact_archive", {"slug": slug, "expected_revision": expected_revision},
+        lambda: tool_artifact_archive(slug, expected_revision, True),
+    )
+
+
+def _mcp_artifact_restore(slug, expected_revision):
+    """Restore an owned archived artifact with its prior viewer grants intact."""
+    return _logged(
+        "artifact_restore", {"slug": slug, "expected_revision": expected_revision},
+        lambda: tool_artifact_archive(slug, expected_revision, False),
+    )
+
+
+_mcp_artifact_access_get.__annotations__ = {"slug": str}
+_mcp_artifact_access_update.__annotations__ = {
+    "slug": str,
+    "expected_revision": int,
+    "team_ids": list[str] | None,
+    "people": list[str] | None,
+    "confirm_everyone": bool,
+}
+_mcp_artifact_archive.__annotations__ = {"slug": str, "expected_revision": int}
+_mcp_artifact_restore.__annotations__ = {"slug": str, "expected_revision": int}
+
+
+def _calliope_team_service():
+    """Native Calliope adapters; the browser owner is already signed/verified."""
+    return {
+        "list": lambda owner, query=None, include_archived=True, limit=200: tool_team_list(
+            query, include_archived, limit, _caller_override=owner
+        ),
+        "people": lambda owner, query=None, limit=500, display_name=None: tool_team_people_search(
+            query, limit, _caller_override=owner, _display_name=display_name
+        ),
+        "get": lambda owner, team_id: tool_team_get(
+            team_id, _caller_override=owner
+        ),
+        "create": lambda owner, name, description="", members=None: tool_team_create(
+            name, description, members, _caller_override=owner
+        ),
+        "update": lambda owner, team_id, expected_revision, **changes: tool_team_update(
+            team_id,
+            expected_revision,
+            _caller_override=owner,
+            **changes,
+        ),
+    }
 
 
 def _selected_calliope_private_document_caller(doc_id, ctx=None):
@@ -4520,6 +5004,10 @@ ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS area_id text;
 ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS area_source text;
 ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS area_confidence real;
 ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS area_updated_at timestamptz;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS archived boolean NOT NULL DEFAULT false;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS archived_at timestamptz;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS archived_by text;
+ALTER TABLE rvbbit.dashboards ADD COLUMN IF NOT EXISTS access_revision bigint NOT NULL DEFAULT 1;
 CREATE TABLE IF NOT EXISTS rvbbit.dashboard_versions (
   dashboard_id bigint NOT NULL REFERENCES rvbbit.dashboards(id) ON DELETE CASCADE,
   version      int NOT NULL,
@@ -4677,7 +5165,8 @@ CREATE OR REPLACE VIEW rvbbit.live_apps AS
          coalesce(dep.tables, 0)::int AS tables,
          coalesce(dep.metrics, 0)::int AS metrics,
          coalesce(dep.semantic_objects, 0)::int AS semantic_objects,
-         d.area_id,area.label AS area_label,d.area_source,d.area_confidence,d.area_updated_at
+         d.area_id,area.label AS area_label,d.area_source,d.area_confidence,d.area_updated_at,
+         d.archived,d.archived_at,d.archived_by,d.access_revision
   FROM rvbbit.dashboards d
   LEFT JOIN rvbbit.artifact_areas area ON area.id=d.area_id
   LEFT JOIN LATERAL (
@@ -4698,6 +5187,13 @@ def _ensure_dashboard_tables():
             c.execute(_DASHBOARDS_DDL)
     except Exception as e:   # noqa: BLE001
         print(f"WARNING: dashboards disabled (could not ensure tables): {e}", file=sys.stderr)
+
+
+def _ensure_artifact_access_tables():
+    try:
+        artifact_access.ensure_tables(_conn)
+    except Exception as e:   # noqa: BLE001
+        print(f"WARNING: artifact access disabled (could not ensure tables): {e}", file=sys.stderr)
 
 
 def _slugify(name):
@@ -5948,7 +6444,10 @@ def tool_publish_dashboard(name, html=None, team=None, description=None, kind="l
         )
     except ValueError as e:
         return {"error": {"code": "INVALID_SEMANTIC_MAP", "message": str(e)}}
-    caller, _ = _caller()
+    try:
+        caller = _artifact_authorization().subject
+    except artifact_access.ArtifactAccessError as exc:
+        return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
     base = _slugify(name)
     with _conn() as c:
         slug, n = base, 1
@@ -5985,7 +6484,11 @@ def tool_update_dashboard(slug, html=None, notes=None, source_artifact_id=None, 
     if not html:
         return {"error": {"code": "EMPTY_HTML",
                           "message": "pass html, or upload_artifact + source_artifact_id"}}
-    caller, _ = _caller()
+    try:
+        authorization = _artifact_authorization()
+        caller = authorization.subject
+    except artifact_access.ArtifactAccessError as exc:
+        return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
     try:
         manifest_patch = (
             _coerce_json_object(manifest, "manifest") if manifest is not None else None
@@ -5993,6 +6496,10 @@ def tool_update_dashboard(slug, html=None, notes=None, source_artifact_id=None, 
     except ValueError as e:
         return {"error": {"code": "INVALID_SEMANTIC_MAP", "message": str(e)}}
     with _conn() as c:
+        try:
+            _artifact_require_owner(slug, conn=c, active=True)
+        except artifact_access.ArtifactAccessError as exc:
+            return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
         d = c.execute(
             "SELECT id, latest_version, manifest FROM rvbbit.dashboards WHERE slug=%s",
             (slug,),
@@ -6044,19 +6551,33 @@ def tool_update_dashboard(slug, html=None, notes=None, source_artifact_id=None, 
 
 
 def tool_list_dashboards(team=None, search=None):
+    try:
+        subject = _artifact_authorization().subject
+    except artifact_access.ArtifactAccessError as exc:
+        return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
     with _conn() as c:
         rows = c.execute(
             "SELECT slug, name, description, owner_email, team, status, latest_version,"
             "area_id,area_source,area_confidence,updated_at "
             "FROM rvbbit.dashboards "
-            "WHERE (%s::text IS NULL OR team=%s::text) "
+            "WHERE rvbbit.artifact_can_view(id,%s,false) "
+            "AND (%s::text IS NULL OR team=%s::text) "
             "AND (%s::text IS NULL OR name ILIKE '%%'||%s::text||'%%' OR description ILIKE '%%'||%s::text||'%%') "
-            "ORDER BY updated_at DESC LIMIT 100", (team, team, search, search, search)).fetchall()
+            "ORDER BY updated_at DESC LIMIT 100",
+            (subject, team, team, search, search, search)).fetchall()
     return {"dashboards": rows}
 
 
 def tool_get_dashboard(slug, version=None):
+    try:
+        subject = _artifact_authorization().subject
+    except artifact_access.ArtifactAccessError as exc:
+        return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
     with _conn() as c:
+        try:
+            artifact_access.require_view(c, slug, subject)
+        except artifact_access.ArtifactAccessError as exc:
+            return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
         d = c.execute("SELECT id, slug, name, description, owner_email, team, status, "
                       "latest_version, manifest, area_id,area_source,area_confidence,created_at "
                       "FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
@@ -6167,7 +6688,10 @@ def tool_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
         return {"error": {"code": "INVALID_SEMANTIC_MAP", "message": str(e)}}
 
     _ensure_dashboard_tables()
-    caller, _ = _caller()
+    try:
+        caller = _artifact_authorization().subject
+    except artifact_access.ArtifactAccessError as exc:
+        return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
     base = _slugify(name)
     health = _live_app_runtime_health(runtime_kind, "created")
     with _conn() as c:
@@ -6217,11 +6741,19 @@ def tool_update_live_app(slug, html=None, notes=None, manifest=None, source_file
     if aerr:
         return aerr
     _ensure_dashboard_tables()
-    caller, _ = _caller()
+    try:
+        authorization = _artifact_authorization()
+        caller = authorization.subject
+    except artifact_access.ArtifactAccessError as exc:
+        return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
     try:
         manifest_patch = _coerce_json_object(manifest, "manifest") if manifest is not None else {}
         source_patch = _coerce_json_object(source_files, "source_files") if source_files is not None else None
         with _conn() as c:
+            try:
+                _artifact_require_owner(slug, conn=c, active=True)
+            except artifact_access.ArtifactAccessError as exc:
+                return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
             d = c.execute(
                 "SELECT id, name, description, latest_version, runtime_kind, app_kind, manifest "
                 "FROM rvbbit.dashboards WHERE slug=%s", (slug,)).fetchone()
@@ -6299,19 +6831,25 @@ def tool_list_live_apps(team=None, search=None, runtime_kind=None, app_kind=None
         app_kind = _normalize_app_kind(app_kind) if app_kind else None
     except ValueError as e:
         return {"error": {"code": "INVALID_ARGUMENT", "message": str(e)}}
+    try:
+        subject = _artifact_authorization().subject
+    except artifact_access.ArtifactAccessError as exc:
+        return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
     with _conn() as c:
         rows = c.execute(
             "SELECT slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
             "latest_version, manifest, last_health, last_debug_at, queries, tables, metrics, "
             "semantic_objects,area_id,area_label,area_source,area_confidence,area_updated_at,updated_at "
             "FROM rvbbit.live_apps "
-            "WHERE (%s::text IS NULL OR team=%s::text) "
+            "WHERE rvbbit.artifact_can_view(id,%s,false) "
+            "AND (%s::text IS NULL OR team=%s::text) "
             "AND (%s::text IS NULL OR runtime_kind=%s::text) "
             "AND (%s::text IS NULL OR app_kind=%s::text) "
             "AND (%s::text IS NULL OR name ILIKE '%%'||%s::text||'%%' "
             "     OR coalesce(description,'') ILIKE '%%'||%s::text||'%%') "
             "ORDER BY updated_at DESC LIMIT 100",
-            (team, team, runtime_kind, runtime_kind, app_kind, app_kind, search, search, search)).fetchall()
+            (subject, team, team, runtime_kind, runtime_kind, app_kind, app_kind,
+             search, search, search)).fetchall()
     apps = []
     for row in rows:
         item = dict(row)
@@ -6325,7 +6863,15 @@ def tool_list_live_apps(team=None, search=None, runtime_kind=None, app_kind=None
 def tool_get_live_app(slug, version=None, include_source=True):
     _ensure_dashboard_tables()
     _ensure_activity_table()
+    try:
+        subject = _artifact_authorization().subject
+    except artifact_access.ArtifactAccessError as exc:
+        return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
     with _conn() as c:
+        try:
+            artifact_access.require_view(c, slug, subject)
+        except artifact_access.ArtifactAccessError as exc:
+            return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
         app = c.execute(
             "SELECT id, slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
             "latest_version, manifest, last_health, last_debug_at,area_id,area_source,"
@@ -8456,11 +9002,17 @@ def _start_artifact_catalog_worker():
 
 def tool_list_artifact_areas():
     _ensure_dashboard_tables()
+    try:
+        subject = _artifact_authorization().subject
+    except artifact_access.ArtifactAccessError as exc:
+        return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
     with _conn() as c:
         rows = c.execute(
             "SELECT a.id,a.label,a.description,a.sort_order,a.active,count(d.id)::int AS artifacts "
             "FROM rvbbit.artifact_areas a LEFT JOIN rvbbit.dashboards d ON d.area_id=a.id "
-            "GROUP BY a.id ORDER BY a.sort_order,a.label"
+            "AND rvbbit.artifact_can_view(d.id,%s,false) "
+            "GROUP BY a.id ORDER BY a.sort_order,a.label",
+            (subject,),
         ).fetchall()
     return {"areas": rows}
 
@@ -8491,10 +9043,18 @@ def tool_set_artifact_area(slug, area_id=None):
 
 def tool_dashboard_dependents(object_ref):
     """Impact analysis: which dashboards depend on a table or metric."""
+    try:
+        subject = _artifact_authorization().subject
+    except artifact_access.ArtifactAccessError as exc:
+        return {"error": {"code": exc.code, "message": str(exc)}, "_http_status": exc.status}
     with _conn() as c:
         rows = c.execute(
-            "SELECT DISTINCT slug, name, team, kind FROM rvbbit.dashboard_sources WHERE object_ref=%s",
-            (object_ref,)).fetchall()
+            "SELECT DISTINCT d.slug,d.name,d.team,dep.kind "
+            "FROM rvbbit.dashboard_deps dep JOIN rvbbit.dashboards d "
+            "ON d.id=dep.dashboard_id AND d.latest_version=dep.version "
+            "WHERE dep.object_ref=%s AND rvbbit.artifact_can_view(d.id,%s,false)",
+            (object_ref, subject),
+        ).fetchall()
     return {"object": object_ref, "dashboards": rows}
 
 
@@ -8519,7 +9079,8 @@ def _mcp_publish_dashboard(name, html=None, team=None, description=None, kind="l
     """Persist a dashboard so it lives + works OUTSIDE Cowork (a shareable URL + the lens app).
     Build `html` from the `dashboard_template` boilerplate (call that tool FIRST): it gets LIVE
     data through Cowork's callMcpTool→run_sql bridge in-app, and the host's injected rvbbitQuery
-    when served — the SAME artifact works both places, no login. Instead of inlining a large
+    when served — the SAME artifact works both places for signed-in viewers. New artifacts are
+    private to their verified human owner until explicitly shared. Instead of inlining a large
     document, you can upload_artifact once and pass source_artifact_id here. Keep each data
     concern its OWN FLAT query in the composePayload parts map — the framework batches them into
     ONE run_sql_multi round trip. NEVER hand-write a json_build_object payload query (it hides the
@@ -8568,7 +9129,12 @@ def _mcp_get_dashboard(slug, version=None):
 def _mcp_dashboard_crawl(slug):
     """Re-extract a dashboard's data dependencies (queries → tables, metrics) into the
     catalog index — runs the LLM pass + reconciles the queries it actually ran."""
-    return _logged("dashboard_crawl", {"slug": slug}, lambda: dashboard_crawl(slug, use_llm=True))
+    return _logged(
+        "dashboard_crawl", {"slug": slug},
+        lambda: _artifact_owner_result(
+            slug, lambda: dashboard_crawl(slug, use_llm=True)
+        ),
+    )
 
 
 def _mcp_dashboard_dependents(object):
@@ -8589,7 +9155,8 @@ def _mcp_create_live_app(name, html=None, runtime_kind="html", app_kind="dashboa
                          source_artifact_id=None, ctx=None):
     """Create a versioned RVBBIT live app. HTML apps are hosted immediately at /d/<slug> and
     call rvbbitQuery(sql) for live, read-only data. Publication automatically queues a separate
-    semantic compiler pass; an authored manifest.semantic_map remains an optional precise hint.
+    semantic compiler pass; new apps are private to their verified human owner until shared.
+    An authored manifest.semantic_map remains an optional precise hint.
     Accepts inline html or an upload_artifact handle via source_artifact_id."""
     return _with_forwarded_mcp_caller(ctx, lambda: _logged(
         "create_live_app", {
@@ -8626,7 +9193,9 @@ def _mcp_semantic_enrichment_status(slug, version=None):
     return _logged(
         "semantic_enrichment_status",
         {"slug": slug, "version": version},
-        lambda: tool_semantic_enrichment_status(slug, version),
+        lambda: _artifact_view_result(
+            slug, lambda: tool_semantic_enrichment_status(slug, version)
+        ),
     )
 
 
@@ -8636,7 +9205,9 @@ def _mcp_enrich_live_app(slug, version=None, force=False):
     return _logged(
         "enrich_live_app",
         {"slug": slug, "version": version, "force": force},
-        lambda: tool_enrich_live_app(slug, version, force),
+        lambda: _artifact_owner_result(
+            slug, lambda: tool_enrich_live_app(slug, version, force)
+        ),
     )
 
 
@@ -8650,7 +9221,9 @@ def _mcp_set_artifact_area(slug, area_id=None):
     return _logged(
         "set_artifact_area",
         {"slug": slug, "area_id": area_id},
-        lambda: tool_set_artifact_area(slug, area_id),
+        lambda: _artifact_owner_result(
+            slug, lambda: tool_set_artifact_area(slug, area_id)
+        ),
     )
 
 
@@ -8677,29 +9250,67 @@ def _mcp_debug_live_app(slug, run_crawl=True, include_activity=True):
         "slug": slug,
         "run_crawl": run_crawl,
         "include_activity": include_activity,
-    }, lambda: tool_debug_live_app(slug, run_crawl, include_activity))
+    }, lambda: _artifact_owner_result(
+        slug, lambda: tool_debug_live_app(slug, run_crawl, include_activity)
+    ))
 
 
 def _mcp_live_app_logs(slug, limit=50):
     """Return recent live-app query events from mcp_activity for debugging."""
-    return _logged("live_app_logs", {"slug": slug, "limit": limit},
-                   lambda: tool_live_app_logs(slug, limit))
+    return _logged(
+        "live_app_logs", {"slug": slug, "limit": limit},
+        lambda: _artifact_owner_result(
+            slug, lambda: tool_live_app_logs(slug, limit)
+        ),
+    )
 
 
 def _mcp_start_live_app(slug, version=None, restart=False, port=None):
     """Start a Python FastAPI live app locally under uvicorn. HTML apps are already hosted."""
-    return _logged("start_live_app", {"slug": slug, "version": version, "restart": restart, "port": port},
-                   lambda: tool_start_live_app(slug, version, restart, port))
+    return _logged(
+        "start_live_app",
+        {"slug": slug, "version": version, "restart": restart, "port": port},
+        lambda: _artifact_owner_result(
+            slug, lambda: tool_start_live_app(slug, version, restart, port)
+        ),
+    )
 
 
 def _mcp_stop_live_app(slug):
     """Stop a locally running Python live app process."""
-    return _logged("stop_live_app", {"slug": slug}, lambda: tool_stop_live_app(slug))
+    return _logged(
+        "stop_live_app", {"slug": slug},
+        lambda: _artifact_owner_result(slug, lambda: tool_stop_live_app(slug)),
+    )
 
 
 def _mcp_live_app_status(slug=None):
     """Inspect local live-app runner state for one app or every running app."""
-    return _logged("live_app_status", {"slug": slug}, lambda: tool_live_app_status(slug))
+    if slug:
+        return _logged(
+            "live_app_status", {"slug": slug},
+            lambda: _artifact_view_result(slug, lambda: tool_live_app_status(slug)),
+        )
+
+    def visible_statuses():
+        subject = _artifact_authorization().subject
+        with _conn() as conn:
+            allowed = {
+                row["slug"] for row in conn.execute(
+                    "SELECT slug FROM rvbbit.dashboards "
+                    "WHERE rvbbit.artifact_can_view(id,%s,false)",
+                    (subject,),
+                ).fetchall()
+            }
+        return {
+            "live_apps": [
+                _live_app_runner_status(candidate, probe=False)
+                for candidate in sorted(_LIVE_APP_PROCS)
+                if candidate in allowed
+            ]
+        }
+
+    return _logged("live_app_status", {"slug": None}, visible_statuses)
 
 
 async def _mcp_capture_live_app(slug, path=None, width=1440, height=900, full_page=True, start=True,
@@ -8720,7 +9331,12 @@ async def _mcp_capture_live_app(slug, path=None, width=1440, height=900, full_pa
             "start": start,
             "wait_ms": wait_ms,
             "return_image": return_image,
-        }, lambda: tool_capture_live_app(slug, path, width, height, full_page, start, wait_ms))
+        }, lambda: _artifact_owner_result(
+            slug,
+            lambda: tool_capture_live_app(
+                slug, path, width, height, full_page, start, wait_ms
+            ),
+        ))
     )
     if return_image and isinstance(res, dict) and not res.get("error") and res.get("path"):
         try:
@@ -10075,6 +10691,7 @@ def _dashboard_inspection(
     trace,
     semantic_selection=None,
     as_of=None,
+    viewer=None,
 ):
     """Build deterministic breadcrumbs for one rendered business object.
 
@@ -10193,8 +10810,9 @@ def _dashboard_inspection(
                 "JOIN rvbbit.dashboards d ON d.id=dd.dashboard_id "
                 "AND d.latest_version=dd.version "
                 "WHERE dd.kind='table' AND dd.object_ref=ANY(%s::text[]) "
-                "AND d.slug<>%s ORDER BY d.name LIMIT 8",
-                (tables, slug),
+                "AND d.slug<>%s AND rvbbit.artifact_can_view(d.id,%s,false) "
+                "ORDER BY d.name LIMIT 8",
+                (tables, slug, viewer),
             ).fetchall()
 
     replay = None
@@ -10675,7 +11293,8 @@ def _metric_detail_snapshot(name, params=None, *, owner=None, days=90, bucket="r
             "SELECT DISTINCT d.slug,d.name,d.description,d.app_kind,d.latest_version "
             "FROM rvbbit.dashboard_deps x JOIN rvbbit.dashboards d ON d.id=x.dashboard_id "
             "WHERE x.kind='metric' AND x.object_ref=%s AND x.version=d.latest_version "
-            "ORDER BY d.name LIMIT 12", (name,),
+            "AND rvbbit.artifact_can_view(d.id,%s,false) "
+            "ORDER BY d.name LIMIT 12", (name, owner),
         ).fetchall()
         try:
             freshness = conn.execute(
@@ -10834,10 +11453,14 @@ def _semantic_home_metric_href(name, params=None):
     return "/gallery?" + urlencode(query, quote_via=quote)
 
 
-def _semantic_home_artifact_row(slug, version=None):
+def _semantic_home_artifact_row(slug, version=None, *, viewer):
     if not _SEMANTIC_HOME_SLUG_RE.fullmatch(str(slug or "")):
         raise ValueError("artifact slug is invalid")
     with _conn() as conn:
+        try:
+            artifact_access.require_view(conn, slug, viewer)
+        except artifact_access.ArtifactAccessError as exc:
+            raise LookupError("That artifact is not available.") from exc
         dashboard = conn.execute(
             "SELECT id,slug,name,description,owner_email,team,runtime_kind,app_kind,"
             "latest_version,area_id,area_source,area_confidence,updated_at "
@@ -10922,7 +11545,7 @@ def _semantic_home_context_key(context):
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
-def _semantic_home_resolve_handle(value, *, validate_sql=False):
+def _semantic_home_resolve_handle(value, *, validate_sql=False, viewer=None):
     """Resolve one client or persisted locator into a current, bounded tile."""
     body = value if isinstance(value, dict) else {}
     kind = str(body.get("kind") or body.get("item_kind") or "").strip().lower()
@@ -10990,7 +11613,9 @@ def _semantic_home_resolve_handle(value, *, validate_sql=False):
         version = int(requested_version) if requested_version not in (None, "") else None
     except (TypeError, ValueError) as exc:
         raise ValueError("version must be a positive integer") from exc
-    dashboard, version_row, manifest, deps = _semantic_home_artifact_row(slug, version)
+    dashboard, version_row, manifest, deps = _semantic_home_artifact_row(
+        slug, version, viewer=viewer
+    )
     selected_version = int(version_row["version"])
     app_kind = str(dashboard.get("app_kind") or "dashboard").lower()
     object_count = len(((manifest.get("semantic_map") or {}).get("objects") or []))
@@ -11138,10 +11763,12 @@ def _semantic_home_board(conn, owner, *, create=False):
     ).fetchone())
 
 
-def _semantic_home_public_item(row):
+def _semantic_home_public_item(row, *, viewer):
     raw = dict(row or {})
     try:
-        resolved = _semantic_home_resolve_handle(raw.get("source") or {})
+        resolved = _semantic_home_resolve_handle(
+            raw.get("source") or {}, viewer=viewer
+        )
         # Keep only the inert, non-authoritative value observed when the user
         # pinned the object as a graceful fallback while its live replay runs.
         stored_presentation = raw.get("presentation") or {}
@@ -11192,12 +11819,14 @@ def _semantic_home_snapshot(owner):
             "layout": board.get("layout") or {},
             "updated_at": _iso_utc(board.get("updated_at")),
         },
-        "items": [_semantic_home_public_item(row) for row in rows],
+        "items": [_semantic_home_public_item(row, viewer=owner) for row in rows],
     }
 
 
-def _semantic_home_preview(source, execution_subject=None):
-    resolved = _semantic_home_resolve_handle(source, validate_sql=True)
+def _semantic_home_preview(source, execution_subject=None, *, viewer):
+    resolved = _semantic_home_resolve_handle(
+        source, validate_sql=True, viewer=viewer
+    )
     if resolved["kind"] == "metric":
         snapshot = resolved.get("snapshot")
         if not snapshot:
@@ -11222,7 +11851,7 @@ def _semantic_home_preview(source, execution_subject=None):
     if resolved["kind"] != "artifact_object":
         raise ValueError("Only named business objects have a live value preview")
     dashboard, _, manifest, _ = _semantic_home_artifact_row(
-        resolved["source"]["slug"], resolved["source"]["version"]
+        resolved["source"]["slug"], resolved["source"]["version"], viewer=viewer
     )
     semantic_object = _semantic_object_from_manifest(manifest, {
         "id": resolved["source"]["object_id"],
@@ -11284,13 +11913,17 @@ def _semantic_home_metric_name(source):
     return base
 
 
-def _semantic_home_metric_draft(source, execution_subject=None, *, preview=True):
+def _semantic_home_metric_draft(
+    source, execution_subject=None, *, preview=True, viewer
+):
     """Rehydrate a pin into a server-owned governed-metric definition draft."""
-    resolved = _semantic_home_resolve_handle(source, validate_sql=True)
+    resolved = _semantic_home_resolve_handle(
+        source, validate_sql=True, viewer=viewer
+    )
     if resolved.get("kind") != "artifact_object":
         raise ValueError("Only named business objects can become governed metrics")
     dashboard, _, manifest, _ = _semantic_home_artifact_row(
-        resolved["source"]["slug"], resolved["source"]["version"]
+        resolved["source"]["slug"], resolved["source"]["version"], viewer=viewer
     )
     semantic_object = _semantic_object_from_manifest(manifest, {
         "id": resolved["source"]["object_id"],
@@ -11306,7 +11939,9 @@ def _semantic_home_metric_draft(source, execution_subject=None, *, preview=True)
     )
     observed = None
     if preview:
-        observed = _semantic_home_preview(resolved["source"], execution_subject)
+        observed = _semantic_home_preview(
+            resolved["source"], execution_subject, viewer=viewer
+        )
         if observed.get("status") == "error":
             raise ValueError(str(observed.get("error") or "The current value could not be read"))
         if observed.get("row_count") not in (None, 1):
@@ -11396,7 +12031,7 @@ def _promote_semantic_home_metric(owner, execution_subject, item_id, values=None
     # anything. The browser supplies only the desired name/description; SQL,
     # provenance, display metadata, and value-column selection stay server-owned.
     draft = _semantic_home_metric_draft(
-        item.get("source") or {}, execution_subject, preview=True
+        item.get("source") or {}, execution_subject, preview=True, viewer=owner
     )
     requested_name = str(values.get("name") or draft["suggested_name"]).strip().lower()
     if not _PROMOTED_METRIC_NAME_RE.fullmatch(requested_name):
@@ -11534,7 +12169,7 @@ def _promote_semantic_home_metric(owner, execution_subject, item_id, values=None
         "version": metric_version,
         "observation_id": observation_id,
         "open_url": _semantic_home_metric_href(requested_name, {}),
-        "item": _semantic_home_public_item(promoted_item),
+        "item": _semantic_home_public_item(promoted_item, viewer=owner),
     }
 
 
@@ -11635,12 +12270,16 @@ def _watch_snapshot(owner, *, slug=None, version=None, object_id=None, limit=100
     return {"watches": [_watch_public(row) for row in rows]}
 
 
-def _watch_semantic_definition(source, execution_subject, *, preview=True):
-    resolved = _semantic_home_resolve_handle(source, validate_sql=True)
+def _watch_semantic_definition(
+    source, execution_subject, *, preview=True, viewer
+):
+    resolved = _semantic_home_resolve_handle(
+        source, validate_sql=True, viewer=viewer
+    )
     if resolved.get("kind") != "artifact_object":
         raise ValueError("Only named, replayable dashboard values can be watched")
     dashboard, _, manifest, _ = _semantic_home_artifact_row(
-        resolved["source"]["slug"], resolved["source"]["version"]
+        resolved["source"]["slug"], resolved["source"]["version"], viewer=viewer
     )
     semantic_object = _semantic_object_from_manifest(manifest, {
         "id": resolved["source"]["object_id"],
@@ -11651,7 +12290,9 @@ def _watch_semantic_definition(source, execution_subject, *, preview=True):
         raise ValueError("This dashboard object is not a single watchable value")
     current = None
     if preview:
-        result = _semantic_home_preview(resolved["source"], execution_subject)
+        result = _semantic_home_preview(
+            resolved["source"], execution_subject, viewer=viewer
+        )
         if result.get("status") == "error":
             raise ValueError(str(result.get("error") or "The current value could not be read"))
         current = _watch_number(result.get("value"))
@@ -11776,7 +12417,7 @@ def _watch_bool(value, *, default):
 def _create_calliope_watch(owner, execution_subject, body):
     body = body if isinstance(body, dict) else {}
     source, presentation, current = _watch_semantic_definition(
-        body.get("source") or body, execution_subject, preview=True
+        body.get("source") or body, execution_subject, preview=True, viewer=owner
     )
     comparator, threshold, cadence, consecutive_n = _watch_inputs(body, current=current)
     name = _semantic_text(body.get("name"), 120) or (
@@ -11914,7 +12555,8 @@ def _reconcile_calliope_watch(watch_id):
     row = dict(row)
     try:
         _source, _presentation, current = _watch_semantic_definition(
-            row["source"], row["execution_subject"], preview=True
+            row["source"], row["execution_subject"], preview=True,
+            viewer=row["owner_email"],
         )
     except Exception as exc:  # noqa: BLE001 — a failed read is a user-visible watch state
         message = _semantic_text(exc, 800) or "The watched value could not be read"
@@ -12087,7 +12729,7 @@ def _start_calliope_watch_worker():
     return True
 
 
-def _dashboard_version_document(slug, version=None):
+def _dashboard_version_document(slug, version=None, viewer=None):
     """Load one exact stored dashboard/app document, or the current version.
 
     Named Home objects intentionally retain the artifact version whose semantic
@@ -12104,6 +12746,11 @@ def _dashboard_version_document(slug, version=None):
     if selected is not None and selected < 1:
         raise ValueError("version must be a positive integer")
     with _conn() as conn:
+        if viewer is not None:
+            try:
+                artifact_access.require_view(conn, slug, viewer)
+            except artifact_access.ArtifactAccessError:
+                return None
         dashboard = conn.execute(
             "SELECT id,slug,latest_version,app_kind FROM rvbbit.dashboards WHERE slug=%s",
             (slug,),
@@ -12432,8 +13079,9 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .artifact-sort,.artifact-area-filter{position:relative;display:flex;align-items:center}.artifact-sort>span,.artifact-area-filter>span{position:absolute;left:9px;color:var(--dim);font:650 6px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;pointer-events:none}
 #artifact-sort,#artifact-area{height:var(--gallery-control-height);min-width:158px;padding:0 26px 0 40px;border:1px solid var(--line);border-radius:0;background:color-mix(in oklch,var(--panel) 86%,transparent);color:var(--fog);font:7px/1 var(--mono);letter-spacing:.07em;text-transform:uppercase;outline:none;cursor:pointer}
 #artifact-area{min-width:132px;padding-left:40px}#artifact-sort:focus,#artifact-area:focus{border-color:var(--line-hot);color:var(--bone)}
-.artifact-pinned-filter{height:var(--gallery-control-height);display:inline-flex;align-items:center;gap:6px;padding:0 10px;border:1px solid var(--line);background:transparent;color:var(--dim);font:700 7px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:border-color .16s,color .16s,background .16s}
+.artifact-pinned-filter,.artifact-archived-filter{height:var(--gallery-control-height);display:inline-flex;align-items:center;gap:6px;padding:0 10px;border:1px solid var(--line);background:transparent;color:var(--dim);font:700 7px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:border-color .16s,color .16s,background .16s}
 .artifact-pinned-filter:hover,.artifact-pinned-filter:focus-visible{outline:0;border-color:color-mix(in oklch,var(--jade) 42%,var(--line));color:var(--jade)}.artifact-pinned-filter[aria-pressed=true]{border-color:color-mix(in oklch,var(--jade) 58%,var(--line));background:var(--jade-soft);color:var(--jade)}
+.artifact-archived-filter b{min-width:15px;padding:2px 4px;border-radius:999px;background:color-mix(in oklch,var(--fog) 15%,transparent);font-size:6px;text-align:center}.artifact-archived-filter:hover,.artifact-archived-filter:focus-visible{outline:0;border-color:color-mix(in oklch,#ef8178 44%,var(--line));color:#ef9b91}.artifact-archived-filter[aria-pressed=true]{border-color:color-mix(in oklch,#ef8178 58%,var(--line));background:color-mix(in oklch,#ef8178 9%,transparent);color:#ef9b91}
 .semantic-launch{padding:10px 0 12px;border-bottom:1px solid var(--line)}
 .semantic-launch[hidden]{display:none}
 .semantic-launch-button{width:100%;min-height:68px;display:grid;grid-template-columns:42px minmax(0,1fr) auto;
@@ -12472,7 +13120,7 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .card-actions{position:absolute;top:10px;right:10px;z-index:5;display:flex;align-items:center;opacity:0;pointer-events:none;transform:translateY(-4px);transition:opacity .16s,transform .16s}
 .card:hover .card-actions,.card:focus-within .card-actions{opacity:1;pointer-events:auto;transform:none}
 .card-action-items{display:flex;align-items:center;gap:5px}
-.card-pin,.card-ask,.card-more{display:flex;align-items:center;gap:6px;min-height:27px;padding:6px 8px;
+.card-pin,.card-ask,.card-share,.card-more{display:flex;align-items:center;gap:6px;min-height:27px;padding:6px 8px;
   border:1px solid color-mix(in oklch,var(--bone) 18%,transparent);border-radius:999px;background:color-mix(in oklch,var(--void) 76%,transparent);
   -webkit-backdrop-filter:blur(13px);backdrop-filter:blur(13px);color:var(--fog);font:650 6px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;
   box-shadow:0 5px 16px rgba(0,0,0,.28);cursor:pointer;transition:border-color .18s,background .18s,color .18s,transform .18s}
@@ -12480,10 +13128,12 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .card-pin:hover,.card-pin:focus-visible{outline:0;transform:translateY(-1px);border-color:var(--amber);background:color-mix(in oklch,var(--void) 86%,var(--amber) 4%);color:var(--amber)}
 .card-ask{border-color:color-mix(in oklch,var(--jade) 36%,var(--line));color:var(--jade)}
 .card-ask:hover,.card-ask:focus-visible{outline:0;transform:translateY(-1px);border-color:var(--jade);background:color-mix(in oklch,var(--jade) 12%,var(--void));color:color-mix(in oklch,var(--jade) 82%,#fff)}
+.card-share{border-color:color-mix(in oklch,var(--amber) 36%,var(--line));color:var(--amber)}.card-share:hover,.card-share:focus-visible{outline:0;transform:translateY(-1px);border-color:var(--amber);background:var(--amber-soft);color:var(--bone-bright)}
 .card-ask:disabled{cursor:wait;opacity:.72}.card-ask.loading span{font-size:0}.card-ask.loading span::after{content:"…";font-size:6px}
 .card-pin[aria-pressed=true]{border-color:color-mix(in oklch,var(--jade) 62%,transparent);background:color-mix(in oklch,var(--jade) 15%,var(--void));color:var(--jade)}
 .card-pin:disabled{cursor:wait;opacity:.62}
 .card-pin b{font-size:10px;font-weight:400;line-height:.6}
+.card[data-archived=true]{background:color-mix(in oklch,var(--panel) 90%,#3b2522);opacity:.82}.card[data-archived=true] .card-link{cursor:default}.card[data-archived=true] .shot{filter:grayscale(.8);opacity:.55}.card-archived-tag{border-color:color-mix(in oklch,#ef8178 44%,var(--line));color:#ef9b91}
 .shot{position:relative;aspect-ratio:16/10;overflow:hidden;background:#0d0b09}
 /* The glyph sits underneath permanently; the shot fades in ON TOP once it
    actually loads. That way a thumbnail still being rendered shows the
@@ -12494,6 +13144,9 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   opacity:0;transition:transform .7s,opacity .45s}
 .shot img.ok{opacity:.84}
 .card:hover .shot img.ok{transform:scale(1.035);opacity:1}
+.card.interaction-suspended,.card.interaction-suspended:hover{background:var(--panel)}
+.card.interaction-suspended .card-actions,.card.interaction-suspended:focus-within .card-actions{opacity:0;pointer-events:none;transform:translateY(-4px)}
+.card.interaction-suspended:hover .shot img.ok{transform:none;opacity:.84}
 .shot::after{content:"";position:absolute;inset:0;z-index:2;pointer-events:none;
   background:linear-gradient(to top,var(--panel) 2%,transparent 46%)}
 .glyph{position:absolute;inset:0;z-index:0;display:grid;place-items:center;
@@ -12510,6 +13163,7 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .pill{padding:3px 8px;border:1px solid var(--line-hot);color:var(--amber)}
 .pill.dim{border-color:var(--line);color:var(--dim)}
 .card-owner{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card-owner.is-current-user{border-color:color-mix(in oklch,var(--jade) 52%,var(--line));background:var(--jade-soft);color:var(--jade);box-shadow:inset 0 1px 0 color-mix(in oklch,var(--bone) 5%,transparent)}
 .when{margin-left:auto;flex:none;color:var(--dim);white-space:nowrap}
 .card h2{font:italic 400 21px/1.2 var(--serif);letter-spacing:-.01em}
 .desc{color:var(--fog);font-size:12.5px;line-height:1.55;
@@ -12537,6 +13191,9 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
 .activity-chart{height:126px;display:flex;align-items:flex-end;gap:3px;margin-top:15px;padding-top:8px;border-bottom:1px solid var(--line);background-image:linear-gradient(to bottom,var(--line) 1px,transparent 1px);background-size:100% 33.333%}.activity-bar{position:relative;min-width:2px;flex:1;height:max(2px,var(--bar-height));background:linear-gradient(to top,color-mix(in oklch,var(--jade) 30%,transparent),var(--jade));box-shadow:0 -3px 11px color-mix(in oklch,var(--jade) 12%,transparent);transition:filter .15s,opacity .15s}.activity-bar:hover{filter:brightness(1.32)}.activity-bar.zero{opacity:.14}.activity-chart-axis{display:flex;justify-content:space-between;margin-top:7px;color:var(--dim);font:6px/1 var(--mono);letter-spacing:.05em;text-transform:uppercase}
 .activity-viewer-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:11px}.activity-viewer{display:grid;grid-template-columns:29px minmax(0,1fr) auto;align-items:center;gap:9px;padding:8px;border:1px solid var(--line);background:color-mix(in oklch,var(--panel-raised) 64%,transparent)}.activity-viewer-avatar{width:29px;height:29px;display:grid;place-items:center;border:1px solid color-mix(in oklch,var(--jade) 35%,var(--line));border-radius:50%;color:var(--jade);font:700 7px/1 var(--mono)}.activity-viewer-copy{min-width:0}.activity-viewer-copy strong{display:block;overflow:hidden;color:var(--bone-bright);font:9px/1.2 var(--mono);text-overflow:ellipsis;white-space:nowrap}.activity-viewer-copy small{display:block;margin-top:4px;color:var(--dim);font:6px/1.2 var(--mono)}.activity-viewer-count{color:var(--fog);font:700 7px/1 var(--mono);text-align:right}.activity-viewer-count b{display:block;color:var(--amber);font-size:12px}.activity-empty{min-height:250px;display:grid;place-items:center;padding:35px;text-align:center}.activity-empty div{max-width:430px}.activity-empty b{display:block;color:var(--bone-bright);font:italic 400 24px/1.1 var(--serif)}.activity-empty p{margin-top:10px;color:var(--fog);font-size:11px;line-height:1.6}.activity-error{min-height:260px;display:grid;place-items:center;color:#f2a28f;font:9px/1.5 var(--mono);text-align:center}
 
+.artifact-access-dialog{width:min(720px,calc(100vw - 32px));max-width:none;margin:auto;padding:0;border:1px solid color-mix(in oklch,var(--amber) 52%,var(--line));background:color-mix(in oklch,var(--panel) 96%,transparent);color:var(--bone);box-shadow:0 34px 120px color-mix(in oklch,var(--void) 88%,transparent)}.artifact-access-dialog::backdrop{background:color-mix(in oklch,var(--void) 72%,transparent);backdrop-filter:blur(8px)}.artifact-access-shell{display:flex;max-height:calc(100dvh - 32px);flex-direction:column}.artifact-access-head{display:flex;align-items:center;gap:13px;min-height:72px;padding:12px 13px 12px 18px;border-bottom:1px solid var(--line);background:color-mix(in oklch,var(--gallery-rail-bg) 94%,transparent);backdrop-filter:blur(20px)}.artifact-access-mark{width:36px;height:36px;display:grid;place-items:center;flex:none;border:1px solid color-mix(in oklch,var(--amber) 45%,var(--line));border-radius:50%;color:var(--amber);font:15px/1 var(--mono)}.artifact-access-heading{min-width:0;display:flex;flex:1;flex-direction:column;gap:4px}.artifact-access-heading>span{color:var(--amber);font:700 6px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}.artifact-access-heading strong{overflow:hidden;color:var(--bone-bright);font:italic 400 21px/1.08 var(--serif);text-overflow:ellipsis;white-space:nowrap}.artifact-access-heading small{color:var(--dim);font:7px/1.3 var(--mono);letter-spacing:.07em;text-transform:uppercase}.artifact-access-close{width:36px;height:36px;display:grid;place-items:center;flex:none;border:1px solid var(--line);background:transparent;color:var(--fog);font-size:18px;cursor:pointer}.artifact-access-close:hover{border-color:var(--amber);color:var(--amber)}.artifact-access-content{min-height:330px;overflow:auto;padding:18px}.artifact-access-loading{min-height:290px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:var(--dim);font:8px/1.5 var(--mono);letter-spacing:.09em;text-transform:uppercase}.artifact-access-loading i{width:22px;height:22px;border:1px solid var(--line-hot);border-right-color:transparent;border-radius:50%;animation:semantic-spin .8s linear infinite}
+.artifact-access-owner{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;padding:12px;border:1px solid color-mix(in oklch,var(--jade) 30%,var(--line));background:color-mix(in oklch,var(--jade) 5%,transparent)}.artifact-access-owner span{display:block;color:var(--jade);font:700 6px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase}.artifact-access-owner strong{display:block;margin-top:6px;color:var(--bone-bright);font:10px/1.2 var(--mono)}.artifact-access-owner b{align-self:center;color:var(--fog);font:italic 400 16px/1 var(--serif)}.artifact-access-section{margin-top:15px}.artifact-access-section>header{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:8px}.artifact-access-section h3{color:var(--bone-bright);font:italic 400 17px/1 var(--serif)}.artifact-access-section header p{color:var(--dim);font:6px/1.35 var(--mono);letter-spacing:.06em;text-align:right;text-transform:uppercase}.artifact-team-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.artifact-team-option{display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:8px;padding:9px;border:1px solid var(--line);cursor:pointer}.artifact-team-option:has(input:checked){border-color:color-mix(in oklch,var(--jade) 52%,var(--line));background:var(--jade-soft)}.artifact-team-option input{accent-color:var(--jade)}.artifact-team-option strong{display:block;color:var(--bone-bright);font:9px/1.2 var(--mono)}.artifact-team-option small{display:block;margin-top:4px;color:var(--dim);font:6px/1.3 var(--mono)}.artifact-team-option>small{margin:0;color:var(--fog);text-transform:uppercase}.artifact-people-search{position:relative}.artifact-people-search input{width:100%;height:36px;padding:0 11px;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 55%,transparent);color:var(--bone);font:10px/1 var(--mono);outline:none}.artifact-people-search input:focus{border-color:var(--jade)}.artifact-person-results{max-height:180px;overflow:auto;border:1px solid var(--line);border-top:0}.artifact-person-results:empty{display:none}.artifact-person-result{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:0;border-bottom:1px solid var(--line);background:color-mix(in oklch,var(--void) 45%,transparent);color:var(--fog);font:8px/1.2 var(--mono);text-align:left;cursor:pointer}.artifact-person-result:last-child{border-bottom:0}.artifact-person-result:hover{background:var(--jade-soft);color:var(--bone)}.artifact-person-result b{color:var(--jade);font-size:12px}.artifact-selected-people{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.artifact-person-chip{display:inline-flex;align-items:center;gap:7px;max-width:100%;padding:5px 7px;border:1px solid color-mix(in oklch,var(--jade) 36%,var(--line));border-radius:999px;background:var(--jade-soft);color:var(--fog);font:7px/1.2 var(--mono)}.artifact-person-chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.artifact-person-chip button{border:0;background:transparent;color:var(--jade);cursor:pointer}.artifact-access-error{min-height:12px;margin-top:11px;color:#f2a28f;font:8px/1.4 var(--mono)}.artifact-access-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;margin-top:14px}.artifact-access-actions button{height:32px;padding:0 12px;border:1px solid var(--line);background:transparent;color:var(--fog);font:700 7px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;cursor:pointer}.artifact-access-actions button[type=submit]{border-color:var(--amber);background:var(--amber);color:#1a1206}.artifact-access-actions button:disabled{opacity:.55;cursor:wait}.artifact-lifecycle{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:18px;padding:13px;border:1px solid color-mix(in oklch,#ef8178 27%,var(--line));background:color-mix(in oklch,#ef8178 4%,transparent)}.artifact-lifecycle strong{display:block;color:var(--bone-bright);font:italic 400 16px/1.1 var(--serif)}.artifact-lifecycle p{margin-top:5px;color:var(--dim);font:7px/1.45 var(--mono)}.artifact-lifecycle button{height:31px;padding:0 10px;border:1px solid color-mix(in oklch,#ef8178 48%,var(--line));background:transparent;color:#ef9b91;font:700 7px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;cursor:pointer}.artifact-lifecycle.restore{border-color:color-mix(in oklch,var(--jade) 30%,var(--line));background:var(--jade-soft)}.artifact-lifecycle.restore button{border-color:var(--jade);color:var(--jade)}
+
 .empty{padding:80px 0;text-align:center;color:var(--fog);font:12px/1.7 var(--mono);letter-spacing:.06em}
 .empty code{color:var(--amber)}
 #none{display:none;padding:60px 0;text-align:center;color:var(--dim);
@@ -12550,7 +13207,7 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .semantic-launch-cta{grid-column:2;justify-content:flex-start;text-align:left}
   .home-head{align-items:flex-start;flex-direction:column;gap:8px}.home-head-actions{width:100%;justify-content:space-between}.home-status{text-align:left}.semantic-home.collapsed .home-head{flex-direction:row}.semantic-home.collapsed .home-head-actions{width:auto;margin-left:auto}.semantic-home.collapsed .home-status{display:none}
   .toolbar{position:sticky;z-index:18;top:56px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:8px 0 9px;background:color-mix(in oklch,var(--void) 88%,transparent);-webkit-backdrop-filter:blur(18px) saturate(1.16);backdrop-filter:blur(18px) saturate(1.16);box-shadow:0 11px 28px rgba(0,0,0,.2)}
-  .toolbar .gallery-view-switch{grid-column:1;width:auto}.toolbar #q{grid-column:1/-1;grid-row:2;width:100%;min-width:0}.gallery-artifact-controls{grid-column:2;grid-row:1}.artifact-sort>span,.artifact-area-filter>span{display:none}#artifact-sort,#artifact-area{min-width:112px;padding-left:9px}.artifact-pinned-filter{padding-inline:9px}
+  .toolbar .gallery-view-switch{grid-column:1;width:auto}.toolbar #q{grid-column:1/-1;grid-row:2;width:100%;min-width:0}.gallery-artifact-controls{grid-column:2;grid-row:1}.artifact-sort>span,.artifact-area-filter>span{display:none}#artifact-sort,#artifact-area{min-width:112px;padding-left:9px}.artifact-pinned-filter,.artifact-archived-filter{padding-inline:9px}
   .gallery-presence{top:64px;right:12px;width:205px;transition:width .24s ease,transform .24s ease,opacity .18s ease}.gallery-presence .presence-calendar,.gallery-presence .presence-meeting{display:none}.gallery-presence .presence-clock{min-height:54px;padding-block:9px}.gallery-presence .presence-time{font-size:26px}
   body.gallery-mobile-scrolled .gallery-presence{opacity:0;pointer-events:none;transform:translateY(-10px)}
   body.gallery-mobile-scrolled .calliope-float{gap:0;width:52px;min-height:52px;padding:4px;border-radius:50%}
@@ -12574,13 +13231,14 @@ h1 em{color:var(--amber);font-family:var(--serif);font-weight:400;font-style:ita
   .trail-loom>header{align-items:flex-start;flex-direction:column}.trail-loom>header b{text-align:left}
   .trail-loom-track{align-items:stretch;flex-direction:column}.trail-loom-step{width:100%;min-height:92px;flex-basis:auto}.trail-loom-link{width:auto;min-width:0;min-height:34px;flex-direction:row}.trail-loom-link i{transform:rotate(90deg)}
   .artifact-activity-dialog{width:100vw;height:100dvh;margin:0;border:0}.activity-head{gap:8px;padding-left:11px}.activity-head-mark,.activity-heading small{display:none}.activity-range button{padding-inline:7px}.activity-content{padding:10px}
+  .artifact-access-dialog{width:100vw;height:100dvh;margin:0;border:0}.artifact-access-shell{max-height:100dvh}.artifact-access-content{padding:11px}.artifact-team-list{grid-template-columns:1fr}.artifact-access-heading small{display:none}
 }
 @media (hover:none){
   .card-actions{opacity:1;pointer-events:auto;transform:none}
   .card-more{display:flex}
   .card-action-items{position:absolute;top:35px;right:0;display:none;align-items:stretch;flex-direction:column;padding:5px;border:1px solid var(--line);background:color-mix(in oklch,var(--void) 94%,transparent);box-shadow:0 12px 32px rgba(0,0,0,.42)}
   .card-actions.open .card-action-items{display:flex}
-  .card-action-items .card-ask,.card-action-items .card-pin{min-width:82px;justify-content:flex-start;box-shadow:none}
+  .card-action-items .card-ask,.card-action-items .card-pin,.card-action-items .card-share{min-width:82px;justify-content:flex-start;box-shadow:none}
 }
 @media (min-width:900px){header.hero{padding-right:min(390px,32vw)}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
@@ -12756,6 +13414,74 @@ _LANDING_JS = """
  document.addEventListener('click',function(event){var button=event.target.closest&&event.target.closest('[data-gallery-activity]');if(button){event.preventDefault();event.stopPropagation();openActivity(button.dataset.galleryActivity);}});
  if(activityRange)activityRange.addEventListener('click',function(event){var button=event.target.closest&&event.target.closest('[data-activity-days]');if(!button)return;activityDays=Number(button.dataset.activityDays)||30;loadActivity();});
  if(activityClose)activityClose.addEventListener('click',function(){activityDialog.close();});if(activityDialog)activityDialog.addEventListener('cancel',function(event){event.preventDefault();activityDialog.close();});
+
+ var accessDialog=document.getElementById('artifact-access-dialog'),
+     accessTitle=document.getElementById('artifact-access-title'),
+     accessMeta=document.getElementById('artifact-access-meta'),
+     accessContent=document.getElementById('artifact-access-content'),
+     accessClose=document.getElementById('artifact-access-close'),
+     accessSlug='',accessSnapshot=null,accessRequest=0,accessPeopleRequest=0,
+     accessPeopleTimer=null,accessSelectedPeople=new Map(),accessSelectedTeams=new Set(),
+     accessSourceCard=null,accessSourceRelease=null;
+ function accessEsc(value){return String(value===null||value===undefined?'':value).replace(/[&<>"']/g,function(char){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char];});}
+ function accessError(message){var node=document.getElementById('artifact-access-error');if(node)node.textContent=message||'';}
+ function accessPeopleMarkup(){
+   if(!accessSelectedPeople.size)return '<span class="artifact-access-no-people">No individual viewers selected.</span>';
+   return Array.from(accessSelectedPeople.values()).map(function(person){var email=person.email||person.principal_email||'';return '<span class="artifact-person-chip"><span>'+accessEsc(person.display_name?person.display_name+' · '+email:email)+'</span><button type="button" data-access-remove-person="'+accessEsc(email)+'" aria-label="Remove '+accessEsc(email)+'">×</button></span>';}).join('');
+ }
+ function renderSelectedPeople(){var host=document.getElementById('artifact-selected-people');if(host)host.innerHTML=accessPeopleMarkup();}
+ function suspendAccessSource(button){
+   if(accessSourceRelease){document.removeEventListener('pointermove',accessSourceRelease);accessSourceRelease=null;}
+   if(accessSourceCard)accessSourceCard.classList.remove('interaction-suspended');
+   accessSourceCard=button&&button.closest?button.closest('.card'):null;
+   if(accessSourceCard)accessSourceCard.classList.add('interaction-suspended');
+   if(button&&button.blur)button.blur();
+ }
+ function releaseAccessSource(){
+   var card=accessSourceCard;accessSourceCard=null;if(!card)return;
+   var release=function(){if(card.matches&&card.matches(':hover'))return;card.classList.remove('interaction-suspended');document.removeEventListener('pointermove',release);if(accessSourceRelease===release)accessSourceRelease=null;};
+   accessSourceRelease=release;requestAnimationFrame(release);document.addEventListener('pointermove',release,{passive:true});
+ }
+ function renderAccess(data){
+   accessSnapshot=data;var artifact=data.artifact||{},grants=data.grants||{},teams=Array.isArray(data.teams)?data.teams:[];
+   accessSelectedTeams=new Set((grants.teams||[]).map(function(team){return String(team.id);}));
+   accessSelectedPeople=new Map();(grants.people||[]).forEach(function(person){accessSelectedPeople.set(String(person.email),person);});
+   accessTitle.textContent=artifact.name||artifact.slug||'Artifact access';
+   accessMeta.textContent=(artifact.app_kind||'artifact')+' · '+(data.summary||'Only you')+' · revision '+(artifact.access_revision||1);
+   var teamMarkup=teams.map(function(team){var id=String(team.id),checked=accessSelectedTeams.has(id),rule=team.system_key==='everyone'?'Every verified signed-in user':((team.member_count||0)+' explicit member'+(Number(team.member_count)===1?'':'s'));return '<label class="artifact-team-option"><input type="checkbox" name="access-team" value="'+accessEsc(id)+'" '+(checked?'checked':'')+'><span><strong>'+accessEsc(team.name)+'</strong><small>'+accessEsc(team.description||rule)+'</small></span><small>'+accessEsc(rule)+'</small></label>';}).join('');
+   var archived=Boolean(artifact.archived);
+   accessContent.innerHTML='<div class="artifact-access-owner"><div><span>Owner · always has access</span><strong>'+accessEsc(artifact.owner_email||data.subject||'')+'</strong></div><b>'+accessEsc(data.summary||'Only you')+'</b></div>'
+     +'<form id="artifact-access-form"><section class="artifact-access-section"><header><h3>Teams</h3><p>Flat workspace Teams · changes apply immediately</p></header><div class="artifact-team-list">'+(teamMarkup||'<span>No Teams configured.</span>')+'</div></section>'
+     +'<section class="artifact-access-section"><header><h3>People</h3><p>Only verified people observed by this workspace</p></header><div class="artifact-people-search"><input id="artifact-people-query" type="search" autocomplete="off" placeholder="Search a name or email…"><div id="artifact-person-results" class="artifact-person-results"></div></div><div id="artifact-selected-people" class="artifact-selected-people">'+accessPeopleMarkup()+'</div></section>'
+     +'<div id="artifact-access-error" class="artifact-access-error" role="status"></div><div class="artifact-access-actions"><button type="button" data-access-cancel>Cancel</button><button type="submit">Save access</button></div></form>'
+     +'<section class="artifact-lifecycle '+(archived?'restore':'')+'"><div><strong>'+(archived?'Restore this artifact':'Archive this artifact')+'</strong><p>'+(archived?'Its prior viewers will regain access. Running apps stay stopped until explicitly started.':'It disappears for every viewer. Versions, sharing, lineage, pins, and audit history remain intact.')+'</p></div><button type="button" data-access-lifecycle="'+(archived?'restore':'archive')+'">'+(archived?'Restore':'Archive')+'</button></section>';
+ }
+ async function openArtifactAccess(slug,button){
+   if(!accessDialog)return;suspendAccessSource(button);accessSlug=slug;var request=++accessRequest;accessTitle.textContent='Artifact access';accessMeta.textContent='Owner-managed application access';accessContent.innerHTML='<div class="artifact-access-loading"><i></i><span>Reading current access…</span></div>';if(!accessDialog.open)accessDialog.showModal();
+   try{var response=await fetch('/api/gallery/artifacts/'+encodeURIComponent(slug)+'/access',{headers:{accept:'application/json'}}),data={};try{data=await response.json();}catch(ignore){}if(request!==accessRequest)return;if(!response.ok)throw new Error(data.error&&data.error.message||'Access is unavailable');renderAccess(data);}
+   catch(error){if(request!==accessRequest)return;accessContent.innerHTML='<div class="activity-error">'+accessEsc(error&&error.message||'Access is unavailable')+'</div>';}
+ }
+ async function searchAccessPeople(query){
+   var results=document.getElementById('artifact-person-results');if(!results)return;var request=++accessPeopleRequest;
+   try{var response=await fetch('/api/gallery/artifact-people?artifact='+encodeURIComponent(accessSlug)+'&q='+encodeURIComponent(query||'')+'&limit=80',{headers:{accept:'application/json'}}),data={};try{data=await response.json();}catch(ignore){}if(request!==accessPeopleRequest)return;if(!response.ok)throw new Error('People unavailable');var people=(data.people||[]).filter(function(person){return !accessSelectedPeople.has(String(person.email));});results.innerHTML=people.map(function(person){return '<button type="button" class="artifact-person-result" data-access-add-person="'+accessEsc(person.email)+'" data-access-person-name="'+accessEsc(person.display_name||'')+'"><span>'+accessEsc(person.display_name?person.display_name+' · '+person.email:person.email)+'</span><b>＋</b></button>';}).join('');}
+   catch(ignore){if(request===accessPeopleRequest)results.innerHTML='';}
+ }
+ async function saveArtifactAccess(form){
+   if(!accessSnapshot)return;var submit=form.querySelector('[type=submit]'),teamIds=[].map.call(form.querySelectorAll('input[name=access-team]:checked'),function(input){return input.value;}),people=Array.from(accessSelectedPeople.keys()),everyone=(accessSnapshot.teams||[]).find(function(team){return team.system_key==='everyone';}),alreadyEveryone=Boolean(accessSnapshot.everyone),addsEveryone=Boolean(everyone&&teamIds.indexOf(String(everyone.id))>=0&&!alreadyEveryone),confirmEveryone=false;
+   if(addsEveryone){confirmEveryone=window.confirm('Share this artifact with Everyone signed in to this workspace?');if(!confirmEveryone)return;}
+   submit.disabled=true;accessError('');
+   try{var response=await fetch('/api/gallery/artifacts/'+encodeURIComponent(accessSlug)+'/access',{method:'PATCH',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify({expected_revision:accessSnapshot.artifact.access_revision,team_ids:teamIds,people:people,confirm_everyone:confirmEveryone})}),data={};try{data=await response.json();}catch(ignore){}if(!response.ok)throw new Error(data.error&&data.error.message||'Access could not be saved');renderAccess(Object.assign({},data,{teams:accessSnapshot.teams,subject:accessSnapshot.subject}));var card=document.querySelector('.card[data-slug="'+CSS.escape(accessSlug)+'"]');if(card)card.dataset.accessRevision=String(data.artifact.access_revision||'');}
+   catch(error){accessError(error&&error.message||'Access could not be saved');submit.disabled=false;}
+ }
+ async function changeArtifactLifecycle(action,button){
+   if(!accessSnapshot)return;var archived=action==='archive',question=archived?'Archive this artifact for every viewer? You can restore it later.':'Restore this artifact and its previous viewer access?';if(!window.confirm(question))return;button.disabled=true;accessError('');
+   try{var response=await fetch('/api/gallery/artifacts/'+encodeURIComponent(accessSlug)+'/lifecycle',{method:'POST',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify({expected_revision:accessSnapshot.artifact.access_revision,archived:archived})}),data={};try{data=await response.json();}catch(ignore){}if(!response.ok)throw new Error(data.error&&data.error.message||'Lifecycle could not be changed');window.location.reload();}
+   catch(error){accessError(error&&error.message||'Lifecycle could not be changed');button.disabled=false;}
+ }
+ document.addEventListener('click',function(event){var button=event.target.closest&&event.target.closest('[data-artifact-access]');if(button){event.preventDefault();event.stopPropagation();openArtifactAccess(button.dataset.artifactAccess,button);}});
+ if(accessContent){accessContent.addEventListener('input',function(event){if(event.target.id!=='artifact-people-query')return;clearTimeout(accessPeopleTimer);accessPeopleTimer=setTimeout(function(){searchAccessPeople(event.target.value);},220);});accessContent.addEventListener('focusin',function(event){if(event.target.id==='artifact-people-query')searchAccessPeople(event.target.value);});accessContent.addEventListener('click',function(event){var add=event.target.closest('[data-access-add-person]'),remove=event.target.closest('[data-access-remove-person]'),cancel=event.target.closest('[data-access-cancel]'),lifecycle=event.target.closest('[data-access-lifecycle]');if(add){var email=add.dataset.accessAddPerson;accessSelectedPeople.set(email,{email:email,display_name:add.dataset.accessPersonName||null});renderSelectedPeople();searchAccessPeople(document.getElementById('artifact-people-query').value);return;}if(remove){accessSelectedPeople.delete(remove.dataset.accessRemovePerson);renderSelectedPeople();return;}if(cancel){accessDialog.close();return;}if(lifecycle)changeArtifactLifecycle(lifecycle.dataset.accessLifecycle,lifecycle);});accessContent.addEventListener('submit',function(event){if(event.target.id!=='artifact-access-form')return;event.preventDefault();saveArtifactAccess(event.target);});}
+ if(accessClose)accessClose.addEventListener('click',function(){accessDialog.close();});if(accessDialog){accessDialog.addEventListener('cancel',function(event){event.preventDefault();accessDialog.close();});accessDialog.addEventListener('close',function(){accessRequest++;accessPeopleRequest++;clearTimeout(accessPeopleTimer);accessSlug='';accessSnapshot=null;releaseAccessSource();});}
+ document.addEventListener('click',function(event){var link=event.target.closest&&event.target.closest('[data-archived-link]');if(link){event.preventDefault();event.stopPropagation();}});
 
  function closeCardActionMenus(except,restoreFocus){
    [].forEach.call(document.querySelectorAll('.card-actions.open'),function(menu){
@@ -13486,6 +14212,7 @@ _LANDING_JS = """
      sortSelect=document.getElementById('artifact-sort'),
      areaSelect=document.getElementById('artifact-area'),
      pinnedFilter=document.getElementById('artifact-pinned-filter'),
+     archivedFilter=document.getElementById('artifact-archived-filter'),
      tallyNode=document.getElementById('gallery-tally'),
      none=document.getElementById('none'),
      semantic=document.getElementById('semantic-launch'),
@@ -13494,7 +14221,7 @@ _LANDING_JS = """
      semanticLocal=document.getElementById('semantic-launch-local'),
      semanticScope=document.getElementById('semantic-launch-scope'),
      semanticError=document.getElementById('semantic-launch-error'),
-     area='',pinnedOnly=false,semanticBusy=false;
+     area='',pinnedOnly=false,archivedOnly=false,semanticBusy=false;
  function queryText(){return q?(q.value||'').trim().replace(/\\s+/g,' '):'';}
  function metricViewActive(){var metricsBrowser=document.getElementById('metrics-browser');return Boolean(metricsBrowser&&!metricsBrowser.hidden);}
  function syncSemantic(shown){
@@ -13529,17 +14256,19 @@ _LANDING_JS = """
    if(area)url.searchParams.set('area',area);else url.searchParams.delete('area');
    if(mode!=='updated')url.searchParams.set('sort',mode);else url.searchParams.delete('sort');
    if(pinnedOnly)url.searchParams.set('pinned','1');else url.searchParams.delete('pinned');
+   if(archivedOnly)url.searchParams.set('archived','1');else url.searchParams.delete('archived');
    history.replaceState(history.state||{},'',url);
  }
  function apply(persist){
    var t=queryText().toLowerCase(),shown=0;
    sortArtifactCards();
    cards.forEach(function(c){
-     var ok=(!area||c.dataset.area===area)&&(!t||c.dataset.search.indexOf(t)>=0)&&(!pinnedOnly||c.classList.contains('pinned'));
+     var isArchived=c.dataset.archived==='true',ok=(archivedOnly?isArchived:!isArchived)&&(!area||c.dataset.area===area)&&(!t||c.dataset.search.indexOf(t)>=0)&&(!pinnedOnly||c.classList.contains('pinned'));
      c.style.display=ok?'':'none'; if(ok)shown++;
    });
-   if(none){none.style.display=shown?'none':'block';none.textContent=pinnedOnly?'No pinned artifacts match these filters.':'No published artifacts match. Explore the company evidence above.';}
-   if(tallyNode&&!metricViewActive())tallyNode.textContent=(t||area||pinnedOnly)?shown+' of '+cards.length+' published artifact'+(cards.length===1?'':'s'):tallyNode.dataset.artifactTally||'';
+   var population=cards.filter(function(card){return (card.dataset.archived==='true')===archivedOnly;}).length;
+   if(none){none.style.display=shown?'none':'block';none.textContent=archivedOnly?'No archived artifacts match these filters.':(pinnedOnly?'No pinned artifacts match these filters.':'No published artifacts match. Explore the company evidence above.');}
+   if(tallyNode&&!metricViewActive())tallyNode.textContent=archivedOnly?(shown+(shown===1?' archived artifact':' archived artifacts')):((t||area||pinnedOnly)?shown+' of '+population+' published artifact'+(population===1?'':'s'):tallyNode.dataset.artifactTally||'');
    syncSemantic(shown);
    if(persist!==false)syncArtifactUrl();
  }
@@ -13551,6 +14280,8 @@ _LANDING_JS = """
    if(sortSelect)sortSelect.value=/^(updated|views|name)$/.test(nextSort)?nextSort:'updated';
    pinnedOnly=Boolean(pinnedFilter&&url.searchParams.get('pinned')==='1');
    if(pinnedFilter)pinnedFilter.setAttribute('aria-pressed',String(pinnedOnly));
+   archivedOnly=Boolean(archivedFilter&&url.searchParams.get('archived')==='1');
+   if(archivedFilter)archivedFilter.setAttribute('aria-pressed',String(archivedOnly));
    apply(false);
  }
  async function launchSemantic(){
@@ -13593,6 +14324,7 @@ _LANDING_JS = """
  if(sortSelect)sortSelect.addEventListener('change',function(){apply(true);});
  if(areaSelect)areaSelect.addEventListener('change',function(){area=areaSelect.value||'';apply(true);});
  if(pinnedFilter)pinnedFilter.addEventListener('click',function(){pinnedOnly=!pinnedOnly;pinnedFilter.setAttribute('aria-pressed',String(pinnedOnly));apply(true);});
+ if(archivedFilter)archivedFilter.addEventListener('click',function(){archivedOnly=!archivedOnly;if(archivedOnly){pinnedOnly=false;if(pinnedFilter)pinnedFilter.setAttribute('aria-pressed','false');}archivedFilter.setAttribute('aria-pressed',String(archivedOnly));apply(true);});
  window.addEventListener('gallery-pins-synced',function(){apply(false);});
  window.addEventListener('popstate',restoreArtifactState);
  // "/" focuses search, the way every browse page should behave
@@ -13870,17 +14602,22 @@ def _rel_time(dt):
     return f"{int(secs // 31557600)}y ago"
 
 
-def _landing_rows():
-    """Every published, web-addressable artifact. rvbbit.live_apps is the view
-    over rvbbit.dashboards (which is ONLY external artifacts — DataRabbit plates
-    live in rvbbit.plates and never appear here), so no filtering is needed and
-    none is wanted: decks and custom app_kinds have public URLs too."""
+def _landing_rows(viewer):
+    """Artifacts visible to one verified viewer plus their archived artifacts.
+
+    Archived rows are returned only to their owner so the Gallery can offer a
+    recovery view. They never pass ordinary artifact routes or reader queries.
+    """
     with _conn() as c:
         rows = c.execute(
             "SELECT slug, name, description, owner_email, team, status, runtime_kind, app_kind, "
             "latest_version, queries, tables, metrics, semantic_objects,area_id,area_label,"
-            "area_source,area_confidence,updated_at "
-            "FROM rvbbit.live_apps ORDER BY updated_at DESC").fetchall()
+            "area_source,area_confidence,updated_at,archived,archived_at,access_revision,"
+            "(lower(owner_email)=lower(%s)) AS is_owner "
+            "FROM rvbbit.live_apps WHERE rvbbit.artifact_can_view(id,%s,false) "
+            "OR (archived AND lower(owner_email)=lower(%s)) ORDER BY updated_at DESC",
+            (viewer, viewer, viewer),
+        ).fetchall()
     if not rows:
         return rows
 
@@ -13927,6 +14664,8 @@ def _warm_thumbs(rows):
     manual refresh. Deduped and semaphore-gated inside _auto_thumb, so calling
     it for every row on every page view is cheap once the volume is warm."""
     for r in rows:
+        if r.get("archived"):
+            continue
         if (r.get("runtime_kind") or "html") != "html":
             continue
         app_kind = (r.get("app_kind") or "dashboard").lower()
@@ -14022,6 +14761,8 @@ def _landing_html(rows, viewer, session=None):
 
     areas, cards = {}, []
     for card_index, r in enumerate(rows):
+        archived = bool(r.get("archived"))
+        is_owner = bool(r.get("is_owner"))
         app_kind = (r.get("app_kind") or "dashboard").lower()
         area_id = str(r.get("area_id") or "").strip().lower()
         area_label = str(r.get("area_label") or "").strip()
@@ -14037,7 +14778,7 @@ def _landing_html(rows, viewer, session=None):
         # (_warm_thumbs), and the script retries a miss with backoff, so a cold
         # gallery fills itself in while you watch instead of after a refresh.
         thumb = ""
-        if (r.get("runtime_kind") or "html") == "html":
+        if not archived and (r.get("runtime_kind") or "html") == "html":
             thumb = (f'<img src="/thumbs/{e(_artifact_kind(app_kind))}/{e(slug)}.png" alt="" '
                      f'decoding="async">')
         deps = []
@@ -14064,6 +14805,9 @@ def _landing_html(rows, viewer, session=None):
         )
         artifact_owner = str(r.get("owner_email") or "").strip()
         owner = artifact_owner or r.get("team") or ""
+        owner_classes = "pill dim card-owner" + (
+            " is-current-user" if artifact_owner and is_owner else ""
+        )
         haystack = " ".join(
             str(x) for x in (name, desc, slug, owner, area_id, area_label) if x
         ).lower()
@@ -14078,19 +14822,25 @@ def _landing_html(rows, viewer, session=None):
             f'<button class="card-pin" type="button" data-home-pin="{e(slug)}" '
             f'aria-pressed="false" title="Pin this artifact to your private Home">'
             f'<b aria-hidden="true">＋</b><span>Pin</span></button>'
-            if calliope_enabled else ""
+            if calliope_enabled and not archived else ""
+        )
+        owner_actions = (
+            f'<button class="card-share" type="button" data-artifact-access="{e(slug)}" '
+            f'title="Manage viewers and lifecycle"><b aria-hidden="true">◎</b><span>Access</span></button>'
+            if is_owner else ""
         )
         card_actions = (
             '<div class="card-actions">'
             '<button class="card-more" type="button" data-card-more aria-expanded="false" '
             'aria-label="Show artifact actions"><b aria-hidden="true">•••</b></button>'
-            f'<div class="card-action-items">{calliope_actions}</div></div>'
-            if calliope_actions else ""
+            f'<div class="card-action-items">{calliope_actions}{owner_actions}</div></div>'
+            if calliope_actions or owner_actions else ""
         )
         utility_tags = (
             ('<span class="card-pin-state" aria-hidden="true" title="Pinned to private Home">◆</span>'
              if calliope_enabled else "")
             + (f'<span class="pill dim card-area">{e(area_label)}</span>' if area_label else "")
+            + ('<span class="pill card-archived-tag">Archived</span>' if archived else '')
         )
         cards.append(
             # New tab: the index is a place you come back to, not a page you
@@ -14098,13 +14848,17 @@ def _landing_html(rows, viewer, session=None):
             # link so every control keeps valid, predictable browser semantics.
             f'<article class="card" data-area="{e(area_id)}" data-search="{e(haystack)}" '
             f'data-slug="{e(slug)}" data-sort-name="{e(str(name).lower())}" '
-            f'data-sort-updated="{updated_sort}" data-sort-views="{total_views if total_views is not None else -1}" '
+            f'data-archived="{str(archived).lower()}" data-owner="{str(is_owner).lower()}" '
+            f'data-access-revision="{int(r.get("access_revision") or 1)}" '
+            + ('style="display:none" ' if archived else '')
+            + f'data-sort-updated="{updated_sort}" data-sort-views="{total_views if total_views is not None else -1}" '
             f'data-sort-order="{card_index}">'
-            f'<a class="card-link" href="{e(href)}" target="_blank" rel="noopener">'
+            f'<a class="card-link" href="{e(href)}" target="_blank" rel="noopener" '
+            + ('data-archived-link aria-disabled="true" tabindex="-1"' if archived else '') + '>'
             f'<div class="shot">{thumb}<div class="glyph">{_KIND_GLYPH.get(app_kind, "◇")}</div></div>'
             f'<div class="body">'
             f'<div class="meta">'
-            + (f'<span class="pill dim card-owner" title="{e(owner)}">{e(owner)}</span>' if owner else "")
+            + (f'<span class="{owner_classes}" title="{e(owner)}">{e(owner)}</span>' if owner else "")
             + f'<span class="when">{e(_rel_time(r.get("updated_at")))}</span></div>'
             f'<h2>{e(name)}</h2>'
             + (f'<p class="desc">{e(desc)}</p>' if desc else "")
@@ -14260,7 +15014,22 @@ def _landing_html(rows, viewer, session=None):
         '</header><div id="activity-content" class="activity-content"></div></div></dialog>'
     )
 
-    total = len(rows)
+    _artifact_access_dialog = (
+        '<dialog id="artifact-access-dialog" class="artifact-access-dialog" '
+        'aria-labelledby="artifact-access-title">'
+        '<div class="artifact-access-shell"><header class="artifact-access-head">'
+        '<span class="artifact-access-mark" aria-hidden="true">◎</span>'
+        '<div class="artifact-access-heading"><span>Audience & lifecycle</span>'
+        '<strong id="artifact-access-title">Artifact access</strong>'
+        '<small id="artifact-access-meta">Owner-managed application access</small></div>'
+        '<button id="artifact-access-close" class="artifact-access-close" type="button" aria-label="Close">×</button>'
+        '</header><div id="artifact-access-content" class="artifact-access-content">'
+        '<div class="artifact-access-loading"><i></i><span>Reading current access…</span></div>'
+        '</div></div></dialog>'
+    )
+
+    total = sum(1 for row in rows if not row.get("archived"))
+    archived_total = sum(1 for row in rows if row.get("archived"))
     tally = f"{total} artifact{'' if total == 1 else 's'}"
     area_options = "".join(
         f'<option value="{e(area_id)}">{e(label)}</option>'
@@ -14284,6 +15053,9 @@ def _landing_html(rows, viewer, session=None):
         + ('<button id="artifact-pinned-filter" class="artifact-pinned-filter" type="button" '
            'aria-pressed="false" title="Show only artifacts pinned to My Home">◆ Pinned</button>'
            if calliope_enabled else '')
+        + (f'<button id="artifact-archived-filter" class="artifact-archived-filter" type="button" '
+           f'aria-pressed="false" title="Manage your archived artifacts">Archived <b>{archived_total}</b></button>'
+           if archived_total else '')
         + '</div></div>'
     )
     if rows:
@@ -14356,6 +15128,7 @@ def _landing_html(rows, viewer, session=None):
 {_metric_promote_dialog}
 {_metric_dialog}
 {_activity_dialog}
+{_artifact_access_dialog}
 <script>{_LANDING_JS}</script><script>{_GALLERY_METRICS_JS}</script></body></html>"""
 
 
@@ -14381,8 +15154,31 @@ def register_dashboard_routes(m):
             headers={"cache-control": "no-store"},
         )
 
+    def _browser_artifact(request, *, include_archived=False):
+        session = auth.read_session_full(request)
+        if not session:
+            return None, None, _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        if not session.get("mapped", True):
+            return None, session, _json({"error": {"code": "ACCESS_PENDING"}}, 403)
+        subject = str(session.get("identity") or session.get("sub") or "").strip().lower()
+        if not subject:
+            return None, session, _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        slug = request.path_params.get("slug")
+        with _conn() as conn:
+            allowed = artifact_access.can_view(
+                conn, slug, subject, include_archived=include_archived
+            )
+        if not allowed:
+            # Artifact existence and archive state are not disclosed.
+            return None, session, _json({"error": {"code": "NOT_FOUND"}}, 404)
+        return subject, session, None
+
     async def _proxy_runner(request, subpath=""):
-        email = auth.read_session(request)
+        email, _, access_error = _browser_artifact(request)
+        if access_error:
+            if getattr(access_error, "status_code", 0) == 401:
+                return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
+            return access_error
         if not email:
             return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
         slug = request.path_params["slug"]
@@ -14455,7 +15251,7 @@ def register_dashboard_routes(m):
             return HTMLResponse(_unmapped_html(s["identity"], s),
                                 headers=browser_page_headers)
         try:
-            rows = _landing_rows()
+            rows = _landing_rows(s["identity"])
         except Exception as ex:   # noqa: BLE001 — an index that can't query is still a page
             print(f"landing page: {ex}", file=sys.stderr)
             rows = []
@@ -14469,19 +15265,15 @@ def register_dashboard_routes(m):
 
     @m.custom_route("/thumbs/{kind}/{slug}.png", methods=["GET"])
     async def _thumb(request):
-        # Hub gallery thumbnails (docs/HUB_PLAN.md). Viewer auth: a browser
-        # session OR the static bearer key — the LENS thumb proxy fetches
-        # server-side with WAREHOUSE_MCP_KEY, browsers ride their session.
-        authed = bool(auth.read_session(request))
-        if not authed and auth.STATIC_KEY:
-            hdr = request.headers.get("authorization", "")
-            authed = hdr.startswith("Bearer ") and hmac.compare_digest(hdr[7:], auth.STATIC_KEY)
-        if not authed and auth.STATIC_KEY:
-            return _json({"error": "unauthorized"}, 401)
+        # Gallery thumbnails carry the same per-human viewer wall as the
+        # artifact itself. A shared service key cannot stand in for a person.
         kind = request.path_params["kind"]
         slug = request.path_params["slug"]
         if kind not in ("app", "dashboard") or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", slug, re.I):
             return _json({"error": "bad artifact handle"}, 400)
+        _, _, access_error = _browser_artifact(request)
+        if access_error:
+            return access_error
         # Lazy self-heal: a missing or out-of-date capture enqueues itself
         # (throttled, deduped) — pre-Hub artifacts and republished versions
         # get thumbnails just by being LOOKED AT. Stale files still serve
@@ -14505,11 +15297,18 @@ def register_dashboard_routes(m):
         # now an unchanged capture costs a 304 instead of its full body.
         st = path.stat()
         etag = f'W/"{int(st.st_mtime)}-{st.st_size}"'
-        cache = "public, max-age=60"
+        # The URL is stable, but its audience is not. Never let a shared proxy
+        # reuse an authorized viewer's thumbnail for somebody else.
+        cache = "private, max-age=60"
+        cache_headers = {
+            "etag": etag,
+            "cache-control": cache,
+            "vary": "Cookie, Authorization",
+        }
         if request.headers.get("if-none-match", "") == etag:
-            return Response(status_code=304, headers={"etag": etag, "cache-control": cache})
+            return Response(status_code=304, headers=cache_headers)
         return Response(path.read_bytes(), media_type=mime,
-                        headers={"cache-control": cache, "etag": etag})
+                        headers=cache_headers)
 
     @m.custom_route("/pdfs/{name}.pdf", methods=["GET"])
     async def _pdf(request):
@@ -14533,9 +15332,12 @@ def register_dashboard_routes(m):
         session = auth.read_session_full(request)
         if not session:
             return RedirectResponse(f"/login?next={quote(request.url.path)}", status_code=302)
+        if not session.get("mapped", True):
+            return HTMLResponse("<h1>404 — no such artifact version</h1>", status_code=404)
         slug = request.path_params["slug"]
+        viewer = session.get("identity") or session.get("sub")
         try:
-            document = _dashboard_version_document(slug, version)
+            document = _dashboard_version_document(slug, version, viewer)
         except ValueError as exc:
             return HTMLResponse(f"<h1>400 — {str(exc)}</h1>", status_code=400)
         if not document:
@@ -14559,8 +15361,9 @@ def register_dashboard_routes(m):
 
     @m.custom_route("/api/d/{slug}/time-travel", methods=["GET"])
     async def _time_travel(request):
-        if not auth.read_session(request):
-            return _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        _, _, access_error = _browser_artifact(request)
+        if access_error:
+            return access_error
         slug = request.path_params["slug"]
         version = request.query_params.get("version")
         try:
@@ -14585,8 +15388,9 @@ def register_dashboard_routes(m):
 
     @m.custom_route("/api/d/{slug}/semantic-enrichment", methods=["GET"])
     async def _semantic_enrichment(request):
-        if not auth.read_session(request):
-            return _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        _, _, access_error = _browser_artifact(request)
+        if access_error:
+            return access_error
         slug = request.path_params["slug"]
         try:
             requested = request.query_params.get("version")
@@ -14661,11 +15465,121 @@ def register_dashboard_routes(m):
                 "events": [],
             })
 
+    @m.custom_route(
+        "/api/gallery/artifacts/{slug}/access", methods=["GET", "PATCH"]
+    )
+    async def _gallery_artifact_access(request):
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            authorization = _artifact_authorization(owner)
+            if request.method == "GET":
+                result = artifact_access.get_access(
+                    _conn, authorization, request.path_params["slug"]
+                )
+            else:
+                try:
+                    body = await request.json()
+                except Exception:  # noqa: BLE001
+                    body = {}
+                body = body if isinstance(body, dict) else {}
+                result = artifact_access.replace_access(
+                    _conn,
+                    authorization,
+                    request.path_params["slug"],
+                    body.get("expected_revision"),
+                    team_ids=body.get("team_ids"),
+                    people=body.get("people"),
+                    confirm_everyone=body.get("confirm_everyone") is True,
+                )
+            return _private_json(result)
+        except artifact_access.ArtifactAccessError as exc:
+            return _private_json(
+                {"error": {"code": exc.code, "message": str(exc)}}, exc.status
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"artifact access ({request.path_params['slug']}): {exc}",
+                file=sys.stderr,
+            )
+            return _private_json(
+                {"error": {"code": "ARTIFACT_ACCESS_UNAVAILABLE",
+                           "message": "Sharing could not be loaded right now."}},
+                503,
+            )
+
+    @m.custom_route("/api/gallery/artifact-people", methods=["GET"])
+    async def _gallery_artifact_people(request):
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            authorization = _artifact_authorization(owner)
+            with _conn() as conn:
+                artifact_access.require_owner(
+                    conn, request.query_params.get("artifact"), authorization
+                )
+            result = artifact_access.search_people(
+                _conn,
+                authorization,
+                request.query_params.get("q") or "",
+                request.query_params.get("limit") or 100,
+            )
+            return _private_json(result)
+        except artifact_access.ArtifactAccessError as exc:
+            return _private_json(
+                {"error": {"code": exc.code, "message": str(exc)}}, exc.status
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"artifact people search: {exc}", file=sys.stderr)
+            return _private_json(
+                {"error": {"code": "PEOPLE_UNAVAILABLE",
+                           "message": "People could not be searched right now."}},
+                503,
+            )
+
+    @m.custom_route(
+        "/api/gallery/artifacts/{slug}/lifecycle", methods=["POST"]
+    )
+    async def _gallery_artifact_lifecycle(request):
+        owner, _, error = _home_owner(request)
+        if error:
+            return error
+        try:
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            body = body if isinstance(body, dict) else {}
+            result = tool_artifact_archive(
+                request.path_params["slug"],
+                body.get("expected_revision"),
+                body.get("archived"),
+                _caller_override=owner,
+            )
+            if result.get("error"):
+                return _private_json(result, int(result.get("_http_status") or 400))
+            return _private_json(result)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"artifact lifecycle ({request.path_params['slug']}): {exc}",
+                file=sys.stderr,
+            )
+            return _private_json(
+                {"error": {"code": "ARTIFACT_LIFECYCLE_UNAVAILABLE",
+                           "message": "That artifact could not be changed right now."}},
+                503,
+            )
+
     @m.custom_route("/api/gallery/artifacts/{slug}/activity", methods=["GET"])
     async def _gallery_artifact_activity(request):
         owner, _, error = _home_owner(request)
         if error:
             return error
+        _, _, access_error = _browser_artifact(request)
+        if access_error:
+            return access_error
         try:
             snapshot = _artifact_activity_snapshot(
                 request.path_params["slug"],
@@ -14915,7 +15829,7 @@ def register_dashboard_routes(m):
             except Exception:  # noqa: BLE001
                 body = {}
             resolved = _semantic_home_resolve_handle(
-                body if isinstance(body, dict) else {}, validate_sql=True
+                body if isinstance(body, dict) else {}, validate_sql=True, viewer=owner
             )
             with _conn() as conn:
                 with conn.transaction():
@@ -14946,7 +15860,7 @@ def register_dashboard_routes(m):
                         "UPDATE rvbbit.calliope_boards SET updated_at=now() WHERE id=%s::uuid",
                         (board["id"],),
                     )
-            return _json({"item": _semantic_home_public_item(row)}, 201)
+            return _json({"item": _semantic_home_public_item(row, viewer=owner)}, 201)
         except LookupError as exc:
             return _json({"error": {"code": "NOT_FOUND", "message": str(exc)}}, 404)
         except ValueError as exc:
@@ -15011,7 +15925,7 @@ def register_dashboard_routes(m):
             return _json({"error": {"code": "NOT_REPLAYABLE"}}, 400)
         try:
             preview = _semantic_home_preview(
-                row.get("source") or {}, session.get("sub") or owner
+                row.get("source") or {}, session.get("sub") or owner, viewer=owner
             )
         except (LookupError, ValueError) as exc:
             return _json({"error": {"code": "PREVIEW_UNAVAILABLE", "message": str(exc)}}, 400)
@@ -15054,7 +15968,8 @@ def register_dashboard_routes(m):
                 if row.get("item_kind") != "artifact_object":
                     raise ValueError("Only named business objects can become governed metrics")
                 draft = _semantic_home_metric_draft(
-                    row.get("source") or {}, execution_subject, preview=True
+                    row.get("source") or {}, execution_subject,
+                    preview=True, viewer=owner,
                 )
                 return _json({"draft": _semantic_home_metric_draft_public(draft)})
             try:
@@ -15225,9 +16140,9 @@ def register_dashboard_routes(m):
 
     @m.custom_route("/api/d/{slug}/inspect", methods=["POST"])
     async def _inspect(request):
-        email = auth.read_session(request)
-        if not email:
-            return _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        email, _, access_error = _browser_artifact(request)
+        if access_error:
+            return access_error
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001
@@ -15248,6 +16163,7 @@ def register_dashboard_routes(m):
                     body.get("trace"),
                     body.get("semantic_object"),
                     body.get("as_of"),
+                    email,
                 )
             finally:
                 _SESSION_SUB.reset(tok)
@@ -15282,9 +16198,9 @@ def register_dashboard_routes(m):
 
     @m.custom_route("/api/d/{slug}/q", methods=["POST"])
     async def _data(request):
-        email = auth.read_session(request)
-        if not email:
-            return _json({"error": {"code": "UNAUTHORIZED"}}, 401)
+        email, _, access_error = _browser_artifact(request)
+        if access_error:
+            return access_error
         slug = request.path_params["slug"]
         try:
             body = await request.json()
@@ -15296,20 +16212,27 @@ def register_dashboard_routes(m):
         as_of = (body or {}).get("as_of")
         origin = _dashboard_query_origin((body or {}).get("origin"))
         t0 = time.time()
-        # Burrow: the viewer's session identity IS a PG role — app queries run
-        # under it (parked in a contextvar; tool schemas stay clean).
-        tok = _SESSION_SUB.set(email)
-        try:
-            res = tool_run_sql(sql, as_of)
-        finally:
-            _SESSION_SUB.reset(tok)
-        _record("dashboard_query", {
-            "dashboard": slug,
-            "sql": sql,
-            "as_of": as_of,
-            "origin": origin,
-        },
-                res, res.get("error"), int((time.time() - t0) * 1000), caller_override=email)
+        def execute_and_record():
+            # Burrow: the viewer's session identity IS a PG role — app queries
+            # run under it. The worker-local context cannot leak into the ASGI
+            # task or another browser session.
+            tok = _SESSION_SUB.set(email)
+            try:
+                res = tool_run_sql(sql, as_of)
+                _record("dashboard_query", {
+                    "dashboard": slug,
+                    "sql": sql,
+                    "as_of": as_of,
+                    "origin": origin,
+                }, res, res.get("error"), int((time.time() - t0) * 1000),
+                    caller_override=email)
+                return res
+            finally:
+                _SESSION_SUB.reset(tok)
+
+        # Dashboard queries have reached several minutes on real workloads.
+        # Keep them and their activity receipt off the shared HTTP event loop.
+        res = await asyncio.to_thread(execute_and_record)
         return _json(res, 400 if res.get("error") else 200)
 
     @m.custom_route("/apps/{slug}/versions/{version}", methods=["GET"])
@@ -15379,7 +16302,48 @@ async def _notify_tool_list_changed_once(ctx, notified_session_ids):
     return True
 
 
+def _offload_sync_mcp_tool(fn):
+    """Make a synchronous FastMCP tool cooperative with the shared ASGI loop.
+
+    The bundled FastMCP release awaits coroutine tools but invokes ordinary
+    callables inline. A slow SQL query, browser operation, connector call, or
+    artifact build would therefore stall every HTTP route and MCP session in
+    this process. Keep native async tools unchanged and run every synchronous
+    registration in asyncio's bounded worker pool. ``to_thread`` copies the
+    current Context, including caller and authorization ContextVars.
+    """
+    if inspect.iscoroutinefunction(fn):
+        return fn
+
+    @functools.wraps(fn)
+    async def offloaded(*args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    return offloaded
+
+
+class _NonBlockingMcpRegistrar:
+    """Transparent FastMCP proxy that offloads synchronous tool handlers."""
+
+    def __init__(self, mcp):
+        self._mcp = mcp
+
+    def __getattr__(self, name):
+        return getattr(self._mcp, name)
+
+    def tool(self, *args, **kwargs):
+        register = self._mcp.tool(*args, **kwargs)
+
+        def decorator(fn):
+            return register(_offload_sync_mcp_tool(fn))
+
+        return decorator
+
+
 def _register(mcp):
+    # Apply the policy once at the registry boundary so a newly added slow tool
+    # cannot freeze Calliope merely because its author used ``def``.
+    mcp = _NonBlockingMcpRegistrar(mcp)
     # FastMCP detects injected Context parameters from the concrete runtime
     # annotation.  This module postpones annotations, so attach it explicitly
     # and keep request metadata out of each public tool schema.
@@ -15523,8 +16487,7 @@ def _register(mcp):
         lambda: tool_ask_brain(query, k, filters, _caller()[0])))
     mcp.tool(name="system_learning_status")(lambda: _logged(
         "system_learning_status", {}, tool_system_learning_status))
-    mcp.tool(name="sync_system_learning")(lambda: _logged(
-        "sync_system_learning", {}, tool_sync_system_learning))
+    mcp.tool(name="sync_system_learning")(_mcp_sync_system_learning)
     mcp.tool(name="ask_system_learning")(lambda query, k=8: _logged(
         "ask_system_learning", {"query": query, "k": k},
         lambda: tool_ask_system_learning(query, k, _caller()[0])))
@@ -15665,6 +16628,15 @@ def _register(mcp):
     mcp.tool(name="dashboard_template")(_mcp_dashboard_template)
     mcp.tool(name="tanstack_chart_template")(_mcp_tanstack_chart_template)
     mcp.tool(name="calliope_work_item")(_mcp_calliope_work_item)
+    mcp.tool(name="team_people_search")(_mcp_team_people_search)
+    mcp.tool(name="team_list")(_mcp_team_list)
+    mcp.tool(name="team_get")(_mcp_team_get)
+    mcp.tool(name="team_create")(_mcp_team_create)
+    mcp.tool(name="team_update")(_mcp_team_update)
+    mcp.tool(name="artifact_access_get")(_mcp_artifact_access_get)
+    mcp.tool(name="artifact_access_update")(_mcp_artifact_access_update)
+    mcp.tool(name="artifact_archive")(_mcp_artifact_archive)
+    mcp.tool(name="artifact_restore")(_mcp_artifact_restore)
     mcp.tool(name="draft_calliope_instrument")(_mcp_draft_calliope_instrument)
     mcp.tool(name="draft_calliope_workflow")(_mcp_draft_calliope_workflow)
     mcp.tool(name="search_calliope_actions")(_mcp_search_calliope_actions)
@@ -15711,21 +16683,35 @@ def _selftest():
         {"a": "SELECT region, drop_pct FROM public._demo_revenue",
          "b": "SELECT bogus_col FROM public._demo_revenue"},
         result_mode="summary", preview_rows=2))
-    # artifact staging round trip: upload (2 chunks) → publish by handle → read back
-    art = tool_upload_artifact("<html><body>selftest", name="selftest-artifact")
-    art2 = tool_upload_artifact(" dashboard</body></html>", artifact_id=art.get("artifact_id"), append=True)
-    show("upload_artifact (chunked)", art2)
-    pub = tool_publish_dashboard("selftest artifact dash", source_artifact_id=art.get("artifact_id"))
-    show("publish_dashboard(source_artifact_id=...)", pub)
-    if not pub.get("error"):
-        got = tool_get_dashboard(pub["slug"])
-        v = (got.get("version") or {}) if isinstance(got, dict) else {}
-        ok = "selftest dashboard" in (v.get("html") or "")
-        show("published html matches staged artifact", {"match": ok, "version": v.get("version")})
-        with _conn() as c:   # selftest tidiness — don't leave the fixture dashboard behind
-            c.execute("DELETE FROM rvbbit.dashboards WHERE slug=%s", (pub["slug"],))
-    show("publish_dashboard(no html, no handle) — must be a structured error",
-         tool_publish_dashboard("selftest empty dash"))
+    # Artifact staging round trip: publication now requires the same verified
+    # human context as a real browser/direct-OAuth/Hermes request.
+    subject_token = _SESSION_SUB.set("warehouse-selftest@local.test")
+    try:
+        art = tool_upload_artifact("<html><body>selftest", name="selftest-artifact")
+        art2 = tool_upload_artifact(
+            " dashboard</body></html>", artifact_id=art.get("artifact_id"), append=True
+        )
+        show("upload_artifact (chunked)", art2)
+        pub = tool_publish_dashboard(
+            "selftest artifact dash", source_artifact_id=art.get("artifact_id")
+        )
+        show("publish_dashboard(source_artifact_id=...)", pub)
+        if not pub.get("error"):
+            got = tool_get_dashboard(pub["slug"])
+            v = (got.get("version") or {}) if isinstance(got, dict) else {}
+            ok = "selftest dashboard" in (v.get("html") or "")
+            show(
+                "published html matches staged artifact",
+                {"match": ok, "version": v.get("version")},
+            )
+            with _conn() as c:  # don't leave the fixture dashboard behind
+                c.execute("DELETE FROM rvbbit.dashboards WHERE slug=%s", (pub["slug"],))
+        show(
+            "publish_dashboard(no html, no handle) — must be a structured error",
+            tool_publish_dashboard("selftest empty dash"),
+        )
+    finally:
+        _SESSION_SUB.reset(subject_token)
     # _logged must degrade exceptions to {"error": ...}, never raise (circuit-breaker fix)
     show("_logged(exception) — structured error, no raise",
          _logged("selftest_boom", {}, lambda: (_ for _ in ()).throw(TypeError("boom"))))
@@ -15750,6 +16736,17 @@ _INSTRUCTIONS = (
     "search_tools('what you want to do') and then get_tool_help(names) for the shortlist, instead "
     "of probing tools one by one. For reads, prefer ONE run_sql / run_sql_multi — nearly everything "
     "readable here has a SQL analog. "
+    "TEAM MANAGEMENT: use team_people_search/team_list/team_get to inspect observed people and flat "
+    "Teams. Observation grants nothing. Everyone is the protected dynamic wildcard for any verified "
+    "application subject; it has no explicit member list and never includes service or anonymous calls. "
+    "Only a verified human member of the protected Admins Team "
+    "may call team_create/team_update; inspect the current revision before updating and never infer "
+    "an email. "
+    "ARTIFACT ACCESS: every newly published dashboard/app is private to its verified human owner. "
+    "Use artifact_access_get before artifact_access_update; viewer lists are exact Teams and observed "
+    "people, the owner is implicit, and adding Everyone requires explicit confirmation. Only the "
+    "owner may update, enrich, run, share, archive, or restore an artifact. Archive is reversible and "
+    "retains versions, grants, lineage, pins, and access receipts. "
     "TO BUILD A LIVE APP: call `live_app_template(runtime_kind='html')` FIRST, edit the template, "
     "and call create_live_app. Hosted HTML apps live at /d/<slug>, are versioned, and call "
     "rvbbitQuery(sql) for live read-only data — one FLAT query per data concern (batch them with "
@@ -15783,7 +16780,9 @@ def _build_mcp():
     m = FastMCP("rvbbit-warehouse", instructions=_INSTRUCTIONS)
     _register(m)
     _ensure_activity_table()
+    _ensure_team_tables()
     _ensure_dashboard_tables()
+    _ensure_artifact_access_tables()
     _start_semantic_enrichment_worker()
     _start_artifact_catalog_worker()
     return m
@@ -16313,7 +17312,7 @@ def _calliope_data_evidence(query, limit):
     return items
 
 
-def _calliope_artifact_evidence(query, limit):
+def _calliope_artifact_evidence(query, owner, limit):
     with _conn() as c:
         rows = c.execute(
             "SELECT d.id,d.slug,d.name,d.description,d.owner_email,d.team,d.status,"
@@ -16330,7 +17329,9 @@ def _calliope_artifact_evidence(query, limit):
             " FILTER (WHERE x.object_ref IS NOT NULL) AS lineage "
             " FROM rvbbit.dashboard_deps x "
             " WHERE x.dashboard_id=d.id AND x.version=d.latest_version"
-            ") dep ON true ORDER BY d.updated_at DESC LIMIT 300"
+            ") dep ON true WHERE rvbbit.artifact_can_view(d.id,%s,false) "
+            "ORDER BY d.updated_at DESC LIMIT 300",
+            (owner,),
         ).fetchall()
     candidates = []
     for row in rows:
@@ -16456,7 +17457,7 @@ def _calliope_evidence_search(query, owner, limit=24):
     quota = max(4, math.ceil(limit / 3))
     sources = [
         ("knowledge", "Company memory", lambda: _calliope_brain_evidence(query, owner, quota)),
-        ("artifacts", "Artifacts & dashboard objects", lambda: _calliope_artifact_evidence(query, quota)),
+        ("artifacts", "Artifacts & dashboard objects", lambda: _calliope_artifact_evidence(query, owner, quota)),
         ("data", "Warehouse semantics", lambda: _calliope_data_evidence(query, quota)),
     ]
     groups = {}
@@ -16667,7 +17668,7 @@ def _trail_append(connections, seen, connection):
     connections.append(connection)
 
 
-def _trail_artifact_neighbors(table_refs, exclude_slug, limit=5):
+def _trail_artifact_neighbors(table_refs, exclude_slug, owner, limit=5):
     refs = list(dict.fromkeys(str(ref) for ref in (table_refs or []) if ref))[:16]
     if not refs:
         return []
@@ -16678,14 +17679,15 @@ def _trail_artifact_neighbors(table_refs, exclude_slug, limit=5):
             "array_agg(DISTINCT dep.object_ref ORDER BY dep.object_ref) AS shared_refs "
             "FROM rvbbit.dashboard_deps dep JOIN rvbbit.dashboards d ON d.id=dep.dashboard_id "
             "WHERE dep.version=d.latest_version AND dep.object_ref=ANY(%s::text[]) "
-            "AND d.slug<>%s GROUP BY d.id,d.slug,d.name,d.description,d.app_kind,"
+            "AND d.slug<>%s AND rvbbit.artifact_can_view(d.id,%s,false) "
+            "GROUP BY d.id,d.slug,d.name,d.description,d.app_kind,"
             "d.runtime_kind,d.latest_version ORDER BY shared_count DESC,d.name LIMIT %s",
-            (refs, exclude_slug or "", int(limit)),
+            (refs, exclude_slug or "", owner, int(limit)),
         ).fetchall()
     return [dict(row) for row in rows]
 
 
-def _trail_artifact_links(dashboard_id, version, slug, limit=8):
+def _trail_artifact_links(dashboard_id, version, slug, owner, limit=8):
     """Directed navigation edges, kept distinct from coincidental shared data."""
     with _conn() as conn:
         outbound = conn.execute(
@@ -16693,8 +17695,9 @@ def _trail_artifact_links(dashboard_id, version, slug, limit=8):
             "target.app_kind,target.latest_version,edge.metadata,edge.source "
             "FROM rvbbit.dashboard_deps edge JOIN rvbbit.dashboards target "
             "ON target.slug=edge.object_ref WHERE edge.dashboard_id=%s AND edge.version=%s "
-            "AND edge.kind='artifact' ORDER BY target.name LIMIT %s",
-            (dashboard_id, version, int(limit)),
+            "AND edge.kind='artifact' AND rvbbit.artifact_can_view(target.id,%s,false) "
+            "ORDER BY target.name LIMIT %s",
+            (dashboard_id, version, owner, int(limit)),
         ).fetchall()
         inbound = conn.execute(
             "SELECT 'inbound' AS direction,source.slug,source.name,source.description,"
@@ -16702,8 +17705,9 @@ def _trail_artifact_links(dashboard_id, version, slug, limit=8):
             "FROM rvbbit.dashboard_deps edge JOIN rvbbit.dashboards source "
             "ON source.id=edge.dashboard_id AND source.latest_version=edge.version "
             "WHERE edge.kind='artifact' AND edge.object_ref=%s "
+            "AND rvbbit.artifact_can_view(source.id,%s,false) "
             "ORDER BY source.name LIMIT %s",
-            (slug, int(limit)),
+            (slug, owner, int(limit)),
         ).fetchall()
     return [dict(row) for row in [*outbound, *inbound]][:limit]
 
@@ -16728,12 +17732,14 @@ def _trail_brain_document_connection(doc, relationship="mentioned by", *, shared
 
 
 def _trail_artifact(handle, owner, limit):
-    resolved = _semantic_home_resolve_handle(handle)
+    resolved = _semantic_home_resolve_handle(handle, viewer=owner)
     source = resolved.get("source") or handle
     kind = resolved["kind"]
     slug = source["slug"]
     version = int(resolved.get("version") or source.get("version") or 1)
-    dashboard, _row, manifest, deps = _semantic_home_artifact_row(slug, version)
+    dashboard, _row, manifest, deps = _semantic_home_artifact_row(
+        slug, version, viewer=owner
+    )
     app_kind = dashboard.get("app_kind") or "dashboard"
     subject = {
         "kind": kind,
@@ -16796,7 +17802,7 @@ def _trail_artifact(handle, owner, limit):
             if len(connections) >= min(6, limit):
                 break
 
-    for linked in _trail_artifact_links(dashboard["id"], version, slug, 8):
+    for linked in _trail_artifact_links(dashboard["id"], version, slug, owner, 8):
         target_kind = linked.get("app_kind") or "dashboard"
         metadata = linked.get("metadata") or {}
         linked_version = (
@@ -16825,7 +17831,7 @@ def _trail_artifact(handle, owner, limit):
             table, kind="db_table", handle={"kind": "db_table", "table": table},
             section="data", detail="Warehouse source", confidence=.98,
         ))
-    for neighbor in _trail_artifact_neighbors(tables, slug, 4):
+    for neighbor in _trail_artifact_neighbors(tables, slug, owner, 4):
         target_kind = neighbor.get("app_kind") or "dashboard"
         _trail_append(connections, seen, _trail_connection(
             "also uses this evidence", neighbor.get("name") or neighbor.get("slug"),
@@ -17326,7 +18332,7 @@ def _trail_catalog_node(handle, owner, limit):
         table_refs = [".".join(filter(None, [clean_handle.get("schema"), clean_handle.get("relation")]))]
     elif row["kind"] == "cube":
         table_refs = [row.get("label")]
-    for artifact in _trail_artifact_neighbors(table_refs, "", 4):
+    for artifact in _trail_artifact_neighbors(table_refs, "", owner, 4):
         artifact_kind = artifact.get("app_kind") or "dashboard"
         _trail_append(connections, seen, _trail_connection(
             "used by", artifact.get("name") or artifact.get("slug"),
@@ -17504,8 +18510,8 @@ def _calliope_evidence_open(item, execution_subject, owner):
                 "JOIN rvbbit.dashboard_versions v ON v.dashboard_id=d.id AND v.version=%s "
                 "LEFT JOIN rvbbit.artifact_semantic_enrichments e "
                 "ON e.dashboard_id=d.id AND e.version=v.version "
-                "WHERE d.slug=%s",
-                (version, slug),
+                "WHERE d.slug=%s AND rvbbit.artifact_can_view(d.id,%s,false)",
+                (version, slug, owner),
             ).fetchone()
         if not row:
             return {"error": {"code": "VERSION_NOT_FOUND", "message": "That artifact version is no longer available."}}
@@ -17591,7 +18597,9 @@ def _build_mcp_oauth(public: str):
                 auth=auth.make_auth_settings(public))
     _register(m)
     _ensure_activity_table()
+    _ensure_team_tables()
     _ensure_dashboard_tables()
+    _ensure_artifact_access_tables()
     _start_semantic_enrichment_worker()
     _start_artifact_catalog_worker()
     import calliope
@@ -17623,6 +18631,7 @@ def _build_mcp_oauth(public: str):
         evidence_open=_calliope_evidence_open,
         metric_detail=_metric_detail_snapshot,
         artifact_capture=_calliope_artifact_capture,
+        team_service=_calliope_team_service(),
     ):
         print("Calliope enabled (Hermes-backed living artifact notebook)", file=sys.stderr)
         _start_calliope_watch_worker()

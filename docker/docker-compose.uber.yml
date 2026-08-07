@@ -248,6 +248,10 @@ services:
       WAREHOUSE_PUBLIC_URL: ${WAREHOUSE_PUBLIC_URL:-}
       WAREHOUSE_LOGIN_PASSWORD: ${WAREHOUSE_LOGIN_PASSWORD:-}
       WAREHOUSE_ALLOWED_EMAILS: ${WAREHOUSE_ALLOWED_EMAILS:-}
+      # One-way bootstrap for the protected application Admins Team. After an
+      # Admin adds durable replacements in Calliope this may be removed; while
+      # present, every restart idempotently restores these memberships.
+      WAREHOUSE_TEAM_BOOTSTRAP_ADMINS: ${WAREHOUSE_TEAM_BOOTSTRAP_ADMINS:-}
       WAREHOUSE_JWT_SECRET: ${WAREHOUSE_JWT_SECRET:-}
       # Google Sign-In (optional). Cloud console -> OAuth client ID -> Web
       # application, redirect URI EXACTLY <WAREHOUSE_PUBLIC_URL>/auth/google/callback.

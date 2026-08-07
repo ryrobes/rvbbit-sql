@@ -1025,6 +1025,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0251_brain_pipeline_flow",
         include_str!("../sql/migrations/0251_brain_pipeline_flow.sql"),
     ),
+    (
+        "0252_application_teams",
+        include_str!("../sql/migrations/0252_application_teams.sql"),
+    ),
+    (
+        "0253_application_everyone_team",
+        include_str!("../sql/migrations/0253_application_everyone_team.sql"),
+    ),
+    (
+        "0254_artifact_access",
+        include_str!("../sql/migrations/0254_artifact_access.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

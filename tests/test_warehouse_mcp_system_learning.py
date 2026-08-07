@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import inspect
 import os
+import sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -15,6 +19,9 @@ def _load_warehouse_mcp(monkeypatch):
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    # Python 3.14's dataclass annotation handling resolves the defining module
+    # through sys.modules while the class decorator runs.
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -84,6 +91,48 @@ def test_system_learning_tools_are_registered_and_summarized(rvbbit, monkeypatch
     assert summary["docs"] == status["docs"]
     assert summary["groups"]
     assert summary["breadcrumbs"]
+
+
+def test_sync_mcp_registrations_do_not_block_event_loop(rvbbit, monkeypatch):
+    """No synchronous MCP handler may stall Calliope's shared ASGI loop."""
+    rvbbit.execute("SELECT rvbbit.migrate()")
+    server = _load_warehouse_mcp(monkeypatch)
+    fake = _FakeMcp()
+    server._register(fake)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_logged(tool, args, thunk):
+        assert tool == "system_learning_status"
+        started.set()
+        assert release.wait(timeout=3)
+        return {"forwarded": server._FORWARDED_CALLER.get()}
+
+    monkeypatch.setattr(server, "_logged", slow_logged)
+    registered = fake.tools["system_learning_status"]
+    assert inspect.iscoroutinefunction(registered)
+    assert all(inspect.iscoroutinefunction(tool) for tool in fake.tools.values())
+
+    async def exercise():
+        marker = {"email": "person@example.com", "platform": "google_chat"}
+        token = server._FORWARDED_CALLER.set(marker)
+        try:
+            task = asyncio.create_task(registered())
+            for _ in range(100):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set()
+            # Reaching this point while the worker is deliberately blocked
+            # proves another ASGI task can still be scheduled.
+            assert not task.done()
+            release.set()
+            assert await asyncio.wait_for(task, timeout=3) == {"forwarded": marker}
+        finally:
+            server._FORWARDED_CALLER.reset(token)
+
+    asyncio.run(exercise())
 
 
 def test_system_learning_mcp_sync_and_search_shortcut(rvbbit, monkeypatch):

@@ -490,7 +490,12 @@ __CALLIOPE_BACKGROUND__
       <span class="action-trust-note"><i></i>Trusted organization mode</span>
       <button id="action-library-close" class="markup-close" type="button" aria-label="Close Calliope Library">×</button>
     </header>
-    <div class="action-library-discovery">
+    <div id="action-library-bootstrap" class="action-library-bootstrap" role="status" aria-live="polite">
+      <i aria-hidden="true"></i>
+      <span>Taking inventory of your system…</span>
+      <small>The Library will appear once its final sections and counts are ready.</small>
+    </div>
+    <div id="action-library-discovery" class="action-library-discovery" hidden>
       <nav id="library-modes" class="library-mode-tabs" aria-label="Library views">
         <button type="button" data-library-mode="inventory" aria-pressed="true">In use <b id="library-inventory-count">0</b></button>
         <button type="button" data-library-mode="discover" aria-pressed="false">Discover <b id="library-discover-count">0</b></button>
@@ -502,9 +507,9 @@ __CALLIOPE_BACKGROUND__
       </label>
       <nav id="action-library-categories" class="action-library-categories" aria-label="Library filters"></nav>
     </div>
-    <div class="action-library-workspace">
+    <div id="action-library-workspace" class="action-library-workspace" hidden>
       <aside class="action-library-results">
-        <header><span id="action-library-summary">Loading your system…</span><button id="inventory-open-view" type="button" aria-label="Inspect the current Library view with Calliope" title="Pin the current view on the Stage">✦</button><button id="action-library-refresh" type="button" aria-label="Refresh Calliope Library">↻</button></header>
+        <header><span id="action-library-summary">Loading your system…</span><button id="team-create" class="team-create-shortcut" type="button" aria-label="Create a Team" title="Create a Team" hidden>＋</button><button id="inventory-open-view" type="button" aria-label="Inspect the current Library view with Calliope" title="Pin the current view on the Stage">✦</button><button id="action-library-refresh" type="button" aria-label="Refresh Calliope Library">↻</button></header>
         <div id="action-library-list" class="action-library-list" aria-live="polite"></div>
       </aside>
       <section class="action-library-detail">
@@ -512,7 +517,7 @@ __CALLIOPE_BACKGROUND__
           <i aria-hidden="true">◎</i>
           <p class="eyebrow">What Calliope knows and can use</p>
           <h3>Your working system, made visible.</h3>
-          <p id="inventory-empty-summary">Sources, tools, meaning, routines, and personal access appear here with their current observed health.</p>
+          <p id="inventory-empty-summary">Sources, tools, meaning, routines, Teams, and personal access appear here with their current observed health.</p>
           <div id="inventory-overview" class="inventory-overview"></div>
           <p id="inventory-warnings" class="inventory-warnings" hidden></p>
         </div>
@@ -528,11 +533,12 @@ __CALLIOPE_BACKGROUND__
           </header>
           <section class="inventory-health"><span>Observed health</span><p id="inventory-detail-health"></p></section>
           <div id="inventory-detail-facts" class="inventory-detail-facts"></div>
+          <section id="team-management" class="team-management" hidden></section>
           <details class="inventory-detail-contract">
             <summary>Configuration context <span>⌄</span></summary>
             <div id="inventory-detail-context"></div>
           </details>
-          <footer class="inventory-detail-actions">
+          <footer id="inventory-detail-actions" class="inventory-detail-actions">
             <p>Calliope receives this exact typed reference—not a name inferred from prose.</p>
             <a id="inventory-detail-open" href="#" hidden>Open →</a>
             <button id="inventory-knowledge-source" type="button" hidden>Consider as knowledge</button>

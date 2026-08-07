@@ -50,6 +50,31 @@ class _Connection:
         return False
 
 
+class _TeamResult:
+    def __init__(self, *, rows=None, row=None):
+        self.rows = rows or []
+        self.row = row
+
+    def fetchall(self):
+        return self.rows
+
+    def fetchone(self):
+        return self.row
+
+
+class _TeamConnection:
+    def __init__(self, teams, *, allowed=False):
+        self.teams = teams
+        self.allowed = allowed
+
+    def execute(self, query, _params=None):
+        if "FROM rvbbit.teams t LEFT JOIN rvbbit.team_members" in query:
+            return _TeamResult(rows=self.teams)
+        if "WHERE t.system_key='admins'" in query:
+            return _TeamResult(row={"allowed": self.allowed})
+        raise AssertionError(query)
+
+
 def _item(ref, *, section="tools", state="healthy", label=None):
     return calliope._library_inventory_item(
         ref=ref,
@@ -85,6 +110,122 @@ def test_inventory_contract_ships_backend_modes_stage_and_typed_handoff():
     assert "data-inventory-focus" in script
     assert ".surface.kind-inventory" in css
     assert ".inventory-detail-contract" in css
+
+
+def test_teams_ship_as_a_native_library_surface_with_admin_gated_editing():
+    backend = (HERE / "calliope.py").read_text(encoding="utf-8")
+    page = (HERE / "calliope" / "index.html").read_text(encoding="utf-8")
+    script = (HERE / "calliope" / "calliope.js").read_text(encoding="utf-8")
+    css = (HERE / "calliope" / "calliope.css").read_text(encoding="utf-8")
+
+    assert '@mcp.custom_route("/api/calliope/teams", methods=["GET"])' in backend
+    assert '@mcp.custom_route("/api/calliope/team-people", methods=["GET"])' in backend
+    assert '@mcp.custom_route("/api/calliope/teams", methods=["POST"])' in backend
+    assert '@mcp.custom_route("/api/calliope/teams/{team_id}", methods=["PATCH"])' in backend
+    assert '"teams": "Teams"' in backend
+    assert 'id="team-create"' in page
+    assert 'id="team-management"' in page
+    assert 'id="action-library-bootstrap"' in page
+    assert 'id="action-library-discovery" class="action-library-discovery" hidden' in page
+    assert 'id="action-library-workspace" class="action-library-workspace" hidden' in page
+    assert "function beginTeamCreation" in script
+    assert 'state.inventorySection === "teams"' in script
+    assert "Only members of Admins can create Teams" in script
+    assert "function renderTeamManagement" in script
+    assert "function renderTeamManagementPreservingPicker" in script
+    assert "nextList.scrollTop = listScrollTop" in script
+    assert 'data-team-member-pill=' in script
+    assert "function searchTeamPeople" in script
+    assert "function identityMatchesQuery" in script
+    assert "function setLibraryBootstrapping" in script
+    assert "state.libraryReady = true" in script
+    assert "function saveTeamDraft" in script
+    assert "Only members of Admins may create Teams." in script
+    assert 'membershipRule: team?.membership_rule || "explicit_members"' in script
+    assert 'team.systemKey === "everyone"' in script
+    assert "Any authenticated user" in script
+    assert "Dynamic membership · evaluated at request time" in script
+    assert ".team-management" in css
+    assert ".team-member-pills" in css
+    assert ".team-member-pill.wildcard" in css
+    assert ".action-library-bootstrap" in css
+
+
+def test_team_inventory_exposes_flat_membership_without_granting_observed_people_access():
+    rows = [
+        {
+            "id": "00000000-0000-4000-8000-000000000001",
+            "slug": "admins",
+            "name": "Admins",
+            "description": "Application administrators",
+            "system_key": "admins",
+            "archived": False,
+            "revision": 2,
+            "created_by": "system",
+            "created_at": "2026-08-07T10:00:00+00:00",
+            "updated_by": "admin@example.com",
+            "updated_at": "2026-08-07T11:00:00+00:00",
+            "last_changed_at": "2026-08-07T11:00:00+00:00",
+            "members": ["admin@example.com"],
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000002",
+            "slug": "everyone",
+            "name": "Everyone",
+            "description": "Automatically includes every user with a verified application sign-in.",
+            "system_key": "everyone",
+            "archived": False,
+            "revision": 1,
+            "created_by": "system",
+            "created_at": "2026-08-07T10:00:00+00:00",
+            "updated_by": "system",
+            "updated_at": "2026-08-07T10:00:00+00:00",
+            "last_changed_at": None,
+            "members": [],
+        },
+        {
+            "id": "c487af4a-fe1a-475b-b813-0393fe1bf0c1",
+            "slug": "finance",
+            "name": "Finance",
+            "description": "Finance collaborators",
+            "system_key": None,
+            "archived": False,
+            "revision": 1,
+            "created_by": "admin@example.com",
+            "created_at": "2026-08-07T11:00:00+00:00",
+            "updated_by": "admin@example.com",
+            "updated_at": "2026-08-07T11:00:00+00:00",
+            "last_changed_at": "2026-08-07T11:00:00+00:00",
+            "members": ["finance@example.com"],
+        },
+    ]
+    items = calliope._library_team_inventory(
+        _TeamConnection(rows, allowed=True),
+        "admin@example.com",
+    )
+
+    admins, everyone, finance = items
+    assert [item["ref"] for item in items] == [
+        "team:00000000-0000-4000-8000-000000000001",
+        "team:00000000-0000-4000-8000-000000000002",
+        "team:c487af4a-fe1a-475b-b813-0393fe1bf0c1",
+    ]
+    assert all(item["section"] == "teams" for item in items)
+    assert all(item["section_label"] == "Teams" for item in items)
+    assert "people:directory" not in {
+        item["ref"] for item in items
+    }
+    assert admins["ref"] == "team:00000000-0000-4000-8000-000000000001"
+    assert admins["detail"]["protected"] is True
+    assert everyone["state"] == "healthy"
+    assert everyone["detail"]["protected"] is True
+    assert everyone["detail"]["dynamic_membership"] is True
+    assert everyone["detail"]["membership_rule"] == "authenticated_users"
+    assert everyone["detail"]["member_count"] is None
+    assert everyone["detail"]["members"] == []
+    assert {fact["label"]: fact["value"] for fact in everyone["facts"]}["Members"] == "Any authenticated user"
+    assert finance["detail"]["members"] == ["finance@example.com"]
+    assert finance["visibility"] == "organization"
 
 
 def test_inventory_item_is_json_stable_and_does_not_infer_unknown_state():
@@ -211,6 +352,7 @@ def test_inventory_snapshot_isolates_collectors_and_filters_exact_refs(monkeypat
         "_library_cube_inventory": lambda _conn, _owner: (_ for _ in ()).throw(RuntimeError("old install")),
         "_library_metric_inventory": lambda _conn, _owner: [],
         "_library_routine_inventory": lambda _conn, _owner: [],
+        "_library_team_inventory": lambda _conn, _owner: [],
         "_library_personal_inventory": lambda _conn, _owner: [],
     }
     for name, collector in collectors.items():

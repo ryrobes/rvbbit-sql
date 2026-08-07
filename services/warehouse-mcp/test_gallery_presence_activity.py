@@ -48,6 +48,9 @@ def _artifact_row(owner="owner@example.com"):
         "area_label": "Revenue",
         "area_source": "auto",
         "area_confidence": 0.91,
+        "archived": False,
+        "access_revision": 1,
+        "is_owner": True,
         "total_views": 12,
         "updated_at": datetime.now(timezone.utc),
     }
@@ -66,7 +69,9 @@ def test_gallery_presence_and_shared_activity_are_native_but_unobtrusive(monkeyp
             "picture": "https://lh3.googleusercontent.com/a/gallery-owner",
         },
     )
-    reader_page = server._landing_html([_artifact_row()], "reader@example.com")
+    reader_page = server._landing_html(
+        [{**_artifact_row(), "is_owner": False}], "reader@example.com"
+    )
 
     assert 'id="gallery-presence"' in owner_page
     assert 'id="presence-meeting"' in owner_page
@@ -77,8 +82,13 @@ def test_gallery_presence_and_shared_activity_are_native_but_unobtrusive(monkeyp
     assert 'class="card-activity"' not in owner_page
     assert 'card-kind' not in owner_page
     assert 'artifact-kind-chips' not in owner_page
-    assert 'class="pill dim card-owner" title="owner@example.com"' in owner_page
+    assert 'class="pill dim card-owner is-current-user" title="owner@example.com"' in owner_page
+    assert 'class="pill dim card-owner" title="owner@example.com"' in reader_page
+    assert 'card-owner is-current-user' not in reader_page
     assert 'data-card-more aria-expanded="false"' in owner_page
+    assert 'data-artifact-access="revenue-room"' in owner_page
+    assert 'data-artifact-access="revenue-room"' not in reader_page
+    assert 'id="artifact-access-dialog"' in owner_page
     assert 'id="artifact-sort"' in owner_page
     assert 'id="artifact-area"' in owner_page
     assert 'data-area="revenue"' in owner_page
@@ -98,6 +108,8 @@ def test_gallery_presence_and_shared_activity_are_native_but_unobtrusive(monkeyp
     assert "/api/gallery/meetings" in server._LANDING_JS
     assert "/api/gallery/artifacts/" in server._LANDING_JS
     assert ".gallery-presence.compact" in server._LANDING_CSS
+    assert ".card.interaction-suspended" in server._LANDING_CSS
+    assert "releaseAccessSource()" in server._LANDING_JS
     gallery_header = owner_page.split("<nav data-warehouse-header>", 1)[1].split("</nav>", 1)[0]
     assert 'data-warehouse-account' in gallery_header
     assert 'src="/auth/avatar"' in gallery_header
@@ -140,7 +152,7 @@ def test_landing_rows_add_shared_activity_totals_and_zero_fill(monkeypatch):
 
     monkeypatch.setattr(server, "_conn", lambda: Connection())
 
-    rows = server._landing_rows()
+    rows = server._landing_rows("viewer@example.com")
 
     assert rows[0]["total_views"] == 12
     assert rows[1]["total_views"] == 0
@@ -163,7 +175,7 @@ def test_landing_rows_keep_artifacts_when_activity_totals_are_unavailable(monkey
 
     monkeypatch.setattr(server, "_conn", lambda: Connection())
 
-    rows = server._landing_rows()
+    rows = server._landing_rows("viewer@example.com")
 
     assert [row["slug"] for row in rows] == ["revenue-room"]
     assert rows[0]["total_views"] is None
@@ -404,6 +416,7 @@ def test_presence_and_activity_render_in_a_real_browser(monkeypatch):
         "app_kind": "dashboard",
         "area_id": "executive",
         "area_label": "Executive",
+        "is_owner": False,
         "total_views": 47,
         "updated_at": datetime.now(timezone.utc) - timedelta(days=2),
     }
@@ -452,6 +465,21 @@ def test_presence_and_activity_render_in_a_real_browser(monkeypatch):
         }],
         "versions": [{"version": "4", "views": 12}],
     }
+    access = {
+        "artifact": {
+            "slug": "revenue-room",
+            "name": "Revenue Room",
+            "app_kind": "app",
+            "owner_email": revenue["owner_email"],
+            "access_revision": 1,
+            "archived": False,
+        },
+        "grants": {"teams": [], "people": []},
+        "teams": [],
+        "summary": "Only you",
+        "subject": revenue["owner_email"],
+        "everyone": False,
+    }
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
@@ -473,6 +501,10 @@ def test_presence_and_activity_render_in_a_real_browser(monkeypatch):
                 self.send_header("content-type", "application/json")
             elif self.path.startswith("/api/gallery/artifacts/revenue-room/activity"):
                 body = json.dumps(activity).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+            elif self.path.startswith("/api/gallery/artifacts/revenue-room/access"):
+                body = json.dumps(access).encode()
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
             elif self.path.startswith("/api/calliope/home"):
@@ -584,6 +616,12 @@ def test_presence_and_activity_render_in_a_real_browser(monkeypatch):
                 - when_box["y"] - when_box["height"] / 2
             ) < 2
             assert owner.evaluate("node => getComputedStyle(node).textOverflow") == "ellipsis"
+            assert "is-current-user" in (owner.get_attribute("class") or "")
+            alpha_owner = page.locator('[data-slug="alpha-forecast"] .card-owner')
+            assert "is-current-user" not in (alpha_owner.get_attribute("class") or "")
+            assert owner.evaluate("node => getComputedStyle(node).color") != alpha_owner.evaluate(
+                "node => getComputedStyle(node).color"
+            )
             actions = revenue_card.locator(".card-actions")
             assert float(actions.evaluate("node => getComputedStyle(node).opacity")) == 0
             assert revenue_card.locator(".card-more").evaluate(
@@ -592,13 +630,39 @@ def test_presence_and_activity_render_in_a_real_browser(monkeypatch):
             revenue_card.hover()
             page.wait_for_timeout(220)
             assert float(actions.evaluate("node => getComputedStyle(node).opacity")) == 1
-            assert revenue_card.locator(".card-action-items button").count() == 2
+            assert revenue_card.locator(".card-action-items button").count() == 3
+            assert revenue_card.locator("[data-artifact-access='revenue-room']").count() == 1
             view_count.click()
             page.wait_for_selector("#artifact-activity-dialog[open]")
             page.wait_for_selector(".activity-viewer")
             assert page.locator(".activity-stat").count() == 4
             assert page.locator(".activity-viewer").count() == 2
             page.locator("#activity-close").click()
+
+            # Opening the owner-only ACCESS modal must retire the source
+            # tile's hover state even though a modal backdrop prevents the
+            # card from receiving its normal pointer-leave event.
+            revenue_card.hover()
+            access_button = revenue_card.locator(
+                "[data-artifact-access='revenue-room']"
+            )
+            access_button.click()
+            page.wait_for_selector("#artifact-access-dialog[open]")
+            page.wait_for_selector(".artifact-access-owner")
+            assert "interaction-suspended" in (
+                revenue_card.get_attribute("class") or ""
+            )
+            page.wait_for_timeout(220)
+            assert float(actions.evaluate("node => getComputedStyle(node).opacity")) == 0
+            page.keyboard.press("Escape")
+            page.wait_for_function(
+                "!document.getElementById('artifact-access-dialog').open"
+            )
+            assert float(actions.evaluate("node => getComputedStyle(node).opacity")) == 0
+            page.locator("h1").hover()
+            page.wait_for_function(
+                "!document.querySelector('[data-slug=\"revenue-room\"]').classList.contains('interaction-suspended')"
+            )
 
             # Sort and filter state is useful enough to survive a copied URL or refresh.
             page.locator("#artifact-sort").select_option("views")

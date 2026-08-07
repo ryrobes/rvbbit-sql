@@ -32,6 +32,9 @@
     actionOpen: $("#action-library-open"),
     actionDialog: $("#action-library-dialog"),
     actionClose: $("#action-library-close"),
+    actionBootstrap: $("#action-library-bootstrap"),
+    actionDiscovery: $("#action-library-discovery"),
+    actionWorkspace: $("#action-library-workspace"),
     libraryModes: $("#library-modes"),
     libraryInventoryCount: $("#library-inventory-count"),
     libraryDiscoverCount: $("#library-discover-count"),
@@ -41,6 +44,7 @@
     actionRefresh: $("#action-library-refresh"),
     actionSummary: $("#action-library-summary"),
     actionList: $("#action-library-list"),
+    teamCreate: $("#team-create"),
     inventoryOpenView: $("#inventory-open-view"),
     inventoryEmpty: $("#inventory-empty"),
     inventoryEmptySummary: $("#inventory-empty-summary"),
@@ -54,10 +58,12 @@
     inventoryDetailKind: $("#inventory-detail-kind"),
     inventoryDetailHealth: $("#inventory-detail-health"),
     inventoryDetailFacts: $("#inventory-detail-facts"),
+    teamManagement: $("#team-management"),
     inventoryDetailContext: $("#inventory-detail-context"),
     inventoryDetailOpen: $("#inventory-detail-open"),
     inventoryAsk: $("#inventory-ask"),
     inventoryKnowledgeSource: $("#inventory-knowledge-source"),
+    inventoryDetailActions: $("#inventory-detail-actions"),
     actionEmpty: $("#action-library-empty"),
     actionSelected: $("#action-library-selected"),
     actionDetailState: $("#action-detail-state"),
@@ -469,6 +475,8 @@
     newSurfaceCount: 0,
     config: null,
     libraryMode: "inventory",
+    libraryReady: false,
+    libraryBootstrapping: false,
     inventoryItems: [],
     inventorySections: [],
     inventoryStates: [],
@@ -482,6 +490,15 @@
     inventorySearchTimer: null,
     inventoryHandoffLoading: false,
     inventoryQuery: "",
+    teamDirectory: null,
+    teamDirectoryLoading: false,
+    teamCanManage: null,
+    teamDraft: null,
+    teamPeopleQuery: "",
+    teamPeopleSearchTimer: null,
+    teamPeopleSearchSequence: 0,
+    teamPeopleLoading: false,
+    teamSaving: false,
     actions: [],
     actionQuery: "",
     actionTotal: 0,
@@ -2658,7 +2675,55 @@
       watch: "◌",
       identity: "◎",
       access_role: "◇",
+      team: "◉",
+      team_create: "＋",
     })[kind] || "◇";
+  }
+
+  function setLibraryBootstrapping(loading) {
+    state.libraryBootstrapping = Boolean(loading);
+    els.actionBootstrap.hidden = !state.libraryBootstrapping;
+    els.actionDiscovery.hidden = state.libraryBootstrapping;
+    els.actionWorkspace.hidden = state.libraryBootstrapping;
+    els.actionDialog.setAttribute("aria-busy", String(state.libraryBootstrapping));
+  }
+
+  function identitySearchTerms(value) {
+    return String(value || "").toLowerCase().match(/[a-z0-9]+/g) || [];
+  }
+
+  function identityMatchesQuery(person, query) {
+    const terms = identitySearchTerms(query);
+    if (!terms.length) return true;
+    const haystack = identitySearchTerms(`${person?.display_name || ""} ${person?.email || ""}`).join(" ");
+    return terms.every((term) => haystack.includes(term));
+  }
+
+  function renderTeamManagementPreservingPicker() {
+    const list = $(".team-people-list", els.teamManagement);
+    const detail = els.teamManagement.closest(".action-library-detail");
+    const listScrollTop = list?.scrollTop || 0;
+    const listScrollLeft = list?.scrollLeft || 0;
+    const detailScrollTop = detail?.scrollTop || 0;
+    const activeSearch = document.activeElement?.matches?.("[data-team-people-search]");
+    const searchPosition = activeSearch ? document.activeElement.selectionStart : null;
+    const activeMember = document.activeElement?.dataset?.teamMember || null;
+    renderTeamManagement();
+    const nextList = $(".team-people-list", els.teamManagement);
+    if (nextList) {
+      nextList.scrollTop = listScrollTop;
+      nextList.scrollLeft = listScrollLeft;
+    }
+    if (detail) detail.scrollTop = detailScrollTop;
+    if (activeSearch) {
+      const nextSearch = $("[data-team-people-search]", els.teamManagement);
+      nextSearch?.focus();
+      if (searchPosition !== null) nextSearch?.setSelectionRange?.(searchPosition, searchPosition);
+    } else if (activeMember) {
+      const nextMember = $$('[data-team-member]', els.teamManagement)
+        .find((candidate) => candidate.dataset.teamMember === activeMember);
+      nextMember?.focus();
+    }
   }
 
   function renderLibraryModeTabs() {
@@ -2682,7 +2747,19 @@
     ].join("");
   }
 
+  function renderTeamCreateControl() {
+    const teamsTab = state.libraryMode === "inventory"
+      && state.inventorySection === "teams"
+      && !state.inventoryState;
+    const allowed = state.teamCanManage === true;
+    els.teamCreate.hidden = !teamsTab;
+    els.teamCreate.disabled = !allowed || state.inventoryLoading || state.teamDirectoryLoading || state.teamSaving;
+    els.teamCreate.title = allowed ? "Create a Team" : "Only members of Admins can create Teams";
+    els.teamCreate.setAttribute("aria-label", els.teamCreate.title);
+  }
+
   function renderInventoryList() {
+    renderTeamCreateControl();
     if (state.libraryMode !== "inventory") return;
     els.inventoryOpenView.disabled = state.inventoryLoading || !state.inventoryItems.length;
     if (state.inventoryLoading) {
@@ -2712,6 +2789,255 @@
     return String(value);
   }
 
+  function selectedInventoryTeam() {
+    if (state.inventoryItem?.kind !== "team") return null;
+    const id = String(state.inventoryItem.detail?.id || state.inventoryItem.ref?.split(":")[1] || "");
+    return (state.teamDirectory?.teams || []).find((team) => String(team.id) === id) || null;
+  }
+
+  function teamDraftFrom(team = null) {
+    const members = new Set(Array.isArray(team?.members) ? team.members : []);
+    return {
+      id: team?.id || null,
+      revision: Number(team?.revision || 0),
+      name: team?.name || "",
+      description: team?.description || "",
+      archived: Boolean(team?.archived),
+      protected: Boolean(team?.protected),
+      systemKey: team?.system_key || null,
+      membershipRule: team?.membership_rule || "explicit_members",
+      dynamicMembership: Boolean(team?.dynamic_membership),
+      members,
+      originalMembers: new Set(members),
+    };
+  }
+
+  function resetTeamDraftForInventory() {
+    if (state.inventoryItem?.kind === "team_create") {
+      state.teamDraft = teamDraftFrom();
+      state.teamPeopleQuery = "";
+      return;
+    }
+    const team = selectedInventoryTeam();
+    state.teamDraft = team ? teamDraftFrom(team) : null;
+    state.teamPeopleQuery = "";
+  }
+
+  function newTeamInventoryItem() {
+    return {
+      ref: "team:new",
+      kind: "team_create",
+      section: "teams",
+      section_label: "Teams",
+      label: "New Team",
+      summary: "Create one flat Team from people Calliope has observed through trusted use.",
+      state: "ready",
+      state_label: "New",
+      health: "Choose a name and explicit members. Creating the Team grants nothing until a later policy uses it.",
+      facts: [],
+      detail: { membership_model: "flat", authority: "Admins" },
+    };
+  }
+
+  function cancelTeamCreation() {
+    if (state.inventoryItem?.kind !== "team_create") return;
+    state.inventoryRef = null;
+    state.inventoryItem = null;
+    state.teamDraft = null;
+    state.teamPeopleQuery = "";
+    renderInventoryList();
+    renderInventoryDetail();
+  }
+
+  async function beginTeamCreation() {
+    if (state.teamCanManage !== true || state.teamSaving) return;
+    state.inventoryRef = "team:new";
+    state.inventoryItem = newTeamInventoryItem();
+    state.teamDraft = teamDraftFrom();
+    state.teamPeopleQuery = "";
+    renderInventoryList();
+    renderInventoryDetail();
+    await loadTeamDirectory({ resetDraft: false });
+    if (!state.teamDirectory?.can_manage) {
+      cancelTeamCreation();
+      toast("Only members of Admins may create Teams.", true);
+      return;
+    }
+    $("[data-team-name]", els.teamManagement)?.focus();
+  }
+
+  function renderTeamManagement() {
+    const item = state.inventoryItem;
+    const relevant = state.libraryMode === "inventory" && ["team", "team_create"].includes(item?.kind);
+    els.teamManagement.hidden = !relevant;
+    if (!relevant) {
+      els.teamManagement.innerHTML = "";
+      return;
+    }
+    if (state.teamDirectoryLoading || !state.teamDirectory) {
+      els.teamManagement.innerHTML = '<div class="team-management-loading"><i></i>Resolving trusted people and Teams…</div>';
+      return;
+    }
+    const directory = state.teamDirectory;
+    const canManage = Boolean(directory.can_manage);
+    const people = Array.isArray(directory.people) ? directory.people : [];
+    const team = state.teamDraft || teamDraftFrom();
+    const dynamic = Boolean(team.dynamicMembership || team.membershipRule === "authenticated_users" || team.systemKey === "everyone");
+    const adminTeam = team.systemKey === "admins";
+    const query = state.teamPeopleQuery.trim();
+    const peopleByEmail = new Map(people.map((person) => [String(person.email || ""), person]));
+    const selectedMembers = [...team.members].map((email) => {
+      const person = peopleByEmail.get(email) || {};
+      return { email, label: String(person.display_name || email) };
+    }).sort((left, right) => left.label.localeCompare(right.label));
+    const memberPills = dynamic
+      ? '<span class="team-member-pill wildcard" title="Evaluated from the verified application subject at request time"><i aria-hidden="true">∞</i><span>Any authenticated user</span></span>'
+      : selectedMembers.map(({ email, label }) => {
+      const canRemove = canManage && !(adminTeam && team.members.size <= 1);
+      const content = `<span>${escapeHtml(label)}</span>${canRemove ? '<i aria-hidden="true">×</i>' : ""}`;
+      return canRemove
+        ? `<button class="team-member-pill" type="button" data-team-member-pill="${escapeHtml(email)}" title="Remove ${escapeHtml(email)} from this Team">${content}</button>`
+        : `<span class="team-member-pill" title="${escapeHtml(email)}">${content}</span>`;
+    }).join("");
+    const visiblePeople = dynamic ? [] : people.filter((person) => identityMatchesQuery(person, query)).slice(0, 120);
+    const memberRows = dynamic ? "" : visiblePeople.map((person) => {
+      const email = String(person.email || "");
+      const checked = team.members.has(email);
+      const protectsLastAdmin = adminTeam && checked && team.members.size <= 1;
+      return `<label class="team-person ${checked ? "selected" : ""}">
+        <input type="checkbox" data-team-member="${escapeHtml(email)}" ${checked ? "checked" : ""} ${canManage && !protectsLastAdmin ? "" : "disabled"} ${protectsLastAdmin ? 'title="Admins must retain at least one member"' : ""}>
+        <span><strong>${escapeHtml(person.display_name || email)}</strong>${person.display_name ? `<small>${escapeHtml(email)}</small>` : ""}</span>
+        <small>${escapeHtml((person.teams || []).join(" · ") || relativeTime(person.last_seen_at))}</small>
+      </label>`;
+    }).join("");
+    const isNew = !team.id;
+    const heading = isNew ? "Create Team" : dynamic ? "Authenticated-user Team" : adminTeam ? "Protected administrator Team" : "Team membership";
+    const subheading = dynamic
+      ? `Every verified application user · revision ${team.revision}`
+      : `${team.members.size.toLocaleString()} selected observed ${team.members.size === 1 ? "person" : "people"}${isNew ? "" : ` · revision ${team.revision}`}`;
+    const authorityNote = dynamic
+      ? "Everyone is evaluated from the verified signed-in subject on each request. Service identities, anonymous requests, and legacy attribution do not match."
+      : canManage
+        ? "Membership in Admins authorizes this change and the receipt will retain both actor and human subject."
+        : "This directory is read-only because you are not a member of Admins.";
+    els.teamManagement.innerHTML = `
+      <header class="team-management-head"><div><span>${heading}</span><p>${subheading}</p></div>
+        ${isNew ? '<button type="button" data-team-cancel>Cancel</button>' : ""}</header>
+      <p class="team-admin-note ${canManage || dynamic ? "allowed" : ""}">${authorityNote}</p>
+      <form class="team-editor-form">
+        <label><span>Name</span><input data-team-name maxlength="120" required value="${escapeHtml(team.name)}" ${team.protected || !canManage ? "disabled" : ""}></label>
+        <label class="wide"><span>Description</span><textarea data-team-description maxlength="2000" rows="2" ${canManage && !dynamic ? "" : "disabled"}>${escapeHtml(team.description)}</textarea></label>
+        <section class="team-member-summary wide" aria-label="Selected Team members">
+          <header><span>Members</span><small>${dynamic ? "Automatic" : `${team.members.size.toLocaleString()} selected`}</small></header>
+          <div class="team-member-pills">${memberPills || '<span class="team-member-pills-empty">No members selected yet</span>'}</div>
+        </section>
+        ${dynamic ? "" : `<label class="wide team-people-search"><span>Members · observed identities only</span><input data-team-people-search type="search" placeholder="Find a name or email" value="${escapeHtml(state.teamPeopleQuery)}"><small class="team-people-search-status">${state.teamPeopleLoading ? "Searching the full observed directory…" : query ? `${visiblePeople.length.toLocaleString()} matching observed ${visiblePeople.length === 1 ? "person" : "people"}` : `${people.length.toLocaleString()} observed ${people.length === 1 ? "person" : "people"}`}</small></label>
+        <div class="team-people-list wide">${memberRows || '<p class="empty">No observed people match this search.</p>'}</div>`}
+        <footer class="team-editor-actions wide">
+          <span>${state.teamSaving ? "Applying one audited Team change…" : dynamic ? "Dynamic membership · evaluated at request time · no explicit member list." : team.archived ? "Archived Teams confer no future access." : adminTeam ? "Admins cannot be renamed, archived, or left empty." : "Flat membership · no nested Teams."}</span>
+          ${canManage && !isNew && !team.protected ? `<button class="danger" type="button" data-team-archive>${team.archived ? "Restore" : "Archive"}</button>` : ""}
+          ${canManage && !dynamic ? `<button class="primary" type="button" data-team-save ${state.teamSaving ? "disabled" : ""}>${isNew ? "Create Team" : "Save changes"}</button>` : ""}
+        </footer>
+      </form>`;
+  }
+
+  async function loadTeamDirectory({ resetDraft = true } = {}) {
+    clearTimeout(state.teamPeopleSearchTimer);
+    state.teamPeopleSearchSequence += 1;
+    state.teamPeopleLoading = false;
+    state.teamDirectoryLoading = true;
+    renderTeamManagement();
+    try {
+      state.teamDirectory = await api("/api/calliope/teams");
+      state.teamCanManage = Boolean(state.teamDirectory?.can_manage);
+      if (resetDraft) resetTeamDraftForInventory();
+    } finally {
+      state.teamDirectoryLoading = false;
+      renderTeamCreateControl();
+      renderTeamManagement();
+    }
+  }
+
+  async function searchTeamPeople(query = state.teamPeopleQuery) {
+    const requestedQuery = String(query || "").trim();
+    const sequence = ++state.teamPeopleSearchSequence;
+    state.teamPeopleLoading = true;
+    const status = $(".team-people-search-status", els.teamManagement);
+    if (status) status.textContent = "Searching the full observed directory…";
+    try {
+      const params = new URLSearchParams({ q: requestedQuery });
+      const data = await api(`/api/calliope/team-people?${params}`);
+      if (sequence !== state.teamPeopleSearchSequence || requestedQuery !== state.teamPeopleQuery.trim()) return;
+      const peopleByEmail = new Map(
+        (state.teamDirectory?.people || []).map((person) => [String(person.email || ""), person])
+      );
+      for (const person of Array.isArray(data.people) ? data.people : []) {
+        peopleByEmail.set(String(person.email || ""), person);
+      }
+      state.teamDirectory = {
+        ...(state.teamDirectory || {}),
+        subject: data.subject || state.teamDirectory?.subject,
+        can_manage: Boolean(data.can_manage),
+        people: [...peopleByEmail.values()],
+      };
+      state.teamCanManage = Boolean(data.can_manage);
+    } finally {
+      if (sequence === state.teamPeopleSearchSequence) {
+        state.teamPeopleLoading = false;
+        renderTeamCreateControl();
+        renderTeamManagementPreservingPicker();
+      }
+    }
+  }
+
+  async function saveTeamDraft({ archived = undefined } = {}) {
+    const draft = state.teamDraft;
+    if (!draft || draft.dynamicMembership || state.teamSaving || !state.teamDirectory?.can_manage) return;
+    const form = $(".team-editor-form", els.teamManagement);
+    if (form && !form.reportValidity()) return;
+    state.teamSaving = true;
+    renderTeamManagement();
+    try {
+      let result;
+      if (!draft.id) {
+        result = await api("/api/calliope/teams", {
+          method: "POST",
+          body: JSON.stringify({
+            name: draft.name,
+            description: draft.description,
+            members: [...draft.members].sort(),
+          }),
+        });
+      } else {
+        const add = [...draft.members].filter((email) => !draft.originalMembers.has(email)).sort();
+        const remove = [...draft.originalMembers].filter((email) => !draft.members.has(email)).sort();
+        const body = {
+          expected_revision: draft.revision,
+          description: draft.description,
+          add_members: add,
+          remove_members: remove,
+        };
+        if (!draft.protected) body.name = draft.name;
+        if (archived !== undefined) body.archived = archived;
+        result = await api(`/api/calliope/teams/${encodeURIComponent(draft.id)}`, {
+          method: "PATCH",
+          body: JSON.stringify(body),
+        });
+      }
+      const saved = result.team;
+      toast(result.changed === false ? "Team was already up to date" : `${saved.name} · Team change recorded`);
+      await loadInventory();
+      state.inventoryRef = `team:${saved.id}`;
+      state.inventoryItem = state.inventoryItems.find((candidate) => candidate.ref === state.inventoryRef) || null;
+      await loadTeamDirectory();
+      renderInventoryList();
+      renderInventoryDetail();
+    } finally {
+      state.teamSaving = false;
+      renderTeamManagement();
+    }
+  }
+
   function renderInventoryDetail() {
     const item = state.inventoryItem;
     const visible = state.libraryMode === "inventory";
@@ -2719,7 +3045,7 @@
     els.inventoryEmpty.hidden = !visible || Boolean(item);
     if (!visible) return;
     const summary = state.inventorySummary || {};
-    els.inventoryEmptySummary.textContent = `${Number(summary.total || 0).toLocaleString()} configured item${Number(summary.total || 0) === 1 ? "" : "s"} are visible across knowledge, tools, meaning, routines, and access.`;
+    els.inventoryEmptySummary.textContent = `${Number(summary.total || 0).toLocaleString()} configured item${Number(summary.total || 0) === 1 ? "" : "s"} are visible across knowledge, tools, meaning, routines, Teams, and access.`;
     els.inventoryOverview.innerHTML = [
       ["Healthy", summary.healthy || 0, "healthy"],
       ["Ready", summary.ready || 0, "ready"],
@@ -2729,7 +3055,10 @@
     ].map(([label, value, tone]) => `<span class="${tone}"><b>${Number(value).toLocaleString()}</b>${label}</span>`).join("");
     els.inventoryWarnings.hidden = !state.inventoryWarnings.length;
     els.inventoryWarnings.textContent = state.inventoryWarnings.join(" ");
-    if (!item) return;
+    if (!item) {
+      renderTeamManagement();
+      return;
+    }
     els.inventoryDetailState.className = `inventory-state ${escapeHtml(item.state || "ready")}`;
     els.inventoryDetailState.textContent = item.state_label || item.state || "Ready";
     els.inventoryDetailSection.textContent = item.section_label || item.section || "Configured item";
@@ -2747,15 +3076,25 @@
     if (item.open_url) els.inventoryDetailOpen.href = item.open_url;
     const knowledgeCandidate = item.kind === "mcp_server" && item.detail?.knowledge_source_candidate;
     els.inventoryKnowledgeSource.hidden = !knowledgeCandidate;
+    els.inventoryDetailActions.hidden = item.kind === "team_create";
     els.inventoryAsk.disabled = state.inventoryHandoffLoading;
     els.inventoryKnowledgeSource.disabled = state.inventoryHandoffLoading;
+    renderTeamManagement();
   }
 
   function selectInventory(ref) {
+    const changed = state.inventoryRef !== (ref || null);
     state.inventoryRef = ref || null;
     state.inventoryItem = state.inventoryItems.find((item) => item.ref === state.inventoryRef) || null;
+    if (changed) {
+      state.teamDraft = null;
+      state.teamPeopleQuery = "";
+    }
     renderInventoryList();
     renderInventoryDetail();
+    if (state.inventoryItem?.kind === "team" && (changed || !state.teamDirectory)) {
+      loadTeamDirectory().catch((error) => toast(error.message, true));
+    }
   }
 
   async function loadInventory({ query = state.inventoryQuery, section = state.inventorySection, inventoryState = state.inventoryState } = {}) {
@@ -2771,6 +3110,10 @@
       state.inventoryStates = Array.isArray(data.states) ? data.states : [];
       state.inventorySummary = data.summary || { total: data.available_total || 0, needs_attention: 0, healthy: 0, ready: 0, working: 0, inactive: 0 };
       state.inventoryWarnings = Array.isArray(data.warnings) ? data.warnings : [];
+      const teamItem = state.inventoryItems.find((item) => item.kind === "team");
+      if (typeof teamItem?.detail?.can_manage === "boolean") {
+        state.teamCanManage = teamItem.detail.can_manage;
+      }
       const stillVisible = state.inventoryItems.some((item) => item.ref === state.inventoryRef);
       if (!stillVisible) {
         state.inventoryRef = null;
@@ -2837,6 +3180,7 @@
       : "What would you like to connect, change, or make possible?";
     els.actionSearch.value = next === "inventory" ? state.inventoryQuery : next === "discover" ? state.actionQuery : "";
     renderLibraryModeTabs();
+    renderTeamCreateControl();
     renderLibraryDetails();
     if (next === "inventory") {
       const total = Number(state.inventorySummary.total || state.inventoryItems.length || 0);
@@ -3167,30 +3511,45 @@
       els.actionSearch.value = "";
       state.actionQuery = "";
     }
+    const bootstrap = !state.libraryReady;
+    if (bootstrap) setLibraryBootstrapping(true);
     if (!els.actionDialog.open) els.actionDialog.showModal();
-    let remembered = "inventory";
-    try { remembered = localStorage.getItem(LIBRARY_MODE_KEY) || "inventory"; } catch {}
-    const mode = actionId || requirement ? "discover" : remembered;
-    await activateLibraryMode(mode, { persist: false, load: false });
-    if (mode === "inventory") await Promise.all([loadInventory(), loadActionHistory(), loadActions()]);
-    else if (mode === "changes") await Promise.all([loadActionHistory({ selectFirst: true }), loadInventory(), loadActions()]);
-    else await Promise.all([
-      loadActions({ query: state.actionQuery, requirement: state.actionRequirement, selectId: actionId }),
-      loadActionHistory(),
-      loadInventory(),
-    ]);
-    requestAnimationFrame(() => (actionId ? els.actionSelected : els.actionSearch).focus?.());
+    try {
+      let remembered = "inventory";
+      try { remembered = localStorage.getItem(LIBRARY_MODE_KEY) || "inventory"; } catch {}
+      const mode = actionId || requirement ? "discover" : remembered;
+      await activateLibraryMode(mode, { persist: false, load: false });
+      if (mode === "inventory") await Promise.all([loadInventory(), loadActionHistory(), loadActions()]);
+      else if (mode === "changes") await Promise.all([loadActionHistory({ selectFirst: true }), loadInventory(), loadActions()]);
+      else await Promise.all([
+        loadActions({ query: state.actionQuery, requirement: state.actionRequirement, selectId: actionId }),
+        loadActionHistory(),
+        loadInventory(),
+      ]);
+      state.libraryReady = true;
+      requestAnimationFrame(() => (actionId ? els.actionSelected : els.actionSearch).focus?.());
+    } finally {
+      if (bootstrap) setLibraryBootstrapping(false);
+    }
   }
 
   async function openActionReceipt(actionId, runId) {
+    const bootstrap = !state.libraryReady;
+    if (bootstrap) setLibraryBootstrapping(true);
     if (!els.actionDialog.open) els.actionDialog.showModal();
-    await activateLibraryMode("changes", { load: false });
-    const [runData] = await Promise.all([
-      api(`/api/calliope/action-runs/${encodeURIComponent(runId)}`),
-      loadActions(),
-      loadActionHistory(),
-    ]);
-    await selectAction(actionId || runData.run?.action_id, { run: runData.run });
+    try {
+      await activateLibraryMode("changes", { load: false });
+      const [runData] = await Promise.all([
+        api(`/api/calliope/action-runs/${encodeURIComponent(runId)}`),
+        loadActions(),
+        loadActionHistory(),
+        loadInventory(),
+      ]);
+      await selectAction(actionId || runData.run?.action_id, { run: runData.run });
+      state.libraryReady = true;
+    } finally {
+      if (bootstrap) setLibraryBootstrapping(false);
+    }
   }
 
   async function openActionWithCalliope() {
@@ -11546,6 +11905,7 @@
     els.actionDialog.addEventListener("close", () => {
       clearTimeout(state.actionSearchTimer);
       clearTimeout(state.inventorySearchTimer);
+      clearTimeout(state.teamPeopleSearchTimer);
       clearTimeout(state.actionPollTimer);
       state.actionRequirement = "";
     });
@@ -11605,7 +11965,7 @@
     els.actionList.addEventListener("click", (event) => {
       const inventory = event.target.closest("[data-inventory-ref]");
       if (inventory && state.libraryMode === "inventory") {
-        selectInventory(inventory.dataset.inventoryRef);
+      selectInventory(inventory.dataset.inventoryRef);
         return;
       }
       const receipt = event.target.closest("[data-action-run]");
@@ -11618,6 +11978,9 @@
       if (!button || state.libraryMode !== "discover") return;
       selectAction(button.dataset.actionId).catch((error) => toast(error.message, true));
     });
+    els.teamCreate.addEventListener("click", () => {
+      beginTeamCreation().catch((error) => toast(error.message, true));
+    });
     els.inventoryOpenView.addEventListener("click", () => {
       const refs = state.inventoryItems.map((item) => item.ref);
       if (refs.length > 24) toast("Pinned the first 24 items in this view; narrow the Library to inspect a more specific set.");
@@ -11629,6 +11992,63 @@
     });
     els.inventoryKnowledgeSource.addEventListener("click", () => {
       handoffInventory([state.inventoryRef], "knowledge_source").catch((error) => toast(error.message, true));
+    });
+    els.teamManagement.addEventListener("input", (event) => {
+      if (!state.teamDraft) return;
+      if (event.target.matches("[data-team-name]")) state.teamDraft.name = event.target.value;
+      if (event.target.matches("[data-team-description]")) state.teamDraft.description = event.target.value;
+      if (event.target.matches("[data-team-people-search]")) {
+        state.teamPeopleQuery = event.target.value;
+        renderTeamManagementPreservingPicker();
+        clearTimeout(state.teamPeopleSearchTimer);
+        const requestedQuery = state.teamPeopleQuery;
+        state.teamPeopleSearchTimer = setTimeout(() => {
+          searchTeamPeople(requestedQuery).catch((error) => toast(error.message, true));
+        }, 220);
+      }
+    });
+    els.teamManagement.addEventListener("change", (event) => {
+      const member = event.target.closest("[data-team-member]");
+      if (!member || !state.teamDraft || !state.teamDirectory?.can_manage) return;
+      if (!member.checked && state.teamDraft.systemKey === "admins" && state.teamDraft.members.size <= 1) {
+        member.checked = true;
+        toast("Admins must retain at least one member", true);
+        return;
+      }
+      if (member.checked) state.teamDraft.members.add(member.dataset.teamMember);
+      else state.teamDraft.members.delete(member.dataset.teamMember);
+      renderTeamManagementPreservingPicker();
+    });
+    els.teamManagement.addEventListener("submit", (event) => {
+      if (!event.target.matches(".team-editor-form")) return;
+      event.preventDefault();
+      saveTeamDraft().catch((error) => toast(error.message, true));
+    });
+    els.teamManagement.addEventListener("click", (event) => {
+      const memberPill = event.target.closest("[data-team-member-pill]");
+      if (memberPill && state.teamDraft && state.teamDirectory?.can_manage) {
+        if (state.teamDraft.systemKey === "admins" && state.teamDraft.members.size <= 1) {
+          toast("Admins must retain at least one member", true);
+          return;
+        }
+        state.teamDraft.members.delete(memberPill.dataset.teamMemberPill);
+        renderTeamManagementPreservingPicker();
+        return;
+      }
+      if (event.target.closest("[data-team-cancel]")) {
+        cancelTeamCreation();
+        return;
+      }
+      if (event.target.closest("[data-team-save]")) {
+        saveTeamDraft().catch((error) => toast(error.message, true));
+        return;
+      }
+      if (event.target.closest("[data-team-archive]") && state.teamDraft) {
+        const next = !state.teamDraft.archived;
+        if (!next || window.confirm(`Archive ${state.teamDraft.name}? Existing membership and audit history will be retained.`)) {
+          saveTeamDraft({ archived: next }).catch((error) => toast(error.message, true));
+        }
+      }
     });
     els.actionEmpty.addEventListener("click", (event) => {
       const example = event.target.closest("[data-action-example]");

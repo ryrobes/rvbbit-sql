@@ -1,0 +1,292 @@
+diff --git a/tools/mcp_tool.py b/tools/mcp_tool.py
+index fe5ab9cfd..57dd41cde 100644
+--- a/tools/mcp_tool.py
++++ b/tools/mcp_tool.py
+@@ -38,6 +38,11 @@ Example config::
+         headers:
+           Authorization: "Bearer sk-..."
+         timeout: 180
++        # Opt in only for a trusted first-party server. Requests then carry
++        # bounded platform/session provenance as MCP metadata; native Google
++        # Chat turns additionally carry the adapter-verified sender email.
++        # None of this is added to public tool arguments.
++        forward_session_identity: true
+         skip_preflight: true  # bypass the content-type probe for a valid
+                               # Streamable HTTP endpoint that answers HEAD/GET
+                               # with a non-MCP content type but serves real
+@@ -485,6 +490,93 @@ def _sanitize_error(text: str) -> str:
+     return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
+ 
+ 
++_HERMES_CALLER_META_KEY = "rvbbit.ai/hermes-caller"
++
++
++def _forwarded_session_metadata(
++    config: dict,
++    *,
++    task_id: str = "",
++    session_id: str = "",
++) -> Optional[dict]:
++    """Capture bounded provenance for one opted-in MCP request.
++
++    This runs in the agent/caller thread before the coroutine crosses onto the
++    dedicated MCP loop, because task-local gateway ContextVars intentionally do
++    not leak across that scheduling boundary. Google Chat additionally forwards
++    the adapter-verified sender email. API-server and cron requests deliberately
++    forward no human identity; their session IDs let a trusted first-party MCP
++    server correlate the request with its own durable records.
++    """
++    if not isinstance(config, dict) or config.get("forward_session_identity") is not True:
++        return None
++    try:
++        from gateway.session_context import get_session_env
++    except Exception:
++        return None
++    platform = str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
++    platform = platform.replace("-", "_")
++    context_session_id = str(
++        get_session_env("HERMES_SESSION_ID", "") or session_id or task_id or ""
++    ).strip()[:240]
++    if not platform and context_session_id.startswith("cron_"):
++        platform = "cron"
++    if platform == "gchat":
++        platform = "google_chat"
++    if platform not in {"google_chat", "api_server", "cron"}:
++        return None
++    envelope = {
++        "source": "hermes",
++        "platform": platform,
++    }
++    if context_session_id:
++        envelope["session_id"] = context_session_id
++    elif platform != "google_chat":
++        # A platform label alone cannot correlate an API/automation request and
++        # would turn every unscoped Hermes call into low-value telemetry.
++        return None
++    if platform == "google_chat":
++        user_id = str(get_session_env("HERMES_SESSION_USER_ID", "") or "").strip().lower()
++        if not user_id or len(user_id) > 254 or "@" not in user_id:
++            return None
++        envelope["user_id"] = user_id
++    return {_HERMES_CALLER_META_KEY: envelope}
++
++
++async def _call_tool_with_metadata(session, name: str, arguments: dict, metadata: Optional[dict]):
++    """Call a tool with MCP ``_meta`` while retaining SDK result validation."""
++    if not metadata:
++        return await session.call_tool(name, arguments=arguments)
++    try:
++        from mcp import types as mcp_types
++
++        params = mcp_types.CallToolRequestParams(
++            name=name,
++            arguments=arguments,
++            **{"_meta": metadata},
++        )
++        request = mcp_types.ClientRequest(
++            mcp_types.CallToolRequest(method="tools/call", params=params)
++        )
++    except (AttributeError, ImportError, TypeError) as exc:
++        # Older optional MCP SDKs may not expose the low-level request types.
++        # Preserve tool availability, but make the attribution downgrade
++        # visible to operators rather than failing the user's request.
++        logger.warning("MCP session identity metadata unavailable: %s", exc)
++        return await session.call_tool(name, arguments=arguments)
++    send_request = getattr(session, "send_request", None)
++    if not callable(send_request):
++        logger.warning("MCP session identity metadata unavailable: client has no send_request")
++        return await session.call_tool(name, arguments=arguments)
++    # Do not catch failures after the request is sent: retrying through
++    # call_tool here could duplicate a successful mutating server operation.
++    result = await send_request(request, mcp_types.CallToolResult)
++    validate = getattr(session, "_validate_tool_result", None)
++    if not result.isError and callable(validate):
++        await validate(name, result)
++    return result
++
++
+ def _exc_str(exc: BaseException) -> str:
+     """Return a non-empty human-readable string for *exc*.
+ 
+@@ -4791,6 +4883,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+                     )
+                 return tool_error(f"MCP server '{server_name}' is not connected")
+ 
++        # Capture while still in the gateway turn's ContextVar scope.  The MCP
++        # coroutine runs on a dedicated loop whose task context is intentionally
++        # isolated from concurrent messaging sessions.
++        request_metadata = _forwarded_session_metadata(
++            server._config,
++            task_id=str(kwargs.get("task_id") or ""),
++            session_id=str(kwargs.get("session_id") or ""),
++        )
++
+         async def _call():
+             _mark_server_call_started(server)
+             async with server._rpc_lock:
+@@ -4800,7 +4901,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+                 # it and detect the gateway platform / session for routing.
+                 server._pending_call_context = contextvars.copy_context()
+                 try:
+-                    result = await server.session.call_tool(tool_name, arguments=args)
++                    result = await _call_tool_with_metadata(
++                        server.session, tool_name, args, request_metadata
++                    )
+                 finally:
+                     server._pending_call_context = None
+             # The RPC round-trip completed — the session is demonstrably
+diff --git a/tests/tools/test_mcp_session_identity.py b/tests/tools/test_mcp_session_identity.py
+new file mode 100644
+index 000000000..70fe77510
+--- /dev/null
++++ b/tests/tools/test_mcp_session_identity.py
+@@ -0,0 +1,149 @@
++"""Per-turn identity forwarding for trusted first-party MCP servers."""
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++from mcp import types as mcp_types
++
++from tools import mcp_tool
++
++
++def test_forwarded_metadata_is_opt_in_and_google_chat_identity_is_verified(monkeypatch):
++    values = {
++        "HERMES_SESSION_PLATFORM": "google_chat",
++        "HERMES_SESSION_USER_ID": "Person@Example.com",
++        "HERMES_SESSION_ID": "gchat-session-1",
++    }
++    monkeypatch.setattr(
++        "gateway.session_context.get_session_env",
++        lambda name, default="": values.get(name, default),
++    )
++
++    assert mcp_tool._forwarded_session_metadata({}) is None
++    metadata = mcp_tool._forwarded_session_metadata({"forward_session_identity": True})
++    assert metadata == {
++        mcp_tool._HERMES_CALLER_META_KEY: {
++            "source": "hermes",
++            "platform": "google_chat",
++            "user_id": "person@example.com",
++            "session_id": "gchat-session-1",
++        }
++    }
++
++    values["HERMES_SESSION_PLATFORM"] = "slack"
++    assert mcp_tool._forwarded_session_metadata({"forward_session_identity": True}) is None
++
++
++def test_api_server_forwards_session_provenance_without_human_identity(monkeypatch):
++    values = {
++        "HERMES_SESSION_PLATFORM": "api_server",
++        "HERMES_SESSION_USER_ID": "untrusted@example.com",
++        "HERMES_SESSION_ID": "calliope_123",
++    }
++    monkeypatch.setattr(
++        "gateway.session_context.get_session_env",
++        lambda name, default="": values.get(name, default),
++    )
++
++    metadata = mcp_tool._forwarded_session_metadata(
++        {"forward_session_identity": True}
++    )
++
++    assert metadata == {
++        mcp_tool._HERMES_CALLER_META_KEY: {
++            "source": "hermes",
++            "platform": "api_server",
++            "session_id": "calliope_123",
++        }
++    }
++
++
++def test_cron_provenance_uses_agent_task_id_when_routing_context_is_blank(monkeypatch):
++    monkeypatch.setattr(
++        "gateway.session_context.get_session_env",
++        lambda _name, default="": default,
++    )
++
++    metadata = mcp_tool._forwarded_session_metadata(
++        {"forward_session_identity": True},
++        task_id="cron_daily-brief_20260804_090000",
++    )
++
++    assert metadata == {
++        mcp_tool._HERMES_CALLER_META_KEY: {
++            "source": "hermes",
++            "platform": "cron",
++            "session_id": "cron_daily-brief_20260804_090000",
++        }
++    }
++
++
++def test_api_server_without_a_session_does_not_emit_ambient_provenance(monkeypatch):
++    monkeypatch.setattr(
++        "gateway.session_context.get_session_env",
++        lambda name, default="": "api_server" if name == "HERMES_SESSION_PLATFORM" else default,
++    )
++
++    assert mcp_tool._forwarded_session_metadata(
++        {"forward_session_identity": True}
++    ) is None
++
++
++def test_low_level_tool_call_serializes_identity_as_mcp_meta():
++    observed = {}
++
++    class Session:
++        async def send_request(self, request, result_type):
++            observed["request"] = request.root.model_dump(by_alias=True, exclude_none=True)
++            observed["result_type"] = result_type
++            return mcp_types.CallToolResult(
++                content=[mcp_types.TextContent(type="text", text="ok")],
++                isError=False,
++            )
++
++        async def _validate_tool_result(self, name, result):
++            observed["validated"] = (name, result.isError)
++
++    metadata = {
++        mcp_tool._HERMES_CALLER_META_KEY: {
++            "source": "hermes",
++            "platform": "google_chat",
++            "user_id": "person@example.com",
++        }
++    }
++    result = asyncio.run(mcp_tool._call_tool_with_metadata(
++        Session(), "publish_dashboard", {"name": "Daily"}, metadata
++    ))
++
++    assert result.isError is False
++    assert observed["request"]["method"] == "tools/call"
++    assert observed["request"]["params"]["_meta"] == metadata
++    assert observed["request"]["params"]["arguments"] == {"name": "Daily"}
++    assert observed["result_type"] is mcp_types.CallToolResult
++    assert observed["validated"] == ("publish_dashboard", False)
++
++
++def test_failure_after_metadata_request_is_not_retried_as_a_duplicate_call():
++    observed = {"fallback_calls": 0}
++
++    class Session:
++        async def send_request(self, _request, _result_type):
++            raise RuntimeError("transport outcome unknown")
++
++        async def call_tool(self, _name, arguments=None):
++            observed["fallback_calls"] += 1
++
++    metadata = {
++        mcp_tool._HERMES_CALLER_META_KEY: {
++            "source": "hermes",
++            "platform": "google_chat",
++            "user_id": "person@example.com",
++        }
++    }
++    with pytest.raises(RuntimeError, match="outcome unknown"):
++        asyncio.run(mcp_tool._call_tool_with_metadata(
++            Session(), "publish_dashboard", {"name": "Daily"}, metadata
++        ))
++
++    assert observed["fallback_calls"] == 0
