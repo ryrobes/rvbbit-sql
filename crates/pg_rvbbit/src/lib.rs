@@ -11,13 +11,14 @@ use std::time::Instant;
 
 ::pgrx::pg_module_magic!();
 
+mod accel_activity;
 mod bitmap;
 mod brain;
 mod cache;
 mod capsule;
 mod catalog;
-mod catalog_kg;
 mod catalog_drift;
+mod catalog_kg;
 mod catcher;
 mod cluster;
 mod code_steps;
@@ -30,8 +31,8 @@ mod delete_log;
 mod df;
 mod duck_backend;
 mod duck_telemetry;
-mod engine_rows;
 mod embeddings;
+mod engine_rows;
 mod evidence;
 mod explain;
 mod fast_hash;
@@ -45,10 +46,10 @@ mod live_counters;
 mod migrations;
 mod model_orchestration;
 mod model_studio;
-mod pgvector_tier;
-mod pg_context;
 mod mv;
 mod operators;
+mod pg_context;
+mod pgvector_tier;
 mod pipeline;
 mod planner;
 mod prewarm;
@@ -57,9 +58,10 @@ mod provider_catalog;
 mod providers;
 mod python_runtime;
 mod rewriter;
-mod storage;
 #[cfg(not(test))]
 mod route_log;
+mod routing_lock_isolation;
+mod storage;
 #[cfg(test)]
 mod route_log {
     pub unsafe fn register_hooks() {}

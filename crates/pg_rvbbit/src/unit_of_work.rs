@@ -199,6 +199,7 @@ fn run_single_llm(op: &OpDef, scope: &mut Scope, feedback: Option<&str>) -> Work
         model: model.clone(),
         system: Some(system),
         user,
+        request_user: scope.request_user(),
         temperature,
         max_tokens: Some(op.max_tokens as u32),
         // Single-LLM operators use the default provider; pin a specific one
@@ -433,6 +434,7 @@ fn run_step_llm(
             Some(system_rendered)
         },
         user: user_rendered,
+        request_user: scope.request_user(),
         temperature,
         max_tokens: Some(max_tokens),
         provider,
@@ -572,6 +574,7 @@ fn run_step_agent(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let request_user = scope.request_user();
     let system = scope.render(step.get("system").and_then(|v| v.as_str()).unwrap_or(""));
     let task = scope.render(step.get("task").and_then(|v| v.as_str()).unwrap_or(""));
     let max_iters = step
@@ -903,6 +906,7 @@ fn run_step_agent(
             &messages,
             &tool_specs,
             Some(max_tokens),
+            request_user.as_deref(),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -2500,6 +2504,12 @@ impl Scope {
         }
     }
 
+    /// Provider-facing end-user attribution captured on the Postgres leader
+    /// before this unit of work may move to a pool thread.
+    pub fn request_user(&self) -> Option<String> {
+        request_user_from_opts(&self.opts)
+    }
+
     /// Render a template by substituting `{{ key }}` and `{{ a.b.c }}`
     /// references.
     pub fn render(&self, template: &str) -> String {
@@ -2556,6 +2566,63 @@ impl Scope {
         };
         descend_value(&base, descend)
     }
+}
+
+/// Internal opts key used to carry cost attribution across worker threads.
+/// It is deliberately hidden from the public operator contract and excluded
+/// from cache hashing. Never use this value for authorization.
+pub(crate) const REQUEST_USER_OPT: &str = "_rvbbit_request_user";
+
+fn clean_request_user(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 254 || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+pub(crate) fn request_user_from_opts(opts: &Value) -> Option<String> {
+    opts.get(REQUEST_USER_OPT)
+        .and_then(Value::as_str)
+        .and_then(clean_request_user)
+}
+
+/// Read the request identity parked by Warehouse MCP on this SQL session.
+/// PostgreSQL GUC access is leader-only; callers must capture this before
+/// dispatching work to the flow pool.
+pub(crate) fn session_request_user() -> Option<String> {
+    if crate::flow::in_pool_worker() {
+        return None;
+    }
+    crate::duck_backend::guc_setting("rvbbit.request_user")
+        .as_deref()
+        .and_then(clean_request_user)
+        .or_else(|| {
+            // Direct SQL clients have no Warehouse application identity, but
+            // their Postgres role is still a useful stable cost dimension.
+            pgrx::Spi::get_one::<String>("SELECT current_user")
+                .ok()
+                .flatten()
+                .and_then(|value| clean_request_user(&value))
+        })
+}
+
+/// Clone public opts and stamp the trusted session identity into an internal
+/// field. Any same-named user-supplied option is removed first so it cannot
+/// spoof provider cost attribution.
+pub(crate) fn with_session_request_user(opts: &Value) -> Value {
+    let mut enriched = if opts.is_object() {
+        opts.clone()
+    } else {
+        Value::Object(Map::new())
+    };
+    if let Value::Object(map) = &mut enriched {
+        map.remove(REQUEST_USER_OPT);
+        if let Some(user) = session_request_user() {
+            map.insert(REQUEST_USER_OPT.to_string(), Value::String(user));
+        }
+    }
+    enriched
 }
 
 fn descend_value(base: &Value, path: &[&str]) -> Value {
@@ -2758,5 +2825,22 @@ mod tests {
         ]);
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0]["mime_type"], "image/png");
+    }
+
+    #[test]
+    fn request_user_is_internal_bounded_telemetry() {
+        let opts = json!({"_rvbbit_request_user": " person@example.com "});
+        assert_eq!(
+            request_user_from_opts(&opts).as_deref(),
+            Some("person@example.com")
+        );
+        assert_eq!(
+            Scope::new(json!({}), opts).request_user().as_deref(),
+            Some("person@example.com")
+        );
+        assert!(request_user_from_opts(&json!({"_rvbbit_request_user": "bad\nuser"})).is_none());
+        assert!(
+            request_user_from_opts(&json!({"_rvbbit_request_user": "x".repeat(255)})).is_none()
+        );
     }
 }

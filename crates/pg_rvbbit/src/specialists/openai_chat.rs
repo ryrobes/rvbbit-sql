@@ -6,7 +6,7 @@
 //! of them with `rvbbit.register_backend(..., 'openai_chat', ...)`.
 //!
 //! Each input is one chat request object — `{model, system, user,
-//! temperature, max_tokens}` — built by `providers::chat`. Chat completions
+//! request_user, temperature, max_tokens}` — built by `providers::chat`. Chat completions
 //! has no batch API, so N inputs become N sequential calls here (the warm
 //! engine parallelizes across rows via the pool); `client_batches` is false.
 //! Semaphores cap both per-backend and total openai_chat fan-out so a bulk
@@ -19,6 +19,70 @@ use serde_json::Value;
 
 use super::{http_client, SpecialistResponse, SpecialistSpec, Transport, Usage};
 use crate::providers::ProviderError;
+
+const OPENROUTER_APP_URL: &str = "https://rvbbit.ai";
+const OPENROUTER_APP_TITLE: &str = "RVBBIT";
+
+/// Resolve the model placed on the provider wire. Ordinary OpenAI-compatible
+/// backends remain caller-selectable. A managed backend instead owns one
+/// canonical service alias: omitted/canonical/legacy-alias requests normalize
+/// to that value, while arbitrary model ids fail clearly rather than silently
+/// changing the service or its billing boundary.
+pub(crate) fn resolve_chat_model(
+    spec: &SpecialistSpec,
+    requested: Option<&str>,
+) -> Result<String, ProviderError> {
+    let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+    let backend_model = spec
+        .transport_opts
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let managed = spec
+        .transport_opts
+        .get("model_policy")
+        .and_then(Value::as_str)
+        == Some("managed");
+
+    if managed {
+        let canonical = backend_model.ok_or_else(|| {
+            ProviderError::Config(format!(
+                "managed chat backend '{}' has no canonical transport_opts.model",
+                spec.name
+            ))
+        })?;
+        let compatible = requested.map_or(true, |model| {
+            model == canonical
+                || spec
+                    .transport_opts
+                    .get("model_aliases")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .any(|alias| alias == model)
+        });
+        if compatible {
+            return Ok(canonical.to_string());
+        }
+        return Err(ProviderError::Config(format!(
+            "backend '{}' manages its model as '{}'; '{}' is not a supported compatibility alias. Select a different provider to choose a model",
+            spec.name,
+            canonical,
+            requested.unwrap_or_default()
+        )));
+    }
+
+    requested
+        .or(backend_model)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ProviderError::Config(
+                "chat request missing 'model' (and the backend has no default in transport_opts.model)".into(),
+            )
+        })
+}
 
 pub struct OpenAiChatTransport {
     /// Cap on concurrent in-flight calls across all openai_chat providers
@@ -38,29 +102,13 @@ impl OpenAiChatTransport {
         spec: &SpecialistSpec,
         input: &Value,
     ) -> Result<(String, Usage), ProviderError> {
-        // Managed/capability backends (Clover) serve a fixed alias stamped in
-        // transport_opts.model — callers may omit the model entirely and get
-        // the backend's default, which is what lets the rest of the system
-        // use a managed provider "freely" without knowing its alias.
-        let model = input
-            .get("model")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                spec.transport_opts
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.trim().is_empty())
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| {
-                ProviderError::Config(
-                    "chat request missing 'model' (and the backend has no default in transport_opts.model)".into(),
-                )
-            })?;
+        let model = resolve_chat_model(spec, input.get("model").and_then(Value::as_str))?;
         let model = model.as_str();
         let user = input.get("user").and_then(|v| v.as_str()).unwrap_or("");
+        let request_user = input
+            .get("request_user")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         let system = input
             .get("system")
             .and_then(|v| v.as_str())
@@ -91,6 +139,7 @@ impl OpenAiChatTransport {
         let body = ChatBody {
             model,
             messages,
+            user: request_user,
             temperature,
             max_tokens: if use_max_completion_tokens {
                 None
@@ -107,9 +156,10 @@ impl OpenAiChatTransport {
         let mut req = http_client()
             .post(&spec.endpoint_url)
             .timeout(Duration::from_millis(spec.timeout_ms))
-            // OpenRouter uses these for attribution; harmless elsewhere.
-            .header("HTTP-Referer", "https://github.com/rvbbit-postgres/rvbbit")
-            .header("X-Title", "rvbbit")
+            // OpenRouter uses these for app attribution; harmless elsewhere.
+            .header("HTTP-Referer", OPENROUTER_APP_URL)
+            .header("X-OpenRouter-Title", OPENROUTER_APP_TITLE)
+            .header("X-Title", OPENROUTER_APP_TITLE)
             .json(&body);
         if let Some(token) = spec.auth_token() {
             req = req.bearer_auth(token);
@@ -198,9 +248,11 @@ impl Transport for OpenAiChatTransport {
         messages: &[crate::providers::ChatMessage],
         tools: &[crate::providers::ToolSpec],
         max_tokens: Option<u32>,
+        request_user: Option<&str>,
     ) -> Result<crate::providers::ChatToolsResponse, ProviderError> {
         use crate::providers::{ChatToolsResponse, ToolCall};
         let t0 = std::time::Instant::now();
+        let model = resolve_chat_model(spec, Some(model))?;
 
         // Wire messages: a Value array so we can echo `tool_calls` verbatim and
         // attach `tool_call_id` on tool-result turns without a struct per shape.
@@ -226,7 +278,10 @@ impl Transport for OpenAiChatTransport {
             })
             .collect();
 
-        let mut body = serde_json::json!({ "model": model, "messages": wire_msgs });
+        let mut body = serde_json::json!({ "model": &model, "messages": wire_msgs });
+        if let Some(user) = request_user.filter(|value| !value.is_empty()) {
+            body["user"] = Value::String(user.to_string());
+        }
         if !tools.is_empty() {
             let wire_tools: Vec<Value> = tools
                 .iter()
@@ -253,14 +308,18 @@ impl Transport for OpenAiChatTransport {
             .and_then(|v| v.as_str())
             .map(|field| field == "max_completion_tokens")
             .unwrap_or_else(|| spec.endpoint_url.contains("api.openai.com"));
-        body[if use_mct { "max_completion_tokens" } else { "max_tokens" }] =
-            serde_json::json!(tool_completion_budget(max_tokens));
+        body[if use_mct {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        }] = serde_json::json!(tool_completion_budget(max_tokens));
 
         let mut req = http_client()
             .post(&spec.endpoint_url)
             .timeout(Duration::from_millis(spec.timeout_ms))
-            .header("HTTP-Referer", "https://github.com/rvbbit-postgres/rvbbit")
-            .header("X-Title", "rvbbit")
+            .header("HTTP-Referer", OPENROUTER_APP_URL)
+            .header("X-OpenRouter-Title", OPENROUTER_APP_TITLE)
+            .header("X-Title", OPENROUTER_APP_TITLE)
             .json(&body);
         if let Some(token) = spec.auth_token() {
             req = req.bearer_auth(token);
@@ -339,10 +398,7 @@ impl Transport for OpenAiChatTransport {
                     .cloned(),
             );
         }
-        let raw_tool_calls = msg
-            .get("tool_calls")
-            .filter(|v| !v.is_null())
-            .cloned();
+        let raw_tool_calls = msg.get("tool_calls").filter(|v| !v.is_null()).cloned();
         let tool_calls: Vec<ToolCall> = raw_tool_calls
             .as_ref()
             .and_then(|v| v.as_array())
@@ -352,11 +408,17 @@ impl Transport for OpenAiChatTransport {
                         let id = tc.get("id").and_then(|v| v.as_str())?.to_string();
                         let func = tc.get("function")?;
                         let name = func.get("name").and_then(|v| v.as_str())?.to_string();
-                        let args_str =
-                            func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
-                        let arguments =
-                            serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({}));
-                        Some(ToolCall { id, name, arguments })
+                        let args_str = func
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
+                        let arguments = serde_json::from_str(args_str)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        Some(ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        })
                     })
                     .collect()
             })
@@ -377,7 +439,7 @@ impl Transport for OpenAiChatTransport {
             tool_calls,
             raw_tool_calls,
             finish_reason,
-            model: model.to_string(),
+            model,
             provider: spec.name.clone(),
             prompt_tokens,
             completion_tokens,
@@ -394,6 +456,8 @@ impl Transport for OpenAiChatTransport {
 struct ChatBody<'a> {
     model: &'a str,
     messages: Vec<Msg<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -442,12 +506,80 @@ struct RespUsage {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_completion_budget;
+    use super::{resolve_chat_model, tool_completion_budget, ChatBody, Msg};
+    use crate::specialists::SpecialistSpec;
+
+    fn spec(transport_opts: serde_json::Value) -> SpecialistSpec {
+        SpecialistSpec {
+            name: "clover_llm".into(),
+            transport: "openai_chat".into(),
+            endpoint_url: "http://example.test/v1/chat/completions".into(),
+            batch_size: 1,
+            max_concurrent: 1,
+            timeout_ms: 1000,
+            auth_header_env: None,
+            resolved_token: None,
+            transport_opts,
+        }
+    }
 
     #[test]
     fn tool_chat_honors_operator_completion_budget() {
         assert_eq!(tool_completion_budget(Some(32_768)), 32_768);
         assert_eq!(tool_completion_budget(None), 4_096);
         assert_eq!(tool_completion_budget(Some(1)), 16);
+    }
+
+    #[test]
+    fn managed_model_normalizes_canonical_legacy_and_omitted_requests() {
+        let spec = spec(serde_json::json!({
+            "model": "clover",
+            "model_policy": "managed",
+            "model_aliases": ["gemma4"]
+        }));
+
+        assert_eq!(resolve_chat_model(&spec, None).unwrap(), "clover");
+        assert_eq!(resolve_chat_model(&spec, Some("clover")).unwrap(), "clover");
+        assert_eq!(resolve_chat_model(&spec, Some("gemma4")).unwrap(), "clover");
+    }
+
+    #[test]
+    fn managed_model_rejects_arbitrary_overrides() {
+        let spec = spec(serde_json::json!({
+            "model": "clover",
+            "model_policy": "managed",
+            "model_aliases": ["gemma4"]
+        }));
+
+        let error = resolve_chat_model(&spec, Some("openai/gpt-5.4")).unwrap_err();
+        assert!(error.to_string().contains("Select a different provider"));
+    }
+
+    #[test]
+    fn ordinary_openai_backend_keeps_caller_model_selection() {
+        let spec = spec(serde_json::json!({"model": "default/model"}));
+        assert_eq!(
+            resolve_chat_model(&spec, Some("chosen/model")).unwrap(),
+            "chosen/model"
+        );
+    }
+
+    #[test]
+    fn chat_body_serializes_provider_tracking_user_separately_from_prompt() {
+        let value = serde_json::to_value(ChatBody {
+            model: "example/model",
+            messages: vec![Msg {
+                role: "user",
+                content: "prompt text",
+            }],
+            user: Some("person@example.com"),
+            temperature: None,
+            max_tokens: Some(32),
+            max_completion_tokens: None,
+        })
+        .unwrap();
+
+        assert_eq!(value["user"], "person@example.com");
+        assert_eq!(value["messages"][0]["content"], "prompt text");
     }
 }

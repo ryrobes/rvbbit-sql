@@ -327,6 +327,62 @@ def test_openai_compatible_local_chat_provider(rvbbit, openai_compatible_chat_se
         rvbbit.execute("SELECT rvbbit.reload_backends()")
 
 
+def test_managed_chat_provider_normalizes_aliases_and_rejects_model_changes(
+    rvbbit, openai_compatible_chat_server
+):
+    """Managed Clover names a service; callers cannot swap its implementation."""
+    name = f"managed_llm_{uuid.uuid4().hex[:8]}"
+    endpoint = openai_compatible_chat_server["endpoint"]
+    try:
+        rvbbit.execute(
+            """
+            SELECT rvbbit.register_backend(
+              backend_name => %s,
+              backend_endpoint => %s,
+              backend_transport => 'openai_chat',
+              backend_timeout_ms => 5000,
+              backend_opts => %s::jsonb)
+            """,
+            (
+                name,
+                endpoint,
+                json.dumps(
+                    {
+                        "model": "clover",
+                        "model_policy": "managed",
+                        "model_aliases": ["gemma4"],
+                    }
+                ),
+            ),
+        )
+        rvbbit.execute("SELECT rvbbit.reload_backends()")
+
+        for requested in ("", "clover", "gemma4"):
+            result = rvbbit.execute(
+                "SELECT rvbbit.provider_test(%s, %s, 'hello')",
+                (name, requested),
+            ).fetchone()[0]
+            assert result["ok"] is True, result
+            assert result["model"] == "clover"
+            assert "model=clover" in result["content"]
+
+        rejected = rvbbit.execute(
+            "SELECT rvbbit.provider_test(%s, 'openai/gpt-5.4', 'hello')", (name,)
+        ).fetchone()[0]
+        assert rejected["ok"] is False
+        assert "Select a different provider" in rejected["error"]
+
+        seen = openai_compatible_chat_server["seen"]
+        assert [call["body"]["model"] for call in seen[-3:]] == [
+            "clover",
+            "clover",
+            "clover",
+        ]
+    finally:
+        rvbbit.execute("DELETE FROM rvbbit.backends WHERE name = %s", (name,))
+        rvbbit.execute("SELECT rvbbit.reload_backends()")
+
+
 def test_openai_chat_respects_backend_max_concurrent(rvbbit, openai_compatible_chat_server):
     """openai_chat honors each backend's max_concurrent catalog setting."""
     name = f"vllm_limit_{uuid.uuid4().hex[:8]}"

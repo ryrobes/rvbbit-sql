@@ -525,8 +525,7 @@ fn parse_json_output(raw: &str) -> Result<serde_json::Value, serde_json::Error> 
     let candidate = if let Some(after_open) = trimmed.strip_prefix("```") {
         match after_open.split_once('\n') {
             Some((language, body))
-                if language.trim().is_empty()
-                    || language.trim().eq_ignore_ascii_case("json") =>
+                if language.trim().is_empty() || language.trim().eq_ignore_ascii_case("json") =>
             {
                 body.trim_end()
                     .strip_suffix("```")
@@ -590,7 +589,7 @@ fn agg_run_inner(op_name: &str, state: Option<JsonB>, expected_return: &str) -> 
         .and_then(|j| j.0.get("collection").cloned())
         .unwrap_or_else(|| serde_json::json!([]));
     let inputs = serde_json::json!({ "collection": collection });
-    let opts = serde_json::json!({});
+    let opts = unit_of_work::with_session_request_user(&serde_json::json!({}));
     let result = unit_of_work::execute(&op, &inputs, &opts);
     crate::probe::record_fresh(&op.name, &inputs, &result);
     // Cache key + receipts for aggregates use the collection hash —
@@ -859,10 +858,14 @@ pub(crate) fn invoke_with_cache_seeded(
     // tiers above, so prewarmed rows — which return at the L1/L2 hits — are not
     // double-counted). Covers the per-row / over-cap path that skips prewarm.
     crate::live_counters::tick(&op.name, 1);
-    let result: WorkResult = crate::takes::execute_attempt(op, inputs, opts, None);
+    // Capture the Warehouse-provided request identity on the leader before a
+    // takes plan can move provider calls onto worker threads. This hidden opt
+    // is telemetry-only and intentionally excluded from the cache key above.
+    let request_opts = crate::unit_of_work::with_session_request_user(opts);
+    let result: WorkResult = crate::takes::execute_attempt(op, inputs, &request_opts, None);
     // Validators + retry: if the operator carries a retry plan and the
     // output fails its validator, re-run with feedback. No-op otherwise.
-    let result = crate::validator::apply_retry(op, inputs, opts, result);
+    let result = crate::validator::apply_retry(op, inputs, &request_opts, result);
     // Post-wards gate the final output.
     let result = crate::validator::apply_post_wards(op, inputs, result);
     crate::probe::record_fresh(&op.name, inputs, &result);
@@ -888,7 +891,12 @@ pub(crate) fn invoke_with_cache_seeded(
 /// Semantic Tests runner so batteries re-exercise the model each run.
 fn cache_bypass_active() -> bool {
     crate::duck_backend::guc_setting("rvbbit.cache_bypass")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "on" | "true" | "1" | "yes"
+            )
+        })
         .unwrap_or(false)
 }
 

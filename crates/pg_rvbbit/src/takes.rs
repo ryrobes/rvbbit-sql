@@ -229,7 +229,7 @@ fn execute_takes(op: &OpDef, inputs: &Value, opts: &Value, feedback: Option<&str
             },
             None,
         ),
-        Reduce::Evaluator => evaluator_pick(op, inputs, &takes, &alive, &plan),
+        Reduce::Evaluator => evaluator_pick(op, inputs, opts, &takes, &alive, &plan),
     };
 
     let mut result = assemble(takes, chosen);
@@ -416,7 +416,12 @@ fn consensus_merge(takes: &[WorkResult], alive: &[usize], plan: &TakesPlan) -> O
             let conf = item.get("confidence").and_then(|c| c.as_f64());
             let entry = tallies.entry(key.clone()).or_insert_with(|| {
                 order += 1;
-                Tally { count: 0, first: item.clone(), first_order: order, confidences: Vec::new() }
+                Tally {
+                    count: 0,
+                    first: item.clone(),
+                    first_order: order,
+                    confidences: Vec::new(),
+                }
             });
             // A duplicate within ONE take is not extra agreement.
             if seen_this_take.insert(key) {
@@ -474,6 +479,7 @@ fn vote(takes: &[WorkResult], alive: &[usize]) -> usize {
 fn evaluator_pick(
     op: &OpDef,
     inputs: &Value,
+    opts: &Value,
     takes: &[WorkResult],
     alive: &[usize],
     plan: &TakesPlan,
@@ -502,6 +508,7 @@ fn evaluator_pick(
         model: model.clone(),
         system: Some(instructions),
         user,
+        request_user: unit_of_work::request_user_from_opts(opts),
         temperature: Some(0.0),
         max_tokens: Some(16),
         provider: None,

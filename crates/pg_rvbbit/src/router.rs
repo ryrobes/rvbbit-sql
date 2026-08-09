@@ -1113,7 +1113,7 @@ fn route_explain(query: &str) -> JsonB {
 
 #[pg_extern(volatile)]
 fn route_shadow_explain(query: &str, log: default!(bool, "false")) -> JsonB {
-    JsonB(route_explain_value_inner(query, true, true, log))
+    JsonB(route_explain_value_inner(query, true, true, log, None))
 }
 
 #[pg_extern(volatile)]
@@ -1799,7 +1799,7 @@ fn route_merge_profiles(target_profile: &str, source_profiles: JsonB, active: bo
 }
 
 pub(crate) fn route_explain_value(query: &str, include_plan: bool) -> Value {
-    route_explain_value_inner(query, include_plan, false, false)
+    route_explain_value_inner(query, include_plan, false, false, None)
 }
 
 fn route_explain_value_inner(
@@ -1807,6 +1807,7 @@ fn route_explain_value_inner(
     include_plan: bool,
     include_shadow: bool,
     log_shadow: bool,
+    relation_oids: Option<&[u32]>,
 ) -> Value {
     let mut out = Map::new();
     out.insert("route".into(), json!("none"));
@@ -1833,7 +1834,10 @@ fn route_explain_value_inner(
         );
     }
 
-    let tables = referenced_rvbbit_tables(query, plan.as_deref());
+    let tables = relation_oids.map_or_else(
+        || referenced_rvbbit_tables(query, plan.as_deref()),
+        referenced_rvbbit_tables_for_oids,
+    );
     out.insert(
         "rvbbit_tables".into(),
         Value::Array(tables.iter().map(table_metric_json).collect()),
@@ -1882,17 +1886,30 @@ fn route_explain_value_inner(
 }
 
 pub(crate) fn route_rewrite_value(query: &str) -> Value {
-    if let Some(fast) = route_rewrite_value_fast(query) {
+    if let Some(fast) = route_rewrite_value_fast(query, None) {
         return fast;
     }
     route_explain_value(query, false)
 }
 
-fn route_rewrite_value_fast(query: &str) -> Option<Value> {
+/// Router entrypoint used by the analyzed-query rewrite hook. PostgreSQL has
+/// already resolved every RangeTblEntry to an OID, so this path never needs to
+/// rediscover references by scanning all registered accelerator names.
+pub(crate) fn route_rewrite_value_for_oids(query: &str, relation_oids: &[u32]) -> Value {
+    if let Some(fast) = route_rewrite_value_fast(query, Some(relation_oids)) {
+        return fast;
+    }
+    route_explain_value_inner(query, false, false, false, Some(relation_oids))
+}
+
+fn route_rewrite_value_fast(query: &str, relation_oids: Option<&[u32]>) -> Option<Value> {
     if safe_select(query).is_err() {
         return None;
     }
-    let tables = referenced_rvbbit_tables(query, None);
+    let tables = relation_oids.map_or_else(
+        || referenced_rvbbit_tables(query, None),
+        referenced_rvbbit_tables_for_oids,
+    );
     if tables.is_empty() {
         return None;
     }
@@ -5054,20 +5071,22 @@ fn route_profile_selection_by_name(name: String, source: &'static str) -> RouteP
 }
 
 thread_local! {
-    /// Per-backend memo of the EXPENSIVE half of the route runtime stamp — the
-    /// full-catalog `string_agg` over every rvbbit table's size/rows/bytes/deletes.
+    /// Per-backend memo of the relation-local half of the route runtime stamp.
+    /// The analyzed query hook supplies exact RangeTblEntry OIDs, so cache keys
+    /// never need to open or aggregate unrelated accelerated relations.
     /// The cheap half (route_force_candidate + active profile) is recomputed fresh on
     /// every call so explicit control — including the training harness's per-candidate
     /// `route_force_candidate` — takes effect immediately. The stamp is used ONLY as the
-    /// route-cache key (rewriter::duck_route_doc_for_probe); the aggregation ran on every
-    /// routable query, BEFORE the cache lookup, so even cache hits paid for it (and
-    /// embedding it in the key thrashed the cache on any data change). Memoizing it with a
-    /// short TTL collapses that cost for long-lived/pooled connections. Routing is
+    /// route-cache key (rewriter::duck_route_doc_for_probe). Memoizing each exact OID set
+    /// with a short TTL collapses repeated metadata reads for long-lived/pooled connections
+    /// without allowing an unrelated table to enter the route path. Routing is
     /// correctness-neutral (never changes query results), so a <=TTL-stale table
     /// fingerprint at worst delays a re-route by TTL after a data-size change.
-    static ROUTE_TABLE_STATE_MEMO: std::cell::RefCell<Option<(Instant, String)>> =
-        const { std::cell::RefCell::new(None) };
+    static ROUTE_TABLE_STATE_MEMO: std::cell::RefCell<HashMap<Vec<u32>, (Instant, String)>> =
+        std::cell::RefCell::new(HashMap::new());
 }
+
+const ROUTE_TABLE_STATE_MEMO_MAX: usize = 512;
 
 /// TTL for the table-state memo. `RVBBIT_ROUTE_STAMP_TTL_MS` overrides the 1000ms
 /// default; `0` disables memoization (recompute every call) for strict freshness.
@@ -5079,7 +5098,7 @@ fn route_stamp_ttl() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-pub(crate) fn route_runtime_stamp() -> String {
+pub(crate) fn route_runtime_stamp(relation_oids: &[u32]) -> String {
     if !relations_present(&[
         "rvbbit.tables",
         "rvbbit.route_profiles",
@@ -5106,43 +5125,27 @@ pub(crate) fn route_runtime_stamp() -> String {
     format!(
         "{profile_stamp}|runtime={}|tables={}",
         crate::duck_backend::accelerator_route_runtime_stamp(),
-        route_table_state_stamp()
+        route_table_state_stamp(relation_oids)
     )
 }
 
-/// The expensive full-catalog table-state aggregation, memoized per-backend with a TTL.
-/// Same shape as the inline form it replaced (`string_agg(...)` or `none`), but using
-/// `relpages` instead of `pg_relation_size` for the heap-fork size — see the note in the
-/// body for why (the fs-stat version was the catalog-crawl slowness).
-fn route_table_state_stamp() -> String {
-    let ttl = route_stamp_ttl();
-    if !ttl.is_zero() {
-        if let Some(cached) = ROUTE_TABLE_STATE_MEMO.with(|memo| {
-            memo.borrow()
-                .as_ref()
-                .filter(|(at, _)| at.elapsed() < ttl)
-                .map(|(_, ts)| ts.clone())
-        }) {
-            return cached;
-        }
+fn normalized_relation_oids(relation_oids: &[u32]) -> Vec<u32> {
+    let mut out = relation_oids.iter().copied().filter(|oid| *oid > 0).collect::<Vec<_>>();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Build a relation-local route-cache fingerprint query using only catalog
+/// columns. `pg_relation_filenode()` is intentionally forbidden here because
+/// it opens target relations with AccessShareLock.
+fn route_table_state_sql(relation_oids: &[u32]) -> Option<String> {
+    let relation_oids = normalized_relation_oids(relation_oids);
+    if relation_oids.is_empty() {
+        return None;
     }
-    // `c.relpages * block_size` (catalog estimate, refreshed by (auto)vacuum/analyze)
-    // replaces `pg_relation_size(c.oid)` here. pg_relation_size stat()s every fork of
-    // every rvbbit-AM relation on EACH call; on a real warehouse (2800+ such relations,
-    // incl. toast) that is ~8s of syscalls, and with this stamp memoized at only a 1s TTL
-    // it recomputed ~10x across a single multi-query statement — turning every routed
-    // catalog-crawl sub-query into an 8s tax (90s to fingerprint a 71-row table). relpages
-    // is free (already in the catalog) and good enough: this string is ONLY a route-cache
-    // key, the precise rvbbit data size is still captured by rg.bytes, and routing is
-    // correctness-neutral so a slightly-stale heap-fork estimate at worst delays a re-route.
-    //
-    // The per-table tombstone count met the same fate (2026-07-17, field evidence: 46% of
-    // a client's total DB runtime — 107k calls, each scanning a 365M-row delete_log). The
-    // stamp is ONE GLOBAL string, so per-table precision adds no invalidation power over a
-    // global monotonic marker: max(deleted_xid) is an O(1) backward index descent and bumps
-    // on every tombstone insert. Tombstone REMOVAL (reap/rebuild) doesn't bump it, but those
-    // paths already move filenode / row-group sums / last_refresh_xid in the same stamp.
-    let table_state = Spi::get_one::<String>(
+    let oid_list = relation_oids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    Some(format!(
         "SELECT coalesce(string_agg( \
                     c.oid::text || ':' || (c.relpages::bigint * current_setting('block_size')::bigint)::text || ':' || \
                     coalesce(rg.rows, 0)::text || ':' || coalesce(rg.bytes, 0)::text || ':' || \
@@ -5153,27 +5156,60 @@ fn route_table_state_stamp() -> String {
                     coalesce(ds.dirty_has_delete, false)::text || ':' || \
                     coalesce(ds.dirty_has_truncate, false)::text || ':' || \
                     coalesce(a.last_refresh_xid, 0)::text || ':' || \
-                    pg_relation_filenode(c.oid)::text, \
+                    c.relfilenode::text || ':' || coalesce(dl.max_deleted_xid::text, '0'), \
                     ',' ORDER BY c.oid \
                 ), 'none') \
-                || '|dl:' || coalesce((SELECT max(deleted_xid) FROM rvbbit.delete_log)::text, '0') \
-	         FROM rvbbit.tables t \
-	         JOIN pg_class c ON c.oid = t.table_oid \
-	         JOIN rvbbit.table_dirty_state ds ON ds.table_oid = c.oid \
-	         LEFT JOIN rvbbit.acceleration_state a ON a.table_oid = c.oid \
-	         LEFT JOIN ( \
-	             SELECT table_oid, sum(n_rows)::bigint AS rows, sum(n_bytes)::bigint AS bytes \
+         FROM rvbbit.tables t \
+         JOIN pg_class c ON c.oid = t.table_oid \
+         JOIN rvbbit.table_dirty_state ds ON ds.table_oid = c.oid \
+         LEFT JOIN rvbbit.acceleration_state a ON a.table_oid = c.oid \
+         LEFT JOIN ( \
+             SELECT table_oid, sum(n_rows)::bigint AS rows, sum(n_bytes)::bigint AS bytes \
              FROM rvbbit.row_groups_visible \
+             WHERE table_oid IN ({oid_list}) \
              GROUP BY table_oid \
          ) rg ON rg.table_oid = c.oid \
-	         WHERE coalesce(t.acceleration_enabled, true)",
-    )
+         LEFT JOIN ( \
+             SELECT table_oid, max(deleted_xid) AS max_deleted_xid \
+             FROM rvbbit.delete_log \
+             WHERE table_oid IN ({oid_list}) \
+             GROUP BY table_oid \
+         ) dl ON dl.table_oid = c.oid \
+         WHERE coalesce(t.acceleration_enabled, true) \
+           AND c.oid IN ({oid_list})"
+    ))
+}
+
+/// Relation-local table state, memoized per analyzed OID set. A query against
+/// table B never consults, opens, or waits on table A.
+fn route_table_state_stamp(relation_oids: &[u32]) -> String {
+    let key = normalized_relation_oids(relation_oids);
+    let Some(sql) = route_table_state_sql(&key) else {
+        return "none".to_string();
+    };
+    let ttl = route_stamp_ttl();
+    if !ttl.is_zero() {
+        if let Some(cached) = ROUTE_TABLE_STATE_MEMO.with(|memo| {
+            memo.borrow()
+                .get(&key)
+                .filter(|(at, _)| at.elapsed() < ttl)
+                .map(|(_, ts)| ts.clone())
+        }) {
+            return cached;
+        }
+    }
+    let table_state = Spi::get_one::<String>(&sql)
     .ok()
     .flatten()
     .unwrap_or_else(|| "none".to_string());
     if !ttl.is_zero() {
-        ROUTE_TABLE_STATE_MEMO
-            .with(|memo| *memo.borrow_mut() = Some((Instant::now(), table_state.clone())));
+        ROUTE_TABLE_STATE_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.len() >= ROUTE_TABLE_STATE_MEMO_MAX && !memo.contains_key(&key) {
+                memo.clear();
+            }
+            memo.insert(key, (Instant::now(), table_state.clone()));
+        });
     }
     table_state
 }
@@ -5218,6 +5254,18 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
         return Vec::new();
     }
     table_metrics_for(&ref_oids)
+}
+
+fn referenced_rvbbit_tables_for_oids(relation_oids: &[u32]) -> Vec<RvbbitTableMetric> {
+    let ref_oids = normalized_relation_oids(relation_oids)
+        .into_iter()
+        .map(i64::from)
+        .collect::<Vec<_>>();
+    if ref_oids.is_empty() {
+        Vec::new()
+    } else {
+        table_metrics_for(&ref_oids)
+    }
 }
 
 /// `(oid, lower(schema), lower(relname))` for one rvbbit-registered relation — the memoized
@@ -9942,5 +9990,17 @@ mod route_unit_tests {
             fallback_external_candidate_order(&features).map(|order| order[0]),
             Some(Candidate::DuckVortex)
         );
+    }
+
+    #[test]
+    fn route_stamp_sql_is_relation_local_and_never_opens_target_heaps() {
+        let sql = route_table_state_sql(&[77, 42, 77]).expect("non-empty OID set");
+        assert!(sql.contains("c.oid IN (42,77)"));
+        assert!(sql.contains("WHERE table_oid IN (42,77)"));
+        assert!(sql.contains("c.relfilenode::text"));
+        assert!(!sql.contains("pg_relation_filenode"));
+        assert!(!sql.contains("pg_relation_size"));
+        assert_eq!(normalized_relation_oids(&[77, 42, 77]), vec![42, 77]);
+        assert!(route_table_state_sql(&[]).is_none());
     }
 }

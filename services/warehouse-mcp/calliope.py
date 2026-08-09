@@ -100,6 +100,7 @@ _MAX_VOICE_PERSONALITY_CHARS = 600
 _MAX_VOICE_SCRIPT_CHARS = 1_200
 _MAX_VOICE_SCRIPT_WORDS = 76
 _MAX_VOICE_AUDIO_BYTES = 16 * 1024 * 1024
+_DEFAULT_VOICE_PREPARE_TIMEOUT_SECONDS = 30
 _VOICE_SAMPLE_RATE = 24_000
 _VOICE_MODES = {"fast", "expressive"}
 _VOICE_STREAM_PROTOCOL = "timed-pcm-ndjson-v1"
@@ -818,6 +819,7 @@ class CalliopeConfig:
     voice_expressive_model: str = "eleven_v3"
     voice_sample_rate: int = _VOICE_SAMPLE_RATE
     max_voice_audio_bytes: int = _MAX_VOICE_AUDIO_BYTES
+    voice_prepare_timeout_seconds: int = _DEFAULT_VOICE_PREPARE_TIMEOUT_SECONDS
     dreaming_enabled: bool = True
     dream_evidence_lab_enabled: bool = True
     dream_timezone: str = "UTC"
@@ -894,6 +896,15 @@ class CalliopeConfig:
             )
         except (TypeError, ValueError):
             max_voice_audio = _MAX_VOICE_AUDIO_BYTES
+        try:
+            voice_prepare_timeout = int(
+                os.environ.get(
+                    "WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS",
+                    str(_DEFAULT_VOICE_PREPARE_TIMEOUT_SECONDS),
+                )
+            )
+        except (TypeError, ValueError):
+            voice_prepare_timeout = _DEFAULT_VOICE_PREPARE_TIMEOUT_SECONDS
         try:
             dream_hour = int(os.environ.get("WAREHOUSE_CALLIOPE_DREAM_HOUR", "3"))
         except (TypeError, ValueError):
@@ -1015,6 +1026,10 @@ class CalliopeConfig:
             max_voice_audio_bytes=max(
                 1024 * 1024,
                 min(max_voice_audio, 64 * 1024 * 1024),
+            ),
+            voice_prepare_timeout_seconds=max(
+                5,
+                min(voice_prepare_timeout, 120),
             ),
             dreaming_enabled=os.environ.get(
                 "WAREHOUSE_CALLIOPE_DREAMS", "1"
@@ -1503,12 +1518,22 @@ def _attribute_voice_semantic_receipts(
         )
 
 
+def _set_voice_statement_timeout(conn: Any, timeout_seconds: int) -> None:
+    """Keep a stuck semantic rewrite from outliving the browser's voice budget."""
+    timeout_ms = max(1_000, (max(1, int(timeout_seconds)) - 2) * 1_000)
+    conn.execute(
+        "SELECT set_config('statement_timeout',%s,false)",
+        (f"{timeout_ms}ms",),
+    )
+
+
 def _generate_voice_script(
     conn_factory: Callable[..., Any],
     source: str,
     mode: str,
     personality: str,
     owner: str,
+    timeout_seconds: int = _DEFAULT_VOICE_PREPARE_TIMEOUT_SECONDS,
 ) -> tuple[str, str, str | None]:
     """Create one receipted spoken projection without mutating the canonical answer."""
     source = str(source or "")[:_MAX_VOICE_SOURCE_CHARS]
@@ -1519,6 +1544,7 @@ def _generate_voice_script(
     operator_input = source
     try:
         with conn_factory() as conn:
+            _set_voice_statement_timeout(conn, timeout_seconds)
             available = conn.execute(
                 "SELECT "
                 "to_regprocedure('rvbbit.clover_llm_apply(text,text,jsonb)') IS NOT NULL AS clover3,"
@@ -1528,6 +1554,7 @@ def _generate_voice_script(
             ).fetchone()
         if available and available.get("clover3"):
             with conn_factory() as conn:
+                _set_voice_statement_timeout(conn, timeout_seconds)
                 raw = conn.execute(
                     "SELECT rvbbit.clover_llm_apply(%s,%s,%s::jsonb) AS script",
                     (source, instruction, "{}"),
@@ -1539,6 +1566,7 @@ def _generate_voice_script(
             provider, model, operator = "clover", "clover_llm_apply", "clover_llm_apply"
         elif available and available.get("clover2"):
             with conn_factory() as conn:
+                _set_voice_statement_timeout(conn, timeout_seconds)
                 raw = conn.execute(
                     "SELECT rvbbit.clover_llm_apply(%s,%s) AS script",
                     (source, instruction),
@@ -1551,6 +1579,7 @@ def _generate_voice_script(
         elif available and (available.get("summarize2") or available.get("summarize1")):
             operator_input = instruction + "\n\nCALLIOPE_ANSWER:\n" + source
             with conn_factory() as conn:
+                _set_voice_statement_timeout(conn, timeout_seconds)
                 raw = conn.execute(
                     "SELECT rvbbit.summarize(%s,%s::jsonb) AS script"
                     if available.get("summarize2")
@@ -1579,12 +1608,14 @@ def _voice_turn(
     owner: str,
     session_id: Any,
     turn_id: Any,
+    timeout_seconds: int = _DEFAULT_VOICE_PREPARE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     normalized_session = _uuid(session_id)
     normalized_turn = _uuid(turn_id)
     if not normalized_session or not normalized_turn:
         raise ValueError("Choose a completed Calliope response to speak.")
     with conn_factory() as conn:
+        _set_voice_statement_timeout(conn, timeout_seconds)
         row = conn.execute(
             "SELECT t.id,t.session_id,t.assistant_message,t.status,t.response_receipt "
             "FROM rvbbit.calliope_turns t "
@@ -1614,7 +1645,13 @@ def _voice_render(
     mode = str(mode or "").strip().lower()
     if mode not in _VOICE_MODES:
         raise ValueError("Voice mode must be fast or expressive.")
-    turn = _voice_turn(conn_factory, owner, session_id, turn_id)
+    turn = _voice_turn(
+        conn_factory,
+        owner,
+        session_id,
+        turn_id,
+        config.voice_prepare_timeout_seconds,
+    )
     source = str(turn.get("assistant_message") or "")
     personality = _clean_voice_personality(personality_value)
     source_hash = hashlib.sha256(
@@ -1640,9 +1677,16 @@ def _voice_render(
     ):
         return dict(existing), True
 
+    rewrite_started = time.monotonic()
     script, provider, rewrite_model = _generate_voice_script(
-        conn_factory, source, mode, personality, owner
+        conn_factory,
+        source,
+        mode,
+        personality,
+        owner,
+        config.voice_prepare_timeout_seconds,
     )
+    rewrite_elapsed_ms = max(0, round((time.monotonic() - rewrite_started) * 1_000))
     if not script:
         raise ValueError("Calliope could not prepare a useful spoken version of that answer.")
     render = {
@@ -1654,12 +1698,14 @@ def _voice_render(
         "personality_hash": personality_hash,
         "rewrite_provider": provider,
         "rewrite_model": rewrite_model,
+        "rewrite_elapsed_ms": rewrite_elapsed_ms,
         "tts_provider": "elevenlabs",
         "tts_model": tts_model,
         "sample_rate": config.voice_sample_rate,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     with conn_factory() as conn:
+        _set_voice_statement_timeout(conn, config.voice_prepare_timeout_seconds)
         stored = conn.execute(
             "UPDATE rvbbit.calliope_turns t SET response_receipt="
             "jsonb_set(coalesce(t.response_receipt,'{}'::jsonb),'{voice}',%s::jsonb,true) "
@@ -1835,12 +1881,14 @@ def _voice_render_for_audio(
     owner: str,
     turn_id: Any,
     render_id: Any,
+    timeout_seconds: int = _DEFAULT_VOICE_PREPARE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     normalized_turn = _uuid(turn_id)
     normalized_render = _uuid(render_id)
     if not normalized_turn or not normalized_render:
         raise LookupError("That spoken response is no longer available.")
     with conn_factory() as conn:
+        _set_voice_statement_timeout(conn, timeout_seconds)
         row = conn.execute(
             "SELECT t.response_receipt FROM rvbbit.calliope_turns t "
             "JOIN rvbbit.calliope_sessions s ON s.id=t.session_id "
@@ -1896,6 +1944,9 @@ async def _open_voice_provider_stream(
             },
         )
         response = await client.send(request, stream=True)
+    except asyncio.CancelledError:
+        await client.aclose()
+        raise
     except httpx.HTTPError as exc:
         await client.aclose()
         raise VoiceProviderError(
@@ -3092,8 +3143,6 @@ BEGIN
     END IF;
 END
 $do$;
-CREATE UNIQUE INDEX IF NOT EXISTS calliope_dream_cycles_nightly_date_idx
-    ON rvbbit.calliope_dream_cycles (cycle_date) WHERE cycle_kind='nightly';
 CREATE INDEX IF NOT EXISTS calliope_dream_cycles_started_idx
     ON rvbbit.calliope_dream_cycles (started_at DESC);
 
@@ -21940,6 +21989,7 @@ def register_calliope_routes(
                     },
                 },
                 "sample_rate": config.voice_sample_rate,
+                "prepare_timeout_seconds": config.voice_prepare_timeout_seconds,
                 "streaming": True,
                 "retains_source_audio": False,
                 "keeps_original_answer": True,
@@ -23077,16 +23127,34 @@ def register_calliope_routes(
             body = {}
         body = body if isinstance(body, dict) else {}
         try:
-            render, reused = await asyncio.to_thread(
-                _voice_render,
-                conn_factory,
-                config,
-                owner,
-                body.get("session_id"),
-                body.get("turn_id"),
-                body.get("mode"),
-                body.get("personality"),
+            render, reused = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _voice_render,
+                    conn_factory,
+                    config,
+                    owner,
+                    body.get("session_id"),
+                    body.get("turn_id"),
+                    body.get("mode"),
+                    body.get("personality"),
+                ),
+                timeout=config.voice_prepare_timeout_seconds,
             )
+        except TimeoutError:
+            print(
+                "WARNING: Calliope conversational voice rewrite timed out",
+                file=os.sys.stderr,
+            )
+            return json_response({
+                "error": {
+                    "code": "VOICE_TEXT_TIMEOUT",
+                    "stage": "text",
+                    "message": (
+                        "The conversational rewrite took too long. "
+                        "Showing the complete answer instead."
+                    ),
+                }
+            }, 504)
         except LookupError as exc:
             return json_response({
                 "error": {"code": "VOICE_TURN_NOT_FOUND", "message": str(exc)}
@@ -23100,6 +23168,7 @@ def register_calliope_routes(
             return json_response({
                 "error": {
                     "code": "VOICE_RENDER_FAILED",
+                    "stage": "text",
                     "message": "Calliope could not prepare that spoken response.",
                 }
             }, 502)
@@ -23126,13 +23195,25 @@ def register_calliope_routes(
                 }
             }, 503)
         try:
-            render = await asyncio.to_thread(
-                _voice_render_for_audio,
-                conn_factory,
-                owner,
-                request.path_params.get("turn_id"),
-                request.query_params.get("render"),
+            render = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _voice_render_for_audio,
+                    conn_factory,
+                    owner,
+                    request.path_params.get("turn_id"),
+                    request.query_params.get("render"),
+                    config.voice_prepare_timeout_seconds,
+                ),
+                timeout=config.voice_prepare_timeout_seconds,
             )
+        except TimeoutError:
+            return json_response({
+                "error": {
+                    "code": "VOICE_AUDIO_TIMEOUT",
+                    "stage": "audio",
+                    "message": "Audio generation did not start in time.",
+                }
+            }, 504)
         except LookupError as exc:
             return json_response({
                 "error": {"code": "VOICE_RENDER_NOT_FOUND", "message": str(exc)}
@@ -23186,7 +23267,22 @@ def register_calliope_routes(
             )
 
         try:
-            client, upstream = await _open_voice_provider_stream(config, render)
+            client, upstream = await asyncio.wait_for(
+                _open_voice_provider_stream(config, render),
+                timeout=config.voice_prepare_timeout_seconds,
+            )
+        except TimeoutError:
+            print(
+                "WARNING: Calliope voice provider connection timed out",
+                file=os.sys.stderr,
+            )
+            return json_response({
+                "error": {
+                    "code": "VOICE_AUDIO_TIMEOUT",
+                    "stage": "audio",
+                    "message": "Audio generation did not start in time.",
+                }
+            }, 504)
         except VoiceProviderError as exc:
             status = 503 if exc.code in {
                 "VOICE_UNAVAILABLE",
@@ -23194,7 +23290,11 @@ def register_calliope_routes(
                 "VOICE_RATE_LIMITED",
             } else 502
             return json_response({
-                "error": {"code": exc.code, "message": str(exc)[:400]}
+                "error": {
+                    "code": exc.code,
+                    "stage": "audio",
+                    "message": str(exc)[:400],
+                }
             }, status)
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -23209,9 +23309,26 @@ def register_calliope_routes(
             written = 0
             complete = False
             frames: list[dict[str, Any]] = []
+            first_audio_deadline = (
+                time.monotonic() + config.voice_prepare_timeout_seconds
+            )
             try:
                 with temporary.open("wb") as handle:
-                    async for line in upstream.aiter_lines():
+                    provider_lines = upstream.aiter_lines().__aiter__()
+                    while True:
+                        try:
+                            if written:
+                                line = await anext(provider_lines)
+                            else:
+                                remaining = first_audio_deadline - time.monotonic()
+                                if remaining <= 0:
+                                    raise TimeoutError
+                                line = await asyncio.wait_for(
+                                    anext(provider_lines),
+                                    timeout=remaining,
+                                )
+                        except StopAsyncIteration:
+                            break
                         audio, alignment = _voice_provider_frame(line)
                         if not audio:
                             continue
@@ -23246,6 +23363,15 @@ def register_calliope_routes(
                     )
             except VoiceProviderError as exc:
                 yield _voice_stream_error(str(exc), exc.code)
+            except TimeoutError:
+                print(
+                    "WARNING: Calliope voice provider produced no audio before timeout",
+                    file=os.sys.stderr,
+                )
+                yield _voice_stream_error(
+                    "Audio generation did not start in time.",
+                    "VOICE_AUDIO_TIMEOUT",
+                )
             finally:
                 await upstream.aclose()
                 await client.aclose()

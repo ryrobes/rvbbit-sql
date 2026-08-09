@@ -91,6 +91,7 @@ def _conn(read_only: bool = False, role: str | None = None):
         # their GRANTs/RLS govern the query. Connection is per-call, so plain
         # SET ROLE is safe (no pool to leak into).
         c.execute('SET ROLE "%s"' % role.replace('"', '""'))
+    _set_request_tracking_user(c)
     if read_only:
         # belt: txn read-only blocks any write/DDL even for a superuser DSN.
         # suspenders (prod): the mapped role simply lacks write grants.
@@ -111,6 +112,29 @@ _SESSION_SUB = contextvars.ContextVar("rvbbit_session_sub", default=None)
 # a task-local override so it can improve attribution without ever changing the
 # access token, PG role, or authorization decision for the call.
 _FORWARDED_CALLER = contextvars.ContextVar("rvbbit_forwarded_caller", default=None)
+
+
+def _request_tracking_user():
+    """Best-effort caller label for provider cost reporting, never auth."""
+    try:
+        caller_fn = globals().get("_caller")
+        caller = caller_fn()[0] if callable(caller_fn) else None
+    except Exception:  # noqa: BLE001 — attribution must not gate a request
+        caller = None
+    value = str(caller or "").strip()
+    if not value or len(value) > 254 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return None
+    return value
+
+
+def _set_request_tracking_user(conn):
+    """Park telemetry identity in the SQL session for pg_rvbbit provider calls."""
+    user = _request_tracking_user()
+    if user:
+        # A custom GUC is intentionally used as an application telemetry seam.
+        # pg_rvbbit captures it before dispatching work to worker threads. It is
+        # never consulted by database or application authorization code.
+        conn.execute("SELECT set_config('rvbbit.request_user', %s, false)", (user,))
 
 
 @dataclass(frozen=True)
@@ -190,6 +214,7 @@ def _ro():
     """An autocommit, read-only connection for grounding lookups (samples/stats/
     freshness) — autocommit so one failed probe can't poison the rest of the loop."""
     c = psycopg.connect(DSN, row_factory=dict_row, autocommit=True)
+    _set_request_tracking_user(c)
     c.execute("SET default_transaction_read_only = on")
     c.execute(f"SET statement_timeout = {STMT_TIMEOUT_MS}")
     return c
@@ -7487,6 +7512,30 @@ def tool_render_pdf(name, html=None, slug=None, source_artifact_id=None,
             "bridge": telemetry}
 
 
+def _is_openrouter_endpoint(url):
+    try:
+        host = (urlsplit(str(url)).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
+def _openai_compatible_request(base, key, payload, app_title="Calliope (RVBBIT)"):
+    """Apply OpenRouter attribution without changing other compatible APIs."""
+    headers = {"Authorization": f"Bearer {key}"}
+    body = dict(payload)
+    if _is_openrouter_endpoint(base):
+        headers.update({
+            "HTTP-Referer": "https://rvbbit.ai",
+            "X-OpenRouter-Title": app_title,
+            # Kept for older OpenRouter clients while the modern header above
+            # is the canonical application name.
+            "X-Title": app_title,
+        })
+        body["user"] = _request_tracking_user() or "calliope-system"
+    return headers, body
+
+
 def _llm_chat(messages, model=None, max_tokens=1600):
     """One openai-compatible chat call using the box's vision/chat envs
     (WAREHOUSE_VISION_BASE/KEY/MODEL; OpenRouter/OpenAI keys as fallback).
@@ -7498,9 +7547,14 @@ def _llm_chat(messages, model=None, max_tokens=1600):
     mdl = model or os.environ.get("WAREHOUSE_VISION_MODEL", "google/gemini-2.5-flash")
     if not key:
         raise RuntimeError("set WAREHOUSE_VISION_KEY (or OPENROUTER_API_KEY / OPENAI_API_KEY)")
+    headers, body = _openai_compatible_request(
+        base,
+        key,
+        {"model": mdl, "max_tokens": max_tokens, "messages": messages},
+    )
     r = httpx.post(f"{base}/chat/completions",
-                   headers={"Authorization": f"Bearer {key}"},
-                   json={"model": mdl, "max_tokens": max_tokens, "messages": messages},
+                   headers=headers,
+                   json=body,
                    timeout=90.0)
     r.raise_for_status()
     return (r.json()["choices"][0]["message"]["content"] or ""), mdl
@@ -8546,11 +8600,16 @@ def _llm_extract(html):
               '{"queries":["<each full SQL the page runs>"],"metrics":["<metric names>"]}. '
               'Give a representative form for dynamically-built SQL. No prose.\n\n--- SOURCE ---\n' + html[:24000])
     try:
+        headers, body = _openai_compatible_request(
+            "https://openrouter.ai/api/v1",
+            key,
+            {"model": EXTRACT_MODEL, "temperature": 0,
+             "messages": [{"role": "user", "content": prompt}]},
+        )
         with httpx.Client(timeout=45) as cli:
             r = cli.post("https://openrouter.ai/api/v1/chat/completions",
-                         headers={"Authorization": f"Bearer {key}"},
-                         json={"model": EXTRACT_MODEL, "temperature": 0,
-                               "messages": [{"role": "user", "content": prompt}]})
+                         headers=headers,
+                         json=body)
             txt = r.json()["choices"][0]["message"]["content"]
         d = json.loads(txt[txt.find("{"):txt.rfind("}") + 1])
         return [q for q in d.get("queries", []) if q], [m for m in d.get("metrics", []) if m]

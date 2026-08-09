@@ -149,6 +149,169 @@ def test_vortex_format_variant_and_forced_datafusion_route(rvbbit, temp_table):
         rvbbit.execute("SET rvbbit.compact_vortex_layout = 'off'")
 
 
+def test_full_rebuild_stages_vortex_from_new_canonical_files(rvbbit, temp_table):
+    rvbbit.execute(f"""
+        CREATE TABLE {temp_table} (
+            id int PRIMARY KEY,
+            bucket int NOT NULL,
+            payload text NOT NULL
+        ) USING rvbbit
+    """)
+    rvbbit.execute(f"""
+        INSERT INTO {temp_table}
+        SELECT g, g % 7, repeat('payload-' || g, 4)
+        FROM generate_series(1, 250) g
+    """)
+    rvbbit.execute("SET rvbbit.compact_hive_layout = 'off'")
+    rvbbit.execute("SET rvbbit.compact_vortex_layout = 'on'")
+
+    rvbbit.execute(
+        f"SELECT rvbbit.refresh_acceleration('{temp_table}'::regclass, true)"
+    ).fetchone()
+    old_paths = {
+        row[0]
+        for row in rvbbit.execute(
+            f"""
+            SELECT path
+            FROM rvbbit.row_group_variants
+            WHERE table_oid = '{temp_table}'::regclass
+              AND layout = 'vortex_scan'
+            """
+        ).fetchall()
+    }
+    assert old_paths
+
+    rvbbit.execute(f"UPDATE {temp_table} SET bucket = (bucket + 1) % 7 WHERE id <= 25")
+    result = rvbbit.execute(
+        f"SELECT rvbbit.rebuild_acceleration('{temp_table}'::regclass, true)"
+    ).fetchone()[0]
+
+    assert result["status"] == "ok"
+    assert result["variants_rows"] == 250
+    assert rvbbit.execute(
+        f"SELECT count(*) FROM rvbbit.variant_build_queue "
+        f"WHERE table_oid = '{temp_table}'::regclass"
+    ).fetchone()[0] == 0
+
+    status = rvbbit.execute(
+        f"""
+        SELECT status, expected_rows, actual_rows, file_count
+        FROM rvbbit.layout_variant_status
+        WHERE table_oid = '{temp_table}'::regclass
+          AND layout = 'vortex_scan'
+        """
+    ).fetchone()
+    assert status[0:3] == ("ready", 250, 250)
+    assert status[3] >= 1
+
+    variants = rvbbit.execute(
+        f"""
+        SELECT v.path, v.build_operation_id,
+               EXISTS (
+                   SELECT 1 FROM rvbbit.row_groups rg
+                   WHERE rg.table_oid = v.table_oid AND rg.rg_id = v.rg_id
+               ) AS has_canonical
+        FROM rvbbit.row_group_variants v
+        WHERE v.table_oid = '{temp_table}'::regclass
+          AND v.layout = 'vortex_scan'
+        """
+    ).fetchall()
+    assert variants
+    assert all(row[1] == result["operation_id"] and row[2] for row in variants)
+    assert old_paths.isdisjoint({row[0] for row in variants})
+    assert rvbbit.execute(
+        f"""
+        SELECT count(*)
+        FROM rvbbit.orphaned_files
+        WHERE table_oid = '{temp_table}'::regclass
+          AND path = ANY(%s)
+        """,
+        (list(old_paths),),
+    ).fetchone()[0] == len(old_paths)
+
+    stage_phases = rvbbit.execute(
+        f"""
+        SELECT status, rows_written, details->>'source'
+        FROM rvbbit.acceleration_phase_log_for('{temp_table}'::regclass)
+        WHERE operation_id = %s AND phase = 'format_variant_stage'
+        """,
+        (result["operation_id"],),
+    ).fetchall()
+    assert any(row == ("ok", 250, "canonical_parquet") for row in stage_phases)
+
+
+def test_variant_queue_coalesces_and_tick_repairs_from_parquet(rvbbit, temp_table):
+    rvbbit.execute(f"""
+        CREATE TABLE {temp_table} (id int, payload text) USING rvbbit
+    """)
+    rvbbit.execute(f"""
+        INSERT INTO {temp_table}
+        SELECT g, repeat('queued-' || g, 3)
+        FROM generate_series(1, 75) g
+    """)
+    rvbbit.execute("SET rvbbit.compact_hive_layout = 'off'")
+    rvbbit.execute("SET rvbbit.compact_vortex_layout = 'on'")
+    rvbbit.execute(
+        f"SELECT rvbbit.rebuild_acceleration('{temp_table}'::regclass, false)"
+    ).fetchone()
+
+    first = rvbbit.execute(
+        f"SELECT rvbbit.enqueue_variant_build('{temp_table}'::regclass, 'first', 1000000)"
+    ).fetchone()[0]
+    second = rvbbit.execute(
+        f"SELECT rvbbit.enqueue_variant_build('{temp_table}'::regclass, 'newest', 1000001)"
+    ).fetchone()[0]
+    assert first["status"] == second["status"] == "queued"
+    queued = rvbbit.execute(
+        f"""
+        SELECT count(*), min(reason), min(priority), min(target_rows)
+        FROM rvbbit.variant_build_queue
+        WHERE table_oid = '{temp_table}'::regclass
+        """
+    ).fetchone()
+    assert queued == (1, "newest", 1000001, 75)
+
+    planned = rvbbit.execute(
+        "SELECT table_oid, status, executed FROM rvbbit.variant_tick(1, true)"
+    ).fetchone()
+    assert planned == (
+        rvbbit.execute(f"SELECT '{temp_table}'::regclass::oid").fetchone()[0],
+        "planned",
+        False,
+    )
+
+    built = rvbbit.execute(
+        "SELECT table_oid, status, executed, rows_written "
+        "FROM rvbbit.variant_tick(1, false)"
+    ).fetchone()
+    assert built[0] == planned[0]
+    assert built[1:] == ("ok", True, 75)
+    assert rvbbit.execute(
+        f"SELECT count(*) FROM rvbbit.variant_build_queue "
+        f"WHERE table_oid = '{temp_table}'::regclass"
+    ).fetchone()[0] == 0
+    assert rvbbit.execute(
+        f"""
+        SELECT status, expected_rows, actual_rows
+        FROM rvbbit.layout_variant_status
+        WHERE table_oid = '{temp_table}'::regclass
+          AND layout = 'vortex_scan'
+        """
+    ).fetchone() == ("ready", 75, 75)
+
+    # A table drop removes the parent registry row before row_groups cascades.
+    # The canonical-change trigger must treat that as teardown, not attempt to
+    # resurrect a queue row with a now-invalid foreign key.
+    rvbbit.execute(
+        f"SELECT rvbbit.enqueue_variant_build('{temp_table}'::regclass, 'drop_probe', 1)"
+    )
+    rvbbit.execute(f"DROP TABLE {temp_table} CASCADE")
+    assert rvbbit.execute(
+        "SELECT count(*) FROM rvbbit.variant_build_queue WHERE table_oid = %s",
+        (planned[0],),
+    ).fetchone()[0] == 0
+
+
 def test_direct_canonical_parquet_import_uses_threaded_writer_and_logs_timing(
     rvbbit, temp_table
 ):

@@ -135,6 +135,7 @@ pub trait Transport: Send + Sync {
         _messages: &[crate::providers::ChatMessage],
         _tools: &[crate::providers::ToolSpec],
         _max_tokens: Option<u32>,
+        _request_user: Option<&str>,
     ) -> Result<crate::providers::ChatToolsResponse, ProviderError> {
         Err(ProviderError::NotImplemented(format!(
             "transport '{}' does not support tool-calling chat",
@@ -165,7 +166,10 @@ fn build_transports() -> HashMap<&'static str, Box<dyn Transport>> {
         Box::new(openai_chat::OpenAiChatTransport::new()),
     );
     m.insert("stub", Box::new(stub::StubTransport::new()));
-    m.insert("peer_queue", Box::new(peer_queue::PeerQueueTransport::new()));
+    m.insert(
+        "peer_queue",
+        Box::new(peer_queue::PeerQueueTransport::new()),
+    );
     m
 }
 
@@ -553,10 +557,7 @@ fn lane_retry_after_ms(resp: reqwest::blocking::Response) -> u64 {
     resp.text()
         .ok()
         .and_then(|b| serde_json::from_str::<Value>(&b).ok())
-        .and_then(|j| {
-            j.pointer("/error/retry_after_ms")
-                .and_then(|v| v.as_u64())
-        })
+        .and_then(|j| j.pointer("/error/retry_after_ms").and_then(|v| v.as_u64()))
         .unwrap_or(500)
 }
 

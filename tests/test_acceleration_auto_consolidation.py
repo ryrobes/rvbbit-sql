@@ -3,6 +3,7 @@ import threading
 import time
 
 import psycopg
+import pytest
 
 
 RVBBIT_DSN = os.environ.get(
@@ -68,7 +69,116 @@ def _wait_for_rebuild_lock_wait(rvbbit, timeout=10):
     raise AssertionError("rebuild did not reach the final lock wait")
 
 
-def test_accel_tick_consolidates_clean_row_group_fanout(rvbbit, temp_table):
+def test_accel_tick_bootstraps_registered_unbuilt_table(rvbbit, temp_table):
+    rvbbit.execute("SET rvbbit.compact_vortex_layout = 'off'")
+    rvbbit.execute("SET rvbbit.compact_hive_layout = 'off'")
+    rvbbit.execute(
+        f"CREATE TABLE {temp_table} (id int PRIMARY KEY, label text) USING rvbbit"
+    )
+    rvbbit.execute(
+        f"INSERT INTO {temp_table} VALUES (1, 'one'), (2, 'two'), (3, 'three')"
+    )
+    rvbbit.execute(f"ANALYZE {temp_table}")
+
+    # Registration alone is eligibility, not a materialized accelerator. This
+    # exact state used to fall through accel_tick as clean forever.
+    assert _row_group_state(rvbbit, temp_table) == (0, 0)
+    assert rvbbit.execute(
+        f"""
+        SELECT count(*)::int
+        FROM pg_trigger
+        WHERE tgrelid = '{temp_table}'::regclass
+          AND NOT tgisinternal
+        """
+    ).fetchone()[0] == 0
+
+    rvbbit.execute(
+        f"""
+        SELECT rvbbit.set_accel_policy(
+            '{temp_table}'::regclass,
+            strategy => 'scheduled',
+            min_interval_secs => 0
+        )
+        """
+    )
+
+    planned = rvbbit.execute(
+        f"""
+        SELECT action, status, executed, reason
+        FROM rvbbit.accel_tick(NULL, true)
+        WHERE table_oid = '{temp_table}'::regclass
+        """
+    ).fetchone()
+    assert planned[0:3] == ("delta", "planned", False)
+    assert planned[3] == "no accelerator baseline"
+
+    executed = rvbbit.execute(
+        f"""
+        SELECT action, status, executed, rows_written, error
+        FROM rvbbit.accel_tick(NULL, false)
+        WHERE table_oid = '{temp_table}'::regclass
+        """
+    ).fetchone()
+    assert executed == ("delta", "ok", True, 3, None)
+    assert _row_group_state(rvbbit, temp_table)[1] == 3
+
+    trigger_names = {
+        row[0]
+        for row in rvbbit.execute(
+            f"""
+            SELECT tgname
+            FROM pg_trigger
+            WHERE tgrelid = '{temp_table}'::regclass
+              AND NOT tgisinternal
+            """
+        ).fetchall()
+    }
+    assert "rvbbit_shadow_heap_dirty_insert" in trigger_names
+    assert rvbbit.execute(f"SELECT count(*) FROM {temp_table}").fetchone()[0] == 3
+
+
+@pytest.mark.parametrize(
+    ("strategy", "target_secs", "prime_demand", "reason_fragment"),
+    [
+        ("target", 3600, False, "target requires a baseline"),
+        ("demand", None, True, "observed slow-path demand"),
+    ],
+)
+def test_accel_tick_bootstrap_respects_policy_gate(
+    rvbbit, temp_table, strategy, target_secs, prime_demand, reason_fragment
+):
+    rvbbit.execute(f"CREATE TABLE {temp_table} (id int) USING rvbbit")
+    rvbbit.execute(f"INSERT INTO {temp_table} SELECT generate_series(1, 20)")
+    rvbbit.execute(f"ANALYZE {temp_table}")
+    if prime_demand:
+        assert rvbbit.execute(f"SELECT count(*) FROM {temp_table}").fetchone()[0] == 20
+        # pg_stat flushes asynchronously; make the observed heap scan visible
+        # before asking the demand policy for its dry-run decision.
+        rvbbit.execute("SELECT pg_stat_force_next_flush()")
+
+    rvbbit.execute(
+        f"""
+        SELECT rvbbit.set_accel_policy(
+            '{temp_table}'::regclass,
+            strategy => %s,
+            freshness_target_secs => %s,
+            min_interval_secs => 0
+        )
+        """,
+        (strategy, target_secs),
+    )
+    planned = rvbbit.execute(
+        f"""
+        SELECT action, status, reason
+        FROM rvbbit.accel_tick(NULL, true)
+        WHERE table_oid = '{temp_table}'::regclass
+        """
+    ).fetchone()
+    assert planned[0:2] == ("delta", "planned")
+    assert reason_fragment in planned[2]
+
+
+def test_fold_tick_consolidates_clean_row_group_fanout(rvbbit, temp_table):
     rvbbit.execute("SET rvbbit.compact_vortex_layout = 'off'")
     rvbbit.execute("SET rvbbit.compact_hive_layout = 'off'")
     rvbbit.execute(
@@ -84,10 +194,19 @@ def test_accel_tick_consolidates_clean_row_group_fanout(rvbbit, temp_table):
     assert _row_group_state(rvbbit, temp_table) == (3, 3)
     _set_consolidation_policy(rvbbit, temp_table, max_row_groups=3)
 
-    planned = rvbbit.execute(
+    freshness = rvbbit.execute(
         f"""
         SELECT action, status, executed, reason
         FROM rvbbit.accel_tick(NULL, true)
+        WHERE table_oid = '{temp_table}'::regclass
+        """
+    ).fetchone()
+    assert freshness == ("skip", "skip", False, "clean")
+
+    planned = rvbbit.execute(
+        f"""
+        SELECT action, status, executed, reason
+        FROM rvbbit.accel_fold_tick(1, true)
         WHERE table_oid = '{temp_table}'::regclass
         """
     ).fetchone()
@@ -97,7 +216,7 @@ def test_accel_tick_consolidates_clean_row_group_fanout(rvbbit, temp_table):
     executed = rvbbit.execute(
         f"""
         SELECT action, status, executed, rows_written, error
-        FROM rvbbit.accel_tick(NULL, false)
+        FROM rvbbit.accel_fold_tick(1, false)
         WHERE table_oid = '{temp_table}'::regclass
         """
     ).fetchone()
@@ -111,7 +230,7 @@ def test_accel_tick_consolidates_clean_row_group_fanout(rvbbit, temp_table):
     assert settings["dropped_row_groups"] == 3
 
 
-def test_accel_tick_consolidates_clean_tombstone_pressure(rvbbit, temp_table):
+def test_fold_tick_consolidates_clean_tombstone_pressure(rvbbit, temp_table):
     rvbbit.execute("SET rvbbit.compact_vortex_layout = 'off'")
     rvbbit.execute("SET rvbbit.compact_hive_layout = 'off'")
     rvbbit.execute(
@@ -135,10 +254,19 @@ def test_accel_tick_consolidates_clean_tombstone_pressure(rvbbit, temp_table):
 
     _set_consolidation_policy(rvbbit, temp_table, max_tombstones=1)
 
-    planned = rvbbit.execute(
+    freshness = rvbbit.execute(
         f"""
         SELECT action, status, executed, reason
         FROM rvbbit.accel_tick(NULL, true)
+        WHERE table_oid = '{temp_table}'::regclass
+        """
+    ).fetchone()
+    assert freshness == ("skip", "skip", False, "clean")
+
+    planned = rvbbit.execute(
+        f"""
+        SELECT action, status, executed, reason
+        FROM rvbbit.accel_fold_tick(1, true)
         WHERE table_oid = '{temp_table}'::regclass
         """
     ).fetchone()
@@ -148,7 +276,7 @@ def test_accel_tick_consolidates_clean_tombstone_pressure(rvbbit, temp_table):
     executed = rvbbit.execute(
         f"""
         SELECT action, status, executed, rows_written, error
-        FROM rvbbit.accel_tick(NULL, false)
+        FROM rvbbit.accel_fold_tick(1, false)
         WHERE table_oid = '{temp_table}'::regclass
         """
     ).fetchone()

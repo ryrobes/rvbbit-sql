@@ -1,7 +1,8 @@
 # Accelerator Freshness — a managed, observable, value-driven control plane
 
-> Status: Layers 1–3 + UI cockpit SHIPPED & verified (2026-06-05) — uncommitted on `main`.
-> Heartbeat = pg_cron calling `rvbbit.accel_tick()`. 9 pg_tests + full live E2E green.
+> Status: Layers 1–3 + split freshness/fold lanes + activity instrumentation shipped.
+> Frequent heartbeat = `rvbbit.accel_tick()`; quiet-window compaction =
+> `rvbbit.accel_fold_tick()`. Both are serialized against each other.
 > Remaining/deferred: the north-star gradient+union (below); per-table route-attribution
 > for realized native-vs-accel speedup; richer cockpit "projected staleness curve" preview.
 > Companion to `SHAPE_MATERIALIZATION_PLAN.md`. The north star (gradient dirtiness +
@@ -58,6 +59,22 @@ built — the controller loop is just open:
   *raises* and tells you to rebuild first → executor catches and escalates.)
 - **Full rebuild** = `rvbbit.rebuild_acceleration(rel, refresh_variants)` — wipes derived
   state, re-exports from the heap. The escalation path.
+- **Vortex follows canonical parquet, not the heap.** A full rebuild now converts its
+  large staged parquet baseline before the final heap handoff lock, converts only the
+  small snapshot-gap range while that lock is held, validates row/file coverage, and
+  publishes both catalogs atomically. Existing Vortex files stay live until the swap
+  and are then retired through `orphaned_files`; an encoder failure never aborts the
+  canonical rebuild. `variant_build_queue` coalesces failures, legacy gaps, and unusual
+  direct row-group mutations to one latest-generation request per table.
+  `rvbbit.variant_tick(max_tables)` is the independent minute heartbeat; use
+  `rvbbit.schedule_variant_tick('* * * * *', 1)` when pg_cron is available. The hourly
+  storage maintenance pass remains reconciliation, not the primary Vortex builder.
+- **Current-only replacement boundary:** ordinary `TRUNCATE` + `COPY`/`INSERT`
+  stays plain PostgreSQL. It records one dirty replacement marker instead of
+  one tombstone per old row, routes latest reads to the heap, and makes
+  `accel_tick()` choose a full rebuild. UPDATE/DELETE still use row tombstones
+  when their identity overlay is complete, preserving accelerated reads until
+  the next fold.
 - **Freshness state** already tracked: `acceleration_state` (last_refresh_xid /
   _generation / _rows / _row_groups / _at), `acceleration_status` view (the authoritative
   computation), `acceleration_operations` (+`_phases`) — rebuild cost & history,
@@ -78,7 +95,33 @@ built — the controller loop is just open:
 - No **policy** expressing the user's cost/latency intent.
 - No **executor** that turns policy + freshness + budget into the right refresh action.
 
-## The design — three layers
+## Admission observer — decide what deserves an accelerator first
+
+The freshness controller starts after a table has been registered. Migration 0259 adds
+the missing pre-registration loop: `rvbbit.accel_autopilot_observe()`. It is deliberately
+**observe-only** and has no SQL path to enable, build, refresh, or rebuild a table.
+
+Each pass admits only read-shaped `SELECT` / `WITH` / `TABLE` SQL and timing from
+`rvbbit.mcp_activity`, then resolves base relations with `EXPLAIN` (never `ANALYZE`).
+Reset-aware `pg_stat_user_tables` deltas remain attached as churn/diagnostic context,
+but they cannot admit or score a candidate because PostgreSQL's table counters do not
+distinguish a user `SELECT` from `COPY`/ETL scans. Only table-level rollups are retained;
+the observer does not make a second archive of raw query text. The durable outputs are:
+
+- `accel_observer_runs` — pass health, resolver coverage, and timing-window counts;
+- `accel_observer_observations` — per-run evidence for before/after comparison;
+- `accel_autopilot_candidates` — the latest `observing | ready | held | managed` state;
+- `accel_observer_counters` — cheap contextual scan/write baselines.
+
+`ready` means recurring SELECT activity crossed the configured call/hour/time thresholds
+and passed conservative table-class, RLS, size, and churn gates. It is a review state, not
+an action. Views, foreign/partitioned/unlogged tables, RLS tables, and out-of-budget sizes
+remain legible as `held` rather than silently disappearing. The
+Scheduled Tasks preset runs it hourly (`7 * * * *`) only after an administrator chooses
+to create the job; a one-shot **Observe now** action lives in DataRabbit's Accelerate
+view. Set the singleton config row's mode to `off` to make every invocation a no-op.
+
+## The design — three freshness layers
 
 Reframe the unit of control: a policy is a **freshness target + a budget**, not a
 schedule. Declare intent ("keep within ~5 min stale" / "best-effort under N refreshes a
@@ -123,6 +166,59 @@ sub-budget (always full-overwrite). Logs to `acceleration_operations` (existing)
 `rvbbit.accel_tick_runs` (new, per-tick summary). Returns `SETOF` per-table actions.
 The difference from a dumb cron: it rebuilds **only dirty, high-value, in-budget**
 tables — the *control* is the policy+budget, not the clock.
+
+Clean row-group fanout and accumulated tombstones are deliberately **not** full-rebuild
+triggers in this high-frequency lane. Those Parquet runs are still authoritative and
+usually preferable to a heap scan. Optional major compaction belongs to
+`rvbbit.accel_fold_tick(budget, dry_run)`, which considers only clean tables over their
+explicit `max_row_groups_before_rebuild` / `max_tombstones_before_rebuild` thresholds.
+It shares the executor singleton lock, tries the per-table maintenance lock without
+waiting, rechecks freshness after acquiring it, and defaults to one table per
+transaction. This makes a frequent cheap freshness cadence compatible with a nightly or
+weekly expensive-fold cadence. Current-only replacement, a missing baseline, high dirty
+drift, and delta refusal remain correctness-required full rebuilds in `accel_tick()`.
+
+### Activity instrumentation — committed history plus truthful live state
+
+`rvbbit.accel_activity_log` is a retention-bounded append-only event stream with
+`sweep_started`, `table_started`, `table_finished`, and `sweep_finished` events. It
+captures lane, reason/action, exact elapsed time, rows/row groups, operation ID, and a
+stable table name even after a relation is dropped. The analysis surfaces are:
+
+- `rvbbit.accel_sweep_history` — one row per heartbeat, including total duration and
+  executed/deferred/failed counts;
+- `rvbbit.accel_table_runtime_profile` — retained per-table run count, error count,
+  average, p50, p95, and maximum duration;
+- `rvbbit.accel_fold_candidates` — clean fragmentation pressure and the reason a table
+  is due or blocked;
+- `rvbbit.accel_live_activity` — the currently running table, lane/action, elapsed
+  time, wait event, blockers, and all per-table advisory locks held by the transaction.
+
+The live view does **not** pretend an ordinary log table can expose uncommitted progress.
+Before each long operation, the worker stamps a compact table/sweep/action/start marker
+into `application_name`, which `pg_stat_activity` exposes immediately. Advisory locks
+corroborate it and provide a fallback for older workers. Committed event history becomes
+visible atomically when the worker finishes. `rvbbit.reap_logs()` includes the activity
+stream in its normal 14-day retention pass.
+
+A conservative starting equilibrium is frequent, small freshness sweeps and independent
+route-format repair, with folds kept in a quiet window:
+
+```sql
+-- Every few minutes, normally budget 1–2:
+SELECT * FROM rvbbit.accel_tick(1, false);
+
+-- Preview clean major-compaction pressure without work:
+SELECT * FROM rvbbit.accel_fold_tick(1, true);
+
+-- Conservative weekly fold, one table/transaction:
+SELECT rvbbit.schedule_accel_fold_tick('17 3 * * 0', 1);
+
+-- Operations/debugging surfaces:
+SELECT * FROM rvbbit.accel_live_activity;
+SELECT * FROM rvbbit.accel_sweep_history ORDER BY sweep_id DESC LIMIT 50;
+SELECT * FROM rvbbit.accel_table_runtime_profile ORDER BY p95_elapsed_ms DESC;
+```
 
 **Demand-driven complement:** ordering by `heap_seq_scans` already approximates
 warm-on-miss (tables people actually hit, currently on the slow path, get refreshed

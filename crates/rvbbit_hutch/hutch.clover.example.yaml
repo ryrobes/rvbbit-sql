@@ -211,7 +211,8 @@ backends:
     timeout_ms: 180000
 
 llms:
-  - name: gemma4
+  - name: clover
+    aliases: [gemma4]
     entitlement: clover_llm
     upstream_base: "http://localhost:8000"
     upstream_model: "nvidia/Gemma-4-31B-IT-NVFP4"

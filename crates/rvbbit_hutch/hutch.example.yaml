@@ -76,18 +76,20 @@ backends:
 # Hosted LLMs on the OpenAI-compatible surface (/v1/chat/completions,
 # routed by the request's `model` field; GET /v1/models lists entitled).
 # llms:
-#   - name: gemma4
-#     entitlement: gemma
+#   - name: clover
+#     aliases: [gemma4]
+#     entitlement: clover_llm
 #     upstream_base: "http://localhost:8000"
 #     upstream_model: "nvidia/Gemma-4-31B-IT-NVFP4"
 #     model_version: "gemma-4-31b-it-nvfp4"
 #     prompt_microusd_per_1k: 100
 #     completion_microusd_per_1k: 300
 #
-# A hosted OpenAI-compatible backend uses the same public model name and
-# supplies its credential only through the process environment:
-#   - name: gemma4
-#     entitlement: gemma
+# A hosted OpenAI-compatible backend keeps the same canonical Clover service
+# name while the server privately changes its implementation model:
+#   - name: clover
+#     aliases: [gemma4]
+#     entitlement: clover_llm
 #     upstream_base: "https://openrouter.ai/api"
 #     upstream_bearer_token_env: OPENROUTER_API_KEY
 #     upstream_model: "~deepseek/deepseek-v4-flash-latest"

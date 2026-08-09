@@ -226,6 +226,10 @@ def test_pk_truncate_delta_refresh_tombstones_all_rows(rvbbit, temp_table):
     rvbbit.execute(
         f"CREATE TABLE {temp_table} (id int PRIMARY KEY, label text) USING rvbbit"
     )
+    rvbbit.execute(
+        f"SELECT rvbbit.set_acceleration_storage_policy("
+        f"'{temp_table}'::regclass, history_policy => 'retained')"
+    )
     rvbbit.execute(f"INSERT INTO {temp_table} VALUES (1, 'one'), (2, 'two')")
     rvbbit.execute(f"SELECT rvbbit.refresh_acceleration('{temp_table}'::regclass, false)")
 
@@ -404,6 +408,10 @@ def test_no_pk_truncate_after_rewrite_tombstones_all_row_groups(rvbbit, temp_tab
     rvbbit.execute("SET rvbbit.accel_identity_map = 'on'")
     idx = f"{temp_table}_id_desc_idx"
     rvbbit.execute(f"CREATE TABLE {temp_table} (id int, label text) USING rvbbit")
+    rvbbit.execute(
+        f"SELECT rvbbit.set_acceleration_storage_policy("
+        f"'{temp_table}'::regclass, history_policy => 'retained')"
+    )
     rvbbit.execute(
         f"INSERT INTO {temp_table} VALUES (1, 'one'), (2, 'two'), (3, 'three')"
     )

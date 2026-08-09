@@ -96,6 +96,12 @@ impl Transport for OpenAiEmbeddingsTransport {
         let mut req = http_client()
             .post(&spec.endpoint_url)
             .timeout(Duration::from_millis(spec.timeout_ms))
+            // This transport can point directly at OpenRouter. Its batched
+            // specialist contract has no per-request caller today, but app
+            // attribution still identifies the spend as RVBBIT.
+            .header("HTTP-Referer", "https://rvbbit.ai")
+            .header("X-OpenRouter-Title", "RVBBIT")
+            .header("X-Title", "RVBBIT")
             .json(&body);
         if let Some(token) = spec.auth_token() {
             req = req.bearer_auth(token);

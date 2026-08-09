@@ -74,7 +74,13 @@ pub(crate) fn redact_body(body: &str) -> String {
     }
 
     // api_key / api-key / apikey / access_token / authorization  (= | :)  <token>
-    for marker in ["api_key", "api-key", "apikey", "access_token", "authorization"] {
+    for marker in [
+        "api_key",
+        "api-key",
+        "apikey",
+        "access_token",
+        "authorization",
+    ] {
         let mut i = 0usize;
         while let Some(rel) = lower[i..].find(marker) {
             let after = i + rel + marker.len();
@@ -140,6 +146,11 @@ pub struct ChatRequest {
     pub model: String,
     pub system: Option<String>,
     pub user: String,
+    /// Stable end-user identifier forwarded to providers that support usage
+    /// attribution (OpenRouter's top-level `user` field). This is telemetry
+    /// only and must never participate in authorization decisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_user: Option<String>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     /// LLM provider backend (a row in `rvbbit.backends`). `None` resolves
@@ -237,11 +248,16 @@ pub fn chat(req: ChatRequest) -> Result<ChatResponse, ProviderError> {
         None => crate::specialists::load_spec(&provider)?,
     };
 
-    let model = req.model;
+    let model = if spec.transport == "openai_chat" {
+        crate::specialists::openai_chat::resolve_chat_model(&spec, Some(&req.model))?
+    } else {
+        req.model
+    };
     let input = serde_json::json!({
         "model": &model,
         "system": req.system,
         "user": req.user,
+        "request_user": req.request_user,
         "temperature": req.temperature,
         "max_tokens": req.max_tokens,
     });
@@ -374,14 +390,23 @@ pub fn chat_with_tools(
     messages: &[ChatMessage],
     tools: &[ToolSpec],
     max_tokens: Option<u32>,
+    request_user: Option<&str>,
 ) -> Result<ChatToolsResponse, ProviderError> {
-    let provider = provider.map(|s| s.to_string()).unwrap_or_else(default_provider_name);
+    let provider = provider
+        .map(|s| s.to_string())
+        .unwrap_or_else(default_provider_name);
     let spec = match crate::specialists::get_cached_spec(&provider) {
         Some(s) => s,
         None => crate::specialists::load_spec(&provider)?,
     };
-    let mut resp = crate::specialists::transport_for(&spec.transport)?
-        .chat_with_tools(&spec, model, messages, tools, max_tokens)?;
+    let mut resp = crate::specialists::transport_for(&spec.transport)?.chat_with_tools(
+        &spec,
+        model,
+        messages,
+        tools,
+        max_tokens,
+        request_user,
+    )?;
     if resp.model.is_empty() {
         resp.model = model.to_string();
     }
@@ -405,7 +430,10 @@ mod redact_tests {
         assert!(out.contains("***REDACTED***"));
 
         let out2 = redact_body(r#"{"api_key": "supersecretvalue123", "x": 1}"#);
-        assert!(!out2.contains("supersecretvalue123"), "api_key value leaked: {out2}");
+        assert!(
+            !out2.contains("supersecretvalue123"),
+            "api_key value leaked: {out2}"
+        );
 
         // Long bodies are truncated with a marker.
         let long = "x".repeat(5000);

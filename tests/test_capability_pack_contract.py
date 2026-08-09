@@ -161,6 +161,20 @@ def test_llm_provider_pack_renders_chat_backend_and_provider_registration():
     assert "ports:" not in compose
 
 
+def test_managed_clover_uses_a_stable_service_model_alias():
+    capability = json.loads(
+        (PACKS / "managed" / "clover" / "capability.json").read_text(encoding="utf-8")
+    )
+    install_sql = "\n".join(capability["managed"]["install"]["sql"])
+
+    assert '"model": "clover"' in install_sql
+    assert '"model_policy": "managed"' in install_sql
+    assert '"model_aliases": ["gemma4"]' in install_sql
+    assert "'provider','clover_llm','model','gemma4'" not in install_sql
+    assert '"provider":"clover_llm","model":"gemma4"' not in install_sql
+    assert "nvidia/Gemma-4-31B-IT-NVFP4" not in install_sql
+
+
 def test_google_meet_pack_renders_as_a_governed_brain_connector():
     pack = PACKS / "integrations" / "google-meet-brain"
     register = subprocess.run(

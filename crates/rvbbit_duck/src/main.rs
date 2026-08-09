@@ -2970,6 +2970,7 @@ struct ServerRequest {
 
 #[derive(Clone)]
 struct CatalogSnapshot {
+    change_id: Option<i64>,
     fingerprint: String,
     catalog: BTreeMap<String, RvbbitDuckTable>,
 }
@@ -3366,17 +3367,34 @@ impl ServerState {
             return Ok((catalog, cache));
         }
 
-        let fingerprint = rvbbit_catalog_fingerprint(&mut self.pg, args)?;
-        cache.catalog_fingerprint = fingerprint.clone();
-        if let Some(snapshot) = &self.catalog {
-            if snapshot.fingerprint == fingerprint {
+        // A transactional append-only cursor replaces the old per-request
+        // fingerprint over every accelerated relation.
+        let change_id = rvbbit_catalog_change_id(&mut self.pg)?;
+        if let (Some(change_id), Some(snapshot)) = (change_id, self.catalog.as_ref()) {
+            if snapshot.change_id == Some(change_id) {
+                cache.catalog_fingerprint = snapshot.fingerprint.clone();
                 cache.catalog_cache_hit = true;
                 return Ok((snapshot.catalog.clone(), cache));
             }
         }
 
+        // Version-skew fallback for an older pg_rvbbit without the change log.
+        if change_id.is_none() {
+            let fingerprint = rvbbit_catalog_fingerprint(&mut self.pg, args)?;
+            cache.catalog_fingerprint = fingerprint.clone();
+            if let Some(snapshot) = &self.catalog {
+                if snapshot.change_id.is_none() && snapshot.fingerprint == fingerprint {
+                    cache.catalog_cache_hit = true;
+                    return Ok((snapshot.catalog.clone(), cache));
+                }
+            }
+        }
+
         let catalog = rvbbit_row_group_catalog(&mut self.pg, args)?;
+        let fingerprint = catalog_signature(&catalog);
+        cache.catalog_fingerprint = fingerprint.clone();
         self.catalog = Some(CatalogSnapshot {
+            change_id,
             fingerprint,
             catalog: catalog.clone(),
         });
@@ -4875,6 +4893,25 @@ fn setting_enabled(value: &str, default: bool) -> bool {
     )
 }
 
+fn rvbbit_catalog_change_id(pg: &mut Client) -> Result<Option<i64>> {
+    let available = pg
+        .query_one(
+            "SELECT to_regclass('rvbbit.accel_catalog_changes') IS NOT NULL",
+            &[],
+        )?
+        .get::<_, bool>(0);
+    if !available {
+        return Ok(None);
+    }
+    let id = pg
+        .query_one(
+            "SELECT coalesce(max(id), 0)::bigint FROM rvbbit.accel_catalog_changes",
+            &[],
+        )?
+        .get::<_, i64>(0);
+    Ok(Some(id))
+}
+
 fn rvbbit_catalog_fingerprint(pg: &mut Client, args: &Args) -> Result<String> {
     let rows = pg.query(&catalog_fingerprint_sql_for_layout(&args.layout)?, &[])?;
     Ok(rows
@@ -4939,9 +4976,9 @@ fn variant_catalog_fingerprint_sql(layout_predicate: &str) -> String {
                    coalesce(sum(rg.n_bytes), 0)::bigint AS row_group_bytes,
                    coalesce(max(rg.rg_id), -1)::bigint AS max_rg_id,
                    coalesce((extract(epoch FROM max(rg.created_at)) * 1000000)::bigint, 0)::bigint AS max_created_us,
-                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   (c.relpages::bigint * current_setting('block_size')::bigint) AS heap_bytes,
                    coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   rvbbit.shadow_heap_dirty_effective(c.oid) AS shadow_heap_dirty,
                    (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) AS deletes,
                    coalesce(md5(string_agg(rg.path || ':' || rg.n_rows || ':' || rg.n_bytes || ':' ||
                            coalesce((extract(epoch FROM rg.created_at) * 1000000)::bigint, 0), ',' ORDER BY rg.rg_id)), '') AS path_sig,
@@ -4969,9 +5006,9 @@ fn variant_catalog_fingerprint_sql(layout_predicate: &str) -> String {
                    coalesce(sum(rg.n_bytes), 0)::bigint AS row_group_bytes,
                    coalesce(max(rg.rg_id), -1)::bigint AS max_rg_id,
                    coalesce((extract(epoch FROM max(rg.created_at)) * 1000000)::bigint, 0)::bigint AS max_created_us,
-                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   (c.relpages::bigint * current_setting('block_size')::bigint) AS heap_bytes,
                    coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   rvbbit.shadow_heap_dirty_effective(c.oid) AS shadow_heap_dirty,
                    (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) AS deletes,
                    coalesce(md5(string_agg(rg.path || ':' || rg.n_rows || ':' || rg.n_bytes || ':' ||
                            coalesce((extract(epoch FROM rg.created_at) * 1000000)::bigint, 0), ',' ORDER BY rg.rg_id)), '') AS path_sig,
@@ -5019,9 +5056,9 @@ fn variant_catalog_fingerprint_sql_exact(layout_predicate: &str) -> String {
                    coalesce(sum(rg.n_bytes), 0)::bigint AS row_group_bytes,
                    coalesce(max(rg.rg_id), -1)::bigint AS max_rg_id,
                    coalesce((extract(epoch FROM max(rg.created_at)) * 1000000)::bigint, 0)::bigint AS max_created_us,
-                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   (c.relpages::bigint * current_setting('block_size')::bigint) AS heap_bytes,
                    coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   rvbbit.shadow_heap_dirty_effective(c.oid) AS shadow_heap_dirty,
                    (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) AS deletes,
                    coalesce(md5(string_agg(rg.path || ':' || rg.n_rows || ':' || rg.n_bytes || ':' ||
                            coalesce((extract(epoch FROM rg.created_at) * 1000000)::bigint, 0), ',' ORDER BY rg.rg_id)), '') AS path_sig,
@@ -5073,9 +5110,9 @@ fn catalog_fingerprint_sql(
                    coalesce(sum(rg.n_bytes), 0)::bigint AS row_group_bytes,
                    coalesce(max(rg.rg_id), -1)::bigint AS max_rg_id,
                    coalesce((extract(epoch FROM max(rg.created_at)) * 1000000)::bigint, 0)::bigint AS max_created_us,
-                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   (c.relpages::bigint * current_setting('block_size')::bigint) AS heap_bytes,
                    coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   rvbbit.shadow_heap_dirty_effective(c.oid) AS shadow_heap_dirty,
                    (SELECT count(*)::bigint FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid) AS deletes,
                    coalesce(md5(string_agg(rg.path || ':' || rg.n_rows || ':' || rg.n_bytes || ':' ||
                            coalesce((extract(epoch FROM rg.created_at) * 1000000)::bigint, 0), ',' ORDER BY rg.rg_id)), '') AS path_sig,
@@ -5123,7 +5160,10 @@ fn rvbbit_row_group_catalog(
         let shadow_heap_retained: bool = row.get(7);
         let shadow_heap_dirty: bool = row.get(8);
         let deletes: i64 = row.get(9);
-        if deletes != 0 || (heap_bytes != 0 && !(shadow_heap_retained && !shadow_heap_dirty)) {
+        if deletes != 0
+            || shadow_heap_dirty
+            || (heap_bytes != 0 && !shadow_heap_retained)
+        {
             continue;
         }
         let mut mapped = Vec::with_capacity(paths.len());
@@ -5219,9 +5259,9 @@ fn catalog_sql_for_layout(layout: &str) -> Result<String> {
                    array_agg({path_expr} ORDER BY rg.rg_id) AS paths,
                    sum(rg.n_rows)::bigint AS row_group_rows,
                    sum(rg.n_bytes)::bigint AS row_group_bytes,
-                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   (c.relpages::bigint * current_setting('block_size')::bigint) AS heap_bytes,
                    coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   rvbbit.shadow_heap_dirty_effective(c.oid) AS shadow_heap_dirty,
                    (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
             FROM rvbbit.row_groups rg
             JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
@@ -5276,9 +5316,9 @@ fn variant_catalog_sql(layout_predicate: &str) -> String {
                    array_agg(rg.path ORDER BY rg.rg_id) AS paths,
                    sum(rg.n_rows)::bigint AS row_group_rows,
                    sum(rg.n_bytes)::bigint AS row_group_bytes,
-                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   (c.relpages::bigint * current_setting('block_size')::bigint) AS heap_bytes,
                    coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   rvbbit.shadow_heap_dirty_effective(c.oid) AS shadow_heap_dirty,
                    (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
             FROM rvbbit.row_group_variants rg
             JOIN chosen_layout cl ON cl.table_oid = rg.table_oid AND cl.layout = rg.layout
@@ -5295,9 +5335,9 @@ fn variant_catalog_sql(layout_predicate: &str) -> String {
                    array_agg(rg.path ORDER BY rg.rg_id) AS paths,
                    sum(rg.n_rows)::bigint AS row_group_rows,
                    sum(rg.n_bytes)::bigint AS row_group_bytes,
-                   pg_relation_size(c.oid)::bigint AS heap_bytes,
+                   (c.relpages::bigint * current_setting('block_size')::bigint) AS heap_bytes,
                    coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-                   coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+                   rvbbit.shadow_heap_dirty_effective(c.oid) AS shadow_heap_dirty,
                    (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
             FROM rvbbit.row_groups rg
             JOIN rvbbit.tables t ON t.table_oid = rg.table_oid
@@ -5327,9 +5367,9 @@ fn variant_catalog_sql_exact(layout_predicate: &str) -> String {
                array_agg(rg.path ORDER BY rg.rg_id) AS paths,
                sum(rg.n_rows)::bigint AS row_group_rows,
                sum(rg.n_bytes)::bigint AS row_group_bytes,
-               pg_relation_size(c.oid)::bigint AS heap_bytes,
+               (c.relpages::bigint * current_setting('block_size')::bigint) AS heap_bytes,
                coalesce(t.shadow_heap_retained, false) AS shadow_heap_retained,
-               coalesce(t.shadow_heap_dirty, false) AS shadow_heap_dirty,
+               rvbbit.shadow_heap_dirty_effective(c.oid) AS shadow_heap_dirty,
                (SELECT count(*) FROM rvbbit.delete_log dl WHERE dl.table_oid = c.oid)::bigint AS deletes
         FROM rvbbit.row_group_variants rg
         JOIN rvbbit.layout_variant_status s
@@ -6477,5 +6517,20 @@ mod tests {
         assert!(response.contains("\"status\":\"fallback\""));
         assert!(response.contains("broker queue is full"));
         assert_eq!(BROKER_QUEUE_DEPTH.load(Ordering::Relaxed), before_depth);
+    }
+
+    #[test]
+    fn catalog_queries_never_open_every_accelerated_heap() {
+        let queries = [
+            catalog_fingerprint_sql_for_layout("scan").unwrap(),
+            catalog_fingerprint_sql_for_layout("vortex_scan").unwrap(),
+            catalog_sql_for_layout("scan").unwrap(),
+            catalog_sql_for_layout("vortex_scan").unwrap(),
+        ];
+        for sql in queries {
+            assert!(sql.contains("c.relpages"));
+            assert!(!sql.contains("pg_relation_size"));
+            assert!(!sql.contains("pg_relation_filenode"));
+        }
     }
 }

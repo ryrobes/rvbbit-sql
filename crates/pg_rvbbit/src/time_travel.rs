@@ -139,6 +139,21 @@ pub(crate) fn generation_for_table(
     table_oid: u32,
     asof: Option<&AsOf>,
 ) -> Result<Option<i64>, String> {
+    if asof.is_some() {
+        let retained = Spi::get_one::<bool>(&format!(
+            "SELECT coalesce((SELECT t.history_policy = 'retained' \
+                                FROM rvbbit.tables t \
+                               WHERE t.table_oid = {table_oid}::oid), true)"
+        ))
+        .map_err(|e| format!("history policy SPI: {e}"))?
+        .unwrap_or(true);
+        if !retained {
+            return Err(format!(
+                "table {} uses history_policy=current; AS OF reads are disabled",
+                table_oid
+            ));
+        }
+    }
     match asof {
         Some(AsOf::Generation(g)) => Ok(Some(*g)),
         Some(AsOf::Timestamp(ts)) => resolve_timestamp_generation(table_oid, ts).map(Some),
@@ -154,8 +169,18 @@ pub(crate) fn generation_for_table(
 /// not the union of every prior snapshot).
 fn is_snapshot_expr(table_oid_expr: &str) -> String {
     format!(
-        "coalesce((SELECT t.min_visible_generation FROM rvbbit.tables t \
-                     WHERE t.table_oid = {table_oid_expr}), 0) > 0"
+        "coalesce((SELECT t.generation_semantics = 'snapshot' \
+                           OR t.min_visible_generation > 0 \
+                     FROM rvbbit.tables t \
+                    WHERE t.table_oid = {table_oid_expr}), false)"
+    )
+}
+
+fn history_retained_expr(table_oid_expr: &str) -> String {
+    format!(
+        "coalesce((SELECT t.history_policy = 'retained' \
+                     FROM rvbbit.tables t \
+                    WHERE t.table_oid = {table_oid_expr}), true)"
     )
 }
 
@@ -168,8 +193,10 @@ pub(crate) fn asof_gen_predicate(
     generation_expr: &str,
 ) -> String {
     let is_snap = is_snapshot_expr(table_oid_expr);
+    let history_retained = history_retained_expr(table_oid_expr);
     format!(
-        "AND {generation_expr} <= {g_expr} \
+        "AND {history_retained} \
+         AND {generation_expr} <= {g_expr} \
          AND (NOT ({is_snap}) OR {generation_expr} = {g_expr})"
     )
 }
@@ -256,7 +283,9 @@ fn read_timestamp_guc() -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    let trimmed = unsafe { CStr::from_ptr(ptr).to_string_lossy() }.trim().to_string();
+    let trimmed = unsafe { CStr::from_ptr(ptr).to_string_lossy() }
+        .trim()
+        .to_string();
     if trimmed.is_empty() {
         None
     } else {

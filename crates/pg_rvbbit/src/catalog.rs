@@ -46,6 +46,17 @@ CREATE TABLE rvbbit.tables (
     -- snapshots) while AS OF still reads the full history. Default 0 = no-op
     -- (generations start at 1), so ordinary append tables are unaffected.
     min_visible_generation bigint NOT NULL DEFAULT 0,
+    -- Storage semantics and retention are intentionally independent. A
+    -- cumulative table's generations are deltas whose union is the current
+    -- table; a snapshot table writes one complete replacement per generation.
+    -- Retained history permits AS OF reads. Current-only history is allowed to
+    -- retire superseded snapshots immediately. Cumulative tables keep
+    -- UPDATE/DELETE correctness tombstones until their next full fold, while a
+    -- TRUNCATE invalidates the entire old baseline without row tombstones.
+    generation_semantics text NOT NULL DEFAULT 'cumulative'
+        CHECK (generation_semantics IN ('cumulative', 'snapshot')),
+    history_policy text NOT NULL DEFAULT 'current'
+        CHECK (history_policy IN ('retained', 'current')),
     -- Phase 4 Lance auto-refresh. When lance_url IS NOT NULL, compact()
     -- mirrors the named vector column into a Lance dataset at this URL
     -- (overwriting per compact), so rvbbit.knn() can do indexed KNN
@@ -428,6 +439,10 @@ CREATE TABLE rvbbit.row_group_variants (
     n_bytes         bigint NOT NULL,
     stats           jsonb,
     per_group_stats jsonb,
+    -- Set for files produced beside a staged canonical rebuild.  The final
+    -- metadata handoff retains only rows from its own operation, preventing a
+    -- late/legacy variant from being mistaken for the new generation.
+    build_operation_id bigint,
     created_at      timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (table_oid, layout, rg_id)
 );
@@ -444,6 +459,48 @@ CREATE TABLE rvbbit.layout_variant_status (
     PRIMARY KEY (table_oid, layout),
     CHECK (status IN ('ready', 'refreshing', 'invalid', 'failed'))
 );
+
+-- Coalesced repair queue for derived Vortex files.  There is deliberately one
+-- row per table: a hot table may publish many canonical generations while a
+-- conversion is pending, but only its latest committed generation matters.
+CREATE TABLE rvbbit.variant_build_queue (
+    table_oid          oid PRIMARY KEY REFERENCES rvbbit.tables(table_oid) ON DELETE CASCADE,
+    target_generation  bigint NOT NULL DEFAULT 0,
+    target_row_groups  bigint NOT NULL DEFAULT 0,
+    target_rows        bigint NOT NULL DEFAULT 0,
+    target_bytes       bigint NOT NULL DEFAULT 0,
+    reason             text NOT NULL DEFAULT 'repair',
+    priority           integer NOT NULL DEFAULT 0,
+    requested_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
+    available_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
+    attempts           integer NOT NULL DEFAULT 0,
+    last_started_at    timestamptz,
+    last_finished_at   timestamptz,
+    last_error         text,
+    CHECK (target_generation >= 0),
+    CHECK (target_row_groups >= 0),
+    CHECK (target_rows >= 0),
+    CHECK (target_bytes >= 0),
+    CHECK (attempts >= 0)
+);
+
+CREATE TABLE rvbbit.variant_build_runs (
+    id                 bigserial PRIMARY KEY,
+    table_oid          oid REFERENCES rvbbit.tables(table_oid) ON DELETE SET NULL,
+    table_name         text NOT NULL,
+    target_generation  bigint,
+    target_row_groups  bigint,
+    target_bytes       bigint,
+    action             text NOT NULL,
+    status             text NOT NULL,
+    rows_written       bigint,
+    started_at         timestamptz NOT NULL DEFAULT clock_timestamp(),
+    finished_at        timestamptz NOT NULL DEFAULT clock_timestamp(),
+    error              text
+);
+
+CREATE INDEX variant_build_runs_table_time_idx
+    ON rvbbit.variant_build_runs (table_oid, started_at DESC);
 
 CREATE TABLE rvbbit.acceleration_state (
     table_oid                 oid PRIMARY KEY REFERENCES rvbbit.tables(table_oid) ON DELETE CASCADE,
@@ -485,7 +542,7 @@ CREATE TABLE rvbbit.acceleration_operations (
     generation_after  bigint,
     settings          jsonb NOT NULL DEFAULT '{}'::jsonb,
     error             text,
-    CHECK (operation IN ('refresh_acceleration', 'rebuild_acceleration', 'compact_acceleration', 'legacy_compact')),
+    CHECK (operation IN ('refresh_acceleration', 'rebuild_acceleration', 'compact_acceleration', 'legacy_compact', 'variant_build')),
     CHECK (status IN ('running', 'ok', 'failed', 'noop')),
     CHECK (watermark_before IS NULL OR watermark_before >= 0),
     CHECK (watermark_after IS NULL OR watermark_after >= 0),
@@ -631,6 +688,7 @@ BEGIN
             ('rvbbit.accel_tick_runs',  'ran_at'),
             ('rvbbit.route_decisions',  'decided_at'),
             ('rvbbit.route_executions', 'executed_at'),
+            ('rvbbit.variant_build_runs', 'started_at'),
             ('rvbbit.mcp_invocations',  'invocation_at'),
             ('rvbbit.cost_events',      'created_at'),
             ('rvbbit.sync_runs',        'started_at'),
@@ -720,6 +778,7 @@ BEGIN
             ('rvbbit.route_executions',          'volume'),
             ('rvbbit.route_observations',        'volume'),
             ('rvbbit.accel_tick_runs',           'volume'),
+            ('rvbbit.variant_build_runs',        'volume'),
             ('rvbbit.cost_events',               'volume'),
             ('rvbbit.receipts',                  'volume'),
             ('rvbbit.mcp_invocations',           'volume'),
@@ -735,6 +794,7 @@ BEGIN
             ('rvbbit.tables',                    'hot'),
             ('rvbbit.table_dirty_markers',       'hot'),
             ('rvbbit.layout_variant_status',     'hot'),
+            ('rvbbit.variant_build_queue',       'hot'),
             ('rvbbit.acceleration_state',        'hot'),
             ('rvbbit.settings',                  'hot'),
             ('rvbbit.orphaned_files',            'hot'),
@@ -1205,17 +1265,34 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION rvbbit.current_replacement_pending(reloid regclass)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT coalesce((
+        SELECT t.history_policy = 'current' AND ds.dirty_has_truncate
+          FROM rvbbit.tables t
+          JOIN rvbbit.table_dirty_state ds ON ds.table_oid = t.table_oid
+         WHERE t.table_oid = reloid
+    ), false)
+$$;
+
 CREATE OR REPLACE FUNCTION rvbbit.accel_overlay_ready(reloid regclass)
 RETURNS boolean
 LANGUAGE sql
 STABLE
 AS $$
-    SELECT CASE rvbbit.accel_identity_mode(reloid)
+    SELECT (CASE rvbbit.accel_identity_mode(reloid)
         WHEN 'primary_key' THEN rvbbit.accel_identity_map_complete(reloid)
         WHEN 'ctid' THEN rvbbit.accel_identity_map_complete(reloid)
                          AND rvbbit.accel_ctid_identity_valid(reloid)
         ELSE false
-    END
+    END)
+       -- A current-only TRUNCATE deliberately creates no per-row tombstones.
+       -- Identity completeness cannot make the obsolete baseline readable: it
+       -- is invalid as a whole until a full rebuild publishes its replacement.
+       AND NOT rvbbit.current_replacement_pending(reloid)
 $$;
 
 CREATE OR REPLACE FUNCTION rvbbit.record_ctid_identity_relfilenode()
@@ -1442,6 +1519,7 @@ DECLARE
     generation_after bigint := 0;
     pre_max_rg_id bigint := -1;
     baseline_max_rg_id bigint := -1;
+    staged_max_rg_id bigint := -1;
     staging_rg_base bigint := 0;
     baseline_generation bigint := 0;
     catchup_generation bigint := 0;
@@ -1455,6 +1533,15 @@ DECLARE
     phase_bytes_written bigint := 0;
     catchup_rows bigint := 0;
     catchup_row_groups bigint := 0;
+    vortex_stage_rows bigint := 0;
+    vortex_stage_result bigint;
+    vortex_stage_attempted boolean := false;
+    vortex_stage_enabled boolean := false;
+    vortex_stage_ok boolean := true;
+    vortex_stage_error text;
+    vortex_expected_rows bigint := 0;
+    vortex_actual_rows bigint := 0;
+    vortex_file_count integer := 0;
     remapped_tombstones int := 0;
     queued_orphan_files int := 0;
     orphan_paths text[];
@@ -1470,6 +1557,12 @@ BEGIN
     IF NOT rvbbit.is_rvbbit_table(reloid) THEN
         RAISE EXCEPTION '% is not an rvbbit table', reloid;
     END IF;
+
+    -- Serialize canonical publication and the independent Vortex retry worker
+    -- without taking a heap lock.  The same class/key is used by compact(),
+    -- current-history pruning, and variant_tick(); advisory xact locks are
+    -- re-entrant when this function is called from accel_tick().
+    PERFORM pg_advisory_xact_lock((1380336724::bigint << 32) | reloid::oid::bigint);
 
     -- Data-loss guard. rebuild regenerates the accelerator FROM the heap. If the
     -- heap is not authoritative (shadow_heap_retained = false — e.g. a legacy
@@ -1515,7 +1608,7 @@ BEGIN
             'scan_upper_xid', scan_upper_xid,
             'metadata_swap', 'post_catchup_export',
             'file_reap', 'queued_after_swap',
-            'variant_refresh', CASE WHEN refresh_variants THEN 'deferred_to_maintain_storage' ELSE 'skipped' END
+            'variant_refresh', CASE WHEN refresh_variants THEN 'staged_from_canonical_parquet' ELSE 'skipped' END
         )
     )
     RETURNING id INTO op_id;
@@ -1604,6 +1697,30 @@ BEGIN
            actual_rows = rebuilt_rows
      WHERE id = phase_id;
 
+    -- Convert the large baseline from its freshly-written canonical parquet
+    -- while OLTP writers are still free to proceed.  This is intentionally a
+    -- best-effort derived build: canonical publication must survive a Vortex
+    -- encoder failure, which is handed to the coalescing repair queue below.
+    IF refresh_variants AND row_groups_written > 0 THEN
+        vortex_stage_attempted := true;
+        BEGIN
+            PERFORM set_config('rvbbit.acceleration_operation_id', op_id::text, true);
+            PERFORM set_config('rvbbit.variant_stage_operation_id', op_id::text, true);
+            PERFORM set_config('rvbbit.variant_stage_min_rg_id', staging_rg_base::text, true);
+            PERFORM set_config('rvbbit.variant_stage_max_rg_id', baseline_max_rg_id::text, true);
+            SELECT rvbbit.refresh_layout_variants(reloid::oid)
+              INTO vortex_stage_result;
+            vortex_stage_enabled := vortex_stage_result >= 0;
+            IF vortex_stage_enabled THEN
+                vortex_stage_rows := vortex_stage_rows + vortex_stage_result;
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            vortex_stage_enabled := true;
+            vortex_stage_ok := false;
+            vortex_stage_error := SQLERRM;
+        END;
+    END IF;
+
     -- Take the short write-blocking handoff lock only after the expensive
     -- baseline scan. Poll with a short lock timeout so a busy table does not
     -- leave a SHARE lock request queued in front of later OLTP writers.
@@ -1631,16 +1748,15 @@ BEGIN
                WHERE table_oid = reloid AND rg_id >= staging_rg_base
               UNION ALL
               SELECT path FROM rvbbit.row_group_variants
-               WHERE table_oid = reloid AND rg_id >= staging_rg_base
+               WHERE table_oid = reloid AND build_operation_id = op_id
               UNION ALL
               SELECT path FROM rvbbit.text_dictionaries
                WHERE table_oid = reloid AND rg_id >= staging_rg_base
           ) staged_files;
 
-        DELETE FROM rvbbit.layout_variant_status WHERE table_oid = reloid;
         DELETE FROM rvbbit.row_group_variants
          WHERE table_oid = reloid
-           AND rg_id >= staging_rg_base;
+           AND build_operation_id = op_id;
         DELETE FROM rvbbit.row_groups
          WHERE table_oid = reloid
            AND rg_id >= staging_rg_base;
@@ -1652,6 +1768,10 @@ BEGIN
                WHERE rg.table_oid = rvbbit.generations.table_oid
                  AND rg.generation = rvbbit.generations.generation
            );
+        -- Row-group INSERT/DELETE triggers observed the abandoned staged set.
+        -- The old canonical + Vortex metadata is still authoritative, so this
+        -- failed handoff must not leave a spurious repair request behind.
+        DELETE FROM rvbbit.variant_build_queue WHERE table_oid = reloid;
 
         IF staged_orphan_paths IS NOT NULL THEN
             INSERT INTO rvbbit.orphaned_files (path, table_oid, reason, operation_id)
@@ -1754,6 +1874,49 @@ BEGIN
            actual_rows = catchup_rows
      WHERE id = catchup_phase_id;
 
+    SELECT coalesce(max(rg_id), -1)::bigint
+      INTO staged_max_rg_id
+      FROM rvbbit.row_groups
+     WHERE table_oid = reloid
+       AND rg_id >= staging_rg_base;
+
+    -- The final heap lock is already held here.  Only convert the usually tiny
+    -- catch-up range; the large baseline Vortex files were produced before the
+    -- lock.  If the baseline was empty, this one call covers the entire staged
+    -- canonical set.
+    IF refresh_variants
+       AND staged_max_rg_id >= staging_rg_base
+       AND (NOT vortex_stage_attempted
+            OR (vortex_stage_enabled AND vortex_stage_ok
+                AND staged_max_rg_id > baseline_max_rg_id)) THEN
+        vortex_stage_attempted := true;
+        BEGIN
+            PERFORM set_config('rvbbit.acceleration_operation_id', op_id::text, true);
+            PERFORM set_config('rvbbit.variant_stage_operation_id', op_id::text, true);
+            PERFORM set_config(
+                'rvbbit.variant_stage_min_rg_id',
+                CASE
+                    WHEN vortex_stage_enabled THEN (baseline_max_rg_id + 1)::text
+                    ELSE staging_rg_base::text
+                END,
+                true
+            );
+            PERFORM set_config('rvbbit.variant_stage_max_rg_id', staged_max_rg_id::text, true);
+            SELECT rvbbit.refresh_layout_variants(reloid::oid)
+              INTO vortex_stage_result;
+            IF vortex_stage_result < 0 THEN
+                vortex_stage_enabled := false;
+            ELSE
+                vortex_stage_enabled := true;
+                vortex_stage_rows := vortex_stage_rows + vortex_stage_result;
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            vortex_stage_enabled := true;
+            vortex_stage_ok := false;
+            vortex_stage_error := SQLERRM;
+        END;
+    END IF;
+
     WITH remapped AS (
         INSERT INTO rvbbit.delete_log
             (table_oid, rg_id, ordinal, deleted_xid, deleted_generation)
@@ -1788,15 +1951,73 @@ BEGIN
      WHERE table_oid = reloid
        AND rg_id >= staging_rg_base;
 
+    -- Validate the derived set before the canonical handoff.  A failed Vortex
+    -- stage is discarded and queued for retry; it never aborts or delays the
+    -- authoritative parquet publication.
+    SELECT coalesce(sum(n_rows), 0)::bigint
+      INTO vortex_expected_rows
+      FROM rvbbit.row_groups
+     WHERE table_oid = reloid
+       AND rg_id >= staging_rg_base;
+    SELECT coalesce(sum(n_rows), 0)::bigint, count(*)::integer
+      INTO vortex_actual_rows, vortex_file_count
+      FROM rvbbit.row_group_variants
+     WHERE table_oid = reloid
+       AND layout = 'vortex_scan'
+       AND build_operation_id = op_id;
+
+    IF vortex_stage_enabled AND vortex_stage_ok
+       AND (vortex_expected_rows <= 0
+            OR vortex_actual_rows <> vortex_expected_rows
+            OR vortex_file_count <= 0) THEN
+        vortex_stage_ok := false;
+        vortex_stage_error := format(
+            'staged Vortex validation failed: expected %s rows, catalog has %s rows in %s files',
+            vortex_expected_rows,
+            vortex_actual_rows,
+            vortex_file_count
+        );
+    END IF;
+
     -- Atomic metadata swap inside this transaction: remove old row groups and
     -- their dependent stats/identity rows. Old tombstones are discarded after
     -- any concurrent, post-snapshot tombstones have been remapped onto the
-    -- staged baseline row-group ordinals above.
+    -- staged baseline row-group ordinals above.  A valid staged Vortex set is
+    -- retained by operation id while every prior variant disappears atomically.
     DELETE FROM rvbbit.delete_log
      WHERE table_oid = reloid
        AND rg_id <= pre_max_rg_id;
     DELETE FROM rvbbit.layout_variant_status WHERE table_oid = reloid;
-    DELETE FROM rvbbit.row_group_variants WHERE table_oid = reloid;
+    IF vortex_stage_enabled AND vortex_stage_ok THEN
+        DELETE FROM rvbbit.row_group_variants
+         WHERE table_oid = reloid
+           AND build_operation_id IS DISTINCT FROM op_id;
+        INSERT INTO rvbbit.layout_variant_status (
+            table_oid, layout, status, expected_rows, actual_rows,
+            file_count, status_message, refreshed_at
+        ) VALUES (
+            reloid, 'vortex_scan', 'ready', vortex_expected_rows,
+            vortex_actual_rows, vortex_file_count, NULL, clock_timestamp()
+        )
+        ON CONFLICT (table_oid, layout) DO UPDATE SET
+            status = EXCLUDED.status,
+            expected_rows = EXCLUDED.expected_rows,
+            actual_rows = EXCLUDED.actual_rows,
+            file_count = EXCLUDED.file_count,
+            status_message = NULL,
+            refreshed_at = EXCLUDED.refreshed_at;
+        variants_rows := vortex_actual_rows;
+    ELSE
+        SELECT array_agg(path ORDER BY path)
+          INTO staged_orphan_paths
+          FROM rvbbit.row_group_variants
+         WHERE table_oid = reloid
+           AND build_operation_id = op_id;
+        orphan_paths := coalesce(orphan_paths, ARRAY[]::text[])
+            || coalesce(staged_orphan_paths, ARRAY[]::text[]);
+        DELETE FROM rvbbit.row_group_variants WHERE table_oid = reloid;
+        variants_rows := NULL;
+    END IF;
     DELETE FROM rvbbit.row_groups
      WHERE table_oid = reloid
        AND rg_id <= pre_max_rg_id;
@@ -1851,7 +2072,43 @@ BEGIN
         GET DIAGNOSTICS queued_orphan_files = ROW_COUNT;
     END IF;
 
-    variants_rows := NULL;
+    IF refresh_variants AND row_groups_written > 0 THEN
+        IF vortex_stage_enabled AND vortex_stage_ok THEN
+            DELETE FROM rvbbit.variant_build_queue WHERE table_oid = reloid;
+        ELSIF vortex_stage_enabled OR NOT vortex_stage_attempted THEN
+            INSERT INTO rvbbit.variant_build_queue (
+                table_oid, target_generation, target_row_groups,
+                target_rows, target_bytes, reason, priority,
+                requested_at, available_at, attempts, last_error
+            )
+            SELECT reloid,
+                   generation_after,
+                   count(*)::bigint,
+                   coalesce(sum(n_rows), 0)::bigint,
+                   coalesce(sum(n_bytes), 0)::bigint,
+                   'canonical_rebuild_stage_failed',
+                   100,
+                   clock_timestamp(),
+                   clock_timestamp(),
+                   0,
+                   vortex_stage_error
+              FROM rvbbit.row_groups
+             WHERE table_oid = reloid
+            ON CONFLICT (table_oid) DO UPDATE SET
+                target_generation = EXCLUDED.target_generation,
+                target_row_groups = EXCLUDED.target_row_groups,
+                target_rows = EXCLUDED.target_rows,
+                target_bytes = EXCLUDED.target_bytes,
+                reason = EXCLUDED.reason,
+                priority = greatest(rvbbit.variant_build_queue.priority, EXCLUDED.priority),
+                requested_at = EXCLUDED.requested_at,
+                available_at = EXCLUDED.available_at,
+                attempts = 0,
+                last_error = EXCLUDED.last_error;
+        END IF;
+    ELSIF NOT refresh_variants THEN
+        DELETE FROM rvbbit.variant_build_queue WHERE table_oid = reloid;
+    END IF;
 
     INSERT INTO rvbbit.acceleration_state (
         table_oid,
@@ -6431,7 +6688,20 @@ BEGIN
                 key_expr
             ) USING TG_RELID, tombstone_gen;
         END IF;
-    ELSIF TG_OP = 'TRUNCATE' THEN
+    ELSIF TG_OP = 'TRUNCATE'
+          AND NOT coalesce((
+              SELECT t.history_policy = 'current'
+                FROM rvbbit.tables t
+               WHERE t.table_oid = TG_RELID
+          ), false)
+          AND nullif(current_setting('rvbbit.snapshot_load_target', true), '')
+              IS DISTINCT FROM TG_RELID::oid::text THEN
+        -- Retained history can continue serving an identity overlay, so its
+        -- ordinary TRUNCATE needs one tombstone per immutable row. Current-only
+        -- tables instead invalidate the entire old baseline and read the heap
+        -- until a full rebuild; producing row tombstones there would be pure
+        -- delete-log amplification. snapshot_load also suppresses them because
+        -- it publishes a complete replacement generation in this transaction.
         tombstone_gen := rvbbit.allocate_generation(TG_RELID);
         INSERT INTO rvbbit.delete_log
             (table_oid, rg_id, ordinal, deleted_xid, deleted_generation)
@@ -6440,6 +6710,19 @@ BEGIN
         CROSS JOIN LATERAL generate_series(0, rg.n_rows - 1) AS ord
         WHERE rg.table_oid = TG_RELID
         ON CONFLICT (table_oid, rg_id, ordinal) DO NOTHING;
+    END IF;
+
+    IF TG_OP = 'TRUNCATE' THEN
+        -- TRUNCATE deliberately swaps the heap relfilenode.  The statement
+        -- trigger above has now recorded the complete dirty boundary. Retained
+        -- tables have tombstoned the prior rows; current-only tables have
+        -- invalidated the old baseline and require a full rebuild. Advance the
+        -- guard's expected relfilenode transactionally; unrelated CLUSTER,
+        -- VACUUM FULL, and ALTER rewrites still differ and remain blocked.
+        UPDATE rvbbit.acceleration_state
+           SET refresh_relfilenode = pg_relation_filenode(TG_RELID),
+               updated_at = clock_timestamp()
+         WHERE table_oid = TG_RELID;
     END IF;
 
     RETURN NULL;
@@ -7518,6 +7801,256 @@ BEGIN
 END;
 $$;
 
+-- Retire every superseded complete-snapshot generation while preserving the
+-- generation selected by min_visible_generation. Catalog deletion is MVCC
+-- safe; physical files are queued behind the ordinary orphan grace period so
+-- readers that planned against the prior catalog snapshot can finish.
+--
+-- This is intentionally snapshot-only. Cumulative generations are deltas, so
+-- deleting an older one would delete still-current rows; those tables must use
+-- rebuild_acceleration() to fold tombstones and row groups into a new baseline.
+CREATE OR REPLACE FUNCTION rvbbit.prune_snapshot_history(
+    rel regclass,
+    force_prune boolean DEFAULT false
+) RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    floor_generation bigint;
+    semantics text;
+    history text;
+    old_rg_ids bigint[];
+    old_paths text[];
+    generations_pruned bigint := 0;
+    row_groups_pruned bigint := 0;
+    tombstones_pruned bigint := 0;
+    variants_pruned bigint := 0;
+    files_queued bigint := 0;
+    n bigint := 0;
+BEGIN
+    SELECT t.min_visible_generation, t.generation_semantics, t.history_policy
+      INTO floor_generation, semantics, history
+      FROM rvbbit.tables t
+     WHERE t.table_oid = rel;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '% is not a registered rvbbit table', rel;
+    END IF;
+    IF semantics <> 'snapshot' OR floor_generation <= 0 THEN
+        RAISE EXCEPTION '% is not an active snapshot table (semantics %, floor %)',
+            rel, semantics, floor_generation;
+    END IF;
+    IF history <> 'current' AND NOT force_prune THEN
+        RETURN jsonb_build_object(
+            'status', 'skipped',
+            'table', rel::text,
+            'reason', 'history_policy is retained'
+        );
+    END IF;
+
+    -- Same per-table lock class used by compact/rebuild/prune_delete_log.
+    -- Advisory xact locks are re-entrant, so snapshot_load can call this while
+    -- still holding compact's generation lock.
+    PERFORM pg_advisory_xact_lock((1380336724::bigint << 32) | rel::oid::bigint);
+
+    SELECT array_agg(rg.rg_id ORDER BY rg.rg_id)
+      INTO old_rg_ids
+      FROM rvbbit.row_groups rg
+     WHERE rg.table_oid = rel
+       AND rg.generation <> floor_generation;
+
+    SELECT array_agg(f.path ORDER BY f.path)
+      INTO old_paths
+      FROM (
+          SELECT rg.path
+            FROM rvbbit.row_groups rg
+           WHERE rg.table_oid = rel
+             AND rg.generation <> floor_generation
+          UNION ALL
+          SELECT v.path
+            FROM rvbbit.row_group_variants v
+            JOIN rvbbit.row_groups rg
+              ON rg.table_oid = v.table_oid AND rg.rg_id = v.rg_id
+           WHERE rg.table_oid = rel
+             AND rg.generation <> floor_generation
+          UNION ALL
+          SELECT d.path
+            FROM rvbbit.text_dictionaries d
+            JOIN rvbbit.row_groups rg
+              ON rg.table_oid = d.table_oid AND rg.rg_id = d.rg_id
+           WHERE rg.table_oid = rel
+             AND rg.generation <> floor_generation
+      ) AS f;
+
+    IF old_rg_ids IS NOT NULL THEN
+        DELETE FROM rvbbit.delete_log dl
+         WHERE dl.table_oid = rel
+           AND dl.rg_id = ANY(old_rg_ids);
+        GET DIAGNOSTICS tombstones_pruned = ROW_COUNT;
+
+        DELETE FROM rvbbit.row_group_variants v
+         WHERE v.table_oid = rel
+           AND v.rg_id = ANY(old_rg_ids);
+        GET DIAGNOSTICS variants_pruned = ROW_COUNT;
+
+        DELETE FROM rvbbit.row_groups rg
+         WHERE rg.table_oid = rel
+           AND rg.rg_id = ANY(old_rg_ids);
+        GET DIAGNOSTICS row_groups_pruned = ROW_COUNT;
+    END IF;
+
+    DELETE FROM rvbbit.generations g
+     WHERE g.table_oid = rel
+       AND g.generation <> floor_generation;
+    GET DIAGNOSTICS generations_pruned = ROW_COUNT;
+
+    -- Also clear tombstones already stranded by an earlier metadata reap. Keep
+    -- tombstones on the live generation: genuine UPDATE/DELETE overlays still
+    -- need them until a rebuild folds the current snapshot.
+    DELETE FROM rvbbit.delete_log dl
+     WHERE dl.table_oid = rel
+       AND NOT EXISTS (
+           SELECT 1 FROM rvbbit.row_groups rg
+            WHERE rg.table_oid = dl.table_oid AND rg.rg_id = dl.rg_id
+       );
+    GET DIAGNOSTICS n = ROW_COUNT;
+    tombstones_pruned := tombstones_pruned + n;
+
+    IF old_paths IS NOT NULL THEN
+        INSERT INTO rvbbit.orphaned_files (path, table_oid, reason, operation_id)
+        SELECT DISTINCT p, rel, 'current_snapshot_history_prune', NULL::bigint
+          FROM unnest(old_paths) AS p
+         WHERE p IS NOT NULL AND btrim(p) <> ''
+        ON CONFLICT (path) DO UPDATE
+           SET table_oid = EXCLUDED.table_oid,
+               reason = EXCLUDED.reason,
+               operation_id = NULL,
+               queued_at = clock_timestamp(),
+               last_error = NULL;
+        GET DIAGNOSTICS files_queued = ROW_COUNT;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'status', 'ok',
+        'table', rel::text,
+        'floor_generation', floor_generation,
+        'generations_pruned', generations_pruned,
+        'row_groups_pruned', row_groups_pruned,
+        'variants_pruned', variants_pruned,
+        'tombstones_pruned', tombstones_pruned,
+        'files_queued', files_queued
+    );
+END;
+$$;
+
+-- Operator-facing policy surface. Changing an already-materialized table from
+-- cumulative to snapshot (or back) requires a full publish/fold, so the setter
+-- refuses that unsafe metadata-only flip. snapshot_load() activates snapshot
+-- semantics as part of its atomic full-generation publish.
+CREATE OR REPLACE FUNCTION rvbbit.set_acceleration_storage_policy(
+    rel regclass,
+    generation_semantics text DEFAULT NULL,
+    history_policy text DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    old_semantics text;
+    old_history text;
+    next_semantics text;
+    next_history text;
+    floor_generation bigint;
+    has_row_groups boolean;
+    fold_required boolean;
+    prune_result jsonb;
+BEGIN
+    SELECT t.generation_semantics,
+           t.history_policy,
+           t.min_visible_generation,
+           EXISTS (SELECT 1 FROM rvbbit.row_groups rg WHERE rg.table_oid = t.table_oid)
+      INTO old_semantics, old_history, floor_generation, has_row_groups
+      FROM rvbbit.tables t
+     WHERE t.table_oid = rel;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '% is not a registered rvbbit table', rel;
+    END IF;
+
+    next_semantics := coalesce(nullif(lower(btrim(generation_semantics)), ''), old_semantics);
+    next_history := coalesce(nullif(lower(btrim(history_policy)), ''), old_history);
+    IF next_semantics NOT IN ('cumulative', 'snapshot') THEN
+        RAISE EXCEPTION 'generation_semantics must be cumulative or snapshot, got %', next_semantics;
+    END IF;
+    IF next_history NOT IN ('retained', 'current') THEN
+        RAISE EXCEPTION 'history_policy must be retained or current, got %', next_history;
+    END IF;
+    IF has_row_groups AND next_semantics <> old_semantics THEN
+        RAISE EXCEPTION
+            'cannot change materialized table % from % to % with metadata alone; publish a complete generation with rvbbit.snapshot_load[_current]() or perform a full conversion fold',
+            rel, old_semantics, next_semantics;
+    END IF;
+
+    UPDATE rvbbit.tables t
+       SET generation_semantics = next_semantics,
+           history_policy = next_history
+     WHERE t.table_oid = rel;
+
+    IF next_semantics = 'snapshot'
+       AND next_history = 'current'
+       AND floor_generation > 0 THEN
+        SELECT rvbbit.prune_snapshot_history(rel) INTO prune_result;
+    END IF;
+
+    fold_required := next_history = 'current'
+        AND (
+            rvbbit.current_replacement_pending(rel)
+            OR (
+                next_semantics = 'cumulative'
+                AND (
+                    EXISTS (SELECT 1 FROM rvbbit.delete_log dl WHERE dl.table_oid = rel)
+                    OR (SELECT count(*) FROM rvbbit.row_groups rg WHERE rg.table_oid = rel) > 1
+                )
+            )
+        );
+
+    RETURN jsonb_build_object(
+        'table', rel::text,
+        'generation_semantics', next_semantics,
+        'history_policy', next_history,
+        'active_snapshot_floor', floor_generation,
+        'fold_required', fold_required,
+        'prune', prune_result,
+        'note', CASE
+            WHEN rvbbit.current_replacement_pending(rel) THEN
+                'current replacement is heap-authoritative until rebuild_acceleration publishes a new baseline'
+            WHEN fold_required THEN
+                'current-only cumulative tables retain correctness deltas/tombstones until rebuild_acceleration folds them'
+            ELSE NULL
+        END
+    );
+END;
+$$;
+
+CREATE OR REPLACE VIEW rvbbit.acceleration_storage_policy AS
+SELECT t.table_oid,
+       t.table_oid::regclass::text AS table_name,
+       t.generation_semantics,
+       t.history_policy,
+       t.min_visible_generation,
+       coalesce(g.generations, 0) AS retained_generations,
+       coalesce(rg.row_groups, 0) AS retained_row_groups,
+       coalesce(rg.rows, 0) AS retained_rows
+  FROM rvbbit.tables t
+  LEFT JOIN LATERAL (
+      SELECT count(*)::bigint AS generations
+        FROM rvbbit.generations g
+       WHERE g.table_oid = t.table_oid
+  ) g ON true
+  LEFT JOIN LATERAL (
+      SELECT count(*)::bigint AS row_groups,
+             coalesce(sum(r.n_rows), 0)::bigint AS rows
+        FROM rvbbit.row_groups r
+       WHERE r.table_oid = t.table_oid
+  ) rg ON true;
+
 -- Gap-free snapshot load: replace a destination rvbbit table's contents with a
 -- fresh full snapshot from `source_query`, recording it as one immutable
 -- generation so the latest view is the new snapshot while AS OF still reads the
@@ -7545,12 +8078,25 @@ AS $$
 DECLARE
     g bigint;
     n bigint;
+    previous_snapshot_target text;
+    prune_result jsonb;
 BEGIN
     IF NOT rvbbit.is_rvbbit_table(dest) THEN
         RAISE EXCEPTION '% is not an rvbbit table', dest;
     END IF;
 
+    -- The generic retained-heap TRUNCATE trigger writes a tombstone for every
+    -- immutable row. A complete snapshot publish does not need those: the new
+    -- exact generation floor atomically supersedes the old snapshot. Scope the
+    -- suppression to this table and restore any outer caller's value promptly.
+    previous_snapshot_target := current_setting('rvbbit.snapshot_load_target', true);
+    PERFORM set_config('rvbbit.snapshot_load_target', dest::oid::text, true);
     EXECUTE format('TRUNCATE TABLE %s', dest);
+    PERFORM set_config(
+        'rvbbit.snapshot_load_target',
+        coalesce(previous_snapshot_target, ''),
+        true
+    );
     EXECUTE format('INSERT INTO %s %s', dest, source_query);
 
     PERFORM rvbbit.compact(dest, keep_heap => true);
@@ -7569,6 +8115,13 @@ BEGIN
     END IF;
 
     PERFORM rvbbit.set_visible_floor(dest, g);
+    UPDATE rvbbit.tables
+       SET generation_semantics = 'snapshot'
+     WHERE table_oid = dest;
+
+    IF (SELECT history_policy FROM rvbbit.tables WHERE table_oid = dest) = 'current' THEN
+        SELECT rvbbit.prune_snapshot_history(dest) INTO prune_result;
+    END IF;
 
     SELECT gg.n_rows INTO n
     FROM rvbbit.generations gg
@@ -7578,6 +8131,24 @@ BEGIN
         SELECT g,
                coalesce(n, 0),
                CASE WHEN coalesce(n, 0) = 0 THEN 'empty' ELSE 'snapshot' END;
+END;
+$$;
+
+-- One-call current-state mirror helper. The policy update and full snapshot
+-- publish are one transaction, so a failed load cannot leave a half-converted
+-- table. Subsequent snapshot_load() calls retain the current-only policy.
+CREATE OR REPLACE FUNCTION rvbbit.snapshot_load_current(dest regclass, source_query text)
+RETURNS TABLE (generation bigint, rows_loaded bigint, action text)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT rvbbit.is_rvbbit_table(dest) THEN
+        RAISE EXCEPTION '% is not a rvbbit table', dest;
+    END IF;
+    UPDATE rvbbit.tables
+       SET history_policy = 'current'
+     WHERE table_oid = dest;
+    RETURN QUERY SELECT * FROM rvbbit.snapshot_load(dest, source_query);
 END;
 $$;
 
@@ -10237,10 +10808,14 @@ mod tests {
 
     #[pg_test]
     fn alerts_enabled_killswitch_toggles() {
-        let on: bool = Spi::get_one("SELECT rvbbit.alerts_enabled()").unwrap().unwrap();
+        let on: bool = Spi::get_one("SELECT rvbbit.alerts_enabled()")
+            .unwrap()
+            .unwrap();
         assert!(on, "alerts_enabled() defaults to true");
         Spi::run("SELECT rvbbit.set_alerts_enabled(false)").unwrap();
-        let off: bool = Spi::get_one("SELECT rvbbit.alerts_enabled()").unwrap().unwrap();
+        let off: bool = Spi::get_one("SELECT rvbbit.alerts_enabled()")
+            .unwrap()
+            .unwrap();
         assert!(!off, "the global kill-switch flips the flag");
     }
 
@@ -10355,11 +10930,10 @@ mod tests {
 
         // idempotent: a second tick has nothing to drain
         Spi::run("SELECT rvbbit.alert_worker_tick(50)").unwrap();
-        let events: i64 = Spi::get_one(
-            "SELECT count(*)::bigint FROM rvbbit.alert_events WHERE rule_name='w1'",
-        )
-        .unwrap()
-        .unwrap();
+        let events: i64 =
+            Spi::get_one("SELECT count(*)::bigint FROM rvbbit.alert_events WHERE rule_name='w1'")
+                .unwrap()
+                .unwrap();
         assert_eq!(events, 1, "drained items are not re-processed");
     }
 
@@ -10416,7 +10990,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(title, "rev breached for US", "embedded placeholders interpolate");
+        assert_eq!(
+            title, "rev breached for US",
+            "embedded placeholders interpolate"
+        );
 
         let typ: String = Spi::get_one(
             "SELECT jsonb_typeof(rvbbit._alert_render_args('{\"n\":\"{count}\"}'::jsonb, \
@@ -10424,7 +11001,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(typ, "number", "a whole-string placeholder keeps the typed value");
+        assert_eq!(
+            typ, "number",
+            "a whole-string placeholder keeps the typed value"
+        );
     }
 
     #[pg_test]
@@ -10442,7 +11022,10 @@ mod tests {
         let hits: i64 = Spi::get_one("SELECT count(*)::bigint FROM _hits WHERE r='sa' AND e='US'")
             .unwrap()
             .unwrap();
-        assert_eq!(hits, 1, "sql action runs with the alert context bound to $1");
+        assert_eq!(
+            hits, 1,
+            "sql action runs with the alert context bound to $1"
+        );
         let done: i64 = Spi::get_one(
             "SELECT count(*)::bigint FROM rvbbit.alert_queue WHERE rule_name='sa' AND status='done'",
         )
@@ -10486,7 +11069,9 @@ mod tests {
         assert!(custom_ok, "a custom schedule flows through to the plan");
     }
 
-    #[pg_test(error = "pg_cron is not installed; run rvbbit.alert_sweep()/alert_worker_tick() manually.")]
+    #[pg_test(
+        error = "pg_cron is not installed; run rvbbit.alert_sweep()/alert_worker_tick() manually."
+    )]
     fn alerts_install_cron_requires_pg_cron_to_schedule() {
         // the test harness has no pg_cron, so the live (non-dry-run) path errors clearly
         Spi::run("SELECT rvbbit.alerts_install_cron()").unwrap();
@@ -10504,14 +11089,21 @@ mod tests {
         )
         .unwrap();
         Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
-        assert_eq!(qcount("sc_hi"), 1, "a score above the gte threshold breaches and fires");
+        assert_eq!(
+            qcount("sc_hi"),
+            1,
+            "a score above the gte threshold breaches and fires"
+        );
 
         let s: f64 = Spi::get_one(
             "SELECT score::float8 FROM rvbbit.alert_state WHERE rule_name='sc_hi' AND entity_key='US'",
         )
         .unwrap()
         .unwrap();
-        assert!((s - 0.95).abs() < 1e-9, "the numeric score is recorded in alert_state");
+        assert!(
+            (s - 0.95).abs() < 1e-9,
+            "the numeric score is recorded in alert_state"
+        );
 
         // below threshold → no fire
         Spi::run("CREATE TABLE _sc2 (entity_key text, score numeric)").unwrap();
@@ -10523,7 +11115,11 @@ mod tests {
         )
         .unwrap();
         Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
-        assert_eq!(qcount("sc_lo"), 0, "a score below the gte threshold does not fire");
+        assert_eq!(
+            qcount("sc_lo"),
+            0,
+            "a score below the gte threshold does not fire"
+        );
     }
 
     #[pg_test]
@@ -10537,7 +11133,11 @@ mod tests {
         )
         .unwrap();
         Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
-        assert_eq!(qcount("sc_lte"), 1, "a low score breaches an lte threshold (e.g. health dropping)");
+        assert_eq!(
+            qcount("sc_lte"),
+            1,
+            "a low score breaches an lte threshold (e.g. health dropping)"
+        );
     }
 
     #[pg_test]
@@ -10549,17 +11149,23 @@ mod tests {
         Spi::run("INSERT INTO rvbbit.alert_state (rule_name, entity_key, last_status) VALUES ('d1','x','fail')").unwrap();
         Spi::run("INSERT INTO rvbbit.alert_events (rule_name) VALUES ('d1')").unwrap();
 
-        let existed: bool = Spi::get_one("SELECT rvbbit.delete_alert('d1')").unwrap().unwrap();
+        let existed: bool = Spi::get_one("SELECT rvbbit.delete_alert('d1')")
+            .unwrap()
+            .unwrap();
         assert!(existed, "delete returns true when the rule existed");
-        let rules: i64 = Spi::get_one("SELECT count(*)::bigint FROM rvbbit.alert_catalog WHERE name='d1'")
-            .unwrap()
-            .unwrap();
+        let rules: i64 =
+            Spi::get_one("SELECT count(*)::bigint FROM rvbbit.alert_catalog WHERE name='d1'")
+                .unwrap()
+                .unwrap();
         assert_eq!(rules, 0, "the rule is gone from the catalog");
-        let state: i64 = Spi::get_one("SELECT count(*)::bigint FROM rvbbit.alert_state WHERE rule_name='d1'")
+        let state: i64 =
+            Spi::get_one("SELECT count(*)::bigint FROM rvbbit.alert_state WHERE rule_name='d1'")
+                .unwrap()
+                .unwrap();
+        assert_eq!(state, 0, "its per-entity state is gone");
+        let again: bool = Spi::get_one("SELECT rvbbit.delete_alert('d1')")
             .unwrap()
             .unwrap();
-        assert_eq!(state, 0, "its per-entity state is gone");
-        let again: bool = Spi::get_one("SELECT rvbbit.delete_alert('d1')").unwrap().unwrap();
         assert!(!again, "delete returns false for a missing rule");
     }
 
@@ -10582,14 +11188,22 @@ mod tests {
         )
         .unwrap();
         Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
-        let fail_st: String = Spi::get_one("SELECT last_status FROM rvbbit.alert_state WHERE rule_name='mc_a'")
-            .unwrap()
-            .unwrap();
-        assert_eq!(fail_st, "fail", "a metric with a 'fail' verdict drives the alert to fail");
-        let pass_st: String = Spi::get_one("SELECT last_status FROM rvbbit.alert_state WHERE rule_name='mc_b'")
-            .unwrap()
-            .unwrap();
-        assert_eq!(pass_st, "pass", "a metric with a 'pass' verdict stays passing");
+        let fail_st: String =
+            Spi::get_one("SELECT last_status FROM rvbbit.alert_state WHERE rule_name='mc_a'")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            fail_st, "fail",
+            "a metric with a 'fail' verdict drives the alert to fail"
+        );
+        let pass_st: String =
+            Spi::get_one("SELECT last_status FROM rvbbit.alert_state WHERE rule_name='mc_b'")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            pass_st, "pass",
+            "a metric with a 'pass' verdict stays passing"
+        );
     }
 
     #[pg_test]
@@ -10647,11 +11261,17 @@ mod tests {
              VALUES ('mc_bad', 1, '{\"kind\":\"metric\"}'::jsonb, '{}'::jsonb, '{\"operator\":\"noop\"}'::jsonb, 'per_entity', 100)",
         )
         .unwrap();
-        Spi::run("INSERT INTO rvbbit.alert_control (name, cadence_tier) VALUES ('mc_bad','normal')").unwrap();
+        Spi::run(
+            "INSERT INTO rvbbit.alert_control (name, cadence_tier) VALUES ('mc_bad','normal')",
+        )
+        .unwrap();
         let errors: i32 = Spi::get_one("SELECT (rvbbit.alert_sweep('normal')->>'errors')::int")
             .unwrap()
             .unwrap();
-        assert!(errors >= 1, "a metric condition with no metric name surfaces as a sweep error, not a silent stale");
+        assert!(
+            errors >= 1,
+            "a metric condition with no metric name surfaces as a sweep error, not a silent stale"
+        );
     }
 
     #[pg_test]
@@ -10664,13 +11284,20 @@ mod tests {
         )
         .unwrap();
         Spi::run("SELECT rvbbit.alert_sweep('normal')").unwrap();
-        let us: String = Spi::get_one("SELECT last_status FROM rvbbit.alert_state WHERE rule_name='ex1' AND entity_key='US'")
-            .unwrap()
-            .unwrap();
-        assert_eq!(us, "fail", "US drop_pct 0.25 > 0.15 → the expr is true → fail");
-        let eu: String = Spi::get_one("SELECT last_status FROM rvbbit.alert_state WHERE rule_name='ex1' AND entity_key='EU'")
-            .unwrap()
-            .unwrap();
+        let us: String = Spi::get_one(
+            "SELECT last_status FROM rvbbit.alert_state WHERE rule_name='ex1' AND entity_key='US'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            us, "fail",
+            "US drop_pct 0.25 > 0.15 → the expr is true → fail"
+        );
+        let eu: String = Spi::get_one(
+            "SELECT last_status FROM rvbbit.alert_state WHERE rule_name='ex1' AND entity_key='EU'",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(eu, "pass", "EU drop_pct 0.05 is not > 0.15 → pass");
     }
 
@@ -10687,31 +11314,50 @@ mod tests {
         let errors: i32 = Spi::get_one("SELECT (rvbbit.alert_sweep('normal')->>'errors')::int")
             .unwrap()
             .unwrap();
-        assert!(errors >= 1, "a non-boolean expr (n + 1) surfaces as a sweep error");
+        assert!(
+            errors >= 1,
+            "a non-boolean expr (n + 1) surfaces as a sweep error"
+        );
     }
 
     #[pg_test]
     fn entity_categories_set_clear_and_join() {
         Spi::run("SELECT rvbbit.define_metric('cat_m', 'SELECT 1 AS value')").unwrap();
         Spi::run("SELECT rvbbit.set_category('metric','cat_m','Marketing','Data Health')").unwrap();
-        let cat: String = Spi::get_one("SELECT category || '/' || subcategory FROM rvbbit.metric_catalog WHERE name='cat_m'")
-            .unwrap()
-            .unwrap();
-        assert_eq!(cat, "Marketing/Data Health", "the category joins onto the metric catalog");
+        let cat: String = Spi::get_one(
+            "SELECT category || '/' || subcategory FROM rvbbit.metric_catalog WHERE name='cat_m'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cat, "Marketing/Data Health",
+            "the category joins onto the metric catalog"
+        );
         // category alone (no subcategory) is valid
         Spi::run("SELECT rvbbit.set_category('metric','cat_m','Finance')").unwrap();
-        let sub: Option<String> = Spi::get_one("SELECT subcategory FROM rvbbit.metric_catalog WHERE name='cat_m'").unwrap();
+        let sub: Option<String> =
+            Spi::get_one("SELECT subcategory FROM rvbbit.metric_catalog WHERE name='cat_m'")
+                .unwrap();
         assert!(sub.is_none(), "a category without a subcategory is allowed");
         // clearing removes the assignment
         Spi::run("SELECT rvbbit.set_category('metric','cat_m', NULL)").unwrap();
-        let cleared: Option<String> = Spi::get_one("SELECT category FROM rvbbit.metric_catalog WHERE name='cat_m'").unwrap();
-        assert!(cleared.is_none(), "clearing nulls the category in the catalog");
+        let cleared: Option<String> =
+            Spi::get_one("SELECT category FROM rvbbit.metric_catalog WHERE name='cat_m'").unwrap();
+        assert!(
+            cleared.is_none(),
+            "clearing nulls the category in the catalog"
+        );
         // the lookup is unified across kinds
         Spi::run("SELECT rvbbit.set_category('alert','cat_a','Ops','Latency')").unwrap();
-        let opts: i64 = Spi::get_one("SELECT count(*)::bigint FROM rvbbit.category_options() WHERE category='Ops'")
-            .unwrap()
-            .unwrap();
-        assert_eq!(opts, 1, "category_options surfaces the distinct pair across kinds");
+        let opts: i64 = Spi::get_one(
+            "SELECT count(*)::bigint FROM rvbbit.category_options() WHERE category='Ops'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            opts, 1,
+            "category_options surfaces the distinct pair across kinds"
+        );
     }
 
     #[pg_test(error = "rvbbit.set_category: subcategory requires a category")]

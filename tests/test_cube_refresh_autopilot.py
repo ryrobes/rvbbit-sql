@@ -67,6 +67,14 @@ def test_refresh_cube_applies_and_reports_autopilot_policy(rvbbit, temp_table):
             "SELECT rvbbit.define_cube(%s, %s, %s, %s, NULL, NULL, %s)",
             (cube, cube_sql, "one row per source row", "test cube", category),
         )
+        assert rvbbit.execute(
+            """
+            SELECT history_policy
+            FROM rvbbit.tables
+            WHERE table_oid = to_regclass('cubes.' || %s)
+            """,
+            (cube,),
+        ).fetchone()[0] == "retained"
 
         status = rvbbit.execute(
             """
@@ -235,13 +243,13 @@ def test_maintain_builds_cube_layouts_and_refreshes_due_snapshot(rvbbit, temp_ta
         assert status == ("layouts_pending", "build_layouts", True)
 
         planned = rvbbit.execute(
-            "SELECT maintenance_action, executed, status FROM rvbbit.maintain('cube', %s::text, true)",
+            "SELECT maintenance_action, executed, status FROM rvbbit.maintain_lifecycle('cube', %s::text, true)",
             (cube,),
         ).fetchone()
         assert planned == ("build_layouts", False, "planned")
 
         executed = rvbbit.execute(
-            "SELECT maintenance_action, executed, status, rows_written > 0 FROM rvbbit.maintain('cube', %s::text)",
+            "SELECT maintenance_action, executed, status, rows_written > 0 FROM rvbbit.maintain_lifecycle('cube', %s::text)",
             (cube,),
         ).fetchone()
         assert executed == ("build_layouts", True, "ok", True)
@@ -265,7 +273,7 @@ def test_maintain_builds_cube_layouts_and_refreshes_due_snapshot(rvbbit, temp_ta
         ).fetchone() == ("refresh_due", "refresh_snapshot", True)
 
         executed = rvbbit.execute(
-            "SELECT maintenance_action, executed, status, rows_written FROM rvbbit.maintain('cube', %s::text)",
+            "SELECT maintenance_action, executed, status, rows_written FROM rvbbit.maintain_lifecycle('cube', %s::text)",
             (cube,),
         ).fetchone()
         assert executed == ("refresh_snapshot", True, "ok", 3)
@@ -281,7 +289,7 @@ def test_maintain_builds_cube_layouts_and_refreshes_due_snapshot(rvbbit, temp_ta
         _drop_cube(rvbbit, cube)
 
 
-def test_cube_refresh_hidden_snapshot_tombstones_do_not_block_current_routes(rvbbit, temp_table):
+def test_cube_refresh_replaces_snapshot_without_tombstone_amplification(rvbbit, temp_table):
     cube = _cube_name()
     category = f"test_{cube}"
     cube_rel = f"cubes.{cube}"
@@ -315,7 +323,7 @@ def test_cube_refresh_hidden_snapshot_tombstones_do_not_block_current_routes(rvb
                 (SELECT count(*) FROM rvbbit.row_groups_visible WHERE table_oid = '{cube_rel}'::regclass)
             """
         ).fetchone()
-        assert raw_tombstones >= 3
+        assert raw_tombstones == 0
         assert visible_tombstones == 0
         assert all_row_groups >= 2
         assert visible_row_groups == 1

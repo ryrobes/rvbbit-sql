@@ -106,6 +106,62 @@ def test_forwarded_identity_never_overrides_oauth_caller(monkeypatch):
     assert observed == ("oauth@example.com", "oauth-client")
 
 
+def test_openrouter_requests_carry_calliope_app_and_human_attribution(monkeypatch):
+    monkeypatch.setattr(server, "_request_tracking_user", lambda: "person@example.com")
+
+    headers, body = server._openai_compatible_request(
+        "https://openrouter.ai/api/v1",
+        "secret",
+        {"model": "example/model", "messages": []},
+    )
+
+    assert headers["HTTP-Referer"] == "https://rvbbit.ai"
+    assert headers["X-OpenRouter-Title"] == "Calliope (RVBBIT)"
+    assert headers["X-Title"] == "Calliope (RVBBIT)"
+    assert body["user"] == "person@example.com"
+
+
+def test_non_openrouter_compatible_request_does_not_add_vendor_fields(monkeypatch):
+    monkeypatch.setattr(server, "_request_tracking_user", lambda: "person@example.com")
+
+    headers, body = server._openai_compatible_request(
+        "https://api.openai.com/v1",
+        "secret",
+        {"model": "example/model", "messages": []},
+    )
+
+    assert set(headers) == {"Authorization"}
+    assert "user" not in body
+
+
+def test_background_openrouter_request_has_stable_system_user(monkeypatch):
+    monkeypatch.setattr(server, "_request_tracking_user", lambda: None)
+
+    _headers, body = server._openai_compatible_request(
+        "https://openrouter.ai/api/v1",
+        "secret",
+        {"model": "example/model", "messages": []},
+    )
+
+    assert body["user"] == "calliope-system"
+
+
+def test_sql_connection_tracks_caller_for_pg_rvbbit_without_authorizing(monkeypatch):
+    observed = []
+
+    class Connection:
+        def execute(self, query, params):
+            observed.append((query, params))
+
+    monkeypatch.setattr(server, "_request_tracking_user", lambda: "person@example.com")
+    server._set_request_tracking_user(Connection())
+
+    assert observed == [(
+        "SELECT set_config('rvbbit.request_user', %s, false)",
+        ("person@example.com",),
+    )]
+
+
 def test_selected_private_document_read_uses_exact_running_calliope_turn(monkeypatch):
     observed = {}
 

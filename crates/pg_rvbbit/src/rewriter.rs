@@ -293,6 +293,49 @@ unsafe fn query_has_extern_params(query: *mut pg_sys::Query) -> bool {
     found
 }
 
+/// Collect exact relation OIDs from the analyzed Query tree, including RTEs in
+/// CTEs, subqueries, and sublinks.
+unsafe extern "C-unwind" fn analyzed_relation_oid_walker(
+    node: *mut pg_sys::Node,
+    context: *mut core::ffi::c_void,
+) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if (*node).type_ == pg_sys::NodeTag::T_RangeTblEntry {
+        let rte = node as *mut pg_sys::RangeTblEntry;
+        if (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
+            (*(context as *mut Vec<u32>)).push((*rte).relid.to_u32());
+        }
+        return false;
+    }
+    if (*node).type_ == pg_sys::NodeTag::T_Query {
+        return pg_sys::query_tree_walker_impl(
+            node as *mut pg_sys::Query,
+            Some(analyzed_relation_oid_walker),
+            context,
+            pg_sys::QTW_EXAMINE_RTES_BEFORE as i32,
+        );
+    }
+    pg_sys::expression_tree_walker_impl(node, Some(analyzed_relation_oid_walker), context)
+}
+
+unsafe fn analyzed_query_relation_oids(query: *mut pg_sys::Query) -> Vec<u32> {
+    if query.is_null() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    pg_sys::query_tree_walker_impl(
+        query,
+        Some(analyzed_relation_oid_walker),
+        (&mut out as *mut Vec<u32>).cast::<core::ffi::c_void>(),
+        pg_sys::QTW_EXAMINE_RTES_BEFORE as i32,
+    );
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Diagnostic — parse a SQL string and return a description of its
 /// Query node. Lets us inspect groupClause / groupingSets / rtable
 /// from outside any hook context.
@@ -726,7 +769,8 @@ unsafe fn try_duck_backend_rewrite(
         return false;
     }
 
-    let route_probe = duck_route_doc_for_probe(query_source);
+    let relation_oids = analyzed_query_relation_oids(query);
+    let route_probe = duck_route_doc_for_probe(query_source, &relation_oids);
     let route_doc = &route_probe.doc;
     if route_doc.get("safe_select").and_then(Value::as_bool) != Some(true) {
         log_route_probe(query_source, route_doc, route_probe.cache_hit, false);
@@ -843,8 +887,12 @@ struct DuckRouteProbe {
     cache_hit: bool,
 }
 
-fn duck_route_doc_for_probe(query_sql: &str) -> DuckRouteProbe {
-    let cache_key = format!("{}\n{}", router::route_runtime_stamp(), query_sql.trim());
+fn duck_route_doc_for_probe(query_sql: &str, relation_oids: &[u32]) -> DuckRouteProbe {
+    let cache_key = format!(
+        "{}\n{}",
+        router::route_runtime_stamp(relation_oids),
+        query_sql.trim()
+    );
     if let Some(cached) = DUCK_ROUTE_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned()) {
         return DuckRouteProbe {
             doc: cached,
@@ -856,7 +904,7 @@ fn duck_route_doc_for_probe(query_sql: &str) -> DuckRouteProbe {
         flag.set(false);
         old
     });
-    let out = router::route_rewrite_value(query_sql);
+    let out = router::route_rewrite_value_for_oids(query_sql, relation_oids);
     IN_REWRITER.with(|flag| flag.set(old));
     DUCK_ROUTE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();

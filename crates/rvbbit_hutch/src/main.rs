@@ -41,6 +41,9 @@ use meter::{Meter, MeterRow};
 use proxy::{forward, ForwardErr};
 use tenants::{TenantStatus, TenantStore};
 
+const OPENROUTER_APP_URL: &str = "https://rvbbit.ai";
+const OPENROUTER_APP_TITLE: &str = "Clover (RVBBIT)";
+
 struct AppState {
     cfg: HutchConfig,
     /// Fully resolved at startup (env override + config-relative rules).
@@ -500,7 +503,7 @@ async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
                 "id": l.name,
                 "object": "model",
                 "owned_by": "rvbbit-hutch",
-                "meta": {"model_version": l.model_version},
+                "meta": {"managed": true},
             })
         })
         .collect();
@@ -574,7 +577,7 @@ async fn chat_completions(
         }
     };
 
-    route_llm_payload(&mut payload, &llm);
+    route_llm_payload(&mut payload, &llm, &tenant.id);
     let is_stream = payload
         .get("stream")
         .and_then(|s| s.as_bool())
@@ -587,6 +590,12 @@ async fn chat_completions(
         .http
         .post(&url)
         .timeout(std::time::Duration::from_millis(llm.timeout_ms));
+    if is_openrouter_upstream(&llm) {
+        request = request
+            .header("HTTP-Referer", OPENROUTER_APP_URL)
+            .header("X-OpenRouter-Title", OPENROUTER_APP_TITLE)
+            .header("X-Title", OPENROUTER_APP_TITLE);
+    }
     match resolve_upstream_bearer_token(&llm, |name| std::env::var(name).ok()) {
         Ok(Some(token)) => request = request.bearer_auth(token),
         Ok(None) => {}
@@ -736,6 +745,12 @@ async fn chat_completions(
         prompt_tokens: pt,
         completion_tokens: ct,
     });
+    // The OpenAI-compatible client contract names the managed Clover service,
+    // not whichever upstream model currently implements it. Exact upstream
+    // provenance remains in the private meter and x-hutch-model-version.
+    if let Some(object) = out.as_object_mut() {
+        object.insert("model".into(), Value::String(llm.name.clone()));
+    }
     let mut resp_out = Json(out).into_response();
     if let Ok(v) = axum::http::HeaderValue::from_str(&llm.model_version) {
         resp_out.headers_mut().insert("x-hutch-model-version", v);
@@ -743,7 +758,11 @@ async fn chat_completions(
     resp_out
 }
 
-fn route_llm_payload(payload: &mut Value, llm: &config::LlmCfg) {
+fn route_llm_payload(payload: &mut Value, llm: &config::LlmCfg, tenant_id: &str) {
+    let supplied_user = payload
+        .get("user")
+        .and_then(Value::as_str)
+        .and_then(bounded_tracking_user);
     if let Some(object) = payload.as_object_mut() {
         for (key, value) in &llm.request_defaults {
             if key != "model" {
@@ -766,7 +785,32 @@ fn route_llm_payload(payload: &mut Value, llm: &config::LlmCfg) {
             }
         }
         object.insert("model".into(), json!(llm.upstream_model));
+        // Preserve pg_rvbbit's human caller when present; direct Hutch clients
+        // still get a stable tenant identifier. This field is provider cost
+        // telemetry only and is never an entitlement/auth input in Hutch.
+        if is_openrouter_upstream(llm) {
+            let tracking_user = supplied_user.unwrap_or_else(|| {
+                bounded_tracking_user(&format!("clover-tenant:{tenant_id}"))
+                    .unwrap_or_else(|| "clover-tenant".to_string())
+            });
+            object.insert("user".into(), Value::String(tracking_user));
+        }
     }
+}
+
+fn bounded_tracking_user(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 254 || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn is_openrouter_upstream(llm: &config::LlmCfg) -> bool {
+    reqwest::Url::parse(&llm.upstream_base)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
 }
 
 fn llm_response_has_answer(out: &Value) -> bool {
@@ -849,7 +893,8 @@ mod llm_upstream_tests {
 
     fn llm(env_name: Option<&str>) -> config::LlmCfg {
         config::LlmCfg {
-            name: "gemma4".into(),
+            name: "clover".into(),
+            aliases: vec!["gemma4".into()],
             entitlement: "clover_llm".into(),
             upstream_base: "https://openrouter.ai/api".into(),
             upstream_bearer_token_env: env_name.map(str::to_string),
@@ -914,14 +959,14 @@ mod llm_upstream_tests {
         cfg.request_overrides
             .insert("model".into(), json!("must-not-win"));
         let mut payload = json!({
-            "model": "gemma4",
+            "model": "clover",
             "reasoning": {"enabled": true},
             "temperature": 0.7,
             "provider": {"order": ["DeepInfra"], "allow_fallbacks": false},
             "messages": [{"role": "user", "content": "hello"}]
         });
 
-        route_llm_payload(&mut payload, &cfg);
+        route_llm_payload(&mut payload, &cfg, "pilot-company");
 
         assert_eq!(payload["model"], "~deepseek/deepseek-v4-flash-latest");
         assert_eq!(payload["reasoning"]["enabled"], false);
@@ -932,6 +977,22 @@ mod llm_upstream_tests {
         assert_eq!(payload["provider"]["sort"], "price");
         assert_eq!(payload["provider"]["zdr"], true);
         assert_eq!(payload["provider"]["data_collection"], "deny");
+        assert_eq!(payload["user"], "clover-tenant:pilot-company");
+    }
+
+    #[test]
+    fn hosted_llm_preserves_bounded_human_tracking_user() {
+        let cfg = llm(Some("OPENROUTER_API_KEY"));
+        let mut payload = json!({
+            "model": "gemma4",
+            "user": "person@example.com",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        route_llm_payload(&mut payload, &cfg, "pilot-company");
+
+        assert_eq!(payload["user"], "person@example.com");
+        assert!(is_openrouter_upstream(&cfg));
     }
 
     #[test]

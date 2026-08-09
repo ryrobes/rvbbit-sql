@@ -13,6 +13,84 @@ parquet layer, so a table needs at least one successful
 `rvbbit.refresh_acceleration(...)` or `rvbbit.compact(...)` before it
 has historical generations to read.
 
+## Generation And History Policies
+
+Generation composition and history retention are separate table policies:
+
+- `generation_semantics = 'cumulative'` means generations are deltas whose
+  visible union is the current table. This is the default for ordinary
+  `refresh_acceleration(...)` workloads.
+- `generation_semantics = 'snapshot'` means each generation is a complete
+  replacement. `snapshot_load(...)` sets this automatically.
+- `history_policy = 'current'` is the default for newly registered tables. It
+  disables historical reads, permits superseded complete snapshots to be
+  retired immediately, and treats a full-table replacement as an invalidation
+  boundary instead of generating one tombstone per old row.
+- `history_policy = 'retained'` is the explicit opt-in for AS OF history.
+  Upgrades preserve existing tables as retained; only newly registered tables
+  receive the current-only default. RVBBIT cubes opt in automatically because
+  their refresh timeline is part of the cube contract.
+
+Inspect the effective policy and its physical footprint with:
+
+```sql
+SELECT *
+FROM rvbbit.acceleration_storage_policy
+WHERE table_oid = 'orders'::regclass;
+```
+
+Current-only tables accept ordinary PostgreSQL replacement ETL; loaders do not
+need RVBBIT-specific syntax:
+
+```sql
+BEGIN;
+TRUNCATE orders;
+COPY orders FROM STDIN;
+COMMIT;
+```
+
+After commit, latest reads use the authoritative heap until
+`rebuild_acceleration(...)` publishes a new baseline. A non-manual
+`accel_tick()` policy recognizes this state as `current replacement pending`
+and always chooses a full rebuild, even when the old and new row counts match.
+The TRUNCATE itself creates no row tombstones.
+
+For callers that explicitly want one SQL operation to load and synchronously
+publish the replacement accelerator, the convenience helper remains available:
+
+```sql
+SELECT *
+FROM rvbbit.snapshot_load_current(
+    'orders'::regclass,
+    $$SELECT id, amount FROM staging.orders$$
+);
+```
+
+Only the newly published snapshot remains in the row-group catalog. Old files
+enter the ordinary orphan queue so readers already using the prior catalog
+snapshot can finish before physical deletion.
+
+An existing snapshot table can opt out of history explicitly:
+
+```sql
+SELECT rvbbit.set_acceleration_storage_policy(
+    'orders'::regclass,
+    history_policy => 'current'
+);
+```
+
+For a cumulative table, `current` disables AS OF but does **not** immediately
+drop old generations or tombstones created by individual UPDATE/DELETE
+operations: older generations may still contain rows that are part of the
+current table. Those row-level overlays keep acceleration online until the next
+fold. A full-table TRUNCATE is different: it invalidates the old baseline as a
+unit, creates no tombstones, and temporarily routes to the heap. The policy
+result reports `fold_required = true` when a full
+`rebuild_acceleration(...)` is needed to
+materialize one current baseline and clear those correctness overlays.
+Changing generation semantics on an already-materialized table is rejected;
+publish a complete snapshot or perform a full conversion instead.
+
 ## Inspect Generations
 
 ```sql

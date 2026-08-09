@@ -497,6 +497,7 @@ fn provider_test(
         model: model.to_string(),
         system: None,
         user: prompt.to_string(),
+        request_user: crate::unit_of_work::session_request_user(),
         temperature: Some(0.0),
         max_tokens: Some(16),
         provider: Some(provider.to_string()),

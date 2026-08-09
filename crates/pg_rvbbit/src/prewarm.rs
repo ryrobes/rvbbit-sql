@@ -54,6 +54,11 @@ pub struct WarmStats {
 /// everything else. Results land in L1 + receipts, so any later per-row
 /// executor call over the same inputs resolves from cache.
 pub fn warm(op: &Arc<OpDef>, opts: &Value, inputs: Vec<Value>) -> WarmStats {
+    // The SQL session is only visible on this leader thread. Carry its
+    // telemetry identity inside opts before any per-row work is dispatched.
+    let enriched_opts = unit_of_work::with_session_request_user(opts);
+    let opts = &enriched_opts;
+
     // Pre-load specialist specs on the leader before any pool dispatch —
     // worker threads can only read the spec cache, not do the SPI load.
     crate::specialists::warm_operator_specs(op.steps.as_ref(), op.takes.as_ref());

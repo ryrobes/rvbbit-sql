@@ -26,7 +26,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{c_char, CStr, CString};
 
 use pgrx::pg_guard;
 use pgrx::pg_sys;
@@ -118,6 +118,20 @@ unsafe extern "C-unwind" fn rvbbit_planner_hook(
     bound_params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
     let _asof_scope = crate::time_travel::planner_scope(query_string);
+    // A current-only table may still physically carry cumulative delta files
+    // and correctness tombstones until its next major fold. Falling back to the
+    // heap for an AS OF query would silently return LATEST rows, which is much
+    // worse than saying history is unavailable. Reject at planner entry before
+    // any route, metadata rewrite, or force-heap fallback can erase the AS OF
+    // semantics. Nested SPI used by this check is guarded by IN_HOOK.
+    if crate::time_travel::active_as_of_enabled() && !IN_HOOK.with(|f| f.get()) {
+        if let Some(oid) = first_current_history_rvbbit_rte(parse) {
+            pgrx::error!(
+                "rvbbit AS OF: table OID {} uses history_policy=current; historical reads are unavailable",
+                oid
+            );
+        }
+    }
     if crate::pg_context::nonsystem_view_access_restricted() {
         return call_next_planner(parse, query_string, cursor_options, bound_params);
     }
@@ -203,6 +217,63 @@ unsafe fn query_allows_rvbbit_file_scan(root: *mut pg_sys::PlannerInfo) -> bool 
     (*query).rowMarks.is_null()
 }
 
+/// System columns (`xmin`, `ctid`, `tableoid`, ...) only exist in PostgreSQL's
+/// heap tuple. Parquet/Vortex row groups deliberately contain user columns
+/// only, so offering a CustomScan for a relation whose query references a
+/// negative attribute number can fail at execution or, worse, manufacture a
+/// meaningless value. Keep that relation on the heap. This also protects the
+/// xid-watermark probes used by refresh_acceleration itself.
+unsafe fn query_references_system_column(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    rti: pg_sys::Index,
+) -> bool {
+    if root.is_null() || rel.is_null() || (*root).parse.is_null() {
+        return false;
+    }
+    let mut attnums: *mut pg_sys::Bitmapset = std::ptr::null_mut();
+    pg_sys::pull_varattnos((*root).parse as *mut pg_sys::Node, rti, &mut attnums);
+    // For a relation inside EXISTS/other subqueries, the outer Query tree can
+    // carry the Var at a different level. The relation-local planner nodes are
+    // already normalized to this `rti`, so inspect them as the authoritative
+    // fallback as well.
+    if !(*rel).reltarget.is_null() {
+        pg_sys::pull_varattnos(
+            (*(*rel).reltarget).exprs as *mut pg_sys::Node,
+            rti,
+            &mut attnums,
+        );
+    }
+    let restrictions = (*rel).baserestrictinfo;
+    if !restrictions.is_null() {
+        for i in 0..(*restrictions).length {
+            let rinfo = pg_sys::list_nth(restrictions, i) as *mut pg_sys::RestrictInfo;
+            if !rinfo.is_null() {
+                // pull_varattnos understands expression nodes, not the planner's
+                // RestrictInfo wrapper itself.
+                pg_sys::pull_varattnos((*rinfo).clause as *mut pg_sys::Node, rti, &mut attnums);
+            }
+        }
+    }
+
+    let first_low = pg_sys::FirstLowInvalidHeapAttributeNumber as i32;
+    let mut member = -1;
+    let mut found = false;
+    loop {
+        member = pg_sys::bms_next_member(attnums, member);
+        if member < 0 {
+            break;
+        }
+        let attnum = member + first_low;
+        if attnum < 0 {
+            found = true;
+            break;
+        }
+    }
+    pg_sys::bms_free(attnums);
+    found
+}
+
 unsafe fn count_rvbbit_rtes(rtable: *mut pg_sys::List) -> usize {
     if rtable.is_null() {
         return 0;
@@ -229,6 +300,57 @@ unsafe fn count_rvbbit_rtes(rtable: *mut pg_sys::List) -> usize {
         }
     }
     count
+}
+
+unsafe fn first_current_history_rvbbit_rte(query: *mut pg_sys::Query) -> Option<u32> {
+    if query.is_null() || (*query).rtable.is_null() {
+        return None;
+    }
+    let rtable = (*query).rtable;
+    for i in 0..(*rtable).length {
+        let rte = pg_sys::list_nth(rtable, i) as *mut pg_sys::RangeTblEntry;
+        if rte.is_null() {
+            continue;
+        }
+        match (*rte).rtekind {
+            pg_sys::RTEKind::RTE_RELATION => {
+                let oid = (*rte).relid.to_u32();
+                // Consult the policy row directly.  A relation can be created
+                // and registered in this same backend after an earlier planner
+                // lookup cached it as non-rvbbit; that performance cache must
+                // never be allowed to bypass the current-only correctness
+                // boundary.
+                if oid >= FIRST_NORMAL_OBJECT_ID && table_history_is_current(oid) {
+                    return Some(oid);
+                }
+            }
+            pg_sys::RTEKind::RTE_SUBQUERY => {
+                if let Some(oid) = first_current_history_rvbbit_rte((*rte).subquery) {
+                    return Some(oid);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn table_history_is_current(oid: u32) -> bool {
+    let old = IN_HOOK.with(|f| {
+        let old = f.get();
+        f.set(true);
+        old
+    });
+    let current = pgrx::Spi::get_one::<bool>(&format!(
+        "SELECT coalesce((SELECT t.history_policy = 'current' \
+                            FROM rvbbit.tables t \
+                           WHERE t.table_oid = {oid}::oid), false)"
+    ))
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    IN_HOOK.with(|f| f.set(old));
+    current
 }
 
 #[pg_guard]
@@ -325,6 +447,9 @@ unsafe extern "C-unwind" fn rvbbit_set_rel_pathlist_hook(
         return;
     }
     if !query_allows_rvbbit_file_scan(root) {
+        return;
+    }
+    if query_references_system_column(root, rel, rti) {
         return;
     }
     if !is_rvbbit_table(oid_u32) {

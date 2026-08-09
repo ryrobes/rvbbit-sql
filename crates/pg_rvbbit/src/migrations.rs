@@ -1049,6 +1049,50 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0257_calliope_session_sharing",
         include_str!("../sql/migrations/0257_calliope_session_sharing.sql"),
     ),
+    (
+        "0258_accel_tick_bootstrap",
+        include_str!("../sql/migrations/0258_accel_tick_bootstrap.sql"),
+    ),
+    (
+        "0259_accel_workload_observer",
+        include_str!("../sql/migrations/0259_accel_workload_observer.sql"),
+    ),
+    (
+        "0260_acceleration_storage_policies",
+        include_str!("../sql/migrations/0260_acceleration_storage_policies.sql"),
+    ),
+    (
+        "0261_current_replacement_tick",
+        include_str!("../sql/migrations/0261_current_replacement_tick.sql"),
+    ),
+    (
+        "0262_cube_retained_history_default",
+        include_str!("../sql/migrations/0262_cube_retained_history_default.sql"),
+    ),
+    (
+        "0263_current_default_retained_snapshot_tombstones",
+        include_str!("../sql/migrations/0263_current_default_retained_snapshot_tombstones.sql"),
+    ),
+    (
+        "0264_vortex_rebuild_pipeline",
+        include_str!("../sql/migrations/0264_vortex_rebuild_pipeline.sql"),
+    ),
+    (
+        "0265_acceleration_select_evidence",
+        include_str!("../sql/migrations/0265_acceleration_select_evidence.sql"),
+    ),
+    (
+        "0266_accel_activity_lanes",
+        include_str!("../sql/migrations/0266_accel_activity_lanes.sql"),
+    ),
+    (
+        "0267_clover_managed_model_alias",
+        include_str!("../sql/migrations/0267_clover_managed_model_alias.sql"),
+    ),
+    (
+        "0268_routing_lock_isolation",
+        include_str!("../sql/migrations/0268_routing_lock_isolation.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

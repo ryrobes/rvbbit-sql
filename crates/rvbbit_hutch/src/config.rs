@@ -204,13 +204,20 @@ fn default_llm_timeout_ms() -> u64 {
 }
 
 /// A hosted LLM behind the OpenAI-compatible surface (/v1/chat/completions
-/// with model-name routing). One entry per public model id; the same
+/// with model-name routing). One entry per canonical public service id; the same
 /// surface serves pg_rvbbit's openai_chat transport, agent()/flow steps,
 /// and raw OpenAI SDKs — no per-consumer plumbing.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmCfg {
-    /// Public model id — what subscribers put in the request's `model`.
+    /// Canonical public model id — what new subscribers put in the request's
+    /// `model`. This is a stable Clover service contract, not the upstream
+    /// implementation model.
     pub name: String,
+    /// Previously advertised public ids accepted for backwards compatibility.
+    /// Aliases route to this entry but are intentionally omitted from
+    /// `/v1/models`, so new clients only discover the canonical name.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub entitlement: String,
     #[serde(default = "default_llm_upstream")]
     pub upstream_base: String,
@@ -264,6 +271,7 @@ impl HutchConfig {
                 }
             }
         }
+        let mut llm_routes: BTreeMap<&str, &str> = BTreeMap::new();
         for llm in &cfg.llms {
             if llm.request_overrides.contains_key("model")
                 || llm.request_defaults.contains_key("model")
@@ -272,6 +280,22 @@ impl HutchConfig {
                     "llm '{}' request policy cannot replace the routed model",
                     llm.name
                 ));
+            }
+            for route in
+                std::iter::once(llm.name.as_str()).chain(llm.aliases.iter().map(String::as_str))
+            {
+                if route.is_empty() || route.trim() != route {
+                    return Err(format!(
+                        "llm '{}' has a blank or whitespace-padded public model route",
+                        llm.name
+                    ));
+                }
+                if let Some(owner) = llm_routes.insert(route, llm.name.as_str()) {
+                    return Err(format!(
+                        "public model route '{}' is claimed by both '{}' and '{}'",
+                        route, owner, llm.name
+                    ));
+                }
             }
         }
         Ok(cfg)
@@ -282,7 +306,9 @@ impl HutchConfig {
     }
 
     pub fn llm(&self, name: &str) -> Option<&LlmCfg> {
-        self.llms.iter().find(|l| l.name == name)
+        self.llms
+            .iter()
+            .find(|l| l.name == name || l.aliases.iter().any(|alias| alias == name))
     }
 }
 
@@ -345,11 +371,16 @@ mod tests {
         assert_eq!(research.upstream_path.as_deref(), Some("/v1/research"));
         assert_eq!(research.timeout_ms, 180_000);
 
-        let gemma = cfg.llm("gemma4").expect("Gemma LLM");
-        assert_eq!(gemma.upstream_model, "nvidia/Gemma-4-31B-IT-NVFP4");
-        assert!(gemma.upstream_bearer_token_env.is_none());
-        assert_eq!(gemma.prompt_microusd_per_1k, 100);
-        assert_eq!(gemma.completion_microusd_per_1k, 200);
+        let clover = cfg.llm("clover").expect("canonical Clover LLM");
+        assert_eq!(clover.name, "clover");
+        assert_eq!(clover.upstream_model, "nvidia/Gemma-4-31B-IT-NVFP4");
+        assert!(clover.upstream_bearer_token_env.is_none());
+        assert_eq!(clover.prompt_microusd_per_1k, 100);
+        assert_eq!(clover.completion_microusd_per_1k, 200);
+        assert_eq!(
+            cfg.llm("gemma4").expect("legacy public alias").name,
+            "clover"
+        );
     }
 
     #[test]
@@ -362,7 +393,8 @@ mod tests {
                 entitlement: clover
                 model_version: mock
             llms:
-              - name: gemma4
+              - name: clover
+                aliases: [gemma4]
                 entitlement: clover_llm
                 upstream_base: https://openrouter.ai/api
                 upstream_bearer_token_env: OPENROUTER_API_KEY
@@ -380,21 +412,22 @@ mod tests {
         )
         .expect("hosted OpenAI-compatible LLM config should parse");
 
-        let gemma = cfg.llm("gemma4").expect("Gemma LLM");
-        assert_eq!(gemma.upstream_base, "https://openrouter.ai/api");
+        let clover = cfg.llm("clover").expect("canonical Clover LLM");
+        assert_eq!(clover.upstream_base, "https://openrouter.ai/api");
         assert_eq!(
-            gemma.upstream_bearer_token_env.as_deref(),
+            clover.upstream_bearer_token_env.as_deref(),
             Some("OPENROUTER_API_KEY")
         );
-        assert_eq!(gemma.upstream_model, "~deepseek/deepseek-v4-flash-latest");
-        assert_eq!(gemma.request_defaults["reasoning"]["enabled"], false);
-        assert_eq!(gemma.request_defaults["temperature"], 0);
-        assert_eq!(gemma.request_defaults["seed"], 0);
-        assert_eq!(gemma.request_overrides["provider"]["zdr"], true);
+        assert_eq!(clover.upstream_model, "~deepseek/deepseek-v4-flash-latest");
+        assert_eq!(clover.request_defaults["reasoning"]["enabled"], false);
+        assert_eq!(clover.request_defaults["temperature"], 0);
+        assert_eq!(clover.request_defaults["seed"], 0);
+        assert_eq!(clover.request_overrides["provider"]["zdr"], true);
         assert_eq!(
-            gemma.request_overrides["provider"]["data_collection"],
+            clover.request_overrides["provider"]["data_collection"],
             "deny"
         );
+        assert_eq!(cfg.llm("gemma4").expect("legacy alias").name, "clover");
     }
 
     #[test]

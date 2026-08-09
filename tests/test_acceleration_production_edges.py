@@ -183,6 +183,11 @@ def test_partition_parent_dml_marks_accelerated_child_partitions(rvbbit, temp_ta
     rvbbit.execute(
         f"CREATE TABLE {p1} PARTITION OF {temp_table} FOR VALUES FROM (10) TO (20) USING rvbbit"
     )
+    for partition in (p0, p1):
+        rvbbit.execute(
+            f"SELECT rvbbit.set_acceleration_storage_policy("
+            f"'{partition}'::regclass, history_policy => 'retained')"
+        )
     rvbbit.execute(
         f"""
         INSERT INTO {temp_table} VALUES

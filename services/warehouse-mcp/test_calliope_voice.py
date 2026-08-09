@@ -26,6 +26,7 @@ def test_voice_config_uses_server_only_elevenlabs_credentials(monkeypatch):
     monkeypatch.setenv("ELEVENLABS_VOICE_ID", "voice-id")
     monkeypatch.delenv("WAREHOUSE_CALLIOPE_TTS_KEY", raising=False)
     monkeypatch.delenv("WAREHOUSE_CALLIOPE_TTS_VOICE_ID", raising=False)
+    monkeypatch.delenv("WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS", raising=False)
 
     config = calliope.CalliopeConfig.from_env()
 
@@ -35,9 +36,14 @@ def test_voice_config_uses_server_only_elevenlabs_credentials(monkeypatch):
     assert config.voice_fast_model == "eleven_flash_v2_5"
     assert config.voice_expressive_model == "eleven_v3"
     assert config.voice_sample_rate == 24_000
+    assert config.voice_prepare_timeout_seconds == 30
 
     monkeypatch.setenv("WAREHOUSE_CALLIOPE_TTS_KEY", "dedicated-secret")
     assert calliope.CalliopeConfig.from_env().voice_api_key == "dedicated-secret"
+    monkeypatch.setenv("WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS", "2")
+    assert calliope.CalliopeConfig.from_env().voice_prepare_timeout_seconds == 5
+    monkeypatch.setenv("WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS", "999")
+    assert calliope.CalliopeConfig.from_env().voice_prepare_timeout_seconds == 120
     monkeypatch.delenv("ELEVENLABS_VOICE_ID")
     assert calliope.CalliopeConfig.from_env().voice_enabled is False
 
@@ -85,6 +91,8 @@ def test_current_three_argument_clover_operator_builds_the_digest_and_attributes
 
         def execute(self, query, params=None):
             calls.append((query, params))
+            if "set_config('statement_timeout'" in query:
+                return Result({"set_config": params[0]})
             if "to_regprocedure" in query:
                 return Result({
                     "clover3": True,
@@ -111,6 +119,10 @@ def test_current_three_argument_clover_operator_builds_the_digest_and_attributes
     assert provider == "clover"
     assert model == "clover_llm_apply"
     assert "$12.4 million" in script
+    timeout_calls = [item for item in calls if "set_config('statement_timeout'" in item[0]]
+    assert len(timeout_calls) == 2
+    assert all(item[1] == ("28000ms",) for item in timeout_calls)
+    assert all(item[0].endswith(",%s,false)") for item in timeout_calls)
     operator_call = next(item for item in calls if "SELECT rvbbit.clover_llm_apply" in item[0])
     assert "%s::jsonb" in operator_call[0]
     assert operator_call[1][2] == "{}"
@@ -142,6 +154,8 @@ def test_saved_voice_receipt_keeps_hash_not_browser_personality(monkeypatch, tmp
             return False
 
         def execute(self, query, params=None):
+            if "set_config('statement_timeout'" in query:
+                return Result({"set_config": params[0]})
             if query.startswith("SELECT t.id"):
                 return Result({
                     "id": turn_id,
@@ -189,6 +203,7 @@ def test_saved_voice_receipt_keeps_hash_not_browser_personality(monkeypatch, tmp
     assert render["mode"] == "expressive"
     assert render["tts_model"] == "eleven_v3"
     assert "personality_hash" in render
+    assert render["rewrite_elapsed_ms"] >= 0
     assert "Sound like" not in stored["json"]
     assert json.loads(stored["json"])["script"] == render["script"]
     assert stored["params"][-1] == "pilot@example.com"
@@ -275,6 +290,18 @@ def test_timed_voice_frame_prefers_original_character_alignment():
     assert line["alignment"]["character_end_times_seconds"] == [0.08, 0.16]
 
 
+def test_voice_preparation_deadline_reports_the_stalled_stage():
+    backend_source = (HERE / "calliope.py").read_text(encoding="utf-8")
+
+    assert '"prepare_timeout_seconds": config.voice_prepare_timeout_seconds' in backend_source
+    assert '"code": "VOICE_TEXT_TIMEOUT"' in backend_source
+    assert '"stage": "text"' in backend_source
+    assert backend_source.count('"code": "VOICE_AUDIO_TIMEOUT"') >= 2
+    assert '"stage": "audio"' in backend_source
+    assert "first_audio_deadline" in backend_source
+    assert "asyncio.wait_for" in backend_source
+
+
 def test_voice_ui_keeps_the_original_turn_and_streams_pcm_in_the_browser():
     theme_source = (HERE / "theme" / "warehouse-theme.src.js").read_text(encoding="utf-8")
     theme_bundle = (HERE / "theme" / "warehouse-theme.js").read_text(encoding="utf-8")
@@ -304,9 +331,18 @@ def test_voice_ui_keeps_the_original_turn_and_streams_pcm_in_the_browser():
     assert "absorbVoiceAlignment" in calliope_source
     assert 'class="voice-transcript"' in calliope_source
     assert "pendingTurns: new Set()" in calliope_source
+    assert "failures: new Map()" in calliope_source
     assert "voicePresentationPending" in calliope_source
     assert "Shaping the spoken version" in calliope_source
     assert "The complete answer is ready · making it conversational" in calliope_source
+    assert "voicePreparationTimeoutMs" in calliope_source
+    assert "rewriteElapsedMs >= voicePreparationTimeoutMs() * 0.6" in calliope_source
+    assert 'timeoutError.code = "VOICE_AUDIO_TIMEOUT"' in calliope_source
+    assert 'showVoiceFailure(turn, "text", error, timedOut)' in calliope_source
+    assert 'showVoiceFailure(' in calliope_source
+    assert '"audio",' in calliope_source
+    assert "onFirstAudio: () => revealVoicePresentation(turn)" in calliope_source
+    assert "turn.response_receipt" in calliope_source
     assert "state.voice.pendingTurns.add(String(pending.id))" in calliope_source
     assert "state.voice.pendingTurns.delete(String(turn.id))" in calliope_source
     assert "spoken cut shaping" in calliope_source
@@ -323,6 +359,7 @@ def test_voice_ui_keeps_the_original_turn_and_streams_pcm_in_the_browser():
 
     calliope_css = (HERE / "calliope" / "calliope.css").read_text(encoding="utf-8")
     assert ".voice-preparing{" in calliope_css
+    assert ".voice-fallback-note{" in calliope_css
     assert ".message.assistant.voice-presentation .message-body{min-height:86px" in calliope_css
     assert ".message.voice-reveal .voice-transcript" in calliope_css
     assert "@keyframes voice-transcript-arrive" in calliope_css

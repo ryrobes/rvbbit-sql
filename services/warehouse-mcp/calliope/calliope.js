@@ -488,6 +488,7 @@
       renderId: null,
       dialogTurnId: null,
       pendingTurns: new Set(),
+      failures: new Map(),
       revealingTurnId: null,
       requestSequence: 0,
       streamComplete: false,
@@ -2835,6 +2836,7 @@
     if (!response.ok) {
       const error = new Error(data?.error?.message || data?.error?.code || `Request failed (${response.status})`);
       error.code = data?.error?.code || "REQUEST_FAILED";
+      error.stage = data?.error?.stage || "";
       error.status = response.status;
       throw error;
     }
@@ -6139,6 +6141,7 @@
     cancelSpeechRecording();
     stopVoicePlayback();
     state.voice.pendingTurns.clear();
+    state.voice.failures.clear();
     state.voice.revealingTurnId = null;
     clearSpatialSelections();
     clearLiveActivity();
@@ -6173,6 +6176,7 @@
     stopVoicePlayback();
     if (!options.preserveActivity || String(state.current?.id || "") !== String(id || "")) {
       state.voice.pendingTurns.clear();
+      state.voice.failures.clear();
       state.voice.revealingTurnId = null;
     }
     const selectedSummary = state.sessions.find((session) => session.id === id);
@@ -6362,6 +6366,7 @@
     return Boolean(
       voiceConfigured()
       && state.voice.preferences.mode !== "off"
+      && !voiceFailure(turn)
       && voiceReceipt(turn),
     );
   }
@@ -6374,9 +6379,81 @@
     return Boolean(
       voiceProjectionRequested()
       && turn?.status === "complete"
-      && !voiceReceipt(turn)
+      && !voiceFailure(turn)
       && state.voice.pendingTurns.has(String(turn?.id || "")),
     );
+  }
+
+  function voicePreparationTimeoutMs() {
+    const seconds = Number(state.config?.text_to_speech?.prepare_timeout_seconds) || 30;
+    return Math.max(5_000, Math.min(120_000, seconds * 1_000));
+  }
+
+  function voiceFailure(turn) {
+    return state.voice.failures.get(String(turn?.id || "")) || null;
+  }
+
+  function voiceFailureMessage(stage, error, timedOut = false) {
+    const code = String(error?.code || "");
+    const seconds = Math.round(voicePreparationTimeoutMs() / 1_000);
+    const rewriteElapsedMs = Number(error?.rewriteElapsedMs) || 0;
+    if (stage === "text") {
+      return timedOut || code === "VOICE_TEXT_TIMEOUT"
+        ? `Conversational rewrite timed out after ${seconds} seconds · complete answer shown`
+        : "Conversational rewrite failed · complete answer shown";
+    }
+    if (timedOut || code === "VOICE_AUDIO_TIMEOUT") {
+      if (rewriteElapsedMs >= voicePreparationTimeoutMs() * 0.6) {
+        return `Conversational rewrite took ${(rewriteElapsedMs / 1_000).toFixed(1)} seconds; audio did not start before the ${seconds}-second limit · complete answer shown`;
+      }
+      return `Voice preparation hit its ${seconds}-second limit during audio generation · complete answer shown`;
+    }
+    if (code === "VOICE_PROVIDER_AUTH") {
+      return "Audio generation failed because ElevenLabs rejected its credentials · complete answer shown";
+    }
+    if (code === "VOICE_RATE_LIMITED") {
+      return "ElevenLabs is temporarily at capacity · complete answer shown";
+    }
+    if (code === "VOICE_PROVIDER_UNAVAILABLE") {
+      return "ElevenLabs could not be reached · complete answer shown";
+    }
+    return "Audio generation failed before playback · complete answer shown";
+  }
+
+  function setVoiceFailure(turn, stage, error, timedOut = false) {
+    if (!turn?.id) return;
+    state.voice.pendingTurns.delete(String(turn.id));
+    state.voice.failures.set(String(turn.id), {
+      stage,
+      code: String(error?.code || ""),
+      message: voiceFailureMessage(stage, error, timedOut),
+    });
+  }
+
+  function revealVoicePresentation(turn) {
+    if (!turn?.id) return;
+    state.voice.pendingTurns.delete(String(turn.id));
+    state.voice.failures.delete(String(turn.id));
+    state.voice.revealingTurnId = String(turn.id);
+    renderChat();
+    state.voice.revealingTurnId = null;
+    if (state.voice.dialogTurnId === String(turn.id) && els.voiceDialog?.open) {
+      openVoiceDialog(turn.id);
+    }
+  }
+
+  function showVoiceFailure(turn, stage, error, timedOut = false) {
+    setVoiceFailure(turn, stage, error, timedOut);
+    state.voice.revealingTurnId = null;
+    renderChat();
+    if (state.voice.dialogTurnId === String(turn?.id || "") && els.voiceDialog?.open) {
+      openVoiceDialog(turn.id);
+    }
+    console.warn("Calliope voice projection skipped", {
+      stage,
+      code: error?.code || "VOICE_FAILED",
+      message: error?.message || "",
+    });
   }
 
   function renderVoiceTranscript(turn, render) {
@@ -6406,6 +6483,13 @@
           <small>The complete answer is ready · making it conversational</small>
         </span>
       </div>`;
+    }
+    const voiceFailed = !failed ? voiceFailure(turn) : null;
+    if (voiceFailed) {
+      return `${safeMarkdown(turn.assistant_message || "")}
+        <div class="voice-fallback-note" role="status" aria-live="polite" data-voice-failure-stage="${escapeHtml(voiceFailed.stage)}">
+          <i aria-hidden="true"></i><span><strong>Voice skipped</strong> · ${escapeHtml(voiceFailed.message)}</span>
+        </div>`;
     }
     return safeMarkdown(
       failed ? turn.error || "That turn did not complete." : turn.assistant_message || "",
@@ -11559,6 +11643,7 @@
     };
     if (state.voice.preferences.mode === "off") {
       state.voice.pendingTurns.clear();
+      state.voice.failures.clear();
       state.voice.revealingTurnId = null;
       stopVoicePlayback();
     }
@@ -11845,13 +11930,19 @@
     return bytes;
   }
 
-  async function playVoiceAudio(turn, render) {
+  async function playVoiceAudio(turn, render, options = {}) {
     if (!turn?.id || !render?.id) return;
     stopVoicePlayback();
     const context = prepareVoiceAudioContext();
     if (!context) throw new Error("This browser cannot play streamed speech.");
     const requestSequence = state.voice.requestSequence;
     const controller = new AbortController();
+    const firstAudioTimeoutMs = Math.max(
+      1,
+      Number(options.firstAudioTimeoutMs) || voicePreparationTimeoutMs(),
+    );
+    let firstAudioTimer = null;
+    let firstAudioTimedOut = false;
     state.voice.controller = controller;
     state.voice.phase = "streaming";
     state.voice.turnId = String(turn.id);
@@ -11859,6 +11950,10 @@
     state.voice.nextStartAt = context.currentTime + 0.045;
     state.voice.streamComplete = false;
     syncVoiceUi();
+    firstAudioTimer = setTimeout(() => {
+      firstAudioTimedOut = true;
+      controller.abort();
+    }, firstAudioTimeoutMs);
     try {
       const response = await fetch(voiceAudioUrl(turn.id, render.id), {
         signal: controller.signal,
@@ -11866,11 +11961,15 @@
       });
       if (!response.ok) {
         let message = `Spoken response failed (${response.status})`;
+        let code = "VOICE_STREAM_FAILED";
         try {
           const body = await response.json();
           message = body?.error?.message || message;
+          code = body?.error?.code || code;
         } catch {}
-        throw new Error(message);
+        const error = new Error(message);
+        error.code = code;
+        throw error;
       }
       if (!response.body) throw new Error("This browser could not read the audio stream.");
       const protocol = response.headers.get("x-calliope-audio-protocol");
@@ -11887,15 +11986,20 @@
         let frame;
         try { frame = JSON.parse(line); } catch { throw new Error("The spoken response stream was malformed."); }
         if (frame?.type === "error") {
-          throw new Error(frame.message || "The spoken response stream stopped unexpectedly.");
+          const error = new Error(frame.message || "The spoken response stream stopped unexpectedly.");
+          error.code = frame.code || "VOICE_STREAM_FAILED";
+          throw error;
         }
         if (frame?.type !== "audio" || !frame.audio_base64) return;
         const bytes = decodeVoiceBase64(frame.audio_base64);
         const schedule = enqueueVoicePcm(bytes, sampleRate, requestSequence);
         if (!schedule) return;
         if (!initialized) {
-          initializeVoiceKaraoke(turn, render, schedule.startAt);
           initialized = true;
+          clearTimeout(firstAudioTimer);
+          firstAudioTimer = null;
+          options.onFirstAudio?.();
+          initializeVoiceKaraoke(turn, render, schedule.startAt);
         }
         absorbVoiceAlignment(
           render,
@@ -11925,9 +12029,19 @@
       }
       syncVoiceUi();
     } catch (error) {
+      clearTimeout(firstAudioTimer);
+      firstAudioTimer = null;
+      if (firstAudioTimedOut) {
+        const timeoutError = new Error("Audio generation did not start within the voice preparation window.");
+        timeoutError.code = "VOICE_AUDIO_TIMEOUT";
+        stopVoicePlayback();
+        throw timeoutError;
+      }
       if (error?.name === "AbortError" || requestSequence !== state.voice.requestSequence) return;
       stopVoicePlayback();
       throw error;
+    } finally {
+      clearTimeout(firstAudioTimer);
     }
   }
 
@@ -11976,10 +12090,29 @@
     );
     const render = voiceReceipt(turn);
     if (!turn || !render) return;
+    const recovering = Boolean(voiceFailure(turn));
+    if (recovering) {
+      state.voice.failures.delete(String(turn.id));
+      state.voice.pendingTurns.add(String(turn.id));
+      renderChat();
+    }
     try {
-      await playVoiceAudio(turn, render);
+      await playVoiceAudio(turn, render, {
+        firstAudioTimeoutMs: voicePreparationTimeoutMs(),
+        onFirstAudio: recovering ? () => revealVoicePresentation(turn) : undefined,
+      });
     } catch (error) {
-      toast(error.message, true);
+      const diagnosedError = {
+        code: error?.code,
+        message: error?.message,
+        rewriteElapsedMs: Number(render.rewrite_elapsed_ms) || 0,
+      };
+      showVoiceFailure(
+        turn,
+        "audio",
+        diagnosedError,
+        error?.code === "VOICE_AUDIO_TIMEOUT",
+      );
     }
   }
 
@@ -11998,14 +12131,26 @@
     }
     stopVoicePlayback();
     const requestSequence = state.voice.requestSequence;
+    const timeoutMs = voicePreparationTimeoutMs();
+    const deadline = performance.now() + timeoutMs;
+    const renderController = new AbortController();
+    let renderTimer = null;
+    let renderTimedOut = false;
+    state.voice.failures.delete(String(turn.id));
     state.voice.phase = "preparing";
     state.voice.turnId = String(turn.id);
+    state.voice.controller = renderController;
     syncVoiceUi();
     renderChat();
     let data;
+    renderTimer = setTimeout(() => {
+      renderTimedOut = true;
+      renderController.abort();
+    }, timeoutMs);
     try {
       data = await api("/api/calliope/voice/renders", {
         method: "POST",
+        signal: renderController.signal,
         body: JSON.stringify({
           session_id: sessionId,
           turn_id: turn.id,
@@ -12019,27 +12164,45 @@
       ) return;
     } catch (error) {
       if (requestSequence !== state.voice.requestSequence) return;
-      state.voice.pendingTurns.delete(String(turn.id));
+      const timedOut = renderTimedOut || error?.code === "VOICE_TEXT_TIMEOUT";
       stopVoicePlayback();
-      renderChat();
-      toast(error.message, true);
+      showVoiceFailure(turn, "text", error, timedOut);
       return;
+    } finally {
+      clearTimeout(renderTimer);
+      if (state.voice.controller === renderController) {
+        state.voice.controller = null;
+      }
     }
     turn.response_receipt = {
       ...(turn.response_receipt || {}),
       voice: data.render,
     };
-    state.voice.pendingTurns.delete(String(turn.id));
-    state.voice.revealingTurnId = String(turn.id);
-    renderChat();
-    state.voice.revealingTurnId = null;
-    if (state.voice.dialogTurnId === String(turn.id) && els.voiceDialog?.open) {
-      openVoiceDialog(turn.id);
+    const remainingMs = Math.floor(deadline - performance.now());
+    if (remainingMs <= 0) {
+      const error = new Error("The conversational rewrite exhausted the voice preparation window.");
+      error.code = "VOICE_TEXT_TIMEOUT";
+      stopVoicePlayback();
+      showVoiceFailure(turn, "text", error, true);
+      return;
     }
     try {
-      await playVoiceAudio(turn, data.render);
+      await playVoiceAudio(turn, data.render, {
+        firstAudioTimeoutMs: remainingMs,
+        onFirstAudio: () => revealVoicePresentation(turn),
+      });
     } catch (error) {
-      toast(error.message, true);
+      const diagnosedError = {
+        code: error?.code,
+        message: error?.message,
+        rewriteElapsedMs: Number(data.render?.rewrite_elapsed_ms) || 0,
+      };
+      showVoiceFailure(
+        turn,
+        "audio",
+        diagnosedError,
+        error?.code === "VOICE_AUDIO_TIMEOUT",
+      );
     }
   }
 

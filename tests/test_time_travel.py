@@ -14,6 +14,10 @@ def _refresh_generation(rvbbit, table):
 def test_as_of_generation_and_timestamp_helpers(rvbbit, temp_table):
     rvbbit.execute(f"CREATE TABLE {temp_table} (id int, label text) USING rvbbit")
     rvbbit.execute(
+        f"SELECT rvbbit.set_acceleration_storage_policy("
+        f"'{temp_table}'::regclass, history_policy => 'retained')"
+    )
+    rvbbit.execute(
         f"INSERT INTO {temp_table} VALUES (1, 'one'), (2, 'two')"
     )
     gen1 = _refresh_generation(rvbbit, temp_table)

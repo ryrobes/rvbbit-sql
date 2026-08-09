@@ -549,6 +549,48 @@ fn vortex_layout_enabled(rel_oid: u32) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug)]
+struct VortexStageRequest {
+    operation_id: i64,
+    min_rg_id: i64,
+    max_rg_id: i64,
+}
+
+fn internal_i64_setting(name: &str) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+    Ok(Spi::get_one::<i64>(&format!(
+        "SELECT nullif(current_setting({}, true), '')::bigint",
+        sql_literal(name)
+    ))?)
+}
+
+fn vortex_stage_request() -> Result<Option<VortexStageRequest>, Box<dyn std::error::Error>> {
+    let Some(operation_id) = internal_i64_setting("rvbbit.variant_stage_operation_id")? else {
+        return Ok(None);
+    };
+    let min_rg_id = internal_i64_setting("rvbbit.variant_stage_min_rg_id")?
+        .ok_or("rvbbit.variant_stage_min_rg_id is required for a staged Vortex build")?;
+    let max_rg_id = internal_i64_setting("rvbbit.variant_stage_max_rg_id")?
+        .ok_or("rvbbit.variant_stage_max_rg_id is required for a staged Vortex build")?;
+    if operation_id <= 0 {
+        return Err("rvbbit.variant_stage_operation_id must be positive".into());
+    }
+    if min_rg_id < 0 || max_rg_id < min_rg_id {
+        return Err(
+            format!("invalid staged Vortex row-group range {min_rg_id}..={max_rg_id}").into(),
+        );
+    }
+    Ok(Some(VortexStageRequest {
+        operation_id,
+        min_rg_id,
+        max_rg_id,
+    }))
+}
+
+fn vortex_only_refresh_requested() -> bool {
+    compact_bool_setting("RVBBIT_VARIANT_VORTEX_ONLY", "rvbbit.variant_vortex_only")
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LayoutVariantSource {
     Heap,
@@ -2037,6 +2079,9 @@ fn reap_unlink_files(paths: Option<Vec<Option<String>>>) -> i32 {
 #[pg_extern]
 fn refresh_layout_variants(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::Error>> {
     let rel_oid = rel.to_u32();
+    Spi::run(&format!(
+        "SELECT pg_advisory_xact_lock((1380336724::bigint << 32) | {rel_oid}::bigint)"
+    ))?;
     let qualified: String = Spi::get_one(&format!("SELECT {rel_oid}::oid::regclass::text"))?
         .ok_or("relation does not exist")?;
 
@@ -2051,6 +2096,24 @@ fn refresh_layout_variants(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::
     path_root.push(rel_oid.to_string());
     std::fs::create_dir_all(&path_root)?;
 
+    // rebuild_acceleration() uses the existing SQL binding as an internal
+    // staged Vortex writer.  The canonical parquet rows for the requested
+    // range are already complete, but the old generation remains live until
+    // the final metadata swap.  Writing to an operation-specific directory
+    // lets that conversion happen without disturbing the current layout.
+    if let Some(request) = vortex_stage_request()? {
+        return refresh_vortex_scan_stage_impl(rel_oid, &qualified, &plans, &path_root, request);
+    }
+
+    // The retry worker deliberately repairs only the derived Vortex layout;
+    // cluster/hive variants keep their independent maintenance policies.
+    if vortex_only_refresh_requested() {
+        if !vortex_layout_enabled(rel_oid) {
+            return Ok(-1);
+        }
+        return refresh_vortex_scan_full_impl(rel_oid, &qualified, &plans, &path_root);
+    }
+
     refresh_layout_variants_impl(rel_oid, &qualified, &plans, &schema, &path_root)
 }
 
@@ -2061,6 +2124,9 @@ fn refresh_layout_variants_xid_range(
     max_xid: &str,
 ) -> Result<i64, Box<dyn std::error::Error>> {
     let rel_oid = rel.to_u32();
+    Spi::run(&format!(
+        "SELECT pg_advisory_xact_lock((1380336724::bigint << 32) | {rel_oid}::bigint)"
+    ))?;
     let min_xid = xid_numeric_literal(min_xid)?;
     let max_xid = xid_numeric_literal(max_xid)?;
     if max_xid.parse::<u128>()? <= min_xid.parse::<u128>()? {
@@ -2284,71 +2350,7 @@ fn refresh_layout_variants_impl(
     }
 
     if vortex_layout_enabled(rel_oid) {
-        let layout = VORTEX_SCAN_LAYOUT;
-        let phase_id = start_acceleration_phase(
-            rel_oid,
-            qualified,
-            "format_variant_rebuild",
-            Some(layout),
-            None,
-            serde_json::json!({
-                "layout_kind": "vortex",
-                "build_mode": "full_rebuild",
-                "source": "canonical_parquet",
-                "file_extension": "vortex",
-            }),
-        )?;
-        let build_result = (|| -> Result<_, Box<dyn std::error::Error>> {
-            clear_variant_layout(rel_oid, layout, path_root)?;
-            let vortex_root = path_root.join(layout_dir_name(layout));
-            write_vortex_scan_chunks_from_canonical_parquet(
-                rel_oid,
-                plans,
-                &vortex_root,
-                layout,
-                false,
-            )
-        })();
-        let variant_chunks = match build_result {
-            Ok(chunks) => chunks,
-            Err(err) => {
-                let _ = finish_acceleration_phase(
-                    phase_id,
-                    "failed",
-                    0,
-                    0,
-                    0,
-                    None,
-                    None,
-                    serde_json::json!({"layout_kind": "vortex"}),
-                    Some(&err.to_string()),
-                );
-                return Err(err);
-            }
-        };
-        let (variant_rows, variant_files, variant_bytes) = variant_chunk_totals(&variant_chunks);
-        let expected_rows = canonical_row_count(rel_oid)?;
-        let valid = validate_variant_chunks(rel_oid, layout, &variant_chunks)?;
-        if valid {
-            rows_written += variant_rows;
-            register_variant_chunks(rel_oid, layout, &variant_chunks)?;
-            mark_variant_status_ready(rel_oid, layout, &variant_chunks)?;
-        }
-        finish_acceleration_phase(
-            phase_id,
-            if valid { "ok" } else { "invalid" },
-            variant_rows,
-            variant_files,
-            variant_bytes,
-            Some(expected_rows),
-            Some(variant_rows),
-            serde_json::json!({
-                "validated": valid,
-                "source": "canonical_parquet",
-                "file_extension": "vortex",
-            }),
-            None,
-        )?;
+        rows_written += refresh_vortex_scan_full_impl(rel_oid, qualified, plans, path_root)?;
     }
 
     // Drop backend-local caches that depend on rvbbit.row_groups state.
@@ -2360,6 +2362,260 @@ fn refresh_layout_variants_impl(
     crate::live_counters::bump_scan_epoch_on_commit();
 
     Ok(rows_written)
+}
+
+fn refresh_vortex_scan_full_impl(
+    rel_oid: u32,
+    qualified: &str,
+    plans: &[ColumnPlan],
+    path_root: &PathBuf,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let layout = VORTEX_SCAN_LAYOUT;
+    let build_id = current_acceleration_operation_id()
+        .or(Spi::get_one::<i64>("SELECT txid_current()::bigint")?)
+        .ok_or("could not allocate a Vortex build id")?;
+    let vortex_root = path_root.join(format!("vortex_build_{build_id}"));
+    let phase_id = start_acceleration_phase(
+        rel_oid,
+        qualified,
+        "format_variant_rebuild",
+        Some(layout),
+        None,
+        serde_json::json!({
+            "layout_kind": "vortex",
+            "build_mode": "full_rebuild_atomic",
+            "source": "canonical_parquet",
+            "file_extension": "vortex",
+            "build_id": build_id,
+        }),
+    )?;
+
+    // build_id is transaction/operation unique. Removing this directory can
+    // only clean debris from a prior failed attempt with that same id; it can
+    // never unlink the currently published Vortex files.
+    remove_dir_if_present(&vortex_root)?;
+    let build_result = write_vortex_scan_chunks_from_canonical_parquet(
+        rel_oid,
+        plans,
+        &vortex_root,
+        layout,
+        false,
+        None,
+    );
+    let variant_chunks = match build_result {
+        Ok(chunks) => chunks,
+        Err(err) => {
+            let _ = remove_dir_if_present(&vortex_root);
+            let _ = finish_acceleration_phase(
+                phase_id,
+                "failed",
+                0,
+                0,
+                0,
+                None,
+                None,
+                serde_json::json!({"layout_kind": "vortex", "build_id": build_id}),
+                Some(&err.to_string()),
+            );
+            return Err(err);
+        }
+    };
+    let (variant_rows, variant_files, variant_bytes) = variant_chunk_totals(&variant_chunks);
+    let expected_rows = canonical_row_count(rel_oid)?;
+    if !variant_chunks_match_expected(expected_rows, &variant_chunks) {
+        let error = format!(
+            "staged Vortex row count mismatch for table oid {rel_oid}: expected {expected_rows}, wrote {variant_rows} in {variant_files} file(s)"
+        );
+        let _ = remove_dir_if_present(&vortex_root);
+        finish_acceleration_phase(
+            phase_id,
+            "invalid",
+            variant_rows,
+            variant_files,
+            variant_bytes,
+            Some(expected_rows),
+            Some(variant_rows),
+            serde_json::json!({"layout_kind": "vortex", "build_id": build_id}),
+            Some(&error),
+        )?;
+        return Err(error.into());
+    }
+
+    let old_paths = registered_variant_paths(rel_oid, layout)?;
+    let publish_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        clear_variant_layout_metadata(rel_oid, layout)?;
+        register_variant_chunks(rel_oid, layout, &variant_chunks)?;
+        mark_variant_status_ready(rel_oid, layout, &variant_chunks)?;
+        queue_variant_orphan_paths(
+            rel_oid,
+            &old_paths,
+            "vortex_atomic_replacement",
+            current_acceleration_operation_id(),
+        )?;
+        if !vortex_only_refresh_requested() {
+            clear_variant_build_queue(rel_oid)?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = publish_result {
+        let _ = remove_dir_if_present(&vortex_root);
+        let _ = finish_acceleration_phase(
+            phase_id,
+            "failed",
+            variant_rows,
+            variant_files,
+            variant_bytes,
+            Some(expected_rows),
+            Some(variant_rows),
+            serde_json::json!({"layout_kind": "vortex", "build_id": build_id}),
+            Some(&err.to_string()),
+        );
+        return Err(err);
+    }
+
+    finish_acceleration_phase(
+        phase_id,
+        "ok",
+        variant_rows,
+        variant_files,
+        variant_bytes,
+        Some(expected_rows),
+        Some(variant_rows),
+        serde_json::json!({
+            "validated": true,
+            "source": "canonical_parquet",
+            "file_extension": "vortex",
+            "metadata_swap": "atomic",
+            "build_id": build_id,
+        }),
+        None,
+    )?;
+    Ok(variant_rows)
+}
+
+fn refresh_vortex_scan_stage_impl(
+    rel_oid: u32,
+    qualified: &str,
+    plans: &[ColumnPlan],
+    path_root: &PathBuf,
+    request: VortexStageRequest,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    if !vortex_layout_enabled(rel_oid) {
+        return Ok(-1);
+    }
+
+    // Keep the catalog tag inseparable from the stage request even when this
+    // internal mode is exercised directly in a diagnostic session.
+    Spi::run(&format!(
+        "SELECT set_config('rvbbit.acceleration_operation_id', '{}', true)",
+        request.operation_id
+    ))?;
+
+    let layout = VORTEX_SCAN_LAYOUT;
+    let range = (request.min_rg_id, request.max_rg_id);
+    let stage_root = path_root
+        .join(format!("vortex_stage_{}", request.operation_id))
+        .join(format!("{}_{}", request.min_rg_id, request.max_rg_id));
+    let expected_rows = canonical_row_count_range(rel_oid, range)?;
+    if expected_rows == 0 {
+        return Ok(0);
+    }
+    let phase_id = start_acceleration_phase(
+        rel_oid,
+        qualified,
+        "format_variant_stage",
+        Some(layout),
+        None,
+        serde_json::json!({
+            "layout_kind": "vortex",
+            "build_mode": "canonical_rebuild_stage",
+            "source": "canonical_parquet",
+            "operation_id": request.operation_id,
+            "min_rg_id": request.min_rg_id,
+            "max_rg_id": request.max_rg_id,
+        }),
+    )?;
+
+    remove_dir_if_present(&stage_root)?;
+    let build_result = write_vortex_scan_chunks_from_canonical_parquet(
+        rel_oid,
+        plans,
+        &stage_root,
+        layout,
+        false,
+        Some(range),
+    );
+    let variant_chunks = match build_result {
+        Ok(chunks) => chunks,
+        Err(err) => {
+            let _ = remove_dir_if_present(&stage_root);
+            let _ = finish_acceleration_phase(
+                phase_id,
+                "failed",
+                0,
+                0,
+                0,
+                Some(expected_rows),
+                None,
+                serde_json::json!({"layout_kind": "vortex"}),
+                Some(&err.to_string()),
+            );
+            return Err(err);
+        }
+    };
+    let (variant_rows, variant_files, variant_bytes) = variant_chunk_totals(&variant_chunks);
+    if !variant_chunks_match_expected(expected_rows, &variant_chunks) {
+        let error = format!(
+            "staged Vortex row count mismatch for table oid {rel_oid}, row groups {}..={}: expected {expected_rows}, wrote {variant_rows}",
+            request.min_rg_id, request.max_rg_id
+        );
+        let _ = remove_dir_if_present(&stage_root);
+        finish_acceleration_phase(
+            phase_id,
+            "invalid",
+            variant_rows,
+            variant_files,
+            variant_bytes,
+            Some(expected_rows),
+            Some(variant_rows),
+            serde_json::json!({"layout_kind": "vortex"}),
+            Some(&error),
+        )?;
+        return Err(error.into());
+    }
+
+    if let Err(err) = register_variant_chunks(rel_oid, layout, &variant_chunks) {
+        let _ = remove_dir_if_present(&stage_root);
+        let _ = finish_acceleration_phase(
+            phase_id,
+            "failed",
+            variant_rows,
+            variant_files,
+            variant_bytes,
+            Some(expected_rows),
+            Some(variant_rows),
+            serde_json::json!({"layout_kind": "vortex"}),
+            Some(&err.to_string()),
+        );
+        return Err(err);
+    }
+
+    finish_acceleration_phase(
+        phase_id,
+        "ok",
+        variant_rows,
+        variant_files,
+        variant_bytes,
+        Some(expected_rows),
+        Some(variant_rows),
+        serde_json::json!({
+            "validated": true,
+            "source": "canonical_parquet",
+            "publication": "deferred_to_canonical_metadata_swap",
+        }),
+        None,
+    )?;
+    Ok(variant_rows)
 }
 
 fn refresh_layout_variants_delta_impl(
@@ -2540,6 +2796,7 @@ fn refresh_vortex_scan_delta_impl(
         &vortex_root,
         layout,
         true,
+        None,
     );
     let variant_chunks = match build_result {
         Ok(chunks) => chunks,
@@ -2564,6 +2821,9 @@ fn refresh_vortex_scan_delta_impl(
     }
     let expected_rows = canonical_row_count(rel_oid)?;
     let valid = validate_registered_variant_layout(rel_oid, layout)?;
+    if valid {
+        clear_variant_build_queue(rel_oid)?;
+    }
     finish_acceleration_phase(
         phase_id,
         if valid { "ok" } else { "invalid" },
@@ -2587,6 +2847,15 @@ fn clear_variant_layout(
     layout: &str,
     path_root: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    clear_variant_layout_metadata(rel_oid, layout)?;
+    let layout_root = path_root.join(layout_dir_name(layout));
+    remove_dir_if_present(&layout_root)
+}
+
+fn clear_variant_layout_metadata(
+    rel_oid: u32,
+    layout: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let layout_escaped = layout.replace('\'', "''");
     Spi::run(&format!(
         "DELETE FROM rvbbit.layout_variant_status \
@@ -2596,11 +2865,81 @@ fn clear_variant_layout(
         "DELETE FROM rvbbit.row_group_variants \
          WHERE table_oid = {rel_oid}::oid AND layout = '{layout_escaped}'"
     ))?;
-    let layout_root = path_root.join(layout_dir_name(layout));
-    match std::fs::remove_dir_all(&layout_root) {
+    Ok(())
+}
+
+fn remove_dir_if_present(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    match std::fs::remove_dir_all(path) {
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(Box::new(err)),
+    }
+    Ok(())
+}
+
+fn registered_variant_paths(
+    rel_oid: u32,
+    layout: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let layout_lit = sql_literal(layout);
+    let mut paths = Vec::new();
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let table = client.select(
+            &format!(
+                "SELECT path FROM rvbbit.row_group_variants \
+                 WHERE table_oid = {rel_oid}::oid AND layout = {layout_lit} \
+                 ORDER BY path"
+            ),
+            None,
+            &[],
+        )?;
+        for row in table {
+            if let Some(path) = row.get::<String>(1)? {
+                paths.push(path);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(paths)
+}
+
+fn queue_variant_orphan_paths(
+    rel_oid: u32,
+    paths: &[String],
+    reason: &str,
+    operation_id: Option<i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if paths.is_empty() || !rvbbit_catalog_table_exists("orphaned_files") {
+        return Ok(());
+    }
+    let operation_sql = operation_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "NULL::bigint".to_string());
+    for path in paths {
+        if path.trim().is_empty() {
+            continue;
+        }
+        Spi::run(&format!(
+            "INSERT INTO rvbbit.orphaned_files (path, table_oid, reason, operation_id) \
+             VALUES ({}, {rel_oid}::oid, {}, {operation_sql}) \
+             ON CONFLICT (path) DO UPDATE SET \
+                 table_oid = EXCLUDED.table_oid, \
+                 reason = EXCLUDED.reason, \
+                 operation_id = EXCLUDED.operation_id, \
+                 queued_at = clock_timestamp(), \
+                 last_error = NULL",
+            sql_literal(path),
+            sql_literal(reason),
+        ))?;
+    }
+    Ok(())
+}
+
+fn clear_variant_build_queue(rel_oid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    if rvbbit_catalog_table_exists("variant_build_queue") {
+        Spi::run(&format!(
+            "DELETE FROM rvbbit.variant_build_queue WHERE table_oid = {rel_oid}::oid"
+        ))?;
     }
     Ok(())
 }
@@ -2612,6 +2951,32 @@ fn canonical_row_count(rel_oid: u32) -> Result<i64, Box<dyn std::error::Error>> 
          WHERE table_oid = {rel_oid}::oid"
     ))?
     .unwrap_or(0))
+}
+
+fn canonical_row_count_range(
+    rel_oid: u32,
+    range: (i64, i64),
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(Spi::get_one::<i64>(&format!(
+        "SELECT coalesce(sum(n_rows), 0)::bigint \
+         FROM rvbbit.row_groups \
+         WHERE table_oid = {rel_oid}::oid \
+           AND rg_id BETWEEN {} AND {}",
+        range.0, range.1
+    ))?
+    .unwrap_or(0))
+}
+
+fn variant_chunks_match_expected(
+    expected_rows: i64,
+    chunks: &[rvbbit_storage::metadata::RowGroupMeta],
+) -> bool {
+    expected_rows > 0
+        && chunks.iter().map(|chunk| chunk.n_rows).sum::<i64>() == expected_rows
+        && !chunks.is_empty()
+        && chunks
+            .iter()
+            .all(|chunk| std::path::Path::new(&chunk.path).is_file())
 }
 
 fn validate_variant_chunks(
@@ -3578,9 +3943,13 @@ fn write_vortex_scan_chunks_from_canonical_parquet(
     path_root: &PathBuf,
     layout: &str,
     only_missing: bool,
+    rg_range: Option<(i64, i64)>,
 ) -> Result<Vec<rvbbit_storage::metadata::RowGroupMeta>, Box<dyn std::error::Error>> {
-    let row_groups = canonical_row_group_paths(rel_oid)?;
+    let row_groups = canonical_row_group_paths_range(rel_oid, rg_range)?;
     if row_groups.is_empty() {
+        if rg_range.is_some() {
+            return Ok(Vec::new());
+        }
         return Err(format!("table oid {rel_oid} has no canonical parquet row groups").into());
     }
 
@@ -3746,13 +4115,23 @@ fn write_vortex_record_batch(
 fn canonical_row_group_paths(
     rel_oid: u32,
 ) -> Result<Vec<(i64, String)>, Box<dyn std::error::Error>> {
+    canonical_row_group_paths_range(rel_oid, None)
+}
+
+fn canonical_row_group_paths_range(
+    rel_oid: u32,
+    rg_range: Option<(i64, i64)>,
+) -> Result<Vec<(i64, String)>, Box<dyn std::error::Error>> {
     let mut row_groups = Vec::new();
+    let range_clause = rg_range
+        .map(|(min_rg_id, max_rg_id)| format!(" AND rg_id BETWEEN {min_rg_id} AND {max_rg_id}"))
+        .unwrap_or_default();
     Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let table = client.select(
             &format!(
                 "SELECT rg_id, path \
                  FROM rvbbit.row_groups \
-                 WHERE table_oid = {rel_oid}::oid \
+                 WHERE table_oid = {rel_oid}::oid {range_clause} \
                  ORDER BY rg_id"
             ),
             None,
@@ -4076,16 +4455,20 @@ fn register_variant_chunks(
     chunks: &[rvbbit_storage::metadata::RowGroupMeta],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let layout_escaped = layout.replace('\'', "''");
+    let operation_id_sql = current_acceleration_operation_id()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "NULL::bigint".to_string());
     for meta in chunks {
         let (stats_escaped, per_group_escaped) = escaped_row_group_json(meta)?;
         let path_str = meta.path.replace('\'', "''");
         Spi::run(&format!(
             "INSERT INTO rvbbit.row_group_variants \
-             (table_oid, layout, rg_id, path, n_rows, n_bytes, stats, per_group_stats) \
+             (table_oid, layout, rg_id, path, n_rows, n_bytes, stats, per_group_stats, build_operation_id) \
              VALUES ({rel_oid}::oid, '{layout_escaped}', {rg_id}, '{path_str}', \
                      {n_rows_meta}, {n_bytes}, \
                      $rvbbit${stats_escaped}$rvbbit$::jsonb, \
-                     $rvbbit${per_group_escaped}$rvbbit$::jsonb)",
+                     $rvbbit${per_group_escaped}$rvbbit$::jsonb, \
+                     {operation_id_sql})",
             rg_id = meta.rg_id,
             n_rows_meta = meta.n_rows,
             n_bytes = meta.n_bytes,

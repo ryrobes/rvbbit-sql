@@ -838,6 +838,7 @@ export ELEVENLABS_VOICE_ID="..."
 export WAREHOUSE_CALLIOPE_TTS_FAST_MODEL="eleven_flash_v2_5"
 export WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_MODEL="eleven_v3"
 export WAREHOUSE_CALLIOPE_TTS_SAMPLE_RATE="24000"
+export WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS="30"
 ```
 
 For the uber Compose stack with Hermes running directly on the Docker host,
@@ -1118,6 +1119,7 @@ dedicated overrides are `WAREHOUSE_CALLIOPE_TTS_KEY` and
 `WAREHOUSE_CALLIOPE_TTS_FAST_MODEL` (`eleven_flash_v2_5`) ·
 `WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_MODEL` (`eleven_v3`) ·
 `WAREHOUSE_CALLIOPE_TTS_SAMPLE_RATE` (24000; supported PCM rates only) ·
+`WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS` (30 default; one rewrite-to-first-audio budget) ·
 `WAREHOUSE_CALLIOPE_TTS_MAX_AUDIO_BYTES` (16 MiB default, 64 MiB ceiling).
 **Artifact semantic compiler:** `WAREHOUSE_SEMANTIC_ENRICHMENT` (default `1`; set `0` to
 disable queueing and the worker) · `WAREHOUSE_SEMANTIC_ENRICH_MODEL` (default

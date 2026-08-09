@@ -26,17 +26,35 @@ pub(crate) fn load_for_table(
     table_oid: u32,
     asof: Option<i64>,
 ) -> Result<HashMap<i64, RoaringBitmap>, String> {
+    // Restrict tombstones to row groups that the scan can actually see. This
+    // matters enormously for full-snapshot tables: retained history may carry
+    // millions of valid tombstones for old generations, but loading those into
+    // the latest scan's bitmap both wastes memory and can spuriously force a
+    // layout fallback merely because the map is non-empty.
+    let visibility_filter = match asof {
+        Some(g) => format!(
+            "AND t.history_policy = 'retained' \
+             AND dl.deleted_generation <= {g} \
+             AND rg.generation <= {g} \
+             AND (NOT (t.generation_semantics = 'snapshot' OR t.min_visible_generation > 0) \
+                  OR rg.generation = {g})"
+        ),
+        None => "AND (NOT (t.generation_semantics = 'snapshot' OR t.min_visible_generation > 0) \
+                     OR rg.generation = t.min_visible_generation)"
+            .to_string(),
+    };
+
     // Quick exit: if the delete_log catalog table doesn't exist (older
     // extension version) or there are no tombstones for this table at all,
     // skip the full query.
     let count: i64 = Spi::get_one::<i64>(&format!(
-        "SELECT count(*)::bigint FROM rvbbit.delete_log \
-         WHERE table_oid = {table_oid}::oid \
-           {asof_filter}",
-        asof_filter = match asof {
-            Some(g) => format!("AND deleted_generation <= {g}"),
-            None => String::new(),
-        }
+        "SELECT count(*)::bigint \
+           FROM rvbbit.delete_log dl \
+           JOIN rvbbit.row_groups rg \
+             ON rg.table_oid = dl.table_oid AND rg.rg_id = dl.rg_id \
+           JOIN rvbbit.tables t ON t.table_oid = dl.table_oid \
+          WHERE dl.table_oid = {table_oid}::oid \
+            {visibility_filter}"
     ))
     .map_err(|e| format!("delete_log count SPI: {e}"))?
     .unwrap_or(0);
@@ -47,14 +65,14 @@ pub(crate) fn load_for_table(
     let mut out: HashMap<i64, RoaringBitmap> = HashMap::new();
     Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let sql = format!(
-            "SELECT rg_id, ordinal FROM rvbbit.delete_log \
-             WHERE table_oid = {table_oid}::oid \
-               {asof_filter} \
-             ORDER BY rg_id, ordinal",
-            asof_filter = match asof {
-                Some(g) => format!("AND deleted_generation <= {g}"),
-                None => String::new(),
-            }
+            "SELECT dl.rg_id, dl.ordinal \
+               FROM rvbbit.delete_log dl \
+               JOIN rvbbit.row_groups rg \
+                 ON rg.table_oid = dl.table_oid AND rg.rg_id = dl.rg_id \
+               JOIN rvbbit.tables t ON t.table_oid = dl.table_oid \
+              WHERE dl.table_oid = {table_oid}::oid \
+                {visibility_filter} \
+              ORDER BY dl.rg_id, dl.ordinal"
         );
         let table = client.select(&sql, None, &[])?;
         for row in table {

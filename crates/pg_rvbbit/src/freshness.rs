@@ -150,9 +150,10 @@ CREATE TABLE rvbbit.accel_policy (
     -- Below this drift ratio the executor does a cheap delta refresh; at/above it
     -- escalates to a full rebuild (the LSM major-compaction trigger).
     full_rebuild_drift_ratio double precision NOT NULL DEFAULT 0.5,
-    -- Optional major-compaction pressure limits. These let the heartbeat fold
-    -- accumulated small row groups or tombstones back into a clean current
-    -- accelerator even when freshness is otherwise up to date.
+    -- Optional major-compaction pressure limits. The high-frequency freshness
+    -- heartbeat deliberately ignores these; the separately scheduled
+    -- accel_fold_tick uses them to fold clean authoritative accelerators during
+    -- a quiet maintenance window.
     max_row_groups_before_rebuild integer,
     max_tombstones_before_rebuild bigint,
     -- Lance datasets are always full-overwrite (expensive). When true, the
@@ -408,7 +409,7 @@ DECLARE
     prop_action text;
     prop_reason text;
     act_reason  text;
-    maintenance_pressure boolean;
+    baseline_missing boolean;
     res         jsonb;
     last_scans  bigint;
     used_today  integer;
@@ -429,45 +430,43 @@ BEGIN
                f.seconds_dirty,
                f.seconds_since_refresh,
                f.row_groups,
+               f.heap_live_tuples,
                f.tombstones,
                f.drift_rows,
                f.drift_ratio,
                f.heap_seq_scans,
                f.lance_accelerated,
+               rvbbit.current_replacement_pending(f.table_oid)
+                   AS current_replacement_pending,
                e.strategy,
                e.freshness_target_secs,
                e.min_interval_secs,
                e.daily_refresh_budget,
                e.full_rebuild_drift_ratio,
-               e.max_row_groups_before_rebuild,
-               e.max_tombstones_before_rebuild,
                e.lance_separate
           FROM rvbbit.accel_freshness f
           JOIN rvbbit.accel_policy_effective e ON e.table_oid = f.table_oid
          WHERE e.active
            AND e.strategy <> 'manual'
-         ORDER BY (f.drift_rows * (1 + f.heap_seq_scans)) DESC,
+         ORDER BY rvbbit.current_replacement_pending(f.table_oid) DESC,
+                  (f.drift_rows * (1 + f.heap_seq_scans)) DESC,
                   f.seconds_dirty DESC NULLS LAST
     LOOP
-        -- Proposed kind: row-group/tombstone pressure asks for a major
-        -- compaction even when the accelerator is otherwise fresh. Otherwise,
-        -- dirty tables choose full vs delta by drift, as before.
-        IF cand.max_row_groups_before_rebuild IS NOT NULL
-           AND cand.row_groups >= cand.max_row_groups_before_rebuild THEN
+        -- Registration is only eligibility: a non-empty table can be enabled
+        -- while still having no accelerator files (and therefore no dirty
+        -- triggers). Treat that as an explicit bootstrap state instead of the
+        -- ordinary clean state. Manual policies remain excluded by the query.
+        baseline_missing := cand.row_groups = 0 AND cand.heap_live_tuples > 0;
+
+        -- Freshness work only: clean fanout/tombstone pressure remains
+        -- authoritative and is handled by the separate off-hours fold lane.
+        -- Dirty tables choose full vs delta by correctness state and drift.
+        IF cand.current_replacement_pending THEN
+            -- A current-only TRUNCATE invalidates the previous baseline as a
+            -- unit and deliberately emits no row tombstones. Delta refresh is
+            -- therefore never correct, even when row counts happen to match.
             prop_action := 'full';
-            prop_reason := format(
-                'row_group_fanout %s >= %s',
-                cand.row_groups,
-                cand.max_row_groups_before_rebuild
-            );
-        ELSIF cand.max_tombstones_before_rebuild IS NOT NULL
-              AND cand.tombstones >= cand.max_tombstones_before_rebuild THEN
-            prop_action := 'full';
-            prop_reason := format(
-                'tombstone_count %s >= %s',
-                cand.tombstones,
-                cand.max_tombstones_before_rebuild
-            );
+            prop_reason := 'current replacement pending';
         ELSIF cand.shadow_heap_dirty THEN
             IF cand.drift_ratio IS NULL THEN
                 prop_action := 'full';
@@ -483,6 +482,12 @@ BEGIN
                 prop_action := 'delta';
                 prop_reason := 'dirty';
             END IF;
+        ELSIF baseline_missing THEN
+            -- refresh_acceleration() owns the canonical first-build path and
+            -- installs the write-tracking triggers. If it refuses an unusual
+            -- legacy state, the execution block safely escalates to rebuild.
+            prop_action := 'delta';
+            prop_reason := 'no accelerator baseline';
         ELSE
             prop_action := 'skip';
             prop_reason := 'clean';
@@ -490,24 +495,21 @@ BEGIN
         is_lance   := coalesce(cand.lance_accelerated, false) AND coalesce(cand.lance_separate, true);
         should_act := false;
         act_reason := prop_reason;
-        maintenance_pressure := prop_action = 'full'
-            AND (prop_reason LIKE 'row_group_fanout %' OR prop_reason LIKE 'tombstone_count %');
-
         IF prop_action = 'skip' THEN
             act_reason := prop_reason;
         ELSIF cand.seconds_since_refresh IS NOT NULL
               AND cand.seconds_since_refresh < cand.min_interval_secs THEN
             act_reason := format('min_interval %ss not elapsed', cand.min_interval_secs);
-        ELSIF maintenance_pressure THEN
-            should_act := true;
-            act_reason := prop_reason;
         ELSE
             -- Strategy gate.
             IF cand.strategy IN ('scheduled', 'continuous') THEN
                 should_act := true;
                 act_reason := prop_reason;
             ELSIF cand.strategy = 'target' THEN
-                IF cand.freshness_target_secs IS NULL
+                IF baseline_missing THEN
+                    should_act := true;
+                    act_reason := prop_reason || '; target requires a baseline';
+                ELSIF cand.freshness_target_secs IS NULL
                    OR coalesce(cand.seconds_dirty, 0) >= cand.freshness_target_secs THEN
                     should_act := true;
                     act_reason := format('%s; stale %ss >= target %ss',
@@ -523,7 +525,11 @@ BEGIN
                   FROM rvbbit.accel_tick_runs r
                  WHERE r.table_oid = cand.f_oid
                  ORDER BY r.ran_at DESC LIMIT 1;
-                IF last_scans IS NOT NULL AND cand.heap_seq_scans > last_scans THEN
+                IF baseline_missing
+                   AND cand.heap_seq_scans > coalesce(last_scans, 0) THEN
+                    should_act := true;
+                    act_reason := prop_reason || '; observed slow-path demand';
+                ELSIF last_scans IS NOT NULL AND cand.heap_seq_scans > last_scans THEN
                     should_act := true;
                     act_reason := prop_reason || '; demand grew on slow path';
                 ELSE
@@ -639,7 +645,8 @@ END;
 $$;
 
 COMMENT ON FUNCTION rvbbit.accel_tick(integer, boolean, integer) IS
-    'Policy-driven accelerator refresh executor (Layer 3). Call on a heartbeat (pg_cron). '
+    'Policy-driven high-frequency accelerator freshness executor (Layer 3). Call on a heartbeat (pg_cron). '
+    'Clean row-group/tombstone pressure is handled separately by accel_fold_tick. '
     'dry_run=true returns the plan without executing — the cockpit "projected consequence" preview.';
 
 -- Convenience: register the heartbeat as a pg_cron job. Errors clearly if
@@ -647,13 +654,14 @@ COMMENT ON FUNCTION rvbbit.accel_tick(integer, boolean, integer) IS
 -- hard dependency on the cron schema.
 CREATE OR REPLACE FUNCTION rvbbit.schedule_accel_tick(
     cron_schedule text DEFAULT '* * * * *',
-    budget        integer DEFAULT 4
+    budget        integer DEFAULT 1
 ) RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
     jobid     bigint;
     cron_home text := current_setting('cron.database_name', true);
     this_db   text := current_database();
-    command   text := format('SELECT rvbbit.accel_tick(%s)', budget);
+    safe_budget integer := CASE WHEN coalesce(budget, 1) <= 0 THEN 0 ELSE 1 END;
+    command   text := format('SELECT rvbbit.accel_tick(%s, false)', safe_budget);
 BEGIN
     -- pg_cron's cron.* functions live only in its home database (cron.database_name).
     -- If that is a DIFFERENT database than this one (e.g. the recommended
@@ -670,7 +678,7 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
         RAISE EXCEPTION 'pg_cron is not installed; cannot schedule the accelerator heartbeat.'
             USING HINT = 'Add pg_cron to shared_preload_libraries and CREATE EXTENSION pg_cron, '
-                         'or call rvbbit.accel_tick() manually.';
+                         'or call rvbbit.accel_tick(1, false) manually.';
     END IF;
     EXECUTE format('SELECT cron.schedule(%L, %L, %L)', 'rvbbit_accel_tick', cron_schedule, command)
         INTO jobid;
@@ -679,7 +687,11 @@ END;
 $$;
 "#,
     name = "accel_tick_layer3",
-    requires = ["rvbbit_bootstrap", "accel_policy_layer2"],
+    requires = [
+        "rvbbit_bootstrap",
+        "accel_freshness_layer1",
+        "accel_policy_layer2"
+    ],
 );
 
 #[cfg(any(test, feature = "pg_test"))]
