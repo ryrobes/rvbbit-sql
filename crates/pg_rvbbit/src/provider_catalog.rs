@@ -144,8 +144,20 @@ BEGIN
         SELECT t.table_oid::regclass AS rel
         FROM rvbbit.tables t
         JOIN rvbbit.table_dirty_state ds ON ds.table_oid = t.table_oid
+        JOIN rvbbit.accel_policy_effective policy
+          ON policy.table_oid = t.table_oid
         JOIN pg_class c ON c.oid = t.table_oid
         WHERE ds.shadow_heap_dirty
+          -- Storage housekeeping must never create supply. Baselines are an
+          -- explicit operator/autopilot decision, and manual means no automatic
+          -- refresh even when an old hourly storage job remains installed.
+          AND policy.active
+          AND policy.strategy <> 'manual'
+          AND EXISTS (
+              SELECT 1
+                FROM rvbbit.row_groups rg
+               WHERE rg.table_oid = t.table_oid
+          )
         ORDER BY t.created_at
         LIMIT cap
     LOOP
@@ -170,16 +182,24 @@ BEGIN
                     coalesce(max(rg.created_at), '-infinity'::timestamptz) AS newest_rg,
                     coalesce(max(rgv.created_at), '-infinity'::timestamptz) AS newest_variant,
                     count(rg.*) AS row_groups,
-                    count(rgv.*) AS variants
+                    count(rgv.*) AS variants,
+                    policy.active AS policy_active,
+                    policy.strategy AS policy_strategy
                 FROM rvbbit.tables t
+                JOIN rvbbit.accel_policy_effective policy
+                  ON policy.table_oid = t.table_oid
                 JOIN pg_class c ON c.oid = t.table_oid
                 LEFT JOIN rvbbit.row_groups rg ON rg.table_oid = t.table_oid
                 LEFT JOIN rvbbit.row_group_variants rgv ON rgv.table_oid = t.table_oid
-                GROUP BY t.table_oid
+                GROUP BY t.table_oid, policy.active, policy.strategy
             )
             SELECT rel
             FROM candidates
             WHERE row_groups > 0
+              -- Variant housekeeping respects the same automation boundary as
+              -- canonical maintenance. Manual tables stay completely manual.
+              AND policy_active
+              AND policy_strategy <> 'manual'
               AND (variants = 0 OR newest_variant < newest_rg)
             ORDER BY newest_rg DESC
             LIMIT cap

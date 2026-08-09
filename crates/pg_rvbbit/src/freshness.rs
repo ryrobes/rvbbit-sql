@@ -147,6 +147,9 @@ CREATE TABLE rvbbit.accel_policy (
     freshness_target_secs    integer,            -- 'target': keep within N seconds stale
     min_interval_secs        integer NOT NULL DEFAULT 60,   -- floor on auto-refresh frequency
     daily_refresh_budget     integer,            -- max auto-refreshes / rolling 24h (NULL = unlimited)
+    -- Receipts before this enrollment epoch remain auditable but do not spend
+    -- the current policy lifecycle's rolling budget.
+    budget_epoch_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
     -- Below this drift ratio the executor does a cheap delta refresh; at/above it
     -- escalates to a full rebuild (the LSM major-compaction trigger).
     full_rebuild_drift_ratio double precision NOT NULL DEFAULT 0.5,
@@ -197,6 +200,32 @@ ALTER TABLE IF EXISTS rvbbit.accel_policy
     ADD COLUMN IF NOT EXISTS max_row_groups_before_rebuild integer;
 ALTER TABLE IF EXISTS rvbbit.accel_policy
     ADD COLUMN IF NOT EXISTS max_tombstones_before_rebuild bigint;
+ALTER TABLE IF EXISTS rvbbit.accel_policy
+    ADD COLUMN IF NOT EXISTS budget_epoch_at timestamptz NOT NULL DEFAULT clock_timestamp();
+
+CREATE OR REPLACE FUNCTION rvbbit.accel_policy_budget_epoch_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.budget_epoch_at := coalesce(NEW.budget_epoch_at, clock_timestamp());
+    ELSIF (
+        (OLD.strategy = 'manual' OR NOT OLD.active)
+        AND NEW.strategy <> 'manual'
+        AND NEW.active
+    ) THEN
+        -- A disabled/manual policy becoming executable is a new automation
+        -- lifecycle. Keep prior receipts, but do not charge them to this one.
+        NEW.budget_epoch_at := clock_timestamp();
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS accel_policy_budget_epoch_guard
+    ON rvbbit.accel_policy;
+CREATE TRIGGER accel_policy_budget_epoch_guard
+BEFORE INSERT OR UPDATE ON rvbbit.accel_policy
+FOR EACH ROW EXECUTE FUNCTION rvbbit.accel_policy_budget_epoch_guard();
 
 -- Effective policy: every registered table, with the manual fallback applied for
 -- tables that have no explicit row. `explicit` distinguishes a real policy from
@@ -218,7 +247,8 @@ SELECT
     p.note,
     p.updated_at,
     p.max_row_groups_before_rebuild,
-    p.max_tombstones_before_rebuild
+    p.max_tombstones_before_rebuild,
+    p.budget_epoch_at
 FROM rvbbit.tables t
 JOIN pg_class c ON c.oid = t.table_oid
 LEFT JOIN rvbbit.accel_policy p ON p.table_oid = t.table_oid;
@@ -442,6 +472,7 @@ BEGIN
                e.freshness_target_secs,
                e.min_interval_secs,
                e.daily_refresh_budget,
+               e.budget_epoch_at,
                e.full_rebuild_drift_ratio,
                e.lance_separate
           FROM rvbbit.accel_freshness f
@@ -538,13 +569,17 @@ BEGIN
                 END IF;
             END IF;
 
-            -- Daily budget (counts executed tick refreshes in the last 24h).
+            -- Daily budget counts only this active policy lifecycle. Historical
+            -- receipts remain intact across retirement and re-enrollment.
             IF should_act AND cand.daily_refresh_budget IS NOT NULL THEN
                 SELECT count(*) INTO used_today
                   FROM rvbbit.accel_tick_runs r
                  WHERE r.table_oid = cand.f_oid
                    AND r.executed
-                   AND r.ran_at > now() - interval '24 hours';
+                   AND r.ran_at > greatest(
+                       now() - interval '24 hours',
+                       cand.budget_epoch_at
+                   );
                 IF used_today >= cand.daily_refresh_budget THEN
                     should_act := false;
                     act_reason := format('daily budget %s exhausted', cand.daily_refresh_budget);

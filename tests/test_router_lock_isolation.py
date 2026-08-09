@@ -4,11 +4,35 @@ import time
 import uuid
 
 import psycopg
+from psycopg.conninfo import make_conninfo
 
 
 RVBBIT_DSN = os.environ.get(
     "RVBBIT_DSN", "postgresql://postgres:rvbbit@pg-rvbbit:5432/bench"
 )
+
+
+def test_preloaded_router_is_inert_without_extension_catalog():
+    """Sibling databases may host pg_cron without installing pg_rvbbit."""
+    dbname = f"rvbbit_catalogless_{uuid.uuid4().hex[:8]}"
+    admin_dsn = make_conninfo(RVBBIT_DSN, dbname="postgres")
+    test_dsn = make_conninfo(RVBBIT_DSN, dbname=dbname)
+
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+        admin.execute(f"CREATE DATABASE {dbname}")
+
+    try:
+        with psycopg.connect(test_dsn, autocommit=True) as conn:
+            assert conn.execute(
+                "SELECT to_regclass('rvbbit.tables')"
+            ).fetchone() == (None,)
+            conn.execute("CREATE TABLE public.scheduler_probe (id integer)")
+            assert conn.execute(
+                "SELECT count(*) FROM public.scheduler_probe"
+            ).fetchone() == (0,)
+    finally:
+        with psycopg.connect(admin_dsn, autocommit=True) as admin:
+            admin.execute(f"DROP DATABASE IF EXISTS {dbname}")
 
 
 def test_unrelated_accelerated_lock_does_not_block_routing(rvbbit):
@@ -143,9 +167,11 @@ def test_legacy_tick_budget_commits_one_table_per_heartbeat(rvbbit):
             WHERE table_oid IN ({oid_list})
             """
         ).fetchall()
-        assert len(rows) == 2
-        assert sum(1 for _, executed, _ in rows if executed) <= 1
-        assert sum(1 for _, _, status in rows if status == "deferred") >= 1
+        # Execution mode now stops after the single permitted action instead
+        # of manufacturing a "tick budget reached" row for every remaining
+        # candidate in the same registry scan.
+        assert len(rows) == 1
+        assert rows[0][1:] == (True, "ok")
     finally:
         for table in reversed(tables):
             rvbbit.execute(f"DROP TABLE IF EXISTS {table} CASCADE")

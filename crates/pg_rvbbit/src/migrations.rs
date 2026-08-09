@@ -1093,6 +1093,42 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0268_routing_lock_isolation",
         include_str!("../sql/migrations/0268_routing_lock_isolation.sql"),
     ),
+    (
+        "0269_accel_tick_parallel_workers",
+        include_str!("../sql/migrations/0269_accel_tick_parallel_workers.sql"),
+    ),
+    (
+        "0270_workload_layout_tick",
+        include_str!("../sql/migrations/0270_workload_layout_tick.sql"),
+    ),
+    (
+        "0271_accel_tick_worker_slots",
+        include_str!("../sql/migrations/0271_accel_tick_worker_slots.sql"),
+    ),
+    (
+        "0272_unified_layout_tick",
+        include_str!("../sql/migrations/0272_unified_layout_tick.sql"),
+    ),
+    (
+        "0273_bounded_heavy_maintenance_slots",
+        include_str!("../sql/migrations/0273_bounded_heavy_maintenance_slots.sql"),
+    ),
+    (
+        "0274_accel_worker_fair_claims",
+        include_str!("../sql/migrations/0274_accel_worker_fair_claims.sql"),
+    ),
+    (
+        "0275_retire_acceleration",
+        include_str!("../sql/migrations/0275_retire_acceleration.sql"),
+    ),
+    (
+        "0276_maintain_storage_policy_guard",
+        include_str!("../sql/migrations/0276_maintain_storage_policy_guard.sql"),
+    ),
+    (
+        "0277_accel_policy_budget_epoch",
+        include_str!("../sql/migrations/0277_accel_policy_budget_epoch.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -366,7 +366,7 @@ function renderVoicePreferences() {
   if (personality && personality.value !== voice.personality) {
     personality.value = voice.personality;
   }
-  if (personality) personality.disabled = voice.mode === "off";
+  if (personality) personality.disabled = voice.mode !== "expressive";
   const count = dialog.querySelector("[data-theme-voice-count]");
   if (count) count.textContent = `${voice.personality.length}/600`;
   const section = dialog.querySelector("[data-theme-voice]");
@@ -472,7 +472,7 @@ function installDialog() {
               <textarea data-theme-voice-personality maxlength="600" rows="2"
                 placeholder="Warm, concise, slightly playful…"></textarea>
             </label>
-            <p>Calliope keeps the full answer on screen and speaks a short, factual cut. Expressive adds restrained performance cues.</p>
+            <p>Calliope keeps the full answer on screen and speaks a short, factual cut. Expressive performs it in your speaking personality; Fast stays neutral.</p>
           </section>
           <div class="warehouse-theme-error" data-theme-error hidden></div>
           <div class="warehouse-theme-actions">

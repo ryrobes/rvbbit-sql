@@ -1,6 +1,7 @@
 # Accelerator Freshness — a managed, observable, value-driven control plane
 
-> Status: Layers 1–3 + split freshness/fold lanes + activity instrumentation shipped.
+> Status: Layers 1–3 + split freshness/fold lanes + unified derived-layout workers +
+> activity instrumentation shipped.
 > Frequent heartbeat = `rvbbit.accel_tick()`; quiet-window compaction =
 > `rvbbit.accel_fold_tick()`. Both are serialized against each other.
 > Remaining/deferred: the north-star gradient+union (below); per-table route-attribution
@@ -65,10 +66,14 @@ built — the controller loop is just open:
   publishes both catalogs atomically. Existing Vortex files stay live until the swap
   and are then retired through `orphaned_files`; an encoder failure never aborts the
   canonical rebuild. `variant_build_queue` coalesces failures, legacy gaps, and unusual
-  direct row-group mutations to one latest-generation request per table.
-  `rvbbit.variant_tick(max_tables)` is the independent minute heartbeat; use
-  `rvbbit.schedule_variant_tick('* * * * *', 1)` when pg_cron is available. The hourly
-  storage maintenance pass remains reconciliation, not the primary Vortex builder.
+  direct row-group mutations to one latest-generation request per table. Migration 0272
+  consumes those automatic Vortex targets in the same 1–8-slot worker fleet as
+  administrator-accepted cluster/Hive layouts:
+  `rvbbit.layout_tick_worker_pass(slot, workers, tables_per_pass)`.
+  `rvbbit.schedule_layout_tick_workers('* * * * *', workers)` replaces the old serial
+  Vortex and workload-layout cron jobs, defaults to four separately committed tables
+  per slot, and lets different tables encode in parallel. The hourly storage maintenance
+  pass remains reconciliation, not the primary Vortex builder.
 - **Current-only replacement boundary:** ordinary `TRUNCATE` + `COPY`/`INSERT`
   stays plain PostgreSQL. It records one dirty replacement marker instead of
   one tombstone per old row, routes latest reads to the heap, and makes
@@ -153,16 +158,28 @@ Declarative, **default-absent = `manual`** so nothing changes until a table opts
 Headline strategy is `target` (a freshness SLO); the rest are escape hatches.
 Helpers: `rvbbit.set_accel_policy(...)`; view `rvbbit.accel_policy_effective`
 (left-joins policy onto accelerated tables, defaulting missing → manual).
+`rvbbit.retire_acceleration(regclass)` is the safe supply-removal primitive: it
+returns the policy to manual, retires canonical/variant files through the
+grace-period orphan queue, and preserves the authoritative heap, table registry,
+operation history, and observer evidence for later re-selection.
+Daily refresh budgets are scoped by `accel_policy.budget_epoch_at`: durable tick
+receipts remain available for audit, while re-enrolling a manual/inactive policy
+starts a fresh automation budget. Editing an already-active policy does not reset
+that epoch or provide a budget-bypass path.
 
 ### Layer 3 — the executor (`rvbbit.accel_tick`), pg_cron is the heartbeat not the brain
 
-`rvbbit.accel_tick(budget int)` — called on a heartbeat by **one** pg_cron job. Per
-dirty, in-budget table, ordered by value (drift × staleness × demand):
+`rvbbit.accel_tick_worker_pass(slot, workers, tables_per_pass, lance_budget)` — called
+by 1–8 independent pg_cron jobs. Per dirty, in-budget table, ordered by value (drift ×
+staleness × demand):
 decide **skip / delta / full** per policy and `full_rebuild_drift_ratio`; **prefer
 auto-delta** (`refresh_acceleration`), escalate to **full** (`rebuild_acceleration`) on
 drift or when delta raises; respect `min_interval_secs`, the per-tick budget, and a
-serialized lock so two ticks never collide. Lance-accelerated tables get a stricter
-sub-budget (always full-overwrite). Logs to `acceleration_operations` (existing) +
+non-waiting per-table claim so two workers never collide. Deltas may overlap freely.
+Full/Lance and derived-layout work share a database-wide bounded pool, defaulting to two
+slots and configurable from 1–8 with
+`rvbbit.set_accel_maintenance_heavy_slots(slot_count)`. Lance-accelerated tables get a
+stricter sub-budget (always full-overwrite). Logs to `acceleration_operations` (existing) +
 `rvbbit.accel_tick_runs` (new, per-tick summary). Returns `SETOF` per-table actions.
 The difference from a dumb cron: it rebuilds **only dirty, high-value, in-budget**
 tables — the *control* is the policy+budget, not the clock.
@@ -172,7 +189,7 @@ triggers in this high-frequency lane. Those Parquet runs are still authoritative
 usually preferable to a heap scan. Optional major compaction belongs to
 `rvbbit.accel_fold_tick(budget, dry_run)`, which considers only clean tables over their
 explicit `max_row_groups_before_rebuild` / `max_tombstones_before_rebuild` thresholds.
-It shares the executor singleton lock, tries the per-table maintenance lock without
+It takes the freshness lane exclusively, tries the per-table maintenance lock without
 waiting, rechecks freshness after acquiring it, and defaults to one table per
 transaction. This makes a frequent cheap freshness cadence compatible with a nightly or
 weekly expensive-fold cadence. Current-only replacement, a missing baseline, high dirty
@@ -193,6 +210,8 @@ stable table name even after a relation is dropped. The analysis surfaces are:
   is due or blocked;
 - `rvbbit.accel_live_activity` — the currently running table, lane/action, elapsed
   time, wait event, blockers, and all per-table advisory locks held by the transaction.
+- `rvbbit.accel_heavy_slot_activity` — all eight possible expensive-work slots, their
+  enabled/free/busy state, and the backend currently owning each active slot.
 
 The live view does **not** pretend an ordinary log table can expose uncommitted progress.
 Before each long operation, the worker stamps a compact table/sweep/action/start marker

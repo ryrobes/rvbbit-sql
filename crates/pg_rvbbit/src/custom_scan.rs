@@ -292,10 +292,11 @@ struct NeededColumn {
 }
 
 /// How to turn a Utf8 parquet value back into a PG datum. text-family columns
-/// store the value verbatim; the text-surrogate types (uuid/numeric/inet/enum/…,
-/// see compact::is_text_surrogate_type) store canonical text and are rebuilt
-/// into the real type via its input function, so the column stays its declared
-/// type to SQL (comparisons/joins/order behave exactly as on the heap).
+/// store the value verbatim; the text-surrogate types (uuid/numeric/inet/enum/…
+/// and PostgreSQL arrays, see compact::is_text_surrogate_type) store canonical
+/// text and are rebuilt into the real type via its input function, so the
+/// column stays its declared type to SQL (comparisons/joins/order/array
+/// operations behave exactly as on the heap).
 #[derive(Clone, Copy)]
 enum Utf8Recon {
     /// text / varchar / bpchar / name — the stored string IS the value.
@@ -313,8 +314,8 @@ enum Utf8Recon {
 
 /// Pick the reconstruction strategy for a Utf8 parquet column from the column's
 /// real PG type. Anything that isn't text-family or jsonb but landed in a Utf8
-/// column was exported as a text surrogate (uuid/numeric/inet/enum/…) and is
-/// rebuilt via its input function.
+/// column was exported as a text surrogate (uuid/numeric/inet/enum/…/arrays)
+/// and is rebuilt via its input function.
 unsafe fn utf8_recon_for(typoid: pg_sys::Oid, typmod: i32) -> Utf8Recon {
     if typoid == pg_sys::TEXTOID
         || typoid == pg_sys::VARCHAROID
@@ -4070,9 +4071,11 @@ unsafe fn read_via(reader: &ColumnReader, row: usize, has_nulls: bool) -> (pg_sy
                     drop(buf);
                     (datum, false)
                 }
-                // Reconstruct the real type (uuid/numeric/inet/enum/…) from its
-                // canonical text via the type's input function. OidInputFunctionCall
-                // palloc's the result in the current context, like any input fn.
+                // Reconstruct the real type (uuid/numeric/inet/enum/…/arrays)
+                // from its canonical text via the type's input function.
+                // OidInputFunctionCall palloc's the result in the current
+                // context, like any input fn. For arrays this is array_in, which
+                // retains dimensions, lower bounds, inner NULLs, and escaping.
                 Utf8Recon::TypeInput {
                     typinput,
                     typioparam,
@@ -4473,5 +4476,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(n, 2, "export_to_parquet should write both rows of the uuid/numeric/enum table");
+    }
+
+    // Production regression: Salesforce array columns such as term_ids are
+    // ordinary text[] (oid 1009). They must export without flattening or
+    // rejecting the relation. The committed read-path semantics are covered by
+    // tests/test_array_roundtrip.py because pg_test cannot publish row groups
+    // until its transaction commits.
+    #[pg_test]
+    fn export_to_parquet_supports_postgres_arrays() {
+        Spi::run(
+            "CREATE TABLE sf_arrays (\
+                id integer, \
+                term_ids text[], \
+                scores integer[], \
+                labels varchar(12)[]\
+             ) USING rvbbit",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO sf_arrays VALUES \
+                (1, ARRAY['term-a', 'term,b', NULL]::text[], ARRAY[1, NULL, 3], ARRAY['new', 'open']::varchar(12)[]), \
+                (2, ARRAY[]::text[], ARRAY[[1, 2], [3, 4]], NULL), \
+                (3, NULL, NULL, ARRAY[]::varchar(12)[])",
+        )
+        .unwrap();
+        let n: i64 = Spi::get_one("SELECT rvbbit.export_to_parquet('sf_arrays'::regclass)")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 3, "export_to_parquet should write PostgreSQL array columns");
     }
 }

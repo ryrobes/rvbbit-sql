@@ -789,7 +789,7 @@ body[data-warehouse-page="calliope"] > main > .chat-column > * {
   box-shadow: 0 0 0 2px color-mix(in oklch, var(--amber, #f5b446) 10%, transparent);
 }
 
-.warehouse-theme-voice[data-mode="off"] .warehouse-theme-voice-personality {
+.warehouse-theme-voice:not([data-mode="expressive"]) .warehouse-theme-voice-personality {
   opacity: .42;
 }
 

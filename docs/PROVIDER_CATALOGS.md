@@ -179,8 +179,11 @@ By default it does not compact storage. To include storage maintenance:
 SELECT rvbbit.maintain(storage_tables => 2);
 ```
 
-That calls `rvbbit.maintain_storage(...)`, which compacts dirty Rvbbit shadow
-heaps and refreshes stale layout variants for a small number of tables.
+That calls `rvbbit.maintain_storage(...)`, which compacts a small number of
+dirty, **already-built** accelerators whose active policy is not `manual`, and
+refreshes stale layout variants. It never creates a baseline or refreshes a
+manual table; accelerator supply remains an explicit OLAP Maint/autopilot
+decision.
 
 ## pg_cron
 

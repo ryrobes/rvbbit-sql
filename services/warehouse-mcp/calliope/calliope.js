@@ -328,6 +328,10 @@
   </svg>`;
   const SPEECH_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
   const VOICE_STORAGE_KEY = "rvbbit-calliope-voice-v1";
+  const TURN_COMPLETED_EVENT = "calliope.turn.completed";
+  const ACTIVE_TURN_STORAGE_KEY = "rvbbit-calliope-active-turn-v1";
+  const TURN_STREAM_RECONNECT_ATTEMPTS = 2;
+  const CALLIOPE_PAGE_ID = freshClientTurnId();
   const SQL_KEYWORDS = new Set(`
     all alter analyze and any array as asc asof at between both by case cast check
     collate column constraint create cross current_date current_time current_timestamp
@@ -377,6 +381,9 @@
     sessionRefreshTimer: null,
     sessionEvents: null,
     sessionEventRefreshTimer: null,
+    sessionSelectSequence: 0,
+    turnActivityGeneration: 0,
+    turnReconnectPromise: null,
     turns: [],
     surfaces: [],
     selectedSurfaceId: null,
@@ -5819,7 +5826,9 @@
     }
   }
 
-  async function loadSessions(selectId = null, refreshCurrent = false) {
+  async function loadSessions(selectId = null, refreshCurrent = false, options = {}) {
+    const activityGeneration = state.turnActivityGeneration;
+    const allowDuringTurn = options.allowDuringTurn === true;
     const data = await api("/api/calliope/sessions");
     state.sessions = data.sessions || [];
     if (!visibleSessionTabs().some((tab) => tab.id === state.sessionTab)) {
@@ -5838,38 +5847,64 @@
       : sessionsForTab(state.sessionTab)[0]?.id;
     const fallback = sessionsForTab("chats")[0] || state.sessions[0];
     const target = explicitId || currentId || rememberedId || tabId || fallback?.id;
+    const mayReplaceCurrent = allowDuringTurn || (
+      !state.busy && activityGeneration === state.turnActivityGeneration
+    );
     if (target && (refreshCurrent || !state.current || state.current.id !== target)) {
-      await selectSession(target, {
+      if (!mayReplaceCurrent) {
+        renderSessions();
+        return { deferred: true };
+      }
+      const selected = await selectSession(target, {
         force: refreshCurrent,
         preserveActivity: refreshCurrent,
+        allowDuringTurn,
+        activityGeneration,
       });
+      return { deferred: selected === false };
     } else if (!target) {
       renderSessions();
-      clearSession();
+      if (mayReplaceCurrent) clearSession();
     } else {
       const summary = state.sessions.find((session) => session.id === target);
       if (summary) rememberSession(summary);
       renderSessions();
     }
+    return { deferred: false };
   }
 
   function scheduleVisibleSessionRefresh() {
     window.clearTimeout(state.sessionEventRefreshTimer);
+    if (state.busy || state.evidenceSearching) {
+      state.sessionEventRefreshTimer = null;
+      return;
+    }
     state.sessionEventRefreshTimer = window.setTimeout(() => {
       if (state.busy || state.evidenceSearching) {
-        scheduleVisibleSessionRefresh();
         return;
       }
       loadSessions(state.current?.id || null, true).catch(() => {});
-    }, state.busy ? 900 : 180);
+    }, 180);
+  }
+
+  function disconnectSessionEvents() {
+    window.clearTimeout(state.sessionEventRefreshTimer);
+    state.sessionEventRefreshTimer = null;
+    state.sessionEvents?.close?.();
+    state.sessionEvents = null;
   }
 
   function connectSessionEvents() {
-    state.sessionEvents?.close?.();
-    if (!("EventSource" in window)) return;
+    disconnectSessionEvents();
+    if (!("EventSource" in window) || document.hidden || state.busy) return;
     const events = new EventSource("/api/calliope/session-events");
     state.sessionEvents = events;
     events.addEventListener("calliope.sessions.changed", scheduleVisibleSessionRefresh);
+  }
+
+  function protectActiveTurnExit(event) {
+    event.preventDefault();
+    event.returnValue = "";
   }
 
   function sessionCardMarkup(session, kind = sessionTabFor(session)) {
@@ -6171,18 +6206,35 @@
   }
 
   async function selectSession(id, options = {}) {
-    if ((state.busy && !options.force) || state.evidenceSearching) return;
+    const allowDuringTurn = options.allowDuringTurn === true;
+    if ((state.busy && !allowDuringTurn) || state.evidenceSearching) return false;
+    const activityGeneration = Number.isInteger(options.activityGeneration)
+      ? options.activityGeneration
+      : state.turnActivityGeneration;
+    const selectionSequence = ++state.sessionSelectSequence;
+    const selectedSummary = state.sessions.find((session) => session.id === id);
+    const data = await api(`/api/calliope/sessions/${encodeURIComponent(id)}`);
+    if (selectionSequence !== state.sessionSelectSequence) return false;
+    if (
+      !allowDuringTurn
+      && (state.busy || activityGeneration !== state.turnActivityGeneration)
+    ) return false;
     cancelSpeechRecording();
-    stopVoicePlayback();
-    if (!options.preserveActivity || String(state.current?.id || "") !== String(id || "")) {
+    const preservingCurrentActivity = Boolean(
+      options.preserveActivity
+      && String(state.current?.id || "") === String(id || ""),
+    );
+    // Session-event refreshes reconcile the same notebook while the spoken
+    // projection is being prepared. They must not invalidate its request
+    // sequence; only an actual navigation should stop voice playback.
+    if (!preservingCurrentActivity) {
+      stopVoicePlayback();
       state.voice.pendingTurns.clear();
       state.voice.failures.clear();
       state.voice.revealingTurnId = null;
     }
-    const selectedSummary = state.sessions.find((session) => session.id === id);
     clearSpatialSelections();
     if (!options.preserveActivity) clearLiveActivity();
-    const data = await api(`/api/calliope/sessions/${encodeURIComponent(id)}`);
     state.current = { ...(selectedSummary || {}), ...(data.session || {}) };
     state.audience = data.audience || null;
     state.turns = data.turns || [];
@@ -6212,6 +6264,8 @@
     if (options.focusComposer !== false && !currentReadOnly()) {
       requestAnimationFrame(composerFocus);
     }
+    if (!allowDuringTurn) scheduleActiveTurnReconnect();
+    return true;
   }
 
   async function createSession(title) {
@@ -6336,7 +6390,7 @@
   function voiceWordRanges(scriptValue) {
     const script = String(scriptValue || "");
     const ignored = new Uint8Array(script.length);
-    for (const match of script.matchAll(/\[[a-z][a-z -]{0,30}\]/gi)) {
+    for (const match of script.matchAll(/\[[^\[\]\r\n]{1,96}\]/g)) {
       const start = Number(match.index || 0);
       for (let index = start; index < start + match[0].length; index += 1) {
         ignored[index] = 1;
@@ -6393,8 +6447,19 @@
     return state.voice.failures.get(String(turn?.id || "")) || null;
   }
 
+  function liveVoiceTurn(turn) {
+    return state.turns.find(
+      (candidate) => String(candidate.id || "") === String(turn?.id || ""),
+    ) || turn;
+  }
+
   function voiceFailureMessage(stage, error, timedOut = false) {
     const code = String(error?.code || "");
+    const detail = String(error?.message || "")
+      .replace(/[\u0000-\u001f\u007f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 320);
     const seconds = Math.round(voicePreparationTimeoutMs() / 1_000);
     const rewriteElapsedMs = Number(error?.rewriteElapsedMs) || 0;
     if (stage === "text") {
@@ -6407,6 +6472,9 @@
         return `Conversational rewrite took ${(rewriteElapsedMs / 1_000).toFixed(1)} seconds; audio did not start before the ${seconds}-second limit · complete answer shown`;
       }
       return `Voice preparation hit its ${seconds}-second limit during audio generation · complete answer shown`;
+    }
+    if (detail) {
+      return `Audio generation failed · ${detail} · complete answer shown`;
     }
     if (code === "VOICE_PROVIDER_AUTH") {
       return "Audio generation failed because ElevenLabs rejected its credentials · complete answer shown";
@@ -6489,6 +6557,7 @@
       return `${safeMarkdown(turn.assistant_message || "")}
         <div class="voice-fallback-note" role="status" aria-live="polite" data-voice-failure-stage="${escapeHtml(voiceFailed.stage)}">
           <i aria-hidden="true"></i><span><strong>Voice skipped</strong> · ${escapeHtml(voiceFailed.message)}</span>
+          ${voiceFailed.code ? `<code>${escapeHtml(voiceFailed.code)}</code>` : ""}
         </div>`;
     }
     return safeMarkdown(
@@ -11655,7 +11724,13 @@
 
   function voiceReceipt(turn) {
     const voice = turn?.response_receipt?.voice;
-    return voice && typeof voice === "object" && voice.id && voice.script ? voice : null;
+    const expectedVersion = Number(state.config?.text_to_speech?.render_version) || 1;
+    return voice
+      && typeof voice === "object"
+      && Number(voice.version || 0) === expectedVersion
+      && voice.id
+      && voice.script
+      ? voice : null;
   }
 
   function voiceAudioUrl(turnId, renderId) {
@@ -12166,7 +12241,7 @@
       if (requestSequence !== state.voice.requestSequence) return;
       const timedOut = renderTimedOut || error?.code === "VOICE_TEXT_TIMEOUT";
       stopVoicePlayback();
-      showVoiceFailure(turn, "text", error, timedOut);
+      showVoiceFailure(liveVoiceTurn(turn), "text", error, timedOut);
       return;
     } finally {
       clearTimeout(renderTimer);
@@ -12174,8 +12249,9 @@
         state.voice.controller = null;
       }
     }
-    turn.response_receipt = {
-      ...(turn.response_receipt || {}),
+    const renderedTurn = liveVoiceTurn(turn);
+    renderedTurn.response_receipt = {
+      ...(renderedTurn.response_receipt || {}),
       voice: data.render,
     };
     const remainingMs = Math.floor(deadline - performance.now());
@@ -12183,13 +12259,13 @@
       const error = new Error("The conversational rewrite exhausted the voice preparation window.");
       error.code = "VOICE_TEXT_TIMEOUT";
       stopVoicePlayback();
-      showVoiceFailure(turn, "text", error, true);
+      showVoiceFailure(liveVoiceTurn(turn), "text", error, true);
       return;
     }
     try {
       await playVoiceAudio(turn, data.render, {
         firstAudioTimeoutMs: remainingMs,
-        onFirstAudio: () => revealVoicePresentation(turn),
+        onFirstAudio: () => revealVoicePresentation(liveVoiceTurn(turn)),
       });
     } catch (error) {
       const diagnosedError = {
@@ -12198,7 +12274,7 @@
         rewriteElapsedMs: Number(data.render?.rewrite_elapsed_ms) || 0,
       };
       showVoiceFailure(
-        turn,
+        liveVoiceTurn(turn),
         "audio",
         diagnosedError,
         error?.code === "VOICE_AUDIO_TIMEOUT",
@@ -12236,17 +12312,154 @@
     return turn;
   }
 
+  function freshClientTurnId() {
+    const cryptoApi = globalThis.crypto;
+    if (typeof cryptoApi?.randomUUID === "function") return cryptoApi.randomUUID();
+    const bytes = new Uint8Array(16);
+    if (typeof cryptoApi?.getRandomValues === "function") {
+      cryptoApi.getRandomValues(bytes);
+    } else {
+      bytes.forEach((_value, index) => { bytes[index] = Math.floor(Math.random() * 256); });
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0"));
+    return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+  }
+
+  function turnTextHash(value) {
+    const text = String(value || "");
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+  }
+
+  function turnSubmissionSignature(payload) {
+    const attachments = (payload.attachments || []).map((item) => ({
+      name: item.name || item.filename || "",
+      type: item.type || item.mime_type || "",
+      bytes: String(item.data_url || "").length,
+      tail: turnTextHash(String(item.data_url || "").slice(-256)),
+    }));
+    return turnTextHash(JSON.stringify({
+      ...payload,
+      message: `${String(payload.message || "").length}:${turnTextHash(payload.message)}`,
+      attachments,
+    }));
+  }
+
+  function readActiveTurnRequest(sessionId, signature = null) {
+    try {
+      const value = JSON.parse(sessionStorage.getItem(ACTIVE_TURN_STORAGE_KEY) || "null");
+      if (!value || value.session_id !== sessionId) return null;
+      if (Date.now() - Number(value.created_at || 0) > 6 * 60 * 60 * 1000) return null;
+      if (signature && value.signature !== signature) return null;
+      return value;
+    } catch {
+      return null;
+    }
+  }
+
+  function rememberActiveTurnRequest(value) {
+    try {
+      sessionStorage.setItem(ACTIVE_TURN_STORAGE_KEY, JSON.stringify(value));
+    } catch {
+      // The server-side idempotency key remains authoritative in this tab.
+    }
+  }
+
+  function forgetActiveTurnRequest(clientTurnId = null) {
+    try {
+      const value = JSON.parse(sessionStorage.getItem(ACTIVE_TURN_STORAGE_KEY) || "null");
+      if (!clientTurnId || value?.client_turn_id === clientTurnId) {
+        sessionStorage.removeItem(ACTIVE_TURN_STORAGE_KEY);
+      }
+    } catch {
+      try { sessionStorage.removeItem(ACTIVE_TURN_STORAGE_KEY); } catch {}
+    }
+  }
+
+  function reportActiveTurnLifecycle(eventName, details = {}) {
+    const sessionId = String(state.current?.id || "");
+    if (!sessionId) return;
+    const request = readActiveTurnRequest(sessionId);
+    const turn = state.turns.find((candidate) => (
+      String(candidate.id || "") === String(request?.turn_id || "")
+      || String(candidate.client_turn_id || "") === String(request?.client_turn_id || "")
+    ));
+    if (!request?.client_turn_id || (!state.busy && turn?.status !== "running")) return;
+    const payload = JSON.stringify({
+      event: eventName,
+      turn_id: request.turn_id || turn?.id || null,
+      client_turn_id: request.client_turn_id,
+      page_id: CALLIOPE_PAGE_ID,
+      visibility: document.visibilityState || "unknown",
+      online: navigator.onLine !== false,
+      persisted: details.persisted === true,
+    });
+    try {
+      const queued = navigator.sendBeacon(
+        "/api/calliope/turn-lifecycle",
+        new Blob([payload], { type: "application/json" }),
+      );
+      if (queued) return;
+    } catch {
+      // Fall through to a keepalive request where sendBeacon is unavailable.
+    }
+    fetch("/api/calliope/turn-lifecycle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+      keepalive: true,
+    }).catch(() => {});
+  }
+
+  function retryableTurnStreamError(error) {
+    const code = String(error?.code || "");
+    if (code === "CALLIOPE_STREAM_ERROR") return false;
+    return ![
+      "CLIENT_TURN_CONFLICT",
+      "INVALID_CLIENT_TURN_ID",
+      "TURN_IN_PROGRESS",
+      "TURN_NOT_FOUND",
+    ].includes(code);
+  }
+
+  function turnReconnectDelay(attempt) {
+    return new Promise((resolve) => window.setTimeout(resolve, 350 * (attempt + 1)));
+  }
+
   async function parseEventStream(response, handler) {
     if (!response.ok) {
-      let detail = "";
-      try { detail = (await response.json())?.error?.message; } catch { detail = await response.text(); }
-      throw new Error(detail || `Turn failed (${response.status})`);
+      let problem = {};
+      try { problem = (await response.json())?.error || {}; } catch { problem = { message: await response.text() }; }
+      const error = new Error(problem.message || `Turn failed (${response.status})`);
+      error.code = problem.code || `TURN_HTTP_${response.status}`;
+      error.turnId = problem.turn_id || null;
+      throw error;
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let completed = false;
+    const projectionErrors = [];
     while (true) {
-      const { done, value } = await reader.read();
+      let chunk;
+      try {
+        chunk = await reader.read();
+      } catch (error) {
+        // A proxy/browser can report an incomplete HTTP stream after the final
+        // durable event has already arrived. The completed turn is authoritative;
+        // do not erase it because the transport's closing handshake was untidy.
+        if (completed) {
+          return { completed: true, transportClosed: true, projectionErrors };
+        }
+        throw error;
+      }
+      const { done, value } = chunk;
       buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
       let boundary;
       while ((boundary = buffer.indexOf("\n\n")) >= 0) {
@@ -12261,15 +12474,29 @@
         if (data.length) {
           let parsed;
           try { parsed = JSON.parse(data.join("\n")); } catch { parsed = { text: data.join("\n") }; }
-          await handler(event, parsed);
+          if (event === TURN_COMPLETED_EVENT) completed = true;
+          try {
+            await handler(event, parsed);
+          } catch (error) {
+            if (error?.code === "CALLIOPE_STREAM_ERROR") throw error;
+            if (projectionErrors.length < 3) {
+              projectionErrors.push({ event, message: String(error?.message || error) });
+            }
+            // Rendering and browser projection are secondary to the attached
+            // server run. Keep draining the response so a transient UI error
+            // cannot abandon Hermes and turn itself into http.disconnect.
+            console.error(`Calliope could not project ${event}; stream retained`, error);
+          }
         }
       }
       if (done) break;
     }
+    return { completed, transportClosed: false, projectionErrors };
   }
 
   async function sendTurn() {
     if (!state.current || currentReadOnly() || state.busy || state.speech.phase !== "idle") return;
+    const sessionId = String(state.current.id);
     applyVoicePreferences(readVoicePreferences());
     state.voice.pendingTurns.clear();
     state.voice.revealingTurnId = null;
@@ -12301,12 +12528,52 @@
     }));
     const outgoingSelectedSurfaceId = state.selectedSurfaceId;
     const outgoingDesignProfileVersionId = state.nextTurnDesignProfileVersionId;
-    const pending = optimisticTurn(
-      message,
-      Boolean(outgoingSpatialSelections.length),
-      outgoingEvidenceSelections,
-      outgoingObjectRefs,
+    const submissionPayload = {
+      message: rawMessage,
+      object_refs: outgoingObjectHandles,
+      attachments: outgoingAttachments,
+      spatial_selections: outgoingSpatialSelections,
+      evidence_refs: outgoingEvidenceHandles,
+      selected_surface_id: outgoingSelectedSurfaceId,
+      ...(outgoingDesignProfileVersionId
+        ? { design_profile_version_id: outgoingDesignProfileVersionId }
+        : {}),
+    };
+    const submissionSignature = turnSubmissionSignature(submissionPayload);
+    const rememberedRequest = readActiveTurnRequest(sessionId, submissionSignature);
+    const clientTurnId = rememberedRequest?.client_turn_id || freshClientTurnId();
+    const requestPayload = {
+      ...submissionPayload,
+      client_turn_id: clientTurnId,
+    };
+    const turnRequest = {
+      session_id: sessionId,
+      client_turn_id: clientTurnId,
+      turn_id: rememberedRequest?.turn_id || null,
+      signature: submissionSignature,
+      created_at: rememberedRequest?.created_at || Date.now(),
+    };
+    rememberActiveTurnRequest(turnRequest);
+    let pending = (
+      turnRequest.turn_id
+        ? state.turns.find((turn) => String(turn.id || "") === turnRequest.turn_id)
+        : null
     );
+    if (pending) {
+      pending.status = "running";
+      pending.error = null;
+      pending.assistant_message = "";
+      renderChat();
+      scrollChatToLiveEdge();
+    } else {
+      pending = optimisticTurn(
+        message,
+        Boolean(outgoingSpatialSelections.length),
+        outgoingEvidenceSelections,
+        outgoingObjectRefs,
+      );
+    }
+    let streamedAssistantMessage = "";
     composerSetValue("");
     state.attachments = [];
     clearSpatialSelections();
@@ -12316,44 +12583,65 @@
     renderDesignProfileChip();
     resizeComposer();
     state.busy = true;
+    state.turnActivityGeneration += 1;
     syncGoogleSheetImportControls();
     els.send.disabled = true;
     composerSetDisabled(true);
     syncSpeechControls();
     setStatus("working", "working");
     beginLiveActivity();
+    window.addEventListener("beforeunload", protectActiveTurnExit);
 
     try {
-      const response = await fetch(`/api/calliope/sessions/${state.current.id}/turn`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: rawMessage,
-          object_refs: outgoingObjectHandles,
-          attachments: outgoingAttachments,
-          spatial_selections: outgoingSpatialSelections,
-          evidence_refs: outgoingEvidenceHandles,
-          selected_surface_id: outgoingSelectedSurfaceId,
-          ...(outgoingDesignProfileVersionId
-            ? { design_profile_version_id: outgoingDesignProfileVersionId }
-            : {}),
-        }),
-      });
-      await parseEventStream(response, async (event, data) => {
+      let streamResult = null;
+      for (
+        let streamAttempt = 0;
+        streamAttempt <= TURN_STREAM_RECONNECT_ATTEMPTS;
+        streamAttempt += 1
+      ) {
+        try {
+          const response = await fetch(`/api/calliope/sessions/${sessionId}/turn`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Calliope-Page-Id": CALLIOPE_PAGE_ID,
+            },
+            body: JSON.stringify(requestPayload),
+          });
+          streamResult = await parseEventStream(response, async (event, data) => {
         if (event === "calliope.turn.started") {
+          const matchingTurn = state.turns.find(
+            (turn) => turn !== pending && String(turn.id || "") === String(data.turn_id || ""),
+          );
+          if (matchingTurn) {
+            state.turns = state.turns.filter((turn) => turn !== pending);
+            pending = matchingTurn;
+            pending.status = "running";
+            pending.error = null;
+          }
           pending.id = data.turn_id;
           pending.ordinal = data.ordinal;
           pending.attachments = data.attachments || pending.attachments;
           pending.evidence_refs = data.evidence_refs || pending.evidence_refs;
           pending.object_refs = data.object_refs || pending.object_refs;
           pending.author = data.author || pending.author;
+          pending.client_turn_id = data.client_turn_id || pending.client_turn_id || clientTurnId;
+          turnRequest.turn_id = String(data.turn_id || "") || turnRequest.turn_id;
+          turnRequest.client_turn_id = pending.client_turn_id;
+          requestPayload.client_turn_id = pending.client_turn_id;
+          rememberActiveTurnRequest(turnRequest);
           renderChat();
           completeLiveContext();
           scrollChatToLiveEdge();
         } else if (event === "assistant.delta") {
-          appendLiveDraft(data.delta || "");
+          const delta = String(data.delta || "");
+          streamedAssistantMessage = `${streamedAssistantMessage}${delta}`.slice(0, 40_000);
+          appendLiveDraft(delta);
         } else if (event === "assistant.completed") {
-          appendLiveDraft(data.content || state.liveActivity.draft, true);
+          streamedAssistantMessage = String(
+            data.content || streamedAssistantMessage,
+          ).slice(0, 40_000);
+          appendLiveDraft(streamedAssistantMessage, true);
         } else if (event === "calliope.progress") {
           mergeLiveWorkingNote(data.text || "");
         } else if (event === "calliope.visual_check") {
@@ -12369,21 +12657,26 @@
           completeLiveTool(data.tool_name, true, data.message);
         } else if (event === "calliope.surfaces") {
           const incoming = data.surfaces || [];
+          const knownSurfaceIds = new Set(state.surfaces.map((surface) => String(surface.id || "")));
+          const freshIncoming = incoming.filter(
+            (surface) => !knownSurfaceIds.has(String(surface.id || "")),
+          );
           state.surfaces = [...incoming, ...state.surfaces.filter((surface) =>
             !incoming.some((next) => next.id === surface.id)
           )];
-          if (!state.stageAtLiveEdge && incoming.length) {
-            state.newSurfaceCount += incoming.length;
+          if (!state.stageAtLiveEdge && freshIncoming.length) {
+            state.newSurfaceCount += freshIncoming.length;
             els.newSurfaces.hidden = false;
             els.newSurfaces.textContent = `${state.newSurfaceCount} new surface${state.newSurfaceCount === 1 ? "" : "s"} ↑`;
           }
-          noteLiveSurfaces(incoming);
+          noteLiveSurfaces(freshIncoming);
           renderStage(state.stageAtLiveEdge);
           renderChat();
         } else if (event === "calliope.turn.completed") {
           pending.status = "complete";
           pending.assistant_message = data.assistant_message || pending.assistant_message;
           pending.response_receipt = data.response_receipt || pending.response_receipt || {};
+          forgetActiveTurnRequest(turnRequest.client_turn_id);
           if (voiceProjectionRequested() && !voiceReceipt(pending)) {
             state.voice.pendingTurns.add(String(pending.id));
           }
@@ -12397,35 +12690,108 @@
           finishLiveActivity(true, data.surface_count);
           scrollChatToLiveEdge();
         } else if (event === "calliope.error" || event === "error") {
-          throw new Error(data.message || "Calliope could not complete the turn");
+          const streamError = new Error(
+            data.message || "Calliope could not complete the turn",
+          );
+          streamError.code = "CALLIOPE_STREAM_ERROR";
+          streamError.serverCode = data.code || null;
+          throw streamError;
         }
-      });
-      await loadSessions(state.current.id, true);
+          });
+          if (!streamResult.completed) {
+            const incomplete = new Error(
+              "The live turn stream ended before Calliope received its completion receipt.",
+            );
+            incomplete.code = "TURN_STREAM_INCOMPLETE";
+            throw incomplete;
+          }
+          break;
+        } catch (streamError) {
+          if (
+            streamAttempt >= TURN_STREAM_RECONNECT_ATTEMPTS
+            || !retryableTurnStreamError(streamError)
+          ) throw streamError;
+          streamedAssistantMessage = "";
+          clearLiveActivity();
+          beginLiveActivity();
+          setStatus("working", "reconnecting");
+          await turnReconnectDelay(streamAttempt);
+        }
+      }
+      try {
+        await loadSessions(sessionId, true, { allowDuringTurn: true });
+      } catch (refreshError) {
+        if (!streamResult.completed) throw refreshError;
+        // The durable completion event already supplied the answer. A secondary
+        // rail refresh is useful reconciliation, but it is not part of the turn.
+        console.warn("Calliope turn completed; notebook refresh deferred", refreshError);
+      }
+      forgetActiveTurnRequest(turnRequest.client_turn_id);
       if (pending.status === "complete") void maybeSpeakTurn(pending.id);
     } catch (error) {
-      state.voice.pendingTurns.delete(String(pending.id));
-      pending.status = "failed";
-      pending.error = error.message;
-      if (rawMessage && !composerValue().trim()) composerSetValue(rawMessage);
-      if (outgoingDesignProfileVersionId && !state.nextTurnDesignProfileVersionId) {
+      const pendingId = String(pending.id);
+      state.voice.pendingTurns.delete(pendingId);
+      let reconciledTurn = null;
+      try {
+        await loadSessions(sessionId, true, { allowDuringTurn: true });
+        reconciledTurn = state.turns.find(
+          (turn) => String(turn.id || "") === pendingId,
+        ) || null;
+      } catch {
+        // Keep the in-memory turn below when the reconciliation request shares
+        // the same transient network failure as the stream.
+      }
+      if (["complete", "partial"].includes(reconciledTurn?.status)) {
+        forgetActiveTurnRequest(turnRequest.client_turn_id);
+        if (
+          reconciledTurn.status === "complete"
+          && voiceProjectionRequested()
+          && !voiceReceipt(reconciledTurn)
+        ) {
+          state.voice.pendingTurns.add(pendingId);
+        }
+        renderChat();
+        finishLiveActivity(true, surfacesForTurn(pendingId).length);
+        if (reconciledTurn.status === "complete") void maybeSpeakTurn(pendingId);
+        return;
+      }
+      const visibleTurn = reconciledTurn || state.turns.find(
+        (turn) => String(turn.id || "") === pendingId,
+      ) || pending;
+      if (
+        ["failed", "interrupted"].includes(reconciledTurn?.status)
+        || error?.code === "CALLIOPE_STREAM_ERROR"
+      ) {
+        forgetActiveTurnRequest(turnRequest.client_turn_id);
+      }
+      if (streamedAssistantMessage && visibleTurn.status !== "failed") {
+        visibleTurn.status = "interrupted";
+        visibleTurn.assistant_message ||= streamedAssistantMessage;
+        visibleTurn.error = error.message;
+      } else if (!reconciledTurn) {
+        visibleTurn.status = "failed";
+        visibleTurn.error = error.message;
+      }
+      const hasUsefulResponse = Boolean(visibleTurn.assistant_message);
+      if (!hasUsefulResponse && rawMessage && !composerValue().trim()) {
+        composerSetValue(rawMessage);
+      }
+      if (!hasUsefulResponse && outgoingDesignProfileVersionId && !state.nextTurnDesignProfileVersionId) {
         state.nextTurnDesignProfileVersionId = outgoingDesignProfileVersionId;
         renderDesignProfileChip();
       }
-      const existingEvidence = new Set(state.evidenceSelections.map((item) => item.key));
-      state.evidenceSelections.push(...outgoingEvidenceSelections.filter(
-        (item) => !existingEvidence.has(item.key),
-      ));
+      if (!hasUsefulResponse) {
+        const existingEvidence = new Set(state.evidenceSelections.map((item) => item.key));
+        state.evidenceSelections.push(...outgoingEvidenceSelections.filter(
+          (item) => !existingEvidence.has(item.key),
+        ));
+      }
       renderEvidenceContextTray();
       renderChat();
       finishLiveActivity(false, 0, error.message);
       toast(error.message, true);
-      try {
-        await loadSessions(state.current?.id, true);
-      } catch {
-        // The original turn error is more useful than a secondary refresh
-        // failure. A later visibility refresh will reconcile the notebook.
-      }
     } finally {
+      window.removeEventListener("beforeunload", protectActiveTurnExit);
       state.busy = false;
       syncGoogleSheetImportControls();
       composerSetDisabled(false);
@@ -12433,6 +12799,220 @@
       setStatus(state.config?.healthy ? "ready" : "unavailable", state.config?.healthy ? "" : "offline");
       syncSpeechControls();
       composerFocus();
+    }
+  }
+
+  function scheduleActiveTurnReconnect() {
+    if (state.busy || state.turnReconnectPromise || currentReadOnly() || !state.current) return;
+    const sessionId = String(state.current.id || "");
+    let request = readActiveTurnRequest(sessionId);
+    let turn = request?.client_turn_id ? state.turns.find((candidate) => (
+      String(candidate.id || "") === String(request.turn_id || "")
+      || String(candidate.client_turn_id || "") === String(request.client_turn_id)
+    )) : null;
+    if (!turn) {
+      turn = state.turns.find(
+        (candidate) => candidate.status === "running" && candidate.client_turn_id,
+      );
+      if (turn) {
+        request = {
+          session_id: sessionId,
+          client_turn_id: String(turn.client_turn_id),
+          turn_id: String(turn.id || ""),
+          signature: "",
+          created_at: Date.now(),
+        };
+        rememberActiveTurnRequest(request);
+      }
+    }
+    if (!turn) return;
+    if (turn.status !== "running") {
+      forgetActiveTurnRequest(request.client_turn_id);
+      return;
+    }
+    queueMicrotask(() => {
+      resumeActiveTurnRequest(request, turn).catch((error) => {
+        console.warn("Calliope could not resume the active turn", error);
+      });
+    });
+  }
+
+  async function resumeActiveTurnRequest(request, initialTurn) {
+    if (state.turnReconnectPromise) return state.turnReconnectPromise;
+    const work = (async () => {
+      const sessionId = String(request.session_id || "");
+      if (
+        state.busy
+        || currentReadOnly()
+        || !state.current
+        || String(state.current.id || "") !== sessionId
+      ) return;
+      let pending = initialTurn;
+      let streamedAssistantMessage = "";
+      state.busy = true;
+      state.turnActivityGeneration += 1;
+      pending.status = "running";
+      pending.error = null;
+      syncGoogleSheetImportControls();
+      els.send.disabled = true;
+      composerSetDisabled(true);
+      syncSpeechControls();
+      setStatus("working", "reconnecting");
+      beginLiveActivity();
+      window.addEventListener("beforeunload", protectActiveTurnExit);
+      try {
+        let streamResult = null;
+        for (
+          let streamAttempt = 0;
+          streamAttempt <= TURN_STREAM_RECONNECT_ATTEMPTS;
+          streamAttempt += 1
+        ) {
+          try {
+            const response = await fetch(`/api/calliope/sessions/${sessionId}/turn`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Calliope-Page-Id": CALLIOPE_PAGE_ID,
+              },
+              body: JSON.stringify({
+                client_turn_id: request.client_turn_id,
+                reattach: true,
+              }),
+            });
+            streamResult = await parseEventStream(response, async (event, data) => {
+              if (event === "calliope.turn.started") {
+                const matchingTurn = state.turns.find(
+                  (turn) => turn !== pending && String(turn.id || "") === String(data.turn_id || ""),
+                );
+                if (matchingTurn) pending = matchingTurn;
+                pending.id = data.turn_id;
+                pending.ordinal = data.ordinal;
+                pending.status = "running";
+                pending.error = null;
+                pending.attachments = data.attachments || pending.attachments;
+                pending.evidence_refs = data.evidence_refs || pending.evidence_refs;
+                pending.object_refs = data.object_refs || pending.object_refs;
+                pending.author = data.author || pending.author;
+                pending.client_turn_id = data.client_turn_id || request.client_turn_id;
+                request.turn_id = String(data.turn_id || "") || request.turn_id;
+                request.client_turn_id = pending.client_turn_id;
+                rememberActiveTurnRequest(request);
+                renderChat();
+                completeLiveContext();
+                scrollChatToLiveEdge();
+              } else if (event === "assistant.delta") {
+                const delta = String(data.delta || "");
+                streamedAssistantMessage = `${streamedAssistantMessage}${delta}`.slice(0, 40_000);
+                appendLiveDraft(delta);
+              } else if (event === "assistant.completed") {
+                streamedAssistantMessage = String(
+                  data.content || streamedAssistantMessage,
+                ).slice(0, 40_000);
+                appendLiveDraft(streamedAssistantMessage, true);
+              } else if (event === "calliope.progress") {
+                mergeLiveWorkingNote(data.text || "");
+              } else if (event === "calliope.visual_check") {
+                noteLiveVisualCheck(data.number || 1, data.budget || 2);
+              } else if (event === "tool.started") {
+                startLiveTool(data.tool_name, data.preview);
+              } else if (event === "tool.completed") {
+                completeLiveTool(data.tool_name);
+              } else if (event === "tool.failed") {
+                completeLiveTool(data.tool_name, true, data.message);
+              } else if (event === "calliope.surfaces") {
+                const incoming = data.surfaces || [];
+                const knownIds = new Set(state.surfaces.map((surface) => String(surface.id || "")));
+                const fresh = incoming.filter(
+                  (surface) => !knownIds.has(String(surface.id || "")),
+                );
+                state.surfaces = [...incoming, ...state.surfaces.filter((surface) =>
+                  !incoming.some((next) => next.id === surface.id)
+                )];
+                noteLiveSurfaces(fresh);
+                renderStage(state.stageAtLiveEdge);
+                renderChat();
+              } else if (event === TURN_COMPLETED_EVENT) {
+                pending.status = "complete";
+                pending.assistant_message = data.assistant_message || streamedAssistantMessage;
+                pending.response_receipt = data.response_receipt || pending.response_receipt || {};
+                forgetActiveTurnRequest(request.client_turn_id);
+                renderChat();
+                finishLiveActivity(true, data.surface_count);
+                scrollChatToLiveEdge();
+              } else if (event === "calliope.error" || event === "error") {
+                const streamError = new Error(
+                  data.message || "Calliope could not reconnect to the turn",
+                );
+                streamError.code = "CALLIOPE_STREAM_ERROR";
+                streamError.serverCode = data.code || null;
+                throw streamError;
+              }
+            });
+            if (!streamResult.completed) {
+              const incomplete = new Error(
+                "The reconnected stream ended before its completion receipt.",
+              );
+              incomplete.code = "TURN_STREAM_INCOMPLETE";
+              throw incomplete;
+            }
+            break;
+          } catch (streamError) {
+            if (
+              streamAttempt >= TURN_STREAM_RECONNECT_ATTEMPTS
+              || !retryableTurnStreamError(streamError)
+            ) throw streamError;
+            streamedAssistantMessage = "";
+            clearLiveActivity();
+            beginLiveActivity();
+            await turnReconnectDelay(streamAttempt);
+          }
+        }
+        await loadSessions(sessionId, true, { allowDuringTurn: true });
+        const completed = state.turns.find(
+          (turn) => String(turn.id || "") === String(pending.id || ""),
+        ) || pending;
+        forgetActiveTurnRequest(request.client_turn_id);
+        if (completed.status === "complete") void maybeSpeakTurn(completed.id);
+      } catch (error) {
+        let reconciled = null;
+        try {
+          await loadSessions(sessionId, true, { allowDuringTurn: true });
+          reconciled = state.turns.find(
+            (turn) => String(turn.id || "") === String(pending.id || ""),
+          ) || null;
+        } catch {
+          // The durable request identity remains in sessionStorage for the next refresh.
+        }
+        if (["complete", "partial"].includes(reconciled?.status)) {
+          forgetActiveTurnRequest(request.client_turn_id);
+          finishLiveActivity(true, surfacesForTurn(reconciled.id).length);
+          if (reconciled.status === "complete") void maybeSpeakTurn(reconciled.id);
+        } else if (["failed", "interrupted"].includes(reconciled?.status)) {
+          forgetActiveTurnRequest(request.client_turn_id);
+          finishLiveActivity(false, 0, reconciled.error || error.message);
+          toast(reconciled.error || error.message, true);
+        } else {
+          pending.status = "running";
+          pending.error = null;
+          renderChat();
+          finishLiveActivity(false, 0, "Connection paused; the original turn is still running.");
+          toast("The original turn is still working; Calliope will reconnect without resending it.");
+        }
+      } finally {
+        window.removeEventListener("beforeunload", protectActiveTurnExit);
+        state.busy = false;
+        syncGoogleSheetImportControls();
+        composerSetDisabled(false);
+        els.send.disabled = false;
+        setStatus(state.config?.healthy ? "ready" : "unavailable", state.config?.healthy ? "" : "offline");
+        syncSpeechControls();
+      }
+    })();
+    state.turnReconnectPromise = work;
+    try {
+      await work;
+    } finally {
+      if (state.turnReconnectPromise === work) state.turnReconnectPromise = null;
     }
   }
 
@@ -12446,6 +13026,15 @@
 
   function setupEvents() {
     setupWorkflowNodeTooltips();
+    window.addEventListener("pagehide", (event) => {
+      reportActiveTurnLifecycle("pagehide", { persisted: event.persisted });
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        reportActiveTurnLifecycle("visibility-hidden");
+      }
+    });
+    window.addEventListener("offline", () => reportActiveTurnLifecycle("offline"));
     window.addEventListener("warehouse-voice-change", (event) => {
       applyVoicePreferences(event.detail);
       renderChat();
@@ -13105,7 +13694,7 @@
     els.speechRecord.addEventListener("click", () => toggleSpeechRecording(els.speechRecord));
     window.addEventListener("pagehide", cancelSpeechRecording);
     window.addEventListener("pagehide", stopVoicePlayback);
-    window.addEventListener("pagehide", () => state.sessionEvents?.close?.());
+    window.addEventListener("pagehide", disconnectSessionEvents);
     if (!state.composerEditor) {
       els.input.addEventListener("input", resizeComposer);
       els.input.addEventListener("paste", pasteImages);
@@ -13716,7 +14305,8 @@
       syncStageEmptyHeadlineRotation();
       if (!document.hidden) {
         updateCalliopeAvatar();
-        loadSessions().catch(() => {});
+        connectSessionEvents();
+        if (!state.busy) loadSessions().catch(() => {});
         loadInbox({ silent: true }).catch(() => {});
         loadBriefStatus({ silent: true }).catch(() => {});
         loadDreams({ silent: true }).catch(() => {});
@@ -13873,7 +14463,7 @@
       }
       clearInterval(state.sessionRefreshTimer);
       state.sessionRefreshTimer = setInterval(() => {
-        if (!document.hidden) loadSessions().catch(() => {});
+        if (!document.hidden && !state.busy) loadSessions().catch(() => {});
       }, 60_000);
       if (launchSurface && state.surfaces.some((surface) => surface.id === launchSurface)) {
         const launched = state.surfaces.find((surface) => surface.id === launchSurface);

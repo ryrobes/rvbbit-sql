@@ -48,7 +48,13 @@ SELECT
     p.note,
     p.updated_at,
     NULL::integer                                  AS max_row_groups_before_rebuild,
-    NULL::bigint                                   AS max_tombstones_before_rebuild
+    NULL::bigint                                   AS max_tombstones_before_rebuild,
+    -- Keep the forward 0277 column in the historical view shape.  Fresh
+    -- installs begin with today's base schema and then replay the migration
+    -- ledger; PostgreSQL rejects CREATE OR REPLACE VIEW when an older replay
+    -- would remove a column.  0277 replaces this placeholder with the real
+    -- policy epoch after adding/backfilling it on upgraded installations.
+    NULL::timestamptz                              AS budget_epoch_at
 FROM rvbbit.tables t
 JOIN pg_class c     ON c.oid = t.table_oid
 JOIN pg_namespace n ON n.oid = c.relnamespace

@@ -21,9 +21,12 @@
 //!   date       → Int32  (PG epoch days; read path converts)
 //!   jsonb      → Binary (PG jsonb body bytes, no varlena header)
 //!   bytea      → Binary
+//!   real[]     → List<Float32>
+//!   uuid/numeric/inet/enum/other PG arrays → canonical Utf8, then
+//!                 reconstructed through the declared PG type's input function
 //!
 //! Unsupported types error clearly so the user knows what to drop or
-//! rewrite. Numeric / interval / range types come later.
+//! rewrite. Ranges, composites, and geometry remain explicit future work.
 //!
 //! NOTE: this writes one row group containing all rows. For very large
 //! tables (>>10M rows) we'll want to chunk by row count and emit multiple
@@ -219,13 +222,17 @@ impl ColumnBuilder {
 /// reconstruct to the real type on read via the type's input function (see
 /// custom_scan's ColumnReader::Utf8 reconstruction). Lossless and semantics-
 /// preserving: the column stays its declared type to SQL, so uuid/numeric/inet/…
-/// comparisons, joins, and ORDER BY behave exactly as on the heap.
+/// comparisons, joins, and ORDER BY behave exactly as on the heap. PostgreSQL
+/// arrays other than the performance-sensitive native real[] path use the same
+/// representation. `array_out`/`array_in` preserve dimensions, lower bounds,
+/// inner NULLs, escaping, and the element type; SQL never sees a text value.
 ///
 /// An explicit allowlist (plus user enums, whose oids are dynamic) rather than a
-/// blind catch-all, so genuinely lossy/unhandled types (ranges, composites,
-/// geometry, arrays-of-composite) still fail loudly instead of degrading.
-fn is_text_surrogate_type(pg_type: u32, typtype: &str) -> bool {
+/// blind catch-all, so genuinely lossy/unhandled scalar types (ranges,
+/// composites, geometry) still fail loudly instead of degrading.
+fn is_text_surrogate_type(pg_type: u32, typtype: &str, typcategory: &str) -> bool {
     typtype == "e" // user-defined enum (dynamic oid)
+        || typcategory == "A" // any PG array; real[] takes the native arm first
         || matches!(
             pg_type,
             2950   // uuid
@@ -248,6 +255,7 @@ fn is_text_surrogate_type(pg_type: u32, typtype: &str) -> bool {
 fn plan_for_pg_type(
     pg_type: u32,
     typtype: &str,
+    typcategory: &str,
     col_name: &str,
 ) -> Result<(DataType, String), String> {
     let quoted = format!("\"{}\"", col_name.replace('"', "\"\""));
@@ -275,9 +283,11 @@ fn plan_for_pg_type(
             DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
             quoted,
         ),
-        // Text-surrogate types (uuid/numeric/inet/…/enum): store canonical text,
-        // reconstruct the real type on read via its input function.
-        n if is_text_surrogate_type(n, typtype) => (DataType::Utf8, format!("{quoted}::text")),
+        // Text-surrogate types (uuid/numeric/inet/…/enum/arrays): store
+        // canonical text, reconstruct the real type on read via its input fn.
+        n if is_text_surrogate_type(n, typtype, typcategory) => {
+            (DataType::Utf8, format!("{quoted}::text"))
+        }
         other => {
             return Err(format!(
                 "rvbbit.export_to_parquet: unsupported PG type oid {other} \
@@ -285,7 +295,7 @@ fn plan_for_pg_type(
                  int8, float4, float8, text, varchar, char, name, timestamp, \
                  timestamptz, date, jsonb, bytea, real[]; round-tripped as text: \
                  uuid, numeric, inet, cidr, macaddr, macaddr8, time, timetz, \
-                 interval, enums)"
+                 interval, enums, PostgreSQL arrays)"
             ));
         }
     })
@@ -295,7 +305,8 @@ fn introspect_columns(rel_oid: u32) -> Result<Vec<ColumnPlan>, String> {
     // attname is the PG `name` type, not text — explicit ::text cast so
     // SPI's row.get::<String>() doesn't choke on the oid mismatch.
     let sql = format!(
-        "SELECT a.attname::text, a.atttypid::oid::int, a.attnotnull, t.typtype::text \
+        "SELECT a.attname::text, a.atttypid::oid::int, a.attnotnull, \
+                t.typtype::text, t.typcategory::text \
          FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
          WHERE a.attrelid = {rel_oid}::oid AND a.attnum > 0 AND NOT a.attisdropped \
          ORDER BY a.attnum"
@@ -308,9 +319,11 @@ fn introspect_columns(rel_oid: u32) -> Result<Vec<ColumnPlan>, String> {
             let pg_type: i32 = row.get::<i32>(2)?.unwrap_or(0);
             let not_null: bool = row.get::<bool>(3)?.unwrap_or(false);
             let typtype: String = row.get::<String>(4)?.unwrap_or_default();
+            let typcategory: String = row.get::<String>(5)?.unwrap_or_default();
             let pg_type_u32 = pg_type as u32;
-            let (arrow_type, select_expr) = plan_for_pg_type(pg_type_u32, &typtype, &name)
-                .map_err(|e| pgrx::spi::Error::CursorNotFound(e))?;
+            let (arrow_type, select_expr) =
+                plan_for_pg_type(pg_type_u32, &typtype, &typcategory, &name)
+                    .map_err(|e| pgrx::spi::Error::CursorNotFound(e))?;
             plans.push(ColumnPlan {
                 name,
                 pg_type: pg_type_u32,
@@ -2117,6 +2130,37 @@ fn refresh_layout_variants(rel: pg_sys::Oid) -> Result<i64, Box<dyn std::error::
     refresh_layout_variants_impl(rel_oid, &qualified, &plans, &schema, &path_root)
 }
 
+/// Rebuild only the governed workload layouts (cluster and Hive).  Vortex has
+/// an independent canonical-Parquet repair queue and must not be rebuilt as a
+/// side effect of catching an accepted workload recommendation up.
+#[pg_extern]
+pub(crate) fn refresh_workload_layout_variants(
+    rel: pg_sys::Oid,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let rel_oid = rel.to_u32();
+    Spi::run(&format!(
+        "SELECT pg_advisory_xact_lock((1380336724::bigint << 32) | {rel_oid}::bigint)"
+    ))?;
+    let qualified: String = Spi::get_one(&format!("SELECT {rel_oid}::oid::regclass::text"))?
+        .ok_or("relation does not exist")?;
+
+    let mut plans = introspect_columns(rel_oid)?;
+    extend_plans_with_legacy_shreds(&mut plans);
+    let schema = schema_for_plans(&plans);
+
+    let data_dir: String =
+        Spi::get_one("SHOW data_directory")?.ok_or("data_directory GUC is NULL")?;
+    let mut path_root = PathBuf::from(data_dir);
+    path_root.push("rvbbit");
+    path_root.push(rel_oid.to_string());
+    std::fs::create_dir_all(&path_root)?;
+
+    let rows =
+        refresh_workload_layout_variants_impl(rel_oid, &qualified, &plans, &schema, &path_root)?;
+    invalidate_layout_variant_caches(rel_oid);
+    Ok(rows)
+}
+
 #[pg_extern]
 fn refresh_layout_variants_xid_range(
     rel: pg_sys::Oid,
@@ -2161,7 +2205,7 @@ fn refresh_layout_variants_xid_range(
     )
 }
 
-fn refresh_layout_variants_impl(
+fn refresh_workload_layout_variants_impl(
     rel_oid: u32,
     qualified: &str,
     plans: &[ColumnPlan],
@@ -2349,10 +2393,10 @@ fn refresh_layout_variants_impl(
         }
     }
 
-    if vortex_layout_enabled(rel_oid) {
-        rows_written += refresh_vortex_scan_full_impl(rel_oid, qualified, plans, path_root)?;
-    }
+    Ok(rows_written)
+}
 
+fn invalidate_layout_variant_caches(rel_oid: u32) {
     // Drop backend-local caches that depend on rvbbit.row_groups state.
     // Without this, the same session would keep planning + scanning from
     // the pre-compact metadata snapshot.
@@ -2360,6 +2404,23 @@ fn refresh_layout_variants_impl(
     crate::custom_scan::invalidate_scan_metadata(rel_oid);
     crate::columnar_cache::invalidate_table(rel_oid);
     crate::live_counters::bump_scan_epoch_on_commit();
+}
+
+fn refresh_layout_variants_impl(
+    rel_oid: u32,
+    qualified: &str,
+    plans: &[ColumnPlan],
+    schema: &Arc<Schema>,
+    path_root: &PathBuf,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let mut rows_written =
+        refresh_workload_layout_variants_impl(rel_oid, qualified, plans, schema, path_root)?;
+
+    if vortex_layout_enabled(rel_oid) {
+        rows_written += refresh_vortex_scan_full_impl(rel_oid, qualified, plans, path_root)?;
+    }
+
+    invalidate_layout_variant_caches(rel_oid);
 
     Ok(rows_written)
 }
@@ -4643,9 +4704,10 @@ mod tests {
         );
     }
 
-    // The text-surrogate allowlist: uuid/numeric/inet/…/enum plan as Utf8 via
-    // ::text (reconstructed on read), native types are untouched, and genuinely
-    // unsupported types still error loudly instead of silently degrading.
+    // The text-surrogate allowlist: uuid/numeric/inet/…/enum and PostgreSQL
+    // arrays plan as Utf8 via ::text (reconstructed on read), native types are
+    // untouched, and genuinely unsupported types still error loudly instead of
+    // silently degrading.
     #[test]
     fn text_surrogate_allowlist_maps_to_cast_text() {
         use super::{is_text_surrogate_type, plan_for_pg_type};
@@ -4654,26 +4716,35 @@ mod tests {
         // interval(1186)
         for &oid in &[2950u32, 1700, 869, 650, 829, 774, 1083, 1266, 1186] {
             assert!(
-                is_text_surrogate_type(oid, "b"),
+                is_text_surrogate_type(oid, "b", "N"),
                 "oid {oid} should be a text surrogate"
             );
-            let (_, expr) = plan_for_pg_type(oid, "b", "c").expect("surrogate must plan ok");
+            let (_, expr) = plan_for_pg_type(oid, "b", "N", "c").expect("surrogate must plan ok");
             assert!(
                 expr.contains("::text"),
                 "surrogate oid {oid} must project ::text: {expr}"
             );
         }
         // user enums are caught by typtype 'e' regardless of (dynamic) oid
-        assert!(is_text_surrogate_type(999_999, "e"));
-        assert!(plan_for_pg_type(999_999, "e", "status")
+        assert!(is_text_surrogate_type(999_999, "e", "E"));
+        assert!(plan_for_pg_type(999_999, "e", "E", "status")
             .unwrap()
             .1
             .contains("::text"));
+        // Array oids are dynamic for user-defined element types. typcategory A
+        // is the stable signal; text[](1009) is the production regression.
+        for &oid in &[1009u32, 1007, 1015, 2951, 999_998] {
+            assert!(is_text_surrogate_type(oid, "b", "A"));
+            assert!(plan_for_pg_type(oid, "b", "A", "terms")
+                .unwrap()
+                .1
+                .contains("::text"));
+        }
         // native types are not surrogates and keep planning natively (int4=23)
-        assert!(!is_text_surrogate_type(23, "b"));
-        assert!(plan_for_pg_type(23, "b", "i").is_ok());
+        assert!(!is_text_surrogate_type(23, "b", "N"));
+        assert!(plan_for_pg_type(23, "b", "N", "i").is_ok());
         // genuinely unsupported types still error (point = 600, not allowlisted)
-        assert!(!is_text_surrogate_type(600, "b"));
-        assert!(plan_for_pg_type(600, "b", "p").is_err());
+        assert!(!is_text_surrogate_type(600, "b", "G"));
+        assert!(plan_for_pg_type(600, "b", "G", "p").is_err());
     }
 }

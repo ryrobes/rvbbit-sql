@@ -52,7 +52,11 @@ SELECT
     p.note,
     p.updated_at,
     p.max_row_groups_before_rebuild,
-    p.max_tombstones_before_rebuild
+    p.max_tombstones_before_rebuild,
+    -- Preserve the forward 0277 view shape during a fresh migration replay.
+    -- The actual column is not required to exist at this point on an upgraded
+    -- database; 0277 installs it and replaces this typed placeholder.
+    NULL::timestamptz AS budget_epoch_at
 FROM rvbbit.tables t
 JOIN pg_class c ON c.oid = t.table_oid
 LEFT JOIN rvbbit.accel_policy p ON p.table_oid = t.table_oid;

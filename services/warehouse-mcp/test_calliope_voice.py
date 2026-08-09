@@ -9,6 +9,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location(
@@ -27,6 +29,7 @@ def test_voice_config_uses_server_only_elevenlabs_credentials(monkeypatch):
     monkeypatch.delenv("WAREHOUSE_CALLIOPE_TTS_KEY", raising=False)
     monkeypatch.delenv("WAREHOUSE_CALLIOPE_TTS_VOICE_ID", raising=False)
     monkeypatch.delenv("WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_STABILITY", raising=False)
 
     config = calliope.CalliopeConfig.from_env()
 
@@ -35,6 +38,7 @@ def test_voice_config_uses_server_only_elevenlabs_credentials(monkeypatch):
     assert config.voice_id == "voice-id"
     assert config.voice_fast_model == "eleven_flash_v2_5"
     assert config.voice_expressive_model == "eleven_v3"
+    assert config.voice_expressive_stability == 0.3
     assert config.voice_sample_rate == 24_000
     assert config.voice_prepare_timeout_seconds == 30
 
@@ -44,15 +48,22 @@ def test_voice_config_uses_server_only_elevenlabs_credentials(monkeypatch):
     assert calliope.CalliopeConfig.from_env().voice_prepare_timeout_seconds == 5
     monkeypatch.setenv("WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS", "999")
     assert calliope.CalliopeConfig.from_env().voice_prepare_timeout_seconds == 120
+    monkeypatch.setenv("WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_STABILITY", "0.18")
+    assert calliope.CalliopeConfig.from_env().voice_expressive_stability == 0.18
+    monkeypatch.setenv("WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_STABILITY", "8")
+    assert calliope.CalliopeConfig.from_env().voice_expressive_stability == 1.0
+    monkeypatch.setenv("WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_STABILITY", "not-a-number")
+    assert calliope.CalliopeConfig.from_env().voice_expressive_stability == 0.3
     monkeypatch.delenv("ELEVENLABS_VOICE_ID")
     assert calliope.CalliopeConfig.from_env().voice_enabled is False
 
 
-def test_voice_script_sanitizer_gates_expression_tags_and_markup():
+def test_voice_script_sanitizer_preserves_open_ended_expression_tags_and_markup():
     source = (
-        "Spoken version: [excited] **Revenue is $12.4M.** "
-        "[whispers] Risk remains elevated. [laughs] [angry] "
-        "[unknown direction] See [the dashboard](https://example.com/private)."
+        "Spoken version: [dryly amused] **Revenue is $12.4M.** "
+        "[with a weary little sigh] Risk remains elevated. "
+        "[laughs, then whispers] [direction 2] "
+        "See [the dashboard](https://example.com/private)."
     )
 
     fast = calliope._clean_voice_script(source, "fast")
@@ -61,11 +72,41 @@ def test_voice_script_sanitizer_gates_expression_tags_and_markup():
     assert "[" not in fast and "]" not in fast
     assert "https://" not in fast
     assert "Revenue is $12.4M" in fast
-    assert expressive.count("[") == 2
-    assert "[excited]" in expressive
-    assert "[whispers]" in expressive
-    assert "[unknown direction]" not in expressive
+    assert expressive.count("[") == 3
+    assert "[dryly amused]" in expressive
+    assert "[with a weary little sigh]" in expressive
+    assert "[laughs, then whispers]" in expressive
+    assert "[direction 2]" not in expressive
     assert "**" not in expressive
+
+
+def test_voice_script_sanitizer_bounds_but_does_not_enumerate_expression_tags():
+    source = " ".join(f"[performance cue {chr(97 + index)}] phrase" for index in range(10))
+
+    expressive = calliope._clean_voice_script(source, "expressive")
+
+    assert expressive.count("[") == calliope._MAX_VOICE_EXPRESSION_TAGS
+    assert "[performance cue a]" in expressive
+    assert "[performance cue h]" in expressive
+    assert "[performance cue i]" not in expressive
+
+
+def test_expressive_instruction_follows_personality_without_a_fixed_tag_script():
+    expressive = calliope._voice_rewrite_instruction(
+        "expressive",
+        "Dry, wry, intimate, and willing to sound genuinely surprised",
+    )
+    fast = calliope._voice_rewrite_instruction(
+        "fast",
+        "Dry, wry, intimate, and willing to sound genuinely surprised",
+    )
+
+    assert "materially shape word choice, cadence, pacing, emphasis" in expressive
+    assert "not a fixed vocabulary" in expressive
+    assert 'VOICE_PERSONALITY="Dry, wry, intimate' in expressive
+    assert "neutral corporate narration" in expressive
+    assert "VOICE_PERSONALITY" not in fast
+    assert "neutral conversational delivery" in fast
 
 
 def test_current_three_argument_clover_operator_builds_the_digest_and_attributes_it():
@@ -126,11 +167,13 @@ def test_current_three_argument_clover_operator_builds_the_digest_and_attributes
     operator_call = next(item for item in calls if "SELECT rvbbit.clover_llm_apply" in item[0])
     assert "%s::jsonb" in operator_call[0]
     assert operator_call[1][2] == "{}"
-    assert "VOICE_PREFERENCE=\"Warm and concise\"" in operator_call[1][1]
+    assert "VOICE_PERSONALITY" not in operator_call[1][1]
+    assert "Warm and concise" not in operator_call[1][1]
+    assert "neutral conversational delivery" in operator_call[1][1]
     receipt_call = next(item for item in calls if "UPDATE rvbbit.receipts" in item[0])
     assert receipt_call[1][0] == "pilot@example.com"
     assert "regexp_replace" in receipt_call[0]
-    assert "VOICE_PREFERENCE" in receipt_call[0]
+    assert "VOICE_(PREFERENCE|PERSONALITY)" in receipt_call[0]
     assert "Warm and concise" not in json.dumps(receipt_call[1], default=str)
 
 
@@ -200,13 +243,58 @@ def test_saved_voice_receipt_keeps_hash_not_browser_personality(monkeypatch, tmp
     )
 
     assert reused is False
+    assert render["version"] == 2
     assert render["mode"] == "expressive"
     assert render["tts_model"] == "eleven_v3"
+    assert render["tts_stability"] == 0.3
     assert "personality_hash" in render
     assert render["rewrite_elapsed_ms"] >= 0
     assert "Sound like" not in stored["json"]
     assert json.loads(stored["json"])["script"] == render["script"]
     assert stored["params"][-1] == "pilot@example.com"
+
+
+def test_stale_voice_render_contract_is_not_playable():
+    turn_id = "c697caa5-f2b0-4e91-ab14-4ad8f666803c"
+    render_id = "5b9914b4-87c7-443c-98b1-9f48c695b905"
+
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            if "set_config('statement_timeout'" in query:
+                return Result({"set_config": params[0]})
+            if query.startswith("SELECT t.response_receipt"):
+                return Result({
+                    "response_receipt": {
+                        "voice": {
+                            "id": render_id,
+                            "version": 1,
+                            "mode": "expressive",
+                            "script": "[warmly] Revenue improved.",
+                        }
+                    }
+                })
+            raise AssertionError(query)
+
+    with pytest.raises(LookupError):
+        calliope._voice_render_for_audio(
+            Connection,
+            "pilot@example.com",
+            turn_id,
+            render_id,
+        )
 
 
 def test_elevenlabs_stream_request_never_places_the_key_in_the_url(monkeypatch, tmp_path):
@@ -253,8 +341,23 @@ def test_elevenlabs_stream_request_never_places_the_key_in_the_url(monkeypatch, 
     assert captured["headers"]["accept"] == "application/json"
     assert captured["params"] == {"output_format": "pcm_24000"}
     assert captured["json"]["model_id"] == "eleven_flash_v2_5"
+    assert captured["json"]["voice_settings"] == {
+        "stability": 0.4,
+        "similarity_boost": 0.75,
+    }
     assert captured["stream"] is True
     asyncio.run(client.aclose())
+
+    expressive_client, expressive_response = asyncio.run(
+        calliope._open_voice_provider_stream(config, {
+            "script": "[quietly delighted] Revenue improved, with one material caveat.",
+            "tts_model": "eleven_v3",
+        })
+    )
+    assert expressive_response.status_code == 200
+    assert captured["json"]["model_id"] == "eleven_v3"
+    assert captured["json"]["voice_settings"] == {"stability": 0.3}
+    asyncio.run(expressive_client.aclose())
 
 
 def test_timed_voice_frame_prefers_original_character_alignment():
@@ -290,6 +393,121 @@ def test_timed_voice_frame_prefers_original_character_alignment():
     assert line["alignment"]["character_end_times_seconds"] == [0.08, 0.16]
 
 
+def test_voice_provider_stream_surfaces_embedded_elevenlabs_error():
+    with pytest.raises(calliope.VoiceProviderError) as raised:
+        calliope._voice_provider_frame(json.dumps({
+            "detail": {
+                "status": "invalid_model",
+                "message": "The selected model is not available for this voice.",
+            }
+        }))
+
+    assert raised.value.code == "VOICE_PROVIDER_ERROR"
+    assert str(raised.value) == (
+        "ElevenLabs: The selected model is not available for this voice."
+    )
+
+
+def test_elevenlabs_http_error_preserves_safe_provider_detail(monkeypatch, tmp_path, capsys):
+    class Response:
+        status_code = 400
+        headers = {"request-id": "provider-request-123"}
+
+        async def aread(self):
+            return b""
+
+        async def aclose(self):
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "detail": {
+                    "status": "invalid_model",
+                    "message": "The selected model cannot synthesize this request.",
+                }
+            }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def build_request(*_args, **_kwargs):
+            return object()
+
+        async def send(self, _request, stream=False):
+            assert stream is True
+            return Response()
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(calliope.httpx, "AsyncClient", Client)
+    config = calliope.CalliopeConfig(
+        hermes_url="http://hermes:8642",
+        hermes_api_key="hermes-key",
+        memory_key="company",
+        file_root=tmp_path,
+        max_image_bytes=1024,
+        voice_api_key="eleven-secret",
+        voice_id="voice-id",
+    )
+
+    with pytest.raises(calliope.VoiceProviderError) as raised:
+        asyncio.run(calliope._open_voice_provider_stream(config, {
+            "script": "Revenue improved, with one material caveat.",
+            "tts_model": "eleven_v3",
+        }))
+
+    assert raised.value.code == "VOICE_PROVIDER_ERROR"
+    assert "selected model cannot synthesize" in str(raised.value)
+    log = capsys.readouterr().err
+    assert "status=400" in log
+    assert "request_id=provider-request-123" in log
+
+
+def test_elevenlabs_connection_error_is_classified_and_logged(monkeypatch, tmp_path, capsys):
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def build_request(*_args, **_kwargs):
+            return object()
+
+        async def send(self, _request, stream=False):
+            assert stream is True
+            raise calliope.httpx.ConnectError("TLS connection failed")
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(calliope.httpx, "AsyncClient", Client)
+    config = calliope.CalliopeConfig(
+        hermes_url="http://hermes:8642",
+        hermes_api_key="hermes-key",
+        memory_key="company",
+        file_root=tmp_path,
+        max_image_bytes=1024,
+        voice_api_key="eleven-secret",
+        voice_id="voice-id",
+    )
+
+    with pytest.raises(calliope.VoiceProviderError) as raised:
+        asyncio.run(calliope._open_voice_provider_stream(config, {
+            "script": "Revenue improved, with one material caveat.",
+            "tts_model": "eleven_v3",
+        }))
+
+    assert raised.value.code == "VOICE_PROVIDER_UNAVAILABLE"
+    assert "could not be reached" in str(raised.value)
+    log = capsys.readouterr().err
+    assert "ElevenLabs voice connection failed" in log
+    assert "error=ConnectError" in log
+    assert "detail=TLS connection failed" in log
+
+
 def test_voice_preparation_deadline_reports_the_stalled_stage():
     backend_source = (HERE / "calliope.py").read_text(encoding="utf-8")
 
@@ -320,6 +538,9 @@ def test_voice_ui_keeps_the_original_turn_and_streams_pcm_in_the_browser():
     assert 'data-theme-voice-mode="off" aria-pressed="true"' in theme_source
     assert "data-theme-voice-personality" in theme_source
     assert "warehouse-voice-change" in theme_source
+    assert 'personality.disabled = voice.mode !== "expressive"' in theme_source
+    assert "Expressive performs it in your speaking personality; Fast stays neutral." in theme_source
+    assert "Expressive performs it in your speaking personality; Fast stays neutral." in theme_bundle
     assert "getVoice" in theme_source
     assert "rvbbit-calliope-voice-v1" in theme_bundle
     assert 'turn.assistant_message || ""' in calliope_source
@@ -333,15 +554,26 @@ def test_voice_ui_keeps_the_original_turn_and_streams_pcm_in_the_browser():
     assert "pendingTurns: new Set()" in calliope_source
     assert "failures: new Map()" in calliope_source
     assert "voicePresentationPending" in calliope_source
+    assert "text_to_speech?.render_version" in calliope_source
+    assert r"\[[^\[\]\r\n]{1,96}\]" in calliope_source
     assert "Shaping the spoken version" in calliope_source
     assert "The complete answer is ready · making it conversational" in calliope_source
     assert "voicePreparationTimeoutMs" in calliope_source
+    assert "preservingCurrentActivity" in calliope_source
+    assert "liveVoiceTurn" in calliope_source
+    select_source = calliope_source.split("async function selectSession", 1)[1].split(
+        "async function createSession", 1
+    )[0]
+    assert select_source.index("if (!preservingCurrentActivity)") \
+        < select_source.index("stopVoicePlayback()")
+    assert "Audio generation failed · ${detail}" in calliope_source
+    assert "voiceFailed.code" in calliope_source
     assert "rewriteElapsedMs >= voicePreparationTimeoutMs() * 0.6" in calliope_source
     assert 'timeoutError.code = "VOICE_AUDIO_TIMEOUT"' in calliope_source
-    assert 'showVoiceFailure(turn, "text", error, timedOut)' in calliope_source
+    assert 'showVoiceFailure(liveVoiceTurn(turn), "text", error, timedOut)' in calliope_source
     assert 'showVoiceFailure(' in calliope_source
     assert '"audio",' in calliope_source
-    assert "onFirstAudio: () => revealVoicePresentation(turn)" in calliope_source
+    assert "onFirstAudio: () => revealVoicePresentation(liveVoiceTurn(turn))" in calliope_source
     assert "turn.response_receipt" in calliope_source
     assert "state.voice.pendingTurns.add(String(pending.id))" in calliope_source
     assert "state.voice.pendingTurns.delete(String(turn.id))" in calliope_source

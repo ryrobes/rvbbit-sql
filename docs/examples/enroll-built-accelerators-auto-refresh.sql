@@ -140,26 +140,61 @@ SELECT format('%I.%I', schema_name, table_name) AS qualified_table,
   FROM applied
  ORDER BY accelerated_bytes DESC, schema_name, table_name;
 
--- Policy enrollment needs ONE global heartbeat; do not create one cron job per
--- table. From DataRabbit Scheduled Tasks, start with this every 15 minutes at a
--- non-round minute (cron: 7,22,37,52 * * * *):
+-- Policy enrollment needs one bounded global worker SET; do not create one cron
+-- job per table. From DataRabbit Scheduled Tasks, start with three distinct
+-- jobs every 15 minutes at a non-round minute (cron: 7,22,37,52 * * * *):
+-- replace/disable the old `rvbbit_accel_tick` singleton job, then add:
 --
---     SELECT * FROM rvbbit.accel_tick(2, false);
+--     CALL rvbbit.accel_tick_worker_pass(1, 3, 4, 1);
+--     CALL rvbbit.accel_tick_worker_pass(2, 3, 4, 1);
+--     CALL rvbbit.accel_tick_worker_pass(3, 3, 4, 1);
 --
--- Budget 2 means at most two ordinary tables are refreshed per heartbeat. The
--- executor prioritizes current-replacement work, then drift x observed demand,
--- and serializes itself cluster-wide. Preview the next heartbeat without doing
--- any work:
+-- Each pass handles up to four tables, but commits after every table. The
+-- workers share the freshness lane, prefer their own stable table partition,
+-- and steal unlocked work. Delta refreshes can use every worker. Full/Lance
+-- and derived-layout work share two heavy slots by default, so one long full
+-- rebuild no longer collapses the fleet to one worker. Preview each worker
+-- without doing any work:
 --
---     SELECT * FROM rvbbit.accel_tick(2, true);
+--     SELECT * FROM rvbbit.accel_tick_worker(1, 3, true, 1);
+--     SELECT * FROM rvbbit.accel_tick_worker(2, 3, true, 1);
+--     SELECT * FROM rvbbit.accel_tick_worker(3, 3, true, 1);
 --
 -- If pg_cron lives in this database, the equivalent helper is:
 --
---     SELECT rvbbit.schedule_accel_tick('7,22,37,52 * * * *', 2);
+--     SELECT rvbbit.schedule_accel_tick_workers('7,22,37,52 * * * *', 3);
+--
+-- The pass size defaults to four. To choose another value (1..16), use:
+--
+--     SELECT rvbbit.schedule_accel_tick_worker_passes(
+--         '7,22,37,52 * * * *', 3, 6
+--     );
 --
 -- When pg_cron has a different home database (the packaged default is
 -- `postgres`), use Scheduled Tasks; the helper will also raise an error with
 -- the exact cron.schedule_in_database(...) command needed there.
+--
+-- Inspect or tune the concurrency shared by full/Lance, Vortex, and accepted
+-- cluster/Hive layout builds. One is the old conservative behavior; two is the
+-- default; raise it only when the server has matching I/O and CPU headroom:
+--
+--     SELECT rvbbit.accel_maintenance_heavy_slots();
+--     SELECT * FROM rvbbit.accel_heavy_slot_activity;
+--     SELECT rvbbit.set_accel_maintenance_heavy_slots(2);
+--
+-- Vortex plus accepted cluster/Hive layouts use a separate unified worker
+-- fleet. Three minute workers, each committing up to four tables, are:
+--
+--     CALL rvbbit.layout_tick_worker_pass(1, 3, 4);
+--     CALL rvbbit.layout_tick_worker_pass(2, 3, 4);
+--     CALL rvbbit.layout_tick_worker_pass(3, 3, 4);
+--
+-- Or, when pg_cron lives in this database:
+--
+--     SELECT rvbbit.schedule_layout_tick_workers('* * * * *', 3);
+--
+-- That helper retires the old serial `rvbbit_variant_tick` job and prior
+-- workload-layout workers so only one fleet owns derived-layout work.
 --
 -- Clean fragmentation no longer forces a long rebuild in that frequent
 -- heartbeat. Inspect and preview the independent maintenance lane with:

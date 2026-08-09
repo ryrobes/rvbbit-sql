@@ -215,7 +215,7 @@ def test_calliope_live_activity_is_temporary_distinct_and_collapses_after_final(
     assert "Transient output · may change" in page
     assert "beginLiveActivity()" in script
     assert 'event === "calliope.progress"' in script
-    assert "appendLiveDraft(data.delta" in script
+    assert "appendLiveDraft(delta)" in script
     assert "finishLiveActivity(true, data.surface_count)" in script
     assert "activity.expanded = !success" in script
     assert "pending.assistant_message += data.delta" not in script
@@ -1327,6 +1327,8 @@ def test_artifact_markup_capture_route_renders_and_retains_exact_version(
                 return Result([artifact])
             if "AND kind='image'" in statement:
                 return Result([])
+            if "rvbbit.artifact_can_view" in statement:
+                return Result([{"allowed": 1}])
             raise AssertionError(statement)
 
     seen = {}

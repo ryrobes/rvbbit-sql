@@ -789,15 +789,17 @@ fallback audio and does not persist it.
 Spoken responses are an independent, opt-in browser preference in the shared
 **Appearance** dialog. **Off** is the default. **Fast** rewrites each newly completed
 answer into a factual two- or three-sentence spoken digest and streams it through
-ElevenLabs Flash without performance tags. **Expressive** uses the same bounded semantic
-rewrite, permits at most two validated v3 audio tags, and synthesizes with ElevenLabs v3.
+ElevenLabs Flash without performance tags or personality direction. **Expressive** uses
+the same factual boundary while letting the browser-local speaking personality materially
+shape wording, cadence, punctuation, and open-ended audible v3 performance tags before
+synthesizing with ElevenLabs v3.
 The full assistant answer remains canonical and unchanged in the turn record. While voice
 is enabled, the conversation displays the concise spoken cut and the small Voice control
 opens the complete answer; switching voice off restores the complete answer directly in
 chat. The latest derived script and non-secret render metadata live under that turn's
 response receipt for reload-safe replay and debugging. The optional speaking-personality
-text lives only in browser storage. Warehouse sends it transiently as untrusted tone
-guidance and retains only its hash. Provider credentials remain server-side. The timed
+text lives only in browser storage. Warehouse sends it transiently as bounded performance
+direction and retains only its hash. Provider credentials remain server-side. The timed
 ElevenLabs stream supplies per-character alignment alongside PCM, so the browser decorates
 each word as it is spoken; a cadence estimate is used only when alignment is absent. Audio
 begins playing while the HTTP response is still arriving, completed audio and its timing
@@ -837,6 +839,7 @@ export ELEVENLABS_VOICE_ID="..."
 # Optional adapters/defaults shown here for explicit deployment control
 export WAREHOUSE_CALLIOPE_TTS_FAST_MODEL="eleven_flash_v2_5"
 export WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_MODEL="eleven_v3"
+export WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_STABILITY="0.3" # lower is more emotionally variable
 export WAREHOUSE_CALLIOPE_TTS_SAMPLE_RATE="24000"
 export WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS="30"
 ```
@@ -1118,6 +1121,7 @@ dedicated overrides are `WAREHOUSE_CALLIOPE_TTS_KEY` and
 `WAREHOUSE_CALLIOPE_TTS_VOICE_ID`) · `WAREHOUSE_CALLIOPE_TTS_BASE_URL` ·
 `WAREHOUSE_CALLIOPE_TTS_FAST_MODEL` (`eleven_flash_v2_5`) ·
 `WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_MODEL` (`eleven_v3`) ·
+`WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_STABILITY` (0.3 default; clamped to 0–1) ·
 `WAREHOUSE_CALLIOPE_TTS_SAMPLE_RATE` (24000; supported PCM rates only) ·
 `WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS` (30 default; one rewrite-to-first-audio budget) ·
 `WAREHOUSE_CALLIOPE_TTS_MAX_AUDIO_BYTES` (16 MiB default, 64 MiB ceiling).

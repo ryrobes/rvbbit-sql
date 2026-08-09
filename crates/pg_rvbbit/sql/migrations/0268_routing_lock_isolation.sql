@@ -74,10 +74,23 @@ BEGIN
 END;
 $$;
 
-DROP EVENT TRIGGER IF EXISTS rvbbit_accel_catalog_ddl_changed;
-CREATE EVENT TRIGGER rvbbit_accel_catalog_ddl_changed
-    ON ddl_command_end
-    EXECUTE FUNCTION rvbbit._mark_accel_catalog_ddl_changed();
+-- On a fresh install this migration is both extension-owned SQL and later
+-- replayed by rvbbit.migrate(). PostgreSQL will not let the replay drop an
+-- event trigger owned by the extension. The trigger already follows the
+-- CREATE OR REPLACE function above, so only seed it when absent.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_event_trigger
+         WHERE evtname = 'rvbbit_accel_catalog_ddl_changed'
+    ) THEN
+        CREATE EVENT TRIGGER rvbbit_accel_catalog_ddl_changed
+            ON ddl_command_end
+            EXECUTE FUNCTION rvbbit._mark_accel_catalog_ddl_changed();
+    END IF;
+END;
+$$;
 
 DO $$
 DECLARE
@@ -143,11 +156,11 @@ BEGIN
 
     -- A fresh migrate() may have just recreated the public transaction body
     -- after extension SQL already installed this wrapper. Refresh the private
-    -- copy whenever the public body is not currently the wrapper.
+    -- copy whenever the public body is not currently the wrapper. Use CREATE
+    -- OR REPLACE instead of dropping the private function: on a fresh install
+    -- it is already an extension-owned object, which PostgreSQL correctly
+    -- refuses to drop while pg_rvbbit remains installed.
     IF position('rvbbit._accel_tick_batch(' IN public_body) = 0 THEN
-        IF to_regprocedure('rvbbit._accel_tick_batch(integer,boolean,integer)') IS NOT NULL THEN
-            DROP FUNCTION rvbbit._accel_tick_batch(integer, boolean, integer);
-        END IF;
         SELECT pg_get_functiondef(
                    'rvbbit.accel_tick(integer,boolean,integer)'::regprocedure
                )

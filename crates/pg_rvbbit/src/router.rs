@@ -5237,11 +5237,7 @@ pub(crate) fn capsule_table_refs(sql: &str) -> Vec<CapsuleTableRef> {
 }
 
 fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTableMetric> {
-    if !relations_present(&[
-        "rvbbit.tables",
-        "rvbbit.row_groups_visible",
-        "rvbbit.delete_log",
-    ]) {
+    if !route_table_metrics_catalog_present() {
         return Vec::new();
     }
     let stringless = sql_stringless(sql).to_lowercase();
@@ -5257,6 +5253,14 @@ fn referenced_rvbbit_tables(sql: &str, plan_text: Option<&str>) -> Vec<RvbbitTab
 }
 
 fn referenced_rvbbit_tables_for_oids(relation_oids: &[u32]) -> Vec<RvbbitTableMetric> {
+    // pg_rvbbit is commonly preloaded server-wide while its SQL extension is
+    // installed only in the application database.  The analyzed-query hook
+    // still runs in sibling databases such as pg_cron's `postgres` home DB.
+    // Treat those resolved OIDs as ordinary PostgreSQL relations instead of
+    // querying an RVBBIT catalog that does not exist there.
+    if !route_table_metrics_catalog_present() {
+        return Vec::new();
+    }
     let ref_oids = normalized_relation_oids(relation_oids)
         .into_iter()
         .map(i64::from)
@@ -5266,6 +5270,17 @@ fn referenced_rvbbit_tables_for_oids(relation_oids: &[u32]) -> Vec<RvbbitTableMe
     } else {
         table_metrics_for(&ref_oids)
     }
+}
+
+fn route_table_metrics_catalog_present() -> bool {
+    relations_present(&[
+        "rvbbit.tables",
+        "rvbbit.table_dirty_state",
+        "rvbbit.acceleration_state",
+        "rvbbit.accel_policy",
+        "rvbbit.row_groups_visible",
+        "rvbbit.delete_log",
+    ])
 }
 
 /// `(oid, lower(schema), lower(relname))` for one rvbbit-registered relation — the memoized

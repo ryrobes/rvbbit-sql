@@ -226,7 +226,7 @@ def test_semantic_object_context_resolves_an_exact_versioned_manifest_handle():
     class Connection:
         def execute(self, query, params):
             assert "JOIN rvbbit.dashboard_versions" in query
-            assert params == ("pipeline-dashboard", 4)
+            assert params == ("pipeline-dashboard", 4, "owner@example.com")
             return Result()
 
     context = {
@@ -251,6 +251,7 @@ def test_semantic_object_context_resolves_an_exact_versioned_manifest_handle():
     changed = calliope._resolve_workflow_semantic_object(
         Connection(),
         {**context, "payload": {"definition_hash": "sha256:stale"}},
+        "owner@example.com",
     )
     assert changed["found"] is False
     assert changed["reason"] == "Semantic object definition changed"
@@ -689,12 +690,12 @@ def test_finish_workflow_tool_advertises_structured_details_and_artifacts():
         "anyOf", [artifact_array["items"]]
     )
     assert {option.get("type") for option in item_options} >= {"object", "string"}
-    assert calliope._normalize_workflow_artifacts(None, "[]") == []
+    assert calliope._normalize_workflow_artifacts(None, "owner@example.com", "[]") == []
     empty_artifacts = SimpleNamespace(
         execute=lambda *_args, **_kwargs: SimpleNamespace(fetchone=lambda: None)
     )
     assert calliope._normalize_workflow_artifacts(
-        empty_artifacts, "unpublished-example"
+        empty_artifacts, "owner@example.com", "unpublished-example"
     ) == [{"ref": "unpublished-example", "version": None, "verified": False}]
 
 
@@ -1153,7 +1154,7 @@ def test_gallery_ask_pins_an_exact_snapshot_and_capsule_has_more_voice():
     gallery = (HERE / "server.py").read_text(encoding="utf-8")
 
     assert '"/api/calliope/gallery/artifacts/{slug}/ask"' in backend
-    assert "AND kind IN ('app','dashboard') AND path IS NOT NULL" in backend
+    assert "AND ai.kind IN ('app','dashboard') AND ai.path IS NOT NULL" in backend
     assert '"display_url": (\n                        f"/calliope/artifacts/' in backend
     assert '"published_url": artifact.get("path")' in backend
     assert '"source": {"origin": "gallery", "artifact_ref": slug, "version": version}' in backend

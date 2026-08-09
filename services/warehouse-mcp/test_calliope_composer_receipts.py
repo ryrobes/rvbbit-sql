@@ -1,6 +1,7 @@
 """Exact composer-object and durable response-receipt contracts."""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sys
@@ -28,6 +29,150 @@ class _Result:
 
     def fetchall(self):
         return self.rows
+
+
+def test_upstream_sse_wait_emits_keepalives_without_cancelling_the_read():
+    class PausedResponse:
+        def __init__(self):
+            self.lines = asyncio.Queue()
+
+        async def aiter_lines(self):
+            while True:
+                line = await self.lines.get()
+                if line is None:
+                    return
+                yield line
+
+    async def exercise():
+        response = PausedResponse()
+        events = calliope._iter_sse(response, heartbeat_seconds=0.01)
+
+        # The first quiet interval creates a downstream heartbeat. The same
+        # pending upstream read remains alive and can still deliver Hermes data.
+        assert await events.__anext__() == (None, None)
+        await response.lines.put("event: assistant.delta")
+        await response.lines.put('data: {"delta":"still working"}')
+        await response.lines.put("")
+        assert await events.__anext__() == (
+            "assistant.delta",
+            {"delta": "still working"},
+        )
+        await response.lines.put(": upstream keepalive")
+        assert await events.__anext__() == (None, None)
+        assert await events.__anext__() == (None, None)
+        await events.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_turn_stream_broker_survives_one_browser_and_replays_to_the_next():
+    async def exercise():
+        release = asyncio.Event()
+        turn_id = "94da7082-b64c-4f3b-8bc4-63e59fcb7d57"
+        started = calliope._sse("calliope.turn.started", {"turn_id": turn_id})
+        completed = calliope._sse(
+            "calliope.turn.completed",
+            {"turn_id": turn_id, "assistant_message": "Finished once."},
+        )
+
+        async def source():
+            yield started
+            await release.wait()
+            yield completed
+
+        broker = calliope._start_turn_stream(turn_id, source())
+        first_browser = calliope._subscribe_turn_stream(broker)
+        assert await first_browser.__anext__() == started
+        await first_browser.aclose()
+
+        # Closing the browser-facing iterator does not own or cancel Hermes.
+        assert broker.task is not None
+        assert not broker.task.done()
+
+        second_browser = calliope._subscribe_turn_stream(broker)
+        assert await second_browser.__anext__() == started
+        release.set()
+        assert await second_browser.__anext__() == completed
+        with pytest.raises(StopAsyncIteration):
+            await second_browser.__anext__()
+        await broker.task
+        assert turn_id not in calliope._TURN_STREAM_BROKERS
+
+    asyncio.run(exercise())
+
+
+def test_turn_request_identity_ignores_its_uuid_but_not_its_payload():
+    first = {
+        "client_turn_id": "94da7082-b64c-4f3b-8bc4-63e59fcb7d57",
+        "message": "Build the forecast",
+        "attachments": [],
+    }
+    retry = {
+        **first,
+        "client_turn_id": "1166ef63-0c7d-423b-8eda-f905e96aef04",
+    }
+    different = {**retry, "message": "Build the risk register"}
+    assert calliope._turn_request_fingerprint(first) == calliope._turn_request_fingerprint(retry)
+    assert calliope._turn_request_fingerprint(first) != calliope._turn_request_fingerprint(different)
+
+
+def test_compression_collision_does_not_claim_browser_storage_is_full():
+    message = calliope._friendly_turn_stream_error(
+        "Session 'abc' is being compressed by another writer"
+    )
+    assert "original turn is still finishing" in message.lower()
+    assert "disk" not in message.lower()
+    assert "permissions" not in message.lower()
+
+
+def test_turn_lifecycle_keeps_heartbeats_and_completed_transport_failures_separate():
+    backend_source = (HERE / "calliope.py").read_text()
+    browser_source = (HERE / "calliope" / "calliope.js").read_text()
+
+    assert 'yield b": keepalive\\n\\n"' in backend_source
+    assert "_TURN_STREAM_HEARTBEAT_SECONDS = 5.0" in backend_source
+    assert "_start_turn_stream(turn_id, stream())" in backend_source
+    assert "_subscribe_turn_stream(broker)" in backend_source
+    assert "calliope_turns_client_turn_idx" in backend_source
+    assert "return { completed: true, transportClosed: true, projectionErrors };" in browser_source
+    assert "if (!streamResult.completed) throw refreshError;" in browser_source
+    assert 'let streamedAssistantMessage = "";' in browser_source
+    assert '["complete", "partial"].includes(reconciledTurn?.status)' in browser_source
+    assert 'visibleTurn.assistant_message ||= streamedAssistantMessage;' in browser_source
+    assert "client_turn_id: clientTurnId" in browser_source
+    assert "TURN_STREAM_RECONNECT_ATTEMPTS = 2" in browser_source
+    assert "ACTIVE_TURN_STORAGE_KEY" in browser_source
+    assert "function scheduleActiveTurnReconnect()" in browser_source
+    assert "reattach: true" in browser_source
+    assert '"/api/calliope/turn-lifecycle"' in backend_source
+    assert "reportActiveTurnLifecycle(\"pagehide\"" in browser_source
+    assert "X-Calliope-Page-Id" in browser_source
+
+
+def test_browser_turn_owns_live_notebook_state_without_detaching_execution():
+    browser_source = (HERE / "calliope" / "calliope.js").read_text()
+
+    # A refresh or selection request that began before send cannot replace the
+    # turns/stage after the active-turn generation changes.
+    assert "turnActivityGeneration: 0" in browser_source
+    assert "sessionSelectSequence: 0" in browser_source
+    assert "activityGeneration === state.turnActivityGeneration" in browser_source
+    assert "selectionSequence !== state.sessionSelectSequence" in browser_source
+    assert "state.turnActivityGeneration += 1;" in browser_source
+    assert browser_source.count("{ allowDuringTurn: true }") >= 2
+
+    # Session notifications are ignored during the turn, while an accidental
+    # page exit receives the browser's normal unsaved-work guard.
+    assert "function disconnectSessionEvents()" in browser_source
+    assert "function protectActiveTurnExit(event)" in browser_source
+    assert 'window.addEventListener("beforeunload", protectActiveTurnExit);' in browser_source
+    assert 'window.removeEventListener("beforeunload", protectActiveTurnExit);' in browser_source
+
+    # A presentation bug must not stop reading the attached response and cause
+    # Starlette to observe http.disconnect. Server-declared errors remain fatal.
+    assert 'error?.code === "CALLIOPE_STREAM_ERROR"' in browser_source
+    assert "projectionErrors.length < 3" in browser_source
+    assert "stream retained" in browser_source
 
 
 def test_composer_markers_are_typed_bounded_deduplicated_and_readable():
@@ -139,7 +284,7 @@ def test_composer_exact_resolution_rechecks_brain_acl_and_artifact_version():
                     "source": "Company Brain",
                 })
             if "JOIN rvbbit.dashboard_versions" in query:
-                assert params == ("enrollment-pulse", 7)
+                assert params == ("enrollment-pulse", 7, "owner@example.com")
                 return _Result({
                     "slug": "enrollment-pulse",
                     "name": "Enrollment pulse",
@@ -297,6 +442,156 @@ def test_object_refs_and_receipts_ship_as_durable_ui_contracts():
     assert ".message-receipt" in css
     assert "window.CalliopeObjectEditor" in editor
     assert "getObjectRefs" in editor
+
+
+def test_browser_reconnects_an_incomplete_stream_without_resending_the_turn(tmp_path):
+    playwright = pytest.importorskip("playwright.sync_api")
+
+    class QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        partial(QuietHandler, directory=str(HERE)),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    session_id = "73ea6745-ee4f-48eb-bc8c-350fb99d096a"
+    turn_id = "94da7082-b64c-4f3b-8bc4-63e59fcb7d57"
+    requests = []
+    completed = False
+    page_errors = []
+
+    def route_api(route):
+        nonlocal completed
+        request = route.request
+        path = urlparse(request.url).path
+        if path == "/api/calliope/config":
+            payload = {
+                "healthy": True,
+                "personal_briefs": False,
+                "google_calendar": False,
+                "speech_to_text": {"enabled": False},
+                "text_to_speech": {"enabled": False},
+            }
+        elif path == "/api/calliope/inbox":
+            payload = {"items": [], "counts": {"unread": 0, "open": 0, "shown": 0, "by_kind": {}}}
+        elif path in {"/api/calliope/styles", "/api/calliope/instruments", "/api/calliope/workflows"}:
+            payload = {path.rsplit("/", 1)[-1]: []}
+        elif path == "/api/calliope/sessions" and request.method == "GET":
+            payload = {"sessions": [{
+                "id": session_id,
+                "title": "Reconnect check",
+                "updated_at": "2026-08-09T15:00:00Z",
+                "access_role": "owner",
+                "read_only": False,
+            }]}
+        elif path == f"/api/calliope/sessions/{session_id}" and request.method == "GET":
+            client_turn_id = requests[0]["client_turn_id"] if requests else None
+            payload = {
+                "session": {
+                    "id": session_id,
+                    "title": "Reconnect check",
+                    "access_role": "owner",
+                    "read_only": False,
+                },
+                "turns": ([{
+                    "id": turn_id,
+                    "client_turn_id": client_turn_id,
+                    "session_id": session_id,
+                    "ordinal": 1,
+                    "user_message": "Please recover this once",
+                    "assistant_message": "Recovered exactly once.",
+                    "attachments": [],
+                    "status": "complete",
+                    "turn_kind": "chat",
+                    "evidence_refs": [],
+                    "object_refs": [],
+                    "response_receipt": {},
+                }] if completed else []),
+                "surfaces": [],
+            }
+        elif path == f"/api/calliope/sessions/{session_id}/turn":
+            body = json.loads(request.post_data or "{}")
+            requests.append(body)
+            started = (
+                "event: calliope.turn.started\n"
+                + "data: "
+                + json.dumps({
+                    "turn_id": turn_id,
+                    "client_turn_id": body["client_turn_id"],
+                    "ordinal": 1,
+                    "attachments": [],
+                    "evidence_refs": [],
+                    "object_refs": [],
+                })
+                + "\n\n"
+            )
+            if len(requests) == 1:
+                # A clean but incomplete body models a proxy/browser stream drop.
+                route.fulfill(status=200, content_type="text/event-stream", body=started)
+                return
+            completed = True
+            stream = (
+                started
+                + "event: assistant.completed\n"
+                + 'data: {"content":"Recovered exactly once."}\n\n'
+                + "event: calliope.turn.completed\n"
+                + "data: "
+                + json.dumps({
+                    "turn_id": turn_id,
+                    "assistant_message": "Recovered exactly once.",
+                    "surface_count": 0,
+                    "response_receipt": {},
+                })
+                + "\n\n"
+            )
+            route.fulfill(status=200, content_type="text/event-stream", body=stream)
+            return
+        elif path == "/api/calliope/session-events":
+            route.fulfill(status=204, body="")
+            return
+        else:
+            route.fulfill(status=404, content_type="application/json", body='{"error":{"message":"fixture"}}')
+            return
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+
+    try:
+        with playwright.sync_playwright() as runtime:
+            browser = runtime.chromium.launch(
+                headless=True,
+                executable_path="/usr/bin/chromium",
+            )
+            page = browser.new_page(viewport={"width": 1200, "height": 800})
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+            page.route("**/api/**", route_api)
+            page.goto(
+                f"http://127.0.0.1:{server.server_port}/calliope/index.html?session={session_id}",
+                wait_until="networkidle",
+            )
+            editor = page.locator("#message-editor .cm-content")
+            editor.click()
+            editor.type("Please recover this once")
+            editor.press("Enter")
+            playwright.expect(page.locator(".message.assistant .message-body")).to_contain_text(
+                "Recovered exactly once."
+            )
+            page.wait_for_function("() => document.querySelector('#send-message')?.disabled === false")
+            assert page.evaluate(
+                "key => sessionStorage.getItem(key)",
+                "rvbbit-calliope-active-turn-v1",
+            ) is None
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert page_errors == []
+    assert len(requests) == 2
+    assert requests[0]["client_turn_id"] == requests[1]["client_turn_id"]
+    assert requests[0]["message"] == requests[1]["message"]
 
 
 def test_rendered_composer_selects_exact_objects_and_shows_durable_receipt(tmp_path):
