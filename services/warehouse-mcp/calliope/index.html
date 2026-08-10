@@ -40,6 +40,9 @@ __CALLIOPE_BACKGROUND__
     <button id="calliope-dreams-open" class="calliope-dreams-open" type="button" title="See what Calliope noticed and imagined overnight" hidden>
       <span>Dreams</span><b id="calliope-dreams-count" hidden>0</b>
     </button>
+    <button id="calliope-pages-open" class="calliope-pages-open" type="button" title="Open living Pages that keep a business question current">
+      <span>Pages</span><b id="calliope-pages-count" hidden>0</b>
+    </button>
     <button id="google-calendar-open" class="google-calendar-open" type="button" hidden aria-label="Connect Google Calendar">
       <span aria-hidden="true">▦</span><b>Calendar</b><i aria-hidden="true"></i>
     </button>
@@ -261,6 +264,78 @@ __CALLIOPE_BACKGROUND__
       <button id="session-share-cancel" class="quiet-action" type="button">Cancel</button>
       <button id="session-share-save" class="primary-action" type="button">Save access</button>
     </footer>
+  </div>
+</dialog>
+
+<dialog id="calliope-pages-dialog" class="calliope-pages-dialog" aria-labelledby="calliope-pages-title">
+  <div class="calliope-pages-shell">
+    <header class="calliope-pages-head">
+      <div>
+        <p class="eyebrow">Questions that keep working</p>
+        <h2 id="calliope-pages-title">Living Pages</h2>
+        <p>Give Calliope a question once. Each revision stays grounded in the company evidence you can see.</p>
+      </div>
+      <div>
+        <button id="calliope-pages-new" class="quiet-action" type="button">New page</button>
+        <button id="calliope-pages-close" class="markup-close" type="button" aria-label="Close Pages">×</button>
+      </div>
+    </header>
+    <div class="calliope-pages-layout">
+      <aside class="calliope-pages-index" aria-label="Your living Pages">
+        <header><span>Your Pages</span><b id="calliope-pages-index-count">0</b></header>
+        <div id="calliope-pages-list" class="calliope-pages-list"></div>
+      </aside>
+      <section class="calliope-pages-workspace">
+        <div id="calliope-pages-empty" class="calliope-pages-empty">
+          <span class="calliope-pages-glyph" aria-hidden="true">P</span>
+          <p class="eyebrow">A durable point of view</p>
+          <h3>What should stay understood?</h3>
+          <p>A client relationship. A department’s priorities. A project’s risks. Start with the question you keep having to reconstruct.</p>
+          <button id="calliope-pages-empty-new" class="primary-action" type="button">Create a living Page</button>
+        </div>
+        <form id="calliope-pages-form" class="calliope-pages-form" hidden>
+          <header>
+            <p class="eyebrow">New living Page</p>
+            <h3>Give the question somewhere to live.</h3>
+            <p>Calliope will find currently visible evidence, synthesize a first revision, and keep exact source receipts.</p>
+          </header>
+          <label><span>Page name</span><input id="calliope-page-name" maxlength="180" required placeholder="Acme relationship pulse" autocomplete="off"></label>
+          <label><span>What should this Page keep understanding?</span><textarea id="calliope-page-question" maxlength="4000" rows="6" required placeholder="What is the current state of this relationship, what changed, what have we promised, and what needs attention next?"></textarea></label>
+          <label><span>Anchor object <i>optional</i></span><input id="calliope-page-anchor" maxlength="500" placeholder="Acme Corp, Project Lantern, Q3 planning…" autocomplete="off"><small>A client, project, ticket, meeting, or other name already present in the Brain.</small></label>
+          <footer>
+            <button id="calliope-pages-form-cancel" class="quiet-action" type="button">Cancel</button>
+            <button id="calliope-pages-create" class="primary-action" type="submit">Create first revision</button>
+          </footer>
+        </form>
+        <article id="calliope-pages-detail" class="calliope-pages-detail" hidden>
+          <header>
+            <div>
+              <p id="calliope-page-detail-meta" class="eyebrow">Living Page</p>
+              <h3 id="calliope-page-detail-title"></h3>
+              <p id="calliope-page-detail-question"></p>
+            </div>
+            <div class="calliope-page-detail-actions">
+              <button id="calliope-page-refresh" class="primary-action" type="button">Refresh</button>
+              <button id="calliope-page-archive" class="quiet-action" type="button">Archive</button>
+            </div>
+          </header>
+          <div id="calliope-page-status" class="calliope-page-status" hidden>
+            <span aria-hidden="true"><i></i><i></i><i></i></span>
+            <div><strong>Calliope is reading across the Brain.</strong><small>Finding the evidence first, then writing one stable revision.</small></div>
+          </div>
+          <div id="calliope-page-stale" class="calliope-page-stale" hidden>
+            <span aria-hidden="true">◇</span><div><strong>This revision is closed.</strong><p>Access to at least one source changed. Refresh to create a new revision from what you can see now.</p></div>
+          </div>
+          <div class="calliope-page-paper">
+            <div id="calliope-page-body" class="calliope-page-body"></div>
+          </div>
+          <details id="calliope-page-evidence" class="calliope-page-evidence">
+            <summary><span>Evidence receipts</span><b id="calliope-page-evidence-count">0 sources</b><i aria-hidden="true">⌄</i></summary>
+            <div id="calliope-page-evidence-list"></div>
+          </details>
+        </article>
+      </section>
+    </div>
   </div>
 </dialog>
 

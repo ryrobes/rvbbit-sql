@@ -41,6 +41,7 @@ import httpx
 import application_teams
 import calliope_access
 import calliope_dreams
+import calliope_pages
 
 
 _HERE = Path(__file__).resolve().parent
@@ -3920,6 +3921,7 @@ def ensure_tables(conn_factory: Callable[..., Any]) -> None:
         conn.execute(_INBOX_DDL)
         conn.execute(_BRIEF_DDL)
         conn.execute(_BRAIN_WORK_DDL)
+        calliope_pages.ensure(conn)
         conn.execute(_GOOGLE_CALENDAR_DDL)
         conn.execute(_GOOGLE_WORKSPACE_DDL)
         conn.execute(_INSTRUMENT_DDL)
@@ -22410,6 +22412,7 @@ def register_calliope_routes(
             "shared_memory": True,
             "personal_briefs": True,
             "personal_notes": True,
+            "pages": True,
             "dreams": {
                 "enabled": config.dreaming_enabled,
                 "timezone": config.dream_timezone,
@@ -22501,6 +22504,116 @@ def register_calliope_routes(
                 "scope": "drive.file",
             }
         return json_response(payload)
+
+    def page_error_response(exc: calliope_pages.PageError) -> Response:
+        return json_response(
+            {"error": {"code": exc.code, "message": str(exc)}}, exc.status
+        )
+
+    @mcp.custom_route("/api/calliope/pages", methods=["GET"])
+    async def list_calliope_pages(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        pages = await asyncio.to_thread(calliope_pages.list_pages, conn_factory, owner)
+        return json_response({"pages": pages})
+
+    @mcp.custom_route("/api/calliope/pages", methods=["POST"])
+    async def create_calliope_page(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        try:
+            page = await asyncio.to_thread(
+                calliope_pages.create_page,
+                conn_factory,
+                owner,
+                body.get("title"),
+                body.get("question"),
+                body.get("anchor"),
+                body.get("source_filters"),
+            )
+            result = await asyncio.to_thread(
+                calliope_pages.refresh_page,
+                conn_factory,
+                owner,
+                page["id"],
+            )
+        except calliope_pages.PageError as exc:
+            return page_error_response(exc)
+        except Exception as exc:
+            return json_response({
+                "error": {
+                    "code": "PAGE_GENERATION_FAILED",
+                    "message": str(exc)[:800],
+                }
+            }, 502)
+        return json_response({"page": result}, 201)
+
+    @mcp.custom_route("/api/calliope/pages/{page_id}", methods=["GET"])
+    async def get_calliope_page(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            result = await asyncio.to_thread(
+                calliope_pages.get_page,
+                conn_factory,
+                owner,
+                request.path_params.get("page_id"),
+            )
+        except calliope_pages.PageError as exc:
+            return page_error_response(exc)
+        return json_response({"page": result})
+
+    @mcp.custom_route("/api/calliope/pages/{page_id}/refresh", methods=["POST"])
+    async def refresh_calliope_page(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            result = await asyncio.to_thread(
+                calliope_pages.refresh_page,
+                conn_factory,
+                owner,
+                request.path_params.get("page_id"),
+                force=bool((body or {}).get("force")) if isinstance(body, dict) else False,
+            )
+        except calliope_pages.PageError as exc:
+            return page_error_response(exc)
+        except Exception as exc:
+            return json_response({
+                "error": {
+                    "code": "PAGE_GENERATION_FAILED",
+                    "message": str(exc)[:800],
+                }
+            }, 502)
+        return json_response({"page": result})
+
+    @mcp.custom_route("/api/calliope/pages/{page_id}", methods=["DELETE"])
+    async def archive_calliope_page(request):
+        owner, err = api_owner(request)
+        if err:
+            return err
+        try:
+            await asyncio.to_thread(
+                calliope_pages.archive_page,
+                conn_factory,
+                owner,
+                request.path_params.get("page_id"),
+            )
+        except calliope_pages.PageError as exc:
+            return page_error_response(exc)
+        return json_response({"archived": True})
 
     @mcp.custom_route("/api/calliope/dreams", methods=["GET"])
     async def list_calliope_dreams(request):

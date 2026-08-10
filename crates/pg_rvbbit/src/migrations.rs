@@ -1129,6 +1129,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0277_accel_policy_budget_epoch",
         include_str!("../sql/migrations/0277_accel_policy_budget_epoch.sql"),
     ),
+    (
+        "0278_calliope_living_pages",
+        include_str!("../sql/migrations/0278_calliope_living_pages.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

@@ -36,6 +36,33 @@
     dreamsSummary: $("#calliope-dreams-summary"),
     dreamsList: $("#calliope-dreams-list"),
     dreamsDetail: $("#calliope-dreams-detail"),
+    pagesOpen: $("#calliope-pages-open"),
+    pagesCount: $("#calliope-pages-count"),
+    pagesDialog: $("#calliope-pages-dialog"),
+    pagesClose: $("#calliope-pages-close"),
+    pagesNew: $("#calliope-pages-new"),
+    pagesEmptyNew: $("#calliope-pages-empty-new"),
+    pagesIndexCount: $("#calliope-pages-index-count"),
+    pagesList: $("#calliope-pages-list"),
+    pagesEmpty: $("#calliope-pages-empty"),
+    pagesForm: $("#calliope-pages-form"),
+    pagesFormCancel: $("#calliope-pages-form-cancel"),
+    pageName: $("#calliope-page-name"),
+    pageQuestion: $("#calliope-page-question"),
+    pageAnchor: $("#calliope-page-anchor"),
+    pageCreate: $("#calliope-pages-create"),
+    pageDetail: $("#calliope-pages-detail"),
+    pageDetailMeta: $("#calliope-page-detail-meta"),
+    pageDetailTitle: $("#calliope-page-detail-title"),
+    pageDetailQuestion: $("#calliope-page-detail-question"),
+    pageRefresh: $("#calliope-page-refresh"),
+    pageArchive: $("#calliope-page-archive"),
+    pageStatus: $("#calliope-page-status"),
+    pageStale: $("#calliope-page-stale"),
+    pageBody: $("#calliope-page-body"),
+    pageEvidence: $("#calliope-page-evidence"),
+    pageEvidenceCount: $("#calliope-page-evidence-count"),
+    pageEvidenceList: $("#calliope-page-evidence-list"),
     calendarOpen: $("#google-calendar-open"),
     actionOpen: $("#action-library-open"),
     actionDialog: $("#action-library-dialog"),
@@ -452,6 +479,15 @@
       loading: false,
       running: false,
       viewedIds: new Set(),
+    },
+    pages: {
+      items: [],
+      selectedId: null,
+      detail: null,
+      mode: "empty",
+      loading: false,
+      mutating: false,
+      requestId: 0,
     },
     viewerRequestId: 0,
     viewerSurface: null,
@@ -2700,6 +2736,242 @@
     window.location.assign(data.url);
   }
 
+  function pageEvidenceMarkup(item) {
+    const occurred = item.occurred_at
+      ? new Date(item.occurred_at).toLocaleDateString([], {
+        year: "numeric", month: "short", day: "numeric",
+      })
+      : "Date unknown";
+    const score = Number(item.score || 0);
+    const relevance = score > 0 ? `${Math.round(score * 100)}% match` : "anchored source";
+    return `<article class="calliope-page-evidence-card" data-page-evidence="${Number(item.ordinal || 0)}">
+      <span>${Number(item.ordinal || 0)}</span>
+      <div><small>${escapeHtml(item.doc_type || "document")} · ${escapeHtml(item.source || "Company Brain")}</small>
+      <strong>${escapeHtml(item.title || "Untitled source")}</strong>
+      <p>${escapeHtml(String(item.excerpt || "").replace(/\s+/g, " ").slice(0, 700))}</p>
+      <em>${escapeHtml(occurred)} · ${escapeHtml(relevance)}</em></div>
+    </article>`;
+  }
+
+  function pageRevisionHtml(body, title) {
+    let markdown = String(body || "").trim();
+    const heading = markdown.match(/^#{1,6}\s+([^\n]+)\n+/);
+    const normalize = (value) => String(value || "").toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ").trim();
+    if (heading && normalize(heading[1]) === normalize(title)) {
+      markdown = markdown.slice(heading[0].length).trimStart();
+    }
+    return richDocumentHtml(markdown, "text/markdown");
+  }
+
+  function renderPageList() {
+    const pages = state.pages.items;
+    els.pagesIndexCount.textContent = String(pages.length);
+    els.pagesCount.hidden = !pages.length;
+    els.pagesCount.textContent = pages.length > 99 ? "99+" : String(pages.length);
+    if (state.pages.loading && !pages.length) {
+      els.pagesList.innerHTML = '<div class="calliope-pages-list-state"><i></i><span>Opening the shelf…</span></div>';
+      return;
+    }
+    if (!pages.length) {
+      els.pagesList.innerHTML = '<div class="calliope-pages-list-empty"><span>Nothing kept current yet.</span><small>Your first Page begins with a question.</small></div>';
+      return;
+    }
+    els.pagesList.innerHTML = pages.map((page) => {
+      const selected = String(page.id) === String(state.pages.selectedId || "");
+      const stale = page.evidence_visible === false;
+      const status = page.last_run_status === "failed" ? "needs attention"
+        : stale ? "source access changed"
+          : page.version ? `revision ${Number(page.version)}` : "waiting for first revision";
+      return `<button class="calliope-page-list-card ${selected ? "active" : ""} ${stale ? "stale" : ""}" type="button" data-page-id="${escapeHtml(page.id)}">
+        <i aria-hidden="true"></i><span><strong>${escapeHtml(page.title)}</strong>
+        <p>${escapeHtml(page.question)}</p><small>${escapeHtml(status)} · ${escapeHtml(relativeTime(page.last_refreshed_at || page.updated_at))}</small></span>
+      </button>`;
+    }).join("");
+  }
+
+  function showPageCreate() {
+    state.pages.mode = "create";
+    els.pagesEmpty.hidden = true;
+    els.pageDetail.hidden = true;
+    els.pagesForm.hidden = false;
+    els.pagesForm.reset();
+    requestAnimationFrame(() => els.pageName.focus());
+  }
+
+  function renderPageDetail() {
+    renderPageList();
+    if (state.pages.mode === "create") {
+      els.pagesEmpty.hidden = true;
+      els.pageDetail.hidden = true;
+      els.pagesForm.hidden = false;
+      return;
+    }
+    const page = state.pages.detail;
+    els.pagesForm.hidden = true;
+    els.pagesEmpty.hidden = Boolean(page);
+    els.pageDetail.hidden = !page;
+    if (!page) return;
+    const revision = page.revision;
+    const evidence = Array.isArray(page.evidence) ? page.evidence : [];
+    const stale = Boolean(page.acl_stale);
+    els.pageDetailTitle.textContent = page.title || "Untitled Page";
+    els.pageDetailQuestion.textContent = page.question || "";
+    els.pageDetailMeta.textContent = revision
+      ? `Living Page · revision ${Number(revision.version || 0)} · ${relativeTime(revision.created_at)}`
+      : page.last_run?.status === "failed"
+        ? "Living Page · first revision needs attention"
+        : "Living Page · waiting for evidence";
+    els.pageStatus.hidden = !state.pages.mutating;
+    els.pageStale.hidden = !stale;
+    els.pageRefresh.disabled = state.pages.mutating;
+    els.pageArchive.disabled = state.pages.mutating;
+    els.pageRefresh.textContent = state.pages.mutating
+      ? "Refreshing…" : revision ? "Refresh" : "Try first revision";
+    if (state.pages.mutating) {
+      els.pageBody.innerHTML = revision?.body
+        ? pageRevisionHtml(revision.body, page.title) : "";
+    } else if (stale) {
+      els.pageBody.innerHTML = "";
+    } else if (revision?.body) {
+      els.pageBody.innerHTML = pageRevisionHtml(revision.body, page.title);
+    } else {
+      const error = page.last_run?.error || "No visible evidence has produced a revision yet.";
+      els.pageBody.innerHTML = `<div class="calliope-page-no-revision"><strong>No revision yet.</strong><p>${escapeHtml(error)}</p></div>`;
+    }
+    els.pageEvidence.hidden = !evidence.length;
+    els.pageEvidenceCount.textContent = `${evidence.length} excerpt${evidence.length === 1 ? "" : "s"}`;
+    els.pageEvidenceList.innerHTML = evidence.map(pageEvidenceMarkup).join("");
+  }
+
+  async function loadPages({ selectId = state.pages.selectedId, silent = false } = {}) {
+    if (state.config?.pages === false) return;
+    const requestId = ++state.pages.requestId;
+    state.pages.loading = true;
+    if (!silent) renderPageList();
+    try {
+      const data = await api("/api/calliope/pages");
+      if (requestId !== state.pages.requestId) return;
+      state.pages.items = Array.isArray(data.pages) ? data.pages : [];
+      const nextId = state.pages.items.some(
+        (item) => String(item.id) === String(selectId || ""),
+      ) ? selectId : state.pages.items[0]?.id || null;
+      state.pages.selectedId = nextId;
+      if (nextId && state.pages.mode !== "create") {
+        const detail = await api(`/api/calliope/pages/${encodeURIComponent(nextId)}`);
+        if (requestId !== state.pages.requestId) return;
+        state.pages.detail = detail.page || null;
+        state.pages.mode = "detail";
+      } else if (!nextId && state.pages.mode !== "create") {
+        state.pages.detail = null;
+        state.pages.mode = "empty";
+      }
+    } finally {
+      if (requestId === state.pages.requestId) {
+        state.pages.loading = false;
+        renderPageDetail();
+      }
+    }
+  }
+
+  async function selectPage(pageId) {
+    if (!pageId || state.pages.mutating) return;
+    state.pages.selectedId = pageId;
+    state.pages.mode = "detail";
+    state.pages.detail = null;
+    renderPageList();
+    const data = await api(`/api/calliope/pages/${encodeURIComponent(pageId)}`);
+    if (String(state.pages.selectedId) !== String(pageId)) return;
+    state.pages.detail = data.page || null;
+    renderPageDetail();
+  }
+
+  async function openPages(selectId = null) {
+    if (state.config?.pages === false) {
+      toast("Living Pages are not enabled on this installation", true);
+      return;
+    }
+    if (!els.pagesDialog.open) els.pagesDialog.showModal();
+    await loadPages({ selectId: selectId || state.pages.selectedId });
+  }
+
+  async function createPage() {
+    if (state.pages.mutating) return;
+    const title = els.pageName.value.trim();
+    const question = els.pageQuestion.value.trim();
+    const anchor = els.pageAnchor.value.trim();
+    if (!title || question.length < 3) return;
+    state.pages.mutating = true;
+    els.pageCreate.disabled = true;
+    els.pageCreate.textContent = "Reading the Brain…";
+    els.pagesForm.classList.add("is-generating");
+    try {
+      const data = await api("/api/calliope/pages", {
+        method: "POST",
+        body: JSON.stringify({
+          title,
+          question,
+          anchor: anchor ? { kind: "entity", label: anchor } : {},
+        }),
+      });
+      const page = data.page;
+      state.pages.selectedId = page.id;
+      state.pages.detail = page;
+      state.pages.mode = "detail";
+      await loadPages({ selectId: page.id, silent: true });
+      toast("Living Page created from governed evidence");
+    } catch (error) {
+      await loadPages({ silent: true }).catch(() => {});
+      throw error;
+    } finally {
+      state.pages.mutating = false;
+      els.pageCreate.disabled = false;
+      els.pageCreate.textContent = "Create first revision";
+      els.pagesForm.classList.remove("is-generating");
+      renderPageDetail();
+    }
+  }
+
+  async function refreshPage() {
+    const id = state.pages.selectedId;
+    if (!id || state.pages.mutating) return;
+    state.pages.mutating = true;
+    renderPageDetail();
+    try {
+      const data = await api(`/api/calliope/pages/${encodeURIComponent(id)}/refresh`, {
+        method: "POST", body: "{}",
+      });
+      state.pages.detail = data.page;
+      await loadPages({ selectId: id, silent: true });
+      toast(data.page?.refresh_result === "unchanged"
+        ? "The evidence has not changed; the current revision still holds"
+        : "Living Page refreshed");
+    } finally {
+      state.pages.mutating = false;
+      renderPageDetail();
+    }
+  }
+
+  async function archivePage() {
+    const id = state.pages.selectedId;
+    if (!id || state.pages.mutating) return;
+    if (!window.confirm(
+      "Archive this living Page? Its revision history will remain in the database.",
+    )) return;
+    state.pages.mutating = true;
+    try {
+      await api(`/api/calliope/pages/${encodeURIComponent(id)}`, { method: "DELETE" });
+      state.pages.selectedId = null;
+      state.pages.detail = null;
+      state.pages.mode = "empty";
+      await loadPages({ selectId: null });
+      toast("Living Page archived");
+    } finally {
+      state.pages.mutating = false;
+      renderPageDetail();
+    }
+  }
+
   function compactNotebookLayout() {
     return window.innerWidth <= 1120;
   }
@@ -2888,6 +3160,7 @@
       setStatus(state.config.healthy ? "ready" : "unavailable", state.config.healthy ? "" : "offline");
       els.actionOpen.hidden = state.config.action_library === false;
       els.dreamsOpen.hidden = state.config.dreams?.enabled !== true;
+      els.pagesOpen.hidden = state.config.pages === false;
       setDreamScope("personal");
       renderDreamChrome();
       syncEvidenceSearchControls();
@@ -13128,6 +13401,40 @@
         handoffDream().catch((error) => toast(error.message, true));
       }
     });
+    els.pagesOpen.addEventListener("click", () => {
+      openPages().catch((error) => toast(error.message, true));
+    });
+    els.pagesClose.addEventListener("click", () => els.pagesDialog.close());
+    els.pagesDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      if (!state.pages.mutating) els.pagesDialog.close();
+    });
+    els.pagesDialog.addEventListener("click", (event) => {
+      if (event.target === els.pagesDialog && !state.pages.mutating) {
+        els.pagesDialog.close();
+      }
+    });
+    els.pagesNew.addEventListener("click", showPageCreate);
+    els.pagesEmptyNew.addEventListener("click", showPageCreate);
+    els.pagesFormCancel.addEventListener("click", () => {
+      state.pages.mode = state.pages.detail ? "detail" : "empty";
+      renderPageDetail();
+    });
+    els.pagesForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      createPage().catch((error) => toast(error.message, true));
+    });
+    els.pagesList.addEventListener("click", (event) => {
+      const card = event.target.closest("[data-page-id]");
+      if (!card) return;
+      selectPage(card.dataset.pageId).catch((error) => toast(error.message, true));
+    });
+    els.pageRefresh.addEventListener("click", () => {
+      refreshPage().catch((error) => toast(error.message, true));
+    });
+    els.pageArchive.addEventListener("click", () => {
+      archivePage().catch((error) => toast(error.message, true));
+    });
     els.actionOpen.addEventListener("click", () => {
       openActionLibrary().catch((error) => toast(error.message, true));
     });
@@ -14337,6 +14644,7 @@
       const launchInstrument = launch.get("instrument");
       const launchWorkflow = launch.get("workflow");
       const launchAction = launch.get("action");
+      const launchPage = launch.get("page");
       const launchInbox = launch.get("inbox");
       const launchBrief = launch.get("brief");
       const launchCalendar = launch.get("calendar");
@@ -14345,6 +14653,7 @@
       await loadBriefStatus({ silent: true });
       await loadGoogleWorkspaceStatus({ silent: true });
       await loadDreams({ silent: true });
+      await loadPages({ selectId: launchPage, silent: true });
       if (launchCalendar && state.config?.google_calendar) {
         const message = ({
           connected: "Google Calendar connected to your private Personal Brief layer",
@@ -14493,13 +14802,16 @@
       if (launchAction) {
         await openActionLibrary(launchAction);
       }
+      if (launchPage) {
+        await openPages(launchPage);
+      }
       if (launchInbox && launchInbox !== "0") {
         openInbox();
         launch.delete("inbox");
         const query = launch.toString();
         window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
       }
-      if (!state.sessions.length && !els.actionDialog.open && !els.instrumentDialog.open && !els.workflowDialog.open && !els.inboxDialog.open) {
+      if (!state.sessions.length && !els.actionDialog.open && !els.instrumentDialog.open && !els.workflowDialog.open && !els.inboxDialog.open && !els.pagesDialog.open) {
         els.dialog.showModal();
         requestAnimationFrame(() => els.newSessionTitle.focus());
       }
